@@ -742,10 +742,22 @@ class Runner:
         # repo-wide config.models.worker_effort default (resolved in _worker_env; owner rulings
         # 2026-07-07). start-session.sh forwards it to `claude --effort` only when non-empty, so the
         # default path (no label, worker_effort null) sends no --effort at all.
+        codex = self.config.get("codex") if isinstance(self.config.get("codex"), dict) else {}
+        def env_bool(name, default):
+            v = os.environ.get(name)
+            if v is not None:
+                return v
+            return "1" if default else "0"
         return {"SL_RUN_ROOT": self.home, "SL_REPO": self.repo, "SL_PANE": self.pane,
                 "SL_DEV_BRANCH": str(self.config.get("dev_branch", "main")),
                 "SL_MODEL": str(model or ""), "SL_EFFORT": str(effort or ""),
-                "SL_AGENT": self.agent}
+                "SL_AGENT": self.agent,
+                "SL_CODEX_DANGEROUS_BYPASS": env_bool(
+                    "SL_CODEX_DANGEROUS_BYPASS", bool(codex.get("dangerous_bypass", False))),
+                "SL_CODEX_BYPASS_HOOK_TRUST": env_bool(
+                    "SL_CODEX_BYPASS_HOOK_TRUST", bool(codex.get("bypass_hook_trust", True))),
+                "SL_CODEX_NO_ALT_SCREEN": env_bool(
+                    "SL_CODEX_NO_ALT_SCREEN", bool(codex.get("no_alt_screen", True)))}
 
     @staticmethod
     def _clean_control(v):
@@ -783,6 +795,10 @@ class Runner:
             model = self._clean_control(self._issue_field(iid, "model"))
             effort = self._clean_control(self._issue_field(iid, "effort"))
         models = self.config.get("models") if isinstance(self.config.get("models"), dict) else {}
+        if self.agent == "codex":
+            return self._script_env(model or os.environ.get("SL_MODEL", ""),
+                                    effort or os.environ.get("SL_EFFORT", "")
+                                    or models.get("worker_effort") or "")
         return self._script_env(model or self._models()[0],
                                 effort or models.get("worker_effort") or "")
 
@@ -929,8 +945,12 @@ class Runner:
                                "answer_path": os.path.join(answers_dir, f"{iid}.md")})
         with open(os.path.join(self.home, "briefs", f"{aid}.md"), "w") as f:
             f.write(text)
+        answerer_effort = ""
+        if self.agent == "codex":
+            answerer_model = os.environ.get("SL_MODEL", "")
+            answerer_effort = os.environ.get("SL_EFFORT", "")
         rc = self._run_script([self._script("launch-session.sh"), "--cwd", answers_dir, aid],
-                              env=self._script_env(answerer_model), timeout=LAUNCH_TIMEOUT)
+                              env=self._script_env(answerer_model, answerer_effort), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             def m(st):
                 recs = st.setdefault("answerers", {})

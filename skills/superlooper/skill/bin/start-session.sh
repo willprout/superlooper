@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Runs INSIDE each session's cmux pane. Seeds an interactive, bypass-permission Claude with
-# the brief. When Claude exits, the pane's shell persists (nothing auto-closes).
+# Runs INSIDE each session's cmux pane. Seeds an interactive coding-agent session with the brief.
+# When the agent exits, the pane's shell persists (nothing auto-closes).
 # SL_ISSUE_ID + SL_RUN_ROOT arrive in the environment (set by launch-session.sh's --command prefix);
-# re-export them so Claude's Stop/PostToolUse hook children inherit them.
+# re-export them so agent hook children inherit them.
 #
 # <id> is the loop id: i<N> for an issue worker, a<N> for an answerer (both share this launcher and
 # the same marker discipline; the runner tells them apart, not this script).
@@ -80,19 +80,61 @@ MODEL="${SL_MODEL:-}"
 # runner resolves precedence and sends SL_EFFORT="" when neither is set). Pass --effort ONLY when
 # non-empty — no forced default when it's empty. Same %q-quoted stack as --model.
 EFFORT="${SL_EFFORT:-}"
-CLAUDE_ARGS=(--dangerously-skip-permissions)
-[ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
-[ -n "$EFFORT" ] && CLAUDE_ARGS+=(--effort "$EFFORT")
-CLAUDE_ARGS+=(--name "$NAME" --remote-control "$NAME")
-# Do NOT pipe Claude through tee/cat — piping drops it into print mode and kills the
-# interactive pane you want to watch. (No headless `claude -p` anywhere — owner billing rule B.9.)
-claude "${CLAUDE_ARGS[@]}" "$(cat "$BRIEF")"
+AGENT="${SL_AGENT:-claude}"
+
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+toml_string() {
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+case "$AGENT" in
+  claude)
+    CLAUDE_ARGS=(--dangerously-skip-permissions)
+    [ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
+    [ -n "$EFFORT" ] && CLAUDE_ARGS+=(--effort "$EFFORT")
+    CLAUDE_ARGS+=(--name "$NAME" --remote-control "$NAME")
+    # Do NOT pipe Claude through tee/cat — piping drops it into print mode and kills the
+    # interactive pane you want to watch. (No headless `claude -p` anywhere — owner billing rule B.9.)
+    claude "${CLAUDE_ARGS[@]}" "$(cat "$BRIEF")"
+    ;;
+  codex)
+    WORKTREE="$(pwd -P)"
+    CODEX_ARGS=(-C "$WORKTREE")
+    if truthy "${SL_CODEX_NO_ALT_SCREEN:-1}"; then CODEX_ARGS=(--no-alt-screen "${CODEX_ARGS[@]}"); fi
+    if truthy "${SL_CODEX_DANGEROUS_BYPASS:-}"; then
+      CODEX_ARGS+=(--dangerously-bypass-approvals-and-sandbox)
+    fi
+    if truthy "${SL_CODEX_BYPASS_HOOK_TRUST:-1}"; then
+      CODEX_ARGS+=(--dangerously-bypass-hook-trust)
+    fi
+    [ -n "$MODEL" ] && CODEX_ARGS+=(-m "$MODEL")
+    [ -n "$EFFORT" ] && CODEX_ARGS+=(-c "model_reasoning_effort=$(toml_string "$EFFORT")")
+    # Interactive Codex, not `codex exec`; the brief is the initial prompt.
+    codex "${CODEX_ARGS[@]}" "$(cat "$BRIEF")"
+    ;;
+  *)
+    echo "[$ID] unsupported agent '$AGENT' (expected: claude or codex)" >&2
+    write_exited 64
+    exit 64
+    ;;
+esac
 rc=$?
-# Deterministic crash/quit/limit signal (RC-DEADPANE): when the Claude process returns to the
+# Deterministic crash/quit/limit signal (RC-DEADPANE): when the agent process returns to the
 # shell, write state/exited/<id> with the real exit code. The runner emits session_exited from
 # this marker (recovered by RESTART), and nudge-pane.sh refuses to type into the now-bash pane —
 # so a runner "resume" can never execute as a permission-bypassed shell command. The EXIT
 # trap then frees the worker lock so a legitimate restart can take this id over.
 write_exited "$rc"
 echo
-echo "[$ID] session ended $(date '+%H:%M') rc=$rc — scroll up to inspect, or: claude --resume"
+resume_cmd="claude --resume"
+[ "$AGENT" = "codex" ] && resume_cmd="codex resume"
+echo "[$ID] session ended $(date '+%H:%M') rc=$rc — scroll up to inspect, or: $resume_cmd"

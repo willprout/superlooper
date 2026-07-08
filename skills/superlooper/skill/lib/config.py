@@ -53,6 +53,7 @@ _NESTED_DEFAULTS = {
     "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
            "quarantine": [], "nightly_time": "02:00"},
     "notify": {"imessage_to": None, "cmd": None},
+    "codex": {"dangerous_bypass": False, "bypass_hook_trust": True, "no_alt_screen": True},
 }
 
 _ALLOWED_TOP = set(_TOP_DEFAULTS) | set(_NESTED_DEFAULTS) | {"repo"}
@@ -170,6 +171,9 @@ def _validate_and_fill(raw):
         v = out["notify"][nk]
         if v is not None and (not isinstance(v, str) or not v.strip()):
             _err(f"'notify.{nk}' must be null or a non-empty string, got {v!r}")
+    for ck in ("dangerous_bypass", "bypass_hook_trust", "no_alt_screen"):
+        if not isinstance(out["codex"][ck], bool):
+            _err(f"'codex.{ck}' must be true or false, got {out['codex'][ck]!r}")
 
     return out
 

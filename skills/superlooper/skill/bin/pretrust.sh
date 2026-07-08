@@ -9,6 +9,17 @@
 set -euo pipefail
 DIR_IN="${1:?usage: pretrust.sh <abs-folder>}"
 DIR="$(cd "$DIR_IN" 2>/dev/null && pwd -P || echo "$DIR_IN")"   # resolve to PHYSICAL path
+AGENT="${SL_AGENT:-claude}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+if [ "$AGENT" = "codex" ]; then
+  exec "$HERE/pretrust-codex.sh" "$DIR"
+fi
+if [ "$AGENT" != "claude" ]; then
+  echo "[pretrust] unsupported agent '$AGENT' (expected: claude or codex)" >&2
+  exit 64
+fi
+
 # (pwd -P resolves symlinks, e.g. /tmp -> /private/tmp, so the key MATCHES the path Claude
 #  keys trust on. Spike A3 caught a logical-vs-physical mismatch that left the prompt hanging.)
 CONF="$HOME/.claude.json"

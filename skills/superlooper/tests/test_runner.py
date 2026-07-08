@@ -47,6 +47,7 @@ def make_config(**over):
         "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
                "quarantine": [], "nightly_time": "02:00"},
         "notify": {"imessage_to": None, "cmd": None},
+        "codex": {"dangerous_bypass": False, "bypass_hook_trust": True, "no_alt_screen": True},
     }
     c.update(over)
     return c
@@ -305,7 +306,7 @@ def test_launch_env_uses_per_issue_model_override(rig):
 
 def test_launch_env_carries_explicit_codex_agent_without_changing_protocol(rig):
     # Runner-level selection only: the same launch action / labels / issue selection path is used,
-    # but launch-session.sh receives SL_AGENT=codex and currently rejects it as unsupported.
+    # but Codex defaults to its own model unless an explicit label/env override is present.
     rig.r.agent = "codex"
     rig.r.tick(now=NOW)
     rig.calls.clear()
@@ -314,6 +315,27 @@ def test_launch_env_carries_explicit_codex_agent_without_changing_protocol(rig):
     call = rig.calls[-1]
     assert call["args"][0].endswith("launch-session.sh") and call["args"][1] == "i101"
     assert call["env"]["SL_AGENT"] == "codex"
+    assert call["env"]["SL_MODEL"] == ""
+    assert call["env"]["SL_EFFORT"] == ""
+    assert call["env"]["SL_CODEX_DANGEROUS_BYPASS"] == "0"
+    assert call["env"]["SL_CODEX_BYPASS_HOOK_TRUST"] == "1"
+    assert call["env"]["SL_CODEX_NO_ALT_SCREEN"] == "1"
+
+
+def test_codex_launch_env_uses_config_and_label_overrides(rig):
+    rig.r.agent = "codex"
+    rig.r.config["codex"]["dangerous_bypass"] = True
+    rig.r.config["codex"]["bypass_hook_trust"] = False
+    rig.r.config["models"]["worker_effort"] = "medium"
+    rig.r.tick(now=NOW)
+    _relabel_parsed(rig, "i101", ["model:gpt-5.5"])
+    rig.calls.clear()
+    rig.r._execute(_launch_action(), NOW)
+    env = rig.calls[-1]["env"]
+    assert env["SL_MODEL"] == "gpt-5.5"
+    assert env["SL_EFFORT"] == "medium"
+    assert env["SL_CODEX_DANGEROUS_BYPASS"] == "1"
+    assert env["SL_CODEX_BYPASS_HOOK_TRUST"] == "0"
 
 
 def test_launch_env_carries_per_issue_effort_and_default_model(rig):
@@ -409,6 +431,22 @@ def test_answerer_env_ignores_per_issue_model_and_effort_labels(rig):
     assert env["SL_MODEL"] == "fable"                  # config answerer, NOT the issue's model:opus[1m]
     assert env["SL_EFFORT"] == ""                      # never a per-issue effort for the answerer
     assert env["SL_AGENT"] == "claude"
+
+
+def test_codex_answerer_uses_only_explicit_env_model_and_effort(rig, monkeypatch):
+    rig.r.agent = "codex"
+    monkeypatch.setenv("SL_MODEL", "gpt-5.5")
+    monkeypatch.setenv("SL_EFFORT", "low")
+    rig.r.tick(now=NOW)
+    _relabel_parsed(rig, "i101", ["model:opus[1m]", "effort:max"])
+    rig.calls.clear()
+    out = rig.r._execute({"act": "hire_answerer", "id": "i101", "num": 101,
+                          "answerer_id": "a1", "question": "A or B?"}, NOW)
+    assert out == "ok"
+    env = rig.calls[-1]["env"]
+    assert env["SL_MODEL"] == "gpt-5.5"
+    assert env["SL_EFFORT"] == "low"
+    assert env["SL_AGENT"] == "codex"
 
 
 def test_launch_stamps_the_override_into_issue_state(rig):

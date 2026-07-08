@@ -832,8 +832,7 @@ def main(argv=None):
                                              "(default: $SL_PANE, else the pane of the cmux tab "
                                              "this command runs in — no need to set it)"),
            "--agent": dict(default="claude", choices=("claude", "codex"),
-                           help="coding agent for launched sessions (default: claude; codex is "
-                                "currently an unsupported launch path)"),
+                           help="coding agent for launched sessions (default: claude)"),
            "--ticks": dict(type=int, default=None,
                            help="stop after N ticks (testing/simulation)")})
     add("status", cmd_status)

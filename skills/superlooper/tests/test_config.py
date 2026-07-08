@@ -56,6 +56,8 @@ def test_minimal_config_fills_defaults(tmp_path):
                          "quarantine": [], "nightly_time": "02:00"}
     assert cfg["cleanup_merged_worktrees"] is True
     assert cfg["notify"] == {"imessage_to": None, "cmd": None}
+    assert cfg["codex"] == {"dangerous_bypass": False, "bypass_hook_trust": True,
+                            "no_alt_screen": True}
     assert cfg["report_time"] == "08:45"
 
 
@@ -177,6 +179,9 @@ def test_bad_nested_field_types_rejected(tmp_path):
         {"qa": {"nightly_cmd": []}},            # null or non-empty string
         {"notify": {"cmd": []}},                # null or non-empty string
         {"notify": {"imessage_to": 5551234}},   # null or non-empty string
+        {"codex": {"dangerous_bypass": "yes"}}, # must be a real bool
+        {"codex": {"bypass_hook_trust": 1}},     # bool only, not int
+        {"codex": {"no_alt_screen": None}},      # bool only
     ]
     for extra in bad_cases:
         _write_cfg(tmp_path, {"repo": "a/b", **extra})

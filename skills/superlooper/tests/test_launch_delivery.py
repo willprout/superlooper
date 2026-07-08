@@ -76,6 +76,7 @@ STUB_CMUX = textwrap.dedent("""\
 """)
 
 STUB_CLAUDE = "#!/usr/bin/env bash\nexit 0\n"
+STUB_CODEX = "#!/usr/bin/env bash\nprintf \"%s\\n\" \"$@\" > \"$STUB_DIR/codex_args\"\nexit 0\n"
 
 pytestmark = pytest.mark.skipif(shutil.which("zsh") is None, reason="zsh required for the launch shim")
 
@@ -129,6 +130,7 @@ def _setup(tmp_path):
     cmux = stubdir / "cmux"
     _x(str(cmux), STUB_CMUX)
     _x(str(stubdir / "claude"), STUB_CLAUDE)
+    _x(str(stubdir / "codex"), STUB_CODEX)
     return run_root, repo, home, stubdir, cmux
 
 
@@ -284,17 +286,45 @@ def test_worker_command_names_model_and_effort_env(tmp_path):
     assert "SL_AGENT=claude" in cmd                      # default agent reaches the session boundary
 
 
-def test_codex_agent_selection_fails_before_creating_a_tab_or_worktree(tmp_path):
-    # Runner-level plumbing exists, but Codex launch is intentionally unsupported for now. The
-    # launcher must fail before cmux/new-surface and before git worktree creation.
+def test_codex_agent_selection_launches_and_pretrusts_project(tmp_path):
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
     r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
-                    extra_env={"SL_AGENT": "codex"})
-    assert r.returncode == 64
-    assert "Codex launch is not implemented" in r.stderr
-    assert not (run_root / "worktrees" / "i1").exists()
-    assert not (run_root / "state" / "panes" / "i1").exists()
-    assert not (stubdir / "closed").exists()
+                    extra_env={"SL_AGENT": "codex",
+                               "SL_MODEL": "gpt-5.5",
+                               "SL_EFFORT": "high",
+                               "SL_CODEX_DANGEROUS_BYPASS": "1"})
+    assert r.returncode == 0, f"expected Codex launch success, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    wt = run_root / "worktrees" / "i1"
+    assert wt.is_dir(), "Codex worker must get the same issue worktree"
+    args = (stubdir / "codex_args").read_text().splitlines()
+    assert args[0] == "--no-alt-screen"
+    assert "--dangerously-bypass-approvals-and-sandbox" in args
+    assert "--dangerously-bypass-hook-trust" in args
+    assert args[args.index("-C") + 1] == str(wt)
+    assert args[args.index("-m") + 1] == "gpt-5.5"
+    assert args[args.index("-c") + 1] == 'model_reasoning_effort="high"'
+    assert args[-1] == "do the thing"
+    codex_config = home / ".codex" / "config.toml"
+    text = codex_config.read_text()
+    assert f'[projects."{wt}"]' in text
+    assert 'trust_level = "trusted"' in text
+
+
+def test_codex_worker_command_names_agent_specific_env(tmp_path):
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    capture = tmp_path / "codex-worker.cmd"
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"SL_AGENT": "codex",
+                               "SL_CODEX_DANGEROUS_BYPASS": "0",
+                               "SL_CODEX_BYPASS_HOOK_TRUST": "0",
+                               "SL_CODEX_NO_ALT_SCREEN": "1",
+                               "STUB_CMD_CAPTURE": str(capture)})
+    assert r.returncode == 2
+    cmd = capture.read_text()
+    assert "SL_AGENT=codex" in cmd
+    assert "SL_CODEX_DANGEROUS_BYPASS=0" in cmd
+    assert "SL_CODEX_BYPASS_HOOK_TRUST=0" in cmd
+    assert "SL_CODEX_NO_ALT_SCREEN=1" in cmd
 
 
 def test_answerer_cwd_mode_launches_in_place_without_worktree(tmp_path):
