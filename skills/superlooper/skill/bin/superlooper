@@ -1,0 +1,859 @@
+#!/usr/bin/env python3
+"""superlooper — the William-facing CLI (plan Task 10, locked decision B.6).
+
+  run             the foreground tick loop (the default way to run it is VISIBLE, in a cmux tab;
+                  launchd + templates/launchd.runner.plist is the keep-alive option)
+  status          render lanes / gate / frozen / journal tail from state + journal (no GitHub)
+  adopt           write the config template into a target repo + create the §C.2 label set +
+                  print branch-protection recommendations (print-only in v1)
+  doctor          preflight: config, required_checks (FAILS HARD when empty), gh, labels,
+                  cmux, jq, launch shim, activity hooks
+  morning-report  render reports/morning-<date>.md from the journal + notify (Task 11)
+  nightly         fresh worktree of origin/<dev> -> qa.nightly_cmd -> flake/persistent triage;
+                  a persistent failure freezes merges + files a scoped fix issue (Task 12)
+  promote-report  dev->prod EVIDENCE (suite vs known-failure ledger, merges since last promotion,
+                  open issues) — NO verdict; William decides (Task 12)
+  accept-failure  accept a failure by fingerprint into the ledger — one approval, ever (Task 12)
+  tidy            close the cmux windows of FINISHED sessions (merged by default; --all extends
+                  to parked/needs-william/bounced) — manual, never automatic; never touches an
+                  in-flight or mid-gate lane, so it is safe to run while the runner is live
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.join(_HERE, "..", "lib"), _HERE):
+    _p = os.path.abspath(_p)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import config as config_lib
+import gh
+import gitops
+import issues as issues_lib
+import journal
+import ledger as ledger_lib
+import loopstate
+import nightly as nightly_lib
+import notify
+import report
+import tidy as tidy_lib
+
+_TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
+
+# cmux close settings, kept in step with runner.py (the agent boundary: cmux specifics stay in
+# the launch/close machinery — this CLI's `tidy` copies the runner's proven _close_stale_session
+# close, it does not invent a second one).
+_CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"   # SL_CMUX overrides (tests)
+_CLOSE_TIMEOUT = 15            # bound the best-effort close of a finished session's pane
+
+# The §C.2 label set, colors included so a fresh repo reads well at a glance. adopt creates
+# all of them idempotently (--force). Runner-managed labels say so — humans learn the loop's
+# vocabulary from the label descriptions.
+LABELS = [
+    ("agent-ready", "0e8a16", "William's approval: the runner may launch this issue"),
+    ("in-progress", "fbca04", "claimed by a loop session (runner-managed)"),
+    ("needs-william", "d93f0b", "parked for an owner decision (runner-managed)"),
+    ("parked", "c2e0c6", "handed back to William with a memo (runner-managed)"),
+    ("expedite", "b60205", "queue-bypass lane: the next free lane takes this first"),
+    ("preserve", "5319e7", "on a PR: resolve conflicts in-branch instead of regenerating"),
+    ("auto-approved:nightly-red", "e99695",
+     "standing rule: auto-filed fix for a red nightly/dev (scoped to restoring green)"),
+    ("superseded", "cccccc", "on a PR: replaced by a rebuild; branch preserved, nothing auto-closed"),
+    ("priority:high", "ff9500", "front of the normal queue"),
+    ("priority:low", "0075ca", "back of the queue"),
+    ("type:build", "1d76db", "build issue"),
+    ("type:investigate", "6f42c1", "investigation issue (report + children, no PR)"),
+    ("type:diagnose-and-fix", "0052cc", "diagnose-and-fix issue (scope check first)"),
+    # Per-issue control knobs (owner ruling 2026-07-07): William drops one on an issue to run its
+    # worker sessions on a specific model/effort. gh refuses to apply a label that doesn't exist, so
+    # these are a STARTER set — the runner has no allowlist, so any `model:<x>`/`effort:<x>` label
+    # you create and apply works (an unknown value fails the launch loudly and parks the issue).
+    ("model:opus", "0366d6", "per-issue worker model: latest Opus (~200K context)"),
+    ("model:opus[1m]", "0366d6", "per-issue worker model: latest Opus + 1M context"),
+    ("model:fable", "0366d6", "per-issue worker model: Fable"),
+    ("effort:low", "8256d0", "per-issue worker effort: low"),
+    ("effort:medium", "8256d0", "per-issue worker effort: medium"),
+    ("effort:high", "8256d0", "per-issue worker effort: high"),
+    ("effort:xhigh", "8256d0", "per-issue worker effort: xhigh"),
+    ("effort:max", "8256d0", "per-issue worker effort: max"),
+]
+
+_CHECKS_REQUIREMENT = (
+    "REQUIREMENT: `required_checks` must name at least one CI check that runs this repo's\n"
+    "tests. A repo with no required check has NO mechanical ship gate (§4.3) — the loop would\n"
+    "merge on vibes. Add the check to .superlooper/config.json AND to the branch protection.")
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _load_config(repo_path):
+    """config load + the D1 repo pin: every gh call this process makes must target config.repo,
+    never whatever repo the operator's cwd happens to sit in (live dry-run 2026-07-03: a runner
+    started outside the adopted repo silently talked to the wrong repo — or none). Every command
+    that loads a config loads it through here."""
+    cfg = config_lib.load(repo_path)
+    gh.set_repo(cfg.get("repo"))
+    return cfg
+
+
+def _origin_repo(repo_path):
+    """owner/name from the git origin remote, or None (adopt falls back to the placeholder)."""
+    try:
+        r = subprocess.run(["git", "-C", repo_path, "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    m = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$", r.stdout.strip())
+    return m.group(1) if m else None
+
+
+# ------------------------------- run -------------------------------
+
+def cmd_run(args):
+    from runner import Runner, preflight_pane, detect_self_pane
+    cfg = _load_config(args.repo)
+    fetch_usage = None
+    fake = os.environ.get("SL_FAKE_USAGE")
+    if fake:
+        # test/simulation seam (Task 15's offline harness): never touch the Keychain/endpoint
+        fetch_usage = lambda: json.loads(fake)
+    # Pane resolution (owner request 2026-07-06 — never hardcode a pane): an explicit --pane /
+    # $SL_PANE wins; otherwise auto-target the cmux tab THIS `superlooper run` is executing in
+    # (its own pane), so it just works wherever you start it and survives a restart that reassigns
+    # pane UUIDs. Empty only when started outside cmux with no override — preflight then fails hard.
+    pane = args.pane or os.environ.get("SL_PANE") or detect_self_pane()
+    src = ("--pane" if args.pane else "$SL_PANE" if os.environ.get("SL_PANE")
+           else "this cmux tab" if pane else "(none)")
+    r = Runner(repo=args.repo, config=cfg, pane=pane, fetch_usage=fetch_usage)
+    print(f"superlooper run: repo={args.repo} state={r.home} pane={r.pane or '(unset)'} [{src}]")
+    # D7: fail HARD before the loop if cmux is unreachable or the pane won't resolve. A quiet
+    # warning here once let a mis-started runner silently abort every launch and burn every
+    # issue's retry cap (live dry-run 2026-07-03/04) — so this refuses to start instead.
+    ok, why = preflight_pane(r.pane)
+    if not ok:
+        print(f"FATAL: {why}", file=sys.stderr)
+        print("Start `superlooper run` INSIDE a visible cmux tab — it targets that tab's own pane "
+              "automatically (no --pane needed). Only pass --pane / $SL_PANE to override.",
+              file=sys.stderr)
+        return 2
+    return r.run(max_ticks=args.ticks)
+
+
+# ------------------------------- status -------------------------------
+
+def cmd_status(args):
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    hb = _read(os.path.join(home, "state", "runner.heartbeat"))
+    has_state = os.path.exists(os.path.join(home, "state", "issues.json"))
+    if hb is None and not has_state:
+        print(f"no runner has ever run for this repo (state home: {home})")
+        return 0
+    if hb is None:
+        print(f"runner: no heartbeat yet   state home: {home}")
+    else:
+        age = int(time.time() - int(hb.strip() or 0))
+        print(f"runner: last heartbeat {age}s ago   state home: {home}")
+    alert = _read(os.path.join(home, "state", "ALERT"))
+    print(f"ALERT: {alert.strip()}" if alert else "ALERT: none")
+    frozen = _read(os.path.join(home, "state", "merges_frozen.json"))
+    if frozen:
+        try:
+            reason = json.loads(frozen).get("reason")
+        except ValueError:
+            reason = "(unreadable marker)"
+        print(f"merges: FROZEN — {reason}")
+    else:
+        print("merges: flowing")
+
+    try:
+        st = loopstate.load(os.path.join(home, "state", "issues.json"))
+    except (OSError, ValueError):
+        st = {"issues": {}}
+    issues = st.get("issues") if isinstance(st.get("issues"), dict) else {}
+    inflight = {"running", "blocked", "frozen", "exited"}
+    lanes = [(i, d) for i, d in sorted(issues.items()) if isinstance(d, dict)
+             and d.get("status") in inflight]
+    gate = [(i, d) for i, d in sorted(issues.items()) if isinstance(d, dict)
+            and d.get("status") in ("gating", "holding")]
+    print(f"\nlanes ({len(lanes)} occupied):")
+    for iid, d in lanes or []:
+        print(f"  {iid}  {d.get('status'):8}  {d.get('branch') or '-'}  "
+              f"retries={d.get('retries', 0)} conflicts={d.get('conflicts', 0)}")
+    if not lanes:
+        print("  (empty)")
+    print(f"gate ({len(gate)}):")
+    for iid, d in gate or []:
+        print(f"  {iid}  {d.get('status'):8}  {d.get('branch') or '-'}")
+    if not gate:
+        print("  (empty)")
+    terminal = {}
+    for i, d in issues.items():
+        if isinstance(d, dict) and d.get("status") in ("merged", "parked", "needs_william",
+                                                       "bounced"):
+            terminal[d["status"]] = terminal.get(d["status"], 0) + 1
+    print("terminal: " + (", ".join(f"{v} {k}" for k, v in sorted(terminal.items()))
+                          or "(none)"))
+    tail = journal.read(home)[-8:]
+    print("\nrecent journal:")
+    for rec in tail:
+        who = rec.get("id") or rec.get("date") or ""
+        print(f"  {int(rec.get('ts', 0))}  {rec.get('act'):16} {who:6} "
+              f"{rec.get('outcome', '')}")
+    if not tail:
+        print("  (empty)")
+    return 0
+
+
+# ------------------------------- adopt -------------------------------
+
+def cmd_adopt(args):
+    cfg_path = os.path.join(args.repo, ".superlooper", "config.json")
+    if os.path.exists(cfg_path):
+        print(f"already adopted: {cfg_path} exists — config left untouched.")
+    else:
+        template = _read(os.path.join(_TEMPLATES, "config.example.json")) or "{}"
+        cfg = json.loads(template)
+        detected = _origin_repo(args.repo)
+        if detected:
+            cfg["repo"] = detected
+        os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        print(f"wrote {cfg_path}" + ("" if detected else
+              ' — EDIT the "repo" field (no github.com origin remote to detect it from)'))
+
+    # D1 pin, adopt's own way: the config may be freshly written (not yet loadable through the
+    # full validator) — pin gh to whatever repo slug the config carries (detected origin on a
+    # fresh adopt, the operator's value on re-adopt). An undetected placeholder ("owner/name")
+    # still pins: label creation then fails LOUDLY against the placeholder instead of silently
+    # creating labels in whatever repo the cwd happens to be.
+    raw_cfg = _read(cfg_path)
+    try:
+        slug = (json.loads(raw_cfg) or {}).get("repo") if raw_cfg else None
+    except ValueError:
+        slug = None
+    gh.set_repo(slug)
+
+    print("creating the label set (idempotent):")
+    for name, color, desc in LABELS:
+        ok = gh.create_label(name, color, desc)
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}")
+
+    dev = "main"
+    raw = _read(cfg_path)
+    if raw:
+        try:
+            dev = json.loads(raw).get("dev_branch") or "main"
+        except ValueError:
+            pass
+    print(f"""
+Branch protection recommendations for `{dev}` (print-only in v1 — apply by hand):
+  - require a pull request before merging (the loop only ever merges PRs)
+  - require status checks to pass: your `required_checks` list
+  - do NOT require branches to be up to date before merging — the loop's merge policy is
+    completion-order with a mechanical merge-update ladder (§4.4); a strict up-to-date rule
+    just recreates the old merge train
+  - keep force pushes blocked (superlooper has no force path at all)
+
+{_CHECKS_REQUIREMENT}""")
+    return 0
+
+
+# ------------------------------- doctor -------------------------------
+
+def cmd_doctor(args):
+    failures = []
+
+    def check(name, ok, detail=""):
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}" + (f" — {detail}" if detail else ""))
+        if not ok:
+            failures.append(name)
+
+    print(f"superlooper doctor: {args.repo}")
+    cfg = None
+    try:
+        cfg = _load_config(args.repo)
+        check("config", True, "valid")
+    except (FileNotFoundError, ValueError) as e:
+        check("config", False, str(e))
+
+    if cfg is not None:
+        rc = cfg.get("required_checks") or []
+        check("required_checks", bool(rc),
+              "EMPTY — a repo with no CI check enforcing its tests has no mechanical "
+              "ship gate (§4.3); adoption requires at least one" if not rc
+              else ", ".join(rc))
+
+    gh_ok = gh.probe()
+    check("gh (reachable + authenticated)", gh_ok)
+    if cfg is not None and gh_ok:
+        have = gh.labels()
+        missing = [n for n, _, _ in LABELS if n not in have]
+        check("labels (§C.2 set)", not missing,
+              ("missing: " + ", ".join(missing)) if missing else "all present")
+
+    cmux = os.environ.get("SL_CMUX", "/Applications/cmux.app/Contents/Resources/bin/cmux")
+    check("cmux binary", os.path.exists(cmux), cmux)
+    check("jq", shutil.which("jq") is not None, "pretrust.sh needs it")
+    shim = os.path.join(os.path.expanduser("~"), ".superlooper", "launch-shim.zsh")
+    check("launch shim installed", os.path.exists(shim),
+          shim if os.path.exists(shim) else f"{shim} missing — run bin/install-launch-shim.sh")
+    settings = _read(os.path.join(os.path.expanduser("~"), ".claude", "settings.json")) or ""
+    check("activity hooks registered", "activity-hook.sh" in settings
+          and "stop-hook.sh" in settings,
+          "~/.claude/settings.json must register activity-hook.sh (PostToolUse) and "
+          "stop-hook.sh (Stop) — bin/install.sh does this" if "activity-hook.sh" not in settings
+          else "")
+
+    if failures:
+        print(f"\nDOCTOR FAILED: {', '.join(failures)}")
+        if "required_checks" in failures:
+            print(_CHECKS_REQUIREMENT)
+        return 1
+    print("\nall checks passed")
+    return 0
+
+
+# ------------------------------- shared report I/O -------------------------------
+
+def _read_json_file(path, default):
+    """Tolerant read for the state files the reports consume: missing -> default; present but
+    unparseable -> {} (existence still counts, e.g. an unreadable freeze marker reads as frozen)."""
+    txt = _read(path)
+    if txt is None:
+        return default
+    try:
+        v = json.loads(txt)
+    except ValueError:
+        return {}
+    return v
+
+
+def _ledger_map(home):
+    """The flat accepted-failure map (ledger.json at the state-home root). Fail closed to {}."""
+    v = _read_json_file(os.path.join(home, "ledger.json"), {})
+    return v if isinstance(v, dict) else {}
+
+
+_MISSING = object()
+
+
+def _frozen_view(home):
+    # Existence = frozen (fail closed). Distinguish MISSING (flowing) from PRESENT-but-not-a-proper
+    # dict (a corrupt/empty/wrong-typed marker still means frozen — matching runner.py's _read_json
+    # posture, so the two morning-report entry points agree).
+    v = _read_json_file(os.path.join(home, "state", "merges_frozen.json"), _MISSING)
+    if v is _MISSING:
+        return None
+    return v if isinstance(v, dict) and v else {"reason": "merges_frozen.json present but unreadable"}
+
+
+def _ready_queue():
+    """The waiting queue for the report: open `agent-ready` issues not yet claimed. gh reads fail
+    closed to [] (a GitHub blip renders an honest empty queue, never a crash)."""
+    out = []
+    for raw in gh.ready_issues():
+        p = issues_lib.parse_issue(raw)
+        if "in-progress" not in (p.get("labels") or []):
+            out.append({"num": p.get("num"), "title": p.get("title")})
+    out.sort(key=lambda q: q["num"] if isinstance(q.get("num"), int) else 1 << 30)
+    return out
+
+
+# ------------------------------- morning-report -------------------------------
+
+def cmd_morning_report(args):
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    date = time.strftime("%Y-%m-%d", time.localtime())
+    view = {"date": date, "now": time.time(), "frozen": _frozen_view(home),
+            "queue": _ready_queue(), "usage": None}
+    text = report.morning(journal.read(home), view, _ledger_map(home), cfg)
+    out_dir = os.path.join(home, "reports")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"morning-{date}.md")
+    with open(out_path, "w") as f:
+        f.write(text)
+    summary = next((ln for ln in text.splitlines()
+                    if ln.strip() and not ln.startswith("#")), "morning report ready")
+    outcome = notify.send(cfg, f"superlooper morning report — {date}", summary)
+    print(f"wrote {out_path}\nnotify: {outcome}")
+    return 0
+
+
+# ------------------------------- nightly QA -------------------------------
+
+NIGHTLY_TIMEOUT = 3600      # the browser suite can be long; still bounded so a hang can't wedge.
+
+
+def _make_nightly_worktree(repo, wt, dev):
+    """A fresh DETACHED checkout of origin/<dev> — the nightly runs against current dev, isolated
+    from any in-flight lane. Cleans a leftover from a crashed run first. False on any git failure.
+    (SL_NIGHTLY_WORKTREE bypasses this for tests/sim, the same way SL_FAKE_USAGE bypasses usage.)"""
+    gitops.worktree_remove(repo, wt)
+    if not gitops.fetch(repo):
+        return False
+    try:
+        r = subprocess.run(["git", "-C", repo, "worktree", "add", "--detach", wt,
+                            f"origin/{dev}"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def _run_suite(cmd, worktree, results_glob):
+    """Run qa.nightly_cmd in the worktree, then parse the JUnit it produced. Returns
+    (cmd_rc, parse_result). A missing binary / timeout is a nonzero rc, never a raise."""
+    try:
+        subprocess.run(["bash", "-lc", cmd], cwd=worktree, capture_output=True,
+                       text=True, timeout=NIGHTLY_TIMEOUT)
+        rc = 0
+    except subprocess.TimeoutExpired:
+        rc = 124
+    except OSError:
+        rc = 127
+    texts = []
+    if isinstance(results_glob, str) and results_glob.strip():
+        for p in sorted(glob.glob(os.path.join(worktree, results_glob))):
+            t = _read(p)
+            if t is not None:
+                texts.append(t)
+    return rc, nightly_lib.parse_junit(texts)
+
+
+def _file_fix_issues(home, failures, dev):
+    """File one standing-rule fix issue per DISTINCT persistent failure, deduped by fingerprint:
+    skip a fp already tracked in state/fix_issues.json, and reconcile against an open
+    auto-approved:nightly-red issue whose body already carries the fp marker (the same crash-window
+    dedup the runner's _exec_file_fix_issue does — a nightly-filed and a runner-filed issue for one
+    breakage stay one issue). Returns the issue numbers now tracking these failures."""
+    path = os.path.join(home, "state", "fix_issues.json")
+    filed_map = _read_json_file(path, {})
+    filed_map = filed_map if isinstance(filed_map, dict) else {}
+    open_bodies = [(it["number"], it["body"]) for it in gh.open_issues("auto-approved:nightly-red")
+                   if isinstance(it, dict) and isinstance(it.get("body"), str)
+                   and type(it.get("number")) is int]
+    tracking, seen = [], set()
+    for f in failures:
+        fp = f.get("fp")
+        if not fp or fp in seen:
+            continue
+        seen.add(fp)
+        if fp in filed_map:
+            tracking.append(filed_map[fp])
+            continue
+        marker = f"Failure fingerprint: `{fp}`"
+        hit = next((num for num, body in open_bodies if marker in body), None)
+        if hit is not None:
+            filed_map[fp] = hit
+            tracking.append(hit)
+            continue
+        issue = nightly_lib.fix_issue(f, dev)
+        num = gh.create_issue(issue["title"], issue["body"], labels=issue["labels"])
+        if num is None:
+            continue                     # gh failed; the next nightly re-files (idempotent by fp)
+        filed_map[fp] = num
+        tracking.append(num)
+    loopstate.save(path, filed_map)
+    return tracking
+
+
+def cmd_nightly(args):
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    os.makedirs(os.path.join(home, "state"), exist_ok=True)
+    qa = cfg.get("qa") if isinstance(cfg.get("qa"), dict) else {}
+    cmd = qa.get("nightly_cmd")
+    date = time.strftime("%Y-%m-%d", time.localtime())
+    now = time.time()
+    if not (isinstance(cmd, str) and cmd.strip()):
+        print("qa.nightly_cmd is null — the browser suite isn't wired for this repo yet; "
+              "nothing to run. (It's built collaboratively first; the config then points at it.)")
+        return 0
+    dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
+    results_glob = qa.get("results_glob")
+
+    injected = os.environ.get("SL_NIGHTLY_WORKTREE")
+    wt = injected or os.path.join(home, "nightly-worktree")
+    made = False
+    if not injected:
+        if not _make_nightly_worktree(args.repo, wt, dev):
+            # can't even build the checkout: honest failure, journal + notify, never a green.
+            journal.append(home, {"act": "nightly", "date": date, "parse_error": True,
+                                  "green": False, "flakes": 0, "persistent": 0, "filed": [],
+                                  "note": "could not create nightly worktree", "outcome": "ok"}, now)
+            notify.send(cfg, f"superlooper nightly could not start ({date})",
+                        f"failed to create a fresh worktree of origin/{dev} — see the nightly log.")
+            print("nightly: could not create the worktree", file=sys.stderr)
+            return 1
+        made = True
+
+    try:
+        rc1, p1 = _run_suite(cmd, wt, results_glob)
+        # Persist the parsed run so `promote-report --use-latest-nightly` can reuse it without
+        # re-running the (long) suite. Written for BOTH the ok and the could-not-parse paths.
+        loopstate.save(os.path.join(home, "state", "last_nightly.json"),
+                       {"date": date, "ok": p1["ok"], "failures": p1["failures"]})
+        if not p1["ok"]:
+            # Broken/empty/missing results are NEVER a silent green: journal parse_error (the
+            # morning report renders it honestly) + notify + nonzero exit. We do NOT touch the
+            # shared ALERT or freeze marker here — those are the runner's to own (it would clear a
+            # nightly-written ALERT within a tick); the durable signals are this journal record
+            # and the immediate push.
+            journal.append(home, {"act": "nightly", "date": date, "parse_error": True,
+                                  "green": False, "flakes": 0, "persistent": 0, "filed": [],
+                                  "cmd_rc": rc1, "outcome": "ok"}, now)
+            notify.send(cfg, f"superlooper nightly — could not parse results ({date})",
+                        f"qa.nightly_cmd exited {rc1}; no parseable JUnit at {results_glob!r}. "
+                        "The nightly could not confirm dev is green — check the nightly log.")
+            print(f"nightly: could not parse results (cmd rc={rc1})", file=sys.stderr)
+            return 1
+
+        run2 = None
+        if qa.get("retry_once", True) and p1["failures"]:
+            _, p2 = _run_suite(cmd, wt, results_glob)
+            # An unparseable retry can't prove a flake, so treat run1's failures as persistent
+            # (conservative): pass them as run2 so the intersection keeps them.
+            run2 = p2["failures"] if p2["ok"] else p1["failures"]
+
+        accepted = set(ledger_lib.load(home).keys())
+        quarantine = qa.get("quarantine") if isinstance(qa.get("quarantine"), list) else []
+        result = nightly_lib.classify(p1["failures"], run2, quarantine, accepted)
+        to_file = result["to_file"]
+
+        frozen_path = os.path.join(home, "state", "merges_frozen.json")
+        filed = []
+        if to_file:
+            # Claim freeze OWNERSHIP with source="nightly" (Codex R2 C2), OVERWRITING any existing
+            # marker: a red nightly is slow to recover (once a night), so it must be sticky against
+            # the runner's dev-green unfreeze. If a dev-check freeze was the only cause and it
+            # recovers first, the runner re-freezes within a tick — so overwriting is the safe
+            # direction (stays frozen until the slow condition clears).
+            loopstate.save(frozen_path,
+                           {"reason": f"nightly red: {len(to_file)} persistent failure(s)",
+                            "fingerprint": to_file[0]["fp"], "since": now, "source": "nightly"})
+            filed = _file_fix_issues(home, to_file, dev)
+        else:
+            # A green nightly clears ONLY a nightly-owned freeze — never a runner dev-check freeze
+            # (which the runner clears when dev checks go green).
+            cur = _read_json_file(frozen_path, None)
+            if isinstance(cur, dict) and cur.get("source") == "nightly":
+                try:
+                    os.remove(frozen_path)
+                except OSError:
+                    pass
+
+        green = not to_file
+        journal.append(home, {"act": "nightly", "date": date, "green": green,
+                              "flakes": len(result["flakes"]), "persistent": len(to_file),
+                              "accepted": len(result["accepted"]),
+                              "quarantined": len(result["quarantined"]),
+                              "filed": filed, "parse_error": False, "cmd_rc": rc1,
+                              "outcome": "ok"}, now)
+
+        if to_file:
+            shown = ", ".join(f"#{n}" for n in filed) or "(dedup: already open)"
+            notify.send(cfg, f"superlooper nightly RED ({date})",
+                        f"{len(to_file)} persistent failure(s); merges frozen, fix issue(s): {shown}")
+            print(f"nightly RED: {len(to_file)} persistent, filed {filed or '(deduped)'}, "
+                  f"merges frozen ({len(result['flakes'])} flake(s), "
+                  f"{len(result['accepted'])} accepted, {len(result['quarantined'])} quarantined)")
+        else:
+            print(f"nightly green ({len(result['flakes'])} flake(s), "
+                  f"{len(result['accepted'])} accepted-ledger, "
+                  f"{len(result['quarantined'])} quarantined)")
+        return 0
+    finally:
+        if made:
+            gitops.worktree_remove(args.repo, wt)
+
+
+# ------------------------------- promotion evidence + accept-failure -------------------------------
+
+def _open_issue_summary():
+    """Open issues for the promotion report's open-issue section: the approved queue + everything
+    in flight, deduped, oldest-first. gh fails closed to [] (a blip renders an honest empty list)."""
+    seen, out = set(), []
+    for label in ("agent-ready", "in-progress"):
+        for raw in gh.open_issues(label):
+            p = issues_lib.parse_issue(raw)
+            num = p.get("num")
+            if isinstance(num, int) and num not in seen:
+                seen.add(num)
+                out.append({"num": num, "title": p.get("title"), "labels": p.get("labels")})
+    out.sort(key=lambda i: i["num"])
+    return out
+
+
+def cmd_promote_report(args):
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    date = time.strftime("%Y-%m-%d", time.localtime())
+    qa = cfg.get("qa") if isinstance(cfg.get("qa"), dict) else {}
+
+    if args.use_latest_nightly:
+        ln = _read_json_file(os.path.join(home, "state", "last_nightly.json"), None)
+        if not isinstance(ln, dict):
+            print("no stored nightly results (state/last_nightly.json) — run `superlooper nightly` "
+                  "first, or omit --use-latest-nightly to run the suite now.", file=sys.stderr)
+            return 1
+        # ok must be EXACTLY True — a corrupt/hand-edited cache with a truthy wrong-typed value
+        # ("false", {}, 1) must never render as parsed evidence (silent all-clear). Anything but
+        # True falls to report.promotion's could-not-parse path (Codex R2 C3).
+        suite = {"ok": ln.get("ok") is True,
+                 "failures": ln.get("failures") if isinstance(ln.get("failures"), list) else [],
+                 "source": f"latest nightly {ln.get('date')}"}
+    else:
+        cmd = qa.get("nightly_cmd")
+        if not (isinstance(cmd, str) and cmd.strip()):
+            print("qa.nightly_cmd is null — nothing to run. Use --use-latest-nightly, or wire the "
+                  "suite in .superlooper/config.json.", file=sys.stderr)
+            return 1
+        dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
+        injected = os.environ.get("SL_NIGHTLY_WORKTREE")
+        wt = injected or os.path.join(home, "promote-worktree")
+        made = False
+        if not injected:
+            if not _make_nightly_worktree(args.repo, wt, dev):
+                print("could not create the suite worktree", file=sys.stderr)
+                return 1
+            made = True
+        try:
+            _, p = _run_suite(cmd, wt, qa.get("results_glob"))
+        finally:
+            if made:
+                gitops.worktree_remove(args.repo, wt)
+        suite = {"ok": p["ok"], "failures": p["failures"], "source": "fresh suite"}
+
+    prod = cfg.get("prod_branch")
+    dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
+    result = gh.compare(prod, dev) if isinstance(prod, str) and prod.strip() else None
+    compare = {"prod_branch": prod, "dev_branch": dev, "result": result}
+
+    text = report.promotion(date, suite, ledger_lib.load(home), compare,
+                            _open_issue_summary(), cfg)
+    out_dir = os.path.join(home, "reports")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"promotion-{date}.md")
+    with open(out_path, "w") as f:
+        f.write(text)
+    outcome = notify.send(cfg, f"superlooper promotion evidence — {date}",
+                          "promotion evidence ready — no verdict, your call (Gate 2).")
+    print(f"wrote {out_path}\nnotify: {outcome}")
+    return 0
+
+
+def cmd_accept_failure(args):
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    fp = args.fingerprint
+    if not (isinstance(fp, str) and fp.strip()):
+        print("accept-failure needs a fingerprint (copy it from a promotion report).",
+              file=sys.stderr)
+        return 2
+    os.makedirs(home, exist_ok=True)             # a first-ever accept may precede any runner run
+    ledger_lib.accept(home, fp.strip(), note=args.note)
+    note = f' — "{args.note}"' if args.note else ""
+    print(f"accepted failure {fp.strip()}{note}\n"
+          "This acceptance persists (one approval, ever) and folds the failure away in future "
+          "promotion reports.")
+    return 0
+
+
+# ------------------------------- tidy -------------------------------
+# `superlooper tidy` closes the cmux windows of FINISHED sessions. It is William's explicit word,
+# never automatic (V1 'nothing auto-closed' — DRYRUN 2026-07-03): a real claude worker idles at
+# its prompt forever after finishing (D4) and never self-closes, so windows pile up. Safe to run
+# while the runner is live — the pure selector (tidy.closable) never picks an in-flight or
+# in-between-gate lane, so a close can only ever land on a finished, idle session.
+
+def _panes_dir(home):
+    return os.path.join(home, "state", "panes")
+
+
+def _recorded_windows(home):
+    """The iids that have a recorded cmux window: a pane marker file state/panes/<iid> (an exact
+    `i<N>` name — the `.ws` sidecar is skipped). Missing dir / unreadable -> empty set."""
+    out = set()
+    try:
+        for name in os.listdir(_panes_dir(home)):
+            if re.fullmatch(r"i\d+", name):
+                out.add(name)
+    except OSError:
+        pass
+    return out
+
+
+def _snapshot(home, iid):
+    """(surface, ws) read from disk NOW. Captured at LIST time — the close then targets exactly
+    the window shown to William, never a re-read that a relaunch during the y/N wait could have
+    redirected to a fresh, LIVE surface (Codex cross-review round 1: the never-close-in-flight
+    property must survive a concurrent re-approval)."""
+    panes = _panes_dir(home)
+    return ((_read(os.path.join(panes, iid)) or "").strip(),
+            (_read(os.path.join(panes, f"{iid}.ws")) or "").strip())
+
+
+def _close_window(cmux, home, iid, surface, ws, *, cleanup):
+    """Best-effort close of the SNAPSHOTTED surface (rc IGNORED — a dead surface is a silent
+    no-op). Then, ONLY when `cleanup` is set, clear iid's pane markers + singleton lock — the
+    runner's _close_stale_session close (runner.py), copied deliberately (runner.py is read-only
+    here; a parallel session owns it — dedup noted as a follow-up).
+
+    Why the close targets the SNAPSHOT surface and not a fresh re-read: the snapshot was taken
+    when the window was listed, so if a relaunch replaced this session while tidy ran, we close
+    the OLD (now-dead) surface — a harmless no-op — and NEVER the new, LIVE one. tidy can't close
+    an in-flight window.
+
+    Why cleanup is gated (Codex cross-review rounds 1-2): pane markers/lock are NOT under any lock
+    tidy can take (the runner writes them from the shell launch stack), so a read-then-remove can
+    never be made atomic against a concurrent relaunch. The airtight fix is structural — `cleanup`
+    is set ONLY for a status that can NEVER relaunch (merged; see tidy.REAPPROVABLE), so there is
+    no concurrent writer and the removal is race-free. For a re-approvable status tidy closes the
+    window but leaves the markers/lock to the runner, whose _close_stale_session frees them on the
+    next relaunch (and _live_lock_ids ignores a dead-PID lock meanwhile) — so tidy never frees a
+    live worker's singleton lock. Freeing a merged session's stale lock mirrors _close_stale_session
+    (the finished-but-alive session held it — D4)."""
+    if surface:
+        args = [cmux, "close-surface", "--surface", surface]
+        if ws:
+            args += ["--workspace", ws]
+        try:
+            subprocess.run(args, capture_output=True, text=True, timeout=_CLOSE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            pass                                  # best-effort; a close failure never wedges tidy
+    if not cleanup:
+        return
+    panes = _panes_dir(home)
+    for p in (os.path.join(panes, iid), os.path.join(panes, f"{iid}.ws"),
+              os.path.join(home, "state", f"worker.{iid}.lock")):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def cmd_tidy(args):
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    try:
+        st = loopstate.load(os.path.join(home, "state", "issues.json"))
+    except (OSError, ValueError):
+        st = {}
+    # Guard st ITSELF: a corrupt issues.json can parse as a JSON list/str/number, so st.get would
+    # raise before the selector's own guards — fail closed to no issues (nothing to close).
+    st = st if isinstance(st, dict) else {}
+    issues = st.get("issues") if isinstance(st.get("issues"), dict) else {}
+    targets = tidy_lib.closable(issues, _recorded_windows(home), scope_all=args.all)
+    scope = "terminal" if args.all else "merged"
+    if not targets:
+        print(f"tidy: no finished ({scope}) session windows to close.")
+        return 0
+
+    # Snapshot each target's surface/ws NOW, before the y/N wait, so the close targets exactly the
+    # windows listed here — a relaunch during the wait can't redirect a close onto a live window.
+    snaps = [{"id": t["id"], "status": t["status"], **dict(zip(("surface", "ws"),
+              _snapshot(home, t["id"])))} for t in targets]
+    print(f"tidy will close {len(snaps)} finished ({scope}) session window(s):")
+    for s in snaps:
+        print(f"  {s['id']:5} {s['status']:13} {s['surface'] or '(no surface)'}")
+    if args.dry_run:
+        print("dry-run: nothing closed.")
+        return 0
+    if not args.yes:
+        try:
+            reply = input("close these windows? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("aborted — nothing closed.")
+            return 0
+
+    cmux = os.environ.get("SL_CMUX", _CMUX_DEFAULT)
+    reconciled = []
+    for s in snaps:
+        # cleanup (remove markers+lock) ONLY for a status that can never relaunch — merged. A
+        # re-approvable session's markers/lock stay the runner's to reconcile (race-free by
+        # construction; see _close_window).
+        cleanup = s["status"] not in tidy_lib.REAPPROVABLE
+        _close_window(cmux, home, s["id"], s["surface"], s["ws"], cleanup=cleanup)
+        if not cleanup:
+            reconciled.append(s["id"])
+    print(f"closed {len(snaps)} window(s)." + (
+        f" {len(reconciled)} re-approvable session(s) left for the runner to reconcile "
+        f"({', '.join(reconciled)})." if reconciled else ""))
+    return 0
+
+
+# ------------------------------- stubs -------------------------------
+
+def _stub(which, wave):
+    def run(args):
+        print(f"`superlooper {which}` is not implemented yet — it lands in {wave}.",
+              file=sys.stderr)
+        return 2
+    return run
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="superlooper", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, **extra):
+        p = sub.add_parser(name)
+        p.add_argument("--repo", default=os.getcwd(),
+                       help="target repo working copy (default: cwd)")
+        for flag, kw in extra.items():
+            p.add_argument(flag, **kw)
+        p.set_defaults(fn=fn)
+
+    add("run", cmd_run,
+        **{"--pane": dict(default=None, help="OVERRIDE the cmux pane that hosts the loop's tabs "
+                                             "(default: $SL_PANE, else the pane of the cmux tab "
+                                             "this command runs in — no need to set it)"),
+           "--ticks": dict(type=int, default=None,
+                           help="stop after N ticks (testing/simulation)")})
+    add("status", cmd_status)
+    add("adopt", cmd_adopt)
+    add("doctor", cmd_doctor)
+    add("nightly", cmd_nightly)
+    add("morning-report", cmd_morning_report)
+    add("promote-report", cmd_promote_report,
+        **{"--use-latest-nightly": dict(action="store_true",
+           help="reuse the latest nightly's results instead of running the suite now")})
+    add("accept-failure", cmd_accept_failure,
+        **{"fingerprint": dict(help="the failure fingerprint from a promotion report"),
+           "--note": dict(default=None, help="why this failure is non-blocking (audit note)")})
+    add("tidy", cmd_tidy,
+        **{"--all": dict(action="store_true",
+                         help="also close parked / needs-william / bounced session windows "
+                              "(default: only merged — the truly-done sessions)"),
+           "--yes": dict(action="store_true", help="skip the y/N confirmation"),
+           "--dry-run": dict(action="store_true",
+                             help="list the windows tidy would close, then close nothing")})
+
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

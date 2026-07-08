@@ -1,0 +1,20 @@
+{
+  "comments": [
+    {
+      "id": "IC_1",
+      "author": {"login": "will-titan"},
+      "authorAssociation": "OWNER",
+      "body": "Approved by William in conversation, 2026-07-02.",
+      "createdAt": "2026-07-02T12:00:00Z",
+      "url": "https://github.com/fake/repo/issues/123#issuecomment-1"
+    },
+    {
+      "id": "IC_2",
+      "author": {"login": "some-worker"},
+      "authorAssociation": "NONE",
+      "body": "<!-- superlooper-investigation -->\nRoot cause: the cache key omitted the tenant id.",
+      "createdAt": "2026-07-02T13:00:00Z",
+      "url": "https://github.com/fake/repo/issues/123#issuecomment-2"
+    }
+  ]
+}

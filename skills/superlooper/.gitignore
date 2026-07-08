@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.tmp
+.DS_Store
+# fake-gh records these at runtime; tests use a tmp copy, but guard against a stray manual run
+# polluting the committed fixtures dir.
+calls.jsonl
+mutations.jsonl
+.claude/worktrees/

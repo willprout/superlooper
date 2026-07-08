@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.tmp
+.DS_Store
+
+# The dashboard's own per-user config lives at the repo root and holds machine-specific
+# checkout paths — never committed (shareability: per-user facts stay out of the repo; see
+# config.example.json). Anchored with a leading slash so it can NEVER match the loop's own
+# committed .superlooper/config.json.
+/config.json
+
+# The dashboard's small persisted state (last-seen timestamps, etc.) — local, not committed.
+/.command-center-state.json
+
+# fake-gh style test harnesses record these at runtime; guard against a stray manual run
+# polluting the committed fixtures.
+calls.jsonl
+mutations.jsonl

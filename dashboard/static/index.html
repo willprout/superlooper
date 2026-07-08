@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>command center</title>
+  <link rel="stylesheet" href="/shell.css">
+  <link rel="stylesheet" href="/boards.css">
+</head>
+<body>
+  <!-- The whole surface is (re)built from /api/snapshot by shell.js — no framework, no build step.
+       Two views share this root: the four-panel shell (screen 7a) and boring mode (screen 8c),
+       toggled with the B key. The airfield renders through the lifted prototype renderers
+       (airfield3) driven by the N-flight engine (airfield_live), bound by field.js. -->
+  <div id="app" data-view="shell">
+    <div id="root" class="cc-loading">connecting to the field…</div>
+  </div>
+  <script src="/airfield3.js"></script>
+  <script src="/airfield_live.js"></script>
+  <script src="/field.js"></script>
+  <!-- The Solari flagship + the boards renderer load before the shell binds them (design record §8). -->
+  <script src="/solari.js"></script>
+  <script src="/boards.js"></script>
+  <!-- The three decision surfaces (Task 9): tower comms feed, Needs You cards, flight-card drawer.
+       Loaded before shell.js, which binds them into the four-panel shell. -->
+  <script src="/tower.js"></script>
+  <script src="/needsyou.js"></script>
+  <script src="/drawer.js"></script>
+  <!-- Task 11: the night replay (a treat over the field engine) + the mechanical morning digest,
+       both on-demand overlays behind a button (design record §4, no-ritual §0.2). -->
+  <script src="/replay.js"></script>
+  <script src="/digest.js"></script>
+  <!-- Issue #41: the Tidy button's confirm dialog — the one ops-verb overlay (runs `superlooper
+       tidy` locally). Loaded before shell.js so window.CCTidy exists when the button binds it. -->
+  <script src="/tidy.js"></script>
+  <script src="/shell.js"></script>
+</body>
+</html>

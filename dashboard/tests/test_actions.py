@@ -1,0 +1,263 @@
+"""The six mechanical verbs (``lib/actions.py``) — the ONLY writes in the whole product (Task 6).
+
+Every verb is exercised END TO END through the real ``gh`` adapter pointed at ``tests/fakes/fake-gh``
+(the DoD: "every write is exercised through the fake-gh harness with mutation assertions; no real
+gh reachable in tests"). We assert the exact mutation each verb produced — which labels moved, the
+audit-comment wording, the flag issue + its first-use label — so the mechanical contract is pinned,
+not just "a write happened".
+
+Three disciplines this file defends:
+  1. **Audit trail, every write.** Each verb leaves a ``… by William via command-center, <date>.``
+     comment (or a flag issue whose body is the raw text) — journal-greppable, William's name.
+  2. **Watched repo only.** Every write is gated on the allow-list of configured slugs; a request
+     naming an unwatched repo is refused with no gh call (the label-writer can't be steered off its
+     repos).
+  3. **Fail closed.** A gh failure (``GH_FAIL``) yields ``ok: False`` — a verb never claims a write
+     landed when it didn't.
+"""
+import json
+from pathlib import Path
+
+import pytest
+
+import actions
+import gh
+
+FAKE_GH = Path(__file__).resolve().parent / "fakes" / "fake-gh"
+REPO = "will-titan/command-center"
+OTHER = "will-titan/superlooper"
+DATE = "2026-07-07"
+
+
+def _use_fake(monkeypatch, fixdir):
+    monkeypatch.setenv("SL_GH", str(FAKE_GH))
+    monkeypatch.setenv("GH_FIXTURES", str(fixdir))
+
+
+def _mutations(fixdir):
+    p = Path(fixdir) / "mutations.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
+
+
+def _calls(fixdir):
+    p = Path(fixdir) / "calls.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
+
+
+def _acts(monkeypatch, tmp_path, allowed=(REPO,)):
+    _use_fake(monkeypatch, tmp_path)
+    return actions.Actions(gh, allowed_repos=list(allowed), today=lambda: DATE)
+
+
+# =============================== approve / re-approve ===============================
+
+def test_approve_adds_agent_ready_removes_parked_and_needs_william(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    res = a.approve(REPO, 4)
+    assert res["ok"] is True
+    muts = _mutations(tmp_path)
+    label = [m for m in muts if m["kind"] == "set_labels"][-1]
+    assert label["num"] == "4"
+    assert label["add"] == "agent-ready"
+    # both blockers cleared in one edit (order-independent membership check)
+    assert set(label["remove"].split(",")) == {"parked", "needs-william"}
+
+
+def test_approve_posts_the_exact_audit_comment(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    a.approve(REPO, 4)
+    comment = [m for m in _mutations(tmp_path) if m["kind"] == "comment"][-1]
+    assert comment["num"] == "4"
+    assert comment["body"] == "Approved by William via command-center, 2026-07-07."
+
+
+def test_approve_is_pinned_to_the_named_repo(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path, allowed=(REPO, OTHER))
+    a.approve(OTHER, 9)
+    assert _calls(tmp_path)[-1]["repo"] == OTHER
+
+
+def test_approve_refuses_an_unwatched_repo_with_no_gh_call(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path, allowed=(REPO,))
+    res = a.approve("evil/elsewhere", 4)
+    assert res["ok"] is False
+    assert res["error"] == "unknown repo"
+    assert _calls(tmp_path) == []          # nothing ever reached gh
+
+
+def test_approve_fails_closed_when_gh_write_fails(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert a.approve(REPO, 4)["ok"] is False
+
+
+class _CommentFailsGh:
+    """A gh double where the LABEL/close/create writes land but the audit COMMENT fails — to prove a
+    verb reports ok:False when its required trail doesn't post. agent-ready must never read as
+    applied-and-recorded when the record didn't land (a bright line: the tap is William's word ONLY
+    when the audit comment carries it)."""
+    def set_labels(self, *a, **k): return True
+    def comment(self, *a, **k): return False
+    def close_issue(self, *a, **k): return True
+    def create_label(self, *a, **k): return True
+    def create_issue(self, *a, **k): return 1
+
+
+@pytest.mark.parametrize("verb", ["approve", "expedite", "bounce_yes"])
+def test_label_verbs_are_not_ok_if_the_audit_comment_fails(verb):
+    a = actions.Actions(_CommentFailsGh(), allowed_repos=[REPO], today=lambda: DATE)
+    res = getattr(a, verb)(REPO, 4)
+    assert res["labeled"] is True          # the label DID move…
+    assert res["commented"] is False       # …but the audit comment did not…
+    assert res["ok"] is False              # …so the verb is NOT a success (no un-audited agent-ready)
+
+
+# =============================== drop (the one destructive verb) ===============================
+
+def test_drop_closes_issue_with_audit_comment_in_one_call(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    res = a.drop(REPO, 5)
+    assert res["ok"] is True
+    close = [m for m in _mutations(tmp_path) if m["kind"] == "close_issue"][-1]
+    assert close["num"] == "5"
+    assert close["comment"] == "Dropped by William via command-center, 2026-07-07."
+
+
+def test_drop_refuses_an_unwatched_repo(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    assert a.drop(OTHER, 5)["ok"] is False
+    assert _calls(tmp_path) == []
+
+
+def test_drop_fails_closed_on_gh_error(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert a.drop(REPO, 5)["ok"] is False
+
+
+# =============================== expedite ===============================
+
+def test_expedite_adds_the_expedite_label_and_audit_comment(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    assert a.expedite(REPO, 7)["ok"] is True
+    muts = _mutations(tmp_path)
+    label = [m for m in muts if m["kind"] == "set_labels"][-1]
+    assert label["num"] == "7"
+    assert label["add"] == "expedite"
+    assert label["remove"] is None                    # expedite only adds
+    comment = [m for m in muts if m["kind"] == "comment"][-1]
+    assert comment["body"] == "Expedited by William via command-center, 2026-07-07."
+
+
+# =============================== bounce-yes ===============================
+
+def test_bounce_yes_reapproves_and_clears_needs_william(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    res = a.bounce_yes(REPO, 8)
+    assert res["ok"] is True
+    label = [m for m in _mutations(tmp_path) if m["kind"] == "set_labels"][-1]
+    assert label["add"] == "agent-ready"
+    assert "needs-william" in label["remove"].split(",")
+
+
+def test_bounce_yes_audit_comment_names_the_accepted_bounce(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    a.bounce_yes(REPO, 8)
+    comment = [m for m in _mutations(tmp_path) if m["kind"] == "comment"][-1]
+    assert comment["body"].startswith("Bounce accepted by William via command-center, 2026-07-07.")
+
+
+# =============================== flag (raw text → issue labeled flag, no AI) ===============================
+
+def test_flag_creates_the_flag_label_first_then_the_issue(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_NEW_ISSUE_NUM", "321")
+    res = a.flag(REPO, "the arrivals board flickers on merge")
+    assert res["ok"] is True
+    assert res["num"] == 321
+    muts = _mutations(tmp_path)
+    # the label is created (force = idempotent first-use) BEFORE the issue that references it
+    lab = next(m for m in muts if m["kind"] == "create_label")
+    assert lab["name"] == "flag" and lab["force"] is True
+    iss = next(m for m in muts if m["kind"] == "create_issue")
+    assert muts.index(lab) < muts.index(iss)
+    assert iss["labels"] == "flag"
+
+
+def test_flag_files_the_raw_text_verbatim_as_the_body_no_ai(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    raw = "the arrivals board flickers on merge\nand the clack is too loud"
+    a.flag(REPO, raw)
+    iss = next(m for m in _mutations(tmp_path) if m["kind"] == "create_issue")
+    assert iss["body"] == raw                       # exact text, no summarization
+    assert iss["title"].startswith("flag:")
+    assert "flickers on merge" in iss["title"]      # title derived mechanically from line 1
+
+
+def test_flag_rejects_empty_text_without_touching_gh(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    res = a.flag(REPO, "   \n  ")
+    assert res["ok"] is False
+    assert _calls(tmp_path) == []
+
+
+def test_flag_fails_closed_when_create_returns_no_number(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_NEW_ISSUE_NUM", "")       # create prints no digits → None
+    assert a.flag(REPO, "something")["ok"] is False
+
+
+# =============================== discuss (compose a briefing snippet — no write, no AI) ===============================
+
+def _snapshot_with_flight(**flight):
+    base = {"id": "i8", "num": 8, "label": "SL-8", "stage": "parked",
+            "memo": None, "pr": None, "branch": "sl-i8-x", "attempt": 1,
+            "cargo": {"present": False, "added": 0, "removed": 0, "files": 0}}
+    base.update(flight)
+    return {"repos": [{"slug": REPO, "name": "command-center", "flights": [base]}]}
+
+
+def test_discuss_composes_from_the_flights_own_facts(monkeypatch):
+    snap = _snapshot_with_flight(stage="parked", memo="tests failed twice — scope looks wrong",
+                                 cargo={"present": True, "added": 40, "removed": 6, "files": 3})
+    text = actions.compose_briefing(snap, REPO, 8)
+    assert "SL-8" in text
+    assert "command-center" in text
+    assert "tests failed twice" in text             # the memo rode into the briefing
+    assert "40" in text and "6" in text             # the diff facts are present
+    assert "github.com/%s/issues/8" % REPO in text  # a pointer the fresh session can open
+
+
+def test_discuss_includes_the_pr_link_when_there_is_one(monkeypatch):
+    snap = _snapshot_with_flight(stage="final", pr=42)
+    text = actions.compose_briefing(snap, REPO, 8)
+    assert "github.com/%s/pull/42" % REPO in text
+
+
+def test_discuss_is_a_minimal_stub_when_the_flight_is_not_on_the_field(monkeypatch):
+    # A queued issue (not flying) still gets a usable snippet — a pointer to the issue, never a crash.
+    snap = {"repos": [{"slug": REPO, "name": "command-center", "flights": []}]}
+    text = actions.compose_briefing(snap, REPO, 99)
+    assert "SL-99" in text
+    assert "github.com/%s/issues/99" % REPO in text
+
+
+def test_discuss_contains_no_model_call_marker(monkeypatch):
+    # Belt-and-suspenders on the no-AI bright line: the briefing is pure string assembly.
+    snap = _snapshot_with_flight()
+    text = actions.compose_briefing(snap, REPO, 8)
+    assert isinstance(text, str) and text.strip()
+
+
+# =============================== the audit-comment wording is pinned directly ===============================
+
+def test_audit_comment_builders_exact_wording():
+    assert actions.approve_comment("2026-07-07") == "Approved by William via command-center, 2026-07-07."
+    assert actions.drop_comment("2026-07-07") == "Dropped by William via command-center, 2026-07-07."
+    assert actions.expedite_comment("2026-07-07") == "Expedited by William via command-center, 2026-07-07."
+    assert actions.bounce_comment("2026-07-07").startswith(
+        "Bounce accepted by William via command-center, 2026-07-07.")

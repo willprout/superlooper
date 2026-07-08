@@ -1,0 +1,42 @@
+# The mechanical ship gate for the superlooper monorepo: run pytest on every PR (and on pushes to
+# main, so the default branch always carries a green run of record). The loop's per-PR gate requires
+# the single "tests" check to be green before it merges (see .superlooper/config.json:
+# required_checks). This one job stays green only if BOTH suites pass, so the check name matches the
+# `required_checks: ["tests"]` contract exactly.
+#
+# Two suites live in this monorepo, each self-contained with its own conftest/pyproject that assume
+# they sit at a project root — so each is run from its OWN directory (a single `pytest` at the repo
+# root would fight two rootdirs). Both run on every PR: the dashboard is the loop-maintained half,
+# the engine (skills/superlooper) is supervised-only, and running both keeps the whole repo honest
+# and catches any accidental cross-half breakage.
+#
+# Free-tier GitHub Actions, owner-approved 2026-07-07. On allowance exhaustion the check simply
+# never goes green and the loop's gate fail-closes — nothing merges, nothing is charged.
+#
+# The runtime is Python 3 stdlib only; pytest is the sole thing CI installs. Python is pinned to
+# 3.9 to match the deployment machine (William's Mac), so a 3.10+ construct that would break there
+# fails the gate here instead of shipping.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+      - name: Engine suite (skills/superlooper)
+        run: python -m pytest
+        working-directory: skills/superlooper
+      - name: Dashboard suite
+        run: python -m pytest
+        working-directory: dashboard

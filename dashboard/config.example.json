@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "repos": [
+    { "path": "~/code/your-adopted-repo" },
+    { "path": "~/code/another-adopted-repo", "airline": "Widget Air" }
+  ],
+  "port": 8611,
+  "poll_seconds": 2,
+  "gh_poll_seconds": 30,
+  "heartbeat_down_seconds": 300,
+  "superlooper_cli": "~/.claude/skills/superlooper/bin/superlooper",
+  "notify": {
+    "imessage_to": null,
+    "cmd": null
+  },
+  "fun": {
+    "master": true,
+    "solari": true,
+    "solari_clack": true,
+    "airlines": true,
+    "living_clock": true,
+    "corner_counter": true,
+    "incident_sign": true
+  }
+}

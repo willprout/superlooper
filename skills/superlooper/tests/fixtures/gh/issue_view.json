@@ -1,0 +1,10 @@
+{
+  "number": 123,
+  "title": "Render the widget",
+  "createdAt": "2026-07-01T09:00:00Z",
+  "labels": [
+    {"id": "LA_1", "name": "type:build", "description": "a build issue", "color": "0dd8ac"},
+    {"id": "LA_2", "name": "agent-ready", "description": "approved by William", "color": "1f883d"}
+  ],
+  "body": "## Goal\nRender the widget.\n\n## Definition of done\n- [ ] it renders\n\n## Boundaries\nNo auth changes.\n\n## Loop metadata\ntouches: frontend\n"
+}

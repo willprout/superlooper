@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""A stand-in for the cmux CLI for the Task-15 offline simulation. Point every cmux caller at it
+with SL_CMUX=<path>/fake-cmux and FAKE_CMUX_DIR=<tmp dir>.
+
+Extends the proven stub-cmux pattern from test_launch_delivery.py into a standalone executable
+that a full runner (launch-session.sh, nudge-pane.sh, notify.py) can drive for many surfaces:
+
+  new-surface   mints a FRESH surface UUID per call (a simulation launches many tabs; the fixed
+                single-UUID stub could not tell them apart) and prints the real
+                "OK <surface> <pane> <workspace>" shape. In deliver mode (CMUX_MODE=deliver, the
+                default) it spawns a DETACHED subshell that plays the new tab's shell + launch
+                shim: poll $SL_LAUNCH_DIR/<surface>.cmd, claim it atomically (mv — the same
+                claim the real shim performs, so a double-source can never double-launch), and
+                run it under bash. CMUX_MODE=drop spawns nothing — the dropped-keystrokes /
+                shim-not-installed failure, which the launcher must catch by delivery timeout.
+  read-screen   serves $FAKE_CMUX_DIR/screens/<surface>.txt, else screens/default.txt, else a
+                built-in idle-Claude screen (box glyphs + bare "❯" composer — classifies 'idle'
+                so nudges/answers deliver). Tests write a screen file to fake menus/dead panes.
+  send/send-key appended to sends.jsonl — the assertion surface for every nudge and answer
+                delivery the runner attempts.
+  rename-tab / close-surface / notify   recorded (closed.jsonl / notify.jsonl).
+
+Every invocation's argv also lands in calls.jsonl (the fake-gh discipline): a dropped
+--workspace or a wrong subcommand is caught by a test, never masked by a permissive router.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import uuid
+
+DIR = os.environ.get("FAKE_CMUX_DIR", "")
+MODE = os.environ.get("CMUX_MODE", "deliver")
+
+# What an idle Claude Code pane looks like to pane_state.classify_screen: TUI box glyphs (so the
+# shell-prompt DEAD heuristic never fires) and the modern bare "❯" + non-breaking-space composer
+# (WS1: this exact render was once mis-read as a menu — serving it here keeps that regression
+# covered at simulation level, not just in pane_state's unit tests).
+IDLE_SCREEN = (
+    "╭──────────────────────────────────────────────╮\n"
+    "│ ❯                                            │\n"
+    "╰──────────────────────────────────────────────╯\n"
+)
+
+# The detached tab-shell + shim simulation (deliver mode). Mirrors shell/launch-shim.zsh's
+# contract: bounded wait for the per-surface command file, atomic claim, run under bash.
+SHIM_SH = """\
+i=0
+while [ ! -f "$FAKE_CMD" ] && [ "$i" -lt 300 ]; do sleep 0.05; i=$((i+1)); done
+[ -f "$FAKE_CMD" ] || exit 0
+claimed="$FAKE_CMD.claimed.$$"
+mv -f "$FAKE_CMD" "$claimed" 2>/dev/null || exit 0
+script="$(cat "$claimed")"
+rm -f "$claimed"
+[ -n "$script" ] || exit 0
+bash -c "$script"
+"""
+
+
+def die(msg, code=1):
+    sys.stderr.write("fake-cmux: %s\n" % msg)
+    sys.exit(code)
+
+
+def log(name, rec):
+    with open(os.path.join(DIR, name), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def opt(args, flag):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def fixed_uuid(name):
+    """One stable UUID per role (pane/workspace) per FAKE_CMUX_DIR, minted on first use."""
+    path = os.path.join(DIR, name)
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        val = str(uuid.uuid4())
+        with open(path, "w") as f:
+            f.write(val)
+        return val
+
+
+def main():
+    args = sys.argv[1:]
+    if not DIR:
+        die("FAKE_CMUX_DIR is required")
+    os.makedirs(DIR, exist_ok=True)
+    log("calls.jsonl", args)
+
+    # A global flag (`--id-format uuids`) may precede the subcommand — strip it.
+    while args and args[0] == "--id-format":
+        args = args[2:]
+    sub = args[0] if args else ""
+    rest = args[1:]
+
+    if sub == "new-surface":
+        surf = str(uuid.uuid4())
+        pane = fixed_uuid("pane.uuid")
+        ws = fixed_uuid("ws.uuid")
+        log("surfaces.jsonl", {"surface": surf, "pane": opt(rest, "--pane")})
+        if MODE == "deliver":
+            launch_dir = os.environ.get("SL_LAUNCH_DIR",
+                                        os.path.expanduser("~/.superlooper/launch"))
+            shim_log = open(os.path.join(DIR, "shim-%s.log" % surf), "ab")
+            env = dict(os.environ)
+            env["FAKE_CMD"] = os.path.join(launch_dir, "%s.cmd" % surf)
+            env["CMUX_SURFACE_ID"] = surf
+            # Detached (its own session): fake-cmux must return to launch-session.sh immediately,
+            # exactly as the real cmux RPC does, while the "tab shell" boots in the background.
+            proc = subprocess.Popen(["bash", "-c", SHIM_SH], env=env, stdout=shim_log,
+                                    stderr=shim_log, stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
+            # Remember the tab's session-leader pid so close-surface can kill the process TREE,
+            # exactly as the real cmux does (Codex review of the D4-class sim tests: a close
+            # that only records would let a silently-broken close-surface still look green).
+            os.makedirs(os.path.join(DIR, "pids"), exist_ok=True)
+            with open(os.path.join(DIR, "pids", surf), "w") as f:
+                f.write(str(proc.pid))
+        # drop mode: the tab exists but nothing ever runs the dropped command (the bug).
+        print("OK %s %s %s" % (surf, pane, ws))
+        sys.exit(0)
+
+    if sub == "identify":
+        # Self-pane auto-detection: the invoking tab's own pane (owner request 2026-07-06).
+        pane = fixed_uuid("pane.uuid")
+        ws = fixed_uuid("ws.uuid")
+        print(json.dumps({"caller": {"pane_id": pane, "workspace_id": ws,
+                                     "surface_type": "terminal"}}))
+        sys.exit(0)
+
+    if sub == "list-pane-surfaces":
+        # D7 preflight probe. Mirrors real cmux: a resolvable pane lists at least its own surface;
+        # an unresolvable one prints "Error: not_found" but STILL EXITS 0 (the exit-code trap the
+        # preflight defends against). FAKE_CMUX_GOOD_PANE pins which pane resolves (default: any
+        # non-empty pane); FAKE_CMUX_BROKEN simulates the detached/lost-socket "Broken pipe".
+        pane = opt(rest, "--pane") or ""
+        if os.environ.get("FAKE_CMUX_BROKEN"):
+            sys.stderr.write("Error: Broken pipe (could not connect to cmux socket)\n")
+            sys.exit(1)
+        good = os.environ.get("FAKE_CMUX_GOOD_PANE")
+        if pane and (good is None or pane == good):
+            print("  surface:1  superlooper tab  [selected]")
+            sys.exit(0)
+        print("Error: not_found: Pane or workspace not found")
+        sys.exit(0)
+
+    if sub == "read-screen":
+        surf = opt(rest, "--surface") or ""
+        for cand in (os.path.join(DIR, "screens", "%s.txt" % surf),
+                     os.path.join(DIR, "screens", "default.txt")):
+            if os.path.isfile(cand):
+                with open(cand) as f:
+                    sys.stdout.write(f.read())
+                sys.exit(0)
+        sys.stdout.write(IDLE_SCREEN)
+        sys.exit(0)
+
+    if sub == "send":
+        # text = the last positional (after --surface/--workspace pairs)
+        positionals = [a for i, a in enumerate(rest)
+                       if not a.startswith("--") and (i == 0 or not rest[i - 1].startswith("--"))]
+        log("sends.jsonl", {"surface": opt(rest, "--surface"),
+                            "workspace": opt(rest, "--workspace"),
+                            "text": positionals[-1] if positionals else ""})
+        sys.exit(0)
+
+    if sub == "send-key":
+        positionals = [a for i, a in enumerate(rest)
+                       if not a.startswith("--") and (i == 0 or not rest[i - 1].startswith("--"))]
+        log("sends.jsonl", {"surface": opt(rest, "--surface"),
+                            "workspace": opt(rest, "--workspace"),
+                            "key": positionals[-1] if positionals else ""})
+        sys.exit(0)
+
+    if sub == "close-surface":
+        surf = opt(rest, "--surface") or ""
+        log("closed.jsonl", {"surface": surf})
+        # Real cmux kills the closed tab's whole process tree (the pane's shell session gets
+        # SIGHUP); the fake mirrors it so the D4-class tests prove the OLD session actually
+        # dies before a same-id relaunch, not merely that a close RPC was recorded. Already-
+        # exited tabs (the common non-linger case) are a silent no-op, like the real thing.
+        try:
+            with open(os.path.join(DIR, "pids", surf)) as f:
+                pid = int(f.read().strip())
+            os.killpg(pid, signal.SIGHUP)
+        except (OSError, ValueError):
+            pass
+        sys.exit(0)
+
+    if sub == "rename-tab":
+        sys.exit(0)
+
+    if sub == "notify":
+        log("notify.jsonl", {"title": opt(rest, "--title"), "body": opt(rest, "--body")})
+        sys.exit(0)
+
+    die("unhandled command: %s" % " ".join(args))
+
+
+if __name__ == "__main__":
+    main()

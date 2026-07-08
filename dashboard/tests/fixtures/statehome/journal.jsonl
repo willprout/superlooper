@@ -1,0 +1,10 @@
+{"ts": 1783363702, "act": "launch", "id": "i23", "num": 23, "branch": "sl/i23-add-a-motto-footer-motto-must-come-via-t", "touches": ["content"], "outcome": "ok"}
+{"ts": 1783363722, "act": "relabel", "id": "i23", "num": 23, "add": ["in-progress"], "remove": ["agent-ready"], "outcome": "ok"}
+{"ts": 1783363833, "act": "event", "event": {"type": "session_blocked", "id": "i23"}}
+
+{"ts": 1783364266, "act": "merge", "id": "i23", "num": 23, "pr": 25, "method": "squash", "wander": true, "outcome": "ok"}
+this line is not json at all — a half-written crash line
+[1, 2, 3]
+{"ts": 1783188550, "act": "regenerate", "id": "i16", "num": 16, "pr": 18, "new_branch": "sl/i16-make-the-greeting-more-formal-r1", "conflicts": 1, "outcome": "ok"}
+42
+{"ts": 1783189995, "act": "park", "id": "i7", "num": 7, "needs_william": false, "memo": "answerer a1 timed out after 15 min. question was: 'When data.json is missing or unparseable, how should load_data() behave?'", "outcome": "ok"}

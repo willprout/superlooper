@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- command-center keep-alive template (Task 12). The DEFAULT way to run the dashboard is a
+     visible `bin/command-center` you can watch; this launchd job is the always-on option for an
+     unattended localhost dashboard. bin/install-launchd.sh substitutes the label, dashboard
+     binary, config path, and log path placeholders below with absolute paths (the placeholder
+     tokens are intentionally kept out of this comment so substitution never rewrites the prose).
+     KeepAlive relaunches a crashed dashboard; RunAtLoad starts it at login. The server still
+     binds 127.0.0.1 ONLY (it can write GitHub labels — William's word — so it must never be
+     reachable off the machine); launchd changes only WHEN it runs, never that bright line. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{command_center_bin}</string>
+        <string>{config_path}</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
+</dict>
+</plist>

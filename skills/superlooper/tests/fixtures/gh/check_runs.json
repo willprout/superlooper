@@ -1,0 +1,7 @@
+{
+  "total_count": 2,
+  "check_runs": [
+    {"name": "review/local-gate", "status": "completed", "conclusion": "success"},
+    {"name": "quality-gate", "status": "completed", "conclusion": "success"}
+  ]
+}

@@ -1,0 +1,95 @@
+SUPERLOOPER — REAL SAMPLE DATA FOR MOCKUPS
+(Genuine artifacts from the live sandbox run of 2026-07-06, repo will-titan/superlooper-sandbox.
+Use these to populate mock screens with true data shapes — never invent shapes.)
+
+=== 1. JOURNAL LINES (the runner's append-only journal.jsonl — the dashboard's main feed) ===
+
+A full happy lifecycle WITH a blocked->answerer round trip (issue #23, "SL-23"):
+
+{"ts": 1783363702, "act": "launch", "id": "i23", "num": 23, "branch": "sl/i23-add-a-motto-footer-motto-must-come-via-t", "touches": ["content"], "outcome": "ok"}
+{"ts": 1783363722, "act": "relabel", "id": "i23", "num": 23, "add": ["in-progress"], "remove": ["agent-ready"], "outcome": "ok"}
+{"ts": 1783363833, "act": "event", "event": {"type": "session_blocked", "id": "i23"}}
+{"ts": 1783363833, "act": "hire_answerer", "id": "i23", "num": 23, "answerer_id": "a2", "question": "What motto should the footer carry?\n\n(I need the exact motto text to place in the index.html footer, and I will use it verbatim...)", "outcome": "ok"}
+{"ts": 1783363852, "act": "deliver_answer", "id": "i23", "answerer_id": "a2", "text": "Use this motto verbatim:\n\nSmall issues, shipped in loops.\n\nWhy: it's on-theme for the superlooper issue loop...", "outcome": "ok"}
+{"ts": 1783364266, "act": "event", "event": {"type": "session_finished", "id": "i23"}}
+{"ts": 1783364266, "act": "gate", "id": "i23", "outcome": "ok"}
+{"ts": 1783364266, "act": "merge", "id": "i23", "num": 23, "pr": 25, "method": "squash", "wander": true, "outcome": "ok"}
+
+NOTE: that final merge has "wander": true — the diff touched areas the issue didn't declare.
+Per the design record, a wandered merge gets NO celebration flourish (neutral touchdown, "see
+report" marker on the arrivals row).
+
+A conflict-regeneration (issue #16 — the "go-around, retire-and-rebuild" story):
+
+{"ts": 1783188505, "act": "merge", "id": "i16", "num": 16, "pr": 18, "method": "squash", "outcome": "merge failed (will retry next tick)"}
+{"ts": 1783188527, "act": "update", "id": "i16", "num": 16, "pr": 18, "outcome": "real conflict — gate decides regenerate/preserve next pass"}
+{"ts": 1783188550, "act": "regenerate", "id": "i16", "num": 16, "pr": 18, "new_branch": "sl/i16-make-the-greeting-more-formal-r1", "conflicts": 1, "outcome": "ok"}
+{"ts": 1783188631, "act": "launch", "id": "i16", "num": 16, "branch": "sl/i16-make-the-greeting-more-formal-r1", "outcome": "ok"}
+{"ts": 1783188879, "act": "merge", "id": "i16", "num": 16, "pr": 19, "method": "squash", "wander": false, "outcome": "ok"}
+
+A gate HOLD (two overlapping lanes sequenced — "number 2 for landing"):
+
+{"ts": 1783188488, "act": "hold", "id": "i15", "reason": "diff overlaps in-flight lane i16 — hold until that lane resolves", "overlap_lane": "i16", "outcome": "ok"}
+
+A PARK with its memo (what a "machine gave up" state carries — issue #7, answerer timeout):
+
+{"ts": 1783189995, "act": "park", "id": "i7", "num": 7, "needs_william": false, "memo": "answerer a1 timed out after 15 min. question was: 'When data.json is missing or unparseable, how should load_data() behave? (a) RAISE the underlying exception... (b) RETURN {} (fail-soft)... Recommendation: (a) raise...'", "outcome": "ok"}
+{"ts": 1783189995, "act": "notify", "title": "superlooper: i7 parked", "outcome": "sent via imessage"}
+
+A launch flake park (the jargony memo the design says must get a plain-language gloss):
+
+{"ts": 1783358556, "act": "park", "id": "i21", "num": 21, "memo": "launch was never delivered (2 verified attempts, or the attempt counter is unreadable) — is the launch shim installed? (bin/install-launch-shim.sh)", "outcome": "ok"}
+
+A nudge (tower log material):
+
+{"ts": 1783185743, "act": "nudge", "id": "i9", "nudge_key": "review", "message": "The gate found no review evidence. Get a fresh-agent review of your diff and post its verdict as a PR comment BEGINNING `<!-- superlooper-review -->` ...", "outcome": "ok"}
+
+=== 2. A REAL ISSUE BODY (what a "flight" is — the four parsed sections) ===
+
+Issue #23 — "Add a motto footer (motto must come via the blocked channel)" — labels: type:build
+
+## Goal
+The sandbox page (index.html) gains a footer line carrying a short project motto. ...
+
+## Definition of done
+- [ ] Exactly one blocked-channel question was asked before any code was written...
+- [ ] index.html contains a footer element whose text is the motto from the answer
+- [ ] The ci check is green on the PR
+
+## Boundaries
+Only index.html. No logic, style, or data changes.
+
+## Loop metadata
+touches: content
+
+Audit comments on the issue (the approval trail):
+- "Approved by William in conversation, 2026-07-06."
+- "Merged as PR #25 by superlooper (gate green: report + review evidence + required checks + mergeable)."
+
+=== 3. A REAL MORNING DIGEST (the mechanical text summary the dashboard renders) ===
+
+# superlooper morning report — 2026-07-06
+3 merged · 8 parked/needs-william · 0 bounce(s) · 1 regen(s) · queue: 0.
+
+## Merged
+- #10 (i10) — .../issues/10 · PR .../pull/12
+- #15 (i15) — .../issues/15 · PR .../pull/17
+- #16 (i16) — .../issues/16 · PR .../pull/19
+
+## Conflict regenerations (last 7 days)
+- #16 (i16) → rebuilt on sl/i16-make-the-greeting-more-formal-r1 (conflict #1)
+
+## Freeze state
+Merges flowing.
+
+=== 4. STATE VOCABULARY (for the mock's status chips / circuit stages) ===
+
+Circuit stages: at the stand → taxi out (launching) → takeoff → downwind (building) →
+base turn (report filed) → final (gate: report ✓ review ✓ CI ✓ mergeable ✓) → touchdown
+(merged) → taxi in (closed).
+Off-path states (each visually DISTINCT per the design record): amber = awaiting William's
+decision (bounce / needs-william) · grey/no-contrail = liveness failure only · parked =
+stalled/gave-up look, never restful · "spinning?" = active contrail but flat progress ·
+freeze = landings paused (CALM), repair flight dispatched · holding = number 2 for landing.
+Liveness tiers (contrail): fresh < 8 min · idle ≥ 8 min (tower peeks) · frozen ≥ 45 min.
+Gate checklist names are REAL and fixed: report / review / CI / mergeable.

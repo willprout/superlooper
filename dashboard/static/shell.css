@@ -1,0 +1,979 @@
+/* command-center — the four-panel shell (screen 7a) + boring mode (screen 8c).
+   Ported from design/project/Command Center.dc.html's inline styling into classes. Pixels only;
+   every value bound here comes from /api/snapshot (the JS computes no semantics — design record B.1).
+   Fonts fall back to the platform's system + monospace faces when IBM Plex isn't installed, so the
+   dashboard stays self-contained (localhost only, no external font egress). */
+
+:root {
+  --sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --cond: 'IBM Plex Sans Condensed', 'IBM Plex Sans', var(--sans);
+
+  --page: #C9D2DC;
+  --shell-bg: #E7EBF0;
+  --shell-border: #AAB2BC;
+  --topbar: #141A21;
+  --panel: #FFFFFF;
+  --panel-border: #D8DFE7;
+  --ink: #1C2229;
+  --ink-2: #2A323C;
+  --ink-3: #4A5560;
+  --muted: #5A6572;
+  --faint: #9AA4B0;
+  --blue: #2D6BC4;
+  --blue-chip-bg: #EDF3FB;
+  --blue-chip-border: #C6D8EF;
+  --amber: #C77E1F;
+  --amber-ink: #8A5B10;
+  --amber-bg: #FBF2DE;
+  --amber-border: #EDD9A8;
+  --green: #2F8A4C;
+  --red: #C0392B;
+  --board-top: #1A1E25;
+  --board-bot: #101318;
+  --board-gold: #F2C94C;
+  --field-bg: #10151B;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+.cc-loading {
+  padding: 40px;
+  font: 500 14px var(--mono);
+  color: var(--muted);
+}
+
+/* ============================ the shell frame ============================ */
+
+.shell {
+  max-width: 1600px;
+  margin: 18px auto;
+  background: var(--shell-bg);
+  border: 1px solid var(--shell-border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 18px 50px rgba(25, 35, 50, 0.25);
+}
+
+/* ---- top bar ---- */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 10px 18px;
+  background: var(--topbar);
+  border-bottom: 1px solid #05070A;
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.crest {
+  width: 32px; height: 32px; border-radius: 4px;
+  image-rendering: pixelated;
+  background:
+    repeating-linear-gradient(45deg, #2D6BC4 0 4px, #1E4E92 4px 8px),
+    #1E4E92;
+  border: 1px solid #05070A;
+  display: block;
+}
+.brand-name {
+  font: 700 13.5px var(--sans);
+  letter-spacing: 3px;
+  color: #E8EDF2;
+}
+.brand-name .airways { font-weight: 400; color: #7A8492; }
+
+.pill {
+  display: flex; align-items: center; gap: 8px;
+  border-radius: 6px; padding: 5px 13px;
+  background: rgba(242, 179, 61, 0.12);
+  border: 1px solid rgba(242, 179, 61, 0.35);
+}
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: #F2B33D; }
+.pill .msg { font: 600 12.5px var(--sans); color: #F2C879; }
+.pill .sep { color: #4A5260; }
+.pill .k { font: 500 12px var(--sans); color: #A8B2BE; }
+.pill.ok { background: rgba(47, 138, 76, 0.12); border-color: rgba(47, 138, 76, 0.35); }
+.pill.ok .dot { background: #58C878; }
+.pill.ok .msg { color: #9FD8B0; }
+.pill.alert { background: rgba(192, 57, 43, 0.16); border-color: rgba(192, 57, 43, 0.45); }
+.pill.alert .dot { background: #FF5A48; }
+.pill.alert .msg { color: #F2C4BC; }
+
+.usage-bar {
+  display: inline-block; width: 64px; height: 7px;
+  background: #2A323C; border-radius: 2px; overflow: hidden;
+}
+.usage-bar > span { display: block; height: 100%; background: #4E8FE0; }
+.usage-pct { font: 600 11.5px var(--mono); color: #A8B2BE; }
+
+.spacer { flex: 1; }
+
+.corner {
+  font: 500 11.5px var(--mono); color: #A8B2BE; letter-spacing: 0.5px;
+}
+.corner strong { color: #E8EDF2; font-weight: 600; }
+.corner .up { color: #58C878; }
+.corner .down { color: #F07A6A; }
+
+.flag-btn {
+  display: flex; align-items: center; gap: 7px;
+  background: var(--blue); border: none; color: #F2F6FA;
+  border-radius: 6px; font: 600 12.5px var(--sans); padding: 7px 16px; cursor: pointer;
+}
+.flag-btn[disabled] { opacity: 0.65; cursor: default; }
+
+/* Tidy (issue #41) — the ops-verb button. Deliberately secondary to Flag (a subtle control on the
+   dark top bar, not a second blue CTA): tidying is housekeeping, not the primary decision surface. */
+.tidy-btn {
+  display: flex; align-items: center; gap: 7px;
+  background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.16);
+  color: #C6CFDA; border-radius: 6px; font: 600 12.5px var(--sans); padding: 6px 14px; cursor: pointer;
+}
+.tidy-btn:hover { background: rgba(255, 255, 255, 0.13); color: #EAF0F6; }
+.tidy-btn[disabled] { opacity: 0.5; cursor: default; }
+
+/* ---- trouble banner (camera-independent, design §4/§5) ---- */
+.trouble {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 18px;
+  background: #F7E9C8; border-bottom: 1px solid var(--amber-border);
+  font: 600 12.5px var(--sans); color: var(--amber-ink);
+}
+.trouble .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); }
+.trouble.alert { background: #3A2422; border-bottom-color: #5A2A25; color: #F2C4BC; }
+.trouble.alert .dot { background: #FF5A48; }
+.trouble[hidden] { display: none; }
+
+/* ---- main row ---- */
+.main {
+  display: grid;
+  grid-template-columns: 320px 1fr 340px;
+  gap: 12px; padding: 12px;
+}
+/* Empty Needs You collapses to a slim all-clear rail (design record §4): its track shrinks and the
+   field's 1fr track soaks up the reclaimed width. shell.js sets this class off the server's
+   all_clear flag; a decision appearing drops it and the full 320px column returns on the next poll. */
+.main.needs-collapsed {
+  grid-template-columns: 46px 1fr 340px;
+}
+/* The desktop breakpoints that keep the airfield from ever getting tiny (issue #29) live at the END
+   of this file — see "desktop breakpoints" — so the base rules here read as the widest-window layout
+   and the responsive overrides come last (standard order). */
+.panel {
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px;
+  padding: 14px; display: flex; flex-direction: column; gap: 11px;
+  box-shadow: 0 1px 3px rgba(30, 40, 60, 0.07);
+  min-width: 0;
+}
+.panel-title {
+  font: 600 10.5px var(--mono); letter-spacing: 1.6px; color: var(--muted);
+}
+.panel-head { display: flex; align-items: baseline; gap: 8px; }
+.panel-head .sub { font: 400 11px var(--mono); color: var(--faint); }
+.panel-head .right { margin-left: auto; font: 500 11px var(--mono); color: var(--muted); }
+
+/* ---- Needs You ---- */
+.needs .badge {
+  background: var(--amber); color: #fff; font: 600 11px var(--mono);
+  padding: 1px 7px; border-radius: 4px;
+}
+.card {
+  background: #FAFBFC; border: 1px solid #E1E7EE; border-radius: 6px;
+  padding: 12px 13px; display: flex; flex-direction: column; gap: 8px;
+}
+.card .chips { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+.chip {
+  font: 600 11px var(--mono); padding: 1px 7px; border-radius: 3px;
+  background: var(--blue-chip-bg); border: 1px solid var(--blue-chip-border); color: var(--blue);
+}
+.chip.state {
+  background: var(--amber-bg); border-color: var(--amber-border); color: var(--amber-ink);
+  letter-spacing: 0.5px; padding: 2px 7px; font-size: 10.5px;
+}
+.card .memo {
+  font: 400 11px/1.55 var(--mono); color: var(--muted);
+  background: #F1F4F8; border: 1px solid #E1E7EE; border-radius: 4px; padding: 7px 9px;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 5.2em; overflow: hidden;
+}
+.card .actions { display: flex; gap: 7px; align-items: center; padding-top: 2px; }
+.btn {
+  border-radius: 6px; font: 600 12px var(--sans); padding: 6px 13px; cursor: pointer;
+}
+.btn.primary { background: var(--blue); color: #F2F6FA; border: none; }
+.btn.ghost { background: none; border: 1px solid #C9D2DC; color: #3A4552; }
+.btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+.btn-note { margin-left: auto; font: 500 10px var(--mono); color: var(--faint); }
+
+.ribbon-allclear {
+  margin-top: auto; display: flex; align-items: center; gap: 10px;
+  background: #EAF5EE; border: 1px solid #BFE0C9; border-radius: 6px; padding: 11px 13px;
+  font: 600 12.5px var(--sans); color: var(--green);
+}
+/* The collapsed (empty Needs You) state: the grid item is a narrow track, so the ribbon becomes a
+   full-height vertical rail down the left edge — slim, but keeping its explicit "all clear" caption
+   (§5). The airfield beside it widens into the reclaimed space. */
+.needs.collapsed {
+  display: flex; min-width: 0; padding: 12px 0 12px 12px;
+}
+.ribbon-allclear.rail {
+  margin: 0; flex: 1; flex-direction: column; justify-content: center; gap: 12px;
+  padding: 16px 0;
+}
+.ribbon-allclear.rail .check { font-size: 17px; line-height: 1; }
+.ribbon-allclear.rail .cap {
+  writing-mode: vertical-rl; letter-spacing: 3px;
+  font: 600 11px var(--mono); color: var(--green);
+}
+.ribbon-more {
+  margin-top: auto; display: flex; align-items: center; gap: 8px;
+  background: var(--amber-bg); border: 1px solid var(--amber-border);
+  border-radius: 6px; padding: 9px 13px;
+  font: 500 12.5px var(--sans); color: var(--amber-ink);
+}
+
+/* ---- The airfield (screen 8a — the lifted renderers driven by the N-flight engine) ---- */
+.field-frame {
+  position: relative; background: var(--field-bg); border: 1px solid #05070A;
+  border-radius: 8px; padding: 14px; display: flex; justify-content: center;
+}
+.field-mount { position: relative; width: 100%; max-width: 800px; }
+.fld-root { position: relative; width: 100%; }
+.fld-root canvas.fld-canvas {
+  display: block; width: 100%; image-rendering: pixelated; border-radius: 3px;
+}
+/* RUNNER DOWN (screen 8d): the whole field greys — a state stale data cannot fake. Every live
+   overlay claim (tags, banner, caption, landmarks, sign, freeze) hides with it: a downed runner
+   means none of them can be trusted; only the card speaks. */
+.fld-root.down canvas.fld-canvas { filter: grayscale(1) brightness(0.62) contrast(0.9); }
+.fld-root.down .fld-overlays > :not(.fld-rd) { display: none !important; }
+.fld-overlays { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+/* author display values (grid etc.) must never defeat the hidden attribute */
+.fld-overlays [hidden] { display: none !important; }
+.fld-tag {
+  position: absolute; transform: translate(-50%, -100%); white-space: nowrap;
+  background: rgba(16, 21, 27, 0.88); border: 1px solid #3A4552; border-radius: 4px;
+  font: 600 10.5px var(--mono); color: #E8EDF2; padding: 2px 7px;
+}
+.fld-tag.amber {
+  background: #C77E1F; border-color: #E8A43C; color: #FFF4DC;
+  transform: translate(-50%, 0);   /* hangs below the ring — the top strip is the hold tag's */
+}
+.fld-tag.spin {
+  background: #8A2E1E; border-color: #C0392B; color: #FFD9CF;
+  transform: translate(-50%, 0);
+}
+.fld-tag.mx {
+  transform: translate(-50%, 0); border-color: #6E5A28; color: #F2C879;
+  font-size: 9px; padding: 1px 5px;
+}
+/* the stand marquee — the queued line, healthy and waiting: calm green, never the ochre "MX REQ" of
+   a park. Sits ABOVE the gates (inherits the default -100% transform), one label over all of them. */
+.fld-tag.stand {
+  border-color: #2F8A4C; color: #9FD8B0; font-size: 9px; padding: 1px 6px; letter-spacing: 0.5px;
+}
+.fld-tag.frozen { border-color: #4A5661; color: #C9D2DC; }
+.fld-lm {
+  position: absolute; transform: translate(-50%, -50%);
+  background: rgba(255, 255, 255, 0.85); border-radius: 3px;
+  font: 600 9px var(--mono); letter-spacing: 0.5px; color: #28343C; padding: 1px 5px;
+  opacity: 0; transition: opacity 0.35s; white-space: nowrap;
+}
+.fld-banner {
+  position: absolute; display: grid; place-items: center; text-align: center;
+  font: 600 10px var(--mono); letter-spacing: 0.3px; color: #232830; overflow: hidden;
+}
+.fld-caption {
+  position: absolute; left: 50%; top: 10px; transform: translateX(-50%); white-space: nowrap;
+  background: rgba(16, 27, 20, 0.85); border: 1px solid #2F8A4C; border-radius: 4px;
+  font: 600 10.5px var(--mono); letter-spacing: 0.5px; color: #9FD8B0; padding: 3px 10px;
+}
+.fld-sign {
+  position: absolute; display: grid; place-items: center; text-align: center;
+  font: 600 8.5px/1.25 var(--mono); color: #6E3A28; overflow: hidden;
+}
+.fld-freeze {
+  position: absolute; transform: translate(-50%, -50%); white-space: nowrap;
+  background: rgba(16, 24, 27, 0.88); border: 1px solid #2D8FA0; border-radius: 4px;
+  font: 600 10px var(--mono); color: #9FD4DE; padding: 2px 8px;
+}
+.fld-rd { position: absolute; inset: 0; display: grid; place-items: center; }
+.fld-rd-card {
+  background: rgba(20, 10, 8, 0.92); border: 2px solid #C0392B; border-radius: 10px;
+  padding: 22px 34px; display: flex; flex-direction: column; gap: 8px; align-items: center;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5); text-align: center;
+}
+.fld-rd-card .t { font: 700 22px var(--sans); letter-spacing: 2px; color: #FF6A58; }
+.fld-rd-card .m { font: 500 13px var(--mono); color: #E8D5D0; }
+.fld-rd-card .s { font: 400 12px var(--sans); color: #B8A8A2; }
+.repo-sel { display: inline-flex; gap: 4px; margin-left: 6px; }
+.repo-tab {
+  background: none; border: 1px solid #C9D2DC; border-radius: 4px; cursor: pointer;
+  font: 600 10px var(--mono); color: var(--muted); padding: 1px 8px;
+}
+.repo-tab.on { background: var(--blue); border-color: var(--blue); color: #F2F6FA; }
+@media (prefers-reduced-motion: reduce) {
+  .fld-lm { transition: none; }
+}
+.field-legend {
+  display: flex; gap: 16px; flex-wrap: wrap;
+  font: 500 11.5px var(--mono); color: var(--muted);
+}
+.field-legend .in-air { color: var(--green); }
+.field-legend .look { margin-left: auto; color: var(--amber); }
+
+/* ---- Tower log ---- */
+.tower { min-height: 0; }
+.tower-row {
+  display: grid; grid-template-columns: 42px 1fr 14px; gap: 6px 8px;
+  padding: 8px 2px; border-bottom: 1px solid #EDF0F4; align-items: start;
+}
+.tower-row .t { font: 500 11px var(--mono); color: var(--faint); }
+.tower-row .msg { font: 400 12.5px/1.45 var(--sans); color: var(--ink-2); }
+.tower-row .caret { color: #C2CAD4; font-size: 11px; cursor: pointer; user-select: none; }
+.tower-row .fchip {
+  background: var(--blue-chip-bg); border: 1px solid var(--blue-chip-border); color: var(--blue);
+  font: 600 10.5px var(--mono); padding: 0 6px; border-radius: 3px; cursor: pointer;
+}
+.tower-raw {
+  grid-column: 1 / -1;
+  font: 400 10px/1.6 var(--mono); background: #141A21; color: #C9D2DC;
+  border-radius: 4px; padding: 8px 10px; margin-top: 6px;
+  white-space: pre-wrap; word-break: break-all;
+}
+.tower-foot { margin-top: auto; padding-top: 10px; font: 400 10.5px var(--mono); color: var(--faint); }
+
+/* ---- boards row ---- */
+.boards { display: grid; grid-template-columns: 1fr 1.18fr; gap: 12px; padding: 0 12px 12px; }
+.board {
+  background: linear-gradient(180deg, var(--board-top), var(--board-bot));
+  border: 1px solid #05070A; border-radius: 8px; padding: 15px 18px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+.board-head { display: flex; align-items: baseline; gap: 10px; }
+.board-head .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--board-gold); align-self: center; }
+.board-head .name { font: 600 15px var(--cond); letter-spacing: 3.5px; color: var(--board-gold); }
+.board-head .tag { font: 400 10px var(--mono); color: #6B7480; letter-spacing: 1px; }
+.board-head .clock { margin-left: auto; font: 500 11px var(--mono); color: #8891A0; }
+.board-cols {
+  display: grid; gap: 8px; margin: 10px 0 5px;
+  font: 500 9.5px var(--mono); letter-spacing: 1px; color: #6B7480;
+}
+.board-row { display: grid; gap: 8px; margin-bottom: 6px; }
+/* dep-row carries a 5th cell for the ⚡ expedite button; the header (dep-cols) leaves it empty. */
+.dep-cols, .dep-row { grid-template-columns: 100px 1fr 56px 110px 24px; align-items: center; }
+.arr-cols, .arr-row { grid-template-columns: 58px 100px 1fr 176px; }
+.flap {
+  font: 500 13px/24px var(--mono); color: #EDEFE8; text-transform: uppercase;
+  white-space: pre; overflow: hidden; text-overflow: ellipsis; border-radius: 2px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.07) 0 50%, rgba(0,0,0,0.32) 50% 100%),
+    repeating-linear-gradient(90deg, #1C222B 0 calc(1ch - 1px), #0B0D10 calc(1ch - 1px) 1ch);
+}
+.flap.dim { color: #9BA3AD; }
+.flap.landed { color: #58C878; }
+.flap.seereport { color: #F2B33D; }
+.flap.link { cursor: pointer; }
+.board-empty {
+  margin-top: 10px; text-align: center;
+  font: 500 12px/22px var(--mono); color: #6E7680; letter-spacing: 2px;
+  background: rgba(255, 255, 255, 0.03); border-radius: 2px;
+}
+
+/* ============================ boring mode (screen 8c — FULLY STATIC) ============================ */
+
+.boring {
+  max-width: 1600px; margin: 18px auto;
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px;
+  overflow: hidden; box-shadow: 0 10px 30px rgba(25, 35, 50, 0.14);
+}
+/* Owner ruling: boring mode is fully static, no exceptions. Kill every transition/animation here. */
+.boring, .boring * { transition: none !important; animation: none !important; }
+
+.boring-bar {
+  display: flex; align-items: center; gap: 14px; padding: 9px 16px; background: var(--topbar);
+}
+.boring-bar .tag { font: 600 11px var(--mono); letter-spacing: 2px; color: #E8EDF2; }
+.boring-bar .hint { font: 500 10.5px var(--mono); color: #7A8492; }
+.boring-bar .hint kbd {
+  border: 1px solid #3A4552; border-radius: 3px; padding: 0 5px; color: #C9D2DC; font: inherit;
+}
+.boring-bar .right { margin-left: auto; font: 500 10.5px var(--mono); color: #7A8492; }
+
+.boring-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 14px; }
+
+.btable { width: 100%; }
+.btable .thead, .btable .brow {
+  display: grid;
+  grid-template-columns: 84px 108px 96px 74px 74px 96px 60px 78px 1fr;
+  gap: 10px;
+}
+.btable .thead {
+  padding: 6px 8px; font: 600 10px var(--mono); letter-spacing: 1px; color: var(--muted);
+  border-bottom: 1.5px solid var(--panel-border);
+}
+.btable .thead .col { cursor: pointer; user-select: none; white-space: nowrap; }
+.btable .thead .col.sorted { color: var(--ink); }
+.btable .thead .col .arrow { color: var(--blue); }
+.btable .brow {
+  padding: 7px 8px; font: 500 12px var(--mono); color: var(--ink-2);
+  border-bottom: 1px solid #EDF0F4; align-items: center;
+}
+.btable .brow .fnum { color: var(--blue); font-weight: 600; cursor: pointer; }
+.btable .brow .stage { font-weight: 600; }
+.btable .brow .note { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.btable .brow .repo { color: #8A93A0; }
+.btable-empty { padding: 14px 8px; font: 500 12px var(--mono); color: var(--faint); }
+
+.firehose {
+  background: var(--topbar); border-radius: 6px; padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.firehose-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.firehose-head .tag { font: 600 10px var(--mono); letter-spacing: 1.5px; color: #7A8492; }
+.firehose-head select, .firehose-head input {
+  background: #1C232C; border: 1px solid #2E3A46; border-radius: 4px;
+  font: 500 10.5px var(--mono); color: #C9D2DC; padding: 3px 10px;
+}
+.firehose-head input { min-width: 220px; }
+.firehose-head input::placeholder { color: #5A6572; }
+.firehose-head .right { margin-left: auto; font: 500 10px var(--mono); color: #5A6572; }
+.firehose-lines { display: flex; flex-direction: column; gap: 3px; max-height: 340px; overflow: auto; }
+.fline {
+  font: 400 10.5px/1.5 var(--mono); color: #C9D2DC;
+  white-space: pre-wrap; word-break: break-all;
+}
+.fline .fnum { color: #6FA8FF; cursor: pointer; }
+.firehose-empty { font: 400 10.5px var(--mono); color: #5A6572; }
+
+/* ---- runner down: the whole surface grays (design §6 / screen 8d cue) ---- */
+#app.runner-down .shell { filter: grayscale(0.85) brightness(0.85); }
+.runner-banner {
+  max-width: 1600px; margin: 18px auto 0;
+  display: flex; align-items: center; gap: 10px;
+  background: #3A4048; border: 1px solid #C0392B; border-radius: 8px; padding: 10px 16px;
+}
+.runner-banner .dot { width: 8px; height: 8px; border-radius: 50%; background: #FF5A48; }
+.runner-banner .t { font: 700 13px var(--sans); letter-spacing: 1px; color: #FF6A58; }
+.runner-banner .sub { font: 500 12px var(--mono); color: #C9D2DC; }
+.runner-banner[hidden] { display: none; }
+
+/* connection trouble (poll failed) — honest, never a frozen stale surface */
+.conn-warn {
+  max-width: 1600px; margin: 10px auto 0; padding: 8px 16px;
+  background: #3A2422; border: 1px solid #5A2A25; border-radius: 8px;
+  font: 500 12px var(--mono); color: #F2C4BC;
+}
+.conn-warn[hidden] { display: none; }
+
+/* ============================ the verbs (Task 6) ============================ */
+/* Card buttons are now live (no longer disabled). Hover/active states so a tap feels mechanical. */
+.btn { transition: filter 0.08s ease, background 0.08s ease; }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn.ghost:hover { background: #EEF2F6; }
+.btn:active { transform: translateY(0.5px); }
+/* Drop is the one destructive verb — armed (mid-confirm) it goes red so the second tap is deliberate. */
+.btn.ghost.danger {
+  background: #FBEAE7; border-color: var(--red); color: var(--red); font-weight: 700;
+}
+/* Discuss reads as a quiet link but is a real button. */
+.btn-note.link { background: none; border: none; cursor: pointer; padding: 0; }
+.btn-note.link:hover { color: var(--blue); text-decoration: underline; }
+
+/* ⚡ Expedite — a small warm chip at the end of a departures row. */
+.dep-expedite {
+  justify-self: end; width: 22px; height: 22px; padding: 0; border-radius: 4px; cursor: pointer;
+  background: var(--amber-bg); border: 1px solid var(--amber-border); color: var(--amber-ink);
+  font: 600 12px var(--mono); line-height: 1;
+}
+.dep-expedite:hover { background: var(--board-gold); border-color: var(--board-gold); color: #241C00; }
+.dep-expedite:active { transform: translateY(0.5px); }
+
+/* ---- toast: transient action feedback, floats over everything ---- */
+.cc-toast {
+  position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 20px);
+  max-width: min(560px, 92vw); z-index: 60;
+  padding: 11px 18px; border-radius: 8px;
+  font: 600 12.5px var(--sans); letter-spacing: 0.2px;
+  background: #17351F; color: #CFF3D9; border: 1px solid #2C6B3D;
+  box-shadow: 0 8px 26px rgba(10, 20, 14, 0.32);
+  opacity: 0; pointer-events: none; transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.cc-toast.show { opacity: 1; transform: translate(-50%, 0); }
+.cc-toast.err { background: #3A2422; color: #F2C4BC; border-color: #5A2A25; }
+
+/* ---- flag composer: a centered overlay OUTSIDE #root (survives the 2s poll re-render) ---- */
+.cc-flagbox {
+  position: fixed; inset: 0; z-index: 70; display: none;
+  align-items: flex-start; justify-content: center;
+  background: rgba(12, 17, 23, 0.42);
+}
+.cc-flagbox.open { display: flex; }
+.cc-flag-card {
+  margin-top: 12vh; width: min(520px, 92vw);
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px;
+  padding: 18px 18px 14px; box-shadow: 0 18px 50px rgba(15, 22, 34, 0.4);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.cc-flag-head {
+  font: 700 13px var(--mono); letter-spacing: 1.2px; color: var(--ink);
+  display: flex; align-items: baseline; gap: 8px;
+}
+.cc-flag-head #cc-flag-target { font: 500 11.5px var(--mono); color: var(--blue); letter-spacing: 0.3px; }
+.cc-flag-sub { font: 400 11.5px/1.5 var(--mono); color: var(--muted); }
+.cc-flag-sub b { color: var(--amber-ink); }
+#cc-flag-text {
+  width: 100%; resize: vertical; min-height: 84px;
+  font: 400 13px/1.5 var(--sans); color: var(--ink);
+  border: 1px solid #C9D2DC; border-radius: 6px; padding: 9px 11px; background: #FBFCFD;
+}
+#cc-flag-text:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-chip-bg); }
+.cc-flag-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ============================ Task 9 — tower comms feed ============================ */
+/* A comms feed of the most recent traffic, newest at the bottom (screen 7a reading order); radio
+   flavor rides beside the real sentence (§7), the "since you last looked" divider marks new traffic
+   (§4). The feed OWNS its scroll (issue #27): it flexes to fill the panel's region and scrolls
+   INSIDE it, so a long log — 14 rows is already tall, and any row expands to its raw journal line —
+   is height-bounded within the panel and never stretches the four-panel grid row that would shove
+   the boards down the page. This mirrors .needs-list's treatment in the same grid (the field canvas
+   anchors the row height; min-height:0 lets the feed shrink below its content so it can scroll);
+   shell.js re-pins the feed to the newest line across the 2s poll re-render. */
+.tower-feed {
+  display: flex; flex-direction: column;
+  flex: 1 1 0; min-height: 0; overflow-y: auto;
+}
+.tower-row { position: relative; }
+/* Radio prefix — a small callsign in amber, flavor beside the real sentence (never replacing it). */
+.tower-row .radio {
+  font: 600 9.5px var(--mono); letter-spacing: 0.4px; color: var(--amber-ink);
+  background: var(--amber-bg); border: 1px solid var(--amber-border);
+  border-radius: 3px; padding: 0 4px; white-space: nowrap;
+}
+/* A thin left accent per comms kind — glanceable, never load-bearing (the sentence carries truth). */
+.tower-row { border-left: 2px solid transparent; padding-left: 6px; }
+.tower-row.kind-merge { border-left-color: #9FD8B0; }
+.tower-row.kind-park, .tower-row.kind-alert { border-left-color: var(--amber); }
+.tower-row.kind-regen { border-left-color: #7A5CBF; }
+.tower-row.kind-radio, .tower-row.kind-answer { border-left-color: var(--blue); }
+/* Fresh (since you last looked) — a soft blue wash + a bolder line so new traffic pops. */
+.tower-row.fresh { background: #F4F8FD; }
+.tower-row.fresh .msg { color: var(--ink); }
+.tower-divider {
+  display: flex; align-items: center; text-align: center; gap: 8px;
+  margin: 6px 0 2px; color: var(--blue);
+}
+.tower-divider::before, .tower-divider::after {
+  content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, transparent, #C6D8EF);
+}
+.tower-divider::after { background: linear-gradient(90deg, #C6D8EF, transparent); }
+.tower-divider span { font: 700 9px var(--mono); letter-spacing: 1.4px; white-space: nowrap; }
+.tower .tower-new {
+  background: var(--blue); color: #F2F6FA; font: 700 9.5px var(--mono); letter-spacing: 0.5px;
+  padding: 1px 7px; border-radius: 4px;
+}
+/* The reveal affordance (issue #36): routine bookkeeping (relabels) is kept off the comms feed by
+   default; this quiet mono control at the foot reveals it on demand. Small and faint so it never
+   competes with real traffic — a footnote, not a signal. Sits below the scrolling feed, not inside. */
+.tower-routine {
+  align-self: flex-start; margin-top: 6px;
+  background: none; border: 1px dashed #D3DAE3; border-radius: 4px;
+  font: 500 10px var(--mono); letter-spacing: 0.3px; color: var(--faint);
+  padding: 2px 8px; cursor: pointer;
+}
+.tower-routine:hover { color: var(--ink-2); border-color: #B7C0CC; }
+.tower-routine.on { color: var(--blue); border-style: solid; border-color: var(--blue-chip-border); }
+
+/* ============================ Task 9 — Needs You cards (plain gloss leads) ============================ */
+.needs-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; min-height: 0; }
+.chip[data-fnum] { cursor: pointer; }
+.card-headline { font: 600 13px/1.4 var(--sans); color: var(--ink); }
+.card-gloss { font: 400 11px/1.5 var(--sans); color: var(--muted); cursor: help; }
+.card-gloss .term { font: 500 10.5px var(--mono); color: var(--faint); }
+/* The conflict-cap collision — one plain sentence, an amber slip that names it (never a bare badge). */
+.card-collision {
+  font: 500 11.5px/1.5 var(--sans); color: var(--amber-ink);
+  background: var(--amber-bg); border: 1px solid var(--amber-border);
+  border-left: 3px solid var(--amber); border-radius: 4px; padding: 8px 10px;
+}
+.card.kind-conflict-cap { border-color: var(--amber-border); box-shadow: 0 0 0 1px var(--amber-bg); }
+.card.kind-bounced { border-left: 3px solid var(--amber); }
+
+/* ============================ Task 9 — the flight-card drawer ============================ */
+.cc-drawer {
+  position: fixed; inset: 0; z-index: 80; display: none;
+  background: rgba(12, 17, 23, 0.42);
+}
+.cc-drawer.open { display: block; }
+.drawer-panel {
+  position: absolute; top: 0; right: 0; height: 100%;
+  width: min(460px, 94vw); overflow-y: auto;
+  background: var(--panel); border-left: 1px solid var(--panel-border);
+  box-shadow: -18px 0 50px rgba(15, 22, 34, 0.35);
+  padding: 18px 20px 26px; display: flex; flex-direction: column; gap: 12px;
+}
+.drawer-head { display: flex; align-items: center; gap: 10px; }
+.drawer-flight {
+  font: 700 16px var(--mono); letter-spacing: 1px; color: var(--blue);
+  background: var(--blue-chip-bg); border: 1px solid var(--blue-chip-border);
+  border-radius: 5px; padding: 3px 10px;
+}
+.drawer-x {
+  margin-left: auto; background: none; border: 1px solid #C9D2DC; border-radius: 6px;
+  width: 30px; height: 30px; cursor: pointer; color: var(--muted); font: 600 13px var(--sans);
+}
+.drawer-x:hover { background: #EEF2F6; color: var(--ink); }
+.drawer-title { font: 600 15px/1.35 var(--sans); color: var(--ink); }
+.drawer-sub { font: 500 11px var(--mono); color: var(--faint); letter-spacing: 0.3px; }
+.drawer-facts { display: flex; gap: 8px; flex-wrap: wrap; }
+.drawer-chip {
+  font: 600 11px var(--mono); padding: 3px 9px; border-radius: 4px;
+  background: #F1F4F8; border: 1px solid #E1E7EE; color: var(--ink-3);
+}
+.drawer-chip.cargo { color: var(--ink-2); }
+.drawer-chip.cargo.empty { color: var(--faint); }
+.drawer-chip.go { background: #F3EEFB; border-color: #DCCEF3; color: #6A4CB0; }
+.drawer-links { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.drawer-link { font: 600 11.5px var(--mono); color: var(--blue); text-decoration: none; }
+.drawer-link:hover { text-decoration: underline; }
+.drawer-branch {
+  font: 500 10.5px var(--mono); color: var(--muted);
+  background: #F1F4F8; border: 1px solid #E1E7EE; border-radius: 3px; padding: 2px 7px;
+  word-break: break-all;
+}
+.drawer-section { display: flex; flex-direction: column; gap: 7px; padding-top: 4px; border-top: 1px solid #EDF0F4; }
+.drawer-label { font: 700 9.5px var(--mono); letter-spacing: 1.4px; color: var(--muted); }
+/* Circuit rail — the discrete stages, the honest current position highlighted (§3/§5).
+   Developer term leads (.rail-dev); the airport metaphor is small, secondary flavor (.rail-flavor)
+   — costume rule 2 / joy-pass owner ruling: the ground-truth rail speaks developer truth first. */
+.drawer-rail { display: flex; align-items: stretch; flex-wrap: wrap; gap: 3px; }
+.rail-step {
+  display: inline-flex; flex-direction: column; align-items: center; gap: 1px;
+  font: 600 9.5px var(--mono); letter-spacing: 0.3px; color: var(--faint);
+  background: #F1F4F8; border: 1px solid #E6EBF1; border-radius: 3px; padding: 2px 6px; cursor: help;
+}
+.rail-dev { font-weight: 700; letter-spacing: 0.2px; }
+.rail-flavor { font-size: 8px; font-weight: 500; font-style: italic; opacity: 0.62; }
+.rail-step.done { color: var(--green); background: #EDF6F0; border-color: #CFE7D7; }
+.rail-step.current {
+  color: #F2F6FA; background: var(--blue); border-color: var(--blue); font-weight: 700;
+}
+.rail-arm { align-self: center; width: 6px; height: 1px; background: #CBD4DE; }
+.drawer-offpath {
+  font: 600 11.5px/1.5 var(--sans); border-radius: 5px; padding: 8px 11px; margin-top: 2px;
+  background: var(--amber-bg); border: 1px solid var(--amber-border);
+  border-left: 3px solid var(--amber); color: var(--amber-ink);
+}
+.drawer-offpath.state-session-frozen, .drawer-offpath.state-merges-freeze {
+  background: #EEF4F6; border-color: #CFE0E6; border-left-color: #2D8FA0; color: #2A5A64;
+}
+/* Clearance checklist — real check names, plain glosses (costume rule 2). */
+.drawer-clearance { display: flex; flex-direction: column; gap: 5px; }
+.clr-row {
+  display: grid; grid-template-columns: 18px auto 1fr; gap: 8px; align-items: baseline;
+  font: 500 12px var(--sans); color: var(--ink-3);
+}
+.clr-row .ck { font-weight: 700; text-align: center; }
+.clr-row .ck.ok { color: var(--green); }
+.clr-row .ck.no { color: var(--faint); }
+.clr-row .clr-label { color: var(--ink); font-weight: 600; }
+.clr-row.ok .clr-label { color: var(--green); }
+.clr-row .clr-gloss { font: 400 10.5px var(--mono); color: var(--muted); }
+.drawer-memo {
+  font: 400 11px/1.55 var(--mono); color: var(--muted);
+  background: #F1F4F8; border: 1px solid #E1E7EE; border-radius: 4px; padding: 7px 9px;
+  white-space: pre-wrap; word-break: break-word;
+}
+/* The drawer's flight journal — the same comms vocabulary, newest first. */
+.drawer-journal { display: flex; flex-direction: column; }
+.drawer-jrow {
+  display: grid; grid-template-columns: 42px 1fr 14px; gap: 6px 8px;
+  padding: 6px 2px 6px 6px; border-bottom: 1px solid #EDF0F4; align-items: start;
+  border-left: 2px solid transparent;
+}
+.drawer-jrow.kind-merge { border-left-color: #9FD8B0; }
+.drawer-jrow.kind-park, .drawer-jrow.kind-alert { border-left-color: var(--amber); }
+.drawer-jrow.kind-regen { border-left-color: #7A5CBF; }
+.drawer-jrow .t { font: 500 11px var(--mono); color: var(--faint); }
+.drawer-jrow .msg { font: 400 12px/1.45 var(--sans); color: var(--ink-2); }
+.drawer-jrow .radio {
+  font: 600 9.5px var(--mono); letter-spacing: 0.4px; color: var(--amber-ink);
+  background: var(--amber-bg); border: 1px solid var(--amber-border); border-radius: 3px; padding: 0 4px;
+}
+.drawer-jrow .caret { color: #C2CAD4; font-size: 11px; cursor: pointer; user-select: none; }
+.drawer-jrow .tower-raw { grid-column: 1 / -1; }
+.drawer-empty { font: 400 11px var(--mono); color: var(--faint); padding: 6px 0; }
+.drawer-actions {
+  display: flex; gap: 8px; align-items: center; margin-top: auto; padding-top: 10px;
+  border-top: 1px solid #EDF0F4;
+}
+.drawer-actions .btn-note.link { margin-left: auto; }
+
+/* ============================ Task 11 — night replay + morning digest ============================ */
+
+/* The field-head tools ([⏮ replay] rides the airfield, design §4). Compact pixel buttons beside the
+   living-clock; they sit left of the right-aligned clock. */
+.field-tools { display: inline-flex; gap: 5px; margin-left: 8px; align-self: center; }
+.field-tool {
+  background: none; border: 1px solid #C9D2DC; border-radius: 4px; cursor: pointer;
+  font: 600 10px var(--mono); letter-spacing: 0.4px; color: var(--muted); padding: 2px 9px;
+}
+.field-tool:hover { background: #EEF2F6; color: var(--ink-2); border-color: #AEBAC6; }
+.field-tool[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+/* ---- Night replay: a treat over the field engine. A DARK card, because the airfield is dark. ---- */
+.cc-replay {
+  position: fixed; inset: 0; z-index: 76; display: none;
+  background: rgba(8, 12, 18, 0.62); align-items: center; justify-content: center; padding: 20px;
+}
+.cc-replay.open { display: flex; }
+.cc-replay-card {
+  width: min(780px, 96vw); background: #12171E; border: 1px solid #05070A;
+  border-radius: 10px; box-shadow: 0 26px 70px rgba(4, 8, 14, 0.6);
+  padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 11px;
+}
+.cc-replay-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cc-replay-title { font: 700 12px var(--mono); letter-spacing: 1px; color: #E7ECF2; }
+.cc-replay-title b { color: var(--board-gold); font-weight: 700; }
+.cc-replay-sub { font: 400 10.5px var(--sans); color: #8A93A0; }
+.cc-replay-trunc { font: 400 10px var(--mono); color: #C99A3A; }
+.cc-replay-head select, .cc-digest-head select {
+  margin-left: auto; background: #1B2129; color: #CBD3DC; border: 1px solid #2A323C;
+  border-radius: 4px; font: 500 11px var(--mono); padding: 3px 6px;
+}
+.cc-replay-x, .cc-digest-x {
+  background: none; border: 1px solid #2A323C; border-radius: 6px; width: 28px; height: 28px;
+  cursor: pointer; color: #9AA4B0; font: 600 12px var(--sans);
+}
+.cc-replay-x:hover { background: #1B2129; color: #E7ECF2; }
+.cc-replay-stage {
+  position: relative; background: var(--field-bg); border: 1px solid #05070A;
+  border-radius: 6px; padding: 10px; display: flex; justify-content: center;
+}
+.cc-replay-canvas { display: block; width: 100%; max-width: 760px; image-rendering: pixelated; border-radius: 3px; }
+.cc-replay-empty {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font: 500 12px var(--mono); color: #6B7480;
+}
+.cc-replay-empty[hidden] { display: none; }   /* the flex display would otherwise defeat [hidden] */
+.cc-replay-caption {
+  min-height: 20px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font: 400 12px var(--sans); color: #D6DCE3;
+}
+.cc-replay-caption .t { font: 600 11px var(--mono); color: #7E8794; min-width: 38px; }
+.cc-replay-caption .fnum {
+  font: 700 10.5px var(--mono); color: #9FC6FF; cursor: pointer;
+  background: #17202B; border: 1px solid #26384B; border-radius: 3px; padding: 1px 6px;
+}
+.cc-replay-caption .radio {
+  font: 600 9.5px var(--mono); letter-spacing: 0.4px; color: #E7C15A;
+  background: #24200F; border: 1px solid #4A3F16; border-radius: 3px; padding: 1px 5px;
+}
+.cc-replay-caption .msg { color: #EDF1F5; }
+.cc-replay-caption .hint { font: 400 10px var(--mono); color: #6B7480; }
+.cc-replay-caption .loading, .cc-replay-caption .err { font: 500 11px var(--mono); color: #7E8794; }
+.cc-replay-caption .err { color: #E58A7E; }
+.cc-replay-controls { display: flex; align-items: center; gap: 10px; }
+.cc-replay-btn {
+  background: #1B2129; border: 1px solid #2A323C; color: #CBD3DC; border-radius: 5px;
+  min-width: 32px; height: 28px; cursor: pointer; font: 600 12px var(--mono); padding: 0 8px;
+}
+.cc-replay-btn:hover { background: #232B34; color: #FFF; }
+.cc-replay-btn.play { color: var(--board-gold); border-color: #3A3418; }
+.cc-replay-scrub { flex: 1; accent-color: #6FA8FF; cursor: pointer; }
+.cc-replay-pos { font: 600 11px var(--mono); color: #8A93A0; min-width: 56px; text-align: right; }
+
+/* ---- Morning digest: the mechanical account. A LIGHT document that scrolls. ---- */
+.cc-digest {
+  position: fixed; inset: 0; z-index: 76; display: none;
+  background: rgba(12, 17, 23, 0.5); align-items: center; justify-content: center; padding: 20px;
+}
+.cc-digest.open { display: flex; }
+.cc-digest-card {
+  width: min(760px, 96vw); max-height: 88vh; background: var(--panel);
+  border: 1px solid var(--panel-border); border-radius: 10px;
+  box-shadow: 0 24px 64px rgba(15, 22, 34, 0.4); display: flex; flex-direction: column;
+}
+.cc-digest-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 14px 18px; border-bottom: 1px solid #EDF0F4;
+}
+.cc-digest-title { font: 700 12px var(--mono); letter-spacing: 1px; color: var(--ink); }
+.cc-digest-title b { color: var(--blue); }
+.cc-digest-sub { font: 400 10.5px var(--sans); color: var(--faint); }
+.cc-digest-head select {
+  background: #F1F4F8; color: var(--ink-3); border: 1px solid #D8DFE7;
+}
+.cc-digest-x { border-color: #C9D2DC; color: var(--muted); }
+.cc-digest-x:hover { background: #EEF2F6; color: var(--ink); }
+.cc-digest-body { overflow-y: auto; padding: 14px 18px 20px; display: flex; flex-direction: column; gap: 16px; }
+.cc-digest-loading, .cc-digest-err { font: 500 12px var(--mono); color: var(--muted); padding: 10px 0; }
+.cc-digest-err { color: var(--red); }
+/* Counts — the mechanical top-line. */
+.cc-digest-counts { display: flex; gap: 8px; flex-wrap: wrap; }
+.cc-digest-count {
+  display: inline-flex; align-items: baseline; gap: 6px; padding: 6px 11px; border-radius: 6px;
+  background: #F1F4F8; border: 1px solid #E1E7EE;
+  font: 600 9.5px var(--mono); letter-spacing: 0.6px; color: var(--muted);
+}
+.cc-digest-count b { font: 700 16px var(--mono); color: var(--ink); }
+.cc-digest-count.zero { opacity: 0.62; }
+.cc-digest-count.hot { background: var(--amber-bg); border-color: var(--amber-border); color: var(--amber-ink); }
+.cc-digest-count.hot b { color: var(--amber-ink); }
+.cc-digest-section { display: flex; flex-direction: column; gap: 7px; }
+.cc-digest-label {
+  font: 700 9.5px var(--mono); letter-spacing: 1.4px; color: var(--muted);
+  display: flex; align-items: center; gap: 8px;
+}
+.cc-digest-label .n {
+  font: 700 9.5px var(--mono); color: var(--blue);
+  background: var(--blue-chip-bg); border: 1px solid var(--blue-chip-border);
+  border-radius: 3px; padding: 0 5px;
+}
+.cc-digest-clean {
+  font: 500 12px var(--sans); color: var(--green);
+  background: #EDF6F0; border: 1px solid #CFE7D7; border-radius: 5px; padding: 9px 12px;
+}
+/* One sentence per exception — the load-bearing lines. */
+.cc-digest-exceptions { display: flex; flex-direction: column; gap: 4px; }
+.cc-digest-exc {
+  display: grid; grid-template-columns: 44px auto auto 1fr 14px; gap: 5px 8px; align-items: baseline;
+  padding: 7px 4px 7px 8px; border-left: 3px solid var(--amber); border-radius: 0 4px 4px 0;
+  background: #FBF7EF; font: 500 12px var(--sans); color: var(--ink-2);
+}
+.cc-digest-exc.kind-go_around, .cc-digest-exc.kind-wander { border-left-color: #7A5CBF; background: #F6F3FB; }
+.cc-digest-exc.kind-missed_approach, .cc-digest-exc.kind-alert,
+.cc-digest-exc.kind-autofix_failed, .cc-digest-exc.kind-runner_down { border-left-color: var(--red); background: #FBEFED; }
+.cc-digest-exc.kind-freeze_arc { border-left-color: #2D8FA0; background: #EEF4F6; }
+.cc-digest-exc .t { font: 600 11px var(--mono); color: var(--faint); }
+.cc-digest-exc .kind {
+  font: 700 8.5px var(--mono); letter-spacing: 0.5px; text-transform: uppercase; color: var(--muted);
+  background: #FFFFFF; border: 1px solid #E1E7EE; border-radius: 3px; padding: 1px 5px; align-self: center;
+}
+.cc-digest-exc .s { color: var(--ink); }
+.cc-digest-exc .caret { color: #B7BFC9; font-size: 11px; cursor: pointer; user-select: none; }
+/* The event table — timestamped, glossed, clickable (same vocabulary as the tower log). */
+.cc-digest-events { display: flex; flex-direction: column; }
+.cc-digest-row {
+  display: grid; grid-template-columns: 44px auto 1fr 14px; gap: 5px 8px; align-items: baseline;
+  padding: 5px 4px 5px 6px; border-bottom: 1px solid #EDF0F4; font: 400 12px var(--sans); color: var(--ink-2);
+  border-left: 2px solid transparent;
+}
+.cc-digest-row.kind-merge { border-left-color: #9FD8B0; }
+.cc-digest-row.kind-park, .cc-digest-row.kind-alert { border-left-color: var(--amber); }
+.cc-digest-row.kind-regen { border-left-color: #7A5CBF; }
+.cc-digest-row .t { font: 500 11px var(--mono); color: var(--faint); }
+.cc-digest-row .msg { color: var(--ink-2); }
+.cc-digest-row .radio {
+  font: 600 9px var(--mono); letter-spacing: 0.3px; color: var(--amber-ink);
+  background: var(--amber-bg); border: 1px solid var(--amber-border); border-radius: 3px; padding: 0 4px;
+}
+.cc-digest-row .caret { color: #C2CAD4; font-size: 11px; cursor: pointer; user-select: none; }
+.cc-digest .fnum {
+  font: 700 10px var(--mono); color: var(--blue); cursor: pointer;
+  background: var(--blue-chip-bg); border: 1px solid var(--blue-chip-border);
+  border-radius: 3px; padding: 0 5px; align-self: center;
+}
+.cc-digest .fnum:hover { text-decoration: underline; }
+.cc-digest-raw {
+  grid-column: 1 / -1; margin-top: 4px; font: 400 10.5px var(--mono); color: var(--muted);
+  background: #F1F4F8; border: 1px solid #E1E7EE; border-radius: 4px; padding: 6px 8px;
+  white-space: pre-wrap; word-break: break-word;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cc-replay-scrub { accent-color: #6FA8FF; }
+}
+
+/* ============================ issue #41 — the Tidy confirm dialog ============================ */
+/* A centered modal OUTSIDE #root (like the flag box / digest) so the 2s poll never touches it. The
+   ops-verb surface is plain and honest — it lists exactly what `superlooper tidy --dry-run` reported
+   and asks before running the close. Amber accents keep it visually distinct from the blue decision
+   verbs: this runs a local machine, it is not William's word. */
+.cc-tidy {
+  position: fixed; inset: 0; z-index: 78; display: none;
+  background: rgba(12, 17, 23, 0.5); align-items: flex-start; justify-content: center; padding: 20px;
+}
+.cc-tidy.open { display: flex; }
+.cc-tidy-card {
+  margin-top: 11vh; width: min(560px, 94vw); max-height: 80vh; background: var(--panel);
+  border: 1px solid var(--panel-border); border-radius: 10px;
+  box-shadow: 0 24px 64px rgba(15, 22, 34, 0.42); display: flex; flex-direction: column;
+}
+.cc-tidy-head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 14px 18px; border-bottom: 1px solid #EDF0F4;
+}
+.cc-tidy-title { font: 700 12.5px var(--mono); letter-spacing: 1px; color: var(--ink); }
+.cc-tidy-title b { color: var(--amber-ink); font-weight: 600; }
+.cc-tidy-sub { font: 400 10.5px/1.5 var(--sans); color: var(--faint); flex: 1 1 220px; }
+.cc-tidy-sub code { font: 500 10px var(--mono); color: var(--ink-3); background: #F1F4F8; padding: 1px 5px; border-radius: 3px; }
+.cc-tidy-x {
+  margin-left: auto; align-self: center; background: none; border: 1px solid #C9D2DC; color: var(--muted);
+  border-radius: 5px; width: 24px; height: 24px; cursor: pointer; font: 600 12px var(--sans);
+}
+.cc-tidy-x:hover { background: #EEF2F6; color: var(--ink); }
+.cc-tidy-body { overflow-y: auto; padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 12px; }
+.cc-tidy-loading, .cc-tidy-empty { font: 500 12px var(--mono); color: var(--muted); padding: 6px 0; }
+.cc-tidy-lead { font: 400 12.5px/1.55 var(--sans); color: var(--ink-2); }
+.cc-tidy-lead b { color: var(--amber-ink); font-weight: 700; }
+/* The window list — exactly what dry-run returned, one row per finished session. */
+.cc-tidy-list { display: flex; flex-direction: column; gap: 5px; }
+.cc-tidy-row {
+  display: grid; grid-template-columns: 64px 96px 1fr; align-items: baseline; gap: 10px;
+  padding: 7px 10px; border-radius: 6px; background: #F5F7FA; border: 1px solid #E4E9EF;
+}
+.cc-tidy-flight { font: 700 12px var(--mono); color: var(--ink); letter-spacing: 0.3px; }
+.cc-tidy-status {
+  justify-self: start; font: 600 9.5px var(--mono); letter-spacing: 0.6px; text-transform: uppercase;
+  color: var(--amber-ink); background: var(--amber-bg); border: 1px solid var(--amber-border);
+  border-radius: 4px; padding: 2px 7px;
+}
+.cc-tidy-surface { font: 400 11px var(--mono); color: var(--muted); word-break: break-all; }
+.cc-tidy-nosurface { color: var(--faint); font-style: italic; }
+.cc-tidy-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+/* The honest result / failure line — a nonzero exit is never a silent success (issue #41). */
+.cc-tidy-result { font: 600 12.5px var(--sans); padding: 8px 11px; border-radius: 6px; }
+.cc-tidy-result.ok { color: var(--green); background: #EAF6EE; border: 1px solid #C6E6D1; }
+.cc-tidy-result.err { color: var(--red); background: #FBECEA; border: 1px solid #F0CFC9; }
+
+/* ============================ desktop breakpoints (issue #29) ============================ */
+/* The airfield is the centerpiece (design record §0.1 joy-is-terminal, §4). In the default grid
+   (above) it is the middle 1fr track flanked by two FIXED columns (Needs You ~320px, Tower Log
+   ~340px), so on a narrowing window every lost pixel comes straight out of the field — unchecked it
+   collapses from ~750px at 1600 to a ~174px postage stamp at 1024. These breakpoints make the FLANKS
+   give way first, never the field. It is a pixels-only reflow (design record B.1): the field needs no
+   canvas rescaling — .field-mount is width:100% capped at 800px (above), so the rendered airfield just
+   follows whatever width the grid hands it. There is never a horizontal page scroll: the field track
+   stays 1fr (it shrinks), the flanks are the only fixed tracks. Mobile stays deferred (§4) — these are
+   desktop window sizes. (Kept at the end of the file so the base rules above read as the widest layout
+   and these responsive overrides come last.) */
+
+/* ≤1450px — trim both flanks so the field keeps a legible size while all three panels stay in view
+   (the familiar 3-panel shell at the very common ~1366/1440 laptop widths). */
+@media (max-width: 1450px) {
+  .main { grid-template-columns: 264px 1fr 288px; }
+  .main.needs-collapsed { grid-template-columns: 46px 1fr 288px; }
+}
+
+/* ≤1300px — trimming is spent, so the Tower Log drops to a full-width row BELOW: .main becomes two
+   tracks (Needs You + field) and the field springs back to full size instead of being squeezed
+   between two fixed columns. Below here the airfield holds ~800px down through 1280 and stays legible
+   to 1024 — the two tightest desktop widths both get the big map, tower under it. This block comes
+   AFTER the ≤1450px one so, where both match, its two-track grids win. */
+@media (max-width: 1300px) {
+  .main { grid-template-columns: 264px 1fr; }
+  .main.needs-collapsed { grid-template-columns: 46px 1fr; }
+  .tower { grid-column: 1 / -1; }
+  /* The dropped tower has no tall field sibling to anchor its row height, so its feed can no longer
+     flex to fill (flex:1 + min-height:0 would collapse to zero — the empty-log bug). Instead let the
+     feed size to its content up to a cap, then scroll INSIDE itself (issue #27) rather than growing
+     its now-auto-height row and stretching the page. */
+  .tower .tower-feed { flex: 0 1 auto; max-height: 240px; }
+}

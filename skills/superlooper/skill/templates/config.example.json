@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "repo": "owner/name",
+  "dev_branch": "main",
+  "prod_branch": null,
+  "lanes": 2,
+  "affinity": "hard",
+  "areas": {
+    "frontend": ["src/components/**", "src/styles/**"],
+    "api": ["src/api/**", "src/server/**"],
+    "db": ["migrations/**", "src/db/**"]
+  },
+  "touches_required": true,
+  "required_checks": ["review/local-gate", "quality-gate"],
+  "merge_method": "squash",
+  "ship_cmd": null,
+  "ship_recheck_cmd": null,
+  "report_required_sections": ["Tests", "Browser evidence", "Regression tests", "Review"],
+  "bright_lines": [],
+  "models": { "worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": null },
+  "session": { "idle_seconds": 480, "freeze_seconds": 2700,
+               "retry_cap": 2, "conflict_cap": 2 },
+  "qa": { "nightly_cmd": null, "results_glob": null,
+          "retry_once": true, "quarantine": [],
+          "nightly_time": "02:00" },
+  "cleanup_merged_worktrees": true,
+  "notify": { "imessage_to": null, "cmd": null },
+  "report_time": "08:45"
+}

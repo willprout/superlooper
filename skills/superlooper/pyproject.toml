@@ -1,0 +1,7 @@
+# Superlooper — pytest-only project config (no runtime deps; the skill payload is Python
+# stdlib only, like autocode). Test import paths (skill/lib, skill/bin) are added to sys.path
+# by tests/conftest.py, not `pythonpath` here, so they resolve regardless of how pytest is
+# invoked and relative to the repo root rather than pytest's rootdir guess.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

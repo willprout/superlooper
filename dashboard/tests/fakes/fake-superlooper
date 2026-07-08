@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""A stand-in for the `superlooper` CLI, driven by a fixture directory — the test harness the
+dashboard's local-command adapter (``lib/tidy.py``) runs against so no test ever reaches the REAL
+``superlooper`` binary (which closes cmux windows — a stray real call would touch William's live
+sessions). The conftest guard already points ``SL_SUPERLOOPER`` at an absent path by default; a
+tidy test overrides it in-body to THIS executable.
+
+Point the adapter at it with ``SL_SUPERLOOPER=<path>/fake-superlooper`` and
+``SL_TIDY_FIXTURES=<dir>``. This models exactly the two subcommand shapes the Tidy button drives:
+
+    superlooper tidy --repo <path> --dry-run     → LISTS the windows tidy would close (closes none)
+    superlooper tidy --repo <path> --yes         → CLOSES them (skips the interactive y/N)
+
+- ``--dry-run`` prints the contents of ``$SL_TIDY_FIXTURES/dry_run.txt`` when present, else a
+  default two-window listing in the REAL CLI's exact print format (``  {id:5} {status:13}
+  {surface}``), so ``lib/tidy.parse_windows`` is exercised against the true shape.
+- ``--yes`` prints ``$SL_TIDY_FIXTURES/execute.txt`` when present, else a default ``closed N
+  window(s).`` line, and records a ``close`` mutation so a test can assert the execute path ran.
+
+Every invocation's full argv (and cwd) is logged to ``$SL_TIDY_FIXTURES/calls.jsonl`` BEFORE any
+sleep/fail, so a test can pin the exact contract the adapter produced — that ``--repo`` was the
+right checkout, that ``--dry-run`` vs ``--yes`` was chosen correctly, and CRUCIALLY that ``--all``
+was NEVER passed (issue #41: merged-only scope; the dashboard never exposes ``--all``).
+
+Fail injection (exercises the adapter's fail-closed paths):
+- ``SL_TIDY_SLEEP=<secs>``  makes the call sleep, so a short adapter timeout trips (rc 124 path).
+- ``SL_TIDY_FAIL=1``        makes the call exit nonzero with a stderr message (the missing-binary /
+                            command-error path — must surface plainly, never a silent success).
+
+Mirrors ``tests/fakes/fake-gh``.
+"""
+import json
+import os
+import sys
+import time
+
+ARGS = sys.argv[1:]
+FIX = os.environ.get("SL_TIDY_FIXTURES", "")
+
+_DEFAULT_DRY_RUN = (
+    "tidy will close 2 finished (merged) session window(s):\n"
+    "  i23   merged        cmux:surface-23\n"
+    "  i16   merged        (no surface)\n"
+    "dry-run: nothing closed.\n"
+)
+_DEFAULT_EXECUTE = "tidy will close 2 finished (merged) session window(s):\n" \
+                   "  i23   merged        cmux:surface-23\n" \
+                   "  i16   merged        (no surface)\n" \
+                   "closed 2 window(s).\n"
+
+
+def die(msg, code=1):
+    sys.stderr.write("fake-superlooper: %s\n" % msg)
+    sys.exit(code)
+
+
+def fixture(name, default):
+    """The contents of ``$SL_TIDY_FIXTURES/<name>`` if present, else ``default``."""
+    path = os.path.join(FIX, name)
+    if FIX and os.path.isfile(path):
+        with open(path) as f:
+            return f.read()
+    return default
+
+
+def record(kind, **extra):
+    rec = {"kind": kind}
+    rec.update(extra)
+    with open(os.path.join(FIX, "mutations.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def opt(flag):
+    if flag in ARGS:
+        i = ARGS.index(flag)
+        if i + 1 < len(ARGS):
+            return ARGS[i + 1]
+    return None
+
+
+def route():
+    if ARGS[:1] != ["tidy"]:
+        die("unhandled command: %s" % " ".join(ARGS))
+    if "--dry-run" in ARGS:
+        sys.stdout.write(fixture("dry_run.txt", _DEFAULT_DRY_RUN))
+        sys.exit(0)
+    # --yes (or a bare tidy) → the execute path. Record it so a test can assert the close ran.
+    record("tidy_execute", repo=opt("--repo"), yes=("--yes" in ARGS), all=("--all" in ARGS))
+    sys.stdout.write(fixture("execute.txt", _DEFAULT_EXECUTE))
+    sys.exit(0)
+
+
+def main():
+    if FIX:
+        with open(os.path.join(FIX, "calls.jsonl"), "a") as f:
+            f.write(json.dumps({"argv": ARGS, "cwd": os.getcwd()}) + "\n")
+    if os.environ.get("SL_TIDY_SLEEP"):
+        time.sleep(float(os.environ["SL_TIDY_SLEEP"]))
+    if os.environ.get("SL_TIDY_FAIL"):
+        die("forced failure (SL_TIDY_FAIL)")
+    route()
+
+
+if __name__ == "__main__":
+    main()

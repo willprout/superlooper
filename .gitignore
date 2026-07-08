@@ -1,0 +1,9 @@
+# Repo-wide ignores. Each sub-project (skills/superlooper, dashboard) also carries its own
+# .gitignore for the files specific to it (e.g. the dashboard's per-user config.json and
+# runtime state) — git honors those per-directory, so they still apply inside their folders.
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.tmp

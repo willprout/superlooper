@@ -1,0 +1,41 @@
+[
+  {
+    "number": 555,
+    "state": "OPEN",
+    "mergeable": "MERGEABLE",
+    "headRefName": "sl/i123-render-the-widget",
+    "labels": [],
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "name": "review/local-gate",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "startedAt": "2026-07-02T14:00:00Z",
+        "completedAt": "2026-07-02T14:05:00Z",
+        "detailsUrl": "https://github.com/fake/repo/runs/1"
+      },
+      {
+        "__typename": "StatusContext",
+        "context": "quality-gate",
+        "state": "SUCCESS",
+        "targetUrl": "https://ci.example/quality/1"
+      }
+    ],
+    "files": [
+      {
+        "path": "src/components/Widget.tsx",
+        "additions": 40,
+        "deletions": 2,
+        "changeType": "MODIFIED"
+      },
+      {
+        "path": "src/api/widget.py",
+        "additions": 18,
+        "deletions": 0,
+        "changeType": "ADDED"
+      }
+    ],
+    "headRefOid": "abc123def456"
+  }
+]

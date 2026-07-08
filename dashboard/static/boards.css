@@ -1,0 +1,130 @@
+/* Boards styling (Task 8) — the departures queue-row states + the Solari arrivals board. The base
+   .board / .flap / .board-* classes live in shell.css (ported from screen 7a); this file adds only
+   what Task 8 introduces: the expedite/awaiting flap colours and the split-flap arrivals surface.
+   Pixels only — every value is bound from the tested snapshot (design record B.1). */
+
+/* ---- departures: real launch order ---- */
+/* An expedited flight (⚡) and the flight next off the stand read GOLD; an awaiting-connection
+   flight reads dim grey and never in the air (design record §3; screen 1d specimens). */
+.flap.exped { color: #F2C94C; }
+.flap.await { color: #9BA3AD; }
+.dep-row.awaiting { opacity: 0.9; }
+/* the awaiting row keeps the grid rhythm but offers no ⚡ bump (it can't leave the stand yet) */
+.dep-expedite-blank { justify-self: end; width: 22px; height: 22px; }
+
+/* ---- boards visual pass (issue #31): one split-flap language across BOTH boards ---- */
+/* boards.css loads after shell.css, so these override the base `.flap` and `.dep-*` grid there.
+   The departures flaps grow to the shared scale (13px → 14px so the flaps READ as flaps) and adopt
+   the EXACT tile face the Solari arrivals tiles paint (#2A313B light half / #1B2129 dark half, split
+   by a mid seam) — the single move that makes the two boards read as one airport's signage. */
+.flap {
+  font: 500 14px/27px var(--mono, 'IBM Plex Mono', monospace);
+  background:
+    /* a thin dark seam at each monospace cell edge → the per-character split-flap tiles */
+    repeating-linear-gradient(90deg, transparent 0 calc(1ch - 1px), rgba(0, 0, 0, 0.5) calc(1ch - 1px) 1ch),
+    /* the tile face: top light half · mid seam · bottom dark half (the arrivals tiles' own colours) */
+    linear-gradient(180deg,
+      #2A313B 0 calc(50% - 0.5px),
+      rgba(0, 0, 0, 0.65) calc(50% - 0.5px) calc(50% + 0.5px),
+      #1B2129 calc(50% + 0.5px) 100%);
+}
+
+/* The audited departures grid: the FLIGHT cell was 100px for a 6-char "SL-441" — far too wide.
+   Tightened to 74px; the redundant Nº position column is gone (row order IS the launch order); the
+   freed width flows into DESTINATION (1fr) so titles stop clipping; STATUS gets a right-aligned
+   remarks column. Four tracks: FLIGHT · DESTINATION · STATUS · ⚡. */
+.dep-cols, .dep-row { grid-template-columns: 74px 1fr 118px 24px; }
+.dep-col-status { text-align: right; }
+
+/* STATUS — a short, colour-coded label that shares the arrivals remark's exact type treatment
+   (600 11px mono, letter-spaced), so a departures row ends in the same colour-chip a landing does.
+   Costume rule 2 (design record §3): the short label never destroys the words — the full server
+   phrase ("NEXT OFF THE STAND", "AWAITING CONNECTION SL-9") rides along as the hover title + aria. */
+.dep-status {
+  justify-self: end; text-align: right;
+  font: 600 11px var(--mono, 'IBM Plex Mono', monospace); letter-spacing: 1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
+.dep-status.next   { color: #F2C94C; }   /* next off the stand — gold, like the flight flap */
+.dep-status.queued { color: #9BA3AD; }   /* waiting its turn — dim */
+.dep-status.await  { color: #6E7680; }   /* awaiting a connection — grey, never in the air */
+
+/* Visually-hidden text: the STATUS chip shows a short label but a screen reader reads the full server
+   phrase from a .cc-sr-only span (costume rule 2 — never destroy the words). Standard clip pattern. */
+.cc-sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
+/* The ⚡ legend — explains the expedite marker AND the tap-to-bump button in place (DoD: legend or
+   hover; we ship a legend so the marker is self-explanatory without a hover). */
+.dep-legend {
+  margin-top: 12px; padding-top: 9px; border-top: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex; align-items: center; gap: 7px;
+  font: 500 10px var(--mono, 'IBM Plex Mono', monospace); letter-spacing: 0.5px; color: #6B7480;
+}
+.dep-legend .bolt { color: #F2C94C; font-size: 12px; }
+
+/* ---- the Solari arrivals board (the flagship) ---- */
+.solari {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-top: 12px; min-height: 96px;
+}
+.solari-row { display: flex; align-items: center; gap: 12px; }
+.solari-row[data-fnum] { cursor: pointer; }
+.solari-tiles { display: flex; gap: 3px; flex-wrap: nowrap; }
+.solari-remark {
+  font: 600 11px var(--mono, 'IBM Plex Mono', monospace); letter-spacing: 1px;
+  white-space: nowrap; color: #58C878;
+}
+.solari-remark.landed { color: #58C878; }
+.solari-remark.seereport { color: #F2B33D; }
+.solari-empty {
+  text-align: center; padding: 26px 0;
+  font: 500 12px/22px var(--mono, 'IBM Plex Mono', monospace);
+  color: #6E7680; letter-spacing: 2px;
+  background: rgba(255, 255, 255, 0.03); border-radius: 2px;
+}
+
+/* ---- board pagination (issue #30): a split-flap page control on both boards ---- */
+/* Both pagers sit in the board's corner (right-aligned). The page indicator is styled as a flap tile
+   — dark face, a mid seam, condensed glyph — so the control reads as part of the split-flap board,
+   not a web widget bolted on. */
+.solari-pager, .dep-pager {
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+  margin-top: 10px;
+}
+.solari-page-prev, .solari-page-next, .dep-page-btn {
+  appearance: none; -webkit-appearance: none;
+  width: 26px; height: 28px; padding: 0;
+  background: #1B2129; color: #C9CFD6;
+  border: 1px solid rgba(0, 0, 0, 0.5); border-radius: 3px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  font: 600 12px var(--mono, 'IBM Plex Mono', monospace); line-height: 26px; cursor: pointer;
+}
+.solari-page-prev:hover, .solari-page-next:hover, .dep-page-btn:hover { background: #232B35; color: #F2F4EF; }
+.solari-page-prev:disabled, .solari-page-next:disabled, .dep-page-btn:disabled {
+  opacity: 0.35; cursor: default; background: #14181E;
+}
+/* The corner page indicator — a split-flap tile: dark face split by a seam at the mid-line. */
+.solari-page-num, .dep-page-num {
+  position: relative; min-width: 46px; height: 28px; padding: 0 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: linear-gradient(#2A313B 0 50%, #1B2129 50% 100%);
+  border-radius: 3px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09), inset 0 -6px 8px rgba(0, 0, 0, 0.3);
+  font: 600 13px/28px 'IBM Plex Sans Condensed', 'IBM Plex Sans', sans-serif;
+  color: #F2F4EF; letter-spacing: 1px; white-space: nowrap;
+}
+.solari-page-num::after, .dep-page-num::after {   /* the mechanical seam across the middle */
+  content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 1px;
+  background: rgba(0, 0, 0, 0.65);
+}
+
+/* Reduced motion: the whole product already ships with the Solari flutter as its only real
+   animation. When the viewer prefers reduced motion the tiles are set instantly by solari.js (same
+   information, no flutter); belt-and-braces, kill any incidental transition on the tiles too. The
+   pager lives inside .solari, so `.solari *` already covers a page-turn — the board just SETS the new
+   page (issue #30), never flutters, under prefers-reduced-motion. */
+@media (prefers-reduced-motion: reduce) {
+  .solari, .solari * { transition: none !important; animation: none !important; }
+}

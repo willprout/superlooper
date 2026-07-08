@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""command-center — the localhost dashboard entry point (Task 5).
+
+The composition root: it loads the dashboard config (decision B.4), wires the tested pure truth
+layer behind a snapshot provider, and serves it plus the static front-end over **127.0.0.1 only**
+(decision B.3 — a label-writing server must never be reachable off the machine). No pip deps: this
+runs on the Python 3 stdlib the deployment Mac already has.
+
+Two clocks (decision B.2): the front-end polls ``/api/snapshot`` every ``poll_seconds`` and the
+server re-reads the local journal/state/diff at that cadence, but ``gh`` and the usage endpoint —
+the rate-limited egress — ride the slower ``gh_poll_seconds`` clock via ``CachedGh`` and a cached
+usage read. Every semantic in the snapshot comes from a unit-tested ``lib/`` function.
+
+Run:  bin/command-center [config.json]        (default: ./config.json, or $CC_CONFIG)
+Serves http://127.0.0.1:<port> — open it in a browser. Ctrl-C to stop.
+"""
+import os
+import sys
+import time
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+# lib before anything else so `import server` / `config` resolve without an install step (mirrors
+# tests/conftest.py's path setup, so the entry point and the tests agree on module resolution).
+sys.path.insert(0, str(_ROOT / "lib"))
+
+import actions as actions_mod  # noqa: E402
+import config as config_mod   # noqa: E402
+import desk as desk_mod       # noqa: E402
+import gh                     # noqa: E402
+import pollers                # noqa: E402
+import server                 # noqa: E402
+import tidy as tidy_mod       # noqa: E402
+import watchdog as watchdog_mod  # noqa: E402
+
+
+def _config_path(argv):
+    if len(argv) > 1:
+        return argv[1]
+    return os.environ.get("CC_CONFIG", "config.json")
+
+
+def build_provider(cfg, dashboard_desk, monitor):
+    """Wire the snapshot provider: fresh local state every call, GitHub + usage on the slow clock,
+    the dashboard's own desk supplying the since-you-last-looked watermark (Task 9), and the
+    dead-man's switch (Task 10) — every poll re-evaluates the runner heartbeat and ``monitor`` (a
+    lib.watchdog.Watchdog) fires exactly one RUNNER DOWN push per down episode, off the poll thread."""
+    interval = cfg.get("gh_poll_seconds", 30)
+    cached_gh = server.CachedGh(gh, interval)
+    usage_cache = pollers.Cached(pollers.read_usage, interval)
+    # One memory for the whole dashboard run: a concluded flight's PR/title/review are fetched once
+    # and remembered, so landed flights stop re-consuming GitHub budget every gh_poll_seconds forever
+    # (issue #48). In-memory only — a restart simply re-remembers; nothing touches the loop's state.
+    concluded = server.ConcludedFlights()
+
+    def provider():
+        snap = server.assemble_snapshot(cfg, now=time.time(), gh_mod=cached_gh,
+                                        usage=usage_cache.get(), diff_reader=pollers.diff_stat,
+                                        desk=dashboard_desk, concluded=concluded)
+        # The one push the dashboard owns (§6): the runner can't announce its own death. Bounded and
+        # never-raising, dispatched on a daemon thread so a slow notifier never stalls the snapshot.
+        server.dispatch_runner_pushes(snap, monitor, cfg)
+        return snap
+
+    return provider
+
+
+def build_data_providers(cfg):
+    """The on-demand night replay + morning digest providers (Task 11). Each reads a FRESH local
+    journal per request — cheap, no ``gh``, no network — and only fires when a button asks (§0.2
+    no-ritual), so neither rides the 2-second poll nor the slow gh clock. ``now`` is the wall clock
+    at request time, so the default window ("the last day") tracks whenever the button is tapped."""
+    def replay_provider(params):
+        return server.assemble_replay(cfg, params, now=time.time())
+
+    def digest_provider(params):
+        return server.assemble_digest(cfg, params, now=time.time())
+
+    return replay_provider, digest_provider
+
+
+def main(argv):
+    cfg_path = _config_path(argv)
+    try:
+        cfg = config_mod.load(cfg_path)
+    except FileNotFoundError as e:
+        sys.stderr.write("command-center: %s\n" % e)
+        return 2
+    except ValueError as e:
+        sys.stderr.write("command-center: %s\n" % e)
+        return 2
+
+    static_dir = str(_ROOT / "static")
+    # The dashboard's OWN tiny state (the since-you-last-looked watermark, Task 9) — under $SL_HOME,
+    # beside the loop state homes it reads, never inside them.
+    dashboard_desk = desk_mod.Desk(desk_mod.default_path())
+    # The dead-man's switch's memory (Task 10): one Watchdog for the process life, so a runner that
+    # stays down costs one push, not one per 2s poll. In-memory → a restart re-arms (fails toward
+    # notifying, never toward a silent missed alert).
+    monitor = watchdog_mod.Watchdog()
+    provider = build_provider(cfg, dashboard_desk, monitor)
+    # The verbs (Task 6) — the only GitHub writes in the product. They take the RAW gh adapter, never
+    # the slow read-cache (a label change must land now, not on the next 30s tick — CachedGh caches
+    # only reads). The allow-list is exactly the configured slugs, so a tap can only ever steer a repo
+    # the operator chose to watch.
+    verbs = actions_mod.Actions(gh, allowed_repos=[r["slug"] for r in cfg["repos"]])
+    # The Tidy button (issue #41) — the ONE local-command verb: it runs `superlooper tidy` to close
+    # finished session windows. Bound to the configured CLI path and an allow-list mapping each
+    # watched repo slug to its checkout (the `--repo` argument), so a tap can only ever tidy a repo
+    # the operator chose to watch. Merged-only scope is enforced in lib/tidy (never passes `--all`).
+    tidy = tidy_mod.Tidy(cfg["superlooper_cli"], {r["slug"]: r["path"] for r in cfg["repos"]})
+    replay_provider, digest_provider = build_data_providers(cfg)
+    httpd = server.build_server(provider, static_dir, port=cfg["port"], actions=verbs,
+                                desk=dashboard_desk, tidy=tidy, replay_provider=replay_provider,
+                                digest_provider=digest_provider)
+    url = "http://%s:%d" % (server.BIND_HOST, cfg["port"])
+    watching = ", ".join(r["slug"] for r in cfg["repos"])
+    sys.stderr.write("command-center: serving %s (watching %s) — Ctrl-C to stop\n" % (url, watching))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        sys.stderr.write("\ncommand-center: stopped\n")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

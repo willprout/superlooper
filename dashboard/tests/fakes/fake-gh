@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""A stand-in for the `gh` CLI, driven by a JSON fixture directory — the test harness the
+dashboard's GitHub adapter (``lib/gh.py``) runs against so no test ever reaches the real ``gh``
+or the network (the conftest guard already points ``SL_GH`` at an absent path by default; a gh
+test overrides it in-body to THIS executable).
+
+Point the adapter at it with ``SL_GH=<path>/fake-gh`` and ``GH_FIXTURES=<dir>``:
+
+- READS (``issue list/view``, ``pr list/view``, ``label list``) are served from fixture files in
+  ``$GH_FIXTURES`` (``issue_list.json`` etc.). A per-target file (``issue_view_5.json``,
+  ``issue_list_agent-ready.json``) wins over the generic one, so one dir can serve several queries.
+- WRITES (``issue edit/comment/create``, ``label create``) are appended as one JSON record per
+  line to ``$GH_FIXTURES/mutations.jsonl``, so a test asserts exactly what the dashboard tried to
+  do (the only writes anywhere are mechanical verbs — label/comment/issue).
+
+Every invocation's full argv AND the ``GH_REPO`` env the adapter injected are logged to
+``$GH_FIXTURES/calls.jsonl`` BEFORE any sleep/fail, so a test can pin the exact gh contract the
+adapter produced — including that a read/write was pinned to the RIGHT repo (the dashboard watches
+many repos; a mis-pinned call would talk to the wrong one).
+
+Fail injection (exercises the adapter's fail-closed paths):
+- ``GH_SLEEP=<secs>``  makes every call sleep, so a short adapter timeout trips (rc 124 path).
+- ``GH_FAIL=1``        makes every call exit nonzero (the fail-closed-to-empty/False parsers).
+
+Ported and trimmed from superlooper's ``tests/fakes/fake-gh`` fixture mode (the stateful
+simulation mode is out of scope for the dashboard's adapter tests).
+"""
+import json
+import os
+import sys
+import time
+
+ARGS = sys.argv[1:]
+FIX = os.environ.get("GH_FIXTURES", "")
+
+
+def die(msg, code=1):
+    sys.stderr.write("fake-gh: %s\n" % msg)
+    sys.exit(code)
+
+
+def serve_first(names):
+    """Print the first fixture file that exists among ``names`` (most-specific first)."""
+    for name in names:
+        path = os.path.join(FIX, name)
+        if os.path.isfile(path):
+            with open(path) as f:
+                sys.stdout.write(f.read())
+            sys.exit(0)
+    die("no fixture among %s in %s" % (names, FIX))
+
+
+def record(kind, **extra):
+    rec = {"kind": kind}
+    rec.update(extra)
+    with open(os.path.join(FIX, "mutations.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def opt(flag):
+    """Value following ``--flag`` in ARGS, or None."""
+    if flag in ARGS:
+        i = ARGS.index(flag)
+        if i + 1 < len(ARGS):
+            return ARGS[i + 1]
+    return None
+
+
+def has(flag):
+    return flag in ARGS
+
+
+def wants(field):
+    """Whether ``field`` is among the --json field list of this call."""
+    return field in (opt("--json") or "").split(",")
+
+
+def route():
+    sub = ARGS[:2]
+
+    # ---------- reads (served from fixtures) ----------
+    if sub == ["issue", "list"]:
+        # a per-label queue (issue_list_agent-ready.json) wins over the generic list, so one dir
+        # can serve different results to open_issues(label=…) vs open_issues() (all open).
+        if opt("--label"):
+            serve_first(["issue_list_%s.json" % opt("--label"), "issue_list.json"])
+        serve_first(["issue_list.json"])
+
+    elif sub == ["issue", "view"]:
+        num = ARGS[2] if len(ARGS) > 2 else ""
+        if wants("comments"):
+            serve_first(["issue_comments_%s.json" % num, "issue_comments.json"])
+        serve_first(["issue_view_%s.json" % num, "issue_view.json"])
+
+    elif sub == ["pr", "list"]:
+        head = opt("--head")
+        if head:
+            serve_first(["pr_list_%s.json" % head, "pr_list.json"])
+        serve_first(["pr_list.json"])
+
+    elif sub == ["pr", "view"]:
+        num = ARGS[2] if len(ARGS) > 2 else ""
+        if wants("comments"):
+            serve_first(["pr_comments_%s.json" % num, "pr_comments.json"])
+        serve_first(["pr_view_%s.json" % num, "pr_view.json"])
+
+    elif sub == ["label", "list"]:
+        serve_first(["label_list.json"])
+
+    # ---------- writes (recorded to mutations.jsonl) ----------
+    elif sub == ["issue", "edit"]:
+        record("set_labels", num=ARGS[2], add=opt("--add-label"), remove=opt("--remove-label"))
+        sys.exit(0)
+
+    elif sub == ["issue", "comment"]:
+        record("comment", num=ARGS[2], body=opt("--body"))
+        sys.exit(0)
+
+    elif sub == ["issue", "close"]:
+        record("close_issue", num=ARGS[2], comment=opt("--comment"))
+        sys.exit(0)
+
+    elif sub == ["issue", "create"]:
+        new_num = os.environ.get("GH_NEW_ISSUE_NUM", "9001")
+        record("create_issue", title=opt("--title"), body=opt("--body"), labels=opt("--label"))
+        sys.stdout.write("https://github.com/fake/repo/issues/%s\n" % new_num)
+        sys.exit(0)
+
+    elif sub == ["label", "create"]:
+        record("create_label", name=ARGS[2], color=opt("--color"),
+               description=opt("--description"), force=has("--force"))
+        sys.exit(0)
+
+    die("unhandled command: %s" % " ".join(ARGS))
+
+
+def main():
+    # Log EVERY invocation (full argv + the injected GH_REPO) BEFORE any sleep/fail, so a test can
+    # pin the exact contract — a dropped --label/--body/--head flag or a mis-pinned repo is then
+    # caught, not masked by a permissive router.
+    if FIX:
+        with open(os.path.join(FIX, "calls.jsonl"), "a") as f:
+            f.write(json.dumps({"argv": ARGS, "repo": os.environ.get("GH_REPO")}) + "\n")
+    if os.environ.get("GH_SLEEP"):
+        time.sleep(float(os.environ["GH_SLEEP"]))
+    if os.environ.get("GH_FAIL"):
+        die("forced failure (GH_FAIL)")
+    route()
+
+
+if __name__ == "__main__":
+    main()

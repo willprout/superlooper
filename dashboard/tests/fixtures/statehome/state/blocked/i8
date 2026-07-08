@@ -1,0 +1,3 @@
+BOUNCED: the footer already ships in index.html as of PR #12, so this issue's premise is gone.
+
+Proposed amendment — Goal: "Restyle the existing footer motto to match the 16-bit palette"; DoD: motto text unchanged, only the CSS class differs.

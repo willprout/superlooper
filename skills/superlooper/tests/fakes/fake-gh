@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""A stand-in for the `gh` CLI, driven by a JSON fixture directory. Point gh.py at it with
+SL_GH=<path>/fake-gh and GH_FIXTURES=<dir>.
+
+Two modes, chosen by whether $GH_FIXTURES/state.json exists:
+
+FIXTURE MODE (the original wave-1 harness — unchanged):
+- READS (issue list/view, pr list/view/diff, api) are served from fixture files in $GH_FIXTURES.
+- WRITES (issue edit/comment, pr comment/merge, issue create) are appended as one JSON record per
+  line to $GH_FIXTURES/mutations.jsonl, so a test asserts what the runner tried to do.
+
+STATEFUL MODE (the Task-15 end-to-end simulation): $GH_FIXTURES/state.json is a little GitHub —
+issues, PRs, comments, and branch check-runs live there; WRITES mutate it (and still append to
+mutations.jsonl, so every assertion the fixture tests rely on keeps working) and READS derive from
+it, so the runner's own label moves / comments / merges are visible to its next poll exactly like
+the real service. Extra realism, all of it load-bearing for the simulated failure modes:
+  - `pr create` snapshots the REAL branch from the bare origin repo ($GH_GIT_REPO): headRefOid =
+    the branch tip, files = the real three-dot diff vs the dev branch (touch verification runs on
+    truth, not fixture lies). It REFUSES a second open PR on the same head (exit 1), exactly the
+    GitHub behaviour the regenerate ladder's suffixed-branch contract exists for.
+  - `mergeable: "auto"` is computed live via `git merge-tree --write-tree` in the origin, so a PR
+    that raced a landed merge genuinely flips to CONFLICTING with no test choreography.
+  - `pr merge --squash` performs a REAL squash-merge of the head branch into the dev branch on the
+    origin (via a temp clone), so origin/<dev> advances and later worktrees/conflicts are honest;
+    it then closes the issues named by `Closes #N` in the PR body (GitHub's server-side behaviour
+    the runner's "close issue happens via Closes #N" step depends on).
+  - statusCheckRollup "auto" renders from state's check_names x pr_check_conclusion, so a test
+    flips CI red/green by editing two state keys, never a per-PR fixture.
+
+Fail injection (both modes):
+- GH_SLEEP=<secs>  makes every call sleep (to exercise gh.py's hard-timeout path).
+- GH_FAIL=1        makes every call exit nonzero (to exercise the fail-closed parsers).
+- $GH_FIXTURES/fail_rules.json: [{"match": "<substring of the joined argv>", "times": N}] — the
+  first matching rule with times>0 fails THIS call and decrements. This is how a simulation makes
+  exactly one `issue edit` blip mid-park (the duplicate-comment-but-never-duplicate-label poke)
+  without failing the whole GitHub.
+- GH_NEW_ISSUE_NUM overrides the number `issue create` reports (fixture mode only; stateful mode
+  numbers issues and PRs from one shared counter, like GitHub).
+
+State/rules read-modify-writes are serialized via an O_EXCL lockfile: the runner's gh calls and a
+fake worker's gh calls run CONCURRENTLY in a simulation, and a lost update here would be a fake-
+harness bug masquerading as a product bug.
+
+This is the harness Task 15's offline end-to-end simulation runs on.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import unquote
+
+ARGS = sys.argv[1:]
+FIX = os.environ.get("GH_FIXTURES", "")
+STATE_PATH = os.path.join(FIX, "state.json") if FIX else ""
+GIT_REPO = os.environ.get("GH_GIT_REPO", "")
+
+
+def die(msg, code=1):
+    sys.stderr.write("fake-gh: %s\n" % msg)
+    sys.exit(code)
+
+
+def serve_first(names):
+    for name in names:
+        path = os.path.join(FIX, name)
+        if os.path.isfile(path):
+            with open(path) as f:
+                sys.stdout.write(f.read())
+            sys.exit(0)
+    die("no fixture among %s in %s" % (names, FIX))
+
+
+def record(kind, **extra):
+    rec = {"kind": kind}
+    rec.update(extra)
+    with open(os.path.join(FIX, "mutations.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def opt(flag):
+    """Value following --flag in ARGS, or None."""
+    if flag in ARGS:
+        i = ARGS.index(flag)
+        if i + 1 < len(ARGS):
+            return ARGS[i + 1]
+    return None
+
+
+def has(flag):
+    return flag in ARGS
+
+
+# --------------------------- stateful mode: lock + state I/O ---------------------------
+
+class _Lock:
+    """Lockfile serializing every state/rules RMW (flock is absent on macOS). Created
+    atomically WITH its holder pid via `ln` of a fully-written temp (the start-session.sh
+    pattern — an O_EXCL-create-then-write would leave an empty-pid window a racer could
+    mis-read as dead and steal, Codex cross-review). A holder is stolen ONLY when its pid is
+    provably dead (or the lock is unreadable AND ancient) — never by age alone: the Task-15
+    round-1 review caught that a live-but-slow holder could be age-stolen mid-merge, exactly
+    the lost-update class this lock exists to prevent. The steal re-checks content before
+    removing so it never deletes a lock a concurrent claimer just won. Any test-harness code
+    editing state.json directly must take THIS SAME lock (test_simulation.Sim.edit_gh_state
+    mirrors it)."""
+
+    def __init__(self, path):
+        self.path = path + ".lock"
+        self._tmp = "%s.%d" % (self.path, os.getpid())
+
+    @staticmethod
+    def _holder(path):
+        """(pid_or_None, alive). Unreadable content -> (None, False). pid<=0 counts as
+        unreadable too: os.kill(0, 0) signals our own process GROUP and would read a stale
+        empty lock as alive forever (Codex round-2 nit)."""
+        try:
+            with open(path) as f:
+                pid = int(f.read().strip() or "0")
+        except (OSError, ValueError):
+            return None, False
+        if pid <= 0:
+            return None, False
+        try:
+            os.kill(pid, 0)
+            return pid, True
+        except ProcessLookupError:
+            return pid, False
+        except (OSError, OverflowError):
+            return pid, True          # can't prove it dead -> treat as alive (never steal)
+
+    def __enter__(self):
+        with open(self._tmp, "w") as f:
+            f.write(str(os.getpid()))
+        deadline = time.time() + 20
+        while True:
+            try:
+                os.link(self._tmp, self.path)       # atomic create-with-content
+                return self
+            except FileExistsError:
+                pid, alive = self._holder(self.path)
+                stale = False
+                try:
+                    stale = time.time() - os.stat(self.path).st_mtime > 30
+                except OSError:
+                    continue                        # lock vanished between link and stat
+                if (pid is not None and not alive) or (pid is None and stale):
+                    # dead (or unreadable-and-ancient) holder: reclaim, but only if the lock
+                    # still carries that content (a fresh claimer's lock must survive)
+                    cur, _ = self._holder(self.path)
+                    if cur == pid:
+                        try:
+                            os.remove(self.path)
+                        except OSError:
+                            pass
+                    continue
+                if time.time() > deadline:
+                    os.remove(self._tmp)
+                    die("state lock timeout")
+                time.sleep(0.01)
+
+    def __exit__(self, *exc):
+        # ownership-checked release: never remove a lock that was stolen and re-claimed
+        pid, _ = self._holder(self.path)
+        if pid == os.getpid():
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+        try:
+            os.remove(self._tmp)
+        except OSError:
+            pass
+
+
+def load_state():
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+def save_state(st):
+    fd, tmp = tempfile.mkstemp(dir=FIX, suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, STATE_PATH)
+
+
+def _git(*args):
+    """git against the bare origin ($GH_GIT_REPO). (rc, stdout) — never raises."""
+    try:
+        r = subprocess.run(["git", "-C", GIT_REPO, *args],
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode, (r.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def _tip(branch):
+    rc, out = _git("rev-parse", "--verify", "refs/heads/%s" % branch)
+    return out if rc == 0 else None
+
+
+# --------------------------- stateful mode: views ---------------------------
+
+def _issue_view(issue, want_fields):
+    out = {}
+    for f in want_fields:
+        if f == "labels":
+            labs = issue.get("labels", [])
+            # a WRONG-TYPED labels value in state.json is served VERBATIM — the Task-15 garbage
+            # scenarios deliberately feed the product parsers wrong-typed JSON, and the fake
+            # must deliver the garbage, not choke on it
+            out["labels"] = [{"name": n} for n in labs] if isinstance(labs, list) else labs
+        else:
+            out[f] = issue.get(f)
+    return out
+
+_ISSUE_LIST_FIELDS = ["number", "title", "labels", "body", "createdAt"]
+
+
+def _rollup(st, pr):
+    ru = pr.get("statusCheckRollup")
+    if ru != "auto":
+        return ru
+    concl = pr.get("pr_check_conclusion") or st.get("pr_check_conclusion", "SUCCESS")
+    return [{"name": n, "status": "COMPLETED", "conclusion": concl}
+            for n in st.get("check_names", [])]
+
+
+def _mergeable(st, pr):
+    m = pr.get("mergeable")
+    if m != "auto":
+        return m
+    if pr.get("state") != "OPEN" or not GIT_REPO:
+        return "UNKNOWN"
+    dev = st.get("dev_branch", "main")
+    head_tip, dev_tip = _tip(pr.get("headRefName", "")), _tip(dev)
+    if not head_tip or not dev_tip:
+        return "UNKNOWN"                       # branch vanished: GitHub would still be computing
+    # merge-tree exits 0 = clean, 1 = conflict, >1 = error (git >= 2.38). No worktree touched.
+    rc, _ = _git("merge-tree", "--write-tree", dev_tip, head_tip)
+    if rc == 0:
+        return "MERGEABLE"
+    if rc == 1:
+        return "CONFLICTING"
+    return "UNKNOWN"
+
+
+def _pr_files(st, pr):
+    files = pr.get("files")
+    if files != "auto":
+        return files
+    if not GIT_REPO:
+        return []
+    dev = st.get("dev_branch", "main")
+    # Three-dot (merge-base) diff — what the GitHub PR files tab shows.
+    rc, out = _git("diff", "--name-only", "%s...%s" % (dev, pr.get("headRefName", "")))
+    return [{"path": p} for p in out.splitlines() if p] if rc == 0 else []
+
+
+def _pr_view(st, pr, want_fields):
+    out = {}
+    for f in want_fields:
+        if f == "mergeable":
+            out[f] = _mergeable(st, pr)
+        elif f == "statusCheckRollup":
+            out[f] = _rollup(st, pr)
+        elif f == "files":
+            out[f] = _pr_files(st, pr)
+        elif f == "labels":
+            out[f] = [{"name": n} for n in pr.get("labels", [])]
+        else:
+            out[f] = pr.get(f)
+    return out
+
+
+def _closes_nums(body):
+    import re
+    return [int(n) for n in re.findall(r"[Cc]loses #(\d+)", body or "")]
+
+
+def _squash_merge(st, pr):
+    """A REAL squash-merge of the PR's head branch into the dev branch on the bare origin, via a
+    temp clone (a bare repo can't merge in place). Nonzero exit = the merge itself failed, which
+    is what real gh does to an unmergeable PR."""
+    dev = st.get("dev_branch", "main")
+    head = pr.get("headRefName", "")
+    tmp = tempfile.mkdtemp(prefix="fake-gh-merge.")
+    try:
+        for cmd in (["git", "clone", "--quiet", GIT_REPO, tmp],
+                    ["git", "-C", tmp, "checkout", "--quiet", dev],
+                    ["git", "-C", tmp, "merge", "--squash", "--quiet", "origin/%s" % head]):
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                die("squash merge failed: %s\n%s" % (" ".join(cmd), r.stderr))
+        r = subprocess.run(["git", "-C", tmp, "commit", "--quiet", "-m",
+                            "%s (#%s)" % (pr.get("title") or head, pr.get("number"))],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            die("squash commit failed: %s" % r.stderr)
+        r = subprocess.run(["git", "-C", tmp, "push", "--quiet", "origin", dev],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            die("push of squash merge failed: %s" % r.stderr)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------- stateful mode: the router ---------------------------
+
+def main_stateful():
+    sub = ARGS[:2]
+    want = [f for f in (opt("--json") or "").split(",") if f]
+
+    # ---------- reads ----------
+    if sub == ["issue", "list"]:
+        with _Lock(STATE_PATH):
+            st = load_state()
+        # sort tolerates wrong-typed numbers: the garbage scenarios seed them deliberately
+        issues = sorted(st.get("issues", {}).values(),
+                        key=lambda i: (type(i.get("number")) is not int,
+                                       i.get("number") if type(i.get("number")) is int else 0))
+        if has("--search"):
+            # GitHub search is substring-fuzzy by design ("parent: #4" also matches "#40") —
+            # the PRODUCT code must do the precise filtering, so the fake must not.
+            needle = (opt("--search") or "").split(" in:body")[0].strip().strip('"')
+            out = [i for i in issues
+                   if isinstance(i.get("body"), str) and needle in i["body"]]
+        else:
+            state = opt("--state") or "open"
+            out = [i for i in issues if state in ("all", i.get("state", "open"))]
+            label = opt("--label")
+            if label:
+                out = [i for i in out
+                       if isinstance(i.get("labels"), list) and label in i["labels"]]
+        limit = int(opt("--limit") or 200)
+        print(json.dumps([_issue_view(i, want or _ISSUE_LIST_FIELDS) for i in out[:limit]]))
+        sys.exit(0)
+
+    elif sub == ["issue", "view"]:
+        with _Lock(STATE_PATH):
+            st = load_state()
+        issue = st.get("issues", {}).get(ARGS[2], {})
+        if want == ["comments"]:
+            print(json.dumps({"comments": issue.get("comments", [])}))
+        else:
+            print(json.dumps(_issue_view(issue, want or _ISSUE_LIST_FIELDS)))
+        sys.exit(0)
+
+    elif sub == ["pr", "list"]:
+        with _Lock(STATE_PATH):
+            st = load_state()
+        prs = sorted(st.get("prs", {}).values(), key=lambda p: p.get("number", 0))
+        head = opt("--head")
+        if head:
+            prs = [p for p in prs if p.get("headRefName") == head]
+        state = (opt("--state") or "open").upper()
+        if state != "ALL":
+            prs = [p for p in prs if p.get("state") == state]
+        limit = int(opt("--limit") or 200)
+        print(json.dumps([_pr_view(st, p, want) for p in prs[:limit]]))
+        sys.exit(0)
+
+    elif sub == ["pr", "view"]:
+        with _Lock(STATE_PATH):
+            st = load_state()
+        pr = st.get("prs", {}).get(ARGS[2], {})
+        if want == ["comments"]:
+            print(json.dumps({"comments": pr.get("comments", [])}))
+        else:
+            print(json.dumps(_pr_view(st, pr, want)))
+        sys.exit(0)
+
+    elif ARGS[:1] == ["api"]:
+        path = ARGS[1] if len(ARGS) > 1 else ""
+        with _Lock(STATE_PATH):
+            st = load_state()
+        if "rate_limit" in path:
+            print(json.dumps({"resources": {}}))
+            sys.exit(0)
+        if "check-runs" in path:
+            ref = unquote(path.split("/commits/")[1].split("/check-runs")[0])
+            runs = st.get("branch_checks", {}).get(ref, [])
+            print(json.dumps({"check_runs": runs}))
+            sys.exit(0)
+        if "compare" in path:
+            print(json.dumps(st.get("compare", {})))
+            sys.exit(0)
+        die("unhandled api path: %s" % path)
+
+    elif sub == ["label", "list"]:
+        with _Lock(STATE_PATH):
+            st = load_state()
+        print(json.dumps([{"name": n} for n in st.get("repo_labels", [])]))
+        sys.exit(0)
+
+    # ---------- writes (mutations.jsonl still records every one) ----------
+    elif sub == ["issue", "edit"]:
+        record("set_labels", num=ARGS[2], add=opt("--add-label"), remove=opt("--remove-label"))
+        with _Lock(STATE_PATH):
+            st = load_state()
+            issue = st.get("issues", {}).get(ARGS[2])
+            if issue is None:
+                die("no such issue %s" % ARGS[2])
+            labels = issue.setdefault("labels", [])
+            for n in (opt("--add-label") or "").split(","):
+                if n and n not in labels:
+                    labels.append(n)
+            for n in (opt("--remove-label") or "").split(","):
+                if n in labels:
+                    labels.remove(n)
+            save_state(st)
+        sys.exit(0)
+
+    elif sub == ["issue", "comment"]:
+        record("comment", num=ARGS[2], body=opt("--body"))
+        with _Lock(STATE_PATH):
+            st = load_state()
+            issue = st.get("issues", {}).get(ARGS[2])
+            if issue is None:
+                die("no such issue %s" % ARGS[2])
+            issue.setdefault("comments", []).append({"body": opt("--body")})
+            save_state(st)
+        sys.exit(0)
+
+    elif sub == ["pr", "comment"]:
+        record("pr_comment", num=ARGS[2], body=opt("--body"))
+        with _Lock(STATE_PATH):
+            st = load_state()
+            pr = st.get("prs", {}).get(ARGS[2])
+            if pr is None:
+                die("no such pr %s" % ARGS[2])
+            pr.setdefault("comments", []).append({"body": opt("--body")})
+            save_state(st)
+        sys.exit(0)
+
+    elif sub == ["issue", "create"]:
+        labels = [n for n in (opt("--label") or "").split(",") if n]
+        record("create_issue", title=opt("--title"), body=opt("--body"), labels=opt("--label"))
+        with _Lock(STATE_PATH):
+            st = load_state()
+            num = st.get("next_num", 1)
+            st["next_num"] = num + 1
+            st.setdefault("issues", {})[str(num)] = {
+                "number": num, "title": opt("--title") or "", "body": opt("--body") or "",
+                "labels": labels, "state": "open", "comments": [],
+                # deterministic, ordered createdAt (the queue sorts oldest-first on it)
+                "createdAt": "2026-07-03T00:00:00Z"[:17] + "%02dZ" % (num % 60),
+            }
+            save_state(st)
+        sys.stdout.write("https://github.com/fake/repo/issues/%s\n" % num)
+        sys.exit(0)
+
+    elif sub == ["issue", "close"]:
+        record("close_issue", num=ARGS[2], comment=opt("--comment"))
+        with _Lock(STATE_PATH):
+            st = load_state()
+            issue = st.get("issues", {}).get(ARGS[2])
+            if issue is None:
+                die("no such issue %s" % ARGS[2])
+            issue["state"] = "closed"
+            if opt("--comment"):
+                issue.setdefault("comments", []).append({"body": opt("--comment")})
+            save_state(st)
+        sys.exit(0)
+
+    elif sub == ["pr", "create"]:
+        head = opt("--head")
+        if not head:
+            die("stateful pr create needs --head")
+        with _Lock(STATE_PATH):
+            st = load_state()
+            for p in st.get("prs", {}).values():
+                if p.get("headRefName") == head and p.get("state") == "OPEN":
+                    # GitHub refuses a second open PR on one head — the regenerate ladder's
+                    # suffixed-branch contract exists BECAUSE of this refusal. Keep it honest.
+                    die("a pull request for branch %s already exists (#%s)"
+                        % (head, p.get("number")))
+            num = st.get("next_num", 1)
+            st["next_num"] = num + 1
+            st.setdefault("prs", {})[str(num)] = {
+                "number": num, "title": opt("--title") or head, "body": opt("--body") or "",
+                "state": "OPEN", "headRefName": head, "headRefOid": _tip(head) or "",
+                "mergeable": "auto", "statusCheckRollup": "auto", "files": "auto",
+                "labels": [], "comments": [],
+            }
+            save_state(st)
+        record("create_pr", num=num, head=head, title=opt("--title"), body=opt("--body"))
+        sys.stdout.write("https://github.com/fake/repo/pull/%s\n" % num)
+        sys.exit(0)
+
+    elif sub == ["pr", "edit"]:
+        record("pr_add_labels", num=ARGS[2], add=opt("--add-label"))
+        with _Lock(STATE_PATH):
+            st = load_state()
+            pr = st.get("prs", {}).get(ARGS[2])
+            if pr is None:
+                die("no such pr %s" % ARGS[2])
+            labels = pr.setdefault("labels", [])
+            for n in (opt("--add-label") or "").split(","):
+                if n and n not in labels:
+                    labels.append(n)
+            save_state(st)
+        sys.exit(0)
+
+    elif sub == ["pr", "merge"]:
+        method = "squash" if has("--squash") else "merge" if has("--merge") else \
+                 "rebase" if has("--rebase") else "unknown"
+        # Phase 1 (under the lock): validate + snapshot. BRANCH PROTECTION is enforced like
+        # the real service (Codex round-1 M1): a merge attempted while any protected check is
+        # not green must be REFUSED here — otherwise a product bug that merges on red checks
+        # would sail through the fake and the rehearsal would certify a broken gate.
+        with _Lock(STATE_PATH):
+            st = load_state()
+            pr = st.get("prs", {}).get(ARGS[2])
+            if pr is None or pr.get("state") != "OPEN":
+                die("pr %s is not open" % ARGS[2])
+            # Branch protection blocks on the PROTECTED checks (state.check_names — the same
+            # names the sim config requires), like the real service: an optional red check
+            # must not false-refuse a legitimate merge (Codex round-2). Fail CLOSED on a
+            # wrong-typed rollup or entry: corrupt check data can't prove green, so it blocks
+            # (this repo's fail-open-on-wrong-typed defect class, Codex round-2).
+            rollup = _rollup(st, pr)
+            protected = set(st.get("check_names", []))
+            if not isinstance(rollup, list):
+                die("pr %s is blocked: statusCheckRollup is unreadable" % ARGS[2])
+            greens = {}
+            for c in rollup:
+                if not isinstance(c, dict):
+                    die("pr %s is blocked: wrong-typed rollup entry %r" % (ARGS[2], c))
+                name = c.get("name") or c.get("context")
+                state = str(c.get("conclusion") or c.get("state") or "").upper()
+                if name in protected:
+                    ok = state in ("SUCCESS", "NEUTRAL", "SKIPPED")
+                    greens[name] = greens.get(name, True) and ok
+            red = sorted(protected - {n for n, ok in greens.items() if ok})
+            if red:
+                die("pr %s is blocked by branch protection (required checks not green: %s)"
+                    % (ARGS[2], red))
+            snapshot = dict(pr)
+        # Phase 2 (NO lock held): the real git squash-merge can take seconds (clone + push);
+        # holding the state lock across it starves — or worse, gets age-stolen from — every
+        # concurrent fake-gh call (Codex round-1 critical).
+        if GIT_REPO:
+            _squash_merge(st, snapshot)        # dies (nonzero) if the merge itself fails
+        # Phase 3 (fresh lock): commit the merged fact, re-validating the PR is still OPEN.
+        with _Lock(STATE_PATH):
+            st = load_state()
+            pr = st.get("prs", {}).get(ARGS[2])
+            if pr is None or pr.get("state") != "OPEN":
+                die("pr %s changed state during the merge" % ARGS[2])
+            pr["state"] = "MERGED"
+            for n in _closes_nums(pr.get("body")):
+                issue = st.get("issues", {}).get(str(n))
+                if issue is not None:
+                    issue["state"] = "closed"  # GitHub's server-side Closes-#N behaviour
+            save_state(st)
+        record("merge_pr", num=ARGS[2], method=method)
+        sys.exit(0)
+
+    elif sub == ["label", "create"]:
+        record("create_label", name=ARGS[2], color=opt("--color"),
+               description=opt("--description"), force=has("--force"))
+        with _Lock(STATE_PATH):
+            st = load_state()
+            labels = st.setdefault("repo_labels", [])
+            if ARGS[2] not in labels:
+                labels.append(ARGS[2])
+            save_state(st)
+        sys.exit(0)
+
+    die("stateful mode: unhandled command: %s" % " ".join(ARGS))
+
+
+# --------------------------- fixture mode (the original harness) ---------------------------
+
+def main_fixture():
+    sub = ARGS[:2]
+    wants_comments = "comments" in (opt("--json") or "")
+
+    if sub == ["issue", "list"]:
+        # child_issues uses --search; keep its fixture separate from the ready-issues list.
+        if has("--search"):
+            serve_first(["issue_search.json", "issue_list.json"])
+        # closed_issue_nums (--state closed) gets its own fixture; a per-label fixture
+        # (issue_list_<label>.json, e.g. issue_list_in-progress.json) lets one test serve
+        # different queues to ready_issues vs open_issues("in-progress").
+        if opt("--state") == "closed":
+            serve_first(["issue_list_closed.json", "issue_list.json"])
+        if opt("--label"):
+            serve_first(["issue_list_%s.json" % opt("--label"), "issue_list.json"])
+        serve_first(["issue_list.json"])
+
+    elif sub == ["issue", "view"]:
+        num = ARGS[2] if len(ARGS) > 2 else ""
+        if wants_comments:
+            serve_first(["issue_comments_%s.json" % num, "issue_comments.json"])
+        serve_first(["issue_view_%s.json" % num, "issue_view.json"])
+
+    elif sub == ["pr", "list"]:
+        serve_first(["pr_list.json"])
+
+    elif sub == ["pr", "view"]:
+        num = ARGS[2] if len(ARGS) > 2 else ""
+        if wants_comments:
+            serve_first(["pr_comments_%s.json" % num, "pr_comments.json"])
+        serve_first(["pr_view_%s.json" % num, "pr_view.json"])
+
+    elif sub == ["pr", "diff"]:
+        num = ARGS[2] if len(ARGS) > 2 else ""
+        serve_first(["pr_diff_%s.txt" % num, "pr_diff.txt"])
+
+    elif ARGS[:1] == ["api"]:
+        # `api` is a one-word subcommand followed by the endpoint path (not two words like the rest)
+        path = ARGS[1] if len(ARGS) > 1 else ""
+        if "compare" in path:
+            serve_first(["compare.json"])
+        if "check-runs" in path:
+            serve_first(["check_runs.json"])
+        if "/status" in path:
+            serve_first(["commit_status.json"])
+        if "rate_limit" in path:
+            serve_first(["rate_limit.json", "api.json"])
+        serve_first(["api.json"])
+
+    elif sub == ["issue", "edit"]:
+        record("set_labels", num=ARGS[2], add=opt("--add-label"), remove=opt("--remove-label"))
+        sys.exit(0)
+
+    elif sub == ["issue", "comment"]:
+        record("comment", num=ARGS[2], body=opt("--body"))
+        sys.exit(0)
+
+    elif sub == ["pr", "comment"]:
+        record("pr_comment", num=ARGS[2], body=opt("--body"))
+        sys.exit(0)
+
+    elif sub == ["issue", "create"]:
+        new_num = os.environ.get("GH_NEW_ISSUE_NUM", "9001")
+        record("create_issue", title=opt("--title"), body=opt("--body"), labels=opt("--label"))
+        sys.stdout.write("https://github.com/fake/repo/issues/%s\n" % new_num)
+        sys.exit(0)
+
+    elif sub == ["label", "list"]:
+        serve_first(["label_list.json"])
+
+    elif sub == ["label", "create"]:
+        record("create_label", name=ARGS[2], color=opt("--color"),
+               description=opt("--description"), force=has("--force"))
+        sys.exit(0)
+
+    elif sub == ["pr", "edit"]:
+        record("pr_add_labels", num=ARGS[2], add=opt("--add-label"))
+        sys.exit(0)
+
+    elif sub == ["issue", "close"]:
+        record("close_issue", num=ARGS[2], comment=opt("--comment"))
+        sys.exit(0)
+
+    elif sub == ["pr", "merge"]:
+        method = "squash" if has("--squash") else "merge" if has("--merge") else \
+                 "rebase" if has("--rebase") else "unknown"
+        record("merge_pr", num=ARGS[2], method=method)
+        sys.exit(0)
+
+    die("unhandled command: %s" % " ".join(ARGS))
+
+
+def check_fail_rules():
+    """First matching fail rule with times>0 fails THIS call (after the argv log, before any
+    mutation) and decrements durably. Substring match on the joined argv, so one rule can target
+    'issue edit' broadly or 'issue edit 5 --add-label needs-william' precisely."""
+    path = os.path.join(FIX, "fail_rules.json")
+    if not os.path.isfile(path):
+        return
+    joined = " ".join(ARGS)
+    with _Lock(path):
+        try:
+            with open(path) as f:
+                rules = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(rules, list):
+            return
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            times = rule.get("times", 0)
+            if isinstance(rule.get("match"), str) and rule["match"] in joined \
+                    and isinstance(times, int) and times > 0:
+                rule["times"] = times - 1
+                fd, tmp = tempfile.mkstemp(dir=FIX, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(rules, f)
+                os.replace(tmp, path)
+                die("forced failure (fail rule %r)" % rule["match"])
+
+
+def main():
+    # Log EVERY invocation's FULL argv (before any sleep/fail) so tests can pin the exact gh
+    # contract gh.py produces — a dropped --label/--head/--body flag or a wrong api path is then
+    # caught, not masked by a permissive router.
+    if FIX:
+        with open(os.path.join(FIX, "calls.jsonl"), "a") as f:
+            f.write(json.dumps(ARGS) + "\n")
+    if os.environ.get("GH_SLEEP"):
+        time.sleep(float(os.environ["GH_SLEEP"]))
+    if os.environ.get("GH_FAIL"):
+        die("forced failure (GH_FAIL)")
+    if FIX:
+        check_fail_rules()
+
+    if STATE_PATH and os.path.isfile(STATE_PATH):
+        main_stateful()
+    else:
+        main_fixture()
+
+
+if __name__ == "__main__":
+    main()

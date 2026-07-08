@@ -1,0 +1,33 @@
+[
+  {
+    "number": 101,
+    "title": "Render the widget",
+    "createdAt": "2026-07-01T09:00:00Z",
+    "labels": [
+      {"id": "LA_1", "name": "type:build", "description": "a build issue", "color": "0dd8ac"},
+      {"id": "LA_2", "name": "agent-ready", "description": "approved by William", "color": "1f883d"}
+    ],
+    "body": "## Goal\nRender the widget.\n\n## Definition of done\n- [ ] it renders\n\n## Boundaries\nNo auth changes.\n\n## Loop metadata\ntouches: frontend\n"
+  },
+  {
+    "number": 102,
+    "title": "Add the API route",
+    "createdAt": "2026-07-01T10:30:00Z",
+    "labels": [
+      {"id": "LA_1", "name": "type:build", "description": "a build issue", "color": "0dd8ac"},
+      {"id": "LA_2", "name": "agent-ready", "description": "approved by William", "color": "1f883d"},
+      {"id": "LA_3", "name": "priority:high", "description": "high band", "color": "b60205"}
+    ],
+    "body": "## Goal\nAdd the route.\n\n## Definition of done\n- [ ] route responds 200\n\n## Boundaries\nAPI only.\n\n## Loop metadata\ntouches: api\n"
+  },
+  {
+    "number": 103,
+    "title": "Wire widget to API",
+    "createdAt": "2026-07-01T11:00:00Z",
+    "labels": [
+      {"id": "LA_1", "name": "type:build", "description": "a build issue", "color": "0dd8ac"},
+      {"id": "LA_2", "name": "agent-ready", "description": "approved by William", "color": "1f883d"}
+    ],
+    "body": "## Goal\nWire the widget to the new route.\n\n## Definition of done\n- [ ] end to end works\n\n## Boundaries\nno db\n\n## Loop metadata\ntouches: frontend, api\nblocked-by: #101, #102\n"
+  }
+]

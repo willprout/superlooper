@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "issues": {
+    "i23": {"status": "merged", "branch": "sl/i23-add-a-motto-footer-motto-must-come-via-t", "lane": null, "launches": 1, "retries": 0, "conflicts": 0, "requeue_front": false, "declared_touches": ["content"], "pr": 25},
+    "i16": {"status": "merged", "branch": "sl/i16-make-the-greeting-more-formal-r1", "lane": null, "launches": 2, "retries": 1, "conflicts": 1, "requeue_front": false, "declared_touches": ["content"], "pr": 19},
+    "i15": {"status": "holding", "branch": "sl/i15-make-the-copyright-line-dynamic-r0", "lane": "i15", "launches": 1, "retries": 0, "conflicts": 0, "requeue_front": false, "declared_touches": ["content"], "pr": 17},
+    "i7": {"status": "parked", "branch": "sl/i7-handle-missing-data-json", "lane": null, "launches": 1, "retries": 0, "conflicts": 0, "requeue_front": false, "declared_touches": ["data"], "pr": null},
+    "i21": {"status": "parked", "branch": null, "lane": null, "launches": 0, "retries": 0, "conflicts": 0, "requeue_front": false, "declared_touches": [], "pr": null}
+  }
+}

@@ -1,0 +1,23 @@
+[
+  {
+    "number": 41,
+    "title": "Investigation child A",
+    "createdAt": "2026-07-02T09:00:00Z",
+    "labels": [{"id": "LA_10", "name": "needs-william", "description": "", "color": "d93f0b"}],
+    "body": "## Goal\nFix the first root cause.\n\n## Loop metadata\nparent: #40\n"
+  },
+  {
+    "number": 42,
+    "title": "Investigation child B",
+    "createdAt": "2026-07-02T09:05:00Z",
+    "labels": [{"id": "LA_10", "name": "needs-william", "description": "", "color": "d93f0b"}],
+    "body": "## Goal\nFix the second root cause.\n\n## Loop metadata\nparent: #40\n"
+  },
+  {
+    "number": 43,
+    "title": "Child of a DIFFERENT parent (substring trap #400 contains #40)",
+    "createdAt": "2026-07-02T09:10:00Z",
+    "labels": [{"id": "LA_10", "name": "needs-william", "description": "", "color": "d93f0b"}],
+    "body": "## Goal\nUnrelated.\n\n## Loop metadata\nparent: #400\n"
+  }
+]

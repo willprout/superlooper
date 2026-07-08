@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""A stand-in for the `claude` binary that PLAYS a loop session for the Task-15 simulation.
+
+Invoked EXACTLY like the real thing (the start-session.sh launch line): the brief CONTENTS
+arrive as the final argv; SL_ISSUE_ID / SL_RUN_ROOT arrive in the environment. It reads its
+marching orders FROM THE BRIEF — report path, blocked path, required H2 sections, answer path —
+so if the brief ever stops carrying real, parseable contract paths, the whole simulation fails
+loudly instead of a fake quietly knowing things a real worker could not.
+
+Scenario selection (what kind of session to play), per test:
+  $SIM_SCENARIO_DIR/<id>.json   a JSON spec for THIS id ({"scenario": "...", ...params}),
+                                with per-generation overrides under "gen<G>" (G parsed from the
+                                branch's -r<G> suffix — a conflict-regenerated rebuild of the
+                                same issue id can behave differently from its first run);
+  $SCENARIO                     a bare scenario name for every id otherwise;
+  default                       "happy".
+
+Scenarios:
+  happy           commit real work, push, open the PR via fake-gh, post the fresh-agent review
+                  verdict comment, write a report with non-empty sections.
+  no-review       happy minus the review comment (the gate must nudge once, then park).
+  empty-sections  happy but the report carries headings with EMPTY bodies (nudge, park, never merge).
+  no-pr           work + report but no PR (gate step 1 park-with-memo).
+  review-late     open the PR + write the report, hold on "wait_for", THEN post the review
+                  marker — the review-comment lands after the PR was cached (the D6 race).
+  investigate     post the `<!-- superlooper-investigation -->` marker comment + create a
+                  `parent:`-linked child issue (labeled needs-william), write the report; no PR.
+  blocked         write the blocked-question marker, STAY ALIVE until the runner clears it
+                  (answer delivered), then proceed with the happy flow.
+  bounce          write the `BOUNCED:` marker ONLY, stay alive until the runner clears it, exit —
+                  the test asserts the RUNNER does the memo comment + label mechanics.
+  vanish          exit instantly with no markers (start-session.sh writes `exited` — the silent
+                  death the relaunch ladder must cap and park).
+  answerer / answerer-park / answerer-silent
+                  play the hired answerer: write a decisive answer / a `PARK:` line / nothing
+                  to the answer path parsed from the answerer brief.
+
+Shared params (all optional): "edit" ({"file","append"} or {"file","line","text"} — same-line
+edits are how two issues manufacture a REAL merge conflict), "question", "memo", "answer",
+"wait_for" (a sync file to await before writing the report — how a test holds one issue's
+finish while another merges), "on_push_refusal" ("block" default | "exit"), "linger" (stay
+alive after the last action, like a real interactive session whose turn ended — so gate nudges
+land in a LIVE pane, not a dead one), "comply_on_nudge" (after a gate nudge arrives in the
+pane, rewrite the report with full prose — the one-nudge-recovery path), and for investigate:
+"skip_marker" / "skip_child" (omit the marker comment / the child issue).
+
+Every wait is BOUNDED: $SIM_STOP (a global kill file the harness touches at teardown) or
+$SIM_WAIT_TIMEOUT (default 60 real seconds) ends it — a fake must never outlive its test.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+def env(name, default=""):
+    return os.environ.get(name, default)
+
+
+ID = env("SL_ISSUE_ID")
+RUN_ROOT = env("SL_RUN_ROOT")
+STOP = env("SIM_STOP")
+WAIT_TIMEOUT = float(env("SIM_WAIT_TIMEOUT", "60"))
+GH = env("SL_GH", "gh")
+
+
+def log(msg):
+    sys.stderr.write("fake-claude[%s]: %s\n" % (ID, msg))
+
+
+def activity():
+    """What the PostToolUse/Stop hooks would stamp for a real session."""
+    path = os.path.join(RUN_ROOT, "state", "activity", ID)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(str(int(time.time())))
+
+
+def stopped():
+    return bool(STOP) and os.path.exists(STOP)
+
+
+def wait_until(pred, what):
+    """Poll until pred() — bounded by SIM_STOP and SIM_WAIT_TIMEOUT. Returns True iff pred won."""
+    deadline = time.time() + WAIT_TIMEOUT
+    while time.time() < deadline:
+        if pred():
+            return True
+        if stopped():
+            log("stopped while waiting for %s" % what)
+            return False
+        time.sleep(0.05)
+    log("TIMED OUT waiting for %s" % what)
+    return False
+
+
+def sh(*args, cwd=None, check=True):
+    r = subprocess.run([str(a) for a in args], cwd=cwd, capture_output=True, text=True,
+                       timeout=60)
+    if check and r.returncode != 0:
+        log("command failed rc=%d: %s\n%s%s" % (r.returncode, " ".join(map(str, args)),
+                                                r.stdout, r.stderr))
+        sys.exit(1)
+    return r
+
+
+def load_spec():
+    spec = {}
+    d = env("SIM_SCENARIO_DIR")
+    path = os.path.join(d, "%s.json" % ID) if d else ""
+    if path and os.path.isfile(path):
+        with open(path) as f:
+            spec = json.load(f)
+    if "scenario" not in spec:
+        spec["scenario"] = env("SCENARIO", "happy")
+    # per-generation override, keyed on the branch's -r<G> suffix (a rebuild of the same id)
+    r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                       capture_output=True, text=True)
+    branch = (r.stdout or "").strip()
+    m = re.search(r"-r(\d+)$", branch)
+    gen = int(m.group(1)) if m else 0
+    spec.update(spec.get("gen%d" % gen, {}))
+    spec["branch"] = branch
+    return spec
+
+
+# --------------------------- the brief is the contract ---------------------------
+
+def parse_brief(brief):
+    """Pull the mechanical contract out of the brief text. A miss is a LOUD failure: the brief
+    footer is load-bearing product prose, and a fake that silently knew the paths anyway would
+    hide a broken template from the rehearsal."""
+    def first(pattern, what):
+        m = re.search(pattern, brief)
+        if not m:
+            log("brief is missing %s (pattern %r)" % (what, pattern))
+            sys.exit(1)
+        return m.group(1)
+
+    return {
+        "issue_num": first(r"#(\d+)", "an issue number"),
+        # [^\s`] not \S: the brief may wrap a path in backticks, which \S would swallow
+        "report_path": first(r"([^\s`]*/reports/i\d+\.md)", "the report path"),
+        "blocked_path": first(r"([^\s`]*/state/blocked/i\d+)\b", "the blocked path"),
+        "sections": list(dict.fromkeys(re.findall(r"`## ([^`]+)`", brief))),
+    }
+
+
+def write_report(contract, empty=False):
+    lines = []
+    for sec in contract["sections"]:
+        lines.append("## %s\n" % sec)
+        if not empty:
+            lines.append("Simulated %s evidence for %s: exercised end-to-end against the fake "
+                         "harness; every assertion in this simulated run passed.\n" % (sec, ID))
+        lines.append("\n")
+    path = contract["report_path"]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("".join(lines))
+    log("report written (%s)" % ("EMPTY sections" if empty else "full"))
+
+
+def write_blocked(contract, text):
+    path = contract["blocked_path"]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+
+
+# --------------------------- worker steps ---------------------------
+
+def do_edit(spec):
+    edit = spec.get("edit") or {"file": "src/%s.txt" % ID, "append": "%s was here\n" % ID}
+    path = edit["file"]
+    if os.path.dirname(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    if "line" in edit:
+        # a SAME-LINE edit — the raw material of a real merge conflict between two issues
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+        while len(lines) < edit["line"]:
+            lines.append("")
+        lines[edit["line"] - 1] = edit["text"]
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    else:
+        with open(path, "a") as f:
+            f.write(edit.get("append", "%s change\n" % ID))
+    sh("git", "add", "--", path)
+    sh("git", "commit", "-q", "-m", "%s: simulated work" % ID)
+
+
+def do_push(spec, contract):
+    """Push the branch. A refusal (the pushed-branch-orphan poke: the remote already carries this
+    branch with DIFFERENT history and no force path exists anywhere) is handled the way the brief
+    tells a real worker to handle any hard stop: block with a specific question. NEVER any form of
+    forced push."""
+    r = sh("git", "push", "-q", "origin", "HEAD", check=False)
+    if r.returncode == 0:
+        return True
+    log("push refused: %s" % (r.stderr or r.stdout).strip()[:200])
+    if spec.get("on_push_refusal", "block") == "exit":
+        sys.exit(0)
+    write_blocked(contract,
+                  "git push of branch %s was refused (non-fast-forward: the remote already has "
+                  "this branch with different history). I must not force-push. How should I "
+                  "proceed with issue #%s?" % (spec.get("branch"), contract["issue_num"]))
+    activity()
+    wait_until(lambda: not os.path.exists(contract["blocked_path"]), "blocked marker clearance")
+    r2 = sh("git", "push", "-q", "origin", "HEAD", check=False)
+    if r2.returncode != 0:
+        log("push still refused after unblock — ending session without clobbering remote work")
+        sys.exit(0)
+    return True
+
+
+def do_pr(spec, contract):
+    branch = spec["branch"]
+    r = sh(GH, "pr", "create", "--head", branch, "--title", "%s (sim)" % ID,
+           "--body", "Closes #%s" % contract["issue_num"], check=False)
+    if r.returncode != 0:
+        log("pr create failed: %s" % (r.stderr or r.stdout).strip()[:200])
+        return None
+    m = re.search(r"/pull/(\d+)", r.stdout)
+    return m.group(1) if m else None
+
+
+def do_review_comment(spec, pr):
+    body = spec.get("review_body",
+                    "<!-- superlooper-review --> Fresh-agent review of the full diff (simulated "
+                    "reviewer, wrote none of it): no P0/P1 findings; ship.")
+    sh(GH, "pr", "comment", pr, "--body", body)
+
+
+# --------------------------- scenarios ---------------------------
+
+def nudged():
+    """Has a gate nudge landed in THIS worker's pane? The runner's nudges go through
+    nudge-pane.sh -> fake-cmux, which logs sends — the only 'screen' a fake session can
+    watch. Filtered to our own surface (state/panes/<id>, recorded by launch-session.sh):
+    in a multi-worker scenario, issue A's nudge must never trigger issue B's compliance
+    (Codex round-1 M2)."""
+    try:
+        with open(os.path.join(RUN_ROOT, "state", "panes", ID)) as f:
+            surf = f.read().strip()
+    except OSError:
+        return False
+    path = os.path.join(env("FAKE_CMUX_DIR"), "sends.jsonl")
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("surface") == surf and "[superlooper gate]" in (rec.get("text") or ""):
+            return True
+    return False
+
+
+def finish(spec, contract, empty_report=False):
+    write_report(contract, empty=empty_report)
+    activity()
+    if spec.get("comply_on_nudge") and empty_report:
+        if wait_until(nudged, "a gate nudge"):
+            write_report(contract, empty=False)
+            activity()
+    if spec.get("linger"):
+        # a real interactive session's process persists after its turn ends (nothing is
+        # auto-closed) — so the pane stays LIVE for gate nudges until the harness stops us.
+        wait_until(stopped, "SIM_STOP (linger)")
+
+
+def worker_flow(spec, contract, review=True, pr=True, empty_report=False):
+    activity()
+    do_edit(spec)
+    activity()
+    do_push(spec, contract)
+    if pr:
+        pr_num = do_pr(spec, contract)
+        if pr_num and review:
+            do_review_comment(spec, pr_num)
+    activity()
+    wf = spec.get("wait_for")
+    if wf:
+        wait_until(lambda: os.path.exists(wf), "sync file %s" % wf)
+    finish(spec, contract, empty_report=empty_report)
+
+
+def scenario_review_late(spec, contract):
+    """The D6 race: open the PR and write the report FIRST (so the gate can see a finished issue
+    with a PR but no review), hold on the sync file, then post the review marker — modelling a
+    review-marker comment that lands AFTER the runner first cached the PR. A real fresh-agent
+    review takes seconds-to-minutes to run and post; the offline sim otherwise posts it
+    synchronously with PR creation, so the cache was never stale relative to the marker."""
+    activity()
+    do_edit(spec)
+    activity()
+    do_push(spec, contract)
+    pr = do_pr(spec, contract)                 # PR exists, NO review comment yet
+    write_report(contract)                     # issue is now 'finished': PR present, review absent
+    activity()
+    wf = spec.get("wait_for")
+    if wf:
+        wait_until(lambda: os.path.exists(wf), "sync file %s" % wf)
+    if pr:
+        do_review_comment(spec, pr)            # the marker lands only NOW
+    activity()
+    if spec.get("linger"):
+        wait_until(stopped, "SIM_STOP (linger)")
+
+
+def scenario_investigate(spec, contract):
+    activity()
+    num = contract["issue_num"]
+    if not spec.get("skip_marker"):
+        sh(GH, "issue", "comment", num, "--body",
+           "<!-- superlooper-investigation --> Root cause (simulated): the flake traces to a "
+           "shared fixture; scoped child issue filed below. Zero code changes made.")
+    if not spec.get("skip_child"):
+        child_body = ("## Goal\nFix the shared fixture the investigation of #%s identified.\n\n"
+                      "## Definition of done\n- [ ] fixture isolated\n\n"
+                      "## Boundaries\nOnly the fixture.\n\n"
+                      "## Loop metadata\ntouches: tests\nparent: #%s\n") % (num, num)
+        sh(GH, "issue", "create", "--title", "Child of #%s: isolate the fixture" % num,
+           "--body", child_body, "--label", "type:build,needs-william")
+    finish(spec, contract)
+
+
+def scenario_blocked(spec, contract):
+    activity()
+    write_blocked(contract, spec.get("question",
+                  "Should the simulated widget use approach A or B? One line is enough."))
+    if wait_until(lambda: not os.path.exists(contract["blocked_path"]),
+                  "the answer (blocked marker clearance)"):
+        worker_flow(spec, contract)
+
+
+def scenario_bounce(spec, contract):
+    activity()
+    write_blocked(contract, spec.get("memo",
+                  "BOUNCED: the premise is stale — the module this issue targets was already "
+                  "replaced on dev.\n\nProposed amendment: retarget the Goal at the new module "
+                  "and drop DoD item 2."))
+    # stay alive while the runner posts the memo + moves labels (a real session ends its TURN
+    # but its process persists); exit once the runner has consumed the marker.
+    wait_until(lambda: not os.path.exists(contract["blocked_path"]), "bounce processing")
+
+
+def scenario_resolve_conflict(spec, brief):
+    """The §C.4 6c session: hired INTO the PR's own preserve-labeled branch to resolve its
+    conflict in place. Recognized by the conflict-resolution brief's own header (same issue id
+    as the original worker — the BRIEF, not the id, declares this job). Does what the brief
+    says: merge origin/<dev>, resolve, plain push, refresh review evidence, rewrite the report."""
+    def first(pattern, what):
+        m = re.search(pattern, brief)
+        if not m:
+            log("conflict brief is missing %s" % what)
+            sys.exit(1)
+        return m.group(1)
+
+    pr = first(r"PR #(\d+)", "the PR number")
+    dev = first(r"origin/(\S+)`", "the dev branch")
+    contract = {
+        "report_path": first(r"([^\s`]*/reports/i\d+\.md)", "the report path"),
+        "blocked_path": first(r"([^\s`]*/state/blocked/i\d+)\b", "the blocked path"),
+        "sections": list(dict.fromkeys(re.findall(r"`## ([^`]+)`", brief))),
+    }
+    activity()
+    sh("git", "fetch", "-q", "origin")
+    r = sh("git", "merge", "--no-edit", "origin/%s" % dev, check=False)
+    if r.returncode != 0:
+        res = spec.get("resolution", {})
+        path, content = res.get("file"), res.get("content", "resolved\n")
+        if not path:
+            log("merge conflicted and no resolution was scripted")
+            sys.exit(1)
+        with open(path, "w") as f:
+            f.write(content)
+        sh("git", "add", "--", path)
+        sh("git", "commit", "-q", "--no-edit")
+    activity()
+    sh("git", "push", "-q", "origin", "HEAD")          # a PLAIN push — never forced
+    do_review_comment(spec, pr)
+    finish(spec, contract)
+
+
+def scenario_answerer(spec):
+    brief = sys.argv[-1]
+    m = re.search(r"([^\s`]*/answers/i\d+\.md)", brief)
+    if not m:
+        log("answerer brief is missing the answer path")
+        sys.exit(1)
+    path = m.group(1)
+    kind = spec["scenario"]
+    if kind == "answerer-silent":
+        log("answerer staying silent (timeout scenario)")
+        return
+    text = ("PARK: this is a product/owner decision — William must choose."
+            if kind == "answerer-park"
+            else spec.get("answer", "Use approach A — it matches the existing pattern in "
+                                    "src/ and needs no new dependency."))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+    log("answer written")
+
+
+def main():
+    if not ID or not RUN_ROOT:
+        log("SL_ISSUE_ID / SL_RUN_ROOT missing — not launched through the real stack?")
+        sys.exit(1)
+    brief = sys.argv[-1] if len(sys.argv) > 1 else ""
+    spec = load_spec()
+    name = spec["scenario"]
+    log("playing scenario %r (branch %r)" % (name, spec.get("branch")))
+
+    if ID.startswith("a"):
+        scenario_answerer(spec)
+        return
+    if "Resolve the merge conflict on PR #" in brief:
+        scenario_resolve_conflict(spec, brief)
+        return
+    if name == "vanish":
+        return
+    contract = parse_brief(brief)
+    if name in ("happy", "conflict"):
+        worker_flow(spec, contract)
+    elif name == "no-review":
+        worker_flow(spec, contract, review=False)
+    elif name == "empty-sections":
+        worker_flow(spec, contract, empty_report=True)
+    elif name == "no-pr":
+        worker_flow(spec, contract, pr=False)
+    elif name == "review-late":
+        scenario_review_late(spec, contract)
+    elif name == "investigate":
+        scenario_investigate(spec, contract)
+    elif name == "blocked":
+        scenario_blocked(spec, contract)
+    elif name == "bounce":
+        scenario_bounce(spec, contract)
+    else:
+        log("unknown scenario %r" % name)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
