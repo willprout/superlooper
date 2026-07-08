@@ -17,6 +17,12 @@
 # is the fence that makes `skills/**` a bright line trustworthy: the engine is supervised-only, and
 # no engine change reaches a live loop without a human saying so here.
 #
+# CANONICAL PUBLISH PATH: this repo-root bin/install.sh is the ONE installer to run — the gated
+# one. The engine ALSO carries its own older installer at skills/superlooper/bin/install.sh (kept
+# byte-for-byte from when the engine was a standalone repo); that copy publishes the SAME payload
+# to the SAME ~/.claude location but WITHOUT this gate. Always publish through THIS script — the
+# nested one is standalone-era dev tooling, not a second publish door to use.
+#
 # Idempotent: re-running re-syncs the payload, never duplicates a hook or the shim block, and leaves
 # an unchanged settings.json byte-for-byte. --dry-run prints what WOULD change (including the gate
 # assessment) and writes nothing.
@@ -88,13 +94,21 @@ engine_gate() {  # engine_gate <report|gate>
     echo "  not in this repo's history) — treating the ENTIRE payload as new:"
     git -C "$REPO_ROOT" ls-files -- "$PAYLOAD_REL" 2>/dev/null | sed 's/^/    A       /' || true
   else
-    changed="$(git -C "$REPO_ROOT" diff --name-status "$last_sha" HEAD -- "$PAYLOAD_REL" 2>/dev/null || true)"
-    if [ -z "$changed" ]; then
-      echo "  no engine changes since last publish ($last_sha) — payload is unchanged."
-      return 0
+    # Capture the diff's exit status explicitly (set -e is disabled inside this function, invoked
+    # as `engine_gate gate || exit`). A git ERROR must NOT be mistaken for "no changes" and waved
+    # through — that would be the one fail-OPEN branch in an otherwise fail-safe gate. On error we
+    # fall through to requiring an explicit OK, exactly as if the payload had changed.
+    if changed="$(git -C "$REPO_ROOT" diff --name-status "$last_sha" HEAD -- "$PAYLOAD_REL" 2>/dev/null)"; then
+      if [ -z "$changed" ]; then
+        echo "  no engine changes since last publish ($last_sha) — payload is unchanged."
+        return 0
+      fi
+      echo "  engine files changed since last publish ($last_sha):"
+      printf '%s\n' "$changed" | sed 's/^/    /'
+    else
+      echo "  WARNING: could not compute the engine diff against $last_sha — refusing to assume"
+      echo "  'unchanged'. Treating the payload as changed; an explicit OK is required below."
     fi
-    echo "  engine files changed since last publish ($last_sha):"
-    printf '%s\n' "$changed" | sed 's/^/    /'
   fi
 
   if [ "$mode" = report ]; then

@@ -18,7 +18,7 @@
     "cmd": "\"$HOME/.claude/skills/superlooper/bin/imessage-notify.sh\" \"$(cat \"$HOME/.superlooper/notify_to\")\" {title} {body}"
   },
   "bright_lines": [
-    "Never modify anything under `skills/**` — the superlooper engine (and any other installed skill) lives there. The engine is supervised-only and is NEVER loop-built; a PR whose diff reaches the `engine` area has drifted out of the dashboard's lane and must be stopped at the gate. Loop workers declare `touches: dashboard` and stay inside `dashboard/**`.",
+    "Never modify anything under `skills/**` — the superlooper engine (and any other installed skill) lives there. The engine is supervised-only and is NEVER loop-built. Declare `touches: dashboard` and stay inside `dashboard/**`; any diff that reaches the `engine` area is flagged at the gate as an out-of-lane wander. The engine's real backstop is publishing: a merged engine change is inert until someone republishes through the gated `bin/install.sh`, which shows the diff and requires an explicit OK.",
     "Never modify anything under `.superlooper/**` — it is the loop's executable config (the referee's own rulebook: gates, required checks, notify commands). A PR that edits it reprograms the loop; such changes come only through a supervised session, never a loop worker.",
     "Never modify anything under `.github/workflows/**` — CI is the mechanical gate that judges your PR, and a worker must not edit its own referee. Workflow changes come only through a supervised session.",
     "No AI or LLM call anywhere inside the dashboard or its server: every button is an existing mechanical verb (label change, comment, issue create). No model calls, no standing seat.",
