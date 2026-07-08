@@ -2,7 +2,7 @@
 actions.decide (tested in test_actions.py); these tests pin what the SHELL must guarantee:
 
   * the env contract launch-session.sh depends on (SL_RUN_ROOT/SL_REPO/SL_PANE/SL_DEV_BRANCH/
-    SL_MODEL/SL_EFFORT) on every launch, worker AND answerer, plus the per-issue model/effort
+    SL_MODEL/SL_EFFORT/SL_AGENT) on every launch, worker AND answerer, plus the per-issue model/effort
     override (label > config > default; durable across a cold restart; answerer unaffected);
   * executor mechanics: ordered gh mutations, loopstate stamps, marker hygiene, fail-and-retry
     (a failed gh write never advances local state past the truth);
@@ -282,6 +282,7 @@ def test_launch_env_contract_and_registration(rig):
     assert env["SL_PANE"] == "pane-1"
     assert env["SL_DEV_BRANCH"] == "main"
     assert env["SL_MODEL"] == "opus"                   # models.worker
+    assert env["SL_AGENT"] == "claude"                  # default agent path stays Claude
     ist = issue_state(rig, "i101")
     assert ist["status"] == "running" and ist["branch"] == "sl/i101-render-the-widget"
     brief_text = (rig.home / "briefs" / "i101.md").read_text()
@@ -300,6 +301,19 @@ def test_launch_env_uses_per_issue_model_override(rig):
     env = rig.calls[-1]["env"]
     assert env["SL_MODEL"] == "fable"                  # per-issue label, not config's "opus"
     assert env["SL_EFFORT"] == ""                      # no effort label -> nothing sent
+
+
+def test_launch_env_carries_explicit_codex_agent_without_changing_protocol(rig):
+    # Runner-level selection only: the same launch action / labels / issue selection path is used,
+    # but launch-session.sh receives SL_AGENT=codex and currently rejects it as unsupported.
+    rig.r.agent = "codex"
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    out = rig.r._execute(_launch_action(), NOW)
+    assert out == "ok"
+    call = rig.calls[-1]
+    assert call["args"][0].endswith("launch-session.sh") and call["args"][1] == "i101"
+    assert call["env"]["SL_AGENT"] == "codex"
 
 
 def test_launch_env_carries_per_issue_effort_and_default_model(rig):
@@ -394,6 +408,7 @@ def test_answerer_env_ignores_per_issue_model_and_effort_labels(rig):
     env = rig.calls[-1]["env"]
     assert env["SL_MODEL"] == "fable"                  # config answerer, NOT the issue's model:opus[1m]
     assert env["SL_EFFORT"] == ""                      # never a per-issue effort for the answerer
+    assert env["SL_AGENT"] == "claude"
 
 
 def test_launch_stamps_the_override_into_issue_state(rig):

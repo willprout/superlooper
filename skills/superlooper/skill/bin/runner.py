@@ -225,11 +225,12 @@ def detect_self_pane(cmux=None, run=None):
 
 
 class Runner:
-    def __init__(self, repo, config, state_home=None, pane=None,
+    def __init__(self, repo, config, state_home=None, pane=None, agent="claude",
                  run_script=None, fetch_usage=None):
         import config as config_lib          # sibling module; only for the state-home default
         self.repo = os.fspath(repo)
         self.config = config
+        self.agent = agent if agent in ("claude", "codex") else "claude"
         # D1 (live dry-run 2026-07-03): pin every gh call to config.repo — gh otherwise infers
         # the repo from the process cwd, and the runner may be started from anywhere.
         gh.set_repo(config.get("repo") if isinstance(config, dict) else None)
@@ -743,7 +744,8 @@ class Runner:
         # default path (no label, worker_effort null) sends no --effort at all.
         return {"SL_RUN_ROOT": self.home, "SL_REPO": self.repo, "SL_PANE": self.pane,
                 "SL_DEV_BRANCH": str(self.config.get("dev_branch", "main")),
-                "SL_MODEL": str(model or ""), "SL_EFFORT": str(effort or "")}
+                "SL_MODEL": str(model or ""), "SL_EFFORT": str(effort or ""),
+                "SL_AGENT": self.agent}
 
     @staticmethod
     def _clean_control(v):

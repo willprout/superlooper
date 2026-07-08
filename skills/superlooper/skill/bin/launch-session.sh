@@ -27,6 +27,19 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CMUX="${SL_CMUX:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
 MODEL="${SL_MODEL:-}"
 EFFORT="${SL_EFFORT:-}"
+AGENT="${SL_AGENT:-claude}"
+case "$AGENT" in
+  claude) ;;
+  codex)
+    echo "[$ID_IN] agent 'codex' is selected, but Codex launch is not implemented yet." >&2
+    echo "[$ID_IN] No cmux tab, worktree, or session was created." >&2
+    exit 64
+    ;;
+  *)
+    echo "[$ID_IN] unsupported agent '$AGENT' (expected: claude or codex)" >&2
+    exit 64
+    ;;
+esac
 
 # ---- Resolve identity + worktree ----------------------------------------------------------------
 if [ "$CWD_MODE" -eq 1 ]; then
@@ -179,11 +192,12 @@ WS_ARGS=()
 # token — a delayed/orphan command from a PRIOR failed launch stamps a DIFFERENT token and can't
 # false-verify.
 # The new tab is a FRESH shell that inherits NONE of this launcher's env, so every var
-# start-session.sh needs must be NAMED here. SL_EFFORT rides alongside SL_MODEL (empty on the
+# start-session.sh needs must be NAMED here. SL_AGENT is validated above and currently only reaches
+# start-session on the Claude path; SL_EFFORT rides alongside SL_MODEL (empty on the
 # default path; set only by a per-issue effort:* label) — %q-quoted like the rest so a value with
 # brackets/spaces can't break or inject the command.
-printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_START_TOKEN=%q %q %q' \
-  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$SURF" "$HERE/start-session.sh" "$ID"
+printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_START_TOKEN=%q %q %q' \
+  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$SURF" "$HERE/start-session.sh" "$ID"
 # Drop the command FIRST — before any further cmux RPC — so the new tab's shell finds it immediately
 # and the shim's bounded wait can't be eaten by an unrelated slow RPC (e.g. rename-tab; review B6).
 # Atomic write (tmp + mv) so the shim never reads a half-written command; refresh .active so its

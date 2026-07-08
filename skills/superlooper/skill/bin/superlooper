@@ -140,8 +140,9 @@ def cmd_run(args):
     pane = args.pane or os.environ.get("SL_PANE") or detect_self_pane()
     src = ("--pane" if args.pane else "$SL_PANE" if os.environ.get("SL_PANE")
            else "this cmux tab" if pane else "(none)")
-    r = Runner(repo=args.repo, config=cfg, pane=pane, fetch_usage=fetch_usage)
-    print(f"superlooper run: repo={args.repo} state={r.home} pane={r.pane or '(unset)'} [{src}]")
+    r = Runner(repo=args.repo, config=cfg, pane=pane, agent=args.agent, fetch_usage=fetch_usage)
+    print(f"superlooper run: repo={args.repo} state={r.home} pane={r.pane or '(unset)'} "
+          f"[{src}] agent={r.agent}")
     # D7: fail HARD before the loop if cmux is unreachable or the pane won't resolve. A quiet
     # warning here once let a mis-started runner silently abort every launch and burn every
     # issue's retry cap (live dry-run 2026-07-03/04) — so this refuses to start instead.
@@ -830,6 +831,9 @@ def main(argv=None):
         **{"--pane": dict(default=None, help="OVERRIDE the cmux pane that hosts the loop's tabs "
                                              "(default: $SL_PANE, else the pane of the cmux tab "
                                              "this command runs in — no need to set it)"),
+           "--agent": dict(default="claude", choices=("claude", "codex"),
+                           help="coding agent for launched sessions (default: claude; codex is "
+                                "currently an unsupported launch path)"),
            "--ticks": dict(type=int, default=None,
                            help="stop after N ticks (testing/simulation)")})
     add("status", cmd_status)

@@ -281,6 +281,20 @@ def test_worker_command_names_model_and_effort_env(tmp_path):
     assert "start-session.sh" in cmd, f"captured the wrong thing: {cmd!r}"
     assert "SL_MODEL=fable" in cmd
     assert "SL_EFFORT=high" in cmd                      # the bug lives here if this line ever fails
+    assert "SL_AGENT=claude" in cmd                      # default agent reaches the session boundary
+
+
+def test_codex_agent_selection_fails_before_creating_a_tab_or_worktree(tmp_path):
+    # Runner-level plumbing exists, but Codex launch is intentionally unsupported for now. The
+    # launcher must fail before cmux/new-surface and before git worktree creation.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={"SL_AGENT": "codex"})
+    assert r.returncode == 64
+    assert "Codex launch is not implemented" in r.stderr
+    assert not (run_root / "worktrees" / "i1").exists()
+    assert not (run_root / "state" / "panes" / "i1").exists()
+    assert not (stubdir / "closed").exists()
 
 
 def test_answerer_cwd_mode_launches_in_place_without_worktree(tmp_path):

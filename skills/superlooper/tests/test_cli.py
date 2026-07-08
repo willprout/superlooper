@@ -221,8 +221,19 @@ def test_run_ticks_once_and_writes_the_heartbeat(rig):
     r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
             env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
     assert r.returncode == 0, r.stdout + r.stderr
+    assert "agent=claude" in r.stdout
     hb = rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat"
     assert hb.exists()
+
+
+def test_run_accepts_explicit_codex_agent_selection(rig):
+    # CLI plumbing only: --agent codex is accepted and reaches the runner. No launch happens in
+    # this one-tick empty queue, so no codex/claude binary can be invoked.
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--agent", "codex",
+            "--ticks", "1", env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "agent=codex" in r.stdout
+    assert (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
 
 
 def test_run_auto_detects_its_own_pane_without_any_pane_flag(rig):
