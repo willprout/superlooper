@@ -221,6 +221,37 @@ def test_a_decision_appearing_flips_all_clear_and_restores_needs_you(tmp_path):
     assert [c["num"] for c in after["needs_you"]] == [3], "the waiting decision must be in the panel"
 
 
+def test_needs_you_carries_long_needs_william_memo_untrimmed(tmp_path):
+    # Issue #3: a worker/answerer question can be longer than the compact card's old memo well. The
+    # assembled dashboard payload must carry the whole memo into the Needs You rendering path; CSS
+    # then decides whether the card grows or scrolls, but the text must not be shortened here.
+    dst = tmp_path / "will-titan__longmemo"
+    (dst / "state").mkdir(parents=True)
+    long_memo = (
+        "Which behavior should win when the imported fixture has both a stale local cache and a "
+        "fresh remote answer?\n\n"
+        "Option A: trust the local cache so the command center stays fully offline during the "
+        "operator review. Option B: discard the stale cache and require a fresh read before the "
+        "session can continue. Recommendation: choose Option B because the decision affects merge "
+        "safety, but I need William to approve that tradeoff before I change the dashboard surface."
+    )
+    (dst / "state" / "issues.json").write_text(json.dumps(
+        {"version": 1, "issues": {
+            "i3": {"status": "needs_william", "branch": "sl/i3-long-memo", "pr": None}}}))
+    (dst / "journal.jsonl").write_text(json.dumps(
+        {"ts": NOW - 20, "act": "park", "id": "i3", "num": 3, "needs_william": True,
+         "memo": long_memo, "outcome": "ok"}) + "\n")
+    (dst / "state" / "runner.heartbeat").write_text(str(NOW - 5))
+
+    snap = server.assemble_snapshot(_config(dst), now=NOW)
+    assert snap["all_clear"] is False
+    assert len(snap["needs_you"]) == 1
+    card = snap["needs_you"][0]
+    assert card["kind"] == "needs-william"
+    assert card["memo"] == long_memo
+    assert "Recommendation: choose Option B" in card["memo"]
+
+
 # =============================== pill + trouble banner + runner ===============================
 
 def test_absent_heartbeat_reads_runner_down(home):

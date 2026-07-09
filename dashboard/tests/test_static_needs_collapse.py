@@ -130,3 +130,36 @@ def test_needsyou_renders_a_slim_ribbon_when_empty_and_the_full_panel_otherwise(
         "the full Needs You panel (title) must still render when a decision is waiting (issue #28)")
     assert "badge" in _NEEDS_CODE[panel:], (
         "the waiting-decision panel must still carry its count badge (issue #28)")
+
+
+def test_long_decision_memo_is_readable_not_clipped():
+    # Issue #3: the server already sends the full worker/answerer question, so the card must not
+    # hide the unread part behind a clipped compact memo well. A max height is acceptable only when
+    # paired with an explicit scroll state; hidden overflow is the regression.
+    memo = _rule_body(_CSS, ".card .memo")
+    assert memo, "Needs You cards must keep a styled memo/question block"
+    assert "white-space: pre-wrap" in memo, "multi-line decision questions must preserve line breaks"
+    assert re.search(r"(word-break|overflow-wrap)\s*:", memo), (
+        "long decision words/paths must wrap inside the narrow Needs You column")
+    assert not re.search(r"overflow(?:-[xy])?\s*:\s*hidden\b", memo), (
+        "long decision text must never be clipped inside the Needs You memo block (issue #3)")
+    if re.search(r"max-height\s*:", memo):
+        assert re.search(r"overflow(?:-y)?\s*:\s*(auto|scroll)\b", memo), (
+            "a height-bounded memo must expose the full text through scrolling (issue #3)")
+
+
+def test_needs_card_actions_wrap_in_the_narrow_sidebar():
+    # At the 264px desktop breakpoint the content column is too narrow for every verb to stay on
+    # one line. The action row must wrap instead of overflowing across the card or memo.
+    actions = _rule_body(_CSS, ".card .actions")
+    assert actions, "Needs You cards must keep an action row"
+    assert re.search(r"flex-wrap\s*:\s*wrap\b", actions), (
+        "Needs You action buttons must wrap at narrow sidebar widths (issue #3)")
+    button = _rule_body(_CSS, ".card .actions .btn")
+    assert re.search(r"max-width\s*:\s*100%", button), (
+        "decision buttons must be bounded by the card content width (issue #3)")
+    assert re.search(r"white-space\s*:\s*normal\b", button), (
+        "long decision button labels must wrap instead of forcing horizontal overflow (issue #3)")
+    note = _rule_body(_CSS, ".card .actions .btn-note")
+    assert re.search(r"margin-left\s*:\s*0", note), (
+        "the Discuss link must not use an auto margin that can force action-row overflow (issue #3)")
