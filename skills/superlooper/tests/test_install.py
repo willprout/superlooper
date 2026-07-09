@@ -24,13 +24,14 @@ INSTALL = os.path.join(REPO_ROOT, "bin", "install.sh")
 
 SKILL_DIR = (".claude", "skills", "superlooper")
 SETTINGS = (".claude", "settings.json")
+CODEX_HOOKS = (".codex", "hooks.json")
 ACT_SUFFIX = "skills/superlooper/bin/activity-hook.sh"
 STOP_SUFFIX = "skills/superlooper/bin/stop-hook.sh"
 SHIM_BEGIN = "# >>> superlooper launch shim >>>"
 
 
 def _run(home, *args):
-    env = {**os.environ, "HOME": str(home)}
+    env = {**os.environ, "HOME": str(home), "CODEX_HOME": str(home / ".codex")}
     env.pop("ZDOTDIR", None)                       # so ~/.zshrc resolves under the fake HOME
     return subprocess.run([INSTALL, *args], env=env, capture_output=True, text=True, timeout=120)
 
@@ -41,6 +42,10 @@ def _skill(home, *parts):
 
 def _settings(home):
     return json.loads(home.joinpath(*SETTINGS).read_text())
+
+
+def _codex_hooks(home):
+    return json.loads(home.joinpath(*CODEX_HOOKS).read_text())
 
 
 def _hook_commands(settings):
@@ -91,6 +96,12 @@ def test_install_lays_down_payload_version_hooks_and_shim(tmp_path):
     assert any(c.endswith(STOP_SUFFIX) for c in _event_commands(s, "Stop")), \
         "stop hook must be registered under Stop"
 
+    c = _codex_hooks(home)
+    assert any(c.endswith(ACT_SUFFIX) for c in _event_commands(c, "PostToolUse")), \
+        "Codex activity hook must be registered under PostToolUse"
+    assert any(c.endswith(STOP_SUFFIX) for c in _event_commands(c, "Stop")), \
+        "Codex stop hook must be registered under Stop"
+
     # launch shim installed
     rc = (home / ".zshrc").read_text()
     assert rc.count(SHIM_BEGIN) == 1, "the launch shim block must be installed once"
@@ -106,6 +117,9 @@ def test_install_is_idempotent(tmp_path):
     cmds = _hook_commands(_settings(home))
     assert sum(c.endswith(ACT_SUFFIX) for c in cmds) == 1, "activity hook must not be duplicated"
     assert sum(c.endswith(STOP_SUFFIX) for c in cmds) == 1, "stop hook must not be duplicated"
+    codex_cmds = _hook_commands(_codex_hooks(home))
+    assert sum(c.endswith(ACT_SUFFIX) for c in codex_cmds) == 1, "Codex activity hook must not be duplicated"
+    assert sum(c.endswith(STOP_SUFFIX) for c in codex_cmds) == 1, "Codex stop hook must not be duplicated"
     assert (home / ".zshrc").read_text().count(SHIM_BEGIN) == 1, "shim block must not be duplicated"
 
 
@@ -144,6 +158,7 @@ def test_dry_run_mutates_nothing(tmp_path):
     assert r.returncode == 0, r.stderr
     assert not _skill(home).exists(), "--dry-run must not write the payload"
     assert not home.joinpath(*SETTINGS).exists(), "--dry-run must not write settings.json"
+    assert not home.joinpath(*CODEX_HOOKS).exists(), "--dry-run must not write Codex hooks.json"
     zshrc = home / ".zshrc"
     assert not zshrc.exists() or SHIM_BEGIN not in zshrc.read_text(), "--dry-run must not touch ~/.zshrc"
 
@@ -172,3 +187,15 @@ def test_install_fails_closed_on_wrongtyped_settings(tmp_path):
             f"a fail-closed install must not modify the malformed settings.json: {blob}"
         assert not _skill(home).exists(), \
             f"a fail-closed install must not publish the payload: {blob}"
+
+
+def test_install_fails_closed_on_wrongtyped_codex_hooks(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".codex").mkdir()
+    blob = '{"hooks": {"PostToolUse": [{"hooks": [{"command": 123}]}]}}'
+    home.joinpath(*CODEX_HOOKS).write_text(blob)
+    r = _run(home)
+    assert r.returncode != 0, "install must fail closed on malformed Codex hooks.json"
+    assert home.joinpath(*CODEX_HOOKS).read_text() == blob
+    assert not _skill(home).exists(), "a fail-closed Codex hook merge must not publish the payload"

@@ -33,6 +33,8 @@ SRC="$REPO_ROOT/skill"                                   # the publishable paylo
 DEST="$HOME/.claude/skills/superlooper"                  # the live installed copy
 SETTINGS_DIR="$HOME/.claude"
 SETTINGS="$SETTINGS_DIR/settings.json"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+CODEX_HOOKS="$CODEX_DIR/hooks.json"
 
 # The two hooks, registered EXACTLY as autocode registers its own (decision B.3): $HOME is left
 # LITERAL — Claude Code expands it when it fires the hook, so the entry is portable across HOMEs.
@@ -138,12 +140,88 @@ if mode == "apply" and added:
 PY
 }
 
+merge_codex_hooks() {  # merge_codex_hooks <mode:apply|report>
+  local mode="$1"
+  python3 - "$CODEX_HOOKS" "$mode" "$ACT_CMD" "$STOP_CMD" <<'PY'
+import json, os, sys, tempfile
+
+path, mode, act_cmd, stop_cmd = sys.argv[1:5]
+targets = [("PostToolUse", act_cmd), ("Stop", stop_cmd)]
+
+def fail(msg):
+    sys.stderr.write("install: " + msg + " — refusing to overwrite %s.\n" % path)
+    sys.exit(2)
+
+doc = {}
+if os.path.exists(path):
+    raw = open(path).read()
+    if raw.strip():
+        try:
+            doc = json.loads(raw)
+        except json.JSONDecodeError as e:
+            fail("%s is not valid JSON (%s)" % (path, e))
+if not isinstance(doc, dict):
+    fail("%s top-level is %s, expected a JSON object" % (path, type(doc).__name__))
+
+hooks = doc.get("hooks", {})
+if not isinstance(hooks, dict):
+    fail("%s 'hooks' is %s, expected an object" % (path, type(hooks).__name__))
+
+have = set()
+for event, groups in hooks.items():
+    if not isinstance(groups, list):
+        fail("hooks['%s'] is %s, expected a list" % (event, type(groups).__name__))
+    for g in groups:
+        if not isinstance(g, dict):
+            fail("a hooks['%s'] entry is %s, expected an object" % (event, type(g).__name__))
+        ghooks = g.get("hooks", [])
+        if not isinstance(ghooks, list):
+            fail("a hooks['%s'] group's 'hooks' is %s, expected a list" % (event, type(ghooks).__name__))
+        for h in ghooks:
+            if not isinstance(h, dict):
+                fail("a hooks['%s'] hook entry is %s, expected an object" % event)
+            cmd = h.get("command")
+            if cmd is not None and not isinstance(cmd, str):
+                fail("a hooks['%s'] hook has a non-string 'command'" % event)
+            if isinstance(cmd, str):
+                have.add((event, cmd))
+
+added = []
+for event, cmd in targets:
+    if (event, cmd) in have:
+        print("  present   : %-11s <- %s" % (event, cmd))
+        continue
+    added.append((event, cmd))
+    if mode == "apply":
+        hooks.setdefault(event, []).append(
+            {"matcher": "*", "hooks": [{"type": "command", "command": cmd}]})
+    print("  %-9s : %-11s <- %s" % ("added" if mode == "apply" else "would add", event, cmd))
+
+if mode == "apply" and added:
+    doc["hooks"] = hooks
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".hooks.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(doc, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+PY
+}
+
 if $DRY; then
   echo "[install] DRY RUN — nothing will be written."
   echo "[install] would publish : $SRC/ -> $DEST/   (rsync -a --delete)"
   echo "[install] would stamp   : $DEST/VERSION = $VERSION"
   echo "[install] settings hooks ($SETTINGS):"
   merge_hooks report
+  echo "[install] codex hooks ($CODEX_HOOKS):"
+  merge_codex_hooks report
   echo "[install] would run     : skill/bin/install-launch-shim.sh"
   exit 0
 fi
@@ -151,11 +229,19 @@ fi
 # 1) Merge the hooks FIRST — so a malformed settings.json fails closed BEFORE any payload lands
 #    (nothing half-installed on a machine whose settings we refuse to touch). flock scopes the
 #    read-modify-write against a concurrent writer; the lock releases when the subshell exits.
+merge_hooks report >/dev/null
+merge_codex_hooks report >/dev/null
 mkdir -p "$SETTINGS_DIR"
 (
   exec 9>"$SETTINGS.lock"
   flock 9 2>/dev/null || true
   merge_hooks apply
+)
+mkdir -p "$CODEX_DIR"
+(
+  exec 9>"$CODEX_HOOKS.lock"
+  flock 9 2>/dev/null || true
+  merge_codex_hooks apply
 )
 
 # 2) Publish the payload. --delete so a file removed from the repo is removed from the install;
