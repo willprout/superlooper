@@ -21,6 +21,7 @@ _TOP_DEFAULTS = {
     "version": 1,
     "dev_branch": "main",
     "prod_branch": None,
+    "agent": "claude",
     "lanes": 2,
     "affinity": "hard",
     "areas": {},
@@ -57,6 +58,7 @@ _NESTED_DEFAULTS = {
 }
 
 _ALLOWED_TOP = set(_TOP_DEFAULTS) | set(_NESTED_DEFAULTS) | {"repo"}
+_AGENTS = {"claude", "codex"}
 _AFFINITIES = {"hard", "soft"}
 _MERGE_METHODS = {"squash", "merge", "rebase"}   # gh's own set; the runner defaults to squash (§B.4)
 
@@ -98,6 +100,8 @@ def _validate_and_fill(raw):
         _err("'dev_branch' must be a non-empty string")
     if out["prod_branch"] is not None and (not isinstance(out["prod_branch"], str) or not out["prod_branch"].strip()):
         _err("'prod_branch' must be null or a non-empty string")
+    if not isinstance(out["agent"], str) or out["agent"] not in _AGENTS:
+        _err(f"'agent' must be one of {sorted(_AGENTS)}, got {out['agent']!r}")
     if isinstance(out["lanes"], bool) or not isinstance(out["lanes"], int) or out["lanes"] < 1:
         _err(f"'lanes' must be an integer >= 1, got {out['lanes']!r}")
     # guard isinstance(str) BEFORE the set membership: an unhashable value (list/dict) would

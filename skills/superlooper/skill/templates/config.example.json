@@ -3,6 +3,7 @@
   "repo": "owner/name",
   "dev_branch": "main",
   "prod_branch": null,
+  "agent": "claude",
   "lanes": 2,
   "affinity": "hard",
   "areas": {

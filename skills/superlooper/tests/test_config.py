@@ -40,6 +40,7 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["version"] == 1
     assert cfg["dev_branch"] == "main"
     assert cfg["prod_branch"] is None
+    assert cfg["agent"] == "claude"
     assert cfg["lanes"] == 2
     assert cfg["affinity"] == "hard"
     assert cfg["areas"] == {}
@@ -59,6 +60,13 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["codex"] == {"dangerous_bypass": False, "bypass_hook_trust": True,
                             "no_alt_screen": True}
     assert cfg["report_time"] == "08:45"
+
+
+def test_agent_default_is_claude_and_codex_is_settable(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b"})
+    assert config.load(tmp_path)["agent"] == "claude"
+    _write_cfg(tmp_path, {"repo": "a/b", "agent": "codex"})
+    assert config.load(tmp_path)["agent"] == "codex"
 
 
 def test_worker_effort_default_is_null_and_settable(tmp_path):
@@ -109,6 +117,13 @@ def test_unknown_top_level_key_rejected(tmp_path):
     with pytest.raises(ValueError) as e:
         config.load(tmp_path)
     assert "bogus_key" in str(e.value)
+
+
+def test_bad_agent_rejected(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b", "agent": "gptbot"})
+    with pytest.raises(ValueError) as e:
+        config.load(tmp_path)
+    assert "agent" in str(e.value)
 
 
 def test_unknown_nested_key_rejected(tmp_path):

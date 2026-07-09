@@ -176,6 +176,21 @@ def test_adopt_never_overwrites_an_existing_config(rig):
     assert "already" in r.stdout.lower()
 
 
+def test_run_uses_config_agent_and_cli_override(rig):
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(
+        {"version": 1, "repo": "o/r", "required_checks": ["ci"], "agent": "codex"}))
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "0",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "agent=codex" in r.stdout
+
+    r2 = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1",
+             "--agent", "claude", "--ticks", "0",
+             env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert "agent=claude" in r2.stdout
+
+
 # --------------------------- status ---------------------------
 
 def test_status_renders_lanes_gate_and_frozen(rig):
