@@ -668,6 +668,17 @@ def test_nudge_spends_the_key_on_sent_and_dead_but_not_on_defer(rig):
     assert issue_state(rig, "i6")["nudged"] == ["sections"]
 
 
+def test_codex_nudge_passes_agent_to_pane_classifier(rig):
+    rig.r.agent = "codex"
+    seed_issue(rig, "i5", status="gating", nudged=[])
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    rig.r._execute({"act": "nudge", "id": "i5", "nudge_key": "sections", "message": "fix"}, NOW)
+    call = rig.calls[-1]
+    assert call["args"][0].endswith("nudge-pane.sh")
+    assert call["env"]["SL_RUN_ROOT"] == str(rig.home)
+    assert call["env"]["SL_AGENT"] == "codex"
+
+
 def test_merge_executor_full_sequence(rig, monkeypatch):
     removed = []
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",

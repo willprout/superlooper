@@ -53,7 +53,7 @@ def _setup(tmp_path):
     return run_root, cmux, log
 
 
-def _run(run_root, cmux, log, surf, iid, msg, screen=IDLE_SCREEN):
+def _run(run_root, cmux, log, surf, iid, msg, screen=IDLE_SCREEN, agent=None):
     env = {
         **os.environ,
         "SL_RUN_ROOT": str(run_root),
@@ -61,6 +61,8 @@ def _run(run_root, cmux, log, surf, iid, msg, screen=IDLE_SCREEN):
         "STUB_LOG": str(log),
         "STUB_SCREEN": screen,
     }
+    if agent is not None:
+        env["SL_AGENT"] = agent
     return subprocess.run([NUDGE, surf, iid, msg], env=env, capture_output=True, text=True, timeout=30)
 
 
@@ -143,3 +145,27 @@ def test_defers_on_real_menu(tmp_path):
     r = _run(run_root, cmux, log, "SURF-UUID-9", "i1", "resume please", screen=REAL_MENU)
     assert r.returncode == 3, f"a real menu must defer, got rc={r.returncode}"
     assert not any(ln.startswith("send ") for ln in log.read_text().splitlines())
+
+
+def test_codex_idle_composer_sends_when_agent_selected(tmp_path):
+    run_root, cmux, log = _setup(tmp_path)
+    screen = "Earlier output\n\n› \n  ? for shortcuts"
+    r = _run(run_root, cmux, log, "SURF-UUID-9", "i1", "resume please",
+             screen=screen, agent="codex")
+    assert r.returncode == 0, f"Codex idle composer must send, got rc={r.returncode}; {r.stderr}"
+    assert any(ln.startswith("send ") for ln in log.read_text().splitlines()), "must actually send"
+
+
+def test_codex_attention_prompts_defer_when_agent_selected(tmp_path):
+    prompts = [
+        "Do you trust the contents of this directory?",
+        "Approval required\nAllow Codex to run command `pytest`?\nApprove / Deny",
+        "You've hit your usage limit. Your usage limit resets later today.",
+        "Unrecognized Codex screen",
+    ]
+    for idx, screen in enumerate(prompts, start=1):
+        run_root, cmux, log = _setup(tmp_path / str(idx))
+        r = _run(run_root, cmux, log, "SURF-UUID-9", "i1", "resume please",
+                 screen=screen, agent="codex")
+        assert r.returncode == 3, f"Codex attention/unknown screen must defer: {screen!r}"
+        assert not any(ln.startswith("send ") for ln in log.read_text().splitlines())

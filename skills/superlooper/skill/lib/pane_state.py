@@ -1,6 +1,9 @@
 """Pure classification of a cmux pane's screen into a send-safety state. No I/O.
 
-classify_screen(text, exited_marker=False, orchestrator=False) -> 'dead' | 'menu' | 'busy' | 'idle'
+classify_screen(text, exited_marker=False, orchestrator=False, agent='claude')
+  Claude -> 'dead' | 'menu' | 'busy' | 'idle'
+  Codex  -> 'dead' | 'busy' | 'idle' | 'trust_blocked' | 'permission_blocked' |
+            'quota_blocked' | 'unknown'
 
 The single decision behind every write into a pane (the doorbell AND the orchestrator's
 resume/answer/nudge), via bin/nudge-pane.sh:
@@ -16,11 +19,14 @@ Why a pure function: screen-scraping is the only signal an external process has 
 to type here", and it is render-version-sensitive — so it must be unit-tested in isolation, and
 the file markers (state/exited/<id>) are the deterministic backstop for the dangerous DEAD case.
 
-Order matters: DEAD, then BUSY (so a generation footer's 'esc to interrupt' is never mis-read as
-a menu), then MENU, else IDLE. For the ORCHESTRATOR surface we fail CLOSED — any ambiguous or
-unrecognized footer, or an unreadable/empty screen, is treated as 'menu' (defer) — because a
-stray Enter into the orchestrator corrupts the brain of the whole run, while a deferred ring is
-simply retried (review A5).
+Order matters for Claude: DEAD, then BUSY (so a generation footer's 'esc to interrupt' is never
+mis-read as a menu), then MENU, else IDLE. For the ORCHESTRATOR surface we fail CLOSED — any
+ambiguous or unrecognized footer, or an unreadable/empty screen, is treated as 'menu' (defer) —
+because a stray Enter into the orchestrator corrupts the brain of the whole run, while a deferred
+ring is simply retried (review A5).
+
+Codex has its own adapter below. It returns distinct blocked states for status surfaces while
+nudge-pane.sh maps those states to the same safe DEFER behavior.
 """
 import re
 
@@ -62,20 +68,71 @@ _MENU_PATTERNS_STRICT = _MENU_PATTERNS + [
     re.compile(r"▶\s|»\s"),
 ]
 
+# Codex-specific screen clues. Keep these out of the Claude path: a bare "›" is Codex's idle
+# composer, while Claude's modern composer uses "❯".
+_CODEX_BUSY_PATTERNS = [
+    re.compile(r"\bworking\b.*\besc(?:ape)? to interrupt\b", re.I),
+    re.compile(r"\brunning\s+posttooluse\s+hook\b", re.I),
+    re.compile(r"\brunning\s+\w+\s+hook\b", re.I),
+]
+_CODEX_IDLE = re.compile(r"(^|\n)\s*›(?:\s|\xa0|$)")
+_CODEX_TRUST = re.compile(r"\bdo you trust the contents of this directory\?", re.I)
+_CODEX_QUOTA = re.compile(
+    r"\busage limit resets\b|\busage limits? (?:resets?|reached)\b|\bquota\b.*\b(resets?|reached|exceeded)\b",
+    re.I,
+)
+_CODEX_PERMISSION_PATTERNS = [
+    re.compile(r"\bpermission\b.*\b(approve|approval|allow|deny)\b", re.I),
+    re.compile(r"\b(approve|allow|deny)\b.*\b(tool|command|permission)\b", re.I),
+    re.compile(r"\bdo you want to (?:allow|approve)\b", re.I),
+    re.compile(r"\bapproval required\b", re.I),
+]
+
 
 def _flatten(text):
     return re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
 
 
-def classify_screen(text, exited_marker=False, orchestrator=False):
+def _looks_dead(raw, flat):
+    if _SESSION_ENDED.search(flat):
+        return True
+    return bool(not _BUSY.search(raw) and _SHELL_PROMPT.search(raw) and "│" not in raw and "╰" not in raw)
+
+
+def _classify_codex(raw, flat, exited_marker=False):
     if exited_marker:
         return "dead"
+    if _looks_dead(raw, flat):
+        return "dead"
+    if not flat:
+        return "unknown"
+    if _CODEX_QUOTA.search(flat):
+        return "quota_blocked"
+    if _CODEX_TRUST.search(flat):
+        return "trust_blocked"
+    for pat in _CODEX_PERMISSION_PATTERNS:
+        if pat.search(flat) or pat.search(raw):
+            return "permission_blocked"
+    for pat in _CODEX_BUSY_PATTERNS:
+        if pat.search(flat) or pat.search(raw):
+            return "busy"
+    if _CODEX_IDLE.search(raw):
+        return "idle"
+    return "unknown"
+
+
+def classify_screen(text, exited_marker=False, orchestrator=False, agent="claude"):
     raw = text or ""
     flat = _flatten(raw)
+    if agent == "codex":
+        return _classify_codex(raw, flat, exited_marker=exited_marker)
+
+    if exited_marker:
+        return "dead"
 
     # DEAD (screen-scrape backstop to the exited marker): explicit end line, or a bare shell
     # prompt with no sign of a live Claude TUI.
-    if _SESSION_ENDED.search(flat):
+    if _looks_dead(raw, flat):
         return "dead"
     if not flat:
         # Unreadable/empty screen -> DEFER for BOTH surfaces (review BASH-3). A live idle Claude
@@ -85,9 +142,6 @@ def classify_screen(text, exited_marker=False, orchestrator=False):
         return "menu"
     if _BUSY.search(flat):
         return "busy"
-    if not _BUSY.search(raw) and _SHELL_PROMPT.search(raw) and "│" not in raw and "╰" not in raw:
-        # last line looks like a shell prompt and there are no Claude TUI box glyphs -> dead.
-        return "dead"
 
     patterns = _MENU_PATTERNS_STRICT if orchestrator else _MENU_PATTERNS
     for pat in patterns:

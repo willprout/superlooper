@@ -978,7 +978,7 @@ class Runner:
                f"{a.get('text', '')}\n"
                f"Your blocked marker has been cleared — continue with the issue.")
         rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
-                              env={"SL_RUN_ROOT": self.home}, timeout=NUDGE_TIMEOUT)
+                              env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
         if rc == 0:
             _rm(os.path.join(self.state, "blocked", iid))
             def m(st):
@@ -1131,7 +1131,7 @@ class Runner:
                    "issue; if you are blocked, write your blocked-question file; if you are "
                    "waiting on long background work, touch your awaiting marker.")
             rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
-                                  env={"SL_RUN_ROOT": self.home}, timeout=NUDGE_TIMEOUT)
+                                  env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
             if rc == 4:
                 self._mark_exited(iid, "dead pane found by frozen recovery", now)
                 return "dead pane — marked exited for relaunch"
@@ -1143,7 +1143,7 @@ class Runner:
         msg = ("[superlooper] Status check: are you progressing? If you are waiting on long "
                "background work, touch your awaiting marker (see your brief).")
         rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
-                              env={"SL_RUN_ROOT": self.home}, timeout=NUDGE_TIMEOUT)
+                              env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
         return "ok" if rc == 0 else f"nudge rc={rc}"
 
     # --- the gate's executors ---
@@ -1164,7 +1164,7 @@ class Runner:
         else:
             rc = self._run_script([self._script("nudge-pane.sh"), surface, iid,
                                    f"[superlooper gate] {a.get('message', '')}"],
-                                  env={"SL_RUN_ROOT": self.home}, timeout=NUDGE_TIMEOUT)
+                                  env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
         if rc in (0, 4):
             # sent, or unsendable-forever (dead pane): either way the one nudge is spent —
             # gate.nudge_or_park parks on the next pass (never an unbounded nudge loop)

@@ -15,7 +15,7 @@
 #   0 = sent (text + Enter). NOTE: "sent" is NOT "a turn was taken" — mid-generation input is
 #       queued/coalesced; the runner confirms real delivery via activity/report progress.
 #   1 = FAILED (a cmux send/send-key error).
-#   3 = DEFERRED (pane at a menu / ambiguous / unreadable). Caller retries later.
+#   3 = DEFERRED (pane at a menu / ambiguous / unreadable / Codex attention prompt). Caller retries later.
 #   4 = DEAD (the Claude process is gone; the pane is a bash shell). Caller RESTARTS — it must
 #       NEVER type, or the message would run as a permission-bypassed shell command (RC-DEADPANE).
 set -uo pipefail
@@ -64,6 +64,7 @@ raw = base64.b64decode(os.environ.get("SCREEN_B64", "") or "").decode("utf-8", "
 print(pane_state.classify_screen(
     raw,
     exited_marker=(os.environ.get("EXITED") == "1"),
+    agent=os.environ.get("SL_AGENT", "claude"),
 ))
 PY
 )"
@@ -71,6 +72,10 @@ PY
 case "$STATE" in
   dead) echo "[nudge] $ID pane is DEAD — not typing; caller must restart" >&2; exit 4 ;;
   menu) echo "[nudge] $ID pane at a menu/ambiguous — deferring" >&2; exit 3 ;;
+  trust_blocked) echo "[nudge] $ID Codex pane is waiting for directory trust — deferring" >&2; exit 3 ;;
+  permission_blocked) echo "[nudge] $ID Codex pane is waiting for permission approval — deferring" >&2; exit 3 ;;
+  quota_blocked) echo "[nudge] $ID Codex pane is usage/quota blocked — deferring" >&2; exit 3 ;;
+  unknown) echo "[nudge] $ID Codex pane state is unknown — deferring" >&2; exit 3 ;;
   busy|idle) : ;;                      # safe to send
   *)    echo "[nudge] $ID unknown pane state '$STATE' — deferring" >&2; exit 3 ;;
 esac

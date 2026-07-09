@@ -149,3 +149,67 @@ def test_permission_dialog_classifies_as_menu_defer():
     ]
     for screen in dialogs:
         assert ps.classify_screen(screen, exited_marker=False) == "menu", screen[:40]
+
+
+# --------------------------- Codex adapter fixtures ----------------------------------------------
+
+CODEX_IDLE_COMPOSER = (
+    "Welcome to Codex\n\n"
+    "› \n"
+    "  ? for shortcuts"
+)
+
+
+def test_codex_busy_fixtures():
+    assert ps.classify_screen("Working (12s • esc to interrupt)", agent="codex") == "busy"
+    assert ps.classify_screen("Running PostToolUse hook", agent="codex") == "busy"
+
+
+def test_codex_idle_composer_fixture():
+    assert ps.classify_screen(CODEX_IDLE_COMPOSER, agent="codex") == "idle"
+
+
+def test_codex_trust_prompt_fixture():
+    screen = "Do you trust the contents of this directory?\n\n  y yes\n  n no"
+    assert ps.classify_screen(screen, agent="codex") == "trust_blocked"
+
+
+def test_codex_permission_approval_prompt_fixtures():
+    screens = [
+        "Approval required\nAllow Codex to run command `pytest`?\n  Approve\n  Deny",
+        "Permission requested: approve or deny this tool use",
+        "Do you want to allow this command?",
+    ]
+    for screen in screens:
+        assert ps.classify_screen(screen, agent="codex") == "permission_blocked"
+
+
+def test_codex_usage_limit_fixture_is_quota_blocked():
+    screen = "You've hit your usage limit. Your usage limit resets at 5:00 PM."
+    assert ps.classify_screen(screen, agent="codex") == "quota_blocked"
+
+
+def test_codex_dead_fixtures():
+    assert ps.classify_screen("anything", exited_marker=True, agent="codex") == "dead"
+    assert ps.classify_screen("[i1] session ended 16:12 — scroll up, or: codex resume\n$ ",
+                              agent="codex") == "dead"
+    assert ps.classify_screen("william@mac superlooper % ", agent="codex") == "dead"
+
+
+def test_codex_unknown_fixtures_fail_closed():
+    assert ps.classify_screen("", agent="codex") == "unknown"
+    assert ps.classify_screen("Some unrecognized Codex screen", agent="codex") == "unknown"
+
+
+def test_codex_only_states_require_codex_agent_selection():
+    # The default Claude path remains the historical four-state classifier. Codex-specific labels
+    # must not leak into Claude classification unless the caller selected agent="codex".
+    codex_screens = [
+        "Do you trust the contents of this directory?",
+        "Approval required\nAllow Codex to run command `pytest`?",
+        "usage limit resets at 5:00 PM",
+        "Some unrecognized Codex screen",
+    ]
+    codex_only = {"trust_blocked", "permission_blocked", "quota_blocked", "unknown"}
+    for screen in codex_screens:
+        assert ps.classify_screen(screen) not in codex_only
