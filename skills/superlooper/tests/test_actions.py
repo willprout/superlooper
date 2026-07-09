@@ -909,12 +909,15 @@ def test_safety_actions_precede_work_actions():
 
 def test_lane_state_from_counts_only_inflight_statuses():
     st = {"version": 1, "issues": {
-        "i1": ist("running", declared_touches=["api"]),
-        "i2": ist("blocked"), "i3": ist("frozen"), "i4": ist("exited"),
+        "i1": ist("running", declared_touches=["api"], type="build"),
+        "i2": ist("blocked", type="investigate"), "i3": ist("frozen"), "i4": ist("exited"),
         "i5": ist("gating"), "i6": ist("merged"), "i7": ist("parked"),
         "i8": "corrupt"}}
     lanes = actions.lane_state_from(st)
     assert [x["id"] for x in lanes] == ["i1", "i2", "i3", "i4"]
     assert lanes[0]["touches"] == ["api"]
+    assert lanes[0]["type"] == "build"
+    assert lanes[1]["type"] == "investigate"
+    assert "type" not in lanes[2]
     assert actions.lane_state_from(None) == []
     assert actions.lane_state_from({"issues": "corrupt"}) == []

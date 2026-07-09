@@ -31,7 +31,8 @@ The view contract (assembled by runner.py each tick):
   parsed_issues  issues.parse_issue() dicts for the union of open `agent-ready` and open
                  `in-progress` issues (deduped). Wrong-typed nums are skipped here — an issue
                  that can't be identified can't be safely acted on.
-  lane_state     [{"id", "touches"}] for currently occupied lanes — lane_state_from() builds it.
+  lane_state     [{"id", "touches", "type"?}] for currently occupied lanes — lane_state_from()
+                 builds it.
   events         this tick's events.detect_events() output.
   disk           {"issues_state": loopstate dict, "blocked": {id: text}, "reports": {id: text},
                   "answers": {id: text}, "exited": {id: marker-text}, "frozen": dict|None,
@@ -146,8 +147,8 @@ def _dget(d, key, want):
 
 
 def lane_state_from(issues_state):
-    """[{"id", "touches"}] for every issue whose status occupies a lane, sorted by issue number
-    (deterministic). Pure; wrong-typed state or entries degrade to no lanes / no touches."""
+    """[{"id", "touches", "type"?}] for every issue whose status occupies a lane, sorted by issue
+    number (deterministic). Pure; wrong-typed state or entries degrade to no lanes / no touches."""
     issues = _dget(issues_state, "issues", dict)
     out = []
     for iid in _sorted_ids(k for k in issues if _iid_num(k) is not None):
@@ -155,7 +156,11 @@ def lane_state_from(issues_state):
         if isinstance(ist, dict) and ist.get("status") in INFLIGHT_STATUSES:
             touches = ist.get("declared_touches")
             touches = [t for t in touches if isinstance(t, str)] if isinstance(touches, list) else []
-            out.append({"id": iid, "touches": touches})
+            lane = {"id": iid, "touches": touches}
+            itype = ist.get("type")
+            if isinstance(itype, str) and itype:
+                lane["type"] = itype
+            out.append(lane)
     return out
 
 

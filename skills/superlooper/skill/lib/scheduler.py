@@ -6,9 +6,10 @@ Three gates, in order:
      v1's `or 0` coercion once read a partial payload as "0% used" and launched over quota; a
      NaN pct would sneak past a bare `>` comparison (NaN > 96 is False), so pcts must be FINITE.
   2. LANES: never exceed config.lanes concurrent sessions; never launch the same id twice.
-  3. ANTI-AFFINITY: under hard affinity, an issue whose declared touch-areas overlap a running
-     lane (or one already selected this tick) is HELD; under soft affinity the overlap is allowed
-     and flagged (symmetrically) for the journal.
+  3. ANTI-AFFINITY: under hard affinity, a merge-producing issue whose declared touch-areas
+     overlap a merge-producing running lane (or one already selected this tick) is HELD.
+     Investigations do not produce PRs or merges, so they are exempt in both directions. Under
+     soft affinity the overlap is allowed and flagged (symmetrically) for the journal.
 
 Eligibility itself (agent-ready, valid type, blocked-by closed) lives in issues.eligible.
 """
@@ -73,11 +74,24 @@ def overlaps(touches_a, touches_b, affinity):
     return _geometric_overlap(touches_a, touches_b)
 
 
+def _merge_affinity_subject(itype):
+    return itype != "investigate"
+
+
+def _anti_affinity_blocks(candidate, occupied, affinity):
+    if not _merge_affinity_subject(candidate.get("type")):
+        return False
+    if not _merge_affinity_subject(occupied.get("type")):
+        return False
+    return overlaps(candidate.get("touches", []), occupied.get("touches", []), affinity)
+
+
 def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen):
     """Return the issues to launch NOW, in priority order, as a list of dicts:
         {"id", "num", "touches", "soft_overlap": bool}
-    `lane_state` is the list of currently OCCUPIED lanes, each {"id", "touches"}. Each parsed
-    issue may carry a "requeue_front" flag (merged in by the runner from loopstate; default False).
+    `lane_state` is the list of currently OCCUPIED lanes, each {"id", "touches", "type"?}. Each
+    parsed issue may carry a "requeue_front" flag (merged in by the runner from loopstate; default
+    False).
     `soft_overlap` (soft affinity only) is True when this launch shares an area with ANY OTHER
     concurrent lane — pre-existing or same-tick — flagged symmetrically so the journal sees the pair.
     """
@@ -92,6 +106,8 @@ def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen):
     affinity = config.get("affinity", "hard")
     running_ids = {lane.get("id") for lane in lane_state}
     lane_touches = [lane.get("touches", []) for lane in lane_state]     # pre-existing occupied lanes
+    lane_occupied = [{"touches": lane.get("touches", []), "type": lane.get("type")}
+                     for lane in lane_state]
 
     candidates = [p for p in parsed_issues
                   if p.get("id") not in running_ids
@@ -100,18 +116,18 @@ def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen):
 
     selected_ids = set(running_ids)
     selected = []
-    occupied = list(lane_touches)                                      # existing + chosen so far
+    occupied = list(lane_occupied)                                     # existing + chosen so far
     for p in candidates:
         if len(selected) >= free:
             break
         if p.get("id") in selected_ids:                               # never launch the same id twice
             continue
         touches = p["touches"]
-        if any(overlaps(touches, ot, affinity) for ot in occupied):
+        if any(_anti_affinity_blocks(p, ot, affinity) for ot in occupied):
             continue                                                  # hard conflict -> held this tick
         selected.append(p)
         selected_ids.add(p.get("id"))
-        occupied.append(touches)
+        occupied.append({"touches": touches, "type": p.get("type")})
 
     # soft_overlap, computed after selection so it is SYMMETRIC: an issue is flagged if it shares
     # an area with any OTHER concurrent lane (a pre-existing lane, or another same-tick selection).

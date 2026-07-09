@@ -172,6 +172,57 @@ def test_hard_affinity_blocks_overlap_with_running_lane():
     assert _nums(out) == [2]           # #1 overlaps the running frontend lane -> held
 
 
+def test_hard_affinity_investigation_not_held_by_running_build_overlap():
+    q = [_issue(1, touches=["frontend"], labels=("type:investigate", "agent-ready"))]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    out = scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), False)
+    assert _nums(out) == [1]
+
+
+def test_hard_affinity_running_investigation_does_not_hold_build_overlap():
+    q = [_issue(2, touches=["frontend"], labels=("type:build", "agent-ready"))]
+    lanes = [{"id": "i9", "type": "investigate", "touches": ["frontend"]}]
+    out = scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), False)
+    assert _nums(out) == [2]
+
+
+def test_hard_affinity_investigation_selected_this_tick_does_not_hold_build_overlap():
+    q = [
+        _issue(1, touches=["frontend"], labels=("type:investigate", "agent-ready")),
+        _issue(2, touches=["frontend"], labels=("type:build", "agent-ready")),
+    ]
+    out = scheduler.launchable(q, [], _cfg(lanes=2, affinity="hard"), OK, set(), False)
+    assert _nums(out) == [1, 2]
+
+
+def test_hard_affinity_build_selected_this_tick_does_not_hold_investigation_overlap():
+    q = [
+        _issue(1, touches=["frontend"], labels=("type:build", "agent-ready")),
+        _issue(2, touches=["frontend"], labels=("type:investigate", "agent-ready")),
+    ]
+    out = scheduler.launchable(q, [], _cfg(lanes=2, affinity="hard"), OK, set(), False)
+    assert _nums(out) == [1, 2]
+
+
+def test_hard_affinity_investigation_still_held_by_open_blocked_by():
+    q = [_issue(1, touches=["frontend"], labels=("type:investigate", "agent-ready"),
+                blocked_by=[99])]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    assert scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), False) == []
+
+
+def test_hard_affinity_build_overlap_with_running_build_still_held():
+    q = [_issue(1, touches=["frontend"], labels=("type:build", "agent-ready"))]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    assert scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), False) == []
+
+
+def test_hard_affinity_diagnose_and_fix_overlap_with_build_still_held():
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    q = [_issue(1, touches=["frontend"], labels=("type:diagnose-and-fix", "agent-ready"))]
+    assert scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), False) == []
+
+
 def test_hard_affinity_wildcard_running_lane_blocks_all():
     q = [_issue(1, touches=["frontend"]), _issue(2, touches=["api"])]
     lanes = [{"id": "i9", "touches": ["*"]}]      # a running lane of unknown scope blocks everything
