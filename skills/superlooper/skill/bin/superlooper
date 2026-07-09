@@ -318,11 +318,19 @@ def cmd_doctor(args):
     check("launch shim installed", os.path.exists(shim),
           shim if os.path.exists(shim) else f"{shim} missing — run bin/install-launch-shim.sh")
     settings = _read(os.path.join(os.path.expanduser("~"), ".claude", "settings.json")) or ""
-    check("activity hooks registered", "activity-hook.sh" in settings
+    check("Claude activity hooks registered", "activity-hook.sh" in settings
           and "stop-hook.sh" in settings,
           "~/.claude/settings.json must register activity-hook.sh (PostToolUse) and "
           "stop-hook.sh (Stop) — bin/install.sh does this" if "activity-hook.sh" not in settings
           else "")
+    codex_home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    codex_hooks = _read(os.path.join(codex_home, "hooks.json")) or ""
+    codex_ok = "activity-hook.sh" in codex_hooks and "stop-hook.sh" in codex_hooks
+    print("  " + ("ok   " if codex_ok else "WARN ")
+          + "Codex activity hooks registered"
+          + ("" if codex_ok else
+             f" — {codex_home}/hooks.json missing superlooper hooks; needed only for --agent codex "
+             "(bin/install.sh registers them)"))
 
     if failures:
         print(f"\nDOCTOR FAILED: {', '.join(failures)}")

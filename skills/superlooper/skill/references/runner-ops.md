@@ -2,7 +2,7 @@
 
 This is the day-to-day operator's guide, written for William. The **runner** is a small,
 deterministic process on your Mac — no AI inside it, zero model tokens to run, one per adopted
-repo. It takes `agent-ready` issues, builds each in a fresh Claude session in its own worktree,
+repo. It takes `agent-ready` issues, builds each in a fresh coding-agent session in its own worktree,
 and merges to the dev mainline when the mechanical gate passes. It is designed to run unattended
 and to fail *safely*: every problem lands as either "continued safely around it" (one issue
 parks, the rest keep going) or "stopped early and safely" (merges freeze, nothing half-lands,
@@ -46,6 +46,60 @@ superlooper status --repo /path/to/repo      # lanes / queue / freeze state, fro
   automatically and no launch is duplicated.
 - **Status:** `superlooper status` renders the current lanes, the queue, and whether merges are
   frozen — read from the journal and disk, so it works whether or not the runner is up.
+
+### Agent selection
+
+Claude remains the default:
+
+```bash
+superlooper run --repo /path/to/repo
+superlooper run --repo /path/to/repo --agent claude
+```
+
+Codex v1 is opt-in:
+
+```bash
+superlooper run --repo /path/to/repo --agent codex
+```
+
+The queue, labels, merge gate, issue protocol, and command-center surfaces are unchanged by the
+agent choice. The runner sets `SL_AGENT=codex` only at the launch/nudge boundary; Codex sessions
+are interactive `codex` sessions in the issue worktree, not `codex exec`.
+
+Codex launch options live in `.superlooper/config.json`:
+
+```json
+"codex": {
+  "dangerous_bypass": false,
+  "bypass_hook_trust": true,
+  "no_alt_screen": true
+}
+```
+
+`dangerous_bypass` is the explicit switch for Codex's dangerous approval/sandbox bypass flag. Leave
+it `false` unless you are supervising that repo and accept the same risk profile as Claude's
+permission-bypassed worker sessions. `bypass_hook_trust` and `no_alt_screen` default on because the
+loop installs its own hooks and needs stable pane reads.
+
+Codex usage/quota accounting is intentionally deferred in v1. A Codex pane that shows trust,
+permission, quota, or unknown attention states is treated as a safe defer; the runner does not
+estimate Codex quota or make scheduling decisions from it yet.
+
+Automated tests use fake `codex`, fake `cmux`, and temporary `CODEX_HOME`/`HOME` fixtures only.
+Real cmux/Codex smoke tests are supervised/manual, not part of the automated suite. When you want a
+real smoke, run:
+
+```bash
+superlooper doctor --repo /path/to/repo
+superlooper run --repo /path/to/repo --agent codex --ticks 1
+```
+
+Expected observations: doctor shows Claude hooks as passing and Codex hooks as either passing or a
+Codex-only warning to fix before `--agent codex`; the run starts inside a visible cmux tab, prints
+`agent=codex`, resolves the pane, and exits after one tick. For a live issue smoke, apply
+`agent-ready` to one small issue, run without `--ticks`, and watch for a sibling cmux tab whose
+command is an interactive Codex session in `state/worktrees/i<N>` with the issue brief as the
+initial prompt.
 
 ---
 
@@ -291,7 +345,9 @@ superlooper doctor --repo /path/to/repo
 ```
 
 It verifies: `gh` is authenticated; `cmux` is on PATH; `jq` is present; the launch shim is
-installed; the two activity hooks are registered in `~/.claude/settings.json`; the config parses;
-the labels exist; and **`required_checks` is non-empty** — a repo with no CI check enforcing its own
-tests has no mechanical ship gate, so `doctor` **fails hard** on an empty `required_checks` and
-`adopt` prints the same requirement. Fix anything red, then start the runner.
+installed; the two Claude activity hooks are registered in `~/.claude/settings.json`; the config
+parses; the labels exist; and **`required_checks` is non-empty** — a repo with no CI check enforcing
+its own tests has no mechanical ship gate, so `doctor` **fails hard** on an empty `required_checks`
+and `adopt` prints the same requirement. It also reports Codex hook readiness from
+`$CODEX_HOME/hooks.json` or `~/.codex/hooks.json` as a warning when missing, because Codex is opt-in.
+Fix anything red, then start the runner.

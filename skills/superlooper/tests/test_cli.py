@@ -62,6 +62,9 @@ def rig(tmp_path):
     (home / ".claude").mkdir()
     (home / ".claude" / "settings.json").write_text(
         json.dumps({"hooks": {"PostToolUse": "activity-hook.sh", "Stop": "stop-hook.sh"}}))
+    (home / ".codex").mkdir()
+    (home / ".codex" / "hooks.json").write_text(
+        json.dumps({"hooks": {"PostToolUse": "activity-hook.sh", "Stop": "stop-hook.sh"}}))
     return type("Rig", (), {"env": env, "repo": repo, "fixdir": fixdir,
                             "home": home, "tmp": tmp_path})
 
@@ -119,6 +122,16 @@ def test_doctor_fails_when_shim_is_missing(rig):
     r = cli(rig, "doctor", "--repo", str(rig.repo))
     assert r.returncode != 0
     assert "shim" in (r.stdout + r.stderr).lower()
+
+
+def test_doctor_warns_when_codex_hooks_are_missing(rig):
+    (rig.home / ".codex" / "hooks.json").unlink()
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert "WARN" in out
+    assert "Codex activity hooks registered" in out
+    assert "hooks.json" in out
 
 
 # --------------------------- adopt ---------------------------

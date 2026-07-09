@@ -18,6 +18,7 @@
   "report_required_sections": ["Tests", "Browser evidence", "Regression tests", "Review"],
   "bright_lines": [],
   "models": { "worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": null },
+  "codex": { "dangerous_bypass": false, "bypass_hook_trust": true, "no_alt_screen": true },
   "session": { "idle_seconds": 480, "freeze_seconds": 2700,
                "retry_cap": 2, "conflict_cap": 2 },
   "qa": { "nightly_cmd": null, "results_glob": null,
