@@ -375,6 +375,21 @@ class Runner:
         return usage_mod.fetch_claude_usage()
 
     def _refresh_usage(self, now):
+        if self.agent == "codex":
+            # Codex quota accounting is intentionally deferred in the v1 adapter. Do not let
+            # Claude's usage endpoint fail-closed gate block opt-in Codex launches.
+            self._usage["checked_at"] = now
+            if self._usage["first_attempt_at"] is None:
+                self._usage["first_attempt_at"] = now
+            self._usage["last_ok"] = {
+                "auth_status": "ok",
+                "five_hour_pct": 0.0,
+                "seven_day_pct": 0.0,
+                "usage_deferred": True,
+                "agent": "codex",
+            }
+            self._usage["last_ok_at"] = now
+            return
         if now - self._usage["checked_at"] < USAGE_REFRESH_SECONDS:
             return
         self._usage["checked_at"] = now

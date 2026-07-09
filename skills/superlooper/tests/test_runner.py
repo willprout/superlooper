@@ -322,6 +322,22 @@ def test_launch_env_carries_explicit_codex_agent_without_changing_protocol(rig):
     assert call["env"]["SL_CODEX_NO_ALT_SCREEN"] == "1"
 
 
+def test_codex_usage_is_deferred_and_does_not_call_claude_usage(rig):
+    # Codex usage/quota accounting is deferred in v1, so stale/unavailable Claude usage must not
+    # block an opt-in Codex launch.
+    rig.r.agent = "codex"
+    rig.r._fetch_usage = lambda: (_ for _ in ()).throw(AssertionError("Claude usage called"))
+
+    rig.r.tick(now=NOW)
+
+    assert any(c["args"][0].endswith("launch-session.sh") and c["args"][1] == "i101"
+               for c in rig.calls)
+    usage = rig.r.usage_view()
+    assert usage["auth_status"] == "ok"
+    assert usage["usage_deferred"] is True
+    assert usage["agent"] == "codex"
+
+
 def test_codex_launch_env_uses_config_and_label_overrides(rig):
     rig.r.agent = "codex"
     rig.r.config["codex"]["dangerous_bypass"] = True
