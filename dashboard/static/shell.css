@@ -187,11 +187,13 @@ html, body {
 .card {
   background: #FAFBFC; border: 1px solid #E1E7EE; border-radius: 6px;
   padding: 12px 13px; display: flex; flex-direction: column; gap: 8px;
+  min-width: 0;
 }
 .card .chips { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
 .chip {
   font: 600 11px var(--mono); padding: 1px 7px; border-radius: 3px;
   background: var(--blue-chip-bg); border: 1px solid var(--blue-chip-border); color: var(--blue);
+  max-width: 100%; overflow-wrap: anywhere;
 }
 .chip.state {
   background: var(--amber-bg); border-color: var(--amber-border); color: var(--amber-ink);
@@ -200,10 +202,20 @@ html, body {
 .card .memo {
   font: 400 11px/1.55 var(--mono); color: var(--muted);
   background: #F1F4F8; border: 1px solid #E1E7EE; border-radius: 4px; padding: 7px 9px;
-  white-space: pre-wrap; word-break: break-word;
-  max-height: 5.2em; overflow: hidden;
+  white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+  max-height: 14rem; overflow: auto;
 }
-.card .actions { display: flex; gap: 7px; align-items: center; padding-top: 2px; }
+.card .actions {
+  display: flex; gap: 7px; align-items: stretch; flex-wrap: wrap; padding-top: 2px;
+}
+.card .actions .btn {
+  max-width: 100%; min-width: 0; white-space: normal; line-height: 1.25; text-align: center;
+}
+.card .actions .btn.primary { flex: 1 1 100%; }
+.card .actions .btn.ghost { flex: 1 1 calc(50% - 4px); }
+.card .actions .btn-note {
+  flex: 1 1 100%; margin-left: 0; text-align: left; line-height: 1.25;
+}
 .btn {
   border-radius: 6px; font: 600 12px var(--sans); padding: 6px 13px; cursor: pointer;
 }
