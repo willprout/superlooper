@@ -64,8 +64,8 @@ PR #4).*
   waits) have the WIDEST window. Reconciled 2026-07-09 against this repo's investigation
   exemption (PR #4) — the fix composes cleanly; see §2b of the incident doc. Full scope + DoD
   + the deliberate park/wildcard decision: `INCIDENT-2026-07-09-held-territory-window.md`
-  (sibling). Interim mitigation active meanwhile: blocked-by chaining for overlapping issues
-  (doc §4; delete that guidance when this ships).
+  (sibling). Filed 2026-07-09 as issue #6. Interim mitigation active meanwhile: blocked-by
+  chaining for overlapping issues (doc §4; delete that guidance when this ships).
 
 ## Parked with preconditions (see the incident docs for detail)
 
@@ -74,7 +74,7 @@ PR #4).*
   command-center quota fix has running data AND a gh-call census sizes the real API budget.
   `INCIDENT-2026-07-08-park-notify-storm.md` (sibling) is authoritative. Precondition (a) is
   accumulating (the dashboard quota fix deployed 2026-07-08); precondition (b) is the
-  gh-call-census investigation issue, filed 2026-07-09.
+  gh-call-census investigation, filed 2026-07-09 as issue #8.
 - **Dogfooding.** Superlooper running its own fix loop — now real: this monorepo is adopted
   and has merged loop-built PRs. Standing candidate issue: dedup the close mechanics between
   runner.py `_close_stale_session` and tidy's `_close_window` (deferred from the tidy session
@@ -96,7 +96,7 @@ PR #4).*
 - **Shareability guard ineffective (loop-fixable dashboard bug).**
   `dashboard/tests/test_no_absolute_paths.py` checks for the wrong account string, so a real
   home-path leak would pass. Zero live leaks confirmed at migration time; the guard is a
-  no-op. Filed as a loop issue 2026-07-09.
+  no-op. Filed as a loop issue 2026-07-09 (issue #7).
 - **`will-titan` left in ~22 tracked files on purpose.** Old GitHub org name in dashboard
   test fixtures + sample data. Harmless (not a credential; tests self-contained). Left
   intentionally — bulk-renaming risks breaking slug-dependent assertions (airline colors,
