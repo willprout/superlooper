@@ -989,3 +989,114 @@ def test_the_stand_shows_at_most_one_plane_per_gate(tmp_path):
     stand = snap["repos"][0]["stand"]
     assert len(stand) == server.STAND_BAYS
     assert [s["num"] for s in stand] == [60, 61, 62, 63][:server.STAND_BAYS]
+
+
+# =============================== GitHub-unreachable: an honest state, never a false all-clear (#38) ===============================
+# When gh is missing / unauthenticated every GitHub read fails closed to empty, and a quiet field
+# would render a cheerful "all clear" indistinguishable from genuinely having no work. The snapshot
+# must tell "gh answered: nothing there" from "gh unavailable/refused" — derived from the open-issue
+# read it ALREADY makes (open_issues_probe), never an extra gh call (issue #38 boundary).
+
+def _quiet_home(tmp_path, name):
+    """An empty, healthy state home (no flights, fresh heartbeat) — the field where the caption logic
+    engages, so a false vs honest all-clear is unambiguous."""
+    dst = tmp_path / ("will-titan__" + name)
+    (dst / "state").mkdir(parents=True)
+    (dst / "state" / "issues.json").write_text(json.dumps({"version": 1, "issues": {}}))
+    (dst / "state" / "runner.heartbeat").write_text(str(NOW - 5))
+    return dst
+
+
+class _ProbeGh:
+    """A gh stub that reports reachability through ``open_issues_probe`` (the real adapter's #38
+    surface). ``reachable=False`` models a missing / unauthenticated / timed-out gh: every read fails
+    closed to empty, exactly like the real adapter. Every call is counted so a test can prove the
+    reachability signal rides a call the snapshot already makes — no extra gh call."""
+    def __init__(self, reachable):
+        self._reachable = reachable
+        self.probe_calls = 0
+        self.open_issues_unlabeled_calls = 0
+        self.open_issues_labeled_calls = 0
+
+    def open_issues_probe(self, repo, label=None, limit=200):
+        self.probe_calls += 1
+        return [], self._reachable
+
+    def open_issues(self, repo, label=None, limit=200):
+        if label == "agent-ready":
+            self.open_issues_labeled_calls += 1
+        else:
+            self.open_issues_unlabeled_calls += 1
+        return []
+
+    def issue(self, repo, num):
+        return {}
+
+    def pr_for_branch(self, repo, branch):
+        return {}
+
+    def pr_comments(self, repo, num):
+        return []
+
+
+def test_snapshot_marks_github_unreachable_when_gh_refuses(tmp_path):
+    dst = _quiet_home(tmp_path, "unreachable")
+    snap = server.assemble_snapshot(_config(dst), now=NOW, gh_mod=_ProbeGh(reachable=False))
+    repo = snap["repos"][0]
+    assert repo["github"]["unreachable"] is True
+    assert repo["github"]["reachable"] is False
+    assert snap["github"]["unreachable"] is True       # top-level aggregate for a global surface
+
+
+def test_unreachable_github_suppresses_the_false_all_clear_caption(tmp_path):
+    # The bug (issue #38): a quiet field + a dead gh must NOT read "all clear" — that false calm is
+    # indistinguishable from genuinely having no work. The dark-tower state carries the truth instead.
+    dst = _quiet_home(tmp_path, "unreachable2")
+    snap = server.assemble_snapshot(_config(dst), now=NOW, gh_mod=_ProbeGh(reachable=False))
+    assert snap["repos"][0]["field_caption"] is None
+
+
+def test_reachable_empty_github_still_says_all_clear(tmp_path):
+    # DoD #3: when gh ANSWERS empty, the genuine all-clear is UNCHANGED — reachable=True is an honest
+    # "no work", not an outage. This is the calm the unreachable state must never be confused with.
+    dst = _quiet_home(tmp_path, "empty")
+    snap = server.assemble_snapshot(_config(dst), now=NOW, gh_mod=_ProbeGh(reachable=True))
+    repo = snap["repos"][0]
+    assert repo["github"]["unreachable"] is False
+    assert repo["github"]["reachable"] is True
+    assert repo["field_caption"] == "no landings yet — all clear"
+    assert snap["github"]["unreachable"] is False
+
+
+def test_github_reachability_is_unknown_without_a_wired_adapter(tmp_path):
+    # gh_mod=None is an embedder that never wired GitHub — reachability UNKNOWN, never "unreachable".
+    # The genuine all-clear (the pre-existing None-gh behavior) must be preserved, not alarmed.
+    dst = _quiet_home(tmp_path, "nogh")
+    snap = server.assemble_snapshot(_config(dst), now=NOW)     # no gh_mod
+    repo = snap["repos"][0]
+    assert repo["github"]["unreachable"] is False
+    assert repo["github"]["reachable"] is None
+    assert repo["field_caption"] == "no landings yet — all clear"
+
+
+def test_unreachable_state_self_heals_when_github_returns(tmp_path):
+    # DoD #2: self-healing on recovery. The same field flips back the instant gh answers again — the
+    # state is derived FRESH each poll, nothing is latched.
+    dst = _quiet_home(tmp_path, "heal")
+    down = server.assemble_snapshot(_config(dst), now=NOW, gh_mod=_ProbeGh(reachable=False))
+    assert down["repos"][0]["github"]["unreachable"] is True
+    assert down["repos"][0]["field_caption"] is None
+    up = server.assemble_snapshot(_config(dst), now=NOW, gh_mod=_ProbeGh(reachable=True))
+    assert up["repos"][0]["github"]["unreachable"] is False
+    assert up["repos"][0]["field_caption"] == "no landings yet — all clear"
+
+
+def test_reachability_rides_the_existing_open_issue_read_no_extra_gh_call(tmp_path):
+    # Boundary (issue #38): derive the state from calls already made — no new gh call. The snapshot
+    # learns reachability through open_issues_probe (the unlabeled open-issue read it already makes),
+    # never a SECOND unlabeled open_issues call added alongside it.
+    dst = _quiet_home(tmp_path, "count")
+    gh = _ProbeGh(reachable=True)
+    server.assemble_snapshot(_config(dst), now=NOW, gh_mod=gh)
+    assert gh.probe_calls == 1                    # one unlabeled probe carries reachability + titles
+    assert gh.open_issues_unlabeled_calls == 0    # …and it REPLACED the old unlabeled open_issues read
