@@ -416,7 +416,8 @@ class Runner:
             self.gh_view = {**self.gh_view, "stale": True,
                             "consecutive_failures": self.gh_view.get("consecutive_failures", 0) + 1}
             return
-        calls = [5]                                    # probe+lists+dev_checks below
+        calls = [6]                                    # probe+lists below, +2 for the dev view
+        # (gh.branch_checks now reads BOTH /check-runs and /status — the full dev universe, #23)
 
         def budget():
             calls[0] += 1

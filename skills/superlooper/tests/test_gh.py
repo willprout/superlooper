@@ -122,7 +122,41 @@ def test_comment_reads_wrong_typed_body_is_refused(ghenv):
 
 
 def test_branch_checks_normalized(ghenv):
+    # with no commit-status fixture, the /status endpoint fails closed to nothing, so the dev
+    # view is exactly the check-runs (the pre-#23 shape stays a subset — a missing status
+    # endpoint never breaks the dev poll).
     assert gh.branch_checks("main") == [
+        {"name": "review/local-gate", "status": "completed", "conclusion": "success"},
+        {"name": "quality-gate", "status": "completed", "conclusion": "success"},
+    ]
+
+
+def test_branch_checks_merges_check_runs_and_commit_statuses(ghenv):
+    # issue #23: the dev view must carry the SAME check universe the PR rollup carries —
+    # check-runs AND commit statuses — so a required check that reports on the dev branch only
+    # as a commit status is visible to freeze/unfreeze. A check-runs-only view was blind to it
+    # (its dev view read pending forever, so a mainline freeze could never auto-lift).
+    (ghenv / "commit_status.json").write_text(json.dumps({
+        "state": "success",
+        "statuses": [{"context": "ship/status", "state": "success"}],
+    }))
+    got = gh.branch_checks("main")
+    # the check-runs (CheckRun shape) survive unchanged...
+    assert {"name": "review/local-gate", "status": "completed", "conclusion": "success"} in got
+    assert {"name": "quality-gate", "status": "completed", "conclusion": "success"} in got
+    # ...and the commit status rides along in the StatusContext shape gate.required_checks_state
+    # already folds ({context, state}), so no downstream special-casing is needed.
+    assert {"context": "ship/status", "state": "success"} in got
+    assert len(got) == 3
+
+
+def test_branch_checks_partial_when_status_endpoint_is_wrong_typed(ghenv):
+    # fail closed INDEPENDENTLY: a wrong-typed /status body drops only the status contribution;
+    # the check-runs still form the dev view (a required status then reads missing -> pending,
+    # never a false green).
+    (ghenv / "commit_status.json").write_text('"a bare string, wrong type"')
+    got = gh.branch_checks("main")
+    assert got == [
         {"name": "review/local-gate", "status": "completed", "conclusion": "success"},
         {"name": "quality-gate", "status": "completed", "conclusion": "success"},
     ]
@@ -256,12 +290,13 @@ def test_pr_for_branch_argv_pins_head_and_state_all(ghenv):
 
 
 def test_branch_checks_argv_encodes_slashed_ref(ghenv):
-    # the real-gh bug the fake would mask: a slashed branch must be URL-encoded in the api path.
+    # the real-gh bug the fake would mask: a slashed branch must be URL-encoded in BOTH the
+    # check-runs AND the commit-status api paths (issue #23 widened the dev view to read both).
     gh.branch_checks("sl/i1-x")
-    argv = _calls(ghenv)[-1]
-    assert argv[0] == "api"
-    assert "commits/sl%2Fi1-x/check-runs" in argv[1]
-    assert "sl/i1-x/check-runs" not in argv[1]        # the raw (broken) form must NOT appear
+    api_paths = [c[1] for c in _calls(ghenv) if c and c[0] == "api" and len(c) > 1]
+    assert any("commits/sl%2Fi1-x/check-runs" in p for p in api_paths)
+    assert any("commits/sl%2Fi1-x/status" in p for p in api_paths)
+    assert not any("sl/i1-x/" in p for p in api_paths)   # the raw (broken) form must NOT appear
 
 
 def test_compare_argv_encodes_refs(ghenv):

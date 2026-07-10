@@ -190,15 +190,39 @@ def pr_for_branch(branch):
 
 
 def branch_checks(branch):
-    """Check-run rollup for a branch's HEAD commit (used to poll dev checks post-merge, where no
-    PR exists). Normalized to [{name, status, conclusion}]. gh substitutes {owner}/{repo}; the ref
-    is URL-encoded so a slashed branch (sl/i1-x) doesn't split into extra path segments."""
-    d = _json_dict(["api", "repos/{owner}/{repo}/commits/%s/check-runs" % quote(branch, safe="")])
-    runs = d.get("check_runs")
-    if not isinstance(runs, list):
-        return []
-    return [{"name": r.get("name"), "status": r.get("status"), "conclusion": r.get("conclusion")}
-            for r in runs if isinstance(r, dict)]
+    """The dev branch HEAD's FULL required-check universe — check-runs AND commit statuses —
+    used to poll dev checks post-merge, where no PR exists (the poll behind freeze/unfreeze).
+
+    GitHub splits these across TWO REST endpoints: /check-runs (CheckRun) and /status (the
+    combined commit-status, latest per context). The GraphQL statusCheckRollup the PR view reads
+    unifies both, so a dev poll that read ONLY /check-runs was BLIND to any required check that
+    reports on the branch as a commit status — its dev view read pending forever, so a mainline
+    freeze could never auto-lift (issue #23). Reading both here restores parity with the PR view.
+
+    Normalized to the SAME two shapes the PR rollup carries, so gate.required_checks_state folds
+    them with no special-casing: check-runs -> {name, status, conclusion}; statuses ->
+    {context, state}. gh substitutes {owner}/{repo}; the ref is URL-encoded so a slashed branch
+    (sl/i1-x) doesn't split into extra path segments.
+
+    The two reads fail closed INDEPENDENTLY to their empty contribution: a required check that
+    never reports still reads pending (never a false green -> never a spurious unfreeze), and a
+    red on EITHER endpoint still freezes. For a required check that reports via a SINGLE endpoint
+    (the norm — GitHub identifies a required check by one context/name), a blip on the other
+    endpoint can only shrink that check's view toward pending, never toward green. The lone
+    exception is a name double-reported across BOTH endpoints with conflicting verdicts where the
+    red side blips — a misconfiguration corner, not a real required-check shape."""
+    ref = quote(branch, safe="")
+    out = []
+    runs = _json_dict(["api", "repos/{owner}/{repo}/commits/%s/check-runs" % ref]).get("check_runs")
+    if isinstance(runs, list):
+        out += [{"name": r.get("name"), "status": r.get("status"),
+                 "conclusion": r.get("conclusion")}
+                for r in runs if isinstance(r, dict)]
+    statuses = _json_dict(["api", "repos/{owner}/{repo}/commits/%s/status" % ref]).get("statuses")
+    if isinstance(statuses, list):
+        out += [{"context": s.get("context"), "state": s.get("state")}
+                for s in statuses if isinstance(s, dict)]
+    return out
 
 
 def compare(base, head):

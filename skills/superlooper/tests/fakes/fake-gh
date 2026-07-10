@@ -223,9 +223,16 @@ def _rollup(st, pr):
     ru = pr.get("statusCheckRollup")
     if ru != "auto":
         return ru
+    # The GraphQL statusCheckRollup carries BOTH shapes GitHub reports: CheckRun (name/conclusion)
+    # from check_names, and StatusContext (context/state) from status_names — a commit status a
+    # ship script stamps. A repo can require either; the dev poll (gh.branch_checks) must see both
+    # (issue #23), so the fake must render both here too.
     concl = pr.get("pr_check_conclusion") or st.get("pr_check_conclusion", "SUCCESS")
-    return [{"name": n, "status": "COMPLETED", "conclusion": concl}
+    scon = pr.get("pr_status_conclusion") or st.get("pr_status_conclusion", "SUCCESS")
+    runs = [{"name": n, "status": "COMPLETED", "conclusion": concl}
             for n in st.get("check_names", [])]
+    statuses = [{"context": n, "state": scon} for n in st.get("status_names", [])]
+    return runs + statuses
 
 
 def _mergeable(st, pr):
@@ -385,6 +392,14 @@ def main_stateful():
             runs = st.get("branch_checks", {}).get(ref, [])
             print(json.dumps({"check_runs": runs}))
             sys.exit(0)
+        if path.endswith("/status"):
+            # the combined commit-status endpoint (issue #23): the dev poll reads this in
+            # addition to /check-runs. `statuses` is the latest status per context; the top-level
+            # `state` is unused by the product parser but included for shape fidelity.
+            ref = unquote(path.split("/commits/")[1].split("/status")[0])
+            statuses = st.get("branch_statuses", {}).get(ref, [])
+            print(json.dumps({"state": "success", "statuses": statuses}))
+            sys.exit(0)
         if "compare" in path:
             print(json.dumps(st.get("compare", {})))
             sys.exit(0)
@@ -523,7 +538,9 @@ def main_stateful():
             # wrong-typed rollup or entry: corrupt check data can't prove green, so it blocks
             # (this repo's fail-open-on-wrong-typed defect class, Codex round-2).
             rollup = _rollup(st, pr)
-            protected = set(st.get("check_names", []))
+            # protected = required check-runs AND required commit-status contexts (issue #23):
+            # branch protection enforces both, so a red required status blocks the merge too.
+            protected = set(st.get("check_names", [])) | set(st.get("status_names", []))
             if not isinstance(rollup, list):
                 die("pr %s is blocked: statusCheckRollup is unreadable" % ARGS[2])
             greens = {}

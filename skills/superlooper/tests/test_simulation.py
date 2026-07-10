@@ -1226,6 +1226,70 @@ def test_red_dev_freezes_files_once_builds_continue_green_unfreezes(sim_factory)
     assert [r for r in sim.journal("unfreeze") if r.get("outcome") == "ok"]
 
 
+def test_dev_commit_status_freeze_auto_lifts_when_status_greens(sim_factory):
+    # issue #23: the required check reports on the dev branch ONLY as a commit STATUS (a
+    # ship-script stamp), never a check-run. A dev poll that read only the REST check-runs API
+    # was BLIND to it -> the dev view read pending forever -> a mainline freeze could NEVER
+    # auto-lift (a human had to delete merges_frozen.json). The widened dev view (check-runs +
+    # commit statuses) sees the ship status go green and lifts the freeze.
+    sim = sim_factory(required_checks=("ship",))
+
+    def to_status_only(st):
+        st["check_names"] = []                                  # no required CHECK-RUN anywhere
+        st["status_names"] = ["ship"]                           # "ship" rides the rollup as a status
+        st["branch_checks"] = {"main": []}                      # dev HEAD carries NO check-runs
+        st["branch_statuses"] = {"main": [{"context": "ship", "state": "failure"}]}   # red status
+    sim.edit_gh_state(to_status_only)
+
+    num = sim.add_issue(title="Builds during the status freeze",
+                        scenario={"scenario": "happy", "linger": True})
+    sid = "i%d" % num
+
+    sim.tick()
+    marker = sim.frozen_marker()
+    assert marker and marker.get("source") == "dev-check", marker
+    # freeze stops MERGES, never builds: the launch happened under the freeze
+    assert sim.loop_issue(sid).get("status") == "running", \
+        "frozen-but-building is the safe idle state — builds must continue"
+
+    # the finished PR HOLDS while frozen; a check-runs-only dev view would hold it FOREVER (the
+    # ship status is invisible to /check-runs, so the freeze would never auto-lift).
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "holding")
+    sim.tick()
+    assert not sim.mutations("merge_pr"), "a frozen mainline must hold every merge"
+
+    # the ship STATUS goes green on dev -> the widened dev view sees it -> unfreeze -> merge flows
+    sim.edit_gh_state(lambda st: st["branch_statuses"].update(
+        main=[{"context": "ship", "state": "success"}]))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert sim.frozen_marker() is None
+    assert [r for r in sim.journal("unfreeze") if r.get("outcome") == "ok"]
+
+
+def test_red_dev_status_stays_frozen_until_green(sim_factory):
+    # fail-closed companion to the above: a genuinely red required STATUS on dev freezes and
+    # STAYS frozen while it is red — the widened view never fabricates a green.
+    sim = sim_factory(required_checks=("ship",))
+
+    def to_red_status(st):
+        st["check_names"] = []
+        st["status_names"] = ["ship"]
+        st["branch_checks"] = {"main": []}
+        st["branch_statuses"] = {"main": [{"context": "ship", "state": "failure"}]}
+    sim.edit_gh_state(to_red_status)
+
+    sim.tick()
+    assert sim.frozen_marker(), "a red required status must freeze"
+    # the status stays red across several ticks -> the mainline stays frozen (never auto-lifts)
+    for _ in range(3):
+        sim.tick()
+    assert sim.frozen_marker(), "a still-red status must keep the mainline frozen (fail closed)"
+    assert not [r for r in sim.journal("unfreeze") if r.get("outcome") == "ok"], \
+        "no unfreeze may fire while the required status is red"
+
+
 def test_fix_issue_create_blip_retries_without_duplicate(sim_factory):
     # a gh blip on the CREATE of the standing-rule fix issue: the next tick retries; the
     # GitHub-reconcile pass guarantees ONE issue per fingerprint, never two.
