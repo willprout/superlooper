@@ -248,6 +248,12 @@ class Runner:
         self._consecutive_tick_errors = 0    # reset on the first clean tick (incident 2026-07-07)
         self._tick_alert_on_disk = False     # the wedge ALERT is confirmed written (retry until so)
         self._tick_alert_notified = False    # the wedge notify+journal fired once this episode
+        # DISTINCT issues in the current unbroken run of launch-delivery failures (issue #24). Any
+        # verified delivery clears it; >= actions.SYSTEMIC_LAUNCH_FAILURE_CAP distinct ids is a
+        # SYSTEMIC launch fault (dead anchor), not N per-issue parks. In-memory on purpose (like
+        # _consecutive_tick_errors): it is live runtime health, and a restart — the documented
+        # recovery for a wedged anchor — is exactly when it should reset to a clean slate.
+        self._launch_fail_ids = set()
 
         self.state = os.path.join(self.home, "state")
         self.issues_path = os.path.join(self.state, "issues.json")
@@ -663,6 +669,29 @@ class Runner:
             "last_report_date": (_read(os.path.join(self.state, "last_morning_report")) or "").strip() or None,
         }
 
+    def _wants_launch(self):
+        """True if the last poll left any APPROVED, not-yet-in-flight issue in the queue — the only
+        condition under which the launch anchor matters. Gates the per-tick anchor re-probe (below)
+        so an idle runner never shells out to cmux, and never alerts, with nothing to launch (#24).
+        Mirrors the morning report's waiting-queue rule (agent-ready, not in-progress)."""
+        for p in self._parsed_by_id.values():
+            labels = [l for l in (p.get("labels") or []) if isinstance(l, str)]
+            if "agent-ready" in labels and "in-progress" not in labels:
+                return True
+        return False
+
+    def _anchor_status(self):
+        """Re-validate the launch anchor — the cmux pane every worker tab is born in — as a
+        {"ok", "reason"} dict for the view. The runner resolves this pane once at boot and preflight
+        fails hard there; but nothing re-checked it AFTER the loop started, so a pane that died
+        mid-run (the runner's tab dragged to another cmux window, ordinary human tidying) went
+        undetected while every launch failed delivery and the per-issue cap walked the whole queue
+        into parks (incident 2026-07-09). This runs the SAME read-only probe each tick there is
+        launch demand, so a dead anchor is caught as a RUNNER-level fault (one alert, launches held)
+        rather than mistaken for N per-issue launch failures. Injected/overridden in tests."""
+        ok, why = preflight_pane(self.pane)
+        return {"ok": ok, "reason": why}
+
     # ------------------------- events -------------------------
 
     def _events_dir(self):
@@ -755,6 +784,13 @@ class Runner:
         if not self.gh_view.get("stale"):
             self._refresh_finishing_prs(ist_map)
             self._refresh_finishing_investigation_comments(ist_map)
+
+        # Launch-anchor liveness (issue #24): hand decide the runner-level launch-health signals it
+        # can't sense itself (it is pure). The DISTINCT-failure streak always; the per-tick pane probe
+        # only when there is demand to launch (so an idle runner never shells out to cmux or alerts).
+        disk["launch_fail_ids"] = sorted(self._launch_fail_ids)
+        if self._wants_launch():
+            disk["launch_anchor"] = self._anchor_status()
 
         lane_state = actions.lane_state_from(st)
         acts = actions.decide(now, self.config, self.usage_view(),
@@ -1012,7 +1048,12 @@ class Runner:
         if rc == 0:
             gh.set_labels(num, add=["in-progress"], remove=["agent-ready"])
             self._update_issue(iid, {"status": "running"})
+            self._launch_fail_ids.clear()              # a verified delivery proves the anchor is live
             return "ok"
+        # Delivery NOT verified: bump the per-issue cap AND record this id in the runner-level
+        # anchor streak (issue #24) — decide reads the streak to tell a dead anchor (many distinct
+        # ids) from a genuinely bad issue (one), and hold the queue instead of walking it into parks.
+        self._launch_fail_ids.add(iid)
         self._update_issue(iid, {"status": "ready"},
                            fn=lambda st, i: self._bump(i, "launch_failures"))
         return f"launch rc={rc} (delivery not verified)"
@@ -1203,6 +1244,7 @@ class Runner:
                                   timeout=LAUNCH_TIMEOUT)
             if rc == 0:
                 self._update_issue(iid, {"status": "running"})
+                self._launch_fail_ids.clear()          # a verified delivery proves the anchor is live (#24)
                 return "ok"
             self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
             return f"relaunch rc={rc}"
@@ -1361,6 +1403,7 @@ class Runner:
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,
                                      "update_head_oid": None, "nudged": []})
+            self._launch_fail_ids.clear()              # a verified delivery proves the anchor is live (#24)
             return "ok"
         self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
         return f"conflict-session launch rc={rc}"

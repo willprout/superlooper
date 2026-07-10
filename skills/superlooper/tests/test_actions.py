@@ -250,6 +250,121 @@ def test_regenerated_issue_relaunches_on_its_stamped_branch():
     assert a["branch"] == "sl/i5-issue-5-r1"
 
 
+# =========================== launch anchor liveness (#24) ===========================
+# The 2026-07-09 incident: the launch anchor — the cmux pane every worker tab is born in —
+# died mid-run (the runner's tab dragged between cmux windows). Each fresh launch failed
+# delivery, and the per-issue cap (2 attempts -> park -> notify) walked the WHOLE queue: 10
+# approved issues became 10 parks + 10 notifications. A dead anchor is a SYSTEMIC, runner-level
+# fault: ONE alert, launches HELD, the queue left intact — never N per-issue parks. Two
+# independent detectors feed one degraded mode: the runner's per-tick pane probe (launch_anchor)
+# and the runner's streak of distinct launch-delivery failures (launch_fail_ids).
+
+def _anchor_down():
+    return {"ok": False, "reason": "cmux cannot resolve pane 'p1' from this workspace"}
+
+
+def _anchor_ok():
+    return {"ok": True, "reason": ""}
+
+
+def test_dead_launch_anchor_alerts_once_holds_launches_and_never_parks():
+    dsk = disk(launch_anchor=_anchor_down())
+    out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
+    assert only(out, "launch") == []                       # every launch held
+    assert only(out, "park") == []                         # zero parks: the queue is intact
+    assert only(out, "relabel") == []                      # agent-ready never stripped
+    a = only(out, "alert")
+    assert len(a) == 1 and a[0]["reasons"] == ["launch_anchor_down"]
+    assert len(only(out, "notify")) == 1                   # exactly ONE notify (the alert itself)
+
+
+def test_dead_launch_anchor_alert_dedupes_across_ticks():
+    dsk = disk(launch_anchor=_anchor_down(), alert={"reasons": ["launch_anchor_down"]})
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    assert only(out, "alert") == [] and not has_notify(out)   # already alerted: no repeat
+    assert only(out, "launch") == [] and only(out, "park") == []
+
+
+def test_launch_anchor_down_but_nothing_queued_does_not_alert():
+    # Idle: a dead anchor with no approved issue to launch is not yet harmful — no alert, no noise.
+    dsk = disk(launch_anchor=_anchor_down())
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=dsk)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_dead_anchor_with_a_sole_at_cap_issue_still_alerts_not_silent():
+    # An approved issue held under a dead anchor must surface the fault even if it is already at its
+    # own launch cap: while degraded its park is SUPPRESSED, so it is part of the held queue — the
+    # runner must not sit on it silently (no launch, no park, no alert).
+    dsk = disk(launch_anchor=_anchor_down(), launch_fail_ids=["i5"],
+               issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures=2)}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert only(out, "launch") == [] and only(out, "park") == []   # held, not parked
+    a = only(out, "alert")
+    assert len(a) == 1 and "launch_anchor_down" in a[0]["reasons"] and has_notify(out)
+
+
+def test_launch_anchor_resolves_and_launches_resume_without_relabeling():
+    # Once the pane resolves again the held queue launches with NO William touch (agent-ready was
+    # never stripped), so recovery needs no re-approval. (Distinct areas so hard affinity lets both
+    # go in one tick.)
+    dsk = disk(launch_anchor=_anchor_ok())
+    out = decide(parsed_issues=[parsed(5, touches=("frontend",)), parsed(6, touches=("api",))],
+                 dsk=dsk)
+    assert len(only(out, "launch")) == 2 and only(out, "alert") == []
+
+
+def test_gating_and_merging_continue_while_the_launch_anchor_is_down():
+    d, g = _gating()                                       # i5 finished, clean PR
+    d["launch_anchor"] = _anchor_down()
+    out = decide(parsed_issues=[parsed(9)], dsk=d, gh_view=g)   # i9 queued behind the dead anchor
+    assert len(only(out, "merge")) == 1                    # the gate still merges the finished PR
+    assert only(out, "launch") == []                       # but the queued launch is held
+    assert len(only(out, "alert")) == 1
+
+
+def test_systemic_launch_failures_across_distinct_issues_alert_and_hold():
+    # DoD #3: K delivery failures across DIFFERENT issues while the anchor STILL RESOLVES (probe ok)
+    # is the SAME runner-level degraded mode — one alert, queue preserved — reached via the runner's
+    # failure streak, not the pane probe.
+    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=["i5", "i6"])   # probe ok, streak >= cap
+    out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
+    assert only(out, "launch") == [] and only(out, "park") == []
+    a = only(out, "alert")
+    assert len(a) == 1 and a[0]["reasons"] == ["launch_systemic_failure"]
+    assert has_notify(out)
+
+
+def test_one_distinct_failing_issue_is_not_systemic():
+    # A single issue failing delivery (below the distinct-issue cap) is NOT a systemic fault: the
+    # queue launches normally (that one issue parks per-issue once it hits its own launch cap — see
+    # the next test). Distinct areas so hard affinity lets both go in one tick.
+    dsk = disk(launch_fail_ids=["i5"])
+    out = decide(parsed_issues=[parsed(5, touches=("frontend",)), parsed(6, touches=("api",))],
+                 dsk=dsk)
+    assert len(only(out, "launch")) == 2 and only(out, "alert") == []
+
+
+def test_single_issue_launch_cap_still_parks_when_anchor_healthy():
+    # DoD #4: a genuinely issue-SPECIFIC launch failure (one issue at its cap, anchor fine, no
+    # other issue failing) still parks that one issue — unchanged.
+    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=["i5"],
+               issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures=2)}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    parks = only(out, "park")
+    assert len(parks) == 1 and parks[0]["id"] == "i5" and has_notify(out)
+    assert only(out, "alert") == []                        # one issue at cap is not systemic
+
+
+def test_launch_anchor_and_fail_ids_wrong_typed_never_raise_or_falsely_degrade():
+    for bad_anchor in (None, "down", 0, [], {"ok": "no"}, {"reason": "x"}):
+        for bad_ids in (None, "i5", 3, {"i5": 1}):
+            dsk = disk(launch_anchor=bad_anchor, launch_fail_ids=bad_ids)
+            out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+            assert len(only(out, "launch")) == 1           # nothing degrades on garbage input
+            assert only(out, "alert") == []
+
+
 def test_running_issue_still_labeled_agent_ready_gets_relabel_reconciliation():
     dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("running")}})
     out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "in-progress", "type:build"))],

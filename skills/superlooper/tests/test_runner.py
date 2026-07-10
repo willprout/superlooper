@@ -76,6 +76,9 @@ def rig(tmp_path, monkeypatch):
         repo=str(repo), config=make_config(), state_home=str(home), pane="pane-1",
         run_script=run_script,
         fetch_usage=lambda: {"auth_status": "ok", "five_hour_pct": 10.0, "seven_day_pct": 20.0})
+    # Healthy launch anchor by default (mirrors the healthy stub usage/run_script above): the real
+    # probe would shell out to cmux, which the suite neutralizes — anchor tests override this.
+    r._anchor_status = lambda: {"ok": True, "reason": ""}
     return type("Rig", (), {"r": r, "calls": calls, "rc_queue": rc_queue,
                             "home": home, "repo": repo, "fixdir": fixdir})
 
@@ -573,6 +576,96 @@ def test_failed_launch_bumps_the_counter_and_moves_no_labels(rig):
     ist = issue_state(rig, "i101")
     assert ist["status"] == "ready" and ist["launch_failures"] == 1
     assert len(mutations(rig)) == before               # no label move without a live worker
+
+
+# --------------------------- launch anchor liveness (#24) ---------------------------
+
+def test_failed_launch_delivery_records_the_issue_in_the_systemic_streak(rig):
+    # A launch whose delivery is not verified feeds the runner-level systemic-failure streak — the
+    # signal decide uses to tell a dead anchor (many issues) from a bad issue (one).
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(2)                             # delivery never verified
+    rig.r._execute(_launch_action(), NOW)
+    assert "i101" in rig.r._launch_fail_ids
+
+
+def test_verified_launch_clears_the_systemic_streak(rig):
+    # A verified delivery is proof the anchor is alive: it clears the whole streak.
+    rig.r.tick(now=NOW)
+    rig.r._launch_fail_ids = {"i9", "i101"}            # a prior run of failures
+    rig.calls.clear()                                  # rc_queue empty -> run_script returns 0 (ok)
+    out = rig.r._execute(_launch_action(), NOW)
+    assert out == "ok" and rig.r._launch_fail_ids == set()
+
+
+def test_verified_recover_delivery_clears_the_systemic_streak(rig):
+    # ANY verified delivery proves the anchor is live — including a recover-exited relaunch, not just
+    # a fresh launch — so it clears the streak and lets a systemic hold lift without a restart.
+    rig.r.tick(now=NOW)                                # poll lands the view (for _worker_env)
+    rig.r._launch_fail_ids = {"i9", "i101"}            # a prior run of failures
+    rig.calls.clear()                                  # rc_queue empty -> run_script returns 0 (ok)
+    out = rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
+    assert out == "ok" and rig.r._launch_fail_ids == set()
+
+
+def test_failed_recover_delivery_does_not_clear_the_streak(rig):
+    # A recover that does NOT verify delivery is not proof of anything — the streak must persist.
+    rig.r.tick(now=NOW)
+    rig.r._launch_fail_ids = {"i9", "i101"}
+    rig.calls.clear()
+    rig.rc_queue.append(2)                             # delivery not verified
+    rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
+    assert rig.r._launch_fail_ids == {"i9", "i101"}
+
+
+def test_brief_failure_does_not_touch_the_streak(rig):
+    # An early skip (issue no longer in the view) is NOT a delivery failure — it must not pollute
+    # the anchor streak, or one dropped issue could masquerade as a systemic fault.
+    rig.r.tick(now=NOW)
+    out = rig.r._execute({"act": "launch", "id": "i999", "num": 999, "branch": "sl/i999-x",
+                          "touches": [], "soft_overlap": False, "orphan": False}, NOW)
+    assert out.startswith("skipped") and rig.r._launch_fail_ids == set()
+
+
+def test_wants_launch_reflects_the_agent_ready_queue(rig):
+    rig.r._parsed_by_id = {"i5": {"labels": ["agent-ready", "type:build"]}}
+    assert rig.r._wants_launch() is True
+    rig.r._parsed_by_id = {"i5": {"labels": ["in-progress", "type:build"]}}  # claimed
+    assert rig.r._wants_launch() is False
+    rig.r._parsed_by_id = {}                           # empty queue
+    assert rig.r._wants_launch() is False
+
+
+def test_tick_holds_launches_and_alerts_when_the_anchor_is_gone(rig):
+    # End to end at the shell: a tick with launch demand re-probes the anchor; a probe that reports
+    # the pane unresolvable holds every launch and raises ONE runner-level alert — no per-issue
+    # parks, no label moves, the approved queue left intact.
+    rig.r._anchor_status = lambda: {"ok": False, "reason": "pane 'pane-1' not found"}
+    before = len(mutations(rig))
+    rig.r.tick(now=NOW)                                # poll lands the queue; probe reports down
+    alert = json.loads((rig.home / "state" / "ALERT").read_text())
+    assert alert["reasons"] == ["launch_anchor_down"]
+    assert issue_state(rig, "i101") is None            # never launched -> no loopstate stamp
+    assert len(mutations(rig)) == before               # agent-ready never moved to in-progress
+    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
+    assert launches == []                              # launch-session.sh never even invoked
+
+
+def test_tick_launches_normally_when_the_anchor_is_healthy(rig):
+    # The healthy path is unchanged: a resolvable anchor + an empty streak launches the queue.
+    rig.r.tick(now=NOW)
+    assert issue_state(rig, "i101")["status"] == "running"
+    assert "ALERT" not in os.listdir(rig.home / "state")
+
+
+def test_a_restart_clears_the_systemic_launch_streak(rig):
+    # The systemic streak is in-memory on purpose: a restart in a visible tab — the documented
+    # recovery for a wedged anchor (issue #24) — resets it to a clean slate.
+    rig.r._launch_fail_ids = {"i1", "i2", "i3"}        # mid-episode: a wedged anchor
+    fresh = runner_mod.Runner(repo=str(rig.repo), config=make_config(),
+                              state_home=str(rig.home), pane="pane-1")
+    assert fresh._launch_fail_ids == set()
 
 
 def test_hire_answerer_env_brief_and_record(rig):
