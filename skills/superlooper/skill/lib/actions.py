@@ -47,7 +47,9 @@ The view contract (assembled by runner.py each tick):
                   is present ONLY for a CLEAN read (issue #21); a refused/starved investigate read is
                   OMITTED, so a KEY-ABSENT investigate id means "no trustworthy read this tick" ->
                   HOLD via await_read, never park,
-                  "dev_checks": [{name,status,conclusion}] (key absent = not fetched)}
+                  "dev_checks": the branch's full check universe — check-runs
+                  {name,status,conclusion} AND commit statuses {context,state} (issue #23; key
+                  absent = not fetched)}
 
 Action vocabulary (the executor contract, one journal record each):
   launch, hire_answerer, deliver_answer, bounce, recover(tier=idle|frozen|exited), gate,

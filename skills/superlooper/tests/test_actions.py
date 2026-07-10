@@ -855,6 +855,46 @@ def test_pending_dev_checks_do_nothing():
     assert only(out, "freeze") == [] and only(out, "unfreeze") == []
 
 
+# --- issue #23: the dev view now carries commit STATUSES ({context,state}), not just check-runs.
+# A required check that reports on dev only as a commit status must drive freeze/unfreeze exactly
+# like a check-run. (The widening lives in gh.branch_checks; decide already folds both shapes —
+# these lock that the freeze/unfreeze rule reads a StatusContext dev view correctly.)
+STATUS_GREEN = [{"context": "ship", "state": "success"}]
+STATUS_RED = [{"context": "ship", "state": "failure"}]
+
+
+def test_commit_status_only_dev_view_unfreezes_when_green():
+    d = disk(frozen={"reason": "dev red", "fingerprint": "f", "since": NOW - 100})
+    out = decide(config=cfg(required_checks=["ship"]),
+                 dsk=d, gh_view=ghv(dev_checks=list(STATUS_GREEN)))
+    assert len(only(out, "unfreeze")) == 1
+
+
+def test_commit_status_only_dev_view_red_freezes_and_stays_frozen():
+    # fail-closed: a genuinely red required status freezes...
+    out = decide(config=cfg(required_checks=["ship"]),
+                 gh_view=ghv(dev_checks=list(STATUS_RED)))
+    assert len(only(out, "freeze")) == 1
+    # ...and stays frozen on the same breakage (no spurious unfreeze while red).
+    fp = actions.dev_fingerprint(list(STATUS_RED), ["ship"])
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+             filed_fingerprints={fp: 9001})
+    out2 = decide(config=cfg(required_checks=["ship"]),
+                  dsk=d, gh_view=ghv(dev_checks=list(STATUS_RED)))
+    assert only(out2, "unfreeze") == [] and only(out2, "freeze") == []
+
+
+def test_check_runs_only_view_missing_the_required_status_stays_pending():
+    # THE old permanent-pending, at the view level: when the required status is ABSENT from the
+    # dev view (what a check-runs-only poll produced), a frozen mainline never lifts — the exact
+    # outage issue #23 fixes by widening gh.branch_checks to also read commit statuses.
+    d = disk(frozen={"reason": "dev red", "fingerprint": "f", "since": NOW - 100})
+    out = decide(config=cfg(required_checks=["ship"]),
+                 dsk=d, gh_view=ghv(dev_checks=[]))   # check-runs only; the ship status is invisible
+    assert only(out, "unfreeze") == []                # pending forever -> never auto-lifts
+    assert only(out, "freeze") == []                  # pending, not red -> no freeze either
+
+
 # =========================== alerts ===========================
 
 def test_persistent_gh_failure_alerts_once_with_notify():
