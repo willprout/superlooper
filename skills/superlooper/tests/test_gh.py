@@ -60,9 +60,10 @@ def test_issue_view(ghenv):
 
 
 def test_issue_comments(ghenv):
-    cs = gh.issue_comments(123)
-    assert len(cs) == 2
-    assert cs[1]["body"].startswith("<!-- superlooper-investigation -->")
+    cr = gh.issue_comments(123)
+    assert cr.ok is True                         # GitHub answered
+    assert len(cr.comments) == 2
+    assert cr.comments[1]["body"].startswith("<!-- superlooper-investigation -->")
 
 
 def test_pr_for_branch_shape(ghenv):
@@ -76,8 +77,48 @@ def test_pr_for_branch_shape(ghenv):
 
 
 def test_pr_comments_has_review_marker(ghenv):
-    cs = gh.pr_comments(555)
-    assert any(c["body"].startswith("<!-- superlooper-review -->") for c in cs)
+    cr = gh.pr_comments(555)
+    assert cr.ok is True
+    assert any(c["body"].startswith("<!-- superlooper-review -->") for c in cr.comments)
+
+
+# --------------------------- comment reads: refused != answered-empty (issue #21) ----------
+# The load-bearing distinction of #21: a REFUSED comment read (rate-limit/403/5xx/timeout, or a
+# wrong-typed/unparseable body) must be distinguishable from GitHub ANSWERING "no comments". The
+# old contract collapsed both to [], so a single stale/refused read false-parked a finished
+# investigation. Now the adapter returns CommentRead(comments, ok): ok is True ONLY on a clean
+# answer.
+
+def test_issue_comments_refused_is_not_answered_empty(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    cr = gh.issue_comments(1)
+    assert cr.ok is False and cr.comments == []   # refused: caller must NOT read this as "no marker"
+
+
+def test_issue_comments_answered_empty_is_ok(ghenv):
+    (ghenv / "issue_comments_1.json").write_text('{"comments": []}')
+    cr = gh.issue_comments(1)
+    assert cr.ok is True and cr.comments == []    # genuine empty thread: an authoritative answer
+
+
+def test_issue_comments_timeout_is_refused(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_SLEEP", "2")
+    # gh.py's 30s hard timeout is too slow to exercise here; drive the low-level read directly.
+    cr = gh._comment_read(["issue", "view", "1", "--json", "comments"], timeout=0.4)
+    assert cr.ok is False and cr.comments == []
+
+
+def test_comment_reads_wrong_typed_body_is_refused(ghenv):
+    # A 200 whose body is valid JSON but the WRONG shape ("comments" missing / not a list) is
+    # NOT a clean answer — it must fail closed to ok=False, never to an authoritative empty.
+    for fixture, call in (("issue_comments_1.json", lambda: gh.issue_comments(1)),
+                          ("pr_comments_1.json", lambda: gh.pr_comments(1))):
+        (ghenv / fixture).write_text('"a bare string, wrong type"')
+        cr = call()
+        assert cr.ok is False and cr.comments == []
+        (ghenv / fixture).write_text('{"comments": "not a list"}')
+        cr = call()
+        assert cr.ok is False and cr.comments == []
 
 
 def test_branch_checks_normalized(ghenv):
@@ -147,8 +188,8 @@ def test_nonzero_rc_fails_closed_everywhere(ghenv, monkeypatch):
     assert gh.ready_issues() == []
     assert gh.issue(1) == {}
     assert gh.pr_for_branch("x") == {}
-    assert gh.issue_comments(1) == []
-    assert gh.pr_comments(1) == []
+    assert gh.issue_comments(1).ok is False and gh.issue_comments(1).comments == []
+    assert gh.pr_comments(1).ok is False and gh.pr_comments(1).comments == []
     assert gh.branch_checks("m") == []
     assert gh.compare("a", "b") == {}
     assert gh.child_issues(1) == []
@@ -183,8 +224,8 @@ def test_missing_binary_fails_closed(ghenv, monkeypatch):
     ("issue_list.json", lambda: gh.ready_issues(), []),
     ("issue_view.json", lambda: gh.issue(1), {}),
     ("pr_list.json", lambda: gh.pr_for_branch("x"), {}),
-    ("issue_comments.json", lambda: gh.issue_comments(1), []),
-    ("pr_comments.json", lambda: gh.pr_comments(1), []),
+    # issue_comments / pr_comments have their OWN wrong-typed test above (they return a
+    # CommentRead, not a bare list — refused != answered-empty, issue #21).
     ("check_runs.json", lambda: gh.branch_checks("m"), []),
     ("compare.json", lambda: gh.compare("a", "b"), {}),
     ("issue_search.json", lambda: gh.child_issues(1), []),

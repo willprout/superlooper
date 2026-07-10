@@ -395,11 +395,12 @@ def test_launch_embeds_post_approval_comments_and_journals_fetch(rig):
 
 
 def test_launch_proceeds_when_comment_fetch_yields_nothing(rig, monkeypatch):
-    # gh.issue_comments fails CLOSED to [] on any gh error, so a fetch failure is indistinguishable
-    # from a comment-less issue — either way the brief is complete and the launch proceeds (never
-    # park a fully-approved issue over a supplementary channel). The journal records fetched=0.
+    # A refused comment read carries comments=[] (CommentRead ok=False), so a fetch failure is, for
+    # brief-building, indistinguishable from a comment-less issue — either way the brief is complete
+    # and the launch proceeds (never park a fully-approved issue over a supplementary channel). The
+    # journal records fetched=0.
     rig.r.tick(now=NOW)
-    monkeypatch.setattr(runner_mod.gh, "issue_comments", lambda num: [])
+    monkeypatch.setattr(runner_mod.gh, "issue_comments", lambda num: runner_mod.gh.CommentRead([], False))
     rig.calls.clear()
     out = rig.r._execute(_launch_action(), NOW)
     assert out == "ok"
@@ -1175,7 +1176,7 @@ def test_refresh_finishing_prs_freshens_finished_issues_only(rig, monkeypatch):
 
     monkeypatch.setattr(runner_mod.gh, "pr_for_branch", fake_pr_for_branch)
     monkeypatch.setattr(runner_mod.gh, "pr_comments",
-                        lambda n: [{"body": "<!-- superlooper-review -->\nAPPROVE"}])
+                        lambda n: runner_mod.gh.CommentRead([{"body": "<!-- superlooper-review -->\nAPPROVE"}], True))
 
     ist_map = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
     rig.r._refresh_finishing_prs(ist_map)
@@ -1470,3 +1471,141 @@ def test_tick_error_alert_write_retries_until_it_lands(rig, tmp_path, monkeypatc
     rig.r.run(max_ticks=6, sleep=lambda s: None)
     assert (rig.home / "state" / "ALERT").exists()         # landed on a later crashing tick
     assert marker.read_text() == "x"                        # ...yet notify still fired exactly once
+
+
+# =========================== issue #21: never strand or wrongly park an investigation ==========
+# These drive the REAL tick loop against a stateful fake-gh (a controllable little GitHub) so the
+# two proven failure modes are impossible: (a) a refused comment read false-parking a finished
+# investigation, and (b) a want-set that grows with merged history starving the tail forever.
+
+_GREEN_CHECK = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+_INV_BODY = ("## Goal\nInvestigate.\n\n## Definition of done\n- [ ] root cause\n\n"
+             "## Boundaries\nnone\n\n## Loop metadata\ntouches:\n")
+
+
+def _stateful(rig, issues, next_num=500):
+    """Flip fake-gh into stateful mode (state.json) so the runner's own reads reflect a
+    controllable little GitHub. `issues` maps num-string -> issue dict."""
+    state = {"issues": issues, "prs": {}, "dev_branch": "main", "check_names": ["ci"],
+             "branch_checks": {"main": list(_GREEN_CHECK)}, "next_num": next_num}
+    (rig.fixdir / "state.json").write_text(json.dumps(state))
+
+
+def _refuse_comment_reads(rig, times):
+    (rig.fixdir / "fail_rules.json").write_text(
+        json.dumps([{"match": "--json comments", "times": times}]))
+
+
+def gh_calls(rig):
+    p = rig.fixdir / "calls.jsonl"
+    return [json.loads(x) for x in p.read_text().splitlines() if x.strip()] if p.exists() else []
+
+
+def _inv_issue(num, comments):
+    return {"number": num, "title": f"Investigate {num}", "state": "open",
+            "labels": ["in-progress", "type:investigate"], "body": _INV_BODY, "comments": comments}
+
+
+def test_investigation_refused_reads_hold_then_recover_and_close(rig):
+    # DoD: comment reads refused across N ticks -> gate HOLDS (zero parks, zero notifies), ONE
+    # bounded refusal record in the journal; reads recover -> the parent closes cleanly.
+    marker = [{"body": "<!-- superlooper-investigation -->\nRoot cause: tenant id omitted."}]
+    _stateful(rig, {"7": _inv_issue(7, marker)})
+    seed_issue(rig, "i7", status="gating", type="investigate", branch="sl/i7-cache", num=7)
+    (rig.home / "reports" / "i7.md").write_text("## Tests\n" + "x" * 60)
+    _refuse_comment_reads(rig, times=999)                  # every comment read refused
+
+    N = 4
+    for k in range(N):
+        rig.r.tick(now=NOW + k * 100)                      # +100 > GH_POLL_SECONDS -> re-polls each tick
+
+    ms = mutations(rig)
+    assert [m for m in ms if m["kind"] == "close_issue"] == []          # never closed on a refused read
+    assert [m for m in ms if m["kind"] == "set_labels"
+            and "parked" in (m.get("add") or "")] == []                 # never parked
+    assert issue_state(rig, "i7")["status"] == "gating"                 # still holding at the gate
+    assert issue_state(rig, "i7")["read_waited"] is True
+    jrnl = journal.read(rig.home)
+    assert len([r for r in jrnl if r.get("act") == "await_read"]) == 1  # ONE bounded record, not N
+    assert [r for r in jrnl if r.get("act") == "notify"] == []          # zero notifies
+
+    (rig.fixdir / "fail_rules.json").unlink()                           # reads recover
+    rig.r.tick(now=NOW + (N + 2) * 100)
+    assert [m for m in mutations(rig) if m["kind"] == "close_issue" and m["num"] == "7"]
+    assert issue_state(rig, "i7")["status"] == "merged"
+
+
+def test_answered_empty_investigation_still_nudges_then_parks(rig):
+    # DoD: answered-empty (marker genuinely absent) still nudges once then parks — UNCHANGED. A
+    # clean read that simply carries no marker is authoritative; only a REFUSED read holds.
+    _stateful(rig, {"7": _inv_issue(7, [{"body": "just chatter, no marker"}])})
+    seed_issue(rig, "i7", status="gating", type="investigate", branch="sl/i7-x", num=7)
+    (rig.home / "reports" / "i7.md").write_text("## Tests\n" + "x" * 60)
+    rig.calls.clear()
+
+    rig.r.tick(now=NOW)                                    # clean read, no marker -> nudge once
+    assert issue_state(rig, "i7")["nudged"] == ["investigation"]
+    assert issue_state(rig, "i7")["status"] == "gating"
+    assert issue_state(rig, "i7").get("read_waited") in (None, False)   # a clean read never "waited"
+
+    rig.r.tick(now=NOW + 100)                              # still no marker, already nudged -> park
+    assert issue_state(rig, "i7")["status"] == "parked"
+    assert [m for m in mutations(rig) if m["kind"] == "set_labels"
+            and "parked" in (m.get("add") or "")]
+
+
+def test_want_set_independent_of_merged_history_no_starvation(rig):
+    # DoD: want-set size is independent of merged-history length; a finished investigation sorting
+    # LAST behind ~30 merged issues still closes within a tick, and poll calls stay under budget.
+    issues = {}
+    for n in range(10, 40):                                # i10..i39: long-merged, reports on disk
+        iid = f"i{n}"
+        seed_issue(rig, iid, status="merged", type="build", branch=f"sl/{iid}-x", num=n)
+        (rig.home / "reports" / f"{iid}.md").write_text("## Tests\nmerged long ago " + "x" * 40)
+        issues[str(n)] = {"number": n, "title": f"old {n}", "state": "closed", "labels": [],
+                          "body": _INV_BODY, "comments": []}
+    seed_issue(rig, "i99", status="gating", type="investigate", branch="sl/i99-x", num=99)
+    (rig.home / "reports" / "i99.md").write_text("## Tests\n" + "x" * 60)
+    issues["99"] = _inv_issue(99, [{"body": "<!-- superlooper-investigation -->\ndone."}])
+    _stateful(rig, issues, next_num=200)
+    rig.calls.clear()
+
+    rig.r.tick(now=NOW)
+
+    assert issue_state(rig, "i99")["status"] == "merged"               # closed within the one tick
+    assert [m for m in mutations(rig) if m["kind"] == "close_issue" and m["num"] == "99"]
+    # merged history consumed NO comment-read budget: the ONLY comment read was i99's.
+    comment_reads = [c for c in gh_calls(rig) if "comments" in c and "--json" in c]
+    assert len(comment_reads) == 1 and "99" in comment_reads[0]
+    # the poll's whole fetch walk stayed well under the call budget despite 30 merged issues.
+    assert len(gh_calls(rig)) < runner_mod.MAX_POLL_CALLS
+
+
+def test_starved_investigation_read_is_rescued_budget_exempt(rig):
+    # DoD-adjacent: even if the budgeted poll walk misses an investigation's comment read, the
+    # budget-exempt rescue picks it up the same tick. Simulate a starved poll by shrinking the
+    # budget to below the number of finishing issues, then assert the rescue still closes i99.
+    monkey_budget = 6
+    issues = {}
+    # a wall of finishing INVESTIGATE issues (gating, reports on disk, no marker yet) ahead of our
+    # investigation, each costing one comment read, so the fixed budget is exhausted before the
+    # investigation's tail read. They HOLD (await_read) rather than parking, keeping the test clean.
+    for n in range(10, 40):
+        iid = f"i{n}"
+        seed_issue(rig, iid, status="gating", type="investigate", branch=f"sl/{iid}-x", num=n)
+        (rig.home / "reports" / f"{iid}.md").write_text("## Tests\n" + "x" * 60)
+        issues[str(n)] = _inv_issue(n, [])                 # no marker yet -> holds, never parks
+    seed_issue(rig, "i99", status="gating", type="investigate", branch="sl/i99-x", num=99)
+    (rig.home / "reports" / "i99.md").write_text("## Tests\n" + "x" * 60)
+    issues["99"] = _inv_issue(99, [{"body": "<!-- superlooper-investigation -->\ndone."}])
+    _stateful(rig, issues, next_num=200)
+
+    import runner as _r
+    old = _r.MAX_POLL_CALLS
+    try:
+        _r.MAX_POLL_CALLS = monkey_budget                 # force the poll to starve the tail
+        rig.r.tick(now=NOW)
+    finally:
+        _r.MAX_POLL_CALLS = old
+    # despite the starved poll walk, the rescue fetched i99's marker and the gate closed it.
+    assert issue_state(rig, "i99")["status"] == "merged"
