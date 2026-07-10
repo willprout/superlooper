@@ -1091,6 +1091,38 @@ def test_unreachable_state_self_heals_when_github_returns(tmp_path):
     assert up["repos"][0]["field_caption"] == "no landings yet — all clear"
 
 
+class _StaleQueueGh:
+    """Models the cache-offset window (Codex review): the fresh reachability probe has FAILED
+    (unreachable), yet a still-cached agent-ready queue read hands back stale rows. The snapshot must
+    NOT fly those stale planes — an unreachable field shows no GitHub-derived queue at all, by
+    construction, never relying on the labeled read also happening to fail."""
+    def open_issues_probe(self, repo, label=None, limit=200):
+        return [], False                      # the reachability oracle: gh is down
+    def open_issues(self, repo, label=None, limit=200):
+        if label == "agent-ready":
+            return [{"number": 71, "title": "stale", "labels": [{"name": "agent-ready"}]}]
+        return []
+    def issue(self, repo, num):
+        return {}
+    def pr_for_branch(self, repo, branch):
+        return {}
+    def pr_comments(self, repo, num):
+        return []
+
+
+def test_unreachable_forces_the_github_queue_dark_no_stale_departures_or_stand(tmp_path):
+    # Blocking fix (Codex review): github.unreachable must actually force the GitHub-derived queue
+    # dark. A stale-cached agent-ready list can outlive the fresh probe's failure by a cache window;
+    # the snapshot must not render "NO DATA LINK" AND a populated departures board / planes at the
+    # gate. When unreachable, departures and stand are empty by construction.
+    dst = _quiet_home(tmp_path, "stalequeue")
+    snap = server.assemble_snapshot(_config(dst), now=NOW, gh_mod=_StaleQueueGh())
+    repo = snap["repos"][0]
+    assert repo["github"]["unreachable"] is True
+    assert repo["boards"]["departures"] == []     # the GitHub-derived queue is dark, never stale rows
+    assert repo["stand"] == []                     # …and no plane stands at a gate on an unread queue
+
+
 def test_reachability_rides_the_existing_open_issue_read_no_extra_gh_call(tmp_path):
     # Boundary (issue #38): derive the state from calls already made — no new gh call. The snapshot
     # learns reachability through open_issues_probe (the unlabeled open-issue read it already makes),

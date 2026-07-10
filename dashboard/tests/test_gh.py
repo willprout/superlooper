@@ -182,14 +182,26 @@ def test_open_issues_probe_unreachable_on_timeout(tmp_path, monkeypatch):
     assert reachable is False                     # a hung gh is unreachable, never a false all-clear
 
 
-def test_open_issues_probe_reachable_but_empty_on_unparseable_json(tmp_path, monkeypatch):
-    # gh RAN and exited 0 but handed back junk — it IS reachable (a real, if useless, answer); the
-    # list still fails closed to empty. rc, not parseability, is the reachability signal.
+def test_open_issues_probe_unreachable_on_unparseable_json(tmp_path, monkeypatch):
+    # gh exited 0 but handed back junk — we have NO trustworthy queue read, so this is NOT a genuine
+    # all-clear (Codex review): reachable means "gh gave us a usable open-issue list," and unparseable
+    # output fails that just as a nonzero rc does. The list still fails closed to empty.
     _use_fake(monkeypatch, tmp_path)
     (tmp_path / "issue_list.json").write_text("not json {{{")
     issues, reachable = gh.open_issues_probe(REPO)
     assert issues == []
-    assert reachable is True
+    assert reachable is False
+
+
+def test_open_issues_probe_unreachable_on_wrong_typed_json(tmp_path, monkeypatch):
+    # Valid JSON but the wrong SHAPE (a dict where a list is required) is also not a usable answer —
+    # reachable is True only for a real open-issue LIST (empty or not), never a false all-clear over
+    # a read we couldn't use.
+    _use_fake(monkeypatch, tmp_path)
+    _write(tmp_path, "issue_list.json", {"not": "a list"})
+    issues, reachable = gh.open_issues_probe(REPO)
+    assert issues == []
+    assert reachable is False
 
 
 def test_open_issues_probe_carries_the_label_through(tmp_path, monkeypatch):

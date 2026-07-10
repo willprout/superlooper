@@ -193,6 +193,11 @@ class _CountingGh:
         self.calls += 1
         return [{"number": self.calls}]
 
+    def open_issues_probe(self, repo, label=None, limit=200):
+        # CachedGh.open_issues now delegates to open_issues_probe (one shared cache entry, issue #38),
+        # so the wrapped adapter must expose it; delegate to open_issues so the call count is unchanged.
+        return self.open_issues(repo, label=label, limit=limit), True
+
 
 def test_cached_gh_serves_one_fetch_within_the_interval():
     clock = [1000.0]

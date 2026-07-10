@@ -75,7 +75,7 @@
     link.hidden = true;
     link.innerHTML = '<span class="t">◈ NO DATA LINK</span>' +
       '<span class="m">can’t reach GitHub — the tower is searching</span>' +
-      '<span class="s">showing local state only · the boards are dark until the link returns</span>';
+      '<span class="s">showing local flights only · the queue is dark until the link returns</span>';
     overlays.appendChild(link);
     fixedEls.link = link;
 

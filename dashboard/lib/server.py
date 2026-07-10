@@ -448,16 +448,19 @@ class CachedGh:
             self._caches[key] = c
         return c.get()
 
-    def open_issues(self, repo, label=None, limit=200):
-        return self._cached(("open_issues", repo, label, limit),
-                            lambda: self._gh.open_issues(repo, label=label, limit=limit))
-
     def open_issues_probe(self, repo, label=None, limit=200):
         # The reachability read (issue #38) rides the SAME slow clock as every other read (decision
         # B.2) — a 2s poll must not re-ask GitHub whether it is reachable every tick. The (list,
         # reachable) tuple is memoized whole, so surface and reachability always come from one fetch.
         return self._cached(("open_issues_probe", repo, label, limit),
                             lambda: self._gh.open_issues_probe(repo, label=label, limit=limit))
+
+    def open_issues(self, repo, label=None, limit=200):
+        # The list-only surface OVER open_issues_probe — mirrors lib/gh.open_issues so both share the
+        # ONE probe cache entry per query (a caller asking for the list and the probe of the same
+        # query never double-fetches gh, and the list can never drift from its reachability signal —
+        # Codex review, issue #38).
+        return self.open_issues_probe(repo, label=label, limit=limit)[0]
 
     def issue(self, repo, num):
         return self._cached(("issue", repo, num), lambda: self._gh.issue(repo, num))
@@ -1158,7 +1161,11 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     # The launch queue in real order (departures board), and its front projected to planes standing at
     # the gates (the field's "at the stand" stage, issue #32). The stand is derived FROM departures —
     # one queue, two honest renderings: the split-flap board (full, paginated) and the physical gates.
-    departures = _departures(gh_mod, slug, flying_nums, titles)
+    # When GitHub is UNREACHABLE the whole GitHub-derived queue is dark BY CONSTRUCTION (issue #38,
+    # Codex review): the reachability probe is our oracle, so we never fly a stale-cached agent-ready
+    # list that could outlive the probe's failure by a cache window — the dark-tower state and a
+    # populated departures board must never contradict each other.
+    departures = [] if gh_unreachable else _departures(gh_mod, slug, flying_nums, titles)
     stand = _stand(departures)
 
     repo_snap = {

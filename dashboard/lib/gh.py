@@ -96,15 +96,17 @@ def ready_issues(repo, limit=200):
 
 
 def open_issues_probe(repo, label=None, limit=200):
-    """Open issues in ``repo`` PLUS whether the ``gh`` call itself succeeded — the ONE honest signal
-    that separates "GitHub answered: no open issues" from "GitHub is unreachable / refused". Returns
+    """Open issues in ``repo`` PLUS whether gh gave us a USABLE answer — the ONE honest signal that
+    separates "GitHub answered: no open issues" from "GitHub is unreachable / unreadable". Returns
     ``(issues, reachable)``:
 
-      * ``reachable`` is ``True`` when gh exited 0 (it ANSWERED, even with an empty or unparseable
-        body — an empty answer is a real all-clear, not an outage);
-      * ``reachable`` is ``False`` ONLY when the subprocess failed (a missing binary, an
-        unauthenticated / erroring gh, a timeout, any nonzero rc) — the honest GitHub-unreachable
-        state (issue #38). The rc, not JSON parseability, is the reachability signal.
+      * ``reachable`` is ``True`` ONLY when gh exited 0 AND its output parsed to a JSON LIST (empty or
+        not) — a real open-issue answer, so an empty list is a genuine all-clear;
+      * ``reachable`` is ``False`` whenever the read is not trustworthy: the subprocess failed (a
+        missing binary, an unauthenticated / erroring gh, a timeout, any nonzero rc), OR gh exited 0
+        but handed back unparseable / wrong-shaped output. A parse failure is no more a trustworthy
+        all-clear than a nonzero rc is (Codex review, issue #38) — either way we could not read the
+        queue, so the field must show the honest dark-tower state, never a false calm.
 
     ``issues`` is the same fail-closed list :func:`open_issues` returns (``[]`` on any failure or
     wrong-typed body), so a caller that only wants the list ignores the second value. This is the
@@ -119,8 +121,10 @@ def open_issues_probe(repo, label=None, limit=200):
     try:
         v = json.loads(out)
     except (json.JSONDecodeError, ValueError):
-        return [], True               # gh answered (rc 0); the body was junk, so an empty-but-typed list
-    return (v if isinstance(v, list) else []), True   # wrong-typed JSON still fails the list closed
+        return [], False              # gh ran but its output was junk — not a usable queue read
+    if not isinstance(v, list):
+        return [], False              # valid JSON of the wrong shape — also not a usable list answer
+    return v, True
 
 
 def open_issues(repo, label=None, limit=200):
