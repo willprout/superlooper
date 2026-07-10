@@ -291,6 +291,37 @@ def test_gate_wander_is_journaled_not_blocking():                # step 3 (wande
     assert d["action"] == "merge" and d["wander"] is True
 
 
+def test_gate_referee_superlooper_path_parks_needs_william():
+    pr = _pr(files=[{"path": ".superlooper/config.json"}])
+    d = _decide(pr=pr)
+    assert d["action"] == "park" and d["needs_william"] is True
+    assert ".superlooper/config.json" in d["reason"]
+
+
+def test_gate_referee_workflow_path_parks_needs_william():
+    pr = _pr(files=[{"path": ".github/workflows/quality.yml"}])
+    d = _decide(pr=pr)
+    assert d["action"] == "park" and d["needs_william"] is True
+    assert ".github/workflows/quality.yml" in d["reason"]
+
+
+def test_gate_referee_path_mixed_with_allowed_path_never_partially_merges():
+    pr = _pr(files=[{"path": "src/components/W.tsx"},
+                    {"path": ".github/workflows/quality.yml"}])
+    d = _decide(pr=pr)
+    assert d["action"] == "park" and d["needs_william"] is True
+    assert ".github/workflows/quality.yml" in d["reason"]
+
+
+def test_gate_declaring_referee_area_does_not_whitelist_referee_path():
+    cfg = _cfg(areas={"frontend": ["src/components/**"],
+                      "loop_rules": [".superlooper/**"]})
+    pr = _pr(files=[{"path": ".superlooper/config.json"}])
+    d = _decide(issue=_issue(declared_touches=["loop_rules"]), pr=pr, cfg=cfg)
+    assert d["action"] == "park" and d["needs_william"] is True
+    assert ".superlooper/config.json" in d["reason"]
+
+
 def test_gate_overlap_with_inflight_lane_holds():                # step 3 (overlap)
     d = _decide(inflight={"i7": ["frontend"]})
     assert d["action"] == "hold" and d["overlap_lane"] == "i7"

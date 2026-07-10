@@ -503,6 +503,32 @@ def test_gate_park_when_no_pr_exists():
     assert len(p) == 1 and p[0]["needs_william"] is False and has_notify(out)
 
 
+def test_referee_path_gate_parks_needs_william_with_file_memo_and_one_notify():
+    d, g = _gating(pv=pr_view(files=["src/f/Widget.tsx", ".superlooper/config.json"]))
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"),
+                                      touches=("frontend",))],
+                 dsk=d, gh_view=g)
+    assert only(out, "merge") == []
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["needs_william"] is True
+    assert ".superlooper/config.json" in p[0]["memo"]
+    notices = only(out, "notify")
+    assert len(notices) == 1 and ".superlooper/config.json" in notices[0]["body"]
+
+
+def test_declared_referee_area_still_parks_needs_william():
+    config = cfg(areas={"frontend": ["src/f/**"], "loop_rules": [".github/workflows/**"]})
+    d, g = _gating(pv=pr_view(files=[".github/workflows/quality.yml"]))
+    out = decide(config=config,
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"),
+                                       touches=("loop_rules",))],
+                 dsk=d, gh_view=g)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["needs_william"] is True
+    assert ".github/workflows/quality.yml" in p[0]["memo"]
+    assert len(only(out, "notify")) == 1
+
+
 def test_conflicting_pr_gets_a_mechanical_update():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING"))
     out = decide(dsk=d, gh_view=g)
