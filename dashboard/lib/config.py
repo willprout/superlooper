@@ -233,6 +233,18 @@ def _enrich_repo(path, airline=None):
             _err(f"repo path {path!r}: its {repo_cfg} 'session.{tk}' must be "
                  f"an integer >= 0, got {v!r}")
         entry[tk] = v
+
+    # The repo's configured lane count (issue #35): how many concurrent builds it runs, so the
+    # empty-queue caption can state the truth ("N RUNWAYS OPEN") instead of a hardcoded "2". Unlike
+    # the thresholds above — which this loader CONSUMES for liveness tiers, so a wrong one fails loud
+    # — `lanes` drives ONLY a cosmetic caption and has no numeric default to fall back to. So an
+    # absent OR unreadable value records None (unknown): downstream the caption then shows no number
+    # rather than inventing one (the owner's honest-fallback ruling, 2026-07-10). Leniency hides no
+    # misconfiguration here — a missing runway count on screen is itself the tell, where a wrong
+    # number would be the thing that misleads.
+    lanes = body.get("lanes")
+    entry["lanes"] = lanes if (_is_int(lanes) and lanes >= 1) else None
+
     entry["state_home"] = state_home(slug)
     return entry
 

@@ -69,7 +69,8 @@ def test_snapshot_carries_every_panel_the_shell_binds(home):
     assert snap["generated_at"] == NOW
     assert len(snap["repos"]) == 1
     repo = snap["repos"][0]
-    for key in ("slug", "airline", "flights", "boards", "tower_log", "shipped", "incident", "state"):
+    for key in ("slug", "airline", "flights", "boards", "tower_log", "shipped", "incident", "state",
+                "lanes", "queue_empty_caption"):
         assert key in repo, "repo snapshot missing %r" % key
     assert set(repo["boards"]) == {"departures", "arrivals"}
 
@@ -133,6 +134,33 @@ def test_departures_empty_without_a_reachable_queue(home):
     # No gh → no readable agent-ready queue → an honest empty board ("queue empty, runways open").
     snap = server.assemble_snapshot(_config(home), now=NOW)
     assert snap["repos"][0]["boards"]["departures"] == []
+
+
+# --- the empty-queue caption reflects the repo's real lanes (issue #35) ---
+# The lane count travels server → snapshot → caption; the JS binds `queue_empty_caption` verbatim
+# (design record B.1). The snapshot also carries the raw `lanes` so the truth is inspectable.
+
+def test_empty_queue_caption_reflects_the_repos_configured_lanes(home):
+    cfg = _config(home)
+    cfg["repos"][0]["lanes"] = 3
+    repo = server.assemble_snapshot(cfg, now=NOW)["repos"][0]
+    assert repo["lanes"] == 3
+    assert repo["queue_empty_caption"] == "QUEUE EMPTY · 3 RUNWAYS OPEN"
+
+
+def test_single_lane_repo_gets_a_singular_runway_caption(home):
+    cfg = _config(home)
+    cfg["repos"][0]["lanes"] = 1
+    repo = server.assemble_snapshot(cfg, now=NOW)["repos"][0]
+    assert repo["queue_empty_caption"] == "QUEUE EMPTY · 1 RUNWAY OPEN"
+
+
+def test_unknown_lane_count_yields_a_numberless_caption(home):
+    # No `lanes` on the repo entry (an unreadable/older adopted config) → the caption drops the
+    # runway clause entirely: an honest empty board with no invented number (issue #35 DoD).
+    repo = server.assemble_snapshot(_config(home), now=NOW)["repos"][0]
+    assert repo["lanes"] is None
+    assert repo["queue_empty_caption"] == "QUEUE EMPTY"
 
 
 # ---- arrivals backlog cap (issue #30 owner amendment): applied where _arrivals is built ----

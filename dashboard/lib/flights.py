@@ -133,6 +133,21 @@ def assign_runways(lanes):
     return {lane: i % 2 for i, lane in enumerate(distinct)}
 
 
+def empty_queue_caption(lanes):
+    """The empty-departures caption, singular/plural-correct, reflecting the repo's REAL lane count.
+
+    "N runways open" = N concurrent build slots ("2 runways = 2 concurrent builds", design record
+    §3). This is a truth-first surface, so it must never claim a count it can't stand behind (issue
+    #35): only a genuine positive int prints a number; ``None`` — or any unreadable value (0,
+    negative, non-int, bool) — falls back to a bare "QUEUE EMPTY" with NO invented number. Owned
+    server-side so the JS binds this finished string (design record B.1) and the singular/plural
+    never drifts into a client-side branch."""
+    if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1:
+        return "QUEUE EMPTY"
+    noun = "RUNWAY" if lanes == 1 else "RUNWAYS"
+    return "QUEUE EMPTY · %d %s OPEN" % (lanes, noun)
+
+
 # =============================== airline identity (§7) ===============================
 # SNES-class tail colors (the prototype's PAL.tail blue and the dashboard-terminal teal first).
 # Deterministic per slug via a tiny explicit hash — Python's builtin hash() is salted per process

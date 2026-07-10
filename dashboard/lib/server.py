@@ -1125,6 +1125,11 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         "colors": {"tail": flights.airline_color(slug)},
         "flights": repo_flights,
         "boards": {"departures": departures, "arrivals": arrivals},
+        # The empty-queue caption states the repo's REAL lane count (issue #35), never a hardcoded
+        # "2": the count travels here and the JS binds the finished string (design record B.1). The
+        # raw `lanes` rides along (None when unknown) so the truth is inspectable in the snapshot.
+        "lanes": repo.get("lanes"),
+        "queue_empty_caption": flights.empty_queue_caption(repo.get("lanes")),
         "stand": stand,
         "last_landing_text": last_landing_text,
         "field_caption": _field_caption(repo_flights, state, arrivals, now, stand),

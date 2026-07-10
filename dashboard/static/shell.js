@@ -300,7 +300,10 @@
     var flights = (r && r.flights) || [];
     var inAir = flights.filter(function (f) { return f.display && f.display.in_air; }).length;
     var deps = r && r.boards ? r.boards.departures.length : 0;
-    var queue = deps ? deps + " QUEUED" : "QUEUE EMPTY · 2 RUNWAYS OPEN";
+    // Empty queue → the server's caption, which states the repo's REAL lane count (singular/plural +
+    // honest no-number fallback all decided server-side, design record B.1 / issue #35). The JS only
+    // binds it; the "QUEUE EMPTY" default guards the no-repo-on-camera case (r is null).
+    var queue = deps ? deps + " QUEUED" : ((r && r.queue_empty_caption) || "QUEUE EMPTY");
     var clock = s.clock || "--:--";
     // The living clock label + the repo selector (single-repo VIEW — the grid is a later flight).
     var daypart = (s.daypart || "day").toUpperCase();
@@ -380,7 +383,7 @@
     if (state.depPage > depPageMax) state.depPage = depPageMax;
     if (state.depPage < 0) state.depPage = 0;
     return '<div class="boards">' +
-      '<div class="board" id="cc-departures">' + window.Boards.departuresInner(deps, r ? r.slug : "", state.depPage) + '</div>' +
+      '<div class="board" id="cc-departures">' + window.Boards.departuresInner(deps, r ? r.slug : "", state.depPage, r ? r.queue_empty_caption : "") + '</div>' +
       '<div class="board" id="cc-arrivals">' +
         '<div class="board-head"><span class="dot"></span><span class="name">ARRIVALS</span>' +
           '<span class="tag">LANDED · NEWEST FIRST</span></div>' +

@@ -25,7 +25,7 @@
   // flutters), so a page turn here is a clean re-render — the joy investment stays on the arrivals.
   var DEP_PAGE_SIZE = 5;
 
-  function departuresInner(deps, slug, page) {
+  function departuresInner(deps, slug, page, emptyCaption) {
     deps = deps || [];
     var pages = Math.max(1, Math.ceil(deps.length / DEP_PAGE_SIZE));
     page = Math.min(Math.max(0, page || 0), pages - 1);
@@ -104,7 +104,10 @@
       '<div class="board-cols dep-cols"><span>FLIGHT</span><span>DESTINATION</span>' +
         '<span class="dep-col-status">STATUS</span></div>' +
       rows +
-      (deps.length ? "" : '<div class="board-empty">— QUEUE EMPTY · 2 RUNWAYS OPEN —</div>') +
+      // The empty-board caption states the repo's REAL lane count — the server's queue_empty_caption
+      // threaded in as emptyCaption (issue #35); the JS only frames it in the split-flap dashes. The
+      // "QUEUE EMPTY" default covers a caption-less slice (no repo / older snapshot).
+      (deps.length ? "" : '<div class="board-empty">— ' + esc(emptyCaption || "QUEUE EMPTY") + ' —</div>') +
       pager +
       legend;
   }
