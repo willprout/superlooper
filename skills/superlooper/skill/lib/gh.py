@@ -206,8 +206,11 @@ def branch_checks(branch):
 
     The two reads fail closed INDEPENDENTLY to their empty contribution: a required check that
     never reports still reads pending (never a false green -> never a spurious unfreeze), and a
-    red on EITHER endpoint still freezes. A blip on one endpoint can only shrink the view toward
-    pending, never toward green."""
+    red on EITHER endpoint still freezes. For a required check that reports via a SINGLE endpoint
+    (the norm — GitHub identifies a required check by one context/name), a blip on the other
+    endpoint can only shrink that check's view toward pending, never toward green. The lone
+    exception is a name double-reported across BOTH endpoints with conflicting verdicts where the
+    red side blips — a misconfiguration corner, not a real required-check shape."""
     ref = quote(branch, safe="")
     out = []
     runs = _json_dict(["api", "repos/{owner}/{repo}/commits/%s/check-runs" % ref]).get("check_runs")
