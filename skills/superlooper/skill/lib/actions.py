@@ -43,14 +43,20 @@ The view contract (assembled by runner.py each tick):
                   "last_report_date": str|None}
   gh_view        {"stale": bool (fresh ONLY when exactly False), "consecutive_failures": int,
                   "closed_nums": set, "prs": {id: pr_view+comments; {} = fetched, none exists;
-                  KEY ABSENT = not fetched yet, so WAIT}, "issue_comments": {id: [...]},
+                  KEY ABSENT = not fetched yet, so WAIT}, "issue_comments": {id: [...]} — an entry
+                  is present ONLY for a CLEAN read (issue #21); a refused/starved investigate read is
+                  OMITTED, so a KEY-ABSENT investigate id means "no trustworthy read this tick" ->
+                  HOLD via await_read, never park,
                   "dev_checks": [{name,status,conclusion}] (key absent = not fetched)}
 
 Action vocabulary (the executor contract, one journal record each):
   launch, hire_answerer, deliver_answer, bounce, recover(tier=idle|frozen|exited), gate,
-  merge, update, nudge, hold, park, regenerate, resolve_conflict, close_investigate,
+  merge, update, nudge, hold, await_read, park, regenerate, resolve_conflict, close_investigate,
   reclaim, relabel, freeze, unfreeze, file_fix_issue, alert, clear_alert, morning_report,
-  notify. Safety actions (alert/freeze/unfreeze) come first; launches come LAST.
+  notify. Safety actions (alert/freeze/unfreeze) come first; launches come LAST. `await_read`
+  is the investigate-gate's HOLD when this tick has no trustworthy comment read (refused or
+  starved): it journals the wait ONCE per episode (deduped on the issue's `read_waited` flag) so
+  a finished investigation is never parked on an unverified read and never waits silently (#21).
 """
 import math
 
@@ -399,12 +405,25 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
             # the old ones) and re-releases to `ready`. It is the ONLY action for this issue this
             # tick — the phase-E launch waits one tick so it fires against the reset counters, never
             # the stale at-cap ones (see the `reapproved_now` guard below).
+            reapproved = False
             if status in REAPPROVAL_STATUSES:
                 p = parsed_by_id.get(iid)
                 labels = p.get("labels") if isinstance(p, dict) and isinstance(p.get("labels"), list) else []
                 if "agent-ready" in labels:
                     out.append({"act": "reapprove", "id": iid, "num": _iid_num(iid)})
                     reapproved_now.add(iid)
+                    reapproved = True
+            # Reconciliation (issue #21): a PARKED investigation whose marker comment appears on a
+            # later SUCCESSFUL read must never be left parked forever — close it. Only a fresh,
+            # trustworthy read acts: the view must be fresh AND the read PRESENT (a refused read is
+            # OMITTED from issue_comments, so `iid in issue_comments` == "a clean answer this poll",
+            # and answered-empty carries no marker so it stays parked). William re-approving (the
+            # reapprove branch above) is his explicit word to re-run, so it wins over reconciliation.
+            if (not reapproved and status == "parked" and not gh_stale
+                    and ist.get("type") == "investigate"
+                    and iid in issue_comments
+                    and gate.investigation_done(issue_comments.get(iid))):
+                out.append({"act": "close_investigate", "id": iid, "num": _iid_num(iid)})
             continue                                   # else re-release happens via labels (phase E)
         num = _iid_num(iid)
         p = parsed_by_id.get(iid)
@@ -429,7 +448,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
             itype = (p.get("type") if isinstance(p, dict) else None) or ist.get("type")
             if itype == "investigate":
                 if iid not in issue_comments:
-                    continue                           # comments not fetched yet -> wait
+                    # No trustworthy comment read this tick: the read was REFUSED (omitted from the
+                    # view by the poll) or STARVED (poll budget/throttle). HOLD — never nudge, never
+                    # park a finished investigation on an unverified read (issue #21: #8's false-park
+                    # off one stale read). Journal ONCE per episode (dedup on read_waited) so the
+                    # wait is never silent and the record stays bounded across a long outage.
+                    if not ist.get("read_waited"):
+                        out.append({"act": "await_read", "id": iid, "num": num,
+                                    "reason": "finished investigation: no trustworthy comment read "
+                                              "yet (GitHub refused, or the read has not landed) — "
+                                              "holding, never parking on an unverified read"})
+                    continue
                 view_comments = issue_comments.get(iid)
                 inv_done = gate.investigation_done(view_comments)
                 pv = {}

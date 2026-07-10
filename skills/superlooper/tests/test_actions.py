@@ -619,6 +619,7 @@ def test_frozen_mainline_holds_merges_but_not_investigation_closes():
 
 
 def test_finished_investigation_without_marker_nudges_then_parks():
+    # ANSWERED-EMPTY (a clean read, marker genuinely absent): nudge once, then park — unchanged.
     d = disk(reports={"i7": GOOD_REPORT},
              issues_state={"version": 1, "issues": {"i7": ist("gating", type="investigate")}})
     g = ghv(issue_comments={"i7": [{"body": "just chatter"}]})
@@ -628,6 +629,78 @@ def test_finished_investigation_without_marker_nudges_then_parks():
     d["issues_state"]["issues"]["i7"]["nudged"] = ["investigation"]
     out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
     assert len(only(out, "park")) == 1 and has_notify(out)
+
+
+def test_finished_investigation_refused_read_holds_never_parks():
+    # REFUSED / STARVED read (iid absent from issue_comments even though the view is FRESH): the
+    # gate must HOLD, never nudge, never park, never notify (issue #21 (a): #8's false-park). It
+    # journals ONE await_read record (never silent) and dedups on read_waited so the hold is bounded.
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {"i7": ist("gating", type="investigate")}})
+    g = ghv(issue_comments={})            # fresh view, but i7's comment read did not land (refused)
+    p7 = parsed(7, labels=("in-progress", "type:investigate"))
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert only(out, "park") == [] and only(out, "nudge") == [] and not has_notify(out)
+    assert len(only(out, "await_read")) == 1 and only(out, "await_read")[0]["num"] == 7
+
+    # even with the nudge ledger already spent, a refused read must STILL hold — the old bug parked
+    # here because the missing marker looked authoritative.
+    d["issues_state"]["issues"]["i7"]["nudged"] = ["investigation"]
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert only(out, "park") == [] and not has_notify(out)
+
+    # bounded: once read_waited is stamped, no further await_read records this episode.
+    d["issues_state"]["issues"]["i7"]["read_waited"] = True
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert only(out, "await_read") == [] and only(out, "park") == []
+
+
+def test_refused_read_recovers_and_the_investigation_closes():
+    # After holding on refused reads, a clean read carrying the marker closes the parent cleanly.
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {
+                 "i7": ist("gating", type="investigate", read_waited=True)}})
+    g = ghv(issue_comments={"i7": [{"body": "<!-- superlooper-investigation --> root cause: X"}]})
+    p7 = parsed(7, labels=("in-progress", "type:investigate"))
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert [a["act"] for a in out if a["act"] in ("close_investigate", "park", "nudge")] \
+        == ["close_investigate"]
+
+
+def test_stale_view_never_emits_await_read_for_an_investigation():
+    # A wholly-stale gh view (a real outage) must not spawn per-issue await_read noise — the poll's
+    # consecutive_failures ALERT owns that. await_read is only for a FRESH view missing ONE read.
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {"i7": ist("gating", type="investigate")}})
+    g = ghv(stale=True, issue_comments={})
+    out = decide(parsed_issues=[parsed(7, labels=("in-progress", "type:investigate"))], dsk=d, gh_view=g)
+    assert only(out, "await_read") == [] and only(out, "park") == []
+
+
+def test_parked_investigation_reconciles_when_marker_appears_on_a_clean_read():
+    # RECONCILIATION (issue #21): a PARKED investigation whose marker comment shows up on a later
+    # SUCCESSFUL read is closed — never left parked forever. The issue is terminal (parked), so it
+    # is NOT in the open-issue queue; the type comes from loopstate.
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {"i7": ist("parked", type="investigate")}})
+    g = ghv(issue_comments={"i7": [{"body": "<!-- superlooper-investigation --> root cause: X"}]})
+    out = decide(parsed_issues=[], dsk=d, gh_view=g)
+    assert [a["act"] for a in out] == [a["act"] for a in out if a["act"] == "close_investigate"]
+    assert len(only(out, "close_investigate")) == 1 and only(out, "close_investigate")[0]["num"] == 7
+
+
+def test_parked_investigation_does_not_reconcile_on_a_refused_read():
+    # A refused read (absent from issue_comments) must NEVER move a parked issue — reconciliation
+    # acts only on a fresh, trustworthy read carrying the marker.
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {"i7": ist("parked", type="investigate")}})
+    g = ghv(issue_comments={})                              # fresh view, i7 read refused/absent
+    out = decide(parsed_issues=[], dsk=d, gh_view=g)
+    assert only(out, "close_investigate") == []
+    # and answered-empty (marker genuinely still absent) also leaves the park untouched.
+    g2 = ghv(issue_comments={"i7": [{"body": "still just chatter"}]})
+    out2 = decide(parsed_issues=[], dsk=d, gh_view=g2)
+    assert only(out2, "close_investigate") == []
 
 
 def test_merged_pr_state_is_absorbed_not_wedged():

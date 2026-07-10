@@ -438,24 +438,42 @@ class Runner:
         st = self._load_state()
         ist_map = st.get("issues") if isinstance(st.get("issues"), dict) else {}
         prs, issue_comments = {}, {}
-        want = set()
-        for iid in list(ist_map) + list(parsed_by_id):
+        # The fetch want-set. Two disciplines are load-bearing (issue #21 (b) — the silent-forever
+        # strand): a terminal issue (merged/bounced/parked-build) is DONE being gated — decide skips
+        # it — yet its report stays on disk forever, so keying "want" off report-on-disk alone grew
+        # the set with every merge and starved the tail under MAX_POLL_CALLS. So:
+        #   * INDEPENDENT OF MERGED HISTORY: terminal issues are excluded outright; only a PARKED
+        #     INVESTIGATION is kept, at LOW priority, so a marker that landed after a park can
+        #     reconcile it (never parked forever) without letting parked accumulation crowd the poll.
+        #   * FINISHING FIRST: finishing work (report on disk / gating / holding / in-progress
+        #     orphan) is fetched before any parked-reconcile read, so parked-issue accumulation can
+        #     never starve a freshly-finished issue of its gating read.
+        want = {}                                      # iid -> priority (0 finishing, 1 reconcile)
+        for iid in set(ist_map) | set(parsed_by_id):
             ist = ist_map.get(iid) if isinstance(ist_map.get(iid), dict) else {}
             p = parsed_by_id.get(iid, {})
+            status = ist.get("status")
+            itype = (p or {}).get("type") or ist.get("type")
+            if status in actions.TERMINAL_STATUSES:
+                if itype == "investigate" and status == "parked":
+                    want[iid] = 1                      # reconcile a late-marker park (low priority)
+                continue                               # merged / bounced / parked-build: never poll
             gating = (os.path.exists(os.path.join(self.home, "reports", f"{iid}.md"))
-                      or ist.get("status") in ("gating", "holding"))
+                      or status in ("gating", "holding"))
             orphanish = "in-progress" in (p.get("labels") or [])
             if gating or orphanish:
-                want.add(iid)
-        for iid in sorted(want, key=lambda x: (len(x), x)):
+                want[iid] = 0
+        for iid in sorted(want, key=lambda x: (want[x], len(x), x)):
             ist = ist_map.get(iid) if isinstance(ist_map.get(iid), dict) else {}
             p = parsed_by_id.get(iid)
             itype = (p or {}).get("type") or ist.get("type")
             if itype == "investigate":
                 if budget():
                     num = (p or {}).get("num") or actions._iid_num(iid)
-                    issue_comments[iid] = gh.issue_comments(num)
-                continue
+                    cr = gh.issue_comments(num)
+                    if cr.ok:                          # store ONLY a clean answer; a refused read
+                        issue_comments[iid] = cr.comments   # is OMITTED, so decide HOLDS (never
+                continue                               # parks on an unverified read) — issue #21
             branch = ist.get("branch")
             if not (isinstance(branch, str) and branch.strip()):
                 if p is None:
@@ -466,7 +484,7 @@ class Runner:
             pv = gh.pr_for_branch(branch)
             if pv.get("number") and budget():
                 pv = dict(pv)
-                pv["comments"] = gh.pr_comments(pv["number"])
+                pv["comments"] = gh.pr_comments(pv["number"]).comments
             prs[iid] = pv
 
         self._parsed_by_id = parsed_by_id
@@ -500,6 +518,11 @@ class Runner:
             if actions._iid_num(iid) is None:
                 continue
             ist = ist if isinstance(ist, dict) else {}
+            # Investigate issues never open a PR — their completion signal is the marker COMMENT,
+            # freshened by _refresh_finishing_investigation_comments. Skip them here so this path
+            # never spends a pointless pr_for_branch lookup on one (issue #21).
+            if ist.get("type") == "investigate":
+                continue
             # A terminal issue is DONE being gated (decide skips it): never refresh it, or the D6
             # re-fetch below would poll a parked-but-unreviewed OPEN PR every tick forever, as its
             # report stays on disk (cross-review C1). This keeps the whole refresh set bounded.
@@ -528,11 +551,53 @@ class Runner:
             pv = gh.pr_for_branch(branch)
             if pv.get("number"):             # POSITIVE find only — a transient {} never erases a cache entry
                 pv = dict(pv)
-                pv["comments"] = gh.pr_comments(pv["number"])
+                pv["comments"] = gh.pr_comments(pv["number"]).comments
                 prs[iid] = pv
                 changed = True
         if changed:
             self.gh_view = {**self.gh_view, "prs": prs}
+
+    def _refresh_finishing_investigation_comments(self, ist_map):
+        """Budget-exempt sibling of _refresh_finishing_prs, for INVESTIGATE issues (issue #21 (b)).
+        The 90s poll walks its want-set under a fixed call budget in sorted order, so a finished
+        investigation can be STARVED of its comment read tick after tick — and the gate then holds
+        forever with no marker in view (and, before #21, false-parked on that unverified read). This
+        rescue refreshes the comment thread for any FINISHING investigation (report on disk, or
+        gating/holding) whose comments are MISSING from the view — starved this poll, or REFUSED
+        (gh.issue_comments omits a refused read). Two invariants keep it from re-introducing the very
+        false-park it defends against:
+          - POSITIVE reads only: a refused/timed-out read fails closed (ok=False) and is SKIPPED, so
+            it never fabricates an empty 'no marker' answer that would false-park a live investigation;
+          - a cached (already-fetched) read is never re-fetched — no double work inside a poll window.
+        Terminal issues are skipped (decide is done with them); parked-investigation reconciliation
+        rides the 90s poll's low-priority want tier, not this every-tick path, so this set stays
+        bounded to the transient finishing-but-unread investigations. Called only on a FRESH view
+        (tick() gates on not-stale): a probe-DOWN outage skips it entirely, but a probe-UP partial
+        refusal (a data-read rate-limit — probe uses the free `gh api rate_limit`, so it stays green)
+        DOES re-issue the read each tick until it lands. That retry is bounded to K = concurrently
+        finishing investigations (a small transient set) and is exactly symmetric with
+        _refresh_finishing_prs's own every-tick re-fetch — a deliberate cost so a late marker or a
+        recovered read reaches the gate within one tick, not one poll window."""
+        if not isinstance(ist_map, dict):
+            return
+        comments = dict(self.gh_view.get("issue_comments") or {})
+        changed = False
+        for iid, ist in ist_map.items():
+            if actions._iid_num(iid) is None:
+                continue
+            ist = ist if isinstance(ist, dict) else {}
+            if ist.get("type") != "investigate" or ist.get("status") in actions.TERMINAL_STATUSES:
+                continue
+            finishing = (os.path.exists(os.path.join(self.home, "reports", f"{iid}.md"))
+                         or ist.get("status") in ("gating", "holding"))
+            if not finishing or iid in comments:       # not finishing, or already a clean read
+                continue
+            cr = gh.issue_comments(actions._iid_num(iid))
+            if cr.ok:                                  # POSITIVE read only — a refusal never overwrites
+                comments[iid] = cr.comments
+                changed = True
+        if changed:
+            self.gh_view = {**self.gh_view, "issue_comments": comments}
 
     def _load_state(self):
         try:
@@ -688,6 +753,7 @@ class Runner:
         # reachable (a stale/unreachable view is left untouched — the gate then waits, never parks).
         if not self.gh_view.get("stale"):
             self._refresh_finishing_prs(ist_map)
+            self._refresh_finishing_investigation_comments(ist_map)
 
         lane_state = actions.lane_state_from(st)
         acts = actions.decide(now, self.config, self.usage_view(),
@@ -922,7 +988,9 @@ class Runner:
         # the visible record; a genuine gh outage still surfaces via the poll's consecutive_failures
         # ALERT). A regenerate/relaunch routes back through here, so the rebuild picks up the thread
         # fresh. brief.build applies the owner-only trust rule and skips the runner's own markers.
-        comments = gh.issue_comments(num)
+        # A refused read (ok=False) carries comments=[] — the same fail-closed "no amendments" the
+        # old contract gave, so brief-building never blocks on a supplementary channel (issue #21).
+        comments = gh.issue_comments(num).comments
         try:
             text = brief.build(pb, self.config, comments=comments)
         except ValueError as e:
@@ -1099,7 +1167,8 @@ class Runner:
                     old[k] = i.get(k)
                 i[k] = 0
             i.update({"status": "ready", "requeue_front": False, "recheck_failed": False,
-                      "update_result": None, "update_head_oid": None, "nudged": [], "pr": None})
+                      "update_result": None, "update_head_oid": None, "nudged": [], "pr": None,
+                      "read_waited": False})
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()
@@ -1166,6 +1235,16 @@ class Runner:
     def _exec_gate(self, a, now):
         self._update_issue(a["id"], {"status": "gating"})
         return "ok"
+
+    def _exec_await_read(self, a, now):
+        """Issue #21: a finished investigation has NO trustworthy comment read this tick — GitHub
+        refused it (omitted from the view), or the poll budget/throttle starved it. decide emitted
+        this exactly ONCE per episode (deduped on `read_waited`) so the hold is journaled, never
+        silent, and never a park. Stamp the flag; the gate keeps holding at status=gating until a
+        clean read lands (then it closes on the marker, or nudges->parks on a genuinely-absent one).
+        Reset by _exec_reapprove so a re-run's own wait re-journals."""
+        self._update_issue(a["id"], {"read_waited": True})
+        return a.get("reason", "holding: finished investigation awaiting a trustworthy comment read")
 
     def _exec_hold(self, a, now):
         self._update_issue(a["id"], {"status": "holding"})

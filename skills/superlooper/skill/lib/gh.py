@@ -12,6 +12,7 @@ Two hard rules, both bought by the autocode runs:
 
 The gh binary is overridable via `SL_GH` (tests point it at tests/fakes/fake-gh).
 """
+import collections
 import copy
 import json
 import os
@@ -142,16 +143,42 @@ def issue(num):
     return _json_dict(["issue", "view", str(num), "--json", _ISSUE_FIELDS])
 
 
+# The comment-read contract (issue #21). A comment read has THREE outcomes, and the caller must
+# tell the last two apart: (1) GitHub answered with comments, (2) GitHub answered "no comments",
+# (3) GitHub REFUSED — rate-limit / 403 / 5xx / timeout / missing binary, or a wrong-typed /
+# unparseable body. The old contract collapsed (2) and (3) both to [], so a single stale or
+# refused read looked identical to an authoritative empty thread — and the investigate gate parked
+# a finished investigation off that unverified read (this repo, #8, 2026-07-10). CommentRead keeps
+# them distinct: `comments` is ALWAYS a list (still fail-closed to [] — acting on nothing is safe),
+# and `ok` is True ONLY on a clean answer ({"comments": <list>} over rc 0). refused -> ok=False, so
+# the gate HOLDS instead of parking; answered-empty -> ok=True, so the gate still nudges->parks.
+CommentRead = collections.namedtuple("CommentRead", ["comments", "ok"])
+
+
+def _comment_read(view_args, timeout=30):
+    rc, out = _run(view_args, timeout=timeout)
+    if rc != 0:
+        return CommentRead([], False)          # GitHub refused / timed out / no binary
+    try:
+        d = json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return CommentRead([], False)          # unparseable body: cannot trust it -> refused
+    if isinstance(d, dict) and isinstance(d.get("comments"), list):
+        return CommentRead(list(d["comments"]), True)   # a clean answer (possibly empty)
+    return CommentRead([], False)              # missing/wrong-typed field: not a clean answer
+
+
 def issue_comments(num):
-    d = _json_dict(["issue", "view", str(num), "--json", "comments"])
-    c = d.get("comments")
-    return c if isinstance(c, list) else []
+    """The issue's comment thread as a CommentRead(comments, ok). `ok` distinguishes a genuine
+    empty thread from a refused read, so a finished investigation is never parked on an unverified
+    read (issue #21)."""
+    return _comment_read(["issue", "view", str(num), "--json", "comments"])
 
 
 def pr_comments(num):
-    d = _json_dict(["pr", "view", str(num), "--json", "comments"])
-    c = d.get("comments")
-    return c if isinstance(c, list) else []
+    """The PR's comment thread as a CommentRead(comments, ok) — same refused-vs-answered-empty
+    contract as issue_comments()."""
+    return _comment_read(["pr", "view", str(num), "--json", "comments"])
 
 
 def pr_for_branch(branch):
