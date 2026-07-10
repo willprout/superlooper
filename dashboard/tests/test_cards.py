@@ -155,6 +155,18 @@ def test_drawer_off_path_state_is_named_in_plain_words():
     assert cur["stage"] == flights.DOWNWIND                        # honest position, not teleported
 
 
+def test_drawer_stranded_gate_names_the_gate_and_holds_its_final_position(tmp_path):
+    # A stranded gate's drawer (issue #22) must tell the owner where the problem is — the GATE, not a
+    # dead session — and keep the plane AT its honest final position (the gate) on the circuit rail.
+    f = _flight(stage=flights.STRANDED, circuit_stage=flights.FINAL)
+    d = cards.flight_drawer(f, [], "r", "Air")
+    assert d["off_path"]["state"] == flights.STRANDED
+    plain = d["off_path"]["plain"].lower()
+    assert "gate" in plain and "frozen" not in plain              # points at the gate, not a dead session
+    cur = next(s for s in d["circuit"] if s["current"])
+    assert cur["stage"] == flights.FINAL                          # held at the gate, never teleported
+
+
 def test_drawer_clearance_checklist_has_real_names_and_plain_glosses():
     f = _flight(stage=flights.FINAL, circuit_stage=flights.FINAL,
                 gate={"report": True, "review": True, "ci": False, "mergeable": True, "cleared": False})

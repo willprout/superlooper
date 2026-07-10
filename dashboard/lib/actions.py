@@ -178,6 +178,7 @@ _STAGE_PHRASE = {
     "awaiting": "awaiting your decision",
     "holding": "holding — number two for landing",
     "session-frozen": "session frozen — a stalled session, no contrail",
+    "stranded": "stranded at the gate — report filed, but the runner hasn't landed it",
     "merges-freeze": "landings paused — a repair flight is out",
 }
 

@@ -69,12 +69,14 @@
   }
 
   // Where a flight PHYSICALLY sits: on-circuit stages sit at their own anchor; holding sits in
-  // the pattern; parked sits at the stalled gates; awaiting/session-frozen sit at the flight's
-  // UNDERLYING circuit position (§5 — the amber ring / grey hull render in place, no magic fix).
+  // the pattern; parked sits at the stalled gates; awaiting/session-frozen/stranded sit at the
+  // flight's UNDERLYING circuit position (§5 — the amber ring / grey hull / stranded plane render
+  // in place, no magic fix). A stranded gate's circuitStage is 'final', so it sits ON the gate.
   function placementOf(f) {
     if (f.stage === 'holding') return 'holding';
     if (f.stage === 'parked') return 'parked';
-    if (f.stage === 'awaiting' || f.stage === 'session-frozen') return f.circuitStage || 'downwind';
+    if (f.stage === 'awaiting' || f.stage === 'session-frozen' ||
+        f.stage === 'stranded') return f.circuitStage || 'downwind';
     return f.stage;
   }
 
@@ -185,6 +187,12 @@
         if (f.stage === 'session-frozen') {
           layoutTags.push({ kind: 'frozen', x: anchor.x, y: anchor.y - box.h / 2 - 6,
                             text: f.label + ' · SESSION FROZEN' });
+        }
+        // A stranded gate is a FINISHED flight the gate never landed — a solid plane held on the
+        // threshold, its own gold tag pointing at the runner (issue #22). Never the grey frozen tag.
+        if (f.stage === 'stranded') {
+          layoutTags.push({ kind: 'stranded', x: anchor.x, y: anchor.y - box.h / 2 - 6,
+                            text: f.label + ' · STRANDED AT GATE' });
         }
       });
       Object.keys(sprites).forEach(function (k) { if (!seen[k]) delete sprites[k]; });

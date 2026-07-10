@@ -53,7 +53,7 @@
     "at-stand": "#5A6572", "taxi-out": "#2D6BC4", "takeoff": "#2D6BC4", "downwind": "#2D6BC4",
     "base-turn": "#2D6BC4", "final": "#2F8A4C", "touchdown": "#8A93A0", "taxi-in": "#8A93A0",
     "parked": "#C77E1F", "awaiting": "#C77E1F", "holding": "#7A5CBF",
-    "session-frozen": "#8A93A0", "merges-freeze": "#2D8FA0",
+    "session-frozen": "#8A93A0", "stranded": "#C79A2E", "merges-freeze": "#2D8FA0",
   };
 
   function repo() {

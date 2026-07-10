@@ -286,6 +286,39 @@ def test_all_clear_field_has_no_trouble_banner(tmp_path):
     assert snap["trouble"]["present"] is False
 
 
+def test_stranded_gate_surfaces_as_its_own_state_end_to_end(tmp_path):
+    # The whole pipeline (issue #22): a finished investigation — report on disk, status `gating` —
+    # whose activity file has aged past the frozen tier is STRANDED at the gate. The snapshot must
+    # name it distinctly (never as a frozen session) on the flight, the pill, and the trouble banner,
+    # sort it in the off-path band, and keep the plane LIT under the trouble spotlight — and every
+    # word it shows the owner must point at the GATE/runner, never at a dead session.
+    dst = tmp_path / "will-titan__strand"
+    (dst / "state" / "activity").mkdir(parents=True)
+    (dst / "reports").mkdir()
+    (dst / "reports" / "i22.md").write_text("## Tests\nok\n")            # report on disk ⇒ session done
+    (dst / "state" / "issues.json").write_text(json.dumps(
+        {"version": 1, "issues": {"i22": {"status": "gating", "branch": "sl/i22-x", "pr": 9}}}))
+    (dst / "journal.jsonl").write_text("")
+    (dst / "state" / "runner.heartbeat").write_text(str(NOW - 5))        # runner is UP (not runner-down)
+    act = dst / "state" / "activity" / "i22"
+    act.write_text("")
+    os.utime(act, (NOW - 2700 - 60, NOW - 2700 - 60))                   # activity aged past frozen
+
+    snap = server.assemble_snapshot(_config(dst), now=NOW)
+    f = next(f for f in snap["flights"] if f["num"] == 22)
+    assert f["stage"] == flights.STRANDED
+    assert f["stage"] != flights.SESSION_FROZEN
+    assert f["display"]["stage_rank"] >= len(flights.CIRCUIT_STAGES)     # sorts in the off-path band
+    assert f["display"]["trouble"] is True                              # stays LIT, never dimmed away
+
+    assert snap["pill"]["state"] == flights.STRANDED
+    assert snap["pill"]["level"] == "attention"
+    assert "gate" in snap["pill"]["message"].lower()                    # points at the gate/runner
+    assert "frozen" not in snap["pill"]["message"].lower()              # NOT a dead session
+    assert snap["trouble"]["present"] is True
+    assert "gate" in snap["trouble"]["text"].lower()
+
+
 # =============================== shipped-delta + firehose + tower window ===============================
 
 def test_per_repo_shipped_delta_counts_outcomes_only(home):

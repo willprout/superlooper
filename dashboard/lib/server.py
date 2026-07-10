@@ -552,8 +552,9 @@ _REVIEW_MARKER = "<!-- superlooper-review -->"
 # by circuit position; off-path states grouped after). Server-side so the JS sorts by a supplied
 # number and never encodes the circuit order itself (design record B.1). Unknown ⇒ 99 (sorts last).
 _STAGE_RANK = {s: i for i, s in enumerate(flights.CIRCUIT_STAGES)}
-for _i, _s in enumerate((flights.HOLDING, flights.SESSION_FROZEN, flights.MERGES_FREEZE,
-                         flights.PARKED, flights.AWAITING), start=len(flights.CIRCUIT_STAGES)):
+for _i, _s in enumerate((flights.HOLDING, flights.STRANDED, flights.SESSION_FROZEN,
+                         flights.MERGES_FREEZE, flights.PARKED, flights.AWAITING),
+                        start=len(flights.CIRCUIT_STAGES)):
     _STAGE_RANK[_s] = _i
 
 # A plain one-line banner per worst-condition, for the camera-independent trouble slot (design §4/§5).
@@ -563,6 +564,7 @@ _TROUBLE_TEXT = {
     flights.AWAITING: "A decision is waiting on you",
     flights.PARKED: "Flights parked — your call",
     flights.SESSION_FROZEN: "A session has frozen on the field",
+    flights.STRANDED: "A finished flight is stranded at the gate — the runner hasn't landed it",
     "spinning": "A flight looks busy but is making no progress",
     flights.MERGES_FREEZE: "Landings paused — a repair flight is out",
 }
@@ -641,6 +643,8 @@ def _flight_note(flight, memo):
         return (memo or "awaiting your decision").strip().replace("\n", " ")[:90]
     if stage == flights.HOLDING:
         return "holding — number 2 for landing"
+    if stage == flights.STRANDED:
+        return "stranded at the gate — report filed, runner hasn't landed it"
     if flight.get("merged"):
         pr = flight.get("pr")
         base = "merged" + (" PR #%s" % pr if pr else "")
@@ -673,7 +677,7 @@ def _lit(flight, worst_state):
     merges-freeze are whole-surface or tower treatments, never a plane spotlight."""
     if worst_state == "spinning":
         return bool(flight.get("spinning"))
-    if worst_state in (flights.PARKED, flights.AWAITING, flights.SESSION_FROZEN):
+    if worst_state in (flights.PARKED, flights.AWAITING, flights.SESSION_FROZEN, flights.STRANDED):
         return flight["stage"] == worst_state
     return False
 
@@ -1159,6 +1163,8 @@ def _pill_message(pill, needs_you, runner_down):
         return "%d parked — your call" % parked
     if st == flights.SESSION_FROZEN:
         return "a session has frozen"
+    if st == flights.STRANDED:
+        return "a flight is stranded at the gate"
     if st == "spinning":
         return "a flight is spinning — no progress"
     if st == flights.MERGES_FREEZE:

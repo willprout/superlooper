@@ -292,6 +292,9 @@ html, body {
   border-color: #2F8A4C; color: #9FD8B0; font-size: 9px; padding: 1px 6px; letter-spacing: 0.5px;
 }
 .fld-tag.frozen { border-color: #4A5661; color: #C9D2DC; }
+/* the stranded gate — a FINISHED flight the runner never landed. Gold, solid, "look at the gate":
+   deliberately NOT the muted grey of the .frozen (dead session) tag, so the eye separates them. */
+.fld-tag.stranded { border-color: #D8A63A; color: #F2D488; }
 .fld-lm {
   position: absolute; transform: translate(-50%, -50%);
   background: rgba(255, 255, 255, 0.85); border-radius: 3px;
@@ -685,6 +688,11 @@ html, body {
 }
 .drawer-offpath.state-session-frozen, .drawer-offpath.state-merges-freeze {
   background: #EEF4F6; border-color: #CFE0E6; border-left-color: #2D8FA0; color: #2A5A64;
+}
+/* a stranded gate's note — gold, so it reads as its own "look at the runner" state, never the
+   blue-grey of the dead-session / paused-landings note above (issue #22 distinctness). */
+.drawer-offpath.state-stranded {
+  background: #FBF3DE; border-color: #EBD9A6; border-left-color: #C79A2E; color: #6E5410;
 }
 /* Clearance checklist — real check names, plain glosses (costume rule 2). */
 .drawer-clearance { display: flex; flex-direction: column; gap: 5px; }
