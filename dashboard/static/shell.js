@@ -76,7 +76,13 @@
       })
       .catch(function () {
         state.connOk = false;
-        updateChrome();
+        // Two very different failures share this path. If we have NEVER painted (no snapshot yet),
+        // there is no shell to hang the conn-warn banner on — render() early-returns on a null
+        // snapshot — so a first-poll failure would sit on the seeded "connecting…" text forever.
+        // Paint an honest first-paint surface straight into #root instead (issue #34). Once we DO
+        // have a last-good snapshot, the conn-warn banner over it is the right, less-alarming surface.
+        if (!state.snapshot) renderDisconnected();
+        else updateChrome();
       })
       .then(function () {
         var ms = 2000;
@@ -122,6 +128,26 @@
     // an open flight card tracks live state (design record §4 — always the same, always current).
     refreshDrawer();
     updateChrome();
+  }
+
+  // The honest FIRST-PAINT failure surface (issue #34). Before the first successful snapshot there is
+  // no shell — so no conn-warn banner, and render() early-returns on a null snapshot. Without this,
+  // a server that never answers the first poll (down, or the wrong port) leaves the page frozen on
+  // the seeded "connecting to the field…" text with no error surface at all. This replaces that seed
+  // with a plain, actionable "can't reach the tower" card the moment the first poll fails. It
+  // self-heals for free: poll() keeps retrying, and the first success calls render(), which rebuilds
+  // #root wholesale from the fresh snapshot and wipes this card. Only ever shown pre-first-snapshot
+  // (the caller gates on !state.snapshot) — once a last-good snapshot exists, the conn-warn banner
+  // over it is the calmer, correct surface.
+  function renderDisconnected() {
+    root.innerHTML =
+      '<div class="cc-disconnected" role="alert">' +
+        '<div class="cc-disc-title"><span class="dot"></span>can’t reach the tower</div>' +
+        '<div class="cc-disc-body">No answer from the command center at this address yet. ' +
+          'Is <code>bin/command-center</code> running, and on the port you opened? ' +
+          'If that port was taken, change <code>port</code> in your <code>config.json</code>.</div>' +
+        '<div class="cc-disc-foot">Retrying automatically… the field appears the moment it answers.</div>' +
+      '</div>';
   }
 
   // The flight-card drawer: find a flight's server-composed drawer object by (repo, num) across the

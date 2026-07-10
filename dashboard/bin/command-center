@@ -14,10 +14,17 @@ usage read. Every semantic in the snapshot comes from a unit-tested ``lib/`` fun
 Run:  bin/command-center [config.json]        (default: ./config.json, or $CC_CONFIG)
 Serves http://127.0.0.1:<port> — open it in a browser. Ctrl-C to stop.
 """
+import errno
 import os
 import sys
 import time
 from pathlib import Path
+
+# Exit codes main() may return. A bad config and a taken port are BOTH first-run dead-ends that must
+# fail friendly (never a raw traceback), but with DISTINCT codes so a supervisor — or a human reading
+# the launchd log — can tell "fix your config.json" from "free the port" apart (issue #34).
+EXIT_CONFIG_ERROR = 2   # config file missing / malformed / schema-invalid (config_mod.load raised)
+EXIT_BIND_FAILED = 3    # the loopback socket could not be bound — almost always the port is in use
 
 _ROOT = Path(__file__).resolve().parent.parent
 # lib before anything else so `import server` / `config` resolve without an install step (mirrors
@@ -38,6 +45,23 @@ def _config_path(argv):
     if len(argv) > 1:
         return argv[1]
     return os.environ.get("CC_CONFIG", "config.json")
+
+
+def _bind_error_line(port, err):
+    """One friendly, actionable line for a socket bind failure (issue #34) — the runtime twin of the
+    config loader's loud errors. Names the PORT and the ``port`` config key to change, so a stranger
+    who hit "that port is taken" gets the README's own advice from the runtime, never a raw ``OSError``
+    traceback. EADDRINUSE (the common case: a second copy, or another app, holds the port) gets the
+    "already in use" wording; any other bind failure still names the port + key so the line is always
+    actionable. Newline-terminated, one line, mirroring the config loader's ``command-center: …`` style."""
+    if err.errno == errno.EADDRINUSE:
+        reason = "is already in use (another command-center may be running, or another app holds it)"
+    elif err.errno == errno.EADDRNOTAVAIL:
+        reason = "is not an address this machine can bind"
+    else:
+        reason = "could not be bound (%s)" % (err.strerror or err)
+    return ('command-center: port %d %s — change "port" in your config.json (or free port %d), '
+            'then start again.\n' % (port, reason, port))
 
 
 def build_provider(cfg, dashboard_desk, monitor):
@@ -85,10 +109,10 @@ def main(argv):
         cfg = config_mod.load(cfg_path)
     except FileNotFoundError as e:
         sys.stderr.write("command-center: %s\n" % e)
-        return 2
+        return EXIT_CONFIG_ERROR
     except ValueError as e:
         sys.stderr.write("command-center: %s\n" % e)
-        return 2
+        return EXIT_CONFIG_ERROR
 
     static_dir = str(_ROOT / "static")
     # The dashboard's OWN tiny state (the since-you-last-looked watermark, Task 9) — under $SL_HOME,
@@ -110,9 +134,18 @@ def main(argv):
     # the operator chose to watch. Merged-only scope is enforced in lib/tidy (never passes `--all`).
     tidy = tidy_mod.Tidy(cfg["superlooper_cli"], {r["slug"]: r["path"] for r in cfg["repos"]})
     replay_provider, digest_provider = build_data_providers(cfg)
-    httpd = server.build_server(provider, static_dir, port=cfg["port"], actions=verbs,
-                                desk=dashboard_desk, tidy=tidy, replay_provider=replay_provider,
-                                digest_provider=digest_provider)
+    # The bind (in build_server) is the first thing that can fail on an otherwise-valid config: the
+    # configured port may be taken by a second command-center or another app. Answer it the way a bad
+    # config is answered — one friendly line, a clean exit code — never a raw OSError traceback (which,
+    # under launchd's KeepAlive, becomes a hot crash-loop). Only the CONSTRUCTION bind is guarded here;
+    # serve_forever below keeps its own KeyboardInterrupt handling (issue #34).
+    try:
+        httpd = server.build_server(provider, static_dir, port=cfg["port"], actions=verbs,
+                                    desk=dashboard_desk, tidy=tidy, replay_provider=replay_provider,
+                                    digest_provider=digest_provider)
+    except OSError as e:
+        sys.stderr.write(_bind_error_line(cfg["port"], e))
+        return EXIT_BIND_FAILED
     url = "http://%s:%d" % (server.BIND_HOST, cfg["port"])
     watching = ", ".join(r["slug"] for r in cfg["repos"])
     sys.stderr.write("command-center: serving %s (watching %s) — Ctrl-C to stop\n" % (url, watching))

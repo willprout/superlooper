@@ -5,9 +5,13 @@
      unattended localhost dashboard. bin/install-launchd.sh substitutes the label, dashboard
      binary, config path, and log path placeholders below with absolute paths (the placeholder
      tokens are intentionally kept out of this comment so substitution never rewrites the prose).
-     KeepAlive relaunches a crashed dashboard; RunAtLoad starts it at login. The server still
-     binds 127.0.0.1 ONLY (it can write GitHub labels — William's word — so it must never be
-     reachable off the machine); launchd changes only WHEN it runs, never that bright line. -->
+     KeepAlive relaunches a crashed dashboard; RunAtLoad starts it at login. ThrottleInterval spaces
+     those relaunches so a bind failure that exits every launch (the configured port is already in
+     use — issue #34) crash-loops COOLLY, at most once per interval, instead of hot-looping the port
+     many times a second: the friendly "port … is already in use" line lands in the log once per
+     interval, giving you time to free the port or change it. The server still binds 127.0.0.1 ONLY
+     (it can write GitHub labels — William's word — so it must never be reachable off the machine);
+     launchd changes only WHEN it runs, never that bright line. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -21,6 +25,8 @@
     <true/>
     <key>RunAtLoad</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>{log_path}</string>
     <key>StandardErrorPath</key>

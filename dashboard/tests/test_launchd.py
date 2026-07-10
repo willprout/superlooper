@@ -85,6 +85,25 @@ def test_committed_template_carries_no_leftover_placeholder():
     assert "{" not in rendered and "}" not in rendered
 
 
+def test_committed_template_throttles_keepalive_relaunches():
+    # Issue #34: KeepAlive relaunches a crashed dashboard, but a bind failure (the port is already in
+    # use) exits on EVERY launch. Absent an EXPLICIT ThrottleInterval, launchd falls back to its own
+    # implicit ~10s default — still ~6 relaunches a minute of log-spamming bind failures, and invisible
+    # in the plist we ship. An explicit, longer interval spaces the relaunches further AND documents
+    # the behavior right in the plist, so the loop is demonstrably COOL (at most once per interval),
+    # leaving a human time to read the friendly line and free the port. Stated in the README's launchd
+    # section (DoD).
+    rendered = launchd.render_plist(_TEMPLATE.read_text(), label=launchd.DEFAULT_LABEL,
+                                    command_center_bin=_BIN, config_path=_CONFIG, log_path=_LOG)
+    doc = plistlib.loads(rendered.encode("utf-8"))
+    ti = doc.get("ThrottleInterval")
+    assert isinstance(ti, int) and not isinstance(ti, bool), (
+        "the keep-alive must set an integer ThrottleInterval so a bind-failure loop is cool, not hot "
+        "(issue #34)")
+    assert ti >= 10, (
+        "a throttle under launchd's own 10s default gives no real protection against a hot crash-loop")
+
+
 # =============================== the CLI the install shell calls ===============================
 
 def test_cli_prints_the_rendered_plist(tmp_path):
