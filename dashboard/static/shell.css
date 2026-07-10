@@ -347,12 +347,37 @@ html, body {
 .fld-link .s { font: 400 9.5px var(--sans); color: #8AA0AE; letter-spacing: 0.2px; }
 @keyframes cc-link-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 @media (prefers-reduced-motion: reduce) { .fld-link .t { animation: none; } }
-.repo-sel { display: inline-flex; gap: 4px; margin-left: 6px; }
+.repo-sel { display: inline-flex; align-items: center; gap: 5px; margin-left: 6px; }
 .repo-tab {
+  position: relative;
   background: none; border: 1px solid #C9D2DC; border-radius: 4px; cursor: pointer;
-  font: 600 10px var(--mono); color: var(--muted); padding: 1px 8px;
+  font: 600 10px var(--mono); color: var(--faint); padding: 1px 8px;
+  transition: color 0.1s ease, border-color 0.1s ease;
 }
-.repo-tab.on { background: var(--blue); border-color: var(--blue); color: #F2F6FA; }
+.repo-tab:hover { color: var(--muted); border-color: #B4BFCB; }
+/* The ACTIVE repo tab must be UNMISTAKABLE at a glance (issue #44) — never a subtle class swap a
+   late-night operator can misread before pressing a verb. It stacks glance signals in the 16-bit
+   menu idiom: a bright filled chip, bolder than its recessive (faint) siblings, wearing the classic
+   menu SELECTION CURSOR (▸), a soft blue glow, and a downward CAMERA NOTCH tying the lit tab to the
+   field it is steering. Joy-positive (§0.1): this ADDS a game-menu treat, not a modal. */
+.repo-tab.on {
+  background: var(--blue); border-color: var(--blue); color: #F2F6FA;
+  font-weight: 700; padding: 2px 9px 2px 7px;
+  box-shadow: 0 0 0 2px rgba(45, 107, 196, 0.26), 0 2px 6px rgba(45, 107, 196, 0.42);
+}
+.repo-tab.on::before {
+  content: "▸"; margin-right: 5px; color: #CDE6FF; font-weight: 700;
+  animation: cc-tab-cursor 1s steps(2, jump-none) infinite;
+}
+.repo-tab.on::after {
+  content: ""; position: absolute; left: 50%; bottom: -5px; transform: translateX(-50%);
+  border-left: 5px solid transparent; border-right: 5px solid transparent;
+  border-top: 5px solid var(--blue);
+}
+@keyframes cc-tab-cursor { 0%, 100% { opacity: 1; } 50% { opacity: 0.32; } }
+@media (prefers-reduced-motion: reduce) {
+  .repo-tab.on::before { animation: none; }
+}
 @media (prefers-reduced-motion: reduce) {
   .fld-lm { transition: none; }
 }
@@ -551,6 +576,15 @@ html, body {
 /* Drop is the one destructive verb — armed (mid-confirm) it goes red so the second tap is deliberate. */
 .btn.ghost.danger {
   background: #FBEAE7; border-color: var(--red); color: var(--red); font-weight: 700;
+}
+/* The armed Drop names its CONSEQUENCE in plain words (issue #44): a red caption raised ONLY on the
+   second-tap, so a mid-confirm Drop can never read as an Approve. Red family (§5: destructive gets
+   the red pole) so it groups with the armed red button and reads as stop-and-think, not a neutral
+   note skimmed past; wraps freely in the narrow Needs You column. */
+.card .drop-consequence {
+  font: 600 11px/1.45 var(--sans); color: var(--red);
+  background: #FBEAE7; border: 1px solid #E3A79D; border-radius: 5px;
+  padding: 6px 9px; overflow-wrap: anywhere;
 }
 /* Discuss reads as a quiet link but is a real button. */
 .btn-note.link { background: none; border: none; cursor: pointer; padding: 0; }
