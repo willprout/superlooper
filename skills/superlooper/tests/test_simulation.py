@@ -735,6 +735,53 @@ def test_silent_exit_relaunch_ladder_parks_at_cap(sim_factory):
 
 
 # =====================================================================================
+# launch anchor liveness (#24): a dead launch anchor must never walk the queue
+# =====================================================================================
+
+def test_dead_launch_anchor_alerts_once_and_never_walks_the_queue(sim_factory, monkeypatch):
+    # The 2026-07-09 incident, end to end. Four approved issues are queued; then the runner's launch
+    # anchor (its cmux pane) stops resolving mid-run — the tab was dragged to another cmux window, so
+    # fake-cmux's list-pane-surfaces resolves only a DIFFERENT pane. The old per-issue cap walked all
+    # four into parks + notifies; the fix detects a RUNNER-level fault: ONE alert + notify, ZERO
+    # parks, the queue left fully intact (every issue keeps agent-ready), across many ticks.
+    sim = sim_factory()
+    nums = [sim.add_issue(title="Queued %d" % i) for i in range(4)]
+    monkeypatch.setenv("FAKE_CMUX_GOOD_PANE", "99999999-dead-dead-dead-999999999999")
+    for _ in range(3):                                 # several ticks — the queue must NOT walk
+        sim.tick()
+
+    assert sim.journal("launch") == []                 # not one launch attempted
+    assert sim.journal("park") == []                   # ZERO parks
+    assert len(sim.journal("alert")) == 1              # exactly ONE alert (deduped across ticks)
+    assert len(sim.notify_lines()) == 1                # exactly ONE notify — the alert itself
+    assert "launch anchor gone" in sim.notify_lines()[0]
+    alert = json.load(open(os.path.join(sim.home, "state", "ALERT")))
+    assert alert["reasons"] == ["launch_anchor_down"]
+    for num in nums:                                   # every issue kept agent-ready, unclaimed
+        assert "agent-ready" in sim.issue(num)["labels"]
+        assert "in-progress" not in sim.issue(num)["labels"]
+    assert sim.mutations("set_labels") == []           # not one label moved on any issue
+
+
+def test_launches_resume_after_the_anchor_resolves(sim_factory, monkeypatch):
+    # DoD #2: once the pane resolves again the held queue launches with NO relabeling — recovery
+    # needs no William touch, because agent-ready was never stripped.
+    sim = sim_factory()
+    num = sim.add_issue(title="Resume me")
+    sid = "i%d" % num
+    monkeypatch.setenv("FAKE_CMUX_GOOD_PANE", "99999999-dead-dead-dead-999999999999")
+    sim.tick()
+    assert sim.loop_issue(sid).get("status") != "running"   # held while the anchor is gone
+    assert "agent-ready" in sim.issue(num)["labels"]
+
+    monkeypatch.delenv("FAKE_CMUX_GOOD_PANE", raising=False)  # the tab is back in its own window
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "running"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert "in-progress" in sim.issue(num)["labels"]
+    assert "agent-ready" not in sim.issue(num)["labels"]
+
+
+# =====================================================================================
 # hard anti-affinity: overlapping declared touches NEVER build concurrently
 # =====================================================================================
 

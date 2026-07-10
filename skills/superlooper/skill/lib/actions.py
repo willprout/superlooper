@@ -76,6 +76,14 @@ GH_ALERT_FAILURES = 10             # consecutive failed poll cycles (~15 min at 
 ANSWERER_TIMEOUT_SECONDS = 900     # the answerer's 15-min freeze tier = its timeout
 RECOVER_RETRY_SECONDS = 600        # frozen-session recovery ladder re-fires at most every 10 min
 LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LAUNCHVERIFY x2)
+# A dead LAUNCH ANCHOR (the cmux pane every worker tab is born in) is a RUNNER-level fault, never
+# N per-issue parks (incident 2026-07-09: a dead anchor walked 10 approved issues into 10 parks in
+# ~8 min). When this many DISTINCT issues fail launch-delivery back-to-back — the runner's streak,
+# any verified delivery clears it — it is systemic, not issue-specific: hold launches, one alert,
+# the queue left intact. 2 distinct issues failing consecutively already outstrips any single bad
+# issue (which the per-issue LAUNCH_FAILURE_CAP handles), so the trip is early and the queue is
+# spared. Kept below/at the pane-probe path (`launch_anchor`), which catches a dead anchor directly.
+SYSTEMIC_LAUNCH_FAILURE_CAP = 2    # >= this many DISTINCT issues failing delivery -> systemic (#24)
 ANSWERER_FAILURE_CAP = 2           # answerer hire failed twice -> park the issue
 DELIVERY_FAILURE_CAP = 3           # answer would not deliver to the pane -> park the issue
 UPDATE_ERROR_ALERT = 4             # persistent merge-update infra errors -> ALERT (never regenerate)
@@ -113,6 +121,22 @@ NUDGE_MESSAGES = {
                      "`<!-- superlooper-investigation -->` — the runner closes the parent only "
                      "when that marker comment exists.",
 }
+
+# Human-readable ALERT notify bodies. The reason CODES (stable, sorted) are what the ALERT file
+# stores and what decide dedups on; these strings are only the push text. A reason not listed here
+# (gh_unreachable, usage_stale, launch_runaway:<id>, update_errors:<id>) falls back to its own code.
+ALERT_MESSAGES = {
+    "launch_anchor_down": "launch anchor gone — restart superlooper in a visible cmux tab. The "
+                          "launch queue is held intact; every approved issue keeps agent-ready and "
+                          "launches resume automatically once the tab's pane resolves again.",
+    "launch_systemic_failure": "launches are failing delivery across multiple issues — a systemic "
+                               "launch fault, not an issue-specific one. The queue is held intact "
+                               "(nothing parked); check the cmux anchor / restart in a visible tab.",
+}
+
+
+def _alert_message(reason):
+    return ALERT_MESSAGES.get(reason, reason)
 
 
 def _real(x):
@@ -344,6 +368,40 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
         v = ist_map.get(iid)
         return v if isinstance(v, dict) else {}
 
+    # ---- launch-anchor liveness (issue #24): a dead launch anchor must never walk the queue ----
+    # The runner launches every worker as a cmux tab in ONE pane (the anchor). When that pane stops
+    # resolving mid-run (the runner's tab dragged to another cmux window), EVERY launch fails
+    # delivery and the per-issue cap (2 -> park) walked the whole approved queue into parks + notifies
+    # (10 issues in ~8 min, 2026-07-09). That is a SYSTEMIC, runner-level fault — one alert, launches
+    # HELD, the queue intact — not N issue-specific parks. Two independent detectors feed one degraded
+    # mode; the runner senses both and passes them in the view (decide stays pure):
+    #   * launch_anchor: the per-tick pane probe. ONLY an EXPLICIT ok is False degrades — a missing or
+    #     wrong-typed probe is treated as ok (fail SAFE for launches: never wedge the whole queue on
+    #     absent probe data; the streak below still backstops a truly dead anchor).
+    #   * launch_fail_ids: the DISTINCT issues in the current unbroken run of launch-delivery failures
+    #     (runner-maintained; any verified delivery clears it). >= SYSTEMIC_LAUNCH_FAILURE_CAP distinct
+    #     issues failing back-to-back is systemic; one issue at its own cap is not (and still parks).
+    anchor = dsk.get("launch_anchor")
+    anchor_down = isinstance(anchor, dict) and anchor.get("ok") is False
+    raw_fail_ids = dsk.get("launch_fail_ids")
+    fail_ids = {x for x in raw_fail_ids if _iid_num(x) is not None} \
+        if isinstance(raw_fail_ids, (list, set, tuple, frozenset)) else set()
+    systemic_launch = len(fail_ids) >= SYSTEMIC_LAUNCH_FAILURE_CAP
+    # A pane probe is only meaningful when there is work it would carry: an approved, not-yet-in-flight
+    # issue that is not already at its own launch cap. Mirrors phase E's candidate filter minus the
+    # this-tick transient guards (parked_now/reapproved_now aren't computed yet, and can only shrink
+    # the set — so this never suppresses a real alert).
+    def _pending_launch(iid, p):
+        labels = p.get("labels") if isinstance(p, dict) and isinstance(p.get("labels"), list) else []
+        fails, corrupt = _counter(ist_of(iid), "launch_failures")
+        return ("agent-ready" in labels and "in-progress" not in labels
+                and ist_of(iid).get("status") in RELAUNCHABLE_STATUSES
+                and not corrupt and fails < LAUNCH_FAILURE_CAP)
+    has_pending_launch = any(_pending_launch(iid, p) for iid, p in parsed_by_id.items())
+    # One degraded mode for both detectors: hold every fresh launch and suppress the per-issue
+    # launch-cap park (phases D+E), so the queue is left intact for when the anchor resolves.
+    launch_degraded = anchor_down or systemic_launch
+
     # ================= A. alerts (safety first, before any work) =================
     reasons = []
     if _count(gv.get("consecutive_failures")) >= GH_ALERT_FAILURES:
@@ -356,12 +414,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
         errs, corrupt = _counter(ist_of(iid), "update_errors")
         if corrupt or errs >= UPDATE_ERROR_ALERT:
             reasons.append(f"update_errors:{iid}")     # a corrupt counter is alert-worthy too
+    if anchor_down and has_pending_launch:             # a dead anchor only matters with work to launch
+        reasons.append("launch_anchor_down")
+    if systemic_launch:
+        reasons.append("launch_systemic_failure")
     reasons.sort()
     if reasons:
         existing = alert_on_disk.get("reasons") if alert_on_disk else None
         if existing != reasons:
             out.append({"act": "alert", "reasons": reasons})
-            notify("superlooper ALERT", "; ".join(reasons))
+            notify("superlooper ALERT", "; ".join(_alert_message(r) for r in reasons))
     elif alert_on_disk:
         out.append({"act": "clear_alert"})
 
@@ -614,6 +676,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
         # status is None/"ready" from here on
         launch_fails, corrupt = _counter(ist, "launch_failures")
         if "agent-ready" in labels and (corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
+            if launch_degraded:
+                continue                               # SYSTEMIC launch fault (#24): hold, never
+                                                       # park per-issue — the queue stays intact for
+                                                       # when the anchor resolves (the alert stands)
             park(iid, num, f"launch was never delivered ({LAUNCH_FAILURE_CAP} verified "
                            "attempts, or the attempt counter is unreadable) — is the launch "
                            "shim installed? (bin/install-launch-shim.sh)")
@@ -643,7 +709,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                 out.append({"act": "reclaim", "id": iid, "num": num})
 
     # ================= E. fresh launches (LAST: freed lanes wait one tick) =================
-    if not gh_stale and not issue_state_corrupt_for_launches:
+    # launch_degraded holds EVERY fresh launch (issue #24): a dead/failing launch anchor makes every
+    # delivery fail, so attempting more only walks the queue. The queue is preserved (agent-ready
+    # intact) and resumes the tick the anchor resolves — no William relabeling.
+    if not gh_stale and not issue_state_corrupt_for_launches and not launch_degraded:
         candidates = []
         for iid in _sorted_ids(parsed_by_id):
             p = parsed_by_id[iid]
