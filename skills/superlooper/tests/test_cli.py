@@ -134,6 +134,85 @@ def test_doctor_warns_when_codex_hooks_are_missing(rig):
     assert "hooks.json" in out
 
 
+def _write_exe(path, body):
+    path.write_text(body)
+    path.chmod(0o755)
+    return str(path)
+
+
+def _stack_env(rig, *, gh_remaining=4999):
+    bindir = rig.tmp / "stack-bin"
+    bindir.mkdir(exist_ok=True)
+    codex = _write_exe(
+        bindir / "codex",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = login ] && [ \"$2\" = status ]; then\n"
+        "  echo 'Logged in using ChatGPT'; exit 0\n"
+        "fi\n"
+        "exit 64\n",
+    )
+    claude = _write_exe(
+        bindir / "claude",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = auth ] && [ \"$2\" = status ] && [ \"$3\" = --json ]; then\n"
+        "  printf '%s\\n' '{\"loggedIn\": true, \"authMethod\": \"claude.ai\"}'; exit 0\n"
+        "fi\n"
+        "exit 64\n",
+    )
+    gh = _write_exe(
+        bindir / "gh",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = auth ] && [ \"$2\" = status ]; then exit 0; fi\n"
+        "if [ \"$1\" = api ] && [ \"$2\" = rate_limit ]; then\n"
+        f"  printf '%s\\n' '{{\"resources\": {{\"core\": {{\"limit\": 5000, \"remaining\": {gh_remaining}}}}}}}'; exit 0\n"
+        "fi\n"
+        "exit 64\n",
+    )
+    cmux = _write_exe(bindir / "cmux", "#!/bin/sh\nexit 0\n")
+    return {"SL_CODEX": codex, "SL_CLAUDE": claude, "SL_GH": gh, "SL_CMUX": cmux}
+
+
+def test_doctor_stack_ok_uses_fake_commands_and_mutates_nothing(rig):
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"cmd": "printf '%s\\n' \"$SL_TITLE\"", "imessage_to": None}
+    cfg_path.write_text(json.dumps(cfg))
+    zshrc = rig.home / ".zshrc"
+    zshrc.write_text('source "$HOME/.superlooper/launch-shim.zsh"\n')
+    watched = [cfg_path, zshrc, rig.home / ".superlooper" / "launch-shim.zsh"]
+    before = {p: p.read_text() for p in watched}
+
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo), env_over=_stack_env(rig))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    for name in ("codex CLI", "cmux present", "claude login", "gh auth",
+                 "gh API headroom", "notify command configured", "launch shim sourced"):
+        assert name in out
+    assert "required_checks" not in out
+    assert {p: p.read_text() for p in watched} == before
+
+
+def test_doctor_stack_fails_with_actionable_hint(rig):
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"cmd": None, "imessage_to": None}
+    cfg_path.write_text(json.dumps(cfg))
+    (rig.home / ".zshrc").write_text("# no shim source\n")
+
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo),
+            env_over=_stack_env(rig, gh_remaining=0))
+
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "FAIL gh API headroom" in out
+    assert "Fix: Wait for the hourly GitHub API quota" in out
+    assert "FAIL notify command configured" in out
+    assert "Fix: Set notify.cmd or notify.imessage_to" in out
+    assert "FAIL launch shim sourced" in out
+    assert "Fix: Run" in out and "install-launch-shim.sh" in out
+
+
 # --------------------------- adopt ---------------------------
 
 def test_adopt_writes_config_creates_labels_and_prints_requirements(rig):

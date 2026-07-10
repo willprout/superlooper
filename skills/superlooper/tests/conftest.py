@@ -24,6 +24,22 @@ for _sub in reversed(("skill/lib", "skill/bin")):
 
 
 @pytest.fixture(autouse=True)
+def _clear_worker_launch_env(monkeypatch):
+    # The suite often launches subprocesses by copying os.environ. A test run can itself be inside a
+    # superlooper worker, which means SL_AGENT/SL_EFFORT/etc. are ambient and would silently change
+    # launcher defaults under test. Tests that need these knobs set them explicitly in-body.
+    for name in (
+        "SL_AGENT",
+        "SL_MODEL",
+        "SL_EFFORT",
+        "SL_CODEX_DANGEROUS_BYPASS",
+        "SL_CODEX_BYPASS_HOOK_TRUST",
+        "SL_CODEX_NO_ALT_SCREEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _never_reach_real_cmux(monkeypatch):
     # Ratchet rule (2026-07-03 toast-spam incident, CLAUDE.md): no test may resolve cmux to
     # the real /Applications binary and fire a live desktop notification. notify._cmux_binary
