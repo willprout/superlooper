@@ -387,17 +387,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
     fail_ids = {x for x in raw_fail_ids if _iid_num(x) is not None} \
         if isinstance(raw_fail_ids, (list, set, tuple, frozenset)) else set()
     systemic_launch = len(fail_ids) >= SYSTEMIC_LAUNCH_FAILURE_CAP
-    # A pane probe is only meaningful when there is work it would carry: an approved, not-yet-in-flight
-    # issue that is not already at its own launch cap. Mirrors phase E's candidate filter minus the
-    # this-tick transient guards (parked_now/reapproved_now aren't computed yet, and can only shrink
-    # the set — so this never suppresses a real alert).
-    def _pending_launch(iid, p):
+    # A dead anchor only matters when approved work is held behind it: an agent-ready, not-in-flight
+    # issue. Deliberately does NOT exclude an at-cap / corrupt-counter issue — while degraded ITS
+    # launch-cap park is SUPPRESSED too (below), so it is part of the held queue the alert must
+    # surface, never sat on silently. (A RELAUNCHABLE status still excludes a running-but-stale-
+    # labelled issue, whose relabel reconciliation is a separate concern.)
+    def _held_queue_member(iid, p):
         labels = p.get("labels") if isinstance(p, dict) and isinstance(p.get("labels"), list) else []
-        fails, corrupt = _counter(ist_of(iid), "launch_failures")
         return ("agent-ready" in labels and "in-progress" not in labels
-                and ist_of(iid).get("status") in RELAUNCHABLE_STATUSES
-                and not corrupt and fails < LAUNCH_FAILURE_CAP)
-    has_pending_launch = any(_pending_launch(iid, p) for iid, p in parsed_by_id.items())
+                and ist_of(iid).get("status") in RELAUNCHABLE_STATUSES)
+    has_pending_launch = any(_held_queue_member(iid, p) for iid, p in parsed_by_id.items())
     # One degraded mode for both detectors: hold every fresh launch and suppress the per-issue
     # launch-cap park (phases D+E), so the queue is left intact for when the anchor resolves.
     launch_degraded = anchor_down or systemic_launch

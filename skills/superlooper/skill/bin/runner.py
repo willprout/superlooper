@@ -1244,6 +1244,7 @@ class Runner:
                                   timeout=LAUNCH_TIMEOUT)
             if rc == 0:
                 self._update_issue(iid, {"status": "running"})
+                self._launch_fail_ids.clear()          # a verified delivery proves the anchor is live (#24)
                 return "ok"
             self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
             return f"relaunch rc={rc}"
@@ -1402,6 +1403,7 @@ class Runner:
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,
                                      "update_head_oid": None, "nudged": []})
+            self._launch_fail_ids.clear()              # a verified delivery proves the anchor is live (#24)
             return "ok"
         self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
         return f"conflict-session launch rc={rc}"

@@ -292,6 +292,18 @@ def test_launch_anchor_down_but_nothing_queued_does_not_alert():
     assert only(out, "alert") == [] and not has_notify(out)
 
 
+def test_dead_anchor_with_a_sole_at_cap_issue_still_alerts_not_silent():
+    # An approved issue held under a dead anchor must surface the fault even if it is already at its
+    # own launch cap: while degraded its park is SUPPRESSED, so it is part of the held queue — the
+    # runner must not sit on it silently (no launch, no park, no alert).
+    dsk = disk(launch_anchor=_anchor_down(), launch_fail_ids=["i5"],
+               issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures=2)}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert only(out, "launch") == [] and only(out, "park") == []   # held, not parked
+    a = only(out, "alert")
+    assert len(a) == 1 and "launch_anchor_down" in a[0]["reasons"] and has_notify(out)
+
+
 def test_launch_anchor_resolves_and_launches_resume_without_relabeling():
     # Once the pane resolves again the held queue launches with NO William touch (agent-ready was
     # never stripped), so recovery needs no re-approval. (Distinct areas so hard affinity lets both

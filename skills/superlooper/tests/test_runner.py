@@ -599,6 +599,26 @@ def test_verified_launch_clears_the_systemic_streak(rig):
     assert out == "ok" and rig.r._launch_fail_ids == set()
 
 
+def test_verified_recover_delivery_clears_the_systemic_streak(rig):
+    # ANY verified delivery proves the anchor is live — including a recover-exited relaunch, not just
+    # a fresh launch — so it clears the streak and lets a systemic hold lift without a restart.
+    rig.r.tick(now=NOW)                                # poll lands the view (for _worker_env)
+    rig.r._launch_fail_ids = {"i9", "i101"}            # a prior run of failures
+    rig.calls.clear()                                  # rc_queue empty -> run_script returns 0 (ok)
+    out = rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
+    assert out == "ok" and rig.r._launch_fail_ids == set()
+
+
+def test_failed_recover_delivery_does_not_clear_the_streak(rig):
+    # A recover that does NOT verify delivery is not proof of anything — the streak must persist.
+    rig.r.tick(now=NOW)
+    rig.r._launch_fail_ids = {"i9", "i101"}
+    rig.calls.clear()
+    rig.rc_queue.append(2)                             # delivery not verified
+    rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
+    assert rig.r._launch_fail_ids == {"i9", "i101"}
+
+
 def test_brief_failure_does_not_touch_the_streak(rig):
     # An early skip (issue no longer in the view) is NOT a delivery failure — it must not pollute
     # the anchor streak, or one dropped issue could masquerade as a systemic fault.
