@@ -547,6 +547,29 @@ def test_finished_without_pr_parks_with_memo(sim_factory):
     assert memos, sim.mutations("comment")
 
 
+def test_referee_path_pr_parks_needs_william_once_without_merging(sim_factory):
+    sim = sim_factory()
+    num = sim.add_issue(title="Referee path wander", touches="frontend",
+                        scenario={"scenario": "happy",
+                                  "edit": {"file": ".superlooper/config.json",
+                                           "append": "\n"}})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "needs_william"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    assert not sim.mutations("merge_pr")
+    assert "needs-william" in sim.issue(num)["labels"]
+    assert "in-progress" not in sim.issue(num)["labels"]
+    memos = [m for m in sim.mutations("comment")
+             if "diff reaches live referee path" in m["body"]]
+    assert len(memos) == 1 and ".superlooper/config.json" in memos[0]["body"]
+    notices = sim.notify_lines()
+    assert len(notices) == 1 and ".superlooper/config.json" in notices[0]
+
+
 # =====================================================================================
 # bounce: the worker writes ONLY the BOUNCED: marker; the RUNNER does comment + labels
 # =====================================================================================

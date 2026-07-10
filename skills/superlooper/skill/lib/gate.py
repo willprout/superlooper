@@ -22,6 +22,10 @@ import config as _config   # pure sibling; used only for path_to_area in gate_de
 REVIEW_MARKER = "<!-- superlooper-review -->"
 INVESTIGATION_MARKER = "<!-- superlooper-investigation -->"
 
+# Paths that define the loop's live referee. Unlike ordinary wander areas, a merged change here
+# immediately changes the rules that judge worker PRs, so these paths are owner-only stops.
+_REFEREE_PREFIXES = (".superlooper/", ".github/workflows/")
+
 # A required H2 section must carry at least this many NON-WHITESPACE characters of prose.
 # Cross-review C3: a report whose headings exist but whose bodies are empty once looked
 # "complete" to a headings-only check — empty headings must never merge.
@@ -99,6 +103,15 @@ def _areas_overlap(a, b):
     """The kickoff's fixed wildcard contract: '*' (a path matching no declared area glob)
     overlaps everything, in either direction."""
     return bool(a) and bool(b) and bool(set(a) & set(b) or "*" in a or "*" in b)
+
+
+def _referee_paths(paths):
+    """Return repo-relative paths that hit the live referee rulebook/check families."""
+    if not isinstance(paths, list):
+        return []
+    return sorted({p for p in paths if isinstance(p, str)
+                   and (p == ".superlooper" or p == ".github/workflows"
+                        or any(p.startswith(prefix) for prefix in _REFEREE_PREFIXES))})
 
 
 def touch_verdict(declared, actual_areas, inflight):
@@ -267,10 +280,18 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     if not isinstance(files, list):
         return {"action": "wait",
                 "reason": "PR files list unreadable — refetching before touch verification"}
-    actual_areas = sorted({_config.path_to_area(cfg, f["path"]) for f in files
-                           if isinstance(f, dict) and isinstance(f.get("path"), str)})
+    paths = [f.get("path") for f in files if isinstance(f, dict) and isinstance(f.get("path"), str)]
+    actual_areas = sorted({_config.path_to_area(cfg, p) for p in paths})
     verdict = touch_verdict(ist.get("declared_touches"), actual_areas, inflight)
     wander = verdict["wander"]
+    referee = _referee_paths(paths)
+    if referee:
+        joined = ", ".join(referee)
+        return {"action": "park", "needs_william": True, "wander": wander,
+                "referee_paths": referee,
+                "reason": "diff reaches live referee path(s): "
+                          f"{joined} — needs-william; never auto-merging changes to "
+                          ".superlooper/** or .github/workflows/**"}
     if verdict["overlap_lane"] is not None:
         return {"action": "hold", "overlap_lane": verdict["overlap_lane"], "wander": wander,
                 "reason": f"diff overlaps in-flight lane {verdict['overlap_lane']} — "
