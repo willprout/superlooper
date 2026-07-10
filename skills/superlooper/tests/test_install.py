@@ -1,20 +1,9 @@
-"""Tests for bin/install.sh — the explicit publish step (plan Task 14).
+"""Tests for the nested install.sh tombstone.
 
-Runs the REAL install.sh against a FAKE $HOME (via the HOME env override, exactly like
-test_install_shim.py) so the real ~/.claude is never touched — the skill's source must NEVER
-publish itself into the live ~/.claude during a test (project publishing rule).
-
-What install.sh must do, and what these tests pin:
-  * rsync the skill/ payload -> $HOME/.claude/skills/superlooper/ (SKILL.md, lib, bin, references)
-  * write VERSION (git SHA + date)
-  * idempotently merge TWO hook registrations into $HOME/.claude/settings.json via python stdlib
-    (PostToolUse -> activity-hook.sh, Stop -> stop-hook.sh), WITHOUT clobbering existing hooks or
-    other settings, and WITHOUT duplicating on re-run
-  * install the launch shim (the ~/.zshrc block)
-  * --dry-run mutates nothing
-  * fail CLOSED on a wrong-typed existing settings.json rather than overwrite it
+The monorepo root ``bin/install.sh`` is the gated, canonical publish path. The nested
+``skills/superlooper/bin/install.sh`` remains only as an explicit redirect for old habits and
+scripts; it must not publish, merge hooks, stamp VERSION, or install the launch shim.
 """
-import json
 import os
 import subprocess
 
@@ -25,177 +14,79 @@ INSTALL = os.path.join(REPO_ROOT, "bin", "install.sh")
 SKILL_DIR = (".claude", "skills", "superlooper")
 SETTINGS = (".claude", "settings.json")
 CODEX_HOOKS = (".codex", "hooks.json")
-ACT_SUFFIX = "skills/superlooper/bin/activity-hook.sh"
-STOP_SUFFIX = "skills/superlooper/bin/stop-hook.sh"
 SHIM_BEGIN = "# >>> superlooper launch shim >>>"
 
 
 def _run(home, *args):
+    poison = home / "poison-bin"
+    poison.mkdir(exist_ok=True)
     env = {**os.environ, "HOME": str(home), "CODEX_HOME": str(home / ".codex")}
-    env.pop("ZDOTDIR", None)                       # so ~/.zshrc resolves under the fake HOME
-    return subprocess.run([INSTALL, *args], env=env, capture_output=True, text=True, timeout=120)
+    env["PATH"] = str(poison)
+    env.pop("ZDOTDIR", None)
+    return subprocess.run([INSTALL, *args], env=env,
+                          capture_output=True, text=True, timeout=30)
 
 
 def _skill(home, *parts):
     return home.joinpath(*SKILL_DIR, *parts)
 
 
-def _settings(home):
-    return json.loads(home.joinpath(*SETTINGS).read_text())
+def _combined_output(proc):
+    return proc.stdout + proc.stderr
 
 
-def _codex_hooks(home):
-    return json.loads(home.joinpath(*CODEX_HOOKS).read_text())
+def _assert_redirect(proc):
+    assert proc.returncode != 0, "nested installer must refuse to publish"
+    out = _combined_output(proc)
+    assert "canonical" in out.lower(), out
+    assert "bin/install.sh" in out, out
+    assert "gated" in out.lower(), out
 
 
-def _hook_commands(settings):
-    """Flatten every hook command string in a settings dict, across all events/groups."""
-    out = []
-    for _event, groups in (settings.get("hooks") or {}).items():
-        for g in groups:
-            for h in g.get("hooks", []):
-                out.append(h.get("command", ""))
-    return out
-
-
-def _event_commands(settings, event):
-    """Hook command strings registered under ONE specific event — so a test can pin that a hook
-    landed under its REQUIRED event, not merely somewhere in the tree."""
-    out = []
-    for g in (settings.get("hooks") or {}).get(event, []):
-        for h in g.get("hooks", []):
-            out.append(h.get("command", ""))
-    return out
-
-
-# --------------------------------------------------------------------------------------------
-
-def test_install_lays_down_payload_version_hooks_and_shim(tmp_path):
+def test_nested_installer_refuses_and_points_to_gated_root_installer(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
-    r = _run(home)
-    assert r.returncode == 0, r.stderr
 
-    # payload: SKILL.md + a lib module + a bin script + a reference all rsynced in
-    assert _skill(home, "SKILL.md").exists(), "SKILL.md must be published"
-    assert _skill(home, "lib", "config.py").exists(), "lib payload must be published"
-    assert _skill(home, "bin", "activity-hook.sh").exists(), "bin payload must be published"
-    assert _skill(home, "references", "issue-writing.md").exists(), "references must be published"
+    proc = _run(home)
 
-    # VERSION = git SHA + date
-    version = _skill(home, "VERSION").read_text().strip()
-    assert version, "VERSION must be non-empty"
-    import re
-    assert re.search(r"\d{4}-\d{2}-\d{2}", version), f"VERSION must carry a date, got {version!r}"
-
-    # hooks merged into settings.json UNDER THEIR REQUIRED EVENTS (not merely somewhere in the tree):
-    # activity-hook -> PostToolUse, stop-hook -> Stop. The event placement is load-bearing.
-    s = _settings(home)
-    assert any(c.endswith(ACT_SUFFIX) for c in _event_commands(s, "PostToolUse")), \
-        "activity hook must be registered under PostToolUse"
-    assert any(c.endswith(STOP_SUFFIX) for c in _event_commands(s, "Stop")), \
-        "stop hook must be registered under Stop"
-
-    c = _codex_hooks(home)
-    assert any(c.endswith(ACT_SUFFIX) for c in _event_commands(c, "PostToolUse")), \
-        "Codex activity hook must be registered under PostToolUse"
-    assert any(c.endswith(STOP_SUFFIX) for c in _event_commands(c, "Stop")), \
-        "Codex stop hook must be registered under Stop"
-
-    # launch shim installed
-    rc = (home / ".zshrc").read_text()
-    assert rc.count(SHIM_BEGIN) == 1, "the launch shim block must be installed once"
-
-
-def test_install_is_idempotent(tmp_path):
-    home = tmp_path / "home"
-    home.mkdir()
-    _run(home)
-    r2 = _run(home)                                # second run must add nothing new
-    assert r2.returncode == 0, r2.stderr
-
-    cmds = _hook_commands(_settings(home))
-    assert sum(c.endswith(ACT_SUFFIX) for c in cmds) == 1, "activity hook must not be duplicated"
-    assert sum(c.endswith(STOP_SUFFIX) for c in cmds) == 1, "stop hook must not be duplicated"
-    codex_cmds = _hook_commands(_codex_hooks(home))
-    assert sum(c.endswith(ACT_SUFFIX) for c in codex_cmds) == 1, "Codex activity hook must not be duplicated"
-    assert sum(c.endswith(STOP_SUFFIX) for c in codex_cmds) == 1, "Codex stop hook must not be duplicated"
-    assert (home / ".zshrc").read_text().count(SHIM_BEGIN) == 1, "shim block must not be duplicated"
-
-
-def test_install_preserves_existing_hooks_and_settings(tmp_path):
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / ".claude").mkdir()
-    # Pre-existing settings: an unrelated top-level key AND a pre-existing PostToolUse hook that
-    # MUST survive the merge (the realistic case: autocode's hooks + suggest-cross-review already
-    # registered). A merge that clobbered these would be the fail-open defect this test guards.
-    seed = {
-        "theme": "dark",
-        "hooks": {
-            "PostToolUse": [
-                {"matcher": "Write", "hooks": [
-                    {"type": "command", "command": "$HOME/.claude/hooks/suggest-cross-review.sh"}]},
-            ],
-        },
-    }
-    home.joinpath(*SETTINGS).write_text(json.dumps(seed))
-    r = _run(home)
-    assert r.returncode == 0, r.stderr
-
-    s = _settings(home)
-    assert s.get("theme") == "dark", "unrelated settings keys must survive the merge"
-    cmds = _hook_commands(s)
-    assert any(c.endswith("suggest-cross-review.sh") for c in cmds), "existing hook must survive"
-    assert any(c.endswith(ACT_SUFFIX) for c in cmds), "superlooper activity hook must be added"
-    assert any(c.endswith(STOP_SUFFIX) for c in cmds), "superlooper stop hook must be added"
-
-
-def test_dry_run_mutates_nothing(tmp_path):
-    home = tmp_path / "home"
-    home.mkdir()
-    r = _run(home, "--dry-run")
-    assert r.returncode == 0, r.stderr
-    assert not _skill(home).exists(), "--dry-run must not write the payload"
-    assert not home.joinpath(*SETTINGS).exists(), "--dry-run must not write settings.json"
-    assert not home.joinpath(*CODEX_HOOKS).exists(), "--dry-run must not write Codex hooks.json"
+    _assert_redirect(proc)
+    assert not _skill(home).exists(), "nested installer must not publish the payload"
+    assert not home.joinpath(*SETTINGS).exists(), "nested installer must not write settings.json"
+    assert not home.joinpath(*CODEX_HOOKS).exists(), "nested installer must not write Codex hooks.json"
     zshrc = home / ".zshrc"
-    assert not zshrc.exists() or SHIM_BEGIN not in zshrc.read_text(), "--dry-run must not touch ~/.zshrc"
+    assert not zshrc.exists() or SHIM_BEGIN not in zshrc.read_text(), \
+        "nested installer must not install the launch shim"
 
 
-def test_install_fails_closed_on_wrongtyped_settings(tmp_path):
-    """A malformed settings.json — at the TOP LEVEL or NESTED — must make install FAIL rather than
-    silently overwrite the user's file (the fail-OPEN-on-wrong-typed-input defect class). It must
-    also not have published the payload (the merge runs before rsync, so a refusal aborts cleanly).
-    Missing keys are tolerated elsewhere; only WRONG types fail closed."""
-    malformed = [
-        '{"hooks": ["this is not an object"]}',                          # hooks not an object
-        '{"hooks": {"PostToolUse": "not a list"}}',                      # event value not a list
-        '{"hooks": {"PostToolUse": ["not an object"]}}',                 # group not an object
-        '{"hooks": {"PostToolUse": [{"hooks": "not a list"}]}}',         # group.hooks not a list
-        '{"hooks": {"PostToolUse": [{"hooks": ["not an object"]}]}}',    # hook entry not an object
-        '{"hooks": {"PostToolUse": [{"hooks": [{"command": 123}]}]}}',   # command not a string
-    ]
-    for i, blob in enumerate(malformed):
-        home = tmp_path / f"home{i}"
+def test_nested_installer_refuses_even_dry_run_and_help(tmp_path):
+    for arg in ("--dry-run", "--help"):
+        home = tmp_path / arg.lstrip("-")
         home.mkdir()
-        (home / ".claude").mkdir()
-        home.joinpath(*SETTINGS).write_text(blob)
-        r = _run(home)
-        assert r.returncode != 0, f"install must fail closed on malformed settings: {blob}"
-        assert home.joinpath(*SETTINGS).read_text() == blob, \
-            f"a fail-closed install must not modify the malformed settings.json: {blob}"
-        assert not _skill(home).exists(), \
-            f"a fail-closed install must not publish the payload: {blob}"
+        proc = _run(home, arg)
+
+        _assert_redirect(proc)
+        assert not _skill(home).exists(), f"{arg} must not publish the payload"
 
 
-def test_install_fails_closed_on_wrongtyped_codex_hooks(tmp_path):
+def test_nested_installer_preserves_existing_target_state(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
-    (home / ".codex").mkdir()
-    blob = '{"hooks": {"PostToolUse": [{"hooks": [{"command": 123}]}]}}'
-    home.joinpath(*CODEX_HOOKS).write_text(blob)
-    r = _run(home)
-    assert r.returncode != 0, "install must fail closed on malformed Codex hooks.json"
-    assert home.joinpath(*CODEX_HOOKS).read_text() == blob
-    assert not _skill(home).exists(), "a fail-closed Codex hook merge must not publish the payload"
+    skill = _skill(home)
+    skill.mkdir(parents=True)
+    version = skill / "VERSION"
+    version.write_text("before\n")
+    settings = home.joinpath(*SETTINGS)
+    settings.write_text('{"theme":"dark"}\n')
+    codex_hooks = home.joinpath(*CODEX_HOOKS)
+    codex_hooks.parent.mkdir(parents=True)
+    codex_hooks.write_text('{"hooks":{}}\n')
+    zshrc = home / ".zshrc"
+    zshrc.write_text("export KEEP=1\n")
+
+    proc = _run(home)
+
+    _assert_redirect(proc)
+    assert version.read_text() == "before\n"
+    assert settings.read_text() == '{"theme":"dark"}\n'
+    assert codex_hooks.read_text() == '{"hooks":{}}\n'
+    assert zshrc.read_text() == "export KEEP=1\n"
