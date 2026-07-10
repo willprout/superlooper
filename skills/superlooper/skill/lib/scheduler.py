@@ -7,7 +7,8 @@ Three gates, in order:
      NaN pct would sneak past a bare `>` comparison (NaN > 96 is False), so pcts must be FINITE.
   2. LANES: never exceed config.lanes concurrent sessions; never launch the same id twice.
   3. ANTI-AFFINITY: under hard affinity, a merge-producing issue whose declared touch-areas
-     overlap a merge-producing running lane (or one already selected this tick) is HELD.
+     overlap a merge-producing running lane, held territory claim, or one already selected this
+     tick is HELD.
      Investigations do not produce PRs or merges, so they are exempt in both directions. Under
      soft affinity the overlap is allowed and flagged (symmetrically) for the journal.
 
@@ -86,14 +87,37 @@ def _anti_affinity_blocks(candidate, occupied, affinity):
     return overlaps(candidate.get("touches", []), occupied.get("touches", []), affinity)
 
 
-def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen):
+def _clean_touches(v):
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def _occupied_from(records):
+    out = []
+    seen = set()
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        rid = rec.get("id")
+        if rid in seen:
+            continue
+        seen.add(rid)
+        out.append({"id": rid, "touches": _clean_touches(rec.get("touches")),
+                    "type": rec.get("type")})
+    return out
+
+
+def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen,
+               territory_claims=None):
     """Return the issues to launch NOW, in priority order, as a list of dicts:
         {"id", "num", "touches", "soft_overlap": bool}
     `lane_state` is the list of currently OCCUPIED lanes, each {"id", "touches", "type"?}. Each
+    `territory_claims` entry has the same shape, but consumes no lane slot; it only participates
+    in anti-affinity.
     parsed issue may carry a "requeue_front" flag (merged in by the runner from loopstate; default
     False).
     `soft_overlap` (soft affinity only) is True when this launch shares an area with ANY OTHER
-    concurrent lane — pre-existing or same-tick — flagged symmetrically so the journal sees the pair.
+    concurrent lane/claim — pre-existing or same-tick — flagged symmetrically so the journal sees
+    the pair.
     """
     if not _usage_ok(usage):
         return []
@@ -104,19 +128,26 @@ def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen):
         return []
 
     affinity = config.get("affinity", "hard")
-    running_ids = {lane.get("id") for lane in lane_state}
-    lane_touches = [lane.get("touches", []) for lane in lane_state]     # pre-existing occupied lanes
+    lanes_in = _occupied_from(lane_state)
+    claims_in = _occupied_from(territory_claims or [])
+    running_ids = {lane.get("id") for lane in lanes_in}
+    claimed_ids = {claim.get("id") for claim in claims_in}
+    claimed_touches = [claim.get("touches", []) for claim in claims_in]
+    lane_touches = [lane.get("touches", []) for lane in lanes_in]       # pre-existing occupied lanes
     lane_occupied = [{"touches": lane.get("touches", []), "type": lane.get("type")}
-                     for lane in lane_state]
+                     for lane in lanes_in]
+    claim_occupied = [{"touches": claim.get("touches", []), "type": claim.get("type")}
+                      for claim in claims_in]
 
     candidates = [p for p in parsed_issues
                   if p.get("id") not in running_ids
+                  and p.get("id") not in claimed_ids
                   and issues.eligible(p, closed_nums, frozen)]
     candidates.sort(key=lambda p: issues.sort_key(p, p.get("requeue_front", False)))
 
-    selected_ids = set(running_ids)
+    selected_ids = set(running_ids) | set(claimed_ids)
     selected = []
-    occupied = list(lane_occupied)                                     # existing + chosen so far
+    occupied = list(lane_occupied) + list(claim_occupied)              # existing + chosen so far
     for p in candidates:
         if len(selected) >= free:
             break
@@ -133,7 +164,8 @@ def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen):
     # an area with any OTHER concurrent lane (a pre-existing lane, or another same-tick selection).
     out = []
     for i, p in enumerate(selected):
-        others = lane_touches + [q["touches"] for j, q in enumerate(selected) if j != i]
+        others = lane_touches + claimed_touches \
+            + [q["touches"] for j, q in enumerate(selected) if j != i]
         soft = affinity == "soft" and any(_geometric_overlap(p["touches"], ot) for ot in others)
         out.append({"id": p["id"], "num": p["num"], "touches": p["touches"], "soft_overlap": soft})
     return out

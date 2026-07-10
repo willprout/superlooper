@@ -32,7 +32,8 @@ The view contract (assembled by runner.py each tick):
                  `in-progress` issues (deduped). Wrong-typed nums are skipped here — an issue
                  that can't be identified can't be safely acted on.
   lane_state     [{"id", "touches", "type"?}] for currently occupied lanes — lane_state_from()
-                 builds it.
+                 builds it. Finished-but-unmerged territory claims are derived separately from
+                 issues_state; they do not consume lane capacity.
   events         this tick's events.detect_events() output.
   disk           {"issues_state": loopstate dict, "blocked": {id: text}, "reports": {id: text},
                   "answers": {id: text}, "exited": {id: marker-text}, "frozen": dict|None,
@@ -81,6 +82,7 @@ FIX_ISSUE_LABELS = ["type:diagnose-and-fix", "agent-ready", "auto-approved:night
 # vs statuses from which a (re)launch is legitimate. gating/holding hold NO lane: the build is
 # done and only merge mechanics remain, so a lane frees the moment the report lands.
 INFLIGHT_STATUSES = {"running", "blocked", "frozen", "exited"}
+TERRITORY_CLAIM_STATUSES = INFLIGHT_STATUSES | {"gating", "holding"}
 TERMINAL_STATUSES = {"merged", "parked", "needs_william", "bounced"}
 RELAUNCHABLE_STATUSES = {None, "ready", "parked", "needs_william", "bounced"}
 # The park-family terminal statuses a FRESH `agent-ready` re-releases. Re-approval is William's
@@ -164,6 +166,46 @@ def lane_state_from(issues_state):
     return out
 
 
+def territory_claims_from(issues_state):
+    """[{"id", "touches", "type"?}] for merge-producing issues whose declared territory is still
+    protected, sorted by issue number. This deliberately outlives the lane for gating/holding
+    issues, but releases on merge, regenerate/requeue (`ready`), and park-family terminal states.
+    Terminal parks release even wildcard/no-touches territory so a no-touches repo cannot freeze."""
+    issues = _dget(issues_state, "issues", dict)
+    out = []
+    for iid in _sorted_ids(k for k in issues if _iid_num(k) is not None):
+        ist = issues.get(iid)
+        if not isinstance(ist, dict) or ist.get("status") not in TERRITORY_CLAIM_STATUSES:
+            continue
+        if ist.get("type") == "investigate":
+            continue
+        touches = ist.get("declared_touches")
+        touches = [t for t in touches if isinstance(t, str)] if isinstance(touches, list) else []
+        claim = {"id": iid, "touches": touches}
+        itype = ist.get("type")
+        if isinstance(itype, str) and itype:
+            claim["type"] = itype
+        out.append(claim)
+    return out
+
+
+def _issues_state_corrupt_for_launches(issues_state):
+    """True when persisted issue state is structurally unreadable enough that fresh launches must
+    stop. Missing state is a cold start and is allowed; present-but-wrong-typed state could hide a
+    held territory claim, so launches fail closed for that tick."""
+    if issues_state is None:
+        return False
+    if not isinstance(issues_state, dict):
+        return True
+    if "issues" not in issues_state:
+        return bool(issues_state)
+    issues = issues_state.get("issues")
+    if not isinstance(issues, dict):
+        return True
+    return any(_iid_num(iid) is not None and not isinstance(ist, dict)
+               for iid, ist in issues.items())
+
+
 def _failing_required(dev_checks, required):
     """(name, conclusion) of the first REQUIRED check reporting a failing state, in the config's
     declared order (deterministic), else None."""
@@ -243,7 +285,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
     frozen_ids = {e.get("id") for e in evs if e.get("type") == "frozen"}
 
     dsk = disk if isinstance(disk, dict) else {}
-    issues_state = _dget(dsk, "issues_state", dict)
+    raw_issues_state = dsk.get("issues_state")
+    issues_state = raw_issues_state if isinstance(raw_issues_state, dict) else {}
+    issue_state_corrupt_for_launches = _issues_state_corrupt_for_launches(raw_issues_state)
     ist_map = _dget(issues_state, "issues", dict)
     blocked = _dget(dsk, "blocked", dict)
     reports = _dget(dsk, "reports", dict)
@@ -568,7 +612,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                 out.append({"act": "reclaim", "id": iid, "num": num})
 
     # ================= E. fresh launches (LAST: freed lanes wait one tick) =================
-    if not gh_stale:
+    if not gh_stale and not issue_state_corrupt_for_launches:
         candidates = []
         for iid in _sorted_ids(parsed_by_id):
             p = parsed_by_id[iid]
@@ -583,7 +627,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                 continue
             candidates.append(dict(p, requeue_front=bool(ist.get("requeue_front"))))
         for sel in scheduler.launchable(candidates, lanes_in, cfg, usage_sched,
-                                        closed_nums, bool(frozen)):
+                                        closed_nums, bool(frozen),
+                                        territory_claims=territory_claims_from(issues_state)):
             iid = sel["id"]
             ist = ist_of(iid)
             branch = ist.get("branch")

@@ -135,7 +135,8 @@ def test_eligible_issue_launches_with_deterministic_branch():
 
 def test_launches_come_last_in_the_action_list():
     dsk = disk(blocked={"i7": "how should I configure X?"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
+               issues_state={"version": 1, "issues": {
+                   "i7": ist("blocked", type="investigate")}})
     out = decide(parsed_issues=[parsed(5)], dsk=dsk)
     kinds = [a["act"] for a in out]
     assert "launch" in kinds and "hire_answerer" in kinds
@@ -921,3 +922,89 @@ def test_lane_state_from_counts_only_inflight_statuses():
     assert "type" not in lanes[2]
     assert actions.lane_state_from(None) == []
     assert actions.lane_state_from({"issues": "corrupt"}) == []
+
+
+def test_territory_claims_from_holds_inflight_and_finished_builds_only():
+    st = {"version": 1, "issues": {
+        "i1": ist("running", declared_touches=["api"], type="build"),
+        "i2": ist("blocked", declared_touches=["ops"], type="investigate"),
+        "i3": ist("gating", declared_touches=["frontend"], type="build"),
+        "i4": ist("holding", declared_touches=["docs"], type="diagnose-and-fix"),
+        "i5": ist("gating", declared_touches=["frontend"], type="investigate"),
+        "i6": ist("ready", declared_touches=["frontend"], branch="sl/i6-x-r1",
+                  conflicts=1, requeue_front=True),
+        "i7": ist("merged", declared_touches=["frontend"]),
+        "i8": ist("parked", declared_touches=["frontend"]),
+        "i9": ist("needs_william", declared_touches=["frontend"]),
+        "i10": ist("bounced", declared_touches=["frontend"]),
+        "i11": "corrupt"}}
+    claims = actions.territory_claims_from(st)
+    assert [x["id"] for x in claims] == ["i1", "i3", "i4"]
+    assert claims[0]["touches"] == ["api"]
+    assert claims[0]["type"] == "build"
+    assert claims[2]["type"] == "diagnose-and-fix"
+    assert actions.territory_claims_from(None) == []
+    assert actions.territory_claims_from({"issues": "corrupt"}) == []
+
+
+def test_finished_claim_holds_overlapping_launch_but_does_not_consume_capacity():
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i9": ist("gating", declared_touches=["frontend"], type="build")}})
+    out = decide(config=cfg(lanes=1, affinity="hard"),
+                 parsed_issues=[parsed(1, touches=["frontend"]), parsed(2, touches=["api"])],
+                 dsk=dsk)
+    launches = only(out, "launch")
+    assert [a["id"] for a in launches] == ["i2"]
+
+
+def test_finished_claim_release_on_merge_regenerate_and_park_allows_overlap():
+    for status, extra in (
+        ("merged", {}),
+        ("ready", {"branch": "sl/i9-old-r1", "conflicts": 1, "requeue_front": True}),
+        ("parked", {}),
+        ("needs_william", {}),
+    ):
+        dsk = disk(issues_state={"version": 1, "issues": {
+            "i9": ist(status, declared_touches=["frontend"], type="build", **extra)}})
+        out = decide(config=cfg(lanes=1, affinity="hard"),
+                     parsed_issues=[parsed(1, touches=["frontend"])],
+                     dsk=dsk)
+        assert [a["id"] for a in only(out, "launch")] == ["i1"], status
+
+
+def test_parked_wildcard_claim_releases_so_no_touches_repo_does_not_freeze():
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i9": ist("parked", declared_touches=[], type="build")}})
+    out = decide(config=cfg(lanes=1, affinity="hard"),
+                 parsed_issues=[parsed(1, touches=[])],
+                 dsk=dsk)
+    assert [a["id"] for a in only(out, "launch")] == ["i1"]
+
+
+def test_finished_investigations_neither_hold_nor_are_held_by_claims():
+    build_claim = disk(issues_state={"version": 1, "issues": {
+        "i9": ist("gating", declared_touches=["frontend"], type="build")}})
+    inv_out = decide(config=cfg(lanes=1, affinity="hard"),
+                     parsed_issues=[parsed(1, labels=("agent-ready", "type:investigate"),
+                                           touches=["frontend"])],
+                     dsk=build_claim)
+    assert [a["id"] for a in only(inv_out, "launch")] == ["i1"]
+
+    inv_claim = disk(issues_state={"version": 1, "issues": {
+        "i9": ist("gating", declared_touches=["frontend"], type="investigate")}})
+    build_out = decide(config=cfg(lanes=1, affinity="hard"),
+                       parsed_issues=[parsed(1, touches=["frontend"])],
+                       dsk=inv_claim)
+    assert [a["id"] for a in only(build_out, "launch")] == ["i1"]
+
+
+def test_corrupt_issue_state_stops_fresh_launches_fail_closed():
+    for bad_state in (
+        {"version": 1},
+        {"version": 1, "issues": "corrupt"},
+        {"version": 1, "issues": {"i9": "corrupt"}},
+        ["not", "state"],
+    ):
+        out = decide(parsed_issues=[parsed(1, touches=["frontend"])],
+                     dsk=disk(issues_state=bad_state))
+        assert only(out, "launch") == [], bad_state

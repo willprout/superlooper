@@ -217,6 +217,42 @@ def test_hard_affinity_build_overlap_with_running_build_still_held():
     assert scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), False) == []
 
 
+def test_hard_affinity_blocks_overlap_with_held_claim_without_consuming_lane():
+    q = [
+        _issue(1, touches=["frontend"], labels=("type:build", "agent-ready")),
+        _issue(2, touches=["api"], labels=("type:build", "agent-ready")),
+    ]
+    claims = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    out = scheduler.launchable(q, [], _cfg(lanes=1, affinity="hard"), OK, set(), False,
+                               territory_claims=claims)
+    assert _nums(out) == [2]           # #1 held by the claim; #2 uses the free lane
+
+
+def test_hard_affinity_claim_release_allows_overlap_next_tick():
+    q = [_issue(1, touches=["frontend"], labels=("type:build", "agent-ready"))]
+    claims = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    assert scheduler.launchable(q, [], _cfg(lanes=1, affinity="hard"), OK, set(), False,
+                                territory_claims=claims) == []
+    out = scheduler.launchable(q, [], _cfg(lanes=1, affinity="hard"), OK, set(), False,
+                               territory_claims=[])
+    assert _nums(out) == [1]
+
+
+def test_hard_affinity_investigations_are_exempt_from_held_claims_both_directions():
+    build_claim = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    inv_claim = [{"id": "i8", "type": "investigate", "touches": ["frontend"]}]
+
+    inv_q = [_issue(1, touches=["frontend"], labels=("type:investigate", "agent-ready"))]
+    build_q = [_issue(2, touches=["frontend"], labels=("type:build", "agent-ready"))]
+
+    inv_out = scheduler.launchable(inv_q, [], _cfg(lanes=1, affinity="hard"), OK, set(), False,
+                                   territory_claims=build_claim)
+    build_out = scheduler.launchable(build_q, [], _cfg(lanes=1, affinity="hard"), OK, set(), False,
+                                     territory_claims=inv_claim)
+    assert _nums(inv_out) == [1]
+    assert _nums(build_out) == [2]
+
+
 def test_hard_affinity_diagnose_and_fix_overlap_with_build_still_held():
     lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
     q = [_issue(1, touches=["frontend"], labels=("type:diagnose-and-fix", "agent-ready"))]
