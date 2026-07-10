@@ -328,6 +328,25 @@ html, body {
 .fld-rd-card .t { font: 700 22px var(--sans); letter-spacing: 2px; color: #FF6A58; }
 .fld-rd-card .m { font: 500 13px var(--mono); color: #E8D5D0; }
 .fld-rd-card .s { font: 400 12px var(--sans); color: #B8A8A2; }
+/* GitHub-unreachable (issue #38): a compact, plain-words card at the top of the field naming the
+   lost data link while the tower beacon (canvas) sweeps for a signal. Cool steel-blue — deliberately
+   NOT the green all-clear caption and NOT the red runner-down takeover: this is "can't see the
+   boards," not "the runner died," so it sits at the top and the LOCAL flights below stay visible. */
+.fld-link {
+  position: absolute; left: 50%; top: 10px; transform: translateX(-50%);
+  display: flex; flex-direction: column; gap: 2px; align-items: center; text-align: center;
+  max-width: 80%; padding: 6px 14px;
+  background: rgba(14, 22, 30, 0.9); border: 1px solid #4E6E82; border-radius: 6px;
+  box-shadow: 0 0 0 1px rgba(122, 178, 204, 0.12), 0 6px 20px rgba(0, 0, 0, 0.42);
+}
+.fld-link .t {
+  font: 700 12px var(--mono); letter-spacing: 1.5px; color: #9FD0E4;
+  animation: cc-link-pulse 1.8s ease-in-out infinite;
+}
+.fld-link .m { font: 600 10.5px var(--mono); color: #C6D6E0; }
+.fld-link .s { font: 400 9.5px var(--sans); color: #8AA0AE; letter-spacing: 0.2px; }
+@keyframes cc-link-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+@media (prefers-reduced-motion: reduce) { .fld-link .t { animation: none; } }
 .repo-sel { display: inline-flex; gap: 4px; margin-left: 6px; }
 .repo-tab {
   background: none; border: 1px solid #C9D2DC; border-radius: 4px; cursor: pointer;
@@ -400,6 +419,13 @@ html, body {
   margin-top: 10px; text-align: center;
   font: 500 12px/22px var(--mono); color: #6E7680; letter-spacing: 2px;
   background: rgba(255, 255, 255, 0.03); border-radius: 2px;
+}
+/* the departures board's dark data-link state (issue #38): the queue is UNREAD, not empty, so this
+   replaces the "QUEUE EMPTY" caption — same split-flap frame, an honest cool steel-blue so the eye
+   never reads a lost link as a genuine empty queue. */
+.board-empty.link-lost {
+  color: #9FD0E4; letter-spacing: 1.5px;
+  background: rgba(122, 178, 204, 0.06);
 }
 
 /* ============================ boring mode (screen 8c — FULLY STATIC) ============================ */

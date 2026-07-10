@@ -193,6 +193,11 @@ class _CountingGh:
         self.calls += 1
         return [{"number": self.calls}]
 
+    def open_issues_probe(self, repo, label=None, limit=200):
+        # CachedGh.open_issues now delegates to open_issues_probe (one shared cache entry, issue #38),
+        # so the wrapped adapter must expose it; delegate to open_issues so the call count is unchanged.
+        return self.open_issues(repo, label=label, limit=limit), True
+
 
 def test_cached_gh_serves_one_fetch_within_the_interval():
     clock = [1000.0]
@@ -221,6 +226,31 @@ def test_cached_gh_caches_per_query_key():
     cached = server.CachedGh(inner, interval=30, clock=lambda: 1000.0)
     cached.open_issues("repo-a")
     cached.open_issues("repo-b")
+    assert inner.calls == 2
+
+
+class _CountingProbeGh:
+    def __init__(self):
+        self.calls = 0
+
+    def open_issues_probe(self, repo, label=None, limit=200):
+        self.calls += 1
+        return [{"number": self.calls}], True
+
+
+def test_cached_gh_caches_open_issues_probe_on_the_slow_clock():
+    # The reachability read (issue #38) rides the SAME slow gh clock as every other read (decision
+    # B.2) — a 2s snapshot loop must not re-ask GitHub whether it is reachable every tick.
+    clock = [1000.0]
+    inner = _CountingProbeGh()
+    cached = server.CachedGh(inner, interval=30, clock=lambda: clock[0])
+    a = cached.open_issues_probe("r")
+    clock[0] = 1020.0                     # 20s later — still inside the 30s window
+    b = cached.open_issues_probe("r")
+    assert inner.calls == 1               # served from cache, one real gh call
+    assert a == b == ([{"number": 1}], True)
+    clock[0] = 1031.0                     # past the window → a fresh read
+    cached.open_issues_probe("r")
     assert inner.calls == 2
 
 

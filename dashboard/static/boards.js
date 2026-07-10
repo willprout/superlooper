@@ -5,7 +5,9 @@
  *
  *   • departuresInner(deps, slug) → the departures board's inner HTML. `deps` is the ordered queue
  *     from flights.queue_rows: ⚡ expedite on top, priority band, number; a blocked flight reads
- *     "awaiting connection SL-N", dimmed, and never offers a launch bump.
+ *     "awaiting connection SL-N", dimmed, and never offers a launch bump. When the server reports
+ *     GitHub unreachable (`unreachable`), an EMPTY board reads as a dark data-link state, never the
+ *     false "QUEUE EMPTY" over a queue we could not read (issue #38).
  *   • attach(mount, arrivals, fun) → drives the persistent Solari board. Exactly the field's model
  *     (window.CCField.attach): the Solari node is created ONCE and re-parented into the fresh mount
  *     every poll, so shell.js's innerHTML rebuild never clobbers a split-flap flutter mid-air. Each
@@ -25,7 +27,7 @@
   // flutters), so a page turn here is a clean re-render — the joy investment stays on the arrivals.
   var DEP_PAGE_SIZE = 5;
 
-  function departuresInner(deps, slug, page, emptyCaption) {
+  function departuresInner(deps, slug, page, emptyCaption, unreachable) {
     deps = deps || [];
     var pages = Math.max(1, Math.ceil(deps.length / DEP_PAGE_SIZE));
     page = Math.min(Math.max(0, page || 0), pages - 1);
@@ -104,10 +106,13 @@
       '<div class="board-cols dep-cols"><span>FLIGHT</span><span>DESTINATION</span>' +
         '<span class="dep-col-status">STATUS</span></div>' +
       rows +
-      // The empty-board caption states the repo's REAL lane count — the server's queue_empty_caption
-      // threaded in as emptyCaption (issue #35); the JS only frames it in the split-flap dashes. The
-      // "QUEUE EMPTY" default covers a caption-less slice (no repo / older snapshot).
-      (deps.length ? "" : '<div class="board-empty">— ' + esc(emptyCaption || "QUEUE EMPTY") + ' —</div>') +
+      // The empty-board line has TWO honest faces (issue #38). Normal: the server's queue_empty_caption,
+      // stating the repo's REAL lane count (issue #35), framed in split-flap dashes. GitHub-unreachable:
+      // the queue is UNREAD, not empty — "QUEUE EMPTY" there would be a false claim — so the board goes
+      // to a distinct dark data-link state instead. `unreachable` is the server's flag; the JS only binds.
+      (deps.length ? "" : (unreachable
+        ? '<div class="board-empty link-lost">◈ NO DATA LINK · CAN’T REACH GITHUB</div>'
+        : '<div class="board-empty">— ' + esc(emptyCaption || "QUEUE EMPTY") + ' —</div>')) +
       pager +
       legend;
   }

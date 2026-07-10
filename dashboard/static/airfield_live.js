@@ -14,6 +14,7 @@
    }
 
    model = { time: 'day'|'dusk'|'night', status: 'ok'|'attention'|'alert', dim: bool,
+             link: 'ok'|'lost' (GitHub data link — 'lost' darkens the tower beacon, issue #38),
              resetKey: string (repo switch clears sprite state),
              banner: {num, text}|null (towed behind that flight while on the leg),
              flights: [{num, label, stage, circuitStage, runway, contrail, spinning, trouble,
@@ -105,7 +106,7 @@
 
     var base = document.createElement('canvas');
     var baseKey = '';
-    var model = { time: 'day', status: 'ok', dim: false, flights: [], banner: null, resetKey: '' };
+    var model = { time: 'day', status: 'ok', dim: false, link: 'ok', flights: [], banner: null, resetKey: '' };
     var sprites = {};          // num -> persistent sprite state (cur pos, trail, transit)
     var raf = 0, last = 0, frame = 0;
 
@@ -308,10 +309,31 @@
       }
     }
 
+    // The dark tower (issue #38): when the GitHub data link is LOST, the beacon stops signalling and
+    // sweeps for a contact it isn't getting. Cold steel-blue, no green/amber/red life, no returns —
+    // "we can't see," rendered as a lonely radar sweep. Overrides the status FX entirely (the loop may
+    // be perfectly healthy; it is the tower's LINK that is dark). Honors reduced motion with a still.
+    function searchingBeacon(now) {
+      var t = reduced ? 0 : now;
+      ctx.fillStyle = 'rgba(120,140,158,0.55)';                 // a dark, unlit beacon core
+      ctx.fillRect(BX - 2, BY - 2, 5, 5);
+      var ang = reduced ? -0.9 : (t / 1400) % (Math.PI * 2);    // one slow sweep hand
+      for (var r = 4; r < 30; r += 2) {
+        var a = 0.30 * (1 - r / 30);                            // fades out along the sweep — no echo
+        ctx.fillStyle = 'rgba(122,178,204,' + a.toFixed(2) + ')';
+        ctx.fillRect(Math.round(BX + Math.cos(ang) * r), Math.round(BY + Math.sin(ang) * r), 2, 2);
+      }
+      var pr = reduced ? 0.5 : (0.5 + 0.5 * Math.sin(t / 520)); // a faint "no signal" ring, breathing
+      ctx.strokeStyle = 'rgba(122,178,204,' + (0.10 + 0.16 * pr).toFixed(2) + ')';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(BX + 0.5, BY + 0.5, 10 + 6 * pr, 0, Math.PI * 2); ctx.stroke();
+    }
+
     // Tower status FX — lifted verbatim from the prototype engine (ok breath / attention pulse /
     // alert blink + rings + wash). Reduced motion gets the steady mid-state frame.
     function towerFX(now) {
       if (reduced) now = 0;
+      if (model.link === 'lost') { searchingBeacon(now); return; }   // dark tower wins the beacon (#38)
       if (model.status === 'ok') {
         var a = 0.12 + 0.06 * Math.sin(now / 900);
         ctx.fillStyle = 'rgba(110,224,138,' + a.toFixed(2) + ')';

@@ -129,6 +129,98 @@ def test_pr_comments_returns_list(tmp_path, monkeypatch):
     assert gh.pr_comments(REPO, 20) == [{"body": "lgtm"}]
 
 
+# --------------------------- reads: reachability probe (issue #38) ---------------------------
+# open_issues_probe is the ONE honest signal that separates "GitHub answered: no open issues" from
+# "GitHub is unreachable / refused". Every other parser fails closed to the same empty value for
+# both, which is safe for acting but LOSES the distinction the field needs to tell a genuine
+# all-clear from a dead data link. The probe surfaces the fail-closed rc instead of swallowing it —
+# and it IS the open-issue read the snapshot already makes every poll, so no extra gh call is added.
+
+def test_open_issues_probe_reports_reachable_on_a_real_answer(tmp_path, monkeypatch):
+    _use_fake(monkeypatch, tmp_path)
+    _write(tmp_path, "issue_list.json", [{"number": 1}, {"number": 2}])
+    issues, reachable = gh.open_issues_probe(REPO)
+    assert issues == [{"number": 1}, {"number": 2}]
+    assert reachable is True                      # gh answered
+
+
+def test_open_issues_probe_reports_reachable_on_an_EMPTY_answer(tmp_path, monkeypatch):
+    # The crux (issue #38): a real, successful, EMPTY answer is reachable=True — an honest all-clear,
+    # NOT the unreachable state. Distinguishing this from the failures below is the whole point.
+    _use_fake(monkeypatch, tmp_path)
+    _write(tmp_path, "issue_list.json", [])
+    issues, reachable = gh.open_issues_probe(REPO)
+    assert issues == []
+    assert reachable is True
+
+
+def test_open_issues_probe_unreachable_on_missing_binary(tmp_path, monkeypatch):
+    # SL_GH stays at the conftest's neutralized absent path — the binary can't be found (rc 127).
+    monkeypatch.setenv("GH_FIXTURES", str(tmp_path))
+    issues, reachable = gh.open_issues_probe(REPO)
+    assert issues == []
+    assert reachable is False                     # a missing gh IS the first-run unreachable gap
+
+
+def test_open_issues_probe_unreachable_on_nonzero_rc(tmp_path, monkeypatch):
+    # An unauthenticated / erroring gh exits nonzero — the second most likely first-run gap.
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL", "1")
+    _write(tmp_path, "issue_list.json", [{"number": 1}])   # present but never reached
+    issues, reachable = gh.open_issues_probe(REPO)
+    assert issues == []
+    assert reachable is False
+
+
+def test_open_issues_probe_unreachable_on_timeout(tmp_path, monkeypatch):
+    _use_fake(monkeypatch, tmp_path)
+    _write(tmp_path, "issue_list.json", [{"number": 1}])
+    monkeypatch.setenv("GH_SLEEP", "2")
+    monkeypatch.setattr(gh, "_DEFAULT_TIMEOUT", 0.3)
+    issues, reachable = gh.open_issues_probe(REPO)
+    assert issues == []
+    assert reachable is False                     # a hung gh is unreachable, never a false all-clear
+
+
+def test_open_issues_probe_unreachable_on_unparseable_json(tmp_path, monkeypatch):
+    # gh exited 0 but handed back junk — we have NO trustworthy queue read, so this is NOT a genuine
+    # all-clear (Codex review): reachable means "gh gave us a usable open-issue list," and unparseable
+    # output fails that just as a nonzero rc does. The list still fails closed to empty.
+    _use_fake(monkeypatch, tmp_path)
+    (tmp_path / "issue_list.json").write_text("not json {{{")
+    issues, reachable = gh.open_issues_probe(REPO)
+    assert issues == []
+    assert reachable is False
+
+
+def test_open_issues_probe_unreachable_on_wrong_typed_json(tmp_path, monkeypatch):
+    # Valid JSON but the wrong SHAPE (a dict where a list is required) is also not a usable answer —
+    # reachable is True only for a real open-issue LIST (empty or not), never a false all-clear over
+    # a read we couldn't use.
+    _use_fake(monkeypatch, tmp_path)
+    _write(tmp_path, "issue_list.json", {"not": "a list"})
+    issues, reachable = gh.open_issues_probe(REPO)
+    assert issues == []
+    assert reachable is False
+
+
+def test_open_issues_probe_carries_the_label_through(tmp_path, monkeypatch):
+    _use_fake(monkeypatch, tmp_path)
+    _write(tmp_path, "issue_list_agent-ready.json", [{"number": 4}])
+    issues, reachable = gh.open_issues_probe(REPO, label="agent-ready")
+    assert issues == [{"number": 4}] and reachable is True
+    argv = _calls(tmp_path)[-1]["argv"]
+    assert argv[argv.index("--label") + 1] == "agent-ready"
+
+
+def test_open_issues_delegates_to_the_probe_and_drops_reachability(tmp_path, monkeypatch):
+    # open_issues stays the list-only surface every existing caller uses — it is now the probe with
+    # the reachability dropped, so the two can never diverge on the query they send gh.
+    _use_fake(monkeypatch, tmp_path)
+    _write(tmp_path, "issue_list.json", [{"number": 9}])
+    assert gh.open_issues(REPO) == [{"number": 9}]
+
+
 # --------------------------- reads: repo pinning ---------------------------
 
 def test_every_read_is_pinned_to_the_given_repo(tmp_path, monkeypatch):

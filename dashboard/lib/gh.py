@@ -95,14 +95,45 @@ def ready_issues(repo, limit=200):
     return open_issues(repo, label="agent-ready", limit=limit)
 
 
-def open_issues(repo, label=None, limit=200):
-    """Open issues in ``repo`` — all of them, or only those carrying ``label`` when given. Raw gh
-    dicts (number/title/labels/body/createdAt). ``[]`` on any failure — with no readable list the
-    dashboard simply shows no flights, which is the honest answer when GitHub is unreachable."""
+def open_issues_probe(repo, label=None, limit=200):
+    """Open issues in ``repo`` PLUS whether gh gave us a USABLE answer — the ONE honest signal that
+    separates "GitHub answered: no open issues" from "GitHub is unreachable / unreadable". Returns
+    ``(issues, reachable)``:
+
+      * ``reachable`` is ``True`` ONLY when gh exited 0 AND its output parsed to a JSON LIST (empty or
+        not) — a real open-issue answer, so an empty list is a genuine all-clear;
+      * ``reachable`` is ``False`` whenever the read is not trustworthy: the subprocess failed (a
+        missing binary, an unauthenticated / erroring gh, a timeout, any nonzero rc), OR gh exited 0
+        but handed back unparseable / wrong-shaped output. A parse failure is no more a trustworthy
+        all-clear than a nonzero rc is (Codex review, issue #38) — either way we could not read the
+        queue, so the field must show the honest dark-tower state, never a false calm.
+
+    ``issues`` is the same fail-closed list :func:`open_issues` returns (``[]`` on any failure or
+    wrong-typed body), so a caller that only wants the list ignores the second value. This is the
+    open-issue read the snapshot already makes every poll — the reachability rides that ONE call, so
+    the unreachable state costs no extra gh call (quota discipline, issue #38)."""
     args = ["issue", "list", "--state", "open", "--json", _ISSUE_FIELDS, "--limit", str(limit)]
     if label:
         args += ["--label", label]
-    return _json_list(args, repo=repo)
+    rc, out = _run(args, repo=repo)
+    if rc != 0:
+        return [], False              # unreachable / refused — never a false all-clear
+    try:
+        v = json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return [], False              # gh ran but its output was junk — not a usable queue read
+    if not isinstance(v, list):
+        return [], False              # valid JSON of the wrong shape — also not a usable list answer
+    return v, True
+
+
+def open_issues(repo, label=None, limit=200):
+    """Open issues in ``repo`` — all of them, or only those carrying ``label`` when given. Raw gh
+    dicts (number/title/labels/body/createdAt). ``[]`` on any failure — with no readable list the
+    dashboard simply shows no flights, which is the honest answer when GitHub is unreachable. The
+    list-only surface over :func:`open_issues_probe`; the two send gh the identical query, so the
+    reachability signal can never drift from the list it accompanies."""
+    return open_issues_probe(repo, label=label, limit=limit)[0]
 
 
 def issue(repo, num):

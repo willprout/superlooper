@@ -65,6 +65,20 @@
     overlays.appendChild(rd);
     fixedEls.rd = rd;
 
+    // GITHUB UNREACHABLE (issue #38): the tower has lost its data link to GitHub, so the queue /
+    // arrivals / titles are blind. Deliberately NOT the full-surface red runner-down takeover — the
+    // LOCAL flights (from the state home) are still real and stay visible; only the GitHub-derived
+    // layer is dark. A compact, plain-words card names it while the canvas tower beacon goes dark and
+    // sweeps for a signal. It self-heals: the next reachable poll rebuilds without it.
+    var link = document.createElement('div');
+    link.className = 'fld-link';
+    link.hidden = true;
+    link.innerHTML = '<span class="t">◈ NO DATA LINK</span>' +
+      '<span class="m">can’t reach GitHub — the tower is searching</span>' +
+      '<span class="s">showing local flights only · the queue is dark until the link returns</span>';
+    overlays.appendChild(link);
+    fixedEls.link = link;
+
     engine = window.AirfieldLive.mount(canvas);
     canvas.addEventListener('click', function (e) {
       var p = logical(e), num = engine.hitTest(p.x, p.y);
@@ -128,12 +142,19 @@
     // test) — this file only carries them to the cloth.
     var banner = repo.field_banner || null;
 
+    // GitHub-unreachable (issue #38): the server's honest flag → the engine's `link` state. When the
+    // link is lost the tower beacon goes dark and sweeps for a signal (a dark tower, never a red
+    // alarm — this is "can't see the boards," not "the runner died"). Local flights stay lit; the
+    // classification is the server's, this only forwards the flag (design record B.1).
+    var linkLost = !!(repo.github && repo.github.unreachable);
+
     var anyLit = flights.some(function (f) { return f.trouble; });
     var layout = engine.update({
       resetKey: repo.slug,
       time: fun.living_clock === false ? 'day' : (snapshot.daypart || 'day'),
       status: snapshot.tower_status || 'attention',
       dim: anyLit || (repo.state && repo.state.state === 'alert'),
+      link: linkLost ? 'lost' : 'ok',
       banner: banner,
       flights: flights.concat(standFlights)
     });
@@ -195,6 +216,11 @@
       var msg = document.getElementById('fld-rd-msg');
       if (msg) msg.textContent = (c.snapshot.runner && c.snapshot.runner.message) || '';
     }
+
+    // GitHub-unreachable card (issue #38) — shown when the data link is lost. Runner-down is more
+    // severe (it grays the whole surface and hides every other overlay via CSS), so it wins when both
+    // are true; here we just bind the flag. The tower beacon's dark-sweep is drawn on the canvas.
+    fixedEls.link.hidden = !(c.repo.github && c.repo.github.unreachable);
   }
 
   window.CCField = { attach: attach };

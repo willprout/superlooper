@@ -433,7 +433,7 @@ class CachedGh:
     never knows a fetch was served from cache. Only READS are wrapped; writes (Task 6) must never
     be cached and go straight to the adapter."""
 
-    _READS = ("open_issues", "issue", "pr_for_branch", "pr_comments")
+    _READS = ("open_issues", "open_issues_probe", "issue", "pr_for_branch", "pr_comments")
 
     def __init__(self, gh_mod, interval, clock=None):
         self._gh = gh_mod
@@ -448,9 +448,19 @@ class CachedGh:
             self._caches[key] = c
         return c.get()
 
+    def open_issues_probe(self, repo, label=None, limit=200):
+        # The reachability read (issue #38) rides the SAME slow clock as every other read (decision
+        # B.2) — a 2s poll must not re-ask GitHub whether it is reachable every tick. The (list,
+        # reachable) tuple is memoized whole, so surface and reachability always come from one fetch.
+        return self._cached(("open_issues_probe", repo, label, limit),
+                            lambda: self._gh.open_issues_probe(repo, label=label, limit=limit))
+
     def open_issues(self, repo, label=None, limit=200):
-        return self._cached(("open_issues", repo, label, limit),
-                            lambda: self._gh.open_issues(repo, label=label, limit=limit))
+        # The list-only surface OVER open_issues_probe — mirrors lib/gh.open_issues so both share the
+        # ONE probe cache entry per query (a caller asking for the list and the probe of the same
+        # query never double-fetches gh, and the list can never drift from its reachability signal —
+        # Codex review, issue #38).
+        return self.open_issues_probe(repo, label=label, limit=limit)[0]
 
     def issue(self, repo, num):
         return self._cached(("issue", repo, num), lambda: self._gh.issue(repo, num))
@@ -682,13 +692,20 @@ def _lit(flight, worst_state):
     return False
 
 
-def _field_caption(repo_flights, state, arrivals, now, stand=()):
+def _field_caption(repo_flights, state, arrivals, now, stand=(), gh_unreachable=False):
     """The quiet-state caption (§5: calm is never ambiguous — the empty field SAYS it is clear).
     Only a genuinely quiet field carries it: repo condition ``ok`` and NO plane on the field at
     all — a holding orbit, a plane at the stand, or a fresh landing still taxiing suppress it
     even though none is a pill condition (review fix 2026-07-07: a caption over a visible plane
     is a false calm). ``stand`` is the queued-flights projection (issue #32); a plane standing at a
-    gate is just as visible as one in the air, so it too suppresses the all-clear."""
+    gate is just as visible as one in the air, so it too suppresses the all-clear.
+
+    ``gh_unreachable`` (issue #38) suppresses the all-clear entirely: when GitHub is unreachable the
+    field's GitHub-derived layer (queue, arrivals enrichment, titles) is BLIND, so a quiet field is
+    not proven quiet — the honest read is "we can't see," which the dark-tower state carries, never a
+    false "all clear." A genuinely EMPTY-but-reachable answer (``gh_unreachable`` False) is unchanged."""
+    if gh_unreachable:
+        return None
     if state["state"] != "ok":
         return None
     if stand or any(f["display"]["on_field"] for f in repo_flights):
@@ -791,18 +808,43 @@ def _required_checks(repo):
     return []
 
 
-def _titles(gh_mod, slug, merged_nums, concluded=None):
-    """Best-effort ``{num: title}`` from GitHub: the open-issue list (queue + in-flight titles) plus
-    a per-issue view for each landed flight (closed, so absent from the open list). Empty when
-    GitHub is unreachable — titles are enrichment, never required (the flight number always shows).
-    A landed flight is concluded, so its title is fetched through ``concluded`` (fetch once, remember
-    — issue #48) when supplied; the open-list read stays on the live clock (its titles DO change)."""
-    titles = {}
+def _probe_open_issues(gh_mod, slug):
+    """The unlabeled open-issue list PLUS gh reachability (issue #38), from the ONE open-issue read
+    the snapshot makes every poll. Returns ``(issues, reachable)`` where ``reachable`` is:
+
+      * ``True`` — gh answered (even empty: an honest all-clear);
+      * ``False`` — gh FAILED (missing binary / unauthenticated / timeout / nonzero rc): the honest
+        GitHub-unreachable state, never a false all-clear;
+      * ``None`` — reachability UNKNOWN: no gh wired (a read-only embedder), or a legacy gh-like that
+        predates ``open_issues_probe``. Unknown is deliberately NOT "unreachable" — the dashboard
+        never alarms a state it cannot actually observe.
+
+    The real adapter (``gh`` + ``CachedGh``) always exposes ``open_issues_probe``; the ``getattr``
+    fallback keeps ``gh_mod`` duck-typed so an embedder without the probe still assembles (with
+    reachability unknown). NO extra gh call: the probe IS the unlabeled open-issue read, reused below
+    for both ``open_nums`` and titles."""
     if gh_mod is None:
-        return titles
-    for iss in gh_mod.open_issues(slug):
+        return [], None
+    probe = getattr(gh_mod, "open_issues_probe", None)
+    if probe is None:                       # a legacy gh-like without the probe → reachability unknown
+        return list(gh_mod.open_issues(slug) or []), None
+    issues, reachable = probe(slug)
+    return (list(issues) if isinstance(issues, (list, tuple)) else []), reachable
+
+
+def _titles(slug, open_issue_list, gh_mod, merged_nums, concluded=None):
+    """Best-effort ``{num: title}`` from GitHub: the ALREADY-fetched open-issue list (queue +
+    in-flight titles, passed in so the unlabeled read is made once — issue #38) plus a per-issue view
+    for each landed flight (closed, so absent from the open list). Empty when GitHub is unreachable —
+    titles are enrichment, never required (the flight number always shows). A landed flight is
+    concluded, so its title is fetched through ``concluded`` (fetch once, remember — issue #48) when
+    supplied; the per-issue reads stay on the live clock (their titles DO change)."""
+    titles = {}
+    for iss in open_issue_list:
         if isinstance(iss, dict) and isinstance(iss.get("number"), int):
             titles[iss["number"]] = iss.get("title")
+    if gh_mod is None:
+        return titles
     for num in merged_nums:
         def fetch(n=num):
             try:
@@ -1026,11 +1068,13 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
                    "required_checks": required_checks, "now": now,
                    "merges_frozen": facts["merges_frozen"], "progress_window_seconds": 900}
 
-    open_nums = set()
-    if gh_mod is not None:
-        for iss in gh_mod.open_issues(slug):
-            if isinstance(iss, dict) and isinstance(iss.get("number"), int):
-                open_nums.add(iss["number"])
+    # The unlabeled open-issue read — made ONCE (issue #38): it yields both the open-issue numbers
+    # (for the closed/concluded signal + queue exclusion) AND gh reachability, and its list is reused
+    # for titles below. gh_reachable: True answered · False unreachable · None unknown (no gh wired).
+    open_issue_list, gh_reachable = _probe_open_issues(gh_mod, slug)
+    gh_unreachable = gh_reachable is False
+    open_nums = {iss["number"] for iss in open_issue_list
+                 if isinstance(iss, dict) and isinstance(iss.get("number"), int)}
 
     # Each real lane owns a runway for the whole poll (§3: "2 runways = 2 concurrent builds").
     lane_runways = flights.assign_runways(
@@ -1085,7 +1129,7 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         flight_records.append((f, jslice, slug))
 
     merged_nums = [f["num"] for f in repo_flights if f["stage"] in _LANDED]
-    titles = _titles(gh_mod, slug, merged_nums, concluded)   # landed ⇒ concluded: title fetched once
+    titles = _titles(slug, open_issue_list, gh_mod, merged_nums, concluded)   # one unlabeled read (#38)
     flying_nums = {f["num"] for f in repo_flights}
 
     # The flight-card drawer (Task 9): ground truth one click from anywhere — attached per flight now
@@ -1117,7 +1161,11 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     # The launch queue in real order (departures board), and its front projected to planes standing at
     # the gates (the field's "at the stand" stage, issue #32). The stand is derived FROM departures —
     # one queue, two honest renderings: the split-flap board (full, paginated) and the physical gates.
-    departures = _departures(gh_mod, slug, flying_nums, titles)
+    # When GitHub is UNREACHABLE the whole GitHub-derived queue is dark BY CONSTRUCTION (issue #38,
+    # Codex review): the reachability probe is our oracle, so we never fly a stale-cached agent-ready
+    # list that could outlive the probe's failure by a cache window — the dark-tower state and a
+    # populated departures board must never contradict each other.
+    departures = [] if gh_unreachable else _departures(gh_mod, slug, flying_nums, titles)
     stand = _stand(departures)
 
     repo_snap = {
@@ -1132,7 +1180,12 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         "queue_empty_caption": flights.empty_queue_caption(repo.get("lanes")),
         "stand": stand,
         "last_landing_text": last_landing_text,
-        "field_caption": _field_caption(repo_flights, state, arrivals, now, stand),
+        "field_caption": _field_caption(repo_flights, state, arrivals, now, stand, gh_unreachable),
+        # GitHub reachability (issue #38): the honest signal the field's dark-tower state binds. When
+        # `unreachable`, the queue/arrivals/titles above are BLIND (fail-closed to empty), so the JS
+        # must render the lost-data-link state, never a false all-clear. `reachable` keeps the raw
+        # tri-state inspectable (True answered · False refused · None no gh wired / unknown).
+        "github": {"reachable": gh_reachable, "unreachable": gh_unreachable},
         "field_banner": _field_banner(repo_flights),
         "tower_log": tower_rows,
         "tower_new": tower_new,
@@ -1313,6 +1366,14 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
                    "offender": pill["offender"],
                    "text": "%s · %s" % (_TROUBLE_TEXT.get(state, state), pill["offender"])}
 
+    # A whole-field GitHub-reachability aggregate (issue #38): gh is one binary/auth for every repo,
+    # so unreachable is effectively global. `unreachable` is True the moment ANY repo's read refused;
+    # `reachable` is True only when every wired repo answered (None ⇒ no gh wired anywhere → unknown).
+    repo_gh = [rs["github"] for rs in repo_snaps]
+    gh_unreachable = any(g["unreachable"] for g in repo_gh)
+    answered = [g["reachable"] for g in repo_gh if g["reachable"] is not None]
+    gh_reachable = all(answered) if answered else None
+
     # Global firehose: the newest records across ALL repos, in time order. Sorting BEFORE the
     # truncation is load-bearing for multi-repo — otherwise a later repo's older block could push a
     # newer record off the tail (a per-repo append + slice is not a global tail).
@@ -1327,6 +1388,9 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
         "poll_seconds": config.get("poll_seconds", 2),
         "pill": pill,
         "tower_status": flights.tower_status(pill),
+        # Whole-field GitHub reachability (issue #38) — the honest signal the boards/field bind so a
+        # dead data link never masquerades as an all-clear. Per-repo truth lives on each repo slice.
+        "github": {"reachable": gh_reachable, "unreachable": gh_unreachable},
         "runner": {"down": runner_down, "repos": runner_repos,
                    "message": _runner_message(runner_repos),
                    "down_seconds": config.get("heartbeat_down_seconds", 300)},
