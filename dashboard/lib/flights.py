@@ -53,8 +53,11 @@ PARKED = "parked"                  # the machine gave up — chocks, dimmed, "yo
 AWAITING = "awaiting"              # amber: a decision waits on William (needs-william / bounced)
 HOLDING = "holding"                # sequenced behind another lane — "number 2 for landing"
 SESSION_FROZEN = "session-frozen"  # a dead SESSION (liveness past the frozen tier) — grey, no contrail
+STRANDED = "stranded"              # a FINISHED session at the gate the GATE stopped advancing (§5 /
+                                   # issue #22) — the report is filed; the runner never landed it.
+                                   # NOT a dead session: the work completed, so it never greys out.
 MERGES_FREEZE = "merges-freeze"    # the REPO's landings are calmly paused — repair flight dispatched
-OFF_PATH_STATES = (PARKED, AWAITING, HOLDING, SESSION_FROZEN, MERGES_FREEZE)
+OFF_PATH_STATES = (PARKED, AWAITING, HOLDING, SESSION_FROZEN, STRANDED, MERGES_FREEZE)
 
 # Liveness tiers (design record §5) — the contrail, tied to the runner's real activity-age tiers.
 FRESH = "fresh"    # activity file younger than the repo's idle threshold — bold, bright contrail
@@ -239,9 +242,13 @@ def flight_stage(status, liveness=None, bounced=False, long_wait=False,
       2. ``AWAITING`` — an owner decision waits: status ``needs_william``/``bounced``, or a blocked
          session whose marker is a ``BOUNCED:`` memo. Amber, never confusable with a dead session.
       3. ``HOLDING`` — sequenced behind an overlapping lane ("number 2 for landing").
-      4. ``SESSION_FROZEN`` — a dead session: status ``frozen``, OR an in-air stage whose contrail
-         has aged into the frozen tier. Time DEGRADED its liveness; it did not advance the plane up
-         the circuit.
+      4. ``STRANDED`` — a FINISHED session at the gate (``FINAL`` + a filed report) whose activity
+         has aged into the frozen tier. The session COMPLETED its work — a finished session's
+         activity file naturally goes stale — so this is the GATE failing to advance, NOT a dead
+         session (issue #22). Distinct look, distinct response: point the owner at the runner/gate.
+      5. ``SESSION_FROZEN`` — a genuinely dead session: status ``frozen``, OR an in-air stage with
+         NO filed report whose contrail has aged into the frozen tier. Time DEGRADED its liveness
+         mid-work; it did not advance the plane up the circuit.
 
     ``long_wait`` (the worker's own ``state/awaiting/<id>`` background-wait touch) is deliberately
     NOT an owner decision, so it never turns a flight amber — it rides along as an annotation the
@@ -257,6 +264,12 @@ def flight_stage(status, liveness=None, bounced=False, long_wait=False,
     stage = circuit_stage(status, report_present=report_present, session_started=session_started,
                           launched=launched, cleared=cleared, closed=closed)
     if liveness == FROZEN and stage in _IN_AIR:
+        # A stale contrail at an in-air stage is a dead session — EXCEPT at the gate with a filed
+        # report: there the session already finished, so its naturally-stale activity means the GATE
+        # stopped advancing, not that the session died (issue #22). Only the frozen tier trips this;
+        # a fresh/absent gate is still cleared-to-land (FINAL), never fabricated into "stranded".
+        if stage == FINAL and report_present:
+            return STRANDED
         return SESSION_FROZEN
     return stage
 
@@ -446,6 +459,8 @@ _CONDITION_RANK = {
     AWAITING: 50,          # an owner decision blocks work — the most actionable attention state
     PARKED: 45,            # the machine gave up on a flight
     SESSION_FROZEN: 30,    # a dead session stalled on the field
+    STRANDED: 28,          # finished work the gate never landed — a nudge fixes it (issue #22); real
+                           #   attention, but the work is safe, so it sits just under a dead session
     "spinning": 25,        # alive-looking but getting nowhere
     MERGES_FREEZE: 20,     # landings calmly paused — the designed safe idle state (lowest attention)
 }
@@ -465,7 +480,7 @@ def repo_state(slug, states, spinning=False, merges_frozen=None, alert=None,
     if alert is not None:
         conditions.append("alert")
     seen = set(states)
-    for st in (AWAITING, PARKED, SESSION_FROZEN):
+    for st in (AWAITING, PARKED, SESSION_FROZEN, STRANDED):
         if st in seen:
             conditions.append(st)
     if spinning:

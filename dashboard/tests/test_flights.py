@@ -216,9 +216,10 @@ def test_at_stand_is_never_session_frozen_for_lack_of_a_contrail():
     assert flights.flight_stage("ready", liveness=None) == flights.AT_STAND
 
 
-def test_the_five_off_path_states_are_pairwise_distinct():
-    # The core §5 honesty guarantee: five states demanding opposite responses, no two collapse.
-    assert len(set(flights.OFF_PATH_STATES)) == 5
+def test_the_off_path_states_are_pairwise_distinct():
+    # The core §5 honesty guarantee: every off-path state demands an opposite response, so no two
+    # collapse. Six of them now, since a stranded gate (issue #22) joined the set.
+    assert len(set(flights.OFF_PATH_STATES)) == len(flights.OFF_PATH_STATES) == 6
 
 
 def test_session_frozen_and_merges_freeze_are_different_values():
@@ -231,6 +232,59 @@ def test_awaiting_marker_is_not_amber_owner_decision():
     # state/awaiting/<id> is a worker's OWN long-background-wait touch (loop contract), not a
     # decision waiting on William — it must not render as the amber awaiting state.
     assert flights.flight_stage("running", session_started=True, long_wait=True) == flights.DOWNWIND
+
+
+# =============================== stranded at the gate (issue #22 / §5) ===============================
+# A finished session (report on disk, status `gating`) whose GATE stopped advancing is its OWN state.
+# The session COMPLETED its work, so its naturally-stale activity file must never read as a dead
+# session; "stranded at the gate" points the owner at the gate/runner, never at a healthy session.
+
+def test_gating_with_report_and_stale_activity_is_stranded_not_frozen():
+    # DoD #1: status `gating` + report present + stale (frozen-tier) session activity → STRANDED at
+    # the gate, NOT a dead session. The session finished its work; the gate abandoned the issue.
+    stage = flights.flight_stage("gating", liveness=flights.FROZEN, report_present=True)
+    assert stage == flights.STRANDED
+    assert stage != flights.SESSION_FROZEN
+
+
+def test_dead_mid_flight_session_still_reads_session_frozen():
+    # DoD #2: a genuinely dead mid-flight session — no report filed, activity aged past the frozen
+    # tier — is UNCHANGED: still a dead SESSION (grey/no-contrail), never stranded-at-gate.
+    stage = flights.flight_stage("running", session_started=True, liveness=flights.FROZEN,
+                                 report_present=False)
+    assert stage == flights.SESSION_FROZEN
+    assert stage != flights.STRANDED
+
+
+def test_stranded_is_distinct_from_session_frozen_and_holding():
+    # The §5 honesty law extended: a stranded gate demands a different response from a dead session
+    # (relaunch the worker) and from calm holding (just wait) — no two may share a value.
+    assert flights.STRANDED not in (flights.SESSION_FROZEN, flights.HOLDING, flights.FINAL,
+                                    flights.PARKED, flights.AWAITING, flights.MERGES_FREEZE)
+
+
+def test_stranded_is_an_off_path_state():
+    # It overrides the on-circuit position (rendered AT the gate) like the other off-path states, so
+    # it joins OFF_PATH_STATES and is not itself an on-circuit stage.
+    assert flights.STRANDED in flights.OFF_PATH_STATES
+    assert flights.STRANDED not in flights.CIRCUIT_STAGES
+
+
+def test_fresh_or_absent_gate_with_report_is_still_final_not_stranded():
+    # A gate whose session JUST finished (fresh, or an absent activity file) is healthy at the gate —
+    # the runner is landing it. Only a session that has gone STALE at the gate is stranded: we never
+    # fabricate "stranded" without positive time evidence (a fresh/absent gate is cleared-to-land,
+    # not stuck), and neither reading is ever the grey dead-session look.
+    assert flights.flight_stage("gating", liveness=flights.FRESH, report_present=True) == flights.FINAL
+    assert flights.flight_stage("gating", liveness=None, report_present=True) == flights.FINAL
+
+
+def test_gating_without_a_report_is_not_stranded():
+    # STRANDED is EARNED by the report on disk (the proof the session finished). A gate with no
+    # report and stale activity can't be proven finished, so it keeps the conservative dead-session
+    # read rather than claiming a clean hand-off to the gate.
+    assert flights.flight_stage("gating", liveness=flights.FROZEN,
+                                report_present=False) == flights.SESSION_FROZEN
 
 
 # =============================== progress ≠ liveness → spinning (§5) ===============================
@@ -480,6 +534,14 @@ def test_repo_state_merges_freeze_is_calm_attention():
     r = flights.repo_state(slug="a/b", states=[flights.DOWNWIND], spinning=False,
                            merges_frozen={"reason": "dev red"}, alert=None, heartbeat_age=10.0)
     assert r["level"] == "attention" and r["state"] == flights.MERGES_FREEZE
+
+
+def test_repo_state_flags_a_stranded_gate_as_attention():
+    # A stranded gate is real trouble the owner should see off-screen (§4/§5): finished work that the
+    # gate isn't landing. It raises the pill to attention and names itself, so the field agrees.
+    r = flights.repo_state(slug="a/b", states=[flights.DOWNWIND, flights.STRANDED], spinning=False,
+                           merges_frozen=None, alert=None, heartbeat_age=10.0)
+    assert r["level"] == "attention" and r["state"] == flights.STRANDED
 
 
 def test_repo_state_alert_is_the_alert_level():
@@ -899,6 +961,21 @@ def test_awaiting_flight_keeps_its_underlying_circuit_position():
     f = flights.build_flight(issue, _REPO)
     assert f["stage"] == flights.AWAITING
     assert f["circuit_stage"] == flights.BASE_TURN
+
+
+def test_build_flight_stranded_gate_is_its_own_state_at_the_gate():
+    # The whole pipeline (issue #22): a finished investigation — report on disk, status `gating` —
+    # whose activity file has aged past the frozen tier is STRANDED at the gate, held AT its final
+    # position (never teleported), and trails no contrail (its session is done, not spinning).
+    issue = {"id": "i22", "num": 22, "status": "gating",
+             "activity_mtime": _REPO["now"] - _REPO["freeze_seconds"] - 60,   # well past frozen
+             "journal": [], "report_present": True}
+    f = flights.build_flight(issue, _REPO)
+    assert f["stage"] == flights.STRANDED
+    assert f["stage"] != flights.SESSION_FROZEN
+    assert f["circuit_stage"] == flights.FINAL
+    assert f["on_circuit"] is False
+    assert f["contrail"] == "none"
 
 
 # =============================== queue order — the departures board (Task 8 / §3) ===============================

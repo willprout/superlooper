@@ -55,6 +55,8 @@ OFF_PATH_PLAIN = {
     flights.AWAITING: "awaiting your decision — amber, a person is needed before it moves",
     flights.HOLDING: "holding — number 2 for landing, sequenced behind an overlapping lane",
     flights.SESSION_FROZEN: "session frozen — a stalled session, no contrail",
+    flights.STRANDED: ("stranded at the gate — the session finished and filed its report, but the "
+                       "gate never landed it; the problem is at the runner/gate, not the session"),
     flights.MERGES_FREEZE: "landings paused — a repair flight is out; builds keep flying",
 }
 
