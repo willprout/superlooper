@@ -51,8 +51,21 @@
 
     // Discuss is the highlighted default ONLY on a conflict-cap card (§8). Everywhere else Approve
     // leads and Discuss is a quiet link.
+    // The armed (second-tap) Drop names its CONSEQUENCE in plain words (issue #44): drop CLOSES the
+    // issue for good — "never-mind", the far pole from approve's "release to build". The caption
+    // rides ABOVE the actions so a mid-confirm Drop can never be mistaken for an Approve. It names
+    // the UNIQUE destructive target — repo AND number: Needs You is WHOLE-FIELD, so two repos can
+    // each carry a #7, and the number alone would not say which one closes (Codex review, issue #44).
+    // Plain visible text, no aria-live role: #root is rebuilt whole every 2s poll while the confirm
+    // stays armed, so a live region would re-announce every tick (Codex review). It is never a browser
+    // confirm() — the state survives that re-render (§4). The button keeps the two-tap gesture ("tap
+    // again"); the caption directly above it carries the repo, so the target is unambiguous.
+    var dropConsequence = confirming
+      ? '<div class="drop-consequence">✕ Closes ' + esc(c.repo) + ' #' + esc(c.num) +
+        ' for good — never-mind, not release.</div>'
+      : "";
     var dropBtn = '<button class="btn ghost' + (confirming ? " danger" : "") + '" data-act="drop"' + da + '>' +
-      (confirming ? "Drop — tap again" : "Drop") + '</button>';
+      (confirming ? "Drop #" + esc(c.num) + " — tap again" : "Drop") + '</button>';
     var actions;
     if (c.discuss_default) {
       actions = '<div class="actions">' +
@@ -69,7 +82,7 @@
     }
 
     return '<div class="card kind-' + esc(c.kind || "parked") + '">' +
-      chips + headline + glossLine + collision + memo + actions + '</div>';
+      chips + headline + glossLine + collision + memo + dropConsequence + actions + '</div>';
   }
 
   // The full NEEDS YOU panel — every waiting decision, whole-field, never filtered by the camera (§4).

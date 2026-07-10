@@ -315,7 +315,11 @@
     var repos = s.repos || [];
     var selector = repos.length > 1 ? '<span class="repo-sel">' + repos.map(function (rp, i) {
       var on = i === Math.min(state.repoIndex, repos.length - 1);
-      return '<button class="repo-tab' + (on ? " on" : "") + '" data-repoidx="' + i + '">' +
+      // The active tab is marked aria-current so "which repo is on camera" is exposed to a11y and is
+      // semantically single (issue #44); the loud glance treatment — selection cursor, glow, camera
+      // notch — is pure CSS on .repo-tab.on so this file decides no semantics.
+      return '<button class="repo-tab' + (on ? " on" : "") + '" data-repoidx="' + i + '"' +
+        (on ? ' aria-current="true" title="on camera — the field below shows this repo"' : '') + '>' +
         esc(rp.name) + '</button>';
     }).join("") + '</span>' : "";
     // Replay (a treat) + digest (the mechanical account) live behind buttons on the field head
