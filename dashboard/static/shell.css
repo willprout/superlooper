@@ -485,6 +485,34 @@ html, body {
 }
 .conn-warn[hidden] { display: none; }
 
+/* first-paint failure (issue #34) — the honest "can't reach the tower" surface shown when the FIRST
+   poll fails, before any snapshot has ever painted (so there is no shell to hang the conn-warn banner
+   on). Reuses the connection-trouble palette so it reads as honest trouble, not a dead page; self-heals
+   when render() rebuilds #root on the first successful poll. */
+.cc-disconnected {
+  max-width: 640px; margin: 60px auto; padding: 20px 22px;
+  background: #3A2422; border: 1px solid #5A2A25; border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(20, 12, 12, 0.28);
+}
+.cc-disc-title {
+  display: flex; align-items: center; gap: 9px;
+  font: 600 15px var(--mono); color: #FBD9D2; letter-spacing: 0.3px;
+}
+.cc-disc-title .dot {
+  width: 9px; height: 9px; border-radius: 50%; background: #FF5A48;
+  box-shadow: 0 0 0 4px rgba(255, 90, 72, 0.16);
+}
+.cc-disc-body {
+  margin-top: 12px; font: 400 13px/1.6 var(--sans); color: #F2C4BC;
+}
+.cc-disc-body code {
+  font: 500 12px var(--mono); color: #FBD9D2;
+  background: rgba(255, 255, 255, 0.06); padding: 1px 5px; border-radius: 4px;
+}
+.cc-disc-foot {
+  margin-top: 12px; font: 500 11px var(--mono); color: #C79A93; letter-spacing: 0.3px;
+}
+
 /* ============================ the verbs (Task 6) ============================ */
 /* Card buttons are now live (no longer disabled). Hover/active states so a tap feels mechanical. */
 .btn { transition: filter 0.08s ease, background 0.08s ease; }

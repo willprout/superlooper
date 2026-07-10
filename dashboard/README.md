@@ -138,6 +138,14 @@ path to keep alive a config other than `./config.json`
 (`bin/install-launchd.sh /path/to/config.json`). The keep-alive still binds localhost only —
 launchd changes only *when* the dashboard runs, never that bright line.
 
+If the configured **`port` is already in use**, `bin/command-center` now exits with one friendly
+line (`port … is already in use — change "port" in your config.json …`) instead of a stack trace.
+Under `KeepAlive` a job that exits on every launch would otherwise *hot* crash-loop, so the plist
+sets **`ThrottleInterval` = 30s**: launchd waits 30 seconds between relaunches, so a port conflict
+logs that one line to `~/Library/Logs/command-center.log` at most once every 30s — a cool loop that
+leaves you time to free the port or change it, never a runaway. Free the port (or edit `port`) and
+the next relaunch comes up clean; no `unload`/`load` needed.
+
 > **Note:** launchd runs with a minimal `PATH`, so the job uses your system `python3`
 > (`/usr/bin/python3` — the stdlib-only runtime this is built for). If your only Python 3 is a
 > Homebrew install not on that path, the job won't find it; run `bin/command-center` in a terminal
