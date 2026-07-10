@@ -140,9 +140,10 @@ launchd changes only *when* the dashboard runs, never that bright line.
 
 If the configured **`port` is already in use**, `bin/command-center` now exits with one friendly
 line (`port … is already in use — change "port" in your config.json …`) instead of a stack trace.
-Under `KeepAlive` a job that exits on every launch would otherwise *hot* crash-loop, so the plist
-sets **`ThrottleInterval` = 30s**: launchd waits 30 seconds between relaunches, so a port conflict
-logs that one line to `~/Library/Logs/command-center.log` at most once every 30s — a cool loop that
+A job that exits on every launch would otherwise relaunch on launchd's implicit ~10s default
+(several times a minute, spamming the log), so the plist sets an explicit, longer
+**`ThrottleInterval` = 30s**: launchd waits 30 seconds between relaunches, so a port conflict logs
+that one line to `~/Library/Logs/command-center.log` at most once every 30s — a cool loop that
 leaves you time to free the port or change it, never a runaway. Free the port (or edit `port`) and
 the next relaunch comes up clean; no `unload`/`load` needed.
 

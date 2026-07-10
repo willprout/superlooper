@@ -21,8 +21,6 @@ import socket
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-import pytest
-
 _ROOT = Path(__file__).resolve().parent.parent
 _BIN = _ROOT / "bin" / "command-center"
 
