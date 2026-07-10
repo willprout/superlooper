@@ -20,14 +20,19 @@ _EXAMPLE = _REPO_ROOT / "config.example.json"
 
 # --- fixtures / helpers ---------------------------------------------------------------------
 
-def _write_repo(base, name, slug, session=None):
+_OMIT = object()   # sentinel: distinguish "omit the key" from writing a literal null/false value
+
+
+def _write_repo(base, name, slug, session=None, lanes=_OMIT):
     """A repo checkout dir carrying a skill-shaped ``.superlooper/config.json`` (only the fields
-    the dashboard reads: ``repo`` slug + optional ``session`` thresholds)."""
+    the dashboard reads: ``repo`` slug + optional ``session`` thresholds + optional ``lanes``)."""
     repo_dir = base / name
     (repo_dir / ".superlooper").mkdir(parents=True)
     body = {"repo": slug}
     if session is not None:
         body["session"] = session
+    if lanes is not _OMIT:
+        body["lanes"] = lanes
     (repo_dir / ".superlooper" / "config.json").write_text(json.dumps(body))
     return repo_dir
 
@@ -205,6 +210,35 @@ def test_reads_repo_overridden_thresholds(tmp_path):
     entry = config.load(cfg_path)["repos"][0]
     assert entry["idle_seconds"] == 90
     assert entry["freeze_seconds"] == 600
+
+
+# --- the repo's configured lane count (issue #35: the empty-queue caption must reflect it) ---
+
+def test_reads_repo_configured_lane_count(tmp_path):
+    repo = _write_repo(tmp_path, "co", "acme/widget", lanes=3)
+    entry = config.load(_write_config(tmp_path, {"repos": [{"path": str(repo)}]}))["repos"][0]
+    assert entry["lanes"] == 3
+
+
+def test_absent_lane_count_reads_as_unknown_not_an_invented_default(one_repo):
+    # The repo omits `lanes` (e.g. an older adopted config) → the dashboard can't know the count, so
+    # it records None (unknown) rather than inventing a number. Downstream the empty-queue caption
+    # then drops the runway clause entirely — the honest fallback (issue #35).
+    _, _, cfg_path = one_repo
+    entry = config.load(cfg_path)["repos"][0]
+    assert entry["lanes"] is None
+
+
+@pytest.mark.parametrize("bad", ["two", 0, -1, True, 2.5])
+def test_unreadable_lane_count_falls_back_to_unknown_not_a_number(tmp_path, bad):
+    # Unlike the liveness thresholds this loader CONSUMES (wrong ones silently mis-tier a session, so
+    # they fail loud), `lanes` drives only a cosmetic truth-caption and has no numeric default to
+    # coerce to. An unreadable value therefore records None (unknown) so the caption shows no number —
+    # the honest fallback the owner mandated (issue #35). This is self-revealing, not hiding: the
+    # missing count on screen IS the signal, where a wrong number would be the thing that misleads.
+    repo = _write_repo(tmp_path, "co", "acme/widget", lanes=bad)
+    entry = config.load(_write_config(tmp_path, {"repos": [{"path": str(repo)}]}))["repos"][0]
+    assert entry["lanes"] is None
 
 
 def test_repo_without_superlooper_config_is_rejected_by_path(tmp_path):

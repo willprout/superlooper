@@ -924,6 +924,33 @@ def test_assign_runways_empty_is_empty():
     assert flights.assign_runways([]) == {}
 
 
+# --- the empty-queue caption reflects the repo's configured lanes (issue #35) ---
+# The empty board used to hardcode "2 RUNWAYS OPEN" for every repo — a false factual claim on a
+# truth-first surface for a repo running one lane (or three). The count now comes from the repo's
+# configured `lanes`; this pure formatter owns the singular/plural and the honest no-number fallback
+# so the JS only binds the finished string (design record B.1).
+
+def test_empty_queue_caption_reflects_the_configured_lane_count():
+    assert flights.empty_queue_caption(2) == "QUEUE EMPTY · 2 RUNWAYS OPEN"
+    assert flights.empty_queue_caption(3) == "QUEUE EMPTY · 3 RUNWAYS OPEN"
+
+
+def test_empty_queue_caption_is_singular_for_a_single_lane():
+    assert flights.empty_queue_caption(1) == "QUEUE EMPTY · 1 RUNWAY OPEN"
+
+
+def test_empty_queue_caption_omits_the_count_when_lanes_unknown():
+    # No readable lane count → fall back honestly: no invented number (issue #35 DoD).
+    assert flights.empty_queue_caption(None) == "QUEUE EMPTY"
+
+
+def test_empty_queue_caption_never_invents_a_number_for_a_bad_count():
+    # A non-positive or non-int input is not a real lane count; the caption claims no number rather
+    # than printing e.g. "0 RUNWAYS OPEN" — defence in depth against a false factual claim.
+    for bad in (0, -1, "two", True, 2.0):
+        assert flights.empty_queue_caption(bad) == "QUEUE EMPTY"
+
+
 # --- airline identity (§7 — auto-generated default, deterministic colors) ---
 
 def test_airline_color_is_deterministic_and_palette_bound():
