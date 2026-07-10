@@ -10,6 +10,7 @@ The one plan-named hard requirement: doctor (and adopt's printout) FAIL HARD whe
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,19 @@ ALL_LABELS = ["agent-ready", "in-progress", "needs-william", "parked", "expedite
               # exist, so adopt must seed the starter set (owner ruling 2026-07-07).
               "model:opus", "model:opus[1m]", "model:fable",
               "effort:low", "effort:medium", "effort:high", "effort:xhigh", "effort:max"]
+
+RULE_START = "<!-- loop-standing-rules:start -->"
+RULE_END = "<!-- loop-standing-rules:end -->"
+RULE_REQUIRED_SNIPPETS = [
+    "Approval is the repo owner's word",
+    "`agent-ready` is never applied by an agent",
+    "Read the parked-issue memo before re-approving",
+    "Reviews are performed by a fresh agent",
+    "shared mutable defaults",
+    "fail-open on wrong-typed input",
+    "No metered or paid spend",
+    "Never work in the loop's own checkout",
+]
 
 
 @pytest.fixture
@@ -78,6 +92,12 @@ def cli(rig, *args, env_over=None, inp=None):
 def mutations(rig):
     p = rig.fixdir / "mutations.jsonl"
     return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+
+def standing_rules_block(text):
+    start = text.index(RULE_START)
+    end = text.index(RULE_END, start) + len(RULE_END)
+    return text[start:end]
 
 
 # --------------------------- doctor ---------------------------
@@ -253,6 +273,77 @@ def test_adopt_never_overwrites_an_existing_config(rig):
     assert r.returncode == 0
     assert (rig.repo / ".superlooper" / "config.json").read_text() == before
     assert "already" in r.stdout.lower()
+
+
+def test_adopt_creates_claude_md_with_loop_standing_rules(rig):
+    fresh = rig.tmp / "fresh-claude"
+    fresh.mkdir()
+
+    r = cli(rig, "adopt", "--repo", str(fresh))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    text = (fresh / "CLAUDE.md").read_text()
+    assert RULE_START in text
+    assert RULE_END in text
+    block = standing_rules_block(text)
+    for snippet in RULE_REQUIRED_SNIPPETS:
+        assert snippet in block
+
+
+def test_adopt_appends_standing_rules_without_touching_existing_claude_md(rig):
+    prior = "# Existing CLAUDE.md\n\nKeep this byte-for-byte.\nNo final newline"
+    claude = rig.repo / "CLAUDE.md"
+    claude.write_text(prior)
+
+    r = cli(rig, "adopt", "--repo", str(rig.repo))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    text = claude.read_text()
+    assert text.startswith(prior)
+    assert text[len(prior):].startswith("\n\n")
+    assert text.count(RULE_START) == 1
+    assert text.count(RULE_END) == 1
+
+
+def test_adopt_preserves_existing_claude_md_bytes_when_appending(rig):
+    prior = b"# Existing CLAUDE.md\r\n\r\nKeep this byte-for-byte.\r\nInvalid byte: \xff"
+    claude = rig.repo / "CLAUDE.md"
+    claude.write_bytes(prior)
+
+    r = cli(rig, "adopt", "--repo", str(rig.repo))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = claude.read_bytes()
+    assert data.startswith(prior)
+    assert data.count(RULE_START.encode()) == 1
+    assert data.count(RULE_END.encode()) == 1
+
+
+def test_adopt_rerun_replaces_the_standing_rules_block_instead_of_duplicating_it(rig):
+    fresh = rig.tmp / "fresh-rerun"
+    fresh.mkdir()
+
+    first = cli(rig, "adopt", "--repo", str(fresh))
+    second = cli(rig, "adopt", "--repo", str(fresh))
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert second.returncode == 0, second.stdout + second.stderr
+    text = (fresh / "CLAUDE.md").read_text()
+    assert text.count(RULE_START) == 1
+    assert text.count(RULE_END) == 1
+
+
+def test_adopted_standing_rules_are_portable_text(rig):
+    fresh = rig.tmp / "fresh-portable-rules"
+    fresh.mkdir()
+
+    r = cli(rig, "adopt", "--repo", str(fresh))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    block = standing_rules_block((fresh / "CLAUDE.md").read_text())
+    for forbidden in ("William", "willprout", "owner/name", fresh.name, str(fresh), "superlooper"):
+        assert forbidden not in block
+    assert not re.search(r"(^|\s)(~?/[^/\s`]+/[^\s`]+)", block)
 
 
 def test_run_uses_config_agent_and_cli_override(rig):

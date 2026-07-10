@@ -4,8 +4,9 @@
   run             the foreground tick loop (the default way to run it is VISIBLE, in a cmux tab;
                   launchd + templates/launchd.runner.plist is the keep-alive option)
   status          render lanes / gate / frozen / journal tail from state + journal (no GitHub)
-  adopt           write the config template into a target repo + create the §C.2 label set +
-                  print branch-protection recommendations (print-only in v1)
+  adopt           write the config template into a target repo + seed CLAUDE.md standing rules +
+                  create the §C.2 label set + print branch-protection recommendations
+                  (print-only in v1)
   doctor          preflight: config, required_checks (FAILS HARD when empty), gh, labels,
                   cmux, jq, launch shim, activity hooks; --stack checks machine-level blocks
   morning-report  render reports/morning-<date>.md from the journal + notify (Task 11)
@@ -92,6 +93,22 @@ _CHECKS_REQUIREMENT = (
     "tests. A repo with no required check has NO mechanical ship gate (§4.3) — the loop would\n"
     "merge on vibes. Add the check to .superlooper/config.json AND to the branch protection.")
 
+_STANDING_RULES_START = "<!-- loop-standing-rules:start -->"
+_STANDING_RULES_END = "<!-- loop-standing-rules:end -->"
+_STANDING_RULES_BLOCK = f"""\
+{_STANDING_RULES_START}
+## Loop Standing Rules
+
+- Approval is the repo owner's word. `agent-ready` is never applied by an agent without that approval.
+- Read the parked-issue memo before re-approving a parked issue; the memo is part of the current request.
+- Reviews are performed by a fresh agent that wrote none of the code. Review prompts must name the known defect classes: shared mutable defaults; fail-open on wrong-typed input.
+- No metered or paid spend without explicit owner confirmation in the current conversation.
+- Never work in the loop's own checkout; work only in the target repo checkout for the approved issue.
+{_STANDING_RULES_END}"""
+_STANDING_RULES_START_BYTES = _STANDING_RULES_START.encode("utf-8")
+_STANDING_RULES_END_BYTES = _STANDING_RULES_END.encode("utf-8")
+_STANDING_RULES_BLOCK_BYTES = _STANDING_RULES_BLOCK.encode("utf-8")
+
 
 def _read(path):
     try:
@@ -122,6 +139,46 @@ def _origin_repo(repo_path):
         return None
     m = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$", r.stdout.strip())
     return m.group(1) if m else None
+
+
+def _seed_standing_rules(repo_path):
+    """Create or update the target repo's CLAUDE.md standing-rules block."""
+    path = os.path.join(repo_path, "CLAUDE.md")
+    try:
+        with open(path, "rb") as f:
+            existing = f.read()
+    except OSError:
+        with open(path, "wb") as f:
+            f.write(_STANDING_RULES_BLOCK_BYTES)
+            f.write(b"\n")
+        return "created"
+
+    start = existing.find(_STANDING_RULES_START_BYTES)
+    end = existing.find(_STANDING_RULES_END_BYTES, start + len(_STANDING_RULES_START_BYTES))
+    if start >= 0 and end >= 0:
+        end += len(_STANDING_RULES_END_BYTES)
+        updated = existing[:start] + _STANDING_RULES_BLOCK_BYTES + existing[end:]
+        if updated != existing:
+            with open(path, "wb") as f:
+                f.write(updated)
+        return "updated"
+
+    if existing == b"":
+        sep = b""
+    elif existing.endswith(b"\r\n\r\n") or existing.endswith(b"\n\n"):
+        sep = b""
+    elif existing.endswith(b"\r\n"):
+        sep = b"\r\n"
+    elif existing.endswith(b"\n"):
+        sep = b"\n"
+    else:
+        sep = b"\r\n\r\n" if b"\r\n" in existing else b"\n\n"
+    with open(path, "wb") as f:
+        f.write(existing)
+        f.write(sep)
+        f.write(_STANDING_RULES_BLOCK_BYTES)
+        f.write(b"\n")
+    return "appended"
 
 
 # ------------------------------- run -------------------------------
@@ -242,6 +299,9 @@ def cmd_adopt(args):
             f.write("\n")
         print(f"wrote {cfg_path}" + ("" if detected else
               ' — EDIT the "repo" field (no github.com origin remote to detect it from)'))
+
+    claude_action = _seed_standing_rules(args.repo)
+    print(f"{claude_action} {os.path.join(args.repo, 'CLAUDE.md')} standing-rules block")
 
     # D1 pin, adopt's own way: the config may be freshly written (not yet loadable through the
     # full validator) — pin gh to whatever repo slug the config carries (detected origin on a
