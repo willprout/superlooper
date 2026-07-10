@@ -7,7 +7,7 @@
   adopt           write the config template into a target repo + create the §C.2 label set +
                   print branch-protection recommendations (print-only in v1)
   doctor          preflight: config, required_checks (FAILS HARD when empty), gh, labels,
-                  cmux, jq, launch shim, activity hooks
+                  cmux, jq, launch shim, activity hooks; --stack checks machine-level blocks
   morning-report  render reports/morning-<date>.md from the journal + notify (Task 11)
   nightly         fresh worktree of origin/<dev> -> qa.nightly_cmd -> flake/persistent triage;
                   a persistent failure freezes merges + files a scoped fix issue (Task 12)
@@ -44,6 +44,7 @@ import loopstate
 import nightly as nightly_lib
 import notify
 import report
+import stack_doctor
 import tidy as tidy_lib
 
 _TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
@@ -281,7 +282,30 @@ Branch protection recommendations for `{dev}` (print-only in v1 — apply by han
 
 # ------------------------------- doctor -------------------------------
 
+def cmd_stack_doctor(args):
+    cfg = None
+    cfg_error = None
+    try:
+        cfg = _load_config(args.repo)
+    except (FileNotFoundError, ValueError) as e:
+        cfg_error = e
+
+    print("superlooper doctor --stack")
+    results = stack_doctor.check_stack(cfg, config_error=cfg_error)
+    for line in stack_doctor.format_results(results):
+        print(line)
+    failures = [r.name for r in results if not r.ok]
+    if failures:
+        print(f"\nSTACK DOCTOR FAILED: {', '.join(failures)}")
+        return 1
+    print("\nall stack checks passed")
+    return 0
+
+
 def cmd_doctor(args):
+    if getattr(args, "stack", False):
+        return cmd_stack_doctor(args)
+
     failures = []
 
     def check(name, ok, detail=""):
@@ -847,7 +871,10 @@ def main(argv=None):
                            help="stop after N ticks (testing/simulation)")})
     add("status", cmd_status)
     add("adopt", cmd_adopt)
-    add("doctor", cmd_doctor)
+    add("doctor", cmd_doctor,
+        **{"--stack": dict(action="store_true",
+                           help="check machine-level loop stack prerequisites instead of "
+                                "repo-level adoption state")})
     add("nightly", cmd_nightly)
     add("morning-report", cmd_morning_report)
     add("promote-report", cmd_promote_report,
