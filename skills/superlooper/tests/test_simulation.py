@@ -743,6 +743,47 @@ def test_hard_affinity_overlapping_issues_run_sequentially(sim_factory):
     assert len(sim.mutations("merge_pr")) == 2
 
 
+def test_finished_issue_holds_declared_territory_until_merge(sim_factory):
+    sim = sim_factory(areas={"submission": ["src/shared.txt"]}, lanes=2, affinity="hard")
+    line3 = {"file": "src/shared.txt", "line": 3}
+    n1 = sim.add_issue(title="i160 finished at gate", touches="submission",
+                       scenario={"scenario": "happy",
+                                 "edit": dict(line3, text="i160 finished version")})
+    n2 = sim.add_issue(title="i163 overlapping candidate", touches="submission",
+                       scenario={"scenario": "happy",
+                                 "edit": dict(line3, text="i163 later version")})
+    s1, s2 = "i%d" % n1, "i%d" % n2
+
+    # Hold the finished PR in the gate-wait window; this is where the incident launched i163.
+    sim.edit_gh_state(lambda st: st.update(pr_check_conclusion="PENDING"))
+    sim.tick()
+    assert sim.loop_issue(s1).get("status") == "running"
+    assert sim.loop_issue(s2).get("status") is None
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % s1))
+    assert sim.tick_until(lambda: sim.loop_issue(s1).get("status") == "gating", ticks=5)
+
+    sim.tick()
+    assert sim.loop_issue(s1).get("status") == "gating"
+    assert sim.loop_issue(s2).get("status") is None, \
+        "overlapping candidate must stay held while the finished PR waits at the gate"
+    assert [r["id"] for r in sim.journal("launch") if r.get("outcome") == "ok"] == [s1]
+
+    sim.edit_gh_state(lambda st: st.update(pr_check_conclusion="SUCCESS"))
+    assert sim.tick_until(lambda: sim.loop_issue(s1).get("status") == "merged", ticks=10), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert sim.origin_file("src/shared.txt").splitlines()[2] == "i160 finished version"
+
+    assert sim.tick_until(lambda: sim.loop_issue(s2).get("status") == "merged", ticks=30), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    launches = [r for r in sim.journal("launch") if r.get("outcome") == "ok"]
+    merges = [r for r in sim.journal("merge") if r.get("outcome") == "ok"]
+    assert [r["id"] for r in launches] == [s1, s2]
+    assert launches[1]["ts"] > merges[0]["ts"], "i163 launches only after i160 merges"
+    assert not sim.journal("regenerate")
+    assert len(sim.mutations("merge_pr")) == 2
+    assert sim.origin_file("src/shared.txt").splitlines()[2] == "i163 later version"
+
+
 def self_events(sim, sid, etype):
     return [r for r in sim.journal("event")
             if r.get("event", {}).get("type") == etype and r.get("event", {}).get("id") == sid]
