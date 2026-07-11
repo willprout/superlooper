@@ -108,9 +108,13 @@ pid singleton), `started/<id>.*` (launch delivery proof). Siblings at the home r
 Launches gate on the Claude usage meter, fail-closed: fresh read over the ceilings (90%
 five-hour / 96% seven-day) launches nothing. One deliberate exception (issue #46): a meter
 that is **unreadable** past a 30-minute grace fails **open** (journal records `fail_open` on
-entry, `usage_recovered` on exit; ALERT carries `usage_stale` meanwhile). So: queue stalled
-with `usage_stale` in ALERT = meter dark < grace or reads-exhausted; check
-`journal.jsonl` for `fail_open` and the machine for the three proven dark-meter causes
+entry, `usage_recovered` on exit; ALERT carries `usage_stale` for exactly as long as the
+episode is active). Read the signals the right way around: **`usage_stale` in ALERT means
+launches are proceeding blind** (dark meter, fail-open engaged) — not a stall. A queue
+actually stalled BY usage carries **no** `usage_stale` alert: a fresh read at/over the
+ceilings (designed fail-closed — wait for the reset), a meter dark for less than the grace,
+or a cached read gone stale (>300s). On a dark meter, check `journal.jsonl` for
+`fail_open`/`usage_recovered` and the machine for the three proven dark-meter causes
 (Keychain locked, missing TLS roots in a new Python — `Install Certificates.command` —, API
 change).
 

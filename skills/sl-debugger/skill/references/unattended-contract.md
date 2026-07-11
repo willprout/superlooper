@@ -30,7 +30,13 @@ stricter mode is always safe.
 - **`full`** — diagnosis plus any repair in the repair ladder (`repair-ladder.md`),
   including state surgery. The standing authority setting IS the pre-given go for state
   surgery (owner amendment to #64, 2026-07-11) — you do not wait for a human word that
-  cannot come. Everything in "Absolute exclusions" below still stands.
+  cannot come. Everything in "Absolute exclusions" below still stands. One adaptation the
+  ladder's surgery protocol needs unattended: where it says "the human stops the runner,"
+  a PID-specific SIGTERM of the runner — the pid read from `state/runner.lock` and
+  positively verified against `ps` — is the permitted stop (a runner stop is always safe by
+  design: nothing merges while it is down). The instance then STAYS down: restarting is
+  human-only (cmux tab), so "the runner is stopped and needs your restart" becomes the
+  memo's headline finding, and the notify says so.
 
 ## Absolute exclusions — at EVERY tier, including `full`
 

@@ -92,9 +92,10 @@ they release on merge, regenerate, and terminal parks (a parked wildcard release
 no-touches repo can't freeze); investigations neither hold nor are held. The old interim
 mitigation (`blocked-by` chaining overlapping issues) is retired. If regenerations recur
 today: (1) publish drift check; (2) were `touches:` honest on both issues? (the morning
-report's Wanders section is the tell); (3) two conflict-regenerations on one issue is the
-designed endpoint — a `needs-william` park whose resolution is the owner re-scoping the
-pair, or a `preserve` label to route an expensive PR to in-branch conflict resolution. That
+report's Wanders section is the tell); (3) the conflict cap (default `conflict_cap: 2`, counting conflicts, not
+regenerations) is the designed endpoint: the first conflict regenerates, the second parks
+`needs-william` — resolution is the owner re-scoping the pair, or a `preserve` label to
+route an expensive PR to in-branch conflict resolution. That
 re-scoping is an owner decision; the debugger's job is the memo that makes it one touch.
 
 ---
@@ -135,7 +136,7 @@ the posted report — his word, not yours.
 |---|---|
 | Queue full, nothing launches | usage meter fail-closed (fresh over-ceiling read); ALERT `launch_anchor_down`/`launch_systemic_failure` (anchor died — queue deliberately held intact); `gh_unreachable`; corrupt `issues.json` (launches held); duplicate `model:*`/`effort:*` labels (the runner waits, never guesses — no park, no memo) or missing `touches:` where required (parks `needs-william` with a memo) |
 | Builds finish, nothing merges | merges frozen (designed idle — check `source`); required check name typo (green PR "waits" forever — `doctor` cross-checks names); review-marker comment missing (gate nudges once then parks); CI genuinely pending |
-| Parks with baffling memos | dev branch missing on origin (park memo blames the launch shim); park cause taxonomy in `lib/actions.py` — the memo's `cause` string is the index |
+| Parks with baffling memos | dev branch missing on origin — current engines name the missing branch in the memo (`launch_base_missing`, issue #28); a memo blaming the launch shim is the generic delivery failure (`launch_delivery`) or a drifted pre-#28 engine. The park cause taxonomy in `lib/actions.py` is the index — the memo's `cause` string is your lookup key |
 | Owner never notified | notify channel: config `notify.imessage_to`/`notify.cmd`, Messages automation permission, `doctor --stack` sends a live test; sends are journaled (`cmd notify failed (rc=…)`) |
 | Dashboard says everything is dead | believe the heartbeat, not the paint: `runner-down` pill = heartbeat stale (whole surface untrusted); grey plane on a finished session = the stranded-vs-dead mispaint (check `reports/i<N>.md` yourself) |
 | "Fixed" bug is back | publish drift (`VERSION` vs main) before regression |

@@ -79,7 +79,10 @@ go), and every step journaled.
 The protocol, every time:
 
 1. **Stop the runner first** (the human's Ctrl-C) for anything the tick reads or writes —
-   you cannot out-edit a 15-second loop. Nothing merges while it's down.
+   you cannot out-edit a 15-second loop. Nothing merges while it's down. (Unattended at
+   authority `full`: the permitted stop is a PID-specific SIGTERM of the pid in
+   `state/runner.lock`, positively verified — see `unattended-contract.md`; the instance
+   then stays down until the owner restarts it.)
 2. **Copy aside before touching**: `cp <file> <file>.pre-surgery-<date>` (or for the
    journal: filter into an archive kept beside it — append-only audit record, archive,
    never delete).
