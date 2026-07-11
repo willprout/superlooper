@@ -26,6 +26,7 @@
           "retry_once": true, "quarantine": [],
           "nightly_time": "02:00" },
   "cleanup_merged_worktrees": true,
+  "cleanup_parked_worktrees": true,
   "janitor": { "aged_park_days": 14 },
   "watchdog": { "authority": "full", "allowlist": [], "grace_minutes": 30,
                 "heartbeat_stale_minutes": 20, "no_progress_minutes": 30 },

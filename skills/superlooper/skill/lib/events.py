@@ -172,6 +172,41 @@ def next_seq(existing_names):
     return (max(nums) + 1) if nums else 1
 
 
+# The processed/ dir accumulates one file per event forever, and BOTH next_seq() and the restart
+# rebuild scan it — so their cost grows with total history (issue #41). These bound the HOT dir: once
+# it exceeds PROCESSED_CAP, the oldest are archived down to PROCESSED_KEEP newest. KEEP is a generous
+# live-marker buffer — the restart rebuild only needs processed events whose report/blocked marker
+# still exists (reconcile_emitted drops the rest), and an issue emits ~no new events once it settles,
+# so KEEP events of other-issue churn cannot elapse within one issue's finish->merge window; even if
+# it somehow did, the only cost is a safe re-emit (idempotent re-gate), never lost data.
+PROCESSED_CAP = 1000
+PROCESSED_KEEP = 500
+
+
+def _seq_of(name):
+    base = name.split(".")[0]
+    return int(base) if isinstance(base, str) and base.isdigit() else None
+
+
+def processed_overflow(names, cap=PROCESSED_CAP, keep=PROCESSED_KEEP):
+    """Given every filename in events/processed/, the OLDEST names to move to the archive so the hot
+    dir (next_seq + rebuild scan it) stays bounded — its listing cost, and thus next_seq's, becomes
+    independent of total history. [] until the dir exceeds `cap` (batched: archives down to `keep`
+    newest, not one-file-per-tick). Only the oldest (lowest seq) names are ever returned, so the
+    newest file — the global-max seq — always stays hot and next_seq keeps returning max+1, monotonic
+    and collision-free. PURE and fail-closed: a non-collection input archives nothing; non-str /
+    non-numeric names never raise and sort first (treated as oldest, archived preferentially)."""
+    if not isinstance(names, (list, tuple, set, frozenset)):
+        return []
+    strs = [n for n in names if isinstance(n, str)]
+    if len(strs) <= cap:
+        return []
+    # ascending: non-numeric first (None -> sort-key False), then by numeric seq — oldest at the head
+    strs.sort(key=lambda n: (_seq_of(n) is not None, _seq_of(n) or 0, n))
+    drop = len(strs) - keep
+    return strs[:drop] if drop > 0 else []
+
+
 def retry_runaway(issues_state, threshold=4):
     """Pure (fact-4): issue ids whose mechanically-stamped retries have blown far past the
     retry cap (2) — a doom-looping relaunch cycle must be loud (state/ALERT, Task 10).

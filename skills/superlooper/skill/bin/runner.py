@@ -38,6 +38,7 @@ import gh
 import gitops
 import journal
 import loopstate
+import tidy
 import usage as usage_mod
 
 TICK_SECONDS = 15
@@ -46,6 +47,9 @@ TICK_ERROR_ALERT = 4           # consecutive tick crashes (~1 min at 15 s) -> AL
                                # from run()'s own guard, not the decide brain (incident 2026-07-07).
 USAGE_REFRESH_SECONDS = 60
 GH_POLL_SECONDS = 90
+JOURNAL_ROTATE_SECONDS = 6 * 3600   # how often to archive the journal's stale tail (issue #41): the
+                                    # first tick rotates (migrates a pre-existing large journal),
+                                    # then at most every 6h — cheap, and read()/status stay bounded
 MAX_POLL_CALLS = 30            # budget cap per poll cycle (poll_ship discipline): the tail of
                                # an oversized fetch list simply waits for the next cycle
 LAUNCH_TIMEOUT = 120           # launch-session.sh verifies delivery within ~30s; be generous
@@ -301,6 +305,7 @@ class Runner:
         self._parsed_by_id = {}
         self._raw_by_id = {}
         self._last_poll = 0
+        self._last_journal_rotate = 0.0     # 0 => the first tick rotates (journal bound, issue #41)
         self._usage = {"last_ok": {}, "last_ok_at": None, "first_attempt_at": None,
                        "checked_at": 0}
         self.emitted = self._rebuild_emitted()
@@ -812,6 +817,59 @@ class Runner:
                 new_emitted.discard(key)
         return written
 
+    def _prune_processed_events(self):
+        """Bound the processed/ dir (issue #41): _persist_events + _rebuild_emitted both scan it, so
+        its unbounded growth made next_seq and the restart rebuild slow with total history. Archive
+        the oldest beyond events_mod.PROCESSED_CAP into processed_archive/ (never deleted). The newest
+        file — the global-max seq — always stays, so next_seq keeps returning max+1 (monotonic, no
+        collision with an archived seq). Best-effort: an unmovable file is left, retried next tick."""
+        pdir = os.path.join(self._events_dir(), "processed")
+        try:
+            names = os.listdir(pdir)
+        except OSError:
+            return
+        overflow = events_mod.processed_overflow(names)
+        if not overflow:
+            return
+        adir = os.path.join(self._events_dir(), "processed_archive")
+        try:
+            os.makedirs(adir, exist_ok=True)
+        except OSError:
+            return
+        for n in overflow:
+            try:
+                os.replace(os.path.join(pdir, n), os.path.join(adir, n))
+            except OSError:
+                pass
+
+    def _reclaim_terminal_worktrees(self, st):
+        """Bound long-run disk growth (issue #41): git worktree remove the worktrees of park-family
+        terminal issues (parked / needs-william / bounced), which otherwise linger forever (only
+        MERGED worktrees are auto-removed today). tidy.reclaimable_worktrees is the pure, fail-closed
+        selector — it never returns an in-flight/gating/holding/ready lane, so a LIVE build is never
+        touched. Safe because re-approval rebuilds from the issue on a fresh branch (the committed
+        work survives on the branch ref; worktree_remove drops only the checkout). Config-gated so an
+        operator can keep parked worktrees for inspection. Best-effort: a worktree that can't be fully
+        removed (worktree_remove -> False) is simply retried on a later tick — never raised."""
+        if not self.config.get("cleanup_parked_worktrees", True):
+            return
+        issues = st.get("issues") if isinstance(st, dict) and isinstance(st.get("issues"), dict) else {}
+        # `isinstance(status, str)` BEFORE the set membership: an unhashable wrong-typed status
+        # ([], {}) from a corrupt issues.json must be skipped, never raise `unhashable type` on the
+        # `in REAPPROVAL_STATUSES` test — this early-out must match the pure selector's own discipline
+        # (a raise here is unguarded and would wedge the tick before the heartbeat stamp).
+        if not any(isinstance(d, dict) and isinstance(d.get("status"), str)
+                   and d.get("status") in actions.REAPPROVAL_STATUSES
+                   for d in issues.values()):
+            return                                     # nothing parked -> skip the listing + git entirely
+        wdir = os.path.join(self.home, "worktrees")
+        try:
+            on_disk = [n for n in os.listdir(wdir) if os.path.isdir(os.path.join(wdir, n))]
+        except OSError:
+            return
+        for iid in tidy.reclaimable_worktrees(issues, on_disk):
+            gitops.worktree_remove(self.repo, self._worktree(iid))
+
     # ------------------------- the tick -------------------------
 
     def tick(self, now=None):
@@ -875,6 +933,18 @@ class Runner:
                 os.replace(path, dest)
             except OSError:
                 pass
+
+        # Long-run growth bounds (issue #41). All three archive (never delete) and are hygiene, not
+        # safety — each is self-guarded so it can never crash the tick or block the heartbeat.
+        if written:                                    # processed/ only grew if events were archived
+            self._prune_processed_events()             # keep next_seq + rebuild scan history-independent
+        self._reclaim_terminal_worktrees(st)           # git-remove park-family worktrees (safe: rebuilt on reapprove)
+        if now - self._last_journal_rotate >= JOURNAL_ROTATE_SECONDS:
+            try:
+                journal.rotate(self.home, now)         # archive the journal's stale tail -> read() stays bounded
+            except Exception as e:
+                self._log(f"journal rotate skipped: {_short_repr(e)}")
+            self._last_journal_rotate = now
 
         # Heartbeat = "a full tick completed", stamped LAST (incident 2026-07-07). It used to be
         # stamped at the TOP of the tick, so a tick that crashed part-way still read as freshly
