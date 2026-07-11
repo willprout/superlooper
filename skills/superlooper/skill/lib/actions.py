@@ -448,11 +448,21 @@ def _fix_issue(dev_branch, name, conclusion, fingerprint):
             "labels": list(FIX_ISSUE_LABELS)}
 
 
-def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view):
+def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
+           wake_grace_until=None):
     """One tick's view of the world -> the ordered action list. See the module docstring for
-    the full view and action contracts."""
+    the full view and action contracts.
+
+    wake_grace_until (issue #42): while now < this deadline the runner just detected a wake gap (a
+    tick that landed far later than the ~15s cadence predicts — the laptop slept). During the grace
+    the FRESH dark-meter crossing is held (no usage_stale alert / no fail-open) and the frozen
+    recovery ladder is held, so the wall-clock jump alone never opens a false-alarm cascade; a
+    genuinely dark meter or dead session still alarms once the grace expires. It gates ONLY the
+    fresh crossing — an already-established dark episode (prev_dark) is never disturbed, so the grace
+    can neither re-open nor falsely close a real outage. None = no grace (the normal case)."""
     if not _real(now):
         return []                      # a tick without a clock decides nothing (fail closed)
+    in_wake_grace = _real(wake_grace_until) and now < wake_grace_until
 
     # ---- defensive coercion of every input (wrong-typed -> safe empty, never a raise) ----
     cfg = config if isinstance(config, dict) else {}
@@ -506,7 +516,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
     # Recovery keys on THIS, never on "not failing open" — which is also true on a cold start, within
     # a fresh grace, and (the trap) on a runner restart mid-outage whose in-memory clock has reset.
     meter_fresh = _real(last_ok) and usage_age <= USAGE_STALE_SECONDS
-    dark_past_grace = have_timeline and dark_age > USAGE_FAIL_OPEN_GRACE_SECONDS
+    # `not in_wake_grace` gates ONLY this fresh crossing (issue #42): a wake gap makes last_ok look
+    # ancient purely from the wall-clock jump, so hold the NEW dark episode until the poller lands a
+    # fresh fetch (within the grace). The prev_dark continuation below is deliberately NOT gated —
+    # the grace must never re-open or falsely close a genuine, already-alerted outage.
+    dark_past_grace = have_timeline and dark_age > USAGE_FAIL_OPEN_GRACE_SECONDS and not in_wake_grace
     # prev_dark: is a dark-meter episode ALREADY established? The usage_stale ALERT is DURABLE (it
     # survives a runner restart); the grace clock above is in-memory (resets on restart). Keying the
     # episode's CONTINUATION on the durable marker makes the grace serve ONCE per episode: a restart
@@ -982,6 +996,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
             # no usage headroom -> the marker persists; relaunch resumes with the quota
             continue
         if iid in frozen_ids or status == "frozen":
+            if in_wake_grace:
+                continue                               # wake grace: hold the recovery ladder (issue #42)
             if type(retries) is not int:
                 park(iid, num, "frozen, and the retry counter is unreadable — parking",
                      cause="frozen_cap")

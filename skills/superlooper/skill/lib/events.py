@@ -43,7 +43,8 @@ def _hash_file(path):
 SETTLED_STATUSES = {"gating", "holding", "merged", "parked", "needs_william", "bounced"}
 
 
-def detect_events(snaps, emitted, now=None, idle_secs=IDLE_SECONDS, freeze_secs=FREEZE_SECONDS):
+def detect_events(snaps, emitted, now=None, idle_secs=IDLE_SECONDS, freeze_secs=FREEZE_SECONDS,
+                  wake_grace_until=None):
     """Pure: per-issue snapshots -> (new_events, updated_emitted_set). See EVENT-MODEL.md.
 
     A snapshot: {id, status, launched, activity_mtime, report_hash, report_mtime, blocked_hash,
@@ -56,7 +57,13 @@ def detect_events(snaps, emitted, now=None, idle_secs=IDLE_SECONDS, freeze_secs=
     activity comparison (review P0-1: the Stop/PostToolUse hooks stamp activity AFTER the report,
     so an mtime compare made every finished session look unresolved and fire false idle+frozen).
     idle/frozen also never fire for a SETTLED status (the runner already owns it).
-    """
+
+    wake_grace_until (issue #42): while now < this deadline, the idle/frozen staleness compare is
+    SKIPPED entirely — a laptop that slept makes every in-flight worker's activity_mtime look hours
+    old on the first post-sleep tick purely from the wall-clock jump, and a healthy session must not
+    be poked for the resume artifact. Suppression un-latches the idle/frozen dedup keys exactly like
+    a fresh session, so a session that is genuinely dead across the sleep re-fires once the grace
+    expires (the runner opens the window; None/absent = no grace, the normal case)."""
     events = []
     em = set(emitted)
 
@@ -92,8 +99,10 @@ def detect_events(snaps, emitted, now=None, idle_secs=IDLE_SECONDS, freeze_secs=
                     or s.get("exited_mtime") is not None)
         settled = s.get("status") in SETTLED_STATUSES
         act = s.get("activity_mtime")
+        in_wake_grace = wake_grace_until is not None and n is not None and n < wake_grace_until
         frozen = idle = False
-        if s.get("launched") and not resolved and not settled and act is not None and n is not None:
+        if (s.get("launched") and not resolved and not settled and act is not None
+                and n is not None and not in_wake_grace):
             stale = n - act
             if stale >= freeze_secs:
                 frozen = True

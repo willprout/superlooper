@@ -103,6 +103,40 @@ def test_idle_clears_and_refires_after_recovery():
     assert ev3 and ev3[0]["type"] == "session_idle"
 
 
+# --------------------------- post-wake grace (issue #42) ---------------------------
+
+def test_wake_grace_suppresses_idle_and_frozen_within_the_window():
+    # Closing the laptop overnight makes a healthy session's activity_mtime look hours old on the
+    # first post-sleep tick (wall clock jumped, the file did not). WITHIN the wake grace window,
+    # neither idle nor frozen fires — the resume artifact must not poke a healthy worker.
+    now = 1000 + events.FREEZE_SECONDS + 50_000        # activity looks ancient purely from the gap
+    ev, _ = events.detect_events([snap(activity_mtime=1000, now=now)], set(),
+                                 wake_grace_until=now + 300)
+    assert ev == []
+
+
+def test_liveness_rearms_after_the_wake_grace_for_a_still_stale_session():
+    # A session that is genuinely dead across the sleep (never re-stamps) still alarms once the grace
+    # expires — and the in-grace suppression must NOT latch the dedup key, or the frozen event could
+    # never re-fire.
+    now = 1000 + events.FREEZE_SECONDS + 50_000
+    ev1, em = events.detect_events([snap(activity_mtime=1000, now=now)], set(),
+                                   wake_grace_until=now + 300)
+    assert ev1 == [] and ("i1", "frozen") not in em    # suppressed AND un-latched during grace
+    ev2, _ = events.detect_events([snap(activity_mtime=1000, now=now + 301)], em,
+                                  wake_grace_until=now + 300)
+    assert ev2 and ev2[0]["type"] == "frozen"          # past the grace, still stale -> re-arms
+
+
+def test_wake_grace_does_not_suppress_a_session_that_restamped_after_wake():
+    # A healthy worker resumes and re-stamps activity within the grace; even past the grace it is
+    # fresh, so it never idles/freezes.
+    now = 1000 + events.FREEZE_SECONDS + 50_000
+    ev, _ = events.detect_events([snap(activity_mtime=now - 5, now=now + 301)], set(),
+                                 wake_grace_until=now + 300)
+    assert ev == []
+
+
 # --------------------------- resolved is NOT sticky (Finding 4) ---------------------------
 
 def test_finished_session_never_false_idles_or_freezes():

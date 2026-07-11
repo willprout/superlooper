@@ -109,12 +109,13 @@ _DEFAULT = object()          # sentinel: None must be passable as a real (garbag
 
 
 def decide(now=NOW, config=_DEFAULT, usage=_DEFAULT, parsed_issues=(), lane_state=(),
-           events=(), dsk=_DEFAULT, gh_view=_DEFAULT):
+           events=(), dsk=_DEFAULT, gh_view=_DEFAULT, wake_grace_until=None):
     return actions.decide(now, cfg() if config is _DEFAULT else config,
                           usage_ok() if usage is _DEFAULT else usage,
                           list(parsed_issues), list(lane_state), list(events),
                           disk() if dsk is _DEFAULT else dsk,
-                          ghv() if gh_view is _DEFAULT else gh_view)
+                          ghv() if gh_view is _DEFAULT else gh_view,
+                          wake_grace_until=wake_grace_until)
 
 
 def only(result, act):
@@ -232,6 +233,48 @@ def test_usage_stale_alert_fires_once_per_dark_episode_while_failing_open():
     out2 = decide(usage=dark_usage(), parsed_issues=[parsed(5)], dsk=d)
     assert only(out2, "alert") == [] and not has_notify(out2)
     assert only(out2, "fail_open") == []
+
+
+def test_wake_grace_holds_the_usage_stale_alert_and_fail_open():
+    # Issue #42: closing the laptop overnight makes the last good usage read look ancient on the
+    # first post-sleep tick, which would fire a usage_stale ALERT text that self-clears a minute
+    # later once the next fetch lands. WITHIN the wake grace the fresh dark crossing is held: no
+    # usage_stale alert, no fail-open launch policy.
+    out = decide(usage=dark_usage(age=2400), parsed_issues=[parsed(5)],
+                 wake_grace_until=NOW + 300)
+    assert only(out, "fail_open") == []
+    assert not any("usage_stale" in a.get("reasons", []) for a in only(out, "alert"))
+
+
+def test_usage_stale_rearms_after_the_wake_grace_if_still_dark():
+    # A meter that is genuinely dark past the grace still alarms — the wake grace only delays the
+    # re-arm, it never silences a real outage.
+    out = decide(usage=dark_usage(age=2400), parsed_issues=[parsed(5)],
+                 wake_grace_until=NOW - 1)             # the grace has already expired
+    a = only(out, "alert")
+    assert a and "usage_stale" in a[0]["reasons"] and has_notify(out)
+    assert len(only(out, "fail_open")) == 1
+
+
+def test_wake_grace_never_closes_a_genuine_ongoing_dark_episode():
+    # A dark episode already established on disk (prev_dark). The wake grace gates only the FRESH
+    # crossing, never an in-flight episode: it must NOT emit usage_recovered nor clear the alert
+    # while the meter is still dark.
+    d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 9000})
+    out = decide(usage=dark_usage(age=2400), parsed_issues=[parsed(5)], dsk=d,
+                 wake_grace_until=NOW + 300)
+    assert only(out, "usage_recovered") == []
+    assert only(out, "clear_alert") == []
+
+
+def test_wake_grace_holds_the_frozen_recovery_ladder():
+    # A session already in `frozen` status before the sleep would otherwise be re-nudged on the first
+    # post-gap tick. Within the wake grace the recovery ladder is held; past it, it resumes.
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist("frozen", last_recover_at=NOW - 9000)}})
+    held = decide(parsed_issues=[parsed(5)], dsk=d, wake_grace_until=NOW + 300)
+    assert [a for a in held if a.get("act") == "recover" and a.get("tier") == "frozen"] == []
+    resumed = decide(parsed_issues=[parsed(5)], dsk=d, wake_grace_until=NOW - 1)
+    assert [a for a in resumed if a.get("act") == "recover" and a.get("tier") == "frozen"]
 
 
 def test_usage_stale_alert_text_names_the_three_causes_and_the_remedy():
