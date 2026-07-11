@@ -32,6 +32,10 @@ class CheckResult:
     ok: bool
     detail: str = ""
     fix: str = ""
+    # An advisory block: printed as WARN, does NOT fail the stack. A warn result always carries
+    # ok=True (it passes), so `not r.ok` — the failure test everywhere — never counts it. Used when
+    # a tool is only conditionally needed on THIS machine (see check_codex / issue #30).
+    warn: bool = False
 
 
 class Probe:
@@ -94,20 +98,57 @@ def _zshrc_path(probe):
     return os.path.join(probe.home, ".zshrc")
 
 
-def check_codex(probe):
+def _codex_required(config):
+    """Whether THIS machine actually needs Codex. True only when a repo's config selects the Codex
+    coding agent (`agent: codex`) — i.e. worker sessions launch through Codex. Codex is NOT required
+    merely to review: `/cross-review` (a Codex second opinion) is the default fresh-agent review,
+    but an independent same-model fresh subagent is an equally valid review path (owner ruling
+    2026-07-10, issue #30), so a Claude-only machine reaches an all-green stack without Codex.
+    Absence is therefore a WARN unless this returns True. Tolerant of a None/wrong-typed config
+    (an unreadable config never forces the requirement).
+
+    Scope: this reads the repo's CONFIG agent only. A one-off `superlooper run --agent codex` that
+    overrides a claude-default config is out of scope for this preflight (the doctor takes no
+    `--agent`); that run fails loudly at launch if Codex is missing, so nothing is silently lost."""
+    cfg = config if isinstance(config, dict) else {}
+    return cfg.get("agent") == "codex"
+
+
+def check_codex(probe, required=False):
+    """`required` (see _codex_required) decides the severity of a missing/unauthenticated Codex: a
+    hard FAIL when this machine launches Codex, otherwise a WARN that leaves the stack green. When
+    it is a WARN the whole story rides in `detail` (format_results only prints `fix` for a FAIL), so
+    the advisory names the same-model-subagent review path and when you would actually need Codex."""
     codex = probe.command("codex", envvar="SL_CODEX")
     if not codex:
+        if required:
+            return CheckResult(
+                "codex CLI", False, "codex not found",
+                "Install the Codex CLI, then run `codex login`.",
+            )
         return CheckResult(
-            "codex CLI", False, "codex not found",
-            "Install the Codex CLI, then run `codex login`.",
+            "codex CLI", True,
+            "codex not found — not needed by this machine's config (agent is not codex); a "
+            "Claude-only stack satisfies the fresh-agent review with an independent same-model "
+            "subagent. Install the Codex CLI and run `codex login` only if you switch a repo to "
+            "--agent codex.",
+            warn=True,
         )
     proc = probe.run([codex, "login", "status"], timeout=10)
     if getattr(proc, "returncode", 1) == 0:
         detail = _out(proc) or codex
         return CheckResult("codex CLI", True, detail)
+    if required:
+        return CheckResult(
+            "codex CLI", False, _out(proc) or "not authenticated",
+            "Run `codex login` and confirm `codex login status` succeeds.",
+        )
+    detail = _out(proc) or "codex present but not authenticated"
     return CheckResult(
-        "codex CLI", False, _out(proc) or "not authenticated",
-        "Run `codex login` and confirm `codex login status` succeeds.",
+        "codex CLI", True,
+        detail + " — not needed unless a repo runs --agent codex; run `codex login` if you plan "
+        "to use it.",
+        warn=True,
     )
 
 
@@ -284,7 +325,7 @@ def check_launch_shim(probe):
 def check_stack(config, config_error=None, probe=None, sender=None, announce=None):
     probe = probe or Probe()
     return [
-        check_codex(probe),
+        check_codex(probe, required=_codex_required(config)),
         check_cmux(probe),
         check_claude(probe),
         check_gh_auth(probe),
@@ -297,7 +338,13 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
 def format_results(results):
     lines = []
     for result in results:
+        # WARN only when the block actually passes (warn ⇒ ok). A malformed warn+not-ok result
+        # renders FAIL, matching how cmd_stack_doctor counts it (`not r.ok`), so the printed label
+        # and the exit code can never disagree.
+        warn = getattr(result, "warn", False) and result.ok
+        label = "WARN" if warn else ("ok  " if result.ok else "FAIL")
         detail = (" - " + result.detail) if result.detail else ""
+        # Only a FAIL prints a `Fix:` line; a WARN carries its guidance inline in `detail`.
         fix = (" Fix: " + result.fix) if (not result.ok and result.fix) else ""
-        lines.append("  %s %s%s%s" % ("ok  " if result.ok else "FAIL", result.name, detail, fix))
+        lines.append("  %s %s%s%s" % (label, result.name, detail, fix))
     return lines

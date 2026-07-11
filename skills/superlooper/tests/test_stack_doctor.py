@@ -113,7 +113,10 @@ def test_stack_doctor_failures_carry_one_line_fix_hints():
         "",
     )
     probe.files["/home/will/.zshrc"] = "# no shim\n"
-    config = {"notify": {"cmd": None, "imessage_to": None}}
+    # agent: codex makes the missing Codex a real FAIL (this machine launches Codex workers), so
+    # this test exercises the fix-hint text on a genuine codex failure. On a Claude-only machine
+    # the same absence is a WARN — see test_codex_absent_and_not_required_warns_stack_still_passes.
+    config = {"agent": "codex", "notify": {"cmd": None, "imessage_to": None}}
 
     results = stack_doctor.check_stack(config, probe=probe)
     failures = {r.name: r for r in results if not r.ok}
@@ -126,6 +129,95 @@ def test_stack_doctor_failures_carry_one_line_fix_hints():
     assert ".superlooper/config.json" in failures["notify channel"].fix
     assert "launch shim sourced" in failures
     assert "install-launch-shim.sh" in failures["launch shim sourced"].fix
+
+
+# --- codex CLI: a WARN, not a FAIL, unless THIS machine actually runs Codex (issue #30) ---------
+# STACK.md tiers Codex as an orchestrator (Tier 2) tool, and the repo-level doctor already treats
+# a missing Codex as a WARN "needed only for --agent codex". The stack doctor used to hard-fail on
+# it regardless, blocking a Claude-only newcomer from ever reaching an all-green stack. Owner ruling
+# 2026-07-10: an independent same-model fresh subagent is a valid review path, so Codex absence must
+# fail the stack ONLY when a repo's config selects `agent: codex`.
+
+def test_codex_required_is_true_only_when_config_selects_the_codex_agent():
+    assert stack_doctor._codex_required({"agent": "codex"}) is True
+    assert stack_doctor._codex_required({"agent": "claude"}) is False
+    assert stack_doctor._codex_required({}) is False          # default agent is claude
+    assert stack_doctor._codex_required(None) is False         # unreadable config never forces it
+
+
+def test_codex_absent_and_not_required_warns_stack_still_passes():
+    probe = _healthy_probe()
+    del probe.commands["codex"]                                # Codex CLI not installed
+    config = {"agent": "claude", "notify": {"cmd": "true", "imessage_to": None}}
+
+    results = stack_doctor.check_stack(
+        config, probe=probe, sender=_ok_sender(), announce=lambda *a: None,
+    )
+    codex = next(r for r in results if r.name == "codex CLI")
+
+    assert codex.warn is True                                  # advisory, not a failure
+    assert codex.ok is True                                    # a WARN does not fail the stack
+    assert [r.name for r in results if not r.ok] == []         # overall stack PASSES
+    # the WARN explains WHY it is optional and names the same-model review path
+    assert "not found" in codex.detail.lower()
+    assert "codex" in codex.detail.lower()
+    # and it renders as a WARN line, not ok/FAIL
+    line = next(l for l in stack_doctor.format_results(results) if "codex CLI" in l)
+    assert line.strip().startswith("WARN")
+
+
+def test_codex_absent_but_required_by_codex_agent_fails_as_before():
+    probe = _healthy_probe()
+    del probe.commands["codex"]
+    config = {"agent": "codex", "notify": {"cmd": "true", "imessage_to": None}}
+
+    results = stack_doctor.check_stack(
+        config, probe=probe, sender=_ok_sender(), announce=lambda *a: None,
+    )
+    codex = next(r for r in results if r.name == "codex CLI")
+
+    assert codex.ok is False                                   # hard FAIL: this machine needs Codex
+    assert codex.warn is False
+    assert "Install the Codex CLI" in codex.fix
+    assert "codex CLI" in [r.name for r in results if not r.ok]
+
+
+def test_codex_present_but_unauthenticated_warns_when_not_required():
+    probe = _healthy_probe()
+    probe.commands["codex"][("login", "status")] = (1, "", "Not logged in")
+
+    result = stack_doctor.check_codex(probe, required=False)
+
+    assert result.ok is True                                   # not needed here -> does not fail
+    assert result.warn is True
+    assert "codex" in result.detail.lower()
+
+
+def test_codex_present_but_unauthenticated_fails_when_required():
+    probe = _healthy_probe()
+    probe.commands["codex"][("login", "status")] = (1, "", "Not logged in")
+
+    result = stack_doctor.check_codex(probe, required=True)
+
+    assert result.ok is False
+    assert result.warn is False
+    assert "codex login" in result.fix
+
+
+def test_format_results_renders_a_warn_label():
+    warn = stack_doctor.CheckResult("codex CLI", True, "codex not found", warn=True)
+    line = stack_doctor.format_results([warn])[0]
+    assert line.strip().startswith("WARN")
+    assert "codex CLI" in line
+
+
+def test_format_results_renders_a_malformed_warn_as_fail_not_warn():
+    # Defensive: a WARN must always pass (warn ⇒ ok). A malformed warn+not-ok result would land in
+    # cmd_stack_doctor's failures (not r.ok) yet must not print a reassuring WARN — the label and
+    # the exit code stay in agreement, so the render layer downgrades it to FAIL.
+    bad = stack_doctor.CheckResult("codex CLI", False, "boom", warn=True)
+    line = stack_doctor.format_results([bad])[0]
+    assert line.strip().startswith("FAIL")
 
 
 def test_claude_api_key_auth_does_not_satisfy_subscription_login():
