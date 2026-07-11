@@ -40,6 +40,7 @@ FAKES = os.path.join(HERE, "fakes")
 
 # conftest.py already puts skill/lib before skill/bin on sys.path (a pinned ordering —
 # test_conftest_paths guards it); this file must not re-insert and scramble it.
+import actions as actions_lib    # noqa: E402
 import config as config_lib      # noqa: E402
 import journal as journal_lib    # noqa: E402
 import loopstate                 # noqa: E402
@@ -292,13 +293,18 @@ class Sim:
         with open(self.scenario_dir / ("%s.json" % sid), "w") as f:
             json.dump(spec, f)
 
-    def fail_next(self, match, times=1):
-        """Arm a fake-gh blip: the next `times` calls whose argv contains `match` fail."""
+    def fail_next(self, match, times=1, stderr=None):
+        """Arm a fake-gh blip: the next `times` calls whose argv contains `match` fail. `stderr`
+        (optional) sets the failure's stderr verbatim — use a realistic message when the product
+        surfaces that stderr into a later gh call, so it doesn't echo `match` and re-arm the rule."""
         path = self.gh_dir / "fail_rules.json"
         rules = []
         if path.exists():
             rules = json.loads(path.read_text())
-        rules.append({"match": match, "times": times})
+        rule = {"match": match, "times": times}
+        if stderr is not None:
+            rule["stderr"] = stderr
+        rules.append(rule)
         path.write_text(json.dumps(rules))
 
     def issue(self, num):
@@ -579,6 +585,78 @@ def test_late_but_in_bound_check_still_merges(sim_factory):
         "never merged after the check reported green: %s" \
         % [(r.get("act"), r.get("outcome")) for r in sim.journal()]
     assert sim.prs_for()[0]["state"] == "MERGED"
+
+
+# =====================================================================================
+# issue #27: a gate-green PR whose MERGE GitHub refuses (branch protection / no merge rights)
+# =====================================================================================
+
+def test_refused_merge_is_bounded_and_escalates_once_to_william(sim_factory):
+    # The end-to-end acceptance for issue #27 (DoD #1): the gate is green (report + review +
+    # checks + mergeable), but GitHub REFUSES the squash-merge every tick — exactly what ordinary
+    # branch protection (required approvals / strict up-to-date) or a token without merge rights
+    # does. Before this fix the runner retried the merge every tick FOREVER: no counter, no cap, no
+    # park, no notify — a green PR that never lands and never explains itself. Now the runner bounds
+    # the retries, then parks needs-william ONCE with the gh refusal reason in the memo, and STOPS.
+    sim = sim_factory()
+    num = sim.add_issue(title="Green PR whose merge is refused", scenario={"scenario": "happy"})
+    sid = "i%d" % num
+    # Every squash-merge refused with a realistic branch-protection stderr (the runner surfaces this
+    # verbatim into the park memo, so it must not echo the 'pr merge' match — see fail_next).
+    sim.fail_next("pr merge", times=99,
+                  stderr="failed to merge: Protected branch update failed (2 approving reviews required)")
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid)), \
+        "worker never finished: %s" % sim.journal()
+
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "needs_william"), \
+        "never escalated: %s" % [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    # retries are BOUNDED: the merge was attempted exactly to the cap, then stopped — never the
+    # forever-retry this issue exists to kill. (A refused merge is journaled but never records a
+    # merge_pr mutation, because the merge never actually happened.)
+    merge_attempts = sim.journal("merge")
+    assert len(merge_attempts) == actions_lib.MERGE_REFUSAL_CAP, \
+        "expected exactly %d bounded merge attempts, got %r" \
+        % (actions_lib.MERGE_REFUSAL_CAP, [r.get("outcome") for r in merge_attempts])
+    assert all("refused" in (r.get("outcome") or "") for r in merge_attempts)
+    assert not sim.mutations("merge_pr"), "a refused merge must never actually land"
+    assert (not sim.prs_for()) or sim.prs_for()[0]["state"] != "MERGED"
+
+    # further ticks do NOT resurrect the retry: the counter stays capped, the issue stays terminal
+    sim.tick(); sim.tick()
+    assert len(sim.journal("merge")) == actions_lib.MERGE_REFUSAL_CAP, "retries restarted after park"
+
+    # label moved to needs-william; the memo NAMES branch protection and carries the gh stderr
+    assert "needs-william" in sim.issue(num)["labels"]
+    assert "in-progress" not in sim.issue(num)["labels"]
+    memos = [m for m in sim.mutations("comment")
+             if "branch protection" in m["body"] and "2 approving reviews required" in m["body"]]
+    assert memos, "the park memo must name branch protection AND carry gh's stderr: %s" \
+        % sim.mutations("comment")
+    # the escalation notifies (standing rule) exactly once
+    notices = [ln for ln in sim.notify_lines() if "needs-william" in ln]
+    assert len(notices) == 1, sim.notify_lines()
+
+
+def test_transient_merge_refusal_clears_within_the_bound_and_merges(sim_factory):
+    # DoD #2: a refusal that clears WITHIN the bound still merges cleanly with zero noise — no
+    # park, no needs-william, no alarm. (fake-gh refuses only the FIRST merge; the retry lands.)
+    sim = sim_factory()
+    num = sim.add_issue(title="Merge refused once then clears", scenario={"scenario": "happy"})
+    sid = "i%d" % num
+    sim.fail_next("pr merge", times=1)                   # one blip, then the merge succeeds
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged"), \
+        "never merged after the transient refusal cleared: %s" \
+        % [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert sim.prs_for()[0]["state"] == "MERGED"
+    assert len(sim.mutations("merge_pr")) == 1            # the retry really landed, exactly once
+    # zero noise: never escalated, and no needs-william notify fired
+    assert "needs-william" not in sim.issue(num)["labels"]
+    assert not [ln for ln in sim.notify_lines() if "needs-william" in ln], sim.notify_lines()
 
 
 def test_finished_without_pr_parks_with_memo(sim_factory):

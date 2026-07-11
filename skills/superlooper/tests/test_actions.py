@@ -600,6 +600,72 @@ def test_green_gate_merges_with_configured_method():
     assert m[0]["num"] == 5 and m[0]["pr"] == 555 and m[0]["method"] == "squash"
 
 
+# --------------------------- merge refusals: bounded + surfaced (issue #27) ---------------------------
+# A gate-green PR whose merge GitHub refuses (ordinary branch protection — required approvals /
+# strict up-to-date — or a token without merge rights) used to retry every tick forever: no
+# counter, no cap, no park, no notify. The executor bumps `merge_refusals` and records the gh
+# stderr in `merge_refusal_reason` on each refusal; decide keeps retrying UNDER the bound, then
+# parks needs-william ONCE with the reason and one notify. The bright line holds: surface branch
+# protection to the owner, never bypass it.
+
+def test_a_merge_refusal_under_the_bound_still_retries_with_no_noise():
+    # DoD #2: a transient refusal that clears within the bound merges cleanly — decide keeps
+    # emitting merge (the retry) and raises NO park and NO notify while under the cap.
+    d, g = _gating()
+    d["issues_state"]["issues"]["i5"].update(
+        merge_refusals=actions.MERGE_REFUSAL_CAP - 1,
+        merge_refusal_reason="failed to merge: the base branch has moved")
+    out = decide(dsk=d, gh_view=g)
+    assert len(only(out, "merge")) == 1                 # still retrying
+    assert only(out, "park") == [] and not has_notify(out)
+
+
+def test_merge_refused_to_the_cap_parks_needs_william_with_reason_and_one_notify():
+    d, g = _gating()
+    reason = "failed to merge: Protected branch update failed (2 approving reviews required)"
+    d["issues_state"]["issues"]["i5"].update(
+        merge_refusals=actions.MERGE_REFUSAL_CAP, merge_refusal_reason=reason)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "merge") == []                     # retries STOP at the cap
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["needs_william"] is True
+    assert "2 approving reviews required" in p[0]["memo"]   # the refusal reason is surfaced
+    n = only(out, "notify")
+    assert len(n) == 1 and "2 approving reviews required" in n[0]["body"]
+
+
+def test_corrupt_merge_refusal_counter_fails_closed_to_a_park():
+    # The fail-OPEN-on-wrong-TYPED defect class: a corrupt counter must NOT read as 0 and re-merge
+    # forever — it lands on the safe action (park to William), like every other capped counter.
+    d, g = _gating()
+    d["issues_state"]["issues"]["i5"]["merge_refusals"] = "lots"
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "merge") == []
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["needs_william"] is True and has_notify(out)
+    # the corrupt path does NOT claim a specific count it doesn't have
+    assert "unreadable" in p[0]["memo"] and "consecutive times" not in p[0]["memo"]
+
+
+def test_a_missing_refusal_reason_still_parks_with_a_sensible_memo():
+    # The cap trips even if the reason was never captured (an odd crash window): the memo must not
+    # be empty or malformed.
+    d, g = _gating()
+    d["issues_state"]["issues"]["i5"]["merge_refusals"] = actions.MERGE_REFUSAL_CAP
+    out = decide(dsk=d, gh_view=g)
+    p = only(out, "park")
+    assert len(p) == 1 and isinstance(p[0]["memo"], str) and len(p[0]["memo"]) > 20
+
+
+def test_reset_merge_refusal_counter_merges_again_episode_scoped():
+    # DoD #3: the guard is episode-scoped, never forever-latched. Once the counter is zeroed (the
+    # reapprove executor's effect), the very PR that was capped merges again from scratch.
+    d, g = _gating()
+    d["issues_state"]["issues"]["i5"].update(merge_refusals=0, merge_refusal_reason=None)
+    out = decide(dsk=d, gh_view=g)
+    assert len(only(out, "merge")) == 1 and only(out, "park") == []
+
+
 def test_missing_sections_nudges_once_then_parks():
     d, g = _gating(report="## Wrong\nstuff")
     out = decide(dsk=d, gh_view=g)

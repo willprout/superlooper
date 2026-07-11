@@ -88,6 +88,7 @@ LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LA
 SYSTEMIC_LAUNCH_FAILURE_CAP = 2    # >= this many DISTINCT issues failing delivery -> systemic (#24)
 ANSWERER_FAILURE_CAP = 2           # answerer hire failed twice -> park the issue
 DELIVERY_FAILURE_CAP = 3           # answer would not deliver to the pane -> park the issue
+MERGE_REFUSAL_CAP = 2              # gate-green PR's merge refused this many ticks -> park (#27)
 UPDATE_ERROR_ALERT = 4             # persistent merge-update infra errors -> ALERT (never regenerate)
 RUNAWAY_THRESHOLD = 4              # retries far past the cap -> ALERT (events.retry_runaway)
 # The bound (seconds) on a FINISHED issue's required-checks PENDING wait (issue #26). A required
@@ -617,6 +618,28 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                 out.append({"act": "clear_checks_pending", "id": iid})       # left the pending episode
 
             if act == "merge":
+                # Bounded merge refusals (issue #27): the gate is green but GitHub can still REFUSE
+                # the merge — ordinary branch protection (required approvals / strict up-to-date) or
+                # a token without merge rights. The executor counts each refusal (`merge_refusals`)
+                # and records the gh stderr (`merge_refusal_reason`); we retry UNDER the cap, then
+                # park needs-william ONCE with the reason. A corrupt counter fails closed to the
+                # park (never re-merge forever on a wrong-typed value). We NEVER bypass protection —
+                # the refusal is surfaced to the owner, whose re-approval resets the guard (the
+                # counter is episode-scoped; _exec_reapprove zeroes it).
+                refusals, corrupt = _counter(ist, "merge_refusals")
+                if corrupt or refusals >= MERGE_REFUSAL_CAP:
+                    why = ist.get("merge_refusal_reason")
+                    why = why if isinstance(why, str) and why.strip() else "(no gh reason captured)"
+                    how_many = ("the merge-refusal counter is unreadable" if corrupt
+                                else f"GitHub refused the merge {MERGE_REFUSAL_CAP} consecutive times")
+                    park(iid, num,
+                         f"the gate is green but {how_many} — ordinary branch protection (required "
+                         "approvals / strict up-to-date) or a token without merge rights. "
+                         f"superlooper never bypasses branch protection. gh said: {why}. Grant what "
+                         "the protection requires (approve the PR / update the token's merge "
+                         "rights), then re-approve the issue to retry.",
+                         needs_william=True)
+                    continue
                 method = cfg.get("merge_method")
                 method = method if method in ("squash", "merge", "rebase") else "squash"
                 out.append({"act": "merge", "id": iid, "num": num, "pr": pv.get("number"),

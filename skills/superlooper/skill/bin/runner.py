@@ -1176,9 +1176,13 @@ class Runner:
     # `retries`: launch-session.sh recomputes `retries = launches - 1` on every verified delivery,
     # so leaving `launches` at its old value would silently restore `retries` on the next launch
     # and re-park the issue at the retry cap. `conflicts` and the answerer counters are reset too
-    # so re-approval is a clean slate on every ladder, not just the launch one.
+    # so re-approval is a clean slate on every ladder, not just the launch one. `merge_refusals`
+    # is here too so the merge-refusal guard is EPISODE-scoped (issue #27): a re-approval rebuilds
+    # from scratch, so the rebuilt PR's merge must be retried from zero, never a forever-latched
+    # park. (The paired `merge_refusal_reason` string is cleared in the reset block below, not
+    # here — this tuple is int counters only, zeroed with `i[k] = 0`.)
     _REAPPROVE_COUNTERS = ("launches", "retries", "conflicts", "launch_failures",
-                           "answerer_failures", "answer_delivery_failures")
+                           "answerer_failures", "answer_delivery_failures", "merge_refusals")
 
     def _exec_reapprove(self, a, now):
         """D7-sibling operator fix: William re-approving a parked/needs-william/bounced issue (a
@@ -1210,7 +1214,8 @@ class Runner:
                 i[k] = 0
             i.update({"status": "ready", "requeue_front": False, "recheck_failed": False,
                       "update_result": None, "update_head_oid": None, "nudged": [], "pr": None,
-                      "read_waited": False, "checks_pending_since": None})
+                      "read_waited": False, "checks_pending_since": None,
+                      "merge_refusal_reason": None})   # paired with merge_refusals=0 above (#27)
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()
@@ -1339,8 +1344,17 @@ class Runner:
 
     def _exec_merge(self, a, now):
         iid, num, pr = a["id"], a.get("num"), a.get("pr")
-        if not gh.merge_pr(pr, a.get("method", "squash")):
-            return "merge failed (will retry next tick)"
+        ok, reason = gh.merge_pr(pr, a.get("method", "squash"))
+        if not ok:
+            # GitHub REFUSED the merge of a gate-green PR — ordinary branch protection (required
+            # approvals / strict up-to-date) or a token without merge rights (issue #27). Count the
+            # refusal and record WHY (the bounded gh stderr): decide keeps retrying under the bound,
+            # then parks needs-william ONCE with this reason. The status never advances past the
+            # truth — the issue stays gating until it merges or the cap parks it. No force path, no
+            # protection bypass: the refusal is surfaced to the owner, never coached around.
+            self._update_issue(iid, {"merge_refusal_reason": reason},
+                               fn=lambda st, i: self._bump(i, "merge_refusals"))
+            return f"merge refused (will retry to the bound): {reason or '(no gh reason)'}"
         gh.comment(num, f"Merged as PR #{pr} by superlooper (gate green: report + review "
                         "evidence + required checks + mergeable).")
         gh.set_labels(num, remove=["in-progress"])
@@ -1380,12 +1394,18 @@ class Runner:
         for sub in ("blocked", "exited", "awaiting"):
             _rm(os.path.join(self.state, sub, iid))
         # 2. durable state: the new branch is stamped BEFORE any relabel, so a partial failure
-        #    can never resurrect the old branch (the orphan sweep checks the stamp).
+        #    can never resurrect the old branch (the orphan sweep checks the stamp). The
+        #    merge-refusal guard is per-PR and episode-scoped (issue #27): a regenerate supersedes
+        #    the old PR and rebuilds on a fresh branch, so the new PR's merge starts from zero —
+        #    reset the counter and its captured reason, exactly like update_result/pr/nudged above.
+        #    (`conflicts` is deliberately NOT reset here — unlike merge_refusals it counts toward
+        #    the conflict cap across generations.)
         self._update_issue(iid, {"status": "ready", "branch": a.get("new_branch"),
                                  "conflicts": a.get("conflicts"), "requeue_front": True,
                                  "update_result": None, "update_head_oid": None,
                                  "nudged": [], "pr": None, "recheck_failed": False,
-                                 "checks_pending_since": None})
+                                 "checks_pending_since": None, "merge_refusals": 0,
+                                 "merge_refusal_reason": None})
         # 3. GitHub: supersede the PR (branch preserved on the remote, PR left open — nothing
         #    auto-closed), tell the issue, requeue it front-of-band.
         dev = self.config.get("dev_branch", "main")

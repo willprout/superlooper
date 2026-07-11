@@ -213,9 +213,31 @@ def test_pr_comment_records(ghenv):
 
 
 def test_merge_pr_records_method(ghenv):
-    assert gh.merge_pr(555, "squash") is True
+    ok, reason = gh.merge_pr(555, "squash")
+    assert ok is True and reason == ""          # a clean merge carries no refusal reason
     m = _mutations(ghenv)[-1]
     assert m["kind"] == "merge_pr" and m["method"] == "squash" and m["num"] == "555"
+
+
+def test_merge_pr_refusal_returns_false_and_a_bounded_stderr_reason(ghenv, monkeypatch):
+    # Issue #27: a refused merge (branch protection, or a token without merge rights) must surface
+    # WHY, not just fail silently. gh's stderr is the honest reason; merge_pr returns it, bounded.
+    monkeypatch.setenv("GH_FAIL", "1")
+    ok, reason = gh.merge_pr(555, "squash")
+    assert ok is False
+    assert isinstance(reason, str) and "forced failure" in reason   # fake-gh's stderr surfaced
+    assert 0 < len(reason) <= gh.MERGE_REFUSAL_REASON_CHARS
+
+
+def test_merge_refusal_reason_is_collapsed_to_one_line_and_bounded():
+    # The tail helper is pure: a pathological multi-line/huge stderr collapses to a single bounded
+    # line (a memo/notify/comment can't be blown up by a chatty gh), and empty/None -> "".
+    big = "failed to merge:\nProtected branch update failed\n" + "x" * 5000
+    r = gh._merge_refusal_reason(big)
+    assert "\n" not in r and len(r) <= gh.MERGE_REFUSAL_REASON_CHARS
+    assert "Protected branch update failed" in gh._merge_refusal_reason(
+        "failed to merge: Protected branch update failed")
+    assert gh._merge_refusal_reason("") == "" and gh._merge_refusal_reason(None) == ""
 
 
 def test_create_issue_returns_number_and_records(ghenv, monkeypatch):
@@ -244,7 +266,7 @@ def test_nonzero_rc_fails_closed_everywhere(ghenv, monkeypatch):
     assert gh.set_labels(1, add=["x"]) is False
     assert gh.comment(1, "y") is False
     assert gh.pr_comment(1, "y") is False
-    assert gh.merge_pr(1, "squash") is False
+    assert gh.merge_pr(1, "squash")[0] is False    # (ok, reason): ok fails closed, reason carries why
     assert gh.create_issue("t", "b") is None
 
 
