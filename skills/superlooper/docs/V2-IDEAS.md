@@ -57,24 +57,24 @@ PR #4).*
 
 ## Ready engine fixes (kickoff-ready now; owner sequences when)
 
-- **Held-territory window** — declared touches unprotected between session-finish and merge;
-  scheduler launches declared-conflicting issues into the gate-wait window and finished builds
-  get regenerated avoidably (live cost: eApp i160's 77-min build, 2026-07-09). Highest-ranked
-  fix in the queue: every 2-lane repo is exposed, and well-gated repos (eApp: CI + ship-recheck
-  waits) have the WIDEST window. Reconciled 2026-07-09 against this repo's investigation
-  exemption (PR #4) — the fix composes cleanly; see §2b of the incident doc. Full scope + DoD
-  + the deliberate park/wildcard decision: `INCIDENT-2026-07-09-held-territory-window.md`
-  (sibling). Filed 2026-07-09 as issue #6. Interim mitigation active meanwhile: blocked-by
-  chaining for overlapping issues (doc §4; delete that guidance when this ships).
+- **Held-territory window — SHIPPED.** Built as issue #6 / PR #14 (merged 2026-07-10), live on
+  the machine since the 14:42 republish + bounce. The interim blocked-by chaining rule is
+  retired (incident doc §4). History: `INCIDENT-2026-07-09-held-territory-window.md` (sibling).
 
 ## Parked with preconditions (see the incident docs for detail)
 
-- **Park-notify-storm engine guards** (notify-once per cause; refused≠empty in the gh
-  adapter; bounded refusal journaling) — PARKED by owner ruling 2026-07-08 until the
-  command-center quota fix has running data AND a gh-call census sizes the real API budget.
-  `INCIDENT-2026-07-08-park-notify-storm.md` (sibling) is authoritative. Precondition (a) is
-  accumulating (the dashboard quota fix deployed 2026-07-08); precondition (b) is the
-  gh-call-census investigation, filed 2026-07-09 as issue #8.
+- **Park-notify-storm engine guards — UNBLOCKED 2026-07-10, scope narrowed.** Both owner
+  preconditions are met: the census (issue #8) confirmed the 5,000-point hourly GraphQL budget
+  suffices (~1,333/hr steady, dashboard pollers dominant, reset ~:36). PARTIALLY BUILT since:
+  the hardening wave's #21 / PR #49 (merged 2026-07-10) gave `issue_comments`/`pr_comments` a
+  refused≠empty read contract, HOLD-on-unreadable for the investigate gate with bounded
+  journaling, and self-reconciling mis-parks. REMAINING unfiled scope: (a) refused≠empty for
+  `pr_for_branch` — the actual 41-text storm path ("finished but no PR exists" in a quota dead
+  zone) with a HOLD posture for build gates; (b) the notify-once per (issue, park-cause) guard
+  in the park path itself. Any issue drafted from the incident doc must reconcile against
+  PR #49 first or it re-specifies finished work; adjacent fences: #27 (merge-refusal cap),
+  #24 (launch-side faults). `INCIDENT-2026-07-08-park-notify-storm.md` (sibling) carries the
+  original analysis.
 - **Dogfooding.** Superlooper running its own fix loop — now real: this monorepo is adopted
   and has merged loop-built PRs. Standing candidate issue: dedup the close mechanics between
   runner.py `_close_stale_session` and tidy's `_close_window` (deferred from the tidy session

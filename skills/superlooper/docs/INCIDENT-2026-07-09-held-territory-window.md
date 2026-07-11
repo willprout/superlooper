@@ -75,12 +75,13 @@ anti-affinity until the issue reaches a state where the claim is meaningless.
 - Free-lane arithmetic (`free = lanes - len(lane_state)`) keeps counting RUNNING only — this fix
   must not reduce build concurrency, only launch ORDER around claimed files.
 
-## 4. Interim mitigation (orchestrator-side, until the fix ships)
+## 4. Interim mitigation — RETIRED 2026-07-10
 
-When writing/approving an issue whose territory overlaps an issue that is in flight OR finished
-with an open unmerged PR: chain it with `blocked-by: #N`. blocked-by holds until the blocker is
-CLOSED, so it spans the unprotected window that touches/affinity currently do not. This is a
-workaround, not the design — remove the guidance when the engine fix lands.
+The fix shipped as issue #6 / PR #14 (merged 2026-07-10) and went LIVE with the 14:42 republish
++ runner bounce the same day (installed engine carries `TERRITORY_CLAIM_STATUSES`). The interim
+blocked-by chaining rule for territory-overlapping issues is retired — territory is now held
+until merge by the engine itself. (Historical text: overlapping issues were chained with
+`blocked-by: #N` to span the unprotected finish→merge window.)
 
 ## 5. Definition of done for the fix session
 
