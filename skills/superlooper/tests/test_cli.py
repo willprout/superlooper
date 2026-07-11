@@ -384,17 +384,19 @@ def test_adopt_detects_and_writes_the_repo_default_branch(rig):
 
 
 def test_adopt_keeps_the_template_default_branch_when_gh_cannot_detect(rig):
-    # gh unreachable: adopt must not crash — it keeps the template's dev_branch ("main") and still
-    # succeeds. doctor is the backstop that later FAILs if that guessed branch is wrong.
+    # gh unreachable: adopt must not crash — it keeps the template's dev_branch ("main") and writes
+    # the config. Its GitHub half (label creation) does fail here, so adopt now exits nonzero
+    # (issue #29) — but cleanly (a handled exit 1, not a traceback), with the config on disk. doctor
+    # is the backstop that later FAILs if that guessed branch is wrong.
     fresh = rig.tmp / "fresh-nogh"
     fresh.mkdir()
     subprocess.run(["git", "init", "-q", str(fresh)], check=True)
     subprocess.run(["git", "-C", str(fresh), "remote", "add", "origin",
                     "https://github.com/will/proj.git"], check=True)
     r = cli(rig, "adopt", "--repo", str(fresh), env_over={"GH_FAIL": "1"})
-    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.returncode == 1, r.stdout + r.stderr     # labels failed -> nonzero, but no crash
     cfg = json.loads((fresh / ".superlooper" / "config.json").read_text())
-    assert cfg["dev_branch"] == "main"               # template fallback, no crash
+    assert cfg["dev_branch"] == "main"               # template fallback, config still written
 
 
 def test_adopt_creates_the_model_and_effort_starter_labels(rig):
@@ -489,6 +491,68 @@ def test_adopted_standing_rules_are_portable_text(rig):
     for forbidden in ("William", "willprout", "owner/name", fresh.name, str(fresh), "superlooper"):
         assert forbidden not in block
     assert not re.search(r"(^|\s)(~?/[^/\s`]+/[^\s`]+)", block)
+
+
+def test_adopt_exits_nonzero_when_every_label_create_fails(rig):
+    # Issue #29: the reported scenario is `adopt` run BEFORE `gh auth login`. Every gh write
+    # fails, so not one label exists — but the config IS written. adopt must NOT report success:
+    # it exits nonzero, names `gh auth login` as the likely fix, states the mixed state plainly
+    # (config kept, labels pending), and says the command is safe to re-run.
+    fresh = rig.tmp / "fresh-nogh-labels"
+    fresh.mkdir()
+    subprocess.run(["git", "init", "-q", str(fresh)], check=True)
+    subprocess.run(["git", "-C", str(fresh), "remote", "add", "origin",
+                    "https://github.com/will/proj.git"], check=True)
+    r = cli(rig, "adopt", "--repo", str(fresh), env_over={"GH_FAIL": "1"})
+    assert r.returncode != 0, r.stdout + r.stderr
+    # the config is written and KEPT despite the gh failure (the mixed state the memo must name)
+    assert (fresh / ".superlooper" / "config.json").exists()
+    out = r.stdout + r.stderr
+    assert "gh auth login" in out                     # the likely fix, named
+    assert "re-run" in out.lower()                    # safe to re-run (idempotent)
+    assert "config" in out.lower() and "pending" in out.lower()   # mixed state, explicit
+    assert out.count("FAIL") >= len(ALL_LABELS)       # every label reported as failed
+
+
+def test_adopt_exits_nonzero_when_some_labels_fail(rig):
+    # A partial GitHub blip: two label creates fail, the rest succeed. Even a single failure must
+    # flip the exit code — a half-created label set is still a runner that silently can't apply
+    # the labels it's missing. The closing summary names the count that failed.
+    fresh = rig.tmp / "fresh-partial-labels"
+    fresh.mkdir()
+    subprocess.run(["git", "init", "-q", str(fresh)], check=True)
+    subprocess.run(["git", "-C", str(fresh), "remote", "add", "origin",
+                    "https://github.com/will/proj.git"], check=True)
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps([
+        {"match": "label create agent-ready", "times": 1},
+        {"match": "label create type:build", "times": 1}]))
+    r = cli(rig, "adopt", "--repo", str(fresh))
+    assert r.returncode != 0, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert "gh auth login" in out
+    assert "2 of %d" % len(ALL_LABELS) in out          # the failed count is reported
+    # the two failed creates were NOT recorded (the fake dies before recording); the rest were
+    created = {m["name"] for m in mutations(rig) if m["kind"] == "create_label"}
+    assert "in-progress" in created and "effort:max" in created
+    assert "agent-ready" not in created and "type:build" not in created
+
+
+def test_adopt_succeeds_when_all_labels_already_exist(rig):
+    # Re-running adopt on a repo whose labels all exist: create-or-update (--force) succeeds for
+    # every one, so adopt reports success and exits 0 — no failure guidance on the clean re-run.
+    fresh = rig.tmp / "fresh-relabel"
+    fresh.mkdir()
+    subprocess.run(["git", "init", "-q", str(fresh)], check=True)
+    subprocess.run(["git", "-C", str(fresh), "remote", "add", "origin",
+                    "https://github.com/will/proj.git"], check=True)
+    first = cli(rig, "adopt", "--repo", str(fresh))
+    assert first.returncode == 0, first.stdout + first.stderr
+    second = cli(rig, "adopt", "--repo", str(fresh))
+    assert second.returncode == 0, second.stdout + second.stderr
+    both = second.stdout + second.stderr
+    assert "gh auth login" not in both                 # no failure guidance on a clean run
+    assert "FAIL" not in second.stdout
+    assert "already" in second.stdout.lower()          # config already adopted, left untouched
 
 
 def test_run_uses_config_agent_and_cli_override(rig):
