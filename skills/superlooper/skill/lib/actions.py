@@ -25,9 +25,12 @@ The view contract (assembled by runner.py each tick):
   now            epoch seconds.
   config         the validated per-repo config (config.load()).
   usage          usage.fetch_claude_usage() result + {"last_ok_at": epoch of the last SUCCESSFUL
-                 fetch (None if never), "first_attempt_at": epoch}. decide computes staleness:
-                 age > USAGE_STALE_SECONDS launches nothing (fail closed, RC-USAGEFAILOPEN);
-                 age > USAGE_ALERT_SECONDS raises the ALERT.
+                 fetch (None if never), "first_attempt_at": epoch}. decide splits the two dark-meter
+                 cases (issue #46): a meter that successfully READS exhausted (a fresh 'ok' at/over
+                 the ceiling) fails CLOSED; a meter that is UNREADABLE past USAGE_FAIL_OPEN_GRACE_
+                 SECONDS FAILS OPEN (launch, journal once, alert once). age > USAGE_STALE_SECONDS
+                 (within the grace) still launches nothing (fail closed); once dark past the grace,
+                 the same crossing FAILS OPEN and raises the usage_stale ALERT together.
   parsed_issues  issues.parse_issue() dicts for the union of open `agent-ready` and open
                  `in-progress` issues (deduped). Wrong-typed nums are skipped here — an issue
                  that can't be identified can't be safely acted on.
@@ -73,8 +76,19 @@ import scheduler
 # Staleness / cap constants. The caps that PARK are deliberately small (park is cheap and safe:
 # one William-touch re-releases); the thresholds that ALERT sit past the caps (a doom loop must
 # be loud, but only a real one).
-USAGE_STALE_SECONDS = 300          # no fresh usage for 5 min -> launch nothing (fail closed)
-USAGE_ALERT_SECONDS = 3600         # no fresh usage for 1 h  -> ALERT (plan Task 10)
+USAGE_STALE_SECONDS = 300          # no fresh usage for 5 min -> cached reading too old to gate as
+                                   # FRESH; WITHIN the fail-open grace below, launches fail CLOSED.
+# The bounded grace before a DARK usage meter flips from fail-closed to fail-OPEN (issue #46). Past
+# this, an UNREADABLE meter (api_error / no_keychain / auth_expired — a TLS/Keychain/auth outage,
+# live incident 2026-07-10) is treated as unreadable-NOT-exhausted: launch normally so work
+# continues, rather than freezing the whole loop while real usage is low. PROTECTS AGAINST two
+# failure modes at once: (a) the doom-loop of stopping everything on a meter we merely cannot READ
+# (the reported defect); (b) flapping on a brief blip — a dark meter still fails CLOSED for the
+# first half hour, riding out transient outages before ever launching blind. It is also the alert
+# threshold: the usage_stale ALERT fires at the exact moment fail-open engages, so the meter is
+# never dark-and-launching silently. A meter that successfully READS exhausted (a fresh 'ok' fetch
+# at/over the ceiling) is unaffected — that still fails CLOSED; only an UNREADABLE meter fails open.
+USAGE_FAIL_OPEN_GRACE_SECONDS = 1800
 GH_ALERT_FAILURES = 10             # consecutive failed poll cycles (~15 min at 90 s) -> ALERT
 ANSWERER_TIMEOUT_SECONDS = 900     # the answerer's 15-min freeze tier = its timeout
 RECOVER_RETRY_SECONDS = 600        # frozen-session recovery ladder re-fires at most every 10 min
@@ -135,8 +149,13 @@ NUDGE_MESSAGES = {
 
 # Human-readable ALERT notify bodies. The reason CODES (stable, sorted) are what the ALERT file
 # stores and what decide dedups on; these strings are only the push text. A reason not listed here
-# (gh_unreachable, usage_stale, launch_runaway:<id>, update_errors:<id>) falls back to its own code.
+# (gh_unreachable, launch_runaway:<id>, update_errors:<id>) falls back to its own code.
 ALERT_MESSAGES = {
+    "usage_stale": "usage meter unreadable past the grace (TLS / Keychain / auth outage) — "
+                   "FAILING OPEN: launching normally so work continues; real usage may be low. "
+                   "Sessions will hit the wall themselves if quota is genuinely gone. Fix the meter "
+                   "(re-login / check `superlooper doctor`); gating resumes automatically once it "
+                   "reads again.",
     "launch_anchor_down": "launch anchor gone — restart superlooper in a visible cmux tab. The "
                           "launch queue is held intact; every approved issue keeps agent-ready and "
                           "launches resume automatically once the tab's pane resolves again.",
@@ -148,6 +167,19 @@ ALERT_MESSAGES = {
 
 def _alert_message(reason):
     return ALERT_MESSAGES.get(reason, reason)
+
+
+def _fail_open_reason(dark_age):
+    """The bounded journal record for entering a fail-open episode (issue #46): a fixed sentence
+    plus the darkness duration in whole minutes. Bounded so a long outage journals ONE record, not
+    a growing one."""
+    mins = int(dark_age // 60) if math.isfinite(dark_age) else None
+    span = f"{mins} min" if mins is not None else "an unbounded span"
+    return (f"usage meter unreadable for {span} (past the {USAGE_FAIL_OPEN_GRACE_SECONDS // 60}-min "
+            "grace) — FAILING OPEN: launching normally so work continues. A dark meter is treated as "
+            "unreadable, not exhausted; if quota is genuinely gone the sessions hit the wall "
+            "themselves and #24's systemic breaker trips. A meter that successfully reads exhausted "
+            "still fails closed.")
 
 
 def _real(x):
@@ -376,13 +408,6 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
     retry_cap = _count(session.get("retry_cap"), 2)
     dev_branch = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
 
-    usage_view = usage if isinstance(usage, dict) else {}
-    last_ok = usage_view.get("last_ok_at")
-    usage_age = (now - last_ok) if _real(last_ok) else math.inf
-    usage_sched = dict(usage_view)
-    usage_sched["stale"] = bool(usage_view.get("stale")) or usage_age > USAGE_STALE_SECONDS
-    usage_launchable = scheduler.usage_ok(usage_sched)
-
     plist = parsed_issues if isinstance(parsed_issues, list) else []
     parsed_by_id = {}
     for p in plist:
@@ -408,6 +433,46 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
     alert_on_disk = dsk.get("alert") if isinstance(dsk.get("alert"), dict) else None
     raw_locks = dsk.get("live_lock_ids")
     live_locks = set(raw_locks) if isinstance(raw_locks, (set, frozenset, list, tuple)) else set()
+
+    # ---- usage gating (issue #46): fail CLOSED on a fresh over-ceiling read; fail OPEN on a DARK
+    # (unreadable-past-grace) meter. Computed here, after alert_on_disk, because the dark-meter
+    # EPISODE is marked by the DURABLE usage_stale ALERT (prev_dark) — the piece that survives a
+    # runner restart. ----
+    usage_view = usage if isinstance(usage, dict) else {}
+    last_ok = usage_view.get("last_ok_at")
+    first_attempt = usage_view.get("first_attempt_at")
+    usage_age = (now - last_ok) if _real(last_ok) else math.inf
+    # A real attempt/success timeline. A malformed/absent usage view (NEITHER timestamp) has none, so
+    # the LAUNCH decision below fails CLOSED — fail-open is never triggered by wrong-typed input.
+    have_timeline = _real(last_ok) or _real(first_attempt)
+    # The dark-meter clock, anchored at the last GOOD read — or, on a cold start that never succeeded,
+    # at the first attempt — so a never-read meter still gets the full grace before we launch blind.
+    dark_anchor = last_ok if _real(last_ok) else first_attempt
+    dark_age = (now - dark_anchor) if _real(dark_anchor) else math.inf
+    # meter_fresh: POSITIVE evidence of a CURRENT good read (last good read exists AND is recent).
+    # Recovery keys on THIS, never on "not failing open" — which is also true on a cold start, within
+    # a fresh grace, and (the trap) on a runner restart mid-outage whose in-memory clock has reset.
+    meter_fresh = _real(last_ok) and usage_age <= USAGE_STALE_SECONDS
+    dark_past_grace = have_timeline and dark_age > USAGE_FAIL_OPEN_GRACE_SECONDS
+    # prev_dark: is a dark-meter episode ALREADY established? The usage_stale ALERT is DURABLE (it
+    # survives a runner restart); the grace clock above is in-memory (resets on restart). Keying the
+    # episode's CONTINUATION on the durable marker makes the grace serve ONCE per episode: a restart
+    # mid-outage neither re-freezes for a second grace nor reads its reset clock as recovery.
+    prev_dark = bool(alert_on_disk) and "usage_stale" in _dget(alert_on_disk, "reasons", list)
+    # The dark-meter episode is ACTIVE when the meter first crosses the grace OR an already-established
+    # episode still has no fresh read. It CLOSES only on a genuinely fresh read (meter_fresh). The
+    # usage_stale ALERT tracks exactly this, so prev_dark next tick stays in lockstep.
+    episode_active = dark_past_grace or (prev_dark and not meter_fresh)
+    # FAIL OPEN (the LAUNCH policy) = the episode is active AND we have a real timeline. The
+    # have_timeline guard keeps a malformed usage view failing CLOSED even mid-episode (never launch on
+    # wrong-typed input) while the alert still stands. A meter that successfully READS exhausted has a
+    # fresh last_ok_at, so meter_fresh is True, the episode is not active, and failing_open is False:
+    # the exhausted-read gate keeps failing closed. The cases are mutually exclusive by construction.
+    failing_open = episode_active and have_timeline
+    usage_sched = dict(usage_view)
+    usage_sched["stale"] = bool(usage_view.get("stale")) or usage_age > USAGE_STALE_SECONDS
+    usage_sched["fail_open"] = failing_open
+    usage_launchable = scheduler.usage_ok(usage_sched)
     filed = _dget(dsk, "filed_fingerprints", dict)
 
     gv = gh_view if isinstance(gh_view, dict) else {}
@@ -486,8 +551,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
         reasons.append("gh_unreachable")
     reasons += [f"launch_runaway:{iid}"
                 for iid in sorted(events_mod.retry_runaway(issues_state, RUNAWAY_THRESHOLD))]
-    if usage_age > USAGE_ALERT_SECONDS:
-        reasons.append("usage_stale")
+    if episode_active:                                 # dark past the grace -> alert AND (with a
+        reasons.append("usage_stale")                  # timeline) fail open, so a dark meter is never
+                                                       # silent; the alert stands until a fresh read
     for iid in _sorted_ids(k for k in ist_map if _iid_num(k) is not None):
         errs, corrupt = _counter(ist_of(iid), "update_errors")
         if corrupt or errs >= UPDATE_ERROR_ALERT:
@@ -504,6 +570,22 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
             notify("superlooper ALERT", "; ".join(_alert_message(r) for r in reasons))
     elif alert_on_disk:
         out.append({"act": "clear_alert"})
+
+    # ---- fail-open episode journaling (issue #46), bounded to ONE record per episode ----
+    # The dark-meter episode IS the usage_stale-alert episode, so the ALERT-on-disk's usage_stale
+    # presence (prev_dark) is the durable episode marker — no new persistent state. Emit a `fail_open`
+    # record on the episode's ENTRY edge (now active, not yet recorded) and a `usage_recovered` record
+    # on its EXIT edge (was recorded, now closed by a fresh read). Both are journal-only (no label
+    # move, no park); the owner notify rides the usage_stale ALERT above. Deduped on prev_dark, so a
+    # continuous outage — INCLUDING one spanning a runner restart — journals exactly one open + one
+    # close. Recovery closes ONLY on `not episode_active`, which (given prev_dark) means a genuinely
+    # fresh read arrived — never merely because a restart reset the in-memory grace clock.
+    if episode_active and not prev_dark:
+        out.append({"act": "fail_open", "reason": _fail_open_reason(dark_age)})
+    elif prev_dark and not episode_active:
+        out.append({"act": "usage_recovered",
+                    "reason": "usage meter readable again — normal usage gating resumed; the "
+                              "fail-open episode is closed."})
 
     # ================= B. dev mainline: freeze / fix-forward / unfreeze =================
     # Requires a FRESH, PRESENT dev-check view: no data never unfreezes and never freezes —

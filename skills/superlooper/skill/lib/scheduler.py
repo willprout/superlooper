@@ -31,9 +31,24 @@ def _finite_pct(x):
 def _usage_ok(usage):
     """FAIL CLOSED: only a dict with 'ok' auth, non-stale, both pcts FINITE and under the ceilings
     passes. Any missing / partial / unhealthy / malformed usage (None, wrong type, NaN, ...)
-    returns False (launch nothing)."""
+    returns False (launch nothing).
+
+    ONE exception, FAIL OPEN (issue #46): when the caller sets `fail_open`, launch. The scheduler
+    never decides this itself — it is a typed, understood flag that decide() sets ONLY after the
+    meter has been UNREADABLE past a bounded grace (a dark meter: TLS/Keychain/auth outage, not a
+    fresh read). Launching into maybe-exhausted quota, where the sessions hit the wall themselves
+    (and #24's systemic breaker catches a real collapse), is a better failure than a full stop with
+    real usage low. This is DELIBERATELY not the refused≠empty / fail-open-on-wrong-typed defect
+    class: decide sets fail_open on a typed, understood status past a measured grace — it is never
+    set for a meter that is FRESHLY reading, so the exhausted-read gate below is untouched (a FRESH
+    'ok' at/over the ceiling still launches nothing). NB: a LAST-known-over-ceiling read that then
+    goes dark past the grace DOES fail open — by design; once the meter is dark we no longer trust
+    that stale pct, and the owner's ruling is that launching beats a full stop (#24 backstops a real
+    collapse)."""
     if not isinstance(usage, dict):
         return False
+    if usage.get("fail_open"):
+        return True
     if usage.get("auth_status") != "ok" or usage.get("stale"):
         return False
     fh = usage.get("five_hour_pct")

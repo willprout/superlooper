@@ -102,6 +102,34 @@ def test_7d_over_96_blocks_new_work():
     assert _nums(scheduler.launchable(q, [], _cfg(), usage96, set(), False)) == [1]
 
 
+# ------------------- fail OPEN on an UNREADABLE meter (issue #46) -------------------
+# The scheduler NEVER fails open on its own: it only honors the `fail_open` flag that decide (which
+# owns the time-based grace clock) sets when the meter has been UNREADABLE past the bounded grace.
+# This split keeps the exhausted-READ gate (fresh 'ok' at/over the ceiling -> no launch) untouched.
+
+def test_fail_open_flag_launches_despite_an_unreadable_status():
+    q = [_issue(1)]
+    for status in ("api_error", "no_keychain", "auth_expired"):
+        usage = {"auth_status": status, "five_hour_pct": None, "seven_day_pct": None,
+                 "stale": True, "fail_open": True}
+        assert _nums(scheduler.launchable(q, [], _cfg(), usage, set(), False)) == [1], status
+
+
+def test_no_fail_open_flag_still_fails_closed_on_an_unreadable_status():
+    # Without the flag (decide has NOT decided to fail open — e.g. still within the grace), an
+    # unreadable meter launches nothing, exactly as before.
+    q = [_issue(1)]
+    usage = {"auth_status": "api_error", "five_hour_pct": None, "seven_day_pct": None, "stale": True}
+    assert scheduler.launchable(q, [], _cfg(), usage, set(), False) == []
+
+
+def test_usage_ok_honors_fail_open_for_the_relaunch_gate():
+    # usage_ok is the SAME rule the runner's relaunch-tier recovery gates on, so fail_open must lift
+    # it too — exited/frozen recovery resumes while the meter is dark (launch normally).
+    assert scheduler.usage_ok({"auth_status": "api_error", "stale": True, "fail_open": True}) is True
+    assert scheduler.usage_ok({"auth_status": "api_error", "stale": True}) is False
+
+
 # --------------------------- lanes math ---------------------------
 
 def test_fills_free_lanes():

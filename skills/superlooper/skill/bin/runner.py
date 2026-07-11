@@ -1602,6 +1602,20 @@ class Runner:
         _rm(os.path.join(self.state, "ALERT"))
         return "ok"
 
+    def _exec_fail_open(self, a, now):
+        """Issue #46: the usage meter has been UNREADABLE past the grace, so decide chose to launch
+        normally rather than freeze the loop on a meter we merely cannot read. Journal-only — the
+        launch policy is applied by usage_ok's fail_open flag and the owner is notified via the
+        usage_stale ALERT that rides the same crossing. decide emits this ONCE per dark episode
+        (deduped on the ALERT-on-disk marker), so the outcome text IS the durable record."""
+        return a.get("reason", "usage meter dark past the grace — failing open (launching normally)")
+
+    def _exec_usage_recovered(self, a, now):
+        """Issue #46: the usage meter reads again; the fail-open episode is closed. Journal-only
+        (normal gating resumes via usage_ok on the fresh reading); the outcome text records the
+        episode close. Emitted ONCE per episode by decide."""
+        return a.get("reason", "usage meter readable again — normal usage gating resumed")
+
     def _exec_morning_report(self, a, now):
         try:
             with open(os.path.join(self.state, "last_morning_report"), "w") as f:
