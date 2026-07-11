@@ -11,7 +11,7 @@ ID="${1:?usage: start-session.sh <id>}"
 : "${SL_RUN_ROOT:?}"
 export SL_ISSUE_ID="$ID"
 export SL_RUN_ROOT
-mkdir -p "$SL_RUN_ROOT/state/started" "$SL_RUN_ROOT/state/exited"
+mkdir -p "$SL_RUN_ROOT/state/started" "$SL_RUN_ROOT/state/exited" "$SL_RUN_ROOT/state/launch_stderr"
 
 write_exited() {  # the deterministic process-gone signal the runner recovers from (RC-DEADPANE)
   printf '%s rc=%s\n' "$(date +%s)" "${1:-0}" > "$SL_RUN_ROOT/state/exited/$ID"
@@ -64,6 +64,13 @@ trap release_worker EXIT                     # free the slot when THIS worker tr
 # dead state is observed promptly, not 45 min later.
 TOKEN="${SL_START_TOKEN:-$ID}"
 printf '%s' "$TOKEN" > "$SL_RUN_ROOT/state/started/$ID.$TOKEN"
+# Clear THIS launch's captured stderr tail now (issue #40, review P1-1) — AFTER the singleton lock
+# (so a duplicate launch of a still-live worker can never wipe the real worker's tail) but BEFORE the
+# brief-missing early-exit just below (which itself writes an exited marker): a prior FAILED launch's
+# stderr must never bleed into a later park memo, on EVERY path that can emit an exited marker.
+# run_agent (re)writes this file when the agent exits.
+ERR_TAIL="$SL_RUN_ROOT/state/launch_stderr/$ID"
+rm -f "$ERR_TAIL"
 BRIEF="$SL_RUN_ROOT/briefs/$ID.md"
 [ -f "$BRIEF" ] || { echo "[$ID] no brief" >&2; write_exited 1; exit 1; }
 # Name the session so William can tell what's running when he's away:
@@ -96,15 +103,42 @@ toml_string() {
   printf '"%s"' "$s"
 }
 
+# ---- LAUNCH STDERR CAPTURE (issue #40, agent boundary) ----
+# A launch that dies immediately — a bad --model, a renamed/dropped CLI flag — writes its real
+# reason to STDERR and then vanishes with the doomed cmux tab; the runner afterward sees only
+# "exited and already relaunched N times (cap N)". Capture a BOUNDED tail of the agent's stderr to a
+# well-known file so the relaunch-cap park memo (which stays agent-agnostic) can NAME the actual
+# error. Knowing the process is `claude`/`codex` is agent-specific, so the capture lives HERE.
+#   * stderr ONLY. stdout stays the interactive TUI on the real terminal (fd3) — piping stdout drops
+#     Claude into print mode and kills the watchable pane (see the claude branch), so fd1 is never
+#     touched. stderr is still tee'd back to the terminal, so a healthy session is visually
+#     unchanged even if the agent ever writes there.
+#   * the AGENT's own exit code comes from PIPESTATUS[0], never the pipeline's.
+#   * the tail is byte-bounded and written only AFTER the agent exits, so it adds no blocking wait to
+#     the live launch path.
+# ERR_TAIL was defined and cleared earlier (right after the singleton lock, before the brief check)
+# so EVERY exited-marker path starts from a clean tail; run_agent only writes it.
+LAUNCH_STDERR_MAX_BYTES="${SL_LAUNCH_STDERR_MAX_BYTES:-4096}"
+AGENT_RC=0
+run_agent() {                            # "$@" = the full agent command line
+  local raw
+  raw="$(mktemp "${TMPDIR:-/tmp}/sl-launch-err.XXXXXX")" || { "$@"; AGENT_RC=$?; return; }
+  { "$@" 2>&1 1>&3 | tee "$raw" >&2; } 3>&1
+  AGENT_RC=${PIPESTATUS[0]}
+  tail -c "$LAUNCH_STDERR_MAX_BYTES" "$raw" > "$ERR_TAIL" 2>/dev/null || true
+  rm -f "$raw"
+}
+
 case "$AGENT" in
   claude)
     CLAUDE_ARGS=(--dangerously-skip-permissions)
     [ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
     [ -n "$EFFORT" ] && CLAUDE_ARGS+=(--effort "$EFFORT")
     CLAUDE_ARGS+=(--name "$NAME" --remote-control "$NAME")
-    # Do NOT pipe Claude through tee/cat — piping drops it into print mode and kills the
-    # interactive pane you want to watch. (No headless `claude -p` anywhere — owner billing rule B.9.)
-    claude "${CLAUDE_ARGS[@]}" "$(cat "$BRIEF")"
+    # Do NOT pipe Claude's STDOUT through tee/cat — piping stdout drops it into print mode and kills
+    # the interactive pane you want to watch. (No headless `claude -p` anywhere — owner billing rule
+    # B.9.) run_agent captures only STDERR (stdout stays the TTY via fd3), so the TUI is unaffected.
+    run_agent claude "${CLAUDE_ARGS[@]}" "$(cat "$BRIEF")"
     ;;
   codex)
     WORKTREE="$(pwd -P)"
@@ -118,8 +152,9 @@ case "$AGENT" in
     fi
     [ -n "$MODEL" ] && CODEX_ARGS+=(-m "$MODEL")
     [ -n "$EFFORT" ] && CODEX_ARGS+=(-c "model_reasoning_effort=$(toml_string "$EFFORT")")
-    # Interactive Codex, not `codex exec`; the brief is the initial prompt.
-    codex "${CODEX_ARGS[@]}" "$(cat "$BRIEF")"
+    # Interactive Codex, not `codex exec`; the brief is the initial prompt. Same stderr-only capture
+    # as the claude branch — stdout stays the interactive TUI.
+    run_agent codex "${CODEX_ARGS[@]}" "$(cat "$BRIEF")"
     ;;
   *)
     echo "[$ID] unsupported agent '$AGENT' (expected: claude or codex)" >&2
@@ -127,7 +162,7 @@ case "$AGENT" in
     exit 64
     ;;
 esac
-rc=$?
+rc=$AGENT_RC        # the AGENT's own exit code, captured through run_agent (PIPESTATUS[0])
 # Deterministic crash/quit/limit signal (RC-DEADPANE): when the agent process returns to the
 # shell, write state/exited/<id> with the real exit code. The runner emits session_exited from
 # this marker (recovered by RESTART), and nudge-pane.sh refuses to type into the now-bash pane —
