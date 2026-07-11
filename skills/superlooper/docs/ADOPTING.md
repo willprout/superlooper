@@ -39,8 +39,9 @@ superlooper doctor --repo /path/to/your/repo      # checks everything is wired c
 
 `adopt` is safe to re-run: it never overwrites an existing config, and it skips labels that
 already exist. `doctor` changes nothing — it only reports. Run `doctor` until it is all-green
-before you start the runner. (Both commands are built in a later task; this doc is the contract
-they implement, and the schema below is live today.)
+before you start the runner. (Both commands are live today — publishing (above) puts the
+`superlooper` command on your PATH so you can run them, and the schema below is the contract
+they implement.)
 
 ---
 
@@ -176,21 +177,41 @@ diff-pinned**, and drop only `strict`. Verify the live protections at change-tim
 
 ---
 
-## Adopt / doctor walkthrough
+## The walkthrough — publish → adopt → doctor → run (in this order)
 
-1. `superlooper adopt --repo <path>` — writes `.superlooper/config.json` from the template,
-   creates the labels above, and prints the branch-protection advice. Edit the config: set
-   `repo`, your `areas`, at least one `required_checks` entry, and any `bright_lines`.
-2. `superlooper doctor --repo <path>` — verifies: `gh` is authenticated, `cmux` is on PATH, `jq`
+Run these four steps in order on a fresh machine and `doctor` reaches all-green *before* you
+`run`. The order is not cosmetic: each step produces what the next one checks for, so following
+them out of order (adopting or running a `doctor` before you have published) guarantees a red
+report.
+
+1. **Publish** — `./bin/install.sh`, once, from the monorepo root. *Why first:* it puts the
+   `superlooper` command on your PATH (so steps 2–4 can be invoked at all) and it installs the
+   launch shim and registers the two activity hooks — the exact artifacts step 3's `doctor`
+   checks for. Skip it and `adopt`/`doctor` are "command not found"; run them from the source
+   tree directly and `doctor` still reports a red launch-shim / activity-hooks check. Re-run any
+   time to republish — it shows the engine diff and asks before overwriting. (See *Getting the
+   `superlooper` command* above for where the link lands and what to do if that dir isn't on
+   your PATH.)
+2. `superlooper adopt --repo <path>` — writes `.superlooper/config.json` from the template,
+   seeds the CLAUDE.md standing-rules block, creates the labels above, and prints the
+   branch-protection advice. *Why here:* it produces the config `doctor` validates in the next
+   step. Then edit the config: set `repo`, your `areas`, at least one `required_checks` entry,
+   and any `bright_lines`.
+3. `superlooper doctor --repo <path>` — verifies: `gh` is authenticated, `cmux` is present, `jq`
    is present, the launch shim is installed, the two activity hooks are registered, the config
-   parses, the labels exist, **`required_checks` is non-empty**, and — new — **every
-   `required_checks` name actually matches a check the repo has reported** on recent PRs and the
-   dev branch. A name typo (`quality-gate` vs `Quality Gate`) or a check the repo never wired reads
-   as "pending" forever, so a green PR would gate without merging; `doctor` fails it here with a
-   case/shape hint, and separately flags a check that reports on PRs but never on the dev branch.
-   Fix anything red.
-3. Approve issues by conversation (William's word applies `agent-ready`), install the skill, and
-   start the runner in a cmux tab you can watch — or under launchd for keep-alive.
+   parses, the labels exist, the `dev_branch` exists on origin, **`required_checks` is non-empty**,
+   and **every `required_checks` name actually matches a check the repo has reported** on recent
+   PRs and the dev branch. A name typo (`quality-gate` vs `Quality Gate`) or a check the repo never
+   wired reads as "pending" forever, so a green PR would gate without merging; `doctor` fails it
+   here with a case/shape hint, and separately flags a check that reports on PRs but never on the
+   dev branch. *Why here:* it is the all-green gate before you run — and only now, with step 1
+   published and step 2's config written, does every check have something real to inspect. Fix
+   anything red and re-run `doctor` until it passes.
+4. `superlooper run --repo <path>` — start the runner in a cmux tab you can watch (it targets that
+   tab's own pane automatically — no `--pane` needed), or under launchd for keep-alive. *Why last:*
+   it launches worker sessions against approved issues, so it needs a green `doctor` and your
+   approvals in hand first. Approve issues by conversation (William's word applies `agent-ready`);
+   the runner picks them up on its next tick.
 
 ## The config file is trusted, executable data — protect it accordingly
 
