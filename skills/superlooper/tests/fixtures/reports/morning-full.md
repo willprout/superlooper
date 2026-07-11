@@ -20,6 +20,9 @@
 ## Wanders
 - #12 (i12) — actual diff wandered beyond its declared `touches:`
 
+## Unattended debugger
+None — the watchdog launched nothing.
+
 ## Gate health
 - Nightly (2026-07-02): 1 persistent failure(s), filed 1 fix issue(s).
 - 0/1 green over the last 7 nights; flakes last run: 2.

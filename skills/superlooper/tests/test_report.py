@@ -335,3 +335,31 @@ def test_promotion_lists_open_issues_and_could_not_parse_is_honest():
 def test_promotion_wrong_typed_inputs_never_raise():
     out = report.promotion(None, None, None, None, None, None)
     assert isinstance(out, str) and out
+
+
+# ------------------------- unattended debugger (issue #66) -------------------------
+
+def test_watchdog_launches_render_and_break_quiet():
+    j = [_rec(1030, "watchdog", outcome="launched", id="d1",
+              signals=["heartbeat_stale"], authority="full")]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "## Unattended debugger" in out
+    assert "d1" in out and "heartbeat_stale" in out and "full" in out
+    assert "nothing happened" not in out.lower()      # an unattended launch is never a quiet night
+
+
+def test_watchdog_failed_launches_are_honest():
+    j = [_rec(1030, "watchdog", outcome="launch_failed", id="d1", rc="no_pane",
+              signals=["alert"])]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "FAILED" in out and "no_pane" in out and "alert" in out
+    assert "nothing happened" not in out.lower()
+
+
+def test_watchdog_notify_only_episodes_stay_quiet():
+    # a notified-then-stood-down episode never launched: the journal holds the record, the
+    # morning summary stays honest about a night where nothing ultimately happened.
+    j = [_rec(1030, "watchdog", outcome="notified", signals=["heartbeat_stale"]),
+         _rec(1040, "watchdog", outcome="stand_down", signals=["heartbeat_stale"])]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "nothing happened" in out.lower()

@@ -60,6 +60,54 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["codex"] == {"dangerous_bypass": False, "bypass_hook_trust": True,
                             "no_alt_screen": True}
     assert cfg["report_time"] == "08:45"
+    # watchdog (issue #66): authority DEFAULTS to full (owner standing rule 2026-07-10) —
+    # the constitution's absolute exclusions are enforced by the sl-debugger contract, not here.
+    assert cfg["watchdog"] == {"authority": "full", "allowlist": [], "grace_minutes": 30,
+                               "heartbeat_stale_minutes": 20, "no_progress_minutes": 30}
+
+
+# --------------------------- watchdog block (issue #66) ---------------------------
+
+def test_watchdog_authority_parses_all_three_tiers(tmp_path):
+    for tier in ("diagnose-only", "allowlist", "full"):
+        _write_cfg(tmp_path, {"repo": "o/r", "watchdog": {"authority": tier}})
+        assert config.load(tmp_path)["watchdog"]["authority"] == tier
+
+
+def test_watchdog_authority_rejects_unknown_tiers(tmp_path):
+    for bad in ("FULL", "", "yolo", None, 1, ["full"]):
+        _write_cfg(tmp_path, {"repo": "o/r", "watchdog": {"authority": bad}})
+        with pytest.raises(ValueError, match="watchdog.authority"):
+            config.load(tmp_path)
+
+
+def test_watchdog_allowlist_must_be_a_list_of_strings(tmp_path):
+    _write_cfg(tmp_path, {"repo": "o/r",
+                          "watchdog": {"allowlist": ["superlooper doctor", "relabel"]}})
+    assert config.load(tmp_path)["watchdog"]["allowlist"] == ["superlooper doctor", "relabel"]
+    for bad in ("relabel", {"a": 1}, [1], [None], 0):
+        _write_cfg(tmp_path, {"repo": "o/r", "watchdog": {"allowlist": bad}})
+        with pytest.raises(ValueError, match="watchdog.allowlist"):
+            config.load(tmp_path)
+
+
+def test_watchdog_minutes_validation(tmp_path):
+    # grace may be 0 (launch on the tripping check); the two detection bounds must be >= 1
+    # (a zero bound would trip on any instantaneous glimpse).
+    _write_cfg(tmp_path, {"repo": "o/r", "watchdog": {"grace_minutes": 0}})
+    assert config.load(tmp_path)["watchdog"]["grace_minutes"] == 0
+    for key, bad in (("grace_minutes", -1), ("grace_minutes", True), ("grace_minutes", "30"),
+                     ("heartbeat_stale_minutes", 0), ("heartbeat_stale_minutes", 1.5),
+                     ("no_progress_minutes", 0), ("no_progress_minutes", False)):
+        _write_cfg(tmp_path, {"repo": "o/r", "watchdog": {key: bad}})
+        with pytest.raises(ValueError, match=f"watchdog.{key}"):
+            config.load(tmp_path)
+
+
+def test_watchdog_unknown_subkey_rejected(tmp_path):
+    _write_cfg(tmp_path, {"repo": "o/r", "watchdog": {"graice_minutes": 30}})
+    with pytest.raises(ValueError, match="watchdog.graice_minutes"):
+        config.load(tmp_path)
 
 
 def test_checks_pending_cap_default_and_validation(tmp_path):

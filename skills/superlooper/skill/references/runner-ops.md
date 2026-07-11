@@ -421,6 +421,51 @@ process is up), so a runner that is alive-but-wedged reads as stale, not healthy
 
 ---
 
+## The unattended-debugger watchdog (`superlooper watchdog`, issue #66)
+
+The shipped implementation of that contract, plus a third detector. `superlooper watchdog --repo
+<path>` is ONE mechanical check — no LLM anywhere on the path, no repair decisions: it detects,
+notifies, waits, launches, journals. Wire it to fire every few minutes by loading
+`templates/launchd.watchdog.plist` as a user **LaunchAgent** (a check needs no cmux pane, so
+launchd is fine here — the issue-#33 prohibition is about the *runner*).
+
+**Trips on** (owner standing rule, 2026-07-10):
+- `heartbeat_stale` — `state/runner.heartbeat` older than `watchdog.heartbeat_stale_minutes`
+  (default 20). An ABSENT heartbeat never trips: the loop never ran in this state home.
+- `alert` — `state/ALERT` present (even unreadable: existence is the signal).
+- `no_progress` — eligible `agent-ready` work exists (its own gh read, filtered through the same
+  eligibility rule the scheduler uses), every lane is empty, and that has held for
+  `watchdog.no_progress_minutes` (default 30) with a FRESH heartbeat and a usage meter that does
+  NOT read exhausted.
+
+**Never trips on designed-safe waits:** gate-waiting on CI and building work are `in-progress`
+(not eligible); blocked-by holds wait for the dependency to close; parked / needs-william is not
+approval; a building lane during a merge freeze is lanes-busy (frozen-but-building is the safe
+idle state); a usage meter that successfully READS exhausted is the fail-closed hold working
+(a DARK meter never suppresses — the #46/#76 asymmetry, so a Keychain-less launchd context
+cannot neuter the detector).
+
+**The flow.** First trip → one text (naming the signal, the grace, the authority tier) → the
+grace window (`watchdog.grace_minutes`, default 30) → if the signal still stands, ONE fresh
+sl-debugger session launches through the same interactive launch shim workers use
+(`launch-session.sh --cwd <repo> d<N>` — never a headless `claude -p`), its brief carrying the
+tripped signal and the standing `watchdog.authority` tier; the session follows the sl-debugger
+skill's `references/unattended-contract.md`. If the signal cleared meanwhile, it stands down
+SILENTLY (journal only). The launch tab targets the runner's recorded anchor pane
+(`state/runner.anchor.json`); with no resolvable pane the launch fails LOUDLY into a journaled +
+notified outcome — never a fabricated success.
+
+**Rails.** Singleton (a live `worker.d*.lock` blocks a second session, and concurrent checks
+yield on `state/watchdog.lock`); once-per-incident (a continuing episode never relaunches — a
+genuinely new episode after recovery may); failed launches retry at most 3× with ONE failure
+text; every transition is journaled (`act: "watchdog"`) and every launch — verified or failed —
+appears in the morning report's "Unattended debugger" section. **Kill-switch:** `touch
+<state-home>/state/WATCHDOG_OFF` — the check keeps observing and journaling but notifies and
+launches nothing; delete it to re-arm. Episode state lives in `state/watchdog.json`; deleting it
+resets the clocks (safe — the bounds simply restart).
+
+---
+
 ## The doctor checklist
 
 Run this until it is all-green before starting the runner on a repo; it changes nothing, only
