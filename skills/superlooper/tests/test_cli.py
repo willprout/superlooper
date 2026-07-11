@@ -207,9 +207,11 @@ def test_doctor_stack_ok_uses_fake_commands_and_mutates_nothing(rig):
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     for name in ("codex CLI", "cmux present", "claude login", "gh auth",
-                 "gh API headroom", "notify command configured", "launch shim sourced"):
+                 "gh API headroom", "notify channel", "launch shim sourced"):
         assert name in out
     assert "required_checks" not in out
+    # the one deliberate side effect is announced before it fires
+    assert "sending" in out.lower() and "test" in out.lower()
     assert {p: p.read_text() for p in watched} == before
 
 
@@ -227,10 +229,29 @@ def test_doctor_stack_fails_with_actionable_hint(rig):
     out = r.stdout + r.stderr
     assert "FAIL gh API headroom" in out
     assert "Fix: Wait for the hourly GitHub API quota" in out
-    assert "FAIL notify command configured" in out
+    assert "FAIL notify channel" in out
     assert "Fix: Set notify.cmd or notify.imessage_to" in out
     assert "FAIL launch shim sourced" in out
     assert "Fix: Run" in out and "install-launch-shim.sh" in out
+
+
+def test_doctor_stack_fails_when_the_notify_test_send_fails(rig):
+    # The live 2026-07-10 incident, end to end: notify.cmd is SET but every send exits nonzero
+    # (recipient file gone). The doctor must FAIL the block and print rc + the stderr reason,
+    # instead of passing because a value was merely configured.
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"cmd": 'printf "recipient file missing\\n" 1>&2; exit 2', "imessage_to": None}
+    cfg_path.write_text(json.dumps(cfg))
+    (rig.home / ".zshrc").write_text('source "$HOME/.superlooper/launch-shim.zsh"\n')
+
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo), env_over=_stack_env(rig))
+
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "FAIL notify channel" in out
+    assert "rc=2" in out
+    assert "recipient file missing" in out          # the actual error rode onto the FAIL line
 
 
 # --------------------------- adopt ---------------------------
