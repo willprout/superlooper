@@ -510,6 +510,9 @@ def test_adopt_exits_nonzero_when_every_label_create_fails(rig):
     out = r.stdout + r.stderr
     assert "gh auth login" in out                     # the likely fix, named
     assert "re-run" in out.lower()                    # safe to re-run (idempotent)
+    # the named re-run command must be RUNNABLE: adopt takes --repo, not a positional (a bare
+    # `superlooper adopt <path>` argparse-errors), so the memo must spell the flag out.
+    assert "adopt --repo" in out
     assert "config" in out.lower() and "pending" in out.lower()   # mixed state, explicit
     assert out.count("FAIL") >= len(ALL_LABELS)       # every label reported as failed
 

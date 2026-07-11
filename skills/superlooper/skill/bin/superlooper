@@ -373,12 +373,12 @@ Branch protection recommendations for `{dev}` (print-only in v1 — apply by han
         print(f"""
 LABEL SETUP INCOMPLETE — {len(failed)} of {len(LABELS)} label(s) could not be created:
   {', '.join(failed)}
-The config IS written and kept ({cfg_path}); the labels are PENDING. Until they exist the
-runner cannot apply them — an approved issue would never get `agent-ready`, so the loop would
-look mysteriously idle rather than error.
+The config IS written and kept ({cfg_path}); the labels are PENDING. Until they exist nobody
+can apply them — gh refuses to apply a label that does not exist — so an issue can't even be
+marked `agent-ready` to approve it, and the loop looks mysteriously idle rather than erroring.
 Most likely cause: gh is not authenticated. Run `gh auth login`, then re-run this exact
-command — `superlooper adopt {args.repo}` is idempotent and safe to re-run (existing labels are
-updated in place, never duplicated).""")
+command — `superlooper adopt --repo {args.repo}` is idempotent and safe to re-run (existing
+labels are updated in place, never duplicated).""")
         return 1
     return 0
 
