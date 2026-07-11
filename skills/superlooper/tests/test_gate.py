@@ -114,6 +114,25 @@ def test_report_sections_empty_required_is_vacuously_ok():
     assert gate.report_sections_ok("anything", []) is True
 
 
+def test_new_default_sections_flow_through_the_unchanged_check(tmp_path):
+    # issue #57 DoD item 4: the DEFAULT list changed but the mechanical CHECK did not. Load the
+    # shipped default via config (not a hardcoded literal) and prove report_sections_ok still enforces
+    # it exactly: every required H2 present with real prose passes; dropping any one still fails.
+    import json
+    import config
+    d = tmp_path / ".superlooper"
+    d.mkdir(parents=True)
+    (d / "config.json").write_text(json.dumps({"repo": "me/tool"}))
+    default = config.load(tmp_path)["report_required_sections"]
+    good = "".join(f"## {s}\n{'x' * 50}\n" for s in default)
+    assert gate.report_sections_ok(good, default) is True
+    missing_last = "".join(f"## {s}\n{'x' * 50}\n" for s in default[:-1])
+    assert gate.report_sections_ok(missing_last, default) is False
+    # and an H2 that exists but is empty still fails (the >= SECTION_MIN_CHARS prose rule is intact)
+    empty_bodies = "".join(f"## {s}\n\n" for s in default)
+    assert gate.report_sections_ok(empty_bodies, default) is False
+
+
 # --------------------------- review_evidence_ok (step 2b) ---------------------------
 
 def test_review_evidence_ship_cmd_repo_owns_review():

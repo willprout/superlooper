@@ -30,7 +30,16 @@ _TOP_DEFAULTS = {
     "merge_method": "squash",
     "ship_cmd": None,
     "ship_recheck_cmd": None,
-    "report_required_sections": ["Tests", "Browser evidence", "Regression tests", "Review"],
+    # report_required_sections (issue #57): the H2 headings a worker's final report must carry with
+    # real prose (the gate checks presence mechanically). The DEFAULT must be honestly satisfiable by
+    # ANY repo — a CLI/library/service worker can never produce "Browser evidence", so a browser-only
+    # default nudged-then-parked every finished issue on a fresh adopt of a non-web repo. So the
+    # shipped floor is exactly the two things every worker is ALREADY required to produce: passing
+    # Tests (TDD + required_checks) and a fresh-agent Review (gate step 2b). A web/UI repo opts back
+    # into richer evidence by setting this list explicitly (see config.example.json / ADOPTING.md,
+    # e.g. ["Tests", "Browser evidence", "Regression tests", "Review"]). Must stay NON-empty: an empty
+    # required list is vacuously ok at the gate, silently disabling the section check.
+    "report_required_sections": ["Tests", "Review"],
     "bright_lines": [],
     "cleanup_merged_worktrees": True,
     # Reclaim the worktrees of park-family terminal issues (parked/needs-william/bounced), which

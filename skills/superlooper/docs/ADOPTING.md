@@ -132,13 +132,20 @@ unless you specifically want this build-vs-investigation split.)
 | `merge_method` | `"squash"` | How the loop merges a green PR (`squash` \| `merge` \| `rebase`). Squash keeps dev history clean; it is the recommended default. |
 | `ship_cmd` | `null` | If set, worker briefs say "ship EXCLUSIVELY via this command" (e.g. a repo's own `scripts/ship.sh` that owns review + CI). If `null`, the brief tells the worker to push the branch and open the PR itself, and the gate requires a fresh-agent review comment on the PR. |
 | `ship_recheck_cmd` | `null` | Run by the runner from the worktree after a merge-update, to re-post a diff-pinned gate verdict. Exit 0 → proceed; nonzero → **park** (the loop never coaches around a fail-closed gate). |
-| `report_required_sections` | `["Tests", "Browser evidence", "Regression tests", "Review"]` | H2 headings a worker's final report must contain, each with real prose — the runner checks their presence mechanically as part of the gate. |
+| `report_required_sections` | `["Tests", "Review"]` | H2 headings a worker's final report must contain, each with real prose — the runner checks their presence mechanically as part of the gate. The default is deliberately **web-agnostic**: every worker can produce passing **Tests** and a fresh-agent **Review**, so a CLI/library/service repo is never nudged-then-parked for evidence it cannot give. Web/UI repos opt into richer evidence explicitly (see below). |
 | `bright_lines` | `[]` | Prose rules injected **verbatim** into every worker brief (e.g. "force-push forbidden", "ship only via ship.sh"). The skill hardcodes none; the repo's adaptation fills these. |
 
 **Review is always mechanically gated.** On a repo with its own pipeline (`ship_cmd` set), that
 pipeline owns review. On a repo without one, the gate refuses to merge until a fresh agent that
 wrote none of the code posts a review verdict as a PR comment beginning `<!-- superlooper-review -->`.
 Either way, no code merges unreviewed — and the reviewer is never the author.
+
+**Adding browser evidence (web/UI repos) — opt-in.** The default `report_required_sections` asks only
+for what *any* repo can honestly show. A web or UI repo that wants a screenshot/recording section in
+every report sets the list explicitly — e.g. `["Tests", "Browser evidence", "Regression tests", "Review"]` —
+and the gate then requires that H2 with real prose like any other. This is an opt-in, deliberately
+*not* the default, precisely so a CLI, library, or service repo is never asked for browser evidence it
+can never produce (and then parked for the missing section).
 
 ### Models, timers, QA, notifications, housekeeping
 

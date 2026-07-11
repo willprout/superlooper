@@ -440,6 +440,23 @@ def test_adopt_writes_config_creates_labels_and_prints_requirements(rig):
     assert "required_checks" in out                  # the same at-least-one-check requirement
 
 
+def test_adopt_yields_web_agnostic_report_sections(rig):
+    # issue #57 DoD: a fresh adopt on a fixture repo must yield a section list a NON-WEB worker can
+    # honestly satisfy — never the old "Browser evidence" demand that nudged-then-parked every
+    # finished issue on a CLI/library/service repo. adopt copies the shipped template, so this is the
+    # end-to-end proof that the honest default reaches a freshly adopted repo's config.
+    fresh = rig.tmp / "fresh-sections"
+    fresh.mkdir()
+    subprocess.run(["git", "init", "-q", str(fresh)], check=True)
+    subprocess.run(["git", "-C", str(fresh), "remote", "add", "origin",
+                    "https://github.com/will/proj.git"], check=True)
+    r = cli(rig, "adopt", "--repo", str(fresh))
+    assert r.returncode == 0, r.stdout + r.stderr
+    cfg = json.loads((fresh / ".superlooper" / "config.json").read_text())
+    assert cfg["report_required_sections"] == ["Tests", "Review"]
+    assert "Browser evidence" not in cfg["report_required_sections"]
+
+
 def test_adopt_detects_and_writes_the_repo_default_branch(rig):
     # issue #28: on a master/develop repo, dev_branch left at the template's "main" makes every
     # worktree creation fail off origin/main. adopt must detect the repo's real default (via gh)
