@@ -18,6 +18,10 @@
   tidy            close the cmux windows of FINISHED sessions (merged by default; --all extends
                   to parked/needs-william/bounced) — manual, never automatic; never touches an
                   in-flight or mid-gate lane, so it is safe to run while the runner is live
+  janitor         propose GitHub-side cleanup (stale merged/superseded sl/* branches, open
+                  `superseded` PRs, aged parked/needs-william issues) and execute ONLY what
+                  William approves (y/N or --yes) — list/--dry-run changes nothing anywhere;
+                  nothing is ever auto-closed or auto-deleted (issue #62, spec §8 V2)
 """
 import argparse
 import glob
@@ -40,6 +44,7 @@ import gate
 import gh
 import gitops
 import issues as issues_lib
+import janitor as janitor_lib
 import journal
 import ledger as ledger_lib
 import loopstate
@@ -1032,6 +1037,199 @@ def cmd_tidy(args):
     return 0
 
 
+# ------------------------------- janitor -------------------------------
+# `superlooper janitor` (issue #62, spec §8 V2) PROPOSES GitHub-side cleanup and executes ONLY
+# what William approves — the same propose/approve word-discipline as tidy, pointed at GitHub
+# instead of cmux windows. Three debris classes, each with a one-line why: stale sl/* remote
+# branches whose PRs merged or were superseded, PRs labeled `superseded` left open by design
+# (§C.4 6b), and parked / needs-william issues gathering dust past janitor.aged_park_days.
+# The list / --dry-run changes NOTHING anywhere; approved actions run mechanically and are
+# journaled; a refused/failed action is surfaced once and held back (state/janitor_refused.json),
+# never silently retried — --retry-refused re-proposes it. There is no schedule wiring for the
+# execute path and none may ever be added: proposals may be generated on a schedule, ACTIONS
+# only ever on the owner's word.
+
+_REFUSED_FILE = "janitor_refused.json"
+_JANITOR_STAMP = "superlooper janitor — approved by the owner: "
+
+
+def _janitor_loopstate(home):
+    """loopstate['issues'] with the fail direction the janitor needs: a MISSING issues.json is
+    an honest empty ({} — no lane has ever run, nothing to exclude), but a PRESENT-yet-unreadable
+    or wrong-typed one is None — the caller must refuse to propose ANYTHING, because nothing is
+    provably idle. (Compare tidy, where unreadable state fails closed to 'close nothing' the
+    same way — here 'nothing' means 'propose nothing'.)"""
+    path = os.path.join(home, "state", "issues.json")
+    try:
+        st = loopstate.load(path)
+    except FileNotFoundError:
+        return {}                # genuinely absent: no lane has ever run
+    except (OSError, ValueError):
+        return None              # present but unreadable (EPERM, corrupt, ...): refuse
+    if not isinstance(st, dict) or not isinstance(st.get("issues"), dict):
+        return None
+    return st["issues"]
+
+
+def _janitor_refused_read(path):
+    """The hold-back map, strictly: a MISSING file -> {} (nothing ever refused), but PRESENT
+    and unreadable / wrong-typed -> None — the caller must refuse to run. Reading corrupt or
+    permission-blocked hold-back state as empty would silently re-propose every previously
+    refused action (cross-review rounds 1-2, C2). Opened directly, not via _read(): _read
+    collapses EVERY OSError to None, and only ENOENT may mean 'nothing ever refused' —
+    an EPERM on a present file must refuse, not blank the map."""
+    try:
+        with open(path) as f:
+            txt = f.read()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    try:
+        v = json.loads(txt)
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def _janitor_fetch(ls_issues):
+    """One fetched snapshot of everything janitor.propose selects from. Every gh read fails
+    closed to empty, so a GitHub blip shrinks the sweep toward proposing NOTHING, never toward
+    proposing more."""
+    sl = {b: tip for b, tip in gh.remote_branches().items()
+          if isinstance(b, str) and b.startswith(janitor_lib.BRANCH_PREFIX)}
+    parked = []
+    for label in janitor_lib.PARK_LABELS:
+        parked += gh.open_issues_activity(label)
+    return {"branches": sl,
+            "branch_prs": {b: gh.pr_for_branch(b) for b in sl},
+            "superseded_prs": gh.open_prs_labeled(janitor_lib.SUPERSEDED_LABEL),
+            "parked_issues": parked,
+            "ls_issues": ls_issues}
+
+
+def _janitor_line(p):
+    """One proposal, one line, why included — exactly what William approves."""
+    if p["kind"] == "branch":
+        what = f"delete branch {p['target']}"
+    elif p["kind"] == "pr":
+        head = f" ({p['head']})" if p.get("head") else ""
+        what = f"close PR #{p['target']}{head}"
+    else:
+        title = p.get("title") or ""
+        what = f"close issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
+    return f"  {what} — {p['why']}"
+
+
+def _janitor_execute(p):
+    """One approved action -> (ok, reason). Mechanical verbs only — delete ref / close PR /
+    close issue — each leaving an audit comment where a comment is possible."""
+    if p["action"] == "delete-branch":
+        ok = gh.delete_branch(p["target"])
+    elif p["action"] == "close-pr":
+        ok = gh.close_pr(p["target"], comment=_JANITOR_STAMP + p["why"])
+    elif p["action"] == "close-issue":
+        ok = gh.close_issue(p["target"], comment=_JANITOR_STAMP + p["why"])
+    else:
+        return False, f"unknown action {p['action']!r}"      # unreachable; fail closed anyway
+    return ok, ("" if ok else "gh refused the write (or was unreachable)")
+
+
+def cmd_janitor(args):
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    days = cfg["janitor"]["aged_park_days"]
+    dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
+
+    ls = _janitor_loopstate(home)
+    if ls is None:
+        print("janitor: state/issues.json exists but is unreadable — nothing is provably "
+              "idle, so nothing will be proposed. Fix or remove it, then re-run.",
+              file=sys.stderr)
+        return 1
+
+    refused_path = os.path.join(home, "state", _REFUSED_FILE)
+    refused_map = _janitor_refused_read(refused_path)
+    if refused_map is None:
+        print(f"janitor: state/{_REFUSED_FILE} exists but is unreadable — running would "
+              "silently drop every held-back refused action. Fix or remove it, then re-run.",
+              file=sys.stderr)
+        return 1
+    refused_keys = set() if args.retry_refused else set(refused_map)
+
+    result = janitor_lib.propose(**_janitor_fetch(ls), now=time.time(), aged_park_days=days,
+                                 refused=refused_keys, dev_branch=dev)
+    props, held = result["proposals"], result["refused"]
+    held_note = (f"({len(held)} previously refused action(s) held back — --retry-refused "
+                 f"re-proposes them; see state/{_REFUSED_FILE})" if held else "")
+
+    if not props:
+        print("janitor: nothing to propose — no GitHub-side debris found."
+              + (" " + held_note if held_note else ""))
+        return 0
+
+    print(f"janitor proposals ({len(props)}) — nothing executes without your approval:")
+    for p in props:
+        print(_janitor_line(p))
+    if held_note:
+        print(held_note)
+    if args.dry_run:
+        print("dry-run: nothing executed, nothing written.")
+        return 0
+    if not args.yes:
+        try:
+            reply = input(f"execute these {len(props)} action(s)? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("aborted — nothing executed.")
+            return 0
+
+    # William's word is given. Re-fetch and re-derive NOW — the y/N wait can be minutes, and
+    # the world may have moved (a mid-wait re-approval must never get its branch deleted) — and
+    # execute only what is STILL eligible. An item that dropped out is skipped, never forced.
+    ls2 = _janitor_loopstate(home)
+    if ls2 is None:
+        print("janitor: state/issues.json became unreadable during the wait — refusing to "
+              "execute (nothing is provably idle anymore).", file=sys.stderr)
+        return 1
+    fresh = janitor_lib.propose(**_janitor_fetch(ls2), now=time.time(), aged_park_days=days,
+                                refused=set(), dev_branch=dev)
+    to_run, skipped = janitor_lib.reconcile(props, fresh["proposals"])
+    now = time.time()
+    executed = failed = 0
+    for p in skipped:
+        print(f"  skip  {p['key']} — no longer eligible (state moved during the wait)")
+        journal.append(home, {"act": "janitor", "action": p["action"], "target": p["target"],
+                              "outcome": "skipped",
+                              "why": "no longer eligible at execution time"}, now)
+    for p in to_run:
+        ok, reason = _janitor_execute(p)
+        journal.append(home, {"act": "janitor", "action": p["action"], "target": p["target"],
+                              "why": p["why"], "outcome": "ok" if ok else "fail",
+                              **({"reason": reason} if reason else {})}, now)
+        if ok:
+            refused_map.pop(p["key"], None)
+            executed += 1
+            print(f"  ok    {p['key']}")
+        else:
+            refused_map[p["key"]] = {"reason": reason, "ts": now}
+            failed += 1
+            print(f"  FAIL  {p['key']} — {reason}; held back from future sweeps "
+                  f"(--retry-refused re-proposes)")
+    # A refusal is NEVER pruned on a key's absence from a sweep: absence is not proof the
+    # debris is gone — a transient gh blip produces the same absence (every read fails closed
+    # to empty), and pruning on it would silently drop the hold-back and let a later sweep
+    # retry a refused action without --retry-refused (cross-review round 1, C1). An entry
+    # clears ONLY via a later successful execution (the pop above); a moot entry lingers
+    # harmlessly (held-back keys that never re-propose never act). Only the execute path
+    # writes state; list/--dry-run changes nothing anywhere.
+    os.makedirs(os.path.dirname(refused_path), exist_ok=True)   # a first sweep may precede any runner run
+    loopstate.save(refused_path, refused_map)
+    print(f"janitor: {executed} executed, {failed} failed, {len(skipped)} skipped.")
+    return 1 if failed else 0
+
+
 # ------------------------------- stubs -------------------------------
 
 def _stub(which, wave):
@@ -1085,6 +1283,15 @@ def main(argv=None):
            "--yes": dict(action="store_true", help="skip the y/N confirmation"),
            "--dry-run": dict(action="store_true",
                              help="list the windows tidy would close, then close nothing")})
+    add("janitor", cmd_janitor,
+        **{"--dry-run": dict(action="store_true",
+                             help="list the proposals and change NOTHING anywhere"),
+           "--yes": dict(action="store_true",
+                         help="skip the y/N confirmation (still your word — never wire this "
+                              "into a schedule)"),
+           "--retry-refused": dict(action="store_true",
+                                   help="re-propose actions a previous sweep recorded as "
+                                        "refused/failed (state/janitor_refused.json)")})
 
     args = ap.parse_args(argv)
     return args.fn(args)

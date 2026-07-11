@@ -566,3 +566,83 @@ def test_set_repo_blank_clears_to_unpinned(envprobe, monkeypatch):
     gh.set_repo("owner/name")
     gh.set_repo("   ")
     assert gh._run(["api", "rate_limit"])[1] == ""
+
+
+# --------------------------- janitor reads/writes (issue #62) ---------------------------
+
+def test_remote_branches_parses_names_and_tips_and_pins_the_api_path(ghenv):
+    branches = gh.remote_branches()
+    assert branches == {"main": "aaa111", "sl/i5-fix-thing": "bbb222",
+                        "sl/i7-old-thing": "ccc333"}
+    argv = _calls(ghenv)[-1]
+    assert argv[0] == "api" and "branches?per_page=100" in argv[1]
+
+
+def test_remote_branches_fails_closed(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.remote_branches() == {}
+
+
+def test_remote_branches_wrong_typed_entries_skip_or_carry_no_tip(ghenv):
+    # a nameless/garbage entry is skipped; a named entry with an unreadable sha is kept with
+    # tip None — the janitor then never proposes it (tip unprovable, fail closed).
+    (ghenv / "branches.json").write_text(json.dumps(
+        [{"name": "main"}, {"name": "x", "commit": {"sha": 42}}, {"name": 42},
+         "garbage", {"nom": "x"}]))
+    assert gh.remote_branches() == {"main": None, "x": None}
+
+
+def test_open_prs_labeled_parses_and_pins_label(ghenv):
+    lst = gh.open_prs_labeled("superseded")
+    assert [p["number"] for p in lst] == [14]
+    assert lst[0]["headRefName"] == "sl/i7-old-thing"
+    argv = _calls(ghenv)[-1]
+    assert _after(argv, "--label") == "superseded" and _after(argv, "--state") == "open"
+    assert "labels" in _after(argv, "--json") and "headRefName" in _after(argv, "--json")
+
+
+def test_open_prs_labeled_fails_closed(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.open_prs_labeled("superseded") == []
+
+
+def test_open_issues_activity_parses_and_asks_for_updated_at(ghenv):
+    lst = gh.open_issues_activity("parked")
+    assert [i["number"] for i in lst] == [9]
+    assert lst[0]["updatedAt"] == "2026-06-01T12:00:00Z"
+    argv = _calls(ghenv)[-1]
+    assert _after(argv, "--label") == "parked" and "updatedAt" in _after(argv, "--json")
+
+
+def test_open_issues_activity_fails_closed(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.open_issues_activity("parked") == []
+
+
+def test_delete_branch_records_and_pins_the_ref_path(ghenv):
+    assert gh.delete_branch("sl/i5-fix-thing") is True
+    m = _mutations(ghenv)[-1]
+    assert m == {"kind": "delete_ref", "ref": "heads/sl/i5-fix-thing"}
+    argv = _calls(ghenv)[-1]
+    # slashes in the branch stay raw path segments; the method is an explicit DELETE
+    assert argv[1].endswith("/git/refs/heads/sl/i5-fix-thing")
+    assert _after(argv, "-X") == "DELETE"
+
+
+def test_delete_branch_fails_closed(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.delete_branch("sl/i5-fix-thing") is False
+
+
+def test_close_pr_records_with_comment(ghenv):
+    assert gh.close_pr(14, comment="superlooper janitor: superseded") is True
+    m = _mutations(ghenv)[-1]
+    assert m["kind"] == "close_pr" and m["num"] == "14"
+    assert m["comment"] == "superlooper janitor: superseded"
+
+
+def test_close_pr_without_comment_and_fail_closed(ghenv, monkeypatch):
+    assert gh.close_pr(14) is True
+    assert _mutations(ghenv)[-1]["comment"] is None
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.close_pr(14) is False

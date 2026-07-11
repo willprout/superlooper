@@ -631,6 +631,14 @@ def main_fixture():
         serve_first(["issue_view_%s.json" % num, "issue_view.json"])
 
     elif sub == ["pr", "list"]:
+        # per-label fixture (pr_list_<label>.json) for the janitor's superseded sweep, and a
+        # per-head fixture (pr_list_head_<branch, / -> __>.json) so a test can serve DIFFERENT
+        # PRs to different pr_for_branch lookups — both fall back to the shared pr_list.json.
+        if opt("--label"):
+            serve_first(["pr_list_%s.json" % opt("--label"), "pr_list.json"])
+        if opt("--head"):
+            serve_first(["pr_list_head_%s.json" % opt("--head").replace("/", "__"),
+                         "pr_list.json"])
         serve_first(["pr_list.json"])
 
     elif sub == ["pr", "view"]:
@@ -651,6 +659,15 @@ def main_fixture():
     elif ARGS[:1] == ["api"]:
         # `api` is a one-word subcommand followed by the endpoint path (not two words like the rest)
         path = ARGS[1] if len(ARGS) > 1 else ""
+        if opt("-X") == "DELETE" and "/git/refs/" in path:
+            # the janitor's approved branch delete: a WRITE through `gh api`, recorded like
+            # every other mutation so tests pin exactly what was deleted.
+            record("delete_ref", ref=unquote(path.split("/git/refs/")[1]))
+            sys.exit(0)
+        if path.endswith("/branches") or "/branches?" in path:
+            # the branch LIST endpoint (janitor sweep) — distinct from the single-branch
+            # existence probe below (".../branches/<name>").
+            serve_first(["branches.json"])
         if "compare" in path:
             serve_first(["compare.json"])
         if "check-runs" in path:
@@ -703,6 +720,10 @@ def main_fixture():
 
     elif sub == ["issue", "close"]:
         record("close_issue", num=ARGS[2], comment=opt("--comment"))
+        sys.exit(0)
+
+    elif sub == ["pr", "close"]:
+        record("close_pr", num=ARGS[2], comment=opt("--comment"))
         sys.exit(0)
 
     elif sub == ["pr", "merge"]:

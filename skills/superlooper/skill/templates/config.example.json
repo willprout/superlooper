@@ -26,6 +26,7 @@
           "retry_once": true, "quarantine": [],
           "nightly_time": "02:00" },
   "cleanup_merged_worktrees": true,
+  "janitor": { "aged_park_days": 14 },
   "notify": { "imessage_to": null, "cmd": null },
   "report_time": "08:45"
 }

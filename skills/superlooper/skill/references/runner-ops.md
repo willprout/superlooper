@@ -181,6 +181,43 @@ superlooper tidy --repo /path/to/repo --yes           # skip the confirmation
 
 ---
 
+## The janitor: GitHub-side debris, propose-and-approve
+
+As the loop runs, debris accumulates **on GitHub** that no other mechanism owns: stale `sl/*`
+remote branches whose PRs merged or were superseded, PRs labeled `superseded` left open by design
+(the regenerate ladder never auto-closes them), and parked / needs-william issues gathering dust.
+`superlooper janitor` is tidy's discipline pointed at GitHub: it **proposes** a one-touch list,
+each item with a one-line why, and executes **only what you approve** — the y/N (or `--yes`) is
+your word, like `agent-ready`. Nothing is ever auto-closed or auto-deleted; there is no schedule
+wiring for the execute path and none may ever be added.
+
+```bash
+superlooper janitor --repo /path/to/repo                  # propose, then ask y/N
+superlooper janitor --repo /path/to/repo --dry-run        # just list; changes NOTHING anywhere
+superlooper janitor --repo /path/to/repo --yes            # skip the confirmation (still your word)
+superlooper janitor --repo /path/to/repo --retry-refused  # re-propose previously failed actions
+```
+
+- **What it proposes:** (1) *delete* a remote `sl/*` branch whose PR **merged**, or whose PR is
+  **closed and labeled `superseded`** — never a branch with no PR, an open PR, or a closed-unmerged
+  PR without the label, and only when the branch's current tip is still the PR's last-known head
+  (commits pushed after the merge/close keep the branch off the list — an unmerged branch's work
+  is never proposed for deletion); (2) *close* an
+  **open PR labeled `superseded`** (the branch stays — it becomes deletable on a *later* sweep,
+  once its PR is closed); (3) *close* a **parked / needs-william issue** with no activity for
+  `janitor.aged_park_days` (config, default 14).
+- **What it can never propose:** anything in-flight or mid-gate ({running, blocked, frozen,
+  exited, gating, holding}) — excluded mechanically by the issue number in the branch name AND by
+  the loopstate-recorded branch. If `state/issues.json` is unreadable, the janitor refuses to
+  propose anything at all (nothing is provably idle).
+- **How it executes:** after your y/N it re-fetches and re-derives, executing only items that are
+  *still* eligible — a re-approval that happened while you read the list can never get its branch
+  deleted. Every approved action is journaled (`act: janitor`); a refused/failed action surfaces
+  once (loud FAIL line, nonzero exit, `state/janitor_refused.json`) and is held back from future
+  sweeps — never silently retried — until `--retry-refused`.
+
+---
+
 ## The morning report
 
 Every day at **`report_time` (default 08:45, Mac-local)** the runner writes a report to
