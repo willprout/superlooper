@@ -171,6 +171,66 @@ def test_quiet_night_stays_honest_after_old_activity():
     assert "nothing happened" in out.lower() and "queue empty" in out.lower()
 
 
+def test_park_then_reapprove_then_merge_renders_once_as_merged_never_open_ask():
+    # DoD (#37): an issue that parked, was re-approved, and then MERGED in the same window must
+    # render once — under Merged — and NEVER as an open ask in Parked. The park record must be
+    # reconciled against the issue's final outcome (it landed), not reported from the raw window.
+    T = 1_000_000
+    j = [
+        {"ts": T, "act": "morning_report", "date": "d", "outcome": "ok"},
+        {"ts": T + 10, "act": "park", "id": "i9", "num": 9, "needs_william": True,
+         "memo": "conflict cap hit — re-approve to retry", "outcome": "ok"},
+        {"ts": T + 20, "act": "reapprove", "id": "i9", "num": 9, "outcome": "ok"},
+        {"ts": T + 30, "act": "merge", "id": "i9", "num": 9, "pr": 42, "outcome": "ok"},
+    ]
+    out = report.morning(j, _view(now=T + 100, queue=[]), ledger={}, config=_cfg())
+
+    merged_section = out.split("## Merged")[1].split("\n## ")[0]
+    parked_section = out.split("## Parked / needs-william")[1].split("\n## ")[0]
+    # landed: it shows once under Merged, with its PR link
+    assert "#9" in merged_section
+    assert f"https://github.com/{REPO}/pull/42" in out
+    # ...annotated as a resolved park episode (labeled, not a second open ask)
+    assert "parked earlier, later merged" in merged_section
+    # NOT an open ask: neither the issue nor its memo appears under Parked
+    assert "#9" not in parked_section
+    assert "re-approve to retry" not in out
+    # the summary counts it as merged, not parked
+    assert "1 merged · 0 parked/needs-william" in out
+
+
+def test_genuine_park_without_a_later_merge_still_renders_as_open_ask():
+    # the other half of the DoD: a park with NO later landing is a real open ask and must survive
+    # reconciliation unchanged (needs-william flagged, memo verbatim).
+    T = 1_000_000
+    j = [
+        {"ts": T, "act": "morning_report", "date": "d", "outcome": "ok"},
+        {"ts": T + 10, "act": "park", "id": "i9", "num": 9, "needs_william": True,
+         "memo": "retry cap hit — genuinely stuck", "outcome": "ok"},
+    ]
+    out = report.morning(j, _view(now=T + 100, queue=[]), ledger={}, config=_cfg())
+    parked_section = out.split("## Parked / needs-william")[1].split("\n## ")[0]
+    assert "#9" in parked_section and "retry cap hit — genuinely stuck" in parked_section
+    assert "needs-william" in parked_section.lower()
+    assert "0 merged · 1 parked/needs-william" in out
+
+
+def test_merge_before_a_later_park_stays_an_open_ask():
+    # reconciliation is by FINAL outcome, not mere co-occurrence: if the merge came BEFORE the park
+    # (an issue that landed, was re-opened, then parked again), the park is the latest word and
+    # remains a genuine open ask — the merge must not silently resolve it away.
+    T = 1_000_000
+    j = [
+        {"ts": T, "act": "morning_report", "date": "d", "outcome": "ok"},
+        {"ts": T + 10, "act": "merge", "id": "i9", "num": 9, "pr": 42, "outcome": "ok"},
+        {"ts": T + 20, "act": "park", "id": "i9", "num": 9, "needs_william": True,
+         "memo": "reopened and stuck again", "outcome": "ok"},
+    ]
+    out = report.morning(j, _view(now=T + 100, queue=[]), ledger={}, config=_cfg())
+    parked_section = out.split("## Parked / needs-william")[1].split("\n## ")[0]
+    assert "#9" in parked_section and "reopened and stuck again" in parked_section
+
+
 def test_a_green_nightly_only_night_is_still_quiet():
     # a routine green nightly is the system working, not activity that needs William — otherwise
     # (a nightly runs EVERY night) there could never be a quiet night in production.
