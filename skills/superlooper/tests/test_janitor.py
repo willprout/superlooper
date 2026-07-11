@@ -21,9 +21,11 @@ import actions
 import janitor
 
 
-def _pr(num, state, labels=(), head=None):
-    """A raw gh PR dict, labels in gh's [{'name': ...}] shape."""
-    d = {"number": num, "state": state, "labels": [{"name": n} for n in labels]}
+def _pr(num, state, labels=(), head=None, oid="tip0"):
+    """A raw gh PR dict, labels in gh's [{'name': ...}] shape. `oid` is headRefOid — the PR's
+    last-known head, matched against the branch's current tip before a delete is proposed."""
+    d = {"number": num, "state": state, "labels": [{"name": n} for n in labels],
+         "headRefOid": oid}
     if head is not None:
         d["headRefName"] = head
     return d
@@ -39,7 +41,7 @@ def _iso(epoch):
 
 
 def propose(**kw):
-    base = dict(branches=[], branch_prs={}, superseded_prs=[], parked_issues=[],
+    base = dict(branches={}, branch_prs={}, superseded_prs=[], parked_issues=[],
                 ls_issues={}, now=NOW, aged_park_days=14, refused=frozenset(),
                 dev_branch="main")
     base.update(kw)
@@ -47,9 +49,12 @@ def propose(**kw):
 
 
 # --------------------------- branch proposals ---------------------------
+# `branches` maps each remote branch to its CURRENT tip sha; a delete is proposed only when
+# that tip IS the PR's last-known head (headRefOid) — commits pushed after the PR merged or
+# closed would otherwise be lost (cross-review round 1, M3).
 
 def test_merged_pr_branch_is_proposed_with_a_why_naming_the_pr():
-    r = propose(branches=["sl/i5-fix-thing"],
+    r = propose(branches={"sl/i5-fix-thing": "tip0"},
                 branch_prs={"sl/i5-fix-thing": ( _pr(12, "MERGED"), True )})
     assert [p["key"] for p in r["proposals"]] == ["branch:sl/i5-fix-thing"]
     p = r["proposals"][0]
@@ -58,58 +63,76 @@ def test_merged_pr_branch_is_proposed_with_a_why_naming_the_pr():
 
 
 def test_closed_superseded_pr_branch_is_proposed():
-    r = propose(branches=["sl/i7-old"],
+    r = propose(branches={"sl/i7-old": "tip0"},
                 branch_prs={"sl/i7-old": (_pr(9, "CLOSED", labels=("superseded",)), True)})
     assert [p["target"] for p in r["proposals"]] == ["sl/i7-old"]
     assert "superseded" in r["proposals"][0]["why"]
 
 
+def test_branch_tip_moved_since_the_pr_is_never_proposed():
+    # commits pushed AFTER the PR merged/closed would be lost with the branch: deletion is
+    # proposed ONLY when the branch's current tip is the PR's last-known head.
+    r = propose(branches={"sl/i5-x": "a-new-tip"},
+                branch_prs={"sl/i5-x": (_pr(12, "MERGED", oid="tip0"), True)})
+    assert r["proposals"] == []
+
+
+def test_unknown_tip_or_missing_head_oid_fails_closed():
+    no_oid = _pr(12, "MERGED")
+    del no_oid["headRefOid"]
+    r = propose(branches={"sl/i5-x": None, "sl/i6-y": "tip0", "sl/i8-z": 42},
+                branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True),
+                            "sl/i6-y": (no_oid, True),
+                            "sl/i8-z": (_pr(13, "MERGED"), True)})
+    assert r["proposals"] == []
+
+
 def test_open_pr_branch_is_never_proposed_even_when_superseded():
     # closing the open superseded PR is its own proposal; the branch follows a LATER sweep —
     # deleting a branch under an open PR would force-close the PR server-side.
-    r = propose(branches=["sl/i7-old"],
+    r = propose(branches={"sl/i7-old": "tip0"},
                 branch_prs={"sl/i7-old": (_pr(9, "OPEN", labels=("superseded",)), True)})
     assert [p for p in r["proposals"] if p["kind"] == "branch"] == []
 
 
 def test_closed_unmerged_pr_without_superseded_is_never_proposed():
-    r = propose(branches=["sl/i7-old"],
+    r = propose(branches={"sl/i7-old": "tip0"},
                 branch_prs={"sl/i7-old": (_pr(9, "CLOSED"), True)})
     assert r["proposals"] == []
 
 
 def test_branch_with_no_pr_is_never_proposed():
     # no PR ever existed: the work can't be proven landed anywhere — never delete it.
-    r = propose(branches=["sl/i7-old"], branch_prs={"sl/i7-old": ({}, True)})
+    r = propose(branches={"sl/i7-old": "tip0"}, branch_prs={"sl/i7-old": ({}, True)})
     assert r["proposals"] == []
 
 
 def test_refused_pr_lookup_fails_closed():
     # ok=False means GitHub REFUSED the lookup (gh.PrRead contract): emptiness is not an answer.
-    r = propose(branches=["sl/i5-x"],
+    r = propose(branches={"sl/i5-x": "tip0"},
                 branch_prs={"sl/i5-x": (_pr(12, "MERGED"), False)})
     assert r["proposals"] == []
 
 
 def test_missing_lookup_entry_fails_closed():
-    r = propose(branches=["sl/i5-x"], branch_prs={})
+    r = propose(branches={"sl/i5-x": "tip0"}, branch_prs={})
     assert r["proposals"] == []
 
 
 def test_non_sl_branches_and_the_dev_branch_are_ignored():
-    r = propose(branches=["main", "feature/foo", "sl/i5-x"],
+    r = propose(branches={"main": "tip0", "feature/foo": "tip0", "sl/i5-x": "tip0"},
                 branch_prs={b: (_pr(1, "MERGED"), True)
                             for b in ("main", "feature/foo", "sl/i5-x")})
     assert [p["target"] for p in r["proposals"]] == ["sl/i5-x"]
     # belt+braces: even a dev branch that matched the prefix is never proposed
-    r2 = propose(branches=["sl/i5-x"], dev_branch="sl/i5-x",
+    r2 = propose(branches={"sl/i5-x": "tip0"}, dev_branch="sl/i5-x",
                  branch_prs={"sl/i5-x": (_pr(1, "MERGED"), True)})
     assert r2["proposals"] == []
 
 
 @pytest.mark.parametrize("status", sorted(actions.TERRITORY_CLAIM_STATUSES))
 def test_inflight_issue_branch_is_excluded_by_number_parsed_from_the_name(status):
-    r = propose(branches=["sl/i5-x"],
+    r = propose(branches={"sl/i5-x": "tip0"},
                 branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True)},
                 ls_issues={"i5": {"status": status}})
     assert r["proposals"] == []
@@ -120,7 +143,7 @@ def test_inflight_issue_branch_is_excluded_by_recorded_branch_name(status):
     # the loopstate branch record is the second, independent exclusion path: a branch whose
     # name doesn't parse (or parses to a different number) is still excluded when a live lane
     # RECORDS it as its own.
-    r = propose(branches=["sl/weird-name"],
+    r = propose(branches={"sl/weird-name": "tip0"},
                 branch_prs={"sl/weird-name": (_pr(12, "MERGED"), True)},
                 ls_issues={"i9": {"status": status, "branch": "sl/weird-name"}})
     assert r["proposals"] == []
@@ -128,7 +151,7 @@ def test_inflight_issue_branch_is_excluded_by_recorded_branch_name(status):
 
 def test_generation_suffixed_branch_of_an_inflight_issue_is_excluded():
     # sl/i5-x-r2 parses to issue 5 — a live rebuild excludes EVERY generation of its branches.
-    r = propose(branches=["sl/i5-x-r2"],
+    r = propose(branches={"sl/i5-x-r2": "tip0"},
                 branch_prs={"sl/i5-x-r2": (_pr(12, "MERGED"), True)},
                 ls_issues={"i5": {"status": "running", "branch": "sl/i5-x-r3"}})
     assert r["proposals"] == []
@@ -136,7 +159,7 @@ def test_generation_suffixed_branch_of_an_inflight_issue_is_excluded():
 
 @pytest.mark.parametrize("status", sorted(actions.TERMINAL_STATUSES))
 def test_terminal_statuses_do_not_exclude(status):
-    r = propose(branches=["sl/i5-x"],
+    r = propose(branches={"sl/i5-x": "tip0"},
                 branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True)},
                 ls_issues={"i5": {"status": status, "branch": "sl/i5-x"}})
     assert [p["target"] for p in r["proposals"]] == ["sl/i5-x"]
@@ -217,6 +240,26 @@ def test_in_progress_labeled_issue_is_mechanically_excluded():
     assert r["proposals"] == []
 
 
+def test_agent_ready_labeled_issue_is_mechanically_excluded():
+    # a re-approval whose label cleanup blipped can leave parked + agent-ready together; the
+    # owner's approval word wins — never propose closing work he approved to run
+    # (cross-review round 1, M2).
+    r = propose(parked_issues=[_issue(9, ("parked", "agent-ready"), NOW - 30 * DAY)])
+    assert r["proposals"] == []
+
+
+@pytest.mark.parametrize("bad", ["14", True, -1, None, 1.5])
+def test_wrong_typed_age_threshold_proposes_no_issues(bad):
+    # a wrong-typed threshold must NOT coerce to the most aggressive setting (0d): the issue
+    # class fails closed to nothing while branch/PR proposals stand on their own evidence
+    # (cross-review round 1, M1).
+    r = propose(parked_issues=[_issue(9, ("parked",), NOW - 365 * DAY)],
+                branches={"sl/i5-x": "tip0"},
+                branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True)},
+                aged_park_days=bad)
+    assert [p["kind"] for p in r["proposals"]] == ["branch"]
+
+
 @pytest.mark.parametrize("status", sorted(actions.TERRITORY_CLAIM_STATUSES))
 def test_inflight_loopstate_issue_is_excluded_whatever_its_labels_say(status):
     r = propose(parked_issues=[_issue(9, ("parked",), NOW - 30 * DAY)],
@@ -238,7 +281,7 @@ def test_zero_day_threshold_proposes_any_aged_park():
 # --------------------------- refused-set handling ---------------------------
 
 def test_refused_keys_are_held_back_and_reported_separately():
-    r = propose(branches=["sl/i5-x"],
+    r = propose(branches={"sl/i5-x": "tip0"},
                 branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True)},
                 parked_issues=[_issue(9, ("parked",), NOW - 30 * DAY)],
                 refused={"branch:sl/i5-x"})
@@ -247,7 +290,7 @@ def test_refused_keys_are_held_back_and_reported_separately():
 
 
 def test_empty_refused_set_reproposes_everything():
-    r = propose(branches=["sl/i5-x"],
+    r = propose(branches={"sl/i5-x": "tip0"},
                 branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True)}, refused=frozenset())
     assert [p["key"] for p in r["proposals"]] == ["branch:sl/i5-x"]
     assert r["refused"] == []
@@ -279,7 +322,7 @@ def test_reconcile_never_executes_unapproved_fresh_items():
 # --------------------------- wrong-typed inputs fail closed ---------------------------
 
 def test_wrong_typed_inputs_propose_nothing_and_never_raise():
-    r = propose(branches="sl/i5-x",            # not a list
+    r = propose(branches="sl/i5-x",            # not a mapping
                 branch_prs=[("sl/i5-x", {})],  # not a dict
                 superseded_prs={"14": {}},     # not a list
                 parked_issues="garbage",       # not a list
@@ -287,8 +330,16 @@ def test_wrong_typed_inputs_propose_nothing_and_never_raise():
     assert r["proposals"] == [] and r["refused"] == []
 
 
-def test_wrong_typed_loopstate_entries_are_skipped_not_raised():
+def test_the_old_list_shape_for_branches_fails_closed():
+    # `branches` is a {name: current tip} mapping; a bare list carries no tips, so no branch
+    # can be proven un-moved — no branch proposals, never a raise.
     r = propose(branches=["sl/i5-x"],
+                branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True)})
+    assert r["proposals"] == []
+
+
+def test_wrong_typed_loopstate_entries_are_skipped_not_raised():
+    r = propose(branches={"sl/i5-x": "tip0"},
                 branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True)},
                 ls_issues={"i5": "running", "i6": None, 7: {"status": "running"},
                            "not-an-iid": {"status": "running"}})
@@ -300,7 +351,7 @@ def test_wrong_typed_loopstate_entries_are_skipped_not_raised():
 def test_wrong_typed_loopstate_as_a_whole_proposes_nothing():
     # the exclusion SOURCE being unreadable means nothing is provably idle: the whole sweep
     # fails closed to no proposals, even for otherwise-perfect candidates.
-    r = propose(branches=["sl/i5-x"],
+    r = propose(branches={"sl/i5-x": "tip0"},
                 branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True)},
                 superseded_prs=[_pr(14, "OPEN", labels=("superseded",), head="sl/i7-a")],
                 parked_issues=[_issue(9, ("parked",), NOW - 30 * DAY)],
@@ -309,18 +360,18 @@ def test_wrong_typed_loopstate_as_a_whole_proposes_nothing():
 
 
 def test_wrong_typed_loopstate_entry_for_another_issue_does_not_exclude():
-    r = propose(branches=["sl/i5-x"],
+    r = propose(branches={"sl/i5-x": "tip0"},
                 branch_prs={"sl/i5-x": (_pr(12, "MERGED"), True)},
                 ls_issues={"i6": "garbage"})
     assert [p["target"] for p in r["proposals"]] == ["sl/i5-x"]
 
 
 def test_inputs_are_never_mutated_and_output_is_deterministic():
-    branches = ["sl/i9-b", "sl/i5-a"]
+    branches = {"sl/i9-b": "tip0", "sl/i5-a": "tip0"}
     prs = [_pr(14, "OPEN", labels=("superseded",), head="sl/i7-a")]
     issues = [_issue(9, ("parked",), NOW - 30 * DAY)]
     ls = {"i1": {"status": "running"}}
-    snap = (list(branches), [dict(p) for p in prs], [dict(i) for i in issues],
+    snap = (dict(branches), [dict(p) for p in prs], [dict(i) for i in issues],
             {k: dict(v) for k, v in ls.items()})
     kw = dict(branches=branches,
               branch_prs={b: (_pr(1, "MERGED"), True) for b in branches},

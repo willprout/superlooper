@@ -1071,12 +1071,27 @@ def _janitor_loopstate(home):
     return st["issues"]
 
 
+def _janitor_refused_read(path):
+    """The hold-back map, strictly: missing file -> {} (nothing ever refused), but PRESENT and
+    unreadable / wrong-typed -> None — the caller must refuse to run. Reading corrupt hold-back
+    state as empty would silently re-propose every previously refused action (the same
+    fail-open class as unreadable issues.json — cross-review round 1, C2)."""
+    txt = _read(path)
+    if txt is None:
+        return {}
+    try:
+        v = json.loads(txt)
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
 def _janitor_fetch(ls_issues):
     """One fetched snapshot of everything janitor.propose selects from. Every gh read fails
     closed to empty, so a GitHub blip shrinks the sweep toward proposing NOTHING, never toward
     proposing more."""
-    sl = [b for b in gh.remote_branches()
-          if isinstance(b, str) and b.startswith(janitor_lib.BRANCH_PREFIX)]
+    sl = {b: tip for b, tip in gh.remote_branches().items()
+          if isinstance(b, str) and b.startswith(janitor_lib.BRANCH_PREFIX)}
     parked = []
     for label in janitor_lib.PARK_LABELS:
         parked += gh.open_issues_activity(label)
@@ -1128,8 +1143,12 @@ def cmd_janitor(args):
         return 1
 
     refused_path = os.path.join(home, "state", _REFUSED_FILE)
-    refused_map = _read_json_file(refused_path, {})
-    refused_map = refused_map if isinstance(refused_map, dict) else {}
+    refused_map = _janitor_refused_read(refused_path)
+    if refused_map is None:
+        print(f"janitor: state/{_REFUSED_FILE} exists but is unreadable — running would "
+              "silently drop every held-back refused action. Fix or remove it, then re-run.",
+              file=sys.stderr)
+        return 1
     refused_keys = set() if args.retry_refused else set(refused_map)
 
     result = janitor_lib.propose(**_janitor_fetch(ls), now=time.time(), aged_park_days=days,
@@ -1192,11 +1211,13 @@ def cmd_janitor(args):
             failed += 1
             print(f"  FAIL  {p['key']} — {reason}; held back from future sweeps "
                   f"(--retry-refused re-proposes)")
-    # Prune moot refusals — keys whose debris is gone entirely (not proposable even with an
-    # empty refused set). A just-failed action's key IS still proposable, so it survives. Only
-    # the execute path writes state; list/--dry-run changes nothing anywhere.
-    eligible = {p["key"] for p in fresh["proposals"]}
-    refused_map = {k: v for k, v in refused_map.items() if k in eligible}
+    # A refusal is NEVER pruned on a key's absence from a sweep: absence is not proof the
+    # debris is gone — a transient gh blip produces the same absence (every read fails closed
+    # to empty), and pruning on it would silently drop the hold-back and let a later sweep
+    # retry a refused action without --retry-refused (cross-review round 1, C1). An entry
+    # clears ONLY via a later successful execution (the pop above); a moot entry lingers
+    # harmlessly (held-back keys that never re-propose never act). Only the execute path
+    # writes state; list/--dry-run changes nothing anywhere.
     os.makedirs(os.path.dirname(refused_path), exist_ok=True)   # a first sweep may precede any runner run
     loopstate.save(refused_path, refused_map)
     print(f"janitor: {executed} executed, {failed} failed, {len(skipped)} skipped.")

@@ -17,6 +17,9 @@ Safety, stated as code below and pinned by tests:
     follows a LATER sweep once the PR is closed; deleting a branch under an open PR would
     force-close the PR server-side), or a closed-unmerged PR without `superseded` is NEVER
     proposed. Never propose deleting an unmerged branch's work.
+  * ...and only when the branch's CURRENT tip is the PR's last-known head (headRefOid): commits
+    pushed after the PR merged/closed would be lost with the branch, so a moved or unprovable
+    tip is never proposed (cross-review round 1, M3).
   * In-flight and mid-gate work (actions.TERRITORY_CLAIM_STATUSES — imported, never re-invented,
     same as tidy) is mechanically excluded by TWO independent paths: the issue number parsed from
     the branch name AND the loopstate-recorded branch. A wrong-typed loopstate record for an
@@ -118,7 +121,9 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
     (a previously failed action is surfaced once and never silently retried — the CLI holds
     these back until --retry-refused).
 
-    branches        remote branch names (list of str).
+    branches        {remote branch name: current tip sha} (gh.remote_branches). The tip is the
+                    moved-since-the-PR guard: a delete is proposed only when it equals the
+                    PR's headRefOid; a missing/wrong-typed tip is never proposed.
     branch_prs      {branch: (pr_dict, ok)} — gh.pr_for_branch's PrRead per branch. ok=False
                     (a REFUSED lookup) fails closed: the branch is not proposed.
     superseded_prs  raw gh dicts for OPEN PRs labeled `superseded`.
@@ -139,7 +144,10 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
         return {"proposals": [], "refused": []}
     ex_nums, ex_branches = _exclusions(ls_issues)
     refused = refused if isinstance(refused, (set, frozenset)) else frozenset()
-    threshold_days = aged_park_days if (type(aged_park_days) is int and aged_park_days >= 0) else 0
+    # A wrong-typed threshold must NOT coerce to the most aggressive setting (0d — propose
+    # every park immediately); None disables the issue class entirely (cross-review r1, M1).
+    threshold_days = aged_park_days if (type(aged_park_days) is int
+                                        and aged_park_days >= 0) else None
     proposals, held = [], []
 
     def emit(p):
@@ -147,7 +155,8 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
 
     # --- stale sl/* branches: work provably landed (merged) or provably replaced (superseded) ---
     branch_prs = branch_prs if isinstance(branch_prs, dict) else {}
-    for b in sorted(b for b in branches if isinstance(b, str)) if isinstance(branches, list) else []:
+    branches = branches if isinstance(branches, dict) else {}
+    for b in sorted(b for b in branches if isinstance(b, str)):
         if not b.startswith(BRANCH_PREFIX) or b == dev_branch:
             continue
         if branch_issue_num(b) in ex_nums or b in ex_branches:
@@ -161,6 +170,12 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
         num = _pr_int(pr.get("number"))
         state = pr.get("state")
         if num is None:
+            continue
+        # The moved-since-the-PR guard: the branch's CURRENT tip must be the PR's last-known
+        # head. Commits pushed after the merge/close would be lost with the branch, so a moved
+        # or unprovable tip (missing sha, missing headRefOid) is never proposed.
+        tip, oid = branches.get(b), pr.get("headRefOid")
+        if not (isinstance(tip, str) and tip and isinstance(oid, str) and oid and tip == oid):
             continue
         if state == "MERGED":
             why = f"PR #{num} merged — the work is on the mainline"
@@ -194,15 +209,20 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
 
     # --- parked / needs-william issues gathering dust past the threshold ---
     seen_issues = set()
-    parked = parked_issues if isinstance(parked_issues, list) else []
+    parked = parked_issues if isinstance(parked_issues, list) and threshold_days is not None \
+        else []
     for i in sorted((i for i in parked if isinstance(i, dict)),
                     key=lambda i: (_pr_int(i.get("number")) is None, _pr_int(i.get("number")) or 0)):
         num = _pr_int(i.get("number"))
         if num is None or num in seen_issues or num in ex_nums:
             continue
         labels = _label_names(i.get("labels"))
-        if "in-progress" in labels:
-            continue                             # claimed by a lane: mechanically excluded
+        # `in-progress` = claimed by a lane; `agent-ready` = the owner's approval word is ON
+        # the issue (a re-approval whose label cleanup blipped can leave it beside a stale
+        # park label) — either one mechanically excludes: never propose closing approved or
+        # claimed work (cross-review round 1, M2).
+        if "in-progress" in labels or "agent-ready" in labels:
+            continue
         park = next((l for l in PARK_LABELS if l in labels), None)
         if park is None:
             continue

@@ -1258,14 +1258,16 @@ def _seed_janitor_fixtures(rig):
       - branches.json: main, sl/i5-fix-thing, sl/i7-old-thing
       - pr_list_superseded.json: OPEN PR #14 labeled superseded on sl/i7-old-thing
       - issue_list_parked.json: issue #9 labeled parked, updatedAt 2026-06-01 (long aged)
-    Add the per-head PR lookups: sl/i5-fix-thing's PR #12 MERGED (branch proposable);
-    sl/i7-old-thing's PR #14 still OPEN (branch NOT proposable — the PR close comes first).
-    And an explicit empty needs-william queue."""
+    Add the per-head PR lookups: sl/i5-fix-thing's PR #12 MERGED with headRefOid matching the
+    branch's current tip in branches.json (branch proposable); sl/i7-old-thing's PR #14 still
+    OPEN (branch NOT proposable — the PR close comes first). And an explicit empty
+    needs-william queue."""
     (rig.fixdir / "pr_list_head_sl__i5-fix-thing.json").write_text(json.dumps(
-        [{"number": 12, "state": "MERGED", "headRefName": "sl/i5-fix-thing", "labels": []}]))
+        [{"number": 12, "state": "MERGED", "headRefName": "sl/i5-fix-thing",
+          "headRefOid": "bbb222", "labels": []}]))
     (rig.fixdir / "pr_list_head_sl__i7-old-thing.json").write_text(json.dumps(
         [{"number": 14, "state": "OPEN", "headRefName": "sl/i7-old-thing",
-          "labels": [{"name": "superseded"}]}]))
+          "headRefOid": "ccc333", "labels": [{"name": "superseded"}]}]))
     (rig.fixdir / "issue_list_needs-william.json").write_text("[]")
 
 
@@ -1401,7 +1403,11 @@ def test_janitor_failed_action_surfaces_once_and_is_held_back(rig):
     assert _janitor_refused(rig) == {}
 
 
-def test_janitor_prunes_a_refusal_whose_debris_is_gone(rig):
+def test_janitor_never_prunes_a_refusal_on_absence(rig):
+    # a key's ABSENCE from a sweep is not proof its debris is gone — a transient gh blip also
+    # produces absence (every read fails closed to empty). Pruning on it would silently drop
+    # the hold-back and let a later sweep retry a refused action without --retry-refused
+    # (cross-review round 1, C1). A refusal clears ONLY via a later successful execution.
     _seed_janitor_fixtures(rig)
     home = _janitor_home(rig)
     (home / "state").mkdir(parents=True, exist_ok=True)
@@ -1409,7 +1415,20 @@ def test_janitor_prunes_a_refusal_whose_debris_is_gone(rig):
         {"branch:sl/i99-vanished": {"reason": "gone", "ts": 1}}))
     r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
     assert r.returncode == 0
-    assert _janitor_refused(rig) == {}           # the moot refusal was pruned on execution
+    assert "branch:sl/i99-vanished" in _janitor_refused(rig)
+
+
+def test_janitor_unreadable_refused_file_refuses_to_run(rig):
+    # corrupt hold-back state read as {} would re-propose every held-back action — the same
+    # fail-open class as unreadable issues.json (cross-review round 1, C2). Refuse instead.
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "janitor_refused.json").write_text("{corrupt")
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    assert "janitor_refused.json" in (r.stdout + r.stderr)
+    assert mutations(rig) == [] and _janitor_journal(rig) == []
 
 
 def test_janitor_nothing_to_propose_is_a_clean_exit(rig):

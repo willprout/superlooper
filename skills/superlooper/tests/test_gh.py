@@ -570,22 +570,26 @@ def test_set_repo_blank_clears_to_unpinned(envprobe, monkeypatch):
 
 # --------------------------- janitor reads/writes (issue #62) ---------------------------
 
-def test_remote_branches_parses_and_pins_the_api_path(ghenv):
-    names = gh.remote_branches()
-    assert names == ["main", "sl/i5-fix-thing", "sl/i7-old-thing"]
+def test_remote_branches_parses_names_and_tips_and_pins_the_api_path(ghenv):
+    branches = gh.remote_branches()
+    assert branches == {"main": "aaa111", "sl/i5-fix-thing": "bbb222",
+                        "sl/i7-old-thing": "ccc333"}
     argv = _calls(ghenv)[-1]
     assert argv[0] == "api" and "branches?per_page=100" in argv[1]
 
 
 def test_remote_branches_fails_closed(ghenv, monkeypatch):
     monkeypatch.setenv("GH_FAIL", "1")
-    assert gh.remote_branches() == []
+    assert gh.remote_branches() == {}
 
 
-def test_remote_branches_skips_wrong_typed_entries(ghenv):
+def test_remote_branches_wrong_typed_entries_skip_or_carry_no_tip(ghenv):
+    # a nameless/garbage entry is skipped; a named entry with an unreadable sha is kept with
+    # tip None — the janitor then never proposes it (tip unprovable, fail closed).
     (ghenv / "branches.json").write_text(json.dumps(
-        [{"name": "main"}, {"name": 42}, "garbage", {"nom": "x"}]))
-    assert gh.remote_branches() == ["main"]
+        [{"name": "main"}, {"name": "x", "commit": {"sha": 42}}, {"name": 42},
+         "garbage", {"nom": "x"}]))
+    assert gh.remote_branches() == {"main": None, "x": None}
 
 
 def test_open_prs_labeled_parses_and_pins_label(ghenv):

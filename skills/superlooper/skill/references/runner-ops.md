@@ -200,7 +200,9 @@ superlooper janitor --repo /path/to/repo --retry-refused  # re-propose previousl
 
 - **What it proposes:** (1) *delete* a remote `sl/*` branch whose PR **merged**, or whose PR is
   **closed and labeled `superseded`** — never a branch with no PR, an open PR, or a closed-unmerged
-  PR without the label (an unmerged branch's work is never proposed for deletion); (2) *close* an
+  PR without the label, and only when the branch's current tip is still the PR's last-known head
+  (commits pushed after the merge/close keep the branch off the list — an unmerged branch's work
+  is never proposed for deletion); (2) *close* an
   **open PR labeled `superseded`** (the branch stays — it becomes deletable on a *later* sweep,
   once its PR is closed); (3) *close* a **parked / needs-william issue** with no activity for
   `janitor.aged_park_days` (config, default 14).

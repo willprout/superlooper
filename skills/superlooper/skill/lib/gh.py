@@ -281,12 +281,20 @@ def recent_pr_check_entries(limit=30):
 
 
 def remote_branches(limit=100):
-    """Names of the repo's remote branches (ONE page, up to `limit` — the janitor's sweep
-    converges across approved runs, so pagination isn't worth its parse fragility; a repo
-    holding >100 live branches has bigger debris problems than a truncated sweep). Fails
-    closed to []."""
+    """{branch name: tip sha} for the repo's remote branches (ONE page, up to `limit` — the
+    janitor's sweep converges across approved runs, so pagination isn't worth its parse
+    fragility; a repo holding >100 live branches has bigger debris problems than a truncated
+    sweep). The tip riding along is the janitor's moved-since-the-PR guard: a delete is
+    proposed only when the tip equals the PR's headRefOid. Fails closed to {}; an entry whose
+    sha is unreadable is kept with tip None (the janitor then never proposes it)."""
     lst = _json_list(["api", "repos/{owner}/{repo}/branches?per_page=%d" % limit])
-    return [b["name"] for b in lst if isinstance(b, dict) and isinstance(b.get("name"), str)]
+    out = {}
+    for b in lst:
+        if isinstance(b, dict) and isinstance(b.get("name"), str):
+            commit = b.get("commit")
+            sha = commit.get("sha") if isinstance(commit, dict) else None
+            out[b["name"]] = sha if isinstance(sha, str) and sha else None
+    return out
 
 
 def open_prs_labeled(label, limit=100):
