@@ -415,8 +415,157 @@ def check_runner_anchor(probe, config):
         "→ Restarting the runner).")
 
 
-def check_stack(config, config_error=None, probe=None, sender=None, announce=None):
+# --- installed-engine publish drift (issue #39) ------------------------------------------------
+# The running loop executes the INSTALLED engine at ~/.claude/skills/superlooper, not this repo, so
+# a merged engine change is inert until someone republishes through the gated bin/install.sh — that
+# fence is the whole reason `skills/**` is a trustworthy bright line, and it stays. The gap this
+# closes is VISIBILITY: on 2026-07-10 the installed copy sat six merged engine fixes behind main and
+# nothing said so; an operator had to remember to diff VERSION by hand. These helpers measure that
+# drift the SAME way bin/install.sh's engine_gate does — the installed VERSION stamp's source commit
+# vs the source repo's current engine payload — so the doctor and the morning report can surface it.
+ENGINE_PAYLOAD_REL = "skills/superlooper/skill"       # mirrors bin/install.sh PAYLOAD_REL
+
+
+def _installed_version_sha(probe):
+    """First token of the installed VERSION stamp ($HOME/.claude/skills/superlooper/VERSION) — the
+    source commit bin/install.sh recorded at the last publish (`<sha> <date>`, or `nogit <date>` for
+    a non-git payload). None when the stamp is missing/empty (never published, or a pre-stamp
+    install). Read via probe so tests inject the file without a real ~/.claude."""
+    path = os.path.join(probe.home, ".claude", "skills", "superlooper", "VERSION")
+    text = probe.read_text(path)
+    if not _nonempty_string(text):
+        return None
+    parts = text.split()
+    return parts[0] if parts else None
+
+
+def _git(probe):
+    return probe.command("git", envvar="SL_GIT")
+
+
+def _source_checkout(probe, repo_path):
+    """Locate a superlooper SOURCE checkout to compare the installed stamp against: a git work tree
+    that actually carries the engine payload (skills/superlooper/skill). We look at the source tree,
+    never the installed copy — the installed copy is rsync'd, has no .git, and is the very thing
+    being measured. Publish drift only *means* something on the machine that develops AND publishes
+    the engine, which is exactly where such a checkout exists. Candidates, in order:
+      1. $SL_SOURCE_REPO — explicit override (tests; an operator whose checkout lives elsewhere).
+      2. repo_path — the adopted repo. In the dogfood loop willprout/superlooper IS the source
+         checkout (and `superlooper doctor --stack` defaults --repo to cwd), so this is the hit.
+    Returns the git top-level of the first candidate that is a work tree carrying the payload, or
+    None — a generic adopted repo (a plain eApp) has no source tree, so the drift check then skips."""
+    git = _git(probe)
+    if not git:
+        return None
+    env = getattr(probe, "env", {}) or {}
+    candidates = []
+    override = env.get("SL_SOURCE_REPO")
+    if _nonempty_string(override):
+        candidates.append(override)
+    if _nonempty_string(repo_path):
+        candidates.append(repo_path)
+    for cand in candidates:
+        proc = probe.run([git, "-C", cand, "rev-parse", "--show-toplevel"])
+        if getattr(proc, "returncode", 1) != 0:
+            continue
+        lines = _out(proc).splitlines()
+        top = lines[0].strip() if lines else ""
+        if top and probe.exists(os.path.join(top, ENGINE_PAYLOAD_REL)):
+            return top
+    return None
+
+
+def engine_drift(probe=None, repo_path=None, dev_branch="main"):
+    """How many engine commits have landed in the source repo since the INSTALLED copy was last
+    published — the installed-engine publish drift (issue #39). PURE of side effects; every external
+    edge is behind `probe`, and it NEVER raises (a garbage input yields a structured skip, so the
+    doctor and the morning-report assembler can call it blind). Returns a dict:
+        {"status": "behind"|"in_sync"|"skipped"|"unknown",
+         "behind": int|None, "installed_sha": str|None, "ref": str|None, "detail": str}
+      behind   — N (>0) engine commits merged since the installed stamp; N in "behind".
+      in_sync  — the installed stamp is at/after the compared ref (behind 0).
+      skipped  — nothing to compare (no stamp, a nogit stamp, or no source checkout here). Not an
+                 anomaly: no morning-report notice, a plain-ok doctor line.
+      unknown  — an anomaly worth a WARN: the stamped commit is not in the checkout's history
+                 (rebased/unrelated), or git errored computing the distance."""
     probe = probe or Probe()
+    dev_branch = dev_branch if _nonempty_string(dev_branch) else "main"
+    sha = _installed_version_sha(probe)
+    if sha is None:
+        return {"status": "skipped", "behind": None, "installed_sha": None, "ref": None,
+                "detail": "installed engine carries no VERSION stamp — nothing published yet, or a "
+                          "pre-stamp install."}
+    if sha == "nogit":
+        return {"status": "skipped", "behind": None, "installed_sha": "nogit", "ref": None,
+                "detail": "installed engine was published from a non-git payload (VERSION 'nogit') "
+                          "— drift cannot be measured."}
+    top = _source_checkout(probe, repo_path)
+    if not top:
+        return {"status": "skipped", "behind": None, "installed_sha": sha, "ref": None,
+                "detail": "no superlooper source checkout here to compare against — run from the "
+                          "engine's source repo (or set SL_SOURCE_REPO) to measure drift."}
+    git = _git(probe)
+    # The stamped commit must be reachable in THIS checkout, or a rev-list distance is meaningless
+    # (a rebased or unrelated history). Fail SAFE: surface it, never fabricate a count.
+    inhist = probe.run([git, "-C", top, "cat-file", "-e", sha + "^{commit}"])
+    if getattr(inhist, "returncode", 1) != 0:
+        return {"status": "unknown", "behind": None, "installed_sha": sha, "ref": None,
+                "detail": "installed stamp %s is not in this checkout's history (rebased or an "
+                          "unrelated tree) — cannot measure drift; republish to re-stamp." % sha}
+    # Prefer origin/<dev_branch> (what the loop merges INTO — this captures merged-but-unpublished
+    # fixes even when the local branch is stale), then the local <dev_branch>, then HEAD. Report
+    # which ref won so the count is honest about what it measured.
+    ref = None
+    for cand in ("origin/" + dev_branch, dev_branch, "HEAD"):
+        proc = probe.run([git, "-C", top, "rev-parse", "--verify", "--quiet", cand + "^{commit}"])
+        if getattr(proc, "returncode", 1) == 0:
+            ref = cand
+            break
+    if ref is None:
+        return {"status": "unknown", "behind": None, "installed_sha": sha, "ref": None,
+                "detail": "could not resolve the %s ref in the source checkout — cannot measure "
+                          "drift." % dev_branch}
+    proc = probe.run([git, "-C", top, "rev-list", "--count", sha + ".." + ref, "--",
+                      ENGINE_PAYLOAD_REL])
+    # Parse STDOUT only for the count: git may print an advisory to stderr (e.g. an ambiguous
+    # refname) while still emitting the number to stdout — merging the two (via _out) would fail
+    # isdigit() and misreport a healthy repo as an anomaly. _out stays for the error-surfacing paths.
+    out = (getattr(proc, "stdout", "") or "").strip()
+    if getattr(proc, "returncode", 1) != 0 or not out.isdigit():
+        return {"status": "unknown", "behind": None, "installed_sha": sha, "ref": ref,
+                "detail": "git could not compute the engine-commit distance against %s — check by "
+                          "hand." % ref}
+    n = int(out)
+    if n <= 0:
+        return {"status": "in_sync", "behind": 0, "installed_sha": sha, "ref": ref,
+                "detail": "installed engine is up to date with %s (stamp %s)." % (ref, sha)}
+    unit = "commit" if n == 1 else "commits"
+    return {"status": "behind", "behind": n, "installed_sha": sha, "ref": ref,
+            "detail": "installed engine %d %s behind %s (stamp %s) — merged engine changes are "
+                      "inert until you republish through the gated bin/install.sh (publishing stays "
+                      "manual)." % (n, unit, ref, sha)}
+
+
+def check_engine_drift(probe, repo_path=None, dev_branch="main"):
+    """doctor --stack's installed-engine freshness line. This lives in the MACHINE-level --stack
+    doctor, not the per-repo doctor, on purpose: the installed engine (~/.claude/skills/superlooper)
+    is one copy per machine, shared by every adopted repo, so its publish drift is a machine fact —
+    the per-repo doctor would print it identically for every repo and imply a per-repo cause. Being
+    behind is BY DESIGN (a merged engine change is inert until republished through the gated
+    bin/install.sh), so this NEVER fails the stack: 'behind' and every measurement anomaly are WARNs
+    at most. The whole story rides in `detail` because format_results prints `fix` only for a FAIL."""
+    d = engine_drift(probe, repo_path=repo_path, dev_branch=dev_branch)
+    name = "installed engine current"
+    if d["status"] in ("behind", "unknown"):
+        return CheckResult(name, True, d["detail"], warn=True)
+    return CheckResult(name, True, d["detail"])           # in_sync / skipped -> a plain ok line
+
+
+def check_stack(config, config_error=None, probe=None, sender=None, announce=None, repo_path=None):
+    probe = probe or Probe()
+    cfg = config if isinstance(config, dict) else {}
+    dev = cfg.get("dev_branch")
+    dev = dev if _nonempty_string(dev) else "main"
     return [
         check_codex(probe, required=_codex_required(config)),
         check_cmux(probe),
@@ -426,6 +575,7 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_notify(config, config_error=config_error, sender=sender, announce=announce),
         check_launch_shim(probe),
         check_runner_anchor(probe, config),
+        check_engine_drift(probe, repo_path=repo_path, dev_branch=dev),
     ]
 
 

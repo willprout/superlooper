@@ -1697,6 +1697,7 @@ class Runner:
         already durable, so the report can always be re-rendered by `superlooper morning-report`."""
         import report                                # lazy: keep the agent-agnostic runner light
         import notify
+        import stack_doctor
         records = journal.read(self.home)
         # ledger.json is the flat accepted-failure map (Task 12); the report only needs its size.
         # Read fail-closed here, exactly as _read_json does everywhere else in the runner.
@@ -1711,8 +1712,15 @@ class Runner:
             if "agent-ready" in labels and "in-progress" not in labels:
                 queue.append({"num": p.get("num"), "title": p.get("title")})
         queue.sort(key=lambda q: q["num"] if isinstance(q.get("num"), int) else 1 << 30)
+        # Installed-engine publish drift (issue #39): the loop runs the INSTALLED engine, so merged
+        # engine fixes are inert until republished through the gated bin/install.sh. engine_drift
+        # measures how far behind the installed copy is (git is impure, so it happens here, not in
+        # the pure report.py). It never raises and skips cleanly when self.repo is not a superlooper
+        # source checkout, so a plain adopted repo carries no notice.
+        drift = stack_doctor.engine_drift(
+            repo_path=self.repo, dev_branch=self.config.get("dev_branch"))
         view = {"date": date, "now": now, "frozen": frozen, "queue": queue,
-                "usage": self.usage_view()}
+                "usage": self.usage_view(), "engine_drift": drift}
         text = report.morning(records, view, ledger, self.config)
         try:
             with open(os.path.join(self.home, "reports", f"morning-{date}.md"), "w") as f:

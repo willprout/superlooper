@@ -317,6 +317,27 @@ def _usage_queue(view):
     return lines
 
 
+def _engine_drift(view):
+    """A one-line installed-engine publish-drift nudge (issue #39), or None. The runner/CLI
+    pre-computes the drift (git lives in the impure assembler; this module stays pure) and hands it
+    in via view['engine_drift'] — a stack_doctor.engine_drift() dict. Rendered ONLY when the
+    installed engine is BEHIND; every other state (in sync, skipped, an unmeasurable anomaly) stays
+    silent here — the doctor is where those surface. Reinforces, never undercuts, the publish gate:
+    the fix is a manual republish, and the line says so."""
+    d = view.get("engine_drift")
+    if not isinstance(d, dict) or d.get("status") != "behind":
+        return None
+    n = d.get("behind")
+    if not (isinstance(n, int) and not isinstance(n, bool) and n > 0):
+        return None
+    ref = d.get("ref")
+    ref = ref if isinstance(ref, str) and ref.strip() else "main"
+    unit = "commit" if n == 1 else "commits"
+    return (f"**Installed engine {n} {unit} behind {ref}** — merged engine fixes are live only "
+            "after you republish through the gated `bin/install.sh` (publishing stays manual; "
+            "republish when convenient).")
+
+
 def _section(title, lines, empty="None."):
     body = "\n".join(lines) if lines else empty
     return f"## {title}\n{body}\n"
@@ -368,6 +389,14 @@ def morning(journal_records, gh_view, ledger, config):
     parts = [
         f"# superlooper morning report — {date}\n",
         f"{summary}\n",
+    ]
+    # The publish-drift nudge sits AFTER the summary tally so it never hijacks the push body (the
+    # first non-title, non-blank line). Drift is a standing condition, not overnight activity, so it
+    # is rendered independently of `quiet` — a quiet night with drift still reads "nothing happened".
+    drift = _engine_drift(view)
+    if drift:
+        parts.append(f"{drift}\n")
+    parts += [
         _section("Merged", merged, "Nothing merged."),
         _section("Parked / needs-william", parked),
         _section("Bounces", bounces),

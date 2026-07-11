@@ -411,7 +411,9 @@ def cmd_stack_doctor(args):
         cfg_error = e
 
     print("superlooper doctor --stack")
-    results = stack_doctor.check_stack(cfg, config_error=cfg_error)
+    # repo_path feeds the installed-engine drift row: in the dogfood loop args.repo (default: cwd) is
+    # itself a superlooper source checkout, which is where publish drift can be measured (issue #39).
+    results = stack_doctor.check_stack(cfg, config_error=cfg_error, repo_path=args.repo)
     for line in stack_doctor.format_results(results):
         print(line)
     failures = [r.name for r in results if not r.ok]
@@ -623,7 +625,12 @@ def cmd_morning_report(args):
     home = str(config_lib.state_home(cfg))
     date = time.strftime("%Y-%m-%d", time.localtime())
     view = {"date": date, "now": time.time(), "frozen": _frozen_view(home),
-            "queue": _ready_queue(), "usage": None}
+            "queue": _ready_queue(), "usage": None,
+            # Installed-engine publish drift (issue #39): computed here (git is impure; report.py
+            # stays pure). engine_drift never raises and skips cleanly when there is no source
+            # checkout, so a plain adopted repo simply carries no drift notice.
+            "engine_drift": stack_doctor.engine_drift(
+                repo_path=args.repo, dev_branch=cfg.get("dev_branch"))}
     text = report.morning(journal.read(home), view, _ledger_map(home), cfg)
     out_dir = os.path.join(home, "reports")
     os.makedirs(out_dir, exist_ok=True)
