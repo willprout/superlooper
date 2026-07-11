@@ -3,7 +3,7 @@ needing input reaches William"). ONE function — send() — with a fixed preced
 
     notify.imessage_to  → text via Messages.app (skill/bin/imessage-notify.sh, an osascript
                           one-liner; the first send triggers a one-time macOS permission click —
-                          see references/runner-ops.md, and a launchd-started runner needs it too)
+                          see references/runner-ops.md, and the launchd-started nightly needs it too)
     notify.cmd          → a shell command template with {title}/{body} (an ntfy/Pushover curl, say)
     cmux notify         → the local desktop toast ($SL_CMUX, same binary doctor probes)
     log-only            → nothing configured and no cmux: the action is already journaled by the

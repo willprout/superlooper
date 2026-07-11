@@ -208,10 +208,12 @@ report.
    published and step 2's config written, does every check have something real to inspect. Fix
    anything red and re-run `doctor` until it passes.
 4. `superlooper run --repo <path>` — start the runner in a cmux tab you can watch (it targets that
-   tab's own pane automatically — no `--pane` needed), or under launchd for keep-alive. *Why last:*
-   it launches worker sessions against approved issues, so it needs a green `doctor` and your
-   approvals in hand first. Approve issues by conversation (William's word applies `agent-ready`);
-   the runner picks them up on its next tick.
+   tab's own pane automatically — no `--pane` needed). This is the *only* way to run it: there is no
+   launchd runner, because a paneless launchd daemon can't open the worker tabs the loop needs
+   (issue #33; restart it the same way — see references/runner-ops.md → "Restarting the runner").
+   *Why last:* it launches worker sessions against approved issues, so it needs a green `doctor` and
+   your approvals in hand first. Approve issues by conversation (William's word applies
+   `agent-ready`); the runner picks them up on its next tick.
 
 ## The config file is trusted, executable data — protect it accordingly
 

@@ -1,17 +1,23 @@
 import json
+import os
 from types import SimpleNamespace
 
+import config as config_lib
 import notify
 import stack_doctor
 
 
 class FakeProbe:
-    def __init__(self, commands=None, files=None, env=None, home="/home/will"):
+    def __init__(self, commands=None, files=None, env=None, home="/home/will", alive_pids=None):
         self.commands = commands or {}
         self.files = files or {}
         self.env = env or {}
         self.home = home
+        self.alive_pids = set(alive_pids or [])
         self.calls = []
+
+    def pid_alive(self, pid):
+        return pid in self.alive_pids
 
     def command(self, name, envvar=None, default=None):
         if envvar and self.env.get(envvar):
@@ -101,6 +107,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("gh API headroom", True),
         ("notify channel", True),
         ("launch shim sourced", True),
+        ("runner anchor (live)", True),      # no repo in this config -> cleanly skipped, passes
     ]
 
 
@@ -339,3 +346,112 @@ def test_notify_check_announces_before_it_sends(tmp_path):
     )
 
     assert events == ["announce", "send"]               # announced, THEN sent — never the reverse
+
+
+# --- runner anchor (live): a LIVE runner's recorded launch anchor must still resolve (issue #33) ---
+# The 2026-07-09 misplacement: a runner's cmux tab was dragged to another window; its pane stopped
+# resolving and every worker launch parked. This is the cheap, read-only after-the-fact catch — it
+# fires ONLY when a runner is actually live (pidfile pid alive), and re-runs the same probe the
+# startup preflight uses. Not-live / no-anchor are skips, never a FAIL.
+
+_ANCHOR_CMUX = "/bin/cmux-anchor"
+
+
+def _anchor_state_dir(tmp_path, monkeypatch, repo="o/r"):
+    monkeypatch.setenv("SL_HOME", str(tmp_path))
+    return os.path.join(str(config_lib.state_home({"repo": repo})), "state")
+
+
+def _anchor_probe(state, *, pid, alive, anchor=None, resolves=True):
+    files = {os.path.join(state, "runner.lock"): str(pid)}
+    if anchor is not None:
+        files[os.path.join(state, "runner.anchor.json")] = json.dumps(anchor)
+    row = "  surface:1  superlooper tab\n" if resolves else "Error: not_found\n"
+    pane = (anchor or {}).get("pane", "PANE-UUID")
+    ws = (anchor or {}).get("workspace")
+    # The probe is workspace-scoped: the command only "resolves" when queried with the recorded
+    # --pane AND --workspace, exactly as the check must call it (cmux scopes pane resolution to a
+    # workspace). A call missing the recorded workspace would miss this key and read as not_found.
+    key = ("list-pane-surfaces", "--pane", pane) + (("--workspace", ws) if ws else ())
+    return FakeProbe(
+        commands={_ANCHOR_CMUX: {"path": _ANCHOR_CMUX, key: (0, row, "")}},
+        files=files, env={"SL_CMUX": _ANCHOR_CMUX},
+        alive_pids=[pid] if alive else [],
+    )
+
+
+def test_runner_anchor_skips_when_no_pidfile(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_HOME", str(tmp_path))
+    probe = FakeProbe(env={"SL_CMUX": _ANCHOR_CMUX})     # no runner.lock file at all
+    r = stack_doctor.check_runner_anchor(probe, {"repo": "o/r"})
+    assert r.ok is True and r.warn is False and "no live runner" in r.detail.lower()
+
+
+def test_runner_anchor_skips_when_pidfile_is_stale(tmp_path, monkeypatch):
+    state = _anchor_state_dir(tmp_path, monkeypatch)
+    probe = _anchor_probe(state, pid=4242, alive=False, anchor={"pane": "PANE-UUID"})
+    r = stack_doctor.check_runner_anchor(probe, {"repo": "o/r"})
+    assert r.ok is True and r.warn is False and "no live runner" in r.detail.lower()
+    assert probe.calls == []                              # never probed cmux — nothing is live
+
+
+def test_runner_anchor_passes_when_live_anchor_resolves(tmp_path, monkeypatch):
+    state = _anchor_state_dir(tmp_path, monkeypatch)
+    anchor = {"pane": "PANE-UUID", "workspace": "WS-7", "window": "WIN-7", "pid": 4242}
+    probe = _anchor_probe(state, pid=4242, alive=True, anchor=anchor, resolves=True)
+    r = stack_doctor.check_runner_anchor(probe, {"repo": "o/r"})
+    assert r.ok is True and r.warn is False
+    assert "resolves" in r.detail and "WS-7" in r.detail and "WIN-7" in r.detail
+
+
+def test_runner_anchor_fails_when_live_anchor_no_longer_resolves(tmp_path, monkeypatch):
+    state = _anchor_state_dir(tmp_path, monkeypatch)
+    anchor = {"pane": "PANE-UUID", "workspace": "WS-7", "window": "WIN-7", "pid": 4242}
+    probe = _anchor_probe(state, pid=4242, alive=True, anchor=anchor, resolves=False)
+    r = stack_doctor.check_runner_anchor(probe, {"repo": "o/r"})
+    assert r.ok is False
+    assert "PANE-UUID" in r.detail
+    assert "superlooper run" in r.fix and "runner-ops" in r.fix
+
+
+def test_runner_anchor_warns_when_live_runner_recorded_no_anchor(tmp_path, monkeypatch):
+    state = _anchor_state_dir(tmp_path, monkeypatch)
+    probe = _anchor_probe(state, pid=4242, alive=True, anchor=None)   # live pid, no anchor file
+    r = stack_doctor.check_runner_anchor(probe, {"repo": "o/r"})
+    assert r.ok is True and r.warn is True
+    assert "no" in r.detail.lower() and "anchor" in r.detail.lower()
+    assert probe.calls == []                              # nothing to probe
+
+
+def test_runner_anchor_skipped_without_repo_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_HOME", str(tmp_path))
+    probe = FakeProbe(env={"SL_CMUX": _ANCHOR_CMUX})
+    for cfg in (None, {}, {"notify": {}}):
+        r = stack_doctor.check_runner_anchor(probe, cfg)
+        assert r.ok is True and r.warn is False and "skip" in r.detail.lower()
+
+
+def test_runner_anchor_probe_is_scoped_to_the_recorded_workspace(tmp_path, monkeypatch):
+    # P0 regression: cmux resolves --pane within the CALLER's workspace by default, and doctor runs
+    # from a different tab than the foreground runner — so the probe MUST pass the runner's recorded
+    # --workspace, or it false-FAILs a healthy runner. Assert the workspace rides on the cmux call.
+    state = _anchor_state_dir(tmp_path, monkeypatch)
+    anchor = {"pane": "PANE-UUID", "workspace": "WS-7", "window": "WIN-7", "pid": 4242}
+    probe = _anchor_probe(state, pid=4242, alive=True, anchor=anchor, resolves=True)
+    r = stack_doctor.check_runner_anchor(probe, {"repo": "o/r"})
+    assert r.ok is True
+    probe_call = next(c for c in probe.calls if "list-pane-surfaces" in c)
+    assert "--workspace" in probe_call and "WS-7" in probe_call
+    assert "--pane" in probe_call and "PANE-UUID" in probe_call
+
+
+def test_runner_anchor_warns_when_recorded_pid_does_not_match_the_live_pid(tmp_path, monkeypatch):
+    # A hard-crashed runner leaves a stale anchor; if the OS recycles its pid, the pidfile reads
+    # "alive" for an unrelated process. The recorded pid must match the live pid, or we'd FAIL on a
+    # dead runner's record. Mismatch -> WARN (no matching anchor), never a cmux probe.
+    state = _anchor_state_dir(tmp_path, monkeypatch)
+    anchor = {"pane": "PANE-UUID", "workspace": "WS-7", "window": "WIN-7", "pid": 111}  # != 4242
+    probe = _anchor_probe(state, pid=4242, alive=True, anchor=anchor, resolves=True)
+    r = stack_doctor.check_runner_anchor(probe, {"repo": "o/r"})
+    assert r.ok is True and r.warn is True and "no matching anchor" in r.detail.lower()
+    assert probe.calls == []
