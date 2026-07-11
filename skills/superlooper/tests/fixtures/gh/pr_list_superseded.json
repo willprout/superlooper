@@ -1,0 +1,9 @@
+[
+  {
+    "number": 14,
+    "title": "old conflicted build",
+    "state": "OPEN",
+    "headRefName": "sl/i7-old-thing",
+    "labels": [{"name": "superseded"}]
+  }
+]

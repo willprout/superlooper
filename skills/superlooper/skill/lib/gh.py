@@ -280,6 +280,32 @@ def recent_pr_check_entries(limit=30):
     return out
 
 
+def remote_branches(limit=100):
+    """Names of the repo's remote branches (ONE page, up to `limit` — the janitor's sweep
+    converges across approved runs, so pagination isn't worth its parse fragility; a repo
+    holding >100 live branches has bigger debris problems than a truncated sweep). Fails
+    closed to []."""
+    lst = _json_list(["api", "repos/{owner}/{repo}/branches?per_page=%d" % limit])
+    return [b["name"] for b in lst if isinstance(b, dict) and isinstance(b.get("name"), str)]
+
+
+def open_prs_labeled(label, limit=100):
+    """Open PRs carrying `label`, raw gh dicts (the janitor's `superseded` sweep — §C.4 6b
+    leaves those PRs open by design, so only the owner's word ever closes one). Fails closed
+    to []."""
+    return _json_list(["pr", "list", "--state", "open", "--label", label,
+                       "--json", "number,title,state,headRefName,labels",
+                       "--limit", str(limit)])
+
+
+def open_issues_activity(label, limit=200):
+    """Open issues carrying `label`, WITH updatedAt — the janitor's dust clock (createdAt says
+    when an issue was born; updatedAt says when it last saw ANY activity, which is what
+    "gathering dust" means). Raw dicts; fails closed to []."""
+    return _json_list(["issue", "list", "--state", "open", "--label", label,
+                       "--json", "number,title,labels,updatedAt", "--limit", str(limit)])
+
+
 def default_branch():
     """The repo's default branch name (e.g. 'main'/'master'/'develop'), or None if gh can't
     answer (unreachable, unauthenticated, or a wrong-typed ref). adopt writes this as `dev_branch`
@@ -364,6 +390,26 @@ def close_issue(num, comment=None):
     """Close an issue (the investigate-type gate: marker comment present -> close the parent).
     True on success."""
     args = ["issue", "close", str(num)]
+    if comment:
+        args += ["--comment", comment]
+    rc, _ = _run(args)
+    return rc == 0
+
+
+def delete_branch(branch):
+    """Delete a remote branch ref — the janitor's approved stale-branch action, only ever
+    invoked on the owner's explicit word, never from any automatic path. This deletes a ref
+    outright; it never rewrites one (there is still no force machinery anywhere). Slashes in
+    the branch stay raw ref segments; anything stranger is percent-encoded. True on success."""
+    rc, _ = _run(["api", "repos/{owner}/{repo}/git/refs/heads/%s" % quote(branch, safe="/"),
+                  "-X", "DELETE"])
+    return rc == 0
+
+
+def close_pr(num, comment=None):
+    """Close a PR without merging — the janitor's approved superseded-PR action (the branch
+    stays; deleting it is a SEPARATE proposal on a later sweep). True on success."""
+    args = ["pr", "close", str(num)]
     if comment:
         args += ["--comment", comment]
     rc, _ = _run(args)

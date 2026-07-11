@@ -1240,3 +1240,184 @@ def test_tidy_snapshots_the_surface_so_a_relaunch_cannot_redirect_the_close(rig)
     r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": str(stub)})
     assert r.returncode == 0, r.stdout + r.stderr
     assert log.read_text().splitlines() == ["close-surface --surface surf-old"]   # snapshot, not re-read
+
+
+# --------------------------- janitor (propose-and-approve GitHub debris sweep) ---------------------------
+# `superlooper janitor` (issue #62, spec §8 V2) PROPOSES GitHub-side cleanup — stale sl/*
+# branches whose PRs merged or were superseded, PRs labeled `superseded` left open by design,
+# and parked / needs-william issues gathering dust — and executes ONLY what William approves
+# (y/N or --yes, the same word-discipline as tidy). The list / --dry-run changes nothing
+# anywhere; nothing is ever auto-closed or auto-deleted; in-flight work can never be proposed.
+
+def _janitor_home(rig):
+    return rig.tmp / "slhome" / "o__r"
+
+
+def _seed_janitor_fixtures(rig):
+    """The committed fixtures already carry one of each debris class:
+      - branches.json: main, sl/i5-fix-thing, sl/i7-old-thing
+      - pr_list_superseded.json: OPEN PR #14 labeled superseded on sl/i7-old-thing
+      - issue_list_parked.json: issue #9 labeled parked, updatedAt 2026-06-01 (long aged)
+    Add the per-head PR lookups: sl/i5-fix-thing's PR #12 MERGED (branch proposable);
+    sl/i7-old-thing's PR #14 still OPEN (branch NOT proposable — the PR close comes first).
+    And an explicit empty needs-william queue."""
+    (rig.fixdir / "pr_list_head_sl__i5-fix-thing.json").write_text(json.dumps(
+        [{"number": 12, "state": "MERGED", "headRefName": "sl/i5-fix-thing", "labels": []}]))
+    (rig.fixdir / "pr_list_head_sl__i7-old-thing.json").write_text(json.dumps(
+        [{"number": 14, "state": "OPEN", "headRefName": "sl/i7-old-thing",
+          "labels": [{"name": "superseded"}]}]))
+    (rig.fixdir / "issue_list_needs-william.json").write_text("[]")
+
+
+def _janitor_journal(rig):
+    p = _janitor_home(rig) / "journal.jsonl"
+    return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+
+def _janitor_refused(rig):
+    p = _janitor_home(rig) / "state" / "janitor_refused.json"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def test_janitor_dry_run_lists_all_three_classes_and_changes_nothing(rig):
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    # one proposal per debris class, each with its one-line why
+    assert "sl/i5-fix-thing" in out and "#12" in out and "merged" in out.lower()
+    assert "#14" in out and "superseded" in out
+    assert "#9" in out and "parked" in out and "threshold 14d" in out
+    # the branch under the OPEN superseded PR is NOT proposed for deletion
+    assert "delete branch sl/i7-old-thing" not in out
+    # dry-run changes NOTHING anywhere: no gh writes, no journal, no refused file, no state dir
+    assert mutations(rig) == []
+    assert _janitor_journal(rig) == []
+    assert _janitor_refused(rig) is None
+
+
+def test_janitor_prompt_default_no_aborts_and_executes_nothing(rig):
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--repo", str(rig.repo), inp="\n")
+    assert r.returncode == 0
+    assert "aborted" in r.stdout
+    assert mutations(rig) == [] and _janitor_journal(rig) == []
+
+
+def test_janitor_yes_executes_all_three_actions_and_journals_them(rig):
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    muts = mutations(rig)
+    kinds = {m["kind"] for m in muts}
+    assert kinds == {"delete_ref", "close_pr", "close_issue"}
+    assert next(m for m in muts if m["kind"] == "delete_ref")["ref"] == "heads/sl/i5-fix-thing"
+    pr_close = next(m for m in muts if m["kind"] == "close_pr")
+    assert pr_close["num"] == "14" and "janitor" in pr_close["comment"]
+    issue_close = next(m for m in muts if m["kind"] == "close_issue")
+    assert issue_close["num"] == "9" and "janitor" in issue_close["comment"]
+    recs = [x for x in _janitor_journal(rig) if x.get("act") == "janitor"]
+    assert len(recs) == 3 and all(x["outcome"] == "ok" for x in recs)
+    assert all(x.get("why") for x in recs)          # the one-line why rides into the journal
+    assert "3 executed" in r.stdout
+
+
+def test_janitor_prompt_y_executes(rig):
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--repo", str(rig.repo), inp="y\n")
+    assert r.returncode == 0
+    assert len(mutations(rig)) == 3
+
+
+def test_janitor_never_proposes_inflight_or_midgate_work(rig):
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    st = loopstate.new_state()
+    st["issues"]["i5"] = dict(loopstate.new_issue(), status="running",
+                              branch="sl/i5-fix-thing")
+    st["issues"]["i7"] = dict(loopstate.new_issue(), status="gating",
+                              branch="sl/i7-old-thing")
+    st["issues"]["i9"] = dict(loopstate.new_issue(), status="holding")
+    loopstate.save(str(home / "state" / "issues.json"), st)
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "nothing to propose" in r.stdout
+    assert mutations(rig) == []
+
+
+def test_janitor_unreadable_loopstate_refuses_to_propose(rig):
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "issues.json").write_text("{corrupt")
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    assert "unreadable" in (r.stdout + r.stderr)
+    assert mutations(rig) == []
+
+
+def test_janitor_respects_the_configured_age_threshold(rig):
+    _seed_janitor_fixtures(rig)
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(
+        {"version": 1, "repo": "o/r", "required_checks": ["quality-gate"],
+         "janitor": {"aged_park_days": 100000}}))
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0
+    assert "close issue" not in r.stdout        # issue #9 is no longer past the threshold
+    assert "#12" in r.stdout                    # the branch/PR proposals are unaffected
+
+
+def test_janitor_failed_action_surfaces_once_and_is_held_back(rig):
+    _seed_janitor_fixtures(rig)
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "git/refs/heads/sl/i5-fix-thing", "times": 1,
+          "stderr": "HTTP 403: refs are protected"}]))
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    # the failure is LOUD: nonzero exit, a FAIL line, a fail journal record, a refused entry
+    assert r.returncode != 0
+    assert "FAIL" in r.stdout and "branch:sl/i5-fix-thing" in r.stdout
+    recs = {x["target"]: x["outcome"] for x in _janitor_journal(rig)
+            if x.get("act") == "janitor"}
+    assert recs == {"sl/i5-fix-thing": "fail", 14: "ok", 9: "ok"}
+    assert "branch:sl/i5-fix-thing" in _janitor_refused(rig)
+
+    # sweep 2, with the world reflecting sweep 1 (PR closed, issue closed): the refused branch
+    # is HELD BACK — surfaced as a held-back count, never silently retried.
+    (rig.fixdir / "pr_list_superseded.json").write_text("[]")
+    (rig.fixdir / "issue_list_parked.json").write_text("[]")
+    r2 = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert "nothing to propose" in r2.stdout and "held back" in r2.stdout
+    deletes = [m for m in mutations(rig) if m["kind"] == "delete_ref"]
+    assert deletes == []                         # sweep 1's delete FAILED, sweep 2 never retried
+
+    # sweep 3 with --retry-refused (no fail rule left): the delete executes and the refusal
+    # record clears.
+    r3 = cli(rig, "janitor", "--yes", "--retry-refused", "--repo", str(rig.repo))
+    assert r3.returncode == 0, r3.stdout + r3.stderr
+    deletes = [m for m in mutations(rig) if m["kind"] == "delete_ref"]
+    assert [d["ref"] for d in deletes] == ["heads/sl/i5-fix-thing"]
+    assert _janitor_refused(rig) == {}
+
+
+def test_janitor_prunes_a_refusal_whose_debris_is_gone(rig):
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "janitor_refused.json").write_text(json.dumps(
+        {"branch:sl/i99-vanished": {"reason": "gone", "ts": 1}}))
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode == 0
+    assert _janitor_refused(rig) == {}           # the moot refusal was pruned on execution
+
+
+def test_janitor_nothing_to_propose_is_a_clean_exit(rig):
+    _seed_janitor_fixtures(rig)
+    (rig.fixdir / "branches.json").write_text("[]")
+    (rig.fixdir / "pr_list_superseded.json").write_text("[]")
+    (rig.fixdir / "issue_list_parked.json").write_text("[]")
+    r = cli(rig, "janitor", "--repo", str(rig.repo))   # no --yes: must not hang on a prompt
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "nothing to propose" in r.stdout
+    assert mutations(rig) == [] and _janitor_journal(rig) == []

@@ -60,6 +60,11 @@ _NESTED_DEFAULTS = {
     "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
            "quarantine": [], "nightly_time": "02:00"},
     "notify": {"imessage_to": None, "cmd": None},
+    # janitor.aged_park_days (issue #62): how long a parked / needs-william issue may sit with
+    # NO activity (GitHub updatedAt) before `superlooper janitor` proposes closing it. A
+    # proposal only — nothing closes without the owner's explicit approval in the janitor's
+    # own confirm step. 0 proposes every parked issue immediately.
+    "janitor": {"aged_park_days": 14},
     "codex": {"dangerous_bypass": False, "bypass_hook_trust": True, "no_alt_screen": True},
 }
 
@@ -177,6 +182,9 @@ def _validate_and_fill(raw):
         _err(f"'qa.quarantine' must be a list of strings, got {q!r}")
     if not isinstance(out["qa"]["nightly_time"], str):
         _err(f"'qa.nightly_time' must be a string like \"02:00\", got {out['qa']['nightly_time']!r}")
+    v = out["janitor"]["aged_park_days"]
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        _err(f"'janitor.aged_park_days' must be an integer >= 0, got {v!r}")
     for nk in ("imessage_to", "cmd"):
         v = out["notify"][nk]
         if v is not None and (not isinstance(v, str) or not v.strip()):

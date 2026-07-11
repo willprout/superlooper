@@ -283,3 +283,27 @@ def test_state_home_respects_sl_home(monkeypatch, tmp_path):
     monkeypatch.setenv("SL_HOME", str(tmp_path / "slhome"))
     home = config.state_home({"repo": "octocat/Hello-World"})
     assert home == tmp_path / "slhome" / "octocat__Hello-World"
+
+
+# --------------------------- janitor knobs (issue #62) ---------------------------
+
+def test_janitor_defaults_and_override(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b"})
+    assert config.load(tmp_path)["janitor"]["aged_park_days"] == 14
+    _write_cfg(tmp_path, {"repo": "a/b", "janitor": {"aged_park_days": 30}})
+    assert config.load(tmp_path)["janitor"]["aged_park_days"] == 30
+
+
+def test_janitor_bad_values_rejected(tmp_path):
+    for bad in (True, -1, "14", None, 1.5):
+        _write_cfg(tmp_path, {"repo": "a/b", "janitor": {"aged_park_days": bad}})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "aged_park_days" in str(e.value)
+
+
+def test_janitor_unknown_subkey_rejected(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b", "janitor": {"aged_prak_days": 30}})
+    with pytest.raises(ValueError) as e:
+        config.load(tmp_path)
+    assert "janitor.aged_prak_days" in str(e.value)
