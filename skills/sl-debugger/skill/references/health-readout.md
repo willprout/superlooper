@@ -19,7 +19,10 @@ superlooper doctor --repo <repo>    # repo-level validation: config, required_ch
 ```
 
 Both are read-only and work whether or not the runner is up (`status` renders from journal +
-disk). `superlooper doctor --stack --repo <repo>` adds machine-level checks — claude/gh
+disk). If `superlooper` isn't on the current PATH (observed live 2026-07-11 — the CLI link
+lands in the owner's interactive PATH, not necessarily yours), invoke the installed copy
+directly: `~/.claude/skills/superlooper/bin/superlooper` — that is the copy the live runner
+itself runs from, so it always exists on a machine with a loop. `superlooper doctor --stack --repo <repo>` adds machine-level checks — claude/gh
 auth, gh API headroom, launch shim, and the **live runner anchor probe** (catches a runner
 whose cmux tab was closed/moved, which otherwise parks the whole queue) — but note its one
 deliberate side effect: it sends a single real test message through the notify channel.
@@ -116,12 +119,15 @@ change).
 Bound to `127.0.0.1` only (default port 8611); it refuses any other bind by construction.
 
 ```bash
-curl -s http://127.0.0.1:8611/api/snapshot | jq '{generated_at, clock, pill, github: .github.reachable, runner: .runner.down, usage: .usage.known}'
+curl -s http://127.0.0.1:8611/api/snapshot | jq '{generated_at, pill, runner: .runner.down, usage: .usage.known,
+  repos: [.repos[] | {slug, heartbeat_age, runner_down, merges_frozen, alert}]}'
 ```
 
-Healthy: `generated_at` advances every poll, `pill.level` `"ok"`, `github.reachable` true,
-`runner.down` false, `usage.known` true. `runner-down` on the pill means the loop's
-heartbeat is absent/stale (>300s) — believe the heartbeat, not the dashboard's memory.
+Healthy: `generated_at` advances every poll, `pill.level` `"ok"`, `runner.down` false with
+fresh per-repo `heartbeat_age`, `usage.known` true. (`generated_at` + `pill` are the stable
+core; other key shapes vary with the installed dashboard's version — an installed dashboard
+lags the repo source exactly like the engine does.) `runner-down` on the pill means the
+loop's heartbeat is absent/stale (>300s) — believe the heartbeat, not the dashboard's memory.
 Known mispaint (issue #22 lineage): a finished session whose report the dashboard can't see
 paints as a dead session (`session-frozen`) instead of `stranded` — check
 `<home>/reports/i<N>.md` existence yourself before trusting a grey plane. GitHub-derived
