@@ -16,7 +16,7 @@
   "merge_method": "squash",
   "ship_cmd": null,
   "ship_recheck_cmd": null,
-  "report_required_sections": ["Tests", "Browser evidence", "Regression tests", "Review"],
+  "report_required_sections": ["Tests", "Review"],
   "bright_lines": [],
   "models": { "worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": null },
   "codex": { "dangerous_bypass": false, "bypass_hook_trust": true, "no_alt_screen": true },

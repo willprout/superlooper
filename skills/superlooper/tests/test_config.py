@@ -48,7 +48,7 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["required_checks"] == []
     assert cfg["merge_method"] == "squash"
     assert cfg["ship_cmd"] is None and cfg["ship_recheck_cmd"] is None
-    assert cfg["report_required_sections"] == ["Tests", "Browser evidence", "Regression tests", "Review"]
+    assert cfg["report_required_sections"] == ["Tests", "Review"]   # issue #57: web-agnostic default
     assert cfg["bright_lines"] == []
     assert cfg["models"] == {"worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": None}
     assert cfg["session"] == {"idle_seconds": 480, "freeze_seconds": 2700,
@@ -64,6 +64,39 @@ def test_minimal_config_fills_defaults(tmp_path):
     # the constitution's absolute exclusions are enforced by the sl-debugger contract, not here.
     assert cfg["watchdog"] == {"authority": "full", "allowlist": [], "grace_minutes": 30,
                                "heartbeat_stale_minutes": 20, "no_progress_minutes": 30}
+
+
+# --------------------------- report sections default (issue #57) ---------------------------
+
+def test_default_report_sections_are_web_agnostic(tmp_path):
+    # issue #57: the SHIPPED default must be honestly satisfiable by ANY repo. A CLI/library/service
+    # worker can never produce "Browser evidence", so demanding it in the default nudged-then-parked
+    # every finished issue on a fresh adopt of a non-web repo. The universal floor is exactly the two
+    # things every worker is ALREADY required to produce: passing tests (TDD + required_checks) and a
+    # fresh-agent review (gate step 2b). A web repo opts back into browser evidence explicitly.
+    _write_cfg(tmp_path, {"repo": "me/cli-tool"})
+    secs = config.load(tmp_path)["report_required_sections"]
+    assert secs == ["Tests", "Review"]
+    assert "Browser evidence" not in secs
+    # must stay NON-empty: report_sections_ok treats an empty required list as vacuously ok, so an
+    # empty default would silently disable the section gate for every repo that omits the field.
+    assert secs
+
+
+def test_example_template_report_sections_are_web_agnostic():
+    # `adopt` copies config.example.json VERBATIM, so its value is exactly what a fresh adopt writes.
+    # It must carry the honest universal default, not the old browser-heavy list (issue #57).
+    raw = json.loads(_EXAMPLE.read_text())
+    assert raw["report_required_sections"] == ["Tests", "Review"]
+    assert "Browser evidence" not in raw["report_required_sections"]
+
+
+def test_explicit_report_sections_survive_load(tmp_path):
+    # issue #57 DoD: a repo that sets report_required_sections explicitly is UNTOUCHED by the new
+    # default — a web repo keeps its "Browser evidence" opt-in exactly as written, in order.
+    web = ["Tests", "Browser evidence", "Regression tests", "Review"]
+    _write_cfg(tmp_path, {"repo": "acme/webapp", "report_required_sections": web})
+    assert config.load(tmp_path)["report_required_sections"] == web
 
 
 # --------------------------- watchdog block (issue #66) ---------------------------

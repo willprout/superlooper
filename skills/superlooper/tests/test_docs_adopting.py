@@ -120,6 +120,25 @@ def test_walkthrough_orders_publish_before_adopt_before_doctor_before_run():
     )
 
 
+def test_report_required_sections_default_is_web_agnostic_with_browser_opt_in():
+    # issue #57: the field table must document the new honest default — the two sections EVERY worker
+    # can produce (Tests, Review) — never the old "Browser evidence" list that a non-web worker can't
+    # satisfy. Browser evidence must still be shown, but as the documented OPT-IN for web repos.
+    text = _doc_text()
+    row = next((ln for ln in text.splitlines()
+                if ln.strip().startswith("| `report_required_sections`")), None)
+    assert row is not None, "ADOPTING.md must document report_required_sections in the field table"
+    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+    assert len(cells) >= 2, f"malformed field-table row: {row!r}"
+    default_cell = cells[1]     # | Field | Default | Meaning |
+    assert default_cell == '`["Tests", "Review"]`', f"unexpected Default cell: {default_cell!r}"
+    assert "Browser evidence" not in default_cell   # the web-only assumption is no longer the default
+    # ...and browser evidence appears elsewhere in the doc as the explicit web-repo opt-in.
+    lowered = text.lower()
+    assert "browser evidence" in lowered
+    assert "opt-in" in lowered or "web repo" in lowered or "web app" in lowered
+
+
 def test_reserved_investigation_lanes_and_borrow_policy_are_documented():
     # issue #63 DoD: the object `lanes` shape AND the chosen borrow policy (may an investigation use
     # an idle build lane?) must be documented so an adopter can find them. Pin the doc so it can't
