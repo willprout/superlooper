@@ -2298,3 +2298,137 @@ def test_park_episode_recovers_and_merges_with_no_further_notify(rig):
     assert st["park_notify_cause"] is None and st["pr_read_pending_since"] is None
     assert len(_journal_acts(rig, "notify")) == 1                  # the park's one text, no more
     assert [m for m in mutations(rig) if m["kind"] == "merge_pr" and m["num"] == "55"]
+
+
+# ============================ long-run growth bounds (issue #41) ============================
+#
+# The tick shell must keep three append-forever stores from degrading status/report/restart with
+# age — always by ARCHIVING, never deleting. The selection logic is pure and unit-tested
+# (test_journal / test_events / test_tidy); these pin that the SHELL wires it in correctly.
+
+_evmod = runner_mod.events_mod
+
+
+# ---- journal rotation ----
+
+def test_tick_rotates_the_journal_archiving_the_stale_tail(rig):
+    # A pre-existing ancient record is archived on the first tick (rotation runs then); the hot
+    # journal — what status/report read — keeps only the recent window, and read_all still finds the
+    # archived record (nothing deleted).
+    journal.append(rig.home, {"act": "ancient_marker"}, now=NOW - 30 * 24 * 3600)
+    rig.r.tick(now=NOW)
+    assert "ancient_marker" not in [r.get("act") for r in journal.read(rig.home)]
+    assert (rig.home / journal.ARCHIVE_FILENAME).exists()
+    assert any(r.get("act") == "ancient_marker" for r in journal.read_all(rig.home))
+
+
+def test_journal_rotation_is_throttled_between_ticks(rig):
+    # After the first tick rotates and arms the throttle, a record that goes stale is NOT archived on
+    # the very next tick — only once JOURNAL_ROTATE_SECONDS has elapsed.
+    rig.r.tick(now=NOW)
+    journal.append(rig.home, {"act": "later_ancient"}, now=NOW - 30 * 24 * 3600)
+    rig.r.tick(now=NOW + 15)                                       # throttled -> still hot
+    assert any(r.get("act") == "later_ancient" for r in journal.read(rig.home))
+    rig.r.tick(now=NOW + runner_mod.JOURNAL_ROTATE_SECONDS + 15)   # interval elapsed -> archived
+    assert all(r.get("act") != "later_ancient" for r in journal.read(rig.home))
+
+
+# ---- processed-events bound ----
+
+def _seed_processed(rig, seqs):
+    pdir = rig.home / "state" / "events" / "processed"
+    for s in seqs:
+        (pdir / f"{s}.json").write_text("{}")
+
+
+def test_prune_processed_events_bounds_the_dir_and_archives_the_rest(rig):
+    n = _evmod.PROCESSED_CAP + 200
+    _seed_processed(rig, range(1, n + 1))
+    rig.r._prune_processed_events()
+    pdir = rig.home / "state" / "events" / "processed"
+    adir = rig.home / "state" / "events" / "processed_archive"
+    kept = sorted(int(p.stem) for p in pdir.glob("*.json"))
+    archived = sorted(int(p.stem) for p in adir.glob("*.json"))
+    assert len(kept) == _evmod.PROCESSED_KEEP
+    assert kept[-1] == n                                          # newest (global-max seq) kept
+    assert archived == list(range(1, n - _evmod.PROCESSED_KEEP + 1))   # oldest archived
+    assert len(kept) + len(archived) == n                        # nothing deleted
+
+
+def test_pruned_processed_keeps_next_seq_correct_and_history_independent(rig):
+    n = _evmod.PROCESSED_CAP + 200
+    _seed_processed(rig, range(1, n + 1))
+    rig.r._prune_processed_events()
+    names = os.listdir(rig.home / "state" / "events" / "processed")
+    assert len(names) == _evmod.PROCESSED_KEEP                    # scan cost bounded, not O(history)
+    assert _evmod.next_seq(names) == n + 1                        # still the true next seq
+
+
+def test_tick_prunes_processed_after_archiving_an_event(rig):
+    # Wiring: a finished session writes one event (moved to processed/); with processed/ already at
+    # the cap, that tick prunes it back down and archives the overflow.
+    _seed_processed(rig, range(1, _evmod.PROCESSED_CAP + 1))      # exactly at the cap
+    seed_issue(rig, "i5", status="running", branch="sl/i5-x")
+    (rig.home / "reports" / "i5.md").write_text("## Tests\n" + "x" * 60)   # -> session_finished
+    rig.r.tick(now=NOW)
+    pdir = rig.home / "state" / "events" / "processed"
+    adir = rig.home / "state" / "events" / "processed_archive"
+    assert len(list(pdir.glob("*.json"))) == _evmod.PROCESSED_KEEP
+    assert adir.is_dir() and len(list(adir.glob("*.json"))) >= 1  # overflow archived, not deleted
+
+
+# ---- worktree reclaim ----
+
+def _mk_worktree(rig, iid):
+    d = rig.home / "worktrees" / iid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "wip").write_text("uncommitted")
+
+
+def test_reclaim_removes_parked_worktree_not_the_running_lane(rig, monkeypatch):
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    _mk_worktree(rig, "i5")
+    _mk_worktree(rig, "i6")
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
+    seed_issue(rig, "i6", status="running", branch="sl/i6-y")
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))
+    rig.r._reclaim_terminal_worktrees(st)
+    assert removed == [str(rig.r._worktree("i5"))]               # parked reclaimed, live lane untouched
+
+
+def test_reclaim_respects_the_config_gate(rig, monkeypatch):
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    rig.r.config = make_config(cleanup_parked_worktrees=False)
+    _mk_worktree(rig, "i5")
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))
+    rig.r._reclaim_terminal_worktrees(st)
+    assert removed == []                                          # gate off -> kept for inspection
+
+
+def test_tick_reclaims_a_parked_worktree(rig, monkeypatch):
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    _mk_worktree(rig, "i5")
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
+    rig.r.tick(now=NOW)
+    assert str(rig.r._worktree("i5")) in removed
+
+
+def test_reclaim_early_out_survives_an_unhashable_status(rig, monkeypatch):
+    # A corrupt issues.json with a wrong-typed (unhashable) status must NOT raise `unhashable type`
+    # on the reclaim early-out's `in REAPPROVAL_STATUSES` membership test — an unguarded raise there
+    # is unhandled and would wedge the tick. Fail closed: skip the corrupt entry, never raise, and
+    # still reclaim a genuinely parked sibling.
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    _mk_worktree(rig, "i9")
+    st = {"issues": {"i1": {"status": []}, "i2": {"status": {}}, "i9": {"status": "parked"}}}
+    rig.r._reclaim_terminal_worktrees(st)              # must not raise on the [] / {} statuses
+    assert removed == [str(rig.r._worktree("i9"))]     # corrupt skipped, valid parked still reclaimed

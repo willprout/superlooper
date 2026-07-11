@@ -152,3 +152,74 @@ def test_wrong_typed_scope_all_falls_to_the_default_merged_scope():
     issues = {"i1": _issue("parked")}
     for bad in ("False", 1, "yes", [1]):
         assert tidy.closable(issues, windows={"i1"}, scope_all=bad) == [], bad
+
+
+# ======================= worktree reclaim (issue #41) =======================
+#
+# Worktrees are auto-removed only for MERGED issues, so a parked / needs-william / bounced lane's
+# worktree lingers forever. reclaimable_worktrees() is the SAME pure fail-closed selector shape as
+# closable(): it names the park-family terminal statuses whose worktree still exists on disk, and it
+# is safe because re-approval rebuilds from the issue on a fresh branch (nothing durable is lost —
+# the branch is on the remote, the audit trail in the journal). merged is deliberately EXCLUDED: it
+# stays on the existing merge-time removal path (its own cleanup_merged_worktrees gate). The runner
+# sweeps this each tick to bound long-run disk growth; a live lane is NEVER touched.
+
+
+def test_reclaims_park_family_worktrees_that_exist_on_disk():
+    issues = {"i1": _issue("parked"), "i2": _issue("needs_william"), "i3": _issue("bounced")}
+    assert set(tidy.reclaimable_worktrees(issues, {"i1", "i2", "i3"})) == {"i1", "i2", "i3"}
+
+
+def test_reclaim_excludes_merged_left_to_the_merge_time_path():
+    # merged worktrees are removed at merge time under cleanup_merged_worktrees — this sweep must not
+    # double-claim them (or it would override that config when it is turned off).
+    issues = {"i1": _issue("merged")}
+    assert tidy.reclaimable_worktrees(issues, {"i1"}) == []
+
+
+def test_reclaim_never_touches_a_live_or_in_between_gate_lane():
+    # the core safety property: an in-flight build ({running,blocked,frozen,exited}) or an in-between
+    # gate lane ({gating,holding}) is a LIVE lane — its worktree is being written; never reclaim it,
+    # even with a worktree dir present on disk.
+    for status in ("running", "blocked", "frozen", "exited", "gating", "holding"):
+        issues = {"i1": _issue(status)}
+        assert tidy.reclaimable_worktrees(issues, {"i1"}) == [], status
+
+
+def test_reclaim_never_touches_not_started_or_unknown_status():
+    for status in ("ready", None, "archived", "closed"):
+        issues = {"i1": _issue(status)}
+        assert tidy.reclaimable_worktrees(issues, {"i1"}) == [], status
+
+
+def test_reclaim_requires_the_worktree_to_exist_on_disk():
+    # nothing on disk -> nothing to reclaim (idempotent: once removed, the dir is gone and the next
+    # sweep skips it, so steady-state cost is a single listing, no git call).
+    issues = {"i1": _issue("parked"), "i2": _issue("parked")}
+    assert tidy.reclaimable_worktrees(issues, {"i2"}) == ["i2"]
+
+
+def test_reclaim_result_is_sorted_by_issue_number():
+    issues = {"i10": _issue("parked"), "i2": _issue("parked"), "i1": _issue("parked")}
+    assert tidy.reclaimable_worktrees(issues, {"i1", "i2", "i10"}) == ["i1", "i2", "i10"]
+
+
+def test_reclaim_fail_closed_on_wrong_typed_inputs():
+    for bad in (None, [], "parked", 5):
+        assert tidy.reclaimable_worktrees(bad, {"i1"}) == [], bad
+    issues = {"i1": _issue("parked")}
+    for bad in (None, 5, "i1"):
+        assert tidy.reclaimable_worktrees(issues, bad) == [], bad
+
+
+def test_reclaim_skips_unhashable_worktree_entries_and_status_without_raising():
+    issues = {"i1": {"status": []}, "i2": _issue("parked")}
+    assert tidy.reclaimable_worktrees(issues, [["i1"], "i2"]) == ["i2"]
+
+
+def test_reclaim_does_not_mutate_its_inputs():
+    issues = {"i1": _issue("parked")}
+    before = copy.deepcopy(issues)
+    ids = {"i1"}
+    tidy.reclaimable_worktrees(issues, ids)
+    assert issues == before and ids == {"i1"}

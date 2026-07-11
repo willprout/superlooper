@@ -214,6 +214,53 @@ def test_next_seq_continues_past_existing_and_processed():
     assert events.next_seq(["0007.json"]) == 8
 
 
+# --------------------------- processed-events bound (issue #41) ---------------------------
+#
+# The processed/ dir accumulates one file per event forever, and both next_seq() and the restart
+# rebuild scan it — so their cost grows with total history. processed_overflow() picks the OLDEST
+# names to move to an archive so the hot dir (and thus that scan cost) stays bounded. The newest
+# file — carrying the global-max seq — is always kept, so next_seq stays monotonic and never
+# collides with an archived seq.
+
+
+def test_processed_overflow_empty_at_or_below_cap():
+    names = [f"{i}.json" for i in range(1, events.PROCESSED_CAP + 1)]
+    assert events.processed_overflow(names) == []          # exactly at the cap: nothing yet
+
+
+def test_processed_overflow_archives_oldest_down_to_keep():
+    n = events.PROCESSED_CAP + 300
+    names = [f"{i}.json" for i in range(1, n + 1)]
+    over = events.processed_overflow(names)
+    # archives the oldest, leaving exactly PROCESSED_KEEP newest hot
+    assert len(over) == n - events.PROCESSED_KEEP
+    archived_seqs = sorted(int(x.split(".")[0]) for x in over)
+    assert archived_seqs == list(range(1, n - events.PROCESSED_KEEP + 1))    # the lowest seqs
+    kept = set(names) - set(over)
+    assert f"{n}.json" in kept                              # the global-max seq is never archived
+
+
+def test_next_seq_stays_correct_and_history_independent_after_pruning():
+    # The bound's PAYOFF: after archiving the oldest, next_seq() over ONLY the retained newest names
+    # still returns global-max+1 — monotonic, no collision with an archived seq, and its input size
+    # is PROCESSED_KEEP regardless of how much total history was archived.
+    n = events.PROCESSED_CAP + 5000
+    names = [f"{i}.json" for i in range(1, n + 1)]
+    retained = set(names) - set(events.processed_overflow(names))
+    assert len(retained) == events.PROCESSED_KEEP          # scan cost bounded, not O(history)
+    assert events.next_seq(retained) == n + 1              # still the true next seq
+
+
+def test_processed_overflow_tolerates_wrong_typed_and_non_numeric():
+    # Fail closed on garbage: a non-list input archives nothing; non-str / non-numeric names never
+    # raise and are treated as oldest (archived first) so they can't outlive a real seq.
+    assert events.processed_overflow(None) == []
+    assert events.processed_overflow("junk") == []
+    weird = ["notanumber.json", "x.json"] + [f"{i}.json" for i in range(1, events.PROCESSED_CAP)]
+    over = events.processed_overflow(weird)
+    assert set(over) <= set(weird) and "notanumber.json" in over and "x.json" in over
+
+
 def test_retry_runaway():
     # fact-4, adapted to issues.json: ids whose mechanically-stamped retries blew far past the
     # retry cap (2) — cap enforcement failing must be loud. threshold = cap + slack.

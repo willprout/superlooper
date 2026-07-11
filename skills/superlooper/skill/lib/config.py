@@ -33,6 +33,10 @@ _TOP_DEFAULTS = {
     "report_required_sections": ["Tests", "Browser evidence", "Regression tests", "Review"],
     "bright_lines": [],
     "cleanup_merged_worktrees": True,
+    # Reclaim the worktrees of park-family terminal issues (parked/needs-william/bounced), which
+    # otherwise linger forever (issue #41). Safe: re-approval rebuilds from the issue on a fresh
+    # branch. Set false to keep parked worktrees on disk for manual inspection.
+    "cleanup_parked_worktrees": True,
     "report_time": "08:45",
 }
 
@@ -165,7 +169,7 @@ def _validate_and_fill(raw):
         _err(f"'affinity' must be one of {sorted(_AFFINITIES)}, got {out['affinity']!r}")
     if not isinstance(out["merge_method"], str) or out["merge_method"] not in _MERGE_METHODS:
         _err(f"'merge_method' must be one of {sorted(_MERGE_METHODS)}, got {out['merge_method']!r}")
-    for flag in ("touches_required", "cleanup_merged_worktrees"):
+    for flag in ("touches_required", "cleanup_merged_worktrees", "cleanup_parked_worktrees"):
         if not isinstance(out[flag], bool):
             _err(f"'{flag}' must be true or false, got {out[flag]!r}")
     for listkey in ("required_checks", "bright_lines", "report_required_sections"):

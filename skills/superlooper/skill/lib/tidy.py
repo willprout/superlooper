@@ -77,3 +77,35 @@ def closable(issues, windows, *, scope_all=False):
                 and status not in actions.INFLIGHT_STATUSES and iid in have_window):
             out.append({"id": iid, "status": status})
     return out
+
+
+def reclaimable_worktrees(issues, worktree_ids):
+    """[iid] for every PARK-FAMILY terminal issue (parked / needs-william / bounced) that still has a
+    worktree dir on disk — the set the runner may safely `git worktree remove` to bound long-run disk
+    growth (issue #41). PURE — no input mutated; a fresh sorted list every call.
+
+    Same fail-closed safety as closable(): a positive REAPPROVABLE allowlist AND an explicit
+    in-flight veto, so an in-flight lane ({running,blocked,frozen,exited}) or an in-between gate lane
+    ({gating,holding}) or a not-yet-started/unknown status is NEVER reclaimed — its worktree is a
+    LIVE lane still being written. Reclaiming a park-family worktree is safe: re-approval rebuilds
+    from the issue on a fresh branch (runner _exec_reapprove/_exec_launch recreate it), and the
+    committed work is preserved on the branch ref (worktree_remove drops only the checkout). merged is
+    DELIBERATELY EXCLUDED — it stays on the existing merge-time removal path and its own
+    cleanup_merged_worktrees gate, so this sweep never overrides that config.
+
+    issues        loopstate['issues']: {iid: {"status": ...}}. Wrong-typed -> nothing selected.
+    worktree_ids  iids that have a worktree dir on disk. Not a collection -> empty -> nothing selected.
+    """
+    have = ({w for w in worktree_ids if isinstance(w, str)}
+            if isinstance(worktree_ids, (set, frozenset, list, tuple)) else set())
+    issues = issues if isinstance(issues, dict) else {}
+    out = []
+    for iid in sorted((k for k in issues if _iid_num(k) is not None), key=_iid_num):
+        ist = issues.get(iid)
+        if not isinstance(ist, dict):
+            continue
+        status = ist.get("status")
+        if (isinstance(status, str) and status in REAPPROVABLE
+                and status not in actions.INFLIGHT_STATUSES and iid in have):
+            out.append(iid)
+    return out

@@ -157,6 +157,7 @@ Either way, no code merges unreviewed — and the reviewer is never the author.
 | `qa.quarantine` | `[]` | Test ids excluded from nightly failure counting. |
 | `qa.nightly_time` | `"02:00"` | When the nightly runs (Mac-local time). |
 | `cleanup_merged_worktrees` | `true` | Remove a worktree after its issue merges. |
+| `cleanup_parked_worktrees` | `true` | Reclaim the worktrees of park-family terminal issues (parked / needs-william / bounced), which otherwise linger forever (issue #41). Safe — re-approval rebuilds from the issue on a fresh branch. Set `false` to keep them for manual inspection. |
 | `notify.imessage_to` | `null` | Phone number / Apple ID the runner texts via the Mac's Messages app. `null` falls back to `notify.cmd`, then `cmux notify`, then log-only. |
 | `notify.cmd` | `null` | A generic notify command template (`{title}`/`{body}`) if you don't use iMessage. |
 | `report_time` | `"08:45"` | When the morning report is generated + pushed (Mac-local time). |
