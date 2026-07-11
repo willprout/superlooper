@@ -50,7 +50,13 @@ _NESTED_DEFAULTS = {
     # the runner's no-flag fallback and force an effort on every repo that omits the field (the
     # stale-fable trap). A per-issue effort:* label overrides it; the answerer never reads it.
     "models": {"worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": None},
-    "session": {"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2, "conflict_cap": 2},
+    # checks_pending_cap (issue #26): seconds a FINISHED PR may sit with its required checks
+    # PENDING before the runner escalates ONCE to needs-william (naming the unreported checks).
+    # The merge decision stays fail-closed — pending never merges — this only bounds the wait so a
+    # required check that never reports can't hold a green PR gating forever, silently. Default
+    # 10800 (3h) clears any real CI run; a huge value effectively disables the bound.
+    "session": {"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2, "conflict_cap": 2,
+                "checks_pending_cap": 10800},
     "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
            "quarantine": [], "nightly_time": "02:00"},
     "notify": {"imessage_to": None, "cmd": None},
@@ -156,7 +162,7 @@ def _validate_and_fill(raw):
     we = out["models"]["worker_effort"]
     if we is not None and (not isinstance(we, str) or not we.strip()):
         _err(f"'models.worker_effort' must be null or a non-empty string, got {we!r}")
-    for sk in ("idle_seconds", "freeze_seconds", "retry_cap", "conflict_cap"):
+    for sk in ("idle_seconds", "freeze_seconds", "retry_cap", "conflict_cap", "checks_pending_cap"):
         v = out["session"][sk]
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:
             _err(f"'session.{sk}' must be an integer >= 0, got {v!r}")

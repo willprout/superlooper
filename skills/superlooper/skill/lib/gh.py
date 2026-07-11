@@ -225,6 +225,22 @@ def branch_checks(branch):
     return out
 
 
+def recent_pr_check_entries(limit=30):
+    """Every statusCheckRollup entry across the repo's most recent PRs (any state), flattened into
+    one list, for the doctor's required_checks cross-check (issue #26). Raw rollup dicts (CheckRun
+    / StatusContext) — the caller runs gate.check_names over them. Fails closed to [] — an
+    unreadable PR list yields 'no evidence', which the doctor renders as 'cannot verify names yet',
+    never as a false 'name not found'."""
+    lst = _json_list(["pr", "list", "--state", "all", "--json", "statusCheckRollup",
+                      "--limit", str(limit)])
+    out = []
+    for pr in lst:
+        rollup = pr.get("statusCheckRollup") if isinstance(pr, dict) else None
+        if isinstance(rollup, list):
+            out += [c for c in rollup if isinstance(c, dict)]
+    return out
+
+
 def compare(base, head):
     """`base...head` merge-base comparison (status/ahead_by/behind_by/files). {} on failure.
     Used for the dev->prod promotion diff (`prod...dev`). Refs are URL-encoded (slashed branches)."""

@@ -63,8 +63,10 @@ def rig(tmp_path):
         p.chmod(0o755)
     repo = tmp_path / "repo"
     (repo / ".superlooper").mkdir(parents=True)
+    # required_checks match the names the committed gh fixtures report (pr_list.json rollup +
+    # check_runs.json), so the doctor's issue-#26 name cross-check passes on a healthy repo.
     (repo / ".superlooper" / "config.json").write_text(json.dumps(
-        {"version": 1, "repo": "o/r", "required_checks": ["ci"]}))
+        {"version": 1, "repo": "o/r", "required_checks": ["review/local-gate", "quality-gate"]}))
     env = {**os.environ,
            "HOME": str(home), "SL_HOME": str(tmp_path / "slhome"),
            "SL_GH": str(_FAKE_GH), "GH_FIXTURES": str(fixdir),
@@ -152,6 +154,75 @@ def test_doctor_warns_when_codex_hooks_are_missing(rig):
     assert "WARN" in out
     assert "Codex activity hooks registered" in out
     assert "hooks.json" in out
+
+
+# ------------- doctor: required_checks name cross-check (issue #26) -------------
+
+def _set_checks(rig, checks):
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(
+        {"version": 1, "repo": "o/r", "required_checks": checks}))
+
+
+def test_doctor_healthy_repo_passes_the_check_name_cross_check(rig):
+    # the rig's required_checks match what the fixtures report on PRs and the dev branch
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_doctor_flags_a_typo_with_a_case_or_shape_hint(rig):
+    # config says "Quality Gate" but the repo reports "quality-gate": a name it cannot find
+    _set_checks(rig, ["Quality Gate"])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "Quality Gate" in out                       # names the offending config entry
+    assert "quality-gate" in out                       # case/shape hint -> the real reported name
+
+
+def test_doctor_fails_a_never_wired_required_check(rig):
+    _set_checks(rig, ["nonexistent-check"])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    assert "nonexistent-check" in (r.stdout + r.stderr)
+
+
+def test_doctor_flags_a_check_that_reports_on_prs_but_never_on_dev(rig):
+    # the 2026-07-09 incident shape: reported on PRs (pr_list.json) but never on the dev branch.
+    _set_checks(rig, ["quality-gate"])
+    (rig.fixdir / "check_runs.json").write_text(json.dumps(
+        {"check_runs": [{"name": "review/local-gate", "status": "completed",
+                         "conclusion": "success"}]}))   # dev reports OTHER checks, never quality-gate
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "quality-gate" in out and "dev" in out.lower()
+
+
+def test_doctor_flags_a_check_that_reports_on_dev_but_never_on_prs(rig):
+    # the mirror of pr-only: reported on the dev branch but never on recent PRs — every PR reads
+    # pending forever, so the green PR never merges (Codex R1).
+    _set_checks(rig, ["quality-gate"])
+    (rig.fixdir / "pr_list.json").write_text(json.dumps([{
+        "number": 700, "state": "OPEN", "statusCheckRollup": [
+            {"__typename": "CheckRun", "name": "review/local-gate",
+             "status": "COMPLETED", "conclusion": "SUCCESS"}]}]))   # PRs never report quality-gate
+    # dev branch DOES report quality-gate
+    (rig.fixdir / "check_runs.json").write_text(json.dumps(
+        {"check_runs": [{"name": "quality-gate", "status": "completed",
+                         "conclusion": "success"}]}))
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "quality-gate" in out and "PR" in out
+
+
+def test_doctor_warns_when_no_checks_observed_yet(rig):
+    # a freshly adopted repo with no CI history: cannot verify names -> WARN, never a hard FAIL.
+    (rig.fixdir / "pr_list.json").write_text("[]")
+    (rig.fixdir / "check_runs.json").write_text(json.dumps({"check_runs": []}))
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "no checks observed" in (r.stdout + r.stderr).lower()
 
 
 def _write_exe(path, body):

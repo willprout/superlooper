@@ -618,6 +618,82 @@ def test_gate_park_when_no_pr_exists():
     assert len(p) == 1 and p[0]["needs_william"] is False and has_notify(out)
 
 
+# ---------------- bounded pending-checks escalation (issue #26) ----------------
+# A required check that never reports reads as "pending" forever, and the pending wait had no
+# timer: a finished issue sat in `gating` with no park, no memo, no notify. These pin the bound.
+
+PENDING_ROLLUP = [{"name": "ci", "status": "IN_PROGRESS", "conclusion": None}]  # required "ci" running
+UNREPORTED_ROLLUP = []                                                          # required "ci" absent
+
+
+def _cap(secs):
+    return cfg(session={"idle_seconds": 480, "freeze_seconds": 2700,
+                        "retry_cap": 2, "conflict_cap": 2, "checks_pending_cap": secs})
+
+
+def _gating_pending(since=_DEFAULT, rollup=PENDING_ROLLUP):
+    over = {} if since is _DEFAULT else {"checks_pending_since": since}
+    return _gating(pv=pr_view(rollup=rollup),
+                   issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555, **over)})
+
+
+def test_first_pending_tick_stamps_the_clock():
+    d, g = _gating_pending()
+    out = decide(config=_cap(60), dsk=d, gh_view=g)
+    assert only(out, "note_checks_pending") == [{"act": "note_checks_pending", "id": "i5"}]
+    assert only(out, "park") == [] and only(out, "merge") == []
+
+
+def test_pending_within_bound_waits_without_escalating():
+    d, g = _gating_pending(since=NOW - 50)
+    out = decide(config=_cap(60), dsk=d, gh_view=g)
+    assert only(out, "park") == [] and only(out, "note_checks_pending") == []
+
+
+def test_pending_past_bound_escalates_once_naming_the_unreported_check():
+    d, g = _gating_pending(since=NOW - 61, rollup=UNREPORTED_ROLLUP)
+    out = decide(config=_cap(60), dsk=d, gh_view=g)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["needs_william"] is True
+    assert "ci" in p[0]["memo"] and has_notify(out)     # names the unreported check + notifies
+    assert only(out, "merge") == []
+
+
+def test_late_but_in_bound_checks_still_merge_cleanly():
+    # the healthy repo: a check reports late (within the bound) and the PR merges — zero behavior
+    # change. The stale pending clock is cleared, never an escalation.
+    d, g = _gating(issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                           checks_pending_since=NOW - 30)})   # default rollup GREEN
+    out = decide(config=_cap(60), dsk=d, gh_view=g)
+    assert len(only(out, "merge")) == 1 and only(out, "park") == []
+    assert only(out, "clear_checks_pending") == [{"act": "clear_checks_pending", "id": "i5"}]
+
+
+def test_corrupt_pending_clock_restamps_never_escalates():
+    for bad in (None, "x", True, float("nan")):
+        d, g = _gating_pending(since=bad)
+        out = decide(config=_cap(60), dsk=d, gh_view=g)
+        assert only(out, "park") == []                  # never escalate off a garbage clock
+        assert only(out, "note_checks_pending") == [{"act": "note_checks_pending", "id": "i5"}]
+
+
+def test_future_pending_clock_cannot_defeat_the_cap():
+    # a numeric-but-corrupt FUTURE timestamp makes now-since negative — the old bound would then
+    # wait forever again. It must be treated as invalid and re-stamped, never trusted (Codex R1).
+    d, g = _gating_pending(since=NOW + 10_000)
+    out = decide(config=_cap(60), dsk=d, gh_view=g)
+    assert only(out, "park") == []
+    assert only(out, "note_checks_pending") == [{"act": "note_checks_pending", "id": "i5"}]
+
+
+def test_negative_pending_clock_never_escalates_spuriously():
+    # a negative timestamp makes now-since huge — it must re-stamp, not escalate on garbage.
+    d, g = _gating_pending(since=-5)
+    out = decide(config=_cap(60), dsk=d, gh_view=g)
+    assert only(out, "park") == []
+    assert only(out, "note_checks_pending") == [{"act": "note_checks_pending", "id": "i5"}]
+
+
 def test_referee_path_gate_parks_needs_william_with_file_memo_and_one_notify():
     d, g = _gating(pv=pr_view(files=["src/f/Widget.tsx", ".superlooper/config.json"]))
     out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"),

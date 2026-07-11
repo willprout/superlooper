@@ -165,7 +165,12 @@ diff-pinned**, and drop only `strict`. Verify the live protections at change-tim
    `repo`, your `areas`, at least one `required_checks` entry, and any `bright_lines`.
 2. `superlooper doctor --repo <path>` — verifies: `gh` is authenticated, `cmux` is on PATH, `jq`
    is present, the launch shim is installed, the two activity hooks are registered, the config
-   parses, the labels exist, and **`required_checks` is non-empty**. Fix anything red.
+   parses, the labels exist, **`required_checks` is non-empty**, and — new — **every
+   `required_checks` name actually matches a check the repo has reported** on recent PRs and the
+   dev branch. A name typo (`quality-gate` vs `Quality Gate`) or a check the repo never wired reads
+   as "pending" forever, so a green PR would gate without merging; `doctor` fails it here with a
+   case/shape hint, and separately flags a check that reports on PRs but never on the dev branch.
+   Fix anything red.
 3. Approve issues by conversation (William's word applies `agent-ready`), install the skill, and
    start the runner in a cmux tab you can watch — or under launchd for keep-alive.
 
