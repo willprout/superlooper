@@ -403,12 +403,26 @@ def main_stateful():
         if "compare" in path:
             print(json.dumps(st.get("compare", {})))
             sys.exit(0)
+        if "/branches/" in path:
+            # branch existence (issue #28) derives from the bare origin: a ref with no tip 404s.
+            name = unquote(path.split("/branches/")[1].split("/")[0])
+            tip = _tip(name)
+            if tip is None:
+                die("HTTP 404: Branch not found (%s)" % name)
+            print(json.dumps({"name": name, "commit": {"sha": tip}}))
+            sys.exit(0)
         die("unhandled api path: %s" % path)
 
     elif sub == ["label", "list"]:
         with _Lock(STATE_PATH):
             st = load_state()
         print(json.dumps([{"name": n} for n in st.get("repo_labels", [])]))
+        sys.exit(0)
+
+    elif sub == ["repo", "view"]:
+        with _Lock(STATE_PATH):
+            st = load_state()
+        print(json.dumps({"defaultBranchRef": {"name": st.get("dev_branch", "main")}}))
         sys.exit(0)
 
     # ---------- writes (mutations.jsonl still records every one) ----------
@@ -629,6 +643,11 @@ def main_fixture():
         num = ARGS[2] if len(ARGS) > 2 else ""
         serve_first(["pr_diff_%s.txt" % num, "pr_diff.txt"])
 
+    elif sub == ["repo", "view"]:
+        # gh.default_branch reads defaultBranchRef.name (issue #28: adopt writes the repo's real
+        # default branch as dev_branch).
+        serve_first(["repo_view.json"])
+
     elif ARGS[:1] == ["api"]:
         # `api` is a one-word subcommand followed by the endpoint path (not two words like the rest)
         path = ARGS[1] if len(ARGS) > 1 else ""
@@ -638,6 +657,16 @@ def main_fixture():
             serve_first(["check_runs.json"])
         if "/status" in path:
             serve_first(["commit_status.json"])
+        if "/branches/" in path:
+            # gh.branch_exists (issue #28): a branch listed in $GH_MISSING_BRANCHES 404s (nonzero
+            # exit, like GitHub); any other branch is reported present. Default = present, so the
+            # healthy doctor path (dev_branch main) passes with no extra fixture setup.
+            name = unquote(path.split("/branches/")[1])
+            missing = {x for x in (os.environ.get("GH_MISSING_BRANCHES") or "").split(",") if x}
+            if name in missing:
+                die("HTTP 404: Branch not found (%s)" % name)
+            print(json.dumps({"name": name, "commit": {"sha": "deadbeef"}}))
+            sys.exit(0)
         if "rate_limit" in path:
             serve_first(["rate_limit.json", "api.json"])
         serve_first(["api.json"])

@@ -146,6 +146,27 @@ def test_doctor_fails_when_shim_is_missing(rig):
     assert "shim" in (r.stdout + r.stderr).lower()
 
 
+def test_doctor_fails_when_the_dev_branch_is_missing_on_origin(rig):
+    # issue #28: the worktree base is origin/<dev_branch>. If that branch does not exist on the
+    # remote, every launch dies at worktree creation. doctor must FAIL and NAME the branch, so the
+    # cause is caught at adoption time, not chased through a "shim not installed?" park memo.
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(
+        {"version": 1, "repo": "o/r", "dev_branch": "develop",
+         "required_checks": ["review/local-gate", "quality-gate"]}))
+    r = cli(rig, "doctor", "--repo", str(rig.repo), env_over={"GH_MISSING_BRANCHES": "develop"})
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "develop" in out                          # the failure NAMES the missing branch
+    assert "FAIL" in out
+
+
+def test_doctor_passes_when_the_dev_branch_exists(rig):
+    # the healthy repo's dev_branch (default "main") exists on origin -> the new check must pass.
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "main" in r.stdout and "dev_branch" in r.stdout.lower()
+
+
 def test_doctor_warns_when_codex_hooks_are_missing(rig):
     (rig.home / ".codex" / "hooks.json").unlink()
     r = cli(rig, "doctor", "--repo", str(rig.repo))
@@ -342,6 +363,38 @@ def test_adopt_writes_config_creates_labels_and_prints_requirements(rig):
     out = r.stdout
     assert "branch protection" in out.lower()
     assert "required_checks" in out                  # the same at-least-one-check requirement
+
+
+def test_adopt_detects_and_writes_the_repo_default_branch(rig):
+    # issue #28: on a master/develop repo, dev_branch left at the template's "main" makes every
+    # worktree creation fail off origin/main. adopt must detect the repo's real default (via gh)
+    # and write it as dev_branch.
+    fresh = rig.tmp / "fresh-branch"
+    fresh.mkdir()
+    subprocess.run(["git", "init", "-q", str(fresh)], check=True)
+    subprocess.run(["git", "-C", str(fresh), "remote", "add", "origin",
+                    "https://github.com/will/proj.git"], check=True)
+    (rig.fixdir / "repo_view.json").write_text(json.dumps({"defaultBranchRef": {"name": "trunk"}}))
+    r = cli(rig, "adopt", "--repo", str(fresh))
+    assert r.returncode == 0, r.stdout + r.stderr
+    cfg = json.loads((fresh / ".superlooper" / "config.json").read_text())
+    assert cfg["dev_branch"] == "trunk"              # detected default, not the template's "main"
+    # the branch-protection printout names the DETECTED branch, not the template default
+    assert "`trunk`" in r.stdout
+
+
+def test_adopt_keeps_the_template_default_branch_when_gh_cannot_detect(rig):
+    # gh unreachable: adopt must not crash — it keeps the template's dev_branch ("main") and still
+    # succeeds. doctor is the backstop that later FAILs if that guessed branch is wrong.
+    fresh = rig.tmp / "fresh-nogh"
+    fresh.mkdir()
+    subprocess.run(["git", "init", "-q", str(fresh)], check=True)
+    subprocess.run(["git", "-C", str(fresh), "remote", "add", "origin",
+                    "https://github.com/will/proj.git"], check=True)
+    r = cli(rig, "adopt", "--repo", str(fresh), env_over={"GH_FAIL": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    cfg = json.loads((fresh / ".superlooper" / "config.json").read_text())
+    assert cfg["dev_branch"] == "main"               # template fallback, no crash
 
 
 def test_adopt_creates_the_model_and_effort_starter_labels(rig):

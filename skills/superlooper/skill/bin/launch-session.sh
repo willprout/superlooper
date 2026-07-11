@@ -111,10 +111,22 @@ BRIEF="$SL_RUN_ROOT/briefs/$ID.md"
 [ -f "$BRIEF" ] || { echo "[$ID] missing brief $BRIEF" >&2; exit 1; }
 
 # Create the worktree (worker mode only) off the fresh dev base; the fallback attaches an EXISTING
-# branch (a relaunch/regenerate reuses the same branch name).
+# branch (a relaunch/regenerate reuses the same branch name). Both attempts are guarded so a
+# failure is DIAGNOSED here, not left to abort with git's generic code under set -e (issue #28): if
+# both fail because the base ref origin/<dev_branch> is missing — the master/develop-repo case — we
+# exit with the DISTINCT code 3 and NAME the base, so the runner's park memo blames the branch, not
+# the launch shim. This runs BEFORE any cmux tab is created, so a missing base costs no orphan tab.
 if [ "$CWD_MODE" -eq 0 ] && [ ! -d "$WT" ]; then
-  git -C "$SL_REPO" worktree add -b "$BRANCH" "$WT" "$BASE" 2>/dev/null \
-    || git -C "$SL_REPO" worktree add "$WT" "$BRANCH"
+  if ! git -C "$SL_REPO" worktree add -b "$BRANCH" "$WT" "$BASE" 2>/dev/null; then
+    if ! git -C "$SL_REPO" worktree add "$WT" "$BRANCH" 2>/dev/null; then
+      if ! git -C "$SL_REPO" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null 2>&1; then
+        echo "[$ID] worktree base '$BASE' does not exist on '$SL_REPO' — the configured dev_branch is not on origin, so no worktree can be created. Run 'superlooper doctor' and set dev_branch to the repo's default, then re-approve." >&2
+        exit 3
+      fi
+      echo "[$ID] could not create the worktree at '$WT' for branch '$BRANCH' (base '$BASE' exists)" >&2
+      exit 1
+    fi
+  fi
 fi
 "$HERE/pretrust.sh" "$WT"                       # first-run trust prompt won't hang
 mkdir -p "$SL_RUN_ROOT/state/activity" "$SL_RUN_ROOT/state/panes" "$SL_RUN_ROOT/state/started" \

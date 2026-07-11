@@ -175,6 +175,46 @@ def test_recent_pr_check_entries_fail_closed(ghenv, monkeypatch):
     assert gh.recent_pr_check_entries() == []       # unreadable PR list -> no evidence, not a crash
 
 
+# --------------------------- default branch + branch existence (issue #28) ----------
+# adopt writes the repo's REAL default branch as dev_branch (a master/develop repo would
+# otherwise fail every worktree creation off origin/main), and doctor validates it exists.
+
+def test_default_branch_parses_the_ref(ghenv):
+    assert gh.default_branch() == "main"             # repo_view.json: defaultBranchRef.name
+
+
+def test_default_branch_reads_a_non_main_default(ghenv):
+    (ghenv / "repo_view.json").write_text(json.dumps({"defaultBranchRef": {"name": "trunk"}}))
+    assert gh.default_branch() == "trunk"
+
+
+def test_default_branch_fails_closed_to_none(ghenv, monkeypatch):
+    # gh unreachable / unauthenticated: adopt must fall back to the template default, never crash.
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.default_branch() is None
+
+
+def test_default_branch_none_on_wrong_typed_ref(ghenv):
+    (ghenv / "repo_view.json").write_text(json.dumps({"defaultBranchRef": None}))
+    assert gh.default_branch() is None               # wrong-typed shape fails closed
+
+
+def test_branch_exists_true_when_present(ghenv):
+    assert gh.branch_exists("main") is True          # default: fake reports the branch present
+
+
+def test_branch_exists_false_when_missing(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_MISSING_BRANCHES", "develop")
+    assert gh.branch_exists("develop") is False      # 404 -> False (doctor FAILs on this)
+
+
+def test_branch_exists_argv_encodes_slashed_ref(ghenv):
+    gh.branch_exists("release/2.0")
+    argv = _calls(ghenv)[-1]
+    # the ref is URL-encoded so a slashed branch doesn't split into extra api path segments
+    assert any("release%2F2.0" in a for a in argv), argv
+
+
 def test_compare(ghenv):
     c = gh.compare("main", "sl/i123-x")
     assert c["status"] == "ahead" and c["ahead_by"] == 3

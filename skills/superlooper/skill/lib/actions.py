@@ -757,9 +757,21 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                 continue                               # SYSTEMIC launch fault (#24): hold, never
                                                        # park per-issue — the queue stays intact for
                                                        # when the anchor resolves (the alert stands)
-            park(iid, num, f"launch was never delivered ({LAUNCH_FAILURE_CAP} verified "
-                           "attempts, or the attempt counter is unreadable) — is the launch "
-                           "shim installed? (bin/install-launch-shim.sh)")
+            if ist.get("launch_error") == "base_missing":
+                # issue #28: launch-session.sh could not create the worktree because its base ref
+                # origin/<dev_branch> does not exist. Name the REAL cause — the missing base branch
+                # — instead of sending the newcomer to debug the launch shim (the wrong component).
+                park(iid, num, f"launch never delivered: the worktree base branch "
+                               f"'origin/{dev_branch}' does not exist, so every worktree creation "
+                               f"fails before Claude starts — a repo/config fault, not a "
+                               f"launch-delivery problem. Set `dev_branch` in "
+                               f".superlooper/config.json to the repo's real default branch "
+                               f"(`superlooper adopt` detects it; `superlooper doctor` validates "
+                               f"it), then re-approve.")
+            else:
+                park(iid, num, f"launch was never delivered ({LAUNCH_FAILURE_CAP} verified "
+                               "attempts, or the attempt counter is unreadable) — is the launch "
+                               "shim installed? (bin/install-launch-shim.sh)")
             continue
         if "in-progress" in labels and iid not in live_locks and not gh_stale and iid in prs:
             pv = prs.get(iid) if isinstance(prs.get(iid), dict) else {}

@@ -211,6 +211,23 @@ def test_orphan_marker_with_wrong_token_does_not_verify(tmp_path):
     assert (run_root / "state" / "started" / "i1.ORPHAN-OTHER-TAB-UUID").exists()
 
 
+def test_missing_base_branch_fails_with_a_distinct_code_before_any_tab(tmp_path):
+    # issue #28: the worktree bases off origin/<dev>. On a repo whose dev_branch is not on origin
+    # (a master/develop repo left at "main", or a bad config), the launcher must FAIL FAST with a
+    # DISTINCT exit code (3), NAME the missing base, and NOT create a tab or fabricate liveness — so
+    # the runner's park memo blames the branch, not the launch shim. The setup's origin has only
+    # 'main', so pointing the worker at 'develop' has no origin/develop base.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={"SL_DEV_BRANCH": "develop"})
+    assert r.returncode == 3, f"missing base must exit 3, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert "origin/develop" in r.stderr                       # names the exact missing base ref
+    assert not (run_root / "worktrees" / "i1").exists()       # no worktree created
+    assert not (run_root / "state" / "activity" / "i1").exists()  # no fabricated liveness
+    assert not (run_root / "state" / "panes" / "i1").exists()     # no pane recorded
+    assert not (stubdir / "closed").exists()                  # never even opened a tab to close
+
+
 def test_worker_singleton_blocks_a_second_worker(tmp_path):
     # RC-WORKER-SINGLETON: if a LIVE worker already owns this id, a second launch's start-session.sh
     # must NOT start a second Claude (no split-brain on one worktree). It exits 0 without stamping the

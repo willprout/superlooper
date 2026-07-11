@@ -250,6 +250,30 @@ def recent_pr_check_entries(limit=30):
     return out
 
 
+def default_branch():
+    """The repo's default branch name (e.g. 'main'/'master'/'develop'), or None if gh can't
+    answer (unreachable, unauthenticated, or a wrong-typed ref). adopt writes this as `dev_branch`
+    so a repo whose default is not 'main' doesn't fail every worktree creation off origin/main
+    (issue #28). None is the honest fallback: adopt keeps the template default and prints a hint."""
+    ref = _json_dict(["repo", "view", "--json", "defaultBranchRef"]).get("defaultBranchRef")
+    name = ref.get("name") if isinstance(ref, dict) else None
+    return name if isinstance(name, str) and name.strip() else None
+
+
+def branch_exists(branch):
+    """True iff `gh api .../branches/<branch>` returns 0 (the branch is present on the remote).
+    ANY nonzero exit -> False. This is DELIBERATELY conservative: a genuine 404 and a transient
+    blip (5xx/timeout/rate-limit) both read as False, so a rare gh hiccup can produce a false
+    'missing' — but it can NEVER produce a false 'present'. That direction is the safe one for
+    doctor's use (issue #28): a false FAIL is a re-runnable annoyance on a human-run check, whereas
+    masking a genuinely-missing base branch would let every launch die at worktree creation
+    undetected. (Not worth distinguishing 404 from 5xx by parsing gh's stderr — that substring
+    match is brittle across gh versions and could misclassify a real 404 as transient, the worse
+    error.) The ref is URL-encoded so a slashed branch doesn't split into extra path segments."""
+    rc, _ = _run(["api", "repos/{owner}/{repo}/branches/%s" % quote(branch, safe="")])
+    return rc == 0
+
+
 def compare(base, head):
     """`base...head` merge-base comparison (status/ahead_by/behind_by/files). {} on failure.
     Used for the dev->prod promotion diff (`prod...dev`). Refs are URL-encoded (slashed branches)."""

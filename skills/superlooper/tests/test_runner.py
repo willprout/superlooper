@@ -580,6 +580,42 @@ def test_failed_launch_bumps_the_counter_and_moves_no_labels(rig):
 
 # --------------------------- launch anchor liveness (#24) ---------------------------
 
+def test_missing_base_branch_launch_records_the_cause_and_skips_the_streak(rig):
+    # issue #28: launch-session.sh exits 3 when the worktree base branch is missing. The runner must
+    # stamp launch_error="base_missing" (so the park memo names the branch) and must NOT feed this to
+    # the systemic-anchor streak — a missing base is a per-repo config fault, not a dead cmux anchor.
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(3)                             # launch-session.sh: worktree base missing
+    out = rig.r._execute(_launch_action(), NOW)
+    assert out != "ok"
+    ist = issue_state(rig, "i101")
+    assert ist["status"] == "ready" and ist["launch_failures"] == 1
+    assert ist["launch_error"] == "base_missing"
+    assert "i101" not in rig.r._launch_fail_ids        # NOT a systemic-anchor fault
+
+
+def test_verified_launch_clears_a_stale_base_missing_error(rig):
+    # A verified delivery proves the base now exists (config fixed + re-approved): the stale cause
+    # must be cleared so a later unrelated park can't inherit the wrong memo.
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", launch_error="base_missing")
+    rig.calls.clear()                                  # rc_queue empty -> run_script returns 0 (ok)
+    out = rig.r._execute(_launch_action(), NOW)
+    assert out == "ok"
+    assert issue_state(rig, "i101")["launch_error"] is None
+
+
+def test_generic_delivery_failure_does_not_stamp_base_missing(rig):
+    # A plain non-delivery (exit 2) is NOT a base problem — launch_error must stay clear so the
+    # default "is the shim installed?" memo is used.
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(2)
+    rig.r._execute(_launch_action(), NOW)
+    assert issue_state(rig, "i101").get("launch_error") is None
+
+
 def test_failed_launch_delivery_records_the_issue_in_the_systemic_streak(rig):
     # A launch whose delivery is not verified feeds the runner-level systemic-failure streak — the
     # signal decide uses to tell a dead anchor (many issues) from a bad issue (one).
