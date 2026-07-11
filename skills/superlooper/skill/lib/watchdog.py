@@ -66,7 +66,12 @@ _SEVEN_DAY_CEILING = 96
 
 
 def new_state():
-    return {"episode": None, "no_progress_since": {}, "next_debugger": 1}
+    # disabled_observed: the signal set the last kill-switched check journaled, so a standing
+    # kill-switch journals once per DISTINCT observation instead of once per check (an
+    # overnight switch at a 5-min interval must not write ~96 identical lines — the
+    # 2026-07-08 unbounded-repetition class). None = not currently disabled-deduping.
+    return {"episode": None, "no_progress_since": {}, "next_debugger": 1,
+            "disabled_observed": None}
 
 
 def coerce_state(raw):
@@ -87,6 +92,9 @@ def coerce_state(raw):
     nd = raw.get("next_debugger")
     if type(nd) is int and nd >= 1:
         st["next_debugger"] = nd
+    dob = raw.get("disabled_observed")
+    if isinstance(dob, list) and all(isinstance(x, str) for x in dob):
+        st["disabled_observed"] = dob
     return st
 
 
@@ -225,11 +233,15 @@ def evaluate(now, config, view, state):
     sigs, details, since = _signals(now, view, state, w)
 
     if view.get("kill_switch"):
-        # Observe + journal + change NOTHING: no episode opens, no clock advances, no launch.
-        return {"state": state, "notify": [], "launch": None,
+        # Observe + journal + change nothing else: no episode opens, no clock advances, no
+        # launch. The journal record dedups on the OBSERVED signal set (review P1-2): a
+        # standing switch writes one line per distinct observation, never one per check.
+        if sigs == state.get("disabled_observed"):
+            return {"state": state, "notify": [], "launch": None, "journal": []}
+        return {"state": dict(state, disabled_observed=sigs), "notify": [], "launch": None,
                 "journal": [_rec("disabled", sigs)]}
 
-    new_state = dict(state, no_progress_since=since)
+    new_state = dict(state, no_progress_since=since, disabled_observed=None)
     journal, notify, launch = [], [], None
     ep = state.get("episode")
 

@@ -31,6 +31,7 @@ _FAKE_LAUNCH = """#!/bin/bash
   printf 'ROOT %s\\n' "${SL_RUN_ROOT:-}"
   printf 'MODEL %s\\n' "${SL_MODEL:-}"
   printf 'AGENT %s\\n' "${SL_AGENT:-}"
+  printf 'VERIFY %s\\n' "${SL_LAUNCH_VERIFY_SECONDS:-unset}"
 } >> "$STUB_LOG"
 exit "${STUB_RC:-0}"
 """
@@ -154,6 +155,21 @@ def test_grace_elapsed_launches_the_debugger_exactly_once(tmp_path):
     r2 = rig.run()
     assert r2.returncode == 0, r2.stderr
     assert len(rig.launch_calls()) == 1
+
+
+def test_launch_env_pins_the_verify_window(tmp_path):
+    # Fresh review P1-1: launch-session.sh inherits the caller's SL_LAUNCH_VERIFY_SECONDS. An
+    # ambient large value (a debugging export, a LaunchAgent env) would let the launch
+    # subprocess outlive the watchdog's own timeout — rc=124 counts a FAILED attempt while the
+    # tab delivers late and a real session starts, so a later check could launch a SECOND
+    # session for the same episode. The watchdog must pin the verify window itself.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.episode(age_seconds=3600)
+    rig.anchor()
+    r = rig.run(SL_LAUNCH_VERIFY_SECONDS="600")
+    assert r.returncode == 0, r.stderr
+    assert "VERIFY 30" in rig.stub_log.read_text()
 
 
 def test_env_pane_overrides_the_anchor(tmp_path):

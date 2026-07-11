@@ -323,13 +323,38 @@ def test_kill_switch_observes_journals_and_launches_nothing():
     assert r["state"]["episode"] is None                 # fully inert: no episode opens
 
 
+def test_kill_switch_journals_once_per_distinct_observation():
+    # Fresh review P1-2 (the 2026-07-08 unbounded-repetition class): an overnight kill-switch
+    # at a 5-min interval must not write ~96 identical journal lines. One record per DISTINCT
+    # observed signal set; a change journals again; re-enabling re-arms the dedup.
+    v = _view(heartbeat=T0 - 21 * MIN, kill_switch=True)
+    r1 = _run(T0, v)
+    assert _outcomes(r1) == ["disabled"]
+    r2 = _run(T0 + 5 * MIN, _view(T0 + 5 * MIN, heartbeat=T0 - 21 * MIN, kill_switch=True),
+              r1["state"])
+    assert r2["journal"] == []                           # same observation: silent
+    r3 = _run(T0 + 10 * MIN, _view(T0 + 10 * MIN, heartbeat=T0 - 21 * MIN,
+                                   alert={"reasons": ["x"]}, kill_switch=True), r2["state"])
+    assert _outcomes(r3) == ["disabled"]                 # the observation CHANGED: journal it
+    assert r3["journal"][0]["signals"] == ["alert", "heartbeat_stale"]
+    # switch removed and later re-applied: the dedup marker cleared, so it journals afresh
+    r4 = _run(T0 + 15 * MIN, _view(T0 + 15 * MIN), r3["state"])
+    r5 = _run(T0 + 20 * MIN, _view(T0 + 20 * MIN, heartbeat=T0 - 21 * MIN, kill_switch=True),
+              r4["state"])
+    assert _outcomes(r5) == ["disabled"]
+
+
 def test_kill_switch_mid_episode_holds_the_launch():
     st = _open_episode(T0)
     now = T0 + 30 * MIN
     r = _run(now, _view(now, heartbeat=T0 - 21 * MIN, kill_switch=True), st)
     assert r["launch"] is None
     assert _outcomes(r) == ["disabled"]
-    assert r["state"] == st                              # state untouched while disabled
+    # the watch state itself is untouched while disabled: the episode neither advances nor
+    # closes, and the no-progress clocks stay exactly as they were.
+    assert r["state"]["episode"] == st["episode"]
+    assert r["state"]["no_progress_since"] == st["no_progress_since"]
+    assert r["state"]["next_debugger"] == st["next_debugger"]
 
 
 # --------------------------- authority delivery ---------------------------

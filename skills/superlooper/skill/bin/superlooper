@@ -1395,6 +1395,13 @@ def _watchdog_launch(repo, cfg, home, state_dir, launch, state):
            "SL_RUN_ROOT": home, "SL_PANE": pane,
            # the debugger is a hired-judgment seat like the answerer — same model default
            "SL_MODEL": models.get("answerer") or "opus[1m]", "SL_EFFORT": "",
+           # PIN the shim verify window (review P1-1): launch-session.sh inherits
+           # SL_LAUNCH_VERIFY_SECONDS, and an ambient large value (a debugging export, a
+           # LaunchAgent env) would let the launch outlive WATCHDOG_LAUNCH_TIMEOUT — rc=124
+           # counts a FAILED attempt while the tab delivers late and a real session starts,
+           # so a later check could launch a SECOND session for one episode. 30s is the
+           # script's own default and sits far under the 180s timeout.
+           "SL_LAUNCH_VERIFY_SECONDS": "30",
            "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
     try:
         r = subprocess.run([script, "--cwd", os.path.abspath(repo), launch["id"]],
