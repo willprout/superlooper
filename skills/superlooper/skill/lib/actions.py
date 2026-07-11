@@ -67,6 +67,7 @@ import math
 import brief
 import events as events_mod
 import gate
+import issues as issues_mod
 import scheduler
 
 # Staleness / cap constants. The caps that PARK are deliberately small (park is cheap and safe:
@@ -207,6 +208,52 @@ def _dget(d, key, want):
     return v if isinstance(v, want) else want()
 
 
+# --- touches_required (issue #36): the knob now ACTS at launch/intake ---
+_MERGE_PRODUCING_TYPES = {"build", "diagnose-and-fix"}   # investigations produce no PR/merge
+
+
+def _declares_touches(p):
+    """True iff the parsed issue declares a non-empty `touches:` (a list with >=1 non-blank area).
+    A literal '*' counts as declared — it is an explicit unknown-scope declaration, and its
+    serialization cost is journaled separately (wildcard_hold), not refused here."""
+    t = p.get("touches") if isinstance(p, dict) else None
+    return isinstance(t, list) and any(isinstance(x, str) and x.strip() for x in t)
+
+
+def _touches_required(cfg):
+    """Fail SAFE to enforcement: a config missing the key or carrying a non-bool (corruption the
+    loader would reject, but decide is defensive of every input) enforces, matching the loader
+    default of True — never silently launch a no-touches issue on a garbled config."""
+    tr = cfg.get("touches_required") if isinstance(cfg, dict) else None
+    return tr if isinstance(tr, bool) else True
+
+
+def _touches_required_memo(num):
+    return (f"issue #{num} is approved (agent-ready) but its `## Loop metadata` declares no "
+            "`touches:` line, and this repo sets `touches_required: true`. superlooper will not "
+            "launch it until the issue declares which area(s) it touches (e.g. `touches: engine`): "
+            "the declaration is what anti-affinity and the wander check verify against. Add a "
+            "`touches:` line to the Loop metadata and re-approve.")
+
+
+def _wildcard_hold_reason(h):
+    """Prose for a wildcard launch-suppression (issue #36): why this approved issue could not
+    co-schedule and the lane serialized. Names which side is the no-touches wildcard."""
+    blocker = h.get("blocker_id")
+    if h.get("self_wildcard") and h.get("blocker_wildcard"):
+        why = (f"it and in-flight lane {blocker} both declare no `touches:` (wildcard '*'), which "
+               "overlaps every lane under hard affinity")
+    elif h.get("self_wildcard"):
+        why = ("it declares no `touches:` (wildcard '*'), which overlaps every lane under hard "
+               "affinity")
+    else:                                       # blocker_wildcard
+        why = (f"in-flight lane {blocker} declares no `touches:` (wildcard '*'), which overlaps "
+               "every lane under hard affinity")
+    return (f"launch held: {why} — so it cannot co-schedule and the lane serializes. This is why "
+            "only one lane is busy; declare a narrower `touches:` (or add matching `areas`) to let "
+            "lanes run in parallel.")
+
+
 def lane_state_from(issues_state):
     """[{"id", "touches", "type"?}] for every issue whose status occupies a lane, sorted by issue
     number (deterministic). Pure; wrong-typed state or entries degrade to no lanes / no touches."""
@@ -306,7 +353,12 @@ def _fix_issue(dev_branch, name, conclusion, fingerprint):
         f"Only the minimal change that restores green. Anything larger becomes a new issue for\n"
         f"William to approve. Merges are frozen until dev is green again.\n\n"
         f"## Loop metadata\n"
-        f"touches:\n"
+        # `touches: *` — a restore-green fix has genuinely unknown scope (whatever broke the check),
+        # so the wildcard is the honest declaration. It also satisfies touches_required (issue #36:
+        # an EMPTY touches would be refused at launch, deadlocking auto-restore-green since this
+        # issue is auto-approved and the mainline is frozen until it lands). '*' serializes under
+        # hard affinity — correct for an expedited fix while merges are frozen anyway.
+        f"touches: *\n"
     )
     return {"act": "file_fix_issue", "fingerprint": fingerprint, "title": title, "body": body,
             "labels": list(FIX_ISSUE_LABELS)}
@@ -652,6 +704,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                     h = {"act": "hold", "id": iid, "reason": g.get("reason"), "wander": wander}
                     if g.get("overlap_lane") is not None:
                         h["overlap_lane"] = g["overlap_lane"]
+                    if g.get("overlap_wildcard"):      # issue #36: the no-match-areas merge-hold cause
+                        h["overlap_wildcard"] = True
                     out.append(h)
             elif act == "nudge":
                 key = g.get("nudge_key")
@@ -802,6 +856,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
     # delivery fail, so attempting more only walks the queue. The queue is preserved (agent-ready
     # intact) and resumes the tick the anchor resolves — no William relabeling.
     if not gh_stale and not issue_state_corrupt_for_launches and not launch_degraded:
+        touches_required = _touches_required(cfg)
         candidates = []
         for iid in _sorted_ids(parsed_by_id):
             p = parsed_by_id[iid]
@@ -814,11 +869,26 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                     or ist.get("status") not in RELAUNCHABLE_STATUSES
                     or corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
                 continue
+            # touches_required (issue #36): the knob ACTS here. An approved merge-producing issue
+            # that declares no `touches:` is REFUSED at launch and handed to William with a memo
+            # naming the missing block — never silently launched into an un-verifiable affinity.
+            # Investigations produce no PR/merge, so touches are meaningless for them: exempt.
+            # Gate on ELIGIBILITY (blocked-by closed, no control-label conflict) so we refuse ONLY at
+            # the true launch point: an issue still waiting on an open dependency keeps waiting (never
+            # parked early), and a label-conflict issue is left for its own handling — not mislabeled
+            # with a "missing touches" memo (fresh-agent review P2-1).
+            if (touches_required and p.get("type") in _MERGE_PRODUCING_TYPES
+                    and not _declares_touches(p)
+                    and issues_mod.eligible(p, closed_nums, bool(frozen))):
+                park(iid, p.get("num"), _touches_required_memo(p.get("num")), needs_william=True)
+                continue
             candidates.append(dict(p, requeue_front=bool(ist.get("requeue_front"))))
+        claims = territory_claims_from(issues_state)
+        selected_ids = set()
         for sel in scheduler.launchable(candidates, lanes_in, cfg, usage_sched,
-                                        closed_nums, bool(frozen),
-                                        territory_claims=territory_claims_from(issues_state)):
+                                        closed_nums, bool(frozen), territory_claims=claims):
             iid = sel["id"]
+            selected_ids.add(iid)
             ist = ist_of(iid)
             branch = ist.get("branch")
             if not (isinstance(branch, str) and branch.strip()):
@@ -826,4 +896,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
             out.append({"act": "launch", "id": iid, "num": sel["num"], "branch": branch,
                         "touches": sel["touches"], "soft_overlap": sel["soft_overlap"],
                         "orphan": False})
+        # Wildcard launch-suppression journaling (issue #36): a no-touches wildcard — the candidate
+        # itself, or the lane blocking it — serializes the queue silently under hard affinity. Record
+        # WHY, ONCE per episode (dedup on the issue's `wildcard_hold_journaled` flag, reset on launch/
+        # reapprove), so "why is only one lane busy" is answerable from the journal. Bounded and
+        # journal-only: no notify, no park, the queue is untouched.
+        for h in scheduler.launch_holds(candidates, lanes_in, cfg, usage_sched,
+                                        closed_nums, bool(frozen), territory_claims=claims):
+            hid = h.get("id")
+            if hid in selected_ids or ist_of(hid).get("wildcard_hold_journaled"):
+                continue
+            out.append({"act": "wildcard_hold", "id": hid, "num": h.get("num"),
+                        "blocker": h.get("blocker_id"), "reason": _wildcard_hold_reason(h)})
     return out

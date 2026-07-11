@@ -117,23 +117,29 @@ def _referee_paths(paths):
 def touch_verdict(declared, actual_areas, inflight):
     """§C.4 step 3. wander = the diff left the declared touches (actual ⊄ declared) — journaled
     and morning-reported, never blocking. Nothing declared -> no promise to break -> no wander
-    (repos without touches_required let issues skip the declaration). overlap_lane = the first
+    (a touches_required:false repo lets issues skip the declaration). overlap_lane = the first
     (sorted — deterministic) in-flight lane whose declared touches overlap the ACTUAL areas;
     the merge HOLDS until that lane resolves, because merging under a live overlapping lane
-    invalidates that lane's base. A wrong-typed inflight view, non-string lane ids (mixed-type
-    keys would break sorted()), and wrong-typed lane entries all degrade to skipped — lane ids
-    are runner-constructed strings, so anything else is corruption, never a real lane."""
+    invalidates that lane's base. overlap_wildcard = that overlap was caused by a wildcard '*' on
+    either side (issue #36): the diff mapped to '*' (files in no declared `areas`), or the blocking
+    lane declares '*'/nothing. It lets the runner journal WHY a merge is held — the no-match-areas
+    trap, not a named-area overlap the operator declared on purpose. A wrong-typed inflight view,
+    non-string lane ids (mixed-type keys would break sorted()), and wrong-typed lane entries all
+    degrade to skipped — lane ids are runner-constructed strings, so anything else is corruption,
+    never a real lane."""
     decl = _clean_areas(declared)
     actual = _clean_areas(actual_areas)
     wander = bool(decl) and "*" not in decl and not set(actual) <= set(decl)
     overlap_lane = None
+    overlap_wildcard = False
     lanes = inflight if isinstance(inflight, dict) else {}
     for lane in sorted(k for k in lanes if isinstance(k, str)):
         touches = _clean_areas(lanes.get(lane))
         if _areas_overlap(actual, touches):
             overlap_lane = lane
+            overlap_wildcard = ("*" in actual) or ("*" in touches)
             break
-    return {"wander": wander, "overlap_lane": overlap_lane}
+    return {"wander": wander, "overlap_lane": overlap_lane, "overlap_wildcard": overlap_wildcard}
 
 
 def _rollup_entries(status_rollup):
@@ -400,9 +406,26 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
                           f"{joined} — needs-william; never auto-merging changes to "
                           ".superlooper/** or .github/workflows/**"}
     if verdict["overlap_lane"] is not None:
-        return {"action": "hold", "overlap_lane": verdict["overlap_lane"], "wander": wander,
-                "reason": f"diff overlaps in-flight lane {verdict['overlap_lane']} — "
-                          "hold until that lane resolves"}
+        lane = verdict["overlap_lane"]
+        if verdict.get("overlap_wildcard"):
+            # issue #36: name the wildcard cause so "why is only one lane busy" is answerable from
+            # the journal. Two shapes: OUR diff mapped to '*' (files in no declared `areas`), or the
+            # blocking lane itself is a no-touches wildcard.
+            if "*" in actual_areas:
+                reason = (f"diff touches files in no declared `areas` (wildcard '*'), which overlaps "
+                          f"every in-flight lane — holding behind lane {lane}. Add an `areas` glob "
+                          "covering these files so the merge can co-schedule with other lanes.")
+            else:
+                # This branch is reachable only when the lane declares the LITERAL '*' (an empty lane
+                # declaration never overlaps at the gate — _areas_overlap requires both sides truthy),
+                # e.g. an in-flight restore-green fix (touches: *). So name that, not "no touches:".
+                reason = (f"in-flight lane {lane} declares `touches: *` (unknown scope), which overlaps "
+                          "every diff — holding until it resolves.")
+        else:
+            reason = f"diff overlaps in-flight lane {lane} — hold until that lane resolves"
+        return {"action": "hold", "overlap_lane": lane,
+                "overlap_wildcard": bool(verdict.get("overlap_wildcard")),
+                "wander": wander, "reason": reason}
 
     # step 4: frozen mainline holds every merge (frozen-but-building is the safe idle state).
     if frozen:

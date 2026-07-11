@@ -278,6 +278,95 @@ def test_hard_affinity_undeclared_touches_conflicts_with_everything():
     assert _nums(out) == [1]           # #1 launches into lane 1, then blocks #2 (unknown scope)
 
 
+# --------------------------- launch_holds (why a launch was suppressed, issue #36) ---------------
+
+def _holds(*a, **k):
+    return scheduler.launch_holds(*a, **k)
+
+
+def test_launch_holds_wildcard_candidate_behind_named_running_lane():
+    # A no-touches (wildcard) candidate can't co-schedule with ANY running lane -> held. The hold
+    # names WHY: the candidate itself is the wildcard.
+    q = [_issue(1, touches=None)]                       # declares nothing -> "*"
+    lanes = [{"id": "i9", "touches": ["frontend"]}]
+    holds = _holds(q, lanes, _cfg(lanes=3, affinity="hard"), OK, set(), False)
+    assert [h["id"] for h in holds] == ["i1"]
+    h = holds[0]
+    assert h["num"] == 1 and h["blocker_id"] == "i9"
+    assert h["self_wildcard"] is True and h["blocker_wildcard"] is False
+
+
+def test_launch_holds_named_candidate_behind_wildcard_running_lane():
+    # The mirror: a running no-touches lane blocks a well-declared candidate. The hold names the
+    # LANE as the wildcard (this is the "lanes:5 serialize to one busy lane" trap).
+    q = [_issue(2, touches=["api"])]
+    lanes = [{"id": "i9", "touches": []}]               # running lane declares nothing -> "*"
+    holds = _holds(q, lanes, _cfg(lanes=3, affinity="hard"), OK, set(), False)
+    assert [h["id"] for h in holds] == ["i2"]
+    assert holds[0]["blocker_id"] == "i9"
+    assert holds[0]["self_wildcard"] is False and holds[0]["blocker_wildcard"] is True
+
+
+def test_launch_holds_same_tick_wildcard_selection_blocks_the_rest():
+    # #1 declares nothing, launches into lane 1, then blocks #2 and #3 (the headline serialization).
+    q = [_issue(1, touches=None), _issue(2, touches=["api"]), _issue(3, touches=["db"])]
+    cfg = _cfg(lanes=3, affinity="hard")
+    assert _nums(scheduler.launchable(q, [], cfg, OK, set(), False)) == [1]
+    holds = _holds(q, [], cfg, OK, set(), False)
+    assert sorted(h["id"] for h in holds) == ["i2", "i3"]
+    for h in holds:
+        assert h["blocker_id"] == "i1" and h["blocker_wildcard"] is True
+
+
+def test_launch_holds_named_vs_named_overlap_is_not_a_wildcard_hold():
+    # Two issues that genuinely declare the SAME named area serialize by the operator's own
+    # design — not a wildcard, so launch_holds stays silent (no mystery to explain).
+    q = [_issue(1, touches=["frontend"]), _issue(2, touches=["frontend"])]
+    assert _holds(q, [], _cfg(lanes=2, affinity="hard"), OK, set(), False) == []
+
+
+def test_launch_holds_disjoint_named_issues_have_no_holds():
+    q = [_issue(1, touches=["frontend"]), _issue(2, touches=["api"])]
+    assert _holds(q, [], _cfg(lanes=2, affinity="hard"), OK, set(), False) == []
+
+
+def test_launch_holds_empty_when_no_free_lanes():
+    # All lanes busy -> everything is LANE-held, not affinity-held; that is not a wildcard mystery.
+    q = [_issue(1, touches=None)]
+    lanes = [{"id": "i8", "touches": ["a"]}, {"id": "i9", "touches": ["b"]}]
+    assert _holds(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), False) == []
+
+
+def test_launch_holds_empty_under_soft_affinity():
+    # soft affinity never blocks a co-schedule, so nothing is suppressed.
+    q = [_issue(1, touches=None)]
+    lanes = [{"id": "i9", "touches": ["frontend"]}]
+    assert _holds(q, lanes, _cfg(lanes=3, affinity="soft"), OK, set(), False) == []
+
+
+def test_launch_holds_empty_when_usage_fails_closed():
+    q = [_issue(1, touches=None)]
+    lanes = [{"id": "i9", "touches": ["frontend"]}]
+    assert _holds(q, lanes, _cfg(lanes=3, affinity="hard"), {}, set(), False) == []
+
+
+def test_launch_holds_wildcard_behind_held_claim_without_a_lane():
+    # A territory claim (finished-but-unmerged lane) also blocks a wildcard candidate, and the
+    # hold surfaces it — the claim consumes no lane slot but still serializes an unknown-scope issue.
+    q = [_issue(1, touches=None), _issue(2, touches=["api"])]
+    claims = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    holds = _holds(q, [], _cfg(lanes=2, affinity="hard"), OK, set(), False, territory_claims=claims)
+    assert [h["id"] for h in holds] == ["i1"]
+    assert holds[0]["blocker_id"] == "i9" and holds[0]["self_wildcard"] is True
+
+
+def test_launch_holds_investigation_is_never_a_wildcard_hold():
+    # Investigations produce no merge, so anti-affinity never holds them — even a no-touches one.
+    q = [_issue(1, touches=None, labels=("type:investigate", "agent-ready"))]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    assert _holds(q, lanes, _cfg(lanes=3, affinity="hard"), OK, set(), False) == []
+
+
 # --------------------------- soft affinity ---------------------------
 
 def test_soft_affinity_allows_overlap_but_flags_it():

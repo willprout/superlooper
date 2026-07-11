@@ -49,7 +49,10 @@ def usage_ok(now=NOW):
             "last_ok_at": now, "first_attempt_at": now - 60}
 
 
-def parsed(num, labels=("agent-ready", "type:build"), touches=(), title=None, **over):
+def parsed(num, labels=("agent-ready", "type:build"), touches=("frontend",), title=None, **over):
+    # touches defaults to a real declared area: the default cfg sets touches_required=True, so a
+    # realistic approved issue DECLARES what it touches. Tests that exercise the no-touches path
+    # pass touches=() explicitly (usually paired with config=cfg(touches_required=False)).
     labels = list(labels)
     tvals = [x[len("type:"):] for x in labels if x.startswith("type:")]
     itype = tvals[0] if len(tvals) == 1 and tvals[0] in ("build", "investigate", "diagnose-and-fix") else "invalid"
@@ -406,6 +409,134 @@ def test_wrong_typed_issue_nums_are_never_scheduled():
            {**parsed(5), "num": "6", "id": "i6"}, {**parsed(5), "num": True, "id": "iTrue"}]
     out = decide(parsed_issues=bad)
     assert [a["id"] for a in only(out, "launch")] == ["i5"]
+
+
+# =========================== touches_required (issue #36) ===========================
+
+def test_touches_required_true_parks_an_approved_issue_missing_touches():
+    # The knob now ACTS: an approved build issue that declares no `touches:` is refused at launch
+    # and handed to William with a memo naming the missing block — never silently launched.
+    out = decide(config=cfg(touches_required=True),
+                 parsed_issues=[parsed(5, touches=())])
+    assert only(out, "launch") == []
+    parks = only(out, "park")
+    assert len(parks) == 1 and parks[0]["id"] == "i5" and parks[0]["needs_william"] is True
+    memo = parks[0]["memo"].lower()
+    assert "touches" in memo and "touches_required" in memo
+    assert has_notify(out)
+
+
+def test_touches_required_true_launches_when_touches_declared():
+    # The gate only bites the MISSING declaration; a well-declared issue launches unchanged.
+    out = decide(config=cfg(touches_required=True),
+                 parsed_issues=[parsed(5, touches=("frontend",))])
+    assert len(only(out, "launch")) == 1 and only(out, "park") == []
+
+
+def test_touches_required_false_relaxes_and_does_not_park_a_no_touches_issue():
+    # false documents what is relaxed: a no-touches issue is allowed. It still launches (its
+    # wildcard cost shows up only when it must co-schedule — see the serialization test below).
+    out = decide(config=cfg(touches_required=False),
+                 parsed_issues=[parsed(5, touches=())])
+    assert only(out, "park") == []
+    assert len(only(out, "launch")) == 1
+
+
+def test_touches_required_true_never_parks_an_investigation_missing_touches():
+    # Investigations produce no PR/merge, so touches are meaningless for them — the gate is about
+    # merge-area affinity, not investigations. A no-touches investigate issue is NOT parked.
+    out = decide(config=cfg(touches_required=True),
+                 parsed_issues=[parsed(5, labels=("agent-ready", "type:investigate"), touches=())])
+    assert only(out, "park") == []
+
+
+def test_touches_required_missing_from_config_defaults_to_enforcing():
+    # A config missing the key (or a corrupt non-bool) fails SAFE to enforcement (the loader
+    # default is True), so a no-touches issue is refused rather than silently launched.
+    c = cfg()
+    del c["touches_required"]
+    out = decide(config=c, parsed_issues=[parsed(5, touches=())])
+    assert only(out, "launch") == [] and len(only(out, "park")) == 1
+
+
+def test_touches_required_does_not_park_a_blocked_issue_early():
+    # P2-1 (fresh review): a no-touches issue still BLOCKED by an open dependency must keep waiting,
+    # not be parked early (which would strip agent-ready and force a needless re-approval). The park
+    # is the true launch point — it fires only once the issue is otherwise eligible.
+    p = parsed(5, touches=(), blocked_by=[3])
+    out = decide(config=cfg(touches_required=True), parsed_issues=[p],
+                 gh_view=ghv(closed_nums=set()))          # #3 still open
+    assert only(out, "park") == [] and only(out, "launch") == []
+    # once the dependency closes, the missing-touches refusal fires (the real launch point)
+    out2 = decide(config=cfg(touches_required=True), parsed_issues=[p],
+                  gh_view=ghv(closed_nums={3}))
+    assert len(only(out2, "park")) == 1 and only(out2, "park")[0]["needs_william"] is True
+
+
+def test_touches_required_does_not_mislabel_a_control_label_conflict_issue():
+    # P2-1: a no-touches issue that is ALSO ineligible for a control-label conflict must not be
+    # parked with a "missing touches" memo (a misdiagnosis). It is left for its own handling.
+    p = parsed(5, touches=(), label_conflict=True)
+    out = decide(config=cfg(touches_required=True), parsed_issues=[p])
+    assert not [pk for pk in only(out, "park") if "touches_required" in pk.get("memo", "")]
+    assert only(out, "launch") == []                      # still not launched (conflict unresolved)
+
+
+def test_touches_required_true_does_not_park_the_auto_filed_restore_green_issue():
+    # Regression (self-review of #36): the nightly-red auto-fix issue is diagnose-and-fix + auto-
+    # approved. It MUST declare `touches: *` so touches_required does not park it — parking the very
+    # issue meant to unfreeze a frozen mainline would deadlock auto-restore-green. Assert the filed
+    # body carries a real touches declaration, and that such an issue launches (never parks).
+    filed = actions._fix_issue("main", "ci", "FAILURE", "fp1")
+    assert "touches: *" in filed["body"]
+    fixp = parsed(5, labels=("agent-ready", "type:diagnose-and-fix", "auto-approved:nightly-red"),
+                  touches=("*",))
+    out = decide(config=cfg(touches_required=True), parsed_issues=[fixp])
+    assert only(out, "park") == [] and len(only(out, "launch")) == 1
+
+
+# =========================== wildcard launch-suppression journaling (issue #36) ===========
+
+def test_wildcard_hold_journaled_when_a_no_touches_lane_serializes_the_queue():
+    # touches_required:false + a running no-touches lane -> a well-declared candidate can't
+    # co-schedule (the lane is a '*' that overlaps everything). The journal must SAY why.
+    lane = [{"id": "i9", "touches": [], "type": "build"}]
+    out = decide(config=cfg(touches_required=False, lanes=3),
+                 parsed_issues=[parsed(5, touches=("api",))], lane_state=lane)
+    assert only(out, "launch") == []
+    wh = only(out, "wildcard_hold")
+    assert len(wh) == 1 and wh[0]["id"] == "i5" and wh[0]["blocker"] == "i9"
+    assert "one lane" in wh[0]["reason"].lower() or "serial" in wh[0]["reason"].lower()
+
+
+def test_wildcard_hold_dedupes_once_per_episode():
+    # Bounded: once the hold is journaled (loopstate flag set), a later tick in the same episode
+    # does NOT re-journal it.
+    lane = [{"id": "i9", "touches": [], "type": "build"}]
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("ready", wildcard_hold_journaled=True)}})
+    out = decide(config=cfg(touches_required=False, lanes=3),
+                 parsed_issues=[parsed(5, touches=("api",))], lane_state=lane, dsk=dsk)
+    assert only(out, "wildcard_hold") == []
+    assert only(out, "launch") == []
+
+
+def test_named_overlap_hold_is_not_journaled_as_wildcard():
+    # A genuine named-area overlap (both declare 'frontend') serializes by the operator's design —
+    # no wildcard mystery, so no wildcard_hold record.
+    lane = [{"id": "i9", "touches": ["frontend"], "type": "build"}]
+    out = decide(parsed_issues=[parsed(5, touches=("frontend",))], lane_state=lane)
+    assert only(out, "launch") == [] and only(out, "wildcard_hold") == []
+
+
+def test_hold_action_carries_overlap_wildcard_for_the_merge_gate():
+    # The merge-side mirror: a finished PR whose diff maps to '*' (no declared area) holds behind an
+    # in-flight lane, and the hold action carries overlap_wildcard so the journal records why.
+    d, g = _gating(pv=pr_view(files=("totally/undeclared.txt",)),
+                   issues_extra={"i9": ist("running", declared_touches=["api"])})
+    out = decide(dsk=d, gh_view=g)
+    holds = only(out, "hold")
+    assert len(holds) == 1 and holds[0].get("overlap_wildcard") is True
 
 
 # =========================== bounce (runner-side label mechanics) ===========================
@@ -1395,9 +1526,11 @@ def test_finished_claim_release_on_merge_regenerate_and_park_allows_overlap():
 
 
 def test_parked_wildcard_claim_releases_so_no_touches_repo_does_not_freeze():
+    # A no-touches repo is a touches_required:false repo (empty touches are allowed there); the
+    # released parked claim must not freeze the sole lane.
     dsk = disk(issues_state={"version": 1, "issues": {
         "i9": ist("parked", declared_touches=[], type="build")}})
-    out = decide(config=cfg(lanes=1, affinity="hard"),
+    out = decide(config=cfg(lanes=1, affinity="hard", touches_required=False),
                  parsed_issues=[parsed(1, touches=[])],
                  dsk=dsk)
     assert [a["id"] for a in only(out, "launch")] == ["i1"]

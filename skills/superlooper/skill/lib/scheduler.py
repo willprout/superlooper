@@ -54,6 +54,15 @@ def usage_ok(usage):
     return _usage_ok(usage)
 
 
+def _is_wildcard(touches):
+    """Does this declaration behave as the wildcard '*' — i.e. overlap EVERY lane? An empty
+    declaration (an issue of unknown scope) is treated as '*', and a literal '*' is one too. This
+    is the single predicate behind both the safe-default serialization AND the issue #36 journaling
+    that explains it: a wildcard is exactly why 'only one lane is busy'."""
+    a = {t for t in touches if isinstance(t, str)} if isinstance(touches, (list, set, tuple)) else set()
+    return (not a) or ("*" in a)
+
+
 def _geometric_overlap(touches_a, touches_b):
     """Do two sets of declared areas share ground? The wildcard '*' (a path in no declared area)
     overlaps everything; an EMPTY declaration is treated as '*' too — an issue of unknown scope
@@ -106,6 +115,60 @@ def _occupied_from(records):
     return out
 
 
+def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territory_claims=None):
+    """Shared core of the launch decision. Returns (selected, holds):
+      selected — the parsed issues chosen to launch this tick, in priority order.
+      holds    — the eligible candidates a hard-affinity overlap SUPPRESSED *while a lane was still
+                 free* (affinity was the binding constraint, not the lane cap). Each is
+                 {"p": parsed_issue, "blocker": occupied_entry}. A candidate the lane cap alone
+                 stopped (encountered after `free` were already chosen) is NOT a hold — it is
+                 lane-bound, not affinity-bound, so it carries no "why is only one lane busy"
+                 mystery.
+    Both public entry points build on this so the "what launched" and "why the rest didn't" views
+    can never drift from one another (they are computed from the SAME selection walk)."""
+    if not _usage_ok(usage):
+        return [], []
+
+    lanes = config.get("lanes", 1)
+    free = max(0, lanes - len(lane_state))
+    if free == 0:
+        return [], []
+
+    affinity = config.get("affinity", "hard")
+    lanes_in = _occupied_from(lane_state)
+    claims_in = _occupied_from(territory_claims or [])
+    running_ids = {lane.get("id") for lane in lanes_in}
+    claimed_ids = {claim.get("id") for claim in claims_in}
+    # occupied entries keep their id so a hold can NAME the lane/claim that blocked it.
+    lane_occupied = [{"id": lane.get("id"), "touches": lane.get("touches", []), "type": lane.get("type")}
+                     for lane in lanes_in]
+    claim_occupied = [{"id": claim.get("id"), "touches": claim.get("touches", []),
+                       "type": claim.get("type")} for claim in claims_in]
+
+    candidates = [p for p in parsed_issues
+                  if p.get("id") not in running_ids
+                  and p.get("id") not in claimed_ids
+                  and issues.eligible(p, closed_nums, frozen)]
+    candidates.sort(key=lambda p: issues.sort_key(p, p.get("requeue_front", False)))
+
+    selected_ids = set(running_ids) | set(claimed_ids)
+    selected, holds = [], []
+    occupied = list(lane_occupied) + list(claim_occupied)              # existing + chosen so far
+    for p in candidates:
+        if len(selected) >= free:
+            break                                                     # lane cap now binding, not affinity
+        if p.get("id") in selected_ids:                               # never launch the same id twice
+            continue
+        blocker = next((ot for ot in occupied if _anti_affinity_blocks(p, ot, affinity)), None)
+        if blocker is not None:
+            holds.append({"p": p, "blocker": blocker})                # affinity conflict -> held this tick
+            continue
+        selected.append(p)
+        selected_ids.add(p.get("id"))
+        occupied.append({"id": p.get("id"), "touches": p["touches"], "type": p.get("type")})
+    return selected, holds
+
+
 def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen,
                territory_claims=None):
     """Return the issues to launch NOW, in priority order, as a list of dicts:
@@ -119,46 +182,13 @@ def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen,
     concurrent lane/claim — pre-existing or same-tick — flagged symmetrically so the journal sees
     the pair.
     """
-    if not _usage_ok(usage):
-        return []
-
-    lanes = config.get("lanes", 1)
-    free = max(0, lanes - len(lane_state))
-    if free == 0:
-        return []
-
+    selected, _ = _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen,
+                        territory_claims)
     affinity = config.get("affinity", "hard")
     lanes_in = _occupied_from(lane_state)
     claims_in = _occupied_from(territory_claims or [])
-    running_ids = {lane.get("id") for lane in lanes_in}
-    claimed_ids = {claim.get("id") for claim in claims_in}
-    claimed_touches = [claim.get("touches", []) for claim in claims_in]
     lane_touches = [lane.get("touches", []) for lane in lanes_in]       # pre-existing occupied lanes
-    lane_occupied = [{"touches": lane.get("touches", []), "type": lane.get("type")}
-                     for lane in lanes_in]
-    claim_occupied = [{"touches": claim.get("touches", []), "type": claim.get("type")}
-                      for claim in claims_in]
-
-    candidates = [p for p in parsed_issues
-                  if p.get("id") not in running_ids
-                  and p.get("id") not in claimed_ids
-                  and issues.eligible(p, closed_nums, frozen)]
-    candidates.sort(key=lambda p: issues.sort_key(p, p.get("requeue_front", False)))
-
-    selected_ids = set(running_ids) | set(claimed_ids)
-    selected = []
-    occupied = list(lane_occupied) + list(claim_occupied)              # existing + chosen so far
-    for p in candidates:
-        if len(selected) >= free:
-            break
-        if p.get("id") in selected_ids:                               # never launch the same id twice
-            continue
-        touches = p["touches"]
-        if any(_anti_affinity_blocks(p, ot, affinity) for ot in occupied):
-            continue                                                  # hard conflict -> held this tick
-        selected.append(p)
-        selected_ids.add(p.get("id"))
-        occupied.append({"touches": touches, "type": p.get("type")})
+    claimed_touches = [claim.get("touches", []) for claim in claims_in]
 
     # soft_overlap, computed after selection so it is SYMMETRIC: an issue is flagged if it shares
     # an area with any OTHER concurrent lane (a pre-existing lane, or another same-tick selection).
@@ -168,4 +198,29 @@ def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen,
             + [q["touches"] for j, q in enumerate(selected) if j != i]
         soft = affinity == "soft" and any(_geometric_overlap(p["touches"], ot) for ot in others)
         out.append({"id": p["id"], "num": p["num"], "touches": p["touches"], "soft_overlap": soft})
+    return out
+
+
+def launch_holds(parsed_issues, lane_state, config, usage, closed_nums, frozen,
+                 territory_claims=None):
+    """Why a launch was SUPPRESSED by the WILDCARD (issue #36): the subset of affinity holds whose
+    overlap was caused by a wildcard '*' on either side — the candidate declares no touches (unknown
+    scope), or the lane/claim blocking it does. This is the silent trap the DoD names: a no-touches
+    issue overlaps every lane under hard affinity, so `lanes: N` serializes to one busy lane with
+    nothing said. A named-vs-named overlap is the operator's OWN declared affinity working as
+    designed and carries no mystery, so it is deliberately excluded. Each entry:
+        {"id", "num", "blocker_id", "self_wildcard": bool, "blocker_wildcard": bool}
+    Empty when usage fails closed, no lane is free (lane-bound, not affinity-bound), or under soft
+    affinity (nothing blocks). The runner journals these once per episode so 'why is only one lane
+    busy' is answerable from the journal."""
+    _, holds = _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territory_claims)
+    out = []
+    for h in holds:
+        p, blocker = h["p"], h["blocker"]
+        self_wc = _is_wildcard(p.get("touches"))
+        blocker_wc = _is_wildcard(blocker.get("touches"))
+        if not (self_wc or blocker_wc):
+            continue                                                  # named-vs-named: not a wildcard
+        out.append({"id": p.get("id"), "num": p.get("num"), "blocker_id": blocker.get("id"),
+                    "self_wildcard": self_wc, "blocker_wildcard": blocker_wc})
     return out
