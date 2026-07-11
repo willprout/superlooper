@@ -1328,6 +1328,16 @@ def test_stale_view_never_stamps_the_pr_read_wait():
 
 # ---------------- notify-once per (issue, park-cause) (issue #61 (b)) ----------------
 
+def test_park_notify_precedes_the_park_action():
+    # Crash-window ordering (Codex review C1): the notify must EXECUTE before _exec_park stamps
+    # the suppression marker, so a runner crash mid-tick can only DUPLICATE a text, never lose
+    # it. The executors run in list order, so this order pin is load-bearing.
+    d, g = _gating(pv={})
+    out = decide(dsk=d, gh_view=g)
+    acts = [a["act"] for a in out]
+    assert acts.index("notify") < acts.index("park")
+
+
 def test_same_cause_repark_is_a_silent_retry():
     d, g = _gating(pv={})                       # answered-empty -> the "no PR exists" park verdict
     out = decide(dsk=d, gh_view=g)

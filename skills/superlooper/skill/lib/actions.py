@@ -539,6 +539,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
         # retry (the labels still converge — the retry is marked so the journal reads as one park
         # episode, not N parks). A DIFFERENT cause is a new episode and texts again; the marker
         # clears when the issue leaves the failing state (clear_park_marker / reapprove).
+        # ORDER IS LOAD-BEARING (Codex review C1): the notify is emitted BEFORE the park action,
+        # so the suppression marker (stamped by _exec_park) can only land after the text already
+        # went out — a runner crash between the two executors DUPLICATES a text on the next tick,
+        # never silently loses it. Fail toward the owner.
         parked_now.add(iid)
         cause = cause if isinstance(cause, str) and cause else memo
         act = {"act": "park", "id": iid, "num": num,
@@ -547,9 +551,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
             act["retry"] = True
             out.append(act)
             return
-        out.append(act)
         who = "needs-william" if needs_william else "parked"
         notify(f"superlooper: {iid} {who}", memo)
+        out.append(act)
 
     # ---- launch-anchor liveness (issue #24): a dead launch anchor must never walk the queue ----
     # The runner launches every worker as a cmux tab in ONE pane (the anchor). When that pane stops

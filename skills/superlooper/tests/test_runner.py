@@ -1095,6 +1095,44 @@ def test_park_comment_retries_until_it_lands_then_never_reposts(rig):
     assert issue_state(rig, "i5")["status"] == "parked"
 
 
+def test_crash_before_the_park_executor_never_loses_the_text(rig):
+    """Crash window (Codex review C1): decide orders notify BEFORE park, so a crash between the
+    two executors leaves the suppression marker UNSTAMPED — the next tick re-derives the park and
+    re-texts (a duplicate, failing toward the owner), never a silent loss. Simulate the crash by
+    executing only the notify half, then re-deciding over the reloaded state."""
+    import actions
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    (rig.home / "reports" / "i5.md").write_text("## Tests\n" + "x" * 60)
+    d = rig.r.disk_view(NOW)
+    g = {"stale": False, "consecutive_failures": 0, "closed_nums": set(),
+         "prs": {"i5": {}}, "issue_comments": {}}          # answered-empty -> park verdict
+    out = actions.decide(NOW, rig.r.config, {"auth_status": "ok", "last_ok_at": NOW,
+                         "first_attempt_at": NOW - 60}, [], [], [], d, g)
+    acts = [a["act"] for a in out]
+    assert acts.index("notify") < acts.index("park")       # the load-bearing executor order
+    rig.r._execute(next(a for a in out if a["act"] == "notify"), NOW)   # ...then crash
+    assert issue_state(rig, "i5").get("park_notify_cause") is None     # marker never stamped
+    out2 = actions.decide(NOW + 15, rig.r.config, {"auth_status": "ok", "last_ok_at": NOW + 15,
+                          "first_attempt_at": NOW - 60}, [], [], [], rig.r.disk_view(NOW + 15), g)
+    assert [a for a in out2 if a["act"] == "notify"]       # the text re-fires, never lost
+
+
+def test_comment_only_failure_still_settles_the_park(rig):
+    """Codex review M1 pin: when the memo COMMENT fails but the label move succeeds, the issue
+    settles terminal (parked) — decide stops re-deriving, so the issue-thread memo is NOT
+    retried further. Accepted: the memo already reached William via the notify text and the
+    journal; the comment is best-effort once the park has landed."""
+    seed_issue(rig, "i5", status="gating")
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue comment", "times": 1, "stderr": "rate limited"}]))
+    out = rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": False,
+                          "memo": "m", "cause": "c"}, NOW)
+    assert out == "ok"
+    st = issue_state(rig, "i5")
+    assert st["status"] == "parked" and st["park_comment_posted"] is False
+    assert [m for m in mutations(rig) if m["kind"] == "comment"] == []
+
+
 def test_a_new_park_cause_is_a_fresh_episode(rig):
     """A park under a DIFFERENT cause re-stamps the marker + clock and posts its own memo."""
     seed_issue(rig, "i5", status="gating", park_notify_cause="old-cause",

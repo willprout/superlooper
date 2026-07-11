@@ -217,7 +217,14 @@ def pr_for_branch(branch):
     if not isinstance(lst, list):
         return PrRead({}, False)                # wrong-typed body: not a clean answer
     if lst:
-        return PrRead(lst[0], True) if isinstance(lst[0], dict) else PrRead({}, False)
+        # A clean FOUND answer must carry a real positive-int PR number (bool excluded) — every
+        # consumer identifies the PR by it, and a numberless entry would read as trustworthy and
+        # then park at the gate as "no PR exists" (the fail-OPEN-on-wrong-typed defect class,
+        # Codex review C2). Anything else is a wrong-shaped body -> refused.
+        first = lst[0]
+        if isinstance(first, dict) and type(first.get("number")) is int and first["number"] > 0:
+            return PrRead(first, True)
+        return PrRead({}, False)
     return PrRead({}, True)                     # a clean answer: no PR on this head
 
 

@@ -150,9 +150,13 @@ def test_pr_for_branch_timeout_is_refused(ghenv, monkeypatch):
 
 def test_pr_for_branch_wrong_typed_body_is_refused(ghenv):
     # A 200 whose body is valid JSON but the WRONG shape is NOT a clean answer — it must fail
-    # closed to ok=False, never to an authoritative "no PR".
+    # closed to ok=False, never to an authoritative "no PR". Includes an entry WITHOUT a real
+    # positive-int `number` (Codex review C2): a numberless "PR" would read as trustworthy and
+    # then park at the gate as "no PR exists" — the fail-OPEN-on-wrong-typed defect class.
     for body in ('"a bare string, wrong type"', '{"not": "a list"}', '["not a dict"]',
-                 "this is not json {{{"):
+                 "this is not json {{{",
+                 '[{}]', '[{"number": null}]', '[{"number": "555"}]', '[{"number": false}]',
+                 '[{"number": 0}]', '[{"number": -3}]'):
         (ghenv / "pr_list.json").write_text(body)
         rd = gh.pr_for_branch("sl/i5-x")
         assert rd.ok is False and rd.pr == {}, body

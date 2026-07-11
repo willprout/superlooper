@@ -1231,10 +1231,14 @@ class Runner:
         # when the label write fails in the same GitHub dead zone that caused the park (the
         # 2026-07-08 storm failed reads and writes in lockstep), decide recognizes next tick's
         # re-derived park as the SAME episode and suppresses its notify — the labels keep
-        # retrying silently; the texting happened once. park_notify_at anchors the stuck-label
-        # ALERT bound, so a same-cause retry must never re-stamp it (the bound would never
-        # elapse); it only repairs an unusable value. park_comment_posted makes the memo comment
-        # once-per-episode too (21 duplicate memos in the storm), retried until it lands.
+        # retrying silently; the texting happened once. The notify action EXECUTES before this
+        # stamp (decide orders it first — Codex review C1), so a crash mid-tick can only
+        # duplicate the text, never lose it. park_notify_at anchors the stuck-label ALERT bound,
+        # so a same-cause retry must never re-stamp it (the bound would never elapse); it only
+        # repairs an unusable value. park_comment_posted makes the memo comment once-per-episode
+        # too (21 duplicate memos in the storm), retried while the park is still re-deriving;
+        # once the label lands (terminal) an unposted memo stays best-effort — the notify text
+        # and the journal already carried it to the owner.
         prev = self._issue_field(iid, "park_notify_cause")
         if prev != cause:
             self._update_issue(iid, {"park_notify_cause": cause, "park_notify_at": now,
