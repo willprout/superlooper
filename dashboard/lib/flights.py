@@ -481,6 +481,53 @@ _CONDITION_RANK = {
 }
 
 
+# State-home format versions this build of the dashboard knows how to read (issue #45). It reads a
+# state home field-by-field and every reader fails CLOSED to empty, so an engine that changes the
+# on-disk SHAPE would silently BLANK the field. The engine stamps the version it wrote; a stamp
+# outside this set means the shape may not be the one these readers expect. ADD a version here only
+# once the readers actually handle that engine's shape.
+KNOWN_STATE_FORMATS = frozenset({1})
+
+
+def _fmt_versions(versions):
+    return "/".join("v%d" % v for v in sorted(versions))
+
+
+def state_format_status(state_format):
+    """Turn the raw state-format stamp fact (``readers`` → ``facts["state_format"]``) into the honest
+    verdict the field binds (issue #45). ``state_format`` is ``None`` (no stamp — a pre-handshake
+    home), the parsed dict (e.g. ``{"version": 1}``), or ``{}`` (present but corrupt).
+
+    Returns ``{present, compatible, version, supported, message}``. ``message`` (the one honest line
+    NAMING the mismatch) is built HERE — server-side, design record B.1 — because it names the
+    versions; it is ``None`` when compatible. The three cases:
+
+      * ``None`` ⇒ GRANDFATHERED. An old runner never stamped a version, and its shape is the one
+        these readers were built for, so it renders normally — a missing stamp must never itself
+        blank the field.
+      * a version in ``KNOWN_STATE_FORMATS`` ⇒ compatible, silent.
+      * any other version, or a present-but-unreadable stamp ⇒ INCOMPATIBLE. The field shows the
+        named mismatch instead of a silently blank surface — the whole point of the handshake.
+    """
+    supported = sorted(KNOWN_STATE_FORMATS)
+    if state_format is None:
+        return {"present": False, "compatible": True, "version": None,
+                "supported": supported, "message": None}
+    version = state_format.get("version")
+    # bool is an int subclass, so a bare isinstance(version, int) would ACCEPT True/False — reject it
+    # (and any non-int) as an unreadable version we can't compare.
+    if isinstance(version, bool) or not isinstance(version, int):
+        version = None
+    if version is not None and version in KNOWN_STATE_FORMATS:
+        return {"present": True, "compatible": True, "version": version,
+                "supported": supported, "message": None}
+    wrote = ("state format v%d" % version) if version is not None else "an unreadable state format"
+    message = ("the runner wrote %s — this command-center reads %s"
+               % (wrote, _fmt_versions(supported)))
+    return {"present": True, "compatible": False, "version": version,
+            "supported": supported, "message": message}
+
+
 def repo_state(slug, states, spinning=False, merges_frozen=None, alert=None,
                heartbeat_age=None, heartbeat_down_seconds=300):
     """One repo's worst condition, for the pill. ``states`` is the list of that repo's flights'

@@ -79,6 +79,22 @@
     overlays.appendChild(link);
     fixedEls.link = link;
 
+    // STATE-FORMAT MISMATCH (issue #45): the runner stamped a state-home format this build of the
+    // dashboard doesn't read, so the fields below may be misread or blank. Without this card the
+    // fail-closed readers would render an all-quiet field and hide WHY — the silent "why is my
+    // dashboard empty." A compact card NAMES the mismatch (the version line is the server's, bound
+    // into `.m`; the title/remedy are static). Distinct from the dark data-link: this is "I can't
+    // read the shape on disk," not "I can't reach GitHub." It self-heals when the dashboard is
+    // updated (or an old-format home reappears): the next poll rebuilds without it.
+    var fmt = document.createElement('div');
+    fmt.className = 'fld-fmt';
+    fmt.hidden = true;
+    fmt.innerHTML = '<span class="t">◇ STATE FORMAT MISMATCH</span>' +
+      '<span class="m"></span>' +
+      '<span class="s">some readings may be blank until command-center is updated</span>';
+    overlays.appendChild(fmt);
+    fixedEls.fmt = fmt;
+
     engine = window.AirfieldLive.mount(canvas);
     canvas.addEventListener('click', function (e) {
       var p = logical(e), num = engine.hitTest(p.x, p.y);
@@ -221,6 +237,16 @@
     // severe (it grays the whole surface and hides every other overlay via CSS), so it wins when both
     // are true; here we just bind the flag. The tower beacon's dark-sweep is drawn on the canvas.
     fixedEls.link.hidden = !(c.repo.github && c.repo.github.unreachable);
+
+    // State-format-mismatch card (issue #45) — shown when the runner stamped a format this dashboard
+    // doesn't read (repo.state_format.compatible === false; a pre-handshake home is compatible, so it
+    // stays hidden). The server built the version-naming line; we only bind it. Like the link card,
+    // runner-down's CSS takeover wins when both are true — but in the real mismatch case the runner
+    // is UP (a new engine stamping a new shape), so this card shows exactly when it matters.
+    var sf = c.repo.state_format;
+    var mismatch = !!(sf && sf.compatible === false);
+    fixedEls.fmt.hidden = !mismatch;
+    if (mismatch) fixedEls.fmt.querySelector('.m').textContent = sf.message || '';
   }
 
   window.CCField = { attach: attach };

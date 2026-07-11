@@ -115,6 +115,33 @@ with `bin/command-center /path/to/config.json` (or `CC_CONFIG=/path/to/config.js
 The server binds `127.0.0.1` **only** — it can write GitHub labels (approve, flag, drop), so it
 is never reachable off your machine, by design.
 
+### One command: bring up the dashboard **and** a repo's runner (`liftoff`)
+
+The dashboard and the loop runner are two processes. `bin/liftoff` is the single command that
+starts — or verifies already-running — **both**: this dashboard and one watched repo's runner.
+
+**Run it inside a cmux tab, exactly like `superlooper run`.** It starts the dashboard in the
+background (a localhost server needs no tab) and then hands *this* tab to the runner
+(`superlooper run` in the foreground), so the runner lands in a visible cmux tab you can watch —
+the one proven restart procedure. (There is deliberately no automated tab placement; your real tab
+is the anchor.)
+
+```sh
+bin/liftoff                       # one watched repo: brings up the dashboard + that repo's runner
+bin/liftoff --repo owner/name     # several watched repos: name whose runner to start
+bin/liftoff /path/to/config.json  # a config other than ./config.json (or set CC_CONFIG)
+```
+
+- **Idempotent — a second run double-starts neither.** It checks the dashboard's `port` (already
+  serving ⇒ left alone) and the runner's pidfile (a live runner ⇒ left alone), then starts only
+  what's missing. So `liftoff` is equally *"bring the pair up"* and *"confirm the pair is up."*
+- **The runner start rides the config contract.** `liftoff` shells the engine's own documented
+  `superlooper run` through the config's **`superlooper_cli`** — the dashboard names the engine's
+  CLI, the engine never names the dashboard. Nothing engine-specific is hardcoded here.
+- If you're **not** in a cmux tab, the dashboard still comes up, but the runner's own preflight
+  refuses to start (it can't see a tab to open worker sessions in) with a message telling you to
+  run inside a cmux tab — the same guard `superlooper run` has always had.
+
 ### 4 · Keep it always-on (optional, macOS)
 
 The default is to run `bin/command-center` in a terminal you can watch. For an always-on

@@ -63,6 +63,25 @@ def _read_json_existence(path):
     return v if isinstance(v, dict) else {}
 
 
+def _read_state_format(path):
+    """The engine's state-home format stamp (issue #45), with the fail direction the HANDSHAKE needs:
+    ``None`` ONLY when truly ABSENT (a pre-handshake home ⇒ the flight model grandfathers it), and
+    ``{}`` for present-but-untrustworthy — corrupt JSON, a non-dict body, OR a file that exists but
+    can't be opened (a directory in its place, a permission-denied read). A present stamp we can't
+    parse is a shape we can't confirm, so it must surface as a NAMED mismatch, never masquerade as
+    "no stamp". This is deliberately stricter than ``_read_json_existence`` (which reads an
+    unopenable file as absent) — for merges_frozen/ALERT absent-vs-unreadable both mean "not
+    frozen/not alerting", but here absent (grandfather) and unreadable (mismatch) must stay distinct."""
+    txt = _read(path)
+    if txt is None:
+        return {} if os.path.exists(path) else None   # exists-but-unopenable ⇒ mismatch, else absent
+    try:
+        v = json.loads(txt)
+    except _JSON_ERRORS:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def _iter_records(lines):
     """Yield the well-formed JSON *objects* from ``lines``, in order; skip blank lines, corrupt
     JSON, and non-dict JSON (arrays/scalars). Same rule as skill ``journal.read``. A generator so
@@ -203,6 +222,12 @@ def read_state_home(home, now=None):
       ``merges_frozen``  ``state/merges_frozen.json`` (``None`` absent; ``{}`` corrupt ⇒ frozen)
       ``alert``          ``state/ALERT`` (``None`` absent; ``{}`` corrupt ⇒ alerting)
       ``reports``        sorted issue ids with a per-issue report (morning digest excluded)
+      ``state_format``   ``state/state_format.json`` — the engine's state-home format stamp (issue
+                         #45). ``None`` when ABSENT (a pre-handshake home ⇒ grandfathered by the
+                         flight model); the parsed dict (e.g. ``{"version": 1}``) when present;
+                         ``{}`` when present-but-corrupt (fail closed — a stamp we can't trust is
+                         "present, version unknown", never mistaken for "no stamp"). Whether a
+                         version is COMPATIBLE is the flight model's call — the reader stays raw.
     """
     now = time.time() if now is None else now
     home = os.fspath(home)
@@ -224,4 +249,9 @@ def read_state_home(home, now=None):
         "merges_frozen": _read_json_existence(os.path.join(state, "merges_frozen.json")),
         "alert": _read_json_existence(os.path.join(state, "ALERT")),
         "reports": _report_ids(os.path.join(home, "reports")),
+        # The engine's state-home format stamp (issue #45): absent ⇒ None (grandfathered), any
+        # present-but-untrustworthy read ⇒ {} which the flight model names as an INCOMPATIBLE stamp
+        # — never a silent blank. Uses its own reader (not _read_json_existence) so a present-but-
+        # UNREADABLE stamp is a mismatch, not mistaken for absent.
+        "state_format": _read_state_format(os.path.join(state, "state_format.json")),
     }
