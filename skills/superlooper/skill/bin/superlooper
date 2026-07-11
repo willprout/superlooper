@@ -401,6 +401,12 @@ def cmd_stack_doctor(args):
     if failures:
         print(f"\nSTACK DOCTOR FAILED: {', '.join(failures)}")
         return 1
+    warnings = [r.name for r in results if getattr(r, "warn", False)]
+    if warnings:
+        # A WARN never fails the stack (exit 0), but naming it in the pass line keeps "all stack
+        # checks passed" honest — e.g. a Claude-only machine with no Codex installed (issue #30).
+        print(f"\nall stack checks passed (warnings: {', '.join(warnings)})")
+        return 0
     print("\nall stack checks passed")
     return 0
 

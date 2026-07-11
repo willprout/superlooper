@@ -8,8 +8,10 @@ Superlooper has two kinds of prerequisites:
 `doctor --stack` is read-only but for ONE deliberate, announced side effect: it sends a single
 test notification through the configured `notify` channel to prove it can actually deliver (see
 the `notify channel` block below). It does not install, repair, source, log in, write config,
-create tabs, or spend model calls. It prints one pass/fail line for each machine block and exits
-nonzero when any block fails.
+create tabs, or spend model calls. It prints one status line per machine block and exits nonzero
+only when a block **FAILs**. A block may also be a **WARN** — an advisory that does not fail the
+stack, used for a tool that is only conditionally needed on this machine (a missing Codex CLI on a
+Claude-only machine is the standing example; see `codex CLI` below).
 
 ## Tier 1: Loop User
 
@@ -47,8 +49,13 @@ Fix every `FAIL` line before starting `superlooper run`.
 
 An orchestrator additionally needs the tools used by the gate and by worker handoff:
 
-- `codex CLI` - Codex CLI must be present and authenticated. The default fresh-agent review path
-  depends on it.
+- `codex CLI` - Needed only when this machine actually runs Codex: a repo whose config sets
+  `agent: codex`, so worker sessions launch through Codex. `/cross-review` (a Codex second opinion)
+  is the *default* fresh-agent review, but an independent same-model fresh subagent is an equally
+  valid review path (owner ruling 2026-07-10), so a Claude-only machine satisfies the fresh-agent
+  review duty without Codex and can reach an all-green stack. The stack doctor therefore reports a
+  missing or unauthenticated Codex as a **WARN** on a Claude-only machine (stack still PASSes); it
+  is a hard **FAIL** only when a repo's config selects `agent: codex`.
 - Repo-level doctor green - `superlooper doctor --repo /path/to/repo` must pass for config,
   `required_checks`, labels, hooks, jq, and the repo adoption contract.
 - Same-workspace launch discipline - start `superlooper run` in the visible cmux tab that owns the
@@ -63,7 +70,10 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
 
 `doctor --stack` emits these exact block names:
 
-- `codex CLI`: install Codex CLI and run `codex login`.
+- `codex CLI`: install the Codex CLI and run `codex login` — but only required when a repo's config
+  sets `agent: codex`. On a Claude-only machine a missing or unauthenticated Codex is a WARN and the
+  stack still passes, because a fresh same-model subagent is a valid review path; install it only if
+  you switch a repo to `--agent codex`.
 - `cmux present`: install cmux or set `SL_CMUX` to the runner's cmux binary.
 - `claude login`: run `claude auth login` with the subscription account.
 - `gh auth`: run `gh auth login --hostname github.com`.

@@ -327,6 +327,57 @@ def test_doctor_stack_fails_with_actionable_hint(rig):
     assert "Fix: Run" in out and "install-launch-shim.sh" in out
 
 
+def _codexless_stack_env(rig, **kw):
+    """A healthy stack env with Codex made unresolvable: SL_CODEX unset AND PATH narrowed so
+    `shutil.which('codex')` misses too. The only `which` the stack doctor runs is for codex
+    (claude/gh/cmux resolve via their SL_* env); PATH keeps the rig's jq bin plus /usr/bin:/bin so
+    notify's `bash -lc` still resolves, but no standard installer ever puts codex in those dirs —
+    so 'Codex is absent' stays hermetic regardless of what the host machine has installed."""
+    env = _stack_env(rig, **kw)
+    del env["SL_CODEX"]
+    env["PATH"] = f"{rig.tmp / 'bin'}:/usr/bin:/bin"
+    return env
+
+
+def test_doctor_stack_warns_but_passes_when_codex_absent_on_a_claude_machine(rig):
+    # Issue #30: a Claude-only newcomer (config agent defaults to claude) with no Codex installed
+    # must still reach an all-green stack. Codex absence is a WARN, not a FAIL, and the exit is 0.
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"cmd": "printf '%s\\n' \"$SL_TITLE\"", "imessage_to": None}
+    cfg_path.write_text(json.dumps(cfg))            # no "agent" key -> defaults to claude
+    (rig.home / ".zshrc").write_text('source "$HOME/.superlooper/launch-shim.zsh"\n')
+
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo),
+            env_over=_codexless_stack_env(rig))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    assert "WARN codex CLI" in out
+    assert "FAIL" not in out
+    assert "all stack checks passed" in out
+
+
+def test_doctor_stack_fails_when_codex_absent_but_config_selects_codex_agent(rig):
+    # Issue #30: the mirror case. A machine whose config runs `agent: codex` genuinely needs Codex,
+    # so its absence is a hard FAIL with the install hint, exactly as before.
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["agent"] = "codex"
+    cfg["notify"] = {"cmd": "printf '%s\\n' \"$SL_TITLE\"", "imessage_to": None}
+    cfg_path.write_text(json.dumps(cfg))
+    (rig.home / ".zshrc").write_text('source "$HOME/.superlooper/launch-shim.zsh"\n')
+
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo),
+            env_over=_codexless_stack_env(rig))
+
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "FAIL codex CLI" in out
+    assert "Install the Codex CLI" in out
+    assert "STACK DOCTOR FAILED" in out
+
+
 def test_doctor_stack_fails_when_the_notify_test_send_fails(rig):
     # The live 2026-07-10 incident, end to end: notify.cmd is SET but every send exits nonzero
     # (recipient file gone). The doctor must FAIL the block and print rc + the stderr reason,
