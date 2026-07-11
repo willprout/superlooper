@@ -22,6 +22,8 @@ assumption, {assumption_hint}
 
 **Long background wait?** touch {awaiting_path} first, and remove it when you resume.
 
+**House rules (every session).** Image and binary evidence (screenshots, PNGs, PDFs) goes in a `reports/screenshots/` subdirectory beside your report — only `.md` files belong at the top level of `reports/`, where the runner reads every file as text (a loose binary there once wedged the runner). Never kill a process by name or pattern (`pkill -f`, `killall`) — the pattern can also match the owner's own live processes; record the PID (`$!`) of anything you background and kill only that PID.
+
 **Finish.** {finish_deliverable}Then write {report_path} with EXACTLY these H2 sections:
 {report_sections} — the runner mechanically checks they exist and carry real prose. The
 report is your LAST action. Never force-push. Never hand-post a commit status. Never label

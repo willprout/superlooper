@@ -155,6 +155,48 @@ def test_bright_line_with_brace_stays_literal(_sl_home):
     assert "Never rebase onto {branch} by hand." in out
 
 
+# --------------------------------------------------------------------------- house rules (universal footer)
+# Two hard-won worker rules (incident 2026-07-07) live in the UNIVERSAL footer, so every adopted
+# repo inherits them — not just the one repo whose CLAUDE.md first carried them:
+#   1. Image/binary evidence goes under `reports/screenshots/`; only `.md` at the top level of
+#      `reports/` (one loose binary there wedges the runner's every tick — 40+ min silent stall).
+#   2. Never kill by name/pattern (`pkill -f`, `killall`) — that once collateral-killed the owner's
+#      live dashboard; background processes are killed by recorded PID only.
+# They live in the template body (not {work_block}), so they render for EVERY issue type.
+
+def _footer(out):
+    """The mechanical footer region only — the William body may legitimately contain these words.
+    rsplit (not split) isolates the LAST occurrence, so a body/amendment that quotes the footer
+    header can't smuggle body text into what we assert on."""
+    return out.rsplit("# Loop contract", 1)[1]
+
+
+@pytest.mark.parametrize("itype", ["build", "investigate", "diagnose-and-fix"])
+def test_footer_screenshots_evidence_subdirectory_rule(_sl_home, itype):
+    footer = _footer(brief.build(_issue(type=itype), _cfg(_sl_home)))
+    assert "reports/screenshots/" in footer, "image/binary evidence must be routed to reports/screenshots/"
+    assert "`.md`" in footer and "top level of `reports/`" in footer, \
+        "the footer must state that only .md files belong at the top level of reports/"
+
+
+@pytest.mark.parametrize("itype", ["build", "investigate", "diagnose-and-fix"])
+def test_footer_never_kill_by_pattern_rule(_sl_home, itype):
+    footer = _footer(brief.build(_issue(type=itype), _cfg(_sl_home)))
+    assert "`pkill -f`" in footer and "`killall`" in footer, \
+        "the footer must name the forbidden by-pattern kills (pkill -f, killall)"
+    assert "kill only that PID" in footer, "the footer must require killing by recorded PID only"
+
+
+@pytest.mark.parametrize("itype", ["build", "investigate", "diagnose-and-fix"])
+def test_footer_house_rules_stay_agent_agnostic(_sl_home, itype):
+    # DoD: the footer stays agent-agnostic — no Claude/Codex specifics, and no leak of the one
+    # repo (command-center) whose CLAUDE.md first carried these rules. Parametrized over all three
+    # types so the per-type {work_block} substitutions are also guarded against a future leak.
+    footer = _footer(brief.build(_issue(type=itype), _cfg(_sl_home)))
+    for tok in ("Claude", "Codex", "command-center", "Gemini", "Copilot"):
+        assert tok not in footer, f"footer must stay agent/repo-agnostic — leaked {tok!r}"
+
+
 # --------------------------------------------------------------------------- absolute paths
 def test_marker_paths_are_absolute_under_state_home(_sl_home):
     cfg = _cfg(_sl_home)
