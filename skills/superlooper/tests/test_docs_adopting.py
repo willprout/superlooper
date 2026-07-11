@@ -1,0 +1,120 @@
+"""ADOPTING.md accuracy guards (issue #32).
+
+ADOPTING.md is a newcomer's first contact with the loop, and two accuracy failures had
+shipped in it:
+
+  1. A stale parenthetical claiming the `adopt`/`doctor` commands "are built in a later
+     task" — they are built and working, so a reader reasonably concludes the workflow is
+     unavailable.
+  2. A walkthrough whose step order (adopt -> doctor -> install the skill) guarantees a red
+     `doctor`: `doctor` checks artifacts (the launch shim, the activity hooks) that only
+     installation creates, and installation also provides the very `superlooper` binary the
+     earlier steps invoke.
+
+These tests pin the doc to the real CLI so it can't drift back: the documented commands must
+exist, and the walkthrough must read publish/install -> adopt -> doctor -> run so that
+following it verbatim reaches a green doctor before `run`.
+"""
+import re
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+_DOC = _ROOT / "docs" / "ADOPTING.md"
+_CLI = _ROOT / "skill" / "bin" / "superlooper"
+
+
+def _doc_text():
+    return _DOC.read_text(encoding="utf-8")
+
+
+def _registered_subcommands():
+    """The subcommand names the CLI actually registers (its argparse ``add("name", ...)`` calls)."""
+    src = _CLI.read_text(encoding="utf-8")
+    return set(re.findall(r'add\("([a-z][a-z-]*)"', src))
+
+
+def _code_spans(text):
+    """Every fenced-code line and inline-code span in the doc.
+
+    Real command invocations live in code formatting; prose does not. Collecting only code
+    spans keeps a prose phrase like the H1 title "...into the superlooper loop" from being
+    mistaken for a `superlooper loop` command invocation.
+    """
+    spans = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            spans.append(line)
+        else:
+            spans.extend(re.findall(r"`([^`]+)`", line))
+    return spans
+
+
+def _documented_subcommands(text):
+    """Tokens invoked as ``superlooper <token>`` inside code formatting (fences / inline code)."""
+    found = set()
+    for span in _code_spans(text):
+        for tok in re.findall(r"\bsuperlooper\s+([a-z][a-z-]*)", span):
+            found.add(tok)
+    return found
+
+
+def _walkthrough(text):
+    """The walkthrough section body: from its ``## ... walkthrough`` header to the next H2."""
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.startswith("## ") and "walkthrough" in line.lower():
+            start = i
+            break
+    assert start is not None, "ADOPTING.md must have a '## ... walkthrough' section"
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("## "):
+            end = j
+            break
+    return "\n".join(lines[start:end])
+
+
+def test_no_stale_built_later_claim():
+    # The commands are live today; any "built in a later task" framing is false and misleading.
+    text = _doc_text().lower()
+    assert "built in a later" not in text
+    assert "built in a later task" not in text
+
+
+def test_every_documented_command_is_a_real_subcommand():
+    documented = _documented_subcommands(_doc_text())
+    registered = _registered_subcommands()
+    assert documented, "expected the doc to invoke `superlooper <cmd>` somewhere in code formatting"
+    unknown = documented - registered
+    assert not unknown, (
+        "ADOPTING.md documents superlooper commands that the CLI does not register: "
+        f"{sorted(unknown)} (registered: {sorted(registered)})"
+    )
+    # The walkthrough's core trio must each be a real subcommand AND be shown to the reader.
+    for cmd in ("adopt", "doctor", "run"):
+        assert cmd in registered, f"CLI unexpectedly lacks a `{cmd}` subcommand"
+        assert cmd in documented, f"walkthrough must invoke `superlooper {cmd}`"
+
+
+def test_walkthrough_orders_publish_before_adopt_before_doctor_before_run():
+    wt = _walkthrough(_doc_text())
+    # Publish/install must come first: it creates the launch shim + activity hooks that `doctor`
+    # checks for, and links the `superlooper` command onto PATH that adopt/doctor/run all need.
+    i_install = wt.find("install.sh")
+    i_adopt = wt.find("superlooper adopt")
+    i_doctor = wt.find("superlooper doctor")
+    i_run = wt.find("superlooper run")
+    assert i_install != -1, "walkthrough must include the publish/install step (./bin/install.sh)"
+    assert i_adopt != -1, "walkthrough must invoke `superlooper adopt`"
+    assert i_doctor != -1, "walkthrough must invoke `superlooper doctor`"
+    assert i_run != -1, "walkthrough must invoke `superlooper run`"
+    assert i_install < i_adopt < i_doctor < i_run, (
+        "walkthrough steps must read publish/install -> adopt -> doctor -> run so that following "
+        "them verbatim reaches a green doctor before run; got "
+        f"install@{i_install} adopt@{i_adopt} doctor@{i_doctor} run@{i_run}"
+    )
