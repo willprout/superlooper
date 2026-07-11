@@ -1243,6 +1243,164 @@ def test_parked_investigation_does_not_reconcile_on_a_refused_read():
     assert only(out2, "close_investigate") == []
 
 
+# =========================== issue #61: refused PR lookup holds; notify-once per park cause ====
+# The 2026-07-08 park-notify storm (41 texts, two ~6.5-min bursts): during hourly GraphQL dead
+# zones the PR-for-branch lookup collapsed "GitHub refused" into "no PR exists", so finished
+# builds were parked as PR-less — and the park path re-notified every tick while its own label
+# write kept failing in the same dead zone. Guard (a): a refused lookup is OMITTED from the view
+# (gh.PrRead), so the build gate HOLDs — journaled once, bounded — and only a bound expiry parks,
+# once. Guard (b): the durable park_notify_cause marker makes a re-derived park a SILENT retry.
+
+
+def _gating_no_pr_read(**ist_over):
+    d = disk(reports={"i5": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {
+                 "i5": ist("gating", branch="sl/i5-issue-5", **ist_over)}})
+    return d, ghv(prs={})       # FRESH view, but i5's PR lookup did not land (refused / starved)
+
+
+def test_finished_build_refused_pr_lookup_holds_never_parks():
+    d, g = _gating_no_pr_read()
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "park") == [] and not has_notify(out)
+    w = only(out, "await_pr_read")
+    assert len(w) == 1 and w[0]["id"] == "i5" and w[0]["num"] == 5 and w[0]["reason"]
+
+
+def test_await_pr_read_stamps_once_per_episode():
+    # bounded refusal journaling: once the wait clock is stamped, no further await_pr_read
+    # records this episode — a long dead zone journals one record, not one per tick.
+    d, g = _gating_no_pr_read(pr_read_pending_since=NOW - 10)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "await_pr_read") == [] and only(out, "park") == [] and not has_notify(out)
+
+
+def test_corrupt_pr_read_clock_restamps_never_parks():
+    # the _since_ok discipline (issue #26): a wrong-typed/future/negative clock is corrupt —
+    # re-stamp it, never trust it to trip (or defeat) the bound.
+    for bad in ("x", -5, NOW + 999, True):
+        d, g = _gating_no_pr_read(pr_read_pending_since=bad)
+        out = decide(dsk=d, gh_view=g)
+        assert only(out, "park") == [], bad
+        assert len(only(out, "await_pr_read")) == 1, bad
+
+
+def test_refused_pr_lookup_past_bound_parks_once_with_notify():
+    d, g = _gating_no_pr_read(pr_read_pending_since=NOW - actions.PR_READ_HOLD_CAP_SECONDS)
+    out = decide(dsk=d, gh_view=g)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["cause"] == "pr_read_refused" and has_notify(out)
+    assert p[0]["needs_william"] is False
+    # ...and while the park's own label move keeps failing (same dead zone), the re-derived park
+    # next tick is a SILENT retry: the durable marker suppresses the repeat notify.
+    d["issues_state"]["issues"]["i5"]["park_notify_cause"] = "pr_read_refused"
+    out2 = decide(dsk=d, gh_view=g)
+    p2 = only(out2, "park")
+    assert len(p2) == 1 and p2[0].get("retry") is True and not has_notify(out2)
+
+
+def test_pr_lookup_recovery_clears_the_wait_and_merges():
+    d, g = _gating(issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                           pr_read_pending_since=NOW - 300)})
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "clear_pr_read") == [{"act": "clear_pr_read", "id": "i5"}]
+    assert len(only(out, "merge")) == 1 and only(out, "park") == [] and not has_notify(out)
+
+
+def test_answered_empty_pr_lookup_still_parks_once():
+    # distinguishability: {} IS a trustworthy answer ("GitHub says no PR on this head") — the
+    # gate still parks, once, and the wait clock clears. Only a REFUSED read holds.
+    d, g = _gating(pv={}, issues_extra={"i5": ist("gating", branch="sl/i5-issue-5",
+                                                  pr_read_pending_since=NOW - 300)})
+    out = decide(dsk=d, gh_view=g)
+    assert len(only(out, "park")) == 1 and has_notify(out)
+    assert only(out, "clear_pr_read") == [{"act": "clear_pr_read", "id": "i5"}]
+
+
+def test_stale_view_never_stamps_the_pr_read_wait():
+    # A wholly-stale gh view (a real outage) must not spawn per-issue await_pr_read noise — the
+    # poll's consecutive_failures ALERT owns that (mirrors await_read's stale-view rule).
+    d, g = _gating_no_pr_read()
+    g["stale"] = True
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "await_pr_read") == [] and only(out, "park") == []
+
+
+# ---------------- notify-once per (issue, park-cause) (issue #61 (b)) ----------------
+
+def test_park_notify_precedes_the_park_action():
+    # Crash-window ordering (Codex review C1): the notify must EXECUTE before _exec_park stamps
+    # the suppression marker, so a runner crash mid-tick can only DUPLICATE a text, never lose
+    # it. The executors run in list order, so this order pin is load-bearing.
+    d, g = _gating(pv={})
+    out = decide(dsk=d, gh_view=g)
+    acts = [a["act"] for a in out]
+    assert acts.index("notify") < acts.index("park")
+
+
+def test_same_cause_repark_is_a_silent_retry():
+    d, g = _gating(pv={})                       # answered-empty -> the "no PR exists" park verdict
+    out = decide(dsk=d, gh_view=g)
+    p = only(out, "park")
+    assert len(p) == 1 and has_notify(out) and p[0]["cause"]
+    # the executor stamped the cause BEFORE its label move failed; the re-derived park is silent
+    d["issues_state"]["issues"]["i5"]["park_notify_cause"] = p[0]["cause"]
+    out2 = decide(dsk=d, gh_view=g)
+    p2 = only(out2, "park")
+    assert len(p2) == 1 and p2[0].get("retry") is True   # the park still retries (labels converge)
+    assert not has_notify(out2)                          # ...but the texting happened once
+
+
+def test_a_different_park_cause_notifies_again():
+    # per-cause-episode, not forever: a park for a NEW cause is a new episode and texts again.
+    d, g = _gating(pv={})
+    d["issues_state"]["issues"]["i5"]["park_notify_cause"] = "some-earlier-cause"
+    out = decide(dsk=d, gh_view=g)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0].get("retry") is None and has_notify(out)
+
+
+def test_recovery_clears_the_park_marker_so_a_later_park_notifies():
+    # the gate reaches a NON-park verdict while a stale marker is set (the episode ended without
+    # the label ever landing): clear it, so a LATER genuine park on this issue texts again.
+    d, g = _gating(issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                           park_notify_cause="pr_read_refused",
+                                           park_notify_at=NOW - 60)})
+    out = decide(dsk=d, gh_view=g)
+    assert len(only(out, "merge")) == 1
+    assert only(out, "clear_park_marker") == [{"act": "clear_park_marker", "id": "i5"}]
+
+
+def test_park_label_stuck_past_bound_alerts_once():
+    # incident §4: a park label move failing past the bound is ALERT-worthy — one more text,
+    # not zero and not twenty. Rides the standard ALERT dedup (re-notify only on reason change).
+    d = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("gating", park_notify_cause="checks",
+                  park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)}})
+    out = decide(dsk=d)
+    a = only(out, "alert")
+    assert len(a) == 1 and "park_label_stuck:i5" in a[0]["reasons"] and has_notify(out)
+    d2 = disk(issues_state=d["issues_state"],
+              alert={"reasons": ["park_label_stuck:i5"], "since": NOW - 100})
+    out2 = decide(dsk=d2)
+    assert only(out2, "alert") == [] and not has_notify(out2)
+
+
+def test_park_label_failing_under_bound_stays_quiet():
+    d = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("gating", park_notify_cause="checks", park_notify_at=NOW - 60)}})
+    out = decide(dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_terminal_parked_issue_never_alerts_label_stuck():
+    # the label landed (status settled terminal): the episode ended in success, no alarm.
+    d = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("parked", park_notify_cause="checks", park_notify_at=NOW - 9999)}})
+    out = decide(dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
 def test_merged_pr_state_is_absorbed_not_wedged():
     # Crash window (Codex round-1 C2): gh merged the PR, the runner died before stamping
     # status=merged. Restart must ABSORB the fact — settle local state + labels — not sit in

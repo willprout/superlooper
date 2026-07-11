@@ -1654,11 +1654,12 @@ def test_orphaned_pushed_branch_no_pr_blocks_and_preserves_remote_work(sim_facto
 
 
 # =====================================================================================
-# the wave-3 GitHub-blip contract: a blip mid-park may duplicate a COMMENT (accepted
-# noise) but never a LABEL transition
+# the GitHub-blip contract, tightened by issue #61: a blip mid-park duplicates NOTHING —
+# the retried park is silent (memo once per episode, wave-3's "accepted noise" removed)
+# and a LABEL transition never duplicates (the original wave-3 invariant, unchanged)
 # =====================================================================================
 
-def test_gh_blip_mid_park_duplicates_comment_never_label_transition(sim_factory):
+def test_gh_blip_mid_park_duplicates_neither_comment_nor_label_transition(sim_factory):
     sim = sim_factory()
     num = sim.add_issue(title="Park with a blip",
                         scenario={"scenario": "no-pr", "linger": True})
@@ -1670,7 +1671,7 @@ def test_gh_blip_mid_park_duplicates_comment_never_label_transition(sim_factory)
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked")
 
     memos = [m for m in sim.mutations("comment") if "parked this issue" in m["body"]]
-    assert len(memos) == 2, "the retried park re-comments — accepted noise (wave-3 ruling)"
+    assert len(memos) == 1, "the retried park must NOT re-comment (notify-once episode, #61)"
     label_moves = [m for m in sim.mutations("set_labels")
                    if m.get("add") and "parked" in m["add"]]
     assert len(label_moves) == 1, "a LABEL transition must never duplicate"

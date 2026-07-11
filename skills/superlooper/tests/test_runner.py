@@ -1055,6 +1055,120 @@ def test_park_executor_labels_comment_and_cleanup(rig):
     assert not (rig.home / "state" / "blocked" / "i5").exists()
 
 
+def test_park_stamps_the_notify_marker_before_the_label_move(rig):
+    """Issue #61 (b): the durable notify-once marker lands BEFORE gh is asked to move labels, so
+    a label write failing in the same dead zone that caused the park cannot re-text — decide
+    recognizes the re-derived park as the SAME episode. The memo comment posts once per episode."""
+    seed_issue(rig, "i5", status="gating")
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue edit", "times": 99, "stderr": "API rate limit exceeded"}]))
+    out = rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": False,
+                          "memo": "no PR exists", "cause": "no_pr"}, NOW)
+    assert "label move failed" in out
+    st = issue_state(rig, "i5")
+    assert st["park_notify_cause"] == "no_pr"          # stamped despite the failed write
+    assert st["park_notify_at"] == NOW
+    assert st["status"] == "gating"                    # never advanced past the truth
+    assert len([m for m in mutations(rig) if m["kind"] == "comment"]) == 1
+    # the retry tick re-attempts the label but must NOT re-post the memo comment,
+    # and must NOT reset the episode clock (the stuck-label alert bound runs from episode start)
+    rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": False,
+                    "memo": "no PR exists", "cause": "no_pr", "retry": True}, NOW + 15)
+    assert len([m for m in mutations(rig) if m["kind"] == "comment"]) == 1
+    assert issue_state(rig, "i5")["park_notify_at"] == NOW
+
+
+def test_park_comment_retries_until_it_lands_then_never_reposts(rig):
+    """A park whose memo comment ALSO failed (the storm's lockstep shape) retries the comment on
+    later ticks until it lands — the memo must reach the issue — but never double-posts."""
+    seed_issue(rig, "i5", status="gating")
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue comment", "times": 1, "stderr": "rate limited"},
+         {"match": "issue edit", "times": 1, "stderr": "rate limited"}]))
+    rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": False,
+                    "memo": "m", "cause": "c"}, NOW)
+    assert [m for m in mutations(rig) if m["kind"] == "comment"] == []
+    out = rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": False,
+                          "memo": "m", "cause": "c", "retry": True}, NOW + 15)
+    assert out == "ok"
+    assert len([m for m in mutations(rig) if m["kind"] == "comment"]) == 1
+    assert issue_state(rig, "i5")["status"] == "parked"
+
+
+def test_crash_before_the_park_executor_never_loses_the_text(rig):
+    """Crash window (Codex review C1): decide orders notify BEFORE park, so a crash between the
+    two executors leaves the suppression marker UNSTAMPED — the next tick re-derives the park and
+    re-texts (a duplicate, failing toward the owner), never a silent loss. Simulate the crash by
+    executing only the notify half, then re-deciding over the reloaded state."""
+    import actions
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    (rig.home / "reports" / "i5.md").write_text("## Tests\n" + "x" * 60)
+    d = rig.r.disk_view(NOW)
+    g = {"stale": False, "consecutive_failures": 0, "closed_nums": set(),
+         "prs": {"i5": {}}, "issue_comments": {}}          # answered-empty -> park verdict
+    out = actions.decide(NOW, rig.r.config, {"auth_status": "ok", "last_ok_at": NOW,
+                         "first_attempt_at": NOW - 60}, [], [], [], d, g)
+    acts = [a["act"] for a in out]
+    assert acts.index("notify") < acts.index("park")       # the load-bearing executor order
+    rig.r._execute(next(a for a in out if a["act"] == "notify"), NOW)   # ...then crash
+    assert issue_state(rig, "i5").get("park_notify_cause") is None     # marker never stamped
+    out2 = actions.decide(NOW + 15, rig.r.config, {"auth_status": "ok", "last_ok_at": NOW + 15,
+                          "first_attempt_at": NOW - 60}, [], [], [], rig.r.disk_view(NOW + 15), g)
+    assert [a for a in out2 if a["act"] == "notify"]       # the text re-fires, never lost
+
+
+def test_comment_only_failure_still_settles_the_park(rig):
+    """Codex review M1 pin: when the memo COMMENT fails but the label move succeeds, the issue
+    settles terminal (parked) — decide stops re-deriving, so the issue-thread memo is NOT
+    retried further. Accepted: the memo already reached William via the notify text and the
+    journal; the comment is best-effort once the park has landed."""
+    seed_issue(rig, "i5", status="gating")
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue comment", "times": 1, "stderr": "rate limited"}]))
+    out = rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": False,
+                          "memo": "m", "cause": "c"}, NOW)
+    assert out == "ok"
+    st = issue_state(rig, "i5")
+    assert st["status"] == "parked" and st["park_comment_posted"] is False
+    assert [m for m in mutations(rig) if m["kind"] == "comment"] == []
+
+
+def test_a_new_park_cause_is_a_fresh_episode(rig):
+    """A park under a DIFFERENT cause re-stamps the marker + clock and posts its own memo."""
+    seed_issue(rig, "i5", status="gating", park_notify_cause="old-cause",
+               park_notify_at=NOW - 500, park_comment_posted=True)
+    out = rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": False,
+                          "memo": "new memo", "cause": "new-cause"}, NOW)
+    assert out == "ok"
+    st = issue_state(rig, "i5")
+    assert st["park_notify_cause"] == "new-cause" and st["park_notify_at"] == NOW
+    assert any(m["kind"] == "comment" and "new memo" in m["body"] for m in mutations(rig))
+
+
+def test_await_pr_read_and_clear_executors(rig):
+    """Issue #61 (a): await_pr_read stamps the hold clock ONCE (idempotent — the bound must run
+    from episode start) and journals its reason as the outcome; clear_pr_read ends the episode."""
+    seed_issue(rig, "i5", status="gating")
+    out = rig.r._execute({"act": "await_pr_read", "id": "i5", "num": 5,
+                          "reason": "holding: PR lookup refused"}, NOW)
+    assert out == "holding: PR lookup refused"
+    assert issue_state(rig, "i5")["pr_read_pending_since"] == NOW
+    rig.r._execute({"act": "await_pr_read", "id": "i5", "num": 5, "reason": "r"}, NOW + 50)
+    assert issue_state(rig, "i5")["pr_read_pending_since"] == NOW
+    rig.r._execute({"act": "clear_pr_read", "id": "i5"}, NOW + 60)
+    assert issue_state(rig, "i5")["pr_read_pending_since"] is None
+
+
+def test_clear_park_marker_executor(rig):
+    seed_issue(rig, "i5", status="gating", park_notify_cause="no_pr",
+               park_notify_at=NOW - 100, park_comment_posted=True)
+    out = rig.r._execute({"act": "clear_park_marker", "id": "i5"}, NOW)
+    assert out == "ok"
+    st = issue_state(rig, "i5")
+    assert st["park_notify_cause"] is None and st["park_notify_at"] is None
+    assert st["park_comment_posted"] is False
+
+
 def test_regenerate_executor_hygiene_state_then_gh(rig, monkeypatch):
     removed = []
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
@@ -1326,6 +1440,20 @@ def test_reapprove_clears_a_stale_pending_clock(rig, monkeypatch):
     assert issue_state(rig, "i5")["checks_pending_since"] is None    # fresh slate, times from scratch
 
 
+def test_reapprove_resets_the_pr_read_wait_and_park_notify_marker(rig, monkeypatch):
+    """Issue #61: re-approval is a clean slate for both new guards — the PR-lookup hold clock
+    times a fresh episode from scratch, and the re-run's own park (if any) texts again."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="parked", pr_read_pending_since=NOW - 999,
+               park_notify_cause="pr_read_refused", park_notify_at=NOW - 999,
+               park_comment_posted=True)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    st = issue_state(rig, "i5")
+    assert st["pr_read_pending_since"] is None
+    assert st["park_notify_cause"] is None and st["park_notify_at"] is None
+    assert st["park_comment_posted"] is False
+
+
 def test_park_purges_cached_agent_ready_to_stop_reapprove_churn(rig):
     """Live 2026-07-06: a park removes agent-ready on GitHub but the runner's cached view kept it
     until the next 90s poll, so the next tick saw 'parked + agent-ready' and reapproved the issue
@@ -1538,7 +1666,8 @@ def test_refresh_finishing_prs_freshens_finished_issues_only(rig, monkeypatch):
 
     def fake_pr_for_branch(branch):
         looked.append(branch)
-        return {"number": 42, "state": "OPEN", "headRefName": branch} if branch == "sl/i7-x" else {}
+        found = {"number": 42, "state": "OPEN", "headRefName": branch}
+        return runner_mod.gh.PrRead(found if branch == "sl/i7-x" else {}, True)
 
     monkeypatch.setattr(runner_mod.gh, "pr_for_branch", fake_pr_for_branch)
     monkeypatch.setattr(runner_mod.gh, "pr_comments",
@@ -1556,7 +1685,7 @@ def test_refresh_finishing_prs_freshens_finished_issues_only(rig, monkeypatch):
 def test_refresh_rechecks_an_unreviewed_open_pr_but_never_downgrades(rig, monkeypatch):
     """D6: a cached OPEN PR with NO review evidence yet IS re-fetched every tick (a late
     review-marker comment must reach the gate before it nudges+parks) — but a transient
-    gh.pr_for_branch failure (fails closed to {}) must NEVER downgrade the known PR to {},
+    gh.pr_for_branch failure (a refused PrRead) must NEVER downgrade the known PR to {},
     which would re-park completed work every tick (the P0 guard the D3 fix bought)."""
     seed_issue(rig, "i7", status="gating", branch="sl/i7-x", num=7)
     (rig.home / "reports" / "i7.md").write_text("# done\n## Tests\nok\n")
@@ -1564,7 +1693,8 @@ def test_refresh_rechecks_an_unreviewed_open_pr_but_never_downgrades(rig, monkey
                      "prs": {"i7": {"number": 5, "state": "OPEN", "headRefName": "sl/i7-x"}}}
 
     called = []
-    monkeypatch.setattr(runner_mod.gh, "pr_for_branch", lambda b: called.append(b) or {})
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: called.append(b) or runner_mod.gh.PrRead({}, False))
 
     ist_map = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
     rig.r._refresh_finishing_prs(ist_map)
@@ -1583,7 +1713,8 @@ def test_refresh_skips_a_cached_pr_that_already_has_review_evidence(rig, monkeyp
         "comments": [{"body": "<!-- superlooper-review -->\nAPPROVE"}]}}}
 
     called = []
-    monkeypatch.setattr(runner_mod.gh, "pr_for_branch", lambda b: called.append(b) or {})
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: called.append(b) or runner_mod.gh.PrRead({}, True))
     rig.r._refresh_finishing_prs(loopstate.load(str(rig.home / "state" / "issues.json"))["issues"])
     assert called == []                                               # reviewed -> skipped (bounded)
 
@@ -1598,23 +1729,25 @@ def test_refresh_skips_a_terminal_parked_issue(rig, monkeypatch):
                      "prs": {"i7": {"number": 5, "state": "OPEN", "headRefName": "sl/i7-x"}}}
 
     called = []
-    monkeypatch.setattr(runner_mod.gh, "pr_for_branch", lambda b: called.append(b) or {})
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: called.append(b) or runner_mod.gh.PrRead({}, True))
     rig.r._refresh_finishing_prs(loopstate.load(str(rig.home / "state" / "issues.json"))["issues"])
     assert called == []                                               # terminal -> never re-fetched
 
 
 def test_refresh_does_not_write_empty_when_lookup_finds_nothing(rig, monkeypatch):
-    """A finished issue with NO cached PR whose fresh lookup returns {} (transient, or genuinely no
-    PR yet) leaves the view unwritten — we never store a {} entry, so a later successful tick can
-    still catch the PR."""
+    """A finished issue with NO cached PR whose fresh lookup finds nothing — REFUSED or genuinely
+    answered-empty (no PR yet: pr create may still be in flight) — leaves the view unwritten. The
+    refresh is POSITIVE-FIND only; answered-empty enters the view via the 90s poll, whose snapshot
+    is rebuilt from scratch, so a {} here would only race the poll it duplicates."""
     seed_issue(rig, "i9", status="running", branch="sl/i9-z", num=9)
     (rig.home / "reports" / "i9.md").write_text("# done\n## Tests\nok\n")
-    rig.r.gh_view = {"stale": False, "prs": {}}
-    monkeypatch.setattr(runner_mod.gh, "pr_for_branch", lambda b: {})
-
-    ist_map = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
-    rig.r._refresh_finishing_prs(ist_map)
-    assert "i9" not in rig.r.gh_view["prs"]                            # no {} stored; next tick can still find it
+    for read in (runner_mod.gh.PrRead({}, False), runner_mod.gh.PrRead({}, True)):
+        rig.r.gh_view = {"stale": False, "prs": {}}
+        monkeypatch.setattr(runner_mod.gh, "pr_for_branch", lambda b, read=read: read)
+        ist_map = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
+        rig.r._refresh_finishing_prs(ist_map)
+        assert "i9" not in rig.r.gh_view["prs"]                        # no {} stored; next tick can still find it
 
 
 # --------------------------- D4: relaunch closes the finished-but-alive session first -----------
@@ -1673,7 +1806,8 @@ def test_tick_skips_pr_refresh_when_github_is_stale(rig, monkeypatch):
     (rig.home / "reports" / "i7.md").write_text("# done\n## Tests\nok\n")
 
     called = []
-    monkeypatch.setattr(runner_mod.gh, "pr_for_branch", lambda b: called.append(b) or {})
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: called.append(b) or runner_mod.gh.PrRead({}, False))
     # Force a stale view and neutralize the poll so it stays stale for this tick.
     monkeypatch.setattr(rig.r, "_poll_github", lambda now: None)
     rig.r.gh_view = {"stale": True, "prs": {"i7": {"number": 9, "state": "OPEN"}}}
@@ -1849,10 +1983,10 @@ _INV_BODY = ("## Goal\nInvestigate.\n\n## Definition of done\n- [ ] root cause\n
              "## Boundaries\nnone\n\n## Loop metadata\ntouches:\n")
 
 
-def _stateful(rig, issues, next_num=500):
+def _stateful(rig, issues, next_num=500, prs=None):
     """Flip fake-gh into stateful mode (state.json) so the runner's own reads reflect a
-    controllable little GitHub. `issues` maps num-string -> issue dict."""
-    state = {"issues": issues, "prs": {}, "dev_branch": "main", "check_names": ["ci"],
+    controllable little GitHub. `issues` maps num-string -> issue dict; `prs` likewise."""
+    state = {"issues": issues, "prs": prs or {}, "dev_branch": "main", "check_names": ["ci"],
              "branch_checks": {"main": list(_GREEN_CHECK)}, "next_num": next_num}
     (rig.fixdir / "state.json").write_text(json.dumps(state))
 
@@ -1975,3 +2109,170 @@ def test_starved_investigation_read_is_rescued_budget_exempt(rig):
         _r.MAX_POLL_CALLS = old
     # despite the starved poll walk, the rescue fetched i99's marker and the gate closed it.
     assert issue_state(rig, "i99")["status"] == "merged"
+
+
+# =========================== issue #61: the 2026-07-08 park-notify storm guards ================
+# These drive the REAL tick loop against the stateful fake-gh through the exact storm shape:
+# hourly GraphQL dead zone -> PR lookups (and label writes) refused for finished builds. Guard
+# (a): refused != answered-empty on the PR-lookup path — the build gate HOLDs, journals once,
+# parks only at the bound. Guard (b): notify-once per (issue, park-cause) — the label move may
+# retry every tick, the TEXTING happens once; a move failing past its bound raises ONE alert.
+
+_BUILD_BODY = ("## Goal\nBuild.\n\n## Definition of done\n- [ ] done\n\n"
+               "## Boundaries\nnone\n\n## Loop metadata\ntouches:\n")
+
+_RATE_LIMITED = "GraphQL: API rate limit exceeded"
+
+
+def _build_issue(num):
+    return {"number": num, "title": f"Build {num}", "state": "open",
+            "labels": ["in-progress", "type:build"], "body": _BUILD_BODY, "comments": []}
+
+
+def _green_pr(num, branch, body=""):
+    """A gate-green PR: mergeable, required check 'ci' green, review marker present."""
+    return {"number": num, "title": f"pr {num}", "body": body, "state": "OPEN",
+            "headRefName": branch, "headRefOid": "oid1", "mergeable": "MERGEABLE",
+            "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+            "files": [{"path": "x.py"}], "labels": [],
+            "comments": [{"body": "<!-- superlooper-review -->\nreviewed, no P0/P1"}]}
+
+
+def _finished_build(rig, iid="i5", num=5, branch="sl/i5-x"):
+    seed_issue(rig, iid, status="gating", type="build", branch=branch, num=num)
+    (rig.home / "reports" / f"{iid}.md").write_text("## Tests\n" + "x" * 60)
+
+
+def _rules(rig, *rules):
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(list(rules)))
+
+
+def _journal_acts(rig, act):
+    return [r for r in journal.read(rig.home) if r.get("act") == act]
+
+
+def test_build_refused_pr_lookups_hold_then_recover_and_merge(rig):
+    # DoD: fake-gh refuses PR reads across N ticks after session_finished -> the build gate HOLDs
+    # (zero parks, zero notifies), the journal carries ONE bounded refusal record; reads recover
+    # -> clean merge, the wait clock cleared. The PR exists the whole time — exactly the storm's
+    # shape, where "GitHub refused" was mistaken for "no PR exists".
+    _stateful(rig, {"5": _build_issue(5)}, prs={"55": _green_pr(55, "sl/i5-x", "Closes #5")})
+    _finished_build(rig)
+    _rules(rig, {"match": "pr list --head", "times": 999, "stderr": _RATE_LIMITED})
+
+    N = 4
+    for k in range(N):
+        rig.r.tick(now=NOW + k * 100)                  # +100 > GH_POLL_SECONDS -> re-polls each tick
+
+    assert [m for m in mutations(rig)
+            if m["kind"] == "set_labels" and "parked" in (m.get("add") or "")] == []
+    assert issue_state(rig, "i5")["status"] == "gating"            # safe idle, still holding
+    assert _journal_acts(rig, "park") == []                        # zero parks
+    assert _journal_acts(rig, "notify") == []                      # zero texts
+    assert len(_journal_acts(rig, "await_pr_read")) == 1           # ONE bounded record, not N
+
+    (rig.fixdir / "fail_rules.json").unlink()                      # the dead zone ends
+    rig.r.tick(now=NOW + (N + 2) * 100)
+    assert [m for m in mutations(rig) if m["kind"] == "merge_pr" and m["num"] == "55"]
+    assert issue_state(rig, "i5")["status"] == "merged"
+    assert issue_state(rig, "i5")["pr_read_pending_since"] is None
+    assert _journal_acts(rig, "notify") == []                      # a clean merge never texts
+
+
+def test_refused_pr_lookups_past_bound_park_once_even_while_labels_fail(rig):
+    # DoD: the bound expires instead -> ONE park + ONE notify, even though the park's own label
+    # move keeps failing in the same dead zone (the exact 2026-07-08 shape: 21 texts in 6.5 min).
+    import actions
+    _stateful(rig, {"5": _build_issue(5)}, prs={"55": _green_pr(55, "sl/i5-x", "Closes #5")})
+    _finished_build(rig)
+    pr_rule = {"match": "pr list --head", "times": 999, "stderr": _RATE_LIMITED}
+    _rules(rig, pr_rule, {"match": "issue edit", "times": 999, "stderr": _RATE_LIMITED})
+
+    rig.r.tick(now=NOW)                                            # stamps the hold clock
+    cap = actions.PR_READ_HOLD_CAP_SECONDS
+    for k in range(5):                                             # bound expired; storm cadence
+        rig.r.tick(now=NOW + cap + 10 + k * 100)
+
+    notifies = _journal_acts(rig, "notify")
+    assert len(notifies) == 1                                      # the texting is what must be once
+    parks = _journal_acts(rig, "park")
+    assert len([r for r in parks if not r.get("retry")]) == 1      # one park episode...
+    assert len(parks) >= 2 and all(r.get("retry") for r in parks[1:])   # ...with silent retries
+    assert len([m for m in mutations(rig) if m["kind"] == "comment"]) == 1  # one memo, not N
+    assert issue_state(rig, "i5")["status"] == "gating"            # label never landed: unsettled
+
+    _rules(rig, pr_rule)                                           # label writes recover; reads still dark
+    rig.r.tick(now=NOW + cap + 560)
+    assert issue_state(rig, "i5")["status"] == "parked"            # the retried move settles it
+    assert len(_journal_acts(rig, "notify")) == 1                  # still exactly one text
+
+
+def test_park_label_failures_notify_once_then_settle(rig):
+    # DoD: label moves failing N ticks in a row under a park verdict produce EXACTLY ONE notify;
+    # the journal shows one park + silent retries, not N parks. The park here is GENUINE
+    # (answered-empty: no PR exists anywhere) — only the WRITE side is failing.
+    _stateful(rig, {"5": _build_issue(5)})
+    _finished_build(rig)
+    _rules(rig, {"match": "issue edit", "times": 3, "stderr": "secondary rate limit"})
+
+    for k in range(4):
+        rig.r.tick(now=NOW + k * 100)
+
+    assert len(_journal_acts(rig, "notify")) == 1
+    parks = _journal_acts(rig, "park")
+    assert len(parks) == 4 and len([r for r in parks if not r.get("retry")]) == 1
+    assert len([m for m in mutations(rig) if m["kind"] == "comment"]) == 1
+    assert issue_state(rig, "i5")["status"] == "parked"            # writes recovered -> settled
+
+
+def test_real_park_still_notifies_exactly_once(rig):
+    # DoD: a real park (no PR anywhere, label writes succeed) still texts exactly once — unchanged.
+    _stateful(rig, {"5": _build_issue(5)})
+    _finished_build(rig)
+    for k in range(3):
+        rig.r.tick(now=NOW + k * 100)
+    assert len(_journal_acts(rig, "notify")) == 1
+    assert len(_journal_acts(rig, "park")) == 1
+    assert issue_state(rig, "i5")["status"] == "parked"
+
+
+def test_park_label_stuck_past_bound_raises_one_alert(rig):
+    # DoD: a label move failing past its bound raises exactly ONE ALERT + notify (incident §4:
+    # one more text, not zero and not twenty).
+    import actions
+    _stateful(rig, {"5": _build_issue(5)})
+    _finished_build(rig)
+    _rules(rig, {"match": "issue edit", "times": 999, "stderr": _RATE_LIMITED})
+
+    rig.r.tick(now=NOW)                                            # park + its one text
+    stuck = actions.PARK_LABEL_STUCK_ALERT_SECONDS
+    rig.r.tick(now=NOW + stuck + 5)                                # past the bound -> ALERT
+    rig.r.tick(now=NOW + stuck + 105)                              # same reasons -> deduped
+
+    alerts = _journal_acts(rig, "alert")
+    assert len(alerts) == 1 and any("park_label_stuck:i5" in str(r.get("reasons")) for r in alerts)
+    assert len(_journal_acts(rig, "notify")) == 2                  # one park text + one ALERT text
+    assert (rig.home / "state" / "ALERT").exists()
+
+
+def test_park_episode_recovers_and_merges_with_no_further_notify(rig):
+    # DoD: the PR becomes visible after k failing ticks (the park label never landed) -> the gate
+    # verdict flips to merge, the notify-once marker and hold clock are CLEARED, no further text.
+    import actions
+    _stateful(rig, {"5": _build_issue(5)}, prs={"55": _green_pr(55, "sl/i5-x", "Closes #5")})
+    _finished_build(rig)
+    _rules(rig, {"match": "pr list --head", "times": 999, "stderr": _RATE_LIMITED},
+           {"match": "issue edit", "times": 999, "stderr": _RATE_LIMITED})
+
+    rig.r.tick(now=NOW)                                            # hold stamped
+    cap = actions.PR_READ_HOLD_CAP_SECONDS
+    rig.r.tick(now=NOW + cap + 10)                                 # bound expired -> park (1 text)
+    rig.r.tick(now=NOW + cap + 110)                                # label still failing -> silent
+    (rig.fixdir / "fail_rules.json").unlink()                      # reads AND writes recover
+    rig.r.tick(now=NOW + cap + 210)                                # PR visible -> clean merge
+
+    st = issue_state(rig, "i5")
+    assert st["status"] == "merged"
+    assert st["park_notify_cause"] is None and st["pr_read_pending_since"] is None
+    assert len(_journal_acts(rig, "notify")) == 1                  # the park's one text, no more
+    assert [m for m in mutations(rig) if m["kind"] == "merge_pr" and m["num"] == "55"]
