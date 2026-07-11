@@ -166,6 +166,118 @@ def test_duplicate_candidate_launches_once():
     assert _nums(out) == [1]
 
 
+# ---------------- reserved investigation lanes: two strict pools (issue #63) ----------------
+# `lanes` may be {"build": N, "investigate": M}: N lanes for merge-producing work, M RESERVED for
+# investigations. No cross-pool borrowing in EITHER direction (see the borrow-policy test). A plain
+# integer stays a single shared pool — the tests above (unchanged) pin that back-compat.
+
+def _inv(num, touches=None, **k):
+    return _issue(num, touches=touches, labels=("type:investigate", "agent-ready"), **k)
+
+
+def _pool_cfg(build=1, investigate=1, affinity="hard"):
+    return {"lanes": {"build": build, "investigate": investigate}, "affinity": affinity}
+
+
+def test_pooled_investigation_launches_while_second_build_waits():
+    # THE OWNER'S CASE: the sole build lane is occupied by a running build. A second approved build
+    # WAITS (build pool full), while an approved investigation launches into the reserved lane.
+    running = [{"id": "i1", "type": "build", "touches": ["frontend"]}]
+    q = [_issue(2, touches=["api"]), _inv(3, touches=["db"])]
+    out = scheduler.launchable(q, running, _pool_cfg(1, 1), OK, set(), False)
+    assert _nums(out) == [3]
+
+
+def test_pooled_reserved_investigation_lane_stays_idle_without_investigations():
+    # RESERVATION: build pool full, the investigation lane idle, ZERO pending investigations — a
+    # queued build does NOT borrow the reserved lane. It stays idle by design.
+    running = [{"id": "i1", "type": "build", "touches": ["frontend"]}]
+    q = [_issue(2, touches=["api"])]
+    assert scheduler.launchable(q, running, _pool_cfg(1, 1), OK, set(), False) == []
+
+
+def test_pooled_investigation_does_not_borrow_an_idle_build_lane():
+    # BORROW POLICY (issue #63): strict reservation, NO borrowing. investigate:1 fills after one
+    # investigation; a second queued investigation does NOT spill into the idle build lane.
+    q = [_inv(1, touches=["a"]), _inv(2, touches=["b"])]
+    out = scheduler.launchable(q, [], _pool_cfg(1, 1), OK, set(), False)
+    assert _nums(out) == [1]           # build lane left idle; the 2nd investigation waits
+
+
+def test_pooled_build_does_not_borrow_an_idle_investigation_lane_mirror():
+    # the mirror of the borrow test — a build never takes the reserved lane even with builds queued
+    # beyond the build pool and the investigation pool empty.
+    q = [_issue(1, touches=["a"]), _issue(2, touches=["b"])]
+    out = scheduler.launchable(q, [], _pool_cfg(1, 1), OK, set(), False)
+    assert _nums(out) == [1]           # investigation lane stays reserved; build #2 waits
+
+
+def test_pooled_untyped_running_lane_counts_as_build():
+    # a running lane with NO persisted type is accounted to the BUILD pool — the merge-safe default:
+    # it blocks a build but leaves the reserved investigation lane free (never the reverse).
+    running = [{"id": "i1", "touches": ["frontend"]}]          # note: no "type" key
+    assert scheduler.launchable([_issue(2, touches=["api"])], running,
+                                _pool_cfg(1, 1), OK, set(), False) == []          # build pool taken
+    assert _nums(scheduler.launchable([_inv(3, touches=["db"])], running,
+                                      _pool_cfg(1, 1), OK, set(), False)) == [3]  # reserved lane free
+
+
+def test_pooled_diagnose_and_fix_draws_on_the_build_pool():
+    # a diagnose-and-fix is merge-producing, so it consumes a BUILD lane, not the reserved lane.
+    running = [{"id": "i1", "type": "diagnose-and-fix", "touches": ["frontend"]}]
+    q = [_issue(2, touches=["api"]), _inv(3, touches=["db"])]
+    out = scheduler.launchable(q, running, _pool_cfg(1, 1), OK, set(), False)
+    assert _nums(out) == [3]           # build pool full (d&f holds it); only the investigation runs
+
+
+def test_pooled_build_pool_zero_never_launches_a_build():
+    q = [_issue(1, touches=["a"])]
+    assert scheduler.launchable(q, [], _pool_cfg(0, 2), OK, set(), False) == []
+
+
+def test_pooled_investigate_pool_zero_never_launches_an_investigation():
+    q = [_inv(1, touches=["a"])]
+    assert scheduler.launchable(q, [], _pool_cfg(2, 0), OK, set(), False) == []
+
+
+def test_pooled_config_still_honors_anti_affinity_within_the_build_pool():
+    # capacity arithmetic is layered ON TOP of anti-affinity, not instead of it: a second build
+    # overlapping a running build is still HELD, even with a free build lane.
+    running = [{"id": "i1", "type": "build", "touches": ["frontend"]}]
+    q = [_issue(2, touches=["frontend"])]
+    assert scheduler.launchable(q, running, _pool_cfg(2, 1), OK, set(), False) == []
+
+
+def test_pooled_both_pools_fill_independently():
+    # a build and an investigation co-schedule into their OWN pools in the same tick.
+    q = [_issue(1, touches=["a"]), _inv(2, touches=["b"])]
+    out = scheduler.launchable(q, [], _pool_cfg(1, 1), OK, set(), False)
+    assert _nums(out) == [1, 2]
+
+
+def test_pooled_usage_ceiling_still_bounds_investigations():
+    # usage fail-closed is unchanged and still gates BOTH pools.
+    q = [_inv(1, touches=["a"])]
+    over = {"five_hour_pct": 91, "seven_day_pct": 10, "auth_status": "ok"}
+    assert scheduler.launchable(q, [], _pool_cfg(1, 1), over, set(), False) == []
+
+
+def test_pooled_blocked_by_still_bounds_investigations():
+    # a blocked-by dependency still holds an investigation until the blocker closes.
+    q = [_inv(1, touches=["a"], blocked_by=[99])]
+    assert scheduler.launchable(q, [], _pool_cfg(1, 1), OK, set(), False) == []
+    assert _nums(scheduler.launchable(q, [], _pool_cfg(1, 1), OK, {99}, False)) == [1]
+
+
+def test_integer_lanes_share_one_pool_across_types():
+    # BACK-COMPAT contrast: a plain integer is a SINGLE shared pool — a build and an investigation
+    # compete for the same lane. Under lanes:1 a running build leaves the investigation waiting
+    # (whereas the reserved-pool form above would launch it). Proves the integer form does not reserve.
+    running = [{"id": "i1", "type": "build", "touches": ["frontend"]}]
+    q = [_inv(2, touches=["db"])]
+    assert scheduler.launchable(q, running, _cfg(lanes=1), OK, set(), False) == []
+
+
 # --------------------------- eligibility integration ---------------------------
 
 def test_ineligible_issues_never_launch():

@@ -72,10 +72,45 @@ _ALLOWED_TOP = set(_TOP_DEFAULTS) | set(_NESTED_DEFAULTS) | {"repo"}
 _AGENTS = {"claude", "codex"}
 _AFFINITIES = {"hard", "soft"}
 _MERGE_METHODS = {"squash", "merge", "rebase"}   # gh's own set; the runner defaults to squash (§B.4)
+# `lanes` reserved-pool keys (issue #63): "build" hosts ALL merge-producing work (build AND
+# diagnose-and-fix); "investigate" is the reserved investigation pool. A merge-producing issue
+# never occupies an investigation lane — that reservation is the whole point.
+_LANE_POOLS = ("build", "investigate")
 
 
 def _err(msg):
     raise ValueError(f"invalid .superlooper/config.json: {msg}")
+
+
+def _validate_lanes(v):
+    """`lanes` is EITHER a plain integer >= 1 (today's single shared pool — full back-compat) OR an
+    object {"build": N, "investigate": M} splitting capacity into two STRICT pools: N lanes for
+    merge-producing work plus M reserved for investigations. Fails loud and specific either way."""
+    _obj_hint = ("or an object with 'build' and 'investigate' pool sizes "
+                 "(e.g. {\"build\": 1, \"investigate\": 1})")
+    if isinstance(v, dict):
+        for k in v:
+            if k not in _LANE_POOLS:
+                _err(f"unknown key 'lanes.{k}' (allowed: {', '.join(_LANE_POOLS)})")
+        # Opting into the object form is a conscious split, so BOTH pools must be stated — a lone
+        # {"build": 2} silently zeroing investigations is exactly the surprise this rejects.
+        missing = [k for k in _LANE_POOLS if k not in v]
+        if missing:
+            _err(f"'lanes' object must set both {' and '.join(repr(k) for k in _LANE_POOLS)} "
+                 f"(missing: {', '.join(missing)})")
+        total = 0
+        for k in _LANE_POOLS:
+            n = v[k]
+            if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                _err(f"'lanes.{k}' must be an integer >= 0, got {n!r}")
+            total += n
+        if total < 1:
+            _err("'lanes' pools must sum to at least 1 (both 'build' and 'investigate' are 0 — "
+                 "nothing would ever launch)")
+        return
+    # int form: bool is an int subclass (True == 1) so it must be rejected explicitly.
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        _err(f"'lanes' must be an integer >= 1 {_obj_hint}, got {v!r}")
 
 
 def _validate_and_fill(raw):
@@ -113,8 +148,7 @@ def _validate_and_fill(raw):
         _err("'prod_branch' must be null or a non-empty string")
     if not isinstance(out["agent"], str) or out["agent"] not in _AGENTS:
         _err(f"'agent' must be one of {sorted(_AGENTS)}, got {out['agent']!r}")
-    if isinstance(out["lanes"], bool) or not isinstance(out["lanes"], int) or out["lanes"] < 1:
-        _err(f"'lanes' must be an integer >= 1, got {out['lanes']!r}")
+    _validate_lanes(out["lanes"])
     # guard isinstance(str) BEFORE the set membership: an unhashable value (list/dict) would
     # raise a raw TypeError from `x in set`, breaking the "schema violation -> ValueError" contract.
     if not isinstance(out["affinity"], str) or out["affinity"] not in _AFFINITIES:

@@ -64,7 +64,7 @@ never a silent 3am surprise.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `lanes` | `2` | How many issues may build at once (parallel worktrees/sessions). Integer ≥ 1. |
+| `lanes` | `2` | How many issues may run at once (parallel worktrees/sessions). Either an **integer ≥ 1** — one shared pool, any issue type may take any lane — or an **object** `{"build": N, "investigate": M}` that reserves capacity by type (see **Reserved investigation lanes** below). The integer form is unchanged; existing configs keep working exactly as before. |
 | `affinity` | `"hard"` | `"hard"` = two issues co-schedule only if their declared `touches:` areas are **disjoint** (no two lanes editing the same area at once). `"soft"` = overlap allowed but journaled. |
 | `areas` | `{}` | A map of area-name → list of path globs (fnmatch). It defines what "touches the same thing" means for affinity and for wander-detection at the gate. A path matching no area maps to the wildcard `*`, which overlaps **everything** under hard affinity (see the wildcard rule below). If a PR's files map to `*` because no glob matched them, the merge is **held** behind every in-flight lane and the journal records that the hold is wildcard-caused — so add a glob covering those files if you don't want that serialization. |
 | `touches_required` | `true` | **If true**, every approved *build* / *diagnose-and-fix* issue must declare a non-empty `touches:` in its Loop metadata. An approved issue that doesn't is **refused at launch** and handed back to William (`needs-william`) with a memo naming the missing block — it never launches until the declaration is added. Investigations are exempt (they produce no merge). The declared areas are what anti-affinity and the gate's wander check verify against (a diff that leaves its declared areas is logged as a wander, never blocked). **If false**, the declaration is optional — but an issue with no `touches:` maps to the wildcard `*` (see below), so under hard affinity it can only run alone; when that serializes a lane the journal records why. Turn off only for a small repo where areas don't matter. |
@@ -88,6 +88,41 @@ wildcard suppresses a launch, and on the merge side when a `*`-mapped diff holds
 lane. So if you set `lanes` high and see only one lane working, `grep wildcard_hold` (and the
 wildcard-flagged `hold` records) in `journal.jsonl` will name the no-touches issue causing it. The
 fix is to declare narrower `touches:` and add `areas` globs that cover your files.
+
+**Reserved investigation lanes.** A plain integer `lanes` serializes *everything* at 1 (including
+investigations, which open no PR and can't cause a merge conflict) and parallelizes *everything* at
+2+ (accepting conflict risk between builds). The missing middle — strictly-sequential
+merge-producing work **with** investigations still flowing in parallel — is expressed by the object
+form:
+
+```json
+"lanes": { "build": 1, "investigate": 1 }
+```
+
+- `build` — lanes for **merge-producing** work: `build` *and* `diagnose-and-fix` issues both draw on
+  this pool (they open PRs and merge, so they're the ones anti-affinity governs). `build: 1` keeps
+  merge-producing work strictly sequential — the whole point.
+- `investigate` — lanes **reserved** for investigations (`type:investigate`, which produce a report
+  and child issues, never a PR).
+
+Both pool sizes are **required** when you use the object form (a lone `{"build": 2}` that silently
+zeroes investigations is rejected at load), each is an integer ≥ 0, and their total must be ≥ 1. The
+canonical `1 + 1` gives you: a running build holds the sole build lane, a second approved build
+**waits**, and an approved investigation launches **immediately** into the reserved lane instead of
+queuing behind the build.
+
+The reservation is **strict, in both directions — no borrowing:**
+
+- A merge-producing issue **never** occupies the reserved investigation lane, even when it's idle and
+  a build is queued (that lane stays idle by design — preserving sequential build discipline is why
+  you reserved it).
+- An investigation **never** borrows an idle build lane. With `investigate: 1`, a second pending
+  investigation waits rather than spilling into the build pool — so a build is always free to launch
+  the moment the running build finishes, never stuck behind an investigation that grabbed its lane.
+
+Anti-affinity, territory claims, the usage/quota ceilings, and `blocked-by` all still apply
+unchanged within each pool; this is purely how lane *capacity* is counted. (Prefer the integer form
+unless you specifically want this build-vs-investigation split.)
 
 ### The ship gate
 

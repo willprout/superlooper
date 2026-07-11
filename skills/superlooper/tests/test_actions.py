@@ -1849,3 +1849,29 @@ def test_corrupt_issue_state_stops_fresh_launches_fail_closed():
         out = decide(parsed_issues=[parsed(1, touches=["frontend"])],
                      dsk=disk(issues_state=bad_state))
         assert only(out, "launch") == [], bad_state
+
+
+# ============= reserved investigation lanes end-to-end through decide() (issue #63) =============
+# The lane-state accounting truth site: decide passes the type-carrying lane_state straight into the
+# reserved-pool scheduler, so the owner's case works with a real config object, not just a unit test.
+
+def test_pooled_lanes_launch_investigation_while_build_waits():
+    # THE OWNER'S CASE: the sole build lane is occupied by a running build; a second approved build
+    # WAITS while an approved investigation launches immediately into the reserved lane.
+    lane = [{"id": "i1", "type": "build", "touches": ["frontend"]}]
+    out = decide(config=cfg(lanes={"build": 1, "investigate": 1}),
+                 parsed_issues=[parsed(2, touches=("api",)),
+                                parsed(3, labels=("agent-ready", "type:investigate"),
+                                       touches=("frontend",))],
+                 lane_state=lane)
+    assert [a["id"] for a in only(out, "launch")] == ["i3"]
+
+
+def test_pooled_lanes_reserved_investigation_lane_not_taken_by_build():
+    # RESERVATION: the build pool is full and the investigation lane idle with nothing to run; the
+    # queued build does NOT borrow the reserved lane.
+    lane = [{"id": "i1", "type": "build", "touches": ["frontend"]}]
+    out = decide(config=cfg(lanes={"build": 1, "investigate": 1}),
+                 parsed_issues=[parsed(2, touches=("api",))],
+                 lane_state=lane)
+    assert only(out, "launch") == []
