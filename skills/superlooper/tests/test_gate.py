@@ -151,7 +151,7 @@ def test_investigation_marker_comment():
 
 def test_touch_verdict_clean():
     v = gate.touch_verdict(["frontend"], ["frontend"], {})
-    assert v == {"wander": False, "overlap_lane": None}
+    assert v == {"wander": False, "overlap_lane": None, "overlap_wildcard": False}
 
 
 def test_touch_verdict_wander():
@@ -177,6 +177,23 @@ def test_touch_verdict_wildcard_overlaps_everything():
     # in EITHER direction (the kickoff's fixed wildcard-overlap contract).
     assert gate.touch_verdict([], ["*"], {"i7": ["db"]})["overlap_lane"] == "i7"
     assert gate.touch_verdict([], ["api"], {"i7": ["*"]})["overlap_lane"] == "i7"
+
+
+def test_touch_verdict_overlap_wildcard_flag_names_the_no_match_cause():
+    # issue #36: when the diff mapped to '*' (files in no declared `areas`), the hold is
+    # wildcard-caused — the flag lets the runner journal WHY the merge is held.
+    v = gate.touch_verdict([], ["*"], {"i7": ["db"]})
+    assert v["overlap_lane"] == "i7" and v["overlap_wildcard"] is True
+    # the lane side being the wildcard also counts (a no-touches in-flight lane holds every merge).
+    v2 = gate.touch_verdict([], ["api"], {"i7": ["*"]})
+    assert v2["overlap_lane"] == "i7" and v2["overlap_wildcard"] is True
+
+
+def test_touch_verdict_named_overlap_is_not_wildcard():
+    # a genuine named-area overlap holds the merge, but it is NOT the wildcard trap — the operator
+    # declared these areas overlapping, so overlap_wildcard stays False.
+    v = gate.touch_verdict(["frontend"], ["frontend"], {"i7": ["frontend", "db"]})
+    assert v["overlap_lane"] == "i7" and v["overlap_wildcard"] is False
 
 
 def test_touch_verdict_first_overlap_deterministic_and_tolerant():
@@ -406,6 +423,33 @@ def test_gate_undeclared_area_file_overlaps_via_wildcard():      # step 3 (the '
     pr = _pr(files=[{"path": "random/loose-file.txt"}])          # matches no configured area
     d = _decide(pr=pr, inflight={"i7": ["db"]})
     assert d["action"] == "hold" and d["overlap_lane"] == "i7"
+
+
+def test_gate_wildcard_hold_reason_names_the_no_match_cause():   # issue #36 (merge-hold journaling)
+    # A diff whose files match no declared `areas` maps to '*' and holds the merge against EVERY
+    # lane. The reason must SAY that (no-declared-area / wildcard) so "why is only one lane busy"
+    # is answerable from the journal, and carry the structured overlap_wildcard flag.
+    pr = _pr(files=[{"path": "random/loose-file.txt"}])
+    d = _decide(pr=pr, inflight={"i7": ["db"]})
+    assert d["action"] == "hold" and d["overlap_wildcard"] is True
+    assert "areas" in d["reason"] and ("wildcard" in d["reason"] or "*" in d["reason"])
+
+
+def test_gate_wildcard_hold_reason_when_the_inflight_lane_is_the_wildcard():
+    # The mirror: our diff is well-declared, but an in-flight lane of unknown scope ('*') holds
+    # every merge. The reason names the LANE as the no-touches wildcard.
+    pr = _pr(files=[{"path": "src/components/Widget.tsx"}])      # maps to 'frontend'
+    d = _decide(pr=pr, inflight={"i7": ["*"]})
+    assert d["action"] == "hold" and d["overlap_wildcard"] is True
+    assert "i7" in d["reason"]
+
+
+def test_gate_named_overlap_hold_is_not_flagged_wildcard():
+    # A genuine named-area overlap holds too, but it is the operator's declared affinity, not the
+    # wildcard trap: overlap_wildcard stays False and the reason is the plain one.
+    d = _decide(inflight={"i7": ["frontend"]})                  # our diff maps to 'frontend'
+    assert d["action"] == "hold" and d["overlap_lane"] == "i7"
+    assert d.get("overlap_wildcard", False) is False
 
 
 def test_gate_frozen_holds_merges():                             # step 4

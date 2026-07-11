@@ -79,7 +79,7 @@ class Sim:
 
     def __init__(self, tmp_path, monkeypatch, lanes=2, affinity="hard", areas=None,
                  required_checks=("ci",), session=None, retry_cap=None, conflict_cap=None,
-                 cleanup_merged_worktrees=True, qa=None):
+                 cleanup_merged_worktrees=True, qa=None, touches_required=False):
         self.tmp = tmp_path
         self.origin = tmp_path / "origin"
         self.repo = tmp_path / "repo"
@@ -123,6 +123,10 @@ class Sim:
         cfg = {
             "repo": "sim/repo", "dev_branch": "main", "lanes": lanes, "affinity": affinity,
             "areas": areas or {}, "required_checks": list(required_checks),
+            # This general harness adds issues with empty `touches:` by default, so it models a
+            # touches_required:false repo unless a test opts in (issue #36 enforcement is unit-tested
+            # in test_actions and exercised end-to-end by the touches_required=True sim below).
+            "touches_required": touches_required,
             "session": sess, "cleanup_merged_worktrees": cleanup_merged_worktrees,
             "notify": {"cmd": "printf '%s|%s\\n' \"$SL_TITLE\" \"$SL_BODY\" >> "
                               + str(self.notify_log)},
@@ -694,6 +698,38 @@ def test_referee_path_pr_parks_needs_william_once_without_merging(sim_factory):
     assert len(memos) == 1 and ".superlooper/config.json" in memos[0]["body"]
     notices = sim.notify_lines()
     assert len(notices) == 1 and ".superlooper/config.json" in notices[0]
+
+
+def test_touches_required_parks_a_no_touches_issue_before_launch(sim_factory):
+    # issue #36 end-to-end: with touches_required ON, an approved build issue that declares no
+    # `touches:` is refused at INTAKE — parked needs-william with a memo naming the missing block —
+    # and NEVER launched (no worker session, no PR, no merge).
+    sim = sim_factory(touches_required=True)
+    num = sim.add_issue(title="Forgot the touches block", touches="")   # empty -> no declaration
+    sid = "i%d" % num
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "needs_william"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert "needs-william" in sim.issue(num)["labels"]
+    assert "in-progress" not in sim.issue(num)["labels"]
+    assert not sim.mutations("merge_pr")                     # never launched -> never merged
+    memos = [m for m in sim.mutations("comment") if "touches_required" in m["body"]]
+    assert len(memos) == 1 and "touches:" in memos[0]["body"]
+    notices = sim.notify_lines()
+    assert notices and any(sid in n and "needs-william" in n for n in notices)
+
+
+def test_touches_required_off_launches_a_no_touches_issue(sim_factory):
+    # The false branch documented: a no-touches issue on a touches_required:false repo launches
+    # normally (relaxed) — the enforcement is exactly the knob, nothing more.
+    sim = sim_factory(touches_required=False)
+    num = sim.add_issue(title="No touches, relaxed repo", touches="",
+                        scenario={"scenario": "happy"})
+    sid = "i%d" % num
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") in ("running", "gating",
+                                                                        "merged")), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert "in-progress" in sim.issue(num)["labels"] or sim.loop_issue(sid)["status"] == "merged"
+    assert not [m for m in sim.mutations("comment") if "touches_required" in m["body"]]
 
 
 # =====================================================================================

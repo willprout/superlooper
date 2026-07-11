@@ -66,8 +66,8 @@ never a silent 3am surprise.
 |---|---|---|
 | `lanes` | `2` | How many issues may build at once (parallel worktrees/sessions). Integer ≥ 1. |
 | `affinity` | `"hard"` | `"hard"` = two issues co-schedule only if their declared `touches:` areas are **disjoint** (no two lanes editing the same area at once). `"soft"` = overlap allowed but journaled. |
-| `areas` | `{}` | A map of area-name → list of path globs (fnmatch). It defines what "touches the same thing" means for affinity and for wander-detection at the gate. A path matching no area maps to the wildcard `*`, which overlaps **everything** under hard affinity (a file in no declared area is treated as touching all lanes — the safe default). |
-| `touches_required` | `true` | If true, every issue must declare `touches:` in its Loop metadata (verified against the actual diff at gate time, so a lying `touches:` is logged as a wander). Turn off for a small repo where areas don't matter. |
+| `areas` | `{}` | A map of area-name → list of path globs (fnmatch). It defines what "touches the same thing" means for affinity and for wander-detection at the gate. A path matching no area maps to the wildcard `*`, which overlaps **everything** under hard affinity (see the wildcard rule below). If a PR's files map to `*` because no glob matched them, the merge is **held** behind every in-flight lane and the journal records that the hold is wildcard-caused — so add a glob covering those files if you don't want that serialization. |
+| `touches_required` | `true` | **If true**, every approved *build* / *diagnose-and-fix* issue must declare a non-empty `touches:` in its Loop metadata. An approved issue that doesn't is **refused at launch** and handed back to William (`needs-william`) with a memo naming the missing block — it never launches until the declaration is added. Investigations are exempt (they produce no merge). The declared areas are what anti-affinity and the gate's wander check verify against (a diff that leaves its declared areas is logged as a wander, never blocked). **If false**, the declaration is optional — but an issue with no `touches:` maps to the wildcard `*` (see below), so under hard affinity it can only run alone; when that serializes a lane the journal records why. Turn off only for a small repo where areas don't matter. |
 
 `areas` example:
 
@@ -78,6 +78,16 @@ never a silent 3am surprise.
   "db":       ["migrations/**", "src/db/**"]
 }
 ```
+
+**The wildcard rule.** An issue that declares no `touches:`, or declares `touches: *`, and any file
+that matches no `areas` glob, both map to the wildcard `*`. Under **hard** affinity `*` overlaps
+**every** lane — the safe default, so an issue of unknown scope never collides with another lane by
+surprise. The cost is serialization: a single wildcard occupant makes `lanes: N` behave like one
+busy lane. That used to be silent; now the loop **says so in the journal** — once per episode when a
+wildcard suppresses a launch, and on the merge side when a `*`-mapped diff holds behind an in-flight
+lane. So if you set `lanes` high and see only one lane working, `grep wildcard_hold` (and the
+wildcard-flagged `hold` records) in `journal.jsonl` will name the no-touches issue causing it. The
+fix is to declare narrower `touches:` and add `areas` globs that cover your files.
 
 ### The ship gate
 

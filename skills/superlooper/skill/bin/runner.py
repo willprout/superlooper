@@ -1014,7 +1014,8 @@ class Runner:
         if p is None:
             return "skipped: issue not in the current GitHub view"
         self._update_issue(iid, {"branch": branch, "num": num, "type": p.get("type"),
-                                 "declared_touches": list(p.get("touches") or [])})
+                                 "declared_touches": list(p.get("touches") or []),
+                                 "wildcard_hold_journaled": False})   # launch ends the hold episode (#36)
         # NB: the per-issue model/effort override is stamped into durable state by _worker_env below
         # (it refreshes on EVERY worker launch so the stamp tracks William's current labels) — see
         # its docstring. Kept in one place so recover/resolve_conflict relaunches stamp identically.
@@ -1228,6 +1229,7 @@ class Runner:
             i.update({"status": "ready", "requeue_front": False, "recheck_failed": False,
                       "update_result": None, "update_head_oid": None, "nudged": [], "pr": None,
                       "read_waited": False, "checks_pending_since": None,
+                      "wildcard_hold_journaled": False,   # a fresh approval re-journals its own hold (#36)
                       "merge_refusal_reason": None})   # paired with merge_refusals=0 above (#27)
             recs = st.get("answerers")
             if isinstance(recs, dict):
@@ -1325,6 +1327,15 @@ class Runner:
         Reset by _exec_reapprove so a re-run's own wait re-journals."""
         self._update_issue(a["id"], {"read_waited": True})
         return a.get("reason", "holding: finished investigation awaiting a trustworthy comment read")
+
+    def _exec_wildcard_hold(self, a, now):
+        """Issue #36: a no-touches wildcard serialized the queue (this issue could not co-schedule).
+        decide emitted this ONCE per episode (deduped on `wildcard_hold_journaled`); stamp the flag
+        so the same continuous hold does not re-journal every tick, and return the reason so the
+        journal outcome carries the WHY. The flag is reset on launch (_exec_launch) and on reapprove,
+        so a later, fresh episode re-journals. Journal-only: no label move, no notify."""
+        self._update_issue(a["id"], {"wildcard_hold_journaled": True})
+        return a.get("reason", "launch held by a no-touches wildcard — the lane serializes")
 
     def _exec_hold(self, a, now):
         self._update_issue(a["id"], {"status": "holding"})
