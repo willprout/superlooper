@@ -80,14 +80,24 @@ SHIM
 
 # --- choose the target dir: first candidate that is on PATH AND writable; else the preferred fallback.
 chosen=""
-chosen_on_path=false
 for dir in "${CANDIDATES[@]}"; do
   if on_path "$dir" && usable "$dir"; then
-    chosen="$dir"; chosen_on_path=true; break
+    chosen="$dir"; break
   fi
 done
 [ -n "$chosen" ] || chosen="$PREFERRED"
 target="$chosen/superlooper"
+
+# A real directory occupying the target is pathological (bin dirs hold executables, not dirs). Do
+# NOT `rm -rf` a path we computed — leave it untouched, print the fix, and exit 0 so a successful
+# publish is never reported as failed over this. (A SYMLINK named superlooper is not caught here;
+# write_shim's `rm -f` removes the link cleanly without touching its target.)
+if [ -d "$target" ] && [ ! -L "$target" ]; then
+  echo "[install-cli-link] WARNING: a directory occupies $target — cannot install the shim there." >&2
+  echo "[install-cli-link] Remove that directory and re-run bin/install.sh" \
+       "(the skill itself is already published)." >&2
+  exit 0
+fi
 
 # --- classify what we are about to do, for an honest report (and to never clobber silently).
 action="linked"
@@ -115,9 +125,14 @@ for dir in "${CANDIDATES[@]}"; do
   fi
 done
 
-# --- report.
+# --- report using the shell's ACTUAL resolution, not an inference: after writing + sweeping, ask
+#     what `superlooper` now resolves to on this PATH. This keeps "resolves now" honest even when a
+#     DIFFERENT superlooper earlier on PATH (in any dir, candidate or not) would shadow our shim.
+hash -r 2>/dev/null || true
+resolved="$(command -v superlooper 2>/dev/null || true)"
+
 if [ "$action" = replaced ]; then
-  echo "[install-cli-link] NOTE: replaced an existing non-shim file at $target."
+  echo "[install-cli-link] NOTE: replaced an existing non-shim entry at $target (its name is ours)."
 fi
 echo "[install-cli-link] $action superlooper -> $INSTALLED_LITERAL"
 echo "[install-cli-link]   shim: $target"
@@ -125,13 +140,17 @@ if [ ! -e "$INSTALLED_REAL" ]; then
   echo "[install-cli-link]   note: $INSTALLED_REAL is not present yet — publish the skill via" \
        "bin/install.sh so the command resolves."
 fi
-if $chosen_on_path; then
-  echo "[install-cli-link]   $chosen is on your PATH — \`superlooper\` resolves now" \
-       "(open a new shell if this dir was just created)."
+if [ "$resolved" = "$target" ]; then
+  echo "[install-cli-link]   \`superlooper\` resolves now -> this shim" \
+       "(open a new shell if $chosen was just created)."
+elif [ -n "$resolved" ]; then
+  echo "[install-cli-link] WARNING: wrote the shim to $target, but \`superlooper\` currently" \
+       "resolves to $resolved — something earlier on your PATH shadows it." >&2
+  echo "[install-cli-link] Put $chosen ahead of it on PATH, or remove the other superlooper." >&2
 else
   echo "[install-cli-link] WARNING: $chosen is not on your PATH — \`superlooper\` will not resolve" \
-       "until you add it."
+       "until you add it." >&2
   echo "[install-cli-link] Add it: append this to your shell profile (e.g. ~/.zshrc), then open a" \
-       "new shell:"
-  echo "[install-cli-link]   export PATH=\"$chosen:\$PATH\""
+       "new shell:" >&2
+  echo "[install-cli-link]   export PATH=\"$chosen:\$PATH\"" >&2
 fi

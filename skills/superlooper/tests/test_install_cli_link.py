@@ -152,6 +152,55 @@ def test_replaces_a_foreign_superlooper_with_a_loud_note(tmp_path):
     assert "replaced" in _out(r).lower()                         # never a silent clobber
 
 
+def test_the_sweep_leaves_a_foreign_superlooper_in_another_dir_untouched(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    local_bin = home / ".local" / "bin"
+    home_bin = home / "bin"
+    home_bin.mkdir(parents=True)
+    foreign = home_bin / "superlooper"                          # a user's own binary, no marker
+    foreign.write_text("#!/bin/sh\necho theirs\n")
+    foreign.chmod(0o755)
+    r = _run(home, path=f"{local_bin}:{SYS}")                    # chooses ~/.local/bin; sweep visits ~/bin
+    assert r.returncode == 0, _out(r)
+    assert (local_bin / "superlooper").exists()
+    assert foreign.exists() and "theirs" in foreign.read_text()  # marker-guarded: NOT swept
+    assert "removed stale shim" not in _out(r)
+
+
+def test_warns_when_a_foreign_superlooper_earlier_on_path_shadows_the_shim(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    other = home / "otherbin"                                   # NOT one of the candidate dirs
+    other.mkdir()
+    foreign = other / "superlooper"
+    foreign.write_text("#!/bin/sh\necho theirs\n")
+    foreign.chmod(0o755)
+    local_bin = home / ".local" / "bin"
+    # otherbin is FIRST on PATH (it wins resolution); ~/.local/bin is a candidate, so the shim lands
+    # there but does NOT actually resolve. The report must say so instead of falsely claiming success.
+    r = _run(home, path=f"{other}:{local_bin}:{SYS}")
+    assert r.returncode == 0, _out(r)
+    assert (local_bin / "superlooper").exists()                 # shim still written to the candidate
+    out = _out(r)
+    assert "shadows" in out
+    assert str(foreign) in out                                  # names WHAT shadows it
+
+
+def test_refuses_and_survives_a_directory_sitting_at_the_target(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    collide = local_bin / "superlooper"
+    collide.mkdir()                                             # pathological: a DIR occupies the target
+    (collide / "keep.txt").write_text("precious")
+    r = _run(home, path=f"{local_bin}:{SYS}")
+    assert r.returncode == 0, _out(r)                           # never fails an otherwise-good publish
+    assert collide.is_dir() and (collide / "keep.txt").read_text() == "precious"   # left untouched
+    assert "a directory occupies" in _out(r)
+
+
 # --- end-to-end: the real publish door links the CLI, and a bare `superlooper` then resolves ------
 
 @pytest.mark.skipif(shutil.which("rsync") is None or shutil.which("git") is None,
@@ -171,6 +220,11 @@ def test_publish_then_a_bare_superlooper_command_resolves(tmp_path):
     env.pop("ZDOTDIR", None)                                     # so the launch shim edits fake .zshrc
     # --yes accepts the engine-diff gate non-interactively (a fresh home has no baseline, so the whole
     # payload counts as new and still needs an explicit OK — supplied here).
+    # Insurance against a future selection regression: record the REAL /usr/local/bin/superlooper
+    # state and assert the publish never changed it (the fake ~/.local/bin must win selection).
+    real_usr_local = Path("/usr/local/bin/superlooper")
+    existed_before = real_usr_local.exists()
+
     r = subprocess.run([ROOT_INSTALL, "--yes"], env=env, capture_output=True, text=True, timeout=180)
     assert r.returncode == 0, _out(r)
 
@@ -178,6 +232,8 @@ def test_publish_then_a_bare_superlooper_command_resolves(tmp_path):
     assert published.exists(), "install.sh must publish the CLI payload"
     shim = local_bin / "superlooper"
     assert shim.exists(), "install.sh must link the superlooper command onto PATH"
+    assert not (home / "bin" / "superlooper").exists()           # only the chosen candidate got it
+    assert real_usr_local.exists() == existed_before, "must never touch the real /usr/local/bin"
     assert "install-cli-link" in _out(r)                         # the linker ran and reported
 
     got = subprocess.run(["superlooper", "--help"], env=env,
@@ -186,3 +242,23 @@ def test_publish_then_a_bare_superlooper_command_resolves(tmp_path):
     out = got.stdout + got.stderr
     assert "usage" in out.lower()
     assert "adopt" in out and "doctor" in out                    # the documented subcommands resolve
+
+
+@pytest.mark.skipif(shutil.which("rsync") is None or shutil.which("git") is None,
+                    reason="the root installer needs rsync + git")
+def test_dry_run_links_nothing_and_publishes_nothing(tmp_path):
+    """The engine-diff publish gate + the whole publish must stay side-effect-free under --dry-run:
+    the linker runs only in the real path (step 5), never in the dry-run branch."""
+    home = tmp_path / "home"
+    home.mkdir()
+    local_bin = home / ".local" / "bin"
+    env = {**os.environ, "HOME": str(home), "CODEX_HOME": str(home / ".codex"),
+           "PATH": f"{local_bin}:{os.environ.get('PATH', '')}"}
+    env.pop("ZDOTDIR", None)
+    r = subprocess.run([ROOT_INSTALL, "--dry-run"], env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, _out(r)
+    assert not (local_bin / "superlooper").exists(), "dry-run must link nothing"
+    assert not (home / ".claude" / "skills" / "superlooper").exists(), "dry-run must publish nothing"
+    out = _out(r)
+    assert "install-cli-link.sh" in out and "would run" in out   # but it announces the step
