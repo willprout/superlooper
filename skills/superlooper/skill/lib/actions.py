@@ -67,6 +67,7 @@ import math
 import brief
 import events as events_mod
 import gate
+import issues as issues_mod
 import scheduler
 
 # Staleness / cap constants. The caps that PARK are deliberately small (park is cheap and safe:
@@ -872,8 +873,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
             # that declares no `touches:` is REFUSED at launch and handed to William with a memo
             # naming the missing block — never silently launched into an un-verifiable affinity.
             # Investigations produce no PR/merge, so touches are meaningless for them: exempt.
+            # Gate on ELIGIBILITY (blocked-by closed, no control-label conflict) so we refuse ONLY at
+            # the true launch point: an issue still waiting on an open dependency keeps waiting (never
+            # parked early), and a label-conflict issue is left for its own handling — not mislabeled
+            # with a "missing touches" memo (fresh-agent review P2-1).
             if (touches_required and p.get("type") in _MERGE_PRODUCING_TYPES
-                    and not _declares_touches(p)):
+                    and not _declares_touches(p)
+                    and issues_mod.eligible(p, closed_nums, bool(frozen))):
                 park(iid, p.get("num"), _touches_required_memo(p.get("num")), needs_william=True)
                 continue
             candidates.append(dict(p, requeue_front=bool(ist.get("requeue_front"))))

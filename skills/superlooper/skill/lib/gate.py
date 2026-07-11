@@ -416,7 +416,10 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
                           f"every in-flight lane — holding behind lane {lane}. Add an `areas` glob "
                           "covering these files so the merge can co-schedule with other lanes.")
             else:
-                reason = (f"in-flight lane {lane} declares no `touches:` (wildcard '*') and overlaps "
+                # This branch is reachable only when the lane declares the LITERAL '*' (an empty lane
+                # declaration never overlaps at the gate — _areas_overlap requires both sides truthy),
+                # e.g. an in-flight restore-green fix (touches: *). So name that, not "no touches:".
+                reason = (f"in-flight lane {lane} declares `touches: *` (unknown scope), which overlaps "
                           "every diff — holding until it resolves.")
         else:
             reason = f"diff overlaps in-flight lane {lane} — hold until that lane resolves"

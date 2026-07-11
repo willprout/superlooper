@@ -442,6 +442,9 @@ def test_gate_wildcard_hold_reason_when_the_inflight_lane_is_the_wildcard():
     d = _decide(pr=pr, inflight={"i7": ["*"]})
     assert d["action"] == "hold" and d["overlap_wildcard"] is True
     assert "i7" in d["reason"]
+    # P2-2 (fresh review): this branch is reached only when the lane declares the LITERAL '*', so
+    # the reason must name that (unknown scope), not the inaccurate "declares no touches:".
+    assert "touches: *" in d["reason"] and "no `touches:`" not in d["reason"]
 
 
 def test_gate_named_overlap_hold_is_not_flagged_wildcard():

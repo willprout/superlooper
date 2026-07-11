@@ -459,6 +459,29 @@ def test_touches_required_missing_from_config_defaults_to_enforcing():
     assert only(out, "launch") == [] and len(only(out, "park")) == 1
 
 
+def test_touches_required_does_not_park_a_blocked_issue_early():
+    # P2-1 (fresh review): a no-touches issue still BLOCKED by an open dependency must keep waiting,
+    # not be parked early (which would strip agent-ready and force a needless re-approval). The park
+    # is the true launch point — it fires only once the issue is otherwise eligible.
+    p = parsed(5, touches=(), blocked_by=[3])
+    out = decide(config=cfg(touches_required=True), parsed_issues=[p],
+                 gh_view=ghv(closed_nums=set()))          # #3 still open
+    assert only(out, "park") == [] and only(out, "launch") == []
+    # once the dependency closes, the missing-touches refusal fires (the real launch point)
+    out2 = decide(config=cfg(touches_required=True), parsed_issues=[p],
+                  gh_view=ghv(closed_nums={3}))
+    assert len(only(out2, "park")) == 1 and only(out2, "park")[0]["needs_william"] is True
+
+
+def test_touches_required_does_not_mislabel_a_control_label_conflict_issue():
+    # P2-1: a no-touches issue that is ALSO ineligible for a control-label conflict must not be
+    # parked with a "missing touches" memo (a misdiagnosis). It is left for its own handling.
+    p = parsed(5, touches=(), label_conflict=True)
+    out = decide(config=cfg(touches_required=True), parsed_issues=[p])
+    assert not [pk for pk in only(out, "park") if "touches_required" in pk.get("memo", "")]
+    assert only(out, "launch") == []                      # still not launched (conflict unresolved)
+
+
 def test_touches_required_true_does_not_park_the_auto_filed_restore_green_issue():
     # Regression (self-review of #36): the nightly-red auto-fix issue is diagnose-and-fix + auto-
     # approved. It MUST declare `touches: *` so touches_required does not park it — parking the very
