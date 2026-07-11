@@ -1195,6 +1195,11 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         "merges_frozen": facts["merges_frozen"], "alert": facts["alert"],
         "runner_down": bool(state["state"] == "runner-down"),
         "heartbeat_age": facts["heartbeat_age"],
+        # The state-format handshake (issue #45): the engine stamps the shape it wrote, and this is
+        # the honest verdict on it. When NOT compatible the field names the mismatch (an engine that
+        # changed the on-disk shape past what these readers parse) instead of silently blanking every
+        # field it can no longer read; a pre-handshake home has no stamp and is grandfathered.
+        "state_format": flights.state_format_status(facts["state_format"]),
     }
     return repo_snap, flight_records, journal, state
 

@@ -92,7 +92,8 @@ def test_state_home_returns_every_contract_key():
     facts = readers.read_state_home(FIX)
     assert set(facts) == {
         "issues_state", "activity", "blocked", "exited", "awaiting",
-        "heartbeat_epoch", "heartbeat_age", "merges_frozen", "alert", "reports"}
+        "heartbeat_epoch", "heartbeat_age", "merges_frozen", "alert", "reports",
+        "state_format"}
 
 
 def test_state_home_issues_json_content():
@@ -144,6 +145,45 @@ def test_state_home_deeply_nested_issues_json_never_raises(tmp_path):
     (_state(tmp_path) / "issues.json").write_text(_DEEP_JSON)
     # unreadable (even pathologically) issue state fails open to {}, never a RecursionError.
     assert readers.read_state_home(tmp_path, now=1300)["issues_state"] == {}
+
+
+# --------------------------- read_state_home: state-format stamp (issue #45) ---------------------------
+# The engine stamps state/state_format.json = {"version": N} so the dashboard can HANDSHAKE on the
+# shape it reads field-by-field. The reader stays semantics-free (like every other): it returns the
+# RAW fact — absent ⇒ None (an old, un-stamped home), present ⇒ the parsed dict, present-but-corrupt
+# ⇒ {} (fail closed on a signal we can't trust). Whether a version is COMPATIBLE is the flight
+# model's call, not the reader's — so these only pin the raw read directions.
+
+def test_state_format_absent_is_none(tmp_path):
+    # A pre-handshake state home (no stamp file) reads as None — the flight model grandfathers it.
+    _state(tmp_path)
+    assert readers.read_state_home(tmp_path, now=1300)["state_format"] is None
+
+
+def test_state_format_present_returns_parsed_dict(tmp_path):
+    (_state(tmp_path) / "state_format.json").write_text('{"version": 7}')
+    assert readers.read_state_home(tmp_path, now=1300)["state_format"] == {"version": 7}
+
+
+def test_state_format_corrupt_fails_closed_to_empty_dict(tmp_path):
+    # Present-but-unreadable is a signal we can't trust, so it fails CLOSED to {} (present, version
+    # unknown) — never None, which would masquerade as "no stamp".
+    (_state(tmp_path) / "state_format.json").write_text("{ half-written not json")
+    assert readers.read_state_home(tmp_path, now=1300)["state_format"] == {}
+
+
+def test_state_format_present_but_unopenable_is_a_mismatch_not_grandfathered(tmp_path):
+    # A stamp that EXISTS but can't be opened (here a directory in its place; a permission-denied
+    # file behaves the same) must NOT read as absent/None — that would silently grandfather a home
+    # whose engine did stamp something. Present-but-unreadable ⇒ {} (the flight model names it a
+    # mismatch), distinct from truly-absent ⇒ None (grandfathered).
+    (_state(tmp_path) / "state_format.json").mkdir()
+    assert readers.read_state_home(tmp_path, now=1300)["state_format"] == {}
+
+
+def test_state_format_fixture_home_has_no_stamp():
+    # The committed fixture predates the handshake, so it exercises the grandfathered (None) path.
+    assert readers.read_state_home(FIX)["state_format"] is None
 
 
 # --------------------------- read_state_home: clocks (tmp) ---------------------------

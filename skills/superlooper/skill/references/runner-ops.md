@@ -54,6 +54,16 @@ superlooper status --repo /path/to/repo      # lanes / queue / freeze state, fro
 - **Status:** `superlooper status` renders the current lanes, the queue, and whether merges are
   frozen — read from the journal and disk, so it works whether or not the runner is up.
 
+**One command for the runner *and* the command-center dashboard (optional).** If you run the
+command-center dashboard, its `bin/liftoff` brings up — or verifies already-running — **both** from a
+single cmux tab: it starts the dashboard in the background, then foregrounds `superlooper run` in
+that tab, exactly as below. So the runner still lands in a visible cmux tab (this same procedure),
+and `liftoff` just spares you starting the dashboard separately. It's idempotent (a second run
+double-starts neither) and stays on the dashboard side — it shells the runner's own `superlooper run`
+through the dashboard's configured CLI path; the runner knows nothing about it. See the
+command-center README ▸ *One command*. Everything below applies unchanged whether you start the
+runner directly or through `liftoff`.
+
 ### Restarting the runner (the proven procedure)
 
 There is **one** way to (re)start the runner, and it is by hand: **open a tab in the cmux window you

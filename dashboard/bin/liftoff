@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""liftoff — the ONE command that brings up the pair (issue #45).
+
+Today the operator starts the runner and the dashboard separately. ``liftoff`` starts — or verifies
+already-running — BOTH: this dashboard and one watched repo's runner. Run it BY HAND inside a cmux
+tab, exactly like ``superlooper run``: it starts the dashboard in the BACKGROUND (a localhost server
+needs no tab) and then FOREGROUNDS the runner in the current tab, so the runner lands in a visible
+cmux tab — the one proven restart procedure (the engine's runner-ops.md). No automated tab placement;
+your real tab is the anchor.
+
+Two boundaries (see lib/liftoff.py):
+  * the engine stays dashboard-agnostic — liftoff shells the engine's OWN ``superlooper run`` through
+    the config's ``superlooper_cli`` (the same generic pointer the Tidy button uses), never a
+    hardcoded engine path;
+  * idempotent — it probes the dashboard's port and the runner's pidfile first, and never
+    double-starts either; each side's own guard (the dashboard's bind-failed exit, issue #34; the
+    runner's pidfile singleton) is the backstop, so even a racing probe is safe.
+
+Run:  bin/liftoff [config.json] [--repo <slug|name|path>]   (default config: ./config.json, or $CC_CONFIG)
+      With one watched repo, --repo is optional. With several, name which runner to start.
+"""
+import errno
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+# Exit codes. Distinct so a supervisor / a human reading a log can tell a first-run config dead-end
+# from a launch failure — the same discipline bin/command-center uses (issue #34).
+EXIT_CONFIG_ERROR = 2   # config missing / malformed / schema-invalid, or an unresolvable --repo
+EXIT_LAUNCH_FAILED = 3  # the runner could not be exec'd (bad CLI path) / the dashboard couldn't spawn
+
+_ROOT = Path(__file__).resolve().parent.parent
+# lib before anything else so `import config` / `liftoff` / `server` resolve without an install step
+# (mirrors bin/command-center + tests/conftest.py, so entry point and tests agree on resolution).
+sys.path.insert(0, str(_ROOT / "lib"))
+
+import config as config_mod   # noqa: E402
+import liftoff as liftoff_mod  # noqa: E402
+import server                 # noqa: E402
+
+_COMMAND_CENTER = str(_ROOT / "bin" / "command-center")
+_USAGE = ("usage: liftoff [config.json] [--repo <slug|name|path>]\n"
+          "  Brings up (or verifies) the dashboard + one watched repo's runner. Run inside a cmux "
+          "tab.\n")
+
+
+class _Usage(Exception):
+    """A usage message to print then exit. ``code`` is 0 for an explicit ``--help`` (help is not an
+    error) and EXIT_CONFIG_ERROR for a genuine parse error."""
+
+    def __init__(self, message, code=EXIT_CONFIG_ERROR):
+        super().__init__(message)
+        self.code = code
+
+
+def _parse_args(argv):
+    """``(config_path, repo_arg)`` from ``argv``. Manual parse (like bin/command-center) so a bad
+    flag fails through our own friendly path, never argparse's bare SystemExit."""
+    config_path, repo_arg = None, None
+    rest = argv[1:]
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("-h", "--help"):
+            raise _Usage(_USAGE, code=0)
+        if a in ("--repo", "-r"):
+            if i + 1 >= len(rest):
+                raise _Usage("liftoff: --repo needs a value\n" + _USAGE)
+            repo_arg = rest[i + 1]
+            i += 2
+            continue
+        if a.startswith("--repo="):
+            repo_arg = a.split("=", 1)[1]
+        elif a.startswith("-"):
+            raise _Usage("liftoff: unknown option %r\n%s" % (a, _USAGE))
+        elif config_path is None:
+            config_path = a
+        else:
+            raise _Usage("liftoff: unexpected extra argument %r\n%s" % (a, _USAGE))
+        i += 1
+    if config_path is None:
+        config_path = os.environ.get("CC_CONFIG", "config.json")
+    return config_path, repo_arg
+
+
+def _state_base():
+    """The writable base under which loop state (and our dashboard log) lives — the same derivation
+    as ``config.state_home`` so liftoff and the runner agree on where ``~/.superlooper`` is."""
+    return os.environ.get("SL_HOME") or os.path.expanduser("~/.superlooper")
+
+
+def _dashboard_up(host, port):
+    """True ONLY if command-center ITSELF is already serving on ``host:port`` — verified by a GET to
+    ``/api/snapshot`` returning our JSON shape, not merely that some process holds the port. So an
+    UNRELATED app squatting the port reads as "not up": liftoff then tries to start the dashboard and
+    the dashboard's own bind-failed guard (issue #34) reports the conflict on that port — never a
+    false "already serving" that leaves the operator with no dashboard. A short timeout keeps the
+    probe cheap; any error (refused, timeout, non-200, non-JSON, wrong shape) ⇒ not our dashboard."""
+    url = "http://%s:%d/api/snapshot" % (host, port)
+    try:
+        with urllib.request.urlopen(url, timeout=1.0) as resp:   # HTTPError (>=400) raises → caught
+            body = json.loads(resp.read())
+    except (OSError, ValueError):
+        return False
+    return isinstance(body, dict) and "generated_at" in body and "repos" in body
+
+
+def _pid_alive(pid):
+    """Whether ``pid`` is a live process — signal 0 probes without touching it. EPERM means it
+    exists but we don't own it (still alive). Mirrors the runner's own liveness check."""
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        return e.errno == errno.EPERM
+    return True
+
+
+def _live_runner_pid(state_home):
+    """The LIVE runner pid for a repo, or ``None``: the pidfile's recorded pid, but only if that
+    process is actually alive (a stale lock from a crashed runner reads as no live runner)."""
+    pid = liftoff_mod.runner_lock_pid(state_home)
+    return pid if (pid is not None and _pid_alive(pid)) else None
+
+
+def _spawn_dashboard(argv, log_path):
+    """Start the dashboard server detached in the BACKGROUND: its own session (survives liftoff being
+    replaced by the runner exec), stdin off, stdout/stderr to a log the operator can tail. The
+    dashboard's bind-failed guard (issue #34) means a racing double-spawn exits cleanly, not a
+    crash-loop."""
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    log = open(log_path, "a")
+    devnull = open(os.devnull, "r")
+    subprocess.Popen(argv, stdin=devnull, stdout=log, stderr=subprocess.STDOUT,
+                     start_new_session=True, close_fds=True)
+
+
+def _exec_runner(argv):
+    """Replace THIS process with ``superlooper run`` — so the current cmux tab becomes the runner's
+    tab (the proven procedure; the engine's own preflight then confirms it can see this tab). Uses
+    ``execvp`` (not ``execv``) so a bare or relative ``superlooper_cli`` — which the config contract
+    explicitly allows, "resolved against PATH like gh's bare gh" — is found on PATH; an absolute path
+    (the default) is used as-is. Never returns on success."""
+    os.execvp(argv[0], argv)
+
+
+def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pid,
+         spawn_dashboard=_spawn_dashboard, exec_runner=_exec_runner, out=None):
+    out = out if out is not None else sys.stderr
+    try:
+        config_path, repo_arg = _parse_args(argv)
+    except _Usage as e:
+        out.write(str(e))
+        return e.code
+
+    try:
+        cfg = config_mod.load(config_path)
+    except (FileNotFoundError, ValueError) as e:
+        out.write("liftoff: %s\n" % e)
+        return EXIT_CONFIG_ERROR
+    try:
+        repo = liftoff_mod.resolve_repo(cfg, repo_arg)
+    except ValueError as e:
+        out.write("liftoff: %s\n" % e)
+        return EXIT_CONFIG_ERROR
+
+    url = "http://%s:%d" % (server.BIND_HOST, cfg["port"])
+    dash_argv = liftoff_mod.dashboard_argv(sys.executable, _COMMAND_CENTER, config_path)
+    run_argv = liftoff_mod.runner_argv(cfg["superlooper_cli"], repo["path"])
+    plan = liftoff_mod.make_plan(
+        repo, url, dash_argv, run_argv,
+        dashboard_up=is_dashboard_up(server.BIND_HOST, cfg["port"]),
+        runner_pid=live_runner_pid(repo["state_home"]))
+
+    # 1) Dashboard first — it must be up (and stay up) before liftoff hands the tab to the runner.
+    dash = plan["dashboard"]
+    if dash["start"]:
+        log_path = os.path.join(_state_base(), "command-center.log")
+        try:
+            spawn_dashboard(dash["argv"], log_path)
+        except OSError as e:
+            out.write("liftoff: could not start the dashboard (%s)\n" % e)
+            return EXIT_LAUNCH_FAILED
+        out.write("liftoff: %s (logging to %s)\n" % (dash["message"], log_path))
+    else:
+        out.write("liftoff: %s\n" % dash["message"])
+
+    # 2) Runner — foreground in THIS cmux tab (the proven procedure), unless one is already live.
+    run = plan["runner"]
+    out.write("liftoff: %s\n" % run["message"])
+    if not run["start"]:
+        return 0
+    out.flush()
+    try:
+        exec_runner(run["argv"])   # replaces this process on success — nothing below runs
+    except OSError as e:
+        out.write("liftoff: could not start the runner via %r (%s)\n"
+                  "  Check 'superlooper_cli' in your config.json, and run liftoff inside a cmux tab.\n"
+                  % (run["argv"][0], e))
+        return EXIT_LAUNCH_FAILED
+    return 0   # only reached under an injected exec_runner (tests); a real execv never returns
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

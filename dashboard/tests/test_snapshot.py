@@ -70,9 +70,44 @@ def test_snapshot_carries_every_panel_the_shell_binds(home):
     assert len(snap["repos"]) == 1
     repo = snap["repos"][0]
     for key in ("slug", "airline", "flights", "boards", "tower_log", "shipped", "incident", "state",
-                "lanes", "queue_empty_caption"):
+                "lanes", "queue_empty_caption", "state_format"):
         assert key in repo, "repo snapshot missing %r" % key
     assert set(repo["boards"]) == {"departures", "arrivals"}
+
+
+# =============================== state-format handshake (issue #45) ===============================
+# The fixture home predates the handshake (no stamp), so the assembled snapshot must grandfather it —
+# render normally, never blank. A newer/unreadable stamp must instead surface a NAMED mismatch.
+
+def _stamp(home, body):
+    (home / "state" / "state_format.json").write_text(body)
+
+
+def test_unstamped_home_is_grandfathered_compatible(home):
+    repo = server.assemble_snapshot(_config(home), now=NOW)["repos"][0]
+    sf = repo["state_format"]
+    assert sf["compatible"] is True and sf["present"] is False and sf["message"] is None
+
+
+def test_current_version_stamp_is_compatible(home):
+    _stamp(home, '{"version": 1}')
+    sf = server.assemble_snapshot(_config(home), now=NOW)["repos"][0]["state_format"]
+    assert sf["compatible"] is True and sf["version"] == 1 and sf["message"] is None
+
+
+def test_unknown_version_stamp_surfaces_a_named_mismatch(home):
+    # An engine that bumped the state format past what this dashboard reads: the snapshot names it
+    # instead of the readers silently blanking every field they can no longer parse.
+    _stamp(home, '{"version": 99}')
+    sf = server.assemble_snapshot(_config(home), now=NOW)["repos"][0]["state_format"]
+    assert sf["compatible"] is False and sf["version"] == 99
+    assert "v99" in sf["message"]
+
+
+def test_corrupt_stamp_surfaces_a_mismatch_not_a_blank(home):
+    _stamp(home, "{ half-written not json")
+    sf = server.assemble_snapshot(_config(home), now=NOW)["repos"][0]["state_format"]
+    assert sf["compatible"] is False and "unreadable" in sf["message"].lower()
 
 
 # =============================== flights ===============================

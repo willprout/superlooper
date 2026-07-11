@@ -59,6 +59,15 @@ WAKE_GAP_SECONDS = 1200
 # land a fresh fetch, before the alarms re-arm. A genuinely dead session or dark meter still alarms
 # once it expires; short enough that a real death is delayed only minutes atop the 45-min freeze tier.
 WAKE_GRACE_SECONDS = 300
+# State-home format version (issue #45). The dashboard reads this state home field-by-field and
+# every reader fails CLOSED to empty, so a future change to the on-disk SHAPE would silently BLANK
+# the dashboard rather than error. The runner stamps this number into state/state_format.json at
+# startup; a reader that doesn't recognize the version NAMES the mismatch instead of blanking. This
+# is the ENGINE's declared state-home format — distinct from loopstate's issues.json schema
+# `version` (a narrower, per-file number). BUMP THIS whenever a change to the state-home layout the
+# dashboard reads (journal record shape, marker semantics, a state file's meaning) is not
+# backward-compatible — never for an additive change an old reader tolerates.
+STATE_FORMAT_VERSION = 1
 USAGE_REFRESH_SECONDS = 60
 GH_POLL_SECONDS = 90
 JOURNAL_ROTATE_SECONDS = 6 * 3600   # how often to archive the journal's stale tail (issue #41): the
@@ -395,10 +404,26 @@ class Runner:
         # Fail-stopped by design: in-flight sessions untouched, nothing merges while down.
         self.stop = True
 
+    def _stamp_state_format(self):
+        """Stamp the state-home format version (issue #45) so the dashboard can HANDSHAKE on the
+        shape it's about to read field-by-field: a reader that doesn't recognize the version names
+        the mismatch instead of silently blanking. Written by the LIVE runner only — from run(),
+        AFTER the singleton is won — so a duplicate or preflight-failing start (which constructs a
+        Runner but never owns the loop) can't overwrite the running engine's stamp with its own
+        version and forge a false (or hide a real) mismatch. Atomic (loopstate.save = tmp +
+        os.replace) because the dashboard polls this file continuously: it must only ever observe a
+        complete version dict, never a half write. Guarded so a stamp failure can never abort run()."""
+        try:
+            loopstate.save(os.path.join(self.state, "state_format.json"),
+                           {"version": STATE_FORMAT_VERSION})
+        except OSError as e:
+            self._log(f"state_format stamp skipped: {_short_repr(e)}")
+
     def run(self, max_ticks=None, sleep=time.sleep):
         if not self.acquire_singleton():
             print("another runner is live for this state home — exiting", file=sys.stderr)
             return 1
+        self._stamp_state_format()                     # the live runner declares its state format (#45)
         self._write_anchor()                           # record the live launch anchor for doctor (#33)
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)

@@ -347,6 +347,26 @@ html, body {
 .fld-link .s { font: 400 9.5px var(--sans); color: #8AA0AE; letter-spacing: 0.2px; }
 @keyframes cc-link-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 @media (prefers-reduced-motion: reduce) { .fld-link .t { animation: none; } }
+
+/* State-format mismatch (issue #45): the runner stamped a shape this dashboard doesn't read. An
+   AMBER card — a data-integrity caution, distinct from the blue "searching" of the dark data-link:
+   this is "I can't read what's on disk," not "I can't reach GitHub." Same compact, plain-words
+   layout as .fld-link so the two honest surfaces read as one family. */
+.fld-fmt {
+  position: absolute; left: 50%; top: 10px; transform: translateX(-50%);
+  display: flex; flex-direction: column; gap: 2px; align-items: center; text-align: center;
+  max-width: 82%; padding: 6px 14px;
+  background: rgba(30, 22, 8, 0.92); border: 1px solid #A6803A; border-radius: 6px;
+  box-shadow: 0 0 0 1px rgba(214, 176, 92, 0.14), 0 6px 20px rgba(0, 0, 0, 0.42);
+}
+.fld-fmt .t {
+  font: 700 12px var(--mono); letter-spacing: 1.2px; color: #F0C775;
+  animation: cc-fmt-pulse 1.8s ease-in-out infinite;
+}
+.fld-fmt .m { font: 600 10.5px var(--mono); color: #ECD9B4; }
+.fld-fmt .s { font: 400 9.5px var(--sans); color: #C2A86E; letter-spacing: 0.2px; }
+@keyframes cc-fmt-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+@media (prefers-reduced-motion: reduce) { .fld-fmt .t { animation: none; } }
 .repo-sel { display: inline-flex; align-items: center; gap: 5px; margin-left: 6px; }
 .repo-tab {
   position: relative;
