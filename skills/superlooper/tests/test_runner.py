@@ -757,6 +757,10 @@ def test_dark_meter_past_grace_fails_open_launches_and_journals(rig):
     assert issue_state(rig, "i101") is None                    # fail closed: not launched yet
     assert [r for r in journal.read(rig.home) if r.get("act") == "fail_open"] == []
 
+    # Advance in sub-cadence-gap steps so the loop reads as AWAKE: a real 30-min outage has ~120
+    # continuous ticks, not one jump — a single 30-min jump would look like a wake gap and grant the
+    # post-wake grace, holding the alarm (issue #42, covered by its own tests).
+    rig.r.tick(now=NOW + 900)                                  # still within the fail-open grace
     rig.r.tick(now=NOW + 1801)                                 # 30 min + 1s dark: past the grace
     assert issue_state(rig, "i101")["status"] == "running"     # FAIL OPEN: launched despite the dark meter
     fo = [r for r in journal.read(rig.home) if r.get("act") == "fail_open"]
@@ -798,6 +802,87 @@ def test_restart_during_an_outage_does_not_falsely_recover(rig):
     fresh.tick(now=NOW)
     assert [r for r in journal.read(rig.home) if r.get("act") == "usage_recovered"] == []
     assert (rig.home / "state" / "ALERT").exists()     # outage alert NOT retracted mid-incident
+
+
+# --------------------------- post-wake grace (issue #42) ---------------------------
+# Closing the laptop overnight suspends the runner mid-tick; on wake the next tick lands hours later
+# than the ~15s cadence predicts. Every in-flight worker's activity_mtime and the usage meter's
+# last-success then look ancient purely from the wall-clock jump, which used to fire a cascade of
+# false frozen-recovery nudges + a self-clearing usage_stale ALERT. These pin the wake-gap grace.
+
+def _activity(rig, iid, mtime):
+    p = rig.home / "state" / "activity" / iid
+    p.write_text("x")
+    os.utime(p, (mtime, mtime))
+
+
+def _frozen_nudges(rig):
+    return [c for c in rig.calls if c["args"][0].endswith("nudge-pane.sh")
+            and "inactive for a long time" in c["args"][3]]
+
+
+def test_a_wake_gap_opens_the_grace_window_and_journals_it(rig):
+    rig.r.tick(now=NOW)
+    assert rig.r._wake_grace_until == 0.0                       # a first tick opens no grace
+    big = NOW + runner_mod.WAKE_GAP_SECONDS + 100              # the resume tick lands far past cadence
+    rig.r.tick(now=big)
+    assert rig.r._wake_grace_until == big + runner_mod.WAKE_GRACE_SECONDS
+    wg = [r for r in journal.read(rig.home) if r.get("act") == "wake_gap"]
+    assert len(wg) == 1
+
+
+def test_a_normal_tick_cadence_opens_no_grace(rig):
+    rig.r.tick(now=NOW)
+    rig.r.tick(now=NOW + runner_mod.TICK_SECONDS)
+    assert rig.r._wake_grace_until == 0.0
+    assert [r for r in journal.read(rig.home) if r.get("act") == "wake_gap"] == []
+
+
+def test_wake_gap_suppresses_frozen_nudges_then_rearms_for_a_dead_session(rig):
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    _activity(rig, "i5", NOW)                                   # healthy and fresh before the sleep
+    rig.r.tick(now=NOW)
+    assert _frozen_nudges(rig) == []
+
+    # laptop slept for hours: activity looks ancient purely from the wall-clock jump
+    big = NOW + runner_mod.WAKE_GAP_SECONDS + 2700
+    rig.r.tick(now=big)
+    assert _frozen_nudges(rig) == []                           # wake grace: no false frozen nudge
+    rig.r.tick(now=big + 30)
+    assert _frozen_nudges(rig) == []                           # still within the grace: still silent
+
+    # the session never re-stamped -> genuinely dead -> the recovery nudge finally fires past the grace
+    rig.r.tick(now=big + runner_mod.WAKE_GRACE_SECONDS + 1)
+    assert len(_frozen_nudges(rig)) == 1
+    assert issue_state(rig, "i5")["status"] == "frozen"
+
+
+def test_a_healthy_session_that_restamps_after_wake_never_gets_a_frozen_nudge(rig):
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    _activity(rig, "i5", NOW)
+    rig.r.tick(now=NOW)
+    big = NOW + runner_mod.WAKE_GAP_SECONDS + 2700
+    rig.r.tick(now=big)                                        # wake: grace opens, no nudge
+    assert _frozen_nudges(rig) == []
+    _activity(rig, "i5", big + 10)                            # worker resumed and re-stamped in-grace
+    rig.r.tick(now=big + runner_mod.WAKE_GRACE_SECONDS + 1)    # past the grace, but activity is fresh
+    assert _frozen_nudges(rig) == []                          # never falsely nudged
+
+
+def test_wake_gap_holds_the_usage_stale_alert_then_rearms_if_still_dark(rig):
+    rig.r.tick(now=NOW)                                        # healthy fetch: last_ok = NOW
+    rig.r._fetch_usage = lambda: {"auth_status": "api_error", "five_hour_pct": None,
+                                  "seven_day_pct": None}       # network still down on wake
+    big = NOW + runner_mod.WAKE_GAP_SECONDS + 2000            # a wake gap AND past the 30-min fail-open grace
+    rig.r.tick(now=big)
+    assert "ALERT" not in os.listdir(rig.home / "state")      # wake grace holds the usage_stale alert
+    assert [r for r in journal.read(rig.home) if r.get("act") == "fail_open"] == []
+
+    rig.r.tick(now=big + runner_mod.WAKE_GRACE_SECONDS + 1)    # past the wake grace, meter still dark
+    alert = json.loads((rig.home / "state" / "ALERT").read_text())
+    assert alert["reasons"] == ["usage_stale"]                # a genuinely dark meter re-arms
 
 
 def test_hire_answerer_env_brief_and_record(rig):

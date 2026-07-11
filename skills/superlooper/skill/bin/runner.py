@@ -45,6 +45,20 @@ TICK_SECONDS = 15
 TICK_ERROR_ALERT = 4           # consecutive tick crashes (~1 min at 15 s) -> ALERT + notify. A
                                # wedged tick never reaches actions.decide, so this alarm is raised
                                # from run()'s own guard, not the decide brain (incident 2026-07-07).
+# Post-wake grace (issue #42). Closing the laptop overnight suspends the runner mid-tick; on wake the
+# next tick lands hours later than the ~15s cadence predicts, so every in-flight worker's activity
+# and the usage meter's last-success look ancient purely from the wall-clock jump — which used to
+# fire a cascade of false frozen-recovery nudges + a self-clearing usage_stale ALERT on a stranger's
+# first sleeping night. A tick whose gap since the previous tick reaches WAKE_GAP_SECONDS is read as
+# a wake (well above any routine tick — even a merge-update recheck maxes near RECHECK_TIMEOUT — and
+# well below the smallest false-alarm window: the usage fail-open grace at 30 min, frozen at 45 min).
+WAKE_GAP_SECONDS = 1200
+# WAKE_GRACE_SECONDS: how long after a detected wake gap the liveness (idle/frozen) and usage_stale
+# alarms stay disarmed. It PROTECTS AGAINST the resume artifact — it is the window a suspended-then-
+# resumed healthy worker needs to re-stamp its activity, and the usage poller (60s cadence) needs to
+# land a fresh fetch, before the alarms re-arm. A genuinely dead session or dark meter still alarms
+# once it expires; short enough that a real death is delayed only minutes atop the 45-min freeze tier.
+WAKE_GRACE_SECONDS = 300
 USAGE_REFRESH_SECONDS = 60
 GH_POLL_SECONDS = 90
 JOURNAL_ROTATE_SECONDS = 6 * 3600   # how often to archive the journal's stale tail (issue #41): the
@@ -306,9 +320,25 @@ class Runner:
         self._raw_by_id = {}
         self._last_poll = 0
         self._last_journal_rotate = 0.0     # 0 => the first tick rotates (journal bound, issue #41)
+        # Wake-gap detection (issue #42): _last_tick_now is the previous tick's wall-clock (used to
+        # spot a resume that landed far past the cadence); _wake_grace_until is the deadline until
+        # which the liveness/usage alarms stay disarmed. Seed _last_tick_now from the durable
+        # heartbeat so a runner RESTARTED after a long downtime (its workers/meter all stale) also
+        # reads the gap and grants grace — not only a process suspended-then-resumed in place. The
+        # in-place suspend case updates _last_tick_now each tick, so it needs no seed. 0.0 = no grace.
+        self._last_tick_now = self._read_heartbeat()
+        self._wake_grace_until = 0.0
         self._usage = {"last_ok": {}, "last_ok_at": None, "first_attempt_at": None,
                        "checked_at": 0}
         self.emitted = self._rebuild_emitted()
+
+    def _read_heartbeat(self):
+        """The last completed tick's wall-clock from the durable heartbeat file (int seconds), or
+        None if it is absent/unreadable — the wake-gap baseline for a fresh process (issue #42)."""
+        try:
+            return float(int(_read(os.path.join(self.state, "runner.heartbeat")).strip()))
+        except (AttributeError, ValueError):
+            return None
 
     # ------------------------- singleton / signals -------------------------
 
@@ -874,6 +904,17 @@ class Runner:
 
     def tick(self, now=None):
         now = time.time() if now is None else now
+        # Wake-gap grace (issue #42): a tick that lands >= WAKE_GAP_SECONDS past the previous one means
+        # the machine was suspended (a healthy loop ticks every ~15s), so every worker's activity and
+        # the usage meter's last-success now look ancient purely from the wall-clock jump. Open a short
+        # grace so the liveness/usage alarms don't fire on the resume artifact; they re-arm (and a
+        # genuinely dead session/dark meter still alarms) once it expires. Stamped BEFORE detection so
+        # the same tick that sees the gap already runs under the grace.
+        if self._last_tick_now is not None and now - self._last_tick_now >= WAKE_GAP_SECONDS:
+            self._wake_grace_until = now + WAKE_GRACE_SECONDS
+            journal.append(self.home, {"act": "wake_gap", "gap": int(now - self._last_tick_now),
+                                       "grace_until": int(self._wake_grace_until)}, now)
+        self._last_tick_now = now
         self._refresh_usage(now)
         try:
             self._poll_github(now)
@@ -892,7 +933,8 @@ class Runner:
         evs, new_emitted = events_mod.detect_events(
             snaps, self.emitted, now,
             idle_secs=session.get("idle_seconds", events_mod.IDLE_SECONDS),
-            freeze_secs=session.get("freeze_seconds", events_mod.FREEZE_SECONDS))
+            freeze_secs=session.get("freeze_seconds", events_mod.FREEZE_SECONDS),
+            wake_grace_until=self._wake_grace_until)
         written = self._persist_events(evs, new_emitted, now)
         self.emitted = new_emitted
         for ev in evs:
@@ -919,7 +961,7 @@ class Runner:
         lane_state = actions.lane_state_from(st)
         acts = actions.decide(now, self.config, self.usage_view(),
                               list(self._parsed_by_id.values()), lane_state, evs, disk,
-                              self.gh_view)
+                              self.gh_view, wake_grace_until=self._wake_grace_until)
         for a in acts:
             try:
                 outcome = self._execute(a, now)
