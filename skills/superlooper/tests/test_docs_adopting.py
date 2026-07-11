@@ -118,3 +118,19 @@ def test_walkthrough_orders_publish_before_adopt_before_doctor_before_run():
         "them verbatim reaches a green doctor before run; got "
         f"install@{i_install} adopt@{i_adopt} doctor@{i_doctor} run@{i_run}"
     )
+
+
+def test_reserved_investigation_lanes_and_borrow_policy_are_documented():
+    # issue #63 DoD: the object `lanes` shape AND the chosen borrow policy (may an investigation use
+    # an idle build lane?) must be documented so an adopter can find them. Pin the doc so it can't
+    # drift away from the scheduler behaviour the tests enforce.
+    text = _doc_text()
+    lowered = text.lower()
+    # the object shape and both pool names appear
+    assert '"build"' in text and '"investigate"' in text
+    assert "reserved investigation lane" in lowered
+    # the borrow policy is stated explicitly (no borrowing, both directions)
+    assert "no borrowing" in lowered
+    assert "borrows an idle build lane" in lowered
+    # and the back-compat promise for the plain integer form is stated
+    assert "integer form is unchanged" in lowered or "existing configs keep working" in lowered

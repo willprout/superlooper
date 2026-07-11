@@ -174,6 +174,56 @@ def test_lanes_must_be_positive_int(tmp_path):
     assert config.load(tmp_path)["lanes"] == 1
 
 
+# --------------------------- reserved investigation lanes (issue #63) ---------------------------
+# `lanes` may ALSO be an object splitting capacity into two strict pools:
+#   {"build": N, "investigate": M}  — N lanes for merge-producing work, M reserved for investigations.
+# A plain integer keeps today's single-shared-pool behaviour exactly (the test above is untouched).
+
+def test_lanes_object_form_parses_and_preserves_shape(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b", "lanes": {"build": 1, "investigate": 1}})
+    assert config.load(tmp_path)["lanes"] == {"build": 1, "investigate": 1}
+    # a zero pool is allowed (one side deliberately paused) as long as the total is >= 1
+    _write_cfg(tmp_path, {"repo": "a/b", "lanes": {"build": 2, "investigate": 0}})
+    assert config.load(tmp_path)["lanes"] == {"build": 2, "investigate": 0}
+    _write_cfg(tmp_path, {"repo": "a/b", "lanes": {"build": 0, "investigate": 3}})
+    assert config.load(tmp_path)["lanes"] == {"build": 0, "investigate": 3}
+
+
+def test_lanes_object_requires_both_pools(tmp_path):
+    # opting into the object form is a conscious split, so BOTH pool sizes must be stated — a lone
+    # {"build": 2} silently zeroing investigations is exactly the surprise this rejects.
+    for bad in ({"build": 1}, {"investigate": 1}):
+        _write_cfg(tmp_path, {"repo": "a/b", "lanes": bad})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "lanes" in str(e.value)
+
+
+def test_lanes_object_rejects_unknown_pool_key(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b", "lanes": {"build": 1, "investigate": 1, "review": 1}})
+    with pytest.raises(ValueError) as e:
+        config.load(tmp_path)
+    assert "review" in str(e.value)
+
+
+def test_lanes_object_pool_sizes_must_be_nonneg_ints(tmp_path):
+    for bad in ({"build": "1", "investigate": 1}, {"build": -1, "investigate": 1},
+                {"build": 1.5, "investigate": 1}, {"build": True, "investigate": 1}):
+        _write_cfg(tmp_path, {"repo": "a/b", "lanes": bad})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "build" in str(e.value) or "lanes" in str(e.value)
+
+
+def test_lanes_object_total_must_be_at_least_one(tmp_path):
+    # both pools zero == nothing would ever launch: reject loudly rather than deadlock silently.
+    for bad in ({"build": 0, "investigate": 0}, {}):
+        _write_cfg(tmp_path, {"repo": "a/b", "lanes": bad})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "lanes" in str(e.value)
+
+
 def test_areas_must_be_dict_of_glob_lists(tmp_path):
     # a value that is a bare string instead of a list of globs is a common mistake -> reject.
     _write_cfg(tmp_path, {"repo": "a/b", "areas": {"frontend": "src/**"}})

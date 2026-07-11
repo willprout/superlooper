@@ -5,7 +5,10 @@ Three gates, in order:
      partial / malformed usage, or over the five-hour / seven-day ceilings, launches NOTHING.
      v1's `or 0` coercion once read a partial payload as "0% used" and launched over quota; a
      NaN pct would sneak past a bare `>` comparison (NaN > 96 is False), so pcts must be FINITE.
-  2. LANES: never exceed config.lanes concurrent sessions; never launch the same id twice.
+  2. LANES: never exceed capacity; never launch the same id twice. `lanes` is EITHER a plain
+     integer (one shared pool of N — today's behaviour) OR {"build": N, "investigate": M}: two
+     STRICT pools, N for merge-producing work plus M RESERVED for investigations, with no
+     cross-pool borrowing in either direction (issue #63). See _lane_free / _lane_pool.
   3. ANTI-AFFINITY: under hard affinity, a merge-producing issue whose declared touch-areas
      overlap a merge-producing running lane, held territory claim, or one already selected this
      tick is HELD.
@@ -130,6 +133,41 @@ def _occupied_from(records):
     return out
 
 
+def _lane_pool(entry):
+    """Which capacity pool a running lane or candidate draws on (issue #63). An investigation goes
+    to the reserved 'investigate' pool; everything else — build, diagnose-and-fix, or an
+    unknown/missing type — draws on the 'build' pool. Mirrors `_merge_affinity_subject`: the
+    build pool is exactly the set anti-affinity governs, the strict sequential merge-producing side.
+    A merge-producing issue therefore never lands in the investigation pool — the reservation."""
+    return "investigate" if entry.get("type") == "investigate" else "build"
+
+
+def _lane_free(config, lane_state):
+    """Per-pool free lane counts. Returns (free, pooled):
+      free   — {pool_name: available_slots}
+      pooled — True when `lanes` is the reserved-pool object, False for the plain-integer form.
+    Integer form (back-compat): ONE shared pool 'all' of N slots — every running lane consumes from
+    it and every candidate draws on it, byte-for-byte today's arithmetic (max(0, N - len(state))).
+    Object form (issue #63): two STRICT pools — 'build' (all merge-producing work) and 'investigate'
+    (reserved) — with NO cross-pool borrowing in either direction. Everything degrades safely rather
+    than raising (the scheduler is total on garbage): a MISSING `lanes` uses the default 1 (via
+    config.get); a PRESENT-but-garbage value (wrong type, negative) fails CLOSED to zero capacity —
+    launch nothing — dominating the old `max(0, N - len)` for every value validation would reject."""
+    raw = config.get("lanes", 1)
+    if isinstance(raw, dict):
+        caps = {p: _nonneg_int(raw.get(p)) for p in ("build", "investigate")}
+        used = {"build": 0, "investigate": 0}
+        for lane in _occupied_from(lane_state):
+            used[_lane_pool(lane)] += 1
+        return {p: max(0, caps[p] - used[p]) for p in caps}, True
+    n = _nonneg_int(raw)                    # present-but-garbage -> 0 -> launch nothing (fail closed)
+    return {"all": max(0, n - len(lane_state))}, False
+
+
+def _nonneg_int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+
 def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territory_claims=None):
     """Shared core of the launch decision. Returns (selected, holds):
       selected — the parsed issues chosen to launch this tick, in priority order.
@@ -144,9 +182,11 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
     if not _usage_ok(usage):
         return [], []
 
-    lanes = config.get("lanes", 1)
-    free = max(0, lanes - len(lane_state))
-    if free == 0:
+    # LANES: never exceed capacity. A plain-integer `lanes` is a single shared pool; the reserved
+    # {"build","investigate"} object is two strict pools with no borrowing (issue #63). `pooled`
+    # tells the selection walk which of a candidate's pools to spend from.
+    free, pooled = _lane_free(config, lane_state)
+    if all(v <= 0 for v in free.values()):
         return [], []
 
     affinity = config.get("affinity", "hard")
@@ -170,9 +210,12 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
     selected, holds = [], []
     occupied = list(lane_occupied) + list(claim_occupied)              # existing + chosen so far
     for p in candidates:
-        if len(selected) >= free:
-            break                                                     # lane cap now binding, not affinity
         if p.get("id") in selected_ids:                               # never launch the same id twice
+            continue
+        pool = _lane_pool(p) if pooled else "all"
+        if free.get(pool, 0) <= 0:
+            # this candidate's pool cap is binding (a build pool full does NOT block investigations,
+            # and vice versa) -> lane-bound, NOT an affinity hold, so it carries no wildcard mystery.
             continue
         blocker = next((ot for ot in occupied if _anti_affinity_blocks(p, ot, affinity)), None)
         if blocker is not None:
@@ -180,6 +223,7 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
             continue
         selected.append(p)
         selected_ids.add(p.get("id"))
+        free[pool] -= 1
         occupied.append({"id": p.get("id"), "touches": p["touches"], "type": p.get("type")})
     return selected, holds
 
