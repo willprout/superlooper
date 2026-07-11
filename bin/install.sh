@@ -308,6 +308,7 @@ if $DRY; then
   echo "[install] codex hooks ($CODEX_HOOKS):"
   merge_codex_hooks report
   echo "[install] would run     : skills/superlooper/skill/bin/install-launch-shim.sh"
+  echo "[install] would run     : skills/superlooper/skill/bin/install-cli-link.sh (superlooper -> PATH)"
   exit 0
 fi
 
@@ -345,6 +346,13 @@ printf '%s\n' "$VERSION" > "$DEST/VERSION"
 # 4) Install the keystroke-free launch shim (idempotent; its own installer guards the ~/.zshrc line).
 "$SRC/bin/install-launch-shim.sh"
 
+# 5) Put a stable `superlooper` command on PATH, pointing at the installed copy (issue #31). Every
+#    doc invokes the CLI bare (`superlooper adopt/doctor/run`); without this the first documented
+#    command is "command not found". The linker writes a thin shim into a standard user bin dir and,
+#    if that dir is not on PATH, prints the exact line to add it — it never silently skips. Idempotent.
+"$SRC/bin/install-cli-link.sh"
+
 echo "[install] published skill -> $DEST"
 echo "[install] VERSION         -> $VERSION"
 echo "[install] hooks + shim registered. Open a NEW cmux tab (or source ~/.zshrc) to load the shim."
+echo "[install] superlooper CLI linked onto PATH (see the [install-cli-link] lines above)."

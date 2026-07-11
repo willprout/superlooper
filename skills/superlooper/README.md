@@ -11,4 +11,5 @@ Codex is available with `superlooper run --agent codex`.
 - **Project rules:** `CLAUDE.md`
 
 Source lives here. `~/.claude/skills/superlooper` is a published copy, created only by
-`bin/install.sh`.
+`bin/install.sh` — which also links a stable `superlooper` command onto your PATH (a thin shim
+pointing at the installed copy), so the bare invocations in the docs resolve after a publish.
