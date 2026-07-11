@@ -1060,25 +1060,31 @@ def _janitor_loopstate(home):
     provably idle. (Compare tidy, where unreadable state fails closed to 'close nothing' the
     same way — here 'nothing' means 'propose nothing'.)"""
     path = os.path.join(home, "state", "issues.json")
-    if not os.path.exists(path):
-        return {}
     try:
         st = loopstate.load(path)
+    except FileNotFoundError:
+        return {}                # genuinely absent: no lane has ever run
     except (OSError, ValueError):
-        return None
+        return None              # present but unreadable (EPERM, corrupt, ...): refuse
     if not isinstance(st, dict) or not isinstance(st.get("issues"), dict):
         return None
     return st["issues"]
 
 
 def _janitor_refused_read(path):
-    """The hold-back map, strictly: missing file -> {} (nothing ever refused), but PRESENT and
-    unreadable / wrong-typed -> None — the caller must refuse to run. Reading corrupt hold-back
-    state as empty would silently re-propose every previously refused action (the same
-    fail-open class as unreadable issues.json — cross-review round 1, C2)."""
-    txt = _read(path)
-    if txt is None:
+    """The hold-back map, strictly: a MISSING file -> {} (nothing ever refused), but PRESENT
+    and unreadable / wrong-typed -> None — the caller must refuse to run. Reading corrupt or
+    permission-blocked hold-back state as empty would silently re-propose every previously
+    refused action (cross-review rounds 1-2, C2). Opened directly, not via _read(): _read
+    collapses EVERY OSError to None, and only ENOENT may mean 'nothing ever refused' —
+    an EPERM on a present file must refuse, not blank the map."""
+    try:
+        with open(path) as f:
+            txt = f.read()
+    except FileNotFoundError:
         return {}
+    except OSError:
+        return None
     try:
         v = json.loads(txt)
     except ValueError:

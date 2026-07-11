@@ -1431,6 +1431,45 @@ def test_janitor_unreadable_refused_file_refuses_to_run(rig):
     assert mutations(rig) == [] and _janitor_journal(rig) == []
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+def test_janitor_permission_denied_refused_file_refuses_to_run(rig):
+    # a PRESENT hold-back file that cannot be OPENED (EPERM, not ENOENT) must read as
+    # unreadable, never as missing/{} — only a genuinely absent file means "nothing ever
+    # refused" (cross-review round 2: _read() collapsed every OSError to None).
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    p = home / "state" / "janitor_refused.json"
+    p.write_text(json.dumps({"branch:sl/i99-x": {"reason": "r", "ts": 1}}))
+    p.chmod(0o000)
+    try:
+        r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    finally:
+        p.chmod(0o644)
+    assert r.returncode != 0
+    assert "janitor_refused.json" in (r.stdout + r.stderr)
+    assert mutations(rig) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+def test_janitor_permission_denied_loopstate_refuses_to_propose(rig):
+    # the same distinction for issues.json: an unreadable-by-permissions exclusion source must
+    # refuse the sweep (nothing is provably idle), never read as "no lanes exist".
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    p = home / "state" / "issues.json"
+    p.write_text(json.dumps({"issues": {"i5": {"status": "running"}}}))
+    p.chmod(0o000)
+    try:
+        r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    finally:
+        p.chmod(0o644)
+    assert r.returncode != 0
+    assert "unreadable" in (r.stdout + r.stderr)
+    assert mutations(rig) == []
+
+
 def test_janitor_nothing_to_propose_is_a_clean_exit(rig):
     _seed_janitor_fixtures(rig)
     (rig.fixdir / "branches.json").write_text("[]")
