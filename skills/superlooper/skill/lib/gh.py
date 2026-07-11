@@ -52,19 +52,28 @@ def set_repo(slug):
     _repo = slug.strip() if isinstance(slug, str) and slug.strip() else None
 
 
-def _run(args, timeout=30):
-    """Run `gh <args>` with a HARD timeout. Returns (rc, stdout). Never raises: a timeout, a
-    missing binary, or any OSError is caught and returned as a nonzero rc with empty stdout so the
-    caller fails closed. stderr is captured (swallowed here — the runner logs failures via rc)."""
+def _run_full(args, timeout=30):
+    """Run `gh <args>` with a HARD timeout. Returns (rc, stdout, stderr). Never raises: a timeout,
+    a missing binary, or any OSError is caught and returned as a nonzero rc with empty streams so
+    the caller fails closed. stderr is returned for the few callers that must surface WHY a write
+    was refused (merge_pr, issue #27); the reads ignore it and act on rc alone."""
     env = {**os.environ, "GH_REPO": _repo} if _repo else None   # None = inherit untouched
     try:
         proc = subprocess.run([_binary(), *args], capture_output=True, text=True,
                               timeout=timeout, env=env)
-        return (proc.returncode, proc.stdout)
+        return (proc.returncode, proc.stdout, proc.stderr)
     except subprocess.TimeoutExpired:
-        return (124, "")          # conventional timeout rc
+        return (124, "", "gh timed out")                    # conventional timeout rc
     except (OSError, ValueError):
-        return (127, "")          # command not found / bad invocation
+        return (127, "", "gh not found / bad invocation")   # command not found / bad invocation
+
+
+def _run(args, timeout=30):
+    """Run `gh <args>`; returns (rc, stdout) — the stderr-swallowing form nearly every caller
+    wants (failures surface via rc). Thin wrapper so the subprocess/env/timeout machinery lives in
+    ONE place."""
+    rc, out, _ = _run_full(args, timeout=timeout)
+    return (rc, out)
 
 
 def _json(args, default, timeout=30):
@@ -324,9 +333,26 @@ def create_issue(title, body, labels=None):
     return int(m.group(1)) if m else None
 
 
+# A merge refusal reason (gh stderr) rides into a park memo / notify / issue comment, so it is
+# bounded — a chatty or pathological gh error can't blow the memo up (issue #27).
+MERGE_REFUSAL_REASON_CHARS = 500
+
+
+def _merge_refusal_reason(stderr):
+    """A single-line, bounded tail of gh's stderr — the honest 'why' behind a refused merge, safe
+    to drop into a memo. Empty/None -> "". Whitespace (incl. newlines) is collapsed so multi-line
+    gh output reads as one line; then the tail is kept within the char bound."""
+    s = " ".join((stderr or "").split())
+    return s[-MERGE_REFUSAL_REASON_CHARS:] if s else ""
+
+
 def merge_pr(num, method="squash"):
-    """Merge a PR with the configured method (squash default, §B.4). True on success. There is no
-    force path anywhere — the runner never force-pushes."""
+    """Merge a PR with the configured method (squash default, §B.4). Returns (ok, reason): (True,
+    "") on success, (False, <bounded gh stderr tail>) when GitHub REFUSES the merge — ordinary
+    branch protection (required approvals / strict up-to-date) or a token without merge rights
+    (issue #27). The caller counts refusals and, at the cap, parks the issue to William with the
+    reason. There is no force path anywhere — the runner never force-pushes, and never bypasses
+    branch protection; it surfaces the refusal so the owner can act on it."""
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}.get(method, "--squash")
-    rc, _ = _run(["pr", "merge", str(num), flag])
-    return rc == 0
+    rc, _, err = _run_full(["pr", "merge", str(num), flag])
+    return (True, "") if rc == 0 else (False, _merge_refusal_reason(err))

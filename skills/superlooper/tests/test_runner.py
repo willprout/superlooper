@@ -812,6 +812,57 @@ def test_merge_failure_retries_next_tick(rig, monkeypatch):
     assert issue_state(rig, "i5")["status"] == "gating"
 
 
+def _fail_rule(rig, match, times):
+    """Refuse the first `times` gh calls whose argv contains `match` (fake-gh fail rule)."""
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps([{"match": match, "times": times}]))
+
+
+def test_merge_refusal_bumps_the_counter_and_records_a_bounded_reason(rig):
+    # Issue #27: a refused merge accumulates a per-issue `merge_refusals` counter and captures the
+    # gh stderr in `merge_refusal_reason`, so decide can cap and surface it — the status never
+    # advances past the truth (still gating).
+    seed_issue(rig, "i5", status="gating")
+    _fail_rule(rig, "pr merge", 5)                       # every merge refused; other gh calls fine
+    out = rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash"}, NOW)
+    assert out != "ok"
+    ist = issue_state(rig, "i5")
+    assert ist["status"] == "gating"
+    assert ist["merge_refusals"] == 1
+    assert isinstance(ist["merge_refusal_reason"], str) and ist["merge_refusal_reason"]
+    assert "\n" not in ist["merge_refusal_reason"]
+    # a second consecutive refusal accumulates (the cap is reached across ticks, not in one)
+    rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash"}, NOW)
+    assert issue_state(rig, "i5")["merge_refusals"] == 2
+
+
+def test_transient_merge_refusal_then_success_merges_cleanly(rig, monkeypatch):
+    # DoD #2: a refusal that clears within the bound still merges — no residual block, status
+    # settles to merged. (fake-gh refuses the FIRST merge only.)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _fail_rule(rig, "pr merge", 1)
+    rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash"}, NOW)
+    assert issue_state(rig, "i5")["merge_refusals"] == 1
+    out = rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash"}, NOW)
+    assert out == "ok"
+    assert issue_state(rig, "i5")["status"] == "merged"
+
+
+def test_reapprove_resets_the_merge_refusal_guard_episode_scoped(rig):
+    # DoD #3: the merge-refusal guard is episode-scoped, never forever-latched. A fresh agent-ready
+    # zeroes `merge_refusals` (journaling the old cost) and clears the captured reason, so the
+    # rebuilt PR's merge is retried from scratch.
+    seed_issue(rig, "i5", status="needs_william", merge_refusals=2,
+               merge_refusal_reason="failed to merge: required approvals")
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    ist = issue_state(rig, "i5")
+    assert ist["merge_refusals"] == 0
+    assert ist["merge_refusal_reason"] is None
+    assert ist["status"] == "ready"
+    rec = [r for r in journal.read(rig.home) if r.get("act") == "reapprove"][-1]
+    assert rec["old_counters"].get("merge_refusals") == 2
+
+
 def test_update_executor_records_each_outcome(rig, monkeypatch):
     seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
     a = {"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": "h1"}
@@ -877,7 +928,8 @@ def test_regenerate_executor_hygiene_state_then_gh(rig, monkeypatch):
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: removed.append(str(path)) or True)
     seed_issue(rig, "i5", status="gating", branch="sl/i5-x", conflicts=0,
-               update_result="conflict", nudged=["checks"])
+               update_result="conflict", nudged=["checks"],
+               merge_refusals=1, merge_refusal_reason="failed to merge: base moved")
     (rig.home / "reports" / "i5.md").write_text("old report")
     out = rig.r._execute({"act": "regenerate", "id": "i5", "num": 5, "pr": 555,
                           "new_branch": "sl/i5-x-r1", "conflicts": 1, "wander": False}, NOW)
@@ -888,6 +940,8 @@ def test_regenerate_executor_hygiene_state_then_gh(rig, monkeypatch):
     assert ist["status"] == "ready" and ist["branch"] == "sl/i5-x-r1"
     assert ist["conflicts"] == 1 and ist["requeue_front"] is True
     assert ist["update_result"] is None and ist["nudged"] == []
+    # the merge-refusal guard is per-PR: the rebuilt PR's merge starts from zero (issue #27)
+    assert ist["merge_refusals"] == 0 and ist["merge_refusal_reason"] is None
     kinds = [m["kind"] for m in mutations(rig)]
     assert "pr_add_labels" in kinds and "pr_comment" in kinds and "comment" in kinds
     lab = [m for m in mutations(rig) if m["kind"] == "set_labels"][-1]

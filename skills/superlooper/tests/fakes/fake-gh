@@ -688,7 +688,13 @@ def main_fixture():
 def check_fail_rules():
     """First matching fail rule with times>0 fails THIS call (after the argv log, before any
     mutation) and decrements durably. Substring match on the joined argv, so one rule can target
-    'issue edit' broadly or 'issue edit 5 --add-label needs-william' precisely."""
+    'issue edit' broadly or 'issue edit 5 --add-label needs-william' precisely.
+
+    Optional `"stderr"` on a rule sets the failure's stderr text verbatim (the default echoes the
+    match). This matters when the product SURFACES a refusal's stderr into a later gh call (issue
+    #27: the merge-refusal memo carries gh's stderr, and a `pr merge` refusal whose message echoed
+    'pr merge' would then re-match the very rule on the park's `issue comment` — a harness artifact,
+    not a product bug). A realistic message like a branch-protection error avoids that echo."""
     path = os.path.join(FIX, "fail_rules.json")
     if not os.path.isfile(path):
         return
@@ -712,7 +718,9 @@ def check_fail_rules():
                 with os.fdopen(fd, "w") as f:
                     json.dump(rules, f)
                 os.replace(tmp, path)
-                die("forced failure (fail rule %r)" % rule["match"])
+                msg = rule["stderr"] if isinstance(rule.get("stderr"), str) \
+                    else "forced failure (fail rule %r)" % rule["match"]
+                die(msg)
 
 
 def main():
