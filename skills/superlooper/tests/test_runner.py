@@ -102,7 +102,7 @@ def seed_issue(rig, iid, **fields):
 
 def test_init_creates_the_c3_layout(rig):
     for sub in ("state/activity", "state/blocked", "state/exited", "state/awaiting",
-                "state/panes", "state/started", "state/events/processed",
+                "state/panes", "state/started", "state/launch_stderr", "state/events/processed",
                 "briefs", "reports", "answers", "worktrees", "logs"):
         assert (rig.home / sub).is_dir(), f"missing {sub}"
     assert (rig.home / "state" / "issues.json").is_file()
@@ -1093,6 +1093,28 @@ def test_park_comment_retries_until_it_lands_then_never_reposts(rig):
     assert out == "ok"
     assert len([m for m in mutations(rig) if m["kind"] == "comment"]) == 1
     assert issue_state(rig, "i5")["status"] == "parked"
+
+
+def test_launch_stderr_tail_flows_from_disk_into_the_relaunch_cap_park_memo(rig):
+    """End-to-end wiring (issue #40): a launch that died at startup leaves its stderr tail in
+    state/launch_stderr/<id>; disk_view must surface it (agent-agnostic) so decide's relaunch-cap
+    park memo NAMES the real error, not just the relaunch count."""
+    import actions
+    seed_issue(rig, "i5", status="running", branch="sl/i5-x", launches=3, retries=2)
+    (rig.home / "state" / "exited" / "i5").write_text("%d rc=1\n" % NOW)
+    (rig.home / "state" / "launch_stderr" / "i5").write_text(
+        "error: unknown option '--effort'\nclaude: run `claude --help` for usage\n")
+    d = rig.r.disk_view(NOW)
+    assert d["launch_stderr"]["i5"].startswith("error: unknown option")   # runner surfaced the file
+    out = actions.decide(NOW, rig.r.config,
+                         {"auth_status": "ok", "last_ok_at": NOW, "first_attempt_at": NOW - 60},
+                         [], [], [], d,
+                         {"stale": False, "consecutive_failures": 0, "closed_nums": set(),
+                          "prs": {}, "issue_comments": {}})
+    parks = [a for a in out if a["act"] == "park"]
+    assert len(parks) == 1 and parks[0]["cause"] == "exited_cap"
+    assert "relaunched" in parks[0]["memo"]                    # cap framing preserved
+    assert "unknown option '--effort'" in parks[0]["memo"]     # ...now names the real launch error
 
 
 def test_crash_before_the_park_executor_never_loses_the_text(rig):

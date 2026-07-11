@@ -170,11 +170,16 @@ NUDGE_MESSAGES = {
 # stores and what decide dedups on; these strings are only the push text. A reason not listed here
 # (gh_unreachable, launch_runaway:<id>, update_errors:<id>) falls back to its own code.
 ALERT_MESSAGES = {
-    "usage_stale": "usage meter unreadable past the grace (TLS / Keychain / auth outage) — "
-                   "FAILING OPEN: launching normally so work continues; real usage may be low. "
-                   "Sessions will hit the wall themselves if quota is genuinely gone. Fix the meter "
-                   "(re-login / check `superlooper doctor`); gating resumes automatically once it "
-                   "reads again.",
+    "usage_stale": "usage meter unreadable past the grace — FAILING OPEN: launching normally so "
+                   "work continues; real usage may be low, and sessions hit the wall themselves if "
+                   "quota is genuinely gone. Three known causes, most→least common: (1) EXPIRED "
+                   "CLAUDE AUTH — re-login (the OAuth token in the macOS Keychain has expired); "
+                   "(2) a STALE PINNED CLIENT VERSION — bump USER_AGENT_VERSION in skill/lib/usage.py "
+                   "to the current claude-code/<version> (a stale User-Agent is silently 403'd); "
+                   "(3) BROKEN TLS TRUST in the invoking Python — a python.org framework install "
+                   "fails every HTTPS with CERTIFICATE_VERIFY_FAILED until you run its "
+                   "'Install Certificates.command'. Diagnose with `superlooper doctor`; gating "
+                   "resumes automatically once the meter reads again.",
     "launch_anchor_down": "launch anchor gone — restart superlooper in a visible cmux tab. The "
                           "launch queue is held intact; every approved issue keeps agent-ready and "
                           "launches resume automatically once the tab's pane resolves again.",
@@ -192,6 +197,28 @@ def _alert_message(reason):
                 "The park already texted once; retries continue silently. Check GitHub "
                 "availability / rate limits (`gh api rate_limit`).")
     return ALERT_MESSAGES.get(reason, reason)
+
+
+LAUNCH_STDERR_MEMO_MAX = 1200      # chars of a failed launch's stderr tail carried into a park memo
+
+
+def _launch_stderr_memo(tail):
+    """Format the captured launch-stderr tail for a relaunch-cap park memo, or "" when there is
+    nothing usable (issue #40). A launch that dies immediately — bad --model, a renamed/dropped CLI
+    flag — writes its real reason to stderr and vanishes with the doomed tab; start-session.sh
+    captures a bounded tail so this memo can NAME the error instead of only "relaunched N times".
+    Fail-open on wrong-typed input (never raise into the tick): a non-string / blank tail yields no
+    addendum. Bounded to the LAST chars — the tail carries the actual error, and a park memo must
+    never become an unbounded stderr dump (start-session.sh already byte-bounds the file; this is
+    the second, memo-side bound)."""
+    if not isinstance(tail, str):
+        return ""
+    t = tail.strip()
+    if not t:
+        return ""
+    if len(t) > LAUNCH_STDERR_MEMO_MAX:
+        t = "…" + t[-LAUNCH_STDERR_MEMO_MAX:]
+    return "\n\nlaunch stderr (tail — the agent's own error just before it exited):\n" + t
 
 
 def _fail_open_reason(dark_age):
@@ -454,6 +481,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
     reports = _dget(dsk, "reports", dict)
     answers = _dget(dsk, "answers", dict)
     exited = _dget(dsk, "exited", dict)
+    launch_stderr = _dget(dsk, "launch_stderr", dict)   # {id: bounded stderr tail} (issue #40)
     frozen = dsk.get("frozen") if isinstance(dsk.get("frozen"), dict) else None
     alert_on_disk = dsk.get("alert") if isinstance(dsk.get("alert"), dict) else None
     raw_locks = dsk.get("live_lock_ids")
@@ -939,12 +967,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
 
         # ---- liveness recovery: exited beats frozen beats idle ----
         if has_exited:
+            # A launch that died at startup left its real reason in the captured stderr tail (#40);
+            # name it in whichever exited-park memo fires, so the operator sees the actual error and
+            # not just the relaunch count.
+            stderr_memo = _launch_stderr_memo(launch_stderr.get(iid))
             if type(retries) is not int:               # corrupt counter -> to William, not a loop
-                park(iid, num, "exited, and the retry counter is unreadable — parking",
+                park(iid, num, "exited, and the retry counter is unreadable — parking" + stderr_memo,
                      cause="exited_cap")
             elif retries >= retry_cap:
                 park(iid, num, f"exited and already relaunched {retries} times (cap "
-                               f"{retry_cap}) — parking", cause="exited_cap")
+                               f"{retry_cap}) — parking" + stderr_memo, cause="exited_cap")
             elif usage_launchable:
                 out.append({"act": "recover", "id": iid, "tier": "exited"})
             # no usage headroom -> the marker persists; relaunch resumes with the quota

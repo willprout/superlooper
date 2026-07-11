@@ -289,7 +289,7 @@ class Runner:
         self.state = os.path.join(self.home, "state")
         self.issues_path = os.path.join(self.state, "issues.json")
         for sub in ("state/activity", "state/blocked", "state/exited", "state/awaiting",
-                    "state/panes", "state/started", "state/events/processed",
+                    "state/panes", "state/started", "state/launch_stderr", "state/events/processed",
                     "briefs", "reports", "answers", "worktrees", "logs"):
             os.makedirs(os.path.join(self.home, sub), exist_ok=True)
         if not os.path.exists(self.issues_path):
@@ -725,6 +725,7 @@ class Runner:
             "reports": reports,
             "answers": self._scan_dir("answers"),
             "exited": self._scan_dir("state", "exited"),
+            "launch_stderr": self._scan_dir("state", "launch_stderr"),   # {id: tail} for #40 memos
             "frozen": frozen,
             "alert": alert,
             "live_lock_ids": self._live_lock_ids(),

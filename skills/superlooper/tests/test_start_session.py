@@ -127,3 +127,122 @@ def test_codex_dangerous_bypass_is_env_controlled(tmp_path):
     assert "--dangerously-bypass-approvals-and-sandbox" in argv
     assert "--dangerously-bypass-hook-trust" not in argv
     assert "--no-alt-screen" not in argv
+
+
+# --------------------------- launch-stderr capture (issue #40) ---------------------------
+# A launch that dies immediately (bad --model, a renamed/dropped CLI flag) writes its real reason
+# to STDERR and vanishes with the doomed cmux tab; the runner then only sees "relaunched N times".
+# start-session.sh (the agent-boundary launcher) must capture a BOUNDED tail of the agent's stderr
+# to a well-known file the agent-agnostic park memo can read: state/launch_stderr/<id>.
+
+def _run_start_capture(tmp_path, stub_body, *, agent="claude", model=None, extra_env=None):
+    """Run start-session.sh i1 with a custom stub agent; return (tail_path, args_path). tail_path is
+    the state/launch_stderr/i1 file (may not exist for a totally quiet launch)."""
+    run_root = tmp_path / "run"
+    (run_root / "briefs").mkdir(parents=True)
+    (run_root / "state").mkdir()
+    (run_root / "briefs" / "i1.md").write_text("do the thing")
+    stubdir = tmp_path / "stub"
+    stubdir.mkdir()
+    _x(str(stubdir / agent), stub_body)
+    args_file = tmp_path / f"{agent}_args"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SL_MODEL", "SL_EFFORT", "SL_CODEX_DANGEROUS_BYPASS",
+                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN")}
+    env.update({
+        "PATH": f"{stubdir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path / "home"),
+        "SL_RUN_ROOT": str(run_root),
+        "SL_TEST_ARGS": str(args_file),
+        "SL_AGENT": agent,
+    })
+    if model is not None:
+        env["SL_MODEL"] = model
+    if extra_env:
+        env.update(extra_env)
+    r = subprocess.run([START, "i1"], env=env, cwd=str(run_root),
+                       capture_output=True, text=True, timeout=30)
+    # start-session.sh itself always exits 0 (it records the agent's rc into the exited marker and
+    # returns to the shell) — a nonzero AGENT must not make the launcher fail.
+    assert r.returncode == 0, f"start-session.sh failed rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    return run_root / "state" / "launch_stderr" / "i1", args_file
+
+
+DYING_STUB = ('#!/usr/bin/env bash\n'
+              'echo "error: unknown option \'--effort\'" >&2\n'
+              'echo "run claude --help for usage" >&2\n'
+              'exit 3\n')
+
+
+def test_launch_stderr_tail_is_captured_when_the_agent_dies_at_launch(tmp_path):
+    tail_path, _ = _run_start_capture(tmp_path, DYING_STUB)
+    assert tail_path.exists(), "start-session.sh must capture the failed launch's stderr tail"
+    body = tail_path.read_text()
+    assert "unknown option '--effort'" in body
+    assert "run claude --help for usage" in body
+
+
+def test_launch_stderr_tail_is_bounded(tmp_path):
+    # A chatty/looping launch must not grow the captured tail without bound; the MOST RECENT lines
+    # (which carry the actual error) are what survive.
+    noisy = ('#!/usr/bin/env bash\n'
+             'for i in $(seq 1 5000); do echo "noise line $i" >&2; done\n'
+             'echo "FINAL: the real error is here at the tail" >&2\n'
+             'exit 3\n')
+    tail_path, _ = _run_start_capture(tmp_path, noisy,
+                                      extra_env={"SL_LAUNCH_STDERR_MAX_BYTES": "512"})
+    assert tail_path.exists(), "start-session.sh must capture the failed launch's stderr tail"
+    body = tail_path.read_text()
+    assert len(body) <= 512
+    assert "the real error is here at the tail" in body   # the tail, not the head, is kept
+
+
+def test_healthy_launch_records_argv_and_captures_an_empty_tail(tmp_path):
+    # Existing behavior unchanged: a healthy (exit 0, quiet) launch still records its argv through
+    # the capture wrapper, and surfaces no error tail.
+    tail_path, args_file = _run_start_capture(tmp_path, STUB_AGENT, model="opus")
+    argv = args_file.read_text().splitlines()
+    assert _flag_value(argv, "--model") == "opus"        # argv flows through the capture wrapper
+    assert (not tail_path.exists()) or tail_path.read_text().strip() == ""
+
+
+def test_a_stale_tail_is_cleared_on_a_brief_missing_relaunch(tmp_path):
+    # Review P1-1: the per-launch clear must run BEFORE the brief-missing early-exit (which itself
+    # writes an exited marker), so a prior FAILED launch's stderr can never mis-attribute to a later
+    # "no brief" park of the same id.
+    tail_path, _ = _run_start_capture(tmp_path, DYING_STUB)     # first launch dies, writes a tail
+    assert "unknown option" in tail_path.read_text()
+    run_root = tail_path.parent.parent.parent
+    (run_root / "briefs" / "i1.md").unlink()                    # brief vanishes before the relaunch
+    stubdir = run_root.parent / "stub"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SL_MODEL", "SL_EFFORT", "SL_CODEX_DANGEROUS_BYPASS",
+                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN")}
+    env.update({"PATH": f"{stubdir}:{os.environ['PATH']}", "HOME": str(run_root.parent / "home"),
+                "SL_RUN_ROOT": str(run_root), "SL_TEST_ARGS": str(run_root.parent / "unused"),
+                "SL_AGENT": "claude"})
+    r = subprocess.run([START, "i1"], env=env, cwd=str(run_root),
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 1                                    # the brief-missing early-exit fired
+    assert (not tail_path.exists()) or tail_path.read_text().strip() == ""   # stale tail was cleared
+
+
+def test_a_stale_tail_does_not_bleed_into_a_later_healthy_launch(tmp_path):
+    # start-session.sh clears the tail at the start of every launch, so a prior FAILED launch's
+    # error can never mis-attribute to a fresh (healthy) relaunch of the same id.
+    tail_path, _ = _run_start_capture(tmp_path, DYING_STUB)
+    assert "unknown option" in tail_path.read_text()
+    # relaunch the SAME id in the SAME run root with a healthy agent:
+    run_root = tail_path.parent.parent.parent
+    stubdir = run_root.parent / "stub"
+    _x(str(stubdir / "claude"), STUB_AGENT)
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SL_MODEL", "SL_EFFORT", "SL_CODEX_DANGEROUS_BYPASS",
+                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN")}
+    env.update({"PATH": f"{stubdir}:{os.environ['PATH']}", "HOME": str(run_root.parent / "home"),
+                "SL_RUN_ROOT": str(run_root), "SL_TEST_ARGS": str(run_root.parent / "claude_args2"),
+                "SL_AGENT": "claude"})
+    r = subprocess.run([START, "i1"], env=env, cwd=str(run_root),
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert (not tail_path.exists()) or tail_path.read_text().strip() == ""

@@ -74,9 +74,9 @@ def ist(status="running", **over):
 
 def disk(**over):
     d = {"issues_state": {"version": 1, "issues": {}}, "blocked": {}, "reports": {},
-         "answers": {}, "exited": {}, "frozen": None, "alert": None, "live_lock_ids": set(),
-         "filed_fingerprints": {}, "local_date": "2026-07-02", "local_hhmm": "12:00",
-         "last_report_date": "2026-07-02"}
+         "answers": {}, "exited": {}, "launch_stderr": {}, "frozen": None, "alert": None,
+         "live_lock_ids": set(), "filed_fingerprints": {}, "local_date": "2026-07-02",
+         "local_hhmm": "12:00", "last_report_date": "2026-07-02"}
     d.update(over)
     return d
 
@@ -232,6 +232,25 @@ def test_usage_stale_alert_fires_once_per_dark_episode_while_failing_open():
     out2 = decide(usage=dark_usage(), parsed_issues=[parsed(5)], dsk=d)
     assert only(out2, "alert") == [] and not has_notify(out2)
     assert only(out2, "fail_open") == []
+
+
+def test_usage_stale_alert_text_names_the_three_causes_and_the_remedy():
+    # The usage_stale ALERT used to name no cause and no remedy, while the real fix lived only in a
+    # code comment (issue #40). The alert text must now name the THREE proven causes and point at
+    # where the remedy lives, so an operator can act off the push alone.
+    msg = actions._alert_message("usage_stale")
+    low = msg.lower()
+    # cause 1 — expired Claude auth (re-login):
+    assert "re-login" in low or "re-log in" in low
+    assert "auth" in low or "keychain" in low
+    # cause 2 — a stale pinned client version (bump USER_AGENT_VERSION in usage.py):
+    assert "user_agent_version" in low
+    assert "usage.py" in low
+    # cause 3 — broken TLS trust in the invoking Python (post-approval amendment, 2026-07-10):
+    assert "certificate_verify_failed" in low
+    assert "install certificates.command" in low
+    # ...and it names WHERE to diagnose/remedy, not just the symptom:
+    assert "superlooper doctor" in low
 
 
 def test_restart_mid_outage_keeps_failing_open_and_never_false_recovers():
@@ -837,6 +856,48 @@ def test_exited_marker_relaunches_under_cap_and_parks_at_cap():
     out = decide(dsk=at_cap)
     assert only(out, "recover") == []
     assert len(only(out, "park")) == 1 and has_notify(out)
+
+
+def test_exited_cap_park_memo_carries_the_launch_stderr_tail():
+    # A launch that dies immediately (bad --model, a renamed/dropped CLI flag) writes its real
+    # reason to stderr and vanishes with the doomed tab; start-session.sh captures a bounded tail
+    # into disk["launch_stderr"][id]. When the relaunch cap parks, the memo must NAME that error,
+    # not just "relaunched N times (cap N)" — the whole point of issue #40.
+    tail = "error: unknown option '--effort'\nclaude: run `claude --help` for usage"
+    dsk = disk(exited={"i5": "x rc=1"}, launch_stderr={"i5": tail},
+               issues_state={"version": 1, "issues": {"i5": ist("running", retries=2)}})
+    out = decide(dsk=dsk)
+    parks = only(out, "park")
+    assert len(parks) == 1 and has_notify(out)
+    memo = parks[0]["memo"]
+    assert "relaunched" in memo                         # the existing cap framing is preserved
+    assert "unknown option '--effort'" in memo          # ...now WITH the real launch error
+
+
+def test_exited_cap_park_memo_bounds_a_huge_stderr_tail():
+    # A chatty or looping launch must never dump its whole stderr into a GitHub park comment.
+    huge = "\n".join("noise line %d" % i for i in range(5000))
+    dsk = disk(exited={"i5": "x rc=1"}, launch_stderr={"i5": huge},
+               issues_state={"version": 1, "issues": {"i5": ist("running", retries=2)}})
+    memo = only(decide(dsk=dsk), "park")[0]["memo"]
+    assert "relaunched" in memo
+    assert "noise line 4999" in memo                    # the TAIL (real error) is kept...
+    assert "noise line 0" not in memo                   # ...the head is dropped
+    assert len(memo) < 3000                             # bounded — never the full spew
+
+
+def test_exited_cap_park_memo_without_stderr_is_unchanged_and_wrong_typed_is_safe():
+    base = disk(exited={"i5": "x rc=1"},
+                issues_state={"version": 1, "issues": {"i5": ist("running", retries=2)}})
+    memo = only(decide(dsk=base), "park")[0]["memo"]
+    assert "relaunched" in memo                          # original memo, no tail appended, no crash
+    # Wrong-typed launch_stderr (non-dict, or a non-string/blank entry) must never raise — it lands
+    # on the safe plain memo (module contract: wrong-typed input never becomes an exception).
+    for bad in ("not-a-dict", {"i5": 123}, {"i5": None}, {"i5": "   "}, None):
+        d = disk(exited={"i5": "x rc=1"}, launch_stderr=bad,
+                 issues_state={"version": 1, "issues": {"i5": ist("running", retries=2)}})
+        m = only(decide(dsk=d), "park")[0]["memo"]
+        assert "relaunched" in m, bad
 
 
 def test_relaunch_tiers_respect_the_usage_gate_but_idle_peek_does_not():
