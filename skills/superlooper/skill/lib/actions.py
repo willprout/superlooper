@@ -16,7 +16,9 @@ Design commitments (all bought in prior runs, all tested):
   * No mutation of any input, no module-level mutable state: same inputs -> same output, twice.
   * NOTIFY IS A STANDING RULE (owner directive): every transition to parked/needs-william,
     every freeze, and every new ALERT emits {"act": "notify"} in the same action list. The
-    scenario table asserts this per scenario.
+    scenario table asserts this per scenario. ONCE per (issue, park-cause) episode (issue #61):
+    when a park's own label move keeps failing, the park re-emits every tick (the labels must
+    converge) but as a marked SILENT retry — the 2026-07-08 storm re-texted one park 41 times.
   * Label mechanics are runner-side only (cross-review C2): bounce/park/reclaim/relabel actions
     carry the label payloads; no worker is ever asked to move a label.
 
@@ -45,25 +47,31 @@ The view contract (assembled by runner.py each tick):
                   "local_date": "YYYY-MM-DD", "local_hhmm": "HH:MM",
                   "last_report_date": str|None}
   gh_view        {"stale": bool (fresh ONLY when exactly False), "consecutive_failures": int,
-                  "closed_nums": set, "prs": {id: pr_view+comments; {} = fetched, none exists;
-                  KEY ABSENT = not fetched yet, so WAIT}, "issue_comments": {id: [...]} — an entry
-                  is present ONLY for a CLEAN read (issue #21); a refused/starved investigate read is
-                  OMITTED, so a KEY-ABSENT investigate id means "no trustworthy read this tick" ->
-                  HOLD via await_read, never park,
+                  "closed_nums": set, "prs": {id: pr_view+comments; {} = GitHub ANSWERED "none
+                  exists"; KEY ABSENT = no trustworthy lookup — not fetched yet, or REFUSED (the
+                  poll omits a refused PrRead, issue #61), so the build gate HOLDs via
+                  await_pr_read, bounded, never an immediate park}, "issue_comments": {id: [...]}
+                  — an entry is present ONLY for a CLEAN read (issue #21); a refused/starved
+                  investigate read is OMITTED, so a KEY-ABSENT investigate id means "no
+                  trustworthy read this tick" -> HOLD via await_read, never park,
                   "dev_checks": the branch's full check universe — check-runs
                   {name,status,conclusion} AND commit statuses {context,state} (issue #23; key
                   absent = not fetched)}
 
 Action vocabulary (the executor contract, one journal record each):
   launch, hire_answerer, deliver_answer, bounce, recover(tier=idle|frozen|exited), gate,
-  merge, update, nudge, hold, await_read, note_checks_pending, clear_checks_pending, park,
-  regenerate, resolve_conflict, close_investigate, reclaim, relabel, freeze, unfreeze,
-  file_fix_issue, alert, clear_alert, morning_report, notify. Safety actions
-  (alert/freeze/unfreeze) come first; launches come LAST. `note_checks_pending`/
-  `clear_checks_pending` stamp/clear the bounded pending-checks clock (issue #26). `await_read`
-  is the investigate-gate's HOLD when this tick has no trustworthy comment read (refused or
-  starved): it journals the wait ONCE per episode (deduped on the issue's `read_waited` flag) so
-  a finished investigation is never parked on an unverified read and never waits silently (#21).
+  merge, update, nudge, hold, await_read, await_pr_read, clear_pr_read, note_checks_pending,
+  clear_checks_pending, park, clear_park_marker, regenerate, resolve_conflict,
+  close_investigate, reclaim, relabel, freeze, unfreeze, file_fix_issue, alert, clear_alert,
+  morning_report, notify. Safety actions (alert/freeze/unfreeze) come first; launches come
+  LAST. `note_checks_pending`/`clear_checks_pending` stamp/clear the bounded pending-checks
+  clock (issue #26). `await_read` is the investigate-gate's HOLD when this tick has no
+  trustworthy comment read (refused or starved): it journals the wait ONCE per episode (deduped
+  on the issue's `read_waited` flag) so a finished investigation is never parked on an
+  unverified read and never waits silently (#21). `await_pr_read`/`clear_pr_read` are the
+  build-gate siblings for a refused PR lookup (issue #61): the stamp doubles as the bound clock
+  (PR_READ_HOLD_CAP_SECONDS -> park once) and the journal-once dedup. `clear_park_marker` ends a
+  notify-once park episode whose label move never landed, so a later genuine park texts again.
 """
 import math
 
@@ -113,6 +121,17 @@ RUNAWAY_THRESHOLD = 4              # retries far past the cap -> ALERT (events.r
 # omits/corrupts session.checks_pending_cap (an unbounded wait is the bug, so a bad value still
 # bounds — never disables).
 CHECKS_PENDING_CAP_DEFAULT = 10800
+# The bound (seconds) on a FINISHED build's refused-PR-lookup HOLD (issue #61). During an hourly
+# GraphQL dead zone the lookup is refused, not answered — the gate HOLDs (safe idle: no park, no
+# text) rather than mistaking the refusal for "no PR exists" (the 2026-07-08 storm). The account's
+# GraphQL window refills at a fixed minute past each hour, so a dead zone lasts ~11 min at most;
+# 15 min outlasts it with margin. Past the bound the gate parks ONCE — fail-to-owner is preserved,
+# it just stops being per-tick.
+PR_READ_HOLD_CAP_SECONDS = 900
+# The bound (seconds) on a park whose LABEL MOVE keeps failing (issue #61 / incident §4). The park
+# already texted once (notify-once marker); silent retries past this bound mean GitHub writes are
+# genuinely stuck — ALERT-worthy: one more text, not zero and not twenty.
+PARK_LABEL_STUCK_ALERT_SECONDS = 600
 
 # The red-nightly standing rule's EXACT label set (spec §4.4, owner-defined 2026-07-02). The
 # distinct `auto-approved:nightly-red` label is what makes this auto-approval auditable as
@@ -166,6 +185,12 @@ ALERT_MESSAGES = {
 
 
 def _alert_message(reason):
+    if isinstance(reason, str) and reason.startswith("park_label_stuck:"):
+        iid = reason.split(":", 1)[1]
+        return (f"{iid} parked but its park label move has been failing for "
+                f"{PARK_LABEL_STUCK_ALERT_SECONDS // 60}+ min — GitHub writes are not landing. "
+                "The park already texted once; retries continue silently. Check GitHub "
+                "availability / rate limits (`gh api rate_limit`).")
     return ALERT_MESSAGES.get(reason, reason)
 
 
@@ -501,16 +526,30 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
     def notify(title, body):
         out.append({"act": "notify", "title": title, "body": body})
 
-    def park(iid, num, memo, needs_william=False):
-        parked_now.add(iid)
-        out.append({"act": "park", "id": iid, "num": num,
-                    "needs_william": needs_william, "memo": memo})
-        who = "needs-william" if needs_william else "parked"
-        notify(f"superlooper: {iid} {who}", memo)
-
     def ist_of(iid):
         v = ist_map.get(iid)
         return v if isinstance(v, dict) else {}
+
+    def park(iid, num, memo, needs_william=False, cause=None):
+        # Notify-once per (issue, park-cause) — issue #61. When the park's own label move fails
+        # (the 2026-07-08 dead zone failed reads AND writes in lockstep), local status never
+        # settles to parked, so decide re-derives this same verdict every tick — and used to
+        # re-text every tick (41 texts). The executor stamps `park_notify_cause` durably BEFORE
+        # attempting the label move; a re-derived park for the SAME cause is therefore a SILENT
+        # retry (the labels still converge — the retry is marked so the journal reads as one park
+        # episode, not N parks). A DIFFERENT cause is a new episode and texts again; the marker
+        # clears when the issue leaves the failing state (clear_park_marker / reapprove).
+        parked_now.add(iid)
+        cause = cause if isinstance(cause, str) and cause else memo
+        act = {"act": "park", "id": iid, "num": num,
+               "needs_william": needs_william, "memo": memo, "cause": cause}
+        if ist_of(iid).get("park_notify_cause") == cause:
+            act["retry"] = True
+            out.append(act)
+            return
+        out.append(act)
+        who = "needs-william" if needs_william else "parked"
+        notify(f"superlooper: {iid} {who}", memo)
 
     # ---- launch-anchor liveness (issue #24): a dead launch anchor must never walk the queue ----
     # The runner launches every worker as a cmux tab in ONE pane (the anchor). When that pane stops
@@ -558,6 +597,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
         errs, corrupt = _counter(ist_of(iid), "update_errors")
         if corrupt or errs >= UPDATE_ERROR_ALERT:
             reasons.append(f"update_errors:{iid}")     # a corrupt counter is alert-worthy too
+        # A park whose label move keeps failing past the bound (issue #61): the marker is stamped
+        # but status never settled terminal, so the silent retries have run long enough to be
+        # ALERT-worthy (one text via the standard dedup — never twenty). A terminal status means
+        # the move landed (episode over); the marker clearing (recovery/reapprove) drops the
+        # reason, which auto-clears the ALERT.
+        stamped = ist_of(iid).get("park_notify_at")
+        if (ist_of(iid).get("status") not in TERMINAL_STATUSES
+                and isinstance(ist_of(iid).get("park_notify_cause"), str)
+                and _real(stamped) and now - stamped >= PARK_LABEL_STUCK_ALERT_SECONDS):
+            reasons.append(f"park_label_stuck:{iid}")
     if anchor_down and has_pending_launch:             # a dead anchor only matters with work to launch
         reasons.append("launch_anchor_down")
     if systemic_launch:
@@ -660,7 +709,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
         if ist.get("recheck_failed"):
             park(iid, num, "ship_recheck_cmd failed after the mechanical merge-update — "
                            "never coached around a fail-closed gate; William decides",
-                 needs_william=True)
+                 needs_william=True, cause="recheck")
             continue
 
         # ---- finished: the ship gate owns this issue ----
@@ -688,8 +737,33 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                 pv = {}
             else:
                 if iid not in prs:
-                    continue                           # PR not fetched yet -> wait
+                    # No trustworthy PR read this tick: the lookup was REFUSED (the poll OMITS a
+                    # refused read from the view) or has not landed yet. HOLD — never park a
+                    # finished build on an unverified lookup: the 2026-07-08 storm parked finished
+                    # work as PR-less inside an hourly GraphQL dead zone (issue #61). Stamp the
+                    # wait clock ONCE (bounded refusal journaling — one record per episode, not
+                    # one per tick); past the bound, park ONCE (fail-to-owner preserved). The
+                    # _since_ok discipline re-stamps a corrupt/future clock rather than letting it
+                    # defeat or spuriously trip the bound (issue #26).
+                    since = ist.get("pr_read_pending_since")
+                    if not _since_ok(since, now):
+                        out.append({"act": "await_pr_read", "id": iid, "num": num,
+                                    "reason": "finished build: no trustworthy PR lookup yet for "
+                                              f"branch {ist.get('branch') or '?'} (GitHub refused "
+                                              "the read, or it has not landed) — holding, never "
+                                              "parking on an unverified lookup"})
+                    elif now - since >= PR_READ_HOLD_CAP_SECONDS:
+                        park(iid, num,
+                             "finished, but GitHub refused every PR lookup for "
+                             f"{PR_READ_HOLD_CAP_SECONDS // 60}+ min (rate limit / 403 / 5xx) — "
+                             "cannot verify whether a PR exists for branch "
+                             f"'{ist.get('branch') or '?'}'. Parked once; if the PR exists it "
+                             "stays intact and re-approving after reads recover will pick it up.",
+                             cause="pr_read_refused")
+                    continue
                 pv = prs.get(iid) if isinstance(prs.get(iid), dict) else {}
+                if _real(ist.get("pr_read_pending_since")):
+                    out.append({"act": "clear_pr_read", "id": iid})   # a trustworthy read landed
                 inv_done = False
                 if pv.get("state") == "MERGED":
                     # crash window (Codex round-1 C2): the merge landed but the runner died
@@ -746,7 +820,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                          + ". An unreported required check keeps a green PR gating forever; verify "
                          "the config names against what the repo actually reports (run "
                          "`superlooper doctor`) and the check's workflow triggers.",
-                         needs_william=True)
+                         needs_william=True, cause="checks_pending")
                     continue
             elif _real(since):
                 out.append({"act": "clear_checks_pending", "id": iid})       # left the pending episode
@@ -772,7 +846,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                          f"superlooper never bypasses branch protection. gh said: {why}. Grant what "
                          "the protection requires (approve the PR / update the token's merge "
                          "rights), then re-approve the issue to retry.",
-                         needs_william=True)
+                         needs_william=True, cause="merge_refused")
                     continue
                 method = cfg.get("merge_method")
                 method = method if method in ("squash", "merge", "rebase") else "squash"
@@ -795,7 +869,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                             "message": NUDGE_MESSAGES.get(key, g.get("reason", ""))})
             elif act == "park":
                 park(iid, num, g.get("reason", "gate parked this issue"),
-                     needs_william=bool(g.get("needs_william")))
+                     needs_william=bool(g.get("needs_william")))   # cause defaults to the memo
             elif act == "regenerate":
                 new_conflicts = _count(conflicts) + 1
                 src = p if isinstance(p, dict) else {"num": num, "id": iid,
@@ -809,6 +883,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
             elif act == "close_investigate":
                 out.append({"act": "close_investigate", "id": iid, "num": num})
             # "wait" -> no action this tick
+
+            # The issue LEFT the failing state without the park label ever landing (issue #61):
+            # the gate reached a non-park verdict while the notify-once marker is still stamped.
+            # Clear it so a LATER genuine park on this issue texts again — the guard is
+            # per-cause-EPISODE, never forever. One-shot: the cleared field stops re-emission.
+            if isinstance(ist.get("park_notify_cause"), str) and iid not in parked_now:
+                out.append({"act": "clear_park_marker", "id": iid})
             continue
 
         # ---- blocked marker present (and no report): bounce or the answerer lifecycle ----
@@ -824,11 +905,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                 if corrupt or deliveries >= DELIVERY_FAILURE_CAP:
                     park(iid, num, f"the answer would not deliver to the session pane "
                                    f"({DELIVERY_FAILURE_CAP} attempts, or the attempt counter "
-                                   f"is unreadable). question was: {blocked_text!r}")
+                                   f"is unreadable). question was: {blocked_text!r}",
+                         cause="answer_delivery")
                 elif answer.lstrip().startswith("PARK:"):
                     park(iid, num, f"answerer escalated to William. question: "
                                    f"{blocked_text!r} — answer: {answer!r}",
-                         needs_william=True)
+                         needs_william=True, cause="answerer_escalated")
                 else:
                     out.append({"act": "deliver_answer", "id": iid,
                                 "answerer_id": aid_rec[0], "text": answer})
@@ -838,13 +920,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                 if age >= ANSWERER_TIMEOUT_SECONDS:
                     park(iid, num, f"answerer {aid_rec[0]} timed out after "
                                    f"{ANSWERER_TIMEOUT_SECONDS // 60} min. question was: "
-                                   f"{blocked_text!r}")
+                                   f"{blocked_text!r}", cause="answerer_timeout")
             else:
                 hires, corrupt = _counter(ist, "answerer_failures")
                 if corrupt or hires >= ANSWERER_FAILURE_CAP:
                     park(iid, num, f"could not launch an answerer ({ANSWERER_FAILURE_CAP} "
                                    f"attempts, or the attempt counter is unreadable). "
-                                   f"question was: {blocked_text!r}")
+                                   f"question was: {blocked_text!r}", cause="answerer_hire")
                 else:
                     out.append({"act": "hire_answerer", "id": iid, "num": num,
                                 "answerer_id": f"a{next_aid}", "question": blocked_text})
@@ -854,20 +936,22 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
         # ---- liveness recovery: exited beats frozen beats idle ----
         if has_exited:
             if type(retries) is not int:               # corrupt counter -> to William, not a loop
-                park(iid, num, "exited, and the retry counter is unreadable — parking")
+                park(iid, num, "exited, and the retry counter is unreadable — parking",
+                     cause="exited_cap")
             elif retries >= retry_cap:
                 park(iid, num, f"exited and already relaunched {retries} times (cap "
-                               f"{retry_cap}) — parking")
+                               f"{retry_cap}) — parking", cause="exited_cap")
             elif usage_launchable:
                 out.append({"act": "recover", "id": iid, "tier": "exited"})
             # no usage headroom -> the marker persists; relaunch resumes with the quota
             continue
         if iid in frozen_ids or status == "frozen":
             if type(retries) is not int:
-                park(iid, num, "frozen, and the retry counter is unreadable — parking")
+                park(iid, num, "frozen, and the retry counter is unreadable — parking",
+                     cause="frozen_cap")
             elif retries >= retry_cap:
                 park(iid, num, f"frozen and already relaunched {retries} times (cap "
-                               f"{retry_cap}) — parking")
+                               f"{retry_cap}) — parking", cause="frozen_cap")
             else:
                 last_rec = ist.get("last_recover_at")
                 last_rec = last_rec if _real(last_rec) else 0
@@ -903,11 +987,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                                f"launch-delivery problem. Set `dev_branch` in "
                                f".superlooper/config.json to the repo's real default branch "
                                f"(`superlooper adopt` detects it; `superlooper doctor` validates "
-                               f"it), then re-approve.")
+                               f"it), then re-approve.", cause="launch_base_missing")
             else:
                 park(iid, num, f"launch was never delivered ({LAUNCH_FAILURE_CAP} verified "
                                "attempts, or the attempt counter is unreadable) — is the launch "
-                               "shim installed? (bin/install-launch-shim.sh)")
+                               "shim installed? (bin/install-launch-shim.sh)",
+                     cause="launch_delivery")
             continue
         if "in-progress" in labels and iid not in live_locks and not gh_stale and iid in prs:
             pv = prs.get(iid) if isinstance(prs.get(iid), dict) else {}
@@ -962,7 +1047,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
             if (touches_required and p.get("type") in _MERGE_PRODUCING_TYPES
                     and not _declares_touches(p)
                     and issues_mod.eligible(p, closed_nums, bool(frozen))):
-                park(iid, p.get("num"), _touches_required_memo(p.get("num")), needs_william=True)
+                park(iid, p.get("num"), _touches_required_memo(p.get("num")),
+                     needs_william=True, cause="touches_missing")
                 continue
             candidates.append(dict(p, requeue_front=bool(ist.get("requeue_front"))))
         claims = territory_claims_from(issues_state)

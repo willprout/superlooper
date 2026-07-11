@@ -67,7 +67,9 @@ def test_issue_comments(ghenv):
 
 
 def test_pr_for_branch_shape(ghenv):
-    pr = gh.pr_for_branch("sl/i123-render-the-widget")
+    rd = gh.pr_for_branch("sl/i123-render-the-widget")
+    assert rd.ok is True                         # GitHub answered (issue #61: refused != answered)
+    pr = rd.pr
     assert pr["number"] == 555 and pr["state"] == "OPEN" and pr["mergeable"] == "MERGEABLE"
     assert pr["labels"] == []   # requested field: the gate reads the `preserve` label from here
     assert {f["path"] for f in pr["files"]} == {"src/components/Widget.tsx", "src/api/widget.py"}
@@ -119,6 +121,41 @@ def test_comment_reads_wrong_typed_body_is_refused(ghenv):
         (ghenv / fixture).write_text('{"comments": "not a list"}')
         cr = call()
         assert cr.ok is False and cr.comments == []
+
+
+# --------------------------- PR lookups: refused != answered-empty (issue #61) ----------
+# The build-gate half of the #21 contract, extended per the 2026-07-08 park-notify storm: during
+# hourly GraphQL dead zones the PR-for-branch lookup collapsed "GitHub refused" into "no PR
+# exists", so finished builds were parked as PR-less. pr_for_branch now returns PrRead(pr, ok):
+# ok is True ONLY on a clean answer ({} pr = GitHub genuinely answered "no PR on this head").
+
+def test_pr_for_branch_refused_is_not_answered_empty(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    rd = gh.pr_for_branch("sl/i5-x")
+    assert rd.ok is False and rd.pr == {}   # refused: caller must NOT read this as "no PR exists"
+
+
+def test_pr_for_branch_answered_empty_is_ok(ghenv):
+    (ghenv / "pr_list.json").write_text("[]")
+    rd = gh.pr_for_branch("sl/i5-x")
+    assert rd.ok is True and rd.pr == {}    # a clean "nothing there": authoritative, may park
+
+
+def test_pr_for_branch_timeout_is_refused(ghenv, monkeypatch):
+    # a timeout surfaces as _run's conventional rc 124 — the refused path, never answered-empty
+    monkeypatch.setattr(gh, "_run", lambda args, timeout=30: (124, ""))
+    rd = gh.pr_for_branch("sl/i5-x")
+    assert rd.ok is False and rd.pr == {}
+
+
+def test_pr_for_branch_wrong_typed_body_is_refused(ghenv):
+    # A 200 whose body is valid JSON but the WRONG shape is NOT a clean answer — it must fail
+    # closed to ok=False, never to an authoritative "no PR".
+    for body in ('"a bare string, wrong type"', '{"not": "a list"}', '["not a dict"]',
+                 "this is not json {{{"):
+        (ghenv / "pr_list.json").write_text(body)
+        rd = gh.pr_for_branch("sl/i5-x")
+        assert rd.ok is False and rd.pr == {}, body
 
 
 def test_branch_checks_normalized(ghenv):
@@ -296,7 +333,7 @@ def test_nonzero_rc_fails_closed_everywhere(ghenv, monkeypatch):
     # reads -> empty-but-typed
     assert gh.ready_issues() == []
     assert gh.issue(1) == {}
-    assert gh.pr_for_branch("x") == {}
+    assert gh.pr_for_branch("x").ok is False and gh.pr_for_branch("x").pr == {}
     assert gh.issue_comments(1).ok is False and gh.issue_comments(1).comments == []
     assert gh.pr_comments(1).ok is False and gh.pr_comments(1).comments == []
     assert gh.branch_checks("m") == []
@@ -332,9 +369,8 @@ def test_missing_binary_fails_closed(ghenv, monkeypatch):
 @pytest.mark.parametrize("fixture,call,empty", [
     ("issue_list.json", lambda: gh.ready_issues(), []),
     ("issue_view.json", lambda: gh.issue(1), {}),
-    ("pr_list.json", lambda: gh.pr_for_branch("x"), {}),
-    # issue_comments / pr_comments have their OWN wrong-typed test above (they return a
-    # CommentRead, not a bare list — refused != answered-empty, issue #21).
+    # issue_comments / pr_comments / pr_for_branch have their OWN wrong-typed tests above (they
+    # return a CommentRead / PrRead, not a bare list — refused != answered-empty, issues #21/#61).
     ("check_runs.json", lambda: gh.branch_checks("m"), []),
     ("compare.json", lambda: gh.compare("a", "b"), {}),
     ("issue_search.json", lambda: gh.child_issues(1), []),
@@ -454,7 +490,7 @@ def test_close_issue_without_comment(ghenv):
 
 
 def test_pr_view_carries_head_oid(ghenv):
-    pr = gh.pr_for_branch("sl/i123-render-the-widget")
+    pr = gh.pr_for_branch("sl/i123-render-the-widget").pr
     assert pr["headRefOid"] == "abc123def456"
     argv = _calls(ghenv)[-1]
     assert "headRefOid" in _after(argv, "--json")

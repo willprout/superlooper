@@ -190,12 +190,35 @@ def pr_comments(num):
     return _comment_read(["pr", "view", str(num), "--json", "comments"])
 
 
+# The PR-lookup contract (issue #61) — the build-gate half of the #21 read discipline. A
+# PR-for-branch lookup has THREE outcomes: (1) GitHub answered with a PR, (2) GitHub answered
+# "no PR on this head", (3) GitHub REFUSED — rate-limit / 403 / 5xx / timeout / missing binary,
+# or an unparseable / wrong-typed body. The old contract collapsed (2) and (3) both to {}, so
+# during the hourly GraphQL dead zones a refused lookup read as "no PR exists" and finished
+# builds were parked as PR-less, re-notifying every tick (the 2026-07-08 storm: 41 texts).
+# PrRead keeps them distinct: `pr` is ALWAYS a dict (still fail-closed to {} — acting on nothing
+# is safe), and `ok` is True ONLY on a clean answer. refused -> ok=False, so the build gate
+# HOLDs; answered-empty -> ok=True, so a genuinely PR-less finish still parks (once).
+PrRead = collections.namedtuple("PrRead", ["pr", "ok"])
+
+
 def pr_for_branch(branch):
-    """The PR whose head is `branch`, whatever its state (so the caller sees open/merged/closed).
-    {} if none / on failure."""
-    lst = _json_list(["pr", "list", "--head", branch, "--state", "all",
-                      "--json", _PR_FIELDS, "--limit", "1"])
-    return lst[0] if lst and isinstance(lst[0], dict) else {}
+    """The PR whose head is `branch`, whatever its state (so the caller sees open/merged/closed),
+    as a PrRead(pr, ok). pr={} with ok=True means GitHub genuinely answered "no PR"; ok=False
+    means the lookup was refused and the caller must NOT treat the emptiness as an answer."""
+    rc, out = _run(["pr", "list", "--head", branch, "--state", "all",
+                    "--json", _PR_FIELDS, "--limit", "1"])
+    if rc != 0:
+        return PrRead({}, False)                # GitHub refused / timed out / no binary
+    try:
+        lst = json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return PrRead({}, False)                # unparseable body: cannot trust it -> refused
+    if not isinstance(lst, list):
+        return PrRead({}, False)                # wrong-typed body: not a clean answer
+    if lst:
+        return PrRead(lst[0], True) if isinstance(lst[0], dict) else PrRead({}, False)
+    return PrRead({}, True)                     # a clean answer: no PR on this head
 
 
 def branch_checks(branch):

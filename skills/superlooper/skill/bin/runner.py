@@ -545,11 +545,16 @@ class Runner:
                 branch = brief.branch_for(p)
             if not budget():
                 continue
-            pv = gh.pr_for_branch(branch)
+            pr_read = gh.pr_for_branch(branch)
+            if not pr_read.ok:
+                continue     # REFUSED lookup: OMITTED from the view, so decide HOLDs — never
+                             # "no PR exists" off a rate-limited read (issue #61; the 2026-07-08
+                             # storm parked finished builds inside hourly GraphQL dead zones)
+            pv = pr_read.pr
             if pv.get("number") and budget():
                 pv = dict(pv)
                 pv["comments"] = gh.pr_comments(pv["number"]).comments
-            prs[iid] = pv
+            prs[iid] = pv    # {} here is TRUSTWORTHY: GitHub answered "no PR on this head"
 
         self._parsed_by_id = parsed_by_id
         self._raw_by_id = raw_by_id
@@ -570,9 +575,12 @@ class Runner:
             moment the marker lands or the PR leaves OPEN, so the re-fetched set stays a small
             transient (finished-but-not-yet-reviewed) even through a long merges-freeze. Any other
             cached PR is skipped — no double-fetch of what the 90s poll just fetched;
-          - NEVER downgrade: gh.pr_for_branch fails CLOSED to {} on a transient blip, so only a
-            POSITIVE find (a PR with a number) updates the view — a {} never overwrites a known PR
-            (that overwrite, run every tick, would re-park completed work — the exact bug this fixes).
+          - NEVER downgrade: only a POSITIVE find (a PR with a number) updates the view. A
+            refused lookup (PrRead ok=False, issue #61) carries nothing, and even a CLEAN
+            answered-empty never overwrites here — a known PR does not vanish from a --state all
+            lookup, so an empty answer over a cached PR is a search-index blip, and writing it
+            (every tick) would re-park completed work — the exact bug the D3 fix bought off.
+            Answered-empty enters the view via the poll's from-scratch snapshot instead.
         Leaves every other view key exactly as _poll_github built it."""
         if not isinstance(ist_map, dict):
             return
@@ -612,8 +620,8 @@ class Runner:
                 if not p:
                     continue
                 branch = brief.branch_for(p)
-            pv = gh.pr_for_branch(branch)
-            if pv.get("number"):             # POSITIVE find only — a transient {} never erases a cache entry
+            pv = gh.pr_for_branch(branch).pr   # a refused read has no pr by construction
+            if pv.get("number"):             # POSITIVE find only — refused/empty never erases a cache entry
                 pv = dict(pv)
                 pv["comments"] = gh.pr_comments(pv["number"]).comments
                 prs[iid] = pv
@@ -1217,9 +1225,27 @@ class Runner:
     def _exec_park(self, a, now):
         iid, num = a["id"], a.get("num")
         label = "needs-william" if a.get("needs_william") else "parked"
-        gh.comment(num, f"**superlooper parked this issue** — {a.get('memo', '')}")
+        cause = a.get("cause")
+        cause = cause if isinstance(cause, str) and cause else a.get("memo", "")
+        # Notify-once marker (issue #61): stamped durably BEFORE the label move is attempted, so
+        # when the label write fails in the same GitHub dead zone that caused the park (the
+        # 2026-07-08 storm failed reads and writes in lockstep), decide recognizes next tick's
+        # re-derived park as the SAME episode and suppresses its notify — the labels keep
+        # retrying silently; the texting happened once. park_notify_at anchors the stuck-label
+        # ALERT bound, so a same-cause retry must never re-stamp it (the bound would never
+        # elapse); it only repairs an unusable value. park_comment_posted makes the memo comment
+        # once-per-episode too (21 duplicate memos in the storm), retried until it lands.
+        prev = self._issue_field(iid, "park_notify_cause")
+        if prev != cause:
+            self._update_issue(iid, {"park_notify_cause": cause, "park_notify_at": now,
+                                     "park_comment_posted": False})
+        elif not actions._since_ok(self._issue_field(iid, "park_notify_at"), now):
+            self._update_issue(iid, {"park_notify_at": now})
+        if not self._issue_field(iid, "park_comment_posted"):
+            if gh.comment(num, f"**superlooper parked this issue** — {a.get('memo', '')}"):
+                self._update_issue(iid, {"park_comment_posted": True})
         if not gh.set_labels(num, add=[label], remove=["in-progress", "agent-ready"]):
-            return "label move failed (will retry next tick)"
+            return "label move failed (will retry silently next tick)"
         # Sync the cache to the label move we JUST made (found live 2026-07-06): a park removes
         # `agent-ready` on GitHub, but the cached view keeps it until the next poll. Without this,
         # the very next tick sees "parked + agent-ready" and `reapprove`s the issue back — reset,
@@ -1283,7 +1309,10 @@ class Runner:
                       "update_result": None, "update_head_oid": None, "nudged": [], "pr": None,
                       "read_waited": False, "checks_pending_since": None,
                       "wildcard_hold_journaled": False,   # a fresh approval re-journals its own hold (#36)
-                      "merge_refusal_reason": None})   # paired with merge_refusals=0 above (#27)
+                      "merge_refusal_reason": None,    # paired with merge_refusals=0 above (#27)
+                      "pr_read_pending_since": None,   # a re-run's refused-read hold times fresh (#61)
+                      "park_notify_cause": None, "park_notify_at": None,
+                      "park_comment_posted": False})   # ...and its own park (if any) texts again (#61)
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()
@@ -1380,6 +1409,35 @@ class Runner:
         Reset by _exec_reapprove so a re-run's own wait re-journals."""
         self._update_issue(a["id"], {"read_waited": True})
         return a.get("reason", "holding: finished investigation awaiting a trustworthy comment read")
+
+    def _exec_await_pr_read(self, a, now):
+        """Issue #61: a finished BUILD has no trustworthy PR lookup this tick — GitHub refused it
+        (omitted from the view) or the poll budget/throttle starved it. decide emitted this only
+        while the wait clock is unstamped, so the hold is journaled once per episode (this
+        outcome IS the bounded refusal record), never silent, and never an immediate park. Stamp
+        idempotently — the PR_READ_HOLD_CAP bound must run from episode start, and a corrupt/
+        future clock is repaired, never trusted (the _since_ok discipline). decide parks ONCE if
+        the bound expires; _exec_clear_pr_read ends the episode when a trustworthy read lands."""
+        def m(st, i):
+            if not actions._since_ok(i.get("pr_read_pending_since"), now):
+                i["pr_read_pending_since"] = now
+        self._update_issue(a["id"], fn=m)
+        return a.get("reason", "holding: finished build awaiting a trustworthy PR lookup")
+
+    def _exec_clear_pr_read(self, a, now):
+        """Issue #61: a trustworthy PR lookup landed (a real PR, or a clean answered-empty) —
+        the refused-read episode is over; a later one times from scratch."""
+        self._update_issue(a["id"], {"pr_read_pending_since": None})
+        return "ok"
+
+    def _exec_clear_park_marker(self, a, now):
+        """Issue #61: the issue left its failing state without the park label ever landing (e.g.
+        the PR became visible and the gate flipped to merge), so the notify-once episode is over.
+        Clearing the marker lets a LATER genuine park on this issue text again — the guard is
+        per-cause-episode, never forever."""
+        self._update_issue(a["id"], {"park_notify_cause": None, "park_notify_at": None,
+                                     "park_comment_posted": False})
+        return "ok"
 
     def _exec_wildcard_hold(self, a, now):
         """Issue #36: a no-touches wildcard serialized the queue (this issue could not co-schedule).
@@ -1482,7 +1540,10 @@ class Runner:
                                  "update_result": None, "update_head_oid": None,
                                  "nudged": [], "pr": None, "recheck_failed": False,
                                  "checks_pending_since": None, "merge_refusals": 0,
-                                 "merge_refusal_reason": None})
+                                 "merge_refusal_reason": None,
+                                 "pr_read_pending_since": None,   # fresh branch, fresh episodes (#61)
+                                 "park_notify_cause": None, "park_notify_at": None,
+                                 "park_comment_posted": False})
         # 3. GitHub: supersede the PR (branch preserved on the remote, PR left open — nothing
         #    auto-closed), tell the issue, requeue it front-of-band.
         dev = self.config.get("dev_branch", "main")
