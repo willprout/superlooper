@@ -49,6 +49,10 @@ GH_POLL_SECONDS = 90
 MAX_POLL_CALLS = 30            # budget cap per poll cycle (poll_ship discipline): the tail of
                                # an oversized fetch list simply waits for the next cycle
 LAUNCH_TIMEOUT = 120           # launch-session.sh verifies delivery within ~30s; be generous
+# launch-session.sh's DISTINCT exit code for "the worktree base branch origin/<dev_branch> does not
+# exist" (issue #28) — a per-repo config fault, kept out of the systemic-anchor streak so the park
+# memo can name the branch instead of the launch shim. Must match launch-session.sh's `exit 3`.
+LAUNCH_BASE_MISSING_RC = 3
 NUDGE_TIMEOUT = 60
 RECHECK_TIMEOUT = 600
 CLOSE_TIMEOUT = 15             # bound the best-effort close of a stale session's pane (D4)
@@ -1047,14 +1051,23 @@ class Runner:
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             gh.set_labels(num, add=["in-progress"], remove=["agent-ready"])
-            self._update_issue(iid, {"status": "running"})
+            # clear any stale base-missing cause: a verified delivery proves the base now exists
+            self._update_issue(iid, {"status": "running", "launch_error": None})
             self._launch_fail_ids.clear()              # a verified delivery proves the anchor is live
             return "ok"
+        if rc == LAUNCH_BASE_MISSING_RC:
+            # The worktree base branch is missing (issue #28): a per-repo CONFIG fault, not a dead
+            # launch anchor. Record the cause so decide's park memo names the branch, and DELIBERATELY
+            # keep it OUT of the systemic-anchor streak (which would HOLD the queue and blame the cmux
+            # anchor). Still counts toward the per-issue launch cap, so it parks (with the right memo).
+            self._update_issue(iid, {"status": "ready", "launch_error": "base_missing"},
+                               fn=lambda st, i: self._bump(i, "launch_failures"))
+            return f"launch rc={rc} (worktree base branch missing)"
         # Delivery NOT verified: bump the per-issue cap AND record this id in the runner-level
         # anchor streak (issue #24) — decide reads the streak to tell a dead anchor (many distinct
         # ids) from a genuinely bad issue (one), and hold the queue instead of walking it into parks.
         self._launch_fail_ids.add(iid)
-        self._update_issue(iid, {"status": "ready"},
+        self._update_issue(iid, {"status": "ready", "launch_error": None},
                            fn=lambda st, i: self._bump(i, "launch_failures"))
         return f"launch rc={rc} (delivery not verified)"
 

@@ -187,6 +187,32 @@ def test_launch_failures_cap_parks_with_notify():
     assert has_notify(out)
 
 
+def test_base_missing_launch_failure_parks_naming_the_branch_not_the_shim():
+    # issue #28: when the launch cap is hit because the worktree base branch is missing (the runner
+    # stamped launch_error="base_missing"), the park memo must name the REAL cause — the missing
+    # base branch — and must NOT send the newcomer chasing the launch shim.
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("ready", launch_failures=2, launch_error="base_missing")}})
+    out = decide(config=cfg(dev_branch="develop"), parsed_issues=[parsed(5)], dsk=dsk)
+    assert only(out, "launch") == []
+    parks = only(out, "park")
+    assert len(parks) == 1 and parks[0]["id"] == "i5"
+    memo = parks[0]["memo"]
+    assert "develop" in memo                       # names the real base branch
+    assert "shim" not in memo.lower()              # NOT the launch-shim wild-goose-chase
+    assert has_notify(out)
+
+
+def test_generic_launch_failure_cap_still_blames_the_shim():
+    # The default (no base_missing cause) memo is unchanged: a plain non-delivery still points at
+    # the launch shim, so the base-missing branch doesn't swallow the ordinary failure mode.
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures=2)}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    parks = only(out, "park")
+    assert len(parks) == 1
+    assert "shim" in parks[0]["memo"].lower()
+
+
 def test_reapproving_a_parked_at_cap_issue_reapproves_and_does_not_relaunch_yet():
     # The live-dry-run bug: a parked-on-launch-cap issue stays filtered from launches forever
     # because launch_failures persists at the cap across a re-added agent-ready. Re-approval must

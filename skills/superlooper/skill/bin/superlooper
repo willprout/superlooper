@@ -305,6 +305,15 @@ def cmd_adopt(args):
         detected = _origin_repo(args.repo)
         if detected:
             cfg["repo"] = detected
+            # issue #28: detect the repo's REAL default branch and write it as dev_branch. Left at
+            # the template's "main", a master/develop repo fails every launch at worktree creation
+            # (the base ref origin/main does not exist). Pin gh to the detected slug first so the
+            # query targets THIS repo, not whatever the cwd resolves. gh unreachable -> None -> keep
+            # the template default (doctor is the backstop that FAILs on a wrong guess).
+            gh.set_repo(detected)
+            default = gh.default_branch()
+            if default:
+                cfg["dev_branch"] = default
         os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
         with open(cfg_path, "w") as f:
             json.dump(cfg, f, indent=2)
@@ -407,6 +416,22 @@ def cmd_doctor(args):
         missing = [n for n, _, _ in LABELS if n not in have]
         check("labels (§C.2 set)", not missing,
               ("missing: " + ", ".join(missing)) if missing else "all present")
+
+    # Issue #28: the worktree base is origin/<dev_branch>. If that branch does not exist on the
+    # remote, EVERY launch dies at worktree creation, delivery never verifies, and the issue parks
+    # with a misleading "is the launch shim installed?" memo. Catch it here, at adoption time, and
+    # NAME the branch. Gated on gh_ok so a full gh outage skips the check entirely; a transient blip
+    # DURING the branches call reads conservatively as "missing" (a re-runnable false FAIL on this
+    # human-run check — the safe direction, see gh.branch_exists). adopt detects the default branch;
+    # this validates whatever dev_branch the config actually holds.
+    if cfg is not None and gh_ok:
+        dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
+        dev_ok = gh.branch_exists(dev)
+        check(f"dev_branch '{dev}' exists on origin", dev_ok,
+              "" if dev_ok else
+              f"origin has no '{dev}' branch — every worktree bases off origin/{dev}, so launches "
+              f"fail before Claude starts. Set dev_branch to the repo's default (superlooper adopt "
+              f"detects it) and re-run doctor")
 
     # Issue #26: cross-check every required_checks NAME against what the repo has actually reported
     # (recent PRs + the dev branch). A name reported nowhere reads as pending forever — a green PR
