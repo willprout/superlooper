@@ -533,6 +533,54 @@ def test_pr_check_failure_hands_back_once_then_parks(sim_factory):
     assert len(nudges) == 1
 
 
+def test_unreported_required_check_escalates_once_to_william(sim_factory):
+    # issue #26: a required_checks entry naming a check the repo NEVER reports reads as pending
+    # forever — a green PR that never merges, with no park, no memo, no notify. Past the bound the
+    # runner escalates ONCE to needs-william, naming the unreported check. The repo reports "ci";
+    # "ghost-check" is required but never reported, so the gate sits at pending until the bound.
+    sim = sim_factory(required_checks=("ghost-check",),
+                      session={"checks_pending_cap": 90})       # bound < one tick's 91s advance
+    num = sim.add_issue(title="Green PR that never merges", scenario={"scenario": "happy"})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "needs_william"), \
+        "never escalated: %s" % [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    # the merge decision stays fail-closed: pending NEVER merges
+    assert not sim.mutations("merge_pr")
+    assert (not sim.prs_for()) or sim.prs_for()[0]["state"] != "MERGED"
+    # the label moved to needs-william and the memo NAMES the unreported check
+    assert "needs-william" in sim.issue(num)["labels"]
+    assert "in-progress" not in sim.issue(num)["labels"]
+    memos = [m for m in sim.mutations("comment")
+             if "ghost-check" in m["body"] and "pending" in m["body"].lower()]
+    assert memos, "the park memo must name the unreported check: %s" % sim.mutations("comment")
+    # the escalation notifies (standing rule) exactly once
+    notices = [ln for ln in sim.notify_lines() if "needs-william" in ln]
+    assert len(notices) == 1, sim.notify_lines()
+
+
+def test_late_but_in_bound_check_still_merges(sim_factory):
+    # issue #26: a check that reports LATE but within the bound merges cleanly — zero behavior
+    # change for a healthy-but-slow repo. The required "ci" is pending, then reports SUCCESS.
+    sim = sim_factory(session={"checks_pending_cap": 100000})   # generous bound: never escalates
+    sim.edit_gh_state(lambda st: st.update(pr_check_conclusion="PENDING"))
+    num = sim.add_issue(title="Slow but green", scenario={"scenario": "happy"})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    # a couple of pending ticks: the runner waits, never escalates, never merges
+    sim.tick(); sim.tick()
+    assert sim.loop_issue(sid).get("status") in ("gating", "holding")
+    assert "needs-william" not in sim.issue(num)["labels"] and not sim.mutations("merge_pr")
+    # the check reports green within the bound -> the PR merges cleanly
+    sim.edit_gh_state(lambda st: st.update(pr_check_conclusion="SUCCESS"))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged"), \
+        "never merged after the check reported green: %s" \
+        % [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert sim.prs_for()[0]["state"] == "MERGED"
+
+
 def test_finished_without_pr_parks_with_memo(sim_factory):
     # §C.4 step 1: a report with no PR anywhere is an immediate park-with-memo (no nudge —
     # there is nothing mechanical the worker could be reminded to re-post).

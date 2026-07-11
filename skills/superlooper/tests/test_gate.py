@@ -245,6 +245,81 @@ def test_checks_rest_lowercase_conclusions_fold_like_graphql_uppercase():
     assert gate.required_checks_state(skipped, ["ci"]) == "green"
 
 
+# ---------------- check_names / pending breakdown / audit (issue #26) ----------------
+
+def test_check_names_extracts_both_rollup_shapes():
+    entries = [{"name": "review/local-gate", "conclusion": "SUCCESS"},
+               {"context": "quality-gate", "state": "SUCCESS"}]
+    assert gate.check_names(entries) == {"review/local-gate", "quality-gate"}
+
+
+def test_check_names_wrong_typed_is_empty_set():
+    for bad in (None, "x", 5, [None, 3, {"nope": 1}, {"name": 42}, {"name": ""}]):
+        assert gate.check_names(bad) == set()
+
+
+def test_pending_breakdown_splits_unreported_from_running():
+    rollup = [{"name": "quality-gate", "status": "IN_PROGRESS", "conclusion": None}]
+    b = gate.pending_required_breakdown(rollup, ["quality-gate", "never-reports"])
+    assert b == {"unreported": ["never-reports"], "running": ["quality-gate"]}
+
+
+def test_pending_breakdown_all_absent_are_unreported():
+    assert gate.pending_required_breakdown([], ["b", "a"]) == {
+        "unreported": ["a", "b"], "running": []}          # sorted, deterministic
+
+
+def test_pending_breakdown_ignores_satisfied_and_failing():
+    rollup = [{"context": "green", "state": "SUCCESS"},
+              {"context": "red", "state": "FAILURE"},
+              {"context": "run", "state": "PENDING"}]
+    b = gate.pending_required_breakdown(rollup, ["green", "red", "run", "absent"])
+    assert b == {"unreported": ["absent"], "running": ["run"]}
+
+
+def test_audit_all_reported_on_dev_is_clean():
+    a = gate.audit_required_checks(["ci"], {"ci"}, {"ci"})
+    assert a["observed"] is True and a["dev_observed"] is True
+    assert a["results"] == [{"name": "ci", "status": "reported", "hint": None}]
+
+
+def test_audit_typo_is_unreported_with_case_and_shape_hint():
+    a = gate.audit_required_checks(["quality-gate"], {"Quality Gate"}, {"Quality Gate"})
+    assert a["results"][0]["status"] == "unreported"
+    assert a["results"][0]["hint"] == "Quality Gate"       # normalized match -> the real name
+
+
+def test_audit_never_wired_check_has_no_hint():
+    a = gate.audit_required_checks(["nonexistent"], {"ci"}, {"ci"})
+    assert a["results"][0] == {"name": "nonexistent", "status": "unreported", "hint": None}
+
+
+def test_audit_pr_only_check_is_distinguished_from_unreported():
+    # reports on PRs, never on the dev branch — the 2026-07-09 incident shape
+    a = gate.audit_required_checks(["quality-gate"], {"quality-gate"}, {"ci"})
+    assert a["results"][0]["status"] == "pr_only"
+    assert a["dev_observed"] is True
+
+
+def test_audit_dev_only_check_is_distinguished():
+    # reports on the dev branch but never on recent PRs -> the PR gate reads pending forever, so a
+    # green PR never merges (Codex R1: the mirror of pr_only, and the headline failure mode)
+    a = gate.audit_required_checks(["quality-gate"], {"ci"}, {"quality-gate"})
+    assert a["results"][0]["status"] == "dev_only"
+    assert a["pr_observed"] is True and a["dev_observed"] is True
+
+
+def test_audit_no_observations_anywhere_flags_no_evidence():
+    a = gate.audit_required_checks(["ci"], set(), set())
+    assert a["observed"] is False and a["dev_observed"] is False
+    assert a["results"][0]["status"] == "unreported"       # trivially, but observed=False guards it
+
+
+def test_audit_wrong_typed_names_fail_closed_to_no_evidence():
+    a = gate.audit_required_checks(["ci"], None, "junk")
+    assert a["observed"] is False and a["dev_observed"] is False
+
+
 # --------------------------- gate_decision: the §C.4 table ---------------------------
 
 def test_gate_happy_path_merges():
@@ -341,6 +416,24 @@ def test_gate_frozen_holds_merges():                             # step 4
 def test_gate_checks_pending_waits():                            # step 5
     d = _decide(pr=_pr(statusCheckRollup=[{"context": "quality-gate", "state": "PENDING"}]))
     assert d["action"] == "wait"
+
+
+def test_gate_checks_pending_surfaces_running_breakdown():       # step 5 (issue #26)
+    d = _decide(pr=_pr(statusCheckRollup=[{"context": "quality-gate", "state": "PENDING"}]))
+    assert d["action"] == "wait" and d["checks_pending"] is True
+    assert d["pending"] == {"unreported": [], "running": ["quality-gate"]}
+
+
+def test_gate_checks_pending_names_the_unreported_check():       # step 5 (issue #26)
+    # the target failure: a required check that never reports reads as pending forever
+    d = _decide(pr=_pr(statusCheckRollup=[]))
+    assert d["action"] == "wait" and d["checks_pending"] is True
+    assert d["pending"] == {"unreported": ["quality-gate"], "running": []}
+
+
+def test_gate_non_pending_decisions_carry_no_checks_pending_flag():
+    assert "checks_pending" not in _decide()                     # merge path
+    assert _decide().get("checks_pending") is None
 
 
 def test_gate_checks_fail_hand_back_once_then_park():            # step 5

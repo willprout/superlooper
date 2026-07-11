@@ -36,6 +36,7 @@ for _p in (os.path.join(_HERE, "..", "lib"), _HERE):
         sys.path.insert(0, _p)
 
 import config as config_lib
+import gate
 import gh
 import gitops
 import issues as issues_lib
@@ -92,6 +93,17 @@ _CHECKS_REQUIREMENT = (
     "REQUIREMENT: `required_checks` must name at least one CI check that runs this repo's\n"
     "tests. A repo with no required check has NO mechanical ship gate (§4.3) — the loop would\n"
     "merge on vibes. Add the check to .superlooper/config.json AND to the branch protection.")
+
+# Issue #26: a `required_checks` entry naming a check the repo never reports (a name typo, or a
+# check reporting on PRs but never on the dev branch) reads as "pending" forever — it keeps a green
+# PR gating with no merge, no park, no memo. The doctor cross-checks every name against what recent
+# PRs and the dev branch have ACTUALLY reported and fails at adoption time, before 3am.
+_CHECKS_NAMES_REQUIREMENT = (
+    "REQUIREMENT: every `required_checks` name must EXACTLY match a check the repo actually\n"
+    "reports (GitHub matches required checks by exact name — 'quality-gate' != 'Quality Gate').\n"
+    "A name it never reports reads as pending forever: a green PR gates with no merge, no park.\n"
+    "Fix the name in .superlooper/config.json, or wire the check to report (for the dev-branch\n"
+    "case, ensure its workflow triggers on push to the dev branch, not only on pull_request).")
 
 _STANDING_RULES_START = "<!-- loop-standing-rules:start -->"
 _STANDING_RULES_END = "<!-- loop-standing-rules:end -->"
@@ -396,6 +408,66 @@ def cmd_doctor(args):
         check("labels (§C.2 set)", not missing,
               ("missing: " + ", ".join(missing)) if missing else "all present")
 
+    # Issue #26: cross-check every required_checks NAME against what the repo has actually reported
+    # (recent PRs + the dev branch). A name reported nowhere reads as pending forever — a green PR
+    # that never merges — and the runner has no way to know it is a typo vs a genuinely-slow check.
+    # Catch it here, at adoption time, with a case/shape hint.
+    names_failed = False
+    if cfg is not None and gh_ok and rc:
+        dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
+        pr_names = gate.check_names(gh.recent_pr_check_entries())
+        dev_names = gate.check_names(gh.branch_checks(dev))
+        audit = gate.audit_required_checks(rc, pr_names, dev_names)
+
+        def _named(results):
+            parts = []
+            for r in results:
+                hint = f" (did you mean {r['hint']!r}?)" if r.get("hint") else ""
+                parts.append(f"{r['name']}{hint}")
+            return ", ".join(parts)
+
+        if not audit["observed"]:
+            # no CI history to cross-check against (fresh repo, or gh has no PR/dev checks yet):
+            # WARN, never a hard FAIL — the names cannot be proven wrong, only unverified.
+            print("  WARN required_checks names — no checks observed on recent PRs or the "
+                  f"'{dev}' branch yet; cannot verify the names (fresh repo?). Re-run doctor "
+                  "after the first CI run.")
+        else:
+            unreported = [r for r in audit["results"] if r["status"] == "unreported"]
+            pr_only = [r for r in audit["results"] if r["status"] == "pr_only"]
+            dev_only = [r for r in audit["results"] if r["status"] == "dev_only"]
+            if unreported:
+                names_failed = True
+                check("required_checks names", False,
+                      "reported on NO recent PR or the dev branch: " + _named(unreported))
+            # pr_only: reports on PRs but never on the dev branch — the 2026-07-09 incident: the
+            # dev-side poll reads pending forever (freeze/unfreeze silently breaks). dev_only: the
+            # mirror — reports on the dev branch but never on a PR, so every PR reads pending
+            # forever and a green PR never merges. Each FAILs only when the OTHER surface has
+            # reported checks (so the absence is real evidence), else it degrades to a WARN.
+            if pr_only and audit["dev_observed"]:
+                names_failed = True
+                check(f"required_checks on '{dev}'", False,
+                      "reports on PRs but NEVER on the dev branch: " + _named(pr_only)
+                      + f" — the dev-side check poll reads pending forever; ensure the check's "
+                      f"workflow triggers on push to '{dev}'")
+            elif pr_only:
+                print(f"  WARN required_checks on '{dev}' — {_named(pr_only)} reports on PRs but "
+                      f"the '{dev}' branch has no check history yet to confirm it runs there; "
+                      "re-check after a dev CI run.")
+            if dev_only and audit["pr_observed"]:
+                names_failed = True
+                check("required_checks on PRs", False,
+                      "reports on the dev branch but NEVER on a PR: " + _named(dev_only)
+                      + " — every PR reads pending forever, so a green PR never merges; ensure the "
+                      "check's workflow triggers on pull_request")
+            elif dev_only:
+                print("  WARN required_checks on PRs — " + _named(dev_only) + " reports on the "
+                      f"'{dev}' branch but no recent PR has reported checks yet to confirm it runs "
+                      "there; re-check after a PR CI run.")
+            if not (unreported or pr_only or dev_only):
+                print(f"  ok   required_checks names — every name seen on PRs and the '{dev}' branch")
+
     cmux = os.environ.get("SL_CMUX", "/Applications/cmux.app/Contents/Resources/bin/cmux")
     check("cmux binary", os.path.exists(cmux), cmux)
     check("jq", shutil.which("jq") is not None, "pretrust.sh needs it")
@@ -421,6 +493,8 @@ def cmd_doctor(args):
         print(f"\nDOCTOR FAILED: {', '.join(failures)}")
         if "required_checks" in failures:
             print(_CHECKS_REQUIREMENT)
+        if names_failed:
+            print(_CHECKS_NAMES_REQUIREMENT)
         return 1
     print("\nall checks passed")
     return 0

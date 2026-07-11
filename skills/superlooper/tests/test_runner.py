@@ -1107,6 +1107,39 @@ def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(ri
     assert st["answerers"] == {}                                    # active answerer dropped
 
 
+# ---------------- bounded pending-checks clock executors (issue #26) ----------------
+
+def test_note_checks_pending_stamps_once_and_is_idempotent(rig):
+    seed_issue(rig, "i5", status="gating")
+    assert rig.r._exec_note_checks_pending({"act": "note_checks_pending", "id": "i5"}, NOW) == "ok"
+    assert issue_state(rig, "i5")["checks_pending_since"] == NOW
+    # a later tick re-emits it; the stamp must NOT reset, or the bound never elapses
+    rig.r._exec_note_checks_pending({"act": "note_checks_pending", "id": "i5"}, NOW + 500)
+    assert issue_state(rig, "i5")["checks_pending_since"] == NOW
+
+
+def test_note_checks_pending_restamps_a_corrupt_or_out_of_range_clock(rig):
+    # non-numeric, a FUTURE value (would defeat the cap), and a NEGATIVE one all re-stamp (Codex R1)
+    for bad in ("garbage", NOW + 10_000, -5):
+        seed_issue(rig, "i5", status="gating", checks_pending_since=bad)
+        rig.r._exec_note_checks_pending({"act": "note_checks_pending", "id": "i5"}, NOW)
+        assert issue_state(rig, "i5")["checks_pending_since"] == NOW
+
+
+def test_clear_checks_pending_nulls_the_clock(rig):
+    seed_issue(rig, "i5", status="gating", checks_pending_since=NOW)
+    assert rig.r._exec_clear_checks_pending({"act": "clear_checks_pending", "id": "i5"},
+                                            NOW + 10) == "ok"
+    assert issue_state(rig, "i5")["checks_pending_since"] is None
+
+
+def test_reapprove_clears_a_stale_pending_clock(rig, monkeypatch):
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="needs_william", checks_pending_since=NOW - 99999)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert issue_state(rig, "i5")["checks_pending_since"] is None    # fresh slate, times from scratch
+
+
 def test_park_purges_cached_agent_ready_to_stop_reapprove_churn(rig):
     """Live 2026-07-06: a park removes agent-ready on GitHub but the runner's cached view kept it
     until the next 90s poll, so the next tick saw 'parked + agent-ready' and reapproved the issue

@@ -136,30 +136,34 @@ def touch_verdict(declared, actual_areas, inflight):
     return {"wander": wander, "overlap_lane": overlap_lane}
 
 
-def required_checks_state(status_rollup, required) -> str:
-    """§C.4 step 5: fold the PR's check rollup down to the REQUIRED checks' joint state:
-    'fail' (any required check failed — beats pending), 'pending' (any required check missing
-    or still running, or the rollup/required list is unreadable — fail closed: WAIT, never
-    merge on a half-read rollup), else 'green'. Rollup entries carry gh's two shapes: CheckRun
-    (name/conclusion) and StatusContext (context/state). An EMPTY required list is vacuously
-    green here; doctor fails hard on it at adopt time (cross-review C3)."""
-    if not isinstance(required, list) or any(not isinstance(r, str) for r in required):
-        return "pending"
-    if not required:
-        return "green"
-    rollup = status_rollup if isinstance(status_rollup, list) else []
+def _rollup_entries(status_rollup):
+    """Fold a check rollup into {check_name: [UPPERCASED state str | None]}. Rollup entries carry
+    gh's two shapes: CheckRun (name/conclusion) and StatusContext (context/state). Non-string
+    states (wrong-typed, unhashable) normalize to None. Strings are UPPERCASED: the GraphQL PR
+    rollup reports "FAILURE" but the REST check-runs API (gh.branch_checks — the dev poll behind
+    freeze/unfreeze) reports "failure"; without this fold the dev branch always read "pending", so
+    red never froze and green never unfroze (Task-15 simulation catch)."""
     entries = {}
-    for c in rollup:
+    for c in status_rollup if isinstance(status_rollup, list) else []:
         if isinstance(c, dict):
             key = c.get("name") or c.get("context")
             if isinstance(key, str):
                 v = c.get("conclusion") or c.get("state")
-                # non-string states (wrong-typed, unhashable) normalize to None -> pending.
-                # Strings are UPPERCASED: the GraphQL PR rollup reports "FAILURE" but the REST
-                # check-runs API (gh.branch_checks — the dev poll behind freeze/unfreeze)
-                # reports "failure"; without this fold the dev branch always read "pending",
-                # so red never froze and green never unfroze (Task-15 simulation catch).
                 entries.setdefault(key, []).append(v.upper() if isinstance(v, str) else None)
+    return entries
+
+
+def required_checks_state(status_rollup, required) -> str:
+    """§C.4 step 5: fold the PR's check rollup down to the REQUIRED checks' joint state:
+    'fail' (any required check failed — beats pending), 'pending' (any required check missing
+    or still running, or the rollup/required list is unreadable — fail closed: WAIT, never
+    merge on a half-read rollup), else 'green'. An EMPTY required list is vacuously green here;
+    doctor fails hard on it at adopt time (cross-review C3)."""
+    if not isinstance(required, list) or any(not isinstance(r, str) for r in required):
+        return "pending"
+    if not required:
+        return "green"
+    entries = _rollup_entries(status_rollup)
     states = []
     for req in required:
         vals = entries.get(req)
@@ -172,6 +176,109 @@ def required_checks_state(status_rollup, required) -> str:
     if all(s in _CHECK_SUCCESS for s in states):
         return "green"
     return "pending"
+
+
+def pending_required_breakdown(status_rollup, required):
+    """For a 'pending' required_checks_state, split the required names into those ABSENT from this
+    rollup ('unreported' — a required check that reports nowhere keeps a green PR gating forever,
+    issue #26; a check that merely reports late is absent only transiently) and those present-but-
+    not-yet-terminal ('running'). Names already satisfied or failing are omitted — they are not
+    what the wait is on. Returns {"unreported": [sorted], "running": [sorted]}. Wrong-typed
+    required -> both empty (fail closed)."""
+    if not isinstance(required, list):
+        return {"unreported": [], "running": []}
+    entries = _rollup_entries(status_rollup)
+    unreported, running = set(), set()
+    for req in required:
+        if not isinstance(req, str):
+            continue
+        vals = entries.get(req)
+        if not vals:
+            unreported.add(req)
+        elif any(s in _CHECK_FAIL for s in vals) or all(s in _CHECK_SUCCESS for s in vals):
+            continue                      # failing or satisfied: not a pending wait
+        else:
+            running.add(req)
+    return {"unreported": sorted(unreported), "running": sorted(running)}
+
+
+def check_names(entries):
+    """The set of distinct check NAMES a rollup reports (issue #26 doctor cross-check). Accepts a
+    PR statusCheckRollup OR gh.branch_checks output — both CheckRun (name) and StatusContext
+    (context) shapes. Empty/wrong-typed keys and a wrong-typed rollup fold to nothing (fail
+    closed: no evidence, never a phantom name)."""
+    out = set()
+    for c in entries if isinstance(entries, list) else []:
+        if isinstance(c, dict):
+            key = c.get("name") or c.get("context")
+            if isinstance(key, str) and key:
+                out.add(key)
+    return out
+
+
+def _normalize_check(name):
+    return re.sub(r"[^a-z0-9]", "", name.lower()) if isinstance(name, str) else ""
+
+
+def _closest_check_name(req, observed):
+    """The observed check name most likely MEANT by `req` when nothing matches exactly: a
+    case-insensitive exact match first ('quality-gate' vs 'Quality-Gate'), then a normalized match
+    ignoring case AND separators ('quality-gate' vs 'Quality Gate'). None when nothing is close — a
+    genuinely unknown name, not a near-miss. Deterministic (observed is scanned sorted)."""
+    lo = req.lower()
+    for o in sorted(observed):
+        if o.lower() == lo:
+            return o
+    target = _normalize_check(req)
+    if target:
+        for o in sorted(observed):
+            if _normalize_check(o) == target:
+                return o
+    return None
+
+
+def audit_required_checks(required, pr_names, dev_names):
+    """Adoption-time cross-check (issue #26): every required_checks name must match a check the
+    repo has ACTUALLY reported — on BOTH surfaces the loop reads. `pr_names` are check names seen
+    on recent PRs (the merge gate reads the PR statusCheckRollup); `dev_names` those seen on the
+    dev branch HEAD (the freeze/unfreeze poll reads gh.branch_checks). Names match CASE-SENSITIVELY
+    — GitHub identifies a required check by exact name, so 'quality-gate' does NOT satisfy a repo
+    that reports 'Quality Gate'. A check missing from EITHER surface reads as pending forever on
+    that surface: a green PR that never merges (PR-side gap) or a mainline freeze that never lifts
+    (dev-side gap). Returns:
+      {"observed": bool,       # any check seen at all (either surface); False = no evidence yet
+       "pr_observed": bool,    # any check seen on recent PRs
+       "dev_observed": bool,   # any check seen on the dev branch
+       "results": [{"name": req, "status": ..., "hint": name|None}]}
+    status per required check (the doctor decides FAIL vs WARN from the *_observed flags):
+      reported   — seen on BOTH surfaces (healthy).
+      pr_only    — seen on recent PRs but NEVER on the dev branch (the 2026-07-09 incident: the
+                   dev poll reads pending forever).
+      dev_only   — seen on the dev branch but NEVER on recent PRs (every PR reads pending forever,
+                   so a green PR never merges).
+      unreported — seen on NEITHER surface. A typo/never-wired name; hint carries the closest
+                   observed name (case- and separator-insensitive) when one exists.
+    Wrong-typed inputs degrade to empty sets (fail closed): with no evidence `observed` is False,
+    and the doctor renders 'cannot verify yet', never a false 'name not found'."""
+    _seq = (set, list, tuple, frozenset)
+    reqs = [r for r in required if isinstance(r, str)] if isinstance(required, list) else []
+    prs = {n for n in pr_names if isinstance(n, str) and n} if isinstance(pr_names, _seq) else set()
+    devs = {n for n in dev_names if isinstance(n, str) and n} if isinstance(dev_names, _seq) else set()
+    observed = prs | devs
+    results = []
+    for req in reqs:
+        on_pr, on_dev = req in prs, req in devs
+        if on_pr and on_dev:
+            status, hint = "reported", None
+        elif on_pr:
+            status, hint = "pr_only", None
+        elif on_dev:
+            status, hint = "dev_only", None
+        else:
+            status, hint = "unreported", _closest_check_name(req, observed)
+        results.append({"name": req, "status": status, "hint": hint})
+    return {"observed": bool(observed), "pr_observed": bool(prs),
+            "dev_observed": bool(devs), "results": results}
 
 
 def _pr_labels(pr_view):
@@ -305,7 +412,13 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     # step 5: required checks.
     checks = required_checks_state(pv.get("statusCheckRollup"), cfg.get("required_checks"))
     if checks == "pending":
-        return {"action": "wait", "wander": wander,
+        # Surface WHICH required checks are keeping this pending (issue #26): the runner bounds the
+        # wait and escalates once past the cap, naming the unreported checks in the memo. The merge
+        # decision itself stays fail-closed — pending never merges — this only makes the wait
+        # bounded and legible instead of silent-forever.
+        return {"action": "wait", "wander": wander, "checks_pending": True,
+                "pending": pending_required_breakdown(pv.get("statusCheckRollup"),
+                                                       cfg.get("required_checks")),
                 "reason": "required checks still pending — polling"}
     if checks == "fail":
         out = nudge_or_park("checks", "a required check failed on the PR")

@@ -52,7 +52,7 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["bright_lines"] == []
     assert cfg["models"] == {"worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": None}
     assert cfg["session"] == {"idle_seconds": 480, "freeze_seconds": 2700,
-                              "retry_cap": 2, "conflict_cap": 2}
+                              "retry_cap": 2, "conflict_cap": 2, "checks_pending_cap": 10800}
     assert cfg["qa"] == {"nightly_cmd": None, "results_glob": None, "retry_once": True,
                          "quarantine": [], "nightly_time": "02:00"}
     assert cfg["cleanup_merged_worktrees"] is True
@@ -60,6 +60,19 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["codex"] == {"dangerous_bypass": False, "bypass_hook_trust": True,
                             "no_alt_screen": True}
     assert cfg["report_time"] == "08:45"
+
+
+def test_checks_pending_cap_default_and_validation(tmp_path):
+    # issue #26: the bound on how long a finished PR may sit with required checks pending before
+    # the runner escalates ONCE to needs-william. Defaults, overrides, and rejects bad types.
+    _write_cfg(tmp_path, {"repo": "me/tool"})
+    assert config.load(tmp_path)["session"]["checks_pending_cap"] == 10800
+    _write_cfg(tmp_path, {"repo": "me/tool", "session": {"checks_pending_cap": 600}})
+    assert config.load(tmp_path)["session"]["checks_pending_cap"] == 600
+    for bad in (-1, "soon", True, 1.5):
+        _write_cfg(tmp_path, {"repo": "me/tool", "session": {"checks_pending_cap": bad}})
+        with pytest.raises(ValueError):
+            config.load(tmp_path)
 
 
 def test_agent_default_is_claude_and_codex_is_settable(tmp_path):

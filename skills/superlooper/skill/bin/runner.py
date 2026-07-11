@@ -1210,7 +1210,7 @@ class Runner:
                 i[k] = 0
             i.update({"status": "ready", "requeue_front": False, "recheck_failed": False,
                       "update_result": None, "update_head_oid": None, "nudged": [], "pr": None,
-                      "read_waited": False})
+                      "read_waited": False, "checks_pending_since": None})
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()
@@ -1277,6 +1277,25 @@ class Runner:
 
     def _exec_gate(self, a, now):
         self._update_issue(a["id"], {"status": "gating"})
+        return "ok"
+
+    def _exec_note_checks_pending(self, a, now):
+        """Issue #26: stamp WHEN a finished issue's required-checks PENDING wait began, so decide
+        can bound it. Idempotent — stamps only if the current clock is not a usable one in [0, now]
+        (unset, or a corrupt/future/negative value): the episode's clock must not reset each tick,
+        or the bound never elapses. decide re-emits this every pending tick until a usable stamp
+        lands, and _exec_clear_checks_pending / reapprove / regenerate clear it."""
+        def m(st, i):
+            if not actions._since_ok(i.get("checks_pending_since"), now):
+                i["checks_pending_since"] = now
+        self._update_issue(a["id"], fn=m)
+        return "ok"
+
+    def _exec_clear_checks_pending(self, a, now):
+        """Issue #26: clear the pending-checks clock the moment the wait is no longer on the checks
+        (green/fail/mergeability), so a later pending episode times from scratch instead of
+        inheriting a stale start (which would escalate immediately on re-entry)."""
+        self._update_issue(a["id"], {"checks_pending_since": None})
         return "ok"
 
     def _exec_await_read(self, a, now):
@@ -1365,7 +1384,8 @@ class Runner:
         self._update_issue(iid, {"status": "ready", "branch": a.get("new_branch"),
                                  "conflicts": a.get("conflicts"), "requeue_front": True,
                                  "update_result": None, "update_head_oid": None,
-                                 "nudged": [], "pr": None, "recheck_failed": False})
+                                 "nudged": [], "pr": None, "recheck_failed": False,
+                                 "checks_pending_since": None})
         # 3. GitHub: supersede the PR (branch preserved on the remote, PR left open — nothing
         #    auto-closed), tell the issue, requeue it front-of-band.
         dev = self.config.get("dev_branch", "main")

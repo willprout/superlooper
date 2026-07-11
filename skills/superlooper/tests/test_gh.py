@@ -162,6 +162,19 @@ def test_branch_checks_partial_when_status_endpoint_is_wrong_typed(ghenv):
     ]
 
 
+def test_recent_pr_check_entries_flattens_recent_pr_rollups(ghenv):
+    # issue #26: the doctor cross-checks required_checks names against what recent PRs actually
+    # reported. This returns the raw rollup entries across recent PRs, flattened.
+    entries = gh.recent_pr_check_entries()
+    names = {e.get("name") or e.get("context") for e in entries}
+    assert names == {"review/local-gate", "quality-gate"}
+
+
+def test_recent_pr_check_entries_fail_closed(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.recent_pr_check_entries() == []       # unreadable PR list -> no evidence, not a crash
+
+
 def test_compare(ghenv):
     c = gh.compare("main", "sl/i123-x")
     assert c["status"] == "ahead" and c["ahead_by"] == 3

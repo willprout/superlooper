@@ -53,9 +53,11 @@ The view contract (assembled by runner.py each tick):
 
 Action vocabulary (the executor contract, one journal record each):
   launch, hire_answerer, deliver_answer, bounce, recover(tier=idle|frozen|exited), gate,
-  merge, update, nudge, hold, await_read, park, regenerate, resolve_conflict, close_investigate,
-  reclaim, relabel, freeze, unfreeze, file_fix_issue, alert, clear_alert, morning_report,
-  notify. Safety actions (alert/freeze/unfreeze) come first; launches come LAST. `await_read`
+  merge, update, nudge, hold, await_read, note_checks_pending, clear_checks_pending, park,
+  regenerate, resolve_conflict, close_investigate, reclaim, relabel, freeze, unfreeze,
+  file_fix_issue, alert, clear_alert, morning_report, notify. Safety actions
+  (alert/freeze/unfreeze) come first; launches come LAST. `note_checks_pending`/
+  `clear_checks_pending` stamp/clear the bounded pending-checks clock (issue #26). `await_read`
   is the investigate-gate's HOLD when this tick has no trustworthy comment read (refused or
   starved): it journals the wait ONCE per episode (deduped on the issue's `read_waited` flag) so
   a finished investigation is never parked on an unverified read and never waits silently (#21).
@@ -88,6 +90,13 @@ ANSWERER_FAILURE_CAP = 2           # answerer hire failed twice -> park the issu
 DELIVERY_FAILURE_CAP = 3           # answer would not deliver to the pane -> park the issue
 UPDATE_ERROR_ALERT = 4             # persistent merge-update infra errors -> ALERT (never regenerate)
 RUNAWAY_THRESHOLD = 4              # retries far past the cap -> ALERT (events.retry_runaway)
+# The bound (seconds) on a FINISHED issue's required-checks PENDING wait (issue #26). A required
+# check that never reports reads as pending forever, and the wait had no timer — so an unreported
+# check kept a green PR gating with no park/memo/notify. Past this, the runner escalates ONCE to
+# needs-william naming the unreported checks. Mirrors config's default; used only when the config
+# omits/corrupts session.checks_pending_cap (an unbounded wait is the bug, so a bad value still
+# bounds — never disables).
+CHECKS_PENDING_CAP_DEFAULT = 10800
 
 # The red-nightly standing rule's EXACT label set (spec §4.4, owner-defined 2026-07-02). The
 # distinct `auto-approved:nightly-red` label is what makes this auto-approval auditable as
@@ -148,6 +157,23 @@ def _count(x, default=0):
     """A usable counter: a real int (bool excluded), else the default. Wrong-typed counters are
     the fail-OPEN defect class — callers decide whether default or park is the safe landing."""
     return x if type(x) is int else default
+
+
+def _since_ok(since, now):
+    """A USABLE pending-checks clock: a real number in [0, now] (issue #26, Codex R1). The runner
+    only ever writes `now`, so a FUTURE value (would make now-since negative and defeat the cap —
+    an unbounded wait again) or a NEGATIVE one (would make now-since huge and escalate spuriously)
+    is corrupt. Treat it as unstamped so it re-stamps, never trusted to defeat OR trip the bound."""
+    return _real(since) and 0 <= since <= now
+
+
+def _checks_pending_cap(config):
+    """session.checks_pending_cap seconds — the bound on a finished issue's pending-checks wait
+    (issue #26). Corrupt/missing -> the module default, never disabled: an unbounded wait is the
+    bug this closes, so a bad value must still bound."""
+    ses = config.get("session") if isinstance(config, dict) and isinstance(config.get("session"), dict) else {}
+    v = ses.get("checks_pending_cap")
+    return v if type(v) is int and v >= 0 else CHECKS_PENDING_CAP_DEFAULT
 
 
 def _counter(ist, key):
@@ -561,6 +587,35 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view)
                 pv, reports.get(iid), cfg, bool(frozen), inflight)
 
             act, wander = g.get("action"), g.get("wander", False)
+
+            # Bounded pending-checks escalation (issue #26): the ONE time-based backstop over the
+            # gate's fail-closed 'pending' wait. A required check that never reports reads as
+            # pending forever, so an unbounded wait left a finished issue in `gating` with no park,
+            # no memo, no notify. Stamp the clock on the first pending tick; escalate ONCE past the
+            # cap (park -> needs_william is terminal, so it can't re-fire); clear it the moment the
+            # wait is no longer on the checks, so a later pending episode times from scratch. The
+            # MERGE decision is untouched — pending never merges — this only makes the wait bounded.
+            since = ist.get("checks_pending_since")
+            if g.get("checks_pending"):
+                if not _since_ok(since, now):
+                    out.append({"act": "note_checks_pending", "id": iid})   # unset/corrupt: (re)stamp
+                elif now - since >= _checks_pending_cap(cfg):
+                    pend = g.get("pending") if isinstance(g.get("pending"), dict) else {}
+                    unrep = [x for x in (pend.get("unreported") or []) if isinstance(x, str)]
+                    running = [x for x in (pend.get("running") or []) if isinstance(x, str)]
+                    detail = (("never reported: " + ", ".join(unrep)) if unrep else "") \
+                        + (("; still running: " + ", ".join(running)) if running else "")
+                    park(iid, num,
+                         "required checks stayed pending past the bound — "
+                         + (detail or "no required check ever reported")
+                         + ". An unreported required check keeps a green PR gating forever; verify "
+                         "the config names against what the repo actually reports (run "
+                         "`superlooper doctor`) and the check's workflow triggers.",
+                         needs_william=True)
+                    continue
+            elif _real(since):
+                out.append({"act": "clear_checks_pending", "id": iid})       # left the pending episode
+
             if act == "merge":
                 method = cfg.get("merge_method")
                 method = method if method in ("squash", "merge", "rebase") else "squash"
