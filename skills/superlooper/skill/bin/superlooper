@@ -337,9 +337,12 @@ def cmd_adopt(args):
     gh.set_repo(slug)
 
     print("creating the label set (idempotent):")
+    failed = []
     for name, color, desc in LABELS:
         ok = gh.create_label(name, color, desc)
         print(f"  {'ok  ' if ok else 'FAIL'} {name}")
+        if not ok:
+            failed.append(name)
 
     dev = "main"
     raw = _read(cfg_path)
@@ -358,6 +361,25 @@ Branch protection recommendations for `{dev}` (print-only in v1 — apply by han
   - keep force pushes blocked (superlooper has no force path at all)
 
 {_CHECKS_REQUIREMENT}""")
+
+    # Issue #29: adopt's GitHub half can fail while its file half succeeds — run before `gh auth
+    # login`, every label create fails but the config is already on disk. Exiting 0 there reports
+    # a success that never happened: the config names labels the runner cannot apply, and the gap
+    # only surfaces later as a mysteriously idle loop (an approved issue that never gets launched).
+    # So: any label create/verify failure is a HARD nonzero exit, closing with the mixed state
+    # named plainly (config kept, labels pending) and the one action most likely to fix it. adopt
+    # stays idempotent, so the memo can honestly promise a clean re-run.
+    if failed:
+        print(f"""
+LABEL SETUP INCOMPLETE — {len(failed)} of {len(LABELS)} label(s) could not be created:
+  {', '.join(failed)}
+The config IS written and kept ({cfg_path}); the labels are PENDING. Until they exist nobody
+can apply them — gh refuses to apply a label that does not exist — so an issue can't even be
+marked `agent-ready` to approve it, and the loop looks mysteriously idle rather than erroring.
+Most likely cause: gh is not authenticated. Run `gh auth login`, then re-run this exact
+command — `superlooper adopt --repo {args.repo}` is idempotent and safe to re-run (existing
+labels are updated in place, never duplicated).""")
+        return 1
     return 0
 
 
