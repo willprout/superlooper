@@ -70,6 +70,18 @@ PR #4).*
   the machine since the 14:42 republish + bounce. The interim blocked-by chaining rule is
   retired (incident doc §4). History: `INCIDENT-2026-07-09-held-territory-window.md` (sibling).
 
+## Standing rules the owner has defined (autonomous paths — each carries its own audit trail)
+
+- **Unattended debugger fallback (owner-ruled 2026-07-10; filed as #66, blocked-by #64).**
+  A mechanical watchdog (no LLM) watches heartbeat/ALERT plus a no-progress detector
+  (eligible work + empty lanes + no launch past a bound); designed-safe waits never trip it.
+  On trip: notify → 30-min grace (configurable) → launch ONE sl-debugger session via the
+  worker shim. Authority is a config setting (`diagnose-only`/`allowlist`/`full`), DEFAULT
+  `full` — full still excludes the constitution (never agent-ready, never merge/force-push,
+  never frozen-text edits, never referee paths). Singleton, once-per-incident, kill-switch
+  file, journaled + morning-report surfaced. #64 carries a binding owner amendment adding
+  the skill's unattended-invocation contract.
+
 ## Parked with preconditions (see the incident docs for detail)
 
 - **Park-notify-storm engine guards — UNBLOCKED 2026-07-10, scope narrowed.** Both owner
