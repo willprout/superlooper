@@ -199,38 +199,60 @@ def preflight_pane(pane, cmux=None, run=None):
     return True, ""
 
 
-def detect_self_pane(cmux=None, run=None):
-    """The cmux pane THIS process is running in — so `superlooper run` started inside a cmux tab
-    targets that tab's OWN pane with zero configuration, and survives a machine restart that
-    reassigns pane UUIDs (owner request 2026-07-06: never hardcode a pane id). Worker tabs then
-    open as siblings in the runner's own pane (`new-surface --pane`), grouped and watchable — the
-    same design the D7 fix requires (runner and workers share one workspace by construction).
+def _caller_field(caller, key):
+    """One field of cmux `identify`'s caller object, fail-CLOSED to "" — a null/int/blank field
+    reads as absent, never leaking a non-string anchor into a boot line or a `new-surface` target
+    (guards against the project's fail-OPEN-on-wrong-TYPED defect class)."""
+    val = caller.get(key) if isinstance(caller, dict) else None
+    return val if isinstance(val, str) and val.strip() else ""
+
+
+def detect_self_anchor(cmux=None, run=None):
+    """The cmux ANCHOR identity THIS process runs in — {"pane", "workspace", "window"}, each fail-
+    closed to "". `pane` is the tab's own pane (the `new-surface --pane` target every worker is born
+    in); `workspace`/`window` name WHERE that pane lives, so a runner started in the WRONG cmux
+    window — the 2026-07-09 focused-window misplacement — is visible from the boot line, not just an
+    opaque pane UUID (issue #33). All three come from ONE `identify` call.
 
     cmux does NOT export a pane id into a tab's shell (only CMUX_SURFACE_ID / CMUX_WORKSPACE_ID),
-    so ask cmux directly: `identify` returns a `caller` object naming the INVOKING tab's `pane_id`.
-    `--id-format uuids` is required — without it `pane_id` comes back null. Returns "" when cmux is
-    unreachable or we're not inside a cmux surface (a detached/launchd start): the caller then
-    falls back to an explicit SL_PANE, and preflight_pane fails hard if neither resolves."""
+    so ask cmux directly: `identify` returns a `caller` object naming the INVOKING tab's `pane_id`,
+    `workspace_id`, and `window_id` (NOT `focused`, which is whatever tab is focused right now — the
+    very fallback that misplaces a runner). `--id-format uuids` is required — without it `pane_id`
+    comes back null. Every field is "" when cmux is unreachable, we're not inside a cmux surface (a
+    detached/launchd start), or the field is absent/wrong-typed. An older cmux that omits window_id
+    still yields pane + workspace; the boot line shows whichever resolve."""
+    empty = {"pane": "", "workspace": "", "window": ""}
     cmux = cmux or os.environ.get("SL_CMUX", _CMUX_DEFAULT)
     run = run or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=15))
     try:
         r = run([cmux, "--id-format", "uuids", "identify"])
     except (OSError, subprocess.TimeoutExpired):
-        return ""
+        return dict(empty)
     if getattr(r, "returncode", 1) != 0:
-        return ""
+        return dict(empty)
     try:
         data = json.loads(getattr(r, "stdout", "") or "")
     except (ValueError, TypeError):
-        return ""
+        return dict(empty)
     caller = data.get("caller") if isinstance(data, dict) else None
-    pane = caller.get("pane_id") if isinstance(caller, dict) else None
-    return pane if isinstance(pane, str) and pane.strip() else ""
+    return {"pane": _caller_field(caller, "pane_id"),
+            "workspace": _caller_field(caller, "workspace_id"),
+            "window": _caller_field(caller, "window_id")}
+
+
+def detect_self_pane(cmux=None, run=None):
+    """The cmux pane THIS process is running in — so `superlooper run` started inside a cmux tab
+    targets that tab's OWN pane with zero configuration, and survives a machine restart that
+    reassigns pane UUIDs (owner request 2026-07-06: never hardcode a pane id). Worker tabs then
+    open as siblings in the runner's own pane (`new-surface --pane`), grouped and watchable — the
+    same design the D7 fix requires (runner and workers share one workspace by construction). Thin
+    wrapper over detect_self_anchor so the identify call + fail-closed rules live in one place."""
+    return detect_self_anchor(cmux=cmux, run=run)["pane"]
 
 
 class Runner:
     def __init__(self, repo, config, state_home=None, pane=None, agent="claude",
-                 run_script=None, fetch_usage=None):
+                 run_script=None, fetch_usage=None, workspace="", window=""):
         import config as config_lib          # sibling module; only for the state-home default
         self.repo = os.fspath(repo)
         self.config = config
@@ -243,6 +265,11 @@ class Runner:
         # constructing the Runner. CMUX_PANE_ID is deliberately NOT read — cmux never exports it
         # (only CMUX_SURFACE_ID / CMUX_WORKSPACE_ID), so that old fallback silently never fired.
         self.pane = pane or os.environ.get("SL_PANE") or ""
+        # Anchor identity of the runner's own tab (issue #33): the workspace/window the pane lives
+        # in. Display + doctor use them to make a misplaced runner visible; they never gate launches
+        # (the pane is the only thing new-surface needs). "" when cmux couldn't resolve them.
+        self.workspace = workspace if isinstance(workspace, str) else ""
+        self.window = window if isinstance(window, str) else ""
         if run_script is not None:
             self._run_script = run_script
         if fetch_usage is not None:
@@ -305,6 +332,30 @@ class Runner:
             _rm(lock)
         self._owns_lock = False
 
+    def _anchor_path(self):
+        return os.path.join(self.state, "runner.anchor.json")
+
+    def _write_anchor(self):
+        """Record THIS live runner's launch anchor (issue #33): the pane every worker tab is born
+        in, the workspace/window it lives in, and our pid. `doctor` reads this to verify a LIVE
+        runner's anchor still resolves — a runner whose tab was dragged to another cmux window (the
+        2026-07-09 misplacement) leaves a recorded anchor that no longer resolves. Written only while
+        the singleton is held and cleared on clean exit, so a present anchor means "a runner claims
+        this pane"; the pid lets a reader pair it with the pidfile and ignore a stale one. Never
+        raises — the anchor is a diagnostic, never a safety gate."""
+        try:
+            loopstate.save(self._anchor_path(), {"pane": self.pane, "workspace": self.workspace,
+                                                 "window": self.window, "pid": os.getpid()})
+        except OSError:
+            pass
+
+    def _clear_anchor(self):
+        """Remove the anchor on clean exit — but only if it is OURS (pid match), so a runner that
+        lost the singleton and is exiting can never delete the live holder's record."""
+        rec = _read_json(self._anchor_path())
+        if isinstance(rec, dict) and rec.get("pid") == os.getpid():
+            _rm(self._anchor_path())
+
     def _handle_signal(self, signum, frame):
         # Fail-stopped by design: in-flight sessions untouched, nothing merges while down.
         self.stop = True
@@ -313,6 +364,7 @@ class Runner:
         if not self.acquire_singleton():
             print("another runner is live for this state home — exiting", file=sys.stderr)
             return 1
+        self._write_anchor()                           # record the live launch anchor for doctor (#33)
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
         ticks = 0
@@ -348,6 +400,7 @@ class Runner:
                     sleep(TICK_SECONDS)
         finally:
             self.release_singleton()
+            self._clear_anchor()
         return 0
 
     def _raise_tick_error_alert(self, count):

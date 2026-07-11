@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """superlooper — the William-facing CLI (plan Task 10, locked decision B.6).
 
-  run             the foreground tick loop (the default way to run it is VISIBLE, in a cmux tab;
-                  launchd + templates/launchd.runner.plist is the keep-alive option)
+  run             the foreground tick loop — always VISIBLE, in a cmux tab (it self-detects that
+                  tab's pane; there is no launchd runner — a paneless daemon can't work, issue #33)
   status          render lanes / gate / frozen / journal tail from state + journal (no GitHub)
   adopt           write the config template into a target repo + seed CLAUDE.md standing rules +
                   create the §C.2 label set + print branch-protection recommendations
@@ -196,24 +196,32 @@ def _seed_standing_rules(repo_path):
 # ------------------------------- run -------------------------------
 
 def cmd_run(args):
-    from runner import Runner, preflight_pane, detect_self_pane
+    from runner import Runner, preflight_pane, detect_self_anchor
     cfg = _load_config(args.repo)
     fetch_usage = None
     fake = os.environ.get("SL_FAKE_USAGE")
     if fake:
         # test/simulation seam (Task 15's offline harness): never touch the Keychain/endpoint
         fetch_usage = lambda: json.loads(fake)
-    # Pane resolution (owner request 2026-07-06 — never hardcode a pane): an explicit --pane /
-    # $SL_PANE wins; otherwise auto-target the cmux tab THIS `superlooper run` is executing in
-    # (its own pane), so it just works wherever you start it and survives a restart that reassigns
-    # pane UUIDs. Empty only when started outside cmux with no override — preflight then fails hard.
-    pane = args.pane or os.environ.get("SL_PANE") or detect_self_pane()
+    # Anchor resolution (owner request 2026-07-06 — never hardcode a pane): one cmux `identify`
+    # names the tab THIS `superlooper run` is executing in — its pane (the `new-surface` target) and
+    # the workspace/window it lives in. An explicit --pane / $SL_PANE still wins for the pane; the
+    # workspace/window come from identify regardless (they describe where the runner actually IS).
+    # Empty only when started outside cmux with no override — preflight then fails hard.
+    anchor = detect_self_anchor()
+    pane = args.pane or os.environ.get("SL_PANE") or anchor["pane"]
     src = ("--pane" if args.pane else "$SL_PANE" if os.environ.get("SL_PANE")
            else "this cmux tab" if pane else "(none)")
     agent = args.agent or cfg.get("agent", "claude")
-    r = Runner(repo=args.repo, config=cfg, pane=pane, agent=agent, fetch_usage=fetch_usage)
+    r = Runner(repo=args.repo, config=cfg, pane=pane, agent=agent,
+               workspace=anchor["workspace"], window=anchor["window"], fetch_usage=fetch_usage)
+    # Anchor identity in the boot line (issue #33): the pane is WHAT worker tabs are born in;
+    # workspace/window name WHERE — so a runner started in the wrong cmux window (the 2026-07-09
+    # focused-window misplacement) is visible at a glance, not an opaque pane UUID that fits any
+    # window. Show whichever of workspace/window cmux resolved; omit the rest (no empty noise).
+    loc = "".join(f" {k}={v}" for k, v in (("workspace", r.workspace), ("window", r.window)) if v)
     print(f"superlooper run: repo={args.repo} state={r.home} pane={r.pane or '(unset)'} "
-          f"[{src}] agent={r.agent}")
+          f"[{src}]{loc} agent={r.agent}")
     # D7: fail HARD before the loop if cmux is unreachable or the pane won't resolve. A quiet
     # warning here once let a mis-started runner silently abort every launch and burn every
     # issue's retry cap (live dry-run 2026-07-03/04) — so this refuses to start instead.

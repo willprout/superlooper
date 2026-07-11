@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
+import config as config_lib
 import notify
 
 
@@ -74,6 +75,17 @@ class Probe:
 
     def expanduser(self, path):
         return os.path.expanduser(path)
+
+    def pid_alive(self, pid):
+        """Is `pid` a live process? Signal 0 probes without delivering. A pid we may not signal
+        (EPERM) still exists, so it counts as alive. Injected in tests to avoid a real os.kill."""
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except (ProcessLookupError, ValueError, TypeError):
+            return False
+        except PermissionError:
+            return True
 
 
 def _out(proc):
@@ -322,6 +334,87 @@ def check_launch_shim(probe):
     )
 
 
+def _has_surface_row(out):
+    """True if cmux `list-pane-surfaces` output contains a real surface row (`[* ]surface:<n> …`).
+    The exact positive-signal test the runner's D7 preflight uses (bin/runner.py): judge on a real
+    row, never a broad 'error:' scan — a valid tab literally titled 'Error: build log' must not
+    false-fail. Mirrored (not imported) to keep lib/ free of a bin/ entry-point dependency."""
+    for ln in (out or "").splitlines():
+        if ln.lstrip().lstrip("*").strip().startswith("surface:"):
+            return True
+    return False
+
+
+def _anchor_where(rec):
+    """The human-readable ' (workspace=… window=…)' suffix from a recorded anchor — whichever of the
+    two the runner resolved. Empty when neither is present, so the line never trails empty noise."""
+    parts = [f"{k}={rec.get(k)}" for k in ("workspace", "window")
+             if isinstance(rec, dict) and _nonempty_string(rec.get(k))]
+    return (" (" + " ".join(parts) + ")") if parts else ""
+
+
+def check_runner_anchor(probe, config):
+    """A LIVE runner's recorded launch anchor must still resolve — else every worker tab is born in
+    a dead/misplaced pane and the whole queue parks (issue #33; the 2026-07-09 misplacement, when a
+    runner's cmux tab was dragged to another window). Cheap and read-only: it fires ONLY when a
+    runner is actually live (its pidfile pid is alive), then re-runs the SAME read-only probe the
+    startup preflight uses. No live runner, a stale pidfile, or an unreadable config are clean SKIPS
+    (pass, never FAIL) — this only judges a live runner with a resolvable claim to check. A live
+    runner that recorded no anchor is a WARN (older runner, or one started before this shipped)."""
+    name = "runner anchor (live)"
+    cfg = config if isinstance(config, dict) else {}
+    try:
+        state = os.path.join(str(config_lib.state_home(cfg)), "state")
+    except (KeyError, AttributeError, TypeError, ValueError):
+        return CheckResult(name, True, "no repo config — runner-anchor check skipped")
+
+    lock = probe.read_text(os.path.join(state, "runner.lock"))
+    pid = None
+    if _nonempty_string(lock):
+        try:
+            pid = int(lock.strip())
+        except ValueError:
+            pid = None
+    if pid is None or not probe.pid_alive(pid):
+        return CheckResult(name, True, "no live runner for this repo — nothing to check")
+
+    try:
+        rec = json.loads(probe.read_text(os.path.join(state, "runner.anchor.json")) or "")
+    except (TypeError, ValueError):
+        rec = None
+    pane = rec.get("pane") if isinstance(rec, dict) else None
+    # Trust the anchor only if it belongs to THIS live pid: a hard-crashed runner leaves a stale
+    # anchor, and if the OS later recycles its pid the pidfile reads "alive" — so require the
+    # recorded pid to match, or an unrelated process would make us FAIL on a dead runner's record.
+    rec_pid = rec.get("pid") if isinstance(rec, dict) else None
+    if not _nonempty_string(pane) or rec_pid != pid:
+        return CheckResult(
+            name, True,
+            "a runner is live (pid %s) but recorded no matching anchor — restart it from a "
+            "visible cmux tab to record one" % pid, warn=True)
+
+    # Scope the probe to the runner's OWN recorded workspace. cmux resolves --pane within the
+    # caller's workspace by default (nudge-pane.sh / launch-session.sh: the 156/156-lost-rings
+    # trap), and doctor runs from a DIFFERENT tab than the foreground runner — so without the
+    # recorded --workspace this would resolve from the doctor's workspace and false-FAIL a healthy
+    # runner. detect_self_anchor recorded caller.workspace_id, the same space --workspace expects.
+    cmux = getattr(probe, "env", {}).get("SL_CMUX") or _CMUX_DEFAULT
+    argv = [cmux, "list-pane-surfaces", "--pane", pane]
+    ws = rec.get("workspace")
+    if _nonempty_string(ws):
+        argv += ["--workspace", ws]
+    proc = probe.run(argv)
+    if _has_surface_row(_out(proc)):
+        return CheckResult(name, True, "live runner's anchor resolves%s" % _anchor_where(rec))
+    return CheckResult(
+        name, False,
+        "live runner (pid %s) anchor no longer resolves: pane %r%s" % (pid, pane, _anchor_where(rec)),
+        "The runner's recorded pane no longer resolves in the workspace it launched in (its cmux tab "
+        "was closed or moved), so every worker launch will fail and the queue parks. Stop it, open a "
+        "tab in the INTENDED cmux window, and re-run `superlooper run` (see references/runner-ops.md "
+        "→ Restarting the runner).")
+
+
 def check_stack(config, config_error=None, probe=None, sender=None, announce=None):
     probe = probe or Probe()
     return [
@@ -332,6 +425,7 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_gh_headroom(probe),
         check_notify(config, config_error=config_error, sender=sender, announce=announce),
         check_launch_shim(probe),
+        check_runner_anchor(probe, config),
     ]
 
 

@@ -134,6 +134,47 @@ def test_sigterm_is_a_clean_fail_stop(rig):
     assert not (rig.home / "state" / "runner.lock").exists()
 
 
+def _anchor_file(rig):
+    return rig.home / "state" / "runner.anchor.json"
+
+
+def test_run_records_the_live_anchor_and_clears_it_on_exit(rig):
+    # issue #33: a LIVE runner records its anchor (the pane worker tabs are born in, plus the
+    # workspace/window it lives in, plus its pid) so `doctor` can later verify it still resolves.
+    # It is present WHILE running and gone after a clean exit — exactly like the pidfile.
+    rig.r.workspace, rig.r.window = "WS-1", "WIN-1"
+    seen = {}
+
+    def spy_tick(now=None):
+        f = _anchor_file(rig)
+        seen["existed"] = f.exists()
+        seen["data"] = json.loads(f.read_text()) if f.exists() else None
+        rig.r.stop = True                              # one tick, then clean stop
+    rig.r.tick = spy_tick
+    rig.r.run(sleep=lambda s: None)
+
+    assert seen["existed"] is True
+    assert seen["data"]["pane"] == "pane-1"
+    assert seen["data"]["workspace"] == "WS-1" and seen["data"]["window"] == "WIN-1"
+    assert seen["data"]["pid"] == os.getpid()
+    assert not _anchor_file(rig).exists()              # cleared on clean exit, like runner.lock
+
+
+def test_a_runner_that_loses_the_singleton_leaves_the_live_anchor_untouched(rig):
+    # The loser's early exit (another runner is live) must never clobber or clear the holder's
+    # recorded anchor — only the owning instance writes/clears it.
+    rig.r.workspace, rig.r.window = "WS-live", "WIN-live"
+    assert rig.r.acquire_singleton() is True
+    rig.r._write_anchor()
+    before = _anchor_file(rig).read_text()
+
+    other = runner_mod.Runner(repo=str(rig.repo), config=make_config(),
+                              state_home=str(rig.home), pane="other-pane",
+                              run_script=lambda *a, **k: 0, fetch_usage=lambda: {})
+    assert other.run(sleep=lambda s: None) == 1        # loses the singleton, exits
+    assert _anchor_file(rig).read_text() == before      # holder's anchor intact
+
+
 # --------------------------- Task-11 seams: morning report + notify ---------------------------
 
 def test_morning_report_seam_writes_the_file_and_pushes(rig, tmp_path):
@@ -1354,6 +1395,60 @@ def test_detect_self_pane_fails_closed_on_wrong_typed_identify(stdout):
     # Never crash, never trust a wrong-typed field — fall closed to "" so the caller reaches the
     # explicit-override / hard-fail path instead (the project's fail-OPEN-on-wrong-TYPED rule).
     assert runner_mod.detect_self_pane(run=_fake_run(0, stdout)) == ""
+
+
+# --------------------------- self-anchor identity (issue #33: a misplaced runner is visible) -----
+
+# Real cmux `identify.caller` carries window_id too (verified against cmux 2026-07-11); the older
+# _IDENTIFY_JSON fixture predates window plumbing, so a runner that lands in the wrong WINDOW — the
+# 2026-07-09 focused-window failure mode — must be nameable from the boot line, not just the pane.
+_IDENTIFY_FULL = (
+    '{"caller": {"surface_id": "S-UUID", "workspace_id": "WS-UUID", "window_id": "WIN-UUID", '
+    '"pane_id": "PANE-UUID", "surface_type": "terminal"}, '
+    '"focused": {"pane_id": "OTHER-PANE"}}')
+
+
+def test_detect_self_anchor_returns_pane_workspace_window():
+    a = runner_mod.detect_self_anchor(run=_fake_run(0, _IDENTIFY_FULL))
+    assert a["pane"] == "PANE-UUID"
+    assert a["workspace"] == "WS-UUID"
+    assert a["window"] == "WIN-UUID"
+
+
+def test_detect_self_anchor_reads_caller_not_focused():
+    # Same discipline as the pane: anchor identity is the tab we RUN in (caller), never whatever
+    # window happens to be focused right now (the focused-window fallback that misplaced a runner).
+    a = runner_mod.detect_self_anchor(run=_fake_run(0, _IDENTIFY_FULL))
+    assert a["pane"] != "OTHER-PANE"
+
+
+def test_detect_self_pane_delegates_to_anchor():
+    # detect_self_pane is the anchor's pane field — one identify call, one fail-closed code path.
+    assert runner_mod.detect_self_pane(run=_fake_run(0, _IDENTIFY_FULL)) == "PANE-UUID"
+
+
+def test_detect_self_anchor_partial_when_older_cmux_omits_window():
+    # A cmux that reports no window_id (older build, or the CLI test stub) still yields pane +
+    # workspace; the missing field is "" (resolvable-when-present, never a crash).
+    a = runner_mod.detect_self_anchor(run=_fake_run(0, _IDENTIFY_JSON))
+    assert a["pane"] == "PANE-UUID" and a["workspace"] == "WS-UUID" and a["window"] == ""
+
+
+@pytest.mark.parametrize("stdout", [
+    "not json", "", "   ", "123", "[]", '"s"',
+    '{"caller": {}}', '{"caller": []}',
+    '{"caller": {"workspace_id": 42, "window_id": null, "pane_id": "  "}}',
+])
+def test_detect_self_anchor_fails_closed_to_empty_strings(stdout):
+    # Never crash, never trust a wrong-typed field: every anchor field falls closed to "".
+    a = runner_mod.detect_self_anchor(run=_fake_run(0, stdout))
+    assert a == {"pane": "", "workspace": "", "window": ""}
+
+
+def test_detect_self_anchor_empty_when_not_in_cmux():
+    def boom(argv):
+        raise OSError("cmux socket unreachable")
+    assert runner_mod.detect_self_anchor(run=boom) == {"pane": "", "workspace": "", "window": ""}
 
 
 # --------------------------- answerer default model (owner ruling 2026-07-05) --------------------

@@ -22,8 +22,10 @@ doctor checklist at the end of this file.
 
 ## Start, stop, status
 
-The runner is one foreground process. The normal way to run it is a **visible `superlooper run` in
-a cmux tab you can watch**; launchd (below) is the keep-alive option for unattended nights.
+The runner is one foreground process, and there is exactly **one** way to run it: a **visible
+`superlooper run` in a cmux tab you can watch**. launchd runs the *nightly* (below), never the
+runner — a launchd runner is a detached daemon with no cmux tab, which can't work (see
+"Restarting the runner" and the launchd section for why).
 
 (The bare `superlooper` command comes from publishing: `bin/install.sh` links it onto your PATH,
 pointing at the installed copy. If your shell can't find it, re-run the installer — it prints the
@@ -40,8 +42,9 @@ superlooper status --repo /path/to/repo      # lanes / queue / freeze state, fro
   reassigns pane UUIDs — you never hardcode a pane. It takes a pidfile singleton, so a second `run`
   on the same repo refuses to start rather than double-drive it.
   - It **fails hard at startup** (never a quiet warning) if it can't reach cmux or resolve a pane —
-    e.g. started outside cmux, or detached/`nohup` so it lost the cmux socket (the launchd caveat
-    below). The message tells you to run it inside a cmux tab.
+    e.g. started outside cmux, or detached/`nohup` so it lost the cmux socket (the same reason there
+    is no launchd runner — see the launchd section below). The message tells you to run it inside a
+    cmux tab.
   - To pin a *specific* pane instead of the current tab's, pass `--pane <id>` or set `$SL_PANE`
     (an override; rarely needed).
 - **Stop:** Ctrl-C (SIGTERM). It exits cleanly and **leaves in-flight sessions untouched** —
@@ -50,6 +53,39 @@ superlooper status --repo /path/to/repo      # lanes / queue / freeze state, fro
   automatically and no launch is duplicated.
 - **Status:** `superlooper status` renders the current lanes, the queue, and whether merges are
   frozen — read from the journal and disk, so it works whether or not the runner is up.
+
+### Restarting the runner (the proven procedure)
+
+There is **one** way to (re)start the runner, and it is by hand: **open a tab in the cmux window you
+want the loop to live in, and run `superlooper run --repo <path>`.** The runner detects its own pane
+(`cmux identify` → the tab you are IN) and opens every worker as a sibling tab there — no pane id,
+no placement flag. The boot line prints the anchor it locked onto:
+
+```
+superlooper run: repo=… state=… pane=<uuid> [this cmux tab] workspace=<uuid> window=<uuid> agent=claude
+```
+
+**Check that `window=` names the window you intended before you walk away** — a runner started in
+the wrong window is visible right there, not hours later when every launch has parked. (This is the
+proven procedure from the 2026-07-09 incident, owner-ruled: a human opens the tab and runs
+`superlooper run`; the self-pane detection does the rest.)
+
+This is not a stopgap for missing automation. **Automated tab-placement is out**, and it stays out
+because it was tried and it failed — two automated placement attempts each broke a *different* way
+the same night (2026-07-09):
+
+- **Focused-window fallback.** The placement targeted whatever cmux window was *focused* when it
+  fired, not the intended one — so the runner, and every worker tab it would open, landed in the
+  wrong window. cmux `identify` reports both `caller` (the tab you are IN) and `focused` (whatever
+  is focused right now); anything that resolves placement from `focused` misplaces the runner.
+- **CLI-created workspace whose tabs never boot shells.** Creating the target workspace from the CLI
+  produced tabs whose shells never started — so the launch shim (sourced by a booting `~/.zshrc`)
+  never ran, and every worker launch was dropped silently, with no shell to receive it.
+
+A human opening a real tab sidesteps both: the tab *is* the `caller`, and its shell boots and
+sources the shim like any other. So the restart story is deliberately manual — and the boot-line
+anchor plus `doctor`'s live-anchor check (see the doctor checklist) are how you confirm it landed in
+the right window.
 
 ### Agent selection
 
@@ -303,26 +339,35 @@ finishing, stalling, or needing input reaches you (spec §2). A send failure is 
 fatal; notifications are a convenience layer, never a safety layer.
 
 **One-time setup:** the first time it texts you, macOS asks permission to let the terminal control
-Messages — click **Allow** once. A **launchd-started** runner needs that same permission granted to
-whatever launchd runs it under, so grant it once there too, or the first night's texts silently
-no-op (they're journaled, so you'll see it in the log).
+Messages — click **Allow** once. The **launchd-started nightly** needs that same permission granted
+to whatever user launchd runs it under, so grant it once there too, or the first night's texts
+silently no-op (they're journaled, so you'll see it in the log).
 
 ---
 
-## launchd (keep-alive for unattended runs)
+## launchd (the nightly only — there is no launchd runner)
 
-The default is a visible `superlooper run` in a cmux tab. For unattended keep-alive, install the
-launchd jobs from the templates:
+launchd runs exactly **one** superlooper job: the nightly QA. There is deliberately **no launchd
+runner** and no runner keep-alive template — the runner is started and restarted by hand in a cmux
+tab (see "Restarting the runner" above).
 
-- **`launchd.runner.plist`** — `KeepAlive=true`, label `com.superlooper.<owner>__<repo>`, logs to
-  the repo's state home. Relaunches the runner if it dies. **Caveat (D7):** a *detached* launchd
-  process is not inside a cmux tab, so it can't self-detect a pane and its `new-surface` calls fail
-  ("Broken pipe" — lost cmux socket). The runner now catches this at startup and refuses to run
-  rather than burning retry caps. The working keep-alive is a `superlooper run` in a **visible cmux
-  tab** (which you can also arrange to relaunch on login); the pure-daemon launchd path needs a
-  cmux surface to launch into and is not the blessed unattended mode.
+**Why there is no launchd runner (issue #33).** A launchd-started process is a detached daemon with
+no cmux tab of its own. The runner launches every worker as a tab in its own pane
+(`new-surface --pane`), so it *needs* a pane — and a paneless daemon cannot self-detect one. Its
+startup preflight (correctly) fails hard in that case, and a `KeepAlive=true` would just relaunch it
+into the identical failure forever, filling the log while nothing ever launches. There is no way to
+make launchd start the runner *correctly*, because the only correct start is inside a cmux tab and
+automated tab-placement is out (the two 2026-07-09 failure modes above). So the old
+`launchd.runner.plist` template — whose own comment advertised its `KeepAlive` as harmless
+crash-recovery — was **removed, not fixed**: it offered a mode that could never work. If you still
+have it installed from an earlier version, `launchctl unload` it and delete the plist; keep-alive of
+the runner is the visible cmux tab, which you can arrange to reopen on login.
+
 - **`launchd.nightly.plist`** — `StartCalendarInterval` at `qa.nightly_time` (02:00 Mac-local),
-  invoking `superlooper nightly --repo <path>`.
+  invoking `superlooper nightly --repo <path>`. This one **does** run under launchd, because
+  `superlooper nightly` needs no cmux pane — it builds a fresh worktree and runs the browser suite,
+  and never opens worker tabs. (A nonzero exit is journaled + pushed, never restart-looped: it is a
+  scheduled one-shot, not a keep-alive.)
 
 All schedule times are **Mac-local** — your Mac runs Mountain time, launchd and the runner both
 read the system clock, so there is no timezone setting to get wrong.
@@ -355,3 +400,14 @@ its own tests has no mechanical ship gate, so `doctor` **fails hard** on an empt
 and `adopt` prints the same requirement. It also reports Codex hook readiness from
 `$CODEX_HOME/hooks.json` or `~/.codex/hooks.json` as a warning when missing, because Codex is opt-in.
 Fix anything red, then start the runner.
+
+**`--stack` also checks a live runner's anchor.** `superlooper doctor --stack` runs the machine-level
+checks (cmux, claude/gh/codex auth, the notify channel, the launch shim) *and* — new (issue #33) — a
+**runner anchor (live)** check. When a runner is live (its pidfile pid is alive, and it recorded a
+matching anchor), it re-runs the same read-only pane probe the startup preflight uses against the
+anchor the runner recorded at launch (`state/runner.anchor.json`) — **scoped to the runner's own
+recorded workspace**, so it gives the same answer whichever tab you run `doctor` from. If that pane
+no longer resolves in the workspace it launched in (its cmux tab was closed or moved), it **FAILs**
+with the restart hint, so you catch a runner that is up but launching into a dead pane before the
+whole queue parks. With no live runner, a stale pidfile, or no matching recorded anchor it is a clean
+pass/warn — nothing to fail — so it is safe to run both before starting and while the loop is up.

@@ -307,6 +307,30 @@ def test_doctor_stack_ok_uses_fake_commands_and_mutates_nothing(rig):
     assert {p: p.read_text() for p in watched} == before
 
 
+def test_doctor_stack_flags_a_live_runner_whose_anchor_no_longer_resolves(rig):
+    # End-to-end (issue #33): a LIVE runner (pidfile = a live pid) whose recorded pane no longer
+    # resolves in cmux FAILs doctor --stack with the manual-restart hint. _stack_env's cmux prints
+    # nothing for list-pane-surfaces, so the recorded pane reads as unresolvable — the misplacement.
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"cmd": "printf '%s\\n' \"$SL_TITLE\"", "imessage_to": None}
+    cfg_path.write_text(json.dumps(cfg))
+    (rig.home / ".zshrc").write_text('source "$HOME/.superlooper/launch-shim.zsh"\n')
+    state = rig.tmp / "slhome" / "o__r" / "state"
+    state.mkdir(parents=True)
+    (state / "runner.lock").write_text(str(os.getpid()))          # this test process = a live pid
+    (state / "runner.anchor.json").write_text(json.dumps(
+        {"pane": "DEADPANE", "workspace": "WS-x", "window": "WIN-x", "pid": os.getpid()}))
+
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo), env_over=_stack_env(rig))
+
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "FAIL runner anchor (live)" in out
+    assert "DEADPANE" in out
+    assert "superlooper run" in out and "runner-ops" in out
+
+
 def test_doctor_stack_fails_with_actionable_hint(rig):
     cfg_path = rig.repo / ".superlooper" / "config.json"
     cfg = json.loads(cfg_path.read_text())
@@ -656,15 +680,16 @@ def test_status_on_a_never_run_repo_is_calm(rig):
 
 # --------------------------- run + stubs ---------------------------
 
-def _cmux_stub(rig, *, resolve=True, self_pane=None):
+def _cmux_stub(rig, *, resolve=True, self_pane=None, workspace="WS-9", window="WIN-9"):
     """A minimal cmux for the run command's pane resolution + D7 preflight. `identify` returns a
-    caller.pane_id (self-pane auto-detection); `list-pane-surfaces` prints a surface line (or an
-    rc-0 'Error: not_found', the exit-code trap) per `resolve`; every other subcommand fails so a
-    tick's launch attempts stay inert (no real tabs) — the run test only pins the heartbeat."""
+    caller.{pane_id,workspace_id,window_id} (self-pane + anchor auto-detection); `list-pane-surfaces`
+    prints a surface line (or an rc-0 'Error: not_found', the exit-code trap) per `resolve`; every
+    other subcommand fails so a tick's launch attempts stay inert (no real tabs)."""
     # `--id-format uuids` precedes the subcommand, so scan all args for the verb.
     # self_pane="" -> identify yields no pane_id (simulates running outside a cmux surface).
     pane = "SELFPANE" if self_pane is None else self_pane
-    caller = f'{{"pane_id": "{pane}"}}' if pane else "{}"
+    caller = (f'{{"pane_id": "{pane}", "workspace_id": "{workspace}", "window_id": "{window}"}}'
+              if pane else "{}")
     body = ("#!/bin/sh\n"
             'for a in "$@"; do case "$a" in\n'
             f'  identify) echo \'{{"caller": {caller}}}\'; exit 0 ;;\n'
@@ -706,6 +731,27 @@ def test_run_auto_detects_its_own_pane_without_any_pane_flag(rig):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "SELFPANE" in r.stdout and "this cmux tab" in r.stdout
     assert (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+
+
+def test_run_boot_line_carries_the_workspace_and_window_anchor(rig):
+    # issue #33: the boot line must name WHERE the runner landed (workspace + window), so a runner
+    # started in the wrong cmux window (the 2026-07-09 misplacement) is visible immediately — not an
+    # opaque pane UUID that could be any window.
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True, self_pane="SELFPANE",
+                                            workspace="WS-42", window="WIN-42"),
+                      "SL_PANE": "", "CMUX_PANE_ID": ""})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "workspace=WS-42" in r.stdout and "window=WIN-42" in r.stdout
+
+
+def test_run_boot_line_omits_anchor_fields_that_do_not_resolve(rig):
+    # An explicit --pane in an environment cmux-identify can't answer: the pane still resolves
+    # (preflight passes), but workspace/window are simply omitted — never printed as empty noise.
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "0",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True, self_pane="")})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "workspace=" not in r.stdout and "window=" not in r.stdout
 
 
 def test_run_fails_hard_when_the_pane_will_not_resolve(rig):

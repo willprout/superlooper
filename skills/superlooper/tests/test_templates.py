@@ -1,6 +1,12 @@
 """The Task-10 templates: the answerer brief (the hired judgment's entire world) and the
-launchd keep-alive plist. Both are consumed by substituting {name} placeholders literally
-(brief.py's _sub convention — never str.format, which chokes on prose braces)."""
+launchd NIGHTLY plist. Both are consumed by substituting {name} placeholders literally
+(brief.py's _sub convention — never str.format, which chokes on prose braces).
+
+There is deliberately NO launchd RUNNER plist (issue #33): a launchd-started runner is a
+detached daemon with no cmux tab, so it can never self-detect a pane; its startup preflight
+correctly fails hard, and a KeepAlive would relaunch it into the same failure forever. The
+runner is started/restarted by hand in a visible cmux tab (references/runner-ops.md → Restarting
+the runner); only the nightly — which needs no pane — runs under launchd."""
 import plistlib
 from pathlib import Path
 
@@ -39,24 +45,21 @@ def test_answerer_brief_renders_clean():
     assert "#42" in out and "A or B?" in out and "/tmp/home/answers/i42.md" in out
 
 
-# --------------------------- launchd template ---------------------------
+# --------------------------- launchd templates ---------------------------
 
-def test_launchd_template_is_a_valid_keepalive_plist():
-    t = (_TEMPLATES / "launchd.runner.plist").read_text()
-    for ph in ("{label}", "{superlooper_bin}", "{repo_path}", "{state_home}"):
-        assert ph in t, f"missing placeholder {ph}"
-    rendered = _sub(t, {"label": "com.superlooper.o__r",
-                        "superlooper_bin": "/Users/w/.claude/skills/superlooper/bin/superlooper",
-                        "repo_path": "/Users/w/projects/r",
-                        "state_home": "/Users/w/.superlooper/o__r"})
-    d = plistlib.loads(rendered.encode())
-    assert d["Label"] == "com.superlooper.o__r"
-    assert d["KeepAlive"] is True
-    args = d["ProgramArguments"]
-    assert args[0].endswith("superlooper") and "run" in args
-    # logs land in the state home (the external watchdog's one place to look)
-    assert d["StandardOutPath"].startswith("/Users/w/.superlooper/o__r")
-    assert d["StandardErrorPath"].startswith("/Users/w/.superlooper/o__r")
+def test_no_launchd_runner_template_ships():
+    # issue #33: the impossible mode must stay gone. NO launchd plist other than the nightly may
+    # invoke the `run` subcommand — a launchd runner is a detached daemon with no cmux tab, so the
+    # pane preflight fails hard whether it loops via KeepAlive or fires once via RunAtLoad. The
+    # runner is (re)started by hand in a cmux tab; nothing under templates/ may re-offer one. Checked
+    # on the parsed ProgramArguments (not a raw-text KeepAlive scan), so a RunAtLoad-only or
+    # differently-named runner plist is caught too.
+    assert not (_TEMPLATES / "launchd.runner.plist").exists()
+    for p in _TEMPLATES.glob("*.plist"):
+        if p.name == "launchd.nightly.plist":
+            continue
+        args = [str(a) for a in plistlib.loads(p.read_text().encode()).get("ProgramArguments", [])]
+        assert "run" not in args, f"{p.name} re-introduces a launchd runner (invokes `run`) — issue #33"
 
 
 def test_launchd_nightly_template_is_a_valid_scheduled_oneshot():
