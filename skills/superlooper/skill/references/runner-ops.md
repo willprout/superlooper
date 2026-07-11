@@ -25,6 +25,10 @@ doctor checklist at the end of this file.
 The runner is one foreground process. The normal way to run it is a **visible `superlooper run` in
 a cmux tab you can watch**; launchd (below) is the keep-alive option for unattended nights.
 
+(The bare `superlooper` command comes from publishing: `bin/install.sh` links it onto your PATH,
+pointing at the installed copy. If your shell can't find it, re-run the installer — it prints the
+exact PATH line to add. See `docs/ADOPTING.md` → "Getting the `superlooper` command".)
+
 ```bash
 superlooper run    --repo /path/to/repo      # the tick loop (foreground; Ctrl-C to stop)
 superlooper status --repo /path/to/repo      # lanes / queue / freeze state, from journal + disk

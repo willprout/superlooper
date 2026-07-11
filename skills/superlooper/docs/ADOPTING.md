@@ -11,6 +11,24 @@ the skill itself; it all enters through this config.
 
 ---
 
+## Getting the `superlooper` command
+
+Both commands below — and every `superlooper …` in these docs — assume the `superlooper` command
+resolves on your shell PATH. **Publishing puts it there.** The gated installer,
+
+```
+./bin/install.sh      # run once from the monorepo root; re-run to republish
+```
+
+copies the skill into `~/.claude/skills/superlooper/` and links a stable `superlooper` command into
+a standard user bin dir (it prefers `~/.local/bin`, falling back through `~/bin` and `/usr/local/bin`
+— whichever is already on your PATH). The link is a thin shim pointing at the installed copy, never
+this source repo, and it is re-created idempotently on every publish. The installer prints exactly
+what it linked and where; if the chosen dir is **not** on your PATH it does not silently skip — it
+prints the exact `export PATH="…"` line to add, then open a new shell. (This is separate from the
+launch shim, which self-runs *worker* sessions; the CLI link is what makes `superlooper` itself
+resolve.)
+
 ## The two commands
 
 ```

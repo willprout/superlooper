@@ -5,6 +5,11 @@ Superlooper has two kinds of prerequisites:
 - Repo state, checked by `superlooper doctor --repo /path/to/repo`.
 - Machine state, checked by `superlooper doctor --stack --repo /path/to/repo`.
 
+Both are invoked through the `superlooper` command itself, which the gated `bin/install.sh` links
+onto your PATH when it publishes the skill (a thin shim pointing at the installed copy; if no
+standard bin dir is on your PATH the installer prints the exact `export PATH="…"` line to add). See
+`ADOPTING.md` → "Getting the `superlooper` command".
+
 `doctor --stack` is read-only but for ONE deliberate, announced side effect: it sends a single
 test notification through the configured `notify` channel to prove it can actually deliver (see
 the `notify channel` block below). It does not install, repair, source, log in, write config,
