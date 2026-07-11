@@ -273,6 +273,59 @@ def test_wrong_typed_inputs_never_raise():
     assert report.morning("nope", 5, ledger=7, config=[])       # no raise
 
 
+# --- installed-engine publish drift notice (issue #39) -----------------------------------------
+# The runner/CLI pre-computes the drift (git lives in the impure assembler; report.py stays pure)
+# and hands it in via view['engine_drift']. The report carries a one-line nudge ONLY when the
+# installed engine is BEHIND — every other state (in sync, skipped, unknown) stays silent here.
+
+def _drift(status="behind", behind=6, ref="origin/main"):
+    return {"status": status, "behind": behind, "ref": ref, "installed_sha": "abc123"}
+
+
+def test_morning_report_carries_a_drift_notice_when_installed_engine_is_behind():
+    out = report.morning([], _view(now=0, queue=[], engine_drift=_drift(behind=6)),
+                         ledger={}, config=_cfg())
+    low = out.lower()
+    assert "installed engine" in low and "6" in out
+    assert "origin/main" in out
+    assert "install.sh" in out                                  # names the gated publish step
+    assert "republish" in low                                   # the nudge
+
+
+def test_drift_notice_uses_singular_for_one_commit():
+    out = report.morning([], _view(now=0, queue=[], engine_drift=_drift(behind=1)),
+                         ledger={}, config=_cfg())
+    assert "1 commit behind" in out and "1 commits" not in out
+
+
+def test_no_drift_notice_when_engine_is_in_sync_or_skipped_or_absent():
+    for ed in (_drift(status="in_sync", behind=0), _drift(status="skipped", behind=None),
+               _drift(status="unknown", behind=None), None):
+        out = report.morning([], _view(now=0, queue=[], engine_drift=ed),
+                             ledger={}, config=_cfg())
+        assert "behind" not in out.lower()
+        assert "republish" not in out.lower()
+
+
+def test_drift_notice_does_not_hijack_the_push_summary_line():
+    # The push notification body is the FIRST non-title, non-blank line — the tally / "nothing
+    # happened". The drift nudge must sit AFTER it, never replace it.
+    out = report.morning([], _view(now=0, queue=[], engine_drift=_drift(behind=6)),
+                         ledger={}, config=_cfg())
+    summary = next(ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#"))
+    assert "behind" not in summary.lower()                      # summary is untouched
+    assert "nothing happened" in summary.lower()                # a quiet night stays quiet
+
+
+def test_drift_notice_does_not_flip_a_quiet_night_to_noisy():
+    # Drift is a standing condition, not overnight activity — a quiet night with drift still reads
+    # "nothing happened overnight", with the nudge as an extra line.
+    out = report.morning([], _view(now=0, queue=[], engine_drift=_drift(behind=6)),
+                         ledger={}, config=_cfg())
+    assert "nothing happened" in out.lower()
+    assert "installed engine" in out.lower()
+
+
 # =============================== promotion evidence ===============================
 
 def _f(tid, text):

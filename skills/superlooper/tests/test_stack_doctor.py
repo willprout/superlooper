@@ -108,6 +108,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("notify channel", True),
         ("launch shim sourced", True),
         ("runner anchor (live)", True),      # no repo in this config -> cleanly skipped, passes
+        ("installed engine current", True),  # no VERSION stamp injected -> cleanly skipped, passes
     ]
 
 
@@ -455,3 +456,189 @@ def test_runner_anchor_warns_when_recorded_pid_does_not_match_the_live_pid(tmp_p
     r = stack_doctor.check_runner_anchor(probe, {"repo": "o/r"})
     assert r.ok is True and r.warn is True and "no matching anchor" in r.detail.lower()
     assert probe.calls == []
+
+
+# --- installed-engine publish drift (issue #39) ------------------------------------------------
+# The running loop executes the INSTALLED engine (~/.claude/skills/superlooper), not this repo, so a
+# merged engine change is inert until someone republishes through the gated bin/install.sh — BY
+# DESIGN. What was missing (observed 2026-07-10) is VISIBILITY: the installed copy sat six merged
+# engine fixes behind main and no surface said so. This is a MACHINE-level fact (one installed copy
+# per machine, shared by every adopted repo), so it lives in the machine-level --stack doctor. It is
+# NEVER a FAIL — being behind is the design; it is a WARN at most. The git edge is behind Probe, so
+# tests inject canned git output and never reach a real repo.
+
+_SRC = "/src"                                          # a stand-in superlooper source checkout
+_VERSION_PATH = "/home/will/.claude/skills/superlooper/VERSION"
+_GIT = "/bin/git"
+
+
+def _drift_probe(*, version="abc123 2026-07-01", behind=None, in_history=True,
+                 refs=("origin/main",), toplevel=_SRC, has_payload=True, count_out=None,
+                 count_rc=0, count_err="", candidate_is_git=True, env=None):
+    """A FakeProbe with git stubbed for the drift walk: rev-parse --show-toplevel on the candidate,
+    cat-file -e on the stamp, rev-parse --verify on each ref, rev-list --count for the chosen ref."""
+    sha = version.split()[0] if version and version.split() else ""
+    spec = {"path": _GIT}
+    spec[("-C", _SRC, "rev-parse", "--show-toplevel")] = (
+        (0, toplevel + "\n", "") if candidate_is_git else (128, "", "not a git repository"))
+    spec[("-C", toplevel, "cat-file", "-e", sha + "^{commit}")] = (
+        (0, "", "") if in_history else (128, "", "Not a valid object name"))
+    # Only the refs in `refs` resolve (rc 0); any other ref the walk probes is left unstubbed, which
+    # FakeProbe returns as rc 127 — i.e. "does not resolve" — so ref preference/fallback is exercised.
+    for r in refs:
+        spec[("-C", toplevel, "rev-parse", "--verify", "--quiet", r + "^{commit}")] = (
+            0, r + "-sha\n", "")
+        out = count_out if count_out is not None else ("" if behind is None else str(behind))
+        spec[("-C", toplevel, "rev-list", "--count", sha + ".." + r, "--",
+              "skills/superlooper/skill")] = (count_rc, out + "\n", count_err)
+    files = {}
+    if version is not None:
+        files[_VERSION_PATH] = version
+    if has_payload:
+        files[toplevel + "/skills/superlooper/skill"] = ""
+    return FakeProbe(commands={"git": spec}, files=files, env=env or {})
+
+
+def test_engine_drift_reports_commit_distance_when_behind():
+    probe = _drift_probe(version="abc123 2026-07-01", behind=6)
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["status"] == "behind"
+    assert d["behind"] == 6
+    assert d["installed_sha"] == "abc123"
+    assert d["ref"] == "origin/main"
+    assert "6" in d["detail"] and "behind" in d["detail"].lower()
+    assert "install.sh" in d["detail"]                       # names the gated publish step
+
+
+def test_engine_drift_in_sync_when_zero_commits_behind():
+    probe = _drift_probe(behind=0)
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["status"] == "in_sync"
+    assert d["behind"] == 0
+
+
+def test_engine_drift_skips_when_no_version_stamp():
+    probe = _drift_probe(version=None)                       # installed copy carries no VERSION
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["status"] == "skipped"
+    assert d["behind"] is None
+    assert "stamp" in d["detail"].lower()
+
+
+def test_engine_drift_skips_on_a_nogit_stamp():
+    probe = _drift_probe(version="nogit 2026-07-01")         # published from a non-git payload
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["status"] == "skipped"
+    assert "nogit" in d["detail"].lower()
+
+
+def test_engine_drift_skips_when_no_source_checkout_present():
+    # A generic adopted repo (an eApp) is NOT a superlooper source tree — there is nothing to
+    # compare against, so the check honestly skips rather than inventing a comparison.
+    probe = _drift_probe(behind=6, has_payload=False)
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["status"] == "skipped"
+    assert "source checkout" in d["detail"].lower()
+
+
+def test_engine_drift_unknown_when_stamp_not_in_history():
+    # A rebased or unrelated history: the stamped commit is not reachable, so a rev-list distance is
+    # meaningless. Surface it as an anomaly (WARN-worthy), never a silent green or a fabricated count.
+    probe = _drift_probe(behind=6, in_history=False)
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["status"] == "unknown"
+    assert d["behind"] is None
+    assert "history" in d["detail"].lower()
+
+
+def test_engine_drift_unknown_when_git_count_errors():
+    probe = _drift_probe(behind=6, count_rc=128, count_out="fatal")
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["status"] == "unknown"
+    assert d["behind"] is None
+
+
+def test_engine_drift_ignores_stderr_advisories_when_the_count_is_valid():
+    # git can print an advisory to stderr (e.g. an ambiguous refname) while still emitting the
+    # count to stdout. The count parse must read stdout only — merging stderr in would fail
+    # isdigit() and misreport a healthy behind/in-sync repo as an 'unknown' anomaly.
+    probe = _drift_probe(behind=6, count_err="warning: refname 'main' is ambiguous.\n")
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["status"] == "behind"
+    assert d["behind"] == 6
+
+
+def test_engine_drift_prefers_origin_dev_ref_over_local_and_head():
+    # The loop merges engine fixes to origin/<dev_branch>; a stale local branch would undercount.
+    # origin/main must win the ref preference when it resolves.
+    probe = _drift_probe(behind=6, refs=("origin/main", "main", "HEAD"))
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["ref"] == "origin/main"
+    assert d["behind"] == 6
+
+
+def test_engine_drift_falls_back_to_local_dev_ref_when_no_origin():
+    probe = _drift_probe(behind=3, refs=("main", "HEAD"))
+    d = stack_doctor.engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert d["ref"] == "main"
+    assert d["behind"] == 3
+
+
+def test_engine_drift_honors_sl_source_repo_override():
+    # An operator whose source checkout is elsewhere (not the adopted repo_path) points at it via
+    # SL_SOURCE_REPO. Here repo_path is a non-source directory; the override supplies the real tree.
+    probe = _drift_probe(behind=2, env={"SL_SOURCE_REPO": _SRC})
+    d = stack_doctor.engine_drift(probe, repo_path="/some/eapp", dev_branch="main")
+    assert d["status"] == "behind"
+    assert d["behind"] == 2
+
+
+def test_engine_drift_never_raises_on_garbage_inputs():
+    # Fail-closed like the rest of the doctor: a wrong-typed probe/args yield a structured skip,
+    # never an exception that could take down doctor or the morning-report assembler.
+    d = stack_doctor.engine_drift(FakeProbe(), repo_path=None, dev_branch="main")
+    assert d["status"] in ("skipped", "unknown")
+    assert isinstance(d["detail"], str) and d["detail"]
+
+
+def test_check_engine_drift_warns_but_never_fails_when_behind():
+    # Being behind is BY DESIGN (inert-until-republished). It must be a WARN — visible but never a
+    # FAIL that would break an otherwise-healthy stack or pressure toward auto-republish.
+    probe = _drift_probe(behind=6)
+    r = stack_doctor.check_engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert r.ok is True and r.warn is True                   # WARN, not FAIL
+    assert "6" in r.detail and "install.sh" in r.detail
+    line = stack_doctor.format_results([r])[0]
+    assert line.strip().startswith("WARN")
+
+
+def test_check_engine_drift_plain_ok_when_in_sync():
+    probe = _drift_probe(behind=0)
+    r = stack_doctor.check_engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert r.ok is True and r.warn is False                  # a clean ok line, no WARN
+    line = stack_doctor.format_results([r])[0]
+    assert line.strip().startswith("ok")
+
+
+def test_check_engine_drift_plain_ok_when_skipped():
+    probe = _drift_probe(behind=6, has_payload=False)        # no source checkout -> skip
+    r = stack_doctor.check_engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert r.ok is True and r.warn is False
+
+
+def test_check_engine_drift_warns_on_measurement_anomaly():
+    probe = _drift_probe(behind=6, in_history=False)         # stamp not in history -> unknown
+    r = stack_doctor.check_engine_drift(probe, repo_path=_SRC, dev_branch="main")
+    assert r.ok is True and r.warn is True
+
+
+def test_check_stack_threads_repo_path_and_dev_branch_into_the_drift_row():
+    # The stack list must carry the drift row, fed the caller's repo_path and the config's
+    # dev_branch (so origin/<dev_branch> is the compared ref, not a hardcoded 'main').
+    probe = _drift_probe(behind=4, refs=("origin/release",))
+    results = stack_doctor.check_stack(
+        {"dev_branch": "release", "notify": {"cmd": "true", "imessage_to": None}},
+        probe=probe, sender=_ok_sender(), announce=lambda *a: None, repo_path=_SRC,
+    )
+    drift = next(r for r in results if r.name == "installed engine current")
+    assert drift.warn is True and "4" in drift.detail and "origin/release" in drift.detail
