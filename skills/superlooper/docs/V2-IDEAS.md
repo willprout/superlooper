@@ -16,8 +16,10 @@ PR #4).*
   `write-issue` (the issue-writing front-end promoted from references/issue-writing.md),
   `adopt`, `cross-review` (absorbed from William's machine-local skill — review quality must
   not ride on ambient tooling), and `sl-debugger` (a skill that understands the whole system
-  so a fresh session can diagnose and fix a broken loop/dashboard instance; MAY be deferred
-  to its own design session if too big — the planning session makes that call explicitly).
+  so a fresh session can diagnose and fix a broken loop/dashboard instance). Owner sequencing
+  ruling 2026-07-10: sl-debugger is authored FIRST as its own build (issue #64, approved);
+  the plugin design runs as investigation #65 (`blocked-by: #64`, approval deliberately held
+  until #64 lands) and absorbs the finished skill rather than inventing it.
   Sharing bar for v1: a stranger pastes the GitHub repo link into a Claude Code session, says
   "install this," and everything needed lands (downloading cmux etc. is acceptable);
   mechanism is the design session's choice. Updates KEEP THE HUMAN GATE: engine/executables
