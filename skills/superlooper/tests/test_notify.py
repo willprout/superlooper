@@ -135,3 +135,61 @@ def test_default_cmux_is_neutralized_in_the_test_suite():
     # bundle and this fails on EVERY machine — not just ones with cmux installed.
     resolved = notify._cmux_binary()
     assert "/Applications/" not in resolved, resolved
+
+
+# --- send_test: the stack doctor's rich-result entry point (issue #25) --------------------
+# send() flattens delivery to a journaled outcome STRING; send_test() runs the SAME precedence
+# but returns the full SendResult (channel, ok, rc, stderr) the doctor needs to FAIL a block on
+# a nonzero send and print the actual error — a string like "cmd notify failed (rc=2)" hides the
+# stderr that says WHY (the live 2026-07-10 incident: recipient file missing → exit 2).
+
+def test_send_test_returns_ok_result_on_successful_cmd_send(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    out_file = tmp_path / "ran.txt"
+    cfg = {"notify": {"imessage_to": None,
+                      "cmd": f'printf "%s" "$SL_TITLE" > {out_file}'}}
+    r = notify.send_test(cfg, "TITLE", "BODY")
+    assert r.channel == "cmd"
+    assert r.ok is True
+    assert r.rc == 0
+    assert out_file.read_text() == "TITLE"          # it really ran through the configured path
+
+
+def test_send_test_carries_rc_and_stderr_from_a_failed_cmd_send(tmp_path, monkeypatch):
+    # Reproduces the live incident shape: the configured command exits nonzero and writes the
+    # real reason to stderr. send_test must surface BOTH so the doctor can print rc + the tail.
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    cfg = {"notify": {"imessage_to": None,
+                      "cmd": 'printf "recipient file missing\\n" 1>&2; exit 2'}}
+    r = notify.send_test(cfg, "t", "b")
+    assert r.channel == "cmd"
+    assert r.ok is False
+    assert r.rc == 2
+    assert "recipient file missing" in r.stderr
+
+
+def test_send_test_never_raises_and_reports_log_only_when_unconfigured(tmp_path, monkeypatch):
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-such-cmux"))
+    r = notify.send_test({"notify": {"imessage_to": None, "cmd": None}}, "t", "b")
+    assert r.channel == "log-only"
+    assert r.ok is True          # nothing to send is not a failure — the doctor gates on config
+
+
+def test_send_never_raises_on_a_pathological_config_value(tmp_path, monkeypatch):
+    # A config value with an embedded null byte makes subprocess.run raise ValueError (not OSError).
+    # The documented contract is "never an exception into the tick" — and the read-only doctor now
+    # calls this path, so it must degrade to a returned failure, never a traceback.
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    out = notify.send({"notify": {"imessage_to": "+1555\x00bad"}}, "t", "b")
+    assert "imessage" in out and "fail" in out.lower(), out
+    r = notify.send_test({"notify": {"cmd": "printf x\x00"}}, "t", "b")
+    assert r.ok is False and r.rc != 0
+
+
+def test_send_still_returns_the_same_outcome_strings_after_refactor(tmp_path, monkeypatch):
+    # send()'s journaled-string contract (the runner depends on it) is unchanged by send_test.
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    ok = notify.send({"notify": {"cmd": 'exit 0'}}, "t", "b")
+    bad = notify.send({"notify": {"cmd": 'exit 2'}}, "t", "b")
+    assert ok == "sent via cmd"
+    assert bad == "cmd notify failed (rc=2)"
