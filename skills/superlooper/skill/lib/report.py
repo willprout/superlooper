@@ -98,13 +98,49 @@ def _in_window(rec, window_start):
     return ts is None or ts >= window_start
 
 
-def _merged(records, repo, window_start):
+_MERGE_ACTS = ("merge", "absorb_merged")
+
+
+def _reconciled_parks(records, window_start):
+    """Issue numbers whose in-window park was SUPERSEDED by a later landing (merge/absorb_merged) —
+    i.e. the issue parked, was re-approved, and merged (#37). Such a park is no longer an OPEN ask:
+    its final outcome is 'merged', so it must not be reported as needing William.
+
+    Reconciliation is by final outcome, not mere co-occurrence — a park counts as resolved only when
+    a landing came strictly at-or-after it (latest merge ts >= latest park ts). A merge that came
+    BEFORE the park (an issue that landed, re-opened, then parked again) leaves the park as the
+    latest word and a genuine open ask. A corrupt park with no comparable ts, paired with any
+    in-window landing, is treated as resolved (a same-window landing is strong evidence the ask was
+    answered); a landing with no comparable ts never resolves a real-ts park (honest over-report)."""
+    park_ts, merge_ts = {}, {}
+
+    def note(store, num, ts):
+        # track the latest KNOWN ts per issue; a missing/corrupt ts records presence at -inf so it
+        # never wins a max() against a real stamp.
+        store[num] = max(store.get(num, float("-inf")), ts if ts is not None else float("-inf"))
+
+    for r in records:
+        if not (_ok(r) and _in_window(r, window_start)):
+            continue
+        num = _num(r.get("num"))
+        if num is None:
+            continue
+        act = r.get("act")
+        if act == "park":
+            note(park_ts, num, _ts(r))
+        elif act in _MERGE_ACTS:
+            note(merge_ts, num, _ts(r))
+    return {num for num, pts in park_ts.items() if num in merge_ts and merge_ts[num] >= pts}
+
+
+def _merged(records, repo, window_start, parked_earlier=frozenset()):
     """Clean merges AND absorbed out-of-band merges (a PR that landed on GitHub between merge and
     bookkeeping) — both are issues that landed. Windowed to the overnight bound, deduped by issue
-    number, latest record wins."""
+    number, latest record wins. Issues in `parked_earlier` (parked then later merged this window)
+    carry an inline note so the resolved park episode reads as history here, not a lost open ask."""
     seen = {}
     for r in records:
-        if r.get("act") in ("merge", "absorb_merged") and _ok(r) and _in_window(r, window_start):
+        if r.get("act") in _MERGE_ACTS and _ok(r) and _in_window(r, window_start):
             num = _num(r.get("num"))
             if num is not None:
                 seen[num] = (r.get("id"), _num(r.get("pr")))
@@ -113,16 +149,19 @@ def _merged(records, repo, window_start):
         iid, pr = seen[num]
         tag = f" ({iid})" if iid else ""
         pr_bit = f" · PR {_pr_link(repo, pr)}" if pr is not None else ""
-        lines.append(f"- #{num}{tag} — {_issue_link(repo, num)}{pr_bit}")
+        note = " · parked earlier, later merged" if num in parked_earlier else ""
+        lines.append(f"- #{num}{tag} — {_issue_link(repo, num)}{pr_bit}{note}")
     return lines
 
 
-def _parked(records, window_start):
+def _parked(records, window_start, resolved=frozenset()):
+    """Open asks only. A parked issue whose final outcome was a later merge (`resolved`, from
+    _reconciled_parks) is dropped here — it renders once under Merged, never as a second open ask."""
     seen = {}
     for r in records:
         if r.get("act") == "park" and _ok(r) and _in_window(r, window_start):
             num = _num(r.get("num"))
-            if num is not None:
+            if num is not None and num not in resolved:
                 seen[num] = (r.get("id"), bool(r.get("needs_william")), r.get("memo"))
     lines = []
     for num in sorted(seen):
@@ -284,8 +323,11 @@ def morning(journal_records, gh_view, ledger, config):
     date = view.get("date")
     date = date if isinstance(date, str) and date.strip() else "(date unknown)"
 
-    merged = _merged(records, repo, overnight_start)
-    parked = _parked(records, overnight_start)
+    # Reconcile park records against final outcomes (#37): a park that later merged this window is
+    # resolved, so it leaves the open-ask Parked section and is annotated on its Merged line.
+    resolved_parks = _reconciled_parks(records, overnight_start)
+    merged = _merged(records, repo, overnight_start, resolved_parks)
+    parked = _parked(records, overnight_start, resolved_parks)
     bounces = _bounces(records, overnight_start)
     regens = _regenerations(records, week_start)
     wanders = _wanders(records, overnight_start)
