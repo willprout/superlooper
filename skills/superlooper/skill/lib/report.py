@@ -266,6 +266,27 @@ def _gate_health(records, window_start, ledger, config):
     return lines
 
 
+def _watchdog(records, window_start):
+    """Unattended-debugger activity (issue #66): every watchdog LAUNCH — verified or failed —
+    must reach the owner's morning surface. Notified/stood-down episodes stay in the journal
+    only: nothing ultimately happened, and the summary's quiet claim must stay honest."""
+    lines = []
+    for r in records:
+        if r.get("act") != "watchdog" or not _in_window(r, window_start):
+            continue
+        sigs = ", ".join(s for s in (r.get("signals") or []) if isinstance(s, str)) \
+            or "(signal unrecorded)"
+        if r.get("outcome") == "launched":
+            lines.append(f"- Launched unattended sl-debugger session {r.get('id')} — signals: "
+                         f"{sigs}; authority: {r.get('authority')}. Its memo is in this "
+                         "reports/ folder.")
+        elif r.get("outcome") == "launch_failed":
+            lines.append(f"- Launch of unattended sl-debugger session {r.get('id')} FAILED "
+                         f"(rc={r.get('rc')}) — signals: {sigs}. The loop needed attention "
+                         "overnight and the fallback could not start.")
+    return lines
+
+
 def _freeze(view):
     frozen = view.get("frozen")
     if isinstance(frozen, dict) and frozen:
@@ -331,13 +352,15 @@ def morning(journal_records, gh_view, ledger, config):
     bounces = _bounces(records, overnight_start)
     regens = _regenerations(records, week_start)
     wanders = _wanders(records, overnight_start)
+    watchdog = _watchdog(records, overnight_start)
     frozen = isinstance(view.get("frozen"), dict) and bool(view.get("frozen"))
     queue = [q for q in view.get("queue") if isinstance(q, dict)] if isinstance(view.get("queue"), list) else []
 
     # A routine (green) nightly is the system working, not activity that needs William — and one
     # runs EVERY night, so counting it here would mean no night is ever quiet. A RED nightly shows
-    # up as `frozen` instead, which does break quiet.
-    quiet = not any((merged, parked, bounces, regens, wanders, queue, frozen))
+    # up as `frozen` instead, which does break quiet. An unattended debugger LAUNCH (or a launch
+    # that failed) always breaks quiet — the owner must never coffee past one (issue #66).
+    quiet = not any((merged, parked, bounces, regens, wanders, watchdog, queue, frozen))
     summary = ("Nothing happened overnight — queue empty." if quiet else
                f"{len(merged)} merged · {len(parked)} parked/needs-william · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · queue: {len(queue)}.")
@@ -350,6 +373,7 @@ def morning(journal_records, gh_view, ledger, config):
         _section("Bounces", bounces),
         _section("Conflict regenerations (last 7 days)", regens),
         _section("Wanders", wanders),
+        _section("Unattended debugger", watchdog, "None — the watchdog launched nothing."),
         _section("Gate health", _gate_health(records, week_start, ledger, cfg)),
         "## Freeze state\n" + "\n".join(_freeze(view)) + "\n",
         _section("Usage / queue", _usage_queue(view)),

@@ -22,6 +22,10 @@
                   `superseded` PRs, aged parked/needs-william issues) and execute ONLY what
                   William approves (y/N or --yes) — list/--dry-run changes nothing anywhere;
                   nothing is ever auto-closed or auto-deleted (issue #62, spec §8 V2)
+  watchdog        one MECHANICAL health check (issue #66): stale heartbeat / present ALERT /
+                  the no-progress shape -> notify the owner -> grace window -> launch ONE
+                  unattended sl-debugger session through the launch shim. Run it on an
+                  interval via templates/launchd.watchdog.plist; state/WATCHDOG_OFF disables
 """
 import argparse
 import glob
@@ -1230,6 +1234,253 @@ def cmd_janitor(args):
     return 1 if failed else 0
 
 
+# ------------------------------- watchdog (issue #66) -------------------------------
+# `superlooper watchdog` is ONE mechanical health check — the unattended-debugger fallback.
+# No LLM call exists anywhere on this path and it makes no repair decisions: it reads the
+# engine's own signals (state/runner.heartbeat, state/ALERT, the no-progress shape), and per
+# lib/watchdog.py's episode rules notifies -> waits the grace -> launches ONE sl-debugger
+# session through the SAME interactive launch shim workers use (launch-session.sh --cwd,
+# never a headless `claude -p` — owner billing rule). Run it on an interval via
+# templates/launchd.watchdog.plist (it may run under launchd: a check needs no cmux pane;
+# the rare launch targets the RUNNER's recorded anchor and fails loudly when none resolves).
+# state/WATCHDOG_OFF disables the whole path; every transition is journaled.
+
+WATCHDOG_LAUNCH_TIMEOUT = 180   # launch-session.sh verifies delivery within ~30s; generous
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True
+
+
+def _live_lock(path):
+    """A lock file naming a LIVE pid. Unreadable/garbage content reads as dead (reclaimable)."""
+    pid = (_read(path) or "").strip()
+    return pid.isdigit() and _pid_alive(int(pid))
+
+
+def _watchdog_heartbeat(state_dir):
+    """Epoch of the last COMPLETED runner tick, or None when the loop never ran here (an
+    absent heartbeat is not a stale one) or the file is unreadable/garbage (fail toward
+    no-signal: the ALERT/no-progress detectors still stand, and a corrupt heartbeat file
+    would otherwise read as an eternal 3am trip)."""
+    txt = _read(os.path.join(state_dir, "runner.heartbeat"))
+    try:
+        return int((txt or "").strip())
+    except ValueError:
+        return None
+
+
+def _watchdog_alert(state_dir):
+    """The ALERT dict, {} when present-but-unreadable (existence IS the signal — fail
+    closed, runner._read_json's posture), None when absent."""
+    path = os.path.join(state_dir, "ALERT")
+    if not os.path.exists(path):
+        return None
+    v = _read_json_file(path, {})
+    return v if isinstance(v, dict) else {}
+
+
+def _watchdog_lanes_busy(home, state_dir):
+    """Any lane occupied, from DISK truth: an in-flight status in issues.json, or a live
+    worker singleton lock for an issue id (a session the state file has not caught up with)."""
+    import actions
+    try:
+        st = loopstate.load(os.path.join(state_dir, "issues.json"))
+    except (OSError, ValueError):
+        st = {}
+    if actions.lane_state_from(st):
+        return True
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        names = []
+    return any(n.startswith("worker.i") and n.endswith(".lock")
+               and _live_lock(os.path.join(state_dir, n)) for n in names)
+
+
+def _watchdog_debugger_live(state_dir):
+    """A live unattended sl-debugger session: any worker.d<N>.lock naming a live pid
+    (start-session.sh's per-id singleton — the same file that keeps workers single)."""
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return False
+    return any(n.startswith("worker.d") and n.endswith(".lock")
+               and _live_lock(os.path.join(state_dir, n)) for n in names)
+
+
+def _watchdog_gh_view(cfg):
+    """(gh_ok, eligible_nums): the no-progress detector's INDEPENDENT eligibility read —
+    agent-ready issues from GitHub, filtered through the same issues.eligible rule the
+    scheduler uses (blocked-by holds, parked/needs-william, in-progress all excluded), so a
+    designed-safe wait can never read as waiting work. Every gh read fails closed toward
+    'nothing eligible' — the safe (non-tripping) direction."""
+    import watchdog as watchdog_lib
+    if not gh.probe():
+        return False, []
+    parsed = [issues_lib.parse_issue(r) for r in gh.ready_issues()]
+    closed = gh.closed_issue_nums()
+    return True, watchdog_lib.eligible_nums(parsed, closed)
+
+
+def _watchdog_usage_exhausted():
+    """True only when the meter SUCCESSFULLY reads at/over a launch ceiling — the runner's
+    designed fail-closed hold. A dark/unreadable meter is False (the #46/#76 asymmetry): it
+    must never suppress the detector, especially under launchd where the Keychain read can
+    fail. SL_FAKE_USAGE injects the read for tests/simulation, exactly like cmd_run."""
+    import watchdog as watchdog_lib
+    fake = os.environ.get("SL_FAKE_USAGE")
+    try:
+        if fake:
+            usage = json.loads(fake)
+        else:
+            import usage as usage_mod
+            usage = usage_mod.fetch_claude_usage()
+    except Exception:
+        return False
+    return watchdog_lib.usage_reads_exhausted(usage)
+
+
+def _watchdog_pane(state_dir):
+    """The cmux pane the debugger tab is born in: an explicit $SL_PANE override, else the
+    RUNNER's recorded anchor (state/runner.anchor.json — present while a runner is live or
+    crashed; a clean stop clears it), else this process's own tab when run by hand inside
+    cmux. "" when nothing resolves — the launch then fails loudly, never silently."""
+    pane = os.environ.get("SL_PANE") or ""
+    if pane.strip():
+        return pane.strip()
+    anchor = _read_json_file(os.path.join(state_dir, "runner.anchor.json"), None)
+    if isinstance(anchor, dict):
+        pane = anchor.get("pane")
+        if isinstance(pane, str) and pane.strip():
+            return pane.strip()
+    from runner import detect_self_anchor
+    return detect_self_anchor()["pane"]
+
+
+def _watchdog_launch(repo, cfg, home, state_dir, launch, state):
+    """Execute one launch request through the SAME shim stack workers use. Returns the rc
+    fed to watchdog.after_launch: 0 only when launch-session.sh VERIFIED delivery."""
+    import watchdog as watchdog_lib
+    ep = state.get("episode") if isinstance(state.get("episode"), dict) else {}
+    wd = cfg.get("watchdog") if isinstance(cfg.get("watchdog"), dict) else {}
+    template = _read(os.path.join(_TEMPLATES, "debugger-brief.md")) or ""
+    brief = watchdog_lib.render_brief(template, {
+        "signals": ", ".join(launch.get("signals") or []),
+        "detail": ep.get("detail") or ", ".join(launch.get("signals") or []),
+        "authority": launch.get("authority"),
+        "allowlist": ", ".join(launch.get("allowlist") or []) or "(none)",
+        "state_home": home,
+        "repo_path": os.path.abspath(repo),
+        "repo_slug": cfg.get("repo"),
+        "grace_minutes": wd.get("grace_minutes", 30),
+    })
+    os.makedirs(os.path.join(home, "briefs"), exist_ok=True)
+    with open(os.path.join(home, "briefs", f"{launch['id']}.md"), "w") as f:
+        f.write(brief)
+    pane = _watchdog_pane(state_dir)
+    if not pane:
+        print("watchdog: no cmux pane resolves (no $SL_PANE, no recorded runner anchor, not "
+              "inside cmux) — cannot launch; notifying instead.", file=sys.stderr)
+        return "no_pane"
+    models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    script = os.environ.get("SL_LAUNCH_SESSION") or os.path.join(_HERE, "launch-session.sh")
+    env = {**os.environ,
+           "SL_RUN_ROOT": home, "SL_PANE": pane,
+           # the debugger is a hired-judgment seat like the answerer — same model default
+           "SL_MODEL": models.get("answerer") or "opus[1m]", "SL_EFFORT": "",
+           "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
+    try:
+        r = subprocess.run([script, "--cwd", os.path.abspath(repo), launch["id"]],
+                           env=env, capture_output=True, text=True,
+                           timeout=WATCHDOG_LAUNCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 124
+    except OSError:
+        return 127
+    out = (r.stdout or "") + (r.stderr or "")
+    if out.strip():
+        print(out.strip())
+    return r.returncode
+
+
+def cmd_watchdog(args):
+    import watchdog as watchdog_lib
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    state_dir = os.path.join(home, "state")
+    os.makedirs(state_dir, exist_ok=True)
+    now = time.time()
+
+    # Per-state-home singleton: a hand-run check and the launchd firing must never interleave
+    # their read-evaluate-write on watchdog.json. A dead holder's lock is reclaimed.
+    lock = os.path.join(state_dir, "watchdog.lock")
+    if _live_lock(lock):
+        print("another watchdog check is live for this state home — exiting")
+        return 0
+    with open(lock, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        heartbeat = _watchdog_heartbeat(state_dir)
+        alert = _watchdog_alert(state_dir)
+        lanes_busy = _watchdog_lanes_busy(home, state_dir)
+        wd = cfg.get("watchdog") if isinstance(cfg.get("watchdog"), dict) else {}
+        stale_secs = wd.get("heartbeat_stale_minutes", 20) * 60
+        hb_fresh = isinstance(heartbeat, int) and now - heartbeat <= stale_secs
+        # The gh eligibility read + usage read are spent only when they can matter: a stale
+        # heartbeat is already the louder signal, and a busy lane is progress by definition.
+        gh_ok, eligible = (False, [])
+        if hb_fresh and not lanes_busy:
+            gh_ok, eligible = _watchdog_gh_view(cfg)
+        usage_exhausted = bool(eligible) and _watchdog_usage_exhausted()
+
+        view = {"heartbeat": heartbeat, "alert": alert, "lanes_busy": lanes_busy,
+                "gh_ok": gh_ok, "eligible_nums": eligible,
+                "usage_exhausted": usage_exhausted,
+                "kill_switch": os.path.exists(
+                    os.path.join(state_dir, watchdog_lib.KILL_SWITCH_FILENAME)),
+                "debugger_live": _watchdog_debugger_live(state_dir)}
+        state_path = os.path.join(state_dir, watchdog_lib.STATE_FILENAME)
+        prior = watchdog_lib.coerce_state(_read_json_file(state_path, None))
+
+        res = watchdog_lib.evaluate(now, cfg, view, prior)
+        for rec in res["journal"]:
+            journal.append(home, rec, now)
+        for title, body in res["notify"]:
+            print(f"notify: {notify.send(cfg, title, body)}")
+
+        final = res["state"]
+        if res["launch"] is not None:
+            rc = _watchdog_launch(args.repo, cfg, home, state_dir, res["launch"], final)
+            done = watchdog_lib.after_launch(now, cfg, final, res["launch"], rc)
+            for rec in done["journal"]:
+                journal.append(home, rec, now)
+            for title, body in done["notify"]:
+                print(f"notify: {notify.send(cfg, title, body)}")
+            final = done["state"]
+
+        loopstate.save(state_path, final)
+        ep = final.get("episode")
+        print("watchdog: " + ("DISABLED (state/WATCHDOG_OFF) — observed: "
+                              + (", ".join(res["journal"][0]["signals"]) or "no signal")
+                              if view["kill_switch"] else
+                              f"episode open ({', '.join(ep['signals'])})" if ep else
+                              "healthy — no signal"))
+        return 0
+    finally:
+        if (_read(lock) or "").strip() == str(os.getpid()):
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
+
 # ------------------------------- stubs -------------------------------
 
 def _stub(which, wave):
@@ -1283,6 +1534,7 @@ def main(argv=None):
            "--yes": dict(action="store_true", help="skip the y/N confirmation"),
            "--dry-run": dict(action="store_true",
                              help="list the windows tidy would close, then close nothing")})
+    add("watchdog", cmd_watchdog)
     add("janitor", cmd_janitor,
         **{"--dry-run": dict(action="store_true",
                              help="list the proposals and change NOTHING anywhere"),

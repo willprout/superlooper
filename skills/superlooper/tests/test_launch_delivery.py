@@ -376,6 +376,37 @@ def test_answerer_cwd_mode_launches_in_place_without_worktree(tmp_path):
     assert "a1" not in st["issues"], "an answerer must not be stamped as an issue"
 
 
+def test_debugger_cwd_mode_launches_like_an_answerer(tmp_path):
+    """The watchdog's unattended sl-debugger session (issue #66) rides the SAME --cwd mode as an
+    answerer, with a d<N> id: launched in an existing dir (the target repo checkout), no worktree,
+    no issues.json entry, and the identical shim delivery verification — never a headless
+    `claude -p` (owner billing rule)."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    (run_root / "briefs" / "d1.md").write_text("diagnose the instance")
+    launch_dir = os.path.join(os.path.dirname(str(run_root)), "launchdir_d")
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{stubdir}:{os.environ['PATH']}",
+        "SL_RUN_ROOT": str(run_root),
+        "SL_PANE": "pane:1",
+        "SL_CMUX": str(cmux),
+        "STUB_DIR": str(stubdir),
+        "SHIM_PATH": SHIM_PATH,
+        "SL_LAUNCH_DIR": launch_dir,
+        "STUB_MODE": "deliver",
+        "SL_LAUNCH_VERIFY_SECONDS": "5",
+    }
+    r = subprocess.run([LAUNCH, "--cwd", str(repo), "d1"], env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"debugger launch must succeed, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert (run_root / "state" / "activity" / "d1").exists(), "debugger activity must be recorded"
+    assert (run_root / "state" / "panes" / "d1").exists(), "debugger pane must be recorded"
+    assert not (run_root / "worktrees" / "d1").exists(), "a debugger session must NOT create a worktree"
+    st = json.load(open(run_root / "state" / "issues.json"))
+    assert "d1" not in st["issues"], "a debugger session must not be stamped as an issue"
+
+
 def test_answerer_missing_cwd_dir_fails(tmp_path):
     """A --cwd dir that does not exist is a runner bug — fail before creating a tab, not silently."""
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)

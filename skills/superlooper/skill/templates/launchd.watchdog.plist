@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- superlooper unattended-debugger watchdog (issue #66). Fires `superlooper watchdog` every
+     {interval_seconds} seconds as a scheduled ONE-SHOT — each firing reads the health signals
+     (state/runner.heartbeat, state/ALERT, the no-progress shape), updates its episode state,
+     and exits. NOT a keep-alive: no KeepAlive/RunAtLoad (issue #33's lesson stands — nothing
+     under templates/ may keep a paneless daemon alive). This job MAY run under launchd because
+     a check needs no cmux pane; only the rare launch step targets the RUNNER's recorded anchor
+     pane (state/runner.anchor.json), and a launch that cannot resolve one fails LOUDLY into a
+     journaled + notified outcome, never a fabricated success. Load it as a user LaunchAgent
+     (~/Library/LaunchAgents) so notify/osascript run in the owner's GUI session; the one-time
+     macOS permission that lets it text (notify.imessage_to) must be granted to that user, same
+     as the nightly (references/runner-ops.md). Placeholders ({label}, {superlooper_bin},
+     {repo_path}, {state_home}, {interval_seconds}) are substituted literally. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{superlooper_bin}</string>
+        <string>watchdog</string>
+        <string>--repo</string>
+        <string>{repo_path}</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>{interval_seconds}</integer>
+    <key>StandardOutPath</key>
+    <string>{state_home}/logs/watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>{state_home}/logs/watchdog.log</string>
+</dict>
+</plist>

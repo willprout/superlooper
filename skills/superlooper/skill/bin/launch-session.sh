@@ -54,12 +54,14 @@ PY
     echo "[$ID_IN] id sanitize validation failed — not launching" >&2
     exit 1
   fi
-  # --cwd is the ANSWERER path only: enforce the a<N> id shape so a runner bug can never route an
-  # issue id (i<N>) through here and silently skip worktree creation + the issue counter (fail closed
-  # on wrong-typed input, not just unsafe input — cross-review, Task 6). worktree_id already rejected
-  # unsafe chars; this pins the mode's contract.
-  if ! [[ "$ID" =~ ^a[0-9]+$ ]]; then
-    echo "[$ID] --cwd mode is for answerer ids (a<N>) only — refusing" >&2; exit 1
+  # --cwd is the in-place path: ANSWERER ids (a<N>) and the watchdog's unattended sl-debugger
+  # sessions (d<N>, issue #66) — both launch in an existing dir, no worktree, no branch. The id
+  # shape is enforced so a runner bug can never route an issue id (i<N>) through here and silently
+  # skip worktree creation + the issue counter (fail closed on wrong-typed input, not just unsafe
+  # input — cross-review, Task 6). worktree_id already rejected unsafe chars; this pins the mode's
+  # contract.
+  if ! [[ "$ID" =~ ^[ad][0-9]+$ ]]; then
+    echo "[$ID] --cwd mode is for answerer (a<N>) / debugger (d<N>) ids only — refusing" >&2; exit 1
   fi
   BRANCH=""
   NAME="superlooper $ID"

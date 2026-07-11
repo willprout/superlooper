@@ -66,6 +66,14 @@ _NESTED_DEFAULTS = {
     # own confirm step. 0 proposes every parked issue immediately.
     "janitor": {"aged_park_days": 14},
     "codex": {"dangerous_bypass": False, "bypass_hook_trust": True, "no_alt_screen": True},
+    # watchdog (issue #66): the unattended-debugger fallback. `authority` is the standing
+    # tier the launched sl-debugger session runs at — DEFAULT `full` (owner standing rule
+    # 2026-07-10); even `full` excludes the constitution absolutely, enforced by the
+    # sl-debugger skill's unattended contract, never relaxed here. `allowlist` names the
+    # exact repair verbs permitted at the `allowlist` tier. grace_minutes is the text->launch
+    # wait; the two *_minutes bounds tune the stale-heartbeat and no-progress detectors.
+    "watchdog": {"authority": "full", "allowlist": [], "grace_minutes": 30,
+                 "heartbeat_stale_minutes": 20, "no_progress_minutes": 30},
 }
 
 _ALLOWED_TOP = set(_TOP_DEFAULTS) | set(_NESTED_DEFAULTS) | {"repo"}
@@ -76,6 +84,8 @@ _MERGE_METHODS = {"squash", "merge", "rebase"}   # gh's own set; the runner defa
 # diagnose-and-fix); "investigate" is the reserved investigation pool. A merge-producing issue
 # never occupies an investigation lane — that reservation is the whole point.
 _LANE_POOLS = ("build", "investigate")
+# watchdog.authority tiers (issue #66): what the unattended sl-debugger session may do.
+_WATCHDOG_AUTHORITIES = {"diagnose-only", "allowlist", "full"}
 
 
 def _err(msg):
@@ -226,6 +236,19 @@ def _validate_and_fill(raw):
     for ck in ("dangerous_bypass", "bypass_hook_trust", "no_alt_screen"):
         if not isinstance(out["codex"][ck], bool):
             _err(f"'codex.{ck}' must be true or false, got {out['codex'][ck]!r}")
+    wd = out["watchdog"]
+    if not isinstance(wd["authority"], str) or wd["authority"] not in _WATCHDOG_AUTHORITIES:
+        _err(f"'watchdog.authority' must be one of {sorted(_WATCHDOG_AUTHORITIES)}, "
+             f"got {wd['authority']!r}")
+    if not isinstance(wd["allowlist"], list) or any(not isinstance(x, str) for x in wd["allowlist"]):
+        _err(f"'watchdog.allowlist' must be a list of strings, got {wd['allowlist']!r}")
+    # grace may be 0 (launch on the tripping check); the detection bounds must be >= 1 —
+    # a zero bound would trip on any instantaneous glimpse of the condition.
+    for wk, lo in (("grace_minutes", 0), ("heartbeat_stale_minutes", 1),
+                   ("no_progress_minutes", 1)):
+        v = wd[wk]
+        if isinstance(v, bool) or not isinstance(v, int) or v < lo:
+            _err(f"'watchdog.{wk}' must be an integer >= {lo}, got {v!r}")
 
     return out
 

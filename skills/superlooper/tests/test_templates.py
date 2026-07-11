@@ -8,6 +8,7 @@ correctly fails hard, and a KeepAlive would relaunch it into the same failure fo
 runner is started/restarted by hand in a visible cmux tab (references/runner-ops.md → Restarting
 the runner); only the nightly — which needs no pane — runs under launchd."""
 import plistlib
+import re
 from pathlib import Path
 
 _TEMPLATES = Path(__file__).resolve().parent.parent / "skill" / "templates"
@@ -58,7 +59,10 @@ def test_no_launchd_runner_template_ships():
     for p in _TEMPLATES.glob("*.plist"):
         if p.name == "launchd.nightly.plist":
             continue
-        args = [str(a) for a in plistlib.loads(p.read_text().encode()).get("ProgramArguments", [])]
+        # render {placeholder}s with a type-neutral dummy first — a template may hold one inside
+        # an <integer> element (e.g. the watchdog's {interval_seconds}), which raw plistlib rejects.
+        rendered = re.sub(r"\{[a-z_]+\}", "1", p.read_text())
+        args = [str(a) for a in plistlib.loads(rendered.encode()).get("ProgramArguments", [])]
         assert "run" not in args, f"{p.name} re-introduces a launchd runner (invokes `run`) — issue #33"
 
 
@@ -79,3 +83,55 @@ def test_launchd_nightly_template_is_a_valid_scheduled_oneshot():
     args = d["ProgramArguments"]
     assert args[0].endswith("superlooper") and "nightly" in args
     assert d["StandardOutPath"].endswith("/logs/nightly.log")
+
+
+# --------------------------- watchdog templates (issue #66) ---------------------------
+
+def test_debugger_brief_carries_the_unattended_invocation_context():
+    t = (_TEMPLATES / "debugger-brief.md").read_text()
+    # every placeholder the watchdog substitutes
+    for ph in ("{signals}", "{detail}", "{authority}", "{allowlist}", "{state_home}",
+               "{repo_path}", "{repo_slug}", "{grace_minutes}"):
+        assert ph in t, f"missing placeholder {ph}"
+    low = t.lower()
+    # the invocation contract: the session knows it is UNATTENDED, invokes the sl-debugger
+    # skill, follows its unattended contract, ends with the memo + notify, and never loops.
+    assert "sl-debugger" in low
+    assert "unattended" in low
+    assert "unattended-contract" in low
+    assert "memo" in low
+    assert "end the session" in low
+    # never a second unattended trigger from inside the session
+    assert "never" in low and ("relaunch" in low or "re-trigger" in low or "schedule" in low)
+
+
+def test_debugger_brief_renders_clean():
+    t = (_TEMPLATES / "debugger-brief.md").read_text()
+    out = _sub(t, {"signals": "heartbeat_stale", "detail": "runner heartbeat stale 42 min",
+                   "authority": "full", "allowlist": "(none)",
+                   "state_home": "/Users/w/.superlooper/o__r",
+                   "repo_path": "/Users/w/projects/r", "repo_slug": "o/r",
+                   "grace_minutes": "30"})
+    assert "{" not in out.replace("{}", ""), "unsubstituted placeholder left behind"
+    assert "heartbeat_stale" in out and "full" in out and "/Users/w/.superlooper/o__r" in out
+
+
+def test_launchd_watchdog_template_is_a_valid_scheduled_oneshot():
+    import plistlib
+    t = (_TEMPLATES / "launchd.watchdog.plist").read_text()
+    for ph in ("{label}", "{superlooper_bin}", "{repo_path}", "{state_home}",
+               "{interval_seconds}"):
+        assert ph in t, f"missing placeholder {ph}"
+    rendered = _sub(t, {"label": "com.superlooper.watchdog.o__r",
+                        "superlooper_bin": "/Users/w/.claude/skills/superlooper/bin/superlooper",
+                        "repo_path": "/Users/w/projects/r",
+                        "state_home": "/Users/w/.superlooper/o__r",
+                        "interval_seconds": "300"})
+    d = plistlib.loads(rendered.encode())
+    assert d["Label"] == "com.superlooper.watchdog.o__r"
+    # a scheduled ONE-SHOT every StartInterval seconds — never a keep-alive (issue #33's
+    # lesson stands: nothing under templates/ may keep-alive or re-offer a launchd runner)
+    assert "KeepAlive" not in d and "RunAtLoad" not in d
+    assert d["StartInterval"] == 300
+    args = [str(a) for a in d["ProgramArguments"]]
+    assert args[0].endswith("superlooper") and "watchdog" in args and "run" not in args

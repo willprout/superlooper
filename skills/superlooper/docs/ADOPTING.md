@@ -160,9 +160,25 @@ Either way, no code merges unreviewed — and the reviewer is never the author.
 | `notify.imessage_to` | `null` | Phone number / Apple ID the runner texts via the Mac's Messages app. `null` falls back to `notify.cmd`, then `cmux notify`, then log-only. |
 | `notify.cmd` | `null` | A generic notify command template (`{title}`/`{body}`) if you don't use iMessage. |
 | `report_time` | `"08:45"` | When the morning report is generated + pushed (Mac-local time). |
+| `watchdog.authority` | `"full"` | Standing authority tier for an **unattended** sl-debugger session the watchdog launches (issue #66): `diagnose-only` \| `allowlist` \| `full`. Even `full` excludes the constitution absolutely (never `agent-ready`, never merge/force-push, never frozen issue text, never `.superlooper/**` or `.github/workflows/**`) — enforced by the sl-debugger skill's unattended contract. |
+| `watchdog.allowlist` | `[]` | The exact repair verbs permitted at the `allowlist` tier, as strings, interpreted literally (never expansively). Ignored at the other tiers. |
+| `watchdog.grace_minutes` | `30` | How long after the watchdog texts you it waits before launching the unattended session. If the signal clears meanwhile it stands down silently. `0` launches on the tripping check. |
+| `watchdog.heartbeat_stale_minutes` | `20` | How stale `state/runner.heartbeat` must be to count as a wedged/dead loop. Keep it comfortably above the longest legitimate tick (a ship recheck can hold one ~10 min). |
+| `watchdog.no_progress_minutes` | `30` | How long eligible `agent-ready` work may wait with **every lane empty and nothing launching** before that reads as a fault. Designed-safe waits (CI gates, blocked-by holds, parked/needs-william, a building lane during a freeze, a usage meter that reads exhausted) never start this clock. |
 
 All schedule times are **Mac-local** — no timezone field, the runner and launchd read the system
 clock.
+
+**The unattended-debugger watchdog** (issue #66) is opt-in wiring: load
+`templates/launchd.watchdog.plist` as a user LaunchAgent to run `superlooper watchdog --repo
+<path>` every few minutes (300 s is a good interval). Each firing is a mechanical one-shot — no
+LLM anywhere in it: it reads the health signals (stale heartbeat, present `state/ALERT`, the
+no-progress shape), texts you when one trips, waits `watchdog.grace_minutes`, and if the signal
+still stands launches ONE fresh sl-debugger session through the same interactive launch shim
+workers use. Every launch is journaled and lands in the morning report. `touch
+<state-home>/state/WATCHDOG_OFF` disables the whole path (it keeps observing and journaling,
+launches nothing); delete the file to re-arm. Operations detail: `references/runner-ops.md` →
+"The unattended-debugger watchdog".
 
 ---
 
