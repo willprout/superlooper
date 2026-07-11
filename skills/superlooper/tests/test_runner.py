@@ -745,6 +745,61 @@ def test_a_restart_clears_the_systemic_launch_streak(rig):
     assert fresh._launch_fail_ids == set()
 
 
+# --------------------------- fail-open on an unreadable meter (issue #46) ---------------------------
+
+def test_dark_meter_past_grace_fails_open_launches_and_journals(rig):
+    # End to end at the shell: the usage endpoint is dark (api_error). WITHIN the grace the loop
+    # fails closed (no launch); PAST the grace it FAILS OPEN — i101 launches anyway and the journal
+    # carries exactly one bounded fail_open record (proving the executor is wired: no "no executor").
+    rig.r._fetch_usage = lambda: {"auth_status": "api_error", "five_hour_pct": None,
+                                  "seven_day_pct": None}
+    rig.r.tick(now=NOW)                                        # first dark fetch: within grace
+    assert issue_state(rig, "i101") is None                    # fail closed: not launched yet
+    assert [r for r in journal.read(rig.home) if r.get("act") == "fail_open"] == []
+
+    rig.r.tick(now=NOW + 1801)                                 # 30 min + 1s dark: past the grace
+    assert issue_state(rig, "i101")["status"] == "running"     # FAIL OPEN: launched despite the dark meter
+    fo = [r for r in journal.read(rig.home) if r.get("act") == "fail_open"]
+    assert len(fo) == 1 and "FAILING OPEN" in fo[0].get("outcome", "")
+    alert = json.loads((rig.home / "state" / "ALERT").read_text())
+    assert alert["reasons"] == ["usage_stale"]                 # owner alerted while work continues
+
+    rig.r.tick(now=NOW + 1802)                                 # still dark, still past grace
+    fo2 = [r for r in journal.read(rig.home) if r.get("act") == "fail_open"]
+    assert len(fo2) == 1                                       # ...one record for the whole episode
+
+
+def test_meter_recovery_closes_the_fail_open_episode_and_clears_the_alert(rig):
+    # A fail-open episode is active on disk (usage_stale alerted). A healthy fetch closes it: the
+    # journal gets a usage_recovered record and the usage_stale alert clears.
+    (rig.home / "state" / "ALERT").write_text(json.dumps({"reasons": ["usage_stale"], "since": NOW - 10}))
+    rig.r.tick(now=NOW)                                        # healthy stub usage -> meter reads again
+    rec = [r for r in journal.read(rig.home) if r.get("act") == "usage_recovered"]
+    assert len(rec) == 1
+    assert "ALERT" not in os.listdir(rig.home / "state")       # the alert cleared
+
+
+def test_fail_open_executors_are_wired_and_return_their_reason(rig):
+    # Direct smoke of the two journal-only executors (no label move, no crash, no "no executor").
+    assert rig.r._execute({"act": "fail_open", "reason": "dark past grace"}, NOW) == "dark past grace"
+    assert rig.r._execute({"act": "usage_recovered", "reason": "readable again"}, NOW) == "readable again"
+
+
+def test_restart_during_an_outage_does_not_falsely_recover(rig):
+    # End to end across a restart: the ALERT (durable) says the episode is open, but a FRESH Runner's
+    # grace clock (in-memory) is reset. The first post-restart tick, with the meter still dark, must
+    # NOT journal usage_recovered nor clear the outage alert — the episode carries across the restart.
+    (rig.home / "state" / "ALERT").write_text(
+        json.dumps({"reasons": ["usage_stale"], "since": NOW - 9000}))
+    fresh = runner_mod.Runner(repo=str(rig.repo), config=make_config(), state_home=str(rig.home),
+                              pane="pane-1", run_script=lambda *a, **k: 0,
+                              fetch_usage=lambda: {"auth_status": "api_error"})   # meter still dark
+    fresh._anchor_status = lambda: {"ok": True, "reason": ""}
+    fresh.tick(now=NOW)
+    assert [r for r in journal.read(rig.home) if r.get("act") == "usage_recovered"] == []
+    assert (rig.home / "state" / "ALERT").exists()     # outage alert NOT retracted mid-incident
+
+
 def test_hire_answerer_env_brief_and_record(rig):
     rig.r.tick(now=NOW)
     (rig.home / "answers" / "i123.md").write_text("stale answer from a prior question")

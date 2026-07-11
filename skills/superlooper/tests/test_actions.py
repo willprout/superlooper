@@ -146,12 +146,15 @@ def test_launches_come_last_in_the_action_list():
     assert kinds.index("hire_answerer") < kinds.index("launch")
 
 
-def test_usage_stale_launches_nothing_but_everything_else_proceeds():
-    stale_usage = {**usage_ok(), "last_ok_at": NOW - 3599}
+def test_usage_stale_within_grace_launches_nothing_but_everything_else_proceeds():
+    # Stale but WITHIN the fail-open grace (issue #46): still fails closed on usage, so no launch,
+    # while every non-launch flow proceeds. (Past the grace it would fail OPEN — covered separately.)
+    stale_usage = {**usage_ok(), "last_ok_at": NOW - 600}       # 10 min: > stale (5m), < grace (30m)
     dsk = disk(blocked={"i7": "question?"},
                issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
     out = decide(usage=stale_usage, parsed_issues=[parsed(5)], dsk=dsk)
     assert only(out, "launch") == []
+    assert only(out, "fail_open") == []             # within the grace: not yet failing open
     assert len(only(out, "hire_answerer")) == 1     # everything else proceeds
 
 
@@ -161,6 +164,129 @@ def test_usage_fail_closed_shapes_never_launch_and_never_raise():
                 {**usage_ok(), "auth_status": "auth_expired"}):
         out = decide(usage=bad, parsed_issues=[parsed(5)])
         assert only(out, "launch") == []
+
+
+# --------------------------- fail OPEN on an UNREADABLE meter (issue #46) ---------------------------
+# Split the two dark-meter cases: a meter that successfully READS exhausted keeps failing CLOSED (a
+# true, cheap "don't launch"); a meter that is UNREADABLE past a bounded grace FAILS OPEN (launch
+# normally, journal it once, alert once) — a full stop with real usage low is a worse failure than
+# launching into maybe-exhausted quota. NB: `usage_ok()` uses fresh timestamps (last_ok_at == NOW),
+# so a dark meter is modeled by an OLD last_ok_at — exactly what the runner leaves behind when a
+# fetch fails (it freezes the last-good reading and its timestamp). The current auth_status the
+# runner shows is the last-good "ok"; the injected api_error/no_keychain/auth_expired variants prove
+# the decision keys on the DARK DURATION, not on any single reported status.
+
+def dark_usage(status="ok", age=2400):
+    # age seconds since the last good read; default 2400s (40 min) is past the 30-min grace.
+    return {"auth_status": status, "five_hour_pct": 10.0, "seven_day_pct": 20.0,
+            "last_ok_at": NOW - age, "first_attempt_at": NOW - age - 120}
+
+
+def test_unreadable_meter_past_grace_fails_open_and_journals_once():
+    for status in ("api_error", "no_keychain", "auth_expired", "ok"):   # 'ok' == the frozen last-good
+        out = decide(usage=dark_usage(status=status), parsed_issues=[parsed(5)])
+        assert len(only(out, "launch")) == 1, status                    # launches PROCEED (fail open)
+        assert len(only(out, "fail_open")) == 1, status                 # one bounded fail-open record
+    # dedup: with the dark episode already recorded on disk (usage_stale alerted), no second record
+    d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100})
+    out = decide(usage=dark_usage(), parsed_issues=[parsed(5)], dsk=d)
+    assert only(out, "fail_open") == []                                 # already journaled this episode
+    assert len(only(out, "launch")) == 1                               # ...but still launching
+
+
+def test_unreadable_meter_within_grace_still_fails_closed():
+    # A brief blip (dark but WITHIN the grace) still fails closed — the grace rides out transients
+    # before launching blind.
+    out = decide(usage=dark_usage(age=600), parsed_issues=[parsed(5)])  # 10 min < 30-min grace
+    assert only(out, "launch") == []
+    assert only(out, "fail_open") == []
+
+
+def test_read_exhausted_meter_still_fails_closed():
+    # A SUCCESSFUL read at/over either ceiling is a true, cheap "don't launch" — unchanged, and NEVER
+    # a fail-open episode (a fresh reading is not a dark meter).
+    for over in ({**usage_ok(), "five_hour_pct": 95.0},
+                 {**usage_ok(), "seven_day_pct": 97.0}):
+        out = decide(usage=over, parsed_issues=[parsed(5)])
+        assert only(out, "launch") == []
+        assert only(out, "fail_open") == []
+
+
+def test_meter_recovery_resumes_gating_and_closes_the_episode():
+    # Episode active on disk (usage_stale alerted). A fresh ok read closes it in the journal and
+    # resumes normal gating.
+    d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 100})
+    out = decide(usage=usage_ok(), parsed_issues=[parsed(5)], dsk=d)
+    assert len(only(out, "usage_recovered")) == 1     # the fail-open episode closes in the journal
+    assert len(only(out, "launch")) == 1              # normal gating resumes (under the ceiling)
+    assert len(only(out, "clear_alert")) == 1         # the usage_stale alert clears
+
+
+def test_usage_stale_alert_fires_once_per_dark_episode_while_failing_open():
+    out = decide(usage=dark_usage(), parsed_issues=[parsed(5)])
+    a = only(out, "alert")
+    assert len(a) == 1 and "usage_stale" in a[0]["reasons"] and has_notify(out)
+    assert len(only(out, "launch")) == 1              # ...and work continues while the alert stands
+    # same dark episode already alerted on disk -> no repeat alert, no re-notify, no second record
+    d = disk(alert={"reasons": a[0]["reasons"], "since": NOW - 100})
+    out2 = decide(usage=dark_usage(), parsed_issues=[parsed(5)], dsk=d)
+    assert only(out2, "alert") == [] and not has_notify(out2)
+    assert only(out2, "fail_open") == []
+
+
+def test_restart_mid_outage_keeps_failing_open_and_never_false_recovers():
+    # The dark-meter EPISODE marker (the usage_stale ALERT) is durable, but the runner's in-memory
+    # grace clock resets on restart. On the first tick after a restart DURING an ongoing outage, the
+    # meter is still dark (last_ok_at None, first_attempt_at just set) — byte-identical to a cold
+    # start. prev_dark (the durable marker) must keep the episode FAILING OPEN, keep the alert, and
+    # never falsely declare recovery or retract the alert. (Regression: keyed on the reset clock, the
+    # first post-restart tick used to emit a false usage_recovered + clear the outage alert.)
+    reset_clock = {"auth_status": "api_error", "five_hour_pct": None, "seven_day_pct": None,
+                   "last_ok_at": None, "first_attempt_at": NOW - 5}     # clock just reset by restart
+    d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 9000})   # episode predates the restart
+    out = decide(usage=reset_clock, parsed_issues=[parsed(5)], dsk=d)
+    assert len(only(out, "launch")) == 1               # still FAILING OPEN across the restart
+    assert only(out, "usage_recovered") == []          # NOT a false recovery
+    assert only(out, "clear_alert") == []              # the dark-meter alert is NOT retracted
+    assert only(out, "fail_open") == []                # already journaled: no duplicate open record
+
+
+def test_malformed_usage_mid_episode_fails_closed_but_keeps_the_alert():
+    # Defect-class-2 guard for the fail-open path: even with a dark episode ACTIVE on disk, a
+    # malformed/absent usage view (no timeline) must NOT launch (never fail open on wrong-typed
+    # input), must NOT clear the dark-meter alert, and must NOT false-recover. The episode simply
+    # persists until a genuinely fresh read closes it.
+    for bad in ({}, None, "x", {"auth_status": "api_error"}):
+        d = disk(alert={"reasons": ["usage_stale"], "since": NOW - 9000})
+        out = decide(usage=bad, parsed_issues=[parsed(5)], dsk=d)
+        assert only(out, "launch") == [], bad             # fail CLOSED on wrong-typed input
+        assert only(out, "clear_alert") == [], bad        # alert not retracted
+        assert only(out, "usage_recovered") == [], bad    # no false recovery
+
+
+def test_stale_over_ceiling_reading_fails_open_past_grace_by_design():
+    # A last-known-OVER-ceiling read that then goes dark past the grace fails OPEN — once the meter is
+    # dark we no longer trust the stale pct, and the owner's ruling is launch-beats-full-stop (#24
+    # backstops a real collapse). Documents the deliberate behavior the scheduler docstring calls out.
+    stale_over = {"auth_status": "ok", "five_hour_pct": 95.0, "seven_day_pct": 14.0,
+                  "last_ok_at": NOW - 2400, "first_attempt_at": NOW - 7200}   # 95%, then dark 40 min
+    out = decide(usage=stale_over, parsed_issues=[parsed(5)])
+    assert len(only(out, "launch")) == 1
+    assert len(only(out, "fail_open")) == 1
+
+
+def test_failing_open_never_cascades_parks_under_a_systemic_launch_failure():
+    # DoD: while failing open, a SYSTEMIC launch failure (#24) holds the queue with ONE runner-level
+    # alert — it never parks issues or strips agent-ready across the queue.
+    d = disk(launch_fail_ids=["i5", "i6"],
+             issues_state={"version": 1, "issues": {
+                 "i5": ist("ready", launch_failures=2),
+                 "i6": ist("ready", launch_failures=2)}})
+    out = decide(usage=dark_usage(), parsed_issues=[parsed(5), parsed(6)], dsk=d)
+    assert only(out, "park") == []                    # no park cascade
+    assert only(out, "launch") == []                  # launches HELD (queue intact for recovery)
+    a = only(out, "alert")
+    assert len(a) == 1 and "launch_systemic_failure" in a[0]["reasons"]
 
 
 def test_gh_stale_suppresses_launch_gate_and_orphans_but_disk_flows_proceed():
@@ -714,7 +840,7 @@ def test_exited_marker_relaunches_under_cap_and_parks_at_cap():
 
 
 def test_relaunch_tiers_respect_the_usage_gate_but_idle_peek_does_not():
-    stale_usage = {**usage_ok(), "last_ok_at": NOW - 3599}
+    stale_usage = {**usage_ok(), "last_ok_at": NOW - 600}   # stale WITHIN the grace -> fail closed
     dsk = disk(exited={"i5": "x rc=1"},
                issues_state={"version": 1, "issues": {"i5": ist("running"), "i6": ist("running")}})
     out = decide(usage=stale_usage, events=[{"type": "session_idle", "id": "i6"}], dsk=dsk)
@@ -1335,11 +1461,13 @@ def test_retry_runaway_alerts():
     assert len(a) == 1 and any("i5" in r for r in a[0]["reasons"]) and has_notify(out)
 
 
-def test_usage_stale_over_an_hour_alerts():
-    stale = {**usage_ok(), "last_ok_at": NOW - 3601}
-    out = decide(usage=stale)
-    a = only(out, "alert")
-    assert len(a) == 1 and any("usage" in r for r in a[0]["reasons"]) and has_notify(out)
+def test_dark_meter_within_grace_does_not_alert_yet():
+    # The grace's silent window (issue #46): a dark meter still fails closed AND stays quiet until
+    # the grace expires — the alert fires only when fail-open engages, so we neither cry wolf on a
+    # blip nor launch-and-alert prematurely. (Past-grace alert + fail-open is covered above.)
+    within = {**usage_ok(), "last_ok_at": NOW - 600}   # 10 min: stale, but < 30-min grace
+    out = decide(usage=within)
+    assert only(out, "alert") == [] and only(out, "fail_open") == []
 
 
 # =========================== morning report ===========================
