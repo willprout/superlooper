@@ -11,12 +11,19 @@ PR #4).*
 
 ## Packaging / distribution (2026-07-08 skills-audit thread)
 
-- **Plugin restructure.** Split the installed skill into a superlooper PLUGIN of 2–3 skills:
-  `superlooper` (ops/router), `write-issue` (the issue-writing front-end, promoted from
-  references/issue-writing.md so any session discovers it in the skill list and invoking it
-  loads the full discipline — today form is enforced mechanically at parse time but quality
-  rides on an agent following a router pointer), maybe `adopt`. Socket for adapting the
-  feature-dev plugin's explore/clarify phases as the front half of `write-issue`.
+- **Plugin restructure — OWNER RULINGS SETTLED 2026-07-10 (design session next).** Split the
+  installed skill into a superlooper PLUGIN of five skills: `superlooper` (ops/router),
+  `write-issue` (the issue-writing front-end promoted from references/issue-writing.md),
+  `adopt`, `cross-review` (absorbed from William's machine-local skill — review quality must
+  not ride on ambient tooling), and `sl-debugger` (a skill that understands the whole system
+  so a fresh session can diagnose and fix a broken loop/dashboard instance; MAY be deferred
+  to its own design session if too big — the planning session makes that call explicitly).
+  Sharing bar for v1: a stranger pastes the GitHub repo link into a Claude Code session, says
+  "install this," and everything needed lands (downloading cmux etc. is acceptable);
+  mechanism is the design session's choice. Updates KEEP THE HUMAN GATE: engine/executables
+  stay inert-until-gated-republish on every machine; only skill content may ride plugin
+  update semantics. Socket still open: adapting the feature-dev plugin's explore/clarify
+  phases as the front half of `write-issue`.
 - **Stack doctor + STACK.md.** The loop's success depends on machine-level blocks outside the
   package: /cross-review + authenticated Codex CLI (audit-proven highest-value external
   block; the brief only says "fresh-agent review" — vendor choice is ambient), cmux +
