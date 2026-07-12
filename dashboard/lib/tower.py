@@ -111,11 +111,13 @@ def _event_row(rec, num):
 
 # The one-line gloss for the acts with no special sub-cases. Each is (radio, kind, sentence-tail);
 # the tail is prefixed with the flight tag by comms_row. A ``None`` radio means "no flavor".
-def comms_row(rec):
+def comms_row(rec, operator="the owner"):
     """One journal record → ``{radio, text, kind, num, tier}``. ``text`` is the real, plain, flight-
     numbered sentence (always non-empty); ``radio`` is optional flavor shown beside it; ``kind`` is
     a style class; ``tier`` is the comms/routine classification (issue #36 — see :func:`tier`). A
-    non-dict record degrades to a bare "unreadable line" row (comms tier), never a crash."""
+    non-dict record degrades to a bare "unreadable line" row (comms tier), never a crash.
+    ``operator`` is the configured operator display name (issue #58) — a re-approval is the owner's
+    own gate, so its line signs their name."""
     if not isinstance(rec, dict):
         return {"radio": "", "text": "an unreadable journal line", "kind": "unknown",
                 "num": None, "tier": "comms"}
@@ -163,7 +165,7 @@ def comms_row(rec):
         row = {"radio": "", "kind": "notify", "text": "note — %s" % (rec.get("title") or "(memo)")}
     elif act in ("reapprove", "approve"):
         row = {"radio": "", "kind": "approve",   # a human gate is a fun-free zone (§7) — stays calm
-               "text": "%s re-approved by William." % who}
+               "text": "%s re-approved by %s." % (who, operator)}
     elif act == "relabel":
         row = {"radio": "", "kind": "relabel", "text": "%s relabelled." % who}
     elif act == "update":

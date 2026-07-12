@@ -54,7 +54,7 @@ refuses it.
 - **`type:build`** — a pre-scoped change. One issue → one PR. Must carry a real Definition of done.
 - **`type:investigate`** — an undiagnosed problem. Output = a root-cause report **as an issue
   comment** + scoped child issues. **Zero PRs.** Children each carry `parent: #N` and are labeled
-  `needs-william` (William approves every child before it runs — one label releases a series).
+  `needs-owner` (William approves every child before it runs — one label releases a series).
   Zero children is a legitimate finding: "nothing to do" is a valid root cause.
 - **`type:diagnose-and-fix`** — a small bug: one session diagnoses **and** fixes, *if* the fix
   stays inside the issue's Boundaries. If the root cause is bigger than the boundaries — or (on
@@ -97,7 +97,7 @@ stalled queue. Re-scope so pieces land independently.
 
 If work in this issue implies work another PR must do — an interface the other side must honor, a
 migration a later change depends on, a follow-up the fix defers — **file it as a new issue**
-(labeled `needs-william`). Never leave it as a `// TODO`, a code comment, or a line in a PR body.
+(labeled `needs-owner`). Never leave it as a `// TODO`, a code comment, or a line in a PR body.
 
 **Why:** this is the eApp's single costliest systemic miss across the autocode runs. A promise
 written as a code comment is invisible to the queue: no one is scheduled to keep it, it merges,

@@ -139,6 +139,15 @@ def create_label(name, color, description):
     return rc == 0
 
 
+def rename_label(old, new):
+    """Rename a label in place (`gh label edit <old> --name <new>`), PRESERVING it on every issue
+    that carries it — the adopt-side migration for issue #58's `needs-william` -> `needs-owner`
+    rename. True on success (rc 0); False on any gh failure, so the caller can report the mixed
+    state honestly rather than pretend the migration landed."""
+    rc, _ = _run(["label", "edit", old, "--name", new])
+    return rc == 0
+
+
 def probe():
     """Is gh reachable + authenticated RIGHT NOW? (`gh api rate_limit` — free, does not count
     against limits.) The runner probes once per poll cycle: a False keeps the previous GitHub

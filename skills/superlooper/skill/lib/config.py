@@ -89,7 +89,7 @@ _NESTED_DEFAULTS = {
                  "heartbeat_stale_minutes": 20, "no_progress_minutes": 30},
 }
 
-_ALLOWED_TOP = set(_TOP_DEFAULTS) | set(_NESTED_DEFAULTS) | {"repo"}
+_ALLOWED_TOP = set(_TOP_DEFAULTS) | set(_NESTED_DEFAULTS) | {"repo", "operator"}
 _AGENTS = {"claude", "codex"}
 _AFFINITIES = {"hard", "soft"}
 _MERGE_METHODS = {"squash", "merge", "rebase"}   # gh's own set; the runner defaults to squash (§B.4)
@@ -151,6 +151,16 @@ def _validate_and_fill(raw):
     for k in raw:
         if k not in _ALLOWED_TOP:
             _err(f"unknown key {k!r} (allowed: {', '.join(sorted(_ALLOWED_TOP))})")
+
+    # operator display name (issue #58): the name every stranger-visible runtime string signs with —
+    # briefs, park memos, label descriptions, dashboard audit trail. Defaults to the repo owner's
+    # GitHub login (the part before "/"), so a fresh adopt attributes the loop's work to the actual
+    # owner and never a hardcoded person. null/absent -> that default; a present value must be a
+    # non-empty string (a blank or a typo fails loud, like every other field). Resolved into `out`
+    # below, after the defaults fill (so it rides the same out dict the loader returns).
+    raw_operator = raw.get("operator")
+    if not (raw_operator is None or (isinstance(raw_operator, str) and raw_operator.strip())):
+        _err(f"'operator' must be null or a non-empty string, got {raw_operator!r}")
 
     # Fill defaults. DEEP-COPY the default when a key is omitted: the list/dict defaults
     # (areas {}, required_checks [], qa.quarantine [], ...) are mutable, so handing out the
@@ -263,6 +273,9 @@ def _validate_and_fill(raw):
         if isinstance(v, bool) or not isinstance(v, int) or v < lo:
             _err(f"'watchdog.{wk}' must be an integer >= {lo}, got {v!r}")
 
+    # Fill the operator (validated above): explicit non-blank value wins, else the repo owner login.
+    out["operator"] = raw_operator.strip() if isinstance(raw_operator, str) else repo.split("/", 1)[0].strip()
+
     return out
 
 
@@ -279,6 +292,24 @@ def load(repo_path):
     except json.JSONDecodeError as e:
         raise ValueError(f"{cfg_path} is not valid JSON: {e}") from e
     return _validate_and_fill(raw)
+
+
+def operator(config):
+    """The operator display name — what every stranger-visible runtime string signs with (issue
+    #58): briefs, park memos, notifications, the morning report. Prefers an explicit non-blank
+    ``operator``, else the repo owner's GitHub login (the part before "/"), else the neutral
+    'the owner'. Never raises: the pure decision cores (gate/brief/report) call it while staying
+    fail-closed on wrong-typed config."""
+    if isinstance(config, dict):
+        op = config.get("operator")
+        if isinstance(op, str) and op.strip():
+            return op.strip()
+        repo = config.get("repo")
+        if isinstance(repo, str) and repo.count("/") == 1:
+            owner = repo.split("/", 1)[0].strip()
+            if owner:
+                return owner
+    return "the owner"
 
 
 def path_to_area(config, path):

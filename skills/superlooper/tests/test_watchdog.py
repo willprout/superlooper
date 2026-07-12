@@ -193,8 +193,9 @@ def test_eligible_nums_excludes_every_designed_safe_wait():
         _raw_issue(4, ["in-progress", "type:build"]),                       # building / gate-waiting on CI
         _raw_issue(5, ["agent-ready", "in-progress", "type:build"]),        # launched already
         _raw_issue(6, ["parked", "type:build"]),                            # parked
-        _raw_issue(7, ["needs-william", "type:build"]),                     # owner's desk
+        _raw_issue(7, ["needs-owner", "type:build"]),                       # owner's desk (current label)
         _raw_issue(8, ["agent-ready"]),                                     # no valid type
+        _raw_issue(9, ["needs-william", "type:build"]),                     # owner's desk (legacy label, #58 compat)
     )]
     assert wd.eligible_nums(parsed, closed_nums={7}) == [1, 3]
 

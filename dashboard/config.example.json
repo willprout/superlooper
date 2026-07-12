@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "operator": null,
   "repos": [
     { "path": "~/code/your-adopted-repo" },
     { "path": "~/code/another-adopted-repo", "airline": "Widget Air" }

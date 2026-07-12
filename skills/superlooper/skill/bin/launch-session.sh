@@ -153,7 +153,7 @@ rm -f "$SL_RUN_ROOT/reports/$ID.md" \
 # --cwd/--command, so we then cd into the folder and fire the bypass-permission Claude via the
 # keystroke-free shim (dropped .cmd file), not typed keystrokes (see below).
 # One consistent label for the tab title, the session's --name, and the Remote Control dashboard, so
-# William can tell what's running from his phone.
+# the operator can tell what's running from their phone.
 # Capture the tab's UUIDs, not the short ref. `--id-format uuids new-surface` prints
 # "OK <surface-uuid> <pane-uuid> <workspace-uuid>". Surface UUIDs are GLOBALLY unique, so the runner
 # can read & ring this tab from any workspace; a `surface:NN` short ref resolves only within the

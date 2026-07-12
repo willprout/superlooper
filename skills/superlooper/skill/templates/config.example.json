@@ -1,6 +1,7 @@
 {
   "version": 1,
   "repo": "owner/name",
+  "operator": null,
   "dev_branch": "main",
   "prod_branch": null,
   "agent": "claude",

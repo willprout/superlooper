@@ -164,12 +164,12 @@ it is a manual command, never wired into the runner, a schedule, or any automati
 ```bash
 superlooper tidy --repo /path/to/repo                 # close MERGED sessions' windows (asks y/N)
 superlooper tidy --repo /path/to/repo --dry-run       # just list what it WOULD close
-superlooper tidy --repo /path/to/repo --all           # also parked / needs-william / bounced
+superlooper tidy --repo /path/to/repo --all           # also parked / needs-owner / bounced
 superlooper tidy --repo /path/to/repo --yes           # skip the confirmation
 ```
 
 - **What it will close:** by default, only the windows of **merged** sessions (truly done). `--all`
-  extends that to the other terminal states — **parked**, **needs-william**, **bounced**. It lists
+  extends that to the other terminal states — **parked**, **needs-owner**, **bounced**. It lists
   every window (issue id, status, surface) and asks `y/N` before closing; `--dry-run` prints the
   list and closes nothing; `--yes` skips the prompt.
 - **What it can never close:** anything still **in flight** ({running, blocked, frozen, exited}) or
@@ -180,7 +180,7 @@ superlooper tidy --repo /path/to/repo --yes           # skip the confirmation
 - **How it closes:** the same best-effort close the runner uses (`cmux close-surface`, exit code
   ignored — a dead window is a silent no-op). For a **merged** session it then clears the pane
   markers and singleton lock (safe to do — merged work never relaunches, so nothing is racing it).
-  For a **re-approvable** session (`--all`'s parked / needs-william / bounced) it closes the window
+  For a **re-approvable** session (`--all`'s parked / needs-owner / bounced) it closes the window
   but **leaves the state markers to the runner** — that session could be re-approved and relaunched
   at any moment, and the runner's own relaunch path frees the stale lock and rewrites the marker,
   so tidy never touches state a live worker might be using. (Cost: a repeat `--all` may re-list an
@@ -195,7 +195,7 @@ superlooper tidy --repo /path/to/repo --yes           # skip the confirmation
 
 As the loop runs, debris accumulates **on GitHub** that no other mechanism owns: stale `sl/*`
 remote branches whose PRs merged or were superseded, PRs labeled `superseded` left open by design
-(the regenerate ladder never auto-closes them), and parked / needs-william issues gathering dust.
+(the regenerate ladder never auto-closes them), and parked / needs-owner issues gathering dust.
 `superlooper janitor` is tidy's discipline pointed at GitHub: it **proposes** a one-touch list,
 each item with a one-line why, and executes **only what you approve** — the y/N (or `--yes`) is
 your word, like `agent-ready`. Nothing is ever auto-closed or auto-deleted; there is no schedule
@@ -214,7 +214,7 @@ superlooper janitor --repo /path/to/repo --retry-refused  # re-propose previousl
   (commits pushed after the merge/close keep the branch off the list — an unmerged branch's work
   is never proposed for deletion); (2) *close* an
   **open PR labeled `superseded`** (the branch stays — it becomes deletable on a *later* sweep,
-  once its PR is closed); (3) *close* a **parked / needs-william issue** with no activity for
+  once its PR is closed); (3) *close* a **parked / needs-owner issue** with no activity for
   `janitor.aged_park_days` (config, default 14).
 - **What it can never propose:** anything in-flight or mid-gate ({running, blocked, frozen,
   exited, gating, holding}) — excluded mechanically by the issue number in the branch name AND by
@@ -238,7 +238,7 @@ on the few items that need you, ignore the rest.
 Sections:
 
 - **Merged** — issues/PRs that landed, cross-linked.
-- **Parked / needs-william** — with the memo comment for each, so you can act without digging.
+- **Parked / needs-owner** — with the memo comment for each, so you can act without digging.
 - **Bounces** — issues a worker bounced on premise drift, each with its proposed amendment.
 - **Conflict regenerations this week** — the tuning metric: if this climbs, tighten `affinity` or
   reduce `lanes`; if it's always zero, you can loosen. This is how you turn the parallelism dial.
@@ -258,7 +258,7 @@ The runner drives these; a few ask for a decision from you.
 |---|---|---|
 | `in-progress` | a worker is building it now | none — watch if you like |
 | `parked` | the build **failed its retry cap** (relaunched, still not done); handed back with a memo | when you have time: read the memo, re-scope or re-approve, or drop it |
-| `needs-william` | an **owner decision is required** — a bounce, a **conflict-cap** hit, a fail-closed gate, or an answerer that punted | decide: see "Answering a bounce" / "a parked conflict" below |
+| `needs-owner` | an **owner decision is required** — a bounce, a **conflict-cap** hit, a fail-closed gate, or an answerer that punted (renamed from `needs-william`; `adopt` migrates the old label in place and the runner recognizes both) | decide: see "Answering a bounce" / "a parked conflict" below |
 | `expedite` | **jump the queue** — slotted into the very next free lane ahead of everything | apply it to an issue you want built next |
 | `preserve` (on a PR) | on a conflict, resolve **in the PR's own branch** instead of regenerating from scratch | apply it to a PR whose diff is expensive to rebuild |
 | `model:<name>` (on an issue) | run **this issue's** worker sessions on `<name>` instead of the config default | apply it to an issue you want built on a specific model |
@@ -266,8 +266,8 @@ The runner drives these; a few ask for a decision from you.
 | `superseded` (on a PR) | the loop replaced this PR with a rebuild on current dev; branch kept, PR left open, nothing auto-closed | none — housekeeping only |
 | `auto-approved:nightly-red` | a fix issue the nightly filed to restore a red mainline; entered by your standing rule, not by hand | none — it builds automatically; the distinct label is just the audit trail |
 
-**`parked` vs `needs-william`** is the distinction that matters: `parked` is *mechanical
-exhaustion* (retries ran out — no decision pending, look when convenient); `needs-william` is *a
+**`parked` vs `needs-owner`** is the distinction that matters: `parked` is *mechanical
+exhaustion* (retries ran out — no decision pending, look when convenient); `needs-owner` is *a
 specific decision only you can make* (look sooner). Both always carry a memo comment.
 
 ### Per-issue model / effort (control knobs)
@@ -293,7 +293,7 @@ first launch). The **answerer** is never affected; it stays on `models.answerer`
 
 A worker that finds **premise-level drift** — the problem is already gone, or what actually shipped
 invalidates the approach — does not guess. It writes a `BOUNCED:` memo, and the **runner** (not the
-worker) posts that memo to the issue, applies `needs-william`, and reclaims the lane. The memo
+worker) posts that memo to the issue, applies `needs-owner`, and reclaims the lane. The memo
 always includes a **ready-to-approve proposed amendment** to the Goal/DoD, so your touch is
 **yes/no, never authoring**:
 
@@ -304,10 +304,10 @@ always includes a **ready-to-approve proposed amendment** to the Goal/DoD, so yo
 You never edit the Goal/DoD in place, even here — approval flows through the label, not through an
 edit (see `approval-protocol.md`).
 
-### A parked conflict (`needs-william` from the conflict cap)
+### A parked conflict (`needs-owner` from the conflict cap)
 
 Two conflict-regenerations on one issue means two work items are fighting over the same code — a
-scoping error only you can untangle. The runner parks it with `needs-william` and a memo naming the
+scoping error only you can untangle. The runner parks it with `needs-owner` and a memo naming the
 issue it collided with. Re-scope one of the two so they stop overlapping (this is also what
 `affinity: hard` and honest `touches:` declarations prevent up front). For an expensive PR you'd
 rather not rebuild, apply `preserve` to route it to a conflict-resolution session in its own branch.
@@ -381,7 +381,7 @@ until the browser suite exists — it's built with you first; the config just po
 
 The runner texts you via your Mac's own Messages app (config `notify.imessage_to`), falling back to
 `notify.cmd`, then `cmux notify`, then log-only. It fires on every transition to `parked` or
-`needs-william`, every freeze, and every ALERT — the standing rule that long-running work
+`needs-owner`, every freeze, and every ALERT — the standing rule that long-running work
 finishing, stalling, or needing input reaches you (spec §2). A send failure is journaled, never
 fatal; notifications are a convenience layer, never a safety layer.
 
@@ -449,7 +449,7 @@ launchd is fine here — the issue-#33 prohibition is about the *runner*).
   NOT read exhausted.
 
 **Never trips on designed-safe waits:** gate-waiting on CI and building work are `in-progress`
-(not eligible); blocked-by holds wait for the dependency to close; parked / needs-william is not
+(not eligible); blocked-by holds wait for the dependency to close; parked / needs-owner is not
 approval; a building lane during a merge freeze is lanes-busy (frozen-but-building is the safe
 idle state); a usage meter that successfully READS exhausted is the fail-closed hold working
 (a DARK meter never suppresses — the #46/#76 asymmetry, so a Keychain-less launchd context

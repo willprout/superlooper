@@ -438,3 +438,45 @@ def test_janitor_unknown_subkey_rejected(tmp_path):
     with pytest.raises(ValueError) as e:
         config.load(tmp_path)
     assert "janitor.aged_prak_days" in str(e.value)
+
+
+# --------------------------- operator display name (issue #58) ---------------------------
+
+def test_operator_defaults_to_repo_owner_login(tmp_path):
+    # No operator field -> default to the owner half of `repo` (the GitHub login). A stranger's
+    # loop then signs its own work, never "William" (issue #58).
+    _write_cfg(tmp_path, {"repo": "alice/widget"})
+    cfg = config.load(tmp_path)
+    assert cfg["operator"] == "alice"
+    assert config.operator(cfg) == "alice"
+
+
+def test_operator_explicit_value_wins(tmp_path):
+    _write_cfg(tmp_path, {"repo": "alice/widget", "operator": "Alice Q."})
+    cfg = config.load(tmp_path)
+    assert cfg["operator"] == "Alice Q."
+    assert config.operator(cfg) == "Alice Q."
+
+
+def test_operator_null_falls_back_to_owner(tmp_path):
+    # null is the "use the default" signal (the shipped example carries it), like the nullable cmds.
+    _write_cfg(tmp_path, {"repo": "alice/widget", "operator": None})
+    assert config.load(tmp_path)["operator"] == "alice"
+
+
+def test_operator_empty_or_wrong_type_rejected(tmp_path):
+    for bad in ("", "  ", 5, ["x"]):
+        _write_cfg(tmp_path, {"repo": "alice/widget", "operator": bad})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "operator" in str(e.value)
+
+
+def test_operator_resolver_is_defensive():
+    # config.operator never raises on a partial/garbage dict — pure functions (gate/brief/report)
+    # call it while fail-closed on wrong-typed config.
+    assert config.operator({"repo": "bob/tool"}) == "bob"
+    assert config.operator({"operator": "Carol"}) == "Carol"
+    assert config.operator({}) == "the owner"
+    assert config.operator({"operator": "  "}) == "the owner"   # blank -> neutral fallback
+    assert config.operator(None) == "the owner"

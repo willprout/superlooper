@@ -24,11 +24,14 @@ a label change is never served stale (the composition root wires it that way).
 """
 import time
 
-# The labels the verbs move. `agent-ready` is applied only in direct response to a William tap
-# (Approve / bounce-yes); the others are ordinary mechanical labels.
+# The labels the verbs move. `agent-ready` is applied only in direct response to an operator tap
+# (Approve / bounce-yes); the others are ordinary mechanical labels. The owner-decision label was
+# renamed `needs-william` -> `needs-owner` (issue #58); the legacy id is still REMOVED alongside the
+# new one so a repo adopted before the rename (or one mid-migration) clears cleanly on re-approve.
 AGENT_READY = "agent-ready"
 PARKED = "parked"
-NEEDS_WILLIAM = "needs-william"
+NEEDS_OWNER = "needs-owner"
+NEEDS_OWNER_LEGACY = "needs-william"
 EXPEDITE = "expedite"
 FLAG = "flag"
 
@@ -36,30 +39,35 @@ FLAG = "flag"
 # adapter's create_label uses --force, so this is idempotent — never an error on a repo that already
 # has the label).
 _FLAG_LABEL_COLOR = "d73a4a"                 # GitHub's default red — a flag is a call for attention
-_FLAG_LABEL_DESC = "Flagged by William from the command center — a planning session sweeps these later"
+
+
+def flag_label_desc(operator):
+    return "Flagged by %s from the command center — a planning session sweeps these later" % operator
+
 
 _FLAG_TITLE_MAX = 72                          # a flag title is the first line, trimmed — the body carries all
 
 
 # =============================== audit-comment wording (pure, pinned by tests) ===============================
-# One shape for every verb — "<Verb-past> by William via command-center, <date>." — so the trail is
-# uniform and greppable, and every write is attributable to William's tap (design record §0 / CLAUDE.md).
+# One shape for every verb — "<Verb-past> by <operator> via command-center, <date>." — so the trail
+# is uniform and greppable, and every write is attributable to the operator's tap (design record §0
+# / CLAUDE.md). `operator` is the configured operator display name (config.operator), issue #58.
 
-def approve_comment(date):
-    return "Approved by William via command-center, %s." % date
-
-
-def drop_comment(date):
-    return "Dropped by William via command-center, %s." % date
+def approve_comment(operator, date):
+    return "Approved by %s via command-center, %s." % (operator, date)
 
 
-def expedite_comment(date):
-    return "Expedited by William via command-center, %s." % date
+def drop_comment(operator, date):
+    return "Dropped by %s via command-center, %s." % (operator, date)
 
 
-def bounce_comment(date):
-    return ("Bounce accepted by William via command-center, %s. "
-            "Proceeding with the amended goal." % date)
+def expedite_comment(operator, date):
+    return "Expedited by %s via command-center, %s." % (operator, date)
+
+
+def bounce_comment(operator, date):
+    return ("Bounce accepted by %s via command-center, %s. "
+            "Proceeding with the amended goal." % (operator, date))
 
 
 def flag_title(text):
@@ -90,10 +98,13 @@ class Actions:
     serializes back to the tap. ``ok`` is the honest GitHub outcome, so a failed write never reads as
     a success."""
 
-    def __init__(self, gh_mod, allowed_repos, today=None):
+    def __init__(self, gh_mod, allowed_repos, today=None, operator=None):
         self._gh = gh_mod
         self._allowed = set(allowed_repos or [])
         self._today = today if today is not None else _default_today
+        # The operator display name every audit comment / flag description signs with (issue #58);
+        # the composition root passes config.operator. Falls back to a neutral word if unset.
+        self._operator = operator if (isinstance(operator, str) and operator.strip()) else "the owner"
 
     def _date(self):
         return self._today() if callable(self._today) else self._today
@@ -109,8 +120,9 @@ class Actions:
         serves both the fresh approval and the re-approval of a parked flight."""
         if repo not in self._allowed:
             return self._refuse("approve")
-        labeled = self._gh.set_labels(repo, num, add=[AGENT_READY], remove=[PARKED, NEEDS_WILLIAM])
-        commented = self._gh.comment(repo, num, approve_comment(self._date()))
+        labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
+                                      remove=[PARKED, NEEDS_OWNER, NEEDS_OWNER_LEGACY])
+        commented = self._gh.comment(repo, num, approve_comment(self._operator, self._date()))
         # ok requires BOTH: agent-ready is William's word ONLY when its audit comment records the
         # tap — a label applied without the trail is not a success (the "journal-greppable via audit
         # comments" contract, and the agent-ready bright line).
@@ -122,7 +134,7 @@ class Actions:
         verb — its single client-side confirm lives at the call site (never here)."""
         if repo not in self._allowed:
             return self._refuse("drop")
-        closed = self._gh.close_issue(repo, num, comment=drop_comment(self._date()))
+        closed = self._gh.close_issue(repo, num, comment=drop_comment(self._operator, self._date()))
         return {"ok": bool(closed), "verb": "drop", "closed": bool(closed)}
 
     def expedite(self, repo, num):
@@ -131,7 +143,7 @@ class Actions:
         if repo not in self._allowed:
             return self._refuse("expedite")
         labeled = self._gh.set_labels(repo, num, add=[EXPEDITE])
-        commented = self._gh.comment(repo, num, expedite_comment(self._date()))
+        commented = self._gh.comment(repo, num, expedite_comment(self._operator, self._date()))
         return {"ok": bool(labeled and commented), "verb": "expedite",
                 "labeled": bool(labeled), "commented": bool(commented)}
 
@@ -142,8 +154,9 @@ class Actions:
         approve."""
         if repo not in self._allowed:
             return self._refuse("bounce-yes")
-        labeled = self._gh.set_labels(repo, num, add=[AGENT_READY], remove=[NEEDS_WILLIAM, PARKED])
-        commented = self._gh.comment(repo, num, bounce_comment(self._date()))
+        labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
+                                      remove=[NEEDS_OWNER, NEEDS_OWNER_LEGACY, PARKED])
+        commented = self._gh.comment(repo, num, bounce_comment(self._operator, self._date()))
         return {"ok": bool(labeled and commented), "verb": "bounce-yes",
                 "labeled": bool(labeled), "commented": bool(commented)}
 
@@ -158,7 +171,7 @@ class Actions:
             return {"ok": False, "verb": "flag", "error": "empty flag"}
         # Create-or-update the label first (idempotent via --force) so the labeled create can't fail
         # for want of the label on a repo seeing its first flag.
-        self._gh.create_label(repo, FLAG, _FLAG_LABEL_COLOR, _FLAG_LABEL_DESC)
+        self._gh.create_label(repo, FLAG, _FLAG_LABEL_COLOR, flag_label_desc(self._operator))
         num = self._gh.create_issue(repo, flag_title(text), text, labels=[FLAG])
         return {"ok": num is not None, "verb": "flag", "num": num}
 

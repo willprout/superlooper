@@ -68,7 +68,7 @@ def test_full_report_has_every_section_with_its_entries():
     assert f"https://github.com/{REPO}/pull/12" in out        # PR link built from repo
     # Parked / needs-william — memos verbatim, needs-william flagged distinctly
     assert "retry cap hit" in out
-    assert "conflict cap hit" in out and "needs-william" in out.lower()
+    assert "conflict cap hit" in out and "needs-owner" in out.lower()
     # Bounces — the BOUNCED memo verbatim
     assert "BOUNCED: the crash is already fixed" in out
     # Conflict regenerations — the tuning metric, with the rebuilt branch
@@ -186,7 +186,7 @@ def test_park_then_reapprove_then_merge_renders_once_as_merged_never_open_ask():
     out = report.morning(j, _view(now=T + 100, queue=[]), ledger={}, config=_cfg())
 
     merged_section = out.split("## Merged")[1].split("\n## ")[0]
-    parked_section = out.split("## Parked / needs-william")[1].split("\n## ")[0]
+    parked_section = out.split("## Parked / needs-owner")[1].split("\n## ")[0]
     # landed: it shows once under Merged, with its PR link
     assert "#9" in merged_section
     assert f"https://github.com/{REPO}/pull/42" in out
@@ -196,7 +196,7 @@ def test_park_then_reapprove_then_merge_renders_once_as_merged_never_open_ask():
     assert "#9" not in parked_section
     assert "re-approve to retry" not in out
     # the summary counts it as merged, not parked
-    assert "1 merged · 0 parked/needs-william" in out
+    assert "1 merged · 0 parked/needs-owner" in out
 
 
 def test_genuine_park_without_a_later_merge_still_renders_as_open_ask():
@@ -209,10 +209,10 @@ def test_genuine_park_without_a_later_merge_still_renders_as_open_ask():
          "memo": "retry cap hit — genuinely stuck", "outcome": "ok"},
     ]
     out = report.morning(j, _view(now=T + 100, queue=[]), ledger={}, config=_cfg())
-    parked_section = out.split("## Parked / needs-william")[1].split("\n## ")[0]
+    parked_section = out.split("## Parked / needs-owner")[1].split("\n## ")[0]
     assert "#9" in parked_section and "retry cap hit — genuinely stuck" in parked_section
-    assert "needs-william" in parked_section.lower()
-    assert "0 merged · 1 parked/needs-william" in out
+    assert "needs-owner" in parked_section.lower()
+    assert "0 merged · 1 parked/needs-owner" in out
 
 
 def test_merge_before_a_later_park_stays_an_open_ask():
@@ -227,7 +227,7 @@ def test_merge_before_a_later_park_stays_an_open_ask():
          "memo": "reopened and stuck again", "outcome": "ok"},
     ]
     out = report.morning(j, _view(now=T + 100, queue=[]), ledger={}, config=_cfg())
-    parked_section = out.split("## Parked / needs-william")[1].split("\n## ")[0]
+    parked_section = out.split("## Parked / needs-owner")[1].split("\n## ")[0]
     assert "#9" in parked_section and "reopened and stuck again" in parked_section
 
 

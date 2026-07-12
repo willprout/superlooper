@@ -127,7 +127,8 @@ def main(argv):
     # the slow read-cache (a label change must land now, not on the next 30s tick — CachedGh caches
     # only reads). The allow-list is exactly the configured slugs, so a tap can only ever steer a repo
     # the operator chose to watch.
-    verbs = actions_mod.Actions(gh, allowed_repos=[r["slug"] for r in cfg["repos"]])
+    verbs = actions_mod.Actions(gh, allowed_repos=[r["slug"] for r in cfg["repos"]],
+                                operator=config_mod.operator(cfg))
     # The Tidy button (issue #41) — the ONE local-command verb: it runs `superlooper tidy` to close
     # finished session windows. Bound to the configured CLI path and an allow-list mapping each
     # watched repo slug to its checkout (the `--repo` argument), so a tap can only ever tidy a repo

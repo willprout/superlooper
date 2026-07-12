@@ -278,10 +278,10 @@ def test_reads_fail_closed_on_timeout(tmp_path, monkeypatch):
 
 def test_set_labels_records_add_and_remove(tmp_path, monkeypatch):
     _use_fake(monkeypatch, tmp_path)
-    assert gh.set_labels(REPO, 4, add=["agent-ready"], remove=["parked", "needs-william"]) is True
+    assert gh.set_labels(REPO, 4, add=["agent-ready"], remove=["parked", "needs-owner"]) is True
     mut = _mutations(tmp_path)[-1]
     assert mut == {"kind": "set_labels", "num": "4",
-                   "add": "agent-ready", "remove": "parked,needs-william"}
+                   "add": "agent-ready", "remove": "parked,needs-owner"}
 
 
 def test_set_labels_noop_when_nothing_to_change(tmp_path, monkeypatch):

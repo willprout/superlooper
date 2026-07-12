@@ -167,7 +167,7 @@ def _parked(records, window_start, resolved=frozenset()):
     for num in sorted(seen):
         iid, needs, memo = seen[num]
         tag = f" ({iid})" if iid else ""
-        who = "**needs-william**" if needs else "parked"
+        who = "**needs-owner**" if needs else "parked"
         lines.append(f"- #{num}{tag} {who} — {memo if isinstance(memo, str) else '(no memo)'}")
     return lines
 
@@ -383,7 +383,7 @@ def morning(journal_records, gh_view, ledger, config):
     # that failed) always breaks quiet — the owner must never coffee past one (issue #66).
     quiet = not any((merged, parked, bounces, regens, wanders, watchdog, queue, frozen))
     summary = ("Nothing happened overnight — queue empty." if quiet else
-               f"{len(merged)} merged · {len(parked)} parked/needs-william · "
+               f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · queue: {len(queue)}.")
 
     parts = [
@@ -398,7 +398,7 @@ def morning(journal_records, gh_view, ledger, config):
         parts.append(f"{drift}\n")
     parts += [
         _section("Merged", merged, "Nothing merged."),
-        _section("Parked / needs-william", parked),
+        _section("Parked / needs-owner", parked),
         _section("Bounces", bounces),
         _section("Conflict regenerations (last 7 days)", regens),
         _section("Wanders", wanders),

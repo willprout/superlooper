@@ -18,9 +18,9 @@ single question. Your entire job is to answer that ONE question decisively, then
   answer file below. Treat every repo as read-only.
 - Be decisive. One recommendation with a one-line why beats a survey of options. Keep the
   answer to at most 10 lines.
-- If the question is genuinely William's to decide (money, scope, product judgment, a
+- If the question is genuinely {operator}'s to decide (money, scope, product judgment, a
   bright-line area), do not guess: answer with a single line beginning exactly `PARK: `
-  followed by why this needs William.
+  followed by why this needs {operator}.
 
 ## Finish
 

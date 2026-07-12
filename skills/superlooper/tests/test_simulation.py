@@ -546,7 +546,7 @@ def test_pr_check_failure_hands_back_once_then_parks(sim_factory):
 def test_unreported_required_check_escalates_once_to_william(sim_factory):
     # issue #26: a required_checks entry naming a check the repo NEVER reports reads as pending
     # forever — a green PR that never merges, with no park, no memo, no notify. Past the bound the
-    # runner escalates ONCE to needs-william, naming the unreported check. The repo reports "ci";
+    # runner escalates ONCE to needs-owner, naming the unreported check. The repo reports "ci";
     # "ghost-check" is required but never reported, so the gate sits at pending until the bound.
     sim = sim_factory(required_checks=("ghost-check",),
                       session={"checks_pending_cap": 90})       # bound < one tick's 91s advance
@@ -559,14 +559,14 @@ def test_unreported_required_check_escalates_once_to_william(sim_factory):
     # the merge decision stays fail-closed: pending NEVER merges
     assert not sim.mutations("merge_pr")
     assert (not sim.prs_for()) or sim.prs_for()[0]["state"] != "MERGED"
-    # the label moved to needs-william and the memo NAMES the unreported check
-    assert "needs-william" in sim.issue(num)["labels"]
+    # the label moved to needs-owner and the memo NAMES the unreported check
+    assert "needs-owner" in sim.issue(num)["labels"]
     assert "in-progress" not in sim.issue(num)["labels"]
     memos = [m for m in sim.mutations("comment")
              if "ghost-check" in m["body"] and "pending" in m["body"].lower()]
     assert memos, "the park memo must name the unreported check: %s" % sim.mutations("comment")
     # the escalation notifies (standing rule) exactly once
-    notices = [ln for ln in sim.notify_lines() if "needs-william" in ln]
+    notices = [ln for ln in sim.notify_lines() if "needs-owner" in ln]
     assert len(notices) == 1, sim.notify_lines()
 
 
@@ -582,7 +582,7 @@ def test_late_but_in_bound_check_still_merges(sim_factory):
     # a couple of pending ticks: the runner waits, never escalates, never merges
     sim.tick(); sim.tick()
     assert sim.loop_issue(sid).get("status") in ("gating", "holding")
-    assert "needs-william" not in sim.issue(num)["labels"] and not sim.mutations("merge_pr")
+    assert "needs-owner" not in sim.issue(num)["labels"] and not sim.mutations("merge_pr")
     # the check reports green within the bound -> the PR merges cleanly
     sim.edit_gh_state(lambda st: st.update(pr_check_conclusion="SUCCESS"))
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged"), \
@@ -601,7 +601,7 @@ def test_refused_merge_is_bounded_and_escalates_once_to_william(sim_factory):
     # branch protection (required approvals / strict up-to-date) or a token without merge rights
     # does. Before this fix the runner retried the merge every tick FOREVER: no counter, no cap, no
     # park, no notify — a green PR that never lands and never explains itself. Now the runner bounds
-    # the retries, then parks needs-william ONCE with the gh refusal reason in the memo, and STOPS.
+    # the retries, then parks needs-owner ONCE with the gh refusal reason in the memo, and STOPS.
     sim = sim_factory()
     num = sim.add_issue(title="Green PR whose merge is refused", scenario={"scenario": "happy"})
     sid = "i%d" % num
@@ -631,21 +631,21 @@ def test_refused_merge_is_bounded_and_escalates_once_to_william(sim_factory):
     sim.tick(); sim.tick()
     assert len(sim.journal("merge")) == actions_lib.MERGE_REFUSAL_CAP, "retries restarted after park"
 
-    # label moved to needs-william; the memo NAMES branch protection and carries the gh stderr
-    assert "needs-william" in sim.issue(num)["labels"]
+    # label moved to needs-owner; the memo NAMES branch protection and carries the gh stderr
+    assert "needs-owner" in sim.issue(num)["labels"]
     assert "in-progress" not in sim.issue(num)["labels"]
     memos = [m for m in sim.mutations("comment")
              if "branch protection" in m["body"] and "2 approving reviews required" in m["body"]]
     assert memos, "the park memo must name branch protection AND carry gh's stderr: %s" \
         % sim.mutations("comment")
     # the escalation notifies (standing rule) exactly once
-    notices = [ln for ln in sim.notify_lines() if "needs-william" in ln]
+    notices = [ln for ln in sim.notify_lines() if "needs-owner" in ln]
     assert len(notices) == 1, sim.notify_lines()
 
 
 def test_transient_merge_refusal_clears_within_the_bound_and_merges(sim_factory):
     # DoD #2: a refusal that clears WITHIN the bound still merges cleanly with zero noise — no
-    # park, no needs-william, no alarm. (fake-gh refuses only the FIRST merge; the retry lands.)
+    # park, no needs-owner, no alarm. (fake-gh refuses only the FIRST merge; the retry lands.)
     sim = sim_factory()
     num = sim.add_issue(title="Merge refused once then clears", scenario={"scenario": "happy"})
     sid = "i%d" % num
@@ -658,9 +658,9 @@ def test_transient_merge_refusal_clears_within_the_bound_and_merges(sim_factory)
         % [(r.get("act"), r.get("outcome")) for r in sim.journal()]
     assert sim.prs_for()[0]["state"] == "MERGED"
     assert len(sim.mutations("merge_pr")) == 1            # the retry really landed, exactly once
-    # zero noise: never escalated, and no needs-william notify fired
-    assert "needs-william" not in sim.issue(num)["labels"]
-    assert not [ln for ln in sim.notify_lines() if "needs-william" in ln], sim.notify_lines()
+    # zero noise: never escalated, and no needs-owner notify fired
+    assert "needs-owner" not in sim.issue(num)["labels"]
+    assert not [ln for ln in sim.notify_lines() if "needs-owner" in ln], sim.notify_lines()
 
 
 def test_finished_without_pr_parks_with_memo(sim_factory):
@@ -691,7 +691,7 @@ def test_referee_path_pr_parks_needs_william_once_without_merging(sim_factory):
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
 
     assert not sim.mutations("merge_pr")
-    assert "needs-william" in sim.issue(num)["labels"]
+    assert "needs-owner" in sim.issue(num)["labels"]
     assert "in-progress" not in sim.issue(num)["labels"]
     memos = [m for m in sim.mutations("comment")
              if "diff reaches live referee path" in m["body"]]
@@ -702,20 +702,20 @@ def test_referee_path_pr_parks_needs_william_once_without_merging(sim_factory):
 
 def test_touches_required_parks_a_no_touches_issue_before_launch(sim_factory):
     # issue #36 end-to-end: with touches_required ON, an approved build issue that declares no
-    # `touches:` is refused at INTAKE — parked needs-william with a memo naming the missing block —
+    # `touches:` is refused at INTAKE — parked needs-owner with a memo naming the missing block —
     # and NEVER launched (no worker session, no PR, no merge).
     sim = sim_factory(touches_required=True)
     num = sim.add_issue(title="Forgot the touches block", touches="")   # empty -> no declaration
     sid = "i%d" % num
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "needs_william"), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
-    assert "needs-william" in sim.issue(num)["labels"]
+    assert "needs-owner" in sim.issue(num)["labels"]
     assert "in-progress" not in sim.issue(num)["labels"]
     assert not sim.mutations("merge_pr")                     # never launched -> never merged
     memos = [m for m in sim.mutations("comment") if "touches_required" in m["body"]]
     assert len(memos) == 1 and "touches:" in memos[0]["body"]
     notices = sim.notify_lines()
-    assert notices and any(sid in n and "needs-william" in n for n in notices)
+    assert notices and any(sid in n and "needs-owner" in n for n in notices)
 
 
 def test_touches_required_off_launches_a_no_touches_issue(sim_factory):
@@ -750,7 +750,7 @@ def test_bounce_runner_posts_memo_and_moves_labels(sim_factory):
     # the memo reached the issue VERBATIM, quoted by the runner
     bounce_comments = [m for m in sim.mutations("comment") if memo in m["body"]]
     assert bounce_comments, "the worker's memo must be posted verbatim by the RUNNER"
-    assert "needs-william" in sim.issue(num)["labels"]
+    assert "needs-owner" in sim.issue(num)["labels"]
     assert "in-progress" not in sim.issue(num)["labels"]
     # the runner consumed the marker; NO answerer was ever hired for a bounce
     assert not os.path.exists(os.path.join(sim.home, "state", "blocked", sid))
@@ -795,7 +795,7 @@ def test_blocked_answerer_roundtrip_resumes_and_merges(sim_factory):
 
 
 def test_answerer_park_escalates_to_william(sim_factory):
-    # the answerer refuses to guess: a PARK: answer parks the issue needs-william with the
+    # the answerer refuses to guess: a PARK: answer parks the issue needs-owner with the
     # question quoted in the memo.
     sim = sim_factory()
     question = "May I spend money on a paid API for this?"
@@ -806,7 +806,7 @@ def test_answerer_park_escalates_to_william(sim_factory):
     sim.tick()
     assert sim.wait_file(os.path.join(sim.home, "state", "blocked", sid))
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "needs_william")
-    assert "needs-william" in sim.issue(num)["labels"]
+    assert "needs-owner" in sim.issue(num)["labels"]
     memos = [m for m in sim.mutations("comment") if question in m["body"]]
     assert memos, "the park memo must quote the worker's question"
     assert not sim.mutations("merge_pr")
@@ -847,11 +847,11 @@ def test_investigate_marker_and_child_parent_closed_child_waits(sim_factory):
     # the marker comment is the mechanical completion signal (cross-review C1)
     assert any(c["body"].startswith("<!-- superlooper-investigation -->")
                for c in sim.issue(num)["comments"])
-    # the child: parent-linked, needs-william, NOT agent-ready — and never launched
+    # the child: parent-linked, needs-owner, NOT agent-ready — and never launched
     children = [i for i in sim.gh_state()["issues"].values()
                 if "parent: #%d" % num in i["body"]]
     assert len(children) == 1
-    assert "needs-william" in children[0]["labels"]
+    assert "needs-owner" in children[0]["labels"]
     assert "agent-ready" not in children[0]["labels"]
     sim.tick()
     sim.tick()
@@ -1126,7 +1126,7 @@ def test_conflict_regenerate_then_park_at_cap_branches_preserved(sim_factory):
     assert sim.tick_until(lambda: sim.loop_issue(s2).get("status") == "needs_william",
                           ticks=15), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
-    assert "needs-william" in sim.issue(n2)["labels"]
+    assert "needs-owner" in sim.issue(n2)["labels"]
     memos = [m for m in sim.mutations("comment") if "conflict cap" in m["body"]]
     assert memos, sim.mutations("comment")
     # exactly ONE regenerate ever (the cap parks, it never loops); both B branches preserved
@@ -1136,7 +1136,7 @@ def test_conflict_regenerate_then_park_at_cap_branches_preserved(sim_factory):
     assert sim.origin_tip(b_branch_1), "the rebuild's branch must also survive on the remote"
     assert not [m for m in sim.mutations("merge_pr")
                 if str(pr_b0["number"]) == m["num"]], "a superseded PR must never merge"
-    assert any("needs-william" in ln for ln in sim.notify_lines())
+    assert any("needs-owner" in ln for ln in sim.notify_lines())
 
 
 def test_preserve_labeled_pr_resolved_in_place_never_regenerated(sim_factory):
@@ -1641,10 +1641,10 @@ def test_orphaned_pushed_branch_no_pr_blocks_and_preserves_remote_work(sim_facto
     blocked_q = open(os.path.join(sim.home, "state", "blocked", sid)).read()
     assert "refused" in blocked_q and "force" in blocked_q
 
-    # the answerer recognizes an owner call -> the issue parks needs-william with the question
+    # the answerer recognizes an owner call -> the issue parks needs-owner with the question
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "needs_william"), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
-    assert "needs-william" in sim.issue(num)["labels"]
+    assert "needs-owner" in sim.issue(num)["labels"]
 
     # THE INVARIANT THE POKE EXISTS FOR: the pushed work was never clobbered or lost
     assert sim.origin_tip("sl/i%d-orphaned-push" % num) == orphan_tip

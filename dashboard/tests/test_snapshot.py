@@ -63,7 +63,7 @@ def _calm(home):
 def test_snapshot_carries_every_panel_the_shell_binds(home):
     snap = server.assemble_snapshot(_config(home), now=NOW)
     for key in ("generated_at", "poll_seconds", "pill", "tower_status", "runner", "usage",
-                "trouble", "needs_you", "all_clear", "repos", "flights", "journal_tail"):
+                "trouble", "needs_you", "all_clear", "repos", "flights", "journal_tail", "operator"):
         assert key in snap, "snapshot missing %r" % key
     assert snap["poll_seconds"] == 2
     assert snap["generated_at"] == NOW
@@ -73,6 +73,13 @@ def test_snapshot_carries_every_panel_the_shell_binds(home):
                 "lanes", "queue_empty_caption", "state_format"):
         assert key in repo, "repo snapshot missing %r" % key
     assert set(repo["boards"]) == {"departures", "arrivals"}
+
+
+def test_snapshot_exposes_the_configured_operator(home):
+    # issue #58: the shell's approve toast reads snapshot.operator to sign the owner's word. An
+    # explicit operator flows through; absent, it falls back to the neutral word, never "William".
+    assert server.assemble_snapshot(_config(home, operator="Ada"), now=NOW)["operator"] == "Ada"
+    assert server.assemble_snapshot(_config(home), now=NOW)["operator"] == "the owner"
 
 
 # =============================== state-format handshake (issue #45) ===============================
@@ -310,7 +317,7 @@ def test_needs_you_carries_long_needs_william_memo_untrimmed(tmp_path):
     assert snap["all_clear"] is False
     assert len(snap["needs_you"]) == 1
     card = snap["needs_you"][0]
-    assert card["kind"] == "needs-william"
+    assert card["kind"] == "needs-owner"
     assert card["memo"] == long_memo
     assert "Recommendation: choose Option B" in card["memo"]
 

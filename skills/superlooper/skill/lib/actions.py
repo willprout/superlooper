@@ -76,6 +76,7 @@ Action vocabulary (the executor contract, one journal record each):
 import math
 
 import brief
+import config as _config
 import events as events_mod
 import gate
 import issues as issues_mod
@@ -423,7 +424,7 @@ def dev_fingerprint(dev_checks, required):
     return gate.fix_issue_fingerprint(name, concl)
 
 
-def _fix_issue(dev_branch, name, conclusion, fingerprint):
+def _fix_issue(dev_branch, name, conclusion, fingerprint, operator="the owner"):
     title = f"Restore green: required check '{name}' is red on {dev_branch}"
     body = (
         f"## Goal\n"
@@ -435,7 +436,7 @@ def _fix_issue(dev_branch, name, conclusion, fingerprint):
         f"- [ ] required check `{name}` is green on `{dev_branch}`\n\n"
         f"## Boundaries\n"
         f"Only the minimal change that restores green. Anything larger becomes a new issue for\n"
-        f"William to approve. Merges are frozen until dev is green again.\n\n"
+        f"{operator} to approve. Merges are frozen until dev is green again.\n\n"
         f"## Loop metadata\n"
         # `touches: *` — a restore-green fix has genuinely unknown scope (whatever broke the check),
         # so the wildcard is the honest declaration. It also satisfies touches_required (issue #36:
@@ -466,6 +467,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
 
     # ---- defensive coercion of every input (wrong-typed -> safe empty, never a raise) ----
     cfg = config if isinstance(config, dict) else {}
+    operator = _config.operator(cfg)          # the owner name every hand-back memo/notify uses (#58)
     session = _dget(cfg, "session", dict)
     retry_cap = _count(session.get("retry_cap"), 2)
     dev_branch = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
@@ -593,7 +595,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             act["retry"] = True
             out.append(act)
             return
-        who = "needs-william" if needs_william else "parked"
+        who = "needs-owner" if needs_william else "parked"
         notify(f"superlooper: {iid} {who}", memo)
         out.append(act)
 
@@ -699,7 +701,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                        f"required check '{name}' is red on {dev_branch}; fix-forward filed, "
                        "building continues")
             if fp not in filed:
-                out.append(_fix_issue(dev_branch, name, concl, fp))
+                out.append(_fix_issue(dev_branch, name, concl, fp, operator))
         elif dev_state == "green" and frozen:
             out.append({"act": "unfreeze"})
 
@@ -754,7 +756,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # ---- recheck failure: an owner decision, checked before any gate re-run ----
         if ist.get("recheck_failed"):
             park(iid, num, "ship_recheck_cmd failed after the mechanical merge-update — "
-                           "never coached around a fail-closed gate; William decides",
+                           f"never coached around a fail-closed gate; {operator} decides",
                  needs_william=True, cause="recheck")
             continue
 
@@ -942,7 +944,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         if blocked_text is not None and not has_exited:
             if blocked_text.lstrip().startswith("BOUNCED:"):
                 out.append({"act": "bounce", "id": iid, "num": num, "memo": blocked_text})
-                notify(f"superlooper: {iid} bounced (needs-william)", blocked_text)
+                notify(f"superlooper: {iid} bounced (needs-owner)", blocked_text)
                 continue
             aid_rec = active_answerer.get(iid)
             answer = answers.get(iid) if isinstance(answers.get(iid), str) else None
@@ -954,7 +956,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                                    f"is unreadable). question was: {blocked_text!r}",
                          cause="answer_delivery")
                 elif answer.lstrip().startswith("PARK:"):
-                    park(iid, num, f"answerer escalated to William. question: "
+                    park(iid, num, f"answerer escalated to {operator}. question: "
                                    f"{blocked_text!r} — answer: {answer!r}",
                          needs_william=True, cause="answerer_escalated")
                 else:

@@ -1271,6 +1271,13 @@ class Runner:
                            fn=lambda st, i: self._bump(i, "launch_failures"))
         return f"launch rc={rc} (delivery not verified)"
 
+    def _operator(self):
+        """The operator display name (issue #58) — config.operator over this repo's config, so
+        every stranger-visible line the runner emits (answerer brief, close-investigate memo) signs
+        the owner's own name and never a hardcoded person."""
+        import config as config_lib
+        return config_lib.operator(self.config)
+
     def _exec_hire_answerer(self, a, now):
         iid, aid, question = a["id"], a["answerer_id"], a["question"]
         _, answerer_model = self._models()
@@ -1280,7 +1287,8 @@ class Runner:
         body = (self._raw_by_id.get(iid) or {}).get("body", "")
         text = _sub(template, {"issue_num": str(a.get("num")), "issue_body": body,
                                "question": question, "worktree": self._worktree(iid),
-                               "answer_path": os.path.join(answers_dir, f"{iid}.md")})
+                               "answer_path": os.path.join(answers_dir, f"{iid}.md"),
+                               "operator": self._operator()})
         with open(os.path.join(self.home, "briefs", f"{aid}.md"), "w") as f:
             f.write(text)
         answerer_effort = ""
@@ -1345,7 +1353,7 @@ class Runner:
                 "or reject — one touch._")
         if not gh.comment(num, body):
             return "memo comment failed (will retry next tick)"
-        if not gh.set_labels(num, add=["needs-william"], remove=["in-progress"]):
+        if not gh.set_labels(num, add=["needs-owner"], remove=["in-progress"]):
             return "label move failed (will retry next tick)"
         _rm(os.path.join(self.state, "blocked", iid))
         self._update_issue(iid, {"status": "bounced"})
@@ -1362,7 +1370,7 @@ class Runner:
 
     def _exec_park(self, a, now):
         iid, num = a["id"], a.get("num")
-        label = "needs-william" if a.get("needs_william") else "parked"
+        label = "needs-owner" if a.get("needs_william") else "parked"
         cause = a.get("cause")
         cause = cause if isinstance(cause, str) and cause else a.get("memo", "")
         # Notify-once marker (issue #61): stamped durably BEFORE the label move is attempted, so
@@ -1462,10 +1470,11 @@ class Runner:
                     recs.pop(aid, None)
         self._update_issue(iid, fn=reset)
         journal.append(self.home, {"act": "reapprove", "id": iid, "old_counters": old}, now)
-        # Clear the park-family labels William re-approved past; the next tick's launch moves
+        # Clear the park-family labels the owner re-approved past; the next tick's launch moves
         # agent-ready -> in-progress. Best-effort: a gh blip only leaves a cosmetic stale label,
-        # never blocks the relaunch (phase E keys off agent-ready, not the parked label).
-        gh.set_labels(num, remove=["parked", "needs-william"])
+        # never blocks the relaunch (phase E keys off agent-ready, not the parked label). Remove BOTH
+        # the current `needs-owner` and the legacy `needs-william` so a repo mid-migration clears too.
+        gh.set_labels(num, remove=["parked", "needs-owner", "needs-william"])
         return f"reapproved (reset {old or 'nothing'})"
 
     def _exec_reclaim(self, a, now):
@@ -1732,7 +1741,7 @@ class Runner:
         iid, num = a["id"], a.get("num")
         if not gh.close_issue(num, comment="Investigation complete — the root-cause report is "
                                            "the marker comment above; child issues (if any) "
-                                           f"carry `parent: #{num}` and await William's "
+                                           f"carry `parent: #{num}` and await {self._operator()}'s "
                                            "approval."):
             return "close failed (will retry next tick)"
         gh.set_labels(num, remove=["in-progress"])

@@ -21,6 +21,15 @@ import actions
 import janitor
 
 
+def test_park_labels_recognize_both_the_new_and_legacy_owner_decision_label():
+    # issue #58 compat: the owner-decision label was renamed needs-william -> needs-owner. The
+    # janitor's aged-park sweep queries EACH PARK_LABEL, so both must be recognized — a repo adopted
+    # before the rename (or one mid-migration) still has its owner-decision issues found.
+    assert "needs-owner" in janitor.PARK_LABELS      # current
+    assert "needs-william" in janitor.PARK_LABELS    # legacy, still swept
+    assert "parked" in janitor.PARK_LABELS
+
+
 def _pr(num, state, labels=(), head=None, oid="tip0"):
     """A raw gh PR dict, labels in gh's [{'name': ...}] shape. `oid` is headRefOid — the PR's
     last-known head, matched against the branch's current tip before a delete is proposed."""

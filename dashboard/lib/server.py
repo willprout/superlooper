@@ -994,7 +994,7 @@ def _ts_key(rec):
     return ts if _finite(ts) else 0   # non-finite (NaN) sorts as oldest, never poisons the sort
 
 
-def _tower_window(records, last_seen=None, limit=14, max_rows=120):
+def _tower_window(records, last_seen=None, limit=14, max_rows=120, operator="the owner"):
     """The tower-log comms window (design record §4 / Task 9): journal records as rows in
     CHRONOLOGICAL order (a comms feed reads by time, never by raw file position — the journal is
     normally append-ordered, but the reader must not assume it). Each row is glossed through the
@@ -1037,7 +1037,7 @@ def _tower_window(records, last_seen=None, limit=14, max_rows=120):
     for i in sel:
         rec = ordered[i]
         ts = rec.get("ts")
-        c = tower_mod.comms_row(rec)
+        c = tower_mod.comms_row(rec, operator)
         rows.append({"ts": ts, "hhmm": _hhmm(ts), "text": c["text"], "radio": c["radio"],
                      "kind": c["kind"], "num": c["num"], "tier": c["tier"],
                      "raw": json.dumps(rec, separators=(",", ":"))})
@@ -1057,6 +1057,7 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     settled GitHub facts a once-per-run fetch instead of a forever poll (issue #48)."""
     slug = repo["slug"]
     name = repo.get("name") or slug
+    operator = config_mod.operator(config)             # signs the re-approval line + drawer (issue #58)
     home = repo["state_home"]
     facts = readers.read_state_home(home, now=now)
     journal = readers.read_journal(home)
@@ -1137,7 +1138,8 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     # come from the tested ``lib/cards`` layer; the server only supplies the title + locale HH:MM.
     for f, jslice, _ in flight_records:
         f["drawer"] = cards_mod.flight_drawer(f, jslice, slug, name,
-                                              title=titles.get(f["num"]), hhmm=_hhmm)
+                                              title=titles.get(f["num"]), hhmm=_hhmm,
+                                              operator=operator)
 
     states = [f["stage"] for f in repo_flights]
     spinning = any(f["spinning"] for f in repo_flights)
@@ -1156,7 +1158,7 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     if arrivals and _finite(arrivals[0]["ts"]):
         last_landing_text = "last landing %s ago" % format_duration(now - arrivals[0]["ts"])
 
-    tower_rows, tower_new = _tower_window(journal, last_seen)
+    tower_rows, tower_new = _tower_window(journal, last_seen, operator=operator)
 
     # The launch queue in real order (departures board), and its front projected to planes standing at
     # the gates (the field's "at the stand" stage, issue #32). The stand is derived FROM departures —
@@ -1389,6 +1391,7 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
         "clock": _hhmm(now),
         "daypart": flights.daypart(now),   # the living clock (§7) — lighting only, never weather
         "fun": _fun_map(config),
+        "operator": config_mod.operator(config),   # the name the approve toast signs with (issue #58)
         "tower_last_seen": last_seen,      # the persisted watermark the divider is drawn against (§4)
         "poll_seconds": config.get("poll_seconds", 2),
         "pill": pill,
@@ -1507,4 +1510,5 @@ def assemble_digest(config, params, *, now=None, hhmm=None):
     journal = readers.read_journal(repo["state_home"])
     return digest_mod.build_digest(journal, slug=repo["slug"],
                                    name=repo.get("name") or repo["slug"],
-                                   start=start, end=end, hhmm=hhmm)
+                                   start=start, end=end, hhmm=hhmm,
+                                   operator=config_mod.operator(config))

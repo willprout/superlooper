@@ -7,7 +7,7 @@ audit-comment wording, the flag issue + its first-use label — so the mechanica
 not just "a write happened".
 
 Three disciplines this file defends:
-  1. **Audit trail, every write.** Each verb leaves a ``… by William via command-center, <date>.``
+  1. **Audit trail, every write.** Each verb leaves a ``… by Ada via command-center, <date>.``
      comment (or a flag issue whose body is the raw text) — journal-greppable, William's name.
   2. **Watched repo only.** Every write is gated on the allow-list of configured slugs; a request
      naming an unwatched repo is refused with no gh call (the label-writer can't be steered off its
@@ -50,7 +50,7 @@ def _calls(fixdir):
 
 def _acts(monkeypatch, tmp_path, allowed=(REPO,)):
     _use_fake(monkeypatch, tmp_path)
-    return actions.Actions(gh, allowed_repos=list(allowed), today=lambda: DATE)
+    return actions.Actions(gh, allowed_repos=list(allowed), today=lambda: DATE, operator="Ada")
 
 
 # =============================== approve / re-approve ===============================
@@ -64,7 +64,7 @@ def test_approve_adds_agent_ready_removes_parked_and_needs_william(tmp_path, mon
     assert label["num"] == "4"
     assert label["add"] == "agent-ready"
     # both blockers cleared in one edit (order-independent membership check)
-    assert set(label["remove"].split(",")) == {"parked", "needs-william"}
+    assert set(label["remove"].split(",")) == {"parked", "needs-owner", "needs-william"}
 
 
 def test_approve_posts_the_exact_audit_comment(tmp_path, monkeypatch):
@@ -72,7 +72,7 @@ def test_approve_posts_the_exact_audit_comment(tmp_path, monkeypatch):
     a.approve(REPO, 4)
     comment = [m for m in _mutations(tmp_path) if m["kind"] == "comment"][-1]
     assert comment["num"] == "4"
-    assert comment["body"] == "Approved by William via command-center, 2026-07-07."
+    assert comment["body"] == "Approved by Ada via command-center, 2026-07-07."
 
 
 def test_approve_is_pinned_to_the_named_repo(tmp_path, monkeypatch):
@@ -124,7 +124,7 @@ def test_drop_closes_issue_with_audit_comment_in_one_call(tmp_path, monkeypatch)
     assert res["ok"] is True
     close = [m for m in _mutations(tmp_path) if m["kind"] == "close_issue"][-1]
     assert close["num"] == "5"
-    assert close["comment"] == "Dropped by William via command-center, 2026-07-07."
+    assert close["comment"] == "Dropped by Ada via command-center, 2026-07-07."
 
 
 def test_drop_refuses_an_unwatched_repo(tmp_path, monkeypatch):
@@ -150,7 +150,7 @@ def test_expedite_adds_the_expedite_label_and_audit_comment(tmp_path, monkeypatc
     assert label["add"] == "expedite"
     assert label["remove"] is None                    # expedite only adds
     comment = [m for m in muts if m["kind"] == "comment"][-1]
-    assert comment["body"] == "Expedited by William via command-center, 2026-07-07."
+    assert comment["body"] == "Expedited by Ada via command-center, 2026-07-07."
 
 
 # =============================== bounce-yes ===============================
@@ -161,14 +161,16 @@ def test_bounce_yes_reapproves_and_clears_needs_william(tmp_path, monkeypatch):
     assert res["ok"] is True
     label = [m for m in _mutations(tmp_path) if m["kind"] == "set_labels"][-1]
     assert label["add"] == "agent-ready"
-    assert "needs-william" in label["remove"].split(",")
+    # clears the current owner-decision label AND the legacy one (issue #58 compat)
+    removed = set(label["remove"].split(","))
+    assert "needs-owner" in removed and "needs-william" in removed
 
 
 def test_bounce_yes_audit_comment_names_the_accepted_bounce(tmp_path, monkeypatch):
     a = _acts(monkeypatch, tmp_path)
     a.bounce_yes(REPO, 8)
     comment = [m for m in _mutations(tmp_path) if m["kind"] == "comment"][-1]
-    assert comment["body"].startswith("Bounce accepted by William via command-center, 2026-07-07.")
+    assert comment["body"].startswith("Bounce accepted by Ada via command-center, 2026-07-07.")
 
 
 # =============================== flag (raw text → issue labeled flag, no AI) ===============================
@@ -256,8 +258,8 @@ def test_discuss_contains_no_model_call_marker(monkeypatch):
 # =============================== the audit-comment wording is pinned directly ===============================
 
 def test_audit_comment_builders_exact_wording():
-    assert actions.approve_comment("2026-07-07") == "Approved by William via command-center, 2026-07-07."
-    assert actions.drop_comment("2026-07-07") == "Dropped by William via command-center, 2026-07-07."
-    assert actions.expedite_comment("2026-07-07") == "Expedited by William via command-center, 2026-07-07."
-    assert actions.bounce_comment("2026-07-07").startswith(
-        "Bounce accepted by William via command-center, 2026-07-07.")
+    assert actions.approve_comment("Ada", "2026-07-07") == "Approved by Ada via command-center, 2026-07-07."
+    assert actions.drop_comment("Ada", "2026-07-07") == "Dropped by Ada via command-center, 2026-07-07."
+    assert actions.expedite_comment("Ada", "2026-07-07") == "Expedited by Ada via command-center, 2026-07-07."
+    assert actions.bounce_comment("Ada", "2026-07-07").startswith(
+        "Bounce accepted by Ada via command-center, 2026-07-07.")

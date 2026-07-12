@@ -1023,7 +1023,7 @@ html, body {
 /* A centered modal OUTSIDE #root (like the flag box / digest) so the 2s poll never touches it. The
    ops-verb surface is plain and honest — it lists exactly what `superlooper tidy --dry-run` reported
    and asks before running the close. Amber accents keep it visually distinct from the blue decision
-   verbs: this runs a local machine, it is not William's word. */
+   verbs: this runs a local machine, it is not the owner's word. */
 .cc-tidy {
   position: fixed; inset: 0; z-index: 78; display: none;
   background: rgba(12, 17, 23, 0.5); align-items: flex-start; justify-content: center; padding: 20px;

@@ -24,7 +24,7 @@ Scenarios:
   review-late     open the PR + write the report, hold on "wait_for", THEN post the review
                   marker — the review-comment lands after the PR was cached (the D6 race).
   investigate     post the `<!-- superlooper-investigation -->` marker comment + create a
-                  `parent:`-linked child issue (labeled needs-william), write the report; no PR.
+                  `parent:`-linked child issue (labeled needs-owner), write the report; no PR.
   blocked         write the blocked-question marker, STAY ALIVE until the runner clears it
                   (answer delivered), then proceed with the happy flow.
   bounce          write the `BOUNCED:` marker ONLY, stay alive until the runner clears it, exit —
@@ -332,7 +332,7 @@ def scenario_investigate(spec, contract):
                       "## Boundaries\nOnly the fixture.\n\n"
                       "## Loop metadata\ntouches: tests\nparent: #%s\n") % (num, num)
         sh(GH, "issue", "create", "--title", "Child of #%s: isolate the fixture" % num,
-           "--body", child_body, "--label", "type:build,needs-william")
+           "--body", child_body, "--label", "type:build,needs-owner")
     finish(spec, contract)
 
 

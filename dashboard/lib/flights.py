@@ -885,7 +885,7 @@ def build_flight(issue, repo):
 
     awaiting_reason = None
     if stage == AWAITING:
-        awaiting_reason = "bounced" if (status == "bounced" or bounced) else "needs-william"
+        awaiting_reason = "bounced" if (status == "bounced" or bounced) else "needs-owner"
 
     return {
         "id": issue.get("id"),
