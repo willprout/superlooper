@@ -68,12 +68,13 @@ _CLOSE_TIMEOUT = 15            # bound the best-effort close of a finished sessi
 
 # The §C.2 label set, colors included so a fresh repo reads well at a glance. adopt creates
 # all of them idempotently (--force). Runner-managed labels say so — humans learn the loop's
-# vocabulary from the label descriptions.
+# vocabulary from the label descriptions. `{operator}` in a description is substituted with the
+# configured operator name at adopt time (issue #58), so a stranger's own labels sign their name.
 LABELS = [
-    ("agent-ready", "0e8a16", "William's approval: the runner may launch this issue"),
+    ("agent-ready", "0e8a16", "{operator}'s approval: the runner may launch this issue"),
     ("in-progress", "fbca04", "claimed by a loop session (runner-managed)"),
-    ("needs-william", "d93f0b", "parked for an owner decision (runner-managed)"),
-    ("parked", "c2e0c6", "handed back to William with a memo (runner-managed)"),
+    ("needs-owner", "d93f0b", "parked for an owner decision (runner-managed)"),
+    ("parked", "c2e0c6", "handed back to {operator} with a memo (runner-managed)"),
     ("expedite", "b60205", "queue-bypass lane: the next free lane takes this first"),
     ("preserve", "5319e7", "on a PR: resolve conflicts in-branch instead of regenerating"),
     ("auto-approved:nightly-red", "e99695",
@@ -348,15 +349,31 @@ def cmd_adopt(args):
     # creating labels in whatever repo the cwd happens to be.
     raw_cfg = _read(cfg_path)
     try:
-        slug = (json.loads(raw_cfg) or {}).get("repo") if raw_cfg else None
+        parsed_cfg = (json.loads(raw_cfg) or {}) if raw_cfg else {}
     except ValueError:
-        slug = None
+        parsed_cfg = {}
+    parsed_cfg = parsed_cfg if isinstance(parsed_cfg, dict) else {}
+    slug = parsed_cfg.get("repo")
     gh.set_repo(slug)
+
+    # operator display name (issue #58): the name every stranger-visible label description signs
+    # with — an explicit `operator` in the config wins, else the repo owner's GitHub login.
+    op = config_lib.operator(parsed_cfg)
+
+    # Migration (issue #58): a repo adopted before this change carries a `needs-william` label.
+    # Rename it in place to the neutral `needs-owner` — preserving it on every issue that carries it
+    # — so a stranger's own audit trail stops reading another person's name. Idempotent: skipped when
+    # the repo already has `needs-owner`, or never had `needs-william`. Runtime reads recognize BOTH
+    # (lib/janitor.py, lib/watchdog.py, dashboard), so a repo mid-migration keeps working either way.
+    have = gh.labels()
+    if "needs-william" in have and "needs-owner" not in have:
+        migrated = gh.rename_label("needs-william", "needs-owner")
+        print(f"migrating label: {'ok  ' if migrated else 'FAIL'} needs-william -> needs-owner")
 
     print("creating the label set (idempotent):")
     failed = []
     for name, color, desc in LABELS:
-        ok = gh.create_label(name, color, desc)
+        ok = gh.create_label(name, color, desc.replace("{operator}", op))
         print(f"  {'ok  ' if ok else 'FAIL'} {name}")
         if not ok:
             failed.append(name)
@@ -684,7 +701,7 @@ def _run_suite(cmd, worktree, results_glob):
     return rc, nightly_lib.parse_junit(texts)
 
 
-def _file_fix_issues(home, failures, dev):
+def _file_fix_issues(home, failures, dev, operator):
     """File one standing-rule fix issue per DISTINCT persistent failure, deduped by fingerprint:
     skip a fp already tracked in state/fix_issues.json, and reconcile against an open
     auto-approved:nightly-red issue whose body already carries the fp marker (the same crash-window
@@ -711,7 +728,7 @@ def _file_fix_issues(home, failures, dev):
             filed_map[fp] = hit
             tracking.append(hit)
             continue
-        issue = nightly_lib.fix_issue(f, dev)
+        issue = nightly_lib.fix_issue(f, dev, operator)
         num = gh.create_issue(issue["title"], issue["body"], labels=issue["labels"])
         if num is None:
             continue                     # gh failed; the next nightly re-files (idempotent by fp)
@@ -795,7 +812,7 @@ def cmd_nightly(args):
             loopstate.save(frozen_path,
                            {"reason": f"nightly red: {len(to_file)} persistent failure(s)",
                             "fingerprint": to_file[0]["fp"], "since": now, "source": "nightly"})
-            filed = _file_fix_issues(home, to_file, dev)
+            filed = _file_fix_issues(home, to_file, dev, config_lib.operator(cfg))
         else:
             # A green nightly clears ONLY a nightly-owned freeze — never a runner dev-check freeze
             # (which the runner clears when dev checks go green).

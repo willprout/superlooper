@@ -89,6 +89,16 @@ def test_nudge_carries_its_message_as_the_sentence():
     assert row["kind"] == "nudge"
 
 
+def test_reapprove_row_signs_the_configured_operator_name():
+    # issue #58: a re-approval is the owner's own gate — its tower line renders the configured
+    # operator, never a hardcoded "William". Default (no operator) reads neutrally.
+    row = tower.comms_row({"act": "reapprove", "id": "i5", "num": 5}, operator="Ada")
+    assert row["text"] == "SL-5 re-approved by Ada."
+    assert "William" not in row["text"]
+    default = tower.comms_row({"act": "reapprove", "id": "i5", "num": 5})
+    assert "the owner" in default["text"] and "William" not in default["text"]
+
+
 def test_answerer_exchange_renders_as_radio_calls():
     # The worker asking and the auto-tower answering are a back-and-forth radio exchange (design §7).
     ask = tower.comms_row({"act": "hire_answerer", "id": "i23", "num": 23,

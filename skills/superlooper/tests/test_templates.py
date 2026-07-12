@@ -25,7 +25,7 @@ def _sub(text, mapping):
 def test_answerer_brief_carries_the_full_contract():
     t = (_TEMPLATES / "answerer-brief.md").read_text()
     # every placeholder the runner substitutes
-    for ph in ("{issue_num}", "{issue_body}", "{question}", "{worktree}", "{answer_path}"):
+    for ph in ("{issue_num}", "{issue_body}", "{question}", "{worktree}", "{answer_path}", "{operator}"):
         assert ph in t, f"missing placeholder {ph}"
     # the plan's contract phrases: one question, read-only worktree, <=10 lines or PARK:,
     # the answer file is the FINAL action (its existence is the done signal)
@@ -41,9 +41,10 @@ def test_answerer_brief_renders_clean():
     t = (_TEMPLATES / "answerer-brief.md").read_text()
     out = _sub(t, {"issue_num": "42", "issue_body": "## Goal\nDo the thing.",
                    "question": "A or B?", "worktree": "/tmp/wt/i42",
-                   "answer_path": "/tmp/home/answers/i42.md"})
+                   "answer_path": "/tmp/home/answers/i42.md", "operator": "acme"})
     assert "{" not in out.replace("{}", ""), "unsubstituted placeholder left behind"
     assert "#42" in out and "A or B?" in out and "/tmp/home/answers/i42.md" in out
+    assert "genuinely acme's to decide" in out and "why this needs acme." in out
 
 
 # --------------------------- launchd templates ---------------------------

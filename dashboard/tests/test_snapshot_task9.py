@@ -108,7 +108,7 @@ def test_assembled_needs_william_and_bounced_cards(tmp_path):
          "memo": "which phrasing do you prefer?"}) + "\n")
     snap = server.assemble_snapshot(_config(dst), now=NOW)
     by = {c["num"]: c for c in snap["needs_you"]}
-    assert by[9]["kind"] == "needs-william" and by[9]["badge"].startswith("AWAITING")
+    assert by[9]["kind"] == "needs-owner" and by[9]["badge"].startswith("AWAITING")
     assert by[8]["kind"] == "bounced" and by[8]["badge"] == "BOUNCED"
     assert "amend" in (by[8]["memo"] or "").lower() or "amend" in by[8]["gloss"]["plain"].lower()
 

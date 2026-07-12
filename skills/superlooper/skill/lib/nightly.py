@@ -161,7 +161,7 @@ def _fence_for(text):
     return "`" * max(3, longest + 1)
 
 
-def fix_issue(failure, dev_branch="main"):
+def fix_issue(failure, dev_branch="main", operator="the owner"):
     """The standing-rule fix issue for one persistent nightly failure — scoped STRICTLY to
     restoring green, carrying the runner's fingerprint dedup marker and the exact standing-rule
     labels. Returns {title, body, labels, fingerprint}."""
@@ -189,7 +189,7 @@ def fix_issue(failure, dev_branch="main"):
         f"- [ ] `{tid}` passes in the nightly suite on `{dev}`\n\n"
         f"## Boundaries\n"
         f"Only the minimal change that restores green. Anything larger becomes a new issue for "
-        f"William to approve. Merges are frozen until the nightly is green again.\n\n"
+        f"{operator} to approve. Merges are frozen until the nightly is green again.\n\n"
         f"## Loop metadata\n"
         f"touches:\n"
     )

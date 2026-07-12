@@ -104,7 +104,7 @@ def test_investigate_footer_replaces_ship_gate(_sl_home):
     out = brief.build(_issue(type="investigate"), _cfg(_sl_home))
     assert "<!-- superlooper-investigation -->" in out
     assert "parent: #123" in out, "child issues must carry parent metadata pointing at this issue"
-    assert "needs-william" in out
+    assert "needs-owner" in out
     # no ship gate / no PR for an investigation
     assert "Ship gate" not in out
     assert "REAL browser" not in out

@@ -1,15 +1,15 @@
 # superlooper morning report — 2026-07-02
 
-3 merged · 2 parked/needs-william · 1 bounce(s) · 1 regen(s) · queue: 2.
+3 merged · 2 parked/needs-owner · 1 bounce(s) · 1 regen(s) · queue: 2.
 
 ## Merged
 - #7 (i7) — https://github.com/titan/eapp/issues/7 · PR https://github.com/titan/eapp/pull/12
 - #8 (i8) — https://github.com/titan/eapp/issues/8
 - #12 (i12) — https://github.com/titan/eapp/issues/12 · PR https://github.com/titan/eapp/pull/20
 
-## Parked / needs-william
+## Parked / needs-owner
 - #9 (i9) parked — retry cap hit (2 relaunches, still no report)
-- #10 (i10) **needs-william** — conflict cap hit — collided with #7 twice
+- #10 (i10) **needs-owner** — conflict cap hit — collided with #7 twice
 
 ## Bounces
 - #11 (i11) — BOUNCED: the crash is already fixed on dev; propose closing

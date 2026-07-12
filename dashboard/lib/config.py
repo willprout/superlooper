@@ -57,7 +57,7 @@ _REPO_THRESHOLD_DEFAULTS = {"idle_seconds": 480, "freeze_seconds": 2700}
 # absolute path (a relative override stays relative, resolved against cwd like gh's bare ``gh``).
 _DEFAULT_SUPERLOOPER_CLI = "~/.claude/skills/superlooper/bin/superlooper"
 
-_ALLOWED_TOP = set(_TOP_DEFAULTS) | {"repos", "notify", "fun", "superlooper_cli"}
+_ALLOWED_TOP = set(_TOP_DEFAULTS) | {"repos", "notify", "fun", "superlooper_cli", "operator"}
 _ALLOWED_REPO_ENTRY = {"path", "airline"}
 
 # Every fun mechanic except the master switch — the snapshot resolves each against master so the
@@ -134,6 +134,20 @@ def _validate_and_fill(raw):
                                         _check_str_or_null)
     out["fun"] = _fill_and_check_map("fun", raw.get("fun", {}), _FUN_DEFAULTS, _check_bool)
     out["repos"] = _load_repos(raw["repos"])
+
+    # operator display name (issue #58): the name the command center signs its audit trail with —
+    # "Approved by <operator> via command-center", the needs-you cards, the digest. One person runs
+    # this localhost dashboard, so it is a single top-level field. Defaults to the owner of the FIRST
+    # watched repo (a shareable install watches the operator's own repos), so a fresh config signs
+    # the operator's own name and never a hardcoded "William". null/absent -> that default; a present
+    # value must be a non-empty string (a blank or typo fails loud, like every other field).
+    raw_operator = raw.get("operator")
+    if raw_operator is None:
+        out["operator"] = out["repos"][0]["owner"]
+    elif isinstance(raw_operator, str) and raw_operator.strip():
+        out["operator"] = raw_operator.strip()
+    else:
+        _err(f"'operator' must be null or a non-empty string, got {raw_operator!r}")
     return out
 
 
@@ -256,6 +270,23 @@ def state_home(slug):
     owner, name = slug.split("/", 1)
     base = os.environ.get("SL_HOME") or os.path.expanduser("~/.superlooper")
     return Path(base) / f"{owner}__{name}"
+
+
+def operator(config):
+    """The operator display name — what the command center signs its audit trail with (issue #58).
+    Prefers an explicit non-blank ``operator``, else the neutral 'the owner'. Never raises: pure
+    display functions (digest/tower/cards) call it and must stay fail-closed on a partial config.
+
+    Unlike the skill's twin resolver (which can derive the owner from the single ``repo`` slug),
+    this has no repo-owner fallback: a dashboard config carries a LIST of repos with possibly
+    different owners, so there is no single owner to derive. That is why ``load`` fills ``operator``
+    from the first watched repo's owner up front — every production caller passes a loaded config
+    where the field is present, and this resolver's 'the owner' branch is the defensive floor only."""
+    if isinstance(config, dict):
+        op = config.get("operator")
+        if isinstance(op, str) and op.strip():
+            return op.strip()
+    return "the owner"
 
 
 def fun_enabled(config, mechanic):

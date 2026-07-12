@@ -140,10 +140,11 @@ def _counts(records):
 
 # =============================== exceptions — one sentence each ===============================
 
-def _exception(rec, num, hhmm):
+def _exception(rec, num, hhmm, operator="the owner"):
     """A single non-freeze exception record → its ``{ts, hhmm, num, kind, sentence, raw}``, or
     ``None`` if the record is not, on its own, an exception. Freeze arcs are handled separately (they
-    pair two records). Each sentence is a plain template over the record's own fields."""
+    pair two records). Each sentence is a plain template over the record's own fields. ``operator``
+    is the configured operator display name (issue #58) — a needs-decision line names the owner."""
     act = rec.get("act")
     ts = rec.get("ts")
     at = hhmm(ts)
@@ -154,7 +155,7 @@ def _exception(rec, num, hhmm):
         if rec.get("needs_william"):
             kind = "awaiting"
             memo = _first_line(rec.get("memo")) or "a decision waits on you"
-            sentence = "%s needs William at %s — %s." % (who, at, memo)
+            sentence = "%s needs %s at %s — %s." % (who, operator, at, memo)
         else:
             kind = "park"
             memo = _first_line(rec.get("memo")) or "the machine gave up"
@@ -249,7 +250,7 @@ def _events(records, hhmm):
     return rows
 
 
-def build_digest(journal, *, slug="", name="", start=None, end=None, hhmm=None):
+def build_digest(journal, *, slug="", name="", start=None, end=None, hhmm=None, operator="the owner"):
     """A journal (list of records) → the mechanical digest the front-end renders.
 
     ``start``/``end`` (epoch seconds, inclusive; ``None`` = unbounded) bound the window; ``hhmm``
@@ -262,7 +263,7 @@ def build_digest(journal, *, slug="", name="", start=None, end=None, hhmm=None):
 
     exceptions = _freeze_arcs(records, hhmm)
     for rec in records:
-        exc = _exception(rec, _rec_num(rec), hhmm)
+        exc = _exception(rec, _rec_num(rec), hhmm, operator)
         if exc is not None:
             exceptions.append(exc)
     exceptions.sort(key=_ts_key)

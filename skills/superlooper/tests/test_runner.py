@@ -943,7 +943,7 @@ def test_bounce_posts_memo_then_labels_then_state(rig):
     assert out == "ok"
     ms = mutations(rig)
     assert ms[-2]["kind"] == "comment" and "BOUNCED: premise gone" in ms[-2]["body"]
-    assert ms[-1]["kind"] == "set_labels" and ms[-1]["add"] == "needs-william" \
+    assert ms[-1]["kind"] == "set_labels" and ms[-1]["add"] == "needs-owner" \
         and ms[-1]["remove"] == "in-progress"
     assert issue_state(rig, "i7")["status"] == "bounced"
     assert not (rig.home / "state" / "blocked" / "i7").exists()
@@ -1133,7 +1133,7 @@ def test_park_executor_labels_comment_and_cleanup(rig):
     ms = mutations(rig)
     assert any(m["kind"] == "comment" and "answerer escalated" in m["body"] for m in ms)
     lab = [m for m in ms if m["kind"] == "set_labels"][-1]
-    assert lab["add"] == "needs-william" and "in-progress" in lab["remove"]
+    assert lab["add"] == "needs-owner" and "in-progress" in lab["remove"]
     st = loopstate.load(str(rig.home / "state" / "issues.json"))
     assert st["issues"]["i5"]["status"] == "needs_william"
     assert st["answerers"] == {}
@@ -1479,9 +1479,9 @@ def test_reapprove_executor_zeroes_counters_rereleases_and_journals_the_old_ones
     assert rec["id"] == "i5"
     assert rec["old_counters"] == {"launches": 3, "retries": 2, "conflicts": 1,
                                    "launch_failures": 2, "answerer_failures": 1}
-    # stale park-family label cleared
+    # stale park-family label cleared (current needs-owner + legacy needs-william, issue #58)
     lab = [m for m in mutations(rig) if m["kind"] == "set_labels"][-1]
-    assert "parked" in lab["remove"] and "needs-william" in lab["remove"]
+    assert "parked" in lab["remove"] and "needs-owner" in lab["remove"]
 
 
 def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(rig, monkeypatch):

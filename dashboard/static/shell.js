@@ -473,7 +473,11 @@
     if (act === "replay-open") { if (window.CCReplay) window.CCReplay.open(repo, state.snapshot && state.snapshot.fun); return; }
     if (act === "digest-open") { if (window.CCDigest) window.CCDigest.open(repo); return; }
     if (act === "discuss") { doDiscuss(repo, num); return; }
-    if (act === "approve") { postVerb("/api/approve", repo, num, "Approved SL-" + num + " — William's word is recorded"); return; }
+    if (act === "approve") {
+      var owner = (state.snapshot && state.snapshot.operator) || "the owner";
+      postVerb("/api/approve", repo, num, "Approved SL-" + num + " — " + owner + "'s word is recorded");
+      return;
+    }
     if (act === "bounce-yes") { postVerb("/api/bounce-yes", repo, num, "Bounce accepted — SL-" + num + " relaunching"); return; }
     if (act === "expedite") { postVerb("/api/expedite", repo, num, "⚡ Expedited SL-" + num); return; }
     if (act === "drop") { onDrop(repo, num); return; }
@@ -840,7 +844,7 @@
   // The drawer's own verb buttons dispatch the same Task-6 endpoints (tap-where-you-read, §0.3).
   if (window.Drawer) window.Drawer.init({ onAction: handleAction });
 
-  // "Since you last looked": when William walks away (the tab hides or the page unloads), record the
+  // "Since you last looked": when the operator walks away (the tab hides or the page unloads), record the
   // newest comms ts as the watermark — a dashboard-local write (never GitHub). On return, everything
   // that arrived while he was gone renders under the divider (design record §4, §7 north star:
   // "walk away → come back → discover what your field did without you").

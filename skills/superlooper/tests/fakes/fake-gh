@@ -714,6 +714,11 @@ def main_fixture():
                description=opt("--description"), force=has("--force"))
         sys.exit(0)
 
+    elif sub == ["label", "edit"]:
+        # `gh label edit <old> --name <new>` — the adopt-side rename migration (issue #58).
+        record("rename_label", old=ARGS[2], new=opt("--name"))
+        sys.exit(0)
+
     elif sub == ["pr", "edit"]:
         record("pr_add_labels", num=ARGS[2], add=opt("--add-label"))
         sys.exit(0)

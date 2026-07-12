@@ -1,6 +1,6 @@
 /* Needs You — the decision inbox (Task 9 / design record §2–§4).
  *
- * window.NeedsYou renders one card per decision waiting on William, from the server's already-glossed
+ * window.NeedsYou renders one card per decision waiting on the operator, from the server's already-glossed
  * cards (lib/cards). Costume rule 2 (§3): the card LEADS with a plain headline + gloss; the literal
  * loop term is secondary (the badge + a hover). The conflict-cap card names the collision in one
  * plain sentence and highlights Discuss as the default (§8 — the guard against a blind Approve on a
@@ -21,7 +21,7 @@
     var confirming = confirmingDrop === (c.repo + "#" + c.num);
 
     // The "yes" verb depends on the kind: a bounce accepts the amendment and relaunches; a parked or
-    // needs-william flight re-approves. The server does the label math either way (Task 6).
+    // needs-owner flight re-approves. The server does the label math either way (Task 6).
     var isBounce = c.reason === "bounced" || c.kind === "bounced";
     var approveAct = isBounce ? "bounce-yes" : "approve";
     var approveLabel = isBounce ? "Accept & relaunch"

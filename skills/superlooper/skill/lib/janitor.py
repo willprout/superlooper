@@ -35,10 +35,12 @@ import time
 import actions
 
 BRANCH_PREFIX = "sl/"
-# The label the runner leaves on a PR replaced by a rebuild (§C.4 6b) and the two park-family
-# labels William's attention queue lives under. Names, not statuses: these are GitHub-side.
+# The label the runner leaves on a PR replaced by a rebuild (§C.4 6b) and the park-family labels
+# the owner's attention queue lives under. Names, not statuses: these are GitHub-side. Both the
+# current `needs-owner` and the legacy `needs-william` are recognized so a repo adopted before the
+# operator-name rename (issue #58) — or one mid-migration — keeps being read correctly.
 SUPERSEDED_LABEL = "superseded"
-PARK_LABELS = ("parked", "needs-william")
+PARK_LABELS = ("parked", "needs-owner", "needs-william")
 
 _BRANCH_NUM_RE = re.compile(r"^sl/i(\d+)(?:-|$)")
 _ISO_Z = "%Y-%m-%dT%H:%M:%SZ"

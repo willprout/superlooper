@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- superlooper nightly-QA template (plan Task 12). Fires ONCE a night at qa.nightly_time
-     (StartCalendarInterval, Mac-local time — William's Mac runs Mountain time; launchd and the
-     runner both read the system clock, so there is no timezone setting to get wrong). It runs a
+     (StartCalendarInterval, in the operator's own Mac-local time — launchd and the runner both
+     read the system clock, so there is no timezone setting to get wrong). It runs a
      fresh browser suite against origin/<dev>, and on a persistent failure freezes merges + files
      a scoped fix issue (auto-approved:nightly-red). Placeholders ({label}, {superlooper_bin},
      {repo_path}, {state_home}, {hour}, {minute}) are substituted literally. This is a scheduled
      one-shot, NOT a keep-alive: no KeepAlive/RunAtLoad — a nonzero exit (e.g. the suite could not
      parse) is journaled + pushed, not restart-looped. The one-time macOS permission that lets it
-     text William (notify.imessage_to) must be granted to the user launchd runs it under, too
+     text the operator (notify.imessage_to) must be granted to the user launchd runs it under, too
      (references/runner-ops.md). -->
 <plist version="1.0">
 <dict>

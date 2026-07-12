@@ -12,7 +12,7 @@ the labels — you touch no labels and you never edit the issue's Goal/DoD yours
 
 **Scope.** Work in this worktree on branch `{branch}`. Stay strictly inside the issue's
 Boundaries. Work this issue should NOT do — and any promise that spills into another PR —
-becomes a NEW issue labeled `needs-william`, never a code comment.
+becomes a NEW issue labeled `needs-owner`, never a code comment.
 
 {work_block}
 
@@ -27,4 +27,4 @@ assumption, {assumption_hint}
 **Finish.** {finish_deliverable}Then write {report_path} with EXACTLY these H2 sections:
 {report_sections} — the runner mechanically checks they exist and carry real prose. The
 report is your LAST action. Never force-push. Never hand-post a commit status. Never label
-anything `agent-ready` (that word is William's alone).
+anything `agent-ready` (that word is {operator}'s alone).

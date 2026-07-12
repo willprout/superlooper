@@ -508,3 +508,44 @@ def test_repo_airline_must_be_a_non_empty_string(tmp_path):
     cfg_path = _write_config(tmp_path, {"repos": [{"path": str(repo), "airline": "  "}]})
     with pytest.raises(ValueError, match="airline.*non-empty"):
         config.load(cfg_path)
+
+
+# --------------------------- operator display name (issue #58) ---------------------------
+
+def test_operator_defaults_to_first_repo_owner(one_repo):
+    # No operator field -> the owner of the first watched repo (acme/widget -> "acme"), so the
+    # command-center audit trail signs the operator's own name, never a hardcoded "William".
+    _, _, cfg_path = one_repo
+    cfg = config.load(cfg_path)
+    assert cfg["operator"] == "acme"
+    assert config.operator(cfg) == "acme"
+
+
+def test_operator_explicit_value_wins(tmp_path):
+    repo = _write_repo(tmp_path, "checkout", "acme/widget")
+    cfg_path = _write_config(tmp_path, {"repos": [{"path": str(repo)}], "operator": "Dana"})
+    cfg = config.load(cfg_path)
+    assert cfg["operator"] == "Dana"
+    assert config.operator(cfg) == "Dana"
+
+
+def test_operator_null_falls_back_to_first_repo_owner(tmp_path):
+    repo = _write_repo(tmp_path, "checkout", "acme/widget")
+    cfg_path = _write_config(tmp_path, {"repos": [{"path": str(repo)}], "operator": None})
+    assert config.load(cfg_path)["operator"] == "acme"
+
+
+def test_operator_empty_or_wrong_type_rejected(tmp_path):
+    repo = _write_repo(tmp_path, "checkout", "acme/widget")
+    for bad in ("", "  ", 7, ["x"]):
+        cfg_path = _write_config(tmp_path, {"repos": [{"path": str(repo)}], "operator": bad})
+        with pytest.raises(ValueError) as e:
+            config.load(cfg_path)
+        assert "operator" in str(e.value)
+
+
+def test_operator_resolver_is_defensive():
+    assert config.operator({"operator": "Dana"}) == "Dana"
+    assert config.operator({}) == "the owner"
+    assert config.operator({"operator": "  "}) == "the owner"
+    assert config.operator(None) == "the owner"

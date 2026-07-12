@@ -126,6 +126,14 @@ def test_needs_william_park_is_an_awaiting_exception():
     assert exc[0]["num"] == 8
 
 
+def test_awaiting_sentence_renders_the_configured_operator_name():
+    # issue #58: the "needs a decision" digest line signs the configured operator, never "William".
+    exc = digest.build_digest([_rec(100, "park", num=8, needs_william=True, memo="which API?")],
+                              slug="o/r", operator="Ada")["exceptions"]
+    assert "needs Ada at" in exc[0]["sentence"]
+    assert "William" not in exc[0]["sentence"]
+
+
 def test_go_around_exception_names_the_conflict():
     exc = digest.build_digest([_rec(100, "regenerate", num=4, conflicts=2)], slug="o/r")["exceptions"]
     assert len(exc) == 1

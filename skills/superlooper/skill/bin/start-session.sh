@@ -73,7 +73,7 @@ ERR_TAIL="$SL_RUN_ROOT/state/launch_stderr/$ID"
 rm -f "$ERR_TAIL"
 BRIEF="$SL_RUN_ROOT/briefs/$ID.md"
 [ -f "$BRIEF" ] || { echo "[$ID] no brief" >&2; write_exited 1; exit 1; }
-# Name the session so William can tell what's running when he's away:
+# Name the session so the operator can tell what's running when they're away:
 #   --name           -> local terminal/tab title + /resume picker
 #   --remote-control -> ENABLES + labels this session on the Remote Control dashboard
 # These are independent (Claude Code docs): --name does NOT set the dashboard label, so we pass

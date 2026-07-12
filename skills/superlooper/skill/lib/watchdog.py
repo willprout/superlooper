@@ -152,7 +152,7 @@ def eligible_nums(parsed_issues, closed_nums):
         labels = [l for l in (p.get("labels") or []) if isinstance(l, str)]
         if not issues.eligible(p, closed_nums, None):
             continue
-        if {"in-progress", "parked", "needs-william"} & set(labels):
+        if {"in-progress", "parked", "needs-owner", "needs-william"} & set(labels):
             continue
         num = p.get("num")
         if type(num) is int and num > 0:

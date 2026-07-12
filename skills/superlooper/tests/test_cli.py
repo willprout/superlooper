@@ -25,7 +25,7 @@ CLI = _ROOT / "skill" / "bin" / "superlooper"
 _FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gh"
 _FAKE_GH = Path(__file__).resolve().parent / "fakes" / "fake-gh"
 
-ALL_LABELS = ["agent-ready", "in-progress", "needs-william", "parked", "expedite",
+ALL_LABELS = ["agent-ready", "in-progress", "needs-owner", "parked", "expedite",
               "preserve", "auto-approved:nightly-red", "superseded",
               "priority:high", "priority:low",
               "type:build", "type:investigate", "type:diagnose-and-fix",
@@ -648,6 +648,53 @@ def test_adopt_succeeds_when_all_labels_already_exist(rig):
     assert "gh auth login" not in both                 # no failure guidance on a clean run
     assert "FAIL" not in second.stdout
     assert "already" in second.stdout.lower()          # config already adopted, left untouched
+
+
+def _fresh_repo(rig, name):
+    fresh = rig.tmp / name
+    fresh.mkdir()
+    subprocess.run(["git", "init", "-q", str(fresh)], check=True)
+    subprocess.run(["git", "-C", str(fresh), "remote", "add", "origin",
+                    "https://github.com/will/proj.git"], check=True)
+    return fresh
+
+
+def test_adopt_migrates_the_legacy_needs_william_label(rig):
+    # issue #58: a repo adopted before the operator-name change carries `needs-william`. Re-adopt
+    # RENAMES it in place to the neutral `needs-owner` (gh label edit preserves it on every issue
+    # that carries it) so a stranger's own audit trail stops reading another person's name.
+    fresh = _fresh_repo(rig, "legacy")
+    legacy = [n for n in ALL_LABELS if n != "needs-owner"] + ["needs-william"]
+    (rig.fixdir / "label_list.json").write_text(json.dumps([{"name": n} for n in legacy]))
+    r = cli(rig, "adopt", "--repo", str(fresh))
+    assert r.returncode == 0, r.stdout + r.stderr
+    renames = [m for m in mutations(rig) if m["kind"] == "rename_label"]
+    assert any(m["old"] == "needs-william" and m["new"] == "needs-owner" for m in renames)
+    assert "needs-william -> needs-owner" in r.stdout
+
+
+def test_adopt_does_not_rename_when_there_is_no_legacy_label(rig):
+    # A fresh repo (or one already migrated) never renames — it just creates `needs-owner`.
+    fresh = _fresh_repo(rig, "cleanlabels")
+    (rig.fixdir / "label_list.json").write_text("[]")
+    r = cli(rig, "adopt", "--repo", str(fresh))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [m for m in mutations(rig) if m["kind"] == "rename_label"]
+    created = {m["name"] for m in mutations(rig) if m["kind"] == "create_label"}
+    assert "needs-owner" in created and "needs-william" not in created
+
+
+def test_adopt_label_descriptions_render_the_operator_name(rig):
+    # issue #58: the seeded label descriptions sign the operator's name (defaulting to the repo
+    # owner login "will"), never a hardcoded "William" and never a raw {operator} placeholder.
+    fresh = _fresh_repo(rig, "opnamed")
+    r = cli(rig, "adopt", "--repo", str(fresh))
+    assert r.returncode == 0, r.stdout + r.stderr
+    descs = {m["name"]: m["description"] for m in mutations(rig) if m["kind"] == "create_label"}
+    assert descs["agent-ready"] == "will's approval: the runner may launch this issue"
+    assert descs["parked"] == "handed back to will with a memo (runner-managed)"
+    assert not any("William" in d for d in descs.values())
+    assert not any("{operator}" in d for d in descs.values())
 
 
 def test_run_uses_config_agent_and_cli_override(rig):
@@ -1285,6 +1332,8 @@ def _seed_janitor_fixtures(rig):
     (rig.fixdir / "pr_list_head_sl__i7-old-thing.json").write_text(json.dumps(
         [{"number": 14, "state": "OPEN", "headRefName": "sl/i7-old-thing",
           "headRefOid": "ccc333", "labels": [{"name": "superseded"}]}]))
+    # The janitor sweeps EVERY park-family label (issue #58: needs-owner + legacy needs-william).
+    (rig.fixdir / "issue_list_needs-owner.json").write_text("[]")
     (rig.fixdir / "issue_list_needs-william.json").write_text("[]")
 
 

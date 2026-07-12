@@ -68,14 +68,14 @@ def card_kind(flight):
     >= 2 — a conflict regeneration happened) and STILL landed on William's desk is the ``conflict-cap``
     case, whatever its underlying stage — the go-around cap is the story that needs telling (§3).
     Otherwise: ``parked`` (the machine gave up), or an amber decision that is a ``bounced`` push-back
-    or a plain ``needs-william``."""
+    or a plain ``needs-owner``."""
     if flight.get("attempt", 1) >= 2:
         return "conflict-cap"
     if flight.get("stage") == flights.PARKED:
         return "parked"
     if flight.get("awaiting_reason") == "bounced":
         return "bounced"
-    return "needs-william"
+    return "needs-owner"
 
 
 # The plain headline + leading gloss + hover term for each kind (costume rule 2).
@@ -85,10 +85,10 @@ _CARD_COPY = {
         "plain": "Parked means the automatic build stopped and is waiting for you. Nothing was lost.",
         "term": "parked", "badge": "PARKED",
     },
-    "needs-william": {
+    "needs-owner": {
         "headline": "A decision is waiting on you before this can move.",
         "plain": "The worker paused and asked for your input to continue.",
-        "term": "needs-william", "badge": "AWAITING",
+        "term": "needs-owner", "badge": "AWAITING",
     },
     "bounced": {
         "headline": "The worker thinks the plan is off and suggested a change.",
@@ -201,13 +201,15 @@ def _cargo(flight):
     return {"present": present, "added": added, "removed": removed, "files": files, "chip": chip}
 
 
-def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None):
+def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, operator="the owner"):
     """The whole flight-card drawer (design record §4) — pure over the flight + its journal slice.
 
     ``hhmm`` is an injected ``ts -> "HH:MM"`` formatter (the server passes its locale-aware one; the
-    default yields ``""`` so the core stays clock-free and testable). Returns the title, circuit
-    rail, off-path note, clearance checklist, issue/PR/branch links, memo history, cargo chip, the
-    glossed journal slice (each row expandable to its raw line), and the go-around counter."""
+    default yields ``""`` so the core stays clock-free and testable). ``operator`` is the configured
+    operator display name (issue #58), threaded to the glossed journal so a re-approval line signs
+    the owner's own name. Returns the title, circuit rail, off-path note, clearance checklist,
+    issue/PR/branch links, memo history, cargo chip, the glossed journal slice (each row expandable
+    to its raw line), and the go-around counter."""
     hhmm = hhmm or (lambda ts: "")
     num = flight.get("num")
     pr = flight.get("pr")
@@ -215,7 +217,7 @@ def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None):
 
     journal = []
     for rec in journal_slice:
-        c = tower.comms_row(rec)
+        c = tower.comms_row(rec, operator)
         ts = rec.get("ts") if isinstance(rec, dict) else None
         journal.append({"ts": ts, "hhmm": hhmm(ts), "text": c["text"], "radio": c["radio"],
                         "kind": c["kind"],

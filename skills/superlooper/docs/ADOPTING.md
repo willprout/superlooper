@@ -67,7 +67,7 @@ never a silent 3am surprise.
 | `lanes` | `2` | How many issues may run at once (parallel worktrees/sessions). Either an **integer ≥ 1** — one shared pool, any issue type may take any lane — or an **object** `{"build": N, "investigate": M}` that reserves capacity by type (see **Reserved investigation lanes** below). The integer form is unchanged; existing configs keep working exactly as before. |
 | `affinity` | `"hard"` | `"hard"` = two issues co-schedule only if their declared `touches:` areas are **disjoint** (no two lanes editing the same area at once). `"soft"` = overlap allowed but journaled. |
 | `areas` | `{}` | A map of area-name → list of path globs (fnmatch). It defines what "touches the same thing" means for affinity and for wander-detection at the gate. A path matching no area maps to the wildcard `*`, which overlaps **everything** under hard affinity (see the wildcard rule below). If a PR's files map to `*` because no glob matched them, the merge is **held** behind every in-flight lane and the journal records that the hold is wildcard-caused — so add a glob covering those files if you don't want that serialization. |
-| `touches_required` | `true` | **If true**, every approved *build* / *diagnose-and-fix* issue must declare a non-empty `touches:` in its Loop metadata. An approved issue that doesn't is **refused at launch** and handed back to William (`needs-william`) with a memo naming the missing block — it never launches until the declaration is added. Investigations are exempt (they produce no merge). The declared areas are what anti-affinity and the gate's wander check verify against (a diff that leaves its declared areas is logged as a wander, never blocked). **If false**, the declaration is optional — but an issue with no `touches:` maps to the wildcard `*` (see below), so under hard affinity it can only run alone; when that serializes a lane the journal records why. Turn off only for a small repo where areas don't matter. |
+| `touches_required` | `true` | **If true**, every approved *build* / *diagnose-and-fix* issue must declare a non-empty `touches:` in its Loop metadata. An approved issue that doesn't is **refused at launch** and handed back to William (`needs-owner`) with a memo naming the missing block — it never launches until the declaration is added. Investigations are exempt (they produce no merge). The declared areas are what anti-affinity and the gate's wander check verify against (a diff that leaves its declared areas is logged as a wander, never blocked). **If false**, the declaration is optional — but an issue with no `touches:` maps to the wildcard `*` (see below), so under hard affinity it can only run alone; when that serializes a lane the journal records why. Turn off only for a small repo where areas don't matter. |
 
 `areas` example:
 
@@ -164,7 +164,7 @@ can never produce (and then parked for the missing section).
 | `qa.quarantine` | `[]` | Test ids excluded from nightly failure counting. |
 | `qa.nightly_time` | `"02:00"` | When the nightly runs (Mac-local time). |
 | `cleanup_merged_worktrees` | `true` | Remove a worktree after its issue merges. |
-| `cleanup_parked_worktrees` | `true` | Reclaim the worktrees of park-family terminal issues (parked / needs-william / bounced), which otherwise linger forever (issue #41). Safe — re-approval rebuilds from the issue on a fresh branch. Set `false` to keep them for manual inspection. |
+| `cleanup_parked_worktrees` | `true` | Reclaim the worktrees of park-family terminal issues (parked / needs-owner / bounced), which otherwise linger forever (issue #41). Safe — re-approval rebuilds from the issue on a fresh branch. Set `false` to keep them for manual inspection. |
 | `notify.imessage_to` | `null` | Phone number / Apple ID the runner texts via the Mac's Messages app. `null` falls back to `notify.cmd`, then `cmux notify`, then log-only. |
 | `notify.cmd` | `null` | A generic notify command template (`{title}`/`{body}`) if you don't use iMessage. |
 | `report_time` | `"08:45"` | When the morning report is generated + pushed (Mac-local time). |
@@ -172,7 +172,7 @@ can never produce (and then parked for the missing section).
 | `watchdog.allowlist` | `[]` | The exact repair verbs permitted at the `allowlist` tier, as strings, interpreted literally (never expansively). Ignored at the other tiers. |
 | `watchdog.grace_minutes` | `30` | How long after the watchdog texts you it waits before launching the unattended session. If the signal clears meanwhile it stands down silently. `0` launches on the tripping check. |
 | `watchdog.heartbeat_stale_minutes` | `20` | How stale `state/runner.heartbeat` must be to count as a wedged/dead loop. Keep it comfortably above the longest legitimate tick (a ship recheck can hold one ~10 min). |
-| `watchdog.no_progress_minutes` | `30` | How long eligible `agent-ready` work may wait with **every lane empty and nothing launching** before that reads as a fault. Designed-safe waits (CI gates, blocked-by holds, parked/needs-william, a building lane during a freeze, a usage meter that reads exhausted) never start this clock. |
+| `watchdog.no_progress_minutes` | `30` | How long eligible `agent-ready` work may wait with **every lane empty and nothing launching** before that reads as a fault. Designed-safe waits (CI gates, blocked-by holds, parked/needs-owner, a building lane during a freeze, a usage meter that reads exhausted) never start this clock. |
 
 All schedule times are **Mac-local** — no timezone field, the runner and launchd read the system
 clock.
@@ -217,7 +217,10 @@ rest are workflow state the runner and William drive.
 
 **Workflow state (the runner drives these):**
 - `in-progress` — a worker is building it.
-- `needs-william` — an owner decision is required (a bounce, a cap hit, a fail-closed gate).
+- `needs-owner` — an owner decision is required (a bounce, a cap hit, a fail-closed gate).
+  (Renamed from the older `needs-william`; `adopt` migrates any existing `needs-william` label in
+  place — preserving it on every issue — and the runner recognizes both, so an already-adopted repo
+  keeps working. Re-run `adopt` to migrate.)
 - `parked` — handed back with a memo after a retry/conflict cap.
 - `preserve` — on a PR: resolve conflicts in the PR's own branch instead of regenerating.
 - `superseded` — on a PR the loop replaced by a rebuild (branch kept, PR left open).

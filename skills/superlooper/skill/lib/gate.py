@@ -341,6 +341,7 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     ist = issue_state if isinstance(issue_state, dict) else {}
     pv = pr_view if isinstance(pr_view, dict) else {}
     cfg = config if isinstance(config, dict) else {}
+    op = _config.operator(cfg)                # the owner name a hand-back memo addresses (issue #58)
     nudged = ist.get("nudged")
 
     def nudge_or_park(key, defect):
@@ -367,13 +368,13 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     # step 1: a PR must exist for the issue branch (identity = the branch lookup itself).
     if not pv.get("number"):
         return {"action": "park",
-                "reason": "finished but no PR exists for the issue branch (memo to William)"}
+                "reason": f"finished but no PR exists for the issue branch (memo to {op})"}
     if pv.get("state") == "MERGED":
         # defensive no-op: post-merge dev-check polling owns this phase; never merge twice.
         return {"action": "wait", "reason": "PR already merged — nothing left to gate"}
     if pv.get("state") == "CLOSED":
         return {"action": "park",
-                "reason": "PR was closed without merging (external intervention) — William decides"}
+                "reason": f"PR was closed without merging (external intervention) — {op} decides"}
 
     # step 2: the report must carry real prose under every required H2 (C3).
     if not report_sections_ok(report_text, cfg.get("report_required_sections")):
@@ -403,7 +404,7 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
         return {"action": "park", "needs_william": True, "wander": wander,
                 "referee_paths": referee,
                 "reason": "diff reaches live referee path(s): "
-                          f"{joined} — needs-william; never auto-merging changes to "
+                          f"{joined} — needs-owner; never auto-merging changes to "
                           ".superlooper/** or .github/workflows/**"}
     if verdict["overlap_lane"] is not None:
         lane = verdict["overlap_lane"]
@@ -469,7 +470,7 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
                 # post-increment >= cap (§C.4 6b) — and a corrupt counter goes to William too
                 return {"action": "park", "needs_william": True, "wander": wander,
                         "reason": "conflict cap reached (or counter unreadable) — "
-                                  "needs-william + memo"}
+                                  "needs-owner + memo"}
             return {"action": "regenerate", "wander": wander,
                     "reason": "real conflict — supersede the PR (branch preserved on the "
                               "remote) and rebuild from the issue on current dev"}

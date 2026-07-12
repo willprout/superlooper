@@ -33,7 +33,7 @@ def test_parked_flight_is_a_parked_card():
 
 
 def test_needs_william_flight_is_a_needs_william_card():
-    assert cards.card_kind(_flight(stage=flights.AWAITING, awaiting_reason="needs-william")) == "needs-william"
+    assert cards.card_kind(_flight(stage=flights.AWAITING, awaiting_reason="needs-owner")) == "needs-owner"
 
 
 def test_bounced_flight_is_a_bounced_card():

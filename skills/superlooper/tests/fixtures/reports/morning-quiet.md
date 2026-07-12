@@ -5,7 +5,7 @@ Nothing happened overnight — queue empty.
 ## Merged
 Nothing merged.
 
-## Parked / needs-william
+## Parked / needs-owner
 None.
 
 ## Bounces
