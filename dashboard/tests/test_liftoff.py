@@ -127,3 +127,45 @@ def test_live_runner_is_not_restarted():
 def test_both_up_starts_neither():
     p = _plan(dashboard_up=True, runner_pid=999)
     assert p["dashboard"]["start"] is False and p["runner"]["start"] is False
+
+
+# --------------------------- missing_config_message (issue #104) ---------------------------
+# The first real run of liftoff failed with a message that named neither WHERE it looked (a bare
+# relative "config.json") nor a way out (it advised "copy config.example.json" while the config sat,
+# already written, one directory over). These pin the honest replacement.
+
+def test_missing_config_message_names_the_absolute_path_and_all_three_ways():
+    msg = liftoff.missing_config_message("/home/op/proj/config.json")
+    assert "/home/op/proj/config.json" in msg               # names WHERE it actually looked
+    # all three ways out: run from the config's directory, pass it as an argument, set CC_CONFIG
+    assert "directory" in msg
+    assert "argument" in msg
+    assert "CC_CONFIG" in msg
+    assert msg.startswith("liftoff:") and msg.endswith("\n")  # liftoff's plain, newline-terminated voice
+
+
+def test_missing_config_message_names_a_config_found_beside_the_script_and_omits_copy_advice():
+    # The live #104 case: liftoff run from the repo root while the config sat in the dashboard dir.
+    # The message must NAME that found config and how to select it — and, because a config already
+    # EXISTS, must NOT advise copying the example (even when an example path is also supplied).
+    msg = liftoff.missing_config_message(
+        "/home/op/proj/config.json",
+        script_dir_config="/home/op/proj/dashboard/config.json",
+        example_config="/home/op/proj/dashboard/config.example.json")
+    assert "/home/op/proj/config.json" in msg                       # where it looked
+    assert "/home/op/proj/dashboard/config.json" in msg             # the config that DOES exist
+    assert "CC_CONFIG" in msg and "argument" in msg                 # the three ways still listed
+    assert "config.example.json" not in msg                         # NO copy-the-example advice
+    assert "copy" not in msg.lower() and "cp " not in msg
+
+
+def test_missing_config_message_advises_copying_the_example_when_none_exists():
+    # No config anywhere obvious → the genuine fresh-install case: spell the exact `cp` first step.
+    msg = liftoff.missing_config_message(
+        "/home/op/proj/config.json",
+        example_config="/home/op/proj/dashboard/config.example.json")
+    assert "/home/op/proj/config.json" in msg
+    assert "/home/op/proj/dashboard/config.example.json" in msg     # the example to copy
+    assert "cp " in msg                                             # the concrete copy command
+    assert "/home/op/proj/dashboard/config.json" in msg            # copies TO the sibling config
+    assert "CC_CONFIG" in msg                                       # the three ways still listed
