@@ -29,7 +29,12 @@ def test_example_config_loads_clean(tmp_path):
     assert cfg["lanes"] == 2
     assert cfg["affinity"] == "hard"
     assert cfg["merge_method"] == "squash"
-    assert cfg["required_checks"] == ["review/local-gate", "quality-gate"]
+    # the shipped example demonstrates the pr/dev split (issue #52): `review/local-gate` gates PR
+    # merges but is excluded from the dev-required set (it reports on PRs only).
+    assert cfg["required_checks"] == {"pr": ["review/local-gate", "quality-gate"],
+                                      "dev": ["quality-gate"]}
+    assert config.pr_required_checks(cfg) == ["review/local-gate", "quality-gate"]
+    assert config.dev_required_checks(cfg) == ["quality-gate"]
     assert cfg["areas"]["frontend"] == ["src/components/**", "src/styles/**"]
 
 
@@ -303,6 +308,84 @@ def test_lanes_object_total_must_be_at_least_one(tmp_path):
         with pytest.raises(ValueError) as e:
             config.load(tmp_path)
         assert "lanes" in str(e.value)
+
+
+# --------------- pr-required vs dev-required checks (issue #52) ---------------
+# `required_checks` may ALSO be an object splitting the required set by SURFACE:
+#   {"pr": [...], "dev": [...]}  — `pr` gates PR merges, `dev` gates the dev freeze/unfreeze.
+# A plain list keeps today's behaviour exactly (the list gates BOTH surfaces — full back-compat).
+# The split lets a repo EXCLUDE a PR-only check (e.g. a ship status stamped on PR head commits
+# only) from the dev set, so a check that NEVER reports on dev can't strand a mainline freeze.
+
+def test_required_checks_list_form_applies_to_both_surfaces(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b", "required_checks": ["ci", "ship"]})
+    cfg = config.load(tmp_path)
+    assert cfg["required_checks"] == ["ci", "ship"]
+    assert config.pr_required_checks(cfg) == ["ci", "ship"]
+    assert config.dev_required_checks(cfg) == ["ci", "ship"]
+
+
+def test_required_checks_object_form_parses_and_splits(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b",
+                          "required_checks": {"pr": ["ci", "ship"], "dev": ["ci"]}})
+    cfg = config.load(tmp_path)
+    assert cfg["required_checks"] == {"pr": ["ci", "ship"], "dev": ["ci"]}
+    assert config.pr_required_checks(cfg) == ["ci", "ship"]
+    assert config.dev_required_checks(cfg) == ["ci"]
+    # an empty dev set is allowed at load (a repo whose CI runs on PRs only, never on dev push);
+    # doctor gates the PR set non-empty at adopt time, not the loader.
+    _write_cfg(tmp_path, {"repo": "a/b", "required_checks": {"pr": ["ci"], "dev": []}})
+    cfg2 = config.load(tmp_path)
+    assert config.dev_required_checks(cfg2) == []
+    assert config.pr_required_checks(cfg2) == ["ci"]
+
+
+def test_required_checks_object_requires_both_keys(tmp_path):
+    # opting into the object form is a conscious split, so BOTH surfaces must be stated — a lone
+    # {"pr": [...]} silently defaulting dev back to pr would recreate the exact stranded-freeze bug.
+    for bad in ({"pr": ["ci"]}, {"dev": ["ci"]}):
+        _write_cfg(tmp_path, {"repo": "a/b", "required_checks": bad})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "required_checks" in str(e.value)
+
+
+def test_required_checks_object_rejects_unknown_key(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b",
+                          "required_checks": {"pr": ["ci"], "dev": ["ci"], "prod": ["ci"]}})
+    with pytest.raises(ValueError) as e:
+        config.load(tmp_path)
+    assert "prod" in str(e.value)
+
+
+def test_required_checks_object_values_must_be_string_lists(tmp_path):
+    for bad in ({"pr": "ci", "dev": ["ci"]}, {"pr": ["ci"], "dev": [1]},
+                {"pr": ["ci"], "dev": None}, {"pr": [{}], "dev": ["ci"]}):
+        _write_cfg(tmp_path, {"repo": "a/b", "required_checks": bad})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "required_checks" in str(e.value)
+
+
+def test_required_checks_list_still_rejects_non_strings(tmp_path):
+    _write_cfg(tmp_path, {"repo": "a/b", "required_checks": [1, 2]})
+    with pytest.raises(ValueError) as e:
+        config.load(tmp_path)
+    assert "required_checks" in str(e.value)
+
+
+def test_required_checks_accessors_fail_closed_on_garbage():
+    # the accessors are called by the pure gate/actions cores on possibly wrong-typed config -> [].
+    for bad in (None, {}, {"required_checks": 5}, {"required_checks": {}},
+                {"required_checks": {"pr": "x", "dev": "y"}}):   # wrong-typed surfaces -> []
+        assert config.pr_required_checks(bad) == []
+        assert config.dev_required_checks(bad) == []
+    # each surface is extracted INDEPENDENTLY: a cleanly-typed list on one surface survives even if
+    # the other is malformed. (Returning the real PR list is the safe direction — an empty PR list
+    # would read as vacuously green at the gate, i.e. fail OPEN; a non-empty list stays fail-closed.)
+    half = {"required_checks": {"pr": ["ci"]}}
+    assert config.pr_required_checks(half) == ["ci"]
+    assert config.dev_required_checks(half) == []
 
 
 def test_areas_must_be_dict_of_glob_lists(tmp_path):

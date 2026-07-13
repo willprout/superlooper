@@ -97,6 +97,9 @@ _MERGE_METHODS = {"squash", "merge", "rebase"}   # gh's own set; the runner defa
 # diagnose-and-fix); "investigate" is the reserved investigation pool. A merge-producing issue
 # never occupies an investigation lane — that reservation is the whole point.
 _LANE_POOLS = ("build", "investigate")
+# `required_checks` surfaces (issue #52): "pr" gates PR merges (§C.4 step 5), "dev" gates the dev
+# freeze/unfreeze poll. The object form declares them separately; a flat list gates BOTH.
+_CHECK_SURFACES = ("pr", "dev")
 # watchdog.authority tiers (issue #66): what the unattended sl-debugger session may do.
 _WATCHDOG_AUTHORITIES = {"diagnose-only", "allowlist", "full"}
 
@@ -134,6 +137,36 @@ def _validate_lanes(v):
     # int form: bool is an int subclass (True == 1) so it must be rejected explicitly.
     if isinstance(v, bool) or not isinstance(v, int) or v < 1:
         _err(f"'lanes' must be an integer >= 1 {_obj_hint}, got {v!r}")
+
+
+def _validate_required_checks(v):
+    """`required_checks` is EITHER a plain list of check-name strings (today — the SAME set gates
+    both PR merges and the dev freeze/unfreeze, full back-compat) OR an object
+    {"pr": [...], "dev": [...]} declaring the two surfaces SEPARATELY (issue #52). The split lets a
+    repo EXCLUDE a check that gates PRs but never reports on the dev branch (a ship status stamped
+    on PR head commits only, which the post-squash-merge dev HEAD never receives) from the dev set —
+    otherwise the widened dev poll reads it `pending` forever and a mainline freeze never lifts.
+    Fails loud + specific either way. An empty list on either surface is allowed here (doctor gates
+    the PR set non-empty at adopt time, exactly like a bare `required_checks: []` still loads)."""
+    if isinstance(v, dict):
+        for k in v:
+            if k not in _CHECK_SURFACES:
+                _err(f"unknown key 'required_checks.{k}' (allowed: {', '.join(_CHECK_SURFACES)})")
+        # opting into the object form is a conscious split, so BOTH surfaces must be stated — a lone
+        # {"pr": [...]} silently defaulting dev back to pr would recreate the stranded-freeze bug.
+        missing = [k for k in _CHECK_SURFACES if k not in v]
+        if missing:
+            _err(f"'required_checks' object must set both "
+                 f"{' and '.join(repr(k) for k in _CHECK_SURFACES)} (missing: {', '.join(missing)})")
+        for k in _CHECK_SURFACES:
+            names = v[k]
+            if not isinstance(names, list) or any(not isinstance(x, str) for x in names):
+                _err(f"'required_checks.{k}' must be a list of strings, got {names!r}")
+        return
+    if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+        _err("'required_checks' must be a list of strings, or an object "
+             '{"pr": [...], "dev": [...]} splitting PR-required from dev-required checks, '
+             f"got {v!r}")
 
 
 def _validate_and_fill(raw):
@@ -191,10 +224,13 @@ def _validate_and_fill(raw):
     for flag in ("touches_required", "cleanup_merged_worktrees", "cleanup_parked_worktrees"):
         if not isinstance(out[flag], bool):
             _err(f"'{flag}' must be true or false, got {out[flag]!r}")
-    for listkey in ("required_checks", "bright_lines", "report_required_sections"):
+    for listkey in ("bright_lines", "report_required_sections"):
         v = out[listkey]
         if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
             _err(f"'{listkey}' must be a list of strings")
+    # required_checks: list (both surfaces) OR {"pr":[...], "dev":[...]} (issue #52) — validated
+    # by its own helper so the object form is accepted and its sub-keys rejected loudly by name.
+    _validate_required_checks(out["required_checks"])
     for strornull in ("ship_cmd", "ship_recheck_cmd"):
         v = out[strornull]
         if v is not None and (not isinstance(v, str) or not v.strip()):
@@ -310,6 +346,38 @@ def operator(config):
             if owner:
                 return owner
     return "the owner"
+
+
+def pr_required_checks(config):
+    """The required checks that gate PR merges — §C.4 step 5 folds the PR statusCheckRollup down to
+    THIS set (issue #52). `required_checks` is EITHER a flat list (the same set gates both surfaces)
+    OR {"pr":[...], "dev":[...]}; this returns the PR set from whichever form is present. Extracts
+    the PR surface INDEPENDENTLY of dev: a cleanly-typed list survives even if `dev` is malformed.
+    A wrong-typed/absent value degrades to []; note an EMPTY set is vacuously GREEN at the gate (not
+    pending — see gate.required_checks_state, cross-review C3), so an empty PR set does NOT fail
+    closed. The backstop against that is `doctor` (adopt-time), which FAILs hard on an empty PR set;
+    the loader also rejects wrong-typed config before it can ever reach the gate."""
+    rc = config.get("required_checks") if isinstance(config, dict) else None
+    if isinstance(rc, dict):
+        pr = rc.get("pr")
+        return pr if isinstance(pr, list) else []
+    return rc if isinstance(rc, list) else []
+
+
+def dev_required_checks(config):
+    """The required checks expected to report on (and gate the freeze/unfreeze of) the DEV branch
+    (issue #52). A flat `required_checks` list applies to both surfaces (back-compat); the object
+    form's `dev` set lets a repo EXCLUDE a PR-only check that never reports on dev — which would
+    otherwise strand a mainline freeze forever. Extracts the dev surface INDEPENDENTLY of pr; a
+    wrong-typed/absent value degrades to []. An EMPTY dev set is a legitimate choice (a repo whose
+    CI runs on PRs only): the freeze mechanism then idles — it never freezes on dev, and it lifts an
+    existing freeze (an empty required set is vacuously green). The loader rejects wrong-typed config,
+    so the []-on-garbage path is defensive only."""
+    rc = config.get("required_checks") if isinstance(config, dict) else None
+    if isinstance(rc, dict):
+        dev = rc.get("dev")
+        return dev if isinstance(dev, list) else []
+    return rc if isinstance(rc, list) else []
 
 
 def path_to_area(config, path):

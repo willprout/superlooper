@@ -128,7 +128,7 @@ unless you specifically want this build-vs-investigation split.)
 
 | Field | Default | Meaning |
 |---|---|---|
-| `required_checks` | `[]` | GitHub check names that must be **green** before the loop merges a PR. **`doctor` fails hard if this is empty** — a repo with no CI check enforcing its own tests has no mechanical gate, so at least one is required before you run. |
+| `required_checks` | `[]` | GitHub check names that must be **green** before the loop merges a PR. Either a **list of strings** — the same set gates PR merges *and* the dev-branch freeze/unfreeze — or an **object** `{"pr": [...], "dev": [...]}` that declares the two surfaces separately (see **PR-required vs dev-required checks** below). **`doctor` fails hard if the PR set is empty** — a repo with no CI check enforcing its own tests has no mechanical gate, so at least one is required before you run. |
 | `merge_method` | `"squash"` | How the loop merges a green PR (`squash` \| `merge` \| `rebase`). Squash keeps dev history clean; it is the recommended default. |
 | `ship_cmd` | `null` | If set, worker briefs say "ship EXCLUSIVELY via this command" (e.g. a repo's own `scripts/ship.sh` that owns review + CI). If `null`, the brief tells the worker to push the branch and open the PR itself, and the gate requires a fresh-agent review comment on the PR. |
 | `ship_recheck_cmd` | `null` | Run by the runner from the worktree after a merge-update, to re-post a diff-pinned gate verdict. Exit 0 → proceed; nonzero → **park** (the loop never coaches around a fail-closed gate). |
@@ -146,6 +146,33 @@ every report sets the list explicitly — e.g. `["Tests", "Browser evidence", "R
 and the gate then requires that H2 with real prose like any other. This is an opt-in, deliberately
 *not* the default, precisely so a CLI, library, or service repo is never asked for browser evidence it
 can never produce (and then parked for the missing section).
+
+**PR-required vs dev-required checks.** The loop reads `required_checks` on **two** surfaces: the merge
+gate folds a PR's checks down to it before merging, and the dev-branch **freeze/unfreeze** poll folds
+the dev HEAD's checks down to it (red on dev freezes merges; back to green lifts the freeze). With a
+plain list, the *same* set governs both. That breaks for a check that **gates PR merges but never
+reports on the dev branch** — e.g. a status a ship script stamps on the PR head commit only, which the
+post-squash-merge dev HEAD never receives. The merge gate legitimately requires it, but the dev poll
+sees it as forever-missing → `pending`, so once the genuinely-dev checks green, the freeze **still
+never lifts**. The split expresses the two question sets separately:
+
+```json
+"required_checks": { "pr": ["review/local-gate", "quality-gate"], "dev": ["quality-gate"] }
+```
+
+- `pr` — checks that must be green on the **PR** before it merges (the mechanical ship gate). **At
+  least one is required**; `doctor` fails hard on an empty PR set.
+- `dev` — checks expected to report on (and gate the freeze/unfreeze of) the **dev branch**. Usually a
+  *subset* of `pr`: drop any check that never reports on dev, so it can't strand a mainline freeze
+  forever. May be empty (a repo whose CI runs on PRs only, never on dev push — the freeze mechanism
+  then simply idles).
+
+Both keys are **required** when you use the object form (a lone `{"pr": [...]}` silently defaulting
+`dev` back to `pr` — which would recreate the exact stranded-freeze bug — is rejected at load).
+`doctor`'s name cross-check is surface-aware: it flags a `dev`-required check that never reports on the
+dev branch, and a `pr`-required check that never reports on a PR, but a check you deliberately excluded
+from `dev` is **not** flagged. (Prefer the plain list unless a required check genuinely never reports
+on dev.)
 
 ### Models, timers, QA, notifications, housekeeping
 
@@ -271,12 +298,13 @@ report.
    and any `bright_lines`.
 3. `superlooper doctor --repo <path>` — verifies: `gh` is authenticated, `cmux` is present, `jq`
    is present, the launch shim is installed, the two activity hooks are registered, the config
-   parses, the labels exist, the `dev_branch` exists on origin, **`required_checks` is non-empty**,
-   and **every `required_checks` name actually matches a check the repo has reported** on recent
-   PRs and the dev branch. A name typo (`quality-gate` vs `Quality Gate`) or a check the repo never
-   wired reads as "pending" forever, so a green PR would gate without merging; `doctor` fails it
-   here with a case/shape hint, and separately flags a check that reports on PRs but never on the
-   dev branch. *Why here:* it is the all-green gate before you run — and only now, with step 1
+   parses, the labels exist, the `dev_branch` exists on origin, **the PR-required checks are
+   non-empty**, and **every `required_checks` name actually matches a check the repo has reported**
+   on recent PRs and the dev branch. A name typo (`quality-gate` vs `Quality Gate`) or a check the
+   repo never wired reads as "pending" forever, so a green PR would gate without merging; `doctor`
+   fails it here with a case/shape hint, and separately flags a **dev-required** check that reports
+   on PRs but never on the dev branch (and the mirror — a PR-required check that reports only on
+   dev). A check you deliberately excluded from the `dev` set is not flagged. *Why here:* it is the all-green gate before you run — and only now, with step 1
    published and step 2's config written, does every check have something real to inspect. Fix
    anything red and re-run `doctor` until it passes.
 4. `superlooper run --repo <path>` — start the runner in a cmux tab you can watch (it targets that

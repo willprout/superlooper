@@ -448,16 +448,18 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
         return {"action": "hold", "wander": wander,
                 "reason": "merges frozen (fix-forward in progress) — holding"}
 
-    # step 5: required checks.
-    checks = required_checks_state(pv.get("statusCheckRollup"), cfg.get("required_checks"))
+    # step 5: required checks. PR gating reads the PR-required set (issue #52): when required_checks
+    # is split {"pr":[...], "dev":[...]}, a check that is PR-required but excluded from the dev set
+    # still gates the PR here; a flat list gates both surfaces (back-compat via the accessor).
+    pr_required = _config.pr_required_checks(cfg)
+    checks = required_checks_state(pv.get("statusCheckRollup"), pr_required)
     if checks == "pending":
         # Surface WHICH required checks are keeping this pending (issue #26): the runner bounds the
         # wait and escalates once past the cap, naming the unreported checks in the memo. The merge
         # decision itself stays fail-closed — pending never merges — this only makes the wait
         # bounded and legible instead of silent-forever.
         return {"action": "wait", "wander": wander, "checks_pending": True,
-                "pending": pending_required_breakdown(pv.get("statusCheckRollup"),
-                                                       cfg.get("required_checks")),
+                "pending": pending_required_breakdown(pv.get("statusCheckRollup"), pr_required),
                 "reason": "required checks still pending — polling"}
     if checks == "fail":
         out = nudge_or_park("checks", "a required check failed on the PR")

@@ -1762,6 +1762,54 @@ def test_commit_status_only_dev_view_unfreezes_when_green():
     assert len(only(out, "unfreeze")) == 1
 
 
+# ------- issue #52: the dev freeze/unfreeze reads the DEV-required set, not the PR set -------
+# A required check that gates PR merges but NEVER reports on the dev branch (e.g. a ship status
+# stamped on PR head commits only, which the post-squash-merge dev HEAD never receives) must not
+# strand a mainline freeze forever. Split config lets the dev set EXCLUDE it, so once the checks
+# that DO report on dev green, the freeze lifts.
+SPLIT_CFG = {"pr": ["ci", "ship"], "dev": ["ci"]}   # ship is PR-only, absent from the dev set
+
+
+def test_pr_only_check_absent_from_dev_does_not_strand_freeze():
+    # dev HEAD reports ci green; `ship` never reports on dev at all. The dev-required set is {ci},
+    # which is green -> the freeze lifts. (Under the old flat list [ci, ship] this read pending
+    # forever because ship is missing from dev — the exact strand-forever bug #52 fixes.)
+    d = disk(frozen={"reason": "dev red", "fingerprint": "f", "since": NOW - 100})
+    out = decide(config=cfg(required_checks=SPLIT_CFG), dsk=d,
+                 gh_view=ghv(dev_checks=list(GREEN)))     # GREEN == [ci SUCCESS]; ship absent
+    assert len(only(out, "unfreeze")) == 1
+
+
+def test_flat_list_with_a_pr_only_check_still_strands_freeze():
+    # Contrast (documents the bug the split fixes): the SAME dev view under a flat list that still
+    # includes the PR-only `ship` reads pending forever -> stranded. The remedy is the config split.
+    d = disk(frozen={"reason": "dev red", "fingerprint": "f", "since": NOW - 100})
+    out = decide(config=cfg(required_checks=["ci", "ship"]), dsk=d,
+                 gh_view=ghv(dev_checks=list(GREEN)))
+    assert only(out, "unfreeze") == []
+
+
+def test_dev_freeze_evaluates_only_the_dev_required_set():
+    # A red `ship` on dev must NOT freeze (ship is not dev-required); a red `ci` MUST freeze.
+    ship_red = [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "ship", "status": "COMPLETED", "conclusion": "FAILURE"}]
+    out = decide(config=cfg(required_checks=SPLIT_CFG), gh_view=ghv(dev_checks=ship_red))
+    assert only(out, "freeze") == [] and only(out, "file_fix_issue") == []
+    out2 = decide(config=cfg(required_checks=SPLIT_CFG), gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out2, "freeze")) == 1 and has_notify(out2)
+
+
+def test_empty_dev_required_set_idles_the_freeze_mechanism():
+    # A repo whose CI runs on PRs only sets an empty dev set. The freeze mechanism then IDLES: even a
+    # red dev check never freezes / files a fix, and any existing freeze lifts (empty set == green).
+    empty_dev = {"pr": ["ci"], "dev": []}
+    out = decide(config=cfg(required_checks=empty_dev), gh_view=ghv(dev_checks=list(RED)))
+    assert only(out, "freeze") == [] and only(out, "file_fix_issue") == []
+    d = disk(frozen={"reason": "dev red", "fingerprint": "f", "since": NOW - 100})
+    out2 = decide(config=cfg(required_checks=empty_dev), dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out2, "unfreeze")) == 1
+
+
 def test_commit_status_only_dev_view_red_freezes_and_stays_frozen():
     # fail-closed: a genuinely red required status freezes...
     out = decide(config=cfg(required_checks=["ship"]),

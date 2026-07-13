@@ -466,12 +466,24 @@ def cmd_doctor(args):
     except (FileNotFoundError, ValueError) as e:
         check("config", False, str(e))
 
+    pr_req, dev_req, rc_union = [], [], []
     if cfg is not None:
-        rc = cfg.get("required_checks") or []
-        check("required_checks", bool(rc),
+        # required_checks may be split by surface (issue #52): the PR set gates PR merges, the dev set
+        # gates the freeze/unfreeze. A flat list -> both accessors return it (back-compat).
+        pr_req = config_lib.pr_required_checks(cfg)
+        dev_req = config_lib.dev_required_checks(cfg)
+        rc_union = sorted(set(pr_req) | set(dev_req))
+        # The PR set is the mechanical ship gate (§4.3) — adoption requires at least one PR-required
+        # check. The dev set MAY be empty (a repo whose CI runs on PRs only, never on dev push).
+        if isinstance(cfg.get("required_checks"), dict):
+            disp = ("PR: " + (", ".join(pr_req) or "(none)")
+                    + " | dev: " + (", ".join(dev_req) or "(none)"))
+        else:
+            disp = ", ".join(pr_req)
+        check("required_checks", bool(pr_req),
               "EMPTY — a repo with no CI check enforcing its tests has no mechanical "
-              "ship gate (§4.3); adoption requires at least one" if not rc
-              else ", ".join(rc))
+              "ship gate (§4.3); adoption requires at least one PR-required check" if not pr_req
+              else disp)
 
     gh_ok = gh.probe()
     check("gh (reachable + authenticated)", gh_ok)
@@ -502,11 +514,16 @@ def cmd_doctor(args):
     # that never merges — and the runner has no way to know it is a typo vs a genuinely-slow check.
     # Catch it here, at adoption time, with a case/shape hint.
     names_failed = False
-    if cfg is not None and gh_ok and rc:
+    if cfg is not None and gh_ok and rc_union:
         dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
+        pr_set, dev_set = set(pr_req), set(dev_req)
         pr_names = gate.check_names(gh.recent_pr_check_entries())
         dev_names = gate.check_names(gh.branch_checks(dev))
-        audit = gate.audit_required_checks(rc, pr_names, dev_names)
+        # Audit every DECLARED name (the union of both surfaces) against what each surface reports.
+        # Which set a name belongs to then decides whether a single-surface report is a problem or
+        # exactly what the split intends (issue #52). audit_required_checks stays surface-symmetric;
+        # the doctor owns the set-membership interpretation.
+        audit = gate.audit_required_checks(rc_union, pr_names, dev_names)
 
         def _named(results):
             parts = []
@@ -522,40 +539,45 @@ def cmd_doctor(args):
                   f"'{dev}' branch yet; cannot verify the names (fresh repo?). Re-run doctor "
                   "after the first CI run.")
         else:
-            unreported = [r for r in audit["results"] if r["status"] == "unreported"]
-            pr_only = [r for r in audit["results"] if r["status"] == "pr_only"]
-            dev_only = [r for r in audit["results"] if r["status"] == "dev_only"]
+            results = audit["results"]
+            # A name reported on NEITHER surface is a typo / never-wired check (FAIL), whatever set.
+            unreported = [r for r in results if r["status"] == "unreported"]
+            # dev_gap: a DEV-required name that reports on PRs but NEVER on the dev branch (status
+            # pr_only) — the dev-side poll reads pending forever, so a mainline freeze never lifts
+            # (the 2026-07-09 incident). Under the split a PR-only check EXCLUDED from the dev set is
+            # NOT flagged — that exclusion is the whole point of issue #52.
+            dev_gap = [r for r in results if r["name"] in dev_set and r["status"] == "pr_only"]
+            # pr_gap: a PR-required name that reports on the dev branch but NEVER on a PR (status
+            # dev_only) — every PR reads pending forever, so a green PR never merges (Codex R1).
+            pr_gap = [r for r in results if r["name"] in pr_set and r["status"] == "dev_only"]
+            # Each surface-gap FAILs only when the OTHER surface has reported checks (so the absence
+            # is real evidence), else it degrades to a WARN.
             if unreported:
                 names_failed = True
                 check("required_checks names", False,
                       "reported on NO recent PR or the dev branch: " + _named(unreported))
-            # pr_only: reports on PRs but never on the dev branch — the 2026-07-09 incident: the
-            # dev-side poll reads pending forever (freeze/unfreeze silently breaks). dev_only: the
-            # mirror — reports on the dev branch but never on a PR, so every PR reads pending
-            # forever and a green PR never merges. Each FAILs only when the OTHER surface has
-            # reported checks (so the absence is real evidence), else it degrades to a WARN.
-            if pr_only and audit["dev_observed"]:
+            if dev_gap and audit["dev_observed"]:
                 names_failed = True
                 check(f"required_checks on '{dev}'", False,
-                      "reports on PRs but NEVER on the dev branch: " + _named(pr_only)
+                      "dev-required but reports on PRs and NEVER on the dev branch: " + _named(dev_gap)
                       + f" — the dev-side check poll reads pending forever; ensure the check's "
-                      f"workflow triggers on push to '{dev}'")
-            elif pr_only:
-                print(f"  WARN required_checks on '{dev}' — {_named(pr_only)} reports on PRs but "
+                      f"workflow triggers on push to '{dev}' (or drop it from the dev-required set)")
+            elif dev_gap:
+                print(f"  WARN required_checks on '{dev}' — {_named(dev_gap)} reports on PRs but "
                       f"the '{dev}' branch has no check history yet to confirm it runs there; "
                       "re-check after a dev CI run.")
-            if dev_only and audit["pr_observed"]:
+            if pr_gap and audit["pr_observed"]:
                 names_failed = True
                 check("required_checks on PRs", False,
-                      "reports on the dev branch but NEVER on a PR: " + _named(dev_only)
+                      "PR-required but reports on the dev branch and NEVER on a PR: " + _named(pr_gap)
                       + " — every PR reads pending forever, so a green PR never merges; ensure the "
                       "check's workflow triggers on pull_request")
-            elif dev_only:
-                print("  WARN required_checks on PRs — " + _named(dev_only) + " reports on the "
+            elif pr_gap:
+                print("  WARN required_checks on PRs — " + _named(pr_gap) + " reports on the "
                       f"'{dev}' branch but no recent PR has reported checks yet to confirm it runs "
                       "there; re-check after a PR CI run.")
-            if not (unreported or pr_only or dev_only):
-                print(f"  ok   required_checks names — every name seen on PRs and the '{dev}' branch")
+            if not (unreported or dev_gap or pr_gap):
+                print("  ok   required_checks names — every name reports on its expected surface(s)")
 
     cmux = os.environ.get("SL_CMUX", "/Applications/cmux.app/Contents/Resources/bin/cmux")
     check("cmux binary", os.path.exists(cmux), cmux)

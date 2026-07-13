@@ -533,6 +533,23 @@ def test_gate_checks_pending_names_the_unreported_check():       # step 5 (issue
     assert d["pending"] == {"unreported": ["quality-gate"], "running": []}
 
 
+def test_gate_reads_pr_required_set_from_split_config():         # step 5 (issue #52)
+    # When required_checks is split {"pr":[...], "dev":[...]}, the merge gate evaluates the PR set,
+    # NEVER the dev set. A check that is PR-required but excluded from the dev set still gates the PR.
+    split = _cfg(required_checks={"pr": ["quality-gate", "ship"], "dev": ["quality-gate"]})
+    # PR rollup: quality-gate green, `ship` MISSING -> the PR set is pending -> wait (never merge).
+    # (If the gate wrongly read the dev set ["quality-gate"], this would merge — the regression.)
+    d = _decide(cfg=split,
+                pr=_pr(statusCheckRollup=[{"context": "quality-gate", "state": "SUCCESS"}]))
+    assert d["action"] == "wait" and d.get("checks_pending") is True
+    assert d["pending"] == {"unreported": ["ship"], "running": []}
+    # both PR-required checks green -> the gate proceeds to merge (nothing else blocks in _pr()).
+    d2 = _decide(cfg=split,
+                 pr=_pr(statusCheckRollup=[{"context": "quality-gate", "state": "SUCCESS"},
+                                           {"context": "ship", "state": "SUCCESS"}]))
+    assert d2["action"] == "merge"
+
+
 def test_gate_non_pending_decisions_carry_no_checks_pending_flag():
     assert "checks_pending" not in _decide()                     # merge path
     assert _decide().get("checks_pending") is None
