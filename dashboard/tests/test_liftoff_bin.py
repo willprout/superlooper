@@ -4,8 +4,9 @@
 ``main()`` takes injectable probes/executors (defaulting to the real socket/kill/Popen/execv) so the
 orchestration is testable WITHOUT touching a real port, process, or replacing the interpreter:
 
-  * a bad config or an ambiguous ``--repo`` fails FRIENDLY (one line, a clean exit code) — never a
-    traceback (mirrors bin/command-center, issue #34);
+  * a bad config or an ambiguous ``--repo`` fails FRIENDLY (a clean exit code, actionable text) —
+    never a traceback (mirrors bin/command-center, issue #34); a MISSING config gets the fuller
+    issue-#104 message that names the absolute path looked at and every way out;
   * idempotent: an up dashboard is not respawned; a live runner is not re-exec'd;
   * both down ⇒ the dashboard is spawned in the BACKGROUND and the runner is exec'd in the
     FOREGROUND (it takes over this cmux tab — the proven procedure);
@@ -93,6 +94,51 @@ def test_missing_config_fails_friendly(tmp_path):
     rc, text, spawn, execr = _run(tmp_path / "nope.json")
     assert rc == lo.EXIT_CONFIG_ERROR
     assert "liftoff:" in text and not spawn.calls and not execr.calls
+    # issue #104: the error names the ABSOLUTE path it looked at and a way out (CC_CONFIG), never a
+    # bare relative "config.json" with no route forward.
+    assert str(tmp_path / "nope.json") in text
+    assert "CC_CONFIG" in text
+
+
+def test_missing_config_names_sibling_when_run_from_the_wrong_dir(tmp_path, monkeypatch):
+    # The live #104 reproduction: the operator ran dashboard/bin/liftoff from the repo root while
+    # their config sat in dashboard/. Simulate it — _ROOT holds a config.json (the sibling that DOES
+    # exist), but the cwd-relative ./config.json is absent. liftoff must NAME the found sibling and
+    # how to select it, and NOT advise copying the example (a config already exists).
+    monkeypatch.setattr(lo, "_ROOT", tmp_path)
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "config.example.json").write_text("{}")   # present, but must be ignored in this case
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    out = io.StringIO()
+    rc = lo.main([str(_BIN)], is_dashboard_up=lambda h, p: True,
+                 live_runner_pid=lambda s: None, spawn_dashboard=_Recorder(),
+                 exec_runner=_Recorder(), out=out)
+    text = out.getvalue()
+    assert rc == lo.EXIT_CONFIG_ERROR
+    assert str(tmp_path / "config.json") in text            # names the sibling config that exists
+    assert str(elsewhere / "config.json") in text           # names the absolute path it looked at
+    assert "config.example.json" not in text                # no copy advice — a config already exists
+
+
+def test_missing_config_advises_copying_example_when_none_exists(tmp_path, monkeypatch):
+    # The fresh-install case: no config anywhere obvious, but the shipped example is there → spell
+    # the exact `cp` first step (and still name where it looked + the three ways out).
+    monkeypatch.setattr(lo, "_ROOT", tmp_path)
+    (tmp_path / "config.example.json").write_text("{}")     # the shipped example; no config.json
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    out = io.StringIO()
+    rc = lo.main([str(_BIN)], is_dashboard_up=lambda h, p: True,
+                 live_runner_pid=lambda s: None, spawn_dashboard=_Recorder(),
+                 exec_runner=_Recorder(), out=out)
+    text = out.getvalue()
+    assert rc == lo.EXIT_CONFIG_ERROR
+    assert str(elsewhere / "config.json") in text           # where it looked (absolute)
+    assert "cp " in text and str(tmp_path / "config.example.json") in text  # the copy-the-example step
+    assert "CC_CONFIG" in text
 
 
 def test_ambiguous_repo_choice_fails_friendly(tmp_path, monkeypatch):

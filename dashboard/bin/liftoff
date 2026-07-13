@@ -155,6 +155,25 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
         out.write(str(e))
         return e.code
 
+    # A missing config is the first-run dead-end (issue #104): answer it BEFORE config.load with a
+    # message that names WHERE liftoff looked (the absolute path — a relative ./config.json resolves
+    # against the cwd, not the script) and every way out. config.load's own FileNotFoundError below
+    # stays as the TOCTOU backstop (file deleted between this check and the read).
+    if not os.path.exists(config_path):
+        looked_at = os.path.abspath(config_path)
+        sibling = str(_ROOT / "config.json")
+        # A config that ships next to the script (its own ../config.json) — named, never auto-used —
+        # unless it IS the path we just looked at (then there is genuinely no config anywhere).
+        script_dir_config = (os.path.abspath(sibling)
+                             if os.path.exists(sibling)
+                             and os.path.realpath(sibling) != os.path.realpath(config_path)
+                             else None)
+        example = str(_ROOT / "config.example.json")
+        example_config = os.path.abspath(example) if os.path.exists(example) else None
+        out.write(liftoff_mod.missing_config_message(
+            looked_at, script_dir_config=script_dir_config, example_config=example_config))
+        return EXIT_CONFIG_ERROR
+
     try:
         cfg = config_mod.load(config_path)
     except (FileNotFoundError, ValueError) as e:

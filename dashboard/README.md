@@ -127,11 +127,16 @@ the one proven restart procedure. (There is deliberately no automated tab placem
 is the anchor.)
 
 ```sh
-bin/liftoff                       # one watched repo: brings up the dashboard + that repo's runner
-bin/liftoff --repo owner/name     # several watched repos: name whose runner to start
-bin/liftoff /path/to/config.json  # a config other than ./config.json (or set CC_CONFIG)
+bin/liftoff                        # from the dashboard directory: reads ./config.json
+bin/liftoff --repo owner/name      # several watched repos: name whose runner to start
+bin/liftoff /path/to/config.json   # from anywhere: name the config (or set CC_CONFIG)
 ```
 
+- **Where it finds the config.** With no path argument, `liftoff` reads `./config.json` **relative
+  to the directory you run it from** (or `$CC_CONFIG`), exactly like `bin/command-center`. So run it
+  from the dashboard directory, or — to run it from anywhere — pass the config's path as the first
+  argument or set `CC_CONFIG=/path/to/config.json`. If the file isn't there, `liftoff` names the
+  absolute path it looked at and all three of those ways out, rather than leaving you guessing.
 - **Idempotent — a second run double-starts neither.** It checks the dashboard's `port` (already
   serving ⇒ left alone) and the runner's pidfile (a live runner ⇒ left alone), then starts only
   what's missing. So `liftoff` is equally *"bring the pair up"* and *"confirm the pair is up."*

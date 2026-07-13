@@ -23,8 +23,67 @@ Two boundaries shape this file:
 Everything here is pure: it takes already-read facts (config, probe results) and returns argvs,
 resolved repos, and a plan. All real I/O (the socket probe, ``os.kill`` liveness, ``Popen``,
 ``execv``) lives in ``bin/liftoff``, which is the composition root.
+
+**Missing-config errors ANNOUNCE, they never auto-switch (issue #104).** liftoff resolves
+``./config.json`` against the directory you RUN it from, not the script's own location. The first
+real run tripped on exactly that: run from the repo root, liftoff reported ``no dashboard config at
+config.json`` (a bare relative path that named nowhere) and advised copying the example — while the
+operator's config sat, already written, in the dashboard dir one directory over. ``missing_config_message``
+is the honest replacement: it names the ABSOLUTE path liftoff checked and every way to point it right.
+When a config already exists beside the script, the message NAMES it and how to select it but does
+NOT silently adopt it — silently switching which config a label-writing dashboard watches is the
+"quietly watch the wrong thing" failure ``lib/config.py`` is built to reject; naming the path and the
+three ways out (run from its directory, pass it as an argument, or set ``$CC_CONFIG``) instead teaches
+the operator liftoff's cwd-relative resolution, so the next run is right by understanding, not luck.
 """
 import os
+
+
+def missing_config_message(looked_at, *, script_dir_config=None, example_config=None):
+    """The friendly, actionable error when liftoff's chosen config file does not exist (issue #104).
+
+    All three inputs are already-resolved facts — the composition root does the disk checks; this
+    stays pure — and every branch names the ABSOLUTE path liftoff looked at plus all three ways to
+    point it right (run liftoff from the config's directory, pass the path as the first argument, or
+    set ``$CC_CONFIG``), mirroring the plain, newline-terminated voice of the sibling command-center's
+    friendly failures (issue #34).
+
+    * ``looked_at`` — the absolute path liftoff resolved and found nothing at. Named first, so the
+      reader learns *where* liftoff actually looked (it resolves a relative path against the directory
+      you run it from, not the script's location — the exact thing that misled the first run).
+    * ``script_dir_config`` — the absolute path of a config that sits beside the script
+      (``<liftoff dir>/../config.json``) IF that file exists, else ``None``. When given (the live #104
+      case), the message NAMES that found config and how to select it and, because a config already
+      exists, OMITS the copy-the-example advice — but never silently adopts it (see the module
+      docstring's rationale).
+    * ``example_config`` — the absolute path of the shipped ``config.example.json`` IF it exists, else
+      ``None``. Used only when no config exists anywhere obvious, to spell the exact ``cp`` first step.
+    """
+    lines = ["liftoff: no config at %s" % looked_at]
+    if script_dir_config is not None:
+        lines += [
+            "  A config already exists beside liftoff, at %s — but liftoff looks for" % script_dir_config,
+            "  ./config.json in the directory you run it FROM, not where the script lives. Use that",
+            "  config any of three ways:",
+            "    - cd to the dashboard directory, then run: bin/liftoff",
+            "    - pass it as the first argument: liftoff %s" % script_dir_config,
+            "    - point CC_CONFIG at it: export CC_CONFIG=%s" % script_dir_config,
+        ]
+    else:
+        lines += [
+            "  liftoff looks for ./config.json in the directory you run it FROM. Point it at your",
+            "  config any of three ways:",
+            "    - run liftoff from the directory that holds config.json",
+            "    - pass it as the first argument: liftoff /path/to/config.json",
+            "    - point CC_CONFIG at it: export CC_CONFIG=/path/to/config.json",
+        ]
+        if example_config is not None:
+            target = os.path.join(os.path.dirname(example_config), "config.json")
+            lines += [
+                "  No config yet? Create one from the example:",
+                "    cp %s %s" % (example_config, target),
+            ]
+    return "\n".join(lines) + "\n"
 
 
 def resolve_repo(config, repo_arg):
