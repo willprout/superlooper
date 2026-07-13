@@ -13,7 +13,7 @@
     "db": ["migrations/**", "src/db/**"]
   },
   "touches_required": true,
-  "required_checks": ["review/local-gate", "quality-gate"],
+  "required_checks": { "pr": ["review/local-gate", "quality-gate"], "dev": ["quality-gate"] },
   "merge_method": "squash",
   "ship_cmd": null,
   "ship_recheck_cmd": null,

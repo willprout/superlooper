@@ -695,9 +695,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # the current freeze state simply persists (frozen-but-building is the safe idle state).
     dev_checks = gv.get("dev_checks")
     if not gh_stale and isinstance(dev_checks, list):
-        dev_state = gate.required_checks_state(dev_checks, cfg.get("required_checks"))
+        # The freeze/unfreeze rule reads the DEV-required set only (issue #52): a check that gates
+        # PR merges but never reports on the dev branch (a ship status on PR heads only) is excluded
+        # via the split config, so it can no longer strand a mainline freeze forever. A flat list
+        # gates both surfaces (back-compat via the accessor).
+        dev_required = _config.dev_required_checks(cfg)
+        dev_state = gate.required_checks_state(dev_checks, dev_required)
         if dev_state == "fail":
-            failing = _failing_required(dev_checks, cfg.get("required_checks"))
+            failing = _failing_required(dev_checks, dev_required)
             name, concl = failing if failing else ("dev", "")
             fp = gate.fix_issue_fingerprint(name, concl)
             if not frozen:

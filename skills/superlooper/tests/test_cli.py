@@ -237,6 +237,39 @@ def test_doctor_flags_a_check_that_reports_on_dev_but_never_on_prs(rig):
     assert "quality-gate" in out and "PR" in out
 
 
+def test_doctor_passes_a_pr_only_check_excluded_from_the_dev_set(rig):
+    # issue #52: `ship` gates PR merges but never reports on the dev branch, and the config EXCLUDES
+    # it from the dev set. That exclusion is exactly the fix — the doctor must NOT flag it (under the
+    # old single-list model this was the 2026-07-09 pr_only FAIL).
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(
+        {"version": 1, "repo": "o/r",
+         "required_checks": {"pr": ["quality-gate", "ship"], "dev": ["quality-gate"]}}))
+    (rig.fixdir / "pr_list.json").write_text(json.dumps([{
+        "number": 555, "state": "OPEN", "statusCheckRollup": [
+            {"__typename": "StatusContext", "context": "quality-gate", "state": "SUCCESS"},
+            {"__typename": "StatusContext", "context": "ship", "state": "SUCCESS"}]}]))
+    # dev reports quality-gate (default check_runs.json) but NEVER ship
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ship" in r.stdout                      # shown in the required_checks display line
+
+
+def test_doctor_flags_a_dev_required_check_that_never_reports_on_dev(rig):
+    # the mis-split the doctor MUST still catch: `ship` is listed as dev-required but reports only on
+    # PRs -> the dev-side poll reads pending forever, so a mainline freeze never lifts.
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(
+        {"version": 1, "repo": "o/r",
+         "required_checks": {"pr": ["quality-gate", "ship"], "dev": ["quality-gate", "ship"]}}))
+    (rig.fixdir / "pr_list.json").write_text(json.dumps([{
+        "number": 555, "state": "OPEN", "statusCheckRollup": [
+            {"__typename": "StatusContext", "context": "quality-gate", "state": "SUCCESS"},
+            {"__typename": "StatusContext", "context": "ship", "state": "SUCCESS"}]}]))
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "ship" in out and "dev" in out.lower()
+
+
 def test_doctor_warns_when_no_checks_observed_yet(rig):
     # a freshly adopted repo with no CI history: cannot verify names -> WARN, never a hard FAIL.
     (rig.fixdir / "pr_list.json").write_text("[]")
