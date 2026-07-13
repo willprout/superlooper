@@ -1430,6 +1430,96 @@ def test_stale_view_never_stamps_the_pr_read_wait():
     assert only(out, "await_pr_read") == [] and only(out, "park") == []
 
 
+# =========================== issue #78: refused COMMENTS read holds the build gate ============
+# The build-gate sibling of #61: the PR LOOKUP can succeed while the comments endpoint is refused
+# (a partial dead zone). On a finished, reviewed PR whose review marker exists but has not yet
+# been seen, the old attachment discarded CommentRead.ok — a refused comments read was
+# indistinguishable from "GitHub answered: no comments", so tick N nudged "review" (key spent) and
+# tick N+k parked a completed, properly-reviewed build. Guard: the runner attaches comments ONLY
+# on a clean read, leaving the key ABSENT otherwise, and the gate WAITs on comments-absent
+# (comments_unread) — journaled once per episode, bounded to a park past the same refused-read
+# bound, cleared when a trustworthy read lands. Symmetric with await_pr_read (#61)/await_read(#21).
+
+
+def _gating_comments_unread(**ist_over):
+    # a FRESH view where i5's PR LOOKUP landed (number present) but its comments sub-read was
+    # REFUSED/starved, so the runner OMITTED the 'comments' key (issue #78).
+    pv = pr_view()
+    del pv["comments"]
+    return _gating(pv=pv, issues_extra={
+        "i5": ist("gating", branch="sl/i5-issue-5", pr=555, **ist_over)})
+
+
+def test_finished_build_refused_comments_read_holds_never_parks():
+    d, g = _gating_comments_unread()
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "park") == [] and not has_notify(out)
+    w = only(out, "await_comments_read")
+    assert len(w) == 1 and w[0]["id"] == "i5" and w[0]["num"] == 5 and w[0]["reason"]
+    # DoD case 3: the refusal spends NO "review" nudge key — the ladder is untouched by the hold.
+    assert only(out, "nudge") == []
+
+
+def test_await_comments_read_stamps_once_per_episode():
+    # bounded refusal journaling: once the wait clock is stamped, no further await_comments_read
+    # records this episode — a long partial dead zone journals one record, not one per tick.
+    d, g = _gating_comments_unread(comments_read_pending_since=NOW - 10)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "await_comments_read") == [] and only(out, "park") == [] and not has_notify(out)
+
+
+def test_corrupt_comments_read_clock_restamps_never_parks():
+    # the _since_ok discipline (issue #26): a wrong-typed/future/negative clock is corrupt —
+    # re-stamp it, never trust it to trip (or defeat) the bound.
+    for bad in ("x", -5, NOW + 999, True):
+        d, g = _gating_comments_unread(comments_read_pending_since=bad)
+        out = decide(dsk=d, gh_view=g)
+        assert only(out, "park") == [], bad
+        assert len(only(out, "await_comments_read")) == 1, bad
+
+
+def test_refused_comments_read_past_bound_parks_once_with_notify():
+    # a permanent partial dead zone (PR lookup up, comments endpoint down) must still hand to the
+    # owner instead of holding silent-forever — park ONCE past the same bound, soft (re-approving
+    # after reads recover picks it up), exactly like await_pr_read's bound expiry.
+    d, g = _gating_comments_unread(
+        comments_read_pending_since=NOW - actions.PR_READ_HOLD_CAP_SECONDS)
+    out = decide(dsk=d, gh_view=g)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["cause"] == "comments_read_refused" and has_notify(out)
+    assert p[0]["needs_william"] is False
+
+
+def test_comments_read_recovery_clears_the_wait_and_merges():
+    # DoD case 1 recovery: the comments read lands (marker present) -> clear_comments_read + merge,
+    # and the wait clock ends so a later refusal times fresh.
+    d, g = _gating(issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                           comments_read_pending_since=NOW - 300)})
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "clear_comments_read") == [{"act": "clear_comments_read", "id": "i5"}]
+    assert len(only(out, "merge")) == 1 and only(out, "park") == [] and not has_notify(out)
+
+
+def test_clean_empty_comments_still_nudges_then_parks_never_waits():
+    # DoD case 2 unchanged: a CLEAN answered-empty comments read (a real [], review endpoint UP)
+    # is NOT an unread-hold — the review nudge->park ladder proceeds and the comments clock is
+    # never stamped (so no clear_comments_read either).
+    d, g = _gating(pv=pr_view(comments=[]))
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "await_comments_read") == [] and only(out, "clear_comments_read") == []
+    n = only(out, "nudge")
+    assert len(n) == 1 and n[0]["nudge_key"] == "review"
+
+
+def test_stale_view_never_stamps_the_comments_read_wait():
+    # A wholly-stale gh view (a real outage) must not spawn per-issue await_comments_read noise —
+    # the poll's consecutive_failures ALERT owns that (mirrors await_pr_read's stale-view rule).
+    d, g = _gating_comments_unread()
+    g["stale"] = True
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "await_comments_read") == [] and only(out, "park") == []
+
+
 # ---------------- notify-once per (issue, park-cause) (issue #61 (b)) ----------------
 
 def test_park_notify_precedes_the_park_action():

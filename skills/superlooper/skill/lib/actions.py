@@ -47,7 +47,9 @@ The view contract (assembled by runner.py each tick):
                   "local_date": "YYYY-MM-DD", "local_hhmm": "HH:MM",
                   "last_report_date": str|None}
   gh_view        {"stale": bool (fresh ONLY when exactly False), "consecutive_failures": int,
-                  "closed_nums": set, "prs": {id: pr_view+comments; {} = GitHub ANSWERED "none
+                  "closed_nums": set, "prs": {id: pr_view (+comments attached ONLY on a clean
+                  CommentRead; a refused/starved comments read leaves 'comments' ABSENT, so the
+                  build gate HOLDs via await_comments_read, issue #78); {} = GitHub ANSWERED "none
                   exists"; KEY ABSENT = no trustworthy lookup — not fetched yet, or REFUSED (the
                   poll omits a refused PrRead, issue #61), so the build gate HOLDs via
                   await_pr_read, bounded, never an immediate park}, "issue_comments": {id: [...]}
@@ -60,7 +62,8 @@ The view contract (assembled by runner.py each tick):
 
 Action vocabulary (the executor contract, one journal record each):
   launch, hire_answerer, deliver_answer, bounce, recover(tier=idle|frozen|exited), gate,
-  merge, update, nudge, hold, await_read, await_pr_read, clear_pr_read, note_checks_pending,
+  merge, update, nudge, hold, await_read, await_pr_read, clear_pr_read, await_comments_read,
+  clear_comments_read, note_checks_pending,
   clear_checks_pending, park, clear_park_marker, regenerate, resolve_conflict,
   close_investigate, reclaim, relabel, freeze, unfreeze, file_fix_issue, alert, clear_alert,
   morning_report, notify. Safety actions (alert/freeze/unfreeze) come first; launches come
@@ -70,7 +73,10 @@ Action vocabulary (the executor contract, one journal record each):
   on the issue's `read_waited` flag) so a finished investigation is never parked on an
   unverified read and never waits silently (#21). `await_pr_read`/`clear_pr_read` are the
   build-gate siblings for a refused PR lookup (issue #61): the stamp doubles as the bound clock
-  (PR_READ_HOLD_CAP_SECONDS -> park once) and the journal-once dedup. `clear_park_marker` ends a
+  (PR_READ_HOLD_CAP_SECONDS -> park once) and the journal-once dedup. `await_comments_read`/
+  `clear_comments_read` are the same siblings for a PR that IS found but whose comments sub-read
+  was refused/starved (issue #78): the gate's comments-absent WAIT, journaled once per episode on
+  the `comments_read_pending_since` clock, park-once past the same bound. `clear_park_marker` ends a
   notify-once park episode whose label move never landed, so a later genuine park texts again.
 """
 import math
@@ -872,6 +878,34 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     continue
             elif _real(since):
                 out.append({"act": "clear_checks_pending", "id": iid})       # left the pending episode
+
+            # Bounded comments-read wait (issue #78): the PR LOOKUP landed but its comments sub-read
+            # was REFUSED or starved this tick, so the runner OMITTED the 'comments' key and the gate
+            # WAITs (step 2b: comments_unread) rather than reading the fail-closed empty as "no review
+            # marker" and marching the review nudge ladder to park a finished, reviewed build — the
+            # build-gate sibling of await_pr_read (#61)/await_read (#21). Journal the wait ONCE per
+            # episode via a clock; past the same refused-read bound, park ONCE so a permanent partial
+            # dead zone (PR lookup up, comments endpoint down) still hands to the owner instead of
+            # holding silent-forever; clear the clock when a trustworthy comments read lands. The
+            # _since_ok discipline re-stamps a corrupt/future clock, never trusting it to defeat or
+            # spuriously trip the bound. Structurally identical to the pending-checks backstop above.
+            csince = ist.get("comments_read_pending_since")
+            if g.get("comments_unread"):
+                if not _since_ok(csince, now):
+                    out.append({"act": "await_comments_read", "id": iid, "num": num,
+                                "reason": "finished build: PR is visible but its comments read was "
+                                          "refused or starved this tick — holding, never parking "
+                                          "review evidence on an unverified empty read"})
+                elif now - csince >= PR_READ_HOLD_CAP_SECONDS:
+                    park(iid, num,
+                         "finished and the PR is visible, but GitHub refused every comments read for "
+                         f"{PR_READ_HOLD_CAP_SECONDS // 60}+ min (rate limit / 403 / 5xx) — cannot "
+                         f"verify review evidence for PR #{pv.get('number') or '?'}. Parked once; the "
+                         "PR stays intact and re-approving after reads recover will pick it up.",
+                         cause="comments_read_refused")
+                    continue
+            elif _real(csince):
+                out.append({"act": "clear_comments_read", "id": iid})   # a trustworthy read landed
 
             if act == "merge":
                 # Bounded merge refusals (issue #27): the gate is green but GitHub can still REFUSE

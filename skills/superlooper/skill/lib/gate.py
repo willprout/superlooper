@@ -334,7 +334,9 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
         the runner clears it whenever the PR head changes), investigation_done (bool,
         precomputed via investigation_done() on the issue comments).
       pr_view — gh.pr_for_branch(branch) ({} when none) with the PR's comments attached
-        under 'comments' (gh.pr_comments).
+        under 'comments' (gh.pr_comments) ONLY on a clean read; a REFUSED/starved comments read
+        leaves the key ABSENT, and step 2b WAITs on it (comments_unread) rather than reading the
+        fail-closed empty as "no review marker" and parking a reviewed build (issue #78).
       frozen — merges_frozen.json exists (freeze stops MERGES only, never builds/closes).
       inflight — {lane_issue_id: declared_touches} for the OTHER currently-running lanes.
     """
@@ -381,8 +383,21 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
         return nudge_or_park("sections",
                              "report is missing required sections or they are empty")
 
-    # step 2b: mechanical review evidence (the standing fresh-agent-review rule).
+    # step 2b: mechanical review evidence (the standing fresh-agent-review rule). A comments read
+    # the runner could not verify leaves the 'comments' key ABSENT (or wrong-typed): the poll and
+    # the finishing refresh attach comments ONLY on a clean CommentRead, so absence means REFUSED
+    # or starved — never an authoritative "no review marker". WAIT for a trustworthy read rather
+    # than reading the fail-closed empty as "no review evidence" and marching the nudge ladder to
+    # park a finished, reviewed build (issue #78; the #21/#61 refused≠empty discipline, closing the
+    # build gate's comments-attachment surface). Reaching here already means the repo has no
+    # ship_cmd (else review_evidence_ok would be True), so the comments read is genuinely load-
+    # bearing. A CLEAN read — a real list, even empty — keeps the nudge->park ladder intact; only
+    # an unreadable/absent read waits, mirroring step-3's unreadable-files WAIT.
     if not review_evidence_ok(cfg, pv.get("comments")):
+        if not isinstance(pv.get("comments"), list):
+            return {"action": "wait", "comments_unread": True,
+                    "reason": "PR comments unread (refused or starved) — waiting for a "
+                              "trustworthy read before judging review evidence"}
         return nudge_or_park("review",
                              "no review evidence (no ship pipeline and no review-marker comment)")
 

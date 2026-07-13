@@ -383,16 +383,52 @@ def test_gate_wrong_typed_report_is_the_sections_path():
 
 
 def test_gate_review_evidence_nudge_once_then_park():            # step 2b
+    # A CLEAN answered-empty comments read ([]) genuinely says "no review marker" — the nudge
+    # ladder is intact, and it is NEVER an unread-hold (issue #78: only an ABSENT read waits).
     pr = _pr(comments=[])
     d = _decide(pr=pr)
     assert d["action"] == "nudge" and d["nudge_key"] == "review"
+    assert d.get("comments_unread") is None
     d2 = _decide(issue=_issue(nudged=["review"]), pr=pr)
     assert d2["action"] == "park"
+
+
+def test_gate_comments_absent_waits_never_nudges():              # step 2b (issue #78)
+    # A REFUSED or starved comments read leaves the 'comments' key ABSENT from the PR view (the
+    # runner attaches it ONLY on a clean CommentRead). The gate must WAIT for a trustworthy read,
+    # never read the absence as "no review marker" and march the nudge ladder to park a finished,
+    # reviewed build — the #21/#61 refused≠empty discipline, now closing the build gate's
+    # comments-attachment surface. Mirrors step-3's unreadable-files WAIT.
+    pr = _pr()
+    del pr["comments"]                                           # comments never attached (refused)
+    d = _decide(pr=pr)
+    assert d["action"] == "wait" and d.get("comments_unread") is True
+    # ...and even after the review nudge key was already spent, absence still WAITs (never parks):
+    # a partial dead zone that opens AFTER the one nudge must not park a reviewed build.
+    d2 = _decide(issue=_issue(nudged=["review"]), pr=pr)
+    assert d2["action"] == "wait" and d2.get("comments_unread") is True
+
+
+def test_gate_wrong_typed_comments_waits_never_nudges():         # step 2b, corrupt view (issue #78)
+    # A wrong-typed comments field is a CORRUPT view, not an authoritative "no marker" — WAIT for
+    # the runner's next-tick refetch, exactly like step-3's corrupt-files field.
+    for junk in ("not-a-list", 7, {"body": "x"}):
+        d = _decide(pr=_pr(comments=junk))
+        assert d["action"] == "wait" and d.get("comments_unread") is True, junk
 
 
 def test_gate_ship_cmd_repo_needs_no_marker_comment():           # step 2b, eApp path
     d = _decide(pr=_pr(comments=[]), cfg=_cfg(ship_cmd="scripts/ship.sh"))
     assert d["action"] == "merge"
+
+
+def test_gate_ship_cmd_repo_ignores_absent_comments():           # step 2b, eApp path (issue #78)
+    # a ship_cmd repo owns review itself, so an unread comments thread is moot — still merges,
+    # never a spurious comments-unread WAIT.
+    pr = _pr()
+    del pr["comments"]
+    d = _decide(pr=pr, cfg=_cfg(ship_cmd="scripts/ship.sh"))
+    assert d["action"] == "merge" and d.get("comments_unread") is None
 
 
 def test_gate_wander_is_journaled_not_blocking():                # step 3 (wander)

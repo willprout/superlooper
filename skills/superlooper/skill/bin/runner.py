@@ -612,8 +612,12 @@ class Runner:
                              # storm parked finished builds inside hourly GraphQL dead zones)
             pv = pr_read.pr
             if pv.get("number") and budget():
-                pv = dict(pv)
-                pv["comments"] = gh.pr_comments(pv["number"]).comments
+                cr = gh.pr_comments(pv["number"])
+                if cr.ok:                        # attach ONLY a clean read; a REFUSED comments read
+                    pv = dict(pv)                # is OMITTED (key ABSENT), so the gate WAITs instead
+                    pv["comments"] = cr.comments # of reading the fail-closed [] as "no review marker"
+                                                 # and parking a reviewed build (issue #78; the
+                                                 # #21/#61 refused≠empty discipline on the build path)
             prs[iid] = pv    # {} here is TRUSTWORTHY: GitHub answered "no PR on this head"
 
         self._parsed_by_id = parsed_by_id
@@ -683,7 +687,11 @@ class Runner:
             pv = gh.pr_for_branch(branch).pr   # a refused read has no pr by construction
             if pv.get("number"):             # POSITIVE find only — refused/empty never erases a cache entry
                 pv = dict(pv)
-                pv["comments"] = gh.pr_comments(pv["number"]).comments
+                cr = gh.pr_comments(pv["number"])
+                if cr.ok:                    # attach ONLY a clean read; a REFUSED comments read
+                    pv["comments"] = cr.comments   # leaves the key ABSENT so the gate WAITs, never
+                                                   # parks a reviewed build on a fail-closed empty
+                                                   # (issue #78 — same discipline as the poll site)
                 prs[iid] = pv
                 changed = True
         if changed:
@@ -1461,6 +1469,7 @@ class Runner:
                       "wildcard_hold_journaled": False,   # a fresh approval re-journals its own hold (#36)
                       "merge_refusal_reason": None,    # paired with merge_refusals=0 above (#27)
                       "pr_read_pending_since": None,   # a re-run's refused-read hold times fresh (#61)
+                      "comments_read_pending_since": None,   # ...and its comments-read hold too (#78)
                       "park_notify_cause": None, "park_notify_at": None,
                       "park_comment_posted": False})   # ...and its own park (if any) texts again (#61)
             recs = st.get("answerers")
@@ -1581,6 +1590,29 @@ class Runner:
         self._update_issue(a["id"], {"pr_read_pending_since": None})
         return "ok"
 
+    def _exec_await_comments_read(self, a, now):
+        """Issue #78: a finished BUILD's PR IS visible but its comments sub-read was REFUSED
+        (omitted from the view) or starved this tick — so the gate can't verify review evidence.
+        HOLD — never nudge, never park a reviewed build on a fail-closed empty comments read (the
+        build-gate sibling of _exec_await_pr_read). decide emitted this only while the wait clock
+        is unstamped, so the hold is journaled once per episode (this outcome IS the bounded
+        refusal record), never silent, never an immediate park. Stamp idempotently — the
+        PR_READ_HOLD_CAP bound must run from episode start, and a corrupt/future clock is repaired,
+        never trusted (the _since_ok discipline). decide parks ONCE if the bound expires;
+        _exec_clear_comments_read ends the episode when a trustworthy comments read lands."""
+        def m(st, i):
+            if not actions._since_ok(i.get("comments_read_pending_since"), now):
+                i["comments_read_pending_since"] = now
+        self._update_issue(a["id"], fn=m)
+        return a.get("reason", "holding: finished build awaiting a trustworthy comments read")
+
+    def _exec_clear_comments_read(self, a, now):
+        """Issue #78: a trustworthy comments read landed (marker present -> merges, or a clean
+        answered-empty -> the review nudge ladder resumes) — the refused-read episode is over; a
+        later one times from scratch."""
+        self._update_issue(a["id"], {"comments_read_pending_since": None})
+        return "ok"
+
     def _exec_clear_park_marker(self, a, now):
         """Issue #61: the issue left its failing state without the park label ever landing (e.g.
         the PR became visible and the gate flipped to merge), so the notify-once episode is over.
@@ -1693,6 +1725,7 @@ class Runner:
                                  "checks_pending_since": None, "merge_refusals": 0,
                                  "merge_refusal_reason": None,
                                  "pr_read_pending_since": None,   # fresh branch, fresh episodes (#61)
+                                 "comments_read_pending_since": None,   # ...comments-read hold too (#78)
                                  "park_notify_cause": None, "park_notify_at": None,
                                  "park_comment_posted": False})
         # 3. GitHub: supersede the PR (branch preserved on the remote, PR left open — nothing
