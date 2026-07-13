@@ -6,6 +6,8 @@ real cmux/claude), and the usage meter via SL_FAKE_USAGE (no test reaches the Ke
 The launchd job runs this exact command every few minutes; each invocation reads the health
 signals, advances the episode state in state/watchdog.json, and exits.
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -15,10 +17,23 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 import journal
 
 _ROOT = Path(__file__).resolve().parent.parent
 CLI = _ROOT / "skill" / "bin" / "superlooper"
+
+
+@pytest.fixture
+def cli():
+    """Load the `superlooper` entry-point script as a module (it guards main() under
+    __name__ == '__main__', so importing runs no command) to unit-test its file-lock helpers."""
+    loader = importlib.machinery.SourceFileLoader("superlooper_cli", str(CLI))
+    spec = importlib.util.spec_from_loader("superlooper_cli", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 _FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gh"
 _FAKE_GH = Path(__file__).resolve().parent / "fakes" / "fake-gh"
 
@@ -112,8 +127,10 @@ def test_healthy_check_is_quiet_and_persists_state(tmp_path):
     assert rig.wjournal() == []                      # no transition, no journal noise
     st = rig.wstate()
     assert st["episode"] is None
-    # the gh fixtures hold eligible agent-ready work (#101/#102) with empty lanes: the
-    # no-progress clocks started, but one glimpse is not an episode.
+    # the gh fixtures hold eligible agent-ready work (#101/#102) with empty lanes. The eligibility
+    # view is now what the SCHEDULER would launch NOW (scheduler.launchable): with the default
+    # `lanes: 2` and disjoint touch-areas (frontend / api), BOTH are launchable this tick, so both
+    # no-progress clocks start. One glimpse is not an episode.
     assert set(st["no_progress_since"]) == {"101", "102"}
     assert rig.launch_calls() == []
 
@@ -247,6 +264,93 @@ def test_watchdog_singleton_yields_to_a_live_check(tmp_path):
     assert not (rig.home / "state" / "watchdog.json").exists()
 
 
+# --------------------------- the atomic singleton lock (issue #92) ---------------------------
+# The per-state-home lock is acquired atomically (create-with-content via `ln`/O_EXCL, NOT
+# check-then-write) so a launchd firing overlapping a hand-run check cannot interleave their
+# read-evaluate-write of watchdog.json. Ownership-checked release + content-guarded dead-holder
+# reclaim, ported from start-session.sh's proven worker-singleton.
+
+def test_acquire_lock_creates_with_our_pid(cli, tmp_path):
+    lock = tmp_path / "watchdog.lock"
+    assert cli._watchdog_acquire_lock(str(lock)) is True
+    assert lock.read_text().strip() == str(os.getpid())
+
+
+def test_acquire_lock_yields_to_a_live_holder(cli, tmp_path):
+    lock = tmp_path / "watchdog.lock"
+    lock.write_text(str(os.getpid()))                     # our own pid is live by construction
+    assert cli._watchdog_acquire_lock(str(lock)) is False
+    assert lock.read_text().strip() == str(os.getpid())   # a live holder's lock is NEVER clobbered
+
+
+def test_acquire_lock_reclaims_a_dead_holder(cli, tmp_path):
+    lock = tmp_path / "watchdog.lock"
+    lock.write_text("999999")                             # a dead pid (test_runner's convention)
+    assert cli._watchdog_acquire_lock(str(lock)) is True
+    assert lock.read_text().strip() == str(os.getpid())
+
+
+def test_acquire_lock_reclaims_garbage_content(cli, tmp_path):
+    lock = tmp_path / "watchdog.lock"
+    lock.write_text("not-a-pid\n")                        # a truncated/corrupt write is not live
+    assert cli._watchdog_acquire_lock(str(lock)) is True
+    assert lock.read_text().strip() == str(os.getpid())
+
+
+def test_release_lock_is_ownership_checked(cli, tmp_path):
+    lock = tmp_path / "watchdog.lock"
+    lock.write_text("999999")                             # a DIFFERENT holder (not us)
+    cli._watchdog_release_lock(str(lock))
+    assert lock.exists()                                  # never remove a lock that isn't ours
+    lock.write_text(str(os.getpid()))
+    cli._watchdog_release_lock(str(lock))
+    assert not lock.exists()
+
+
+def test_acquire_lock_exactly_one_of_many_concurrent_checks_wins_a_free_slot(cli, tmp_path):
+    # The core atomicity the old check-then-write LACKED: many checks firing at once against a FREE
+    # (absent) lock — a launchd firing overlapping a hand-run check — must resolve to EXACTLY ONE
+    # winner, never two proceeding into a duplicate-episode / burned-launch race. The old
+    # `if _live_lock: return; open(lock,"w")` let every racer past (absent -> not live) and all
+    # write; the `ln`/O_EXCL create arbitrates to one. fork (not spawn) so children share this
+    # loaded CLI module; each exits 0 iff it acquired.
+    lock = tmp_path / "watchdog.lock"                     # absent: a free slot
+    n = 16
+    pids = []
+    for _ in range(n):
+        pid = os.fork()
+        if pid == 0:                                      # child
+            got = False
+            try:
+                got = cli._watchdog_acquire_lock(str(lock))
+            except BaseException:
+                got = False
+            if got:
+                time.sleep(1.0)      # HOLD the slot (a real check does its work while holding) so
+                                     # every racer that fails the link sees us LIVE and yields
+            os._exit(0 if got else 1)
+        pids.append(pid)
+    wins = 0
+    for pid in pids:
+        _, status = os.waitpid(pid, 0)
+        if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+            wins += 1
+    assert wins == 1, f"expected exactly one winner, got {wins}"
+    assert lock.exists()                                  # the winner's lock stands
+
+
+def test_watchdog_reclaims_a_dead_holders_lock_and_runs(tmp_path):
+    # End to end: a lock left by a DEAD holder (a prior check that crashed mid-run) is reclaimed,
+    # and the check proceeds — the lock never wedges the detector forever.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)                                   # a stale heartbeat -> an episode opens
+    (rig.home / "state" / "watchdog.lock").write_text("999999")
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert [x["outcome"] for x in rig.wjournal()] == ["notified"]
+    assert (rig.home / "state" / "watchdog.json").exists()
+
+
 def test_no_progress_trips_from_the_gh_view(tmp_path):
     rig = _Rig(tmp_path)
     rig.heartbeat(10)                                # the loop looks healthy...
@@ -279,6 +383,66 @@ def test_no_progress_stands_down_when_a_lane_is_busy(tmp_path):
     assert r.returncode == 0, r.stderr
     assert rig.wjournal() == []
     assert rig.wstate()["no_progress_since"] == {}
+
+
+def _seed_territory_claim(rig, status, iid="i106", touches=None):
+    """Seed issues.json with a merge-producing issue holding a territory claim (`gating` /
+    `holding`) — a finished build gate-waiting on CI / holding through a merge freeze. It occupies
+    NO lane, but its declared territory is still protected."""
+    import loopstate
+    st = loopstate.new_state()
+    claim = loopstate.new_issue()
+    claim["status"] = status
+    claim["type"] = "build"
+    claim["declared_touches"] = touches if touches is not None else []   # [] == wildcard '*'
+    st["issues"][iid] = claim
+    loopstate.save(str(rig.home / "state" / "issues.json"), st)
+
+
+@pytest.mark.parametrize("status", ["gating", "holding"])
+def test_territory_claim_suppresses_no_progress(tmp_path, status):
+    # The #92 binding bug: a finished merge-producing build gate-waiting on CI (or holding through
+    # a merge freeze) with a wildcard claim, plus eligible approved work behind it and empty lanes,
+    # is a DESIGNED-SAFE wait — the scheduler holds the eligible work behind the territory claim.
+    # The no-progress clock must not run and nothing must notify.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(10)                                # the loop looks healthy...
+    _seed_territory_claim(rig, status)               # ...but a gating/holding claim holds the queue
+    old = time.time() - 3600
+    (rig.home / "state" / "watchdog.json").write_text(json.dumps(
+        {"episode": None, "no_progress_since": {"101": old, "102": old}, "next_debugger": 1}))
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert rig.wjournal() == []                       # no episode opens
+    assert rig.wstate()["no_progress_since"] == {}    # the clock does not run
+    assert rig.wstate()["episode"] is None
+    assert rig.launch_calls() == []
+
+
+def test_refused_ready_read_freezes_clocks_and_holds_the_episode(tmp_path):
+    # DoD gap #2 + #4, end to end: probe SUCCEEDS but the agent-ready list read is REFUSED (an
+    # hourly GraphQL dead zone). The no-progress condition is UNOBSERVABLE, not cleared, so an open
+    # no_progress episode is HELD (not stood down) and the clocks FREEZE — no duplicate owner text,
+    # no restarted grace.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(10)                                # heartbeat fresh: only gh is dark
+    old = time.time() - 3600
+    ep = {"signals": ["no_progress"], "opened_at": time.time() - 600, "detail": "seeded",
+          "launched_at": None, "launch_id": None, "launch_attempts": 0,
+          "launch_failure_notified": False}
+    (rig.home / "state" / "watchdog.json").write_text(json.dumps(
+        {"episode": ep, "no_progress_since": {"101": old}, "next_debugger": 1}))
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "--label agent-ready", "times": 5}]))
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert rig.wjournal() == []                       # a quiet hold: no stand_down, no notify
+    st = rig.wstate()
+    assert st["episode"] is not None                  # the episode is HELD across the outage
+    assert st["episode"]["signals"] == ["no_progress"]
+    assert st["episode"]["opened_at"] == ep["opened_at"]      # SAME episode, grace clock intact
+    assert st["no_progress_since"] == {"101": old}    # clocks FROZEN, not reset
+    assert rig.launch_calls() == []
 
 
 def test_usage_reading_exhausted_suppresses_no_progress(tmp_path):

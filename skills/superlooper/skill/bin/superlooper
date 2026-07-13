@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1310,6 +1311,73 @@ def _live_lock(path):
     return pid.isdigit() and _pid_alive(int(pid))
 
 
+def _watchdog_acquire_lock(lock_path):
+    """Per-state-home singleton acquire — ported from start-session.sh's `ln`-of-temp worker lock.
+    We write our pid into a temp file and then HARDLINK it onto the lock: `ln`/O_EXCL fails if the
+    lock already exists, so ACQUIRING A FREE SLOT is atomic — of any number of checks racing for an
+    absent lock, exactly ONE wins the link and the rest see its live pid and yield. This is the
+    guarantee that closes the OLD check-then-write hole (its read-liveness → open(,"w") let a
+    launchd firing and a hand-run check BOTH pass the check and BOTH write watchdog.json — the
+    duplicate-episode / burned-launch race, issue #92). The pid is present BEFORE the file becomes
+    the lock, so there is no empty-content window a racer could misread as stale (start-session.sh's
+    codex P1-a lesson). Returns True iff we now hold the lock; False when a LIVE check owns it.
+
+    A dead/garbage holder is reclaimed, GUARDED by a content re-check: remove the lock only if it
+    still names that same dead holder, so we don't delete a fresh lock a concurrent claimer won
+    between our read and our remove. This guard NARROWS but does not fully eliminate the reclaim
+    race (a POSIX file op cannot atomically 'remove-if-content-is-X'); the residual is the same in
+    kind as loopstate._acquire's stale-steal and start-session.sh's worker singleton, and it is
+    reachable only when a check has already crashed leaving a stale lock AND two more checks race to
+    reclaim it AND one is preempted mid-reclaim — a rare cube for a job that fires minutes apart. A
+    duplicate episode text or a burned launch attempt (both self-limiting via the episode rails) is
+    the worst case, never a corrupt state file."""
+    me = str(os.getpid())
+    state_dir = os.path.dirname(lock_path) or "."
+    for _ in range(50):
+        fd, tmp = tempfile.mkstemp(dir=state_dir, prefix="watchdog.", suffix=".lock.tmp")
+        try:
+            os.write(fd, me.encode())               # full content BEFORE it becomes the lock
+        finally:
+            os.close(fd)
+        linked = False
+        try:
+            os.link(tmp, lock_path)                 # atomic create-with-content; fails if lock exists
+            linked = True
+        except FileExistsError:
+            pass
+        except OSError:
+            _rm_quiet(tmp)
+            return False                            # a fs that can't link -> yield, never double-run
+        finally:
+            _rm_quiet(tmp)
+        if linked:
+            return True
+        holder = (_read(lock_path) or "").strip()
+        if holder.isdigit() and _pid_alive(int(holder)):
+            return False                            # a LIVE check owns it
+        # dead/garbage holder -> reclaim, but only if the lock STILL names that same holder (content
+        # re-check), so we never remove a fresh lock a concurrent claimer just won between our read
+        # and our remove. Then loop: the atomic link above arbitrates the now-free slot.
+        if (_read(lock_path) or "").strip() == holder:
+            _rm_quiet(lock_path)
+    return False
+
+
+def _watchdog_release_lock(lock_path):
+    """Ownership-checked release: remove the lock ONLY if it still names US (start-session.sh's
+    release_worker) — after a reclaim race the file may name a different check, and an
+    unconditional remove would break the singleton by deleting their lock."""
+    if (_read(lock_path) or "").strip() == str(os.getpid()):
+        _rm_quiet(lock_path)
+
+
+def _rm_quiet(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _watchdog_heartbeat(state_dir):
     """Epoch of the last COMPLETED runner tick, or None when the loop never ran here (an
     absent heartbeat is not a stale one) or the file is unreadable/garbage (fail toward
@@ -1332,14 +1400,21 @@ def _watchdog_alert(state_dir):
     return v if isinstance(v, dict) else {}
 
 
-def _watchdog_lanes_busy(home, state_dir):
-    """Any lane occupied, from DISK truth: an in-flight status in issues.json, or a live
-    worker singleton lock for an issue id (a session the state file has not caught up with)."""
-    import actions
+def _watchdog_loopstate(state_dir):
+    """The persisted issue state (issues.json), or {} when absent/corrupt. Read ONCE per check and
+    shared by the lane-occupancy and gh-eligibility views so they see the same disk truth."""
     try:
-        st = loopstate.load(os.path.join(state_dir, "issues.json"))
+        return loopstate.load(os.path.join(state_dir, "issues.json"))
     except (OSError, ValueError):
-        st = {}
+        return {}
+
+
+def _watchdog_lanes_busy(st, state_dir):
+    """Any lane occupied, from DISK truth: an in-flight status in issues.json, or a live
+    worker singleton lock for an issue id (a session the state file has not caught up with).
+    NB gating/holding statuses hold a territory CLAIM but occupy no lane, so they are NOT
+    lanes-busy — the no-progress view respects them through scheduler.launchable instead."""
+    import actions
     if actions.lane_state_from(st):
         return True
     try:
@@ -1361,22 +1436,34 @@ def _watchdog_debugger_live(state_dir):
                and _live_lock(os.path.join(state_dir, n)) for n in names)
 
 
-def _watchdog_gh_view(cfg):
-    """(gh_ok, eligible_nums): the no-progress detector's INDEPENDENT eligibility read —
-    agent-ready issues from GitHub, filtered through the same issues.eligible rule the
-    scheduler uses (blocked-by holds, parked/needs-william, in-progress all excluded), so a
-    designed-safe wait can never read as waiting work. Every gh read fails closed toward
-    'nothing eligible' — the safe (non-tripping) direction."""
+def _watchdog_gh_view(cfg, st):
+    """(gh_ok, eligible_nums): the no-progress detector's eligibility read — the issues the
+    SCHEDULER would launch RIGHT NOW, so every scheduler hold is respected and a designed-safe
+    wait can never read as waiting work:
+      * agent-ready issues from GitHub, run through the same issues.eligible rule the scheduler
+        uses (blocked-by holds, in-progress, parked/needs-owner all excluded);
+      * lane capacity + anti-affinity + TERRITORY CLAIMS from issues.json — the #92 fix: a
+        gating/holding issue's claim occupies no lane but holds the eligible work behind it.
+    gh_ok is False when the view is UNOBSERVABLE, so the caller FREEZES the clocks instead of
+    reading a refusal as 'nothing eligible': the probe is down, OR (the #92 trap) the probe
+    SUCCEEDS but a list read is REFUSED — read-health `ok` distinguishes that from a genuine
+    empty answer (the #21/#61 contract). A clean answered-empty read is observable (gh_ok True)."""
+    import actions
     import watchdog as watchdog_lib
     if not gh.probe():
         return False, []
-    parsed = [issues_lib.parse_issue(r) for r in gh.ready_issues()]
-    closed = gh.closed_issue_nums()
-    return True, watchdog_lib.eligible_nums(parsed, closed)
+    ready = gh.ready_issues_health()
+    closed = gh.closed_issue_nums_health()
+    if not ready.ok or not closed.ok:
+        return False, []                    # probe ok but a read REFUSED -> unobservable
+    parsed = [issues_lib.parse_issue(r) for r in ready.value]
+    lane_state = actions.lane_state_from(st)
+    claims = actions.territory_claims_from(st)
+    return True, watchdog_lib.launchable_nums(parsed, lane_state, cfg, closed.value, claims)
 
 
 def _watchdog_usage_exhausted():
-    """True only when the meter SUCCESSFULLY reads at/over a launch ceiling — the runner's
+    """True only when the meter SUCCESSFULLY reads strictly OVER a launch ceiling — the runner's
     designed fail-closed hold. A dark/unreadable meter is False (the #46/#76 asymmetry): it
     must never suppress the detector, especially under launchd where the Keychain read can
     fail. SL_FAKE_USAGE injects the read for tests/simulation, exactly like cmd_run."""
@@ -1471,26 +1558,29 @@ def cmd_watchdog(args):
     os.makedirs(state_dir, exist_ok=True)
     now = time.time()
 
-    # Per-state-home singleton: a hand-run check and the launchd firing must never interleave
-    # their read-evaluate-write on watchdog.json. A dead holder's lock is reclaimed.
+    # Per-state-home singleton: a hand-run check and the launchd firing must not interleave their
+    # read-evaluate-write on watchdog.json. Acquired ATOMICALLY (create-with-content via os.link,
+    # not the old check-then-write) so two overlapping checks racing to acquire a FREE slot can
+    # never both proceed; a dead holder's lock is reclaimed via an atomic os.rename steal (one
+    # winner per rename).
     lock = os.path.join(state_dir, "watchdog.lock")
-    if _live_lock(lock):
+    if not _watchdog_acquire_lock(lock):
         print("another watchdog check is live for this state home — exiting")
         return 0
-    with open(lock, "w") as f:
-        f.write(str(os.getpid()))
     try:
+        st = _watchdog_loopstate(state_dir)
         heartbeat = _watchdog_heartbeat(state_dir)
         alert = _watchdog_alert(state_dir)
-        lanes_busy = _watchdog_lanes_busy(home, state_dir)
+        lanes_busy = _watchdog_lanes_busy(st, state_dir)
         wd = cfg.get("watchdog") if isinstance(cfg.get("watchdog"), dict) else {}
-        stale_secs = wd.get("heartbeat_stale_minutes", 20) * 60
+        stale_secs = wd.get("heartbeat_stale_minutes",
+                            watchdog_lib.HEARTBEAT_STALE_MINUTES_DEFAULT) * 60
         hb_fresh = isinstance(heartbeat, int) and now - heartbeat <= stale_secs
         # The gh eligibility read + usage read are spent only when they can matter: a stale
         # heartbeat is already the louder signal, and a busy lane is progress by definition.
         gh_ok, eligible = (False, [])
         if hb_fresh and not lanes_busy:
-            gh_ok, eligible = _watchdog_gh_view(cfg)
+            gh_ok, eligible = _watchdog_gh_view(cfg, st)
         usage_exhausted = bool(eligible) and _watchdog_usage_exhausted()
 
         view = {"heartbeat": heartbeat, "alert": alert, "lanes_busy": lanes_busy,
@@ -1527,11 +1617,7 @@ def cmd_watchdog(args):
                               "healthy — no signal"))
         return 0
     finally:
-        if (_read(lock) or "").strip() == str(os.getpid()):
-            try:
-                os.remove(lock)
-            except OSError:
-                pass
+        _watchdog_release_lock(lock)
 
 
 # ------------------------------- stubs -------------------------------

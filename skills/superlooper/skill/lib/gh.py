@@ -96,6 +96,33 @@ def _json_dict(args, timeout=30):
     return v if isinstance(v, dict) else {}
 
 
+# The read-health contract, generalized (issue #92) — the #21/#61 refused-vs-answered-empty
+# discipline for the two reads the unattended watchdog's no-progress detector depends on. A
+# fail-closed empty read is safe for the runner (act on nothing), but the watchdog must tell a
+# REFUSED read apart from a genuinely empty one: a refused list read that looked like "nothing
+# eligible" reset the no-progress clocks and stood an episode down (the trap gh.probe's docstring
+# names). ReadHealth carries `ok` — True ONLY on a clean, well-typed answer (rc 0 + a JSON list);
+# `value` is ALWAYS the empty-but-typed fallback on any refusal, so a caller that ignores `ok`
+# still fails closed exactly as before.
+ReadHealth = collections.namedtuple("ReadHealth", ["value", "ok"])
+
+
+def _json_list_health(args, timeout=30):
+    """(list, ok): _json_list's read-health twin. ok=False on a nonzero rc / timeout / missing
+    binary, unparseable body, or a wrong-typed (non-list) body — every refusal the fail-closed
+    parsers collapse to []. value is [] on any of those."""
+    rc, out = _run(args, timeout=timeout)
+    if rc != 0:
+        return ReadHealth([], False)
+    try:
+        v = json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return ReadHealth([], False)
+    if not isinstance(v, list):
+        return ReadHealth([], False)
+    return ReadHealth(v, True)
+
+
 # --------------------------- reads (fail closed to empty-but-typed) ---------------------------
 
 def ready_issues(limit=200):
@@ -103,6 +130,26 @@ def ready_issues(limit=200):
     issues.parse_issue on each."""
     return _json_list(["issue", "list", "--state", "open", "--label", "agent-ready",
                        "--json", _ISSUE_FIELDS, "--limit", str(limit)])
+
+
+def ready_issues_health(limit=200):
+    """ready_issues() as a ReadHealth(issues, ok) — the watchdog's read-health variant (issue
+    #92). ok distinguishes a refused list read from a genuinely empty agent-ready queue, so a
+    refused read FREEZES the no-progress clocks instead of masquerading as 'no work exists'."""
+    return _json_list_health(["issue", "list", "--state", "open", "--label", "agent-ready",
+                              "--json", _ISSUE_FIELDS, "--limit", str(limit)])
+
+
+def closed_issue_nums_health(limit=200):
+    """closed_issue_nums() as a ReadHealth(nums_set, ok) — the watchdog's read-health variant
+    (issue #92). A refused closed-list read (ok=False) must not reset the detector's clocks: an
+    empty closed set makes every blocked-by dependency read as unmet, which could wrongly shrink
+    the eligible set and stand an episode down."""
+    rh = _json_list_health(["issue", "list", "--state", "closed", "--json", "number",
+                            "--limit", str(limit)])
+    nums = {i["number"] for i in rh.value
+            if isinstance(i, dict) and type(i.get("number")) is int}
+    return ReadHealth(nums, rh.ok)
 
 
 def open_issues(label, limit=200):
