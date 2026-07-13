@@ -270,6 +270,25 @@ def test_doctor_flags_a_dev_required_check_that_never_reports_on_dev(rig):
     assert "ship" in out and "dev" in out.lower()
 
 
+def test_doctor_flags_a_pr_required_check_that_reports_only_on_dev(rig):
+    # split mirror of the dev-gap case: `ship` is PR-required but reports ONLY on the dev branch,
+    # never on a PR -> every PR reads pending forever, so a green PR never merges. Must FAIL.
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(
+        {"version": 1, "repo": "o/r",
+         "required_checks": {"pr": ["quality-gate", "ship"], "dev": ["quality-gate"]}}))
+    # PRs report quality-gate only (never ship); the dev branch reports quality-gate + ship
+    (rig.fixdir / "pr_list.json").write_text(json.dumps([{
+        "number": 555, "state": "OPEN", "statusCheckRollup": [
+            {"__typename": "StatusContext", "context": "quality-gate", "state": "SUCCESS"}]}]))
+    (rig.fixdir / "check_runs.json").write_text(json.dumps(
+        {"check_runs": [{"name": "quality-gate", "status": "completed", "conclusion": "success"},
+                        {"name": "ship", "status": "completed", "conclusion": "success"}]}))
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "ship" in out and "PR" in out
+
+
 def test_doctor_warns_when_no_checks_observed_yet(rig):
     # a freshly adopted repo with no CI history: cannot verify names -> WARN, never a hard FAIL.
     (rig.fixdir / "pr_list.json").write_text("[]")

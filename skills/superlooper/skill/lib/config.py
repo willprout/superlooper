@@ -351,8 +351,12 @@ def operator(config):
 def pr_required_checks(config):
     """The required checks that gate PR merges — §C.4 step 5 folds the PR statusCheckRollup down to
     THIS set (issue #52). `required_checks` is EITHER a flat list (the same set gates both surfaces)
-    OR {"pr":[...], "dev":[...]}; this returns the PR set from whichever form is present. Fail-closed:
-    wrong-typed config -> [] (the gate then reads that as pending — never a phantom green)."""
+    OR {"pr":[...], "dev":[...]}; this returns the PR set from whichever form is present. Extracts
+    the PR surface INDEPENDENTLY of dev: a cleanly-typed list survives even if `dev` is malformed.
+    A wrong-typed/absent value degrades to []; note an EMPTY set is vacuously GREEN at the gate (not
+    pending — see gate.required_checks_state, cross-review C3), so an empty PR set does NOT fail
+    closed. The backstop against that is `doctor` (adopt-time), which FAILs hard on an empty PR set;
+    the loader also rejects wrong-typed config before it can ever reach the gate."""
     rc = config.get("required_checks") if isinstance(config, dict) else None
     if isinstance(rc, dict):
         pr = rc.get("pr")
@@ -364,8 +368,11 @@ def dev_required_checks(config):
     """The required checks expected to report on (and gate the freeze/unfreeze of) the DEV branch
     (issue #52). A flat `required_checks` list applies to both surfaces (back-compat); the object
     form's `dev` set lets a repo EXCLUDE a PR-only check that never reports on dev — which would
-    otherwise strand a mainline freeze forever. Fail-closed like pr_required_checks (wrong-typed
-    config -> []; the freeze rule then simply never fires on a garbage view, the safe direction)."""
+    otherwise strand a mainline freeze forever. Extracts the dev surface INDEPENDENTLY of pr; a
+    wrong-typed/absent value degrades to []. An EMPTY dev set is a legitimate choice (a repo whose
+    CI runs on PRs only): the freeze mechanism then idles — it never freezes on dev, and it lifts an
+    existing freeze (an empty required set is vacuously green). The loader rejects wrong-typed config,
+    so the []-on-garbage path is defensive only."""
     rc = config.get("required_checks") if isinstance(config, dict) else None
     if isinstance(rc, dict):
         dev = rc.get("dev")

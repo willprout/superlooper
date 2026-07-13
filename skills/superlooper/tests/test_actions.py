@@ -1799,6 +1799,17 @@ def test_dev_freeze_evaluates_only_the_dev_required_set():
     assert len(only(out2, "freeze")) == 1 and has_notify(out2)
 
 
+def test_empty_dev_required_set_idles_the_freeze_mechanism():
+    # A repo whose CI runs on PRs only sets an empty dev set. The freeze mechanism then IDLES: even a
+    # red dev check never freezes / files a fix, and any existing freeze lifts (empty set == green).
+    empty_dev = {"pr": ["ci"], "dev": []}
+    out = decide(config=cfg(required_checks=empty_dev), gh_view=ghv(dev_checks=list(RED)))
+    assert only(out, "freeze") == [] and only(out, "file_fix_issue") == []
+    d = disk(frozen={"reason": "dev red", "fingerprint": "f", "since": NOW - 100})
+    out2 = decide(config=cfg(required_checks=empty_dev), dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out2, "unfreeze")) == 1
+
+
 def test_commit_status_only_dev_view_red_freezes_and_stays_frozen():
     # fail-closed: a genuinely red required status freezes...
     out = decide(config=cfg(required_checks=["ship"]),
