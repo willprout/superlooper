@@ -51,6 +51,12 @@ superlooper status --repo /path/to/repo      # lanes / queue / freeze state, fro
   nothing merges while it is down, so a stop is always safe. Restarting rebuilds all state from
   GitHub + disk (GitHub is the source of truth), so any manual daytime work you did is absorbed
   automatically and no launch is duplicated.
+  - **If you run the unattended-debugger watchdog LaunchAgent** (below), `touch
+    <state-home>/state/WATCHDOG_OFF` **before** a deliberate stop and **delete it when you
+    restart**. A stopped runner leaves its heartbeat to go stale, which is exactly the fault the
+    watchdog exists to catch — so without the kill-switch it will text you and, after the grace,
+    launch an sl-debugger session against a loop you stopped on purpose. (The watchdog cannot
+    tell a deliberate stop from a crash; the kill-switch is how you tell it.)
 - **Status:** `superlooper status` renders the current lanes, the queue, and whether merges are
   frozen — read from the journal and disk, so it works whether or not the runner is up.
 
@@ -443,17 +449,23 @@ launchd is fine here — the issue-#33 prohibition is about the *runner*).
 - `heartbeat_stale` — `state/runner.heartbeat` older than `watchdog.heartbeat_stale_minutes`
   (default 20). An ABSENT heartbeat never trips: the loop never ran in this state home.
 - `alert` — `state/ALERT` present (even unreadable: existence is the signal).
-- `no_progress` — eligible `agent-ready` work exists (its own gh read, filtered through the same
-  eligibility rule the scheduler uses), every lane is empty, and that has held for
-  `watchdog.no_progress_minutes` (default 30) with a FRESH heartbeat and a usage meter that does
-  NOT read exhausted.
+- `no_progress` — work the SCHEDULER would launch RIGHT NOW exists (its own gh read, run through
+  `scheduler.launchable` with the real lane state + territory claims, so every scheduler hold is
+  respected), every lane is empty, and that has held for `watchdog.no_progress_minutes`
+  (default 30) with a FRESH heartbeat and a usage meter that does NOT read exhausted.
 
 **Never trips on designed-safe waits:** gate-waiting on CI and building work are `in-progress`
 (not eligible); blocked-by holds wait for the dependency to close; parked / needs-owner is not
 approval; a building lane during a merge freeze is lanes-busy (frozen-but-building is the safe
-idle state); a usage meter that successfully READS exhausted is the fail-closed hold working
-(a DARK meter never suppresses — the #46/#76 asymmetry, so a Keychain-less launchd context
-cannot neuter the detector).
+idle state); **a finished PR gate-waiting on CI (or holding through a merge freeze) holds a
+territory claim** that occupies no lane but keeps overlapping eligible work behind it — the
+no-progress view runs through `scheduler.launchable`, so that held work is not counted as
+launchable (issue #92); a usage meter that successfully READS exhausted is the fail-closed hold
+working (a DARK meter never suppresses — the #46/#76 asymmetry, so a Keychain-less launchd context
+cannot neuter the detector). When the no-progress view is UNOBSERVABLE this check (gh unreachable —
+a probe blip OR a refused list read), the clocks FREEZE and an open no_progress episode is HELD,
+not stood down: a gh blip cannot drop the episode and re-trip it (a duplicate text + a restarted
+grace) on recovery.
 
 **The flow.** First trip → one text (naming the signal, the grace, the authority tier) → the
 grace window (`watchdog.grace_minutes`, default 30) → if the signal still stands, ONE fresh

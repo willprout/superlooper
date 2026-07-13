@@ -18,6 +18,7 @@ These tests pin the DoD properties before the module exists (TDD red):
   * the authority setting rides into the launch request (default `full`).
 """
 import issues
+import scheduler
 import watchdog as wd
 
 T0 = 1_700_000_000
@@ -170,6 +171,62 @@ def test_busy_lanes_reset_the_clock_even_when_gh_is_dark():
     assert r["state"]["no_progress_since"] == {}
 
 
+def _open_no_progress_episode(now=T0):
+    """A tripped, notified episode whose ONLY signal is no_progress at `now` (issue #42 has
+    waited the full bound; heartbeat fresh, gh reachable)."""
+    st = {"episode": None, "no_progress_since": {"42": now - 31 * MIN}, "next_debugger": 1}
+    r = _run(now, _view(now, eligible_nums=[42]), st)
+    assert r["state"]["episode"] is not None
+    assert r["state"]["episode"]["signals"] == ["no_progress"]
+    return r["state"]
+
+
+def test_open_no_progress_episode_is_held_across_a_gh_outage():
+    # Gap #2: an open no_progress episode must NOT stand down when the condition is merely
+    # UNOBSERVABLE (gh dark), only when it is genuinely OBSERVED clear. Standing down on a blip
+    # drops the episode and re-trips on recovery — a duplicate owner text and a restarted grace.
+    st = _open_no_progress_episode(T0)
+    opened_at = st["episode"]["opened_at"]
+    r = _run(T0 + 5 * MIN, _view(T0 + 5 * MIN, gh_ok=False, eligible_nums=[]), st)
+    assert r["state"]["episode"] is not None                 # HELD, not stood down
+    assert r["state"]["episode"]["opened_at"] == opened_at   # SAME episode (grace clock intact)
+    assert r["notify"] == []
+    assert r["launch"] is None
+    assert r["journal"] == []                                # a quiet hold, no stand_down record
+    assert r["state"]["no_progress_since"] == st["no_progress_since"]   # clock frozen, preserved
+
+
+def test_held_no_progress_episode_resumes_the_same_episode_on_recovery():
+    st = _open_no_progress_episode(T0)                       # opened_at = T0, grace 30 min
+    # gh goes dark right at what WOULD be launch time: held, no launch, grace clock NOT restarted
+    held = _run(T0 + 35 * MIN, _view(T0 + 35 * MIN, gh_ok=False, eligible_nums=[]), st)
+    assert held["launch"] is None
+    assert held["state"]["episode"]["opened_at"] == T0
+    # gh recovers with the queue still waiting: the SAME episode (grace already elapsed from T0)
+    # launches immediately — the outage did not defer the launch.
+    r = _run(T0 + 40 * MIN, _view(T0 + 40 * MIN, eligible_nums=[42]), held["state"])
+    assert r["launch"] is not None
+    assert r["launch"]["signals"] == ["no_progress"]
+
+
+def test_observed_no_progress_clear_stands_down_silently():
+    st = _open_no_progress_episode(T0)
+    # gh is UP and reports the queue empty (work launched / merged): a genuine OBSERVED clear
+    r = _run(T0 + 5 * MIN, _view(T0 + 5 * MIN, gh_ok=True, eligible_nums=[]), st)
+    assert r["state"]["episode"] is None
+    assert r["notify"] == []
+    assert _outcomes(r) == ["stand_down"]
+
+
+def test_busy_lane_stands_a_no_progress_episode_down_even_when_gh_is_dark():
+    # A busy lane is DISK truth (a launch happened): a definite designed-hold clear, an
+    # OBSERVATION in its own right, so the episode stands down even though gh is unreachable.
+    st = _open_no_progress_episode(T0)
+    r = _run(T0 + 5 * MIN, _view(T0 + 5 * MIN, lanes_busy=True, gh_ok=False), st)
+    assert r["state"]["episode"] is None
+    assert _outcomes(r) == ["stand_down"]
+
+
 def test_stale_heartbeat_preempts_no_progress():
     # With the loop itself dead/wedged, the no-progress detector is moot: the stale-heartbeat
     # signal fires and the no-progress clock is left untouched (issues.json is not current).
@@ -179,25 +236,71 @@ def test_stale_heartbeat_preempts_no_progress():
     assert r["state"]["no_progress_since"] == {"42": T0 - 60 * MIN}
 
 
-def _raw_issue(num, labels, blocked_by=""):
-    body = f"## Loop metadata\nblocked-by: {blocked_by}\n" if blocked_by else ""
-    return {"number": num, "title": f"issue {num}",
-            "labels": [{"name": n} for n in labels], "body": body}
+def _parsed(num, labels, touches=None, blocked_by=""):
+    body = "## Loop metadata\n"
+    if touches is not None:
+        body += "touches: " + ", ".join(touches) + "\n"
+    if blocked_by:
+        body += "blocked-by: " + blocked_by + "\n"
+    return issues.parse_issue({"number": num, "title": f"issue {num}",
+                               "labels": [{"name": n} for n in labels], "body": body})
 
 
-def test_eligible_nums_excludes_every_designed_safe_wait():
-    parsed = [issues.parse_issue(r) for r in (
-        _raw_issue(1, ["agent-ready", "type:build"]),                       # genuinely waiting
-        _raw_issue(2, ["agent-ready", "type:build"], blocked_by="#99"),     # blocked-by hold
-        _raw_issue(3, ["agent-ready", "type:build"], blocked_by="#7"),      # dep closed -> in
-        _raw_issue(4, ["in-progress", "type:build"]),                       # building / gate-waiting on CI
-        _raw_issue(5, ["agent-ready", "in-progress", "type:build"]),        # launched already
-        _raw_issue(6, ["parked", "type:build"]),                            # parked
-        _raw_issue(7, ["needs-owner", "type:build"]),                       # owner's desk (current label)
-        _raw_issue(8, ["agent-ready"]),                                     # no valid type
-        _raw_issue(9, ["needs-william", "type:build"]),                     # owner's desk (legacy label, #58 compat)
-    )]
-    assert wd.eligible_nums(parsed, closed_nums={7}) == [1, 3]
+def test_launchable_nums_excludes_every_designed_safe_wait():
+    # The no-progress eligibility view is what the SCHEDULER would launch now, run through the
+    # same eligibility rule + belt-and-braces label exclusions as the runner's candidate filter.
+    parsed = [
+        _parsed(1, ["agent-ready", "type:build"], touches=["a"]),                 # genuinely waiting
+        _parsed(2, ["agent-ready", "type:build"], touches=["b"], blocked_by="#99"),  # blocked-by hold
+        _parsed(3, ["agent-ready", "type:build"], touches=["c"], blocked_by="#7"),   # dep closed -> in
+        _parsed(4, ["in-progress", "type:build"], touches=["d"]),                 # building / gate-waiting on CI
+        _parsed(5, ["agent-ready", "in-progress", "type:build"], touches=["e"]),  # launched already
+        _parsed(6, ["parked", "type:build"], touches=["f"]),                      # parked
+        _parsed(7, ["needs-owner", "type:build"], touches=["g"]),                 # owner's desk (current label)
+        _parsed(8, ["agent-ready"], touches=["h"]),                               # no valid type
+        _parsed(9, ["needs-william", "type:build"], touches=["i"]),               # owner's desk (legacy label)
+    ]
+    assert wd.launchable_nums(parsed, lane_state=[], config={"lanes": 10},
+                              closed_nums={7}, territory_claims=[]) == [1, 3]
+
+
+def test_launchable_nums_counts_genuinely_waiting_work():
+    parsed = [_parsed(101, ["agent-ready", "type:build"], touches=["frontend"]),
+              _parsed(102, ["agent-ready", "type:build"], touches=["api"])]
+    assert wd.launchable_nums(parsed, lane_state=[], config={"lanes": 5},
+                              closed_nums=set(), territory_claims=[]) == [101, 102]
+
+
+def test_launchable_nums_excludes_candidates_held_by_a_territory_claim():
+    # The #92 binding bug: a gating/holding issue's wildcard territory claim occupies NO lane
+    # but blocks every overlapping candidate under hard affinity. The scheduler holds those
+    # candidates, so the watchdog must NOT count them as launchable — a gate-waiting build with
+    # eligible work behind it is a designed-safe wait, never a no-progress trip.
+    parsed = [_parsed(101, ["agent-ready", "type:build"], touches=["frontend"]),
+              _parsed(102, ["agent-ready", "type:build"], touches=["api"])]
+    wildcard_claim = [{"id": "i106", "touches": [], "type": "build"}]
+    assert wd.launchable_nums(parsed, lane_state=[], config={"lanes": 10},
+                              closed_nums=set(), territory_claims=wildcard_claim) == []
+
+
+def test_launchable_nums_respects_a_narrow_territory_claim_but_not_disjoint_work():
+    # A narrow (non-wildcard) claim only holds candidates that actually overlap it: a claim on
+    # `api` blocks #102 (api) but not #101 (frontend).
+    parsed = [_parsed(101, ["agent-ready", "type:build"], touches=["frontend"]),
+              _parsed(102, ["agent-ready", "type:build"], touches=["api"])]
+    api_claim = [{"id": "i106", "touches": ["api"], "type": "build"}]
+    assert wd.launchable_nums(parsed, lane_state=[], config={"lanes": 10},
+                              closed_nums=set(), territory_claims=api_claim) == [101]
+
+
+def test_launchable_nums_passes_usage_as_a_synthetic_pass():
+    # The watchdog keeps its OWN reads-exhausted gate (usage_reads_exhausted) with the dark-meter
+    # asymmetry, so launchable_nums must NOT re-judge the meter — it passes a synthetic usage pass
+    # so a dark/absent meter never reads here as "nothing launchable" (which would neuter the
+    # detector under launchd where the Keychain read fails).
+    parsed = [_parsed(101, ["agent-ready", "type:build"], touches=["frontend"])]
+    assert wd.launchable_nums(parsed, lane_state=[], config={"lanes": 5},
+                              closed_nums=set(), territory_claims=[]) == [101]
 
 
 # --------------------------- the flow: notify -> grace -> one launch ---------------------------
@@ -391,6 +494,25 @@ def test_usage_reads_exhausted_only_on_a_successful_over_ceiling_read():
     assert wd.usage_reads_exhausted(None) is False
     assert wd.usage_reads_exhausted({"auth_status": "ok", "five_hour_pct": float("nan"),
                                      "seven_day_pct": 1.0}) is False
+
+
+def test_watchdog_usage_ceilings_match_the_schedulers():
+    # The watchdog duplicates the scheduler's launch ceilings (to stay importable without it), so a
+    # drift would make the detector's "designed hold" suppression disagree with what the scheduler
+    # actually holds on. Pin them equal.
+    assert wd._FIVE_HOUR_CEILING == scheduler.FIVE_HOUR_LAUNCH_CEILING
+    assert wd._SEVEN_DAY_CEILING == scheduler.SEVEN_DAY_NEW_WORK_CEILING
+
+
+def test_usage_exactly_at_the_ceiling_is_not_exhausted():
+    # The comparison is strictly OVER (`>`), matching the scheduler: a read EXACTLY at the ceiling
+    # still launches, so it must not read as a designed hold.
+    assert wd.usage_reads_exhausted(
+        {"auth_status": "ok", "five_hour_pct": float(wd._FIVE_HOUR_CEILING),
+         "seven_day_pct": 1.0}) is False
+    assert wd.usage_reads_exhausted(
+        {"auth_status": "ok", "five_hour_pct": 1.0,
+         "seven_day_pct": float(wd._SEVEN_DAY_CEILING)}) is False
 
 
 # --------------------------- brief rendering ---------------------------

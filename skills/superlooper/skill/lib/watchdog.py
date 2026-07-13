@@ -15,9 +15,11 @@ Three signals, per the heartbeat/ALERT contract in references/runner-ops.md:
                    ABSENT heartbeat is NOT stale — the loop never ran in this state home.
   alert            state/ALERT present (the runner's own persistent-fault alarm). Presence
                    is the whole signal; an unreadable file still counts (fail closed).
-  no_progress      eligible agent-ready work exists, every lane is empty, and nothing has
-                   launched for the whole bound — with a FRESH heartbeat (a dead loop is
-                   the heartbeat's finding) and a usage meter that does NOT read exhausted.
+  no_progress      work the SCHEDULER would launch NOW exists, every lane is empty, and nothing
+                   has launched for the whole bound — with a FRESH heartbeat (a dead loop is
+                   the heartbeat's finding) and a usage meter that does NOT read exhausted. The
+                   eligibility view is `scheduler.launchable` (launchable_nums), NOT bare
+                   issues.eligible, so it respects EXACTLY the holds the scheduler respects.
 
 Designed-safe waits must NEVER trip (the DoD's bright line). They are excluded structurally:
   * gate-waiting on CI / building work is `in-progress`, not `agent-ready` -> not eligible;
@@ -26,10 +28,20 @@ Designed-safe waits must NEVER trip (the DoD's bright line). They are excluded s
   * frozen-but-building occupies a lane -> lanes_busy resets the no-progress clock (a freeze
     stops merges, never builds — the constitution — so an EMPTY-lane freeze with waiting
     work is a genuine anomaly and does trip);
+  * a TERRITORY CLAIM from a gating/holding issue occupies NO lane but holds every overlapping
+    eligible candidate behind it under hard affinity -> scheduler.launchable excludes those held
+    candidates, so a finished PR gate-waiting on CI (with a wildcard/overlapping claim) plus one
+    eligible issue is a designed-safe wait, not a trip (issue #92 — the binding fix);
   * a usage meter that successfully READS exhausted is the runner fail-closed holding on
     purpose -> clock resets. A DARK (unreadable) meter never suppresses — the #46/#76
     asymmetry: fail open on unreadable, fail closed only on reads-exhausted — so a launchd
     context with no Keychain access cannot silently neuter the detector.
+
+When the no-progress view is UNOBSERVABLE this check (gh unreachable — a probe blip OR a refused
+list read, distinguished from a genuine empty answer by gh's read-health `ok`), the clocks FREEZE
+and an open no_progress episode is HELD, never stood down on the blip: a gh outage cannot drop the
+episode and re-trip it (a duplicate owner text + a restarted grace) on recovery. A genuinely
+OBSERVED clear (gh up and reporting nothing launchable, or a lane gone busy) still stands down.
 
 Episode discipline (the anti-storm rails): one notify when the episode opens; a clear during
 the grace stands down SILENTLY (journal only); at most one VERIFIED launch per episode, a
@@ -40,6 +52,7 @@ file (state/WATCHDOG_OFF) makes every check observe + journal and change nothing
 import math
 
 import issues
+import scheduler
 
 # Signal codes — sorted alphabetically wherever a list of them is stored or journaled, so
 # episode comparisons and journal greps are deterministic.
@@ -58,9 +71,10 @@ LAUNCH_ATTEMPT_CAP = 3                 # failed-launch retries per episode; then
 KILL_SWITCH_FILENAME = "WATCHDOG_OFF"  # state/WATCHDOG_OFF disables the whole path
 STATE_FILENAME = "watchdog.json"       # state/watchdog.json — episode + no-progress clocks
 
-# The scheduler's launch ceilings (spec): a SUCCESSFUL usage read at/over either one means
-# the runner is holding launches BY DESIGN. Values duplicated from scheduler to keep this
-# module importable without it; a drift would only shift the designed-hold suppression.
+# The scheduler's launch ceilings (spec): a SUCCESSFUL usage read strictly OVER either one means
+# the runner is holding launches BY DESIGN (the comparison below is `>`, matching the scheduler's
+# `>` gate — spec ">90%"/">96%"). Values duplicated from scheduler to keep this module importable
+# without it; a test pins them equal, and a drift would only shift the designed-hold suppression.
 _FIVE_HOUR_CEILING = 90
 _SEVEN_DAY_CEILING = 96
 
@@ -124,9 +138,11 @@ def _wcfg(config):
 
 
 def usage_reads_exhausted(usage):
-    """True ONLY for a successful usage read at/over a launch ceiling — the runner's designed
-    fail-closed hold. Anything unreadable/partial/malformed is False: a dark meter is
-    unreadable, NOT exhausted (the #46/#76 asymmetry), so it never suppresses the detector."""
+    """True ONLY for a successful usage read strictly OVER a launch ceiling (the `>` below matches
+    the scheduler's `>` gate — a read exactly AT the ceiling still launches, so it is not
+    exhausted) — the runner's designed fail-closed hold. Anything unreadable/partial/malformed is
+    False: a dark meter is unreadable, NOT exhausted (the #46/#76 asymmetry), so it never
+    suppresses the detector."""
     if not isinstance(usage, dict) or usage.get("auth_status") != "ok":
         return False
     fh, sd = usage.get("five_hour_pct"), usage.get("seven_day_pct")
@@ -139,30 +155,67 @@ def usage_reads_exhausted(usage):
     return fh > _FIVE_HOUR_CEILING or sd > _SEVEN_DAY_CEILING
 
 
-def eligible_nums(parsed_issues, closed_nums):
-    """The issue numbers of genuinely-waiting approved work: launchable per issues.eligible
-    (agent-ready, valid type, every blocked-by dependency CLOSED) and not already claimed or
-    handed back. The extra label exclusions are belt-and-braces — a park removes agent-ready
-    mechanically, but a half-moved label set must read as a designed-safe wait, never a trip.
-    `frozen` is passed as None deliberately: eligibility ignores freeze (builds continue)."""
-    out = []
+def launchable_nums(parsed_issues, lane_state, config, closed_nums, territory_claims):
+    """The issue numbers the SCHEDULER would launch RIGHT NOW — every scheduler hold already
+    applied. This is the no-progress detector's eligibility view, and it must respect EXACTLY the
+    holds the scheduler respects, or a designed-safe wait reads as waiting work and trips:
+      * eligibility (agent-ready, valid type, every blocked-by dependency CLOSED) — via the same
+        issues.eligible rule scheduler._plan uses;
+      * lane capacity + anti-affinity among running lanes and same-tick selections;
+      * TERRITORY CLAIMS — the #92 binding fix: a gating/holding issue holds a claim that occupies
+        NO lane but blocks every overlapping candidate under hard affinity, so a finished PR
+        gate-waiting on CI (with a wildcard/overlapping claim) plus one eligible issue is a
+        designed-safe wait, not a no-progress trip.
+    Usage is passed as a synthetic PASS (fail_open) DELIBERATELY: the watchdog keeps its OWN
+    reads-exhausted gate (usage_reads_exhausted) with the #46/#76 dark-meter asymmetry, so
+    re-running scheduler's fail-closed usage rule here would double-count the meter and let a dark
+    meter wrongly read as 'nothing launchable' — neutering the detector under launchd. `frozen` is
+    False: eligibility ignores freeze (builds continue).
+    The belt-and-braces label exclusions (in-progress / parked / needs-owner / needs-william)
+    mirror the runner's own candidate filter — a park removes agent-ready mechanically, but a
+    half-moved label set must read as a designed-safe wait, never a trip.
+
+    CONTRACT: this is exactly `scheduler.launchable` — the SCHEDULER's holds — NOT the runner's
+    full launch decision. The runner (actions.decide) applies two further gates the scheduler does
+    not: it PARKS an approved no-touches merge-producing issue (touches_required), and it FREEZES
+    launches on a structurally-corrupt issues.json. Such an issue is treated here as launchable, so
+    the view can transiently OVER-count relative to what the runner will actually launch. That
+    cannot produce a spurious 30-min trip in practice: the runner parks the no-touches issue within
+    a tick or two (dropping agent-ready → gone from the next read), and a corrupt issues.json raises
+    state/ALERT (the watchdog's `alert` signal fires anyway). The only surviving window is GitHub
+    WRITES stuck while READS keep succeeding for the whole bound — and a write dead zone refuses
+    reads in lockstep (gh_ok False → clocks freeze). Deliberately NOT duplicating the runner's park
+    logic here keeps this a thin scheduler wrapper and this module free of the actions/gate subtree."""
+    candidates = []
     for p in parsed_issues:
         if not isinstance(p, dict):
             continue
-        labels = [l for l in (p.get("labels") or []) if isinstance(l, str)]
-        if not issues.eligible(p, closed_nums, None):
+        labels = {l for l in (p.get("labels") or []) if isinstance(l, str)}
+        if {"in-progress", "parked", "needs-owner", "needs-william"} & labels:
             continue
-        if {"in-progress", "parked", "needs-owner", "needs-william"} & set(labels):
-            continue
-        num = p.get("num")
-        if type(num) is int and num > 0:
-            out.append(num)
-    return sorted(set(out))
+        candidates.append(p)
+    selected = scheduler.launchable(candidates, lane_state, config, {"fail_open": True},
+                                    closed_nums, False, territory_claims=territory_claims)
+    return sorted({sel["num"] for sel in selected
+                   if type(sel.get("num")) is int and sel["num"] > 0})
 
 
 def _hb_fresh(now, heartbeat, stale_seconds):
     ok = isinstance(heartbeat, (int, float)) and not isinstance(heartbeat, bool)
     return ok and now - heartbeat <= stale_seconds
+
+
+def _no_progress_observable(now, view, w):
+    """Can we TRUST a no_progress CLEAR this check? A definite designed-hold — a busy lane or a
+    successful reads-exhausted meter (both DISK/meter truth, independent of GitHub) — IS an
+    observation and clears the clock. Otherwise we need a trustworthy eligibility view: gh
+    reachable AND a fresh heartbeat. When neither holds, the condition is UNOBSERVABLE (a gh blip
+    / a wedged loop), not cleared — so an open no_progress episode is HELD rather than stood down
+    on the blip (which would re-trip on recovery: a duplicate owner text + a restarted grace)."""
+    if view.get("lanes_busy") or view.get("usage_exhausted"):
+        return True
+    return bool(view.get("gh_ok")) and _hb_fresh(now, view.get("heartbeat"),
+                                                 w["heartbeat_stale_seconds"])
 
 
 def _update_no_progress(now, view, state, w):
@@ -247,9 +300,20 @@ def evaluate(now, config, view, state):
 
     if not sigs:
         if ep is not None:
+            ep_signals = ep.get("signals") or []
+            if NO_PROGRESS in ep_signals and not _no_progress_observable(now, view, w):
+                # The no_progress condition is UNOBSERVABLE this check (gh unreachable / heartbeat
+                # not fresh), NOT cleared. Standing down here would drop the episode on a gh blip
+                # and re-trip it on recovery — a duplicate owner text and a restarted grace that
+                # can defer the launch indefinitely across repeated blips. HOLD the SAME episode
+                # (opened_at, grace clock, frozen no-progress clock all intact); a genuinely
+                # OBSERVED clear stands it down below. Quiet: no notify, no launch, no journal line
+                # (a long outage at a 5-min interval must not write a record per check).
+                new_state["episode"] = ep
+                return {"state": new_state, "journal": [], "notify": [], "launch": None}
             # Self-recovery or owner intervention during (or after) the grace: stand down
             # SILENTLY — the journal keeps the record, the phone stays quiet.
-            journal.append(_rec("stand_down", ep.get("signals") or []))
+            journal.append(_rec("stand_down", ep_signals))
         new_state["episode"] = None
         return {"state": new_state, "journal": journal, "notify": notify, "launch": launch}
 
@@ -291,8 +355,9 @@ def after_launch(now, config, state, launch, rc):
     launch shim) marks the episode launched — once per incident, no relaunch on the same
     episode. A nonzero rc counts an attempt (retried by later checks up to LAUNCH_ATTEMPT_CAP)
     and texts the owner ONCE per episode about the failure — the loop still needs attention
-    and now the fallback could not start either."""
-    w = _wcfg(config)
+    and now the fallback could not start either. `config` is accepted for call-site symmetry with
+    evaluate(); after_launch reads no config knob (authority/allowlist already rode into the launch
+    request), so it deliberately does NOT resolve _wcfg(config)."""
     state = coerce_state(state)
     ep = state.get("episode")
     if ep is None:                       # stand-down raced the launch; keep the honest record

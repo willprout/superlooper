@@ -123,6 +123,46 @@ def test_comment_reads_wrong_typed_body_is_refused(ghenv):
         assert cr.ok is False and cr.comments == []
 
 
+# ------------- watchdog reads: refused != answered-empty (issue #92, the #21/#61 contract) ------
+# The no-progress detector must distinguish a REFUSED list read from a genuinely empty one: a
+# probe-ok-but-refused read reset its clocks and stood episodes down (the fail-closed-empty-read-
+# as-truth trap gh.probe's own docstring warns about). These read-health variants carry `ok`.
+
+def test_ready_issues_health_answered(ghenv):
+    rd = gh.ready_issues_health()
+    assert rd.ok is True
+    assert [i["number"] for i in rd.value] == [101, 102, 103]
+
+
+def test_ready_issues_health_refused_is_not_answered_empty(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    rd = gh.ready_issues_health()
+    assert rd.ok is False and rd.value == []   # refused: caller must NOT read this as "no work"
+
+
+def test_ready_issues_health_wrong_typed_body_is_refused(ghenv):
+    (ghenv / "issue_list.json").write_text('{"not": "a list"}')
+    rd = gh.ready_issues_health()
+    assert rd.ok is False and rd.value == []
+
+
+def test_closed_issue_nums_health_answered(ghenv):
+    rd = gh.closed_issue_nums_health()
+    assert rd.ok is True and rd.value == {41, 52}
+
+
+def test_closed_issue_nums_health_answered_empty_is_ok(ghenv):
+    (ghenv / "issue_list_closed.json").write_text("[]")
+    rd = gh.closed_issue_nums_health()
+    assert rd.ok is True and rd.value == set()   # a genuine empty closed list: authoritative
+
+
+def test_closed_issue_nums_health_refused_is_not_answered_empty(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    rd = gh.closed_issue_nums_health()
+    assert rd.ok is False and rd.value == set()
+
+
 # --------------------------- PR lookups: refused != answered-empty (issue #61) ----------
 # The build-gate half of the #21 contract, extended per the 2026-07-08 park-notify storm: during
 # hourly GraphQL dead zones the PR-for-branch lookup collapsed "GitHub refused" into "no PR
