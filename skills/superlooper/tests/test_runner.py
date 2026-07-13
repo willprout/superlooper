@@ -1857,6 +1857,100 @@ def test_refresh_does_not_write_empty_when_lookup_finds_nothing(rig, monkeypatch
         assert "i9" not in rig.r.gh_view["prs"]                        # no {} stored; next tick can still find it
 
 
+# --------- issue #78: the build-path comments attachment obeys the #21/#61 read discipline -------
+
+def test_poll_attaches_comments_only_on_a_clean_read(rig, monkeypatch):
+    """The PR LOOKUP can land while the comments endpoint is REFUSED (a partial dead zone). The
+    poll must attach comments ONLY on a clean CommentRead — a refused read is OMITTED (the
+    'comments' key left ABSENT), so the gate WAITs instead of reading the fail-closed [] as an
+    authoritative 'no review marker' and parking a reviewed build (issue #78)."""
+    seed_issue(rig, "i123", status="gating", branch="sl/i123-render-the-widget", type="build")
+    (rig.home / "reports" / "i123.md").write_text("## Tests\n" + "x" * 60)
+
+    monkeypatch.setattr(runner_mod.gh, "pr_comments",
+                        lambda n: runner_mod.gh.CommentRead([], False))    # REFUSED comments read
+    rig.r._poll_github(NOW)
+    pv = rig.r.gh_view["prs"]["i123"]
+    assert pv["number"] == 555                                         # the PR lookup itself landed
+    assert "comments" not in pv                                        # ...but the refused read is OMITTED
+
+    # a CLEAN read (even genuinely empty) DOES attach — the answered-empty keeps the nudge ladder.
+    monkeypatch.setattr(runner_mod.gh, "pr_comments",
+                        lambda n: runner_mod.gh.CommentRead([], True))     # clean answered-empty
+    rig.r._last_poll = 0                                               # bypass the 90s poll throttle
+    rig.r._poll_github(NOW + 1)
+    assert rig.r.gh_view["prs"]["i123"].get("comments") == []
+
+
+def test_refresh_attaches_comments_only_on_a_clean_read(rig, monkeypatch):
+    """The finishing refresh obeys the same read discipline as the poll: a POSITIVE PR find whose
+    comments read is REFUSED attaches the PR but leaves the 'comments' key ABSENT, so the gate
+    WAITs rather than parking a reviewed build on a fail-closed empty (issue #78). (A refused
+    pr_for_branch already never downgrades a cached PR — issue #61.)"""
+    seed_issue(rig, "i7", status="gating", branch="sl/i7-x", num=7)
+    (rig.home / "reports" / "i7.md").write_text("# done\n## Tests\nok\n")
+    rig.r.gh_view = {"stale": False, "prs": {}, "issue_comments": {}}   # empty cache = the D3 window
+
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead(
+                            {"number": 42, "state": "OPEN", "headRefName": b}, True))
+    monkeypatch.setattr(runner_mod.gh, "pr_comments",
+                        lambda n: runner_mod.gh.CommentRead([], False))    # REFUSED comments read
+
+    ist_map = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
+    rig.r._refresh_finishing_prs(ist_map)
+    pv = rig.r.gh_view["prs"]["i7"]
+    assert pv["number"] == 42 and "comments" not in pv                 # PR visible, refused read omitted
+
+    # once the comments endpoint recovers, a clean read (with the marker) DOES attach.
+    monkeypatch.setattr(runner_mod.gh, "pr_comments",
+                        lambda n: runner_mod.gh.CommentRead(
+                            [{"body": "<!-- superlooper-review -->\nAPPROVE"}], True))
+    rig.r._refresh_finishing_prs(ist_map)
+    assert rig.r.gh_view["prs"]["i7"]["comments"][0]["body"].startswith("<!-- superlooper-review -->")
+
+
+def test_tick_refused_comments_holds_then_recovers_and_merges(rig, monkeypatch):
+    """End-to-end through REAL ticks (issue #78): on a finished, reviewed build the PR LOOKUP lands
+    while the comments endpoint is REFUSED (a partial dead zone — fake-gh fails only `pr view --json
+    comments`, never `pr list`). Across ticks the gate WAITs — status stays gating, ZERO nudges,
+    ZERO parks, exactly ONE bounded await_comments_read journal record, the review nudge key NEVER
+    spent. When the comments read recovers, the marker is seen and the PR MERGES."""
+    # align required_checks with the fixture PR's rollup so a recovered gate can actually merge
+    rig.r.config = make_config(required_checks=["quality-gate"])
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i123", status="gating", branch="sl/i123-render-the-widget", num=123,
+               type="build", declared_touches=[])
+    (rig.home / "reports" / "i123.md").write_text("## Tests\n" + "all green, evidence attached " * 4)
+
+    # refuse EVERY comments read; the PR lookup (`pr list ... --state all`) is left clean.
+    (rig.fixdir / "fail_rules.json").write_text(
+        json.dumps([{"match": "--json comments", "times": 99}]))
+
+    rig.r.tick(now=NOW)                                    # tick 1: refused -> hold + stamp the clock
+    rig.r.tick(now=NOW + 5)                                # tick 2: still refused -> bounded, no repeat
+    st = issue_state(rig, "i123")
+    assert st["status"] == "gating"                        # HELD — never parked, never merged
+    assert st.get("nudged") in ([], None)                 # the review nudge key was NOT spent
+    assert isinstance(st.get("comments_read_pending_since"), (int, float))   # wait clock stamped
+    awaits = [r for r in journal.read(rig.home)
+              if r.get("act") == "await_comments_read" and r.get("id") == "i123"]
+    assert len(awaits) == 1                                # ONE bounded record across the two ticks
+    assert not [r for r in journal.read(rig.home)
+                if r.get("act") == "park" and r.get("id") == "i123"]
+    assert not [r for r in journal.read(rig.home)
+                if r.get("act") == "nudge" and r.get("id") == "i123"]
+
+    # the comments endpoint recovers; the marker (fixture pr_comments.json) is now readable.
+    (rig.fixdir / "fail_rules.json").write_text("[]")
+    rig.r.tick(now=NOW + 200)                              # >90s: poll + refresh both re-read cleanly
+    assert issue_state(rig, "i123")["status"] == "merged"
+    assert any(m["kind"] == "merge_pr" for m in mutations(rig))
+    assert [r for r in journal.read(rig.home)
+            if r.get("act") == "clear_comments_read" and r.get("id") == "i123"]
+    assert issue_state(rig, "i123").get("comments_read_pending_since") is None   # episode ended
+
+
 # --------------------------- D4: relaunch closes the finished-but-alive session first -----------
 
 def test_close_stale_session_frees_the_singleton_lock(rig):
