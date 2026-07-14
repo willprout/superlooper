@@ -817,6 +817,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     for iid in all_ids:
         ist = ist_of(iid)
         status = _status_of(ist)     # hash-safe: a wrong-typed status folds to a no-set sentinel (#95)
+        if status is _CORRUPT_STATUS:
+            # A wrong-typed/unhashable status is UNREADABLE lifecycle bookkeeping: hash-safety alone is
+            # not enough, because the sentinel would fall through every non-membership branch below as
+            # if this were cold state and could still gate -> MERGE a finished PR, or ORPHAN-launch an
+            # in-progress one — acting on corrupted state (Codex cross-review). Fail CLOSED by taking NO
+            # consequential action on it: the membership sites already keep it out of lanes/claims and
+            # fresh launches, and detect_events has surfaced a bounded corrupt_status record naming it, so
+            # leaving it fully inert here is the skip the issue asks for. Identity check (`is`) so a raw
+            # None cold-start issue — a legitimate member of RELAUNCHABLE_STATUSES — is never caught. (#95)
+            continue
         # External-close absorption (issue #108): William closing the issue on GitHub — the
         # dashboard's Drop, or a close by hand — WHILE the loop is bouncing/parking it is his
         # answer. Absorb it: settle terminal, stand the episode down (no more label writes, no more

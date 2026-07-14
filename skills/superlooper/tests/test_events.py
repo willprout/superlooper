@@ -385,6 +385,7 @@ def test_event_key_roundtrips_every_event_type():
         ("i1", "exited", 7)
     assert events._event_key({"type": "session_idle", "id": "i1"}) == ("i1", "idle")
     assert events._event_key({"type": "frozen", "id": "i1"}) == ("i1", "frozen")
+    assert events._event_key({"type": "corrupt_status", "id": "i1"}) == ("i1", "corrupt_status")
     assert events._event_key({"type": "unknown", "id": "i1"}) is None
 
 
