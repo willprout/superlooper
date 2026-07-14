@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import signal
+import sys
 from pathlib import Path
 
 import pytest
@@ -177,6 +178,170 @@ def test_a_runner_that_loses_the_singleton_leaves_the_live_anchor_untouched(rig)
                               run_script=lambda *a, **k: 0, fetch_usage=lambda: {})
     assert other.run(sleep=lambda s: None) == 1        # loses the singleton, exits
     assert _anchor_file(rig).read_text() == before      # holder's anchor intact
+
+
+# --------------------------- the Restart button: self re-exec (issue #116) ---------------------------
+
+def _restart_marker(rig):
+    return rig.home / "state" / "runner.restart"
+
+
+def _journal(rig):
+    p = rig.home / "journal.jsonl"
+    return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+
+def test_restart_marker_between_ticks_reexecs_in_place(rig):
+    # The command-center Restart button drops a marker in the STATE HOME (never .superlooper/**); the
+    # runner honors it at the safe point BETWEEN ticks (never mid-executor) by re-exec'ing itself in
+    # place — the SAME invocation, so a fresh process image reloads the installed engine in the same
+    # cmux tab and starts with cleared in-memory state.
+    recorded = []
+    rig.r._reexec = lambda argv: recorded.append(list(argv))
+    rig.r.tick = lambda now=None: None                                # isolate honoring from tick internals
+    _restart_marker(rig).write_text(json.dumps({"operator": "William", "source": "command-center"}))
+    try:
+        rig.r.run(max_ticks=1, sleep=lambda s: None)
+    finally:
+        os.environ.pop("SL_RESTART_ADOPT", None)
+    assert recorded == [[sys.executable] + list(sys.argv)]             # re-runs THIS exact invocation
+    assert not _restart_marker(rig).exists()                          # consumed BEFORE the exec (no re-loop)
+    assert "runner_restart" in [j.get("act") for j in _journal(rig)]  # the verb is journaled
+
+
+def test_no_restart_marker_means_no_reexec(rig):
+    recorded = []
+    rig.r._reexec = lambda argv: recorded.append(argv)
+    rig.r.tick = lambda now=None: None
+    rig.r.run(max_ticks=2, sleep=lambda s: None)
+    assert recorded == []
+
+
+def test_restart_is_honored_even_when_the_systemic_launch_hold_is_tripped(rig):
+    # Tonight's shape (issue #116): a wedged anchor tripped the in-memory systemic-launch hold, and
+    # the owner wants the button to clear it. The hold must never SUPPRESS the restart — the re-exec
+    # is what wipes the streak (see test_a_restart_clears_the_systemic_launch_streak: a fresh Runner
+    # starts with an empty set).
+    rig.r._launch_fail_ids = {"i1", "i2", "i3", "i4"}                 # mid-episode: a wedged anchor
+    recorded = []
+    rig.r._reexec = lambda argv: recorded.append(argv)
+    rig.r.tick = lambda now=None: None
+    _restart_marker(rig).write_text("{}")
+    try:
+        rig.r.run(max_ticks=1, sleep=lambda s: None)
+    finally:
+        os.environ.pop("SL_RESTART_ADOPT", None)
+    assert len(recorded) == 1
+
+
+def test_a_present_but_corrupt_restart_marker_is_still_honored(rig):
+    # Existence is the signal (like state/ALERT): a present-but-unparseable marker still restarts —
+    # the button's intent is not lost to a malformed body.
+    recorded = []
+    rig.r._reexec = lambda argv: recorded.append(argv)
+    rig.r.tick = lambda now=None: None
+    _restart_marker(rig).write_text("not json {{{")
+    try:
+        rig.r.run(max_ticks=1, sleep=lambda s: None)
+    finally:
+        os.environ.pop("SL_RESTART_ADOPT", None)
+    assert len(recorded) == 1
+
+
+def test_reexec_adopts_the_singleton_without_a_double_start_window(rig):
+    # os.execv PRESERVES the pid, so after a self-restart the lock still holds our OWN live pid — the
+    # normal singleton check would read that as "another live runner" and refuse. A one-shot env
+    # token (set by the pre-exec image, matching our post-exec pid) proves the lock is ours-by-
+    # re-exec, so the reborn image adopts it in place. The lock is NEVER released across the exec, so
+    # a concurrent `run` WITHOUT the token still sees our live pid and refuses — no double-start.
+    assert rig.r.acquire_singleton() is True
+    (rig.home / "state" / "runner.lock").write_text(str(os.getpid()))   # our pid = the live holder
+    other = runner_mod.Runner(repo=str(rig.repo), config=make_config(),
+                              state_home=str(rig.home), pane="p")
+    assert other.acquire_singleton() is False                           # no token → refuses (no window)
+    reborn = runner_mod.Runner(repo=str(rig.repo), config=make_config(),
+                               state_home=str(rig.home), pane="pane-1")
+    os.environ["SL_RESTART_ADOPT"] = str(os.getpid())
+    try:
+        assert reborn.acquire_singleton() is True                       # token → adopts in place
+        assert reborn._reexec_adopted is True
+    finally:
+        os.environ.pop("SL_RESTART_ADOPT", None)
+    assert os.environ.get("SL_RESTART_ADOPT") is None                   # token consumed exactly once
+
+
+def test_reexec_adoption_never_rewrites_the_pidfile(rig):
+    # Critical (fresh-agent review): the lock ALREADY holds our pid (execv preserved it), so adoption
+    # must take it WITHOUT reopening/truncating the pidfile — else a concurrent `run` could read an
+    # empty file mid-rewrite and double-start (the very window this feature must not open). Proof: a
+    # READ-ONLY pidfile is still adopted cleanly, because adoption never opens it for write.
+    lock = rig.home / "state" / "runner.lock"
+    lock.write_text(str(os.getpid()))
+    lock.chmod(0o444)
+    reborn = runner_mod.Runner(repo=str(rig.repo), config=make_config(),
+                               state_home=str(rig.home), pane="pane-1")
+    os.environ["SL_RESTART_ADOPT"] = str(os.getpid())
+    try:
+        assert reborn.acquire_singleton() is True          # adopted without any write
+        assert reborn._reexec_adopted is True
+        assert lock.read_text() == str(os.getpid())        # pidfile intact — never emptied
+    finally:
+        os.environ.pop("SL_RESTART_ADOPT", None)
+        lock.chmod(0o644)
+
+
+def test_a_marker_targeting_us_is_honored(rig):
+    recorded = []
+    rig.r._reexec = lambda argv: recorded.append(argv)
+    rig.r.tick = lambda now=None: None
+    _restart_marker(rig).write_text(json.dumps({"target_pid": os.getpid()}))
+    try:
+        rig.r.run(max_ticks=1, sleep=lambda s: None)
+    finally:
+        os.environ.pop("SL_RESTART_ADOPT", None)
+    assert len(recorded) == 1
+
+
+def test_a_marker_targeting_a_different_runner_is_cleared_not_honored(rig):
+    # A marker written for a runner that died before honoring it (the operator then started a FRESH
+    # runner — a new pid): it was never a request for US, so clear it and never spuriously restart.
+    recorded = []
+    rig.r._reexec = lambda argv: recorded.append(argv)
+    rig.r.tick = lambda now=None: None
+    _restart_marker(rig).write_text(json.dumps({"target_pid": os.getpid() + 1}))
+    rig.r.run(max_ticks=1, sleep=lambda s: None)
+    assert recorded == []                                  # not honored
+    assert not _restart_marker(rig).exists()               # the stale marker is cleared
+    assert any(j.get("act") == "runner_restart" and j.get("phase") == "stale" for j in _journal(rig))
+
+
+def test_an_undecodable_restart_marker_is_still_honored(rig):
+    # Existence is the signal (like state/ALERT): even a marker of undecodable bytes still restarts —
+    # a corrupt body never loses the request. (No target_pid parses out ⇒ honored by any runner.)
+    recorded = []
+    rig.r._reexec = lambda argv: recorded.append(argv)
+    rig.r.tick = lambda now=None: None
+    _restart_marker(rig).write_bytes(b"\xff\xfe not utf-8 \x00")
+    try:
+        rig.r.run(max_ticks=1, sleep=lambda s: None)
+    finally:
+        os.environ.pop("SL_RESTART_ADOPT", None)
+    assert len(recorded) == 1
+
+
+def test_a_reexec_adopted_start_journals_the_completed_restart(rig):
+    # After the exec the reborn image records the "up" half of the restart trail (old pid → new),
+    # so the journal (and morning report) show the restart landed, not just that it was requested.
+    (rig.home / "state" / "runner.lock").write_text(str(os.getpid()))
+    rig.r.tick = lambda now=None: None
+    os.environ["SL_RESTART_ADOPT"] = str(os.getpid())
+    try:
+        rig.r.run(max_ticks=1, sleep=lambda s: None)
+    finally:
+        os.environ.pop("SL_RESTART_ADOPT", None)
+    ups = [j for j in _journal(rig)
+           if j.get("act") == "runner_restart" and j.get("phase") == "up"]
+    assert ups and ups[0].get("new_pid") == os.getpid()
 
 
 # --------------------------- Task-11 seams: morning report + notify ---------------------------

@@ -19,6 +19,11 @@ inject a fail-closed ``{"ok": false, ...}`` envelope), else a default 3-proposal
 ok-per-key result echoing the requested keys, and records a ``janitor_execute`` mutation carrying
 the exact keys so a test proves ONLY the tapped subset was sent.
 
+It also models the Restart button's shell (issue #116; see ``route_request_restart``):
+
+    superlooper request-restart --repo <path> --check --json   → reports live-runner liveness (JSON)
+    superlooper request-restart --repo <path> --json           → 'drops the marker' (records a call)
+
 - ``--dry-run`` prints the contents of ``$SL_TIDY_FIXTURES/dry_run.txt`` when present, else a
   default two-window listing in the REAL CLI's exact print format (``  {id:5} {status:13}
   {surface}``), so ``lib/tidy.parse_windows`` is exercised against the true shape.
@@ -133,6 +138,9 @@ def route():
     if ARGS[:1] == ["janitor"]:
         _janitor()
         return
+    if ARGS[:1] == ["request-restart"]:
+        route_request_restart()
+        return
     if ARGS[:1] != ["tidy"]:
         die("unhandled command: %s" % " ".join(ARGS))
     if "--dry-run" in ARGS:
@@ -141,6 +149,37 @@ def route():
     # --yes (or a bare tidy) → the execute path. Record it so a test can assert the close ran.
     record("tidy_execute", repo=opt("--repo"), yes=("--yes" in ARGS), all=("--all" in ARGS))
     sys.stdout.write(fixture("execute.txt", _DEFAULT_EXECUTE))
+    sys.exit(0)
+
+
+def route_request_restart():
+    """Model the real `superlooper request-restart --json` contract the dashboard's ``lib/restart``
+    parses (issue #116). ``SL_RESTART_RUNNING=0`` simulates no live runner (the dead-runner refuse);
+    ``SL_RESTART_GARBAGE=1`` prints non-JSON so a test can exercise the adapter's unparseable path.
+    ``--check`` reports liveness and writes nothing; the plain form 'writes the marker' (recorded as
+    a mutation so a test can assert the request landed, with its audit fields)."""
+    if os.environ.get("SL_RESTART_GARBAGE"):
+        sys.stdout.write("not json — the CLI misbehaved\n")
+        sys.exit(0)
+    running = os.environ.get("SL_RESTART_RUNNING", "1") != "0"
+    repo = opt("--repo") or ""
+    manual = "open a cmux tab and run: superlooper run --repo %s" % repo
+    pid = 4242 if running else None
+    if "--check" in ARGS:
+        out = {"ok": True, "verb": "request-restart", "running": running, "pid": pid,
+               "requested": False, "manual": manual}
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.exit(0)
+    if not running:
+        out = {"ok": False, "verb": "request-restart", "running": False, "pid": None,
+               "requested": False, "manual": manual,
+               "error": "no runner is live for this repo — nothing to restart"}
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.exit(1)
+    record("restart_request", repo=repo, operator=opt("--operator"), source=opt("--source"))
+    out = {"ok": True, "verb": "request-restart", "running": True, "pid": pid,
+           "requested": True, "manual": manual}
+    sys.stdout.write(json.dumps(out) + "\n")
     sys.exit(0)
 
 

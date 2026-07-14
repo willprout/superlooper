@@ -274,7 +274,14 @@
       '<button class="tidy-btn" data-act="tidy-open" data-repo="' + esc(r ? r.slug : "") + '"' +
         (r ? "" : " disabled") +
         ' title="Tidy — close the terminal windows of finished sessions (runs superlooper tidy locally; no GitHub)">\u{1F9F9} Tidy</button>' +
-      // The Janitor button (issue #121) — the second ops-verb button: clears GitHub-side debris
+      // The Restart button (issue #116) — an OPS-verb button: asks the LIVE runner to restart
+      // itself in its own cmux tab (runs `superlooper request-restart` locally; a confirm dialog states
+      // exactly what will happen first, and reports honestly when no loop is running). Never launches
+      // or places a tab. Carries the camera repo, like Tidy/Flag, so a tap targets the repo on screen.
+      '<button class="restart-btn" data-act="restart-open" data-repo="' + esc(r ? r.slug : "") + '"' +
+        (r ? "" : " disabled") +
+        ' title="Restart the loop — asks the running runner to restart itself in its own cmux tab (runs superlooper request-restart locally; no GitHub)">\u{1F504} Restart</button>' +
+      // The Janitor button (issue #121) — an ops-verb button: clears GitHub-side debris
       // (stale merged/superseded loop branches, superseded PRs, aged parked issues) by running
       // `superlooper janitor` locally; a sweep dialog groups every proposal and executes only the
       // ones tapped. Carries the camera repo, like Flag/Tidy, so a tap sweeps the repo on screen.
@@ -477,6 +484,7 @@
 
     if (act === "flag-open") { openFlagBox(repo); return; }
     if (act === "tidy-open") { if (window.CCTidy) window.CCTidy.open(repo); return; }
+    if (act === "restart-open") { if (window.CCRestart) window.CCRestart.open(repo); return; }
     if (act === "janitor-open") { if (window.CCJanitor) window.CCJanitor.open(repo); return; }
     if (act === "replay-open") { if (window.CCReplay) window.CCReplay.open(repo, state.snapshot && state.snapshot.fun); return; }
     if (act === "digest-open") { if (window.CCDigest) window.CCDigest.open(repo); return; }

@@ -15,6 +15,10 @@
   promote-report  dev->prod EVIDENCE (suite vs known-failure ledger, merges since last promotion,
                   open issues) — NO verdict; William decides (Task 12)
   accept-failure  accept a failure by fingerprint into the ledger — one approval, ever (Task 12)
+  request-restart ask the LIVE runner to restart ITSELF in its own cmux tab (issue #116): drops a
+                  request marker the runner honors between ticks by re-exec'ing in place (fresh
+                  engine, cleared in-memory state). Never launches/places a tab; with no live runner
+                  it refuses and names the manual start. A local ops UI over the loop shells this
   tidy            close the cmux windows of FINISHED sessions (merged by default; --all extends
                   to parked/needs-william/bounced) — manual, never automatic; never touches an
                   in-flight or mid-gate lane, so it is safe to run while the runner is live
@@ -298,6 +302,65 @@ def cmd_run(args):
                   file=sys.stderr)
             return 2
     return r.run(max_ticks=args.ticks)
+
+
+# ------------------------------- request-restart (issue #116) -------------------------------
+
+def _emit_restart(args, result):
+    """Print a request-restart result: one JSON object when ``--json`` (for a local ops UI over the
+    loop to parse), else a plain human line for a terminal operator."""
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(result) + "\n")
+        return
+    if result.get("requested"):
+        sys.stdout.write("restart requested — the live runner (pid %s) will restart itself in its "
+                         "own cmux tab after the current tick.\n" % result.get("pid"))
+    elif result.get("running"):
+        sys.stdout.write("a runner is live for this repo (pid %s).\n" % result.get("pid"))
+    else:
+        sys.stdout.write("no runner is live for this repo — nothing to restart.\n  %s\n"
+                         % result.get("manual"))
+
+
+def cmd_request_restart(args):
+    """Ask the LIVE runner to restart ITSELF in its own cmux tab (issue #116). A local ops UI over
+    the loop shells this (exactly as it shells ``superlooper tidy``); it can also be run by hand.
+
+    It NEVER launches or places a tab: it only drops a request marker in the state home that a
+    RUNNING runner honors between ticks by re-exec'ing in place (a fresh process image that reloads
+    the installed engine and clears in-memory episode state). With no live runner it makes no attempt
+    to resurrect one — resurrecting a dead loop is out, because a runner must run in a visible cmux
+    tab a human opened and automated tab placement is owner-ruled out (2026-07-09). It refuses and
+    names the one-line manual start instead.
+
+    ``--check`` reports whether a live runner exists and writes NOTHING (the button's preflight);
+    ``--json`` emits one JSON object for the dashboard; ``--operator``/``--source`` are audit fields
+    recorded in the marker (the runner journals them when it honors the restart)."""
+    from runner import live_runner_pid, write_restart_request
+    cfg = _load_config(args.repo)
+    state_dir = os.path.join(str(config_lib.state_home(cfg)), "state")
+    manual = "open a cmux tab and run: superlooper run --repo %s" % os.path.abspath(args.repo)
+    pid = live_runner_pid(state_dir)                      # None ⇒ stale/absent pidfile ⇒ no live runner
+    running = pid is not None
+
+    if getattr(args, "check", False):                    # preflight only — never writes the marker
+        _emit_restart(args, {"ok": True, "verb": "request-restart", "running": running,
+                             "pid": pid, "requested": False, "manual": manual})
+        return 0
+
+    if not running:                                      # dead-runner case — launch/place NOTHING
+        _emit_restart(args, {"ok": False, "verb": "request-restart", "running": False, "pid": None,
+                             "requested": False, "manual": manual,
+                             "error": "no runner is live for this repo — nothing to restart"})
+        return 1
+
+    # Bind the marker to the pid we just saw live, so a runner that dies before honoring it can't
+    # have a freshly-started replacement (a new pid) spuriously honor it (fresh-agent review).
+    write_restart_request(state_dir, {"requested_at": int(time.time()), "target_pid": pid,
+                                      "source": args.source or "cli", "operator": args.operator})
+    _emit_restart(args, {"ok": True, "verb": "request-restart", "running": True, "pid": pid,
+                         "requested": True, "manual": manual})
+    return 0
 
 
 # ------------------------------- status -------------------------------
@@ -1804,6 +1867,16 @@ def main(argv=None):
            "--yes": dict(action="store_true", help="skip the y/N confirmation"),
            "--dry-run": dict(action="store_true",
                              help="list the windows tidy would close, then close nothing")})
+    add("request-restart", cmd_request_restart,
+        **{"--check": dict(action="store_true",
+                           help="report whether a live runner exists and write nothing "
+                                "(a read-only preflight)"),
+           "--json": dict(action="store_true",
+                          help="emit a single JSON object (for a UI over the loop to parse)"),
+           "--operator": dict(default=None,
+                              help="operator name recorded in the request marker (audit)"),
+           "--source": dict(default=None,
+                            help="who asked (audit only)")})
     add("watchdog", cmd_watchdog)
     add("janitor", cmd_janitor,
         **{"--dry-run": dict(action="store_true",

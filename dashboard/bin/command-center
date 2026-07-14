@@ -37,6 +37,7 @@ import desk as desk_mod       # noqa: E402
 import gh                     # noqa: E402
 import pollers                # noqa: E402
 import janitor as janitor_mod  # noqa: E402
+import restart as restart_mod # noqa: E402
 import server                 # noqa: E402
 import tidy as tidy_mod       # noqa: E402
 import watchdog as watchdog_mod  # noqa: E402
@@ -135,10 +136,18 @@ def main(argv):
     # watched repo slug to its checkout (the `--repo` argument), so a tap can only ever tidy a repo
     # the operator chose to watch. Merged-only scope is enforced in lib/tidy (never passes `--all`).
     tidy = tidy_mod.Tidy(cfg["superlooper_cli"], {r["slug"]: r["path"] for r in cfg["repos"]})
-    # The Janitor button (issue #121) — the GitHub-side debris sweep, the second local-command verb.
-    # Bound to the SAME configured CLI + watched-repo allow-list as Tidy; it runs `superlooper
-    # janitor` (which owns the whole propose/approve safety contract) and executes only the subset
-    # the owner taps. Owner ruling 2026-07-13: full CLI parity without leaving the dashboard.
+    # The Restart button (issue #116) — a local-command verb: it shells `superlooper
+    # request-restart` to ask the LIVE runner to restart itself in its own cmux tab (never a launch
+    # or a tab placement — that bright line stays). Bound to the same configured CLI path and the
+    # same watched-repo allow-list as Tidy, and signed with the operator so the runner journals who
+    # asked; the marker-writing + dead-runner refusal live in the engine (request-restart).
+    restart = restart_mod.Restart(cfg["superlooper_cli"],
+                                  {r["slug"]: r["path"] for r in cfg["repos"]},
+                                  operator=config_mod.operator(cfg))
+    # The Janitor button (issue #121) — a local-command verb: the GitHub-side debris sweep. Bound to
+    # the SAME configured CLI + watched-repo allow-list as Tidy; it runs `superlooper janitor` (which
+    # owns the whole propose/approve safety contract) and executes only the subset the owner taps.
+    # Owner ruling 2026-07-13: full CLI parity without leaving the dashboard.
     janitor = janitor_mod.Janitor(cfg["superlooper_cli"],
                                   {r["slug"]: r["path"] for r in cfg["repos"]})
     replay_provider, digest_provider = build_data_providers(cfg)
@@ -149,7 +158,7 @@ def main(argv):
     # serve_forever below keeps its own KeyboardInterrupt handling (issue #34).
     try:
         httpd = server.build_server(provider, static_dir, port=cfg["port"], actions=verbs,
-                                    desk=dashboard_desk, tidy=tidy, janitor=janitor,
+                                    desk=dashboard_desk, tidy=tidy, restart=restart, janitor=janitor,
                                     replay_provider=replay_provider,
                                     digest_provider=digest_provider)
     except OSError as e:
