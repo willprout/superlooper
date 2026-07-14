@@ -277,17 +277,105 @@ def test_reads_fail_closed_on_timeout(tmp_path, monkeypatch):
 # --------------------------- writes: happy path + recording ---------------------------
 
 def test_set_labels_records_add_and_remove(tmp_path, monkeypatch):
+    # Each label operation is its OWN gh edit (issue #114: a single all-or-nothing edit lets one
+    # repo-absent remove sink the add). The add is one edit; each remove is its own edit; every one
+    # is pinned to the right issue.
     _use_fake(monkeypatch, tmp_path)
     assert gh.set_labels(REPO, 4, add=["agent-ready"], remove=["parked", "needs-owner"]) is True
-    mut = _mutations(tmp_path)[-1]
-    assert mut == {"kind": "set_labels", "num": "4",
-                   "add": "agent-ready", "remove": "parked,needs-owner"}
+    muts = [m for m in _mutations(tmp_path) if m["kind"] == "set_labels"]
+    assert all(m["num"] == "4" for m in muts)
+    # The ADD lands FIRST (the load-bearing order: agent-ready is applied before any blocker is
+    # cleared, and a failed add short-circuits before firing doomed removes).
+    assert muts[0]["add"] == "agent-ready" and muts[0]["remove"] is None
+    adds = [m for m in muts if m["add"]]
+    assert [m["add"] for m in adds] == ["agent-ready"]           # exactly one add edit
+    assert all(m["remove"] is None for m in adds)                # the add edit carries no remove
+    removes = [m["remove"] for m in muts if m["remove"]]
+    assert removes == ["parked", "needs-owner"]                  # one edit per removed label, in order
+    assert all(m["add"] is None for m in muts if m["remove"])    # a remove edit carries no add
 
 
 def test_set_labels_noop_when_nothing_to_change(tmp_path, monkeypatch):
     _use_fake(monkeypatch, tmp_path)
     assert gh.set_labels(REPO, 4) is True     # nothing to do -> True, and no gh call made
     assert _calls(tmp_path) == []
+
+
+# --------------------------- writes: a repo-nonexistent remove must not sink the write (issue #114) ---------------------------
+# gh's ``issue edit --remove-label X`` HARD-FAILS when X is not defined in the REPO's label set —
+# even when the issue never carried it. A completed #58 rename removes the legacy id from the repo,
+# so a batched remove that still names it errored out and the agent-ready add never landed (every
+# Approve tap died with "nothing changed"). Removing a label the repo no longer defines is vacuously
+# done; it must not be treated as a failure, and it must not take the add / the other removes with it.
+
+def _removed_labels(muts):
+    """Every label the adapter actually removed, flattened across however many edit calls it made
+    (one batched edit, or one-per-label — either shape answers 'did label X get removed?')."""
+    out = set()
+    for m in muts:
+        if m["kind"] == "set_labels" and m.get("remove"):
+            out.update(m["remove"].split(","))
+    return out
+
+
+def _added_labels(muts):
+    out = set()
+    for m in muts:
+        if m["kind"] == "set_labels" and m.get("add"):
+            out.update(m["add"].split(","))
+    return out
+
+
+def test_set_labels_tolerates_a_repo_absent_remove_and_still_lands_add_and_others(tmp_path, monkeypatch):
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_LABEL_NOT_IN_REPO", "needs-william")   # a repo that FINISHED the #58 rename
+    ok = gh.set_labels(REPO, 4, add=["agent-ready"],
+                       remove=["parked", "needs-owner", "needs-william"])
+    assert ok is True                                    # a vacuous remove is NOT a failure
+    muts = _mutations(tmp_path)
+    assert "agent-ready" in _added_labels(muts)          # the add LANDED (the whole point of Approve)
+    removed = _removed_labels(muts)
+    assert {"parked", "needs-owner"} <= removed          # the real removes LANDED too
+    assert "needs-william" not in removed                # the repo-absent one was never recorded
+
+
+def test_set_labels_still_removes_the_legacy_label_when_the_repo_defines_it(tmp_path, monkeypatch):
+    # Mid-migration: the repo STILL carries needs-william. The fix must not stop clearing it (the
+    # legacy id was included on purpose so a mid-migration repo clears cleanly).
+    _use_fake(monkeypatch, tmp_path)
+    ok = gh.set_labels(REPO, 4, add=["agent-ready"], remove=["parked", "needs-william"])
+    assert ok is True
+    removed = _removed_labels(_mutations(tmp_path))
+    assert "needs-william" in removed and "parked" in removed
+
+
+def test_set_labels_surfaces_a_genuine_remove_failure_no_false_ok(tmp_path, monkeypatch):
+    # A NON "not found" failure on a remove (auth/network/500) is a real failure — it must be
+    # surfaced, never swallowed as if it were a vacuous repo-absent remove.
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL_REMOVE", "1")
+    assert gh.set_labels(REPO, 4, add=["agent-ready"], remove=["parked"]) is False
+
+
+def test_label_absent_classifier_only_tolerates_the_benign_gh_not_found_shape():
+    # The tolerance must match gh's EXACT benign shape (``'<label>' not found``) and nothing looser —
+    # a genuine 404/auth/repo error that merely ECHOES the label name must NOT be swallowed (that
+    # would be a false-ok, the one thing this fix must never introduce). Fail closed on ambiguity.
+    assert gh._label_absent_from_repo("failed to update issue #4: 'needs-william' not found",
+                                      "needs-william") is True
+    assert gh._label_absent_from_repo("HTTP 404: Not Found while removing needs-owner",
+                                      "needs-owner") is False          # 404 echoing the label ≠ benign
+    assert gh._label_absent_from_repo("gh: could not resolve to a Repository 'needs-owner' not-found",
+                                      "needs-owner") is False          # not the exact benign shape
+    assert gh._label_absent_from_repo("", "parked") is False           # no stderr ≠ benign
+
+
+def test_set_labels_fails_closed_when_the_add_fails(tmp_path, monkeypatch):
+    # Auth/network fails everything, including the add — the write did not land, so ok is False and
+    # the failure toast fires. (The add is authoritative; a failed add is never a success.)
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.set_labels(REPO, 4, add=["agent-ready"], remove=["parked", "needs-william"]) is False
 
 
 def test_comment_records_body(tmp_path, monkeypatch):

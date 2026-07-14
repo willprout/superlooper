@@ -60,11 +60,10 @@ def test_approve_adds_agent_ready_removes_parked_and_needs_william(tmp_path, mon
     res = a.approve(REPO, 4)
     assert res["ok"] is True
     muts = _mutations(tmp_path)
-    label = [m for m in muts if m["kind"] == "set_labels"][-1]
-    assert label["num"] == "4"
-    assert label["add"] == "agent-ready"
-    # both blockers cleared in one edit (order-independent membership check)
-    assert set(label["remove"].split(",")) == {"parked", "needs-owner", "needs-william"}
+    assert all(m["num"] == "4" for m in muts if m["kind"] == "set_labels")
+    assert "agent-ready" in _added_labels(muts)                              # agent-ready applied
+    # all three blockers cleared (each in its own edit — issue #114 split; order-independent)
+    assert _removed_labels(muts) == {"parked", "needs-owner", "needs-william"}
 
 
 def test_approve_posts_the_exact_audit_comment(tmp_path, monkeypatch):
@@ -93,6 +92,81 @@ def test_approve_fails_closed_when_gh_write_fails(tmp_path, monkeypatch):
     a = _acts(monkeypatch, tmp_path)
     monkeypatch.setenv("GH_FAIL", "1")
     assert a.approve(REPO, 4)["ok"] is False
+
+
+# --------------------------- approve survives a completed #58 migration (issue #114) ---------------------------
+# The live bug: on a repo that FINISHED the needs-william -> needs-owner rename, the batched remove
+# still named the now-repo-absent legacy label, gh hard-failed the whole edit, and the agent-ready
+# add never landed — every Approve tap died with "nothing changed". These pin the fix end to end.
+
+def _removed_labels(muts):
+    out = set()
+    for m in muts:
+        if m["kind"] == "set_labels" and m.get("remove"):
+            out.update(m["remove"].split(","))
+    return out
+
+
+def _added_labels(muts):
+    out = set()
+    for m in muts:
+        if m["kind"] == "set_labels" and m.get("add"):
+            out.update(m["add"].split(","))
+    return out
+
+
+def test_approve_succeeds_on_a_repo_that_finished_the_needs_owner_migration(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_LABEL_NOT_IN_REPO", "needs-william")   # the #58 rename is complete here
+    res = a.approve(REPO, 4)
+    assert res["ok"] is True and res["labeled"] is True           # the dead button lives again
+    muts = _mutations(tmp_path)
+    assert "agent-ready" in _added_labels(muts)                   # agent-ready LANDED
+    assert {"parked", "needs-owner"} <= _removed_labels(muts)     # the real removes LANDED
+    comment = [m for m in muts if m["kind"] == "comment"][-1]     # the audit comment posted
+    assert comment["body"] == "Approved by Ada via command-center, 2026-07-07."
+
+
+def test_approve_still_clears_the_legacy_label_mid_migration(tmp_path, monkeypatch):
+    # A repo still carrying needs-william (mid-migration) MUST still get it removed on approve.
+    a = _acts(monkeypatch, tmp_path)
+    res = a.approve(REPO, 4)
+    assert res["ok"] is True
+    assert "needs-william" in _removed_labels(_mutations(tmp_path))
+
+
+def test_bounce_yes_succeeds_on_a_repo_that_finished_the_migration(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_LABEL_NOT_IN_REPO", "needs-william")
+    res = a.bounce_yes(REPO, 8)
+    assert res["ok"] is True and res["labeled"] is True
+    muts = _mutations(tmp_path)
+    assert "agent-ready" in _added_labels(muts)
+    assert "needs-owner" in _removed_labels(muts)
+    comment = [m for m in muts if m["kind"] == "comment"][-1]
+    assert comment["body"].startswith("Bounce accepted by Ada via command-center, 2026-07-07.")
+
+
+def test_bounce_yes_still_clears_the_legacy_label_mid_migration(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    assert a.bounce_yes(REPO, 8)["ok"] is True
+    assert "needs-william" in _removed_labels(_mutations(tmp_path))
+
+
+def test_approve_still_fails_on_a_genuine_write_error_not_masked_by_tolerance(tmp_path, monkeypatch):
+    # A genuine (non "not found") failure on a label write is NOT a vacuous repo-absent remove —
+    # the tap's failure toast must still fire (no false-ok from the #114 tolerance).
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL_REMOVE", "1")
+    assert a.approve(REPO, 4)["ok"] is False
+
+
+def test_bounce_yes_still_fails_on_a_genuine_write_error(tmp_path, monkeypatch):
+    # The re-release path (bounce-yes) shares the same tolerance — pin that IT, too, still surfaces a
+    # genuine remove failure as not-ok (the DoD covers BOTH affected verbs).
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL_REMOVE", "1")
+    assert a.bounce_yes(REPO, 8)["ok"] is False
 
 
 class _CommentFailsGh:
@@ -159,10 +233,11 @@ def test_bounce_yes_reapproves_and_clears_needs_william(tmp_path, monkeypatch):
     a = _acts(monkeypatch, tmp_path)
     res = a.bounce_yes(REPO, 8)
     assert res["ok"] is True
-    label = [m for m in _mutations(tmp_path) if m["kind"] == "set_labels"][-1]
-    assert label["add"] == "agent-ready"
-    # clears the current owner-decision label AND the legacy one (issue #58 compat)
-    removed = set(label["remove"].split(","))
+    muts = _mutations(tmp_path)
+    assert "agent-ready" in _added_labels(muts)
+    # clears the current owner-decision label AND the legacy one (issue #58 compat), each in its
+    # own edit (issue #114 split)
+    removed = _removed_labels(muts)
     assert "needs-owner" in removed and "needs-william" in removed
 
 

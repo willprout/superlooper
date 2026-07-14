@@ -19,8 +19,16 @@ adapter produced — including that a read/write was pinned to the RIGHT repo (t
 many repos; a mis-pinned call would talk to the wrong one).
 
 Fail injection (exercises the adapter's fail-closed paths):
-- ``GH_SLEEP=<secs>``  makes every call sleep, so a short adapter timeout trips (rc 124 path).
-- ``GH_FAIL=1``        makes every call exit nonzero (the fail-closed-to-empty/False parsers).
+- ``GH_SLEEP=<secs>``          makes every call sleep, so a short adapter timeout trips (rc 124 path).
+- ``GH_FAIL=1``                makes every call exit nonzero (the fail-closed-to-empty/False parsers).
+- ``GH_LABEL_NOT_IN_REPO=a,b`` makes ``issue edit --remove-label`` HARD-FAIL — exactly as real gh
+  does — when any named label is not defined in the REPO's label set (e.g. after a completed #58
+  rename): it prints ``'<name>' not found`` to stderr, exits nonzero, and records NO mutation
+  (real gh's edit is all-or-nothing, so a doomed remove reverts the whole edit). This reproduces
+  issue #114: a batched remove carrying a repo-nonexistent legacy label sinks the agent-ready add.
+- ``GH_FAIL_REMOVE=1``         makes any ``issue edit --remove-label`` fail with a GENERIC (non
+  "not found") error — an auth/network/500-class failure on a remove. The adapter must surface
+  this as a real failure (it is NOT a vacuous repo-absent remove), so ``ok`` stays honest.
 
 Ported and trimmed from superlooper's ``tests/fakes/fake-gh`` fixture mode (the stateful
 simulation mode is out of scope for the dashboard's adapter tests).
@@ -109,7 +117,20 @@ def route():
 
     # ---------- writes (recorded to mutations.jsonl) ----------
     elif sub == ["issue", "edit"]:
-        record("set_labels", num=ARGS[2], add=opt("--add-label"), remove=opt("--remove-label"))
+        remove = opt("--remove-label")
+        # Real gh fails the WHOLE edit (recording nothing) if any --remove-label names a label the
+        # REPO doesn't define — even when the issue never carried it (issue #114). Model that: if any
+        # removed label is in GH_LABEL_NOT_IN_REPO, die like real gh and record no mutation.
+        absent = set(filter(None, (os.environ.get("GH_LABEL_NOT_IN_REPO") or "").split(",")))
+        if remove and absent:
+            for lbl in remove.split(","):
+                if lbl in absent:
+                    die("failed to update issue #%s: '%s' not found" % (ARGS[2], lbl))
+        # A generic (non "not found") failure on a remove — auth/network/500. NOT vacuous; the
+        # adapter must surface it, never tolerate it.
+        if remove and os.environ.get("GH_FAIL_REMOVE"):
+            die("failed to update issue #%s: HTTP 503 (server error)" % ARGS[2])
+        record("set_labels", num=ARGS[2], add=opt("--add-label"), remove=remove)
         sys.exit(0)
 
     elif sub == ["issue", "comment"]:
