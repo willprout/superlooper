@@ -1591,7 +1591,19 @@ class Runner:
         if not gh.set_labels(num, add=["needs-owner"], remove=["in-progress"]):
             return "label move failed (will retry silently next tick)"
         _rm(os.path.join(self.state, "blocked", iid))
-        self._update_issue(iid, {"status": "bounced"})
+        def settle(st, i):
+            # Stand down any answerer still filed for this issue (mirrors _exec_park /
+            # _exec_absorb_close): a bounce is terminal, so it must not leave a `for: <iid>` record
+            # behind. This keeps the "answerers holds exactly the ACTIVE answerers" invariant airtight
+            # across EVERY terminal transition — the property tidy.closable_answerers rests on to close
+            # a bounced issue's finished answerer window (issue #132 review).
+            recs = st.get("answerers")
+            if isinstance(recs, dict):
+                for aid in [k for k, v in recs.items()
+                            if isinstance(v, dict) and v.get("for") == iid]:
+                    recs.pop(aid, None)
+            i["status"] = "bounced"
+        self._update_issue(iid, fn=settle)
         return "ok"
 
     def _exec_absorb_close(self, a, now):

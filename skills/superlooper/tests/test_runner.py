@@ -1367,6 +1367,27 @@ def test_bounce_comment_only_failure_still_settles_the_bounce(rig):
     assert lab["add"] == "needs-owner"                 # the label DID land — the bounce is real
 
 
+def test_bounce_stands_down_a_lingering_answerer_record(rig):
+    """Issue #132 review: a bounce settles the issue terminal ('bounced'), so it must also stand
+    down any answerer record still filed for that issue — mirroring _exec_park / _exec_absorb_close.
+    Without this the "answerers holds exactly the active answerers" invariant that
+    tidy.closable_answerers rests on would have a gap: a bounced issue's finished answerer window
+    would stay protected from tidy until the issue was reapproved or closed by hand. Only THIS
+    issue's record is dropped — an answerer for another issue is untouched."""
+    seed_issue(rig, "i7", status="blocked")
+    (rig.home / "state" / "blocked" / "i7").write_text("BOUNCED: premise gone")
+    def add_answerers(st):
+        st["answerers"] = {"a1": {"for": "i7", "launched_at": NOW},
+                           "a2": {"for": "i9", "launched_at": NOW}}
+    loopstate.update(str(rig.home / "state" / "issues.json"), add_answerers)
+    out = rig.r._execute({"act": "bounce", "id": "i7", "num": 7,
+                          "memo": "BOUNCED: premise gone"}, NOW)
+    assert out == "ok"
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))
+    assert st["issues"]["i7"]["status"] == "bounced"
+    assert st["answerers"] == {"a2": {"for": "i9", "launched_at": NOW}}   # only i7's record dropped
+
+
 def test_absorb_close_settles_terminal_and_stands_down(rig, monkeypatch):
     """Issue #108: the issue was closed on GitHub while the loop was bouncing/parking it. Absorb:
     settle terminal, clear the handback markers + blocked/awaiting files, reclaim the worktree, and

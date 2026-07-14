@@ -181,10 +181,17 @@
         '<button class="btn ghost" data-tidy-close>Close</button></div>');
   }
 
-  // i23 -> SL-23 (the flight number everywhere else on the field); a non-iN id shows as-is.
+  // i23 -> SL-23 (the flight number everywhere else on the field). a1 -> A-1: a finished answerer
+  // session (issue #132) gets its own short code, mirroring the SL- flight code so it reads at a
+  // glance as a helper session, not a flight — and fits the same narrow flight column. Any other id
+  // shows as-is.
   function flightLabel(id) {
-    var m = /^i(\d+)$/.exec(String(id || ""));
-    return m ? "SL-" + m[1] : String(id || "?");
+    var s = String(id || "");
+    var m = /^i(\d+)$/.exec(s);
+    if (m) { return "SL-" + m[1]; }
+    var a = /^a(\d+)$/.exec(s);
+    if (a) { return "A-" + a[1]; }
+    return s || "?";
   }
 
   function setBody(html) {
