@@ -33,9 +33,13 @@
   <!-- Issue #41: the Tidy button's confirm dialog — the one ops-verb overlay (runs `superlooper
        tidy` locally). Loaded before shell.js so window.CCTidy exists when the button binds it. -->
   <script src="/tidy.js"></script>
-  <!-- Issue #116: the Restart button's confirm dialog — the second ops-verb overlay (runs
+  <!-- Issue #116: the Restart button's confirm dialog — an ops-verb overlay (runs
        `superlooper request-restart` locally). Loaded before shell.js so window.CCRestart exists. -->
   <script src="/restart.js"></script>
+  <!-- Issue #121: the Janitor sweep dialog — an ops-verb overlay (runs `superlooper janitor`
+       locally to clear GitHub debris). Loaded before shell.js so window.CCJanitor exists when the
+       button binds it. -->
+  <script src="/janitor.js"></script>
   <script src="/shell.js"></script>
 </body>
 </html>

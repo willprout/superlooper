@@ -1303,31 +1303,121 @@ def _janitor_execute(p):
     return ok, ("" if ok else "gh refused the write (or was unreachable)")
 
 
+def _janitor_read_state(home, retry_refused):
+    """The two fail-closed reads every janitor sweep depends on. Returns
+    (ls_issues, refused_map, refused_keys, error) — `error` is None on success, else a
+    human-readable string (the caller decides stderr vs a JSON envelope). Either read failing
+    closed (present-but-unreadable) means nothing is provably safe, so the caller must refuse
+    the whole sweep — exactly as the interactive path does."""
+    ls = _janitor_loopstate(home)
+    if ls is None:
+        return None, None, None, ("state/issues.json exists but is unreadable — nothing is "
+                                  "provably idle, so nothing will be proposed. Fix or remove "
+                                  "it, then re-run.")
+    refused_map = _janitor_refused_read(os.path.join(home, "state", _REFUSED_FILE))
+    if refused_map is None:
+        return None, None, None, (f"state/{_REFUSED_FILE} exists but is unreadable — running "
+                                  "would silently drop every held-back refused action. Fix or "
+                                  "remove it, then re-run.")
+    refused_keys = set() if retry_refused else set(refused_map)
+    return ls, refused_map, refused_keys, None
+
+
+def _janitor_execute_subset(args, home, days, dev):
+    """Execute EXACTLY the approved keys the command center tapped (comma-separated in
+    --execute-keys), through the SAME reconcile → execute → journal → refused-holdback flow the
+    interactive `--yes` path uses. Machine output only: one JSON result object. Nothing weakens
+    a safety rule — a FRESH re-derivation still gates every action (act-time re-verification: a
+    key that moved, went in-flight, or is no longer proposed is skipped, never forced), and a
+    currently-refused key is held back unless --retry-refused is given (holdback parity)."""
+    keys = [k for k in (args.execute_keys or "").split(",") if k]
+    ls, refused_map, _refused_keys, err = _janitor_read_state(home, retry_refused=True)
+    if err is not None:
+        print(json.dumps({"ok": False, "error": err}))
+        return 1
+    now = time.time()
+    # refused=set(): the holdback is applied per-key below (an explicit tap of a held key with
+    # --retry-refused must be able to run); reconcile just needs the full fresh eligibility set.
+    fresh = janitor_lib.propose(**_janitor_fetch(ls), now=now, aged_park_days=days,
+                                refused=set(), dev_branch=dev)
+    to_run, skipped = janitor_lib.reconcile([{"key": k} for k in keys], fresh["proposals"])
+    refused_path = os.path.join(home, "state", _REFUSED_FILE)
+    results, executed, failed = [], 0, 0
+    for p in skipped:
+        results.append({"key": p["key"], "outcome": "skipped",
+                        "reason": "no longer eligible (state moved, or not a current proposal)"})
+    if getattr(args, "dry_run", False):
+        # --dry-run wins over --execute-keys: report what WOULD run, write NOTHING (no gh write, no
+        # journal, no refused-map save) — the CLI's documented "change nothing" contract holds even
+        # when a subset was named. (Not a path the command center takes; a CLI-only safety net.)
+        for p in to_run:
+            outcome = ("held" if (p["key"] in refused_map and not args.retry_refused)
+                       else "would-run")
+            results.append({"key": p["key"], "action": p["action"], "target": p["target"],
+                            "outcome": outcome})
+        print(json.dumps({"ok": True, "results": results, "executed": 0, "failed": 0,
+                          "skipped": sum(1 for r in results if r["outcome"] == "skipped"),
+                          "held": sum(1 for r in results if r["outcome"] == "held")}))
+        return 0
+    for p in to_run:
+        if p["key"] in refused_map and not args.retry_refused:
+            # held back from a prior failure — an explicit tap does not silently retry it; the
+            # owner must ask for a retry (parity with the CLI's --retry-refused holdback).
+            results.append({"key": p["key"], "outcome": "held",
+                            "reason": "held back from a prior failure — retry to act"})
+            continue
+        ok, reason = _janitor_execute(p)
+        journal.append(home, {"act": "janitor", "action": p["action"], "target": p["target"],
+                              "why": p["why"], "outcome": "ok" if ok else "fail",
+                              **({"reason": reason} if reason else {})}, now)
+        if ok:
+            refused_map.pop(p["key"], None)
+            executed += 1
+            results.append({"key": p["key"], "action": p["action"], "target": p["target"],
+                            "outcome": "ok"})
+        else:
+            refused_map[p["key"]] = {"reason": reason, "ts": now}
+            failed += 1
+            results.append({"key": p["key"], "action": p["action"], "target": p["target"],
+                            "outcome": "fail", "reason": reason})
+    os.makedirs(os.path.dirname(refused_path), exist_ok=True)   # a first sweep may precede any run
+    loopstate.save(refused_path, refused_map)
+    print(json.dumps({"ok": True, "results": results, "executed": executed, "failed": failed,
+                      "skipped": sum(1 for r in results if r["outcome"] == "skipped"),
+                      "held": sum(1 for r in results if r["outcome"] == "held")}))
+    return 1 if failed else 0
+
+
 def cmd_janitor(args):
     cfg = _load_config(args.repo)
     home = str(config_lib.state_home(cfg))
     days = cfg["janitor"]["aged_park_days"]
     dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
 
-    ls = _janitor_loopstate(home)
-    if ls is None:
-        print("janitor: state/issues.json exists but is unreadable — nothing is provably "
-              "idle, so nothing will be proposed. Fix or remove it, then re-run.",
-              file=sys.stderr)
-        return 1
+    if getattr(args, "execute_keys", None) is not None:
+        return _janitor_execute_subset(args, home, days, dev)
 
-    refused_path = os.path.join(home, "state", _REFUSED_FILE)
-    refused_map = _janitor_refused_read(refused_path)
-    if refused_map is None:
-        print(f"janitor: state/{_REFUSED_FILE} exists but is unreadable — running would "
-              "silently drop every held-back refused action. Fix or remove it, then re-run.",
-              file=sys.stderr)
+    ls, refused_map, refused_keys, err = _janitor_read_state(home, args.retry_refused)
+    if err is not None:
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": err}))
+        else:
+            print("janitor: " + err, file=sys.stderr)
         return 1
-    refused_keys = set() if args.retry_refused else set(refused_map)
+    refused_path = os.path.join(home, "state", _REFUSED_FILE)
 
     result = janitor_lib.propose(**_janitor_fetch(ls), now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)
     props, held = result["proposals"], result["refused"]
+
+    if getattr(args, "json", False):
+        # machine-readable propose: the full snapshot, one JSON object, and NOTHING is executed
+        # or written. The command center renders this exactly the way `--dry-run` prints for a
+        # human — same pure propose(), no re-derived safety anywhere.
+        print(json.dumps({"ok": True, "proposals": props, "held": held,
+                          "aged_park_days": days}))
+        return 0
+
     held_note = (f"({len(held)} previously refused action(s) held back — --retry-refused "
                  f"re-proposes them; see state/{_REFUSED_FILE})" if held else "")
 
@@ -1809,7 +1899,14 @@ def main(argv=None):
                               "into a schedule)"),
            "--retry-refused": dict(action="store_true",
                                    help="re-propose actions a previous sweep recorded as "
-                                        "refused/failed (state/janitor_refused.json)")})
+                                        "refused/failed (state/janitor_refused.json)"),
+           "--json": dict(action="store_true",
+                          help="machine-readable output: print the proposal snapshot as JSON "
+                               "and change nothing (the command center drives this)"),
+           "--execute-keys": dict(default=None, metavar="k1,k2",
+                                  help="execute EXACTLY these approved proposal keys "
+                                       "(comma-separated) — the command center's tapped subset; "
+                                       "implies --json output")})
 
     args = ap.parse_args(argv)
     return args.fn(args)

@@ -5,11 +5,19 @@ dashboard's local-command adapter (``lib/tidy.py``) runs against so no test ever
 sessions). The conftest guard already points ``SL_SUPERLOOPER`` at an absent path by default; a
 tidy test overrides it in-body to THIS executable.
 
-Point the adapter at it with ``SL_SUPERLOOPER=<path>/fake-superlooper`` and
-``SL_TIDY_FIXTURES=<dir>``. This models exactly the two subcommand shapes the Tidy button drives:
+Point the adapter at it with ``SL_SUPERLOOPER=<path>/fake-superlooper`` and a fixtures dir env —
+``SL_TIDY_FIXTURES`` (Tidy) or ``SL_JANITOR_FIXTURES`` (Janitor, issue #121). This models the
+subcommand shapes the two local-command buttons drive:
 
-    superlooper tidy --repo <path> --dry-run     → LISTS the windows tidy would close (closes none)
-    superlooper tidy --repo <path> --yes         → CLOSES them (skips the interactive y/N)
+    superlooper tidy --repo <path> --dry-run              → LISTS windows tidy would close
+    superlooper tidy --repo <path> --yes                  → CLOSES them (skips the y/N)
+    superlooper janitor --repo <path> --json              → PROPOSES GitHub debris as JSON
+    superlooper janitor --repo <path> --json --execute-keys k1,k2  → executes that tapped subset
+
+The janitor path prints ``$FIX/propose.json`` / ``$FIX/execute.json`` when present (a test can
+inject a fail-closed ``{"ok": false, ...}`` envelope), else a default 3-proposal snapshot / an
+ok-per-key result echoing the requested keys, and records a ``janitor_execute`` mutation carrying
+the exact keys so a test proves ONLY the tapped subset was sent.
 
 It also models the Restart button's shell (issue #116; see ``route_request_restart``):
 
@@ -40,7 +48,9 @@ import sys
 import time
 
 ARGS = sys.argv[1:]
-FIX = os.environ.get("SL_TIDY_FIXTURES", "")
+# One fixtures dir, whichever local-command button set it (Tidy or Janitor). calls.jsonl and
+# mutations.jsonl land here for either verb.
+FIX = os.environ.get("SL_TIDY_FIXTURES") or os.environ.get("SL_JANITOR_FIXTURES") or ""
 
 _DEFAULT_DRY_RUN = (
     "tidy will close 2 finished (merged) session window(s):\n"
@@ -52,6 +62,24 @@ _DEFAULT_EXECUTE = "tidy will close 2 finished (merged) session window(s):\n" \
                    "  i23   merged        cmux:surface-23\n" \
                    "  i16   merged        (no surface)\n" \
                    "closed 2 window(s).\n"
+
+# The default `janitor --json` snapshot: one proposal per debris class, in the CLI's exact
+# envelope shape ({"ok", "proposals":[{kind,key,action,target,why(,head|title)}], "held",
+# "aged_park_days"}), so lib/janitor.parse_propose / group_proposals run against the true format.
+_DEFAULT_PROPOSE = {
+    "ok": True,
+    "proposals": [
+        {"kind": "branch", "key": "branch:sl/i23-old-thing", "action": "delete-branch",
+         "target": "sl/i23-old-thing", "why": "PR #40 merged — the work is on the mainline"},
+        {"kind": "pr", "key": "pr:41", "action": "close-pr", "target": 41, "head": "sl/i18-x",
+         "why": "open but superseded — replaced by a rebuild; the branch stays"},
+        {"kind": "issue", "key": "issue:9", "action": "close-issue", "target": 9,
+         "title": "flaky retry logic",
+         "why": "parked and untouched for 30d (threshold 14d)"},
+    ],
+    "held": [],
+    "aged_park_days": 14,
+}
 
 
 def die(msg, code=1):
@@ -83,7 +111,33 @@ def opt(flag):
     return None
 
 
+def _janitor():
+    """`superlooper janitor --json [--execute-keys k1,k2]`. --execute-keys → the subset executor
+    (records a mutation carrying the exact keys, echoes one ok result per key); otherwise the
+    machine-readable propose. Exit code tracks the real CLI: nonzero when the envelope is a
+    fail-closed refusal (``ok: false``) or when an executed action failed (``failed > 0``)."""
+    keys_arg = opt("--execute-keys")
+    if keys_arg is not None:
+        keys = [k for k in keys_arg.split(",") if k]
+        record("janitor_execute", repo=opt("--repo"), keys=keys)
+        default = {"ok": True,
+                   "results": [{"key": k, "outcome": "ok"} for k in keys],
+                   "executed": len(keys), "failed": 0, "skipped": 0, "held": 0}
+        out = fixture("execute.json", json.dumps(default))
+    else:
+        out = fixture("propose.json", json.dumps(_DEFAULT_PROPOSE))
+    sys.stdout.write(out)
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        doc = {}
+    sys.exit(0 if (doc.get("ok") and not doc.get("failed")) else 1)
+
+
 def route():
+    if ARGS[:1] == ["janitor"]:
+        _janitor()
+        return
     if ARGS[:1] == ["request-restart"]:
         route_request_restart()
         return
@@ -133,10 +187,10 @@ def main():
     if FIX:
         with open(os.path.join(FIX, "calls.jsonl"), "a") as f:
             f.write(json.dumps({"argv": ARGS, "cwd": os.getcwd()}) + "\n")
-    if os.environ.get("SL_TIDY_SLEEP"):
-        time.sleep(float(os.environ["SL_TIDY_SLEEP"]))
-    if os.environ.get("SL_TIDY_FAIL"):
-        die("forced failure (SL_TIDY_FAIL)")
+    if os.environ.get("SL_TIDY_SLEEP") or os.environ.get("SL_JANITOR_SLEEP"):
+        time.sleep(float(os.environ.get("SL_TIDY_SLEEP") or os.environ.get("SL_JANITOR_SLEEP")))
+    if os.environ.get("SL_TIDY_FAIL") or os.environ.get("SL_JANITOR_FAIL"):
+        die("forced failure")
     route()
 
 

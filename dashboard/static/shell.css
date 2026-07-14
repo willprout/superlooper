@@ -139,16 +139,16 @@ html, body {
 .tidy-btn:hover { background: rgba(255, 255, 255, 0.13); color: #EAF0F6; }
 .tidy-btn[disabled] { opacity: 0.5; cursor: default; }
 
-/* Restart (issue #116) — the second ops-verb button, styled exactly like Tidy: a subtle secondary
-   control on the dark top bar, not a second blue CTA. "Turn the loop off and on again" is ops
-   housekeeping, not the primary decision surface. */
-.restart-btn {
+/* Restart (issue #116) + Janitor / Sweep (issue #121) — ops-verb buttons in the same local-command
+   class as Tidy, so they share Tidy's subtle ghost-on-dark treatment (housekeeping, not a blue
+   decision CTA). */
+.restart-btn, .janitor-btn {
   display: flex; align-items: center; gap: 7px;
   background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.16);
   color: #C6CFDA; border-radius: 6px; font: 600 12.5px var(--sans); padding: 6px 14px; cursor: pointer;
 }
-.restart-btn:hover { background: rgba(255, 255, 255, 0.13); color: #EAF0F6; }
-.restart-btn[disabled] { opacity: 0.5; cursor: default; }
+.restart-btn:hover, .janitor-btn:hover { background: rgba(255, 255, 255, 0.13); color: #EAF0F6; }
+.restart-btn[disabled], .janitor-btn[disabled] { opacity: 0.5; cursor: default; }
 
 /* ---- trouble banner (camera-independent, design §4/§5) ---- */
 .trouble {
@@ -1081,6 +1081,130 @@ html, body {
 .cc-tidy-result { font: 600 12.5px var(--sans); padding: 8px 11px; border-radius: 6px; }
 .cc-tidy-result.ok { color: var(--green); background: #EAF6EE; border: 1px solid #C6E6D1; }
 .cc-tidy-result.err { color: var(--red); background: #FBECEA; border: 1px solid #F0CFC9; }
+
+/* ==================== issue #121 — the Janitor "ramp sweep" dialog (16-bit ground crew) ==================== */
+/* Same modal skeleton as Tidy (a centered overlay OUTSIDE #root), but the joy gate (§0.1/§0.8) asks
+   for ground-crew energy, not a bare admin table: chunky pixel-art tiles with hard "sticker" shadows,
+   a pixel broom sprite, per-kind glyph chips, and a satisfying armed state when the owner taps a piece
+   of debris onto the sweep. Amber/gold SNES accents mark it a LOCAL command (like Tidy), never the
+   owner's word. Every proposal is an individual tap — there is no sweep-all. */
+.cc-janitor {
+  position: fixed; inset: 0; z-index: 78; display: none;
+  background: rgba(12, 17, 23, 0.55); align-items: flex-start; justify-content: center; padding: 20px;
+}
+.cc-janitor.open { display: flex; }
+.cc-jan-card {
+  margin-top: 10vh; width: min(600px, 94vw); max-height: 82vh; background: var(--panel);
+  border: 2px solid #05070A; border-radius: 8px;
+  box-shadow: 0 0 0 3px #C9D2DC, 10px 12px 0 rgba(15, 22, 34, 0.28); display: flex; flex-direction: column;
+}
+.cc-jan-head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 14px 18px; border-bottom: 2px solid #E4E9EF;
+  background: repeating-linear-gradient(45deg, #FBF7EC 0 6px, #F7F1DF 6px 12px);
+}
+.cc-jan-title { font: 700 12.5px var(--mono); letter-spacing: 1.5px; color: var(--ink); display: flex; align-items: center; gap: 8px; }
+.cc-jan-title b { color: var(--amber-ink); font-weight: 600; letter-spacing: 0.5px; }
+/* The pixel broom — a real 16x16 sprite, rendered crisp (image-rendering: pixelated), it gives a
+   little sweep on hover. The joy gate's "16-bit sprite, not an admin icon". */
+.cc-jan-sprite {
+  width: 20px; height: 20px; display: inline-block; image-rendering: pixelated;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' shape-rendering='crispEdges'%3E%3Crect x='11' y='2' width='3' height='2' fill='%238A5B10'/%3E%3Crect x='9' y='4' width='3' height='2' fill='%238A5B10'/%3E%3Crect x='7' y='6' width='3' height='2' fill='%238A5B10'/%3E%3Crect x='5' y='8' width='3' height='2' fill='%238A5B10'/%3E%3Crect x='3' y='10' width='5' height='2' fill='%235A6572'/%3E%3Crect x='2' y='12' width='7' height='2' fill='%23C77E1F'/%3E%3Crect x='2' y='14' width='7' height='1' fill='%23F2C94C'/%3E%3Crect x='2' y='15' width='1' height='1' fill='%23C77E1F'/%3E%3Crect x='4' y='15' width='1' height='1' fill='%23C77E1F'/%3E%3Crect x='6' y='15' width='1' height='1' fill='%23C77E1F'/%3E%3Crect x='8' y='15' width='1' height='1' fill='%23C77E1F'/%3E%3C/svg%3E") center/contain no-repeat;
+  transform-origin: 60% 90%;
+}
+.cc-jan-title:hover .cc-jan-sprite { animation: cc-jan-sweep 0.5s steps(3) 2; }
+@keyframes cc-jan-sweep { 0%,100% { transform: rotate(0deg); } 33% { transform: rotate(-16deg); } 66% { transform: rotate(12deg); } }
+.cc-jan-sub { font: 400 10.5px/1.5 var(--sans); color: var(--faint); flex: 1 1 220px; }
+.cc-jan-sub code { font: 500 10px var(--mono); color: var(--ink-3); background: #F1F4F8; padding: 1px 5px; border-radius: 3px; }
+.cc-jan-x {
+  margin-left: auto; align-self: center; background: none; border: 2px solid #C9D2DC; color: var(--muted);
+  border-radius: 4px; width: 24px; height: 24px; cursor: pointer; font: 600 12px var(--sans);
+}
+.cc-jan-x:hover { background: #EEF2F6; color: var(--ink); }
+.cc-jan-body { overflow-y: auto; padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 14px; }
+.cc-jan-loading { font: 500 12px var(--mono); color: var(--muted); padding: 6px 0; }
+.cc-jan-empty {
+  font: 700 13px var(--mono); color: var(--green); padding: 14px 12px; text-align: center;
+  background: #EAF6EE; border: 2px solid #C6E6D1; border-radius: 6px; box-shadow: 3px 3px 0 #D6ECDD;
+}
+.cc-jan-lead { font: 400 12.5px/1.55 var(--sans); color: var(--ink-2); }
+.cc-jan-list { display: flex; flex-direction: column; gap: 14px; }
+/* A debris pile per kind — a chunky pixel tile with a hard shadow. */
+.cc-jan-group {
+  border: 2px solid #05070A; border-radius: 6px; background: #F5F7FA; box-shadow: 4px 4px 0 #DDE3EB;
+  padding: 8px; display: flex; flex-direction: column; gap: 6px;
+}
+.cc-jan-group-head {
+  font: 700 10.5px var(--mono); letter-spacing: 0.8px; text-transform: uppercase; color: var(--ink-2);
+  display: flex; align-items: center; gap: 7px; padding: 1px 2px;
+}
+.cc-jan-count {
+  font: 700 9.5px var(--mono); color: var(--amber-ink); background: var(--amber-bg);
+  border: 1px solid var(--amber-border); border-radius: 4px; padding: 1px 6px;
+}
+/* Per-kind pixel glyph chip — a small square in the kind's accent, with a game-icon glyph. */
+.cc-jan-kind { width: 16px; height: 16px; border: 2px solid #05070A; border-radius: 3px; image-rendering: pixelated;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 9px; line-height: 1; }
+.cc-jan-branch .cc-jan-kind { background: #E6F0E8; }
+.cc-jan-branch .cc-jan-kind::before { content: "\1F33F"; }   /* branch → a sprig */
+.cc-jan-pr .cc-jan-kind { background: #EDE7F6; }
+.cc-jan-pr .cc-jan-kind::before { content: "\1F500"; }       /* PR → superseded/replaced */
+.cc-jan-issue .cc-jan-kind { background: #FBF2DE; }
+.cc-jan-issue .cc-jan-kind::before { content: "\1F4CB"; }    /* issue → a clipboard on the gate */
+/* One piece of debris — a tap target. Nothing is pre-selected; tapping ARMS it (a satisfying press
+   into the amber "loaded onto the cart" state with a pixel check). */
+.cc-jan-row {
+  display: grid; grid-template-columns: 20px 1fr; grid-template-areas: "check what" "check why";
+  gap: 1px 9px; align-items: center; padding: 7px 9px; border: 2px solid #E4E9EF; border-radius: 5px;
+  background: #FFF; box-shadow: 2px 2px 0 #E9EEF3; cursor: pointer; user-select: none;
+  transition: transform 0.05s ease, background 0.08s ease, border-color 0.08s ease;
+}
+.cc-jan-row:hover { border-color: #C6D0DA; background: #FAFCFE; }
+.cc-jan-check {
+  grid-area: check; width: 16px; height: 16px; border: 2px solid #8A94A0; border-radius: 3px;
+  background: #FFF; display: inline-flex; align-items: center; justify-content: center;
+  font: 700 11px var(--mono); color: var(--amber-ink); image-rendering: pixelated;
+}
+.cc-jan-what { grid-area: what; font: 600 12px var(--mono); color: var(--ink); word-break: break-word; }
+.cc-jan-why { grid-area: why; font: 400 11px/1.4 var(--sans); color: var(--muted); }
+.cc-jan-row.is-selected {
+  background: var(--amber-bg); border-color: var(--amber-ink); box-shadow: 3px 3px 0 var(--amber-border);
+  transform: translate(-1px, -1px);
+}
+.cc-jan-row.is-selected .cc-jan-check { background: var(--board-gold); border-color: var(--amber-ink); }
+.cc-jan-row:focus-visible { outline: 2px solid var(--amber-ink); outline-offset: 1px; }
+/* Held-back debris — a prior sweep's failure the CLI holds back. Shown once, muted, NOT tappable. */
+.cc-jan-held { border: 2px dashed #D8B36A; border-radius: 6px; background: #FCF6E7; padding: 8px 10px; }
+.cc-jan-held-head { font: 700 10px var(--mono); letter-spacing: 0.6px; text-transform: uppercase; color: var(--amber-ink); }
+.cc-jan-held-row { font: 500 11px var(--mono); color: var(--ink-3); padding: 2px 0; }
+.cc-jan-held-note { font: 400 10.5px/1.5 var(--sans); color: var(--muted); margin-top: 3px; }
+.cc-jan-held-note code { font: 500 10px var(--mono); color: var(--ink-3); background: #F1F4F8; padding: 1px 4px; border-radius: 3px; }
+.cc-jan-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+/* The consequence-stating confirm: a chunky pixel button that names exactly what the sweep will do. */
+.cc-jan-actions .btn.primary { border: 2px solid #05070A; box-shadow: 3px 3px 0 #16324F; }
+.cc-jan-actions .btn.primary:not([disabled]):active { transform: translate(1px, 1px); box-shadow: 1px 1px 0 #16324F; }
+/* The honest per-item result after a sweep — ok / fail / skipped / held, never a silent success. */
+.cc-jan-result { font: 700 12.5px var(--sans); padding: 8px 11px; border-radius: 6px; border: 2px solid; }
+.cc-jan-result.ok { color: var(--green); background: #EAF6EE; border-color: #C6E6D1; }
+.cc-jan-result.err { color: var(--red); background: #FBECEA; border-color: #F0CFC9; }
+.cc-jan-result .cc-jan-bad { color: var(--red); }
+.cc-jan-results { gap: 4px; }
+.cc-jan-res-row {
+  display: grid; grid-template-columns: 18px minmax(0, auto) 1fr; align-items: baseline; gap: 8px;
+  padding: 5px 9px; border-radius: 5px; background: #F5F7FA; border: 1px solid #E4E9EF;
+}
+.cc-jan-res-glyph { font: 700 12px var(--mono); }
+.cc-jan-res-key { font: 600 11px var(--mono); color: var(--ink); }
+.cc-jan-res-reason { font: 400 10.5px var(--sans); color: var(--muted); }
+.cc-jan-res-ok { background: #EEF7F1; border-color: #CDE7D6; }
+.cc-jan-res-ok .cc-jan-res-glyph { color: var(--green); }
+.cc-jan-res-fail { background: #FBECEA; border-color: #F0CFC9; }
+.cc-jan-res-fail .cc-jan-res-glyph { color: var(--red); }
+.cc-jan-res-held .cc-jan-res-glyph, .cc-jan-res-skipped .cc-jan-res-glyph { color: var(--amber-ink); }
+@media (prefers-reduced-motion: reduce) {
+  .cc-jan-title:hover .cc-jan-sprite { animation: none; }
+  .cc-jan-row, .cc-jan-actions .btn.primary { transition: none; }
+}
 
 /* ============================ the Restart button's dialog (issue #116) ============================ */
 /* A sibling of Tidy above — the same modal chrome and design tokens so the two ops-verb overlays
