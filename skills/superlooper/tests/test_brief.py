@@ -135,6 +135,37 @@ def test_investigate_has_no_pr_guidance(_sl_home):
     assert "root-cause report" in out, "the assumption hint should point at the report instead"
 
 
+# --------------------------------------------------------------------------- drive step (issue #101)
+# The BUILD / diagnose-and-fix ship gate's "drive it" step must be honestly satisfiable by ANY repo,
+# not just a web app. #57 fixed this same non-web mismatch for the report_required_sections DEFAULT;
+# this fixes it in the brief PROSE. A CLI / API / library / service worker has no browser to drive,
+# so a browser-ONLY step 2 left every non-web worker with an instruction it could not honestly
+# follow (fudge it, or be stuck). The reworded step keeps the "drive the REAL feature end-to-end,
+# not just the tests" intent AND still names a REAL browser for the web case (DoD: web repos still
+# get a browser-drive instruction). diagnose-and-fix reuses the build ship gate, so both are pinned.
+
+def _ship_gate(out):
+    """The ship-gate block only (build / diagnose-and-fix): from the Ship gate header to the next
+    footer section, so an unrelated footer token can't vacuously satisfy a drive-step assertion."""
+    return out.split("**Ship gate", 1)[1].split("**Blocked?", 1)[0]
+
+
+@pytest.mark.parametrize("itype", ["build", "diagnose-and-fix"])
+def test_ship_gate_drive_step_is_honest_for_non_web(_sl_home, itype):
+    gate = _ship_gate(brief.build(_issue(type=itype), _cfg(_sl_home)))
+    assert "end-to-end" in gate, "the drive step must keep the drive-the-real-feature-end-to-end intent"
+    assert any(tok in gate for tok in ("CLI", "API", "library", "service")), \
+        "the drive step must name a non-web surface a non-web (CLI/library/service) repo can honestly drive"
+
+
+@pytest.mark.parametrize("itype", ["build", "diagnose-and-fix"])
+def test_ship_gate_drive_step_still_covers_web(_sl_home, itype):
+    # DoD: web repos still get a browser-drive instruction — the reworded prose keeps a REAL browser
+    # as the web-app case (this also keeps test_build_footer_has_ship_gate's "REAL browser" green).
+    gate = _ship_gate(brief.build(_issue(type=itype), _cfg(_sl_home)))
+    assert "REAL browser" in gate, "the web case must still name a real browser to drive"
+
+
 # --------------------------------------------------------------------------- bright lines
 def test_bright_lines_injected_verbatim(_sl_home):
     lines = ["Force-push is forbidden.", "Ship EXCLUSIVELY via scripts/ship.sh."]
