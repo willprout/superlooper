@@ -93,6 +93,16 @@ def test_held_back_actions_are_surfaced():
     assert re.search(r"\.held", _JAN_JS), "janitor.js must surface the server's held-back keys"
 
 
+def test_proposal_rows_are_keyboard_operable():
+    # A proposal row is role="checkbox" tabindex="0"; a <div> does not fire click on Space/Enter, so
+    # janitor.js must wire a keydown handler that toggles selection AND keep aria-checked honest — a
+    # keyboard-only owner must be able to arm debris, and a screen reader must announce the real state.
+    assert re.search(r"Enter", _JAN_JS) and re.search(r'e\.key', _JAN_JS), (
+        "janitor.js must handle Space/Enter to toggle a focused proposal row")
+    assert re.search(r'setAttribute\(\s*["\']aria-checked', _JAN_JS), (
+        "toggle() must update aria-checked so the a11y state never goes stale")
+
+
 def test_shell_has_a_janitor_button_carrying_the_camera_repo():
     m = re.search(r'data-act="janitor-open"[\s\S]{0,140}?data-repo=', _SHELL_JS) or \
         re.search(r'data-repo=[\s\S]{0,140}?data-act="janitor-open"', _SHELL_JS)

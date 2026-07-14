@@ -1346,6 +1346,19 @@ def _janitor_execute_subset(args, home, days, dev):
     for p in skipped:
         results.append({"key": p["key"], "outcome": "skipped",
                         "reason": "no longer eligible (state moved, or not a current proposal)"})
+    if getattr(args, "dry_run", False):
+        # --dry-run wins over --execute-keys: report what WOULD run, write NOTHING (no gh write, no
+        # journal, no refused-map save) — the CLI's documented "change nothing" contract holds even
+        # when a subset was named. (Not a path the command center takes; a CLI-only safety net.)
+        for p in to_run:
+            outcome = ("held" if (p["key"] in refused_map and not args.retry_refused)
+                       else "would-run")
+            results.append({"key": p["key"], "action": p["action"], "target": p["target"],
+                            "outcome": outcome})
+        print(json.dumps({"ok": True, "results": results, "executed": 0, "failed": 0,
+                          "skipped": sum(1 for r in results if r["outcome"] == "skipped"),
+                          "held": sum(1 for r in results if r["outcome"] == "held")}))
+        return 0
     for p in to_run:
         if p["key"] in refused_map and not args.retry_refused:
             # held back from a prior failure — an explicit tap does not silently retry it; the

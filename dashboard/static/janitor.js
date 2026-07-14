@@ -77,7 +77,15 @@
       if (row) { toggle(row.getAttribute("data-jan-key")); return; }
     });
     document.addEventListener("keydown", function (e) {
-      if (isOpen() && e.key === "Escape" && !busy) close();
+      if (!isOpen()) return;
+      if (e.key === "Escape" && !busy) { close(); return; }
+      // A proposal row is role="checkbox" tabindex="0"; a <div> doesn't synthesize a click on
+      // Space/Enter, so wire it explicitly — a keyboard-only owner must be able to arm debris too.
+      if (e.key === " " || e.key === "Enter" || e.key === "Spacebar") {
+        var t = e.target;
+        var row = t && t.closest ? t.closest("[data-jan-key]") : null;
+        if (row) { e.preventDefault(); toggle(row.getAttribute("data-jan-key")); }
+      }
     });
   }
 
@@ -152,6 +160,7 @@
     var row = node.querySelector('[data-jan-key="' + cssEsc(key) + '"]');
     if (row) {
       row.classList.toggle("is-selected", !!selected[key]);
+      row.setAttribute("aria-checked", selected[key] ? "true" : "false");   // keep a11y state honest
       var box = row.querySelector(".cc-jan-check");
       if (box) box.textContent = selected[key] ? "✓" : "";
     }
@@ -256,13 +265,16 @@
         '<span class="cc-jan-res-key">' + esc(r.key) + '</span>' + reason +
       '</div>';
     }).join("");
-    var swept = b.executed || 0;
+    // Counts come from the trusted local CLI as integers, but coerce anyway — the escaping
+    // discipline says no field reaches innerHTML without being made safe first.
+    var swept = Number(b.executed) || 0;
+    var nFailed = Number(b.failed) || 0, nSkipped = Number(b.skipped) || 0, nHeld = Number(b.held) || 0;
     var parts = ['<b>' + swept + '</b> swept'];
-    if (b.failed) parts.push('<b class="cc-jan-bad">' + b.failed + '</b> failed');
-    if (b.skipped) parts.push(b.skipped + ' skipped');
-    if (b.held) parts.push(b.held + ' held');
-    var cls = b.failed ? "err" : "ok";
-    var glyph = b.failed ? "⚠" : "✓";
+    if (nFailed) parts.push('<b class="cc-jan-bad">' + nFailed + '</b> failed');
+    if (nSkipped) parts.push(nSkipped + ' skipped');
+    if (nHeld) parts.push(nHeld + ' held');
+    var cls = nFailed ? "err" : "ok";
+    var glyph = nFailed ? "⚠" : "✓";
     setBody(
       '<div class="cc-jan-result ' + cls + '">' + glyph + ' ' + parts.join(' · ') + '.</div>' +
       '<div class="cc-jan-list cc-jan-results">' + rows + '</div>' +

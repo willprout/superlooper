@@ -1927,6 +1927,21 @@ def test_janitor_execute_keys_failure_is_held_back_then_retryable(rig):
     assert _janitor_refused(rig) == {}
 
 
+def test_janitor_execute_keys_with_dry_run_changes_nothing(rig):
+    # --dry-run wins over --execute-keys: it re-derives and reports what WOULD run, but performs no
+    # gh write, no journal, no refused-map write (the CLI's documented "change NOTHING" contract).
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--json", "--execute-keys", "pr:14,issue:9", "--dry-run",
+            "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["executed"] == 0
+    assert {x["key"]: x["outcome"] for x in doc["results"]} == {
+        "pr:14": "would-run", "issue:9": "would-run"}
+    assert mutations(rig) == [] and _janitor_journal(rig) == []
+    assert _janitor_refused(rig) is None      # nothing written anywhere
+
+
 def test_janitor_execute_keys_unreadable_loopstate_refuses(rig):
     _seed_janitor_fixtures(rig)
     home = _janitor_home(rig)

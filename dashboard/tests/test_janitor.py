@@ -165,6 +165,22 @@ def test_execute_ignores_wrong_typed_keys(jan_fix):
     assert argv[argv.index("--execute-keys") + 1] == "pr:41"
 
 
+def test_execute_drops_a_key_containing_a_comma(jan_fix):
+    # keys are transported comma-joined; a comma-bearing key would round-trip wrong, so it fails
+    # closed (dropped) — never split into two keys that could touch something the owner didn't tap.
+    verb, fixtures = jan_fix
+    res = verb.execute(SLUG, ["branch:sl/foo,bar", "pr:41"])
+    assert res["ok"] is True
+    argv = _calls(fixtures)[-1]["argv"]
+    assert argv[argv.index("--execute-keys") + 1] == "pr:41"   # only the clean key survives
+
+
+def test_execute_with_only_comma_keys_is_refused(jan_fix):
+    verb, fixtures = jan_fix
+    res = verb.execute(SLUG, ["branch:a,b"])
+    assert res["ok"] is False and _calls(fixtures) == []       # nothing left → refused, no subprocess
+
+
 def test_unknown_repo_is_refused_before_any_subprocess(jan_fix):
     verb, fixtures = jan_fix
     assert verb.propose("someone/else")["error"] == "unknown repo"

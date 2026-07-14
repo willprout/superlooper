@@ -203,7 +203,11 @@ class Janitor:
         path = self._paths.get(repo)
         if path is None:
             return self._refuse("janitor")
-        keys = [k for k in keys if isinstance(k, str) and k] if isinstance(keys, list) else []
+        # keys are transported to the CLI comma-joined, so a key containing a comma would round-trip
+        # wrong (splitting into two). Tool-minted keys are comma-free by construction; a comma-bearing
+        # key is anomalous, so it fails closed (dropped) rather than corrupting the subset.
+        keys = ([k for k in keys if isinstance(k, str) and k and "," not in k]
+                if isinstance(keys, list) else [])
         if not keys:
             return {"ok": False, "verb": "janitor", "repo": repo, "results": [], "executed": 0,
                     "failed": 0, "skipped": 0, "held": 0, "error": "no proposals selected"}
