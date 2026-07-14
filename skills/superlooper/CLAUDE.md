@@ -51,10 +51,12 @@ directives are fixed points — never relitigate them, never safety-creep around
   lives in `lib/` so it is testable without cmux/GitHub.
 - Every review by a fresh agent that did not write the code. This repo has no built-in
   review pipeline, so the duty is explicit (owner directive 2026-07-02): **every exec/build
-  session ends its task with a cross-review** — `/cross-review` (Codex second opinion) by
-  default, a fresh subagent reviewer if Codex is unavailable. P0/P1 findings are fixed
-  before the task's final commit. This is a non-regulated project: at most 2 review/fix
-  rounds per change, then stop and present William a consolidated decision.
+  session ends its task with a cross-review** — `/superlooper:cross-review` (Codex second
+  opinion) by default, a fresh subagent reviewer if Codex is unavailable. P0/P1 findings are
+  fixed before the task's final commit. This is a non-regulated project: at most 2 review/fix
+  rounds per change, then stop and present William a consolidated decision. (Transition note:
+  the machine-local cross-review command may coexist with this namespaced skill until the
+  owner retires it — owner decision O3.)
 - Never claim done without evidence: run the tests, run the dry-run harness, show output.
 - **No test may reach a real external binary** (cmux, osascript, gh, claude) — conftest
   neutralizes the resolution env vars by default (autouse), and a guard test fails if the
