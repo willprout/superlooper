@@ -204,7 +204,14 @@ ALERT_MESSAGES = {
                           "launches resume automatically once the tab's pane resolves again.",
     "launch_systemic_failure": "launches are failing delivery across multiple issues — a systemic "
                                "launch fault, not an issue-specific one. The queue is held intact "
-                               "(nothing parked); check the cmux anchor / restart in a visible tab.",
+                               "(nothing parked). The usual cause when this trips after you walk "
+                               "away is macOS App Nap suspending an idle/occluded cmux: it still "
+                               "answers new-surface but defers spawning the tab's shell past the "
+                               "verify window, so no worker starts. Fix: run "
+                               "`defaults write com.cmuxterm.app NSAppSleepDisabled -bool true` "
+                               "(or re-run bin/install-launch-shim.sh), then FULLY QUIT and "
+                               "relaunch cmux in a visible tab and restart the runner — the flag is "
+                               "read only at app launch. If it persists, check the cmux anchor.",
 }
 
 

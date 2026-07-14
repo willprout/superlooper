@@ -78,6 +78,10 @@ def _healthy_probe():
             "/Applications/cmux.app/Contents/Resources/bin/cmux": {
                 "path": "/Applications/cmux.app/Contents/Resources/bin/cmux",
             },
+            "defaults": {
+                "path": "defaults",
+                ("read", "com.cmuxterm.app", "NSAppSleepDisabled"): (0, "1\n", ""),
+            },
         },
         files={
             "/home/will/.superlooper/launch-shim.zsh": "# shim\n",
@@ -107,6 +111,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("gh API headroom", True),
         ("notify channel", True),
         ("launch shim sourced", True),
+        ("cmux App Nap disabled", True),
         ("runner anchor (live)", True),      # no repo in this config -> cleanly skipped, passes
         ("installed engine current", True),  # no VERSION stamp injected -> cleanly skipped, passes
     ]
@@ -272,6 +277,83 @@ def test_launch_shim_filename_comment_does_not_count_as_sourced():
 
     assert result.ok is False
     assert "install-launch-shim.sh" in result.fix
+
+
+# --- cmux App Nap: the launch-delivery-dies-40-min-after-you-walk-away killer (issue #120) ----
+# With display/system sleep disabled, macOS App Nap is the one mechanism that suspends an idle,
+# occluded cmux while the system stays awake — a napped cmux answers new-surface (returns a UUID)
+# but defers spawning the tab's shell past the 30s verify window, so no worker starts (rc=2) and
+# the systemic breaker trips ~40 min after the operator walks away. The cure is the persistent
+# `NSAppSleepDisabled` default on the cmux bundle; the doctor must FAIL loudly when it is absent.
+
+def test_app_nap_passes_when_nsappsleepdisabled_is_true():
+    probe = _healthy_probe()
+
+    result = stack_doctor.check_cmux_app_nap(probe)
+
+    assert result.ok is True and not getattr(result, "warn", False)
+    assert ["defaults", "read", "com.cmuxterm.app", "NSAppSleepDisabled"] in probe.calls
+
+
+def test_app_nap_fails_when_the_default_is_absent():
+    probe = _healthy_probe()
+    # Key/domain absent: `defaults read` exits 1 with a "does not exist" message on stderr.
+    probe.commands["defaults"][("read", "com.cmuxterm.app", "NSAppSleepDisabled")] = (
+        1, "", "The domain/default pair of (com.cmuxterm.app, NSAppSleepDisabled) does not exist\n")
+
+    result = stack_doctor.check_cmux_app_nap(probe)
+
+    assert result.ok is False
+    assert "NSAppSleepDisabled" in result.fix and "-bool true" in result.fix
+    assert "cmux" in result.fix.lower() and ("restart" in result.fix.lower()
+                                             or "relaunch" in result.fix.lower()
+                                             or "quit" in result.fix.lower())
+
+
+def test_app_nap_fails_when_the_default_is_explicitly_false():
+    probe = _healthy_probe()
+    probe.commands["defaults"][("read", "com.cmuxterm.app", "NSAppSleepDisabled")] = (0, "0\n", "")
+
+    result = stack_doctor.check_cmux_app_nap(probe)
+
+    assert result.ok is False
+    assert "-bool true" in result.fix
+
+
+def test_app_nap_honors_a_bundle_id_override():
+    probe = _healthy_probe()
+    probe.env["SL_CMUX_BUNDLE_ID"] = "com.example.other"
+    probe.commands["defaults"][("read", "com.example.other", "NSAppSleepDisabled")] = (0, "1\n", "")
+
+    result = stack_doctor.check_cmux_app_nap(probe)
+
+    assert result.ok is True
+    assert ["defaults", "read", "com.example.other", "NSAppSleepDisabled"] in probe.calls
+
+
+def test_app_nap_warns_but_does_not_fail_when_defaults_is_unavailable():
+    # No `defaults` binary resolvable (an unusual, non-macOS-ish env): the hazard cannot be read,
+    # so this must WARN (pass) rather than FAIL — we never fail the stack on an undeterminable state.
+    probe = _healthy_probe()
+    del probe.commands["defaults"]
+
+    result = stack_doctor.check_cmux_app_nap(probe)
+
+    assert result.ok is True
+    assert getattr(result, "warn", False) is True
+
+
+def test_app_nap_warns_when_the_read_errors_rather_than_reporting_absent():
+    # `defaults` resolves but the read fails to execute (rc 127 from Probe on an OSError) — that is
+    # NOT the documented "does not exist" (rc 1), so it must WARN (can't determine), never FAIL.
+    probe = _healthy_probe()
+    probe.commands["defaults"][("read", "com.cmuxterm.app", "NSAppSleepDisabled")] = (
+        127, "", "could not exec")
+
+    result = stack_doctor.check_cmux_app_nap(probe)
+
+    assert result.ok is True
+    assert getattr(result, "warn", False) is True
 
 
 # --- notify channel: verified by a real test send, not just "is it set" (issue #25) ---------
