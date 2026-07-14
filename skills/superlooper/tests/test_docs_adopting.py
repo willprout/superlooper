@@ -19,7 +19,11 @@ import re
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-_DOC = _ROOT / "docs" / "ADOPTING.md"
+# ADOPTING.md now rides the gated payload under `skill/` so it publishes to the stable path
+# `~/.claude/skills/superlooper/docs/ADOPTING.md` (issue #85, design §6.3 / D9). It used to sit
+# at `docs/ADOPTING.md` outside the payload; the relocation is what gives the `adopt` skill a
+# published contract to route to on any machine where the CLI exists.
+_DOC = _ROOT / "skill" / "docs" / "ADOPTING.md"
 _CLI = _ROOT / "skill" / "bin" / "superlooper"
 
 

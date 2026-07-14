@@ -17,7 +17,8 @@ never a mechanical switch.
 **This is a universal skill.** It runs on any repo through one per-repo config
 (`.superlooper/config.json`); nothing repo-specific is hardcoded here. Repo-specific facts (an
 eApp's `ship.sh`, its bright-line areas, its required checks) enter only through that config —
-see `docs/ADOPTING.md` in the superlooper source repo.
+see the published `docs/ADOPTING.md` contract at `~/.claude/skills/superlooper/docs/ADOPTING.md`
+(the **adopt** skill wires up a repo from scratch).
 
 ## Router — for the job in front of you, open the one reference or invoke the one sibling skill
 
