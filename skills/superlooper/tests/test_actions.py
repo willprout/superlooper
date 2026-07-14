@@ -296,6 +296,21 @@ def test_usage_stale_alert_text_names_the_three_causes_and_the_remedy():
     assert "superlooper doctor" in low
 
 
+def test_systemic_launch_failure_alert_names_app_nap_and_the_exact_remedy():
+    # The systemic launch breaker trips exactly when the operator has walked away (issue #120) — the
+    # moment they most need the alert to name the real cause. The message must name macOS App Nap and
+    # carry the exact `defaults write` command + the cmux-relaunch step, so a "walked away" breaker
+    # trip is never silent about what to run.
+    msg = actions._alert_message("launch_systemic_failure")
+    low = msg.lower()
+    assert "app nap" in low or "app-nap" in low
+    assert "defaults write com.cmuxterm.app nsappsleepdisabled -bool true" in low
+    # must tell the operator to relaunch cmux (the flag is read only at app launch):
+    assert any(w in low for w in ("relaunch", "restart", "quit"))
+    # the breaker's hold-the-queue behavior is unchanged — the message still says the queue is held:
+    assert "held" in low or "intact" in low
+
+
 def test_restart_mid_outage_keeps_failing_open_and_never_false_recovers():
     # The dark-meter EPISODE marker (the usage_stale ALERT) is durable, but the runner's in-memory
     # grace clock resets on restart. On the first tick after a restart DURING an ongoing outage, the

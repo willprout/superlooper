@@ -41,6 +41,13 @@ def _clear_worker_launch_env(monkeypatch):
         # external binary" ratchet. Neutralize them so such a call resolves to no source checkout.
         "SL_SOURCE_REPO",
         "SL_GIT",
+        # App Nap check overrides (issue #120): same ratchet. stack_doctor.check_cmux_app_nap runs
+        # `defaults read <bundle> NSAppSleepDisabled`, and cmd_stack_doctor builds a REAL Probe. An
+        # ambient SL_DEFAULTS (pointing at real /usr/bin/defaults) or SL_CMUX_BUNDLE_ID would send a
+        # FakeProbe-less doctor test to the host's real user defaults — against the "no test reaches a
+        # real external binary / reads real macOS defaults" rule. Neutralize so such a call can't.
+        "SL_DEFAULTS",
+        "SL_CMUX_BUNDLE_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 

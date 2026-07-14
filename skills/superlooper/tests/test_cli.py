@@ -333,7 +333,19 @@ def _stack_env(rig, *, gh_remaining=4999):
         "exit 64\n",
     )
     cmux = _write_exe(bindir / "cmux", "#!/bin/sh\nexit 0\n")
-    return {"SL_CODEX": codex, "SL_CLAUDE": claude, "SL_GH": gh, "SL_CMUX": cmux}
+    # `defaults` MUST be stubbed too (issue #120): the stack doctor now runs
+    # `defaults read com.cmuxterm.app NSAppSleepDisabled`, and cmd_stack_doctor builds a REAL Probe.
+    # Without this stub the CLI doctor would read the host's real com.cmuxterm.app domain — reaching a
+    # real external binary AND making the green-stack assertion depend on the host's actual cmux App
+    # Nap setting. Report App Nap disabled (rc 0, "1") so the healthy stack is green everywhere.
+    defaults = _write_exe(
+        bindir / "defaults",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = read ] && [ \"$3\" = NSAppSleepDisabled ]; then echo 1; exit 0; fi\n"
+        "exit 1\n",
+    )
+    return {"SL_CODEX": codex, "SL_CLAUDE": claude, "SL_GH": gh, "SL_CMUX": cmux,
+            "SL_DEFAULTS": defaults}
 
 
 def test_doctor_stack_ok_uses_fake_commands_and_mutates_nothing(rig):
@@ -351,7 +363,8 @@ def test_doctor_stack_ok_uses_fake_commands_and_mutates_nothing(rig):
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     for name in ("codex CLI", "cmux present", "claude login", "gh auth",
-                 "gh API headroom", "notify channel", "launch shim sourced"):
+                 "gh API headroom", "notify channel", "launch shim sourced",
+                 "cmux App Nap disabled"):
         assert name in out
     assert "required_checks" not in out
     # the one deliberate side effect is announced before it fires
@@ -403,12 +416,36 @@ def test_doctor_stack_fails_with_actionable_hint(rig):
     assert "Fix: Run" in out and "install-launch-shim.sh" in out
 
 
+def test_doctor_stack_flags_missing_app_nap_default(rig):
+    # Issue #120 end-to-end: when NSAppSleepDisabled is not set for the cmux bundle, `doctor --stack`
+    # must FAIL loudly with the exact remedy — this is the machine that systemically loses launch
+    # delivery ~40 min after the operator walks away. The `defaults` stub reports the key absent
+    # (rc 1), exactly as the real binary does on an un-nap-proofed machine.
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"cmd": "printf '%s\\n' \"$SL_TITLE\"", "imessage_to": None}
+    cfg_path.write_text(json.dumps(cfg))
+    (rig.home / ".zshrc").write_text('source "$HOME/.superlooper/launch-shim.zsh"\n')
+    env = _stack_env(rig)
+    env["SL_DEFAULTS"] = _write_exe(rig.tmp / "stack-bin" / "defaults-absent",
+                                    "#!/bin/sh\nexit 1\n")   # every read -> "does not exist"
+
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo), env_over=env)
+
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "FAIL cmux App Nap disabled" in out
+    assert "defaults write com.cmuxterm.app NSAppSleepDisabled -bool true" in out
+    assert any(w in out.lower() for w in ("relaunch", "restart", "quit"))
+
+
 def _codexless_stack_env(rig, **kw):
     """A healthy stack env with Codex made unresolvable: SL_CODEX unset AND PATH narrowed so
-    `shutil.which('codex')` misses too. The only `which` the stack doctor runs is for codex
-    (claude/gh/cmux resolve via their SL_* env); PATH keeps the rig's jq bin plus /usr/bin:/bin so
-    notify's `bash -lc` still resolves, but no standard installer ever puts codex in those dirs —
-    so 'Codex is absent' stays hermetic regardless of what the host machine has installed."""
+    `shutil.which('codex')` misses too. codex/claude/gh/cmux/defaults all resolve via their SL_* env
+    (SL_DEFAULTS keeps the App Nap read off the host's real com.cmuxterm.app domain), so the only
+    unresolved `which` left is for codex; PATH keeps the rig's jq bin plus /usr/bin:/bin so notify's
+    `bash -lc` still resolves, but no standard installer ever puts codex in those dirs — so 'Codex is
+    absent' stays hermetic regardless of what the host machine has installed."""
     env = _stack_env(rig, **kw)
     del env["SL_CODEX"]
     env["PATH"] = f"{rig.tmp / 'bin'}:/usr/bin:/bin"

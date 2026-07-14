@@ -16,6 +16,12 @@ import notify
 
 
 _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+# cmux's CFBundleIdentifier — the macOS user-defaults domain App Nap reads NSAppSleepDisabled from
+# (verified from /Applications/cmux.app/Contents/Info.plist). Overridable via SL_CMUX_BUNDLE_ID for
+# a differently-signed build or a test. See check_cmux_app_nap.
+_CMUX_BUNDLE_ID = "com.cmuxterm.app"
+_APP_NAP_TRUE = {"1", "yes", "true", "on"}
+_APP_NAP_FALSE = {"0", "no", "false", "off"}
 GH_MIN_REMAINING = 500
 
 # The one message the doctor actually sends to prove the channel. Static (no clock) so the check
@@ -334,6 +340,80 @@ def check_launch_shim(probe):
     )
 
 
+def check_cmux_app_nap(probe):
+    """cmux must have App Nap disabled, or overnight launch delivery dies ~40 min after the operator
+    walks away (issue #120). With display/system sleep disabled (`pmset` displaysleep=0, sleep=0),
+    macOS App Nap is the ONE mechanism that suspends an idle, occluded cmux while the rest of the
+    machine stays fully awake: a napped cmux still answers `new-surface` (a surface UUID comes back
+    and a tab appears) but defers spawning that tab's shell past launch-session.sh's 30s verify
+    window — so the launch shim never runs, no worker starts (rc=2 'LAUNCH NOT DELIVERED'), and
+    enough back-to-back failures trip the systemic launch breaker. The cure is the persistent
+    `NSAppSleepDisabled` default on the cmux bundle, which AppKit reads at app launch.
+
+    FAIL loudly (like check_launch_shim) when the default is absent or explicitly false — that is a
+    machine that WILL systemically fail delivery once cmux naps. The `fix` names the exact command
+    AND that cmux must be fully relaunched (the flag is read only at startup, so a cmux already
+    running stays nap-eligible — the manual `defaults write` alone never protects the live app). An
+    undeterminable state (no `defaults` binary, or the read fails to execute — a non-macOS-ish env
+    where cmux would not run anyway) WARNs rather than FAILs: we never fail the stack on a state we
+    could not read."""
+    env = getattr(probe, "env", {}) or {}
+    bundle = env.get("SL_CMUX_BUNDLE_ID") or _CMUX_BUNDLE_ID
+    name = "cmux App Nap disabled"
+    fix = (
+        "Run `defaults write %s NSAppSleepDisabled -bool true` (or re-run "
+        "bin/install-launch-shim.sh), then FULLY QUIT and relaunch cmux — the flag is read only at "
+        "app launch, so a cmux that is already running stays App-Nap-eligible until you restart it."
+        % bundle
+    )
+    defaults = probe.command("defaults", envvar="SL_DEFAULTS", default="/usr/bin/defaults")
+    if not defaults:
+        return CheckResult(
+            name, True,
+            "could not find a `defaults` binary to read NSAppSleepDisabled for %s — App Nap state "
+            "unknown (cmux runs only on macOS, where `defaults` is always present)." % bundle,
+            warn=True)
+    proc = probe.run([defaults, "read", bundle, "NSAppSleepDisabled"])
+    rc = getattr(proc, "returncode", 1)
+    value = (getattr(proc, "stdout", "") or "").strip().lower()
+    if rc == 0:
+        if value in _APP_NAP_TRUE:
+            return CheckResult(
+                name, True,
+                "NSAppSleepDisabled=%s for %s (App Nap off; takes effect for cmux started AFTER it "
+                "was set, so relaunch cmux once if you enabled it while cmux was running)."
+                % (value, bundle))
+        if value in _APP_NAP_FALSE:
+            return CheckResult(
+                name, False,
+                "NSAppSleepDisabled=%s for %s — App Nap is explicitly ENABLED, so an idle/occluded "
+                "cmux gets napped and worker launches stop delivering ~40 min after you walk away."
+                % (value, bundle),
+                fix)
+        # Present but an unexpected value: don't silently trust it, but don't fail the stack on it.
+        return CheckResult(
+            name, True,
+            "NSAppSleepDisabled for %s read back an unexpected value %r — verify by hand with "
+            "`defaults read %s NSAppSleepDisabled`." % (bundle, value or "(empty)", bundle),
+            warn=True)
+    # rc 1 is `defaults`' own "does not exist" — a genuine ABSENT default (App Nap PERMITTED). Any
+    # OTHER non-zero (124 = our Probe's timeout, 127 = exec failure, or an unexpected error from a
+    # binary that did run) means the read is not trustworthy: can't determine -> WARN, never a
+    # false "App Nap permitted" FAIL.
+    if rc == 1:
+        return CheckResult(
+            name, False,
+            "NSAppSleepDisabled is not set for %s — macOS App Nap is PERMITTED, so an idle/occluded "
+            "cmux gets napped and defers spawning worker-tab shells past the 30s launch verify "
+            "window (the ~40-min-after-you-walk-away systemic launch failure)." % bundle,
+            fix)
+    return CheckResult(
+        name, True,
+        "could not read NSAppSleepDisabled for %s (`defaults read` exited %s) — App Nap state "
+        "unknown this run." % (bundle, rc),
+        warn=True)
+
+
 def _has_surface_row(out):
     """True if cmux `list-pane-surfaces` output contains a real surface row (`[* ]surface:<n> …`).
     The exact positive-signal test the runner's D7 preflight uses (bin/runner.py): judge on a real
@@ -575,6 +655,7 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_gh_headroom(probe),
         check_notify(config, config_error=config_error, sender=sender, announce=announce),
         check_launch_shim(probe),
+        check_cmux_app_nap(probe),
         check_runner_anchor(probe, config),
         check_engine_drift(probe, repo_path=repo_path, dev_branch=dev),
     ]
