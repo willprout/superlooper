@@ -576,6 +576,11 @@ class Runner:
         if not self.acquire_singleton():
             print("another runner is live for this state home — exiting", file=sys.stderr)
             return 1
+        # Hygiene (fresh-agent review): consume any lingering re-exec adopt token so it can never be
+        # inherited by a worker subprocess. acquire_singleton already pops it on the adoption path;
+        # this also covers the edge where the lock was externally deleted mid-exec and the reborn
+        # image took the normal-acquire path, leaving the token set.
+        os.environ.pop("SL_RESTART_ADOPT", None)
         self._stamp_state_format()                     # the live runner declares its state format (#45)
         self._write_anchor()                           # record the live launch anchor for doctor (#33)
         if self._reexec_adopted:
