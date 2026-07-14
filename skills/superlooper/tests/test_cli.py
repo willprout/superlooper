@@ -930,6 +930,64 @@ def test_run_fails_hard_when_no_pane_and_not_in_cmux(rig):
     assert "cmux tab" in (r.stdout + r.stderr).lower()
 
 
+# ------------- request-restart: the command-center Restart button's shell (issue #116) -------------
+
+def _state_dir(rig):
+    return rig.tmp / "slhome" / "o__r" / "state"
+
+
+def test_request_restart_drops_the_marker_when_a_runner_is_live(rig):
+    # A LIVE runner (its pidfile pid is alive — this test process stands in) ⇒ the request lands: the
+    # marker is dropped in the STATE HOME (never .superlooper/**), carrying the audit fields the
+    # runner journals when it honors the restart.
+    state = _state_dir(rig)
+    state.mkdir(parents=True)
+    (state / "runner.lock").write_text(str(os.getpid()))
+    r = cli(rig, "request-restart", "--repo", str(rig.repo), "--json",
+            "--operator", "William", "--source", "command-center")
+    assert r.returncode == 0, r.stdout + r.stderr
+    body = json.loads(r.stdout)
+    assert body["ok"] is True and body["running"] is True and body["requested"] is True
+    marker = json.loads((state / "runner.restart").read_text())
+    assert marker["source"] == "command-center" and marker["operator"] == "William"
+    assert isinstance(marker["requested_at"], (int, float))
+
+
+def test_request_restart_refuses_and_names_the_manual_start_when_no_runner_is_live(rig):
+    # Dead-runner case: a STALE pidfile (dead pid) ⇒ the button makes NO attempt to launch or place
+    # anything. It reports plainly that no loop is running and shows the one-line manual start.
+    state = _state_dir(rig)
+    state.mkdir(parents=True)
+    (state / "runner.lock").write_text("999999")             # a dead pid → no live runner
+    r = cli(rig, "request-restart", "--repo", str(rig.repo), "--json")
+    assert r.returncode != 0
+    body = json.loads(r.stdout)
+    assert body["ok"] is False and body["running"] is False
+    assert "superlooper run" in body["manual"]               # the one-line manual start
+    assert not (state / "runner.restart").exists()           # nothing written, nothing launched
+
+
+def test_request_restart_with_no_pidfile_at_all_refuses(rig):
+    # The loop never ran here (no state home) — still the dead-runner path, and it creates nothing.
+    r = cli(rig, "request-restart", "--repo", str(rig.repo), "--json")
+    assert r.returncode != 0
+    body = json.loads(r.stdout)
+    assert body["running"] is False and body["ok"] is False
+
+
+def test_request_restart_check_reports_liveness_without_writing(rig):
+    # --check is the button's preflight (like tidy --dry-run): it reports whether a live runner
+    # exists and writes NOTHING, so the confirm dialog can decide what to show before the owner taps.
+    state = _state_dir(rig)
+    state.mkdir(parents=True)
+    (state / "runner.lock").write_text(str(os.getpid()))
+    r = cli(rig, "request-restart", "--repo", str(rig.repo), "--check", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    body = json.loads(r.stdout)
+    assert body["running"] is True and body.get("requested") in (False, None)
+    assert not (state / "runner.restart").exists()           # --check writes nothing
+
+
 # ------------- run: runner-managed label boot preflight (issue #108) -------------
 
 def _cli_module():

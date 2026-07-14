@@ -36,6 +36,7 @@ import config as config_mod   # noqa: E402
 import desk as desk_mod       # noqa: E402
 import gh                     # noqa: E402
 import pollers                # noqa: E402
+import restart as restart_mod # noqa: E402
 import server                 # noqa: E402
 import tidy as tidy_mod       # noqa: E402
 import watchdog as watchdog_mod  # noqa: E402
@@ -134,6 +135,14 @@ def main(argv):
     # watched repo slug to its checkout (the `--repo` argument), so a tap can only ever tidy a repo
     # the operator chose to watch. Merged-only scope is enforced in lib/tidy (never passes `--all`).
     tidy = tidy_mod.Tidy(cfg["superlooper_cli"], {r["slug"]: r["path"] for r in cfg["repos"]})
+    # The Restart button (issue #116) — the SECOND local-command verb: it shells `superlooper
+    # request-restart` to ask the LIVE runner to restart itself in its own cmux tab (never a launch
+    # or a tab placement — that bright line stays). Bound to the same configured CLI path and the
+    # same watched-repo allow-list as Tidy, and signed with the operator so the runner journals who
+    # asked; the marker-writing + dead-runner refusal live in the engine (request-restart).
+    restart = restart_mod.Restart(cfg["superlooper_cli"],
+                                  {r["slug"]: r["path"] for r in cfg["repos"]},
+                                  operator=config_mod.operator(cfg))
     replay_provider, digest_provider = build_data_providers(cfg)
     # The bind (in build_server) is the first thing that can fail on an otherwise-valid config: the
     # configured port may be taken by a second command-center or another app. Answer it the way a bad
@@ -142,7 +151,8 @@ def main(argv):
     # serve_forever below keeps its own KeyboardInterrupt handling (issue #34).
     try:
         httpd = server.build_server(provider, static_dir, port=cfg["port"], actions=verbs,
-                                    desk=dashboard_desk, tidy=tidy, replay_provider=replay_provider,
+                                    desk=dashboard_desk, tidy=tidy, restart=restart,
+                                    replay_provider=replay_provider,
                                     digest_provider=digest_provider)
     except OSError as e:
         sys.stderr.write(_bind_error_line(cfg["port"], e))
