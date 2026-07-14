@@ -582,6 +582,135 @@ def test_launch_anchor_and_fail_ids_wrong_typed_never_raise_or_falsely_degrade()
             assert only(out, "alert") == []
 
 
+# =========================== canary re-arm of the systemic hold (#115) ===========================
+# The 2026-07-13 incident: three launch deliveries failed back-to-back, #24's breaker tripped
+# correctly (one park raced the streak, one alert, launches HELD) — but the hold never released on
+# its own. The systemic streak clears ONLY on a verified delivery, and with launches held no
+# delivery is ever attempted, so the loop sat healthy-but-frozen until a manual restart. Re-arm the
+# breaker: while the systemic hold stands, probe once per CANARY_RETRY_SECONDS with a SINGLE canary
+# launch of the front-of-queue issue. A verified delivery clears the streak; a failed canary
+# re-enters the hold, charging no per-issue cap and parking nothing.
+
+def _held(**over):
+    """A systemic-hold disk view (streak >= cap, probe ok, alert already on disk), plus a canary
+    clock stamped `age` seconds in the past (default: exactly one retry interval)."""
+    age = over.pop("age", actions.CANARY_RETRY_SECONDS)
+    d = dict(launch_anchor=_anchor_ok(), launch_fail_ids=["i5", "i6"],
+             launch_fail_at=NOW - age,
+             alert={"reasons": ["launch_systemic_failure"]})
+    d.update(over)
+    return disk(**d)
+
+
+def test_systemic_hold_fires_one_canary_of_the_front_of_queue_after_the_interval():
+    # After a full retry interval since the last delivery failure, decide probes with ONE canary
+    # launch — of the highest-priority queued issue, never the whole queue.
+    out = decide(now=NOW, dsk=_held(),
+                 parsed_issues=[parsed(5),
+                                parsed(6, labels=("agent-ready", "type:build", "priority:high")),
+                                parsed(7)])
+    launches = only(out, "launch")
+    assert len(launches) == 1                              # ONE probe, not a queue walk
+    assert launches[0]["id"] == "i6"                       # front-of-queue in PRIORITY order
+    assert launches[0].get("canary") is True
+    assert only(out, "park") == []                         # a probe never parks
+
+
+def test_systemic_hold_holds_and_does_not_canary_before_the_interval():
+    # Inside the interval the hold still governs: no launch, and the already-on-disk alert never
+    # repeats (no new notify per tick).
+    out = decide(now=NOW, dsk=_held(age=actions.CANARY_RETRY_SECONDS - 1),
+                 parsed_issues=[parsed(5), parsed(6)])
+    assert only(out, "launch") == []                       # interval not elapsed: still held
+    assert only(out, "park") == []
+    assert only(out, "alert") == [] and not has_notify(out)   # already alerted: no repeat
+
+
+def test_canary_probe_emits_no_new_alert_or_notify():
+    # The canary rides UNDER the original systemic alert: it adds no second alert and no second text.
+    out = decide(now=NOW, dsk=_held(), parsed_issues=[parsed(5), parsed(6), parsed(7)])
+    assert len(only(out, "launch")) == 1
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_no_canary_while_the_anchor_probe_itself_is_down():
+    # anchor_down self-re-arms via its per-tick probe; a canary into a probe-dead pane is wasted, so
+    # the streak-canary defers to the probe while the pane is reported dead.
+    out = decide(now=NOW,
+                 dsk=_held(launch_anchor=_anchor_down()),
+                 parsed_issues=[parsed(5), parsed(6)])
+    assert only(out, "launch") == []
+    a = only(out, "alert")                                 # both detectors are named in the alert
+    assert len(a) == 1
+    assert set(a[0]["reasons"]) == {"launch_anchor_down", "launch_systemic_failure"}
+
+
+def test_systemic_recovery_journals_a_record_and_clears_the_alert_and_resumes():
+    # The canary's verified delivery cleared the streak (runner); THIS tick sees systemic fall while
+    # the durable alert still names it — the exit edge: ONE recovery record, the alert cleared, and
+    # the held queue resumes launching (agent-ready was never stripped, so no William re-touch).
+    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=[],
+               alert={"reasons": ["launch_systemic_failure"]})
+    out = decide(now=NOW, dsk=dsk,
+                 parsed_issues=[parsed(5, touches=("frontend",)), parsed(6, touches=("api",))])
+    rec = only(out, "launch_recovered")
+    assert len(rec) == 1 and isinstance(rec[0].get("reason"), str) and rec[0]["reason"]
+    assert len(only(out, "clear_alert")) == 1
+    assert len(only(out, "launch")) == 2                   # queue resumes
+
+
+def test_systemic_recovery_record_is_not_re_emitted_once_the_alert_is_cleared():
+    # Deduped on the durable alert marker: once the alert is gone, no further recovery record.
+    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=[], alert=None)
+    out = decide(now=NOW, dsk=dsk, parsed_issues=[parsed(5)])
+    assert only(out, "launch_recovered") == []
+
+
+def test_reapprove_during_the_systemic_hold_does_not_launch_into_the_dead_anchor():
+    # DoD #3 / tonight's 20:21 shape: re-approving a parked issue while the hold stands resets its
+    # counters (reapprove) but must NOT launch into the known-bad anchor — the hold governs.
+    dsk = _held(age=1,                                     # interval NOT elapsed: no canary this tick
+                issues_state={"version": 1, "issues": {
+                    "i5": ist("ready", launch_failures=1),
+                    "i6": ist("ready", launch_failures=1),
+                    "i7": ist("parked", launch_failures=2)}})
+    out = decide(now=NOW, dsk=dsk,
+                 parsed_issues=[parsed(5), parsed(6), parsed(7)])
+    ra = only(out, "reapprove")
+    assert len(ra) == 1 and ra[0]["id"] == "i7"           # re-approval is honored (counters reset)
+    assert only(out, "launch") == []                      # but nothing launches into the dead anchor
+    assert only(out, "park") == []
+
+
+def test_after_the_hold_clears_the_previously_held_queue_launches():
+    # DoD #3 second half: once the streak clears (canary verified / restart), the queue frozen at
+    # 20:21 launches with no William re-touch.
+    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=[],
+               issues_state={"version": 1, "issues": {
+                   "i7": ist("ready", branch="sl/i7-x", launch_failures=0)}})
+    out = decide(now=NOW, dsk=dsk, parsed_issues=[parsed(7)])
+    launches = only(out, "launch")
+    assert len(launches) == 1 and launches[0]["id"] == "i7"
+    assert launches[0].get("canary") is not True          # a normal launch, not a probe
+
+
+def test_wrong_typed_canary_clock_never_raises_or_probes_immediately():
+    # A missing/garbage launch_fail_at must not make the canary fire the instant the hold engages:
+    # the interval gate fails CLOSED (no real clock -> no probe this tick), never raising.
+    for bad in (None, "soon", [], {"at": 1}, float("nan"), float("inf")):
+        out = decide(now=NOW, dsk=_held(launch_fail_at=bad),
+                     parsed_issues=[parsed(5), parsed(6)])
+        assert only(out, "launch") == []                  # no probe on a garbage clock
+        assert only(out, "park") == []
+
+
+def test_running_issue_still_labeled_agent_ready_gets_relabel_reconciliation():
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("running")}})
+    out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "in-progress", "type:build"))],
+                 dsk=dsk)
+    assert only(out, "launch") == []
+
+
 def test_running_issue_still_labeled_agent_ready_gets_relabel_reconciliation():
     dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("running")}})
     out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "in-progress", "type:build"))],
