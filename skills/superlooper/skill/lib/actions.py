@@ -340,6 +340,26 @@ def _dget(d, key, want):
     return v if isinstance(v, want) else want()
 
 
+# A corrupt state/issues.json can carry a WRONG-TYPED status. An UNHASHABLE one ([]/{}) makes any
+# `status in <SET>` membership test raise `unhashable type`, and because the tick stamps its heartbeat
+# LAST (runner.tick), that raise wedges the whole tick before the heartbeat — so the dashboard's
+# dead-man's switch reads a LIVE runner as dead (issue #95, the same fail-open-on-wrong-typed defect
+# class events.detect_events / snapshot / tidy.closable / retry_runaway already guard). The existing
+# `isinstance(ist, dict)` guards on these sites do NOT catch it: a dict ist can still hold a wrong-typed
+# status VALUE. Fold every such value to a sentinel that is a member of NO status set, so each membership
+# test stays hash-safe and fails CLOSED in every direction — a corrupt issue occupies no lane, makes no
+# territory claim, and is never launched. A genuinely status-less None must NOT collapse to the sentinel
+# (None is a legitimate member of RELAUNCHABLE_STATUSES — cold/ready), so it is preserved as-is.
+_CORRUPT_STATUS = object()
+
+
+def _status_of(ist):
+    """`ist['status']` when it is None or a well-typed str; else a sentinel that belongs to no status
+    set (a wrong-typed/unhashable status fails closed, never raising into a `status in <SET>` test)."""
+    s = ist.get("status") if isinstance(ist, dict) else None
+    return s if (s is None or isinstance(s, str)) else _CORRUPT_STATUS
+
+
 # --- touches_required (issue #36): the knob now ACTS at launch/intake ---
 _MERGE_PRODUCING_TYPES = {"build", "diagnose-and-fix"}   # investigations produce no PR/merge
 
@@ -393,7 +413,7 @@ def lane_state_from(issues_state):
     out = []
     for iid in _sorted_ids(k for k in issues if _iid_num(k) is not None):
         ist = issues.get(iid)
-        if isinstance(ist, dict) and ist.get("status") in INFLIGHT_STATUSES:
+        if isinstance(ist, dict) and _status_of(ist) in INFLIGHT_STATUSES:
             touches = ist.get("declared_touches")
             touches = [t for t in touches if isinstance(t, str)] if isinstance(touches, list) else []
             lane = {"id": iid, "touches": touches}
@@ -413,7 +433,7 @@ def territory_claims_from(issues_state):
     out = []
     for iid in _sorted_ids(k for k in issues if _iid_num(k) is not None):
         ist = issues.get(iid)
-        if not isinstance(ist, dict) or ist.get("status") not in TERRITORY_CLAIM_STATUSES:
+        if not isinstance(ist, dict) or _status_of(ist) not in TERRITORY_CLAIM_STATUSES:
             continue
         if ist.get("type") == "investigate":
             continue
@@ -673,7 +693,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     def _held_queue_member(iid, p):
         labels = p.get("labels") if isinstance(p, dict) and isinstance(p.get("labels"), list) else []
         return ("agent-ready" in labels and "in-progress" not in labels
-                and ist_of(iid).get("status") in RELAUNCHABLE_STATUSES)
+                and _status_of(ist_of(iid)) in RELAUNCHABLE_STATUSES)
     has_pending_launch = any(_held_queue_member(iid, p) for iid, p in parsed_by_id.items())
     # One degraded mode for both detectors: hold every fresh launch and suppress the per-issue
     # launch-cap park (phases D+E), so the queue is left intact for when the anchor resolves.
@@ -709,7 +729,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         stamped = ist_of(iid).get("park_notify_at")
         being_absorbed = not gh_stale and _iid_num(iid) in closed_nums
         if (not being_absorbed
-                and ist_of(iid).get("status") not in TERMINAL_STATUSES
+                and _status_of(ist_of(iid)) not in TERMINAL_STATUSES
                 and isinstance(ist_of(iid).get("park_notify_cause"), str)
                 and _real(stamped) and now - stamped >= PARK_LABEL_STUCK_ALERT_SECONDS):
             reasons.append(f"park_label_stuck:{iid}")
@@ -796,7 +816,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     all_ids = _sorted_ids({k for k in ist_map if _iid_num(k) is not None} | set(parsed_by_id))
     for iid in all_ids:
         ist = ist_of(iid)
-        status = ist.get("status")
+        status = _status_of(ist)     # hash-safe: a wrong-typed status folds to a no-set sentinel (#95)
         # External-close absorption (issue #108): William closing the issue on GitHub — the
         # dashboard's Drop, or a close by hand — WHILE the loop is bouncing/parking it is his
         # answer. Absorb it: settle terminal, stand the episode down (no more label writes, no more
@@ -924,7 +944,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             inflight = {}
             for other in ist_map:
                 oist = ist_of(other)
-                if other != iid and oist.get("status") in INFLIGHT_STATUSES:
+                if other != iid and _status_of(oist) in INFLIGHT_STATUSES:
                     ot = oist.get("declared_touches")
                     inflight[other] = [t for t in ot if isinstance(t, str)] \
                         if isinstance(ot, list) else []
@@ -1226,7 +1246,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             if ("agent-ready" not in labels or "in-progress" in labels
                     or iid in parked_now
                     or iid in reapproved_now   # just re-released: launch next tick, reset counters
-                    or ist.get("status") not in RELAUNCHABLE_STATUSES
+                    or _status_of(ist) not in RELAUNCHABLE_STATUSES   # wrong-typed status: never launch (#95)
                     or corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
                 continue
             yield iid, p, ist

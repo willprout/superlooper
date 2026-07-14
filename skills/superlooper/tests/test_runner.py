@@ -260,6 +260,24 @@ def test_gh_outage_marks_the_view_stale_and_counts_failures(rig, monkeypatch):
     assert rig.r.gh_view["consecutive_failures"] == 2
 
 
+def test_tick_survives_an_unhashable_status_in_issues_json(rig):
+    # Issue #95: a corrupt state/issues.json carrying a wrong-typed UNHASHABLE status ([]/{}) must
+    # not wedge the tick. Before the fix, detect_events (and its sibling status-membership tests all
+    # along the tick path — the poll, the finishing-PR/investigation refreshes, lane_state_from,
+    # decide) raised `unhashable type` BEFORE the heartbeat stamp, so the dead-man's switch read a
+    # LIVE runner as dead. A whole healthy loop must not be taken down by one poisoned entry: the
+    # tick completes, the poll stays fresh (never perpetually stale on the corrupt entry), and the
+    # heartbeat is stamped.
+    seed_issue(rig, "i5", status=[])
+    seed_issue(rig, "i7", status={})
+    seed_issue(rig, "i123", status="gating", branch="sl/i123-render-the-widget", type="build")
+    (rig.home / "reports" / "i123.md").write_text("## Tests\n" + "x" * 60)
+    rig.r.tick(now=NOW)                                # must not raise
+    assert (rig.home / "state" / "runner.heartbeat").read_text().strip() == str(int(NOW))
+    assert rig.r.gh_view["stale"] is False            # the poll survived the corrupt entry, not wedged-stale
+    assert "i123" in rig.r.gh_view["prs"]             # the healthy finishing issue was still refreshed
+
+
 def test_tick_survives_every_helper_failing(rig, monkeypatch):
     monkeypatch.setenv("GH_FAIL", "1")
     rig.r._run_script = lambda *a, **k: 127            # no scripts, no cmux

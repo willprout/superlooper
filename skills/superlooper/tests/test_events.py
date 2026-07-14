@@ -190,6 +190,54 @@ def test_settled_status_never_idles_or_freezes():
         assert ev == [], f"{st} should not fire idle/frozen, got {[e['type'] for e in ev]}"
 
 
+# --------------------------- corrupt / wrong-typed status (issue #95) ---------------------------
+
+def test_detect_events_skips_an_unhashable_status_without_raising():
+    # A corrupt state/issues.json can carry a wrong-typed UNHASHABLE status ([] or {}). The
+    # settled-suppression test `status in SETTLED_STATUSES` raises `unhashable type` on it and wedges
+    # the whole tick BEFORE the heartbeat is stamped (the dashboard's dead-man's switch then reads a
+    # live runner as dead). detect_events must SKIP the corrupt entry, fail closed, and still detect
+    # every other issue's events. Seeds the two DoD shapes ([] and {}) beside a healthy finished issue.
+    for bad in ([], {}):
+        snaps = [snap(id="i1", status=bad, activity_mtime=1000, now=1000 + 60),
+                 snap(id="i2", status="running", report_hash="rep", report_mtime=1000)]
+        ev, _ = events.detect_events(snaps, set())          # must NOT raise
+        types = {(e["id"], e["type"]) for e in ev}
+        assert ("i2", "session_finished") in types, f"healthy event lost for status={bad!r}"
+        assert ("i1", "corrupt_status") in types, f"corrupt status {bad!r} swallowed silently"
+
+
+def test_corrupt_status_is_fail_closed_not_settled():
+    # Fail closed: a wrong-typed status is NOT a settled status, so the idle/frozen liveness tiers
+    # still evaluate (their response is a safe peek, never a blind action). A launched, stale,
+    # unhashable-status session therefore still fires session_idle.
+    ev, _ = events.detect_events(
+        [snap(status=[], activity_mtime=1000, now=1000 + events.IDLE_SECONDS + 1)], set())
+    assert "session_idle" in [e["type"] for e in ev]
+
+
+def test_corrupt_status_record_is_bounded_and_unlatches_on_repair():
+    # The skip is visible but BOUNDED: one corrupt_status record per corrupt id (deduped via the
+    # emitted set, like idle/frozen), never one per tick. It un-latches when the status becomes
+    # well-typed again, so a later re-corruption re-fires exactly once.
+    ev, em = events.detect_events([snap(status={})], set())
+    assert [e["type"] for e in ev] == ["corrupt_status"]
+    assert ("i1", "corrupt_status") in em
+    ev2, em = events.detect_events([snap(status={})], em)          # still corrupt -> no re-fire
+    assert ev2 == []
+    ev3, em = events.detect_events([snap(status="running")], em)   # repaired -> un-latch
+    assert ("i1", "corrupt_status") not in em
+    ev4, _ = events.detect_events([snap(status=[])], em)           # re-corrupted -> re-fires once
+    assert [e["type"] for e in ev4] == ["corrupt_status"]
+
+
+def test_none_status_is_not_flagged_as_corrupt():
+    # A genuinely status-less issue (None) is normal cold state, NOT corruption: it must never emit a
+    # corrupt_status record (the guard keys on wrong-TYPED, not on absent).
+    ev, _ = events.detect_events([snap(status=None, activity_mtime=1000, now=1000 + 60)], set())
+    assert "corrupt_status" not in [e["type"] for e in ev]
+
+
 def test_exited_is_resolved_and_unlatches_on_clear():
     ev, em = events.detect_events(
         [snap(exited_token=9, exited_mtime=1.0, activity_mtime=1000,
