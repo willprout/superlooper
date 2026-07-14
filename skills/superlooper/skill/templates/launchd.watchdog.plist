@@ -10,7 +10,7 @@
      journaled + notified outcome, never a fabricated success. Load it as a user LaunchAgent
      (~/Library/LaunchAgents) so notify/osascript run in the owner's GUI session; the one-time
      macOS permission that lets it text (notify.imessage_to) must be granted to that user, same
-     as the nightly (references/runner-ops.md). Placeholders ({label}, {superlooper_bin},
+     as the nightly (plugin/skills/superlooper/references/runner-ops.md). Placeholders ({label}, {superlooper_bin},
      {repo_path}, {state_home}, {interval_seconds}) are substituted literally. -->
 <plist version="1.0">
 <dict>

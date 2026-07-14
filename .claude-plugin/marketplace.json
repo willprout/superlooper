@@ -1,0 +1,14 @@
+{
+  "name": "superlooper",
+  "description": "The superlooper marketplace: one pure-content plugin distributing the issue-loop workflow skills.",
+  "owner": {
+    "name": "William Prout"
+  },
+  "plugins": [
+    {
+      "name": "superlooper",
+      "source": "./plugin",
+      "description": "The universal issue-loop workflow, as pure-content skills. Agents write GitHub issues, William approves by his word, a deterministic runner builds each in a fresh session, a mechanical per-PR gate merges to the dev mainline. The executable engine and the dashboard install separately through the gated source repo — never through this plugin."
+    }
+  ]
+}

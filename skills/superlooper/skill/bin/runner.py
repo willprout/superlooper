@@ -1026,7 +1026,8 @@ class Runner:
         # alive and the dashboard's dead-man's switch never fired through a 42-min wedge. Now a
         # wedged tick lets the heartbeat go stale. Note the split: runner.lock (the pidfile) says
         # the PROCESS is up; runner.heartbeat says the loop is making PROGRESS — different signals,
-        # on purpose. The external-watchdog contract in references/runner-ops.md matches this.
+        # on purpose. The external-watchdog contract in
+        # plugin/skills/superlooper/references/runner-ops.md matches this.
         try:
             with open(os.path.join(self.state, "runner.heartbeat"), "w") as f:
                 f.write(str(int(now)))

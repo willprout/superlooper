@@ -411,7 +411,8 @@ def check_runner_anchor(probe, config):
         "live runner (pid %s) anchor no longer resolves: pane %r%s" % (pid, pane, _anchor_where(rec)),
         "The runner's recorded pane no longer resolves in the workspace it launched in (its cmux tab "
         "was closed or moved), so every worker launch will fail and the queue parks. Stop it, open a "
-        "tab in the INTENDED cmux window, and re-run `superlooper run` (see references/runner-ops.md "
+        "tab in the INTENDED cmux window, and re-run `superlooper run` (see "
+        "plugin/skills/superlooper/references/runner-ops.md "
         "→ Restarting the runner).")
 
 
