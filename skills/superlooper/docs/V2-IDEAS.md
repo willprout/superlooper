@@ -11,7 +11,7 @@ PR #4).*
 
 ## Packaging / distribution (2026-07-08 skills-audit thread)
 
-- **Plugin restructure — OWNER RULINGS SETTLED 2026-07-10 (design session next).** Split the
+- **Plugin restructure — DESIGNED 2026-07-11; record committed (children #82–#90 filed).** Split the
   installed skill into a superlooper PLUGIN of five skills: `superlooper` (ops/router),
   `write-issue` (the issue-writing front-end promoted from references/issue-writing.md),
   `adopt`, `cross-review` (absorbed from William's machine-local skill — review quality must
@@ -26,6 +26,8 @@ PR #4).*
   stay inert-until-gated-republish on every machine; only skill content may ride plugin
   update semantics. Socket still open: adapting the feature-dev plugin's explore/clarify
   phases as the front half of `write-issue`.
+  Design record committed (issue #65 → child #82): `DESIGN-2026-07-11-plugin-restructure.md`
+  carries the full approved design; the nine scoped children are #82–#90.
 - **Stack doctor + STACK.md.** The loop's success depends on machine-level blocks outside the
   package: /cross-review + authenticated Codex CLI (audit-proven highest-value external
   block; the brief only says "fresh-agent review" — vendor choice is ambient), cmux +
