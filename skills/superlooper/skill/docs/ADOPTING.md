@@ -212,8 +212,8 @@ no-progress shape), texts you when one trips, waits `watchdog.grace_minutes`, an
 still stands launches ONE fresh sl-debugger session through the same interactive launch shim
 workers use. Every launch is journaled and lands in the morning report. `touch
 <state-home>/state/WATCHDOG_OFF` disables the whole path (it keeps observing and journaling,
-launches nothing); delete the file to re-arm. Operations detail: `references/runner-ops.md` →
-"The unattended-debugger watchdog".
+launches nothing); delete the file to re-arm. Operations detail:
+`plugin/skills/superlooper/references/runner-ops.md` → "The unattended-debugger watchdog".
 
 ---
 
@@ -240,7 +240,8 @@ rest are workflow state the runner and William drive.
   `effort:high`, `effort:xhigh`, `effort:max`.
 - **Exactly one of each per issue** (2+ makes the issue wait for you, like a duplicate `type:`).
   The value is pass-through — no allowlist — so an **unknown** value fails the launch and parks the
-  issue with a memo. The one-shot answerer is unaffected (config-only). See `runner-ops.md`.
+  issue with a memo. The one-shot answerer is unaffected (config-only). See
+  `plugin/skills/superlooper/references/runner-ops.md`.
 
 **Workflow state (the runner drives these):**
 - `in-progress` — a worker is building it.
@@ -310,7 +311,8 @@ report.
 4. `superlooper run --repo <path>` — start the runner in a cmux tab you can watch (it targets that
    tab's own pane automatically — no `--pane` needed). This is the *only* way to run it: there is no
    launchd runner, because a paneless launchd daemon can't open the worker tabs the loop needs
-   (issue #33; restart it the same way — see references/runner-ops.md → "Restarting the runner").
+   (issue #33; restart it the same way — see
+   plugin/skills/superlooper/references/runner-ops.md → "Restarting the runner").
    *Why last:* it launches worker sessions against approved issues, so it needs a green `doctor` and
    your approvals in hand first. Approve issues by conversation (William's word applies
    `agent-ready`); the runner picks them up on its next tick.
