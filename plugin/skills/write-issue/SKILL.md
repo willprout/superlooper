@@ -1,3 +1,8 @@
+---
+name: write-issue
+description: Use when drafting or filing a GitHub issue for the superlooper loop — the rigorous body format (Goal / Definition of done / Boundaries / Loop metadata), the thin-issue "point, never assert" doctrine, the one `type:` label, `touches:`/`blocked-by`/`parent`, turning cross-PR promises into issues, and filing with `gh` carrying every label except `agent-ready`. Agents draft loop issues; William approves them by his word.
+---
+
 # Writing loop issues
 
 You are an agent writing GitHub issues for the superlooper loop, in a planning conversation with
@@ -7,7 +12,8 @@ Every rule below exists because a specific thing went wrong when it was missing;
 name the incident so the rule is never quietly dropped.
 
 You **draft** issues here. You do **not** apply `agent-ready` — that is William's word alone
-(see `approval-protocol.md`). File issues carrying every label *except* `agent-ready`.
+(see the superlooper skill's `references/approval-protocol.md`). File issues carrying every label
+*except* `agent-ready`.
 
 ---
 
@@ -134,5 +140,6 @@ gh issue create \
 ```
 
 Then bring the drafted issues to William for approval in conversation. When he approves, the
-approval step (`approval-protocol.md`) applies `agent-ready` and records the audit comment. Until
-then the issue sits un-queued — which is correct: an unapproved issue must never build.
+approval step (the superlooper skill's `references/approval-protocol.md`) applies `agent-ready`
+and records the audit comment. Until then the issue sits un-queued — which is correct: an
+unapproved issue must never build.
