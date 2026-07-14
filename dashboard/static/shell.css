@@ -139,6 +139,17 @@ html, body {
 .tidy-btn:hover { background: rgba(255, 255, 255, 0.13); color: #EAF0F6; }
 .tidy-btn[disabled] { opacity: 0.5; cursor: default; }
 
+/* Restart (issue #116) — the second ops-verb button, styled exactly like Tidy: a subtle secondary
+   control on the dark top bar, not a second blue CTA. "Turn the loop off and on again" is ops
+   housekeeping, not the primary decision surface. */
+.restart-btn {
+  display: flex; align-items: center; gap: 7px;
+  background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.16);
+  color: #C6CFDA; border-radius: 6px; font: 600 12.5px var(--sans); padding: 6px 14px; cursor: pointer;
+}
+.restart-btn:hover { background: rgba(255, 255, 255, 0.13); color: #EAF0F6; }
+.restart-btn[disabled] { opacity: 0.5; cursor: default; }
+
 /* ---- trouble banner (camera-independent, design §4/§5) ---- */
 .trouble {
   display: flex; align-items: center; gap: 10px;
@@ -1070,6 +1081,52 @@ html, body {
 .cc-tidy-result { font: 600 12.5px var(--sans); padding: 8px 11px; border-radius: 6px; }
 .cc-tidy-result.ok { color: var(--green); background: #EAF6EE; border: 1px solid #C6E6D1; }
 .cc-tidy-result.err { color: var(--red); background: #FBECEA; border: 1px solid #F0CFC9; }
+
+/* ============================ the Restart button's dialog (issue #116) ============================ */
+/* A sibling of Tidy above — the same modal chrome and design tokens so the two ops-verb overlays
+   read as one system (§0.8), with restart-specific pieces: the plain-words consequence list and the
+   no-runner notice (which shows the manual start and offers no confirm — nothing to launch). */
+.cc-restart {
+  position: fixed; inset: 0; z-index: 78; display: none;
+  background: rgba(12, 17, 23, 0.5); align-items: flex-start; justify-content: center; padding: 20px;
+}
+.cc-restart.open { display: flex; }
+.cc-restart-card {
+  margin-top: 11vh; width: min(540px, 94vw); max-height: 80vh; background: var(--panel);
+  border: 1px solid var(--panel-border); border-radius: 10px;
+  box-shadow: 0 24px 64px rgba(15, 22, 34, 0.42); display: flex; flex-direction: column;
+}
+.cc-restart-head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 14px 18px; border-bottom: 1px solid #EDF0F4;
+}
+.cc-restart-title { font: 700 12.5px var(--mono); letter-spacing: 1px; color: var(--ink); }
+.cc-restart-title b { color: var(--blue); font-weight: 600; }
+.cc-restart-sub { font: 400 10.5px/1.5 var(--sans); color: var(--faint); flex: 1 1 220px; }
+.cc-restart-sub code { font: 500 10px var(--mono); color: var(--ink-3); background: #F1F4F8; padding: 1px 5px; border-radius: 3px; }
+.cc-restart-x {
+  margin-left: auto; align-self: center; background: none; border: 1px solid #C9D2DC; color: var(--muted);
+  border-radius: 5px; width: 24px; height: 24px; cursor: pointer; font: 600 12px var(--sans);
+}
+.cc-restart-x:hover { background: #EEF2F6; color: var(--ink); }
+.cc-restart-body { overflow-y: auto; padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 12px; }
+.cc-restart-loading { font: 500 12px var(--mono); color: var(--muted); padding: 6px 0; }
+.cc-restart-lead { font: 400 12.5px/1.55 var(--sans); color: var(--ink-2); }
+.cc-restart-lead b { color: var(--blue); font-weight: 700; }
+/* The consequence, in plain words — exactly what a tap will do (finish tick → restart → workers untouched). */
+.cc-restart-consequence { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px;
+  font: 400 12px/1.5 var(--sans); color: var(--ink-2); }
+.cc-restart-consequence b { color: var(--ink); font-weight: 700; }
+/* The dead-runner notice — the button never resurrects a loop; it points at the manual start. */
+.cc-restart-notice { font: 400 12.5px/1.55 var(--sans); color: var(--ink-2); }
+.cc-restart-notice b { color: var(--ink); font-weight: 700; }
+.cc-restart-manual { padding: 8px 11px; border-radius: 6px; background: #F5F7FA; border: 1px solid #E4E9EF; }
+.cc-restart-manual code { font: 500 11px var(--mono); color: var(--ink-2); word-break: break-all; }
+.cc-restart-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+/* The honest result / failure line — a failed request is never a silent success (issue #116). */
+.cc-restart-result { font: 600 12.5px var(--sans); padding: 8px 11px; border-radius: 6px; }
+.cc-restart-result.ok { color: var(--green); background: #EAF6EE; border: 1px solid #C6E6D1; }
+.cc-restart-result.err { color: var(--red); background: #FBECEA; border: 1px solid #F0CFC9; }
 
 /* ============================ desktop breakpoints (issue #29) ============================ */
 /* The airfield is the centerpiece (design record §0.1 joy-is-terminal, §4). In the default grid

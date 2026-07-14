@@ -86,6 +86,14 @@ CLOSE_TIMEOUT = 15             # bound the best-effort close of a stale session'
 DELIVERY_RETRY_SECONDS = 120   # min spacing between answer-delivery attempts to one pane
 _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"   # SL_CMUX overrides (tests)
 
+# The Restart request marker (issue #116). A Restart request asks the LIVE runner to restart ITSELF
+# in its own cmux tab: `superlooper request-restart` drops this file in the STATE HOME (never
+# .superlooper/**), and the runner honors it at the safe point between ticks by re-exec'ing in place.
+# It is a small JSON audit record (operator + when + source); its mere EXISTENCE is the signal — a
+# present-but-corrupt body still restarts, like state/ALERT. (A local ops UI over the loop shells the
+# `request-restart` command, exactly as it shells `superlooper tidy`; the engine names no such UI.)
+RESTART_MARKER = "runner.restart"
+
 _TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
 
 # The conflict-resolution session's brief (§C.4 6c — the `preserve` escape). Inline: it is
@@ -172,6 +180,62 @@ def _pid_alive(pid):
         return False
     except PermissionError:
         return True
+
+
+# ------------------------- restart request marker (issue #116) -------------------------
+# Shared by the Runner (which HONORS the marker) and `superlooper request-restart` (which WRITES it),
+# so the two agree on the path/format in one place.
+
+def restart_marker_path(state_dir):
+    return os.path.join(os.fspath(state_dir), RESTART_MARKER)
+
+
+def read_restart_request(state_dir):
+    """The restart request dict, or ``None`` when the marker is ABSENT. A present-but-unparseable
+    body reads as ``{}`` — existence is the signal (like state/ALERT), so a malformed marker never
+    loses the button's intent. ``_read`` maps BOTH a missing file and an UNDECODABLE one to ``None``,
+    so an ``os.path.exists`` check distinguishes them: a present-but-unreadable marker is still a
+    request (``{}``), only a genuinely absent one is ``None``."""
+    path = restart_marker_path(state_dir)
+    txt = _read(path)
+    if txt is None:
+        return {} if os.path.exists(path) else None
+    try:
+        val = json.loads(txt)
+    except (ValueError, TypeError):
+        return {}
+    return val if isinstance(val, dict) else {}
+
+
+def write_restart_request(state_dir, payload):
+    """Atomically drop the restart marker (tmp + ``os.replace``) so the honoring runner never reads a
+    half write. The tmp name is per-pid so two concurrent ``request-restart`` calls can't corrupt
+    each other's tmp before the rename (fresh-agent review). Returns the path written."""
+    path = restart_marker_path(state_dir)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+    return path
+
+
+def clear_restart_request(state_dir):
+    _rm(restart_marker_path(state_dir))
+
+
+def live_runner_pid(state_dir):
+    """The pid of the LIVE runner for this state home (its ``runner.lock`` pid, confirmed alive), or
+    ``None`` — a stale pidfile (dead pid), an unparseable one, or no pidfile all read as ``None``.
+    This is what the Restart button's dead-runner check rides on: no live runner ⇒ the button makes
+    no attempt to launch anything, it just reports that no loop is running."""
+    txt = _read(os.path.join(os.fspath(state_dir), "runner.lock"))
+    if txt is None:
+        return None
+    try:
+        pid = int(txt.strip())
+    except ValueError:
+        return None
+    return pid if _pid_alive(pid) else None
 
 
 def _has_surface_row(out):
@@ -303,6 +367,9 @@ class Runner:
             self._fetch_usage = fetch_usage
         self.stop = False
         self._owns_lock = False
+        # True once this process ADOPTED the singleton across a Restart re-exec (issue #116) — the
+        # reborn half of a self-restart, set in acquire_singleton via the SL_RESTART_ADOPT token.
+        self._reexec_adopted = False
         self._consecutive_tick_errors = 0    # reset on the first clean tick (incident 2026-07-07)
         self._tick_alert_on_disk = False     # the wedge ALERT is confirmed written (retry until so)
         self._tick_alert_notified = False    # the wedge notify+journal fired once this episode
@@ -368,6 +435,22 @@ class Runner:
             except ValueError:
                 pid = None
             held_by_us = pid == os.getpid() and self._owns_lock
+            # Re-exec adoption (issue #116): os.execv PRESERVES the pid, so after the Restart button's
+            # self-restart the lock still holds our OWN live pid — the check just below would read
+            # that as "another live runner" and refuse. A one-shot env token, set by _honor_restart in
+            # the PRE-exec image and equal to our post-exec pid, proves the lock is ours-by-re-exec, so
+            # the reborn image adopts it IN PLACE — returning WITHOUT reopening the pidfile. Not
+            # rewriting it is the point: `open(lock, "w")` truncates before it writes, and a
+            # concurrent `run` reading that momentary empty file would see "no holder" and double-start
+            # (fresh-agent review). Since the lock is never even briefly emptied across the exec, a
+            # concurrent `run` always reads our live pid and refuses — genuinely zero window. The token
+            # is consumed here so a later, unrelated acquire can never mistake a stale value for a
+            # fresh re-exec.
+            if pid == os.getpid() and os.environ.get("SL_RESTART_ADOPT") == str(os.getpid()):
+                os.environ.pop("SL_RESTART_ADOPT", None)
+                self._reexec_adopted = True
+                self._owns_lock = True
+                return True
             if pid is not None and _pid_alive(pid) and not held_by_us:
                 return False
         with open(lock, "w") as f:
@@ -409,6 +492,71 @@ class Runner:
         # Fail-stopped by design: in-flight sessions untouched, nothing merges while down.
         self.stop = True
 
+    # ------------------------- restart button (issue #116) -------------------------
+
+    def _restart_requested(self):
+        """True when a Restart request marker has been dropped in the state home by `superlooper
+        request-restart` (existence is the signal — see read_restart_request)."""
+        return read_restart_request(self.state) is not None
+
+    def _honor_restart(self):
+        """Honor a Restart request: consume the marker, journal the intent (old pid), then re-exec
+        THIS invocation in place so a fresh process image reloads the currently-installed engine in
+        the SAME cmux tab with cleared in-memory episode state (the systemic-launch streak, the
+        tick-error counter, the wake grace — all reset by construction in a new __init__). The
+        singleton lock is NOT released: the reborn image (same pid, via the SL_RESTART_ADOPT token)
+        adopts it, so there is no window a second runner could double-start. Returns ONLY if the exec
+        itself fails (or under a test's injected _reexec): the marker is already consumed, so the loop
+        simply continues on the old image rather than re-looping the restart."""
+        req = read_restart_request(self.state) or {}
+        # The marker binds to the pid `request-restart` saw live (fresh-agent review). If that pid is
+        # NOT us, the request targeted a DIFFERENT runner that died before honoring it, and we are a
+        # freshly-started replacement — it was never a request for US. Clear it and do NOT restart, so
+        # a manual restart after a crash-with-pending-marker doesn't spuriously self-restart. (A
+        # marker with no target_pid — a hand-written one — is honored by whoever is running.)
+        target = req.get("target_pid")
+        if target is not None and target != os.getpid():
+            clear_restart_request(self.state)
+            try:
+                journal.append(self.home, {"act": "runner_restart", "phase": "stale",
+                                           "target_pid": target, "our_pid": os.getpid()})
+            except Exception:
+                pass
+            return
+        clear_restart_request(self.state)                  # consume BEFORE the exec — never re-loop
+        try:
+            journal.append(self.home, {"act": "runner_restart", "phase": "reexec",
+                                       "old_pid": os.getpid(), "request": req})
+        except Exception:
+            pass
+        os.environ["SL_RESTART_ADOPT"] = str(os.getpid())  # the reborn image adopts the held lock
+        try:
+            self._reexec([sys.executable] + list(sys.argv))
+        except OSError as e:
+            # The exec itself failed (e.g. the interpreter path vanished mid-run): stay up on the old
+            # image, drop the now-useless adopt token, and journal it. The button already reported
+            # success on the REQUEST landing; a rare exec failure surfaces here + in the morning report.
+            os.environ.pop("SL_RESTART_ADOPT", None)
+            try:
+                journal.append(self.home, {"act": "runner_restart", "phase": "reexec_failed",
+                                           "error": _short_repr(e)})
+            except Exception:
+                pass
+            return
+        # os.execv does not return on success; a returning INJECTED _reexec (tests only) lands here —
+        # drop the token so the test process's environment is left clean.
+        os.environ.pop("SL_RESTART_ADOPT", None)
+
+    def _reexec(self, argv):                               # injectable (tests); default replaces us
+        """Replace THIS process image with a fresh one running the same invocation. ``os.execv``
+        PRESERVES the pid — so the runner stays the foreground process of its own cmux tab (a NEW
+        pid would orphan from the tab and the shell would fall back to its prompt) — and reloads
+        every engine module from disk, which is exactly how a republished engine is picked up and the
+        in-memory episode state is wiped. ``argv[0]`` is the interpreter; ``argv[1:]`` re-runs the
+        exact CLI (`superlooper run --repo …`) the operator launched, so the new process re-detects
+        the SAME pane from the SAME tab."""
+        os.execv(argv[0], argv)
+
     def _stamp_state_format(self):
         """Stamp the state-home format version (issue #45) so the dashboard can HANDSHAKE on the
         shape it's about to read field-by-field: a reader that doesn't recognize the version names
@@ -428,8 +576,22 @@ class Runner:
         if not self.acquire_singleton():
             print("another runner is live for this state home — exiting", file=sys.stderr)
             return 1
+        # Hygiene (fresh-agent review): consume any lingering re-exec adopt token so it can never be
+        # inherited by a worker subprocess. acquire_singleton already pops it on the adoption path;
+        # this also covers the edge where the lock was externally deleted mid-exec and the reborn
+        # image took the normal-acquire path, leaving the token set.
+        os.environ.pop("SL_RESTART_ADOPT", None)
         self._stamp_state_format()                     # the live runner declares its state format (#45)
         self._write_anchor()                           # record the live launch anchor for doctor (#33)
+        if self._reexec_adopted:
+            # The reborn half of a Restart re-exec (issue #116): record that the restart LANDED (the
+            # "up" side of old pid → new), so the journal + morning report show it completed — not
+            # merely that it was requested. Guarded: a diagnostic must never abort run().
+            try:
+                journal.append(self.home, {"act": "runner_restart", "phase": "up",
+                                           "new_pid": os.getpid()})
+            except Exception:
+                pass
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
         ticks = 0
@@ -460,6 +622,13 @@ class Runner:
                     self._consecutive_tick_errors = 0
                     self._tick_alert_on_disk = False
                     self._tick_alert_notified = False
+                # Honor a Restart request (issue #116) at the SAFE POINT between ticks — a tick has
+                # just fully returned (even a crashing one is caught above), so no executor is
+                # mid-flight and no worker session is touched. _honor_restart re-execs in place and
+                # does not return; if the exec itself fails it returns and the loop simply continues
+                # on the old image (the marker is already consumed, so it never re-loops).
+                if not self.stop and self._restart_requested():
+                    self._honor_restart()
                 ticks += 1
                 if not self.stop and (max_ticks is None or ticks < max_ticks):
                     sleep(TICK_SECONDS)
