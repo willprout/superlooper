@@ -12,9 +12,11 @@ markers, heartbeat), and optionally the **command-center dashboard** on `127.0.0
 truth lives: the state home; the engine source (`skills/superlooper/skill/` in the
 superlooper repo) — the installed copy at `~/.claude/skills/superlooper/` is what actually
 runs (they drift; the `VERSION` file arbitrates); the incident corpus in
-`skills/superlooper/docs/`; and the installed superlooper skill's runner-ops reference
-(`~/.claude/skills/superlooper/references/` → `runner-ops.md`) for how the loop is *meant*
-to be operated.
+`skills/superlooper/docs/`; and the superlooper skill's runner-ops reference — the plugin
+sibling `../superlooper/references/runner-ops.md` (this skill and the ops skill ship as
+siblings in the installed plugin, so the relative path resolves inside the plugin cache;
+runner-ops moved out of the engine's installed `references/` into the plugin) — for how the
+loop is *meant* to be operated.
 
 **Diagnosis before repair, always.** The readout is read-only; run it fully before mutating
 anything. Most documented incidents needed rung 1–2 repairs or none at all.
