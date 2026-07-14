@@ -48,23 +48,34 @@ def _binary():
     return os.environ.get("SL_GH", "gh")
 
 
-def _run(args, repo=None, timeout=None):
-    """Run ``gh <args>`` pinned to ``repo`` with a HARD timeout. Returns ``(rc, stdout)``. Never
-    raises: a timeout, a missing binary, or any OSError is caught and returned as a nonzero rc with
-    empty stdout so the caller fails closed. stderr is captured and swallowed (the rc is the
-    signal). ``repo`` (``owner/name``) is injected as ``GH_REPO`` so the call targets exactly that
-    repo; a falsy ``repo`` inherits the ambient environment untouched."""
+def _run3(args, repo=None, timeout=None):
+    """Run ``gh <args>`` pinned to ``repo`` with a HARD timeout. Returns ``(rc, stdout, stderr)``.
+    Never raises: a timeout, a missing binary, or any OSError is caught and returned as a nonzero rc
+    with empty streams so the caller fails closed. ``repo`` (``owner/name``) is injected as
+    ``GH_REPO`` so the call targets exactly that repo; a falsy ``repo`` inherits the ambient
+    environment untouched.
+
+    stderr is surfaced (not swallowed) for the ONE caller that needs it — :func:`set_labels`, which
+    must tell gh's benign "label not found" (a remove of a label the repo no longer defines) apart
+    from a genuine auth/network failure. Every other caller uses :func:`_run` and reads only the rc."""
     if timeout is None:
         timeout = _DEFAULT_TIMEOUT
     env = {**os.environ, "GH_REPO": repo} if repo else None
     try:
         proc = subprocess.run([_binary(), *args], capture_output=True, text=True,
                               timeout=timeout, env=env)
-        return (proc.returncode, proc.stdout)
+        return (proc.returncode, proc.stdout, proc.stderr)
     except subprocess.TimeoutExpired:
-        return (124, "")          # conventional timeout rc
+        return (124, "", "")      # conventional timeout rc
     except (OSError, ValueError):
-        return (127, "")          # command not found / bad invocation
+        return (127, "", "")      # command not found / bad invocation
+
+
+def _run(args, repo=None, timeout=None):
+    """:func:`_run3` for callers that act on the rc alone (every write but ``set_labels`` and every
+    read). Returns ``(rc, stdout)``; stderr is captured by the subprocess but discarded here."""
+    rc, out, _err = _run3(args, repo=repo, timeout=timeout)
+    return (rc, out)
 
 
 def _json(args, default, repo=None, timeout=None):
@@ -166,19 +177,52 @@ def pr_for_branch(repo, branch):
 
 # --------------------------- writes (fail closed to False / None) ---------------------------
 
+def _label_absent_from_repo(stderr, label):
+    """Whether a failed ``--remove-label <label>`` failed *only* because the REPO no longer defines
+    that label — gh's message is exactly ``failed to update …: '<label>' not found``. Removing a label
+    the repo doesn't define is vacuously done, so this ONE benign shape is tolerated. Everything else
+    stays a real failure: we match gh's precise ``'<label>' not found`` token (the quoted label
+    immediately followed by ``not found``), NOT the looser "contains 'not found' and the label
+    somewhere" — a genuine 404 / auth / repo error that merely ECHOES the label name (e.g. ``HTTP 404:
+    Not Found while removing <label>``) must surface, never read as a vacuous no-op (a false-ok is the
+    one outcome this fix must never introduce; fail closed on any wording we don't recognize)."""
+    if not stderr:
+        return False
+    return re.search(r"'%s' not found" % re.escape(label), stderr, re.IGNORECASE) is not None
+
+
 def set_labels(repo, num, add=None, remove=None):
     """Add/remove labels on an issue. ``True`` on success, ``False`` on failure (act as if it never
     happened). Nothing to change ⇒ ``True`` with no gh call. NOTE: applying ``agent-ready`` is
-    William's word alone — the call SITES enforce that, never this mechanical verb."""
+    William's word alone — the call SITES enforce that, never this mechanical verb.
+
+    Each label operation is its OWN gh call, because a single ``gh issue edit`` is all-or-nothing:
+    it HARD-FAILS the whole edit — the add included — if any ``--remove-label`` names a label the
+    REPO's label set doesn't define, EVEN when the issue never carried it. A repo that finished the
+    #58 ``needs-william`` → ``needs-owner`` rename no longer defines the legacy id, so the old
+    batched write errored and the agent-ready add never landed — every Approve tap died with
+    "nothing changed" (issue #114). Splitting the write means:
+
+      * the ADD is authoritative and goes first — a failed add is auth/network (the write did not
+        land), so we stop and report failure honestly (the tap's failure toast fires);
+      * each REMOVE is independent — one repo-absent label (``'<name>' not found``) is a vacuous
+        no-op that is tolerated, while every OTHER remove still lands and every non-"not found"
+        failure is surfaced as a real failure (no false-ok).
+
+    The mid-migration intent is preserved: a repo that STILL defines the legacy label removes it
+    normally (that remove simply succeeds)."""
     if not add and not remove:
         return True                # nothing to do
-    args = ["issue", "edit", str(num)]
     if add:
-        args += ["--add-label", ",".join(add)]
-    if remove:
-        args += ["--remove-label", ",".join(remove)]
-    rc, _ = _run(args, repo=repo)
-    return rc == 0
+        rc, _ = _run(["issue", "edit", str(num), "--add-label", ",".join(add)], repo=repo)
+        if rc != 0:
+            return False           # the add did not land — a genuine failure, never a success
+    ok = True
+    for label in (remove or []):
+        rc, _out, err = _run3(["issue", "edit", str(num), "--remove-label", label], repo=repo)
+        if rc != 0 and not _label_absent_from_repo(err, label):
+            ok = False             # a genuine (non repo-absent) remove failure — surface it
+    return ok
 
 
 def comment(repo, num, body):
