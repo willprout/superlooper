@@ -118,6 +118,16 @@ LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LA
 # issue (which the per-issue LAUNCH_FAILURE_CAP handles), so the trip is early and the queue is
 # spared. Kept below/at the pane-probe path (`launch_anchor`), which catches a dead anchor directly.
 SYSTEMIC_LAUNCH_FAILURE_CAP = 2    # >= this many DISTINCT issues failing delivery -> systemic (#24)
+# A tripped systemic-launch breaker (#24) cannot clear itself: the streak clears ONLY on a VERIFIED
+# delivery, yet the hold suppresses every delivery, so the loop sits healthy-but-frozen until a
+# manual restart (live 2026-07-13 — three failures held, the owner's 20:21 re-approve launched
+# nothing). Re-arm the breaker: while the hold stands, every CANARY_RETRY_SECONDS attempt ONE canary
+# launch of the front-of-queue issue as a probe. A verified delivery clears the streak and normal
+# launching resumes; a failed canary re-enters the hold, charging NO per-issue launch cap and parking
+# nothing. Spaced generously — a probe every few minutes catches recovery without hammering a
+# genuinely dead anchor — and the interval is measured from the LAST delivery failure, so the first
+# canary waits a full interval after the trip rather than firing the instant the hold engages (#115).
+CANARY_RETRY_SECONDS = 300
 ANSWERER_FAILURE_CAP = 2           # answerer hire failed twice -> park the issue
 DELIVERY_FAILURE_CAP = 3           # answer would not deliver to the pane -> park the issue
 MERGE_REFUSAL_CAP = 2              # gate-green PR's merge refused this many ticks -> park (#27)
@@ -661,6 +671,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # One degraded mode for both detectors: hold every fresh launch and suppress the per-issue
     # launch-cap park (phases D+E), so the queue is left intact for when the anchor resolves.
     launch_degraded = anchor_down or systemic_launch
+    # prev_systemic: was a systemic-launch hold ALREADY established? The launch_systemic_failure
+    # ALERT is DURABLE (survives a runner restart), so its presence on disk is the episode marker —
+    # the same durable-marker discipline usage's prev_dark uses. Its falling edge (prev_systemic and
+    # not systemic_launch) is the recovery the canary probe (or a restart) produces: the streak
+    # cleared on a verified delivery while the alert still names it. Journaled once below (#115).
+    prev_systemic = bool(alert_on_disk) and "launch_systemic_failure" in _dget(alert_on_disk, "reasons", list)
 
     # ================= A. alerts (safety first, before any work) =================
     reasons = []
@@ -718,6 +734,21 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         out.append({"act": "usage_recovered",
                     "reason": "usage meter readable again — normal usage gating resumed; the "
                               "fail-open episode is closed."})
+
+    # ---- systemic-launch recovery journaling (issue #115), the exit edge of the #24 hold ----
+    # The systemic hold cannot clear itself (the streak clears only on a verified delivery, which the
+    # hold suppresses), so the canary probe below re-arms it: a verified canary delivery clears the
+    # runner's streak, and THIS tick sees systemic_launch fall while the durable ALERT still names it
+    # — the exit edge. Emit ONE journal record; the ALERT itself is retracted by the reasons diff in
+    # section A above (it no longer lists launch_systemic_failure). A restart — the documented #24
+    # fallback — clears the streak the same way, so it too journals exactly one recovery. Deduped on
+    # the durable marker (prev_systemic): once section A clears the alert, the next tick sees no
+    # marker and emits nothing.
+    if prev_systemic and not systemic_launch:
+        out.append({"act": "launch_recovered",
+                    "reason": "launch delivery verified again (a canary probe or a restart) — the "
+                              "systemic launch hold is cleared; the queue resumes launching in "
+                              "priority order."})
 
     # ================= B. dev mainline: freeze / fix-forward / unfreeze =================
     # Requires a FRESH, PRESENT dev-check view: no data never unfreezes and never freezes —
@@ -1172,10 +1203,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # ================= E. fresh launches (LAST: freed lanes wait one tick) =================
     # launch_degraded holds EVERY fresh launch (issue #24): a dead/failing launch anchor makes every
     # delivery fail, so attempting more only walks the queue. The queue is preserved (agent-ready
-    # intact) and resumes the tick the anchor resolves — no William relabeling.
-    if not gh_stale and not issue_state_corrupt_for_launches and not launch_degraded:
-        touches_required = _touches_required(cfg)
-        candidates = []
+    # intact) and resumes the tick the anchor resolves — no William relabeling. The #115 canary
+    # (below) is the ONE exception: a single probe re-arms a systemic hold that cannot clear itself.
+    def _eligible_launch_ids():
+        """Approved, not-in-flight, launchable issues in priority order — the shared candidate set
+        for both normal fresh launches AND the #115 canary probe. A PURE filter with NO side effects
+        (it never parks): the touches-required park belongs to the normal path only, and a canary must
+        never park while the systemic hold stands."""
         for iid in _sorted_ids(parsed_by_id):
             p = parsed_by_id[iid]
             labels = p.get("labels") if isinstance(p.get("labels"), list) else []
@@ -1187,17 +1221,27 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     or ist.get("status") not in RELAUNCHABLE_STATUSES
                     or corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
                 continue
-            # touches_required (issue #36): the knob ACTS here. An approved merge-producing issue
-            # that declares no `touches:` is REFUSED at launch and handed to William with a memo
-            # naming the missing block — never silently launched into an un-verifiable affinity.
-            # Investigations produce no PR/merge, so touches are meaningless for them: exempt.
-            # Gate on ELIGIBILITY (blocked-by closed, no control-label conflict) so we refuse ONLY at
-            # the true launch point: an issue still waiting on an open dependency keeps waiting (never
-            # parked early), and a label-conflict issue is left for its own handling — not mislabeled
-            # with a "missing touches" memo (fresh-agent review P2-1).
-            if (touches_required and p.get("type") in _MERGE_PRODUCING_TYPES
-                    and not _declares_touches(p)
-                    and issues_mod.eligible(p, closed_nums, bool(frozen))):
+            yield iid, p, ist
+
+    def _needs_touches(p):
+        # touches_required (issue #36): an approved merge-producing issue that declares no `touches:`
+        # is REFUSED at launch (never silently launched into an un-verifiable affinity). Investigations
+        # produce no PR/merge, so touches are meaningless for them: exempt. Gate on ELIGIBILITY
+        # (blocked-by closed, no control-label conflict) so we refuse ONLY at the true launch point:
+        # an issue waiting on an open dependency keeps waiting, and a label-conflict issue is left for
+        # its own handling — not mislabeled with a "missing touches" memo (fresh-agent review P2-1).
+        return (_touches_required(cfg) and p.get("type") in _MERGE_PRODUCING_TYPES
+                and not _declares_touches(p)
+                and issues_mod.eligible(p, closed_nums, bool(frozen)))
+
+    def _launch_branch(iid):
+        branch = ist_of(iid).get("branch")
+        return branch if isinstance(branch, str) and branch.strip() else brief.branch_for(parsed_by_id[iid])
+
+    if not gh_stale and not issue_state_corrupt_for_launches and not launch_degraded:
+        candidates = []
+        for iid, p, ist in _eligible_launch_ids():
+            if _needs_touches(p):
                 park(iid, p.get("num"), _touches_required_memo(p.get("num")),
                      needs_william=True, cause="touches_missing")
                 continue
@@ -1208,11 +1252,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                                         closed_nums, bool(frozen), territory_claims=claims):
             iid = sel["id"]
             selected_ids.add(iid)
-            ist = ist_of(iid)
-            branch = ist.get("branch")
-            if not (isinstance(branch, str) and branch.strip()):
-                branch = brief.branch_for(parsed_by_id[iid])
-            out.append({"act": "launch", "id": iid, "num": sel["num"], "branch": branch,
+            out.append({"act": "launch", "id": iid, "num": sel["num"], "branch": _launch_branch(iid),
                         "touches": sel["touches"], "soft_overlap": sel["soft_overlap"],
                         "orphan": False})
         # Wildcard launch-suppression journaling (issue #36): a no-touches wildcard — the candidate
@@ -1227,4 +1267,27 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 continue
             out.append({"act": "wildcard_hold", "id": hid, "num": h.get("num"),
                         "blocker": h.get("blocker_id"), "reason": _wildcard_hold_reason(h)})
+    elif (systemic_launch and not anchor_down
+            and not gh_stale and not issue_state_corrupt_for_launches):
+        # Canary re-arm of the SYSTEMIC hold (issue #115). The streak-based hold cannot clear itself,
+        # so once per CANARY_RETRY_SECONDS since the last delivery failure, probe with ONE canary
+        # launch of the front-of-queue issue. A verified delivery clears the streak (runner) and normal
+        # launching resumes next tick; a failed canary re-enters the hold — the runner charges NO
+        # per-issue cap and this decide emits no park. Skipped while the pane probe itself reports the
+        # anchor DEAD (anchor_down): that detector self-re-arms via its per-tick probe, and a canary
+        # into a probe-dead pane is wasted; once the probe recovers but the streak persists, THIS path
+        # fires and clears it. The interval gate fails CLOSED on a garbage/absent clock (no probe).
+        fail_at = dsk.get("launch_fail_at")
+        if _real(fail_at) and now - fail_at >= CANARY_RETRY_SECONDS:
+            candidates = [dict(p, requeue_front=bool(ist.get("requeue_front")))
+                          for iid, p, ist in _eligible_launch_ids()
+                          if not _needs_touches(p)]   # a touches-missing issue is never the probe
+            claims = territory_claims_from(issues_state)
+            probe = scheduler.launchable(candidates, lanes_in, cfg, usage_sched,
+                                         closed_nums, bool(frozen), territory_claims=claims)
+            if probe:
+                sel = probe[0]                         # the single front-of-queue issue, priority order
+                out.append({"act": "launch", "id": sel["id"], "num": sel["num"],
+                            "branch": _launch_branch(sel["id"]), "touches": sel["touches"],
+                            "soft_overlap": sel["soft_overlap"], "orphan": False, "canary": True})
     return out

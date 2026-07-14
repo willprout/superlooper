@@ -92,6 +92,10 @@ def issue_state(rig, iid):
     return loopstate.load(str(rig.home / "state" / "issues.json"))["issues"].get(iid)
 
 
+def _all_issue_states(rig):
+    return loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
+
+
 def seed_issue(rig, iid, **fields):
     def m(st):
         st["issues"].setdefault(iid, loopstate.new_issue()).update(fields)
@@ -743,6 +747,129 @@ def test_a_restart_clears_the_systemic_launch_streak(rig):
     fresh = runner_mod.Runner(repo=str(rig.repo), config=make_config(),
                               state_home=str(rig.home), pane="pane-1")
     assert fresh._launch_fail_ids == set()
+
+
+# --------------------------- canary re-arm of the systemic hold (#115) ---------------------------
+
+def test_a_launch_delivery_failure_stamps_the_canary_retry_clock(rig):
+    # The canary retry clock is anchored at the most recent delivery failure, so the FIRST probe
+    # waits a full interval after the breaker trips (never fires the instant the hold engages).
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(2)                             # delivery never verified
+    rig.r._execute(_launch_action(), NOW)
+    assert rig.r._launch_fail_at == NOW
+
+
+def test_a_verified_launch_resets_the_canary_retry_clock(rig):
+    # A verified delivery clears the streak AND resets the clock, so a later degraded episode starts
+    # its interval fresh rather than inheriting a stale timestamp.
+    rig.r.tick(now=NOW)
+    rig.r._launch_fail_at = NOW - 500
+    rig.r._launch_fail_ids = {"i9", "i101"}
+    rig.calls.clear()                                  # rc_queue empty -> run_script returns 0 (ok)
+    out = rig.r._execute(_launch_action(), NOW)
+    assert out == "ok" and rig.r._launch_fail_at == 0
+
+
+def test_a_failed_canary_probe_charges_no_per_issue_launch_cap(rig):
+    # DoD #2: the canary is a SYSTEMIC probe, never charged to the issue. A failed canary must not
+    # bump the per-issue launch-failure counter (else repeated probes would eventually park the very
+    # front-of-queue issue the breaker is trying to protect).
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="ready", launch_failures=1)
+    rig.calls.clear()
+    rig.rc_queue.append(2)                             # canary delivery still failing
+    out = rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    assert out != "ok"
+    assert issue_state(rig, "i101")["launch_failures"] == 1     # UNCHANGED — no cap charged
+    assert rig.r._launch_fail_at == NOW                         # but the retry clock advances
+
+
+def test_a_failed_canary_probe_re_enters_the_hold_without_parking(rig):
+    # A failed canary keeps the streak intact (the hold persists) and parks nothing.
+    rig.r.tick(now=NOW)
+    rig.r._launch_fail_ids = {"i101", "i102"}
+    rig.calls.clear()
+    rig.rc_queue.append(2)
+    rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    assert rig.r._launch_fail_ids == {"i101", "i102"}          # streak preserved -> still held
+    assert issue_state(rig, "i101")["status"] == "ready"       # queued, not parked
+
+
+def test_a_verified_canary_clears_the_streak_and_launches_the_issue(rig):
+    # A verified canary delivery IS a real launch: it clears the systemic streak, resets the clock,
+    # and the probed issue is genuinely running (labels moved) — the queue re-arms from here.
+    rig.r.tick(now=NOW)
+    rig.r._launch_fail_ids = {"i101", "i102"}
+    rig.r._launch_fail_at = NOW - 500
+    rig.calls.clear()                                  # rc_queue empty -> run_script returns 0 (ok)
+    out = rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    assert out == "ok"
+    assert rig.r._launch_fail_ids == set() and rig.r._launch_fail_at == 0
+    assert issue_state(rig, "i101")["status"] == "running"
+    m = mutations(rig)[-1]
+    assert m["kind"] == "set_labels" and m["add"] == "in-progress" and m["remove"] == "agent-ready"
+
+
+def test_launch_recovered_executor_is_wired_and_returns_its_reason(rig):
+    # Journal-only executor (no label move, no crash, no "no executor for ...").
+    assert rig.r._execute({"act": "launch_recovered", "reason": "hold cleared"}, NOW) == "hold cleared"
+
+
+def test_systemic_hold_re_arms_via_canary_end_to_end(rig):
+    # DoD #1 (#115): trip (2 distinct-issue delivery failures) -> hold; a canary after the retry
+    # interval with delivery STILL failing -> still held, zero parks, zero new notifies, per-issue
+    # caps untouched; delivery recovers -> the canary verifies -> streak clears, the ALERT clears
+    # with a journaled recovery record, and the held queue resumes launching in priority order.
+    # Soft affinity so the resume is a clean parallel launch, not an affinity-serialized dribble.
+    rig.r.config["affinity"] = "soft"
+    launches = lambda: [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
+
+    # ---- trip: two DISTINCT issues fail delivery back-to-back (the breaker's own signal) ----
+    rig.r._poll_github(NOW)                            # populate the queue WITHOUT auto-launching
+    rig.rc_queue.extend([2, 2])                        # i101, i102 both fail delivery
+    rig.r._execute(_launch_action("i101", 101, "sl/i101-render-the-widget"), NOW)
+    rig.r._execute(_launch_action("i102", 102, "sl/i102-add-the-api-route"), NOW)
+    assert rig.r._launch_fail_ids == {"i101", "i102"}          # streak is systemic (>= cap)
+    assert rig.r._launch_fail_at == NOW                        # the retry clock is anchored here
+    assert mutations(rig) == [] or all(m.get("kind") != "set_labels"    # failed launches move no
+                                       for m in mutations(rig))          # labels -> queue intact
+
+    # ---- hold: a tick sees the streak, alerts once, holds every launch, parks nothing ----
+    rig.calls.clear()
+    rig.r.tick(now=NOW + 15)                           # interval (300s) not elapsed -> no canary
+    assert launches() == []                            # held: launch-session.sh not invoked
+    alert = json.loads((rig.home / "state" / "ALERT").read_text())
+    assert alert["reasons"] == ["launch_systemic_failure"]
+    assert [i for i in _all_issue_states(rig).values() if i.get("status") == "parked"] == []
+
+    # ---- canary after the interval, delivery still failing: ONE probe, still held, no cap charged ----
+    rig.calls.clear()
+    rig.rc_queue.append(2)                             # canary delivery still fails
+    rig.r.tick(now=NOW + 400)                          # >= CANARY_RETRY_SECONDS since the trip
+    probes = launches()
+    assert len(probes) == 1 and probes[0]["args"][1] == "i102"   # front-of-queue (priority:high)
+    assert rig.r._launch_fail_ids == {"i101", "i102"}           # still held
+    assert issue_state(rig, "i102")["launch_failures"] == 1      # probe charged NO per-issue cap
+    assert [i for i in _all_issue_states(rig).values() if i.get("status") == "parked"] == []
+    assert alert == json.loads((rig.home / "state" / "ALERT").read_text())   # no new/changed alert
+
+    # ---- recovery: a later canary verifies; streak + clock clear, the issue runs ----
+    rig.calls.clear()
+    rig.r.tick(now=NOW + 800)                          # rc_queue empty -> delivery verified (rc 0)
+    assert rig.r._launch_fail_ids == set() and rig.r._launch_fail_at == 0
+    assert issue_state(rig, "i102")["status"] == "running"
+
+    # ---- resume: the next tick journals the recovery, clears the alert, launches the rest ----
+    rig.calls.clear()
+    rig.r.tick(now=NOW + 900)
+    rec = [r for r in journal.read(rig.home) if r.get("act") == "launch_recovered"]
+    assert len(rec) == 1
+    assert "ALERT" not in os.listdir(rig.home / "state")        # alert cleared on recovery
+    resumed = {c["args"][1] for c in launches()}
+    assert "i101" in resumed and "i102" not in resumed          # held queue resumes; canary'd issue
+    assert resumed <= {"i101", "i103"}                          # ...is already running, not relaunched
 
 
 # --------------------------- fail-open on an unreadable meter (issue #46) ---------------------------
