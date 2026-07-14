@@ -191,11 +191,15 @@ def restart_marker_path(state_dir):
 
 
 def read_restart_request(state_dir):
-    """The restart request dict, or ``None`` when absent. A present-but-unparseable marker reads as
-    ``{}`` — existence is the signal, so a malformed body never loses the button's intent."""
-    txt = _read(restart_marker_path(state_dir))
+    """The restart request dict, or ``None`` when the marker is ABSENT. A present-but-unparseable
+    body reads as ``{}`` — existence is the signal (like state/ALERT), so a malformed marker never
+    loses the button's intent. ``_read`` maps BOTH a missing file and an UNDECODABLE one to ``None``,
+    so an ``os.path.exists`` check distinguishes them: a present-but-unreadable marker is still a
+    request (``{}``), only a genuinely absent one is ``None``."""
+    path = restart_marker_path(state_dir)
+    txt = _read(path)
     if txt is None:
-        return None
+        return {} if os.path.exists(path) else None
     try:
         val = json.loads(txt)
     except (ValueError, TypeError):
@@ -205,9 +209,10 @@ def read_restart_request(state_dir):
 
 def write_restart_request(state_dir, payload):
     """Atomically drop the restart marker (tmp + ``os.replace``) so the honoring runner never reads a
-    half write. Returns the path written."""
+    half write. The tmp name is per-pid so two concurrent ``request-restart`` calls can't corrupt
+    each other's tmp before the rename (fresh-agent review). Returns the path written."""
     path = restart_marker_path(state_dir)
-    tmp = path + ".tmp"
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     with open(tmp, "w") as f:
         json.dump(payload, f)
     os.replace(tmp, path)
@@ -434,14 +439,18 @@ class Runner:
             # self-restart the lock still holds our OWN live pid — the check just below would read
             # that as "another live runner" and refuse. A one-shot env token, set by _honor_restart in
             # the PRE-exec image and equal to our post-exec pid, proves the lock is ours-by-re-exec, so
-            # the reborn image adopts it in place. The lock is never released across the exec, so no
-            # second runner can slip through the gap (a concurrent `run` WITHOUT the token sees our
-            # live pid and refuses). The token is consumed here so a later, unrelated acquire can never
-            # mistake a stale value for a fresh re-exec.
+            # the reborn image adopts it IN PLACE — returning WITHOUT reopening the pidfile. Not
+            # rewriting it is the point: `open(lock, "w")` truncates before it writes, and a
+            # concurrent `run` reading that momentary empty file would see "no holder" and double-start
+            # (fresh-agent review). Since the lock is never even briefly emptied across the exec, a
+            # concurrent `run` always reads our live pid and refuses — genuinely zero window. The token
+            # is consumed here so a later, unrelated acquire can never mistake a stale value for a
+            # fresh re-exec.
             if pid == os.getpid() and os.environ.get("SL_RESTART_ADOPT") == str(os.getpid()):
                 os.environ.pop("SL_RESTART_ADOPT", None)
                 self._reexec_adopted = True
-                held_by_us = True
+                self._owns_lock = True
+                return True
             if pid is not None and _pid_alive(pid) and not held_by_us:
                 return False
         with open(lock, "w") as f:
@@ -500,6 +509,20 @@ class Runner:
         itself fails (or under a test's injected _reexec): the marker is already consumed, so the loop
         simply continues on the old image rather than re-looping the restart."""
         req = read_restart_request(self.state) or {}
+        # The marker binds to the pid `request-restart` saw live (fresh-agent review). If that pid is
+        # NOT us, the request targeted a DIFFERENT runner that died before honoring it, and we are a
+        # freshly-started replacement — it was never a request for US. Clear it and do NOT restart, so
+        # a manual restart after a crash-with-pending-marker doesn't spuriously self-restart. (A
+        # marker with no target_pid — a hand-written one — is honored by whoever is running.)
+        target = req.get("target_pid")
+        if target is not None and target != os.getpid():
+            clear_restart_request(self.state)
+            try:
+                journal.append(self.home, {"act": "runner_restart", "phase": "stale",
+                                           "target_pid": target, "our_pid": os.getpid()})
+            except Exception:
+                pass
+            return
         clear_restart_request(self.state)                  # consume BEFORE the exec — never re-loop
         try:
             journal.append(self.home, {"act": "runner_restart", "phase": "reexec",

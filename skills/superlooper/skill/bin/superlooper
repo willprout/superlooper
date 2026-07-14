@@ -354,7 +354,9 @@ def cmd_request_restart(args):
                              "error": "no runner is live for this repo — nothing to restart"})
         return 1
 
-    write_restart_request(state_dir, {"requested_at": int(time.time()),
+    # Bind the marker to the pid we just saw live, so a runner that dies before honoring it can't
+    # have a freshly-started replacement (a new pid) spuriously honor it (fresh-agent review).
+    write_restart_request(state_dir, {"requested_at": int(time.time()), "target_pid": pid,
                                       "source": args.source or "cli", "operator": args.operator})
     _emit_restart(args, {"ok": True, "verb": "request-restart", "running": True, "pid": pid,
                          "requested": True, "manual": manual})

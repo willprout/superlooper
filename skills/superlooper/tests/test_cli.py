@@ -951,6 +951,7 @@ def test_request_restart_drops_the_marker_when_a_runner_is_live(rig):
     marker = json.loads((state / "runner.restart").read_text())
     assert marker["source"] == "command-center" and marker["operator"] == "William"
     assert isinstance(marker["requested_at"], (int, float))
+    assert marker["target_pid"] == os.getpid()               # bound to the runner it checked live
 
 
 def test_request_restart_refuses_and_names_the_manual_start_when_no_runner_is_live(rig):
