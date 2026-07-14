@@ -41,7 +41,7 @@ _BUILD_WORK_BLOCK = """\
 
 **Ship gate (all of it, before you finish):**
 1. Your tests pass.
-2. Drive the changed feature in a REAL browser; record exactly what you drove and what you saw.
+2. Drive the changed behavior end-to-end and record exactly what you drove and what you saw — a REAL browser for a web UI, the actual CLI / API / library / service surface for a non-web repo (not just that the tests pass).
 3. Add/update regression tests covering what you built.
 4. {ship_instructions}
 5. CI is green on your PR."""
