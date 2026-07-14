@@ -747,8 +747,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     if prev_systemic and not systemic_launch:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "
-                              "systemic launch hold is cleared; the queue resumes launching in "
-                              "priority order."})
+                              "systemic launch streak is cleared and normal launching resumes in "
+                              "priority order (unless a separate hold, e.g. a dead launch anchor, "
+                              "still stands)."})
 
     # ================= B. dev mainline: freeze / fix-forward / unfreeze =================
     # Requires a FRESH, PRESENT dev-check view: no data never unfreezes and never freezes —

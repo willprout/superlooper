@@ -812,6 +812,41 @@ def test_a_verified_canary_clears_the_streak_and_launches_the_issue(rig):
     assert m["kind"] == "set_labels" and m["add"] == "in-progress" and m["remove"] == "agent-ready"
 
 
+def test_a_failed_canary_via_base_missing_charges_no_cap_and_re_spaces_the_clock(rig):
+    # A canary is a systemic probe (#115): even a base-missing (rc=3) canary must charge NO per-issue
+    # cap and must re-space the retry clock (so the next probe waits a full interval, never a per-tick
+    # re-fire). base_missing deliberately stays OUT of the streak (a config fault, not a dead anchor),
+    # so the hold persists on the existing streak.
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="ready", launch_failures=1)
+    rig.r._launch_fail_ids = {"i101", "i102"}
+    rig.r._launch_fail_at = NOW - 500
+    rig.calls.clear()
+    rig.rc_queue.append(3)                             # launch-session.sh: worktree base missing
+    out = rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    assert out != "ok"
+    assert issue_state(rig, "i101")["launch_failures"] == 1     # NO per-issue cap charged to a probe
+    assert rig.r._launch_fail_at == NOW                         # clock re-spaced (no per-tick re-fire)
+    assert rig.r._launch_fail_ids == {"i101", "i102"}          # base_missing out of the streak; held
+
+
+def test_a_canary_whose_brief_fails_still_re_spaces_the_retry_clock(rig, monkeypatch):
+    # If the front-of-queue canary issue cannot be briefed, the probe must STILL re-space the retry
+    # clock — otherwise it would busy-spin every tick and the systemic hold could never self-clear
+    # (the exact freeze #115 targets, re-triggered on a narrow input).
+    rig.r.tick(now=NOW)
+    rig.r._launch_fail_ids = {"i101", "i102"}
+    rig.r._launch_fail_at = NOW - 500
+    rig.calls.clear()
+    monkeypatch.setattr(runner_mod.brief, "build",
+                        lambda *a, **k: (_ for _ in ()).throw(ValueError("unbriefable issue")))
+    out = rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    assert out.startswith("brief failed")
+    assert rig.r._launch_fail_at == NOW                         # clock re-spaced despite the brief error
+    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
+    assert launches == []                                       # never even reached launch-session.sh
+
+
 def test_launch_recovered_executor_is_wired_and_returns_its_reason(rig):
     # Journal-only executor (no label move, no crash, no "no executor for ...").
     assert rig.r._execute({"act": "launch_recovered", "reason": "hold cleared"}, NOW) == "hold cleared"

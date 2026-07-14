@@ -1237,6 +1237,12 @@ class Runner:
         p = self._parsed_by_id.get(iid)
         if p is None:
             return "skipped: issue not in the current GitHub view"
+        if canary:
+            # (#115) A canary is a systemic PROBE: re-space the retry clock up front so EVERY
+            # non-verified outcome below (a brief error, a base-missing worktree, or an unverified
+            # delivery) makes the next probe wait a full CANARY_RETRY_SECONDS — never a per-tick
+            # re-fire. A verified delivery resets the clock to 0 via _delivery_cleared() below.
+            self._launch_fail_at = now
         self._update_issue(iid, {"branch": branch, "num": num, "type": p.get("type"),
                                  "declared_touches": list(p.get("touches") or []),
                                  "wildcard_hold_journaled": False})   # launch ends the hold episode (#36)
@@ -1285,10 +1291,13 @@ class Runner:
             # The worktree base branch is missing (issue #28): a per-repo CONFIG fault, not a dead
             # launch anchor. Record the cause so decide's park memo names the branch, and DELIBERATELY
             # keep it OUT of the systemic-anchor streak (which would HOLD the queue and blame the cmux
-            # anchor). Still counts toward the per-issue launch cap, so it parks (with the right memo).
+            # anchor). Still counts toward the per-issue launch cap, so it parks (with the right memo)
+            # — UNLESS this was a #115 canary probe, which is never charged to the issue (the clock is
+            # already re-spaced above; the hold persists on the existing streak).
             self._update_issue(iid, {"status": "ready", "launch_error": "base_missing"},
-                               fn=lambda st, i: self._bump(i, "launch_failures"))
-            return f"launch rc={rc} (worktree base branch missing)"
+                               fn=None if canary else (lambda st, i: self._bump(i, "launch_failures")))
+            verb = "canary launch" if canary else "launch"
+            return f"{verb} rc={rc} (worktree base branch missing)"
         # Delivery NOT verified. Stamp the #115 canary retry clock so the next probe waits a full
         # interval, and record this id in the runner-level anchor streak (issue #24) — decide reads
         # the streak to tell a dead anchor (many distinct ids) from a genuinely bad issue (one).
