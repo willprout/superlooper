@@ -760,6 +760,78 @@ def test_bounce_runner_posts_memo_and_moves_labels(sim_factory):
 
 
 # =====================================================================================
+# issue #108: the exact 2026-07-13 incident — bounce + a missing needs-owner label +
+# an external close mid-storm -> one notify total, terminal settle, no storm
+# =====================================================================================
+
+def test_bounce_missing_label_texts_once_then_external_close_absorbs(sim_factory):
+    sim = sim_factory()
+    memo = ("BOUNCED: already fixed by #61 — the module this issue targets shipped differently.\n\n"
+            "Proposed amendment: close as duplicate.")
+    num = sim.add_issue(title="Stale premise", scenario={"scenario": "bounce", "memo": memo})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "state", "blocked", sid))
+    # the needs-owner label did NOT exist in the repo (the incident): every bounce label move fails.
+    # Target ONLY the bounce's `--add-label needs-owner` argv, so the launch's in-progress add is
+    # untouched.
+    sim.fail_next("--add-label needs-owner", times=99,
+                  stderr="could not add label: 'needs-owner' not found")
+    # ride the storm a few ticks: the label never lands, so decide re-derives the bounce each tick
+    for _ in range(4):
+        sim.tick()
+    # ...but the owner was texted EXACTLY ONCE (notify-once per bounce), never once per tick
+    assert len([ln for ln in sim.notify_lines() if "bounced" in ln]) == 1, sim.notify_lines()
+    # ...and the verbatim memo comment posted exactly once (never 21 duplicates)
+    assert len([m for m in sim.mutations("comment") if "already fixed by #61" in m["body"]]) == 1
+    assert sim.loop_issue(sid).get("status") != "bounced"     # label never landed -> not settled
+    # the owner presses Drop mid-storm: the issue is closed on GitHub
+    def close_it(st):
+        st["issues"][str(num)]["state"] = "closed"
+    sim.edit_gh_state(close_it)
+    # within a poll the loop ABSORBS the close: settles terminal, stands the episode down
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    texts_after_absorb = len(sim.notify_lines())
+    labels_after_absorb = len(sim.mutations("set_labels"))
+    for _ in range(3):
+        sim.tick()
+    # stood down: no more texts, no more label writes, the blocked marker is consumed
+    assert len(sim.notify_lines()) == texts_after_absorb, sim.notify_lines()
+    assert len(sim.mutations("set_labels")) == labels_after_absorb
+    assert not os.path.exists(os.path.join(sim.home, "state", "blocked", sid))
+    # the whole incident produced EXACTLY ONE owner text about this bounce
+    assert len([ln for ln in sim.notify_lines() if "bounced" in ln]) == 1, sim.notify_lines()
+
+
+def test_external_close_of_a_parked_issue_absorbs_and_concludes(sim_factory):
+    # the dashboard-lingering half of #108: a terminally-parked issue that the owner then closes on
+    # GitHub must be ABSORBED to a concluded terminal state, so the flight leaves the field — not
+    # linger forever as a stale "awaiting your call".
+    sim = sim_factory()
+    num = sim.add_issue(title="Widget without review",
+                        scenario={"scenario": "no-review", "linger": True})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    # the owner closes it on GitHub (Drop)
+    def close_it(st):
+        st["issues"][str(num)]["state"] = "closed"
+    sim.edit_gh_state(close_it)
+    labels_before = len(sim.mutations("set_labels"))
+    texts_before = len(sim.notify_lines())
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    # stood down: no label churn, no new texts after the absorb
+    for _ in range(3):
+        sim.tick()
+    assert len(sim.mutations("set_labels")) == labels_before
+    assert len(sim.notify_lines()) == texts_before
+
+
+# =====================================================================================
 # blocked -> a real answerer session -> answer nudged in -> resumed -> merged
 # =====================================================================================
 

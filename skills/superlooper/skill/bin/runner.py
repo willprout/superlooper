@@ -1354,17 +1354,70 @@ class Runner:
 
     def _exec_bounce(self, a, now):
         iid, num = a["id"], a.get("num")
+        cause = a.get("cause") or "bounce"
+        # Notify-once marker (issue #108, mirroring #61's _exec_park): stamp the durable hand-back
+        # marker BEFORE the label move, so when the label write fails in the dead zone that NEEDS the
+        # bounce (the 2026-07-13 missing `needs-owner` label — #58 renamed it in adopt, nobody re-ran
+        # adopt post-republish), decide recognizes next tick's re-derived bounce as the SAME episode
+        # and suppresses its notify — the label keeps retrying silently; the text happened once. The
+        # notify EXECUTES before this stamp (decide orders it first), so a crash mid-tick can only
+        # DUPLICATE the text, never lose it. `park_notify_at` anchors the stuck-label ALERT bound, so
+        # a same-cause retry must never re-stamp it (the bound would never elapse); it only repairs an
+        # unusable value. `park_comment_posted` makes the verbatim memo comment once-per-episode,
+        # retried while the bounce is still re-deriving; once the label lands (terminal) an unposted
+        # memo stays best-effort — the notify text and the journal already carried it to the owner.
+        # The marker fields are REUSED from the park path (a bounce and a park never overlap on one
+        # issue), which also gets this path the `park_label_stuck` alert and the reapprove reset free.
+        prev = self._issue_field(iid, "park_notify_cause")
+        if prev != cause:
+            self._update_issue(iid, {"park_notify_cause": cause, "park_notify_at": now,
+                                     "park_comment_posted": False})
+        elif not actions._since_ok(self._issue_field(iid, "park_notify_at"), now):
+            self._update_issue(iid, {"park_notify_at": now})
         body = ("**Bounced by the worker session** (premise-level drift found at launch-time "
                 "reconciliation). The worker's memo, verbatim:\n\n"
                 f"{a.get('memo', '')}\n\n"
                 "_Labels moved by the runner. The proposed amendment above is ready to approve "
                 "or reject — one touch._")
-        if not gh.comment(num, body):
-            return "memo comment failed (will retry next tick)"
+        if not self._issue_field(iid, "park_comment_posted"):
+            if gh.comment(num, body):
+                self._update_issue(iid, {"park_comment_posted": True})
         if not gh.set_labels(num, add=["needs-owner"], remove=["in-progress"]):
-            return "label move failed (will retry next tick)"
+            return "label move failed (will retry silently next tick)"
         _rm(os.path.join(self.state, "blocked", iid))
         self._update_issue(iid, {"status": "bounced"})
+        return "ok"
+
+    def _exec_absorb_close(self, a, now):
+        """Issue #108: the issue was CLOSED on GitHub (William pressed the dashboard's Drop, or
+        closed it by hand) WHILE the loop was bouncing/parking it. His close IS his answer — so
+        settle local state terminal and stand the episode down: NO further label writes (the issue
+        is closed; its labels are moot), NO notify, and clear the hand-back markers + blocked/awaiting
+        files so nothing re-derives the bounce/park next tick. Settles to 'merged' — loopstate has no
+        'closed' status and 'merged' is the engine's terminal-good bucket for a closed-not-PR-merged
+        issue (mirrors _exec_close_investigate); the dashboard, seeing the issue CLOSED on GitHub,
+        concludes the flight off the field. Idempotent — decide re-emits only while the issue is still
+        in a non-terminal hand-back episode or lingering as a closed owner-decision status; once this
+        settles it to 'merged', _in_owner_handback_episode is False and the absorb never re-fires."""
+        iid = a["id"]
+        _rm(os.path.join(self.state, "blocked", iid))
+        _rm(os.path.join(self.state, "awaiting", iid))
+        def settle(st, i):
+            # drop any lingering answerer record for this issue (mirrors _exec_park): an
+            # answerer-caused park that was still storming when the owner closed it would otherwise
+            # leave its `for: <iid>` record behind.
+            recs = st.get("answerers")
+            if isinstance(recs, dict):
+                for aid in [k for k, v in recs.items()
+                            if isinstance(v, dict) and v.get("for") == iid]:
+                    recs.pop(aid, None)
+            i.update({"status": "merged", "park_notify_cause": None, "park_notify_at": None,
+                      "park_comment_posted": False})
+        self._update_issue(iid, fn=settle)
+        # Reclaim the worktree, exactly as _exec_absorb_merged does for its 'merged' settle — a
+        # bounce/park absorbed this way would otherwise leave its worktree behind to accumulate.
+        if self.config.get("cleanup_merged_worktrees", True):
+            gitops.worktree_remove(self.repo, self._worktree(iid))
         return "ok"
 
     def _forget_cached_label(self, iid, label):

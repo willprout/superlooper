@@ -65,8 +65,8 @@ Action vocabulary (the executor contract, one journal record each):
   merge, update, nudge, hold, await_read, await_pr_read, clear_pr_read, await_comments_read,
   clear_comments_read, note_checks_pending,
   clear_checks_pending, park, clear_park_marker, regenerate, resolve_conflict,
-  close_investigate, reclaim, relabel, freeze, unfreeze, file_fix_issue, alert, clear_alert,
-  morning_report, notify. Safety actions (alert/freeze/unfreeze) come first; launches come
+  close_investigate, absorb_close, reclaim, relabel, freeze, unfreeze, file_fix_issue, alert,
+  clear_alert, morning_report, notify. Safety actions (alert/freeze/unfreeze) come first; launches come
   LAST. `note_checks_pending`/`clear_checks_pending` stamp/clear the bounded pending-checks
   clock (issue #26). `await_read` is the investigate-gate's HOLD when this tick has no
   trustworthy comment read (refused or starved): it journals the wait ONCE per episode (deduped
@@ -78,6 +78,8 @@ Action vocabulary (the executor contract, one journal record each):
   was refused/starved (issue #78): the gate's comments-absent WAIT, journaled once per episode on
   the `comments_read_pending_since` clock, park-once past the same bound. `clear_park_marker` ends a
   notify-once park episode whose label move never landed, so a later genuine park texts again.
+  `absorb_close` (issue #108) settles a bounced/parked issue the owner CLOSED on GitHub mid-episode
+  to a concluded terminal state and stands the episode down (no more label writes / texts).
 """
 import math
 
@@ -199,10 +201,10 @@ ALERT_MESSAGES = {
 def _alert_message(reason):
     if isinstance(reason, str) and reason.startswith("park_label_stuck:"):
         iid = reason.split(":", 1)[1]
-        return (f"{iid} parked but its park label move has been failing for "
+        return (f"{iid} handed back to the owner but its label move has been failing for "
                 f"{PARK_LABEL_STUCK_ALERT_SECONDS // 60}+ min — GitHub writes are not landing. "
-                "The park already texted once; retries continue silently. Check GitHub "
-                "availability / rate limits (`gh api rate_limit`).")
+                "The hand-back (park or bounce) already texted once; retries continue silently. "
+                "Check GitHub availability / rate limits (`gh api rate_limit`).")
     return ALERT_MESSAGES.get(reason, reason)
 
 
@@ -258,6 +260,28 @@ def _since_ok(since, now):
     an unbounded wait again) or a NEGATIVE one (would make now-since huge and escalate spuriously)
     is corrupt. Treat it as unstamped so it re-stamps, never trusted to defeat OR trip the bound."""
     return _real(since) and 0 <= since <= now
+
+
+def _in_owner_handback_episode(ist, blocked_text):
+    """True iff the issue is in an owner-handback episode — a park or a bounce that is handing the
+    issue back to the owner (issue #108). Either it has already SETTLED into an owner-decision
+    status, or it is mid-handback with the durable marker / BOUNCED memo present (the storm states,
+    where a label move keeps failing and status has not settled). Scopes external-close absorption
+    to exactly these episodes, so a normal merge-close (status 'merged') or a plain running build is
+    never mistaken for the owner's Drop. A 'merged' status short-circuits to False FIRST: it is the
+    settled-DONE bucket (a real landing, an absorbed out-of-band merge, OR this issue's own
+    absorb_close), so it must never re-absorb — even if a crash left a stale park_notify_cause behind
+    (which clear_park_marker would otherwise mop up). This also makes absorb_close idempotent: once it
+    settles an issue to 'merged', this returns False and the absorb never re-fires."""
+    ist = ist if isinstance(ist, dict) else {}
+    status = ist.get("status")
+    if status == "merged":
+        return False
+    if status in ("bounced", "parked", "needs_william"):
+        return True
+    if isinstance(blocked_text, str) and blocked_text.lstrip().startswith("BOUNCED:"):
+        return True
+    return isinstance(ist.get("park_notify_cause"), str)
 
 
 def _checks_pending_cap(config):
@@ -651,13 +675,18 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         errs, corrupt = _counter(ist_of(iid), "update_errors")
         if corrupt or errs >= UPDATE_ERROR_ALERT:
             reasons.append(f"update_errors:{iid}")     # a corrupt counter is alert-worthy too
-        # A park whose label move keeps failing past the bound (issue #61): the marker is stamped
-        # but status never settled terminal, so the silent retries have run long enough to be
-        # ALERT-worthy (one text via the standard dedup — never twenty). A terminal status means
-        # the move landed (episode over); the marker clearing (recovery/reapprove) drops the
-        # reason, which auto-clears the ALERT.
+        # A hand-back (park #61, OR bounce #108 — both reuse this marker) whose label move keeps
+        # failing past the bound: the marker is stamped but status never settled terminal, so the
+        # silent retries have run long enough to be ALERT-worthy (one text via the standard dedup —
+        # never twenty). A terminal status means the move landed (episode over); the marker clearing
+        # (recovery / reapprove / absorb_close) drops the reason, which auto-clears the ALERT. Skip an
+        # issue the owner has CLOSED on GitHub (fresh proof): its stuck label is moot — absorb_close
+        # settles it this same tick — so a "label stuck" text as the owner drops it is pure noise (#108
+        # review P2). gh_stale keeps this fail-SAFE: an unproven close never suppresses a real alert.
         stamped = ist_of(iid).get("park_notify_at")
-        if (ist_of(iid).get("status") not in TERMINAL_STATUSES
+        being_absorbed = not gh_stale and _iid_num(iid) in closed_nums
+        if (not being_absorbed
+                and ist_of(iid).get("status") not in TERMINAL_STATUSES
                 and isinstance(ist_of(iid).get("park_notify_cause"), str)
                 and _real(stamped) and now - stamped >= PARK_LABEL_STUCK_ALERT_SECONDS):
             reasons.append(f"park_label_stuck:{iid}")
@@ -729,6 +758,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     for iid in all_ids:
         ist = ist_of(iid)
         status = ist.get("status")
+        # External-close absorption (issue #108): William closing the issue on GitHub — the
+        # dashboard's Drop, or a close by hand — WHILE the loop is bouncing/parking it is his
+        # answer. Absorb it: settle terminal, stand the episode down (no more label writes, no more
+        # texts, no dashboard presence). POSITIVE proof only — a FRESH view whose closed set names
+        # this issue (#48: never act on a stale/refused read, which fails closed to still-open);
+        # SCOPED to owner-handback episodes so a normal merge-close (status 'merged', its own
+        # terminal) or a plain running build is never mistaken for the owner's Drop. Checked before
+        # the terminal-status block AND the bounce/park re-derivations below, so it wins over every
+        # retry the stuck label would otherwise keep firing.
+        if (not gh_stale and _iid_num(iid) in closed_nums
+                and _in_owner_handback_episode(ist, blocked.get(iid))):
+            out.append({"act": "absorb_close", "id": iid, "num": _iid_num(iid)})
+            continue
         if status in TERMINAL_STATUSES:
             # Re-approval (dry-run finding, 2026-07-04): a parked-on-cap issue stays filtered
             # from launches FOREVER — its at-cap counter persists across a re-added `agent-ready`
@@ -982,8 +1024,24 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # ---- blocked marker present (and no report): bounce or the answerer lifecycle ----
         if blocked_text is not None and not has_exited:
             if blocked_text.lstrip().startswith("BOUNCED:"):
-                out.append({"act": "bounce", "id": iid, "num": num, "memo": blocked_text})
+                # Notify-once per bounce (issue #108, mirroring #61's park guard). A bounce hands the
+                # issue back to the owner via a needs-owner label move; when that move keeps failing
+                # (the 2026-07-13 missing-`needs-owner`-label storm), local status never settles, so
+                # decide re-derives THIS bounce every tick — and used to re-text every tick (a text
+                # every ~18s). The executor stamps the durable handback marker (`park_notify_cause`,
+                # REUSED: a bounce and a park never overlap on one issue, and reuse gets the
+                # park_label_stuck alert + reapprove reset for free) BEFORE the label move, so a
+                # re-derived bounce for the same cause is a SILENT retry — the labels still converge.
+                # ORDER IS LOAD-BEARING (mirrors park, Codex C1): notify BEFORE the bounce action, so
+                # a crash between the two executors can only DUPLICATE a text, never lose it.
+                cause = "bounce"
+                act = {"act": "bounce", "id": iid, "num": num, "memo": blocked_text, "cause": cause}
+                if ist.get("park_notify_cause") == cause:
+                    act["retry"] = True
+                    out.append(act)
+                    continue
                 notify(f"superlooper: {iid} bounced (needs-owner)", blocked_text)
+                out.append(act)
                 continue
             aid_rec = active_answerer.get(iid)
             answer = answers.get(iid) if isinstance(answers.get(iid), str) else None

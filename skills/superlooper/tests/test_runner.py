@@ -959,6 +959,97 @@ def test_bounce_gh_failure_keeps_the_marker_for_retry(rig, monkeypatch):
     assert (rig.home / "state" / "blocked" / "i7").exists()
 
 
+def test_bounce_stamps_the_notify_marker_before_the_label_move(rig):
+    """Issue #108: the bounce reuses #61's notify-once marker — stamped BEFORE gh is asked to move
+    the needs-owner label, so a label write failing in the dead zone that NEEDS the bounce (the
+    2026-07-13 missing needs-owner label) cannot re-text: decide sees the re-derived bounce as the
+    SAME episode. The memo comment posts once per episode; the episode clock never re-stamps."""
+    seed_issue(rig, "i7", status="running")
+    (rig.home / "state" / "blocked" / "i7").write_text("BOUNCED: premise gone")
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue edit", "times": 99,
+          "stderr": "could not add label: 'needs-owner' not found"}]))
+    out = rig.r._execute({"act": "bounce", "id": "i7", "num": 7,
+                          "memo": "BOUNCED: premise gone", "cause": "bounce"}, NOW)
+    assert "label move failed" in out
+    st = issue_state(rig, "i7")
+    assert st["park_notify_cause"] == "bounce"         # stamped despite the failed write
+    assert st["park_notify_at"] == NOW
+    assert st["status"] == "running"                   # never advanced past the truth
+    assert (rig.home / "state" / "blocked" / "i7").exists()   # marker kept for retry
+    assert len([m for m in mutations(rig) if m["kind"] == "comment"]) == 1
+    # the retry tick re-attempts the label but must NOT re-post the memo, nor reset the clock
+    # (the stuck-label alert bound runs from episode start)
+    rig.r._execute({"act": "bounce", "id": "i7", "num": 7,
+                    "memo": "BOUNCED: premise gone", "cause": "bounce", "retry": True}, NOW + 15)
+    assert len([m for m in mutations(rig) if m["kind"] == "comment"]) == 1
+    assert issue_state(rig, "i7")["park_notify_at"] == NOW
+
+
+def test_bounce_comment_retries_until_it_lands_then_never_reposts(rig):
+    """A bounce whose memo comment ALSO failed retries the comment on later ticks until it lands —
+    the worker's verbatim memo must reach the issue — but never double-posts (mirrors park)."""
+    seed_issue(rig, "i7", status="running")
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue comment", "times": 1, "stderr": "rate limited"},
+         {"match": "issue edit", "times": 1, "stderr": "rate limited"}]))
+    rig.r._execute({"act": "bounce", "id": "i7", "num": 7, "memo": "BOUNCED: m",
+                    "cause": "bounce"}, NOW)
+    assert [m for m in mutations(rig) if m["kind"] == "comment"] == []
+    out = rig.r._execute({"act": "bounce", "id": "i7", "num": 7, "memo": "BOUNCED: m",
+                          "cause": "bounce", "retry": True}, NOW + 15)
+    assert out == "ok"
+    assert len([m for m in mutations(rig) if m["kind"] == "comment"]) == 1
+    assert issue_state(rig, "i7")["status"] == "bounced"
+
+
+def test_bounce_comment_only_failure_still_settles_the_bounce(rig):
+    """Codex-M1 tradeoff, mirrored for bounce (issue #108 review P2): when the memo COMMENT fails
+    but the label move succeeds, the issue settles terminal (bounced) — decide stops re-deriving, so
+    the on-issue memo is NOT retried further. Accepted: the worker's verbatim memo already reached
+    the owner via the notify text and the journal; the on-issue comment is best-effort once the
+    bounce has landed (exactly the park path's accepted behavior)."""
+    seed_issue(rig, "i7", status="running")
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue comment", "times": 1, "stderr": "rate limited"}]))
+    out = rig.r._execute({"act": "bounce", "id": "i7", "num": 7, "memo": "BOUNCED: m",
+                          "cause": "bounce"}, NOW)
+    assert out == "ok"
+    st = issue_state(rig, "i7")
+    assert st["status"] == "bounced" and st["park_comment_posted"] is False
+    assert [m for m in mutations(rig) if m["kind"] == "comment"] == []
+    lab = [m for m in mutations(rig) if m["kind"] == "set_labels"][-1]
+    assert lab["add"] == "needs-owner"                 # the label DID land — the bounce is real
+
+
+def test_absorb_close_settles_terminal_and_stands_down(rig, monkeypatch):
+    """Issue #108: the issue was closed on GitHub while the loop was bouncing/parking it. Absorb:
+    settle terminal, clear the handback markers + blocked/awaiting files, reclaim the worktree, and
+    NEVER write a label or a comment (the issue is closed — labels are moot, and the owner already
+    answered)."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    seed_issue(rig, "i7", status="running", park_notify_cause="bounce", park_notify_at=NOW - 30)
+    (rig.home / "state" / "blocked" / "i7").write_text("BOUNCED: premise gone")
+    (rig.home / "state" / "awaiting" / "i7").write_text("waiting")
+    def add_answerer(st):
+        st["answerers"] = {"a1": {"for": "i7", "launched_at": NOW}}
+    loopstate.update(str(rig.home / "state" / "issues.json"), add_answerer)
+    out = rig.r._execute({"act": "absorb_close", "id": "i7", "num": 7}, NOW)
+    assert out == "ok"
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))
+    assert st["issues"]["i7"]["status"] == "merged"    # terminal (loopstate has no 'closed')
+    assert st["issues"]["i7"]["park_notify_cause"] is None and st["issues"]["i7"]["park_notify_at"] is None
+    assert st["issues"]["i7"]["park_comment_posted"] is False
+    assert st["answerers"] == {}                        # lingering answerer record cleaned
+    assert not (rig.home / "state" / "blocked" / "i7").exists()
+    assert not (rig.home / "state" / "awaiting" / "i7").exists()
+    assert removed == [str(rig.r._worktree("i7"))]      # worktree reclaimed (mirrors absorb_merged)
+    assert [m for m in mutations(rig) if m["kind"] == "set_labels"] == []
+    assert [m for m in mutations(rig) if m["kind"] == "comment"] == []
+
+
 def test_recover_exited_relaunches(rig):
     seed_issue(rig, "i5", status="running", branch="sl/i5-x")
     out = rig.r._execute({"act": "recover", "id": "i5", "tier": "exited"}, NOW)

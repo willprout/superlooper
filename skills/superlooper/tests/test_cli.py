@@ -893,6 +893,88 @@ def test_run_fails_hard_when_no_pane_and_not_in_cmux(rig):
     assert "cmux tab" in (r.stdout + r.stderr).lower()
 
 
+# ------------- run: runner-managed label boot preflight (issue #108) -------------
+
+def _cli_module():
+    """Import the extensionless CLI as a module so its pure helpers can be unit-tested. Safe: the
+    file guards its entrypoint behind `if __name__ == '__main__'`, and conftest already put
+    skill/lib + skill/bin on sys.path so its imports resolve."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("superlooper_cli", str(CLI))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def test_runner_managed_labels_is_the_tagged_subset():
+    # the runner-managed subset is derived from the '(runner-managed)' tag in the LABELS
+    # descriptions, so the LABELS list stays the single source of truth.
+    sl = _cli_module()
+    assert set(sl.runner_managed_labels()) == {"in-progress", "needs-owner", "parked"}
+
+
+def test_missing_runner_labels_pure():
+    sl = _cli_module()
+    assert sl.missing_runner_labels(set(ALL_LABELS)) == []
+    assert sl.missing_runner_labels({"agent-ready", "in-progress", "parked"}) == ["needs-owner"]
+    assert set(sl.missing_runner_labels(set())) == {"in-progress", "needs-owner", "parked"}
+    assert set(sl.missing_runner_labels([])) == {"in-progress", "needs-owner", "parked"}  # list ok
+    assert set(sl.missing_runner_labels("garbage")) == {"in-progress", "needs-owner", "parked"}
+
+
+def test_run_fails_loud_when_a_runner_managed_label_is_missing(rig):
+    # the 2026-07-13 incident: `needs-owner` did not exist, so every bounce/park label move retried
+    # forever. The runner defends itself at boot — FAIL LOUD, naming the label AND the exact adopt
+    # remediation, rather than boot into a repo where it cannot hand issues back.
+    (rig.fixdir / "label_list.json").write_text(json.dumps(
+        [{"name": n} for n in ALL_LABELS if n != "needs-owner"]))
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode != 0, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert "needs-owner" in out                            # names the missing label
+    assert "adopt" in out and str(rig.repo) in out         # names the exact remediation
+    # it never started: no heartbeat written
+    assert not (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+
+
+def test_run_boots_when_all_runner_managed_labels_present(rig):
+    # the all-present case: the healthy rig has ALL_LABELS -> the preflight passes and the runner
+    # ticks normally.
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+
+
+def test_run_skips_the_label_preflight_when_gh_is_unreachable(rig):
+    # a transient gh blip at boot must NOT block a restart: a refused label read fails closed
+    # (ok=False) and SKIPS the check, and fix-1's bounded-storm guards cover a genuinely-missing
+    # label until the next doctor/adopt. gh unreachable -> boot proceeds; the tick's own poll marks
+    # the view stale and simply waits.
+    (rig.fixdir / "label_list.json").write_text(json.dumps([{"name": "agent-ready"}]))
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True), "GH_FAIL": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+
+
+def test_run_boots_when_the_label_read_is_refused_but_gh_probes_ok(rig):
+    # P1 (issue #108 review, the #92 refused-vs-answered-empty class): `gh api rate_limit` (probe) is
+    # EXEMPT from rate limiting, so during a core-throttle window it reads OK while the label LIST
+    # read is throttled to a fail-closed empty set. The preflight must read that as a REFUSED read
+    # (ok=False) and SKIP — never as "every runner-managed label missing" — or it would wedge the
+    # boot during the very rate-limit window this issue hardens against. label_list.json is intact
+    # (all labels present), but the ONE `label list` call is forced to fail, mimicking the throttle.
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps([{"match": "label list", "times": 1}]))
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+
+
 # --------------------------- promotion + accept-failure (Task 12) ---------------------------
 
 def test_accept_failure_persists_into_the_ledger(rig):
