@@ -21,8 +21,6 @@ tests pin the DoD facts so they cannot silently regress:
 import re
 from pathlib import Path
 
-import yaml
-
 # tests/test_write_issue_promotion.py -> tests -> superlooper -> skills -> <repo root>
 _REPO = Path(__file__).resolve().parents[3]
 _WRITE_ISSUE = _REPO / "plugin" / "skills" / "write-issue" / "SKILL.md"
@@ -39,10 +37,19 @@ def _read():
 
 
 def _frontmatter(text):
-    """Return the parsed YAML frontmatter block (the fenced ``---`` header)."""
+    """Return the SKILL.md frontmatter as a dict. Parsed without a yaml dependency (CI has no
+    PyYAML): the block is simple top-level ``key: value`` lines, split on the first colon so
+    colons inside a value (e.g. `` `type:` ``) stay in the value."""
     m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
     assert m, "SKILL.md must open with a `---` YAML frontmatter block"
-    return yaml.safe_load(m.group(1))
+    fm = {}
+    for line in m.group(1).splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, sep, val = line.partition(":")
+        assert sep, f"frontmatter line is not `key: value`: {line!r}"
+        fm[key.strip()] = val.strip()
+    return fm
 
 
 # ---- the move (design D3: moved, never forked) -------------------------------------------
