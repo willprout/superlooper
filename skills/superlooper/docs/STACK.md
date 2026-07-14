@@ -55,12 +55,14 @@ Fix every `FAIL` line before starting `superlooper run`.
 An orchestrator additionally needs the tools used by the gate and by worker handoff:
 
 - `codex CLI` - Needed only when this machine actually runs Codex: a repo whose config sets
-  `agent: codex`, so worker sessions launch through Codex. `/cross-review` (a Codex second opinion)
-  is the *default* fresh-agent review, but an independent same-model fresh subagent is an equally
-  valid review path (owner ruling 2026-07-10), so a Claude-only machine satisfies the fresh-agent
-  review duty without Codex and can reach an all-green stack. The stack doctor therefore reports a
-  missing or unauthenticated Codex as a **WARN** on a Claude-only machine (stack still PASSes); it
-  is a hard **FAIL** only when a repo's config selects `agent: codex`.
+  `agent: codex`, so worker sessions launch through Codex. `/superlooper:cross-review` (a Codex
+  second opinion) is the *default* fresh-agent review, but an independent same-model fresh subagent
+  is an equally valid review path (owner ruling 2026-07-10), so a Claude-only machine satisfies the
+  fresh-agent review duty without Codex and can reach an all-green stack. The stack doctor therefore
+  reports a missing or unauthenticated Codex as a **WARN** on a Claude-only machine (stack still
+  PASSes); it is a hard **FAIL** only when a repo's config selects `agent: codex`. (Transition note:
+  the machine-local cross-review command may coexist with this namespaced skill until the owner
+  retires it — owner decision O3.)
 - Repo-level doctor green - `superlooper doctor --repo /path/to/repo` must pass for config,
   `required_checks`, labels, hooks, jq, and the repo adoption contract.
 - Same-workspace launch discipline - start `superlooper run` in the visible cmux tab that owns the
