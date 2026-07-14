@@ -223,3 +223,138 @@ def test_reclaim_does_not_mutate_its_inputs():
     ids = {"i1"}
     tidy.reclaimable_worktrees(issues, ids)
     assert issues == before and ids == {"i1"}
+
+
+# ======================= answerer windows (issue #132) =======================
+#
+# An answerer session (a<N>) hired by the Discuss/blocked flow is NOT a tracked issue, so
+# closable() never sees it and its cmux window lingers after its Q&A concludes (live evidence:
+# state/panes/a1 left behind after delivery). closable_answerers() is the SAME pure fail-closed
+# selector shape, adapted to a lifecycle where "finished" is the ABSENCE of a record:
+#
+#   * The runner writes answerers[a<N>] at hire and POPS it the moment the answerer's lifecycle
+#     ends — delivery, park (timeout / escalation / hire-cap), owner-absorb, re-approval (runner.py,
+#     four pop sites). So the `answerers` map holds EXACTLY the currently-active answerers; a finished
+#     one shows up as a pane marker with no record.
+#   * The clock-free race guard is a high-water mark: next_answerer is bumped to N+1 ATOMICALLY with
+#     writing a<N>'s record (one loopstate.update), and launch-session.sh writes a<N>'s pane marker
+#     only AFTER delivery verifies — strictly BEFORE that atomic write. So in the ONLY window where
+#     a<N> has a marker but no record (mid-hire), next_answerer has NOT yet passed N, and
+#     `N < next_answerer` is False: a mid-hire answerer is NEVER selected. aids are allocated
+#     monotonically and never reused, so a selected a<N> can never relaunch — closing its window and
+#     clearing its marker are both permanently race-free.
+#
+# Selection = a<N> has a pane marker AND a<N> is not an active record AND N < next_answerer.
+
+
+def test_delivered_answerer_window_is_selected():
+    # The primary case: answer delivered -> record popped, marker lingers, counter already past N.
+    got = tidy.closable_answerers({}, next_answerer=2, windows={"a1"})
+    assert got == [{"id": "a1", "status": "finished"}]
+
+
+def test_active_answerer_is_never_selected_even_with_a_window_and_high_water():
+    # a1 is mid-answer (a live record exists) -> NEVER close, even though its marker is on disk and
+    # the counter has moved past it.
+    answerers = {"a1": {"for": "i5", "launched_at": 100}}
+    assert tidy.closable_answerers(answerers, next_answerer=2, windows={"a1"}) == []
+
+
+def test_mid_hire_race_is_not_selected_counter_not_yet_past_n():
+    # The airtight guard: launch-session.sh wrote the a1 marker, but the runner has NOT yet written
+    # the record + bumped next_answerer (that atomic write lands together). During this window
+    # next_answerer is still 1, so `1 < 1` is False and a1 is left alone — never kill a mid-hire.
+    assert tidy.closable_answerers({}, next_answerer=1, windows={"a1"}) == []
+
+
+def test_failed_hire_marker_is_not_selected_until_a_later_hire_completes():
+    # A hire that failed (rc != 0) never bumped the counter, and a re-hire REUSES the same aid. So
+    # while next_answerer has not passed a1, a1 must not be closed — a re-hire could relight it.
+    assert tidy.closable_answerers({}, next_answerer=1, windows={"a1"}) == []
+
+
+def test_high_water_boundary_selects_below_but_not_at_next_answerer():
+    # N < next_answerer is strict: with next_answerer=3, a1/a2 are past-and-finished, a3 is the aid
+    # currently being (or about to be) hired and must be left alone.
+    got = tidy.closable_answerers({}, next_answerer=3, windows={"a1", "a2", "a3"})
+    assert [g["id"] for g in got] == ["a1", "a2"]
+
+
+def test_answerer_without_a_recorded_window_is_not_selected():
+    # closable_answerers closes WINDOWS: no pane marker on disk -> nothing to close.
+    assert tidy.closable_answerers({}, next_answerer=5, windows=set()) == []
+    assert tidy.closable_answerers({}, next_answerer=5, windows={"a2"}) == \
+        [{"id": "a2", "status": "finished"}]
+
+
+def test_answerer_result_is_sorted_by_number_not_lexically():
+    got = tidy.closable_answerers({}, next_answerer=99, windows={"a1", "a2", "a10"})
+    assert [g["id"] for g in got] == ["a1", "a2", "a10"]
+
+
+def test_next_answerer_wrong_typed_or_missing_selects_nothing():
+    # Not a real positive int -> nothing is `< next_answerer` -> close nothing (fail closed). bool is
+    # excluded (True is an int subclass but never a real counter); a float/str/None cannot gate.
+    for bad in (None, "2", 2.0, True, False, [1], {}):
+        assert tidy.closable_answerers({}, next_answerer=bad, windows={"a1"}) == [], bad
+
+
+def test_wrong_typed_answerers_map_fails_closed():
+    # A corrupt answerers map means we CANNOT prove a<N> is inactive -> never close it (when in
+    # doubt, do not close). Unlike an empty {} (the normal all-delivered case), a NON-dict fails closed.
+    for bad in (None, [], "a1", 5):
+        assert tidy.closable_answerers(bad, next_answerer=5, windows={"a1"}) == [], bad
+
+
+def test_empty_answerers_dict_is_the_normal_delivered_case_not_a_failure():
+    # {} is a VALID active set (everything delivered) -> the window IS closable.
+    assert tidy.closable_answerers({}, next_answerer=5, windows={"a1"}) == \
+        [{"id": "a1", "status": "finished"}]
+
+
+def test_a_record_with_any_value_type_protects_that_aid():
+    # The active check is key-presence, not value shape: a wrong-typed record value still means the
+    # runner tracked a1 -> protect it (fail closed), never close.
+    for rec in ("garbage", 5, None, {}, {"for": "i9"}):
+        answerers = {"a1": rec}
+        assert tidy.closable_answerers(answerers, next_answerer=5, windows={"a1"}) == [], rec
+
+
+def test_wrong_typed_windows_selects_nothing():
+    for bad in (None, 5, "a1"):
+        assert tidy.closable_answerers({}, next_answerer=5, windows=bad) == [], bad
+
+
+def test_unhashable_window_entries_are_skipped_not_raised():
+    # The contract is "wrong-typed -> skipped, never a raise" (a list slips past the collection
+    # check yet raises inside set()); valid a<N> ids still count.
+    got = tidy.closable_answerers({}, next_answerer=5, windows=[["a1"], "a2"])
+    assert got == [{"id": "a2", "status": "finished"}]
+
+
+def test_non_answerer_window_names_are_skipped():
+    # Only a<N> ids are answerer windows; an i<N> issue id, a bare "a", or a typo'd "aX" is ignored.
+    windows = {"a2", "a", "aX", "i3", "a2.ws"}
+    assert tidy.closable_answerers({}, next_answerer=5, windows=windows) == \
+        [{"id": "a2", "status": "finished"}]
+
+
+def test_a0_is_not_a_real_answerer_and_is_skipped():
+    # The runner allocates aids from a1 (never a0), so a stray `a0` pane marker is corruption, not a
+    # finished answerer — skip it (positive allowlist: only act on a provably-real answerer id).
+    assert tidy.closable_answerers({}, next_answerer=5, windows={"a0", "a1"}) == \
+        [{"id": "a1", "status": "finished"}]
+
+
+def test_answerer_does_not_mutate_its_inputs():
+    answerers = {"a1": {"for": "i5"}}
+    windows = {"a1", "a2"}
+    before_a = copy.deepcopy(answerers)
+    tidy.closable_answerers(answerers, next_answerer=3, windows=windows)
+    assert answerers == before_a and windows == {"a1", "a2"}
+
+
+def test_repeated_answerer_calls_return_independent_lists():
+    a = tidy.closable_answerers({}, next_answerer=2, windows={"a1"})
+    b = tidy.closable_answerers({}, next_answerer=2, windows={"a1"})
+    assert a == b and a is not b and a[0] is not b[0]

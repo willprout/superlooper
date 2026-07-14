@@ -70,6 +70,25 @@ def test_parse_windows_is_status_agnostic():
         {"id": "i9", "status": "needs_william", "surface": "cmux:s-9"}]
 
 
+def test_parse_windows_reads_answerer_rows():
+    # Issue #132: `superlooper tidy` now ALSO lists finished answerer session windows (a<N>) with a
+    # synthetic "finished" status. The dashboard must bind those rows too, or the Tidy button would
+    # silently under-count and never offer to close them — the exact linger the CLI now fixes.
+    out = ("tidy will close 2 finished (merged) session window(s):\n"
+           "  i23   merged        cmux:surface-23\n"
+           "  a1    finished      cmux:answerer-1\n")
+    assert tidy_mod.parse_windows(out) == [
+        {"id": "i23", "status": "merged", "surface": "cmux:surface-23"},
+        {"id": "a1", "status": "finished", "surface": "cmux:answerer-1"}]
+
+
+def test_parse_windows_reads_an_answerer_with_no_surface():
+    out = ("tidy will close 1 finished (merged) session window(s):\n"
+           "  a7    finished      (no surface)\n")
+    assert tidy_mod.parse_windows(out) == [
+        {"id": "a7", "status": "finished", "surface": ""}]
+
+
 def test_parse_closed_reads_the_count():
     assert tidy_mod.parse_closed("closed 3 window(s).\n") == 3
     assert tidy_mod.parse_closed("closed 1 window(s). 1 re-approvable ...") == 1

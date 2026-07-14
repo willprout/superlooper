@@ -91,3 +91,13 @@ def test_shell_dispatches_tidy_open_to_the_overlay():
 def test_tidy_surfaces_are_styled():
     assert ".cc-tidy" in _CSS, "shell.css must style the .cc-tidy dialog"
     assert ".tidy-btn" in _CSS, "shell.css must style the .tidy-btn top-bar button"
+
+
+def test_answerer_windows_get_their_own_flight_code():
+    # Issue #132: a finished answerer window (a<N>) now appears in the Tidy dialog. It must read as a
+    # helper session, not a flight — its label is A-<N>, mirroring the SL-<N> flight code (joy §0.1:
+    # the new rows stay on-theme and honest, never a bare raw id).
+    assert re.search(r"/\^a\(\\d\+\)\$/", _TIDY_JS), (
+        "tidy.js flightLabel must recognize an a<N> answerer id")
+    assert re.search(r'"A-"', _TIDY_JS), (
+        "an answerer id must render as the A-<N> code, mirroring SL-<N>")

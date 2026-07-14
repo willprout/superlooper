@@ -67,15 +67,18 @@ def _run(binary, args, timeout=None):
 #     tidy will close N finished (merged) session window(s):
 #       i23   merged        cmux:surface-23           <- f"  {id:5} {status:13} {surface or '(no surface)'}"
 #       i16   merged        (no surface)
+#       a1    finished      cmux:answerer-1           <- a FINISHED answerer session window (#132)
 #     dry-run: nothing closed.                         (--dry-run)   /   closed N window(s).   (--yes)
 # or, when nothing is finished:
 #     tidy: no finished (merged) session windows to close.
 
-# An indented window row: two leading spaces, the `iN` id, the single-token status, then the
-# surface (which may itself contain non-space punctuation like `cmux:...`). Header/footer prose
-# never matches (it does not start with two-spaces-then-`iN`), so it is ignored — an empty list is
-# the honest "nothing finished to close" read.
-_WINDOW_RE = re.compile(r"^ {2}(i\d+)\s+(\S+)\s+(.*\S)\s*$")
+# An indented window row: two leading spaces, the id, the single-token status, then the surface
+# (which may itself contain non-space punctuation like `cmux:...`). The id is `iN` (a tracked issue
+# session) OR `aN` (a finished answerer session — issue #132; the CLI folds these into the same
+# list with a synthetic "finished" status). Header/footer prose never matches (it does not start
+# with two-spaces-then-an-id), so it is ignored — an empty list is the honest "nothing finished
+# to close" read.
+_WINDOW_RE = re.compile(r"^ {2}([ia]\d+)\s+(\S+)\s+(.*\S)\s*$")
 _CLOSED_RE = re.compile(r"closed\s+(\d+)\s+window")
 
 
