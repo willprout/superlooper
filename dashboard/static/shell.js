@@ -274,6 +274,13 @@
       '<button class="tidy-btn" data-act="tidy-open" data-repo="' + esc(r ? r.slug : "") + '"' +
         (r ? "" : " disabled") +
         ' title="Tidy — close the terminal windows of finished sessions (runs superlooper tidy locally; no GitHub)">\u{1F9F9} Tidy</button>' +
+      // The Janitor button (issue #121) — the second ops-verb button: clears GitHub-side debris
+      // (stale merged/superseded loop branches, superseded PRs, aged parked issues) by running
+      // `superlooper janitor` locally; a sweep dialog groups every proposal and executes only the
+      // ones tapped. Carries the camera repo, like Flag/Tidy, so a tap sweeps the repo on screen.
+      '<button class="janitor-btn" data-act="janitor-open" data-repo="' + esc(r ? r.slug : "") + '"' +
+        (r ? "" : " disabled") +
+        ' title="Sweep — clear GitHub-side debris (runs superlooper janitor locally; you tap exactly what to clear)">\u{1F5D1}️ Sweep</button>' +
       '<button class="flag-btn" data-act="flag-open" data-repo="' + esc(r ? r.slug : "") + '"' +
         (r ? "" : " disabled") +
         ' title="Flag something you see — files a GitHub issue labeled flag (no AI)">⚑ Flag</button>' +
@@ -470,6 +477,7 @@
 
     if (act === "flag-open") { openFlagBox(repo); return; }
     if (act === "tidy-open") { if (window.CCTidy) window.CCTidy.open(repo); return; }
+    if (act === "janitor-open") { if (window.CCJanitor) window.CCJanitor.open(repo); return; }
     if (act === "replay-open") { if (window.CCReplay) window.CCReplay.open(repo, state.snapshot && state.snapshot.fun); return; }
     if (act === "digest-open") { if (window.CCDigest) window.CCDigest.open(repo); return; }
     if (act === "discuss") { doDiscuss(repo, num); return; }

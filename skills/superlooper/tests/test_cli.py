@@ -1716,3 +1716,165 @@ def test_janitor_nothing_to_propose_is_a_clean_exit(rig):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "nothing to propose" in r.stdout
     assert mutations(rig) == [] and _janitor_journal(rig) == []
+
+
+# --------------------------- janitor --json / --execute-keys (command-center wiring, issue #121) ---------------------------
+# The command center drives the SAME `superlooper janitor` machinery the terminal does (the way the
+# Tidy button drives `superlooper tidy`), so it needs a machine-readable propose and a subset
+# executor. `--json` prints the propose() snapshot (proposals + held-back keys) and changes NOTHING;
+# `--execute-keys k1,k2` executes EXACTLY those approved keys through the same reconcile → execute →
+# journal → refused-holdback flow. Neither weakens a single safety rule: propose() is still the pure
+# selector, act-time re-verification still runs, and a currently-refused key is still held back.
+
+def test_janitor_json_lists_proposals_as_structured_data_and_changes_nothing(rig):
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--json", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)                       # stdout is ONE json object, no human lines
+    assert doc["ok"] is True
+    by_key = {p["key"]: p for p in doc["proposals"]}
+    assert set(by_key) == {"branch:sl/i5-fix-thing", "pr:14", "issue:9"}
+    assert by_key["branch:sl/i5-fix-thing"]["kind"] == "branch"
+    assert by_key["branch:sl/i5-fix-thing"]["action"] == "delete-branch"
+    assert by_key["pr:14"]["action"] == "close-pr" and by_key["pr:14"]["target"] == 14
+    assert by_key["issue:9"]["action"] == "close-issue"
+    assert all(p.get("why") for p in doc["proposals"])
+    assert doc["held"] == [] and doc["aged_park_days"] == 14
+    # --json is a read: no gh writes, no journal, no refused file
+    assert mutations(rig) == [] and _janitor_journal(rig) == [] and _janitor_refused(rig) is None
+
+
+def test_janitor_json_reports_held_back_keys_separately(rig):
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "janitor_refused.json").write_text(json.dumps(
+        {"branch:sl/i5-fix-thing": {"reason": "HTTP 403", "ts": 1}}))
+    r = cli(rig, "janitor", "--json", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    keys = {p["key"] for p in doc["proposals"]}
+    assert "branch:sl/i5-fix-thing" not in keys       # held back, not proposed
+    assert doc["held"] == ["branch:sl/i5-fix-thing"]  # surfaced once, separately
+    assert mutations(rig) == []
+
+
+def test_janitor_json_empty_sweep_is_ok_true_with_no_proposals(rig):
+    _seed_janitor_fixtures(rig)
+    (rig.fixdir / "branches.json").write_text("[]")
+    (rig.fixdir / "pr_list_superseded.json").write_text("[]")
+    (rig.fixdir / "issue_list_parked.json").write_text("[]")
+    r = cli(rig, "janitor", "--json", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["ok"] is True and doc["proposals"] == []
+
+
+def test_janitor_json_unreadable_loopstate_emits_ok_false_and_exits_nonzero(rig):
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "issues.json").write_text("{corrupt")
+    r = cli(rig, "janitor", "--json", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    doc = json.loads(r.stdout)
+    assert doc["ok"] is False and "unreadable" in doc["error"]
+    assert mutations(rig) == []
+
+
+def test_janitor_execute_keys_runs_only_the_named_subset(rig):
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--json", "--execute-keys", "pr:14", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["ok"] is True and doc["executed"] == 1 and doc["failed"] == 0
+    assert [x["key"] for x in doc["results"]] == ["pr:14"]
+    assert doc["results"][0]["outcome"] == "ok"
+    # ONLY the PR closed — the branch delete and issue close the owner did NOT tap never ran
+    kinds = {m["kind"] for m in mutations(rig)}
+    assert kinds == {"close_pr"}
+    recs = [x for x in _janitor_journal(rig) if x.get("act") == "janitor"]
+    assert len(recs) == 1 and recs[0]["target"] == 14 and recs[0]["outcome"] == "ok"
+    assert recs[0].get("why")
+
+
+def test_janitor_execute_keys_multiple_keys(rig):
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--json", "--execute-keys", "pr:14,issue:9",
+            "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["executed"] == 2
+    assert {m["kind"] for m in mutations(rig)} == {"close_pr", "close_issue"}
+
+
+def test_janitor_execute_keys_skips_a_key_no_longer_eligible(rig):
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--json", "--execute-keys", "branch:sl/i999-vanished",
+            "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["executed"] == 0 and doc["skipped"] == 1
+    assert doc["results"][0]["outcome"] == "skipped"
+    assert mutations(rig) == []
+
+
+def test_janitor_execute_keys_act_time_reverification_excludes_inflight(rig):
+    # the owner taps a branch in the dashboard; before the CLI acts, that issue goes in-flight.
+    # a FRESH re-derivation no longer proposes it, so reconcile drops it — never deleted.
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    st = loopstate.new_state()
+    st["issues"]["i5"] = dict(loopstate.new_issue(), status="running",
+                              branch="sl/i5-fix-thing")
+    loopstate.save(str(home / "state" / "issues.json"), st)
+    r = cli(rig, "janitor", "--json", "--execute-keys", "branch:sl/i5-fix-thing",
+            "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["results"][0]["outcome"] == "skipped"
+    assert [m for m in mutations(rig) if m["kind"] == "delete_ref"] == []
+
+
+def test_janitor_execute_keys_failure_is_held_back_then_retryable(rig):
+    _seed_janitor_fixtures(rig)
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "git/refs/heads/sl/i5-fix-thing", "times": 1,
+          "stderr": "HTTP 403: refs are protected"}]))
+    r = cli(rig, "janitor", "--json", "--execute-keys", "branch:sl/i5-fix-thing",
+            "--repo", str(rig.repo))
+    assert r.returncode != 0
+    doc = json.loads(r.stdout)
+    assert doc["failed"] == 1 and doc["results"][0]["outcome"] == "fail"
+    assert "branch:sl/i5-fix-thing" in _janitor_refused(rig)
+
+    # a second tap of the SAME key, no retry flag: held back, never silently retried
+    r2 = cli(rig, "janitor", "--json", "--execute-keys", "branch:sl/i5-fix-thing",
+             "--repo", str(rig.repo))
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    doc2 = json.loads(r2.stdout)
+    assert doc2["results"][0]["outcome"] == "held" and doc2["executed"] == 0
+    assert [m for m in mutations(rig) if m["kind"] == "delete_ref"] == []
+
+    # explicit retry (no fail rule left): it executes and the refusal record clears
+    r3 = cli(rig, "janitor", "--json", "--execute-keys", "branch:sl/i5-fix-thing",
+             "--retry-refused", "--repo", str(rig.repo))
+    assert r3.returncode == 0, r3.stdout + r3.stderr
+    doc3 = json.loads(r3.stdout)
+    assert doc3["results"][0]["outcome"] == "ok"
+    assert [m["ref"] for m in mutations(rig) if m["kind"] == "delete_ref"] == \
+        ["heads/sl/i5-fix-thing"]
+    assert _janitor_refused(rig) == {}
+
+
+def test_janitor_execute_keys_unreadable_loopstate_refuses(rig):
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "issues.json").write_text("{corrupt")
+    r = cli(rig, "janitor", "--json", "--execute-keys", "pr:14", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    doc = json.loads(r.stdout)
+    assert doc["ok"] is False and "unreadable" in doc["error"]
+    assert mutations(rig) == []

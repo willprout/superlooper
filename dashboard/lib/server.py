@@ -149,6 +149,13 @@ _ACTION_PATHS = set(_LABEL_VERBS) | {"/api/flag", "/api/discuss"}
 # ``lib.tidy.Tidy``, kept separate from ``actions`` because it drives a different egress entirely.
 _TIDY_PATHS = {"/api/tidy/dry-run": "dry_run", "/api/tidy": "execute"}
 
+# The Janitor endpoints (issue #121) — the dashboard's THIRD button in the local-command class:
+# the GitHub-side debris sweep (``superlooper janitor``). Two steps: propose lists what the sweep
+# WOULD do (grouped by kind, the dialog shows exactly this), execute runs EXACTLY the keys the owner
+# tapped. Backed by a ``lib.janitor.Janitor`` — like Tidy, it drives the CLI so the janitor's whole
+# safety contract stays the single source of truth (the dashboard re-derives none of it).
+_JANITOR_PATHS = {"/api/janitor/propose": "propose", "/api/janitor": "execute"}
+
 
 def _is_allowed_origin(origin, host):
     """True when a POST's ``Origin`` is our own page — or absent (a non-browser caller like curl or a
@@ -243,7 +250,35 @@ def _route_tidy(clean, body_bytes, tidy):
     return _json_resp(200, getattr(tidy, _TIDY_PATHS[clean])(repo))
 
 
-def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, desk=None, tidy=None):
+def _route_janitor(clean, body_bytes, janitor):
+    """The Janitor endpoints (issue #121) — the GitHub-side debris sweep, the third LOCAL COMMAND
+    button (same class as Tidy). Same-origin is already enforced by the caller (a foreign page must
+    not be able to sweep GitHub any more than it could drive the label writer). ``janitor=None`` (a
+    read-only embedder, or writes disabled) → 405. Dispatches to the tested ``lib.janitor.Janitor``:
+    ``propose`` returns the proposals grouped by kind (the dialog shows exactly this), ``execute``
+    runs EXACTLY the ``keys`` the owner tapped. A command failure is the action's own honest ``ok:
+    false`` body at 200 — never an HTTP error, never a silent success."""
+    if janitor is None:
+        return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
+    payload, err = _parse_json_body(body_bytes)
+    if err is not None:
+        return err
+    repo = payload.get("repo")
+    if not isinstance(repo, str) or not repo.strip():
+        return _json_resp(400, {"ok": False, "error": "missing 'repo'"})
+    if clean == "/api/janitor/propose":
+        return _json_resp(200, janitor.propose(repo))
+    # execute: the tapped subset. `keys` must be a list (the CLI/adapter then refuses an empty or
+    # garbage selection) — a body missing it, or sending a non-list, is a bad request. Nothing ever
+    # sweeps that the owner did not tap.
+    keys = payload.get("keys")
+    if not isinstance(keys, list):
+        return _json_resp(400, {"ok": False, "error": "missing or bad 'keys'"})
+    return _json_resp(200, janitor.execute(repo, keys))
+
+
+def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, desk=None, tidy=None,
+                janitor=None):
     """The pure POST router. Order is deliberate: cross-origin → 403 (before any parsing, for every
     POST); the Tidy local-command endpoints (need only ``tidy``); the dashboard-local tower-seen
     write (needs only ``desk``); then the gh verbs — writes-disabled → 405; unknown action path →
@@ -254,6 +289,8 @@ def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, des
         return _json_resp(403, {"ok": False, "error": "cross-origin write refused"})
     if clean in _TIDY_PATHS:
         return _route_tidy(clean, body_bytes, tidy)
+    if clean in _JANITOR_PATHS:
+        return _route_janitor(clean, body_bytes, janitor)
     if clean == "/api/tower-seen":
         return _route_tower_seen(body_bytes, desk)
     if actions is None:                  # gh writes not wired → method not allowed (Task 5 contract)
@@ -316,7 +353,8 @@ def _provider_get(provider, params):
 
 
 def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"", origin=None,
-          host=None, desk=None, tidy=None, replay_provider=None, digest_provider=None):
+          host=None, desk=None, tidy=None, janitor=None, replay_provider=None,
+          digest_provider=None):
     """Map one request to a :class:`Response`, with no socket in sight (unit-testable with an
     injected ``snapshot_provider`` and ``actions``). ``POST`` drives the six mechanical verbs
     (Task 6) plus the dashboard-local tower-seen write (Task 9) via :func:`_route_post`;
@@ -326,10 +364,12 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
     fresh truth); a provider that raises fails closed to a typed 500 so the client's poll loop
     survives. Every other ``GET`` serves a static file (traversal-safe). ``HEAD`` routes like ``GET``
     (the handler omits the body); any other method is a clean 405. ``tidy`` (a ``lib.tidy.Tidy``)
-    backs the Tidy local-command endpoints (issue #41); ``None`` leaves that surface off (405)."""
+    backs the Tidy local-command endpoints (issue #41) and ``janitor`` (a ``lib.janitor.Janitor``)
+    the Janitor GitHub-sweep endpoints (issue #121); ``None`` leaves that surface off (405)."""
     clean = path.split("?", 1)[0]
     if method == "POST":
-        return _route_post(clean, body, origin, host, actions, snapshot_provider, desk, tidy)
+        return _route_post(clean, body, origin, host, actions, snapshot_provider, desk, tidy,
+                           janitor)
     if method not in ("GET", "HEAD"):
         return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
 
@@ -353,13 +393,14 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
 
 # =============================== the server (loopback only) ===============================
 
-def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=None,
+def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=None, janitor=None,
                  replay_provider=None, digest_provider=None):
     """A ``BaseHTTPRequestHandler`` subclass that delegates to :func:`route`. Kept thin: the socket
     machinery lives here (reading the POST body + Origin), every decision lives in the pure router
     above. ``actions`` (an ``lib.actions.Actions``) enables the POST verbs; ``desk`` (a
     ``lib.desk.Desk``) enables the dashboard-local tower-seen write; ``tidy`` (a ``lib.tidy.Tidy``)
-    enables the Tidy local-command endpoints (issue #41); ``replay_provider`` / ``digest_provider``
+    enables the Tidy local-command endpoints (issue #41); ``janitor`` (a ``lib.janitor.Janitor``)
+    enables the Janitor GitHub-sweep endpoints (issue #121); ``replay_provider`` / ``digest_provider``
     (``fn(params)->dict``) enable the on-demand Task-11 GETs. ``None`` for any of them leaves that
     surface off (POST → 405; replay/digest GET → 404)."""
 
@@ -400,27 +441,28 @@ def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=N
             self._write(route(self.command, self.path, snapshot_provider, static_root,
                               actions=actions, body=self._read_body(),
                               origin=self.headers.get("Origin"), host=self.headers.get("Host"),
-                              desk=desk, tidy=tidy))
+                              desk=desk, tidy=tidy, janitor=janitor))
 
     return _Handler
 
 
 def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, actions=None, desk=None,
-                 tidy=None, replay_provider=None, digest_provider=None):
+                 tidy=None, janitor=None, replay_provider=None, digest_provider=None):
     """Construct (do NOT start) the loopback HTTP server. Refuses any non-loopback ``host`` with a
     ``ValueError`` — binding ``0.0.0.0`` or a LAN interface would expose a label-writing (and now
     local-command-running, issue #41) server off the machine, a bright line (decision B.3).
     ``actions`` wires the POST verbs (Task 6); ``desk`` wires the tower-seen watermark write (Task
-    9); ``tidy`` wires the Tidy local-command endpoints (issue #41); ``replay_provider`` /
-    ``digest_provider`` wire the on-demand replay + digest GETs (Task 11); omit any for a surface
-    that stays off. ``port=0`` binds an ephemeral port (tests). Call ``.serve_forever()`` to run it."""
+    9); ``tidy`` wires the Tidy local-command endpoints (issue #41); ``janitor`` wires the Janitor
+    GitHub-sweep endpoints (issue #121); ``replay_provider`` / ``digest_provider`` wire the on-demand
+    replay + digest GETs (Task 11); omit any for a surface that stays off. ``port=0`` binds an
+    ephemeral port (tests). Call ``.serve_forever()`` to run it."""
     if host != BIND_HOST:
         raise ValueError(
             "command center binds %s only (refusing %r) — it can write GitHub labels, so it must "
             "never be reachable off the machine" % (BIND_HOST, host))
     return ThreadingHTTPServer((host, port),
                                make_handler(snapshot_provider, static_root, actions, desk, tidy,
-                                            replay_provider, digest_provider))
+                                            janitor, replay_provider, digest_provider))
 
 
 # =============================== CachedGh — the gh slow clock (decision B.2) ===============================
