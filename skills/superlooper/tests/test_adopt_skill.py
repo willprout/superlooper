@@ -63,9 +63,11 @@ def test_skill_md_exists_with_frontmatter():
 
 def test_bootstrap_orders_clone_install_stackdoctor_then_the_trio():
     text = read(SKILL_MD)
-    lowered = text.lower()
     steps = [
-        ("clone", lowered.find("clone")),
+        # anchor on `git clone` (body step 1 only), NOT a bare "clone" — the frontmatter
+        # description also says "clone", and matching that would leave the body clone step's
+        # position effectively unpinned.
+        ("git clone", text.find("git clone")),
         ("install.sh", text.find("install.sh")),
         ("doctor --stack", text.find("doctor --stack")),
         ("superlooper adopt", text.find("superlooper adopt")),

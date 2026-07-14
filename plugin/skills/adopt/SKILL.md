@@ -54,8 +54,9 @@ to run at all). Do them top to bottom.
 
 4. **Adopt the repo — `superlooper adopt --repo <path>`.** Writes `.superlooper/config.json` from
    the template, seeds the CLAUDE.md standing-rules block, creates the label set, and prints the
-   branch-protection advice. It is safe to re-run: it never overwrites an existing config and
-   skips labels that already exist. Then **edit the config**: set `repo`, your `areas`, at least
+   branch-protection advice. It is safe to re-run: it never overwrites an existing config, and it
+   creates the labels idempotently (`--force`) — an existing label is updated in place, never
+   duplicated. Then **edit the config**: set `repo`, your `areas`, at least
    one `required_checks` entry, and any `bright_lines`. (Every field is documented in the
    published contract — see below.)
 
