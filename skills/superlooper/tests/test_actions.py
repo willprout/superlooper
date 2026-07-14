@@ -1595,6 +1595,151 @@ def test_terminal_parked_issue_never_alerts_label_stuck():
     assert only(out, "alert") == [] and not has_notify(out)
 
 
+# ---------------- bounce gets #61's park guards (issue #108) ----------------
+# The bounce path (a worker's launch-time BOUNCED memo) never received #61's notify-once + stuck-
+# alert guards, so a bounce whose label move keeps failing (the 2026-07-13 missing needs-owner
+# label) re-emitted its notify EVERY tick — a text every ~18s, unbounded. These mirror the park
+# notify-once tests above; bounce reuses the same durable handback marker (park_notify_*).
+
+def test_bounce_notifies_once_then_silent_retries():
+    dsk = disk(blocked={"i7": "BOUNCED: premise gone"},
+               issues_state={"version": 1, "issues": {"i7": ist("running")}})
+    out = decide(dsk=dsk)
+    b = only(out, "bounce")
+    assert len(b) == 1 and b[0].get("retry") is None and has_notify(out)
+    # the executor stamped the cause BEFORE its label move failed; the re-derived bounce is silent
+    dsk["issues_state"]["issues"]["i7"]["park_notify_cause"] = b[0]["cause"]
+    out2 = decide(dsk=dsk)
+    b2 = only(out2, "bounce")
+    assert len(b2) == 1 and b2[0].get("retry") is True   # the bounce still retries (labels converge)
+    assert not has_notify(out2)                          # ...but the texting happened once
+
+
+def test_bounce_notify_precedes_the_bounce_action():
+    # Crash-window ordering (mirrors park, Codex C1): notify BEFORE the bounce action, so a crash
+    # mid-tick can only DUPLICATE a text, never lose it.
+    dsk = disk(blocked={"i7": "BOUNCED: x"},
+               issues_state={"version": 1, "issues": {"i7": ist("running")}})
+    out = decide(dsk=dsk)
+    acts = [a["act"] for a in out]
+    assert acts.index("notify") < acts.index("bounce")
+
+
+def test_bounce_label_stuck_past_bound_alerts_once():
+    # a bounce label move failing past the bound is ALERT-worthy — one more text, not twenty. Rides
+    # the SAME park_label_stuck machinery (reused handback marker) + the standard ALERT dedup.
+    d = disk(blocked={"i7": "BOUNCED: x"},
+             issues_state={"version": 1, "issues": {
+                 "i7": ist("running", park_notify_cause="bounce",
+                           park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)}})
+    out = decide(dsk=d)
+    a = only(out, "alert")
+    assert len(a) == 1 and "park_label_stuck:i7" in a[0]["reasons"] and has_notify(out)
+    # the same-cause bounce retry underneath must stay silent (only the ALERT texts)
+    assert only(out, "bounce") and only(out, "bounce")[0].get("retry") is True
+    d2 = disk(blocked={"i7": "BOUNCED: x"}, issues_state=d["issues_state"],
+              alert={"reasons": ["park_label_stuck:i7"], "since": NOW - 100})
+    out2 = decide(dsk=d2)
+    assert only(out2, "alert") == [] and not has_notify(out2)
+
+
+def test_label_stuck_alert_is_suppressed_for_an_issue_being_absorbed():
+    # issue #108 review P2: if a storm ran past the bound and the owner then closes the issue, the
+    # same tick absorbs the close — so a "label stuck" alert text as they drop it is pure noise.
+    # A positively-closed (fresh view) issue raises no stuck alert; it just absorbs.
+    d = disk(blocked={"i7": "BOUNCED: x"},
+             issues_state={"version": 1, "issues": {
+                 "i7": ist("running", park_notify_cause="bounce",
+                           park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)}})
+    out = decide(dsk=d, gh_view=ghv(closed_nums={7}))
+    assert only(out, "absorb_close") == [{"act": "absorb_close", "id": "i7", "num": 7}]
+    assert not any("park_label_stuck" in r for a in only(out, "alert") for r in a["reasons"])
+    assert not has_notify(out)                          # no stuck-label text on the drop tick
+
+
+def test_bounce_label_failing_under_bound_stays_quiet():
+    d = disk(blocked={"i7": "BOUNCED: x"},
+             issues_state={"version": 1, "issues": {
+                 "i7": ist("running", park_notify_cause="bounce", park_notify_at=NOW - 60)}})
+    out = decide(dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+# ---------------- absorb external closes for bounced/parked issues (issue #108) ----------------
+# William closing the issue on GitHub (the dashboard's Drop) while the loop is bouncing/parking it
+# is his answer: absorb the close, settle terminal, stand down. Positive-proof only (a fresh view
+# whose closed set names the issue); scoped to bounce/park episodes so a normal merge-close or a
+# plain running build is untouched.
+
+def test_external_close_while_bouncing_absorbs_no_bounce_no_notify():
+    dsk = disk(blocked={"i7": "BOUNCED: premise gone"},
+               issues_state={"version": 1, "issues": {
+                   "i7": ist("running", park_notify_cause="bounce", park_notify_at=NOW - 30)}})
+    out = decide(dsk=dsk, gh_view=ghv(closed_nums={7}))
+    assert only(out, "bounce") == []
+    assert only(out, "absorb_close") == [{"act": "absorb_close", "id": "i7", "num": 7}]
+    assert not has_notify(out)
+
+
+def test_external_close_while_parking_absorbs_no_park_no_notify():
+    dsk = disk(reports={"i5": GOOD_REPORT},
+               issues_state={"version": 1, "issues": {
+                   "i5": ist("gating", park_notify_cause="checks", park_notify_at=NOW - 30)}})
+    out = decide(dsk=dsk, gh_view=ghv(closed_nums={5}))
+    assert only(out, "park") == []
+    assert only(out, "absorb_close") == [{"act": "absorb_close", "id": "i5", "num": 5}]
+    assert not has_notify(out)
+
+
+def test_external_close_while_terminally_bounced_absorbs_to_conclude():
+    # post-storm: status already terminal 'bounced', issue closed on GitHub -> absorb so the flight
+    # concludes (no lingering owner-decision presence). One absorb, no notify.
+    dsk = disk(issues_state={"version": 1, "issues": {"i7": ist("bounced")}})
+    out = decide(dsk=dsk, gh_view=ghv(closed_nums={7}))
+    assert only(out, "absorb_close") == [{"act": "absorb_close", "id": "i7", "num": 7}]
+    assert not has_notify(out)
+
+
+def test_external_close_while_terminally_parked_absorbs():
+    for status in ("parked", "needs_william"):
+        dsk = disk(issues_state={"version": 1, "issues": {"i5": ist(status)}})
+        out = decide(dsk=dsk, gh_view=ghv(closed_nums={5}))
+        assert only(out, "absorb_close") == [{"act": "absorb_close", "id": "i5", "num": 5}], status
+
+
+def test_external_close_absorb_requires_a_fresh_view():
+    # a STALE gh view never absorbs (positive-proof discipline, #48): a closed_nums from a stale
+    # read is not acted on — the close must be freshly proven.
+    dsk = disk(issues_state={"version": 1, "issues": {"i7": ist("bounced")}})
+    out = decide(dsk=dsk, gh_view=ghv(stale=True, closed_nums={7}))
+    assert only(out, "absorb_close") == []
+
+
+def test_merged_issue_close_is_not_absorbed():
+    # a normally-merged build issue is closed by Closes #N; it must NOT be re-absorbed as an
+    # external close (its status is 'merged', not a bounce/park episode).
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("merged")}})
+    out = decide(dsk=dsk, gh_view=ghv(closed_nums={5}))
+    assert only(out, "absorb_close") == []
+
+
+def test_merged_issue_with_a_stale_park_marker_is_not_re_absorbed():
+    # idempotency + crash-window safety: a 'merged' issue that still carries a stale park_notify_cause
+    # (a crash between the merge and clear_park_marker executors) must NOT absorb — 'merged' is DONE.
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("merged", park_notify_cause="checks", park_notify_at=NOW - 9999)}})
+    out = decide(dsk=dsk, gh_view=ghv(closed_nums={5}))
+    assert only(out, "absorb_close") == []
+
+
+def test_running_build_close_is_out_of_scope_not_absorbed():
+    # closing a plain running build (no bounce/park episode) is out of THIS issue's scope: never
+    # absorbed here (the fail-to-owner posture on the build path is unchanged).
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("running")}})
+    out = decide(dsk=dsk, gh_view=ghv(closed_nums={5}))
+    assert only(out, "absorb_close") == []
+
+
 def test_merged_pr_state_is_absorbed_not_wedged():
     # Crash window (Codex round-1 C2): gh merged the PR, the runner died before stamping
     # status=merged. Restart must ABSORB the fact — settle local state + labels — not sit in

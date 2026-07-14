@@ -133,6 +133,33 @@ def _reconciled_parks(records, window_start):
     return {num for num, pts in park_ts.items() if num in merge_ts and merge_ts[num] >= pts}
 
 
+def _owner_closed(records, window_start):
+    """Issue numbers whose in-window park/bounce was STOOD DOWN by the owner CLOSING the issue on
+    GitHub — an `absorb_close` (issue #108). The owner already answered by closing, so the hand-back
+    is no longer an OPEN ask and must not be reported as one (it leaves Parked AND Bounces). NOT a
+    landing: an absorbed close is a drop, never listed under Merged. Mirrors _reconciled_parks'
+    at/after-ts discipline — a close resolves only a park/bounce that came at-or-before it — so an
+    issue the owner closed, then re-opened and re-approved and that parked AGAIN this window still
+    reads as a genuine open ask (its latest word is the new park, not the old close)."""
+    ask_ts, close_ts = {}, {}
+
+    def note(store, num, ts):
+        store[num] = max(store.get(num, float("-inf")), ts if ts is not None else float("-inf"))
+
+    for r in records:
+        if not (_ok(r) and _in_window(r, window_start)):
+            continue
+        num = _num(r.get("num"))
+        if num is None:
+            continue
+        act = r.get("act")
+        if act in ("park", "bounce"):
+            note(ask_ts, num, _ts(r))
+        elif act == "absorb_close":
+            note(close_ts, num, _ts(r))
+    return {num for num, ats in ask_ts.items() if num in close_ts and close_ts[num] >= ats}
+
+
 def _merged(records, repo, window_start, parked_earlier=frozenset()):
     """Clean merges AND absorbed out-of-band merges (a PR that landed on GitHub between merge and
     bookkeeping) — both are issues that landed. Windowed to the overnight bound, deduped by issue
@@ -172,12 +199,14 @@ def _parked(records, window_start, resolved=frozenset()):
     return lines
 
 
-def _bounces(records, window_start):
+def _bounces(records, window_start, resolved=frozenset()):
+    """Open push-backs only. A bounce the owner CLOSED on GitHub (`resolved`, from _owner_closed)
+    is dropped — the owner already answered by closing, so it is history, not an open ask."""
     seen = {}
     for r in records:
         if r.get("act") == "bounce" and _ok(r) and _in_window(r, window_start):
             num = _num(r.get("num"))
-            if num is not None:
+            if num is not None and num not in resolved:
                 seen[num] = (r.get("id"), r.get("memo"))
     lines = []
     for num in sorted(seen):
@@ -366,11 +395,14 @@ def morning(journal_records, gh_view, ledger, config):
     date = date if isinstance(date, str) and date.strip() else "(date unknown)"
 
     # Reconcile park records against final outcomes (#37): a park that later merged this window is
-    # resolved, so it leaves the open-ask Parked section and is annotated on its Merged line.
+    # resolved, so it leaves the open-ask Parked section and is annotated on its Merged line. A
+    # park/bounce the owner CLOSED on GitHub (#108, an absorb_close) is likewise no longer an open
+    # ask — it drops from Parked/Bounces but is NOT a landing, so it never renders under Merged.
     resolved_parks = _reconciled_parks(records, overnight_start)
+    owner_closed = _owner_closed(records, overnight_start)
     merged = _merged(records, repo, overnight_start, resolved_parks)
-    parked = _parked(records, overnight_start, resolved_parks)
-    bounces = _bounces(records, overnight_start)
+    parked = _parked(records, overnight_start, resolved_parks | owner_closed)
+    bounces = _bounces(records, overnight_start, owner_closed)
     regens = _regenerations(records, week_start)
     wanders = _wanders(records, overnight_start)
     watchdog = _watchdog(records, overnight_start)

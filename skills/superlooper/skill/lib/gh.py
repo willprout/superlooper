@@ -178,6 +178,20 @@ def labels(limit=200):
     return {l["name"] for l in lst if isinstance(l, dict) and isinstance(l.get("name"), str)}
 
 
+def labels_health(limit=200):
+    """labels() as a ReadHealth(names_set, ok) — the boot preflight's read-health variant (issue
+    #108, the #92 refused-vs-answered-empty discipline). `gh api rate_limit` (the probe) is EXEMPT
+    from rate limiting, so it reads OK even when core quota is exhausted and the label LIST read is
+    throttled to a fail-closed empty set; without `ok` the preflight would read that empty as 'every
+    runner-managed label missing' and refuse to boot during the very throttle window it must survive.
+    A refused label read (ok=False) SKIPS the preflight (like an unreachable gh); only a CLEAN read
+    (ok=True) that genuinely lacks a runner-managed label fails loud."""
+    rh = _json_list_health(["label", "list", "--json", "name", "--limit", str(limit)])
+    names = {l["name"] for l in rh.value
+             if isinstance(l, dict) and isinstance(l.get("name"), str)}
+    return ReadHealth(names, rh.ok)
+
+
 def create_label(name, color, description):
     """Create-or-update one label (`--force` updates an existing one, so adopt is idempotent).
     True on success."""

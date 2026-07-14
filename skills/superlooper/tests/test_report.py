@@ -231,6 +231,56 @@ def test_merge_before_a_later_park_stays_an_open_ask():
     assert "#9" in parked_section and "reopened and stuck again" in parked_section
 
 
+def test_park_the_owner_closed_is_not_reported_as_an_open_ask():
+    # issue #108: a park the owner STOOD DOWN by closing the issue on GitHub (an absorb_close) is no
+    # longer an open ask — it must leave the "Open asks only" Parked section, and NOT appear under
+    # Merged (an absorbed close is a drop, never a landing).
+    T = 1_000_000
+    j = [
+        {"ts": T, "act": "morning_report", "date": "d", "outcome": "ok"},
+        {"ts": T + 10, "act": "park", "id": "i9", "num": 9, "needs_william": True,
+         "memo": "conflict cap hit", "outcome": "ok"},
+        {"ts": T + 30, "act": "absorb_close", "id": "i9", "num": 9, "outcome": "ok"},
+    ]
+    out = report.morning(j, _view(now=T + 100, queue=[]), ledger={}, config=_cfg())
+    parked_section = out.split("## Parked / needs-owner")[1].split("\n## ")[0]
+    merged_section = out.split("## Merged")[1].split("\n## ")[0]
+    assert "#9" not in parked_section and "conflict cap hit" not in out
+    assert "#9" not in merged_section                  # a drop is never listed as a landing
+    # nothing else happened, so the reconciled-away park leaves a genuinely quiet night
+    assert "nothing happened" in out.lower()
+
+
+def test_bounce_the_owner_closed_is_not_reported_as_an_open_ask():
+    # the same for a bounce: the owner closed it, so it is resolved and drops out of Bounces.
+    T = 1_000_000
+    j = [
+        {"ts": T, "act": "morning_report", "date": "d", "outcome": "ok"},
+        {"ts": T + 10, "act": "bounce", "id": "i11", "num": 11,
+         "memo": "BOUNCED: already fixed on dev", "outcome": "ok"},
+        {"ts": T + 30, "act": "absorb_close", "id": "i11", "num": 11, "outcome": "ok"},
+    ]
+    out = report.morning(j, _view(now=T + 100, queue=[]), ledger={}, config=_cfg())
+    bounces_section = out.split("## Bounces")[1].split("\n## ")[0]
+    assert "#11" not in bounces_section and "already fixed on dev" not in out
+    assert "nothing happened" in out.lower()           # the reconciled-away bounce leaves it quiet
+
+
+def test_absorb_close_before_a_later_repark_stays_an_open_ask():
+    # reconciliation is by FINAL outcome (mirrors #37): a close that came BEFORE a later re-park
+    # (owner closed, reopened, re-approved, parked again) leaves the new park a genuine open ask.
+    T = 1_000_000
+    j = [
+        {"ts": T, "act": "morning_report", "date": "d", "outcome": "ok"},
+        {"ts": T + 10, "act": "absorb_close", "id": "i9", "num": 9, "outcome": "ok"},
+        {"ts": T + 20, "act": "park", "id": "i9", "num": 9, "needs_william": True,
+         "memo": "reopened and stuck again", "outcome": "ok"},
+    ]
+    out = report.morning(j, _view(now=T + 100, queue=[]), ledger={}, config=_cfg())
+    parked_section = out.split("## Parked / needs-owner")[1].split("\n## ")[0]
+    assert "#9" in parked_section and "reopened and stuck again" in parked_section
+
+
 def test_a_green_nightly_only_night_is_still_quiet():
     # a routine green nightly is the system working, not activity that needs William — otherwise
     # (a nightly runs EVERY night) there could never be a quiet night in production.

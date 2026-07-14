@@ -100,6 +100,39 @@ LABELS = [
     ("effort:max", "8256d0", "per-issue worker effort: max"),
 ]
 
+
+# Runner-managed label preflight (issue #108). RATIONALE — FAIL LOUD, never auto-create:
+# `in-progress` / `needs-owner` / `parked` are the labels the RUNNER itself ADDS as machinery when
+# it hands an issue back to the owner (park/bounce) or claims one (launch). `gh` refuses to apply a
+# label that does not exist, so if one is missing every hand-back label move FAILS and — before
+# issue #108's bounce/park guards — retried FOREVER (the 2026-07-13 storm: #58 renamed
+# needs-william->needs-owner inside adopt, nobody re-ran adopt after the republish, and the bounce
+# executor re-fired the owner text every ~18s until the label was hand-created). `doctor` checks the
+# whole label set, but nothing forces a doctor run after a republish, so the runner must defend
+# itself at boot. It FAILS LOUD (returns nonzero, naming the label + the exact `superlooper adopt`
+# remediation) rather than auto-creating the labels: `adopt` is the sole label-mutation authority
+# (see CLAUDE.md ▸ the adopt/doctor split and "facts enter through the config contract") — a boot
+# that silently created labels would fork that authority and mask a broken adoption — and refusing
+# to start in a broken state mirrors the established boot-preflight discipline (preflight_pane, the
+# FAILS-HARD-when-empty required_checks check, issue #104's missing-config start-up error). The
+# runner-managed SUBSET is derived from the "(runner-managed)" tag in each LABELS description, so
+# LABELS stays the single source of truth. (`agent-ready` is the owner's word, not runner-managed,
+# and `superseded` is best-effort — regenerate proceeds even if its add fails — so neither storms.)
+
+
+def runner_managed_labels():
+    """The runner-managed subset of LABELS — the labels the RUNNER writes as machinery, tagged
+    '(runner-managed)' in their descriptions (in-progress, needs-owner, parked)."""
+    return [name for name, _color, desc in LABELS if "(runner-managed)" in desc]
+
+
+def missing_runner_labels(existing):
+    """The runner-managed labels ABSENT from `existing` (a set/list of label names), in LABELS
+    order. Fails closed on a wrong-typed `existing` (treats it as empty -> every one missing), so a
+    garbage gh read never masquerades as 'all present'."""
+    have = set(existing) if isinstance(existing, (set, list, tuple, frozenset)) else set()
+    return [n for n in runner_managed_labels() if n not in have]
+
 _CHECKS_REQUIREMENT = (
     "REQUIREMENT: `required_checks` must name at least one CI check that runs this repo's\n"
     "tests. A repo with no required check has NO mechanical ship gate (§4.3) — the loop would\n"
@@ -243,6 +276,27 @@ def cmd_run(args):
               "automatically (no --pane needed). Only pass --pane / $SL_PANE to override.",
               file=sys.stderr)
         return 2
+    # Runner-managed label preflight (issue #108 — rationale in the LABELS section above): the
+    # runner MOVES needs-owner/parked/in-progress as machinery; if one is missing it cannot hand
+    # issues back, so refuse to start and NAME the fix. But a transient blip at boot must NEVER block
+    # a restart, so this fails loud ONLY on a POSITIVE proof of absence — a CLEAN, well-typed label
+    # read (`labels_health().ok`) that genuinely lacks a runner-managed label. A refused read fails
+    # closed to an empty set (ok=False) and SKIPS the check, exactly like an unreachable gh. This is
+    # the #92 refused-vs-answered-empty discipline: `gh api rate_limit` (probe) is EXEMPT from rate
+    # limiting, so it reads OK while the core label read is throttled — reading that throttled-empty
+    # as "every label missing" would wedge the boot during the very rate-limit window it must survive.
+    labels = gh.labels_health()
+    if labels.ok:
+        missing = missing_runner_labels(labels.value)
+        if missing:
+            print(f"FATAL: runner-managed label(s) missing from {cfg.get('repo')}: "
+                  f"{', '.join(missing)}", file=sys.stderr)
+            print("These are how the runner hands issues back (park/bounce) and claims them "
+                  "(launch); gh refuses to apply a label that doesn't exist, so every hand-back "
+                  "would fail and retry. Create them (adopt is idempotent — it updates existing "
+                  f"labels in place, never duplicates):\n  superlooper adopt --repo {args.repo}",
+                  file=sys.stderr)
+            return 2
     return r.run(max_ticks=args.ticks)
 
 
