@@ -97,7 +97,23 @@ def detect_events(snaps, emitted, now=None, idle_secs=IDLE_SECONDS, freeze_secs=
         # resolved = a rest marker EXISTS (no activity comparison — review P0-1).
         resolved = (bool(s.get("report_mtime")) or bool(s.get("blocked_mtime"))
                     or s.get("exited_mtime") is not None)
-        settled = s.get("status") in SETTLED_STATUSES
+        # A corrupt state/issues.json can carry a WRONG-TYPED status. An UNHASHABLE one ([]/{}) makes
+        # `status in SETTLED_STATUSES` raise `unhashable type`, which — since the tick stamps its
+        # heartbeat LAST (runner.tick) — wedges the whole tick before the heartbeat and the dashboard's
+        # dead-man's switch then reads a live runner as dead (issue #95). Guard with isinstance(str)
+        # exactly like tidy.closable / retry_runaway / snapshot(ist) do for this same
+        # fail-open-on-wrong-typed defect class: a non-str status fails CLOSED to not-settled (the
+        # idle/frozen tiers then still evaluate — their response is a safe peek, never a blind action),
+        # and the skip is surfaced ONCE per corrupt id via the same emitted-dedup the tiers use (a
+        # bounded record naming the id, never a silent swallow). A genuinely absent None is normal cold
+        # state, not corruption, so it is not flagged; it stays hashable and reads as not-settled.
+        status = s.get("status")
+        if isinstance(status, str) or status is None:
+            settled = status in SETTLED_STATUSES
+            em.discard((sid, "corrupt_status"))    # well-typed now -> un-latch so a re-corruption re-fires
+        else:
+            emit({"type": "corrupt_status", "id": sid}, (sid, "corrupt_status"))
+            settled = False
         act = s.get("activity_mtime")
         in_wake_grace = wake_grace_until is not None and n is not None and n < wake_grace_until
         frozen = idle = False
@@ -132,6 +148,8 @@ def _event_key(ev):
         return (i, "idle")
     if t == "frozen":
         return (i, "frozen")
+    if t == "corrupt_status":
+        return (i, "corrupt_status")
     return None
 
 

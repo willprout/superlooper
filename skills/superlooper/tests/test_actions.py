@@ -2317,6 +2317,57 @@ def test_territory_claims_from_holds_inflight_and_finished_builds_only():
     assert actions.territory_claims_from({"issues": "corrupt"}) == []
 
 
+# ------------- wrong-typed / unhashable status: sibling audit of detect_events (issue #95) -------------
+# Every `status in <SET>` reached in the tick must be hash-safe. A DICT-shaped issue whose STATUS
+# VALUE is unhashable ([]/{}) slips past the existing `isinstance(ist, dict)` guards, so an unguarded
+# membership test raises `unhashable type` and wedges the tick before its heartbeat stamp.
+
+def test_lane_state_from_skips_an_unhashable_status():
+    st = {"version": 1, "issues": {
+        "i1": ist("running", declared_touches=["api"], type="build"),
+        "i2": ist([]), "i3": ist({})}}               # dict ist, unhashable status value
+    lanes = actions.lane_state_from(st)              # must NOT raise
+    assert [x["id"] for x in lanes] == ["i1"]        # corrupt entries occupy no lane (fail closed)
+
+
+def test_territory_claims_from_skips_an_unhashable_status():
+    st = {"version": 1, "issues": {
+        "i1": ist("gating", declared_touches=["api"], type="build"),
+        "i2": ist([]), "i3": ist({})}}
+    claims = actions.territory_claims_from(st)       # must NOT raise
+    assert [x["id"] for x in claims] == ["i1"]       # corrupt entries make no territory claim (fail closed)
+
+
+def test_decide_survives_an_unhashable_status_and_never_launches_it():
+    # The whole tick brain must not raise on a corrupt issues.json, and a corrupt-status issue is
+    # NEVER launched (fail closed for launches) even carrying a fresh agent-ready label — a corrupt
+    # status is not a well-typed RELAUNCHABLE one.
+    st = {"version": 1, "issues": {"i5": ist([]), "i7": ist({})}}
+    out = decide(parsed_issues=[parsed(5), parsed(7)], dsk=disk(issues_state=st))   # must NOT raise
+    assert only(out, "launch") == []
+
+
+def test_corrupt_status_finished_issue_is_never_gated_or_merged():
+    # Codex cross-review (round 1): a wrong-typed status is UNREADABLE lifecycle state, so hash-safety
+    # is not enough — the loop must also take NO consequential action on it. A corrupt entry with a
+    # finished report AND a clean mergeable PR otherwise falls through decide's non-membership branches
+    # as if it were cold state and emits gate -> MERGE (a merge off corrupted state). Fail closed: skip.
+    d, g = _gating(status=[])
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "gate") == [] and only(out, "merge") == []
+
+
+def test_corrupt_status_in_progress_issue_is_never_orphan_launched():
+    # Codex cross-review (round 1): the same fall-through emits an ORPHAN launch for a corrupt entry
+    # carrying a GitHub in-progress label + an open PR — a launch off corrupted lifecycle state, which
+    # the fail-closed contract forbids. Skipping the corrupt entry entirely blocks it.
+    st = {"version": 1, "issues": {"i5": ist([], branch="sl/i5-issue-5")}}
+    g = ghv(prs={"i5": pr_view(branch="sl/i5-issue-5", state="OPEN")})
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))],
+                 dsk=disk(issues_state=st), gh_view=g)
+    assert only(out, "launch") == []
+
+
 def test_finished_claim_holds_overlapping_launch_but_does_not_consume_capacity():
     dsk = disk(issues_state={"version": 1, "issues": {
         "i9": ist("gating", declared_touches=["frontend"], type="build")}})

@@ -581,7 +581,7 @@ class Runner:
         for iid in set(ist_map) | set(parsed_by_id):
             ist = ist_map.get(iid) if isinstance(ist_map.get(iid), dict) else {}
             p = parsed_by_id.get(iid, {})
-            status = ist.get("status")
+            status = actions._status_of(ist)   # hash-safe: a wrong-typed status won't raise here (#95)
             itype = (p or {}).get("type") or ist.get("type")
             if status in actions.TERMINAL_STATUSES:
                 if itype == "investigate" and status == "parked":
@@ -667,10 +667,11 @@ class Runner:
             # A terminal issue is DONE being gated (decide skips it): never refresh it, or the D6
             # re-fetch below would poll a parked-but-unreviewed OPEN PR every tick forever, as its
             # report stays on disk (cross-review C1). This keeps the whole refresh set bounded.
-            if ist.get("status") in actions.TERMINAL_STATUSES:
+            status = actions._status_of(ist)   # hash-safe: a wrong-typed status won't raise here (#95)
+            if status in actions.TERMINAL_STATUSES:
                 continue
             finished = (os.path.exists(os.path.join(self.home, "reports", f"{iid}.md"))
-                        or ist.get("status") in ("gating", "holding"))
+                        or status in ("gating", "holding"))
             if not finished:
                 continue
             cached = prs.get(iid)
@@ -731,10 +732,11 @@ class Runner:
             if actions._iid_num(iid) is None:
                 continue
             ist = ist if isinstance(ist, dict) else {}
-            if ist.get("type") != "investigate" or ist.get("status") in actions.TERMINAL_STATUSES:
+            status = actions._status_of(ist)   # hash-safe: a wrong-typed status won't raise here (#95)
+            if ist.get("type") != "investigate" or status in actions.TERMINAL_STATUSES:
                 continue
             finishing = (os.path.exists(os.path.join(self.home, "reports", f"{iid}.md"))
-                         or ist.get("status") in ("gating", "holding"))
+                         or status in ("gating", "holding"))
             if not finishing or iid in comments:       # not finishing, or already a clean read
                 continue
             cr = gh.issue_comments(actions._iid_num(iid))
