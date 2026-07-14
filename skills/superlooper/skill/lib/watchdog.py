@@ -8,7 +8,7 @@ exists anywhere in this module and it makes no repair decisions: it detects, not
 waits, launches, journals. All judgment lives in the launched session (the sl-debugger
 skill's unattended contract).
 
-Three signals, per the heartbeat/ALERT contract in references/runner-ops.md:
+Three signals, per the heartbeat/ALERT contract in plugin/skills/superlooper/references/runner-ops.md:
   heartbeat_stale  state/runner.heartbeat older than the configured bound. The heartbeat
                    marks tick PROGRESS (stamped at the END of a successful tick), so a
                    runner that is alive-but-wedged reads stale, exactly as intended. An

@@ -5,8 +5,9 @@ launchd NIGHTLY plist. Both are consumed by substituting {name} placeholders lit
 There is deliberately NO launchd RUNNER plist (issue #33): a launchd-started runner is a
 detached daemon with no cmux tab, so it can never self-detect a pane; its startup preflight
 correctly fails hard, and a KeepAlive would relaunch it into the same failure forever. The
-runner is started/restarted by hand in a visible cmux tab (references/runner-ops.md → Restarting
-the runner); only the nightly — which needs no pane — runs under launchd."""
+runner is started/restarted by hand in a visible cmux tab
+(plugin/skills/superlooper/references/runner-ops.md → Restarting the runner); only the nightly —
+which needs no pane — runs under launchd."""
 import plistlib
 import re
 from pathlib import Path

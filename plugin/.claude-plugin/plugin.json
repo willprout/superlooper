@@ -1,0 +1,15 @@
+{
+  "name": "superlooper",
+  "description": "The universal issue-loop workflow, as pure-content skills (superlooper, write-issue, adopt, cross-review, sl-debugger). No hooks, no MCP servers, nothing executable — the runner engine and dashboard install separately through the gated source repo. Deliberately unversioned: every commit to main is an update (SHA versioning).",
+  "author": {
+    "name": "William Prout"
+  },
+  "homepage": "https://github.com/willprout/superlooper",
+  "keywords": [
+    "superlooper",
+    "issue-loop",
+    "workflow",
+    "automation",
+    "github-issues"
+  ]
+}

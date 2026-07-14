@@ -12,7 +12,7 @@
 # via AppleScript. A nonzero exit is fine — notify.py turns it into a journaled outcome, never a
 # raise. The FIRST real send triggers a one-time macOS automation-permission prompt ("Terminal
 # wants to control Messages" → Allow); the launchd-started nightly needs that permission granted to
-# whatever user it runs under too (references/runner-ops.md).
+# whatever user it runs under too (plugin/skills/superlooper/references/runner-ops.md).
 set -u
 
 recipient="${1:-}"

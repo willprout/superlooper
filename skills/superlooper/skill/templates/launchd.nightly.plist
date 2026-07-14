@@ -9,7 +9,7 @@
      one-shot, NOT a keep-alive: no KeepAlive/RunAtLoad — a nonzero exit (e.g. the suite could not
      parse) is journaled + pushed, not restart-looped. The one-time macOS permission that lets it
      text the operator (notify.imessage_to) must be granted to the user launchd runs it under, too
-     (references/runner-ops.md). -->
+     (plugin/skills/superlooper/references/runner-ops.md). -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
