@@ -606,9 +606,10 @@ def test_readopt_adds_a_new_starter_label_without_disturbing_the_others(rig):
     created = {m["name"] for m in muts if m["kind"] == "create_label"}
     assert "model:sonnet" in created                      # the new knob reaches an adopted repo
     assert set(ALL_LABELS) <= created                     # every pre-existing label survives, re-created
-    # adopt is create-only: it must never delete a label, and the only rename is the historical
-    # needs-william -> needs-owner migration (#58) — never a model:* knob.
-    assert not [m for m in muts if m["kind"] == "delete_label"]
+    # adopt never RENAMES an owner knob either: the only rename it performs is the historical
+    # needs-william -> needs-owner migration (#58). (Deletion needs no assertion — it is structurally
+    # impossible rather than merely untested: skill/lib/gh.py exposes no delete_label at all, so no
+    # adopt path can emit one. A test for it would pass vacuously and imply a guard that isn't there.)
     assert not [m for m in muts if m["kind"] == "rename_label" and m["old"].startswith("model:")]
 
 
