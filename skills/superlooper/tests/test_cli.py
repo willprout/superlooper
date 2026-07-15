@@ -31,7 +31,7 @@ ALL_LABELS = ["agent-ready", "in-progress", "needs-owner", "parked", "expedite",
               "type:build", "type:investigate", "type:diagnose-and-fix",
               # per-issue model/effort control knobs — gh refuses to apply a label that does not
               # exist, so adopt must seed the starter set (owner ruling 2026-07-07).
-              "model:opus", "model:opus[1m]", "model:fable",
+              "model:opus", "model:opus[1m]", "model:fable", "model:sonnet",
               "effort:low", "effort:medium", "effort:high", "effort:xhigh", "effort:max"]
 
 RULE_START = "<!-- loop-standing-rules:start -->"
@@ -591,8 +591,26 @@ def test_adopt_creates_the_model_and_effort_starter_labels(rig):
     r = cli(rig, "adopt", "--repo", str(fresh))
     assert r.returncode == 0, r.stdout + r.stderr
     created = {m["name"] for m in mutations(rig) if m["kind"] == "create_label"}
-    assert {"model:opus", "model:opus[1m]", "model:fable"} <= created
+    assert {"model:opus", "model:opus[1m]", "model:fable", "model:sonnet"} <= created
     assert {"effort:low", "effort:medium", "effort:high", "effort:xhigh", "effort:max"} <= created
+
+
+def test_readopt_adds_a_new_starter_label_without_disturbing_the_others(rig):
+    # issue #134: a NEW seeded knob (model:sonnet) has to reach repos that were adopted before it
+    # existed, and migrations ride adopt — not install (the 2026-07-13 needs-owner storm lesson).
+    # Re-running adopt on an ALREADY-adopted repo re-creates the whole set idempotently (--force):
+    # the new label appears and nothing else is renamed or removed.
+    r = cli(rig, "adopt", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    muts = mutations(rig)
+    created = {m["name"] for m in muts if m["kind"] == "create_label"}
+    assert "model:sonnet" in created                      # the new knob reaches an adopted repo
+    assert set(ALL_LABELS) <= created                     # every pre-existing label survives, re-created
+    # adopt never RENAMES an owner knob either: the only rename it performs is the historical
+    # needs-william -> needs-owner migration (#58). (Deletion needs no assertion — it is structurally
+    # impossible rather than merely untested: skill/lib/gh.py exposes no delete_label at all, so no
+    # adopt path can emit one. A test for it would pass vacuously and imply a guard that isn't there.)
+    assert not [m for m in muts if m["kind"] == "rename_label" and m["old"].startswith("model:")]
 
 
 def test_adopt_never_overwrites_an_existing_config(rig):

@@ -291,9 +291,10 @@ first launch). The **answerer** is never affected; it stays on `models.answerer`
   runner **refuses to launch it** until you fix the labels — exactly like a missing/duplicate
   `type:` label. It waits; it never guesses.
 - **No allowlist.** The value is passed straight to the agent. `adopt` seeds a starter set
-  (`model:opus`, `model:opus[1m]`, `model:fable`, `effort:low…max`), but any `model:<x>`/`effort:<x>`
-  label you create and apply works. An **unknown** value fails the launch loudly and the retry cap
-  parks the issue — so a typo surfaces as a parked issue with a memo, not a silent wrong-model run.
+  (`model:opus`, `model:opus[1m]`, `model:fable`, `model:sonnet`, `effort:low…max`), but any
+  `model:<x>`/`effort:<x>` label you create and apply works. An **unknown** value fails the launch
+  loudly and the retry cap parks the issue — so a typo surfaces as a parked issue with a memo, not
+  a silent wrong-model run.
 
 ### Answering a bounce
 

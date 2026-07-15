@@ -234,7 +234,8 @@ rest are workflow state the runner and William drive.
 
 **Per-issue model / effort (William's control knobs — apply/remove any time):**
 - `model:<name>` — run **this issue's** worker sessions on `<name>` instead of `models.worker`.
-  `adopt` seeds `model:opus`, `model:opus[1m]`, `model:fable`; create more as you need them.
+  `adopt` seeds `model:opus`, `model:opus[1m]`, `model:fable`, `model:sonnet`; create more as you
+  need them.
 - `effort:<level>` — run this issue's worker sessions at reasoning effort `<level>` (when absent,
   falls back to `models.worker_effort`, else nothing). `adopt` seeds `effort:low`, `effort:medium`,
   `effort:high`, `effort:xhigh`, `effort:max`.

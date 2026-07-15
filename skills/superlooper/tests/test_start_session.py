@@ -101,6 +101,14 @@ def test_bracketed_model_survives_verbatim(tmp_path):
     assert _flag_value(argv, "--model") == "opus[1m]"
 
 
+def test_sonnet_model_reaches_the_claude_cli(tmp_path):
+    # issue #134: `sonnet` is a bare alias the claude CLI accepts on --model (its own --help lists
+    # 'fable', 'opus', 'sonnet' as the latest-model aliases), so the seeded `model:sonnet` label
+    # needs no mapping — the existing pass-through carries the value verbatim to the CLI.
+    argv = _run_start(tmp_path, model="sonnet")
+    assert _flag_value(argv, "--model") == "sonnet"
+
+
 def test_codex_default_uses_interactive_tui_with_no_model_or_effort(tmp_path):
     argv = _run_start(tmp_path, agent="codex")
     assert argv[0] == "--no-alt-screen"
