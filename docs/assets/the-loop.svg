@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 1410" width="1240" height="1410" style="display:block;" font-family="&#39;IBM Plex Mono&#39;,monospace">
+      <defs>
+        <g id="bO"><circle r="10" fill="#E8862E" stroke="#28343C" stroke-width="2.5"></circle></g>
+        <g id="bG"><circle r="10" fill="#57A85E" stroke="#28343C" stroke-width="2.5"></circle></g>
+        <g id="rimG"><rect x="-44" y="0" width="88" height="18" rx="3" fill="#5CB350" stroke="#28343C" stroke-width="3"></rect><rect x="-34" y="3" width="15" height="12" fill="#82CC77"></rect><rect x="26" y="3" width="10" height="12" fill="#3E8A46"></rect></g>
+        <g id="rimB"><rect x="-44" y="0" width="88" height="18" rx="3" fill="#3D6FA8" stroke="#28343C" stroke-width="3"></rect><rect x="-34" y="3" width="15" height="12" fill="#6493C6"></rect><rect x="26" y="3" width="10" height="12" fill="#2C5280"></rect></g>
+        <g id="rimR"><rect x="-44" y="0" width="88" height="18" rx="3" fill="#D9482E" stroke="#28343C" stroke-width="3"></rect><rect x="-34" y="3" width="15" height="12" fill="#E87860"></rect><rect x="26" y="3" width="10" height="12" fill="#A83420"></rect></g>
+      </defs>
+
+      <rect x="0" y="0" width="1240" height="1410" fill="#F4F0E3"></rect>
+
+      
+      <g>
+        <path d="M 786,882 L 1130,882 L 1130,180 L 944,180 L 944,222" fill="none" stroke="#28343C" stroke-width="62" stroke-linejoin="round" stroke-linecap="butt"></path>
+        <path d="M 786,882 L 1130,882 L 1130,180 L 944,180 L 944,222" fill="none" stroke="#D9482E" stroke-width="56" stroke-linejoin="round" stroke-linecap="butt"></path>
+        <path d="M 790,868 L 1116,868 L 1116,194 L 956,194 L 956,220" fill="none" stroke="#E87860" stroke-width="11" stroke-linejoin="round" stroke-linecap="butt"></path>
+        <path d="M 790,900 L 1148,900 L 1148,162 L 926,162 L 926,220" fill="none" stroke="#A83420" stroke-width="9" stroke-linejoin="round" stroke-linecap="butt"></path>
+        
+        <use href="#rimR" x="944" y="222"></use>
+        <use href="#bO" x="944" y="266"></use>
+        <use href="#bO" x="944" y="298"></use>
+        <text x="1046" y="132" font-size="18" font-weight="600" fill="#B8641E" text-anchor="middle">new issues loop back</text>
+      </g>
+
+      
+      <g>
+        <rect x="268" y="0" width="64" height="150" fill="#5CB350" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="276" y="0" width="13" height="150" fill="#82CC77"></rect><rect x="320" y="0" width="9" height="150" fill="#3E8A46"></rect>
+        <use href="#rimG" x="300" y="150"></use>
+        <rect x="448" y="0" width="64" height="150" fill="#5CB350" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="456" y="0" width="13" height="150" fill="#82CC77"></rect><rect x="500" y="0" width="9" height="150" fill="#3E8A46"></rect>
+        <use href="#rimG" x="480" y="150"></use>
+        <rect x="628" y="0" width="64" height="150" fill="#5CB350" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="636" y="0" width="13" height="150" fill="#82CC77"></rect><rect x="680" y="0" width="9" height="150" fill="#3E8A46"></rect>
+        <use href="#rimG" x="660" y="150"></use>
+        <rect x="808" y="0" width="64" height="150" fill="#5CB350" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="816" y="0" width="13" height="150" fill="#82CC77"></rect><rect x="860" y="0" width="9" height="150" fill="#3E8A46"></rect>
+        <use href="#rimG" x="840" y="150"></use>
+        <g font-size="18" font-weight="600" fill="#3E4750" text-anchor="middle">
+          <text x="300" y="198">planning session</text>
+          <text x="480" y="198">investigation</text>
+          <text x="660" y="198">cleanup sweep</text>
+          <text x="840" y="198">bots</text>
+        </g>
+        <use href="#bO" x="300" y="230"></use><use href="#bO" x="300" y="272"></use>
+        <use href="#bO" x="480" y="242"></use>
+        <use href="#bO" x="660" y="227"></use><use href="#bO" x="660" y="268"></use>
+        <use href="#bO" x="840" y="252"></use>
+        <g style="display:none">
+          <use href="#bO" x="480" y="284"></use>
+          <use href="#bO" x="840" y="290"></use>
+        </g>
+      </g>
+
+      
+      <path d="M 268,300 L 972,300 L 798,600 L 442,600 Z" fill="#CFE4EA"></path>
+      <path d="M 380,318 L 320,430" stroke="rgba(255,255,255,0.5)" stroke-width="9" stroke-linecap="round"></path>
+      <path d="M 415,318 L 342,462" stroke="rgba(255,255,255,0.5)" stroke-width="9" stroke-linecap="round"></path>
+
+      
+      <g>
+        <use href="#bO" x="322" y="366"></use><use href="#bO" x="358" y="366"></use><use href="#bO" x="394" y="366"></use><use href="#bO" x="430" y="366"></use><use href="#bO" x="466" y="366"></use><use href="#bO" x="502" y="366"></use><use href="#bO" x="538" y="366"></use><use href="#bO" x="574" y="366"></use><use href="#bO" x="610" y="366"></use><use href="#bO" x="646" y="366"></use><use href="#bO" x="682" y="366"></use><use href="#bO" x="718" y="366"></use><use href="#bO" x="754" y="366"></use><use href="#bO" x="790" y="366"></use><use href="#bO" x="826" y="366"></use><use href="#bO" x="862" y="366"></use><use href="#bO" x="898" y="366"></use>
+        <use href="#bO" x="556" y="344"></use><use href="#bO" x="592" y="344"></use><use href="#bO" x="628" y="344"></use><use href="#bO" x="664" y="344"></use><use href="#bO" x="700" y="344"></use>
+        <g style="display:none">
+          <use href="#bO" x="412" y="344"></use><use href="#bO" x="448" y="344"></use><use href="#bO" x="484" y="344"></use><use href="#bO" x="520" y="344"></use><use href="#bO" x="736" y="344"></use><use href="#bO" x="772" y="344"></use><use href="#bO" x="808" y="344"></use>
+          <use href="#bO" x="540" y="322"></use><use href="#bO" x="600" y="322"></use><use href="#bO" x="660" y="322"></use><use href="#bO" x="720" y="322"></use>
+        </g>
+      </g>
+
+      
+      <rect x="320" y="380" width="600" height="8" fill="#E8C94F" stroke="#28343C" stroke-width="2"></rect>
+      <path d="M 334,388 V 402 M 356,388 V 402 M 378,388 V 402 M 400,388 V 402 M 422,388 V 402 M 444,388 V 402 M 466,388 V 402 M 488,388 V 402 M 510,388 V 402 M 532,388 V 402 M 554,388 V 402 M 576,388 V 402 M 598,388 V 402 M 620,388 V 402 M 642,388 V 402 M 664,388 V 402 M 686,388 V 402 M 708,388 V 402 M 730,388 V 402 M 752,388 V 402 M 774,388 V 402 M 796,388 V 402 M 818,388 V 402 M 840,388 V 402 M 862,388 V 402 M 884,388 V 402 M 906,388 V 402" stroke="#E8C94F" stroke-width="4"></path>
+      <line x1="318" y1="384" x2="290" y2="384" stroke="#28343C" stroke-width="2"></line>
+      <text x="284" y="390" font-size="20" fill="#8A6A10" text-anchor="end" font-weight="700">your approval</text>
+      <text x="284" y="414" font-size="16" fill="#7A828E" text-anchor="end" font-weight="500">the agent-ready label</text>
+
+      
+      <use href="#bG" x="585" y="455"></use>
+      <use href="#bG" x="665" y="500"></use>
+      <use href="#bG" x="488" y="563"></use><use href="#bG" x="524" y="563"></use><use href="#bG" x="560" y="563"></use><use href="#bG" x="596" y="563"></use><use href="#bG" x="632" y="563"></use><use href="#bG" x="668" y="563"></use><use href="#bG" x="704" y="563"></use><use href="#bG" x="740" y="563"></use>
+      <use href="#bG" x="470" y="585"></use><use href="#bG" x="506" y="585"></use><use href="#bG" x="542" y="585"></use><use href="#bG" x="578" y="585"></use><use href="#bG" x="614" y="585"></use><use href="#bG" x="650" y="585"></use><use href="#bG" x="686" y="585"></use><use href="#bG" x="722" y="585"></use><use href="#bG" x="758" y="585"></use>
+      <g style="display:inline">
+        <text x="460" y="527" font-size="16" font-weight="600" fill="#3E6B47">approved · agent-ready</text>
+      </g>
+
+      
+      <path d="M 240,300 L 268,300 L 442,600 L 414,600 Z" fill="#C9C2AE" stroke="#28343C" stroke-width="3"></path>
+      <line x1="250" y1="306" x2="422" y2="596" stroke="#DED8C6" stroke-width="7"></line>
+      <line x1="261" y1="306" x2="434" y2="596" stroke="#A89F87" stroke-width="5"></line>
+      <path d="M 1000,300 L 972,300 L 798,600 L 826,600 Z" fill="#C9C2AE" stroke="#28343C" stroke-width="3"></path>
+      <line x1="990" y1="306" x2="818" y2="596" stroke="#DED8C6" stroke-width="7"></line>
+      <line x1="979" y1="306" x2="806" y2="596" stroke="#A89F87" stroke-width="5"></line>
+      <rect x="222" y="288" width="54" height="16" rx="3" fill="#C9C2AE" stroke="#28343C" stroke-width="2.5"></rect>
+      <rect x="964" y="288" width="54" height="16" rx="3" fill="#C9C2AE" stroke="#28343C" stroke-width="2.5"></rect>
+      <circle cx="298" cy="390" r="3" fill="#28343C"></circle>
+      <circle cx="356" cy="490" r="3" fill="#28343C"></circle>
+      <circle cx="414" cy="590" r="3" fill="#28343C"></circle>
+      <circle cx="942" cy="390" r="3" fill="#28343C"></circle>
+      <circle cx="884" cy="490" r="3" fill="#28343C"></circle>
+      <circle cx="826" cy="590" r="3" fill="#28343C"></circle>
+      <rect x="402" y="600" width="436" height="24" fill="#C9C2AE" stroke="#28343C" stroke-width="3"></rect>
+      <rect x="406" y="603" width="428" height="7" fill="#DED8C6"></rect>
+      <rect x="406" y="616" width="428" height="5" fill="#A89F87"></rect>
+      <circle cx="424" cy="612" r="3" fill="#28343C"></circle>
+      <circle cx="620" cy="612" r="3" fill="#28343C"></circle>
+      <circle cx="816" cy="612" r="3" fill="#28343C"></circle>
+
+      
+      <g style="display:inline">
+        <rect x="838" y="600" width="126" height="24" fill="none" stroke="rgba(86,93,102,0.45)" stroke-width="2.5" stroke-dasharray="8 8"></rect>
+        <rect x="876" y="624" width="88" height="18" rx="3" fill="none" stroke="rgba(86,93,102,0.45)" stroke-width="2.5" stroke-dasharray="8 8"></rect>
+        <rect x="888" y="642" width="64" height="72" fill="none" stroke="rgba(86,93,102,0.45)" stroke-width="2.5" stroke-dasharray="8 8"></rect>
+        <text x="920" y="744" font-size="15" font-weight="600" fill="#8A93A0" text-anchor="middle">+ add a lane</text>
+      </g>
+
+      
+      <line x1="445" y1="642" x2="445" y2="1240" stroke="#3D6FA8" stroke-width="2"></line>
+      <line x1="445" y1="642" x2="453" y2="642" stroke="#3D6FA8" stroke-width="2"></line>
+      <line x1="445" y1="1240" x2="453" y2="1240" stroke="#3D6FA8" stroke-width="2"></line>
+      <text x="426" y="941" font-size="17" font-weight="600" fill="#3D6FA8" text-anchor="middle" letter-spacing="1.5" transform="rotate(-90 426 941)">agents building</text>
+
+      
+      <g>
+        <use href="#rimB" x="500" y="624"></use>
+        <rect x="468" y="642" width="64" height="150" fill="#5B8FC9" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="476" y="642" width="13" height="150" fill="#85AFDC"></rect><rect x="520" y="642" width="9" height="150" fill="#40719F"></rect>
+        <rect x="468" y="792" width="64" height="150" fill="#4A7DB5" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="476" y="792" width="13" height="150" fill="#74A3CC"></rect><rect x="520" y="792" width="9" height="150" fill="#345F8E"></rect>
+        <rect x="468" y="942" width="64" height="150" fill="#3A6BA1" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="476" y="942" width="13" height="150" fill="#6493C6"></rect><rect x="520" y="942" width="9" height="150" fill="#2A527E"></rect>
+        <rect x="468" y="1092" width="64" height="130" fill="#2C598C" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="476" y="1092" width="13" height="130" fill="#5585B4"></rect><rect x="520" y="1092" width="9" height="130" fill="#1F4269"></rect>
+        <use href="#rimB" x="500" y="792"></use>
+        <use href="#rimB" x="500" y="942"></use>
+        <use href="#rimB" x="500" y="1092"></use>
+        <use href="#rimB" x="500" y="1222"></use>
+      </g>
+
+      
+      <g>
+        <use href="#rimB" x="740" y="624"></use>
+        <rect x="708" y="642" width="64" height="150" fill="#5B8FC9" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="716" y="642" width="13" height="150" fill="#85AFDC"></rect><rect x="760" y="642" width="9" height="150" fill="#40719F"></rect>
+        <rect x="708" y="792" width="64" height="150" fill="#4A7DB5" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="716" y="792" width="13" height="150" fill="#74A3CC"></rect><rect x="760" y="792" width="9" height="150" fill="#345F8E"></rect>
+        <rect x="708" y="942" width="64" height="150" fill="#3A6BA1" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="716" y="942" width="13" height="150" fill="#6493C6"></rect><rect x="760" y="942" width="9" height="150" fill="#2A527E"></rect>
+        <rect x="708" y="1092" width="64" height="130" fill="#2C598C" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="716" y="1092" width="13" height="130" fill="#5585B4"></rect><rect x="760" y="1092" width="9" height="130" fill="#1F4269"></rect>
+        <use href="#rimB" x="740" y="792"></use>
+        <use href="#rimB" x="740" y="942"></use>
+        <use href="#rimB" x="740" y="1092"></use>
+        <use href="#rimB" x="740" y="1222"></use>
+        
+        <rect x="772" y="848" width="20" height="68" rx="3" fill="#D9482E" stroke="#28343C" stroke-width="3"></rect>
+        <rect x="776" y="852" width="12" height="8" fill="#E87860"></rect>
+      </g>
+      <g style="display:inline">
+        <text x="848" y="840" font-size="16" font-weight="600" fill="#B8641E">new issues found mid-run</text>
+      </g>
+
+      
+      <g font-size="19" font-weight="600" fill="#3E4750" text-anchor="middle">
+        <text x="620" y="722">build</text>
+        <text x="620" y="872">review</text>
+        <text x="620" y="1022">test</text>
+        <text x="620" y="1162">ci</text>
+      </g>
+
+      
+      <rect x="424" y="1240" width="392" height="14" fill="#C9C2AE" stroke="#28343C" stroke-width="2.5"></rect>
+      <rect x="430" y="1254" width="380" height="94" fill="#CFE4EA" stroke="#28343C" stroke-width="3"></rect>
+      <path d="M 470,1268 L 452,1334" stroke="rgba(255,255,255,0.55)" stroke-width="8" stroke-linecap="round"></path>
+      <path d="M 496,1268 L 480,1328" stroke="rgba(255,255,255,0.55)" stroke-width="8" stroke-linecap="round"></path>
+      <g>
+        <use href="#bG" x="482" y="1286"></use><use href="#bG" x="515" y="1286"></use><use href="#bG" x="548" y="1286"></use><use href="#bG" x="692" y="1286"></use><use href="#bG" x="725" y="1286"></use><use href="#bG" x="758" y="1286"></use>
+        <use href="#bG" x="474" y="1309"></use><use href="#bG" x="507" y="1309"></use><use href="#bG" x="540" y="1309"></use><use href="#bG" x="573" y="1309"></use><use href="#bG" x="606" y="1309"></use><use href="#bG" x="639" y="1309"></use><use href="#bG" x="672" y="1309"></use><use href="#bG" x="705" y="1309"></use><use href="#bG" x="738" y="1309"></use><use href="#bG" x="771" y="1309"></use>
+        <use href="#bG" x="458" y="1332"></use><use href="#bG" x="491" y="1332"></use><use href="#bG" x="524" y="1332"></use><use href="#bG" x="557" y="1332"></use><use href="#bG" x="590" y="1332"></use><use href="#bG" x="623" y="1332"></use><use href="#bG" x="656" y="1332"></use><use href="#bG" x="689" y="1332"></use><use href="#bG" x="722" y="1332"></use><use href="#bG" x="755" y="1332"></use><use href="#bG" x="785" y="1332"></use>
+      </g>
+      <rect x="424" y="1348" width="392" height="14" fill="#C9C2AE" stroke="#28343C" stroke-width="2.5"></rect>
+      <rect x="570" y="1266" width="100" height="36" rx="4" fill="#F2E6C8" stroke="#28343C" stroke-width="2.5"></rect>
+      <text x="620" y="1291" font-size="20" fill="#3E4750" text-anchor="middle" font-weight="700">main</text>
+    </svg>
