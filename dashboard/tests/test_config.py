@@ -60,7 +60,13 @@ def test_minimal_config_fills_all_defaults(one_repo):
     assert cfg["port"] == 8611
     assert cfg["poll_seconds"] == 2
     assert cfg["gh_poll_seconds"] == 30
+    # The dashboard's own direct GitHub reads happen only in FALLBACK (issue #146) and ride a
+    # deliberately slower clock — a runner-less surface must not spend the shared budget fast.
+    assert cfg["fallback_gh_poll_seconds"] == 120
     assert cfg["heartbeat_down_seconds"] == 300
+    # How long the runner may go quiet before the dashboard stops calling its view live truth.
+    # Well under heartbeat_down_seconds: stop trusting a stale view long before declaring it dead.
+    assert cfg["runner_silent_seconds"] == 90
     assert cfg["notify"] == {"imessage_to": None, "cmd": None}
 
 

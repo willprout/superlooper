@@ -496,7 +496,13 @@ def condition_rank(kind):
 # on-disk SHAPE would silently BLANK the field. The engine stamps the version it wrote; a stamp
 # outside this set means the shape may not be the one these readers expect. ADD a version here only
 # once the readers actually handle that engine's shape.
-KNOWN_STATE_FORMATS = frozenset({1})
+#
+# v2 (issue #146) adds state/gh_view.json — the runner's own published GitHub view, which this build
+# reads as its primary truth. v1 stays known: that home is a pre-#146 engine, whose shape these
+# readers still parse exactly as before; it simply publishes no view, so the dashboard names that
+# and falls back to polling GitHub directly (source_mode's `no-published-view`) rather than
+# pretending an old engine is a broken one.
+KNOWN_STATE_FORMATS = frozenset({1, 2})
 
 
 def _fmt_versions(versions):
@@ -536,6 +542,101 @@ def state_format_status(state_format):
                % (wrote, _fmt_versions(supported)))
     return {"present": True, "compatible": False, "version": version,
             "supported": supported, "message": message}
+
+
+# =============================== which source are we rendering? (issue #146) ===============================
+# The dashboard renders the RUNNER's own published view (state/gh_view.json) as its primary truth.
+# It kept its own GitHub poller too — but only as a FALLBACK, and never a silent one. This is the
+# pure decision of which mode we are in; the server binds it and the field renders the banner.
+#
+# Why it matters: before this, the dashboard asked GitHub its own questions on its own clock. That
+# made it a second poller on one rate-limit budget (a contributor to the 2026-07-08 GraphQL
+# exhaustion behind the park/notify storms, INCIDENT-2026-07-08-park-notify-storm §1b) AND let its
+# board disagree with the runner's own state — an externally-closed issue rendered open, a dead
+# session rendered "launching" (2026-07-15). One source, honestly stamped, closes that class.
+#
+# NOTHING LATCHES. The mode is a pure function of the CURRENT facts, so a runner that comes back
+# returns the dashboard to LIVE on the very next poll — no restart, no sticky banner to dismiss.
+
+SOURCE_LIVE = "live"
+SOURCE_FALLBACK = "fallback"
+
+# The two fallback reasons are deliberately distinct. Naming a healthy-but-old engine "silent"
+# would send the owner to debug a runner that is ticking perfectly.
+FALLBACK_RUNNER_SILENT = "runner-silent"      # the heartbeat went quiet past the threshold
+FALLBACK_NO_VIEW = "no-published-view"        # nothing to render: a pre-#146 engine, or a corrupt doc
+
+_GITHUB_DIRECT_LINE = "showing GitHub directly — not the runner's view"
+
+
+def _usable_view(view):
+    """The published view IF it is one we may render as truth, else ``None``. Fail closed: a
+    non-dict (a corrupt read, a wrong-typed body) and a document with no ``published_at`` are both
+    unusable — the publish stamp is what dates every number on screen, so a document that can't be
+    dated can't be shown as live. ``bool`` is excluded explicitly (it is an int subclass, so a
+    ``published_at`` of ``True`` would otherwise pass as a timestamp)."""
+    if not isinstance(view, dict) or isinstance(view, bool):
+        return None
+    at = view.get("published_at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        return None
+    return view
+
+
+def source_mode(view, heartbeat_age, heartbeat_epoch, now, silent_after,
+                fetched_at=None, hhmm=None):
+    """Which source the dashboard is rendering, and the honest words for it.
+
+    ``view``            the runner's published view (``readers`` → ``facts["published_view"]``).
+    ``heartbeat_age``   seconds since the runner's last completed tick (``None`` ⇒ never ticked).
+    ``heartbeat_epoch`` that tick's wall clock — what "silent since" names.
+    ``silent_after``    the staleness threshold (config ``runner_silent_seconds``).
+    ``fetched_at``      when the dashboard's OWN GitHub read last landed — the age of what is on
+                        screen in FALLBACK (``None`` ⇒ no direct read yet).
+    ``hhmm``            an injectable epoch → "HH:MM" formatter (the server passes the locale one).
+
+    Returns ``{mode, reason, data_age, tick_age, silent_since, banner}``. ``banner`` is ``None`` in
+    LIVE and, in FALLBACK, the lines the field shouts — built HERE (design record B.1: the JS binds
+    words, never derives them) so the banner and the mode can never disagree.
+
+    LIVE requires BOTH a usable view AND a fresh heartbeat: a view is only as trustworthy as the
+    tick behind it, and a fresh tick that publishes nothing is not the runner's truth either.
+    """
+    usable = _usable_view(view)
+    silent = not isinstance(heartbeat_age, (int, float)) or heartbeat_age > silent_after
+    tick_age = heartbeat_age if isinstance(heartbeat_age, (int, float)) else None
+
+    if usable is not None and not silent:
+        polled = usable.get("polled_at")
+        # Age the data by the runner's last GitHub READ, not the tick that copied it out — a tick
+        # inside the poll window republishes an unchanged answer, and dating it "now" would present
+        # a 90s-old reading as current. A runner that has never reached GitHub still publishes
+        # (marked stale): age that by the publish stamp, the freshest fact we have.
+        stamp = polled if isinstance(polled, (int, float)) and not isinstance(polled, bool) \
+            else usable["published_at"]
+        return {"mode": SOURCE_LIVE, "reason": None, "data_age": now - stamp,
+                "tick_age": tick_age, "silent_since": None, "banner": None}
+
+    # --- FALLBACK. Name which of the two failures this is, and never claim the other. ---
+    reason = FALLBACK_RUNNER_SILENT if silent else FALLBACK_NO_VIEW
+    silent_since = heartbeat_epoch if (reason == FALLBACK_RUNNER_SILENT
+                                       and isinstance(heartbeat_epoch, (int, float))
+                                       and not isinstance(heartbeat_epoch, bool)) else None
+    # What is on screen now came from the dashboard's own read, so age it by that. Unknown before
+    # the first direct poll lands — never a guess.
+    data_age = (now - fetched_at) if isinstance(fetched_at, (int, float)) \
+        and not isinstance(fetched_at, bool) else None
+
+    if reason == FALLBACK_RUNNER_SILENT:
+        when = hhmm(silent_since) if (hhmm and silent_since is not None) else None
+        first = ("runner silent since %s" % when) if when else "runner silent — no tick seen"
+    else:
+        # The runner is ticking; it just publishes no view (an engine older than issue #146). Say
+        # exactly that, so the owner updates the engine instead of hunting a dead runner.
+        first = "runner publishes no view — engine predates the published-view handshake"
+    return {"mode": SOURCE_FALLBACK, "reason": reason, "data_age": data_age,
+            "tick_age": tick_age, "silent_since": silent_since,
+            "banner": {"lines": [first, _GITHUB_DIRECT_LINE]}}
 
 
 def repo_state(slug, states, spinning=False, merges_frozen=None, alert=None,

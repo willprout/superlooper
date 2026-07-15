@@ -25,9 +25,26 @@ _TOP_DEFAULTS = {
     "version": 1,
     "port": 8611,
     "poll_seconds": 2,            # front-end + journal/state re-read cadence (decision B.2)
-    "gh_poll_seconds": 30,        # the slower `gh` clock
+    "gh_poll_seconds": 30,        # the slower `gh` clock (also paces the usage pill's fetch)
+    # The cadence for the dashboard's OWN direct GitHub reads, which since issue #146 happen ONLY in
+    # FALLBACK (the runner went quiet and there is no published view to render). Deliberately slower
+    # than `gh_poll_seconds`: a runner-less dashboard is a degraded surface, not a reason to spend
+    # the shared rate-limit budget faster than a person reads — that budget's exhaustion is what
+    # produced the 2026-07-08 park/notify storms. In LIVE mode this paces nothing (zero reads).
+    "fallback_gh_poll_seconds": 120,
     "heartbeat_down_seconds": 300,  # runner heartbeat age → RUNNER DOWN surface (Task 10 hook)
+    # How long the runner's heartbeat may go quiet before the dashboard stops presenting its
+    # published view as live truth and falls back to polling GitHub directly, loudly (issue #146).
+    # A healthy runner ticks every ~15s, so this is ~6 missed ticks: long enough to ride out one
+    # slow tick, far short of `heartbeat_down_seconds` (the RUNNER DOWN surface) — the dashboard
+    # should stop trusting a stale view well before it declares the runner dead.
+    "runner_silent_seconds": 90,
 }
+
+# The same default as a named constant, for the assembler's fallback when a config predates the key
+# (an older config.json validates fine — `_fill` supplies the default — but an embedder may hand
+# `_assemble_repo` a bare dict, and a magic number inline is what this issue forbids).
+RUNNER_SILENT_SECONDS = _TOP_DEFAULTS["runner_silent_seconds"]
 
 # The notify block mirrors the skill's shape (decision B.4): imessage_to → cmd → log precedence,
 # resolved by Task 10. Both null by default (a fresh shareable install nags no one).
@@ -117,7 +134,8 @@ def _validate_and_fill(raw):
         _err(f"unsupported 'version' {out['version']!r} (this build understands version 1)")
     if not _is_int(out["port"]) or not (_MIN_PORT <= out["port"] <= _MAX_PORT):
         _err(f"'port' must be an integer in {_MIN_PORT}..{_MAX_PORT}, got {out['port']!r}")
-    for sk in ("poll_seconds", "gh_poll_seconds", "heartbeat_down_seconds"):
+    for sk in ("poll_seconds", "gh_poll_seconds", "fallback_gh_poll_seconds",
+               "heartbeat_down_seconds", "runner_silent_seconds"):
         v = out[sk]
         if not _is_int(v) or v < 1:
             _err(f"'{sk}' must be an integer >= 1, got {v!r}")

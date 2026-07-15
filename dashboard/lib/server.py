@@ -39,6 +39,7 @@ import launch_rules
 import notify as notify_mod
 import pollers
 import readers
+import runner_source
 import replay as replay_mod
 import tower as tower_mod
 import version as version_mod
@@ -631,6 +632,16 @@ class CachedGh:
 
     def pr_comments(self, repo, num):
         return self._cached(("pr_comments", repo, num), lambda: self._gh.pr_comments(repo, num))
+
+    def newest_fetch_at(self):
+        """When the most recent real ``gh`` fetch landed, across every memoized query (``None``
+        before the first). This is the age of what FALLBACK mode is showing (issue #146): with the
+        runner quiet, its published document is abandoned, so the only honest clock left is our own
+        last read. The newest fetch is the right one — the caches expire independently, and the
+        picture is as fresh as its freshest part."""
+        stamps = [c.last_fetch_at() for c in self._caches.values()]
+        stamps = [s for s in stamps if s is not None]
+        return max(stamps) if stamps else None
 
 
 # =============================== ConcludedFlights — fetch once, remember (issue #48) ===============================
@@ -1229,12 +1240,59 @@ def _tower_window(records, last_seen=None, limit=14, max_rows=120, operator="the
     return rows, new_count
 
 
+def _newest_direct_fetch(gh_mod):
+    """When the dashboard's OWN GitHub read last landed (``None`` if never / not a cached adapter).
+    In FALLBACK this is the age of what's on screen — the runner's document is abandoned, so the
+    only honest clock is our own last read."""
+    fn = getattr(gh_mod, "newest_fetch_at", None)
+    return fn() if callable(fn) else None
+
+
+def _pick_source(facts, config, now, gh_mod):
+    """Choose which source answers this repo's GitHub questions, and the honest words for it
+    (issue #146).
+
+    The runner's published view is PRIMARY: when it is usable and the heartbeat is fresh, the
+    assembler is handed a :class:`runner_source.RunnerSource` and reaches GitHub zero times. When
+    the runner goes quiet (or is too old to publish), the GitHub adapter takes over — the loud
+    FALLBACK — and the mode dict carries the banner that says so.
+
+    Returns ``(source, mode)``. ``concluded`` memory is deliberately NOT used in LIVE (see the call
+    site): there is no egress to memoize, and a value remembered from the runner's document must
+    never be served later as though a real GitHub read had confirmed it."""
+    mode = flights.source_mode(
+        facts["published_view"],
+        heartbeat_age=facts["heartbeat_age"], heartbeat_epoch=facts["heartbeat_epoch"],
+        now=now, silent_after=config.get("runner_silent_seconds", config_mod.RUNNER_SILENT_SECONDS),
+        fetched_at=_newest_direct_fetch(gh_mod), hhmm=_hhmm)
+    if mode["mode"] == flights.SOURCE_LIVE:
+        return runner_source.RunnerSource(facts["published_view"]), mode
+    return gh_mod, mode
+
+
+def _flight_closed(source, slug, num, open_nums):
+    """Whether flight ``num``'s issue has closed, asked the way THIS source can honestly answer.
+
+    A source that knows closure POSITIVELY (the runner's published ``closed_nums``) is asked
+    outright: its open set is partial — it polls agent-ready + in-progress only — so inferring
+    closure from absence would conclude every parked/holding flight. The GitHub adapter has no such
+    oracle (a per-flight ``issue()`` read would be exactly the egress this issue removes), so it
+    keeps the original inference from its complete open-issue list."""
+    oracle = getattr(source, "is_closed", None)
+    if callable(oracle):
+        return bool(oracle(slug, num))
+    return bool(source is not None and num not in open_nums)
+
+
 def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concluded=None):
     """Fold one repo's state home into its snapshot slice: flights (each with its drawer), boards,
     tower window (with the since-you-last-looked divider against ``last_seen``), shipped delta,
     incident sign, and the repo's worst-condition state (for the pill). ``concluded`` (a
     ``ConcludedFlights``, ``None`` in embedders that don't wire it) makes each concluded flight's
-    settled GitHub facts a once-per-run fetch instead of a forever poll (issue #48)."""
+    settled GitHub facts a once-per-run fetch instead of a forever poll (issue #48).
+
+    Since issue #146 the GitHub facts come from the RUNNER's published view whenever it is fresh
+    (``_pick_source``); ``gh_mod`` is the fallback for a silent runner, never the primary."""
     slug = repo["slug"]
     name = repo.get("name") or slug
     operator = config_mod.operator(config)             # signs the re-approval line + drawer (issue #58)
@@ -1242,6 +1300,12 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     facts = readers.read_state_home(home, now=now)
     journal = readers.read_journal(home)
     required_checks = _required_checks(repo)
+
+    # Which source is answering — the runner's own view (normal) or GitHub directly (loud fallback).
+    # Everything below asks `source`, never `gh_mod`, so LIVE is zero-egress by construction.
+    source, source_mode = _pick_source(facts, config, now, gh_mod)
+    if source_mode["mode"] == flights.SOURCE_LIVE:
+        concluded = None      # nothing to memoize when nothing goes out; see _pick_source
 
     issues_state = facts["issues_state"].get("issues", facts["issues_state"]) or {}
     flight_repo = {"idle_seconds": repo.get("idle_seconds", 480),
@@ -1252,7 +1316,7 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     # The unlabeled open-issue read — made ONCE (issue #38): it yields both the open-issue numbers
     # (for the closed/concluded signal + queue exclusion) AND gh reachability, and its list is reused
     # for titles below. gh_reachable: True answered · False unreachable · None unknown (no gh wired).
-    open_issue_list, gh_reachable = _probe_open_issues(gh_mod, slug)
+    open_issue_list, gh_reachable = _probe_open_issues(source, slug)
     gh_unreachable = gh_reachable is False
     open_nums = {iss["number"] for iss in open_issue_list
                  if isinstance(iss, dict) and isinstance(iss.get("number"), int)}
@@ -1280,24 +1344,24 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         # would freeze a still-live flight's facts for the run (Codex review; the departures blocker
         # resolver already holds this line). ``is_closed`` (absence) still feeds the pre-existing
         # ``closed`` stage input; only the MEMORY demands the stronger signal.
-        is_closed = bool(gh_mod is not None and num not in open_nums)
+        is_closed = _flight_closed(source, slug, num, open_nums)
         is_concluded = st.get("status") == "merged"
         if not is_concluded and concluded is not None and is_closed:
-            is_concluded = concluded.confirm_closed(slug, num, lambda n=num: gh_mod.issue(slug, n))
+            is_concluded = concluded.confirm_closed(slug, num, lambda n=num: source.issue(slug, n))
         mem = concluded if is_concluded else None
-        if gh_mod is None or not branch:
+        if source is None or not branch:
             pr_facts = {}
         elif mem is not None:
-            pr_facts = mem.pr_facts(slug, branch, lambda b=branch: gh_mod.pr_for_branch(slug, b))
+            pr_facts = mem.pr_facts(slug, branch, lambda b=branch: source.pr_for_branch(slug, b))
         else:
-            pr_facts = gh_mod.pr_for_branch(slug, branch)
+            pr_facts = source.pr_for_branch(slug, branch)
         worktree = os.path.join(os.fspath(home), "worktrees", iid)
         cargo = diff_reader(worktree)
         issue = {
             "id": iid, "num": num, "status": st.get("status"), "branch": branch, "pr": pr,
             "activity_mtime": facts["activity"].get(iid), "blocked": facts["blocked"].get(iid),
             "awaiting_marker": iid in facts["awaiting"], "report_present": iid in facts["reports"],
-            "review_present": _review_present(gh_mod, slug, pr, mem), "journal": jslice,
+            "review_present": _review_present(source, slug, pr, mem), "journal": jslice,
             "pr_facts": pr_facts, "cargo": cargo, "diff_delta": None,
             "closed": is_closed,
         }
@@ -1310,7 +1374,7 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         flight_records.append((f, jslice, slug))
 
     merged_nums = [f["num"] for f in repo_flights if f["stage"] in _LANDED]
-    titles = _titles(slug, open_issue_list, gh_mod, merged_nums, concluded)   # one unlabeled read (#38)
+    titles = _titles(slug, open_issue_list, source, merged_nums, concluded)   # one unlabeled read (#38)
     flying_nums = {f["num"] for f in repo_flights}
 
     # The flight-card drawer (Task 9): ground truth one click from anywhere — attached per flight now
@@ -1347,7 +1411,7 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     # Codex review): the reachability probe is our oracle, so we never fly a stale-cached agent-ready
     # list that could outlive the probe's failure by a cache window — the dark-tower state and a
     # populated departures board must never contradict each other.
-    departures = [] if gh_unreachable else _departures(gh_mod, slug, titles, issues_state)
+    departures = [] if gh_unreachable else _departures(source, slug, titles, issues_state)
     stand = _stand(departures, flying_nums)
 
     repo_snap = {
@@ -1382,6 +1446,13 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         # changed the on-disk shape past what these readers parse) instead of silently blanking every
         # field it can no longer read; a pre-handshake home has no stamp and is grandfathered.
         "state_format": flights.state_format_status(facts["state_format"]),
+        # WHICH SOURCE this slice was built from, and how old it is (issue #146). `mode` is `live`
+        # (the runner's own published view — the normal state) or `fallback` (the runner went quiet,
+        # so we polled GitHub ourselves). `data_age`/`tick_age` are shown in BOTH modes so the owner
+        # can always see how old this picture is and when the runner last completed a tick; `banner`
+        # is the fallback's two-fact shout and is None in LIVE. Nothing latches — a recovered runner
+        # returns the next poll to LIVE and the banner clears itself.
+        "source": source_mode,
     }
     return repo_snap, flight_records, journal, state
 

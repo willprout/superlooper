@@ -37,18 +37,26 @@ def test_known_version_is_compatible_and_silent():
 def test_current_engine_version_is_known():
     # The version the engine stamps today (see the engine's STATE_FORMAT_VERSION) must be in this
     # dashboard's supported set — otherwise a healthy pairing would false-alarm a mismatch.
+    assert 2 in flights.KNOWN_STATE_FORMATS
+    assert flights.state_format_status({"version": 2})["compatible"] is True
+
+
+def test_the_previous_engine_format_is_still_known():
+    # v1 (a pre-#146 engine) is still a shape these readers parse: it simply publishes no runner
+    # view, which the dashboard NAMES on its own (source_mode's `no-published-view` fallback). An
+    # old engine is not a broken one, and must not raise the format-mismatch card.
     assert 1 in flights.KNOWN_STATE_FORMATS
     assert flights.state_format_status({"version": 1})["compatible"] is True
 
 
 def test_unknown_newer_version_is_named_mismatch():
-    st = flights.state_format_status({"version": 2})
+    st = flights.state_format_status({"version": 3})
     assert st["compatible"] is False
     assert st["present"] is True
-    assert st["version"] == 2
+    assert st["version"] == 3
     # The line NAMES both sides of the mismatch — the honest diagnostic that replaces a blank field.
-    assert "v2" in st["message"]
-    assert "v1" in st["message"]
+    assert "v3" in st["message"]
+    assert "v1" in st["message"] and "v2" in st["message"]
 
 
 def test_present_but_unreadable_stamp_is_a_mismatch_not_a_blank():

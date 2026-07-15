@@ -254,4 +254,11 @@ def read_state_home(home, now=None):
         # — never a silent blank. Uses its own reader (not _read_json_existence) so a present-but-
         # UNREADABLE stamp is a mismatch, not mistaken for absent.
         "state_format": _read_state_format(os.path.join(state, "state_format.json")),
+        # The runner's own published GitHub view (issue #146) — the dashboard's PRIMARY source. The
+        # runner rewrites it every tick (atomically), so a read can still land on an old or, with a
+        # crash mid-rename, an unreadable file: absent ⇒ None (a pre-#146 engine that publishes
+        # nothing — the flight model falls back and NAMES it), present-but-corrupt ⇒ {} (which
+        # carries no publish stamp, so source_mode refuses to render it as truth). Whether the
+        # document is FRESH enough to be truth is the flight model's call; this stays raw.
+        "published_view": _read_json_existence(os.path.join(state, "gh_view.json")),
     }

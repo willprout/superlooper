@@ -8,6 +8,8 @@
   "port": 8611,
   "poll_seconds": 2,
   "gh_poll_seconds": 30,
+  "fallback_gh_poll_seconds": 120,
+  "runner_silent_seconds": 90,
   "heartbeat_down_seconds": 300,
   "superlooper_cli": "~/.claude/skills/superlooper/bin/superlooper",
   "notify": {
