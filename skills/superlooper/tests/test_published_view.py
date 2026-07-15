@@ -256,3 +256,14 @@ def test_a_wrong_typed_carried_pr_never_raises():
         doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
                                    carry_prs={"i7": bad})
         assert "i7" not in doc["prs"]
+
+
+def test_a_wrong_typed_total_is_never_immortalized_by_the_carry():
+    # The carry seeds itself from the document ON DISK, and it is a FIXED POINT: junk allowed in
+    # would republish itself forever. `_size_totals` only emits well-typed numbers, so the raw keys
+    # must be stripped rather than copied — else a corrupt/hand-edited total rides through untouched.
+    pr = {"number": 25, "state": "MERGED", "additions": "banana", "changedFiles": True}
+    doc = published_view.build(_view(prs={}), {}, tracked_ids={"i15"}, now=1, polled_at=1,
+                               carry_prs={"i15": pr})
+    got = doc["prs"]["i15"]
+    assert "additions" not in got and "changedFiles" not in got

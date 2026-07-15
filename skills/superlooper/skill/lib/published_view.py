@@ -53,6 +53,13 @@ _SETTLED_PR_STATES = frozenset({"MERGED", "CLOSED"})
 # never the "+0/−0" that would libel a worker as having done nothing.
 CARRY_PR_LIMIT = 60
 
+# The cargo chip's three numbers. `_size_totals` is the ONLY authority on them: they are stripped
+# from an entry before its validated answer is merged back, so a wrong-typed total (from a corrupt
+# or hand-edited document the carry seeds itself from) can't ride through. The dashboard revalidates
+# too, so this is belt-and-braces — but the carry is a FIXED POINT, and junk allowed in here would
+# republish itself forever.
+_SIZE_TOTAL_KEYS = ("additions", "deletions", "changedFiles")
+
 
 def _dict(v):
     return v if isinstance(v, dict) else {}
@@ -102,9 +109,9 @@ def _carried_pr(pr, state):
 
     Summing at carry time also makes the entry a FIXED POINT: it re-carries itself unchanged on
     every later tick, which is what stops the chip blanking one poll window later instead of one."""
-    out = {k: v for k, v in pr.items() if k != "files"}
+    out = {k: v for k, v in pr.items() if k != "files" and k not in _SIZE_TOTAL_KEYS}
     out["state"] = state
-    out.update(_size_totals(pr))
+    out.update(_size_totals(pr))     # the validated totals are the only ones that survive the carry
     return out
 
 
@@ -177,9 +184,16 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
     for iid, pr in _dict(view.get("prs")).items():
         # A flight this runner merged: loopstate's record beats the cached read, which is
         # DEFINITIONALLY pre-merge (the gate only merges an OPEN one) and will never be refreshed —
-        # the issue is terminal, so it is never polled again. Settle it here rather than publish a
-        # landed flight whose PR claims to be open, and reduce it now so its shape is the same on
-        # the tick it lands as on every tick after, when only the carry holds it.
+        # the issue is terminal, so it is never polled again.
+        #
+        # Precisely: this settles from the tick AFTER the landing, not the landing tick itself. The
+        # tick loads `ist_map` before `_exec_merge` writes `status: merged` to disk, so the landing
+        # tick still sees the pre-merge map and publishes the raw OPEN read. Harmless — nothing in
+        # the dashboard's LIVE path reads a PR's `state`, and cargo/gate render correctly from that
+        # raw entry — and it self-corrects on the very next tick, including the worst interleaving
+        # (a poll firing in between, which drops the entry to the carry: the `iid in merged` test
+        # below runs BEFORE the settled-state test in both loops, so an OPEN-stamped carry entry is
+        # promoted anyway and nothing is ever lost).
         prs[iid] = _carried_pr(pr, "MERGED") if (isinstance(pr, dict) and iid in merged) else pr
     settling = []
     for iid, pr in _dict(carry_prs).items():

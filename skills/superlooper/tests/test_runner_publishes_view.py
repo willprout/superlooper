@@ -161,8 +161,13 @@ def test_the_engine_stamps_the_state_format_that_names_this_shape():
 # gh is never asked again.
 
 def _seed_merged(rig, iid, pr):
-    """The runner's state at the instant after a landing: loopstate says merged, and the cached PR
-    is still the pre-merge OPEN read the gate acted on."""
+    """The runner's state on the tick AFTER a landing: loopstate says merged (`_exec_merge` wrote it
+    last tick), and the cached PR is still the pre-merge OPEN read the gate acted on — nothing ever
+    writes the merge back into gh_view, and the issue is terminal now, so it is never polled again.
+
+    Deliberately the tick AFTER: a tick loads `ist_map` before `_exec_merge` writes to disk, so the
+    landing tick itself still publishes the raw OPEN read. That one-tick lag is by design (see
+    published_view.build) and self-corrects here."""
     def m(st):
         st["issues"].setdefault(iid, loopstate.new_issue()).update(
             {"status": "merged", "branch": "sl/%s-a-thing" % iid, "pr": pr["number"]})
@@ -177,7 +182,7 @@ _PRE_MERGE_READ = {"number": 25, "state": "OPEN", "mergeable": "MERGEABLE",
                              {"path": "b.py", "additions": 20, "deletions": 3}]}
 
 
-def test_a_landing_the_runner_performed_keeps_its_pr_facts(rig):
+def test_the_tick_after_a_landing_keeps_its_pr_facts(rig):
     _seed_merged(rig, "i15", _PRE_MERGE_READ)
     rig.r.tick(now=NOW + 10_000)
     pr = view(rig)["prs"].get("i15")
@@ -189,6 +194,9 @@ def test_a_landing_the_runner_performed_keeps_its_pr_facts(rig):
 def test_the_landings_pr_facts_survive_the_poll_that_forgets_it(rig):
     # The window that actually broke: the next poll rebuilds `prs` from the want-set, which skips a
     # terminal issue outright — so the PR is gone from the live view and ONLY the carry can hold it.
+    # The empty-`prs` assignment below MODELS that skip rather than driving `_poll` (which would need
+    # a live GitHub answer); the behaviour it stands in for is `runner.py`'s want-set loop, which
+    # `continue`s on `status in actions.TERMINAL_STATUSES`. That is the pinned assumption here.
     _seed_merged(rig, "i15", _PRE_MERGE_READ)
     rig.r.tick(now=NOW + 10_000)                     # publishes, seeding the carry
     rig.r.gh_view = {**rig.r.gh_view, "prs": {}}     # the poll drops the terminal issue
