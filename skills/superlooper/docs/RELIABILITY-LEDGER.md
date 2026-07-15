@@ -12,12 +12,20 @@ are genuinely his. An incident is any night or wave where that failed: work stal
 was interrupted for something mechanical, recovery needed his hands, or the system was loud/wrong
 at him.
 
-**Standing to date (2026-07-15).** The loop's best stretch is real: 33 issues approved→merged in
-~28 hours with zero interventions (2026-07-11→12), and a second adopted repo at 88 lifetime
-merges. Across every incident below: **no data loss, no bad merge, ever** — the failure mode is
-always *stall + owner interrupt*, never corruption. But of the eight nights this ledger covers,
-roughly half broke the promise somewhere. The owner's felt estimate — "works three out of four
-times" — is about right, and the misses cluster in the classes below rather than being random.
+**Standing to date (2026-07-15, corrected by the two-round forensics audit that day).** The best
+*verified* stretch is **23 merges in ~26.6h** (07-09 18:53 → 07-10 21:30, eApp) — and a GitHub
+cross-check found **at least 6 human touchpoints inside that window** (an `agent-ready` re-add
+that recovered a park storm, four merges with no journal record, one session interrupt), so the
+honest unattended claim is the untouched overnight core (~23:12 → 09:15), not the full stretch.
+Two earlier figures in this ledger did not survive the audit: "33 in ~28h zero interventions" is
+not in any journal, and "88 lifetime merges" was a *gate* count — real lifetime merges are **91
+across all homes** (eApp 62, command-center 22, sandboxes 7). Across every incident below:
+**no bad merge, ever, and no owner code lost** — the failure mode is always *stall + owner
+interrupt*, never corruption. (One nuance, 07-15: a recovery step destroyed gate *evidence* — a
+review attestation living only in a deleted worktree — forcing a full re-review; work product
+survived.) Roughly half of covered nights broke the promise somewhere. The owner's felt estimate
+— "works three out of four times" — is about right, and the misses cluster in the classes below
+rather than being random.
 
 ---
 
@@ -87,6 +95,11 @@ stack doctor now checks more of this chain; found only because a human read the 
 Recorded so the ledger stays honest in both directions. 0 parks, 0 regenerations, 1
 self-recovered nudge, 1 predicted scope-wander. This is what the system does when the
 environment holds still.
+*Correction (2026-07-15 forensics):* this entry's numbers are not in any journal. The real best
+window is 07-09→10 (23 merges/~26.6h) and it contained ≥6 human touchpoints (see Standing).
+07-11's own journal shows 1 launch, 0 merges, and 15 NEEDS-WILLIAM parks — the "promise held"
+night as remembered did not happen as written. Kept, annotated, as an example of why this ledger
+now insists on journal-backed numbers.
 
 **2026-07-12→13 — publish drift strands a fixed issue 38 hours** · *Class 3* ·
 An investigation sat stranded at its gate for 38h on a bug that was already fixed on `main` — the
@@ -107,6 +120,12 @@ but their shells never ran, so delivery verification failed (rc=2) and the syste
 breaker tripped — three times in one evening. The breaker held the queue correctly each time but
 cannot re-arm itself; every recovery needed a manual restart. Fixed: App Nap pinned off (#120);
 breaker self-re-arm filed as #115; Restart button #116.
+*Correction (2026-07-15 forensics):* the App Nap attribution is withdrawn. The unified log
+(retention verified to 06-23) shows **zero** cmux suspension/nap events across 07-09→13, the
+machine is held awake around the clock, and the owner confirms keep-awake was set *before*
+07-11. The rc=2 delivery failures were real but their cause is unproven (the era predates launch
+stderr capture; see the i161 sidebar in the 07-15 forensics entry). The breaker-can't-re-arm and
+manual-restart findings stand.
 
 **2026-07-14 — new UI over a stale server: "no such action"** · *Class 3* ·
 The dashboard reads its JS from disk per request but the server keeps boot-time code; after the
@@ -134,6 +153,103 @@ nudge-failure surfacing; evidence-based stop hook; approval-time merge pre-autho
 resume-at-gate; durable Q&A on the issue) — proposed 2026-07-15, pending owner's word and a
 fresh-eyes architecture review he requested.
 
+**2026-07-15 (morning, second machine) — the i336/i337 recovery marathon** · *Classes 3, 4, 5, 6* ·
+Cost: two owner-driven runner restarts, three hand-merges, two state surgeries, one full review
+re-run, a morning of owner + agent attention. Seven distinct defects confirmed with journal
+evidence: **D8** the crash-recovery relaunch path bypasses `blocked-by` (a worker launched past
+its open blocker; contained only by the worker's own step-0 reconcile bounce); **D9** stale pane
+markers survive a bounce — the runner typed "are you progressing?" into a dead session's window
+while the owner watched, and only a runner stop + hand-deleting two marker files cleared it;
+**D10** identical relabel journaled twice 18s apart; **D11** "accept and relaunch" has two
+opposite meanings — on a finished issue with a live PR it wipes the finish report and rebuilds
+from scratch; **D12** doc drift as a root cause (ops docs name dead verbs, a sync orphaned the
+installed docs, the debugger playbook wasn't installed on the machine having the incident);
+**D13** the debugger rails and the verified recovery procedure contradict each other on
+hand-merging; **D14** stop hooks failed `posix_spawn '/bin/sh'` ENOENT (root-caused same day —
+see the forensics entry). A reapprove cycle also deleted a worktree holding the only copy of the
+gate's review attestation, forcing a full re-review.
+
+**2026-07-15 — the two-round forensics audit: four mysteries solved, two beliefs refuted** ·
+*Meta-entry; verdicts recorded here because the bundles live off-repo (owner's machines).*
+Round 1 (journals + system logs): App Nap refuted as the freeze cause; the track record corrected
+(see Standing); the failure tail is concentrated, not spread — and ~25 of 29 eApp night-parks
+were *designed* owner-decision escalations, not faults. Round 2 (worker session transcripts —
+the worker-side flight recorder, opened for the first time):
+(a) the **07-09 launch storm** (10 issues parked in 7 min) died at `cmux new-surface`: the
+runner's launch-anchor pane lived in a workspace that had been deleted; cmux was alive and
+refusing correctly; the park memos blamed the launch shim — the wrong component; no CLI ever
+spawned. Human recovery at 23:12 (owner's `agent-ready` re-add).
+(b) **i280's 14 all-night rc=3 nudge defers were CORRECT**: the worker had opened an interactive
+`AskUserQuestion` dialog (protocol violation in an unattended session); the classifier rightly
+refused to type into it — then the runner falsely *parked the live, actively-working lane*. The
+worker also wrote its report to a worktree-relative path, invisible to the runner.
+(c) the **i336 logged-out wedge** was an in-process auth death inside one long-lived session
+(00:15–08:09; it also killed the session's wake timer); Codex was never logged out (its failures
+were shared-subscription contention timeouts). The runner nudged the "Not logged in" screen for
+94 minutes because a login prompt classifies as "idle, safe to send." Root cause unknowable from
+disk; forward captures specified.
+(d) **D14 solved**: the runner prunes a finished lane's worktree while the worker CLI still sits
+in it; the next turn's hook spawn dies (cwd deleted) — killing the liveness/exit stamp at the
+exact moment of completion. Four occurrences on 07-15 alone; the mechanism behind zombie windows
+and blind recovery cascades.
+(e) **rc=0 "sent" is not "arrived"**: of six successfully-typed nudges to one session, only three
+registered as turns and one arrived corrupted, interleaved with the session's own output.
+Delivery-by-exit-code is a fiction in both directions.
+Also: round 1's own report mislabeled which machine it ran on — a class-3 drift instance inside
+our own forensics, caught by the owner.
+
+**2026-07-15 (afternoon) — i328: a finished, merged issue stalls the queue two hours** ·
+*Classes 1, 4, 6* · All three completion signals defeated at once: the worker wrote its report
+worktree-relative (the second occurrence *that day*); the PR was merged out-of-band so the
+runner — which only associates branch→PR once an issue *finishes* — still carried `pr: null` and
+never knew the PR existed; and an interactive session doesn't exit when done. The idle ladder
+then looped in a way it structurally cannot escape: each "are you progressing?" answer is a
+tool-call turn that *refreshes the very liveness stamp the ladder watches*, so it can never
+escalate — 8 nudges ~497s apart, the runner asking in prose and unable to hear the prose answer
+("I'm done, complete"). The owner unstuck it by telling the session to move its report. Exposes:
+report-path compliance must be mechanically rescued, not instructed; in-flight lanes need
+per-tick branch→PR reconciliation; probes must demand machine-readable replies and must not
+reset the clock they feed.
+
+---
+
+## The owner's documented frustrations (recorded 2026-07-15, in his words where quoted)
+
+Recorded as first-class reliability data: this is what the failures *cost*, and any fix wave
+that doesn't retire items from this list isn't fixing the right things.
+
+- **The question flow is "so broken it's not even funny."** The ask card shows only the first
+  ~3 lines, so he can't read the question he's being asked to answer. There is no answer path in
+  the UI: Approve-and-relaunch "half the time throws away the work"; Drop kills the PR; the only
+  real path is typing into the terminal window — which works, but leaves the ask card frozen
+  forever, and unblocking *that* requires his helper agents, "and then they break it worse."
+- **Finished work gets destroyed by the recovery verbs.** He sees "approve and relaunch" twice a
+  day minimum, and understands it to mean throwing away a build that took 2 hours and multiple
+  review rounds. (Root-caused as D11 — mostly a verb defect, not the regenerate policy — but the
+  felt cost stands.)
+- **Frozen sessions are immovable.** Lanes get blocked; sessions stay frozen "no matter if I
+  restart or press drop or press approve"; recovery has required stopping the runner and editing
+  state files by hand. "Nothing is intuitive for how to handle these failures."
+- **His helper agents cannot understand superlooper.** They guess, and guessing has made
+  incidents worse. The system "has gotten so complex and changes shape that I don't even
+  understand how it works anymore." (D12 made this concrete: the docs they'd need were wrong,
+  orphaned, or not installed.)
+- **He assumed the dashboard was a live, perfect mirror of the runner. It isn't, and nothing
+  says so.** Documented divergences: an externally-closed issue never absorbed; a dead session
+  shown as "launching"; the frozen ask card; a day-stale server under fresh UI. (Fix queued as
+  #146.)
+- **"Questions" that aren't questions.** Much of what lands on him is the system's own
+  anticipated mechanism — "I can't merge without human approval isn't a question, it's a failure
+  mechanism to be anticipated" — arriving ungracefully, at night, blocking lanes, on repos where
+  the sensitive-area refusal was knowable at approval time.
+- **The queue stalls on agent sloppiness.** A whole afternoon queue stalled two hours because
+  one agent put its report in the wrong folder (i328) — "an agent couldn't follow instructions"
+  must not be able to cost a queue.
+- **The overnight promise itself:** "kind of shattered when it only works [attended]." He has
+  run several hardening passes and wants the next one to be the last — and is explicitly not
+  confident that incremental patching is the right approach at all (a fresh-eyes architecture
+  review was commissioned 2026-07-15 at his request).
+
 ---
 
 ## Reading the pattern
@@ -144,3 +260,15 @@ trust even when no work is lost; class 1 keeps shrinking as signals get mechaniz
 system's clearest success story. Class 3 is self-inflicted: the loop improves itself faster than
 its own deployment story propagates the improvements. Any proposal claiming to fix reliability
 should say which class it attacks.
+
+*Re-read after the 2026-07-15 forensics:* the audit moved weight between classes. Class 2's
+headline villain (App Nap) is withdrawn — every adjudicated "environment" failure traced instead
+to class 4 (our own lifecycle bookkeeping: a stale launch anchor aimed at a deleted workspace,
+markers outliving sessions, worktrees pruned under live CLIs) or class 6 (workers writing reports
+to the wrong path, opening interactive dialogs, merging their own PRs out-of-band). Two
+cross-cutting patterns now have names: **the runner's senses and its subjects speak different
+languages** (it reads files and exit codes; sessions answer in prose and dialogs — so "I'm done"
+is inaudible and a question dialog reads as a hang), and **its probes contaminate their own
+measurements** (a nudge answer refreshes the liveness clock the ladder watches; a "sent" exit
+code counts as delivery). And one class got *larger*: most of what lands on the owner at night is
+class 5 by design — anticipated owner-decisions arriving ungracefully — not failure at all.
