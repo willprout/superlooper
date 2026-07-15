@@ -142,8 +142,15 @@ mkdir -p "$SL_RUN_ROOT/state/activity" "$SL_RUN_ROOT/state/panes" "$SL_RUN_ROOT/
 # `started` marker is NOT cleared here: it is PER-LAUNCH (state/started/<id>.<token>), keyed on this
 # tab's fresh surface UUID, so a stale one cannot collide — and clearing a shared one would let an
 # overlapping launch delete this launch's own proof (codex verify P1-b).
+# state/mail/<id> and state/status/<id>.json join this list for the same reason (issue #148): mail
+# was addressed to the session that just died — the fresh one would consume a stranger's
+# instruction as if it were its own — and a stale progress clock would let a relaunched session
+# that has not yet rested look like it had already stamped HEAD. Delivery RECEIPTS
+# (mail/<id>.consumed.*/.claimed.*/.discarded.*) are deliberately NOT cleared: they are the record
+# of what was actually handed over, and history survives a restart.
 rm -f "$SL_RUN_ROOT/reports/$ID.md" \
-      "$SL_RUN_ROOT/state/blocked/$ID" "$SL_RUN_ROOT/state/exited/$ID" "$SL_RUN_ROOT/state/awaiting/$ID"
+      "$SL_RUN_ROOT/state/blocked/$ID" "$SL_RUN_ROOT/state/exited/$ID" "$SL_RUN_ROOT/state/awaiting/$ID" \
+      "$SL_RUN_ROOT/state/mail/$ID" "$SL_RUN_ROOT/state/status/$ID.json"
 # NOTE: the activity stamp (the runner's liveness/freeze baseline) is deliberately NOT written here.
 # Writing it before delivery is confirmed is exactly what fabricated "launched & alive" for up to
 # 45 min in run-20260625-1857 while no worker had actually started. It is written ONLY after the

@@ -17,6 +17,7 @@ behavior is unchanged. The Claude-only fence is asserted here too.
 """
 import json
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -87,9 +88,16 @@ def _decision(result):
     return json.loads(out) if out else None
 
 
-def _receipts(run_root):
-    mail_dir = run_root / "state" / "mail"
-    return sorted(p for p in mail_dir.iterdir() if ".consumed." in p.name) if mail_dir.exists() else []
+def _mailbox(run_root):
+    d = run_root / "state" / "mail"
+    return sorted(p.name for p in d.iterdir()) if d.exists() else []
+
+
+def _receipts(run_root, kind="consumed"):
+    d = run_root / "state" / "mail"
+    if not d.exists():
+        return []
+    return sorted(p for p in d.iterdir() if (".%s." % kind) in p.name)
 
 
 def _put_mail(run_root, text):
@@ -165,6 +173,92 @@ def test_an_empty_report_is_not_harvested(tmp_path):
 
     assert r.returncode == 0, r.stderr
     assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+
+
+def test_a_symlinked_report_is_never_harvested(tmp_path):
+    # Harvesting MOVES the link itself, so the canonical report would BECOME a symlink to whatever
+    # it points at — and the runner reads the canonical report and posts it.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    secret = tmp_path / "id_rsa"
+    secret.write_text("PRIVATE KEY")
+    (wt / "reports").mkdir()
+    (wt / "reports" / f"{ISSUE}.md").symlink_to(secret)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+    assert secret.read_text() == "PRIVATE KEY"
+
+
+def test_a_symlinked_reports_dir_cannot_drag_a_file_out_of_another_directory(tmp_path):
+    # The subtler one: the FILE is real, its PARENT is the link. Following it would move a file out
+    # of a directory that has nothing to do with this worker.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    elsewhere = tmp_path / "someone-elses-dir"
+    elsewhere.mkdir()
+    victim = elsewhere / f"{ISSUE}.md"
+    victim.write_text("## Tests\nnot this worker's file\n")
+    (wt / "reports").symlink_to(elsewhere)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert victim.exists(), "the hook must never move a file that resolves outside the worker cwd"
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+
+
+def test_harvest_refuses_when_git_cannot_say_whether_the_file_is_tracked(tmp_path):
+    # Fail CLOSED in the destructive direction. With git unavailable the hook cannot tell a stray
+    # report from one the worker COMMITTED — and moving a committed file leaves a deletion in the
+    # branch under review. A missed rescue stalls a queue; a wrong move destroys work.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(REPORT_TEXT)
+    # A PATH carrying everything the hook needs EXCEPT git — the honest shape of "git is missing",
+    # rather than an empty PATH (which would just fail to find bash and prove nothing).
+    nogit = tmp_path / "nogit-bin"
+    nogit.mkdir()
+    # `dirname` matters: the hook resolves its own lib through it. Omit it and the hook silently
+    # degrades to the activity-only fallback — the harvest would never even be attempted and this
+    # test would pass while proving nothing.
+    for tool in ("bash", "python3", "date", "mkdir", "cat", "dirname"):
+        real = shutil.which(tool)
+        if real:
+            (nogit / tool).symlink_to(real)
+    assert shutil.which("git", path=str(nogit)) is None, "the rig must really hide git"
+    env = {**os.environ, "SL_ISSUE_ID": ISSUE, "SL_RUN_ROOT": str(run_root), "SL_AGENT": "claude",
+           "PATH": str(nogit)}
+    r = subprocess.run([str(nogit / "bash"), STOP_HOOK], input=json.dumps(_payload(wt)), env=env,
+                       capture_output=True, text=True, timeout=60)
+
+    assert r.returncode == 0, r.stderr
+    # The clock proves worker_hook.py really RAN — without it, "the stray survived" would just mean
+    # the hook no-opped.
+    assert _status(run_root)["head"] is None, "the harness must have run, with git unavailable"
+    assert stray.exists(), "unknown tracked-state must refuse the move"
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+
+
+def test_a_report_in_a_plain_non_git_cwd_is_still_harvested(tmp_path):
+    # The other side of that fence: git ran and said "not a work tree". There is no branch to
+    # damage, so the rescue must still happen — refusing everything would be over-correcting.
+    run_root = _state_home(tmp_path)
+    plain = tmp_path / "plain"
+    (plain / "reports").mkdir(parents=True)
+    (plain / "reports" / f"{ISSUE}.md").write_text(REPORT_TEXT)
+
+    r = _stop(run_root, plain)
+
+    assert r.returncode == 0, r.stderr
+    assert (run_root / "reports" / f"{ISSUE}.md").read_text() == REPORT_TEXT
 
 
 def test_a_git_tracked_file_is_never_harvested(tmp_path):
@@ -344,9 +438,11 @@ def test_an_empty_mailbox_is_silent(tmp_path):
     assert r.stdout.strip() == "", "no mail == no stdout at all; the stop proceeds untouched"
 
 
-def test_a_blank_mail_is_consumed_without_blocking(tmp_path):
+def test_a_blank_mail_is_discarded_never_recorded_as_delivered(tmp_path):
     # A blank mail carries no instruction. Blocking on it would burn a turn saying nothing — but it
-    # must still leave the inbox or it would be retried on every rest.
+    # must still leave the inbox or it would be retried on every rest. The receipt has to say what
+    # actually happened: a ".consumed" here would be a delivery proof for a delivery that never
+    # occurred, and the runner is told to trust that word.
     run_root = _state_home(tmp_path)
     wt = tmp_path / "worktrees" / ISSUE
     _worktree(wt)
@@ -356,7 +452,28 @@ def test_a_blank_mail_is_consumed_without_blocking(tmp_path):
 
     assert r.returncode == 0, r.stderr
     assert _decision(r) is None
-    assert not mail.exists()
+    assert not mail.exists(), "it must leave the inbox or it retries forever"
+    assert _receipts(run_root, "consumed") == [], "nothing was delivered — nothing may say it was"
+    assert len(_receipts(run_root, "discarded")) == 1
+
+
+def test_a_consumed_receipt_is_only_written_after_the_block_reaches_claude(tmp_path):
+    # THE contract of the receipt: .consumed means "Claude was handed this". If the block JSON
+    # cannot be written, the mail must NOT be recorded as delivered — the leftover .claimed is the
+    # honest "in flight, never proven" state a runner may retry.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    _put_mail(run_root, "ping")
+    env = {**os.environ, "SL_ISSUE_ID": ISSUE, "SL_RUN_ROOT": str(run_root), "SL_AGENT": "claude"}
+    # stdout closed: the hook physically cannot deliver.
+    r = subprocess.run(["bash", "-c", 'exec bash "$1" >&-', "_", STOP_HOOK],
+                       input=json.dumps(_payload(wt)), env=env, capture_output=True,
+                       text=True, timeout=60)
+
+    assert r.returncode == 0, "an undeliverable block must still not break the session"
+    assert _receipts(run_root, "consumed") == [], "no delivery happened — no delivery proof"
+    assert len(_receipts(run_root, "claimed")) == 1, "the claim stands as in-flight and unproven"
 
 
 def test_mail_is_bounded_so_a_huge_file_cannot_be_stuffed_into_the_turn(tmp_path):
@@ -370,7 +487,10 @@ def test_mail_is_bounded_so_a_huge_file_cannot_be_stuffed_into_the_turn(tmp_path
     assert r.returncode == 0, r.stderr
     d = _decision(r)
     assert d["decision"] == "block"
-    assert len(d["reason"]) < 100_000, "an unbounded reason would blow the turn's context"
+    assert d["reason"].startswith("x" * 1000)
+    assert "truncated" in d["reason"], "a truncated instruction must SAY it was truncated"
+    # Pinned to the actual bound, not a loose ceiling: 16 KiB of mail + the truncation notice.
+    assert len(d["reason"]) < 16384 + 200, "an unbounded reason would blow the turn's context"
 
 
 # --------------------------- fences, liveness, and cwd safety ---------------------------
