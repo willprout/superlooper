@@ -51,7 +51,14 @@
       // `blocked_by` — the JS composes, never parses.
       var statusFull = String(d.status_text || (launchable ? "QUEUED" : "AWAITING")).toUpperCase();
       var statusLabel, statusState;
-      if (!launchable) {
+      if (d.status === "paperwork") {
+        // A flight the RUNNER would refuse over its labels (issue #138) — its own state, never the
+        // awaiting grey, and never launchable. `refusal_text` is the server's plain sentence naming
+        // the bad label + the fix; it rides the hover title AND the screen-reader span (NOT
+        // uppercased — a label name is lowercase, and shouting it would misname it), so the owner
+        // can act from where they read it.
+        statusLabel = "PAPERWORK"; statusState = "paperwork";
+      } else if (!launchable) {
         statusLabel = d.blocked_by != null ? ("AWAITING SL-" + d.blocked_by) : "AWAITING";
         statusState = "await";
       } else if (next) {
@@ -59,6 +66,7 @@
       } else {
         statusLabel = "QUEUED"; statusState = "queued";
       }
+      var statusDetail = d.refusal_text || statusFull;
 
       // Only a launchable flight offers the ⚡ bump — an awaiting flight can't leave the stand until
       // its connection lands, so a "bump to the top of the launch order" button there would be a lie.
@@ -67,12 +75,14 @@
             ' title="⚡ Expedite SL-' + esc(d.num) + ' — bump to the top of the launch order">⚡</button>'
         : '<span class="dep-expedite-blank" aria-hidden="true"></span>';
 
-      return '<div class="board-row dep-row' + (launchable ? "" : " awaiting") + '">' +
+      var rowState = launchable ? "" : (d.status === "paperwork" ? " paperwork" : " awaiting");
+
+      return '<div class="board-row dep-row' + rowState + '">' +
         '<span class="' + flightCls + '" data-fnum="' + esc(d.num) + '">' + esc(flight) + '</span>' +
         '<span class="flap">' + esc(d.destination || "—") + '</span>' +
-        '<span class="dep-status ' + statusState + '" title="' + esc(statusFull) + '">' +
+        '<span class="dep-status ' + statusState + '" title="' + esc(statusDetail) + '">' +
           '<span aria-hidden="true">' + esc(statusLabel) + '</span>' +
-          '<span class="cc-sr-only">' + esc(statusFull) + '</span>' +
+          '<span class="cc-sr-only">' + esc(statusDetail) + '</span>' +
         '</span>' +
         expBtn +
       '</div>';

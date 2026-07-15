@@ -124,14 +124,20 @@ def test_departures_status_is_a_short_colour_coded_label():
 def test_departures_status_keeps_the_full_phrase_for_the_screen_reader():
     # Costume rule 2 (design record §3): the short chip never destroys the real words. The full server
     # phrase must reach a SCREEN READER as real DOM text — not a mouse-only title alone (Codex review):
-    # a visually-hidden (.cc-sr-only) span carries the full statusFull while the short visible chip is
+    # a visually-hidden (.cc-sr-only) span carries the full phrase while the short visible chip is
     # aria-hidden, so an SR reads the whole phrase and not both. The title stays too (belt-and-braces).
-    assert "cc-sr-only" in _BOARDS and "esc(statusFull)" in _BOARDS, (
-        "the full status phrase (statusFull) must ride in a .cc-sr-only span so a screen reader reads it")
+    #
+    # `statusDetail` IS that full phrase: `statusFull` on every ordinary row, and on a PAPERWORK row
+    # (issue #138) the server's fuller plain-words reason — which label is bad and how to fix it. A
+    # refused flight is exactly where the short chip would destroy the most, so it carries the most.
+    assert "cc-sr-only" in _BOARDS and "esc(statusDetail)" in _BOARDS, (
+        "the full status phrase (statusDetail) must ride in a .cc-sr-only span so a screen reader reads it")
+    assert "var statusDetail = d.refusal_text || statusFull;" in _BOARDS, (
+        "statusDetail must fall back to the full server phrase whenever there is no refusal reason")
     assert re.search(r'aria-hidden="true"', _BOARDS) and "esc(statusLabel)" in _BOARDS, (
         "the short visible chip (statusLabel) must be aria-hidden so the SR reads the full phrase only")
     assert ".cc-sr-only" in _CSS, "boards.css must ship the visually-hidden utility the SR text uses"
-    assert re.search(r'title="[^"]*\+\s*esc\(statusFull\)', _BOARDS), (
+    assert re.search(r'title="[^"]*\+\s*esc\(statusDetail\)', _BOARDS), (
         "the full phrase should also stay on the hover title for a mouse user")
 
 

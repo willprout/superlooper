@@ -35,6 +35,7 @@ import cards as cards_mod
 import config as config_mod
 import digest as digest_mod
 import flights
+import launch_rules
 import notify as notify_mod
 import pollers
 import readers
@@ -1005,12 +1006,21 @@ def _connection_resolver(gh_mod, slug):
     return satisfied
 
 
-def _departures(gh_mod, slug, flying_nums, titles):
-    """The launch queue in REAL order (design record §3 / Task 8): open ``agent-ready`` issues not
-    already flying, ordered ⚡ expedite → priority band → issue number, with any unmet ``blocked-by``
-    connection shown as "awaiting connection SL-N" — never in the air. The ordering + connection
-    semantics are the tested pure :func:`flights.queue_rows`; this only gathers candidates and hands
-    it a fail-closed connection resolver. Empty when GitHub is unreachable (the honest empty board)."""
+def _departures(gh_mod, slug, titles, issues_state):
+    """The launch queue in REAL order (design record §3 / Task 8) — the RUNNER's order, mirrored.
+
+    The candidates are the open ``agent-ready`` issues the runner would still launch. Launching
+    strips ``agent-ready`` (the runner's own label move), so an in-flight issue leaves this board by
+    itself; the loopstate check behind ``launch_rules.is_launch_candidate`` is what makes that
+    airtight when a label write is mid-flight — and, far more importantly, is what lets a
+    conflict-REBUILT issue back onto the board at all (issue #138). The regenerate path puts
+    ``agent-ready`` back with status ``ready`` + ``requeue_front``: that flight is queued again,
+    front of its band. The board used to drop every issue that had a loopstate entry, so a rebuild —
+    the moment the owner most needs the truth — was exactly when its order went wrong.
+
+    The ordering, the eligibility refusals and the connection semantics are all the tested pure
+    :func:`flights.queue_rows`; this only gathers facts and hands it a fail-closed connection
+    resolver. Empty when GitHub is unreachable (the honest empty board)."""
     if gh_mod is None:
         return []
     candidates = []
@@ -1018,10 +1028,15 @@ def _departures(gh_mod, slug, flying_nums, titles):
         if not isinstance(iss, dict):
             continue
         num = iss.get("number")
-        if not isinstance(num, int) or num in flying_nums:
+        if not isinstance(num, int):
+            continue
+        state = issues_state.get("i%d" % num)
+        if not launch_rules.is_launch_candidate(state):
             continue
         candidates.append({"num": num, "title": iss.get("title") or titles.get(num) or "",
-                           "labels": iss.get("labels"), "body": iss.get("body")})
+                           "labels": iss.get("labels"), "body": iss.get("body"),
+                           "created_at": iss.get("createdAt"),
+                           "requeue_front": launch_rules.requeue_front(state)})
     return flights.queue_rows(candidates, satisfied=_connection_resolver(gh_mod, slug))
 
 
@@ -1032,14 +1047,20 @@ def _departures(gh_mod, slug, flying_nums, titles):
 STAND_BAYS = 3
 
 
-def _stand(departures):
+def _stand(departures, flying_nums=()):
     """The queued flights standing at the gates (design record §3: "at the stand — approved, queued").
     A pure projection of the ALREADY-derived departures queue (``flights.queue_rows`` via
     :func:`_departures`) — no new semantics: exactly the LAUNCHABLE rows, in the queue's own launch
-    order, capped to the physical gate count. A blocked "awaiting connection" row is never launchable,
-    so it is shown only on the board and never parks a plane (§3: never in the air). The field binder
-    turns each row into a healthy waiting plane; it computes nothing."""
-    launchable = [d for d in departures if d.get("launchable")]
+    order, capped to the physical gate count. A blocked "awaiting connection" row and a "paperwork"
+    row are never launchable, so they are shown only on the board and never park a plane (§3: never
+    in the air). The field binder turns each row into a healthy waiting plane; it computes nothing.
+
+    ``flying_nums`` are the issues that ALREADY have a plane on the field (they have a loopstate
+    entry, so ``_assemble_repo`` built a flight for them). A requeued flight is both — queued on the
+    board AND a plane the runner has flown before — so it is skipped here: one issue is one plane,
+    and the field must never show its aircraft twice (the board is where its queue position lives)."""
+    launchable = [d for d in departures
+                  if d.get("launchable") and d.get("num") not in set(flying_nums)]
     return [{"num": d["num"], "flight": d.get("flight") or ("SL-%d" % d["num"]),
              "destination": d.get("destination") or "", "pos": d.get("pos"),
              "expedited": bool(d.get("expedited"))}
@@ -1274,8 +1295,8 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     # Codex review): the reachability probe is our oracle, so we never fly a stale-cached agent-ready
     # list that could outlive the probe's failure by a cache window — the dark-tower state and a
     # populated departures board must never contradict each other.
-    departures = [] if gh_unreachable else _departures(gh_mod, slug, flying_nums, titles)
-    stand = _stand(departures)
+    departures = [] if gh_unreachable else _departures(gh_mod, slug, titles, issues_state)
+    stand = _stand(departures, flying_nums)
 
     repo_snap = {
         "slug": slug, "name": name, "airline": repo.get("airline") or name,

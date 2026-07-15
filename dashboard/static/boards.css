@@ -9,6 +9,10 @@
 .flap.exped { color: #F2C94C; }
 .flap.await { color: #9BA3AD; }
 .dep-row.awaiting { opacity: 0.9; }
+/* A PAPERWORK row (issue #138) keeps the board's full grid and split-flap voice — it is signage, not
+   an error slab (§0.1): the flight is real and will fly, it just can't be dispatched on these
+   labels. It sits at the same weight as an awaiting row, with only its amber chip marking it out. */
+.dep-row.paperwork { opacity: 0.9; }
 /* the awaiting row keeps the grid rhythm but offers no ⚡ bump (it can't leave the stand yet) */
 .dep-expedite-blank { justify-self: end; width: 22px; height: 22px; }
 
@@ -48,6 +52,12 @@
 .dep-status.next   { color: #F2C94C; }   /* next off the stand — gold, like the flight flap */
 .dep-status.queued { color: #9BA3AD; }   /* waiting its turn — dim */
 .dep-status.await  { color: #6E7680; }   /* awaiting a connection — grey, never in the air */
+/* PAPERWORK (issue #138) — the runner refuses this flight over its labels, so it is not in the
+   queue at all until the owner fixes one. Amber, because THAT is this dashboard's colour for "an
+   owner decision waits" (§5, --amber #C77E1F on the light chrome) — brightened here to carry on the
+   board's dark tile face. Orange, deliberately NOT the gold of a flight that is genuinely next: at
+   a glance the two must never trade places, which is the exact lie this state was built to end. */
+.dep-status.paperwork { color: #E0973A; }
 
 /* Visually-hidden text: the STATUS chip shows a short label but a screen reader reads the full server
    phrase from a .cc-sr-only span (costume rule 2 — never destroy the words). Standard clip pattern. */
