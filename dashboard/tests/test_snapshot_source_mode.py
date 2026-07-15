@@ -266,3 +266,59 @@ def test_a_partial_view_never_concludes_a_live_flight(home):
     f15 = next(f for f in _repo(snap)["flights"] if f["num"] == 15)
     assert f15["stage"] not in (flights.TOUCHDOWN, flights.TAXI_IN), (
         "an issue merely absent from the runner's partial view was concluded")
+
+
+# =============================== the settled-PR carry, end to end (review P0) ===============================
+# The regression the fresh-agent review caught: the runner's want-set skips TERMINAL_STATUSES, so a
+# merged flight's PR is never re-polled and vanished from the published view the tick it landed. In
+# LIVE that blanked the arrivals cargo chip (+N/−N/files) and left a merged flight's gate checklist
+# unticked — while FALLBACK, which remembers concluded facts (issue #48), still showed them. A
+# landing losing its cargo is a §0.1 joy regression traded for plumbing; these pin it shut.
+
+_MERGED_PR = {"number": 25, "state": "MERGED", "mergeable": "MERGEABLE",
+              "statusCheckRollup": [{"name": "tests", "conclusion": "SUCCESS"}],
+              "comments": [{"body": "<!-- superlooper-review --> verdict: ok"}],
+              "files": [{"path": "a.py", "additions": 100, "deletions": 5},
+                        {"path": "b.py", "additions": 20, "deletions": 3}]}
+
+
+def _flight(snap, num):
+    return next(f for f in _repo(snap)["flights"] if f["num"] == num)
+
+
+def test_a_landed_flights_cargo_survives_in_live(home):
+    # i23 is merged; its worktree is long gone, so the PR is the ONLY thing that remembers what it
+    # carried. The chip must show the real numbers, not an empty +0/−0 that reads as "did nothing".
+    _heartbeat(home, 10)
+    _publish(home, prs={"i23": _MERGED_PR})
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh())
+    cargo = _flight(snap, 23)["cargo"]
+    assert cargo["added"] == 120 and cargo["removed"] == 8 and cargo["files"] == 2
+
+
+def test_a_landed_flights_gate_checklist_is_complete_in_live(home):
+    # The runner refuses to merge without the review marker and green CI, so a merged flight showing
+    # review/ci unticked would have the dashboard contradicting a known invariant.
+    _heartbeat(home, 10)
+    _publish(home, prs={"i23": _MERGED_PR})
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh())
+    gate = _flight(snap, 23)["gate"]
+    assert gate["review"] is True and gate["ci"] is True and gate["mergeable"] is True
+
+
+def test_the_settled_carry_still_costs_no_github_reads(home):
+    # The fix must come from the document, not from quietly re-opening the egress it closed.
+    _heartbeat(home, 10)
+    _publish(home, prs={"i23": _MERGED_PR})
+    gh = _CountingGh()
+    server.assemble_snapshot(_config(home), now=NOW, gh_mod=gh)
+    assert gh.reads == []
+
+
+def test_a_view_without_the_pr_still_fails_closed_not_open(home):
+    # An old document (or a PR the runner genuinely never read): the gate must read NOT cleared —
+    # blank is honest, a hopeful tick would not be.
+    _heartbeat(home, 10)
+    _publish(home, prs={})
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh())
+    assert _flight(snap, 23)["gate"]["cleared"] is False

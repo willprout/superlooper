@@ -117,3 +117,59 @@ def test_a_non_dict_raw_issue_is_skipped_not_published():
                                tracked_ids=set(), now=1, polled_at=1)
     assert "i7" not in doc["issues"]
     assert doc["issues"]["i8"]["number"] == 8
+
+
+# --------------------------- the settled-PR carry (fresh-agent review, P0) ---------------------------
+# The runner's `want` set EXCLUDES terminal statuses (actions.TERMINAL_STATUSES) — a merged flight is
+# done being gated, so the poll never re-reads its PR and `prs` is rebuilt from scratch each window.
+# Left alone, a landing's PR facts vanish from the document the moment it lands, and the dashboard's
+# arrivals board loses the cargo chip it is supposed to keep FOREVER (issue #47/#48: the worktree is
+# cleaned up, but the PR remembers +N/−N/files). That is a joy regression (§0.1) traded for plumbing.
+#
+# So a SETTLED PR carries forward, exactly as titles do. The line is the one ConcludedFlights already
+# proved: only MERGED/CLOSED is remembered. Those facts can never change again. An OPEN PR that is
+# merely missing this window (a poll-budget starve) is NOT carried — its CI/mergeable can still move,
+# and serving a frozen "green" would be the false-clearance class the gate refuses.
+
+def test_a_settled_prs_facts_carry_forward_after_the_flight_lands():
+    carried = {"i7": {"number": 12, "state": "MERGED",
+                      "files": [{"path": "a.py", "additions": 10, "deletions": 2}]}}
+    doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
+                               carry_prs=carried)
+    assert doc["prs"]["i7"]["state"] == "MERGED"
+    assert doc["prs"]["i7"]["files"], "the cargo chip's own numbers must survive the landing"
+
+
+def test_a_closed_prs_facts_carry_forward_too():
+    doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
+                               carry_prs={"i7": {"number": 12, "state": "CLOSED"}})
+    assert doc["prs"]["i7"]["state"] == "CLOSED"
+
+
+def test_an_open_pr_is_never_carried():
+    # It can still change. A frozen OPEN read would show yesterday's CI as today's — the exact
+    # false-clearance the gate exists to prevent.
+    doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
+                               carry_prs={"i7": {"number": 12, "state": "OPEN"}})
+    assert "i7" not in doc["prs"]
+
+
+def test_a_fresh_pr_read_always_wins_over_a_carried_one():
+    fresh = {"number": 12, "state": "MERGED", "mergeable": "MERGEABLE"}
+    doc = published_view.build(_view(prs={"i7": fresh}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
+                               carry_prs={"i7": {"number": 12, "state": "CLOSED"}})
+    assert doc["prs"]["i7"] == fresh
+
+
+def test_an_untracked_prs_facts_are_pruned():
+    # Bounded by loopstate, exactly like the title carry — the document must not grow forever.
+    doc = published_view.build(_view(prs={}), {}, tracked_ids=set(), now=1, polled_at=1,
+                               carry_prs={"i7": {"number": 12, "state": "MERGED"}})
+    assert "i7" not in doc["prs"]
+
+
+def test_a_wrong_typed_carried_pr_never_raises():
+    for bad in ("nope", None, 7, []):
+        doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
+                                   carry_prs={"i7": bad})
+        assert "i7" not in doc["prs"]

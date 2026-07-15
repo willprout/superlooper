@@ -290,21 +290,13 @@
         lines.map(function (l) { return '<span class="m">' + esc(l) + '</span>'; }).join('');
     }
 
-    // The stamp: ALWAYS, both modes. Deliberately not gated on `fallback`.
-    fixedEls.age.textContent = 'data ' + agePhrase(src.data_age) +
-      ' · last tick ' + agePhrase(src.tick_age);
+    // The stamp: ALWAYS, both modes. Deliberately not gated on `fallback`. Both phrases are the
+    // SERVER's words (design B.1) — including its "?" for an age we don't honestly have, which is
+    // never rendered as a number: a "0s ago" would claim the freshest possible data at the exact
+    // moment we have none. The data_age/tick_age numbers ride the snapshot too, for inspection.
+    fixedEls.age.textContent = 'data ' + (src.data_age_text || '?') +
+      ' · last tick ' + (src.tick_age_text || '?');
     fixedEls.age.classList.toggle('fld-age-warn', fallback);
-  }
-
-  /* An age in seconds as a short human phrase. `null`/absent is "?" — NEVER 0s: before the first
-     direct poll lands (and when the runner has never ticked) we have no honest age, and printing a
-     zero would claim the freshest possible data at the exact moment we have none. */
-  function agePhrase(secs) {
-    if (secs == null || typeof secs !== 'number' || !isFinite(secs)) return '?';
-    var s = Math.max(0, Math.round(secs));
-    if (s < 60) return s + 's ago';
-    if (s < 3600) return Math.round(s / 60) + 'm ago';
-    return Math.round(s / 3600) + 'h ago';
   }
 
   window.CCField = { attach: attach };

@@ -142,6 +142,16 @@ class RunnerSource:
         row = self._issues.get(_iid(n))
         if isinstance(row, dict):
             return dict(row, state="OPEN")
+        # Not in the poll set and not provably closed — but the view may still REMEMBER its title
+        # (the carry outlives the poll set, and `closed_nums` is capped at the 200 most recently
+        # closed, so a flight that landed long enough ago falls off it while loopstate still tracks
+        # it). Hand back the title alone and assert NO state: it is evidence of a name, never of
+        # closure, and inventing a state here would let the connection resolver fly a blocked
+        # flight. Without this the arrivals board silently reverts to bare flight numbers once a
+        # repo has closed 200 issues — the carry the engine pays for every tick, unreachable.
+        title = self._titles.get(_iid(n))
+        if title:
+            return {"number": n, "title": title}
         return {}          # unknown to the runner: the callers all fail closed on {}
 
     # --------------------------- PRs ---------------------------

@@ -69,13 +69,24 @@ WAKE_GRACE_SECONDS = 300
 # dashboard reads (journal record shape, marker semantics, a state file's meaning) is not
 # backward-compatible — never for an additive change an old reader tolerates.
 #
-# v2 (issue #146): the home now carries state/gh_view.json — the runner's own GitHub view, which the
-# dashboard renders as its PRIMARY truth. The new file is additive on disk, yet this is deliberately
-# NOT the "additive change an old reader tolerates" case the rule above exempts: a pre-#146 dashboard
-# does not merely miss the file, it goes on double-polling GitHub on its own clock — the second
-# poller on one rate-limit budget (2026-07-08 storm §1b) whose answers diverge from the runner's.
-# That is the defect this version names. Tolerating it silently is precisely what v2 exists to stop,
-# so the stamp moves and an un-updated dashboard says so on its face.
+# v2 (issue #146) — a DELIBERATE EXCEPTION to the rule above, made by the owner, not by this code.
+# The home now carries state/gh_view.json (the runner's own GitHub view, which the dashboard renders
+# as its primary truth). That addition is backward-compatible ON DISK — every v1 file is unchanged,
+# so a pre-#146 dashboard misreads nothing and renders exactly as it did before. By the letter of the
+# rule above, that is an additive change an old reader tolerates, and it would NOT earn a bump.
+#
+# Issue #146's approved DoD directs the bump anyway ("the state-format contract is updated ... so a
+# stale dashboard reading a new layout fails loudly, not silently"), because the thing at stake is
+# not a misread field but a false BELIEF: after #146 the owner expects this dashboard to be showing
+# the runner's view, and an un-updated one silently isn't — it is still double-polling GitHub, the
+# exact divergence the issue exists to end. The stamp is the only channel that reaches an old
+# dashboard, so v2 is what makes that visible.
+#
+# The cost is real and worth naming: the card an old dashboard shows says "some readings may be
+# blank", and none will be. See PR #146 — flagged for William's ruling. If he prefers the rule as
+# written, revert to 1 here and to {1} in the dashboard's KNOWN_STATE_FORMATS; everything else in
+# #146 works unchanged (a v1 home is already handled — the dashboard names it as `no-published-view`
+# and falls back loudly).
 STATE_FORMAT_VERSION = 2
 USAGE_REFRESH_SECONDS = 60
 GH_POLL_SECONDS = 90
@@ -413,10 +424,13 @@ class Runner:
         # poll ATTEMPT and advances even when the probe finds GitHub down — publishing that as the
         # data's age would date stale data by a failed read. None until the first poll lands.
         self._last_poll_ok = None
-        # The previously published titles, kept so a MERGED flight's title survives its issue leaving
-        # the poll set (published_view's carry discipline). Seeded lazily from the document on disk so
-        # a restarted runner doesn't blank the arrivals board it published a tick ago.
+        # The previously published titles and SETTLED PRs, kept so a MERGED flight's title and its
+        # PR's +N/−N/files survive its issue leaving the poll set (published_view's carry
+        # discipline — the want-set stops polling a terminal issue outright). Seeded lazily from the
+        # document on disk so a restarted runner doesn't blank the arrivals board it published a
+        # tick ago.
         self._published_titles = None
+        self._published_prs = None
         self._last_journal_rotate = 0.0     # 0 => the first tick rotates (journal bound, issue #41)
         # Wake-gap detection (issue #42): _last_tick_now is the previous tick's wall-clock (used to
         # spot a resume that landed far past the cadence); _wake_grace_until is the deadline until
@@ -610,15 +624,18 @@ class Runner:
         healthy loop as dead, the 2026-07-07 class). Catches Exception, not just OSError: the
         document is built from live GitHub answers, and a wrong-typed one must not wedge the loop."""
         try:
-            if self._published_titles is None:      # seed the carry from disk once, post-restart
+            if self._published_titles is None:      # seed both carries from disk once, post-restart
                 prior = _read_json(self._view_path()) or {}
                 self._published_titles = prior.get("titles") if isinstance(prior.get("titles"), dict) else {}
+                self._published_prs = prior.get("prs") if isinstance(prior.get("prs"), dict) else {}
             doc = published_view.build(
                 self.gh_view, self._raw_by_id,
                 tracked_ids=set(ist_map) if isinstance(ist_map, dict) else set(),
-                now=now, polled_at=self._last_poll_ok, carry_titles=self._published_titles)
+                now=now, polled_at=self._last_poll_ok, carry_titles=self._published_titles,
+                carry_prs=self._published_prs)
             loopstate.save(self._view_path(), doc)
             self._published_titles = doc["titles"]
+            self._published_prs = doc["prs"]
         except Exception as e:
             self._log(f"view publish skipped: {_short_repr(e)}")
 

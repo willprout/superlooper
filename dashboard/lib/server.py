@@ -1264,7 +1264,7 @@ def _pick_source(facts, config, now, gh_mod):
         facts["published_view"],
         heartbeat_age=facts["heartbeat_age"], heartbeat_epoch=facts["heartbeat_epoch"],
         now=now, silent_after=config.get("runner_silent_seconds", config_mod.RUNNER_SILENT_SECONDS),
-        fetched_at=_newest_direct_fetch(gh_mod), hhmm=_hhmm)
+        fetched_at=_newest_direct_fetch(gh_mod), hhmm=_hhmm, fmt=format_duration)
     if mode["mode"] == flights.SOURCE_LIVE:
         return runner_source.RunnerSource(facts["published_view"]), mode
     return gh_mod, mode

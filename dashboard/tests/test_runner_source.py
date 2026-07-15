@@ -195,3 +195,25 @@ def test_a_wrong_typed_view_never_raises(bad):
 def test_a_wrong_typed_issue_row_is_skipped():
     s = src(issues={"i7": "not a dict", "i8": _issue(8)})
     assert [i["number"] for i in s.open_issues("o/r")] == [8]
+
+
+# --------------------------- the carry must stay reachable (fresh-agent review, P1) ---------------------------
+
+def test_a_carried_title_is_reachable_even_past_the_closed_nums_cap():
+    # The engine's closed_nums is capped (gh.closed_issue_nums(limit=200)), so a flight that landed
+    # long ago eventually falls off it. Its title is STILL in the document (loopstate tracks it, so
+    # the carry republishes it) — reading it must not depend on the cap, or the arrivals board goes
+    # back to bare flight numbers and the carry the engine paid for is wasted.
+    s = src(closed_nums=list(range(1000, 1200)), titles={"i23": "Add a motto footer"})
+    assert s.issue("o/r", 23)["title"] == "Add a motto footer"
+
+
+def test_a_title_only_answer_never_claims_a_state():
+    # It is evidence of a title, NOT of closure — the connection resolver concludes a blocker only on
+    # state == "CLOSED", and inventing one here would fly a still-blocked flight.
+    s = src(closed_nums=[], titles={"i23": "Add a motto footer"})
+    assert s.issue("o/r", 23).get("state") is None
+
+
+def test_an_issue_with_neither_a_row_nor_a_title_is_still_empty():
+    assert src(closed_nums=[], titles={}).issue("o/r", 23) == {}

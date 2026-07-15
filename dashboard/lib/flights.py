@@ -568,6 +568,26 @@ FALLBACK_NO_VIEW = "no-published-view"        # nothing to render: a pre-#146 en
 
 _GITHUB_DIRECT_LINE = "showing GitHub directly — not the runner's view"
 
+# What the stamp says when there is no honest age to show: no GitHub read has landed yet, or the
+# runner has never ticked. Deliberately NOT "0s ago", which would claim the freshest possible data
+# at the exact moment we have none.
+UNKNOWN_AGE_TEXT = "?"
+
+
+def _stamped(mode, fmt):
+    """Attach the rendered age phrases. The words are composed HERE, server-side (design record
+    B.1: the JS binds strings, it never derives them) — the same discipline that already puts "last
+    landing 4m ago" in the snapshot rather than in the browser. ``fmt`` is the injectable duration
+    formatter (the server passes its ``format_duration``); without one the raw numbers still ride,
+    so an embedder that renders its own words is unaffected."""
+    for key in ("data_age", "tick_age"):
+        secs = mode.get(key)
+        if fmt is None or not isinstance(secs, (int, float)) or isinstance(secs, bool):
+            mode[key + "_text"] = UNKNOWN_AGE_TEXT if fmt is not None else None
+        else:
+            mode[key + "_text"] = "%s ago" % fmt(max(0, secs))
+    return mode
+
 
 def _usable_view(view):
     """The published view IF it is one we may render as truth, else ``None``. Fail closed: a
@@ -584,7 +604,7 @@ def _usable_view(view):
 
 
 def source_mode(view, heartbeat_age, heartbeat_epoch, now, silent_after,
-                fetched_at=None, hhmm=None):
+                fetched_at=None, hhmm=None, fmt=None):
     """Which source the dashboard is rendering, and the honest words for it.
 
     ``view``            the runner's published view (``readers`` → ``facts["published_view"]``).
@@ -594,10 +614,12 @@ def source_mode(view, heartbeat_age, heartbeat_epoch, now, silent_after,
     ``fetched_at``      when the dashboard's OWN GitHub read last landed — the age of what is on
                         screen in FALLBACK (``None`` ⇒ no direct read yet).
     ``hhmm``            an injectable epoch → "HH:MM" formatter (the server passes the locale one).
+    ``fmt``             an injectable seconds → duration formatter, for the rendered age phrases.
 
-    Returns ``{mode, reason, data_age, tick_age, silent_since, banner}``. ``banner`` is ``None`` in
-    LIVE and, in FALLBACK, the lines the field shouts — built HERE (design record B.1: the JS binds
-    words, never derives them) so the banner and the mode can never disagree.
+    Returns ``{mode, reason, data_age, tick_age, data_age_text, tick_age_text, silent_since,
+    banner}``. ``banner`` is ``None`` in LIVE and, in FALLBACK, the lines the field shouts — built
+    HERE (design record B.1: the JS binds words, never derives them) so the banner and the mode can
+    never disagree. The ages ride as both raw seconds (inspectable) and rendered text.
 
     LIVE requires BOTH a usable view AND a fresh heartbeat: a view is only as trustworthy as the
     tick behind it, and a fresh tick that publishes nothing is not the runner's truth either.
@@ -610,12 +632,13 @@ def source_mode(view, heartbeat_age, heartbeat_epoch, now, silent_after,
         polled = usable.get("polled_at")
         # Age the data by the runner's last GitHub READ, not the tick that copied it out — a tick
         # inside the poll window republishes an unchanged answer, and dating it "now" would present
-        # a 90s-old reading as current. A runner that has never reached GitHub still publishes
-        # (marked stale): age that by the publish stamp, the freshest fact we have.
-        stamp = polled if isinstance(polled, (int, float)) and not isinstance(polled, bool) \
-            else usable["published_at"]
-        return {"mode": SOURCE_LIVE, "reason": None, "data_age": now - stamp,
-                "tick_age": tick_age, "silent_since": None, "banner": None}
+        # a 90s-old reading as current. A runner that has never reached GitHub publishes a document
+        # with no read behind it at all: that is an UNKNOWN age (the field says "data ?"), never the
+        # publish stamp, which would claim freshness for data that doesn't exist.
+        data_age = (now - polled) if isinstance(polled, (int, float)) \
+            and not isinstance(polled, bool) else None
+        return _stamped({"mode": SOURCE_LIVE, "reason": None, "data_age": data_age,
+                         "tick_age": tick_age, "silent_since": None, "banner": None}, fmt)
 
     # --- FALLBACK. Name which of the two failures this is, and never claim the other. ---
     reason = FALLBACK_RUNNER_SILENT if silent else FALLBACK_NO_VIEW
@@ -634,9 +657,9 @@ def source_mode(view, heartbeat_age, heartbeat_epoch, now, silent_after,
         # The runner is ticking; it just publishes no view (an engine older than issue #146). Say
         # exactly that, so the owner updates the engine instead of hunting a dead runner.
         first = "runner publishes no view — engine predates the published-view handshake"
-    return {"mode": SOURCE_FALLBACK, "reason": reason, "data_age": data_age,
-            "tick_age": tick_age, "silent_since": silent_since,
-            "banner": {"lines": [first, _GITHUB_DIRECT_LINE]}}
+    return _stamped({"mode": SOURCE_FALLBACK, "reason": reason, "data_age": data_age,
+                     "tick_age": tick_age, "silent_since": silent_since,
+                     "banner": {"lines": [first, _GITHUB_DIRECT_LINE]}}, fmt)
 
 
 def repo_state(slug, states, spinning=False, merges_frozen=None, alert=None,

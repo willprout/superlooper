@@ -58,11 +58,12 @@ def test_live_reports_the_tick_timer():
     assert m["tick_age"] == 12.0
 
 
-def test_data_age_falls_back_to_the_publish_stamp_when_github_was_never_read():
-    # A runner that has never reached GitHub still publishes (marked stale). The document is still
-    # the freshest thing we have, so age it by when it was WRITTEN rather than showing nothing.
+def test_data_age_is_unknown_when_github_was_never_read():
+    # A runner that has never reached GitHub still publishes its document (marked stale) — but there
+    # is no GitHub data in it to be "5s old". Ageing it by the PUBLISH stamp would claim freshness
+    # for data that does not exist; the honest answer is unknown, which the field renders "data ?".
     m = _mode(view=_view(published_at=970, polled_at=None, stale=True), now=1000)
-    assert m["data_age"] == 30
+    assert m["data_age"] is None
 
 
 # --------------------------- FALLBACK: the runner went quiet ---------------------------

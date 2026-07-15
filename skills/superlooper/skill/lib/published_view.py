@@ -18,10 +18,13 @@ Two disciplines are load-bearing:
   * **Never invent.** A fact the runner does not hold is ABSENT from the document, never a
     fabricated empty a reader would mistake for an answer — the refused-vs-answered-empty line the
     poll path already holds (issues #21/#61/#78). An unreadable view publishes as ``stale``.
-  * **Titles carry forward.** The poll set is agent-ready + in-progress issues only, so a MERGED
-    flight's issue (closed now) drops out and its title would vanish — blanking the arrivals board
-    on the landing it just celebrated. Titles survive for issues the runner still TRACKS in
-    loopstate, and are pruned the moment it doesn't, which is what bounds the document's growth.
+  * **Titles and SETTLED PRs carry forward.** The poll set is agent-ready + in-progress issues
+    only, and the want-set skips ``TERMINAL_STATUSES`` outright, so a MERGED flight drops out of
+    both ``raw_by_id`` and ``prs`` the moment it lands. Left alone, its title and its PR's
+    ``+N/−N/files`` would vanish exactly when the arrivals board wants to celebrate it — and that
+    cargo chip is meant to outlive the flight forever (the worktree is cleaned up; the PR is what
+    remembers). Both survive for issues the runner still TRACKS in loopstate, and are pruned the
+    moment it doesn't, which is what bounds the document's growth.
 
 This module never raises: it runs inside the tick, ahead of the heartbeat stamp, and a raise here
 would wedge the loop exactly as the 2026-07-07 binary-file incident did.
@@ -33,6 +36,14 @@ would wedge the loop exactly as the 2026-07-07 binary-file incident did.
 # through, so the published shape is a NAMED contract and a future gh field can't silently
 # balloon the file.
 _ISSUE_KEYS = ("number", "title", "labels", "body", "createdAt")
+
+# The PR states a carry may remember. A MERGED/CLOSED PR is SETTLED — its checks, its mergeability
+# and its diff can never move again, so republishing it forever is simply the truth. An OPEN PR is
+# not: its CI can go red, its mergeability can rot. When one goes missing from a poll window (the
+# want-set skipped it, or MAX_POLL_CALLS starved the tail) the honest answer is ABSENT — the gate
+# then fails closed to not-cleared, whereas a frozen "green" would be a false clearance. Same line
+# the dashboard's own ConcludedFlights drew for the same reason.
+_SETTLED_PR_STATES = frozenset({"MERGED", "CLOSED"})
 
 
 def _dict(v):
@@ -55,18 +66,20 @@ def _closed_list(closed_nums):
     return sorted(n for n in closed_nums if type(n) is int)
 
 
-def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=None):
+def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=None,
+          carry_prs=None):
     """The document for ``state/gh_view.json``.
 
     ``gh_view``     the runner's in-memory view (``stale``, ``consecutive_failures``,
                     ``closed_nums``, ``prs``, ``dev_checks``).
     ``raw_by_id``   ``{iid: raw gh issue dict}`` for the issues polled this window.
-    ``tracked_ids`` the iids loopstate still tracks — what bounds the title carry.
+    ``tracked_ids`` the iids loopstate still tracks — what bounds both carries.
     ``now``         this tick's wall clock (stamped as ``published_at``).
     ``polled_at``   the last SUCCESSFUL GitHub poll's clock, or ``None`` if never reached. A
                     DIFFERENT clock from ``published_at`` on purpose: the dashboard shows how old
                     the DATA is, which is the poll, not the tick that copied it out.
     ``carry_titles`` the previous document's ``titles`` map (see the carry discipline above).
+    ``carry_prs``    the previous document's ``prs`` map; only SETTLED entries are remembered.
 
     An unreadable ``gh_view`` yields an empty-but-typed document marked ``stale`` — never a
     confident all-clear.
@@ -88,6 +101,16 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
         if iid in tracked and iid not in titles and t:
             titles[iid] = t
 
+    # The same carry for SETTLED PRs. This is what keeps a landed flight's cargo chip alive: the
+    # want-set stops polling an issue the moment it goes terminal, so without this the PR facts
+    # would disappear on the exact tick the arrivals board lights up. A fresh read always wins; an
+    # unsettled or wrong-typed remembered entry is dropped rather than frozen in.
+    prs = dict(_dict(view.get("prs")))
+    for iid, pr in _dict(carry_prs).items():
+        if iid in tracked and iid not in prs and isinstance(pr, dict) \
+                and pr.get("state") in _SETTLED_PR_STATES:
+            prs[iid] = pr
+
     return {
         "published_at": int(now),
         "polled_at": int(polled_at) if isinstance(polled_at, (int, float)) else None,
@@ -98,6 +121,6 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
         "issues": issues,
         "titles": titles,
         "closed_nums": _closed_list(view.get("closed_nums")),
-        "prs": _dict(view.get("prs")),
+        "prs": prs,
         "dev_checks": _dict(view.get("dev_checks")),
     }
