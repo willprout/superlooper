@@ -159,3 +159,34 @@ def test_writes_disabled_still_wins_over_the_skew_explanation():
     not manufacture a different answer for a surface that is simply off."""
     resp = _post(UNKNOWN, version=_Version(stale=True), actions=None)
     assert resp.status == 405
+
+
+# =============================== our own bookkeeping never breaks a button ===============================
+
+class _BrokenVersion:
+    """A stamp that blows up — a corrupt tree, a permissions change, a bug in our own walk."""
+
+    def skew(self):
+        raise RuntimeError("the stamp exploded")
+
+    def state(self):
+        raise RuntimeError("the stamp exploded")
+
+
+def test_a_broken_stamp_degrades_to_the_plain_404_never_a_500():
+    """This feature is bookkeeping ABOUT the dashboard. If it fails, the honest fallback is the
+    behavior we had before it existed — never a 500 that turns an informational miss into an outage."""
+    resp = _post(UNKNOWN, version=_BrokenVersion(), actions=_Actions())
+    assert resp.status == 404
+    assert _body(resp)["error"] == "no such action"
+
+
+def test_a_broken_stamp_never_fails_the_whole_snapshot(tmp_path):
+    """The field is the truth the owner opened the dashboard for. A stamp that can't be taken must
+    cost the version block and nothing else — the poll loop must not wedge over it."""
+    (tmp_path / "lib").mkdir()
+    snap = server.assemble_snapshot(
+        {"repos": [], "fun": {}, "operator": "William", "poll_seconds": 2},
+        now=1_000_000, version=_BrokenVersion())
+    assert "version" not in snap, "an unavailable stamp is omitted, not faked"
+    assert snap["generated_at"] == 1_000_000, "…and the rest of the snapshot is untouched"

@@ -153,14 +153,18 @@ def dashboard_restart_decision(url, snapshot):
     composition root) or ``None`` if nothing of ours is serving. Returns ``{action, pid, message}``:
 
     * ``start`` — nothing is serving; just bring one up.
-    * ``stop-then-start`` — stop ``pid``, wait for it to actually go, then start fresh. The pid comes
-      from the snapshot of the process that answered OUR shape check, which is the only
-      identification that cannot name a stranger: a pattern kill (``pkill -f``) once
-      collateral-killed William's live dashboard (2026-07-07), and even the port-holder is not safe
-      — ``_dashboard_up``'s own contract admits an unrelated app can squat the port.
-    * ``refuse`` — something is serving but will not say which process it is (a server predating this
-      issue). Guessing a kill target is exactly the failure above, so liftoff stops and tells the
-      owner how to finish by hand.
+    * ``stop-then-start`` — stop ``pid``, wait for it to actually go, then start fresh. The pid is
+      trusted ONLY when the responder also carries the ``product`` marker naming itself a
+      command-center. A pid is just a number anything could print, and the snapshot's general shape
+      (``generated_at`` + ``repos``) is a resemblance, not a proof — without the explicit claim, any
+      localhost responder could aim a SIGTERM at a process of its choosing. A signal is the one
+      irreversible thing done to another process here, and it has bitten this project before: a
+      pattern kill (``pkill -f``) collateral-killed William's live dashboard (2026-07-07), and the
+      port-holder is no safer — ``_dashboard_up``'s own contract admits an unrelated app can squat
+      the port.
+    * ``refuse`` — something is serving but will not identify itself as a command-center with a pid
+      (a server predating this issue, or a stranger on the port). Guessing a kill target is exactly
+      the failure above, so liftoff stops and tells the owner how to finish by hand.
 
     A dashboard that is already current still restarts: the flag is the owner's explicit act, not a
     repair the machine talks itself into. The message just says so.
@@ -171,11 +175,13 @@ def dashboard_restart_decision(url, snapshot):
     version = (snapshot.get("version") or {}) if isinstance(snapshot, dict) else {}
     pid = version.get("pid")
     # bool is an int in Python — screen it out explicitly, or `True` reads as pid 1.
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    identified = (version.get("product") == "command-center"
+                  and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0)
+    if not identified:
         return {"action": "refuse", "pid": None,
-                "message": ("a dashboard is serving at %s but does not report its pid — it predates "
-                            "--restart-dashboard, so liftoff cannot tell which process it is and "
-                            "will not guess.\n"
+                "message": ("something is serving at %s but does not identify itself as a "
+                            "command-center with a pid — either it predates --restart-dashboard or "
+                            "it is not ours. liftoff will not guess which process to signal.\n"
                             "  Stop it by hand (Ctrl-C in the tab running it, or close that tab), "
                             "then run: liftoff --restart-dashboard" % url)}
     was = "stale" if version.get("skew") else "already current"

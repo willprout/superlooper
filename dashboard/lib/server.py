@@ -317,12 +317,13 @@ def _unroutable(clean, version):
     old 404 — laundering a genuine bug into a reassuring "you're just stale" would trade one lie for
     another.
 
-    Never raises: the stamp reads the filesystem, and a failure to take it must degrade to the plain
-    old 404, never a 500 on the button path.
+    Never raises: the stamp walks the filesystem, and no failure to take it may become a 500 on the
+    button path. A bug in our own bookkeeping must degrade to the plain old 404 — the same
+    fail-toward-the-old-behavior posture the snapshot route takes with its provider.
     """
     try:
         stale = version is not None and version.skew()
-    except OSError:
+    except Exception:                    # a stamp bug must never break a button that would 404 anyway
         stale = False
     if not stale:
         return _json_resp(404, {"ok": False, "error": "no such action"})
@@ -1530,7 +1531,7 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
     if version is not None:
         try:
             snap["version"] = version.state()
-        except OSError:
+        except Exception:   # the field is the truth the owner came for; never 500 the poll over a stamp
             pass
     return snap
 

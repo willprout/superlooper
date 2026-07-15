@@ -50,12 +50,14 @@ lo = _load()
 URL = "http://127.0.0.1:8611"
 
 
-def _snap(pid=4242, skew=True):
-    return {"generated_at": 1, "repos": [],
-            "version": {"server": "aaaa", "server_on_disk": "bbbb" if skew else "aaaa",
-                        "assets": "cccc", "assets_at_boot": "cccc", "skew": skew,
-                        "message": "stale" if skew else None,
-                        "remedy": "bin/liftoff --restart-dashboard", "pid": pid}}
+def _snap(pid=4242, skew=True, product="command-center"):
+    v = {"server": "aaaa", "server_on_disk": "bbbb" if skew else "aaaa",
+         "assets": "cccc", "assets_at_boot": "cccc", "skew": skew,
+         "message": "stale" if skew else None,
+         "remedy": "bin/liftoff --restart-dashboard", "pid": pid}
+    if product is not None:
+        v["product"] = product
+    return {"generated_at": 1, "repos": [], "version": v}
 
 
 # =============================== the pure decision ===============================
@@ -91,6 +93,17 @@ def test_a_malformed_pid_is_refused_not_coerced():
     for bad in (None, 0, -1, "4242", 4242.7, True):
         d = liftoff_mod.dashboard_restart_decision(URL, _snap(pid=bad))
         assert d["action"] == "refuse", "pid %r must not be trusted as a kill target" % (bad,)
+
+
+def test_a_responder_that_does_not_claim_to_be_a_command_center_is_never_signalled():
+    """The snapshot's general shape is a RESEMBLANCE, not a proof of identity. Any localhost
+    responder carrying generated_at/repos/a pid could otherwise aim a SIGTERM at any process it
+    named. The product marker makes identity an explicit claim. (Fresh review, issue #136.)"""
+    for impostor in (None, "", "something-else", "Command-Center", 1):
+        d = liftoff_mod.dashboard_restart_decision(URL, _snap(pid=4242, product=impostor))
+        assert d["action"] == "refuse", (
+            "product %r must not be trusted to hand over a kill target" % (impostor,))
+        assert d["pid"] is None
 
 
 def test_an_already_current_dashboard_still_restarts_because_the_owner_asked():
@@ -148,7 +161,20 @@ class _Probe:
         return self._snaps[min(self.calls - 1, len(self._snaps) - 1)]
 
 
-def _run(cfg_path, *, probe, stop=None, spawn=None, execr=None, sleep=None):
+class _Life:
+    """Process liveness, staged: alive for the first ``alive_for`` checks, then dead. ``alive_for=None``
+    means it never dies (the hung-dashboard case)."""
+
+    def __init__(self, alive_for=0):
+        self._n = alive_for
+        self.calls = 0
+
+    def __call__(self, pid):
+        self.calls += 1
+        return True if self._n is None else self.calls <= self._n
+
+
+def _run(cfg_path, *, probe, stop=None, spawn=None, execr=None, sleep=None, alive=None):
     spawn = spawn if spawn is not None else _Recorder()
     execr = execr if execr is not None else _Recorder()
     stop = stop if stop is not None else _Recorder()
@@ -156,6 +182,7 @@ def _run(cfg_path, *, probe, stop=None, spawn=None, execr=None, sleep=None):
     rc = lo.main([str(_BIN), str(cfg_path), "--restart-dashboard"],
                  dashboard_snapshot=probe, stop_process=stop,
                  spawn_dashboard=spawn, exec_runner=execr,
+                 pid_alive=(alive if alive is not None else _Life(alive_for=0)),
                  sleep=(sleep if sleep is not None else _Recorder()), out=out)
     return rc, out.getvalue(), stop, spawn, execr
 
@@ -172,12 +199,40 @@ def test_restart_stops_exactly_the_reported_pid_then_starts_a_fresh_one(cfg):
 def test_restart_never_double_starts_when_the_old_one_will_not_die(cfg):
     """The whole point of the guarantee: if the old process survives, spawning a second one gives two
     dashboards racing for one port. Start nothing, say so."""
-    probe = _Probe([_snap(pid=4242)])                # up, and stays up forever
-    rc, text, stop, spawn, execr = _run(cfg, probe=probe)
+    rc, text, stop, spawn, execr = _run(cfg, probe=_Probe([_snap(pid=4242)]),
+                                        alive=_Life(alive_for=None))   # never dies
     assert rc == lo.EXIT_LAUNCH_FAILED
-    assert spawn.calls == [], "must NOT start a second dashboard while the old one still answers"
-    assert "still answering" in text
+    assert spawn.calls == [], "must NOT start a second dashboard while the old one is still alive"
+    assert "still alive" in text
     assert "4242" in text, "the owner needs the pid to finish the job by hand"
+
+
+def test_a_hung_dashboard_that_stops_answering_is_not_mistaken_for_a_dead_one(cfg):
+    """The P0 the fresh review caught (issue #136).
+
+    The snapshot probe returns None for a timeout, a transient 500, a truncated body — every symptom
+    of a dashboard that is HUNG BUT ALIVE and still holding the port. If probe-silence counted as
+    death, liftoff would spawn a replacement beside it; the new process would die at bind, the stale
+    server would keep answering, and liftoff would report success. Death is decided by the PROCESS,
+    never by the port going quiet.
+    """
+    probe = _Probe([_snap(pid=4242), None])          # stops answering immediately after the stop…
+    rc, text, stop, spawn, execr = _run(cfg, probe=probe, alive=_Life(alive_for=None))  # …but lives
+    assert rc == lo.EXIT_LAUNCH_FAILED
+    assert spawn.calls == [], (
+        "a silent-but-alive dashboard still holds the port — starting a second one is the double "
+        "start this flag exists to avoid")
+    assert "still alive" in text
+
+
+def test_a_dashboard_we_could_not_signal_never_gets_a_replacement_beside_it(cfg):
+    """EPERM: the pid is not ours to kill. We could not stop it ⇒ we do not start a rival."""
+    def boom(pid):
+        raise PermissionError("not yours")
+    rc, text, stop, spawn, execr = _run(cfg, probe=_Probe([_snap(pid=4242)]), stop=boom)
+    assert rc == lo.EXIT_LAUNCH_FAILED
+    assert spawn.calls == [], "never start a second dashboard beside one we could not stop"
+    assert "starting nothing" in text
 
 
 def test_restart_with_nothing_serving_just_starts_one(cfg):
