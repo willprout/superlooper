@@ -48,6 +48,13 @@ def _clear_worker_launch_env(monkeypatch):
         # real external binary / reads real macOS defaults" rule. Neutralize so such a call can't.
         "SL_DEFAULTS",
         "SL_CMUX_BUNDLE_ID",
+        # Plugin-presence override (issue #90): same ratchet, one step subtler. No real binary is at
+        # risk here — but cmd_stack_doctor builds a REAL Probe reading os.environ, and the CLI rig
+        # copies os.environ into the subprocess, so an ambient SL_PLUGIN_ID would send the doctor
+        # looking for a DIFFERENT plugin id than the test's stub reports and false-fail the
+        # green-stack assertion. STACK.md advertises this var to fork users, and a fork user
+        # dogfooding this repo is exactly who would have it exported.
+        "SL_PLUGIN_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 

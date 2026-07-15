@@ -761,12 +761,12 @@ def _plugin_probe(rows=None, *, rc=0, out=None, err="", has_claude=True, env=Non
     """A FakeProbe whose `claude plugin list --json` returns `rows` (or a raw `out`/`rc` for the
     malformed-output and error paths). `has_claude=False` removes the CLI entirely."""
     probe = _healthy_probe()
+    probe.env.update(env or {})
     if not has_claude:
         del probe.commands["claude"]
         return probe
     payload = out if out is not None else json.dumps(rows or [])
     probe.commands["claude"][_PLUGIN_LIST] = (rc, payload, err)
-    probe.env.update(env or {})
     return probe
 
 
@@ -806,6 +806,33 @@ def test_superlooper_plugin_warns_when_installed_but_disabled():
     assert r.ok is True and r.warn is True
     assert "disabled" in r.detail.lower()
     assert "plugin enable superlooper@superlooper" in r.detail   # the cure for THIS state, not reinstall
+
+
+def test_superlooper_plugin_does_not_claim_disabled_on_an_unreadable_enabled_flag():
+    # P1 regression: DISABLED is claimed ONLY on a literal `enabled: false`. The CLI's --json schema
+    # is undocumented, so a row that lacks the key (or carries an unexpected value) is a state we
+    # could not read — asserting DISABLED there hands the operator a confident wrong diagnosis whose
+    # cure (`plugin enable`) changes nothing. _plugin_rows already applies this discipline to the
+    # list shape; it must not be abandoned one level down at the row.
+    row_no_key = _plugin_row()
+    del row_no_key["enabled"]
+    for row in (row_no_key, _plugin_row(enabled="true"), _plugin_row(enabled=None)):
+        r = stack_doctor.check_superlooper_plugin(_plugin_probe([row]))
+        assert r.ok is True and r.warn is True, row
+        assert "disabled" not in r.detail.lower(), row      # never a false DISABLED verdict
+        assert "cannot tell" in r.detail.lower(), row       # an honest could-not-determine instead
+
+
+def test_superlooper_plugin_passes_when_any_matching_row_is_enabled():
+    # The same id can appear at more than one scope (user/project/local). Any enabled row means the
+    # skills load, so a disabled row sorting FIRST must not be read as "disabled".
+    probe = _plugin_probe([_plugin_row(enabled=False, scope="project"),
+                           _plugin_row(enabled=True, scope="user")])
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is False
+    assert "user" in r.detail                              # reports the row that actually loads
 
 
 def test_superlooper_plugin_warns_when_empty_plugin_list():

@@ -708,8 +708,8 @@ def check_superlooper_plugin(probe):
             "list`." % (problem, plugin_id),
             warn=True)
 
-    row = next((r for r in rows if r.get("id") == plugin_id), None)
-    if row is None:
+    matching = [r for r in rows if r.get("id") == plugin_id]
+    if not matching:
         return CheckResult(
             name, True,
             "%s is not installed — planning and worker sessions on this machine lose the "
@@ -718,21 +718,41 @@ def check_superlooper_plugin(probe):
             % (plugin_id, _PLUGIN_INSTALL),
             warn=True)
 
-    scope = row.get("scope")
-    where = " at %s scope" % scope if _nonempty_string(scope) else ""
-    if row.get("enabled") is True:
-        version = row.get("version")
+    def _where(row):
+        scope = row.get("scope")
+        return " at %s scope" % scope if _nonempty_string(scope) else ""
+
+    # ANY enabled row means the skills load, so judge on that rather than on the first row: the same
+    # id can legitimately appear at more than one scope (user/project/local), and a disabled row
+    # sorting ahead of an enabled one must not be read as "disabled".
+    enabled = next((r for r in matching if r.get("enabled") is True), None)
+    if enabled is not None:
+        version = enabled.get("version")
         stamp = " v%s" % version if _nonempty_string(version) else ""
-        return CheckResult(name, True, "%s installed and enabled%s%s" % (plugin_id, where, stamp))
+        return CheckResult(
+            name, True, "%s installed and enabled%s%s" % (plugin_id, _where(enabled), stamp))
 
     # Installed but not enabled — the same silent skill loss as absence, but a different cure:
-    # re-installing would not help, enabling would.
+    # re-installing would not help, enabling would. Claim this ONLY on a literal `enabled: false`.
+    # The CLI's --json schema is not documented, so a row that simply lacks the key (or carries an
+    # unexpected value) is a state we could not read — and asserting DISABLED there would hand the
+    # operator a confident wrong diagnosis with a cure that changes nothing. Same discipline
+    # _plugin_rows applies to the list shape, applied one level down to the row.
+    row = matching[0]
+    if not any(r.get("enabled") is False for r in matching):
+        return CheckResult(
+            name, True,
+            "%s is installed%s but `claude plugin list --json` did not report a usable `enabled` "
+            "flag for it (%r) — cannot tell whether its skills load. The CLI's JSON schema is not "
+            "documented and may have changed; check by hand with `claude plugin list`."
+            % (plugin_id, _where(row), row.get("enabled")),
+            warn=True)
     return CheckResult(
         name, True,
         "%s is installed%s but DISABLED — its skills do not load, so planning and worker sessions "
         "lose the superlooper ops, write-issue and debugger skills (they still RUN: briefs are "
         "self-contained, so this never fails the stack). To fix, run `claude plugin enable %s`."
-        % (plugin_id, where, plugin_id),
+        % (plugin_id, _where(row), plugin_id),
         warn=True)
 
 
