@@ -301,7 +301,13 @@ html, body {
    overlay claim (tags, banner, caption, landmarks, sign, freeze) hides with it: a downed runner
    means none of them can be trusted; only the card speaks. */
 .fld-root.down canvas.fld-canvas { filter: grayscale(1) brightness(0.62) contrast(0.9); }
-.fld-root.down .fld-overlays > :not(.fld-rd) { display: none !important; }
+/* The source banner and the freshness stamp (issue #146) survive the runner-down takeover, unlike
+   every other overlay. They are not claims about the FIELD — which is exactly what a downed runner
+   makes untrustworthy — but about the DASHBOARD: which source these pixels came from and how old
+   they are. Both stay TRUE when the runner is gone, and are precisely what the owner needs then
+   (runner-down is a superset of runner-silent, so this is when fallback is certain to be running).
+   Same principle as the stale-tower NOTAM (#136): a surface reporting the tower, not the field. */
+.fld-root.down .fld-overlays > :not(.fld-rd):not(.fld-src):not(.fld-age) { display: none !important; }
 .fld-overlays { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
 /* author display values (grid etc.) must never defeat the hidden attribute */
 .fld-overlays [hidden] { display: none !important; }
@@ -403,6 +409,49 @@ html, body {
 .fld-fmt .s { font: 400 9.5px var(--sans); color: #C2A86E; letter-spacing: 0.2px; }
 @keyframes cc-fmt-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 @media (prefers-reduced-motion: reduce) { .fld-fmt .t { animation: none; } }
+
+/* SOURCE MODE — FALLBACK (issue #146): these pixels are NOT the runner's view; the dashboard went
+   and asked GitHub itself because the runner went quiet. Deliberately the loudest honest surface on
+   the field and deliberately NOT shaped like .fld-link / .fld-fmt: those are compact centred cards,
+   and the eye learns to file a familiar card as chrome. This is a full-width hazard BAND across the
+   top of the field — a different silhouette, a violet nobody else on this surface owns, and
+   hazard stripes that read as "different source" at a glance from across the room. The owner spent
+   weeks reading this field as a live mirror of the runner while it quietly wasn't one; a whisper
+   here would rebuild that exact bug. LIVE renders none of this. */
+.fld-src {
+  position: absolute; left: 0; right: 0; top: 0; z-index: 3;
+  display: flex; flex-direction: column; gap: 1px; align-items: center; text-align: center;
+  padding: 5px 12px;
+  background:
+    repeating-linear-gradient(135deg,
+      rgba(146, 84, 214, 0.30) 0 10px, rgba(38, 16, 58, 0.30) 10px 20px),
+    rgba(34, 14, 52, 0.95);
+  border-bottom: 2px solid #B37AE8;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+}
+.fld-src .t {
+  font: 700 12px var(--mono); letter-spacing: 1.4px; color: #E4C4FF;
+  animation: cc-src-pulse 1.6s ease-in-out infinite;
+}
+/* The two facts (silent since HH:MM · showing GitHub directly), composed server-side. */
+.fld-src .m { font: 600 10.5px var(--mono); color: #EBD9FA; letter-spacing: 0.2px; }
+@keyframes cc-src-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.58; } }
+@media (prefers-reduced-motion: reduce) { .fld-src .t { animation: none; } }
+
+/* The always-on freshness stamp: how old the data is, and when the runner last ticked. Shown in
+   BOTH modes — it is the honesty that makes the surface readable, not a warning — so it stays
+   quiet and out of the way (bottom-right, low contrast) until fallback tints it to match the band.
+   §0.1: joy is terminal. A permanent alarm would tax every glance at a healthy field; a small
+   truthful stamp costs nothing and makes the delight trustworthy. */
+/* Bottom-LEFT, not right: the painted incident sign ("N landings since the last incident") lives
+   bottom-right, and it is a §7 joy element — covering it to make room for a freshness stamp would
+   trade delight for plumbing, which §0.1 forbids outright. Verified by screenshot, not by eye. */
+.fld-age {
+  position: absolute; left: 6px; bottom: 5px; z-index: 3; white-space: nowrap;
+  background: rgba(16, 21, 27, 0.78); border: 1px solid #33404E; border-radius: 4px;
+  font: 600 9px var(--mono); letter-spacing: 0.3px; color: #8DA0B0; padding: 2px 7px;
+}
+.fld-age-warn { color: #E4C4FF; border-color: #7E4FB0; background: rgba(34, 14, 52, 0.88); }
 .repo-sel { display: inline-flex; align-items: center; gap: 5px; margin-left: 6px; }
 .repo-tab {
   position: relative;

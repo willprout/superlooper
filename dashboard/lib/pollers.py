@@ -54,6 +54,12 @@ class Cached:
             self._last = now
         return self._value
 
+    def last_fetch_at(self):
+        """When the wrapped fetch last actually ran (``None`` before the first). The dashboard's
+        FALLBACK mode shows the age of what's on screen (issue #146), and in fallback that data came
+        from THIS fetch — so the cache is the only thing that knows how old the picture really is."""
+        return self._last
+
 
 # ============================ diff_stat: the worktree cargo poller ============================
 

@@ -95,6 +95,28 @@
     overlays.appendChild(fmt);
     fixedEls.fmt = fmt;
 
+    // SOURCE MODE (issue #146). The field normally renders the RUNNER's own published view. When the
+    // runner goes quiet the dashboard polls GitHub itself — a second opinion, on a stale premise —
+    // and that must never look like the real thing: the owner read this surface as a live mirror of
+    // the runner for weeks while it quietly wasn't one. So fallback SHOUTS, in a band the eye can't
+    // file as chrome, naming both facts (since when the runner went silent; that this is GitHub
+    // directly). The server composes the words (design B.1); this only binds them. Self-clearing:
+    // the poll after the runner returns rebuilds without it, no restart, nothing to dismiss.
+    var srcBanner = document.createElement('div');
+    srcBanner.className = 'fld-src';
+    srcBanner.hidden = true;
+    overlays.appendChild(srcBanner);
+    fixedEls.src = srcBanner;
+
+    // The always-on freshness stamp: how old the DATA on screen is, and how long since the runner's
+    // last completed tick. Shown in BOTH modes and never gated on trouble — it is the honesty that
+    // makes the whole surface readable, not a warning. The two clocks are genuinely different (a
+    // fresh tick can still be republishing a 90s-old GitHub read), so both are named in plain words.
+    var age = document.createElement('span');
+    age.className = 'fld-age';
+    overlays.appendChild(age);
+    fixedEls.age = age;
+
     engine = window.AirfieldLive.mount(canvas);
     canvas.addEventListener('click', function (e) {
       var p = logical(e), num = engine.hitTest(p.x, p.y);
@@ -247,6 +269,34 @@
     var mismatch = !!(sf && sf.compatible === false);
     fixedEls.fmt.hidden = !mismatch;
     if (mismatch) fixedEls.fmt.querySelector('.m').textContent = sf.message || '';
+
+    bindSource(c.repo.source);
+  }
+
+  /* Bind the source-mode surfaces (issue #146): the always-on freshness stamp, and the fallback
+     banner. Both read the server's verdict (repo.source) and derive nothing — which mode we're in,
+     and the words for it, are decided once in lib/flights.source_mode so the banner and the board
+     can never tell two different stories. */
+  function bindSource(src) {
+    src = src || {};
+    var fallback = src.mode === 'fallback';
+
+    // The banner: fallback only. LIVE stays quiet, or the shout becomes wallpaper and the fallback
+    // is invisible again — the very failure this issue closes.
+    fixedEls.src.hidden = !fallback;
+    if (fallback) {
+      var lines = (src.banner && src.banner.lines) || [];
+      fixedEls.src.innerHTML = '<span class="t">◆ FALLBACK — GITHUB DIRECT</span>' +
+        lines.map(function (l) { return '<span class="m">' + esc(l) + '</span>'; }).join('');
+    }
+
+    // The stamp: ALWAYS, both modes. Deliberately not gated on `fallback`. Both phrases are the
+    // SERVER's words (design B.1) — including its "?" for an age we don't honestly have, which is
+    // never rendered as a number: a "0s ago" would claim the freshest possible data at the exact
+    // moment we have none. The data_age/tick_age numbers ride the snapshot too, for inspection.
+    fixedEls.age.textContent = 'data ' + (src.data_age_text || '?') +
+      ' · last tick ' + (src.tick_age_text || '?');
+    fixedEls.age.classList.toggle('fld-age-warn', fallback);
   }
 
   window.CCField = { attach: attach };

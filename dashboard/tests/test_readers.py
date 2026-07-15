@@ -93,7 +93,7 @@ def test_state_home_returns_every_contract_key():
     assert set(facts) == {
         "issues_state", "activity", "blocked", "exited", "awaiting",
         "heartbeat_epoch", "heartbeat_age", "merges_frozen", "alert", "reports",
-        "state_format"}
+        "state_format", "published_view"}
 
 
 def test_state_home_issues_json_content():
@@ -264,3 +264,36 @@ def test_corrupt_files_never_raise_and_fail_closed_where_existence_means_state(t
     # existence == frozen / alerting: a corrupt-but-present marker still counts (fail closed).
     assert facts["merges_frozen"] == {}
     assert facts["alert"] == {}
+
+
+# --------------------------- the runner's published view (issue #146) ---------------------------
+# The dashboard's PRIMARY source: the runner writes its own GitHub view to state/gh_view.json each
+# tick and the dashboard renders THAT rather than asking GitHub the same questions itself. The
+# reader stays raw and fail-tolerant as ever — whether a view is fresh enough to render as truth is
+# flights.source_mode's call, not the reader's.
+
+def test_published_view_absent_is_none(tmp_path):
+    # A pre-#146 engine publishes nothing. Absent must be distinguishable from present-but-corrupt:
+    # the first is an old engine (fall back and say so), the second is a broken document.
+    _state(tmp_path)
+    assert readers.read_state_home(tmp_path, now=1300)["published_view"] is None
+
+
+def test_published_view_present_returns_the_parsed_document(tmp_path):
+    (_state(tmp_path) / "gh_view.json").write_text(
+        '{"published_at": 1200, "polled_at": 1150, "stale": false, "issues": {}}')
+    v = readers.read_state_home(tmp_path, now=1300)["published_view"]
+    assert v["published_at"] == 1200 and v["polled_at"] == 1150
+
+
+def test_published_view_corrupt_fails_closed_to_empty_dict(tmp_path):
+    # The runner rewrites this file every tick and can be caught mid-write (the write is atomic, but
+    # a truncated/garbage file must still never raise into the 2s poll loop). Present-but-unreadable
+    # reads as {} — which source_mode refuses to render as live truth (no publish stamp).
+    (_state(tmp_path) / "gh_view.json").write_text("{ half-written not json")
+    assert readers.read_state_home(tmp_path, now=1300)["published_view"] == {}
+
+
+def test_published_view_non_dict_body_fails_closed_to_empty_dict(tmp_path):
+    (_state(tmp_path) / "gh_view.json").write_text("[1, 2, 3]")
+    assert readers.read_state_home(tmp_path, now=1300)["published_view"] == {}

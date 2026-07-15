@@ -38,6 +38,7 @@ import gh
 import gitops
 import journal
 import loopstate
+import published_view
 import tidy
 import usage as usage_mod
 
@@ -67,7 +68,26 @@ WAKE_GRACE_SECONDS = 300
 # `version` (a narrower, per-file number). BUMP THIS whenever a change to the state-home layout the
 # dashboard reads (journal record shape, marker semantics, a state file's meaning) is not
 # backward-compatible — never for an additive change an old reader tolerates.
-STATE_FORMAT_VERSION = 1
+#
+# v2 (issue #146) — a DELIBERATE EXCEPTION to the rule above, made by the owner, not by this code.
+# The home now carries state/gh_view.json (the runner's own GitHub view, which the dashboard renders
+# as its primary truth). That addition is backward-compatible ON DISK — every v1 file is unchanged,
+# so a pre-#146 dashboard misreads nothing and renders exactly as it did before. By the letter of the
+# rule above, that is an additive change an old reader tolerates, and it would NOT earn a bump.
+#
+# Issue #146's approved DoD directs the bump anyway ("the state-format contract is updated ... so a
+# stale dashboard reading a new layout fails loudly, not silently"), because the thing at stake is
+# not a misread field but a false BELIEF: after #146 the owner expects this dashboard to be showing
+# the runner's view, and an un-updated one silently isn't — it is still double-polling GitHub, the
+# exact divergence the issue exists to end. The stamp is the only channel that reaches an old
+# dashboard, so v2 is what makes that visible.
+#
+# The cost is real and worth naming: the card an old dashboard shows says "some readings may be
+# blank", and none will be. See PR #146 — flagged for William's ruling. If he prefers the rule as
+# written, revert to 1 here and to {1} in the dashboard's KNOWN_STATE_FORMATS; everything else in
+# #146 works unchanged (a v1 home is already handled — the dashboard names it as `no-published-view`
+# and falls back loudly).
+STATE_FORMAT_VERSION = 2
 USAGE_REFRESH_SECONDS = 60
 GH_POLL_SECONDS = 90
 JOURNAL_ROTATE_SECONDS = 6 * 3600   # how often to archive the journal's stale tail (issue #41): the
@@ -400,6 +420,17 @@ class Runner:
         self._parsed_by_id = {}
         self._raw_by_id = {}
         self._last_poll = 0
+        # The last SUCCESSFUL GitHub read (issue #146). Distinct from _last_poll, which is the last
+        # poll ATTEMPT and advances even when the probe finds GitHub down — publishing that as the
+        # data's age would date stale data by a failed read. None until the first poll lands.
+        self._last_poll_ok = None
+        # The previously published titles and SETTLED PRs, kept so a MERGED flight's title and its
+        # PR's +N/−N/files survive its issue leaving the poll set (published_view's carry
+        # discipline — the want-set stops polling a terminal issue outright). Seeded lazily from the
+        # document on disk so a restarted runner doesn't blank the arrivals board it published a
+        # tick ago.
+        self._published_titles = None
+        self._published_prs = None
         self._last_journal_rotate = 0.0     # 0 => the first tick rotates (journal bound, issue #41)
         # Wake-gap detection (issue #42): _last_tick_now is the previous tick's wall-clock (used to
         # spot a resume that landed far past the cadence); _wake_grace_until is the deadline until
@@ -571,6 +602,50 @@ class Runner:
                            {"version": STATE_FORMAT_VERSION})
         except OSError as e:
             self._log(f"state_format stamp skipped: {_short_repr(e)}")
+
+    def _view_path(self):
+        return os.path.join(self.state, "gh_view.json")
+
+    def _publish_view(self, now, ist_map):
+        """Write this tick's GitHub view to ``state/gh_view.json`` (issue #146) — the file the
+        dashboard renders as its PRIMARY truth.
+
+        The runner has always held this view and thrown it away each tick, which left the dashboard
+        no choice but to ask GitHub the same questions on its own clock: a second poller on one
+        rate-limit budget (a contributor to the 2026-07-08 storm, §1b) whose answers drifted from the
+        runner's (an externally-closed issue rendered as open; a dead session rendered as launching).
+        Publishing it is what collapses the two views into one.
+
+        Shaping is the pure ``published_view.build`` (tested standalone); this only supplies the
+        runner's facts and does the write. Atomic (``loopstate.save`` = tmp + ``os.replace``) because
+        the dashboard polls this file every ~2s and must only ever see a whole document. Fully
+        guarded — publishing is a REPORT, never a duty the loop owes itself, so any failure costs the
+        document and not the tick (it runs ahead of the heartbeat stamp; a raise here would present a
+        healthy loop as dead, the 2026-07-07 class). Catches Exception, not just OSError: the
+        document is built from live GitHub answers, and a wrong-typed one must not wedge the loop."""
+        try:
+            if self._published_titles is None:      # seed both carries from disk once, post-restart
+                prior = _read_json(self._view_path()) or {}
+                self._published_titles = prior.get("titles") if isinstance(prior.get("titles"), dict) else {}
+                self._published_prs = prior.get("prs") if isinstance(prior.get("prs"), dict) else {}
+            tracked = set(ist_map) if isinstance(ist_map, dict) else set()
+            # The landings this runner performed itself. `_exec_merge` records them here and never
+            # back into gh_view, so loopstate is the ONLY place the merge is written down — and the
+            # cached PR it merged still reads OPEN (the gate can't merge one that doesn't). Without
+            # this the settled carry refuses every real landing and the cargo chip blanks a poll
+            # window later. `_status_of` is hash-safe: a wrong-typed status can't raise here (#95).
+            merged_ids = {iid for iid in tracked
+                          if actions._status_of(ist_map.get(iid) if isinstance(ist_map.get(iid), dict)
+                                                else {}) == "merged"}
+            doc = published_view.build(
+                self.gh_view, self._raw_by_id, tracked_ids=tracked,
+                now=now, polled_at=self._last_poll_ok, carry_titles=self._published_titles,
+                carry_prs=self._published_prs, merged_ids=merged_ids)
+            loopstate.save(self._view_path(), doc)
+            self._published_titles = doc["titles"]
+            self._published_prs = doc["prs"]
+        except Exception as e:
+            self._log(f"view publish skipped: {_short_repr(e)}")
 
     def run(self, max_ticks=None, sleep=time.sleep):
         if not self.acquire_singleton():
@@ -796,6 +871,7 @@ class Runner:
 
         self._parsed_by_id = parsed_by_id
         self._raw_by_id = raw_by_id
+        self._last_poll_ok = now              # this read LANDED — the age the published view reports
         self.gh_view = {"stale": False, "consecutive_failures": 0, "closed_nums": closed,
                         "prs": prs, "issue_comments": issue_comments, "dev_checks": dev_checks}
 
@@ -1197,6 +1273,14 @@ class Runner:
             except Exception as e:
                 self._log(f"journal rotate skipped: {_short_repr(e)}")
             self._last_journal_rotate = now
+
+        # Publish the GitHub view this tick decided against (issue #146) — the dashboard's primary
+        # truth. Stamped after decide/execute so the document reflects the SAME view the tick acted
+        # on: the board the owner reads and the decisions the runner made can never be two different
+        # stories. Before the heartbeat, so a fresh heartbeat always has a view of its own vintage
+        # behind it (the dashboard trusts the view exactly as far as the heartbeat is fresh); and
+        # self-guarded, so a publish failure costs the document, never the tick.
+        self._publish_view(now, ist_map)
 
         # Heartbeat = "a full tick completed", stamped LAST (incident 2026-07-07). It used to be
         # stamped at the TOP of the tick, so a tick that crashed part-way still read as freshly

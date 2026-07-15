@@ -76,7 +76,13 @@ def build_provider(cfg, dashboard_desk, monitor, version=None):
     ``version`` (a lib.version.Version, stamped once at boot) rides along so every poll re-checks
     whether this process's code still matches disk (issue #136)."""
     interval = cfg.get("gh_poll_seconds", 30)
-    cached_gh = server.CachedGh(gh, interval)
+    # The dashboard's own GitHub reads are the FALLBACK path only (issue #146): when the runner is
+    # ticking, the snapshot is built from its published view and this adapter is never consulted. So
+    # it rides the slower fallback clock — a runner-less dashboard is degraded, and must not spend
+    # the shared rate-limit budget faster than a person reads (the 2026-07-08 storms began with that
+    # budget's exhaustion). The usage pill keeps the normal `gh_poll_seconds` clock: it is a
+    # different endpoint on a different budget, and its freshness shouldn't hinge on the runner.
+    cached_gh = server.CachedGh(gh, cfg.get("fallback_gh_poll_seconds", 120))
     usage_cache = pollers.Cached(pollers.read_usage, interval)
     # One memory for the whole dashboard run: a concluded flight's PR/title/review are fetched once
     # and remembered, so landed flights stop re-consuming GitHub budget every gh_poll_seconds forever
