@@ -1016,6 +1016,35 @@ def test_the_board_ties_by_creation_time_like_the_runner(tmp_path):
     assert [d["num"] for d in snap["repos"][0]["boards"]["departures"]] == [99, 50]
 
 
+def test_a_corrupt_loopstate_status_never_takes_down_the_board(tmp_path):
+    # Fail-closed, the sharp edge (fresh-agent review, issue #138): the board reads loopstate to see
+    # a requeued flight, so a wrong-typed status now reaches a `status in <frozenset>` test — and an
+    # UNHASHABLE one (a list/dict) would raise TypeError straight through the poll, taking down every
+    # repo and every flight, not just its own row. The engine folds exactly this value class to a
+    # sentinel (_status_of, issue #95); the mirror must too. SL-52's entry is corrupt; SL-50 must
+    # still fly, and SL-52 must simply not be launchable.
+    #
+    # SL-52 gets an activity file deliberately. `build_flight` carries its OWN pre-existing
+    # `status in _LAUNCHED_STATUSES` trap of the same shape, but it sits behind an `or`
+    # short-circuit that an activity file satisfies — so this scenario isolates the departures
+    # path. That other trap is real and on main; it is filed separately rather than fixed here.
+    ready = [{"number": 50, "title": "unaffected", "labels": [{"name": "agent-ready"}],
+              "createdAt": "2026-01-01T00:00:00Z"},
+             {"number": 52, "title": "corrupt loopstate", "labels": [{"name": "agent-ready"}],
+              "createdAt": "2026-02-01T00:00:00Z"}]
+    dst = _landed_home(tmp_path, "corrupt")
+    (dst / "state" / "issues.json").write_text(json.dumps({"version": 1, "issues": {
+        "i1": {"status": "merged", "branch": "sl/i1-x", "pr": 2},
+        "i52": {"status": []}}}))                       # unhashable — the raise-into-the-poll shape
+    (dst / "state" / "activity").mkdir(parents=True, exist_ok=True)
+    (dst / "state" / "activity" / "i52").write_text("")
+    os.utime(dst / "state" / "activity" / "i52", (NOW - 60, NOW - 60))
+    snap = server.assemble_snapshot(_config(dst), now=NOW, gh_mod=_QueueGh(ready))
+    deps = {d["num"] for d in snap["repos"][0]["boards"]["departures"]}
+    assert 50 in deps                                   # the board survives and still tells the truth
+    assert 52 not in deps                               # …and the corrupt flight fails closed
+
+
 def test_snapshot_fun_map_carries_the_solari_toggles(home):
     # The Solari flutter + its clack are gated by the fun map the client binds (Task 8 / §7 / B.10).
     snap = server.assemble_snapshot(_config(home), now=NOW)

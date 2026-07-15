@@ -24,13 +24,23 @@ What is mirrored (engine source → what's here):
   ``issues.sort_key``               → :func:`sort_key`
   ``actions.RELAUNCHABLE_STATUSES`` → :data:`RELAUNCHABLE_STATUSES`
 
-What is deliberately NOT mirrored: lane capacity, anti-affinity, usage caps, the launch-failure cap
-and the touches-required park. Those are TICK-LOCAL — they decide whether the runner launches a
-candidate on THIS tick, not where the candidate sits in the queue. The board shows the launch
-ORDER; it does not predict the tick. (``blocked-by`` is the one eligibility rule the board renders
-richer than the engine: the runner simply drops a dependency-blocked issue from its candidates,
-while the board keeps showing it as "awaiting connection SL-N", never launchable — design record
-§3. That is a rendering of the same verdict, not a different verdict.)
+What is deliberately NOT mirrored: lane capacity, anti-affinity, usage caps, the launch-failure cap,
+the ``in-progress`` label check, and the touches-required park. These gate whether the runner
+launches a candidate AT ALL on a given tick; none of them REORDERS the queue. The board shows the
+launch ORDER; it does not predict the tick.
+
+Two of those are worth naming honestly rather than waving at, because they are not strictly
+transient. ``launch_failures`` is a PERSISTENT per-issue counter, and the runner's ``base_missing``
+path bumps it while leaving ``agent-ready`` in place — so an at-cap issue can read as launchable
+here for up to one tick, until the runner's own park lands and strips the label (which takes it off
+this board by itself). The window is a tick and it closes on its own, so mirroring the cap would buy
+noise, not truth. If that ever stops being true, it belongs here with a parity test — not in a
+comment.
+
+``blocked-by`` is the one eligibility rule the board renders RICHER than the engine: the runner
+simply drops a dependency-blocked issue from its candidates, while the board keeps showing it as
+"awaiting connection SL-N", never launchable (design record §3). That is a rendering of the same
+verdict, not a different verdict.
 
 Everything here is a pure function of a label list and a loopstate dict — no I/O, no ``gh``.
 """
@@ -185,18 +195,29 @@ def sort_key(num, expedite, rank, requeue_front, created_at):
 
 def is_launch_candidate(issue_state):
     """Would the runner still launch this issue, given its loopstate entry (``None`` when it has
-    none)? Mirror of ``actions._eligible_launch_ids``'s status gate.
+    none)? Mirror of ``actions._eligible_launch_ids``'s status gate — including, precisely, its
+    ``_status_of`` fold.
 
     This is the rule the board needs to see a REQUEUED flight at all. Launching strips
     ``agent-ready`` (so an in-flight issue leaves the board by itself), but the conflict-rebuild
     path puts ``agent-ready`` BACK with status ``ready`` + ``requeue_front`` — that issue is queued
-    again, and the runner will launch it next, front of its band. A wrong-typed status is not one
-    the runner launches from, so it fails closed here too (engine issue #95)."""
+    again, and the runner will launch it next, front of its band.
+
+    A wrong-typed status fails CLOSED — never launched, and never RAISED on. That second half is
+    load-bearing and is why this reads the status through the same fold the engine uses
+    (``_status_of``/``_CORRUPT_STATUS``, engine issue #95): an UNHASHABLE status (a list, a dict)
+    would make a bare ``status in <frozenset>`` throw TypeError, and this runs inside the snapshot
+    poll — so one corrupt entry would take down the whole board, every repo and every flight, not
+    merely its own row. ``None`` must survive the fold intact: it is a legitimate member of
+    RELAUNCHABLE_STATUSES (the never-launched issue), not a corrupt value."""
     if issue_state is None:
         return True
     if not isinstance(issue_state, dict):
         return False
-    return issue_state.get("status") in RELAUNCHABLE_STATUSES
+    status = issue_state.get("status")
+    if not (status is None or isinstance(status, str)):
+        return False
+    return status in RELAUNCHABLE_STATUSES
 
 
 def requeue_front(issue_state):

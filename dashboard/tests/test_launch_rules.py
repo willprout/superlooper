@@ -183,6 +183,26 @@ def test_an_in_flight_issue_is_not_a_candidate():
         assert launch_rules.is_launch_candidate({"status": status}) is False
 
 
+def test_a_wrong_typed_status_fails_closed_and_never_raises():
+    # Mirror of the engine's `_status_of`/`_CORRUPT_STATUS` (issue #95). A corrupt status must fail
+    # CLOSED — never launch, never raise. The UNHASHABLE ones are the sharp edge: a bare
+    # `status in <frozenset>` raises TypeError on a list/dict, and this runs inside the poll, so one
+    # corrupt entry would take down the whole board — every repo, every flight, not just its row.
+    for bad in ([], {}, 42, 3.5, True, object(), b"ready"):
+        assert launch_rules.is_launch_candidate({"status": bad}) is False
+
+
+def test_a_wrong_typed_loopstate_entry_fails_closed():
+    for bad in ("ready", [], 42):
+        assert launch_rules.is_launch_candidate(bad) is False
+
+
+def test_requeue_front_survives_a_wrong_typed_entry():
+    assert launch_rules.requeue_front(None) is False
+    assert launch_rules.requeue_front("nonsense") is False
+    assert launch_rules.requeue_front({"requeue_front": "yes"}) is True   # coerced, exactly as the runner does
+
+
 # =========================================================================== the engine bridge
 # The point of issue #138: the board's order is only true if it is the RUNNER's order. These read
 # the engine's own code and compare. They SKIP when the engine's source isn't on disk (a
@@ -194,6 +214,14 @@ def _engine_issues():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     path = os.path.join(root, "skills", "superlooper", "skill", "lib", "issues.py")
     if not os.path.exists(path):
+        # A standalone dashboard install genuinely has no engine to compare against, so skipping is
+        # the honest answer. But in the MONOREPO the bridge must never quietly disarm itself: if
+        # skills/ is right here and issues.py simply isn't where we look (a move, a rename), a skip
+        # would leave CI green while the mirror drifted unchecked — the one failure this test cannot
+        # afford, since a silent skip is indistinguishable from a pass.
+        if os.path.isdir(os.path.join(root, "skills")):
+            pytest.fail("the engine is in this checkout but its issues.py is not at %s — the parity "
+                        "bridge must never silently disarm. Fix the path, don't let it skip." % path)
         pytest.skip("engine source not on disk (standalone dashboard install) — mirror untestable here")
     spec = importlib.util.spec_from_file_location("engine_issues_readonly", path)
     mod = importlib.util.module_from_spec(spec)

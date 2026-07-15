@@ -1059,8 +1059,8 @@ def _stand(departures, flying_nums=()):
     entry, so ``_assemble_repo`` built a flight for them). A requeued flight is both — queued on the
     board AND a plane the runner has flown before — so it is skipped here: one issue is one plane,
     and the field must never show its aircraft twice (the board is where its queue position lives)."""
-    launchable = [d for d in departures
-                  if d.get("launchable") and d.get("num") not in set(flying_nums)]
+    flying = set(flying_nums)
+    launchable = [d for d in departures if d.get("launchable") and d.get("num") not in flying]
     return [{"num": d["num"], "flight": d.get("flight") or ("SL-%d" % d["num"]),
              "destination": d.get("destination") or "", "pos": d.get("pos"),
              "expedited": bool(d.get("expedited"))}
