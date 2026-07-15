@@ -49,6 +49,15 @@ class FakeProbe:
         return path.replace("~", self.home, 1) if path.startswith("~") else path
 
 
+def _plugin_row(plugin_id="superlooper@superlooper", enabled=True, scope="user"):
+    """One row of `claude plugin list --json`, shaped exactly as the real CLI emits it (verified
+    against Claude Code's own output on 2026-07-15): the marketplace-qualified id, the enable flag,
+    and the scope the plugin was installed at."""
+    return {"id": plugin_id, "version": "1.0.0", "scope": scope, "enabled": enabled,
+            "installPath": "/home/will/.claude/plugins/cache/superlooper/superlooper/1.0.0",
+            "installedAt": "2026-07-14T00:00:00.000Z", "lastUpdated": "2026-07-14T00:00:00.000Z"}
+
+
 def _healthy_probe():
     return FakeProbe(
         commands={
@@ -61,6 +70,11 @@ def _healthy_probe():
                 ("auth", "status", "--json"): (
                     0,
                     json.dumps({"loggedIn": True, "authMethod": "claude.ai"}),
+                    "",
+                ),
+                ("plugin", "list", "--json"): (
+                    0,
+                    json.dumps([_plugin_row()]),
                     "",
                 ),
             },
@@ -114,6 +128,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("cmux App Nap disabled", True),
         ("runner anchor (live)", True),      # no repo in this config -> cleanly skipped, passes
         ("installed engine current", True),  # no VERSION stamp injected -> cleanly skipped, passes
+        ("superlooper plugin", True),        # installed + enabled in the healthy probe
     ]
 
 
@@ -724,3 +739,190 @@ def test_check_stack_threads_repo_path_and_dev_branch_into_the_drift_row():
     )
     drift = next(r for r in results if r.name == "installed engine current")
     assert drift.warn is True and "4" in drift.detail and "origin/release" in drift.detail
+
+
+# --- superlooper plugin presence (issue #90) ---------------------------------------------------
+# After the plugin restructure (design D10), loop machines get their SKILL CONTENT from the
+# superlooper plugin, not from the gated engine payload. A machine without it silently loses the
+# ops / write-issue / debugger skills in planning and worker sessions — nothing errors, the sessions
+# are just dumber. This block makes that absence visible. It is a WARN, NEVER a FAIL: the runner
+# itself does not depend on the skills being installed (briefs are self-contained), so a missing
+# plugin must not block an otherwise-healthy stack from passing.
+#
+# Truth surface: `claude plugin list --json`, the DOCUMENTED CLI (plugins reference → `plugin list`),
+# which reports install AND enable state in one call. The registry file ~/.claude/plugins/
+# installed_plugins.json is deliberately NOT read: it appears nowhere in the official plugin docs,
+# so it is an internal implementation detail this check must not couple to.
+
+_PLUGIN_LIST = ("plugin", "list", "--json")
+
+
+def _plugin_probe(rows=None, *, rc=0, out=None, err="", has_claude=True, env=None):
+    """A FakeProbe whose `claude plugin list --json` returns `rows` (or a raw `out`/`rc` for the
+    malformed-output and error paths). `has_claude=False` removes the CLI entirely."""
+    probe = _healthy_probe()
+    probe.env.update(env or {})
+    if not has_claude:
+        del probe.commands["claude"]
+        return probe
+    payload = out if out is not None else json.dumps(rows or [])
+    probe.commands["claude"][_PLUGIN_LIST] = (rc, payload, err)
+    return probe
+
+
+def test_superlooper_plugin_passes_when_installed_and_enabled():
+    probe = _plugin_probe([_plugin_row()])
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is False              # a clean ok line, no advisory
+    assert "superlooper@superlooper" in r.detail
+    assert "user" in r.detail                            # names the scope it is installed at
+    line = stack_doctor.format_results([r])[0]
+    assert line.strip().startswith("ok")
+
+
+def test_superlooper_plugin_warns_when_not_installed():
+    # Another marketplace's plugin is installed, but not ours.
+    probe = _plugin_probe([_plugin_row("superpowers@superpowers-marketplace")])
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is True               # advisory — never fails the stack
+    assert "not installed" in r.detail.lower()
+    # the WARN carries the whole story inline (format_results prints `fix` only for a FAIL), so the
+    # exact install path must be in `detail` or the operator is told a problem with no cure
+    assert "plugin marketplace add willprout/superlooper" in r.detail
+    assert "plugin install superlooper@superlooper" in r.detail
+    line = stack_doctor.format_results([r])[0]
+    assert line.strip().startswith("WARN")
+
+
+def test_superlooper_plugin_warns_when_installed_but_disabled():
+    probe = _plugin_probe([_plugin_row(enabled=False)])
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is True
+    assert "disabled" in r.detail.lower()
+    assert "plugin enable superlooper@superlooper" in r.detail   # the cure for THIS state, not reinstall
+
+
+def test_superlooper_plugin_does_not_claim_disabled_on_an_unreadable_enabled_flag():
+    # P1 regression: DISABLED is claimed ONLY on a literal `enabled: false`. The CLI's --json schema
+    # is undocumented, so a row that lacks the key (or carries an unexpected value) is a state we
+    # could not read — asserting DISABLED there hands the operator a confident wrong diagnosis whose
+    # cure (`plugin enable`) changes nothing. _plugin_rows already applies this discipline to the
+    # list shape; it must not be abandoned one level down at the row.
+    row_no_key = _plugin_row()
+    del row_no_key["enabled"]
+    for row in (row_no_key, _plugin_row(enabled="true"), _plugin_row(enabled=None)):
+        r = stack_doctor.check_superlooper_plugin(_plugin_probe([row]))
+        assert r.ok is True and r.warn is True, row
+        assert "disabled" not in r.detail.lower(), row      # never a false DISABLED verdict
+        assert "cannot tell" in r.detail.lower(), row       # an honest could-not-determine instead
+
+
+def test_superlooper_plugin_passes_when_any_matching_row_is_enabled():
+    # The same id can appear at more than one scope (user/project/local). Any enabled row means the
+    # skills load, so a disabled row sorting FIRST must not be read as "disabled".
+    probe = _plugin_probe([_plugin_row(enabled=False, scope="project"),
+                           _plugin_row(enabled=True, scope="user")])
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is False
+    assert "user" in r.detail                              # reports the row that actually loads
+
+
+def test_superlooper_plugin_warns_when_empty_plugin_list():
+    probe = _plugin_probe([])
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is True
+    assert "not installed" in r.detail.lower()
+
+
+def test_superlooper_plugin_warns_when_claude_cli_is_absent():
+    # No `claude` to ask: the state is undeterminable, so WARN — never a confident "not installed".
+    probe = _plugin_probe(has_claude=False)
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is True
+    assert "not installed" not in r.detail.lower()       # must NOT assert absence it cannot know
+    assert probe.calls == []                             # nothing to probe
+
+
+def test_superlooper_plugin_warns_when_the_list_command_errors():
+    # `claude plugin list --json` exits nonzero (an older CLI without the subcommand, a broken
+    # install): undeterminable -> WARN, never a false "not installed".
+    probe = _plugin_probe(rc=1, out="", err="unknown command 'plugin'")
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is True
+    assert "not installed" not in r.detail.lower()
+    assert "could not" in r.detail.lower() or "unknown" in r.detail.lower()
+
+
+def test_superlooper_plugin_warns_when_the_output_is_not_parseable_json():
+    probe = _plugin_probe(out="not json at all")
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is True
+    assert "not installed" not in r.detail.lower()
+
+
+def test_superlooper_plugin_warns_when_the_output_shape_is_unexpected():
+    # The CLI's --json schema is NOT documented (only the flag is), so a future shape change must
+    # degrade to an honest WARN rather than crash the doctor or fabricate a verdict.
+    for payload in (json.dumps({"plugins": []}), json.dumps(["a string"]), json.dumps(None)):
+        probe = _plugin_probe(out=payload)
+        r = stack_doctor.check_superlooper_plugin(probe)
+        assert r.ok is True and r.warn is True, payload
+        assert isinstance(r.detail, str) and r.detail
+
+
+def test_superlooper_plugin_reads_the_documented_cli_not_the_internal_registry_file():
+    # installed_plugins.json is an internal file the official plugin docs never mention. Couple to
+    # the documented `plugin list --json` CLI instead, so a registry-format change cannot silently
+    # turn this block into a liar. Assert BOTH: the CLI is called, the file is never read.
+    probe = _plugin_probe([_plugin_row()])
+    probe.files["/home/will/.claude/plugins/installed_plugins.json"] = json.dumps(
+        {"version": 2, "plugins": {}})            # present and saying "nothing installed"
+    reads = []
+    inner = probe.read_text
+    probe.read_text = lambda p: (reads.append(p), inner(p))[1]
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is False       # the CLI's truth wins; the file is irrelevant
+    assert ["/bin/claude", "plugin", "list", "--json"] in probe.calls
+    assert not any("installed_plugins" in p for p in reads)
+
+
+def test_superlooper_plugin_honors_a_plugin_id_override():
+    probe = _plugin_probe([_plugin_row("other@elsewhere")], env={"SL_PLUGIN_ID": "other@elsewhere"})
+
+    r = stack_doctor.check_superlooper_plugin(probe)
+
+    assert r.ok is True and r.warn is False
+    assert "other@elsewhere" in r.detail
+
+
+def test_superlooper_plugin_missing_never_fails_the_whole_stack():
+    # The load-bearing guarantee: the runner never depends on the skills being installed (briefs are
+    # self-contained), so a missing plugin must leave an otherwise-healthy stack green and exit 0.
+    probe = _plugin_probe([])                     # plugin absent
+    config = {"agent": "claude", "notify": {"cmd": "true", "imessage_to": None}}
+
+    results = stack_doctor.check_stack(
+        config, probe=probe, sender=_ok_sender(), announce=lambda *a: None,
+    )
+    plugin = next(r for r in results if r.name == "superlooper plugin")
+
+    assert plugin.warn is True and plugin.ok is True
+    assert [r.name for r in results if not r.ok] == []          # overall stack still PASSES
