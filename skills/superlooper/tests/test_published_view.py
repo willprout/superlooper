@@ -137,7 +137,9 @@ def test_a_settled_prs_facts_carry_forward_after_the_flight_lands():
     doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
                                carry_prs=carried)
     assert doc["prs"]["i7"]["state"] == "MERGED"
-    assert doc["prs"]["i7"]["files"], "the cargo chip's own numbers must survive the landing"
+    # The cargo chip's own numbers survive — as TOTALS, not the per-file rows (see the size test).
+    assert doc["prs"]["i7"]["additions"] == 10
+    assert doc["prs"]["i7"]["changedFiles"] == 1
 
 
 def test_a_closed_prs_facts_carry_forward_too():
@@ -152,6 +154,87 @@ def test_an_open_pr_is_never_carried():
     doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
                                carry_prs={"i7": {"number": 12, "state": "OPEN"}})
     assert "i7" not in doc["prs"]
+
+
+# --------------------------- the merge the runner performed itself (review round 2) ---------------------------
+# THE bug the first carry missed. The gate can only merge a PR that reads OPEN + MERGEABLE + green,
+# so the cached read at the moment of merging says "OPEN" — and `_exec_merge` records the landing in
+# LOOPSTATE (`status: merged`), never back into gh_view. The next poll's want-set then skips the now
+# terminal issue, its PR leaves `prs`, and a carry keyed only on a SETTLED gh state refuses it: the
+# cargo chip worked for one poll window and blanked forever after.
+#
+# loopstate's `merged` status IS the runner's own positive record of its own merge — the strongest
+# fact in the building, written by the executor after gh.merge_pr returned ok. So the carry reads it
+# and stamps the state the runner established by ACTION rather than waiting for a poll to observe it.
+
+def test_a_flight_the_runner_merged_carries_even_though_its_cached_pr_still_reads_open():
+    # The real sequence: the cached PR is the pre-merge read (OPEN), loopstate says merged.
+    cached = {"i7": {"number": 12, "state": "OPEN", "mergeable": "MERGEABLE",
+                     "files": [{"path": "a.py", "additions": 10, "deletions": 2}]}}
+    doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
+                               carry_prs=cached, merged_ids={"i7"})
+    assert "i7" in doc["prs"], "the flight the runner merged lost its PR facts"
+    assert doc["prs"]["i7"]["state"] == "MERGED", "the runner's own merge must be recorded as one"
+    assert doc["prs"]["i7"]["additions"] == 10
+
+
+def test_an_open_pr_the_runner_did_not_merge_is_still_never_carried():
+    # The discipline holds: only the runner's OWN recorded merge promotes an OPEN read. A parked
+    # flight (open PR, terminal, never merged) stays absent rather than frozen.
+    doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
+                               carry_prs={"i7": {"number": 12, "state": "OPEN"}}, merged_ids=set())
+    assert "i7" not in doc["prs"]
+
+
+def test_a_merged_flights_pr_keeps_carrying_across_many_ticks():
+    # The carry must be a fixed point: what it publishes this tick is what it re-carries next tick,
+    # forever. If the reduced shape couldn't survive its own round trip, the chip would blank on the
+    # SECOND poll instead of the first — the same bug, one window later.
+    prs = {"i7": {"number": 12, "state": "OPEN",
+                  "files": [{"path": "a.py", "additions": 10, "deletions": 2}]}}
+    for _ in range(5):
+        doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
+                                   carry_prs=prs, merged_ids={"i7"})
+        prs = doc["prs"]
+    assert prs["i7"]["state"] == "MERGED"
+    assert prs["i7"]["additions"] == 10 and prs["i7"]["changedFiles"] == 1
+
+
+# --------------------------- the carry stays bounded (review round 2, P1) ---------------------------
+# `tracked_ids` is loopstate, and NOTHING prunes loopstate — it grows with every landing, forever. So
+# "bounded by tracked_ids" is not a bound at all once the carry actually fires. This file is rewritten
+# by the runner every tick and re-read by the dashboard every 2s, so it must not accumulate.
+
+def test_the_carry_drops_the_per_file_rows_and_keeps_the_totals():
+    # `files` is the bulk of a PR read and the dashboard only ever wants the totals (its cargo chip).
+    pr = {"number": 12, "state": "MERGED",
+          "files": [{"path": "a.py", "additions": 10, "deletions": 2},
+                    {"path": "b.py", "additions": 5, "deletions": 1}]}
+    doc = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=1, polled_at=1,
+                               carry_prs={"i7": pr})
+    got = doc["prs"]["i7"]
+    assert "files" not in got, "the per-file rows must not accumulate in a file re-read every 2s"
+    assert (got["additions"], got["deletions"], got["changedFiles"]) == (15, 3, 2)
+
+
+def test_the_carry_is_capped_to_the_most_recent_landings():
+    carry = {"i%d" % n: {"number": n, "state": "MERGED"} for n in range(1, 300)}
+    tracked = set(carry)
+    doc = published_view.build(_view(prs={}), {}, tracked_ids=tracked, now=1, polled_at=1,
+                               carry_prs=carry)
+    assert len(doc["prs"]) == published_view.CARRY_PR_LIMIT
+    # The cap keeps the NEWEST landings — the only ones the arrivals board can show anyway.
+    assert "i299" in doc["prs"]
+    assert "i1" not in doc["prs"]
+
+
+def test_a_fresh_read_is_never_dropped_by_the_cap():
+    # The cap bounds the CARRY, never this window's live answers — starving the gate of a finishing
+    # flight's PR to make room for old landings would be a spectacular own goal.
+    carry = {"i%d" % n: {"number": n, "state": "MERGED"} for n in range(1, 300)}
+    doc = published_view.build(_view(prs={"i7": {"number": 7, "state": "OPEN"}}), {},
+                               tracked_ids=set(carry) | {"i7"}, now=1, polled_at=1, carry_prs=carry)
+    assert doc["prs"]["i7"]["state"] == "OPEN"
 
 
 def test_a_fresh_pr_read_always_wins_over_a_carried_one():

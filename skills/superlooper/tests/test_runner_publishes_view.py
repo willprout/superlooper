@@ -147,3 +147,79 @@ def test_the_engine_stamps_the_state_format_that_names_this_shape():
     # The home now carries state/gh_view.json, which a pre-#146 dashboard doesn't read. The stamp is
     # what makes that mismatch LOUD instead of silent (issue #45), so the version must have moved.
     assert runner_mod.STATE_FORMAT_VERSION >= 2
+
+
+# --------------------------- the landing sequence, as the runner actually performs it ---------------------------
+# The test whose ABSENCE let a broken carry pass twice (fresh-agent review, round 2). Every earlier
+# carry test handed `build` a PR already reading MERGED — the one input the runner never produces.
+# The gate can only merge a PR that reads OPEN + MERGEABLE + green, so the cached read at the moment
+# of merging says OPEN, and `_exec_merge` writes the landing to LOOPSTATE, never back into gh_view.
+# The next poll's want-set skips the now-terminal issue and its PR leaves the view for good.
+#
+# So this drives the real order — cached OPEN read, loopstate merged, poll drops it — through the
+# runner's own `_publish_view`. It fails against a carry that waits for gh to say "MERGED", because
+# gh is never asked again.
+
+def _seed_merged(rig, iid, pr):
+    """The runner's state at the instant after a landing: loopstate says merged, and the cached PR
+    is still the pre-merge OPEN read the gate acted on."""
+    def m(st):
+        st["issues"].setdefault(iid, loopstate.new_issue()).update(
+            {"status": "merged", "branch": "sl/%s-a-thing" % iid, "pr": pr["number"]})
+    loopstate.update(str(rig.home / "state" / "issues.json"), m)
+    rig.r.gh_view = {**rig.r.gh_view, "prs": {iid: pr}, "stale": False}
+    rig.r._last_poll = NOW + 10_000          # inside the window: no re-poll will rebuild `prs`
+
+
+_PRE_MERGE_READ = {"number": 25, "state": "OPEN", "mergeable": "MERGEABLE",
+                   "statusCheckRollup": [{"name": "ci", "conclusion": "SUCCESS"}],
+                   "files": [{"path": "a.py", "additions": 100, "deletions": 5},
+                             {"path": "b.py", "additions": 20, "deletions": 3}]}
+
+
+def test_a_landing_the_runner_performed_keeps_its_pr_facts(rig):
+    _seed_merged(rig, "i15", _PRE_MERGE_READ)
+    rig.r.tick(now=NOW + 10_000)
+    pr = view(rig)["prs"].get("i15")
+    assert pr, "the flight the runner just merged published no PR facts"
+    assert pr["state"] == "MERGED"
+    assert (pr["additions"], pr["deletions"], pr["changedFiles"]) == (120, 8, 2)
+
+
+def test_the_landings_pr_facts_survive_the_poll_that_forgets_it(rig):
+    # The window that actually broke: the next poll rebuilds `prs` from the want-set, which skips a
+    # terminal issue outright — so the PR is gone from the live view and ONLY the carry can hold it.
+    _seed_merged(rig, "i15", _PRE_MERGE_READ)
+    rig.r.tick(now=NOW + 10_000)                     # publishes, seeding the carry
+    rig.r.gh_view = {**rig.r.gh_view, "prs": {}}     # the poll drops the terminal issue
+    rig.r.tick(now=NOW + 10_015)
+    pr = view(rig)["prs"].get("i15")
+    assert pr and pr["state"] == "MERGED", "the cargo chip blanks one poll window after landing"
+    assert pr["additions"] == 120
+
+
+def test_the_landings_facts_still_stand_many_ticks_later(rig):
+    # A landed flight's chip is meant to outlive the flight — its worktree is gone, so the PR is the
+    # only thing that remembers. Re-carrying must be a fixed point, not a slow fade.
+    _seed_merged(rig, "i15", _PRE_MERGE_READ)
+    rig.r.tick(now=NOW + 10_000)
+    rig.r.gh_view = {**rig.r.gh_view, "prs": {}}
+    for i in range(6):
+        rig.r.tick(now=NOW + 10_015 + i * 15)
+    pr = view(rig)["prs"].get("i15")
+    assert pr and pr["additions"] == 120 and pr["state"] == "MERGED"
+
+
+def test_a_parked_flights_open_pr_is_not_frozen_into_the_view(rig):
+    # The other half of the discipline: only a merge the RUNNER recorded promotes an OPEN read. A
+    # parked flight's PR can still change, so freezing its green CI would be a false clearance.
+    def m(st):
+        st["issues"].setdefault("i15", loopstate.new_issue()).update(
+            {"status": "parked", "branch": "sl/i15-a-thing", "pr": 25})
+    loopstate.update(str(rig.home / "state" / "issues.json"), m)
+    rig.r.gh_view = {**rig.r.gh_view, "prs": {"i15": dict(_PRE_MERGE_READ)}, "stale": False}
+    rig.r._last_poll = NOW + 10_000
+    rig.r.tick(now=NOW + 10_000)
+    rig.r.gh_view = {**rig.r.gh_view, "prs": {}}
+    rig.r.tick(now=NOW + 10_015)
+    assert "i15" not in view(rig)["prs"]

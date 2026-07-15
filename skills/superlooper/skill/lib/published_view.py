@@ -45,6 +45,14 @@ _ISSUE_KEYS = ("number", "title", "labels", "body", "createdAt")
 # the dashboard's own ConcludedFlights drew for the same reason.
 _SETTLED_PR_STATES = frozenset({"MERGED", "CLOSED"})
 
+# How many landed flights keep their PR facts. `tracked_ids` looks like a bound but isn't: nothing
+# prunes loopstate, so it grows with every landing forever — and this file is rewritten every tick
+# and re-read by the dashboard every ~2s. The newest landings are the only ones the arrivals board
+# can show (it caps at 5 pages / 3 days), so this sits comfortably above anything renderable while
+# keeping the document's size flat. Past the cap a flight's cargo chip reads absent — honest, and
+# never the "+0/−0" that would libel a worker as having done nothing.
+CARRY_PR_LIMIT = 60
+
 
 def _dict(v):
     return v if isinstance(v, dict) else {}
@@ -54,6 +62,50 @@ def _issue_row(raw):
     """One published issue: only the named keys, only when present. A key gh didn't answer stays
     ABSENT rather than becoming a None the dashboard would render as a real (empty) value."""
     return {k: raw[k] for k in _ISSUE_KEYS if k in raw}
+
+
+def _iid_num(iid):
+    """``i23`` -> ``23``; anything else -> ``None`` (sorts last under the carry cap)."""
+    if isinstance(iid, str) and iid.startswith("i") and iid[1:].isdigit():
+        return int(iid[1:])
+    return None
+
+
+def _size_totals(pr):
+    """``{additions, deletions, changedFiles}`` for a PR, from its per-file rows when it still has
+    them, else from totals a previous carry already summed. Empty when neither is present — absent
+    must stay absent, never a "+0/−0" the dashboard would render as a worker who changed nothing."""
+    files = pr.get("files")
+    if isinstance(files, list) and files:
+        added = deleted = 0
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            a, d = f.get("additions"), f.get("deletions")
+            added += a if isinstance(a, int) and not isinstance(a, bool) else 0
+            deleted += d if isinstance(d, int) and not isinstance(d, bool) else 0
+        return {"additions": added, "deletions": deleted, "changedFiles": len(files)}
+    out = {}
+    for k in ("additions", "deletions", "changedFiles"):
+        v = pr.get(k)
+        if isinstance(v, int) and not isinstance(v, bool):
+            out[k] = v
+    return out
+
+
+def _carried_pr(pr, state):
+    """The reduced entry a carried PR keeps: everything the dashboard reads (``number``, ``state``,
+    ``mergeable``, ``statusCheckRollup`` and the review ``comments`` its gate checklist needs) with
+    the per-file rows COLLAPSED to their totals. ``files`` is the bulk of a PR read and nothing
+    downstream wants the rows — only the chip's three numbers — so summing here keeps a document
+    that is rewritten every tick and re-read every 2s from growing with every landing.
+
+    Summing at carry time also makes the entry a FIXED POINT: it re-carries itself unchanged on
+    every later tick, which is what stops the chip blanking one poll window later instead of one."""
+    out = {k: v for k, v in pr.items() if k != "files"}
+    out["state"] = state
+    out.update(_size_totals(pr))
+    return out
 
 
 def _closed_list(closed_nums):
@@ -67,7 +119,7 @@ def _closed_list(closed_nums):
 
 
 def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=None,
-          carry_prs=None):
+          carry_prs=None, merged_ids=None):
     """The document for ``state/gh_view.json``.
 
     ``gh_view``     the runner's in-memory view (``stale``, ``consecutive_failures``,
@@ -80,6 +132,8 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
                     the DATA is, which is the poll, not the tick that copied it out.
     ``carry_titles`` the previous document's ``titles`` map (see the carry discipline above).
     ``carry_prs``    the previous document's ``prs`` map; only SETTLED entries are remembered.
+    ``merged_ids``   the iids loopstate records as ``merged`` — the runner's own record of its own
+                     landings, and what settles a cached PR still reading OPEN (see below).
 
     An unreadable ``gh_view`` yields an empty-but-typed document marked ``stale`` — never a
     confident all-clear.
@@ -101,15 +155,44 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
         if iid in tracked and iid not in titles and t:
             titles[iid] = t
 
-    # The same carry for SETTLED PRs. This is what keeps a landed flight's cargo chip alive: the
-    # want-set stops polling an issue the moment it goes terminal, so without this the PR facts
-    # would disappear on the exact tick the arrivals board lights up. A fresh read always wins; an
-    # unsettled or wrong-typed remembered entry is dropped rather than frozen in.
-    prs = dict(_dict(view.get("prs")))
+    # The same carry for SETTLED PRs — what keeps a landed flight's cargo chip alive once the
+    # want-set stops polling its now-terminal issue.
+    #
+    # An entry is settled two ways, and the second is the load-bearing one:
+    #   * gh SAID so — its cached state already reads MERGED/CLOSED (an externally closed PR, or the
+    #     crash-recovery path that re-observes a merge someone else's tick performed);
+    #   * the RUNNER DID it — loopstate says `merged`. This is the normal landing, and it is the only
+    #     path that fires in practice: the gate can only merge a PR that reads OPEN + MERGEABLE +
+    #     green, so the cached read at the moment of merging says OPEN, and `_exec_merge` records the
+    #     landing in loopstate and never back into gh_view. Waiting for a poll to observe MERGED is
+    #     waiting for a poll that never comes — the issue is terminal, so it is never fetched again.
+    #     loopstate's `merged` is the runner's own positive record of its own action (written after
+    #     gh.merge_pr returned ok), which is a stronger fact than any re-read would be.
+    #
+    # An OPEN PR the runner did NOT merge (a parked flight) is still never carried: its CI and
+    # mergeability can still move, and a frozen "green" would be the false clearance the gate exists
+    # to refuse. A fresh read always wins over any carry.
+    merged = merged_ids if isinstance(merged_ids, (set, frozenset)) else set(merged_ids or ())
+    prs = {}
+    for iid, pr in _dict(view.get("prs")).items():
+        # A flight this runner merged: loopstate's record beats the cached read, which is
+        # DEFINITIONALLY pre-merge (the gate only merges an OPEN one) and will never be refreshed —
+        # the issue is terminal, so it is never polled again. Settle it here rather than publish a
+        # landed flight whose PR claims to be open, and reduce it now so its shape is the same on
+        # the tick it lands as on every tick after, when only the carry holds it.
+        prs[iid] = _carried_pr(pr, "MERGED") if (isinstance(pr, dict) and iid in merged) else pr
+    settling = []
     for iid, pr in _dict(carry_prs).items():
-        if iid in tracked and iid not in prs and isinstance(pr, dict) \
-                and pr.get("state") in _SETTLED_PR_STATES:
-            prs[iid] = pr
+        if iid not in tracked or iid in prs or not isinstance(pr, dict):
+            continue
+        if iid in merged:
+            settling.append((iid, _carried_pr(pr, "MERGED")))
+        elif pr.get("state") in _SETTLED_PR_STATES:
+            settling.append((iid, _carried_pr(pr, pr["state"])))
+    # Newest landings first, then capped — the file must not grow with every landing forever.
+    settling.sort(key=lambda kv: (_iid_num(kv[0]) is None, -(_iid_num(kv[0]) or 0)))
+    for iid, pr in settling[:CARRY_PR_LIMIT]:
+        prs[iid] = pr
 
     return {
         "published_at": int(now),

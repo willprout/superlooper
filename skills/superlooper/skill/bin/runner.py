@@ -628,11 +628,19 @@ class Runner:
                 prior = _read_json(self._view_path()) or {}
                 self._published_titles = prior.get("titles") if isinstance(prior.get("titles"), dict) else {}
                 self._published_prs = prior.get("prs") if isinstance(prior.get("prs"), dict) else {}
+            tracked = set(ist_map) if isinstance(ist_map, dict) else set()
+            # The landings this runner performed itself. `_exec_merge` records them here and never
+            # back into gh_view, so loopstate is the ONLY place the merge is written down — and the
+            # cached PR it merged still reads OPEN (the gate can't merge one that doesn't). Without
+            # this the settled carry refuses every real landing and the cargo chip blanks a poll
+            # window later. `_status_of` is hash-safe: a wrong-typed status can't raise here (#95).
+            merged_ids = {iid for iid in tracked
+                          if actions._status_of(ist_map.get(iid) if isinstance(ist_map.get(iid), dict)
+                                                else {}) == "merged"}
             doc = published_view.build(
-                self.gh_view, self._raw_by_id,
-                tracked_ids=set(ist_map) if isinstance(ist_map, dict) else set(),
+                self.gh_view, self._raw_by_id, tracked_ids=tracked,
                 now=now, polled_at=self._last_poll_ok, carry_titles=self._published_titles,
-                carry_prs=self._published_prs)
+                carry_prs=self._published_prs, merged_ids=merged_ids)
             loopstate.save(self._view_path(), doc)
             self._published_titles = doc["titles"]
             self._published_prs = doc["prs"]

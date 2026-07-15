@@ -63,22 +63,37 @@ def _label_names(row):
     return [l.get("name") for l in row.get("labels") or [] if isinstance(l, dict)]
 
 
+# The cargo chip's three numbers. `_pr_size` is the ONLY authority on them: they are stripped from
+# the raw entry before its validated answer is merged in, so a wrong-typed total (a string, a bool)
+# can never ride through untouched and reach the chip.
+_SIZE_KEYS = ("additions", "deletions", "changedFiles")
+
+
 def _pr_size(pr):
-    """``{additions, deletions, changedFiles}`` summed from the runner's ``files`` list, or ``{}``
-    when it read no files. The dashboard's cargo chip wants the totals; the runner's PR read carries
-    the per-file rows (its ``_PR_FIELDS`` includes ``files``), so the totals are DERIVED rather than
-    re-asked of GitHub — the whole point of one source. Absent stays absent: an empty ``+0/−0`` on a
-    PR nobody measured would read as a worker that changed nothing."""
+    """``{additions, deletions, changedFiles}`` for a PR, or ``{}`` when nobody has measured it.
+
+    Two shapes arrive, both from the runner. A freshly polled PR carries the per-file rows (its
+    ``_PR_FIELDS`` includes ``files``) and is summed here — DERIVED rather than re-asked of GitHub,
+    the whole point of one source. A CARRIED PR (a landed flight, kept alive by the published view)
+    already had its rows collapsed to totals engine-side, so those pass straight through; a landing
+    that lost its chip here would defeat the carry the engine pays for every tick.
+
+    Absent stays absent: an empty ``+0/−0`` on a PR nobody measured would read as a worker that
+    changed nothing."""
     files = pr.get("files")
-    if not isinstance(files, list) or not files:
-        return {}
-    added = deleted = 0
-    for f in files:
-        if not isinstance(f, dict):
-            continue
-        added += _int(f.get("additions")) or 0
-        deleted += _int(f.get("deletions")) or 0
-    return {"additions": added, "deletions": deleted, "changedFiles": len(files)}
+    if isinstance(files, list) and files:
+        added = deleted = 0
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            added += _int(f.get("additions")) or 0
+            deleted += _int(f.get("deletions")) or 0
+        return {"additions": added, "deletions": deleted, "changedFiles": len(files)}
+    out = {}
+    for k in ("additions", "deletions", "changedFiles"):
+        if _int(pr.get(k)) is not None:
+            out[k] = pr[k]
+    return out
 
 
 class RunnerSource:
@@ -167,7 +182,9 @@ class RunnerSource:
         pr = _dict(self._prs.get(iid))
         if not pr:
             return {}
-        return dict(pr, **_pr_size(pr))
+        out = {k: v for k, v in pr.items() if k not in _SIZE_KEYS}
+        out.update(_pr_size(pr))       # the validated totals are the only ones that reach the chip
+        return out
 
     def pr_comments(self, repo, num):
         """The PR's comments as the runner read them. ``[]`` when it holds none — the runner OMITS a

@@ -217,3 +217,18 @@ def test_a_title_only_answer_never_claims_a_state():
 
 def test_an_issue_with_neither_a_row_nor_a_title_is_still_empty():
     assert src(closed_nums=[], titles={}).issue("o/r", 23) == {}
+
+
+def test_a_carried_prs_pre_summed_totals_pass_straight_through():
+    # A landed flight's PR is reduced engine-side: the per-file rows are collapsed to totals so the
+    # document doesn't grow with every landing (published_view.CARRY_PR_LIMIT). The chip must read
+    # those totals — a landing that lost its numbers here would defeat the carry the engine pays for.
+    pr = {"number": 25, "state": "MERGED", "additions": 120, "deletions": 8, "changedFiles": 2}
+    got = src(prs={"i23": pr}).pr_for_branch("o/r", "sl/i23-add-a-motto-footer")
+    assert (got["additions"], got["deletions"], got["changedFiles"]) == (120, 8, 2)
+
+
+def test_a_wrong_typed_total_is_dropped_not_rendered():
+    pr = {"number": 25, "state": "MERGED", "additions": "lots", "changedFiles": True}
+    got = src(prs={"i23": pr}).pr_for_branch("o/r", "sl/i23-x")
+    assert "additions" not in got and "changedFiles" not in got
