@@ -1013,9 +1013,20 @@ def test_build_flight_stranded_gate_is_its_own_state_at_the_gate():
 # of it derived here so the JS only paints split-flaps; the squint test holds on the queue.
 
 
-def _cand(num, title="Do the thing", labels=None, body=""):
-    """A departures candidate in the gh issue shape the assembler passes (number/title/labels/body)."""
-    return {"num": num, "title": title, "labels": labels or [], "body": body}
+def _cand(num, title="Do the thing", labels=None, body="", created_at="", requeue_front=False,
+          typed=True):
+    """A departures candidate in the gh issue shape the assembler passes.
+
+    A real approved issue ALWAYS carries exactly one valid ``type:`` label — the runner refuses to
+    launch one that doesn't (``issues.eligible``), so the board shows such an issue as paperwork,
+    never as launchable. ``typed`` therefore adds the default ``type:build`` whenever the fixture
+    doesn't name a ``type:`` label of its own, keeping every ordering fixture a realistic flight; a
+    test that is ABOUT the paperwork rules passes ``typed=False`` or its own ``type:`` labels."""
+    labels = list(labels or [])
+    if typed and not any(n.startswith("type:") for n in flights.label_names(labels)):
+        labels = _lbl("type:build") + labels
+    return {"num": num, "title": title, "labels": labels, "body": body,
+            "created_at": created_at, "requeue_front": requeue_front}
 
 
 def _lbl(*names):
@@ -1090,9 +1101,23 @@ def test_queue_orders_by_priority_then_number_when_no_expedite():
     assert all(r["launchable"] for r in rows)
 
 
-def test_queue_number_is_the_tiebreak_within_a_band():
+def test_queue_creation_time_is_the_tiebreak_within_a_band():
+    # FIFO within a band means OLDEST-CREATED first — the runner's own tiebreak (issues.sort_key).
+    # The board used to tie by issue NUMBER, which is a different order whenever an issue is created
+    # out of number order (a reopened/imported issue, or one filed while another sat unapproved).
+    rows = flights.queue_rows(
+        [_cand(3, created_at="2026-06-01T00:00:00Z"),    # lowest number, but the NEWEST
+         _cand(9, created_at="2026-01-01T00:00:00Z"),    # highest number, but the OLDEST
+         _cand(7, created_at="2026-03-01T00:00:00Z")],
+        satisfied=_sat_none)
+    assert [r["num"] for r in rows] == [9, 7, 3]
+
+
+def test_queue_number_is_only_the_last_resort_tiebreak():
+    # Same instant (or no createdAt at all): the runner pre-sorts its candidates by issue number and
+    # sorts stably, so number IS its final tiebreak — the board must not flap between two flights.
     rows = flights.queue_rows([_cand(9), _cand(3), _cand(7)], satisfied=_sat_none)
-    assert [r["num"] for r in rows] == [3, 7, 9]         # oldest issue first (FIFO)
+    assert [r["num"] for r in rows] == [3, 7, 9]
 
 
 def test_expedite_jumps_to_the_top_over_any_priority():
@@ -1136,6 +1161,100 @@ def test_expedite_never_launches_a_blocked_flight():
     assert rows[0]["launchable"] is False
     assert rows[0]["pos"] is None
     assert "AWAITING CONNECTION" in rows[0]["status_text"].upper()
+
+
+# ---- paperwork: a flight the RUNNER would refuse over its labels (issue #138) ----
+# The board's old lie: it applied no eligibility check at all, so a mislabeled issue rendered as
+# launchable — even NEXT OFF THE STAND — indefinitely, while the runner silently never took it.
+
+def test_a_missing_type_label_is_paperwork_never_launchable():
+    rows = flights.queue_rows([_cand(5, typed=False)], satisfied=_sat_none)
+    assert rows[0]["launchable"] is False
+    assert rows[0]["status"] == "paperwork"
+    assert rows[0]["pos"] is None                        # never a launch position
+    assert "PAPERWORK" in rows[0]["status_text"].upper()
+    assert "NO TYPE LABEL" in rows[0]["status_text"].upper()
+
+
+def test_an_unknown_type_label_is_paperwork_and_names_the_label():
+    rows = flights.queue_rows([_cand(5, labels=_lbl("type:frobnicate"))], satisfied=_sat_none)
+    assert rows[0]["status"] == "paperwork"
+    assert rows[0]["refusal"] == "type_unknown"
+    assert "type:frobnicate" in rows[0]["refusal_text"]   # the plain words name the bad label
+
+
+def test_duplicate_model_labels_are_paperwork():
+    rows = flights.queue_rows([_cand(5, labels=_lbl("model:opus", "model:sonnet"))],
+                              satisfied=_sat_none)
+    assert rows[0]["launchable"] is False
+    assert rows[0]["refusal"] == "model_duplicate"
+
+
+def test_duplicate_effort_labels_are_paperwork():
+    rows = flights.queue_rows([_cand(5, labels=_lbl("effort:high", "effort:low"))],
+                              satisfied=_sat_none)
+    assert rows[0]["launchable"] is False
+    assert rows[0]["refusal"] == "effort_duplicate"
+
+
+def test_a_paperwork_flight_is_never_next_off_the_stand():
+    # The headline defect: the mislabeled issue is the LOWEST-numbered, highest-priority candidate,
+    # so every old rule would have crowned it NEXT OFF THE STAND. The runner would never take it.
+    rows = flights.queue_rows(
+        [_cand(1, labels=_lbl("priority:high"), typed=False),
+         _cand(50, labels=_lbl("priority:low"))],
+        satisfied=_sat_none)
+    assert rows[0]["num"] == 50                          # the flight the runner would really launch
+    assert "NEXT OFF THE STAND" in rows[0]["status_text"].upper()
+    by_num = {r["num"]: r for r in rows}
+    assert by_num[1]["status"] == "paperwork"
+    assert "NEXT OFF THE STAND" not in by_num[1]["status_text"].upper()
+
+
+def test_expedite_never_lifts_a_paperwork_flight():
+    # ⚡ is a priority signal, not a paperwork fix — the runner refuses the issue either way.
+    rows = flights.queue_rows([_cand(5, labels=_lbl("expedite"), typed=False)], satisfied=_sat_none)
+    assert rows[0]["launchable"] is False
+    assert rows[0]["expedited"] is False
+    assert rows[0]["pos"] is None
+
+
+def test_paperwork_and_awaiting_are_distinct_honest_states():
+    # Two different reasons a flight can't leave — never collapsed into one another (design §5).
+    rows = flights.queue_rows(
+        [_cand(5, typed=False), _cand(6, body="blocked-by: #9"), _cand(7)],
+        satisfied=_sat_none)
+    by_num = {r["num"]: r for r in rows}
+    assert by_num[5]["status"] == "paperwork"
+    assert by_num[6]["status"] == "awaiting"
+    assert by_num[7]["status"] == "queued"
+    assert rows[0]["num"] == 7                           # the only launchable one leads the board
+
+
+# ---- requeue-front: the conflict-rebuilt flight jumps its band (issue #138) ----
+
+def test_a_requeued_flight_goes_to_the_front_of_its_own_band():
+    # loopstate's requeue_front: the runner puts a conflict-rebuilt issue ahead of its band, even
+    # though it is the NEWEST of them. The board had no concept of this at all — so its order was
+    # wrong exactly when a rebuild happened, the moment the owner most needs the truth.
+    rows = flights.queue_rows(
+        [_cand(10, created_at="2026-01-01T00:00:00Z"),
+         _cand(11, created_at="2026-02-01T00:00:00Z"),
+         _cand(12, created_at="2026-03-01T00:00:00Z", requeue_front=True)],
+        satisfied=_sat_none)
+    assert [r["num"] for r in rows] == [12, 10, 11]
+    assert rows[0]["pos"] == 1
+    assert "NEXT OFF THE STAND" in rows[0]["status_text"].upper()
+
+
+def test_a_requeue_never_leaves_its_band():
+    # It jumps to the front of its OWN band — not over a higher band, and never over ⚡.
+    rows = flights.queue_rows(
+        [_cand(10, labels=_lbl("priority:high"), created_at="2026-09-01T00:00:00Z"),
+         _cand(11, created_at="2026-01-01T00:00:00Z", requeue_front=True),
+         _cand(12, labels=_lbl("expedite", "priority:low"), created_at="2026-09-01T00:00:00Z")],
+        satisfied=_sat_none)
+    assert [r["num"] for r in rows] == [12, 10, 11]      # ⚡, then high band, then the requeued normal
 
 
 def test_queue_row_carries_flight_and_destination_for_the_board():

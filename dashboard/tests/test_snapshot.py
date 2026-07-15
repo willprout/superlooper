@@ -815,11 +815,25 @@ def test_field_banner_is_the_longest_flying_downwind_flight(home):
 class _QueueGh:
     """A gh stub whose agent-ready queue carries labels + bodies. ``closed_nums`` are the issues that
     have landed (their ``issue`` view reads state CLOSED); everything else reads OPEN, and an issue
-    listed in ``unreadable`` fails closed to ``{}`` (a gh error)."""
-    def __init__(self, ready, closed_nums=(), unreadable=()):
-        self._ready = ready
+    listed in ``unreadable`` fails closed to ``{}`` (a gh error).
+
+    A real approved issue always carries exactly one valid ``type:`` label — the runner refuses to
+    launch one that doesn't (issue #138), so the board shows such an issue as paperwork rather than
+    as a queued flight. The stub therefore hands each fixture a ``type:build`` unless it names a
+    ``type:`` label of its own, so a queue fixture is a realistic queue; the paperwork tests pass
+    their own (bad) type labels and get the refusal they are asking about. ``typed=False`` turns the
+    courtesy off entirely, for a test whose whole point is an issue with NO type label."""
+    def __init__(self, ready, closed_nums=(), unreadable=(), typed=True):
+        self._ready = [self._typed(r) for r in ready] if typed else list(ready)
         self._closed = set(closed_nums)
         self._unreadable = set(unreadable)
+
+    @staticmethod
+    def _typed(issue):
+        labels = list(issue.get("labels") or [])
+        if any(str(lb.get("name", "")).startswith("type:") for lb in labels if isinstance(lb, dict)):
+            return issue
+        return dict(issue, labels=labels + [{"name": "type:build"}])
 
     def open_issues(self, repo, label=None, limit=200):
         if label == "agent-ready":
@@ -915,6 +929,120 @@ def test_departures_exclude_flights_already_in_the_air(home):
     nums = {d["num"] for d in snap["repos"][0]["boards"]["departures"]}
     assert 99 in nums
     assert 15 not in nums
+
+
+# ---- the board is the RUNNER's launch order, end to end (issue #138) ----
+# The three drifts the board used to carry, each proved through the whole assemble path: an issue
+# the runner refuses is never launchable; a conflict-rebuilt issue is back at the front of its band;
+# creation time — not the issue number — breaks a tie.
+
+def _requeue_home(tmp_path, name="requeue"):
+    """A calm home whose SL-52 came back from a conflict rebuild: the regenerate path leaves it
+    `ready` with `requeue_front` in loopstate and puts `agent-ready` back on the issue."""
+    dst = _landed_home(tmp_path, name)
+    (dst / "state" / "issues.json").write_text(json.dumps({"version": 1, "issues": {
+        "i1": {"status": "merged", "branch": "sl/i1-x", "pr": 2},
+        "i52": {"status": "ready", "branch": "sl/i52-rebuilt-2", "lane": None, "launches": 1,
+                "retries": 0, "conflicts": 1, "requeue_front": True, "declared_touches": [],
+                "pr": None}}}))
+    return dst
+
+
+_REQUEUE_READY = [
+    {"number": 50, "title": "queued since january", "labels": [{"name": "agent-ready"}],
+     "createdAt": "2026-01-01T00:00:00Z"},
+    {"number": 51, "title": "queued since february", "labels": [{"name": "agent-ready"}],
+     "createdAt": "2026-02-01T00:00:00Z"},
+    {"number": 52, "title": "rebuilt after a conflict", "labels": [{"name": "agent-ready"}],
+     "createdAt": "2026-03-01T00:00:00Z"},
+]
+
+
+def test_a_requeued_flight_is_back_on_the_board_at_the_front_of_its_band(tmp_path):
+    # SL-52 is the NEWEST of the three, so oldest-first would put it last — but loopstate says the
+    # runner re-fronted it, and the runner launches it next. The board used to drop every issue that
+    # had a loopstate entry at all, so it couldn't see this flight, let alone place it.
+    snap = server.assemble_snapshot(_config(_requeue_home(tmp_path)), now=NOW,
+                                    gh_mod=_QueueGh(_REQUEUE_READY))
+    deps = snap["repos"][0]["boards"]["departures"]
+    assert [d["num"] for d in deps] == [52, 50, 51]
+    assert deps[0]["requeue_front"] is True
+    assert "NEXT OFF THE STAND" in deps[0]["status_text"].upper()
+
+
+def test_a_requeued_flight_never_parks_a_second_plane_on_the_field(tmp_path):
+    # It is queued on the BOARD, but it is also a plane the runner has already flown (it has a
+    # loopstate entry, so the field draws its aircraft). One issue is one plane.
+    snap = server.assemble_snapshot(_config(_requeue_home(tmp_path)), now=NOW,
+                                    gh_mod=_QueueGh(_REQUEUE_READY))
+    repo = snap["repos"][0]
+    assert 52 in {d["num"] for d in repo["boards"]["departures"]}   # on the board…
+    assert 52 in {f["num"] for f in snap["flights"]}                # …and already a plane…
+    assert 52 not in {s["num"] for s in repo["stand"]}              # …so never a SECOND one at a gate
+    assert {s["num"] for s in repo["stand"]} == {50, 51}
+
+
+def test_an_issue_the_runner_would_refuse_is_paperwork_never_next_off_the_stand(tmp_path):
+    # The headline defect: SL-60 has no `type:` label, so the runner silently never launches it —
+    # yet it is the highest-priority candidate, so the old board crowned it NEXT OFF THE STAND
+    # indefinitely. Now it names the bad label where the owner reads it, and SL-61 leads.
+    ready = [{"number": 60, "title": "mislabeled", "createdAt": "2026-01-01T00:00:00Z",
+              "labels": [{"name": "agent-ready"}, {"name": "priority:high"}]},
+             {"number": 61, "title": "properly labelled", "createdAt": "2026-02-01T00:00:00Z",
+              "labels": [{"name": "agent-ready"}, {"name": "type:build"}]}]
+    dst = _landed_home(tmp_path, "paperwork")
+    snap = server.assemble_snapshot(_config(dst), now=NOW, gh_mod=_QueueGh(ready, typed=False))
+    repo = snap["repos"][0]
+    deps = {d["num"]: d for d in repo["boards"]["departures"]}
+    assert deps[60]["status"] == "paperwork"
+    assert deps[60]["launchable"] is False
+    assert deps[60]["pos"] is None
+    assert "type:" in deps[60]["refusal_text"]                     # names the bad label in plain words
+    assert 60 not in {s["num"] for s in repo["stand"]}             # and never parks a plane
+    # the flight the runner would REALLY launch next leads the board
+    assert repo["boards"]["departures"][0]["num"] == 61
+    assert "NEXT OFF THE STAND" in deps[61]["status_text"].upper()
+
+
+def test_the_board_ties_by_creation_time_like_the_runner(tmp_path):
+    # The runner ties by createdAt; the board used to tie by issue number. SL-99 is older than
+    # SL-50, so it launches first despite the higher number.
+    ready = [{"number": 50, "title": "newer, lower number", "labels": [{"name": "agent-ready"}],
+              "createdAt": "2026-06-01T00:00:00Z"},
+             {"number": 99, "title": "older, higher number", "labels": [{"name": "agent-ready"}],
+              "createdAt": "2026-01-01T00:00:00Z"}]
+    snap = server.assemble_snapshot(_config(_landed_home(tmp_path, "ties")), now=NOW,
+                                    gh_mod=_QueueGh(ready))
+    assert [d["num"] for d in snap["repos"][0]["boards"]["departures"]] == [99, 50]
+
+
+def test_a_corrupt_loopstate_status_never_takes_down_the_board(tmp_path):
+    # Fail-closed, the sharp edge (fresh-agent review, issue #138): the board reads loopstate to see
+    # a requeued flight, so a wrong-typed status now reaches a `status in <frozenset>` test — and an
+    # UNHASHABLE one (a list/dict) would raise TypeError straight through the poll, taking down every
+    # repo and every flight, not just its own row. The engine folds exactly this value class to a
+    # sentinel (_status_of, issue #95); the mirror must too. SL-52's entry is corrupt; SL-50 must
+    # still fly, and SL-52 must simply not be launchable.
+    #
+    # SL-52 gets an activity file deliberately. `build_flight` carries its OWN pre-existing
+    # `status in _LAUNCHED_STATUSES` trap of the same shape, but it sits behind an `or`
+    # short-circuit that an activity file satisfies — so this scenario isolates the departures
+    # path. That other trap is real and on main; it is filed separately rather than fixed here.
+    ready = [{"number": 50, "title": "unaffected", "labels": [{"name": "agent-ready"}],
+              "createdAt": "2026-01-01T00:00:00Z"},
+             {"number": 52, "title": "corrupt loopstate", "labels": [{"name": "agent-ready"}],
+              "createdAt": "2026-02-01T00:00:00Z"}]
+    dst = _landed_home(tmp_path, "corrupt")
+    (dst / "state" / "issues.json").write_text(json.dumps({"version": 1, "issues": {
+        "i1": {"status": "merged", "branch": "sl/i1-x", "pr": 2},
+        "i52": {"status": []}}}))                       # unhashable — the raise-into-the-poll shape
+    (dst / "state" / "activity").mkdir(parents=True, exist_ok=True)
+    (dst / "state" / "activity" / "i52").write_text("")
+    os.utime(dst / "state" / "activity" / "i52", (NOW - 60, NOW - 60))
+    snap = server.assemble_snapshot(_config(dst), now=NOW, gh_mod=_QueueGh(ready))
+    deps = {d["num"] for d in snap["repos"][0]["boards"]["departures"]}
+    assert 50 in deps                                   # the board survives and still tells the truth
+    assert 52 not in deps                               # …and the corrupt flight fails closed
 
 
 def test_snapshot_fun_map_carries_the_solari_toggles(home):

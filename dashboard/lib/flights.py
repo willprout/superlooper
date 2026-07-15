@@ -34,6 +34,8 @@ a test in ``tests/test_flights.py``:
 import re
 import time
 
+import launch_rules
+
 # --------------------------- vocabulary (the state diagram's alphabet) ---------------------------
 # On-circuit discrete stages (design record §3), in traffic-pattern order. A flight's position is
 # ALWAYS exactly one of these (or an off-path state below) — never an interpolation.
@@ -583,15 +585,11 @@ def tower_status(pill):
 # declares in its body. Computed here (design record B.1) so the split-flap board only PAINTS the
 # order — delete the flaps and this list is still the correct launch sequence (the squint test).
 #
-# Priority bands. The runner's own launch order is FIFO within a band; the dashboard reflects it,
-# it does not invent it. The vocabulary is a small fixed set — a `priority:<band>` label maps to a
-# rank where SMALLER is more urgent; a bare `priority:<n>` numeric label rides the same axis
-# (``priority:0`` most urgent); absent or unrecognized ⇒ the middle band (``normal``). If the loop
-# ever adopts a different priority vocabulary, extend this one map — nothing else changes.
-_PRIORITY_RANK = {"high": 0, "normal": 1, "medium": 1, "low": 2}
-_DEFAULT_PRIORITY_BAND = "normal"
-_EXPEDITE_LABEL = "expedite"
-_PRIORITY_PREFIX = "priority:"
+# Priority bands, eligibility and the tiebreak are the RUNNER's, not ours: they all come from
+# ``lib/launch_rules``, the tested mirror of the engine's own ``issues.eligible``/``sort_key``
+# (issue #138). Nothing about the launch order is decided in this file any more — it used to be,
+# and the two copies drifted until the board could advertise a flight as NEXT OFF THE STAND that
+# the runner would never launch. Change the mirror (and its parity test), never this.
 
 # blocked-by connections live in the issue body's Loop metadata (NOT a label): a `blocked-by:` line
 # carrying one or more `#<n>` issue refs. Matched case-insensitively; only refs ON that line count,
@@ -620,40 +618,19 @@ def has_label(labels, name):
     return name in label_names(labels)
 
 
-def _priority_pairs(labels):
-    """Every ``(rank, band)`` a flight's ``priority:*`` labels imply. Scanning ALL of them (not the
-    first the set happens to yield) makes the result deterministic across processes — Python's set
-    iteration order is hash-seeded, so "return the first priority label" would flap run to run."""
-    pairs = []
-    for n in label_names(labels):
-        if n.lower().startswith(_PRIORITY_PREFIX):
-            band = n.split(":", 1)[1].strip().lower()
-            if band in _PRIORITY_RANK:
-                pairs.append((_PRIORITY_RANK[band], band))
-            elif band.isdigit():
-                pairs.append((int(band), band))
-    return pairs
-
-
 def priority_band(labels):
-    """The named priority band from a ``priority:<band>`` label — ``high`` / ``normal`` / ``low`` —
-    or ``normal`` when absent or unrecognized (the honest middle: an unlabeled flight is neither
-    rushed nor deferred). With several priority labels, the MOST URGENT (lowest rank) wins,
-    deterministically."""
-    pairs = _priority_pairs(labels)
-    if not pairs:
-        return _DEFAULT_PRIORITY_BAND
-    return min(pairs, key=lambda rb: (rb[0], rb[1]))[1]
+    """The named priority band for a flight — ``high`` / ``normal`` / ``low`` — as the RUNNER reads
+    it: only its exact ``priority:high`` / ``priority:low`` labels move a band, and everything else
+    (absent, ``priority:normal``, a bare number, a mis-cased label) is the honest middle. There is
+    no ``medium``: the board once displayed one the runner has never had."""
+    return launch_rules.band_name(launch_rules.priority_rank(labels))
 
 
 def priority_rank(labels):
-    """The numeric launch-urgency rank (SMALLER = leaves sooner) for a flight's ``priority:*`` label.
-    Named bands map through ``_PRIORITY_RANK``; a bare numeric ``priority:<n>`` rides the same axis
-    (``priority:0`` most urgent); absent/unknown ⇒ the middle band. Several priority labels resolve
-    to the most urgent (minimum) rank, deterministically. Expedite is a SEPARATE, stronger signal
-    handled by :func:`queue_rows`, never folded in here."""
-    pairs = _priority_pairs(labels)
-    return min(r for r, _ in pairs) if pairs else _PRIORITY_RANK[_DEFAULT_PRIORITY_BAND]
+    """The runner's numeric launch-urgency band (SMALLER = leaves sooner): ``1`` high, ``2`` normal,
+    ``3`` low. Expedite is a SEPARATE, stronger signal handled by :func:`queue_rows`, never folded
+    in here. See :mod:`launch_rules` for the mirrored rule and its parity test."""
+    return launch_rules.priority_rank(labels)
 
 
 def parse_blocked_by(body):
@@ -670,10 +647,14 @@ def parse_blocked_by(body):
     return sorted(nums)
 
 
-def _queue_status_text(launchable, blocked_by, pos):
-    """The plain split-flap STATUS phrase for a queue row (real words, costume rule 2): an unmet
-    connection reads ``AWAITING CONNECTION SL-N`` (never in the air); the flight at the front of the
-    launch order is ``NEXT OFF THE STAND``; everything else is plainly ``QUEUED``."""
+def _queue_status_text(launchable, blocked_by, pos, refusal=None):
+    """The plain split-flap STATUS phrase for a queue row (real words, costume rule 2): a flight the
+    runner would refuse over its labels reads ``PAPERWORK — NO TYPE LABEL`` (ground ops holds a
+    flight whose dispatch paperwork is wrong; nothing about it is in the air); an unmet connection
+    reads ``AWAITING CONNECTION SL-N``; the flight at the front of the launch order is ``NEXT OFF
+    THE STAND``; everything else is plainly ``QUEUED``."""
+    if refusal is not None:
+        return "PAPERWORK — %s" % refusal["flap"]
     if not launchable:
         return "AWAITING CONNECTION SL-%d" % blocked_by
     if pos == 1:
@@ -682,41 +663,70 @@ def _queue_status_text(launchable, blocked_by, pos):
 
 
 def queue_rows(candidates, satisfied):
-    """The ordered departures/launch queue (design record §3): ⚡ expedite on top, then the priority
-    band, then issue number ascending (FIFO within a band). A candidate whose ``blocked-by``
-    connection has NOT arrived is not launchable — it is shown ``awaiting connection SL-N`` and sinks
-    below every launchable flight, NEVER in the air; ⚡ cannot override an unmet connection.
+    """The ordered departures/launch queue (design record §3) — the RUNNER's launch order, mirrored.
 
-    ``candidates`` are the eligible issues (open, ``agent-ready``, not already flying) in the gh
-    shape ``{num, title, labels, body}``. ``satisfied(n)`` is a predicate the caller supplies —
-    ``True`` only with POSITIVE proof that blocker issue ``n`` has landed/closed (its connection has
-    arrived). It MUST fail closed: an unknown/unreadable blocker stays a blocker, so a flight is
-    never shown in the air on a hopeful guess. Returns a list of row dicts; the JS binds them to
-    flaps and computes nothing."""
+    The order is exactly ``launch_rules.sort_key``: ⚡ expedite on top, then the priority band, then
+    a conflict-requeued flight at the front of its own band, then oldest-first by issue CREATION
+    time (the runner's tiebreak — never the issue number, which only settles a true tie).
+
+    Two states are not launchable, and neither is ever shown in the air or offered as next off the
+    stand:
+
+      * **paperwork** — the runner's own eligibility rules would refuse this flight over its labels
+        (a missing/unknown/doubled ``type:``, a doubled or blank ``model:``/``effort:``). The board
+        used to render such an issue as launchable, even NEXT OFF THE STAND, forever — while the
+        runner silently never took it. Now it names the bad label in plain words instead.
+      * **awaiting connection** — a ``blocked-by`` connection that has NOT arrived. ⚡ cannot
+        override it.
+
+    ``candidates`` are the open, ``agent-ready``, still-launchable issues the server gathered, in
+    the shape ``{num, title, labels, body, created_at, requeue_front}`` (the last two default to
+    ``""``/``False``, so a caller that has no loopstate still gets a correct order). ``satisfied(n)``
+    is a predicate the caller supplies — ``True`` only with POSITIVE proof that blocker issue ``n``
+    has landed/closed. It MUST fail closed: an unknown/unreadable blocker stays a blocker, so a
+    flight is never shown in the air on a hopeful guess. Returns a list of row dicts; the JS binds
+    them to flaps and computes nothing."""
     rows = []
     for c in candidates:
         num = c.get("num")
         labels = c.get("labels")
+        # The runner's label verdict comes FIRST: an issue it would refuse is never launchable, so
+        # its ⚡ and its queue position are meaningless — it is off the launch order entirely, just
+        # as it is in the runner's own candidate list.
+        refusal = launch_rules.refusal(labels)
         blockers = parse_blocked_by(c.get("body"))
         unmet = [n for n in blockers if not satisfied(n)]
         blocked_by = unmet[0] if unmet else None          # the first connection still to arrive
-        launchable = blocked_by is None
-        expedited = has_label(labels, _EXPEDITE_LABEL) and launchable  # ⚡ never lifts a blocked flight
+        launchable = refusal is None and blocked_by is None
+        expedited = launch_rules.has_expedite(labels) and launchable  # ⚡ never lifts a held flight
+        rank = launch_rules.priority_rank(labels)
         rows.append({
             "num": num,
             "flight": "SL-%d" % num,
             "destination": c.get("title") or "",
             "expedited": expedited,
-            "priority": priority_band(labels),
-            "priority_rank": priority_rank(labels),
+            "priority": launch_rules.band_name(rank),
+            "priority_rank": rank,
             "blocked_by": blocked_by,
             "launchable": launchable,
+            # The order's own inputs, kept on the row so the snapshot stays inspectable: the board's
+            # sequence is re-derivable from what it shows (the squint test).
+            "created_at": c.get("created_at") if isinstance(c.get("created_at"), str) else "",
+            "requeue_front": bool(c.get("requeue_front")),
+            # The refusal, discrete (the pixels never parse prose): its code, and the plain sentence
+            # naming the bad label + the fix, so the owner can act from where they read it.
+            "refusal": refusal["code"] if refusal else None,
+            "refusal_text": refusal["text"] if refusal else None,
+            "_refusal": refusal,                          # popped below, once the phrase is built
         })
 
-    # Launchable flights first (⚡, then band, then FIFO by number); blocked flights after, in the
-    # same band/number order. A stable key means the order is fully determined by the facts.
-    rows.sort(key=lambda r: (not r["launchable"], not r["expedited"],
-                             r["priority_rank"], r["num"]))
+    # Launchable flights first, in the RUNNER's order; held flights after them in that same order.
+    # A total key means the order is fully determined by the facts — never gh's list order.
+    rows.sort(key=lambda r: (not r["launchable"],
+                             launch_rules.sort_key(num=r["num"], expedite=r["expedited"],
+                                                   rank=r["priority_rank"],
+                                                   requeue_front=r["requeue_front"],
+                                                   created_at=r["created_at"])))
 
     pos = 0
     for r in rows:
@@ -726,8 +736,9 @@ def queue_rows(candidates, satisfied):
             r["status"] = "expedited" if r["expedited"] else "queued"
         else:
             r["pos"] = None
-            r["status"] = "awaiting"
-        r["status_text"] = _queue_status_text(r["launchable"], r["blocked_by"], r["pos"])
+            r["status"] = "paperwork" if r["refusal"] else "awaiting"
+        r["status_text"] = _queue_status_text(r["launchable"], r["blocked_by"], r["pos"],
+                                              refusal=r.pop("_refusal"))
     return rows
 
 
