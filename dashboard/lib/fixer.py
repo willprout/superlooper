@@ -29,8 +29,30 @@ adapter drives the shim the way the engine's own watchdog drives it (``superloop
   owner's note lands there VERBATIM;
 * the ``SL_RUN_ROOT``/``SL_PANE``/``SL_AGENT`` handshake, and the pinned ``SL_LAUNCH_VERIFY_SECONDS``;
 * ``worker.d<N>.lock`` naming a live pid as "a debugger is already on this patient" — the SAME file
-  the watchdog checks before its own launch, so the two never launch past each other: whichever
-  starts first is seen by the other.
+  the watchdog checks before its own launch, so in the ordinary case whichever starts first is seen
+  by the other.
+
+KNOWN GAP, recorded rather than papered over (cross-review, issue #141). The ``d<N>`` namespace is
+SHARED with the engine's watchdog, but its allocator is not: the watchdog counts from
+``state/watchdog.json`` ▸ ``next_debugger`` and never reads ``briefs/``. Two consequences the
+dashboard cannot fully close from inside its own boundary:
+
+1. *A reused id.* The watchdog's counter does not advance when the dashboard launches, so a later
+   watchdog launch can pick an id this button already used and overwrite its brief. Mitigated by
+   reading its counter as an allocation floor (:func:`watchdog_next_debugger` — a READ; writing that
+   file would make this a co-author of the watchdog's episode state machine, which §6 forbids), and
+   defused by keeping the durable record of every launch in the dashboard's OWN log, which the
+   engine never touches: a clobbered brief costs no history.
+2. *A simultaneous launch.* Both sides check ``worker.d*.lock`` before launching, but the lock is
+   created by ``start-session.sh`` a beat later — so a watchdog check firing inside that window
+   could allocate a DIFFERENT id and launch a second debugger. Narrow (it needs an open post-grace
+   episode landing in a few-second window), but its correlation is worst exactly when it matters:
+   a wedged runner is both what trips the watchdog and what makes the owner tap this button.
+
+Both dissolve the moment the ENGINE owns an owner-tap launch verb (a ``superlooper debug`` that
+allocates under the watchdog's own lock, exactly as ``request-restart`` owns the restart marker) —
+at which point this adapter becomes a thin CLI shell like ``lib/restart``. That is engine work; this
+issue's boundary is ``dashboard/**``, so it is filed for the owner rather than smuggled in here.
 
 Bright lines this module encodes (not conveniences):
 
@@ -284,17 +306,26 @@ def launch_env(base_env, state_home, pane, model=None, agent=None):
     return env
 
 
-def next_fixer_id(seen_ids):
-    """The next debugger id: one past the highest ``d<N>`` ever seen in this state home. Never
-    re-uses a number even across a gap — a prior session's brief IS the record of what it was told,
-    and clobbering it would rewrite history. Garbage and non-debugger ids (``i44``, ``a2``) are
-    ignored, never a crash."""
+def next_fixer_id(seen_ids, floor=None):
+    """The next debugger id: one past the highest ``d<N>`` ever seen in this state home, never below
+    ``floor``. Never re-uses a number even across a gap, so THIS side can't clobber a prior
+    session's brief. Garbage and non-debugger ids (``i44``, ``a2``) are ignored, never a crash.
+
+    ``floor`` is the engine watchdog's own counter (see :func:`watchdog_next_debugger`). The
+    watchdog allocates from that counter and never reads ``briefs/``, so "one past the highest
+    brief" can land exactly on the id it has already earmarked — and both would write the same brief
+    path. Honouring its floor keeps the dashboard off its next id. A non-int/absent floor is ignored,
+    and a floor can only ever RAISE the id, never lower it into a used number."""
     highest = 0
     for name in seen_ids or []:
         m = _ID_RE.match(str(name))
         if m:
             highest = max(highest, int(m.group(1)))
-    return "d%d" % (highest + 1)
+    n = highest + 1
+    # `is True/False` guard: bool is an int subclass, and `floor=True` must not become id d1.
+    if isinstance(floor, int) and not isinstance(floor, bool) and floor > n:
+        n = floor
+    return "d%d" % n
 
 
 # =============================== filesystem reads (fail closed, never raise) ===============================
@@ -359,6 +390,28 @@ def _seen_ids(state_home):
     return seen
 
 
+def watchdog_next_debugger(state_home):
+    """The id number the ENGINE's watchdog will hand its next unattended debugger session
+    (``state/watchdog.json`` ▸ ``next_debugger``), or ``None`` when absent/unreadable/garbage.
+
+    READ-ONLY, deliberately. Writing this file would make the dashboard a co-author of the
+    watchdog's episode state machine — its anti-storm rails (one notify per episode, at most one
+    launch per incident, the attempt cap) live in the same document, behind the engine's own atomic
+    lock protocol. That is machinery the center must not add to the runner (design §6), and getting
+    it subtly wrong would be worse than the narrow race it would close. So we read its intent and
+    step around it; the remaining gap is recorded honestly in this module's header."""
+    try:
+        doc = json.loads((_state_dir(state_home) / "watchdog.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    n = doc.get("next_debugger")
+    if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+        return n
+    return None
+
+
 def resolve_pane(state_home):
     """The cmux pane the fixer's tab is born in, resolved the way the ENGINE resolves it: an explicit
     ``$SL_PANE``, else the RUNNER's recorded anchor (``state/runner.anchor.json`` — present while a
@@ -394,16 +447,22 @@ def default_log_path():
 # =============================== the verb ===============================
 
 def _run(argv, env, timeout):
-    """Run the shim; returns ``(rc, stdout, stderr)``. NEVER raises: a timeout, a missing script, a
-    non-executable file — each is caught and returned as a nonzero rc, so the caller fails closed
-    (mirrors ``restart._run``)."""
+    """Run the shim; returns ``(rc, stdout, stderr, spawned)``. NEVER raises: a timeout, a missing
+    script, a bad shebang — each is caught and returned as a nonzero rc, so the caller fails closed
+    (mirrors ``restart._run``).
+
+    ``spawned`` is False ONLY when the process never started at all (an ``OSError`` from the exec
+    itself). The caller uses it to clean up the brief it just wrote: a launch that never spawned
+    reached nothing, so leaving its brief behind would burn an id and litter the state home with a
+    session that never existed. A TIMEOUT is spawned=True — the tab may yet deliver late, so its
+    brief must stay."""
     try:
         proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
-        return proc.returncode, proc.stdout, proc.stderr
+        return proc.returncode, proc.stdout, proc.stderr, True
     except subprocess.TimeoutExpired:
-        return 124, "", "timed out"
+        return 124, "", "timed out", True
     except (OSError, ValueError):
-        return 127, "", "command not found"
+        return 127, "", "command not found", False
 
 
 class Fixer:
@@ -505,12 +564,20 @@ class Fixer:
 
             # Resolve everything the shim REQUIRES before writing a single byte: an unresolvable
             # launch must leave no brief behind, so a refusal is indistinguishable from never having
-            # tapped.
+            # tapped. Executability is part of "resolvable" — a present-but-unrunnable shim (a
+            # checkout that lost its +x, a half-finished install) must be caught HERE, not by the
+            # subprocess failing after the brief is already on disk.
             if not os.path.isfile(script):
                 return self._refuse(
                     "fixer",
                     "could not find the engine's launch-session.sh at %s — is superlooper "
                     "installed? (set 'superlooper_cli' in config.json)" % script,
+                    live=False)
+            if not os.access(script, os.X_OK):
+                return self._refuse(
+                    "fixer",
+                    "the engine's launch-session.sh at %s is not executable — nothing launched"
+                    % script,
                     live=False)
             pane = resolve_pane(home)
             if not pane:
@@ -520,18 +587,25 @@ class Fixer:
                     "loop once so the fixer's tab has somewhere to be born",
                     live=False)
 
-            fixer_id = next_fixer_id(_seen_ids(home))
+            fixer_id = next_fixer_id(_seen_ids(home), floor=watchdog_next_debugger(home))
             prompt = compose_prompt(ctx, note, entry["path"], home, operator=self._operator)
+            brief = Path(home) / "briefs" / ("%s.md" % fixer_id)
             try:
-                briefs = Path(home) / "briefs"
-                briefs.mkdir(parents=True, exist_ok=True)
-                (briefs / ("%s.md" % fixer_id)).write_text(prompt)
+                brief.parent.mkdir(parents=True, exist_ok=True)
+                brief.write_text(prompt)
             except OSError as e:
                 return self._refuse("fixer", "could not write the session brief: %s" % e, live=False)
 
-            rc, out, err = _run(launch_argv(script, entry["path"], fixer_id),
-                                launch_env(os.environ, home, pane, agent=self._agent),
-                                self._timeout)
+            rc, out, err, spawned = _run(launch_argv(script, entry["path"], fixer_id),
+                                         launch_env(os.environ, home, pane, agent=self._agent),
+                                         self._timeout)
+            if not spawned:
+                # Nothing ever ran: the brief reached no one, so it must not linger (it would burn
+                # an id and read to a later reader as a session that existed).
+                try:
+                    brief.unlink()
+                except OSError:
+                    pass
 
         ts = self._stamp()
         if rc == 0:

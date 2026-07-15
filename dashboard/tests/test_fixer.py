@@ -261,6 +261,22 @@ def test_launch_env_carries_the_shims_required_handshake():
     assert env["PATH"] == "/usr/bin", "the ambient env must survive — the shim needs git/cmux on PATH"
 
 
+def test_the_seat_is_deliberately_forced_to_claude_opus():
+    # An INTENTIONAL decision, pinned so it reads as a choice rather than an oversight: the agent
+    # and model are the ENGINE's config knobs (`agent`, `models.answerer`), and this dashboard's
+    # config schema has neither — so rather than half-read a config it doesn't own, the button
+    # forces the same defaults the engine's own watchdog launch uses for a debugger seat.
+    # sl-debugger is a Claude skill; a codex-agent repo still gets a claude fixer, on purpose.
+    env = fixer_mod.launch_env({}, "/h", "p")
+    assert env["SL_AGENT"] == "claude"
+    assert env["SL_MODEL"] == "opus[1m]"
+    # A caller CAN override (the parameter exists for the day the engine's config is threaded
+    # through), and a garbage agent still falls back to claude rather than reaching the shim —
+    # launch-session.sh exits 64 on an unsupported agent.
+    assert fixer_mod.launch_env({}, "/h", "p", agent="codex")["SL_AGENT"] == "codex"
+    assert fixer_mod.launch_env({}, "/h", "p", agent="hal9000")["SL_AGENT"] == "claude"
+
+
 def test_launch_env_pins_the_verify_window():
     # The engine pins this for its own watchdog launch (review P1-1 there): an ambient large
     # SL_LAUNCH_VERIFY_SECONDS would let the launch outlive our timeout, so a late-delivering tab
@@ -275,9 +291,48 @@ def test_next_fixer_id_shape_and_succession():
     assert fixer_mod.next_fixer_id(["d1", "d2"]) == "d3"
     # Non-debugger ids and garbage are ignored, never crash the allocator.
     assert fixer_mod.next_fixer_id(["i44", "a2", "junk", "d7"]) == "d8"
-    # Gaps never re-use a number: a brief for d3 exists ⇒ the next is d4, so we can never clobber
-    # a prior session's brief (which is its transcript's opening message).
+    # Gaps never re-use a number: a brief for d3 exists ⇒ the next is d4, so THIS side can never
+    # clobber a prior session's brief.
     assert fixer_mod.next_fixer_id(["d3"]) == "d4"
+
+
+def test_next_fixer_id_respects_the_watchdogs_counter():
+    # The engine's watchdog allocates from its OWN counter (state/watchdog.json next_debugger) and
+    # never consults briefs/ — so "one past the highest brief" can land exactly on the id the
+    # watchdog has already earmarked, and the two would write the same brief path. Taking the floor
+    # from its counter keeps the dashboard off the watchdog's next id. (This is the read-only half
+    # of the fix; see test_a_watchdog_clobber_cannot_erase_the_record for the other half.)
+    assert fixer_mod.next_fixer_id(["d1"], floor=5) == "d5"
+    assert fixer_mod.next_fixer_id(["d9"], floor=3) == "d10", "the floor never LOWERS the id"
+    assert fixer_mod.next_fixer_id([], floor=None) == "d1"
+    for junk in ("x", -3, 0, 2.5, True):
+        assert fixer_mod.next_fixer_id(["d1"], floor=junk) == "d2", (
+            "a garbage floor (%r) must never crash or lower the id" % junk)
+
+
+def test_the_watchdog_counter_is_read_not_written(tmp_path):
+    # Reading the watchdog's counter is fine; WRITING it would make the dashboard a co-author of the
+    # engine's episode state machine (its anti-storm rails live in that same file) — machinery the
+    # center must not add to the runner (design §6). Read-only, fails closed on anything unreadable.
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "watchdog.json").write_text(json.dumps({"next_debugger": 7, "episode": {"x": 1}}))
+    before = (state / "watchdog.json").read_text()
+    assert fixer_mod.watchdog_next_debugger(str(tmp_path)) == 7
+    assert (state / "watchdog.json").read_text() == before, "the dashboard must not write this file"
+
+
+@pytest.mark.parametrize("body", ["{not json", json.dumps({"next_debugger": "x"}),
+                                  json.dumps({}), json.dumps([1, 2])])
+def test_an_unreadable_watchdog_counter_fails_closed_to_none(tmp_path, body):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "watchdog.json").write_text(body)
+    assert fixer_mod.watchdog_next_debugger(str(tmp_path)) is None
+
+
+def test_a_missing_watchdog_file_is_none_not_a_crash(tmp_path):
+    assert fixer_mod.watchdog_next_debugger(str(tmp_path)) is None
 
 
 # =============================== the adapter (subprocess, against the fake) ===============================
@@ -406,6 +461,59 @@ def test_unwatched_repo_is_refused_before_any_subprocess(fx):
     assert res["ok"] is False
     assert res["error"] == "unknown repo"
     assert _launches(tmp_path) == []
+
+
+def test_execute_allocates_clear_of_the_watchdogs_next_id(fx):
+    verb, tmp_path, home, _log = fx
+    (home / "state" / "watchdog.json").write_text(json.dumps({"next_debugger": 4}))
+    res = verb.execute(SLUG, "x", _snapshot())
+    assert res["id"] == "d4", "the dashboard must not step onto an id the watchdog has earmarked"
+
+
+def test_a_watchdog_clobber_cannot_erase_the_record(fx):
+    # The residual of the shared-namespace gap: the engine's watchdog can later reuse an id and
+    # overwrite <state_home>/briefs/d1.md (it allocates from its own counter and never reads
+    # briefs/). The dashboard cannot stop that from inside its own boundary — so the DURABLE record
+    # of what the owner asked lives in the dashboard's OWN log, which the engine never touches. This
+    # is what keeps that gap from costing history.
+    verb, _tmp, home, log = fx
+    verb.execute(SLUG, "the queue is frozen", _snapshot(runner_down=True))
+    (home / "briefs" / "d1.md").write_text("the watchdog overwrote this with its own brief")
+    rows = [json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
+    assert rows[0]["note"] == "the queue is frozen", "the owner's words survive a clobbered brief"
+    assert "runner-down" in rows[0]["trouble"]
+
+
+def test_a_non_executable_shim_refuses_before_writing_a_brief(fx, monkeypatch):
+    # The refusal contract is "resolve everything the shim REQUIRES before writing a single byte".
+    # A file that exists but cannot be executed must be caught by that pre-flight, not by the
+    # subprocess blowing up after the brief is already on disk.
+    verb, tmp_path, home, _log = fx
+    dud = tmp_path / "not-executable-shim"
+    dud.write_text("#!/bin/sh\necho hi\n")
+    dud.chmod(0o644)
+    monkeypatch.setenv("SL_LAUNCH_SESSION", str(dud))
+    res = verb.execute(SLUG, "x", _snapshot())
+    assert res["ok"] is False
+    assert "launch-session.sh" in res["error"] or "execute" in res["error"].lower()
+    assert _launches(tmp_path) == []
+    assert not (home / "briefs" / "d1.md").exists(), (
+        "a shim that can't run must leave no brief — the refusal is indistinguishable from "
+        "never having tapped")
+
+
+def test_a_launch_that_never_spawned_leaves_no_brief_behind(fx, monkeypatch):
+    # The belt-and-braces half: if the process could not be spawned at all (an OSError the
+    # pre-flight didn't predict — a bad shebang, a broken interpreter), the brief we just wrote
+    # reached nothing, so it must not linger and burn an id.
+    verb, tmp_path, home, _log = fx
+    bad = tmp_path / "bad-shebang"
+    bad.write_text("#!/nonexistent/interpreter\n")
+    bad.chmod(0o755)
+    monkeypatch.setenv("SL_LAUNCH_SESSION", str(bad))
+    res = verb.execute(SLUG, "x", _snapshot())
+    assert res["ok"] is False
+    assert not (home / "briefs" / "d1.md").exists(), "nothing spawned ⇒ no brief left behind"
 
 
 def test_unresolvable_shim_says_so_plainly_and_launches_nothing(fx, monkeypatch):
