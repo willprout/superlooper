@@ -205,6 +205,10 @@
     if (banner) banner.hidden = !(s && s.runner && s.runner.down);
     var conn = el("conn-warn");
     if (conn) conn.hidden = state.connOk;
+    // The stale-tower NOTAM (issue #136) — the server's own decision, bound here because this is the
+    // one path BOTH the shell and boring mode run, and the notice lives outside #root so a rebuild
+    // never clobbers it. Nothing about skew is computed here (B.1); we hand it the version block.
+    if (window.CCNotam) window.CCNotam.update(s && s.version);
   }
 
   // ============================ the shell (screen 7a) ============================

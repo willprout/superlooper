@@ -40,6 +40,7 @@ import janitor as janitor_mod  # noqa: E402
 import restart as restart_mod # noqa: E402
 import server                 # noqa: E402
 import tidy as tidy_mod       # noqa: E402
+import version as version_mod  # noqa: E402
 import watchdog as watchdog_mod  # noqa: E402
 
 
@@ -66,11 +67,13 @@ def _bind_error_line(port, err):
             'then start again.\n' % (port, reason, port))
 
 
-def build_provider(cfg, dashboard_desk, monitor):
+def build_provider(cfg, dashboard_desk, monitor, version=None):
     """Wire the snapshot provider: fresh local state every call, GitHub + usage on the slow clock,
     the dashboard's own desk supplying the since-you-last-looked watermark (Task 9), and the
     dead-man's switch (Task 10) — every poll re-evaluates the runner heartbeat and ``monitor`` (a
-    lib.watchdog.Watchdog) fires exactly one RUNNER DOWN push per down episode, off the poll thread."""
+    lib.watchdog.Watchdog) fires exactly one RUNNER DOWN push per down episode, off the poll thread.
+    ``version`` (a lib.version.Version, stamped once at boot) rides along so every poll re-checks
+    whether this process's code still matches disk (issue #136)."""
     interval = cfg.get("gh_poll_seconds", 30)
     cached_gh = server.CachedGh(gh, interval)
     usage_cache = pollers.Cached(pollers.read_usage, interval)
@@ -82,7 +85,7 @@ def build_provider(cfg, dashboard_desk, monitor):
     def provider():
         snap = server.assemble_snapshot(cfg, now=time.time(), gh_mod=cached_gh,
                                         usage=usage_cache.get(), diff_reader=pollers.diff_stat,
-                                        desk=dashboard_desk, concluded=concluded)
+                                        desk=dashboard_desk, concluded=concluded, version=version)
         # The one push the dashboard owns (§6): the runner can't announce its own death. Bounded and
         # never-raising, dispatched on a daemon thread so a slow notifier never stalls the snapshot.
         server.dispatch_runner_pushes(snap, monitor, cfg)
@@ -124,7 +127,14 @@ def main(argv):
     # stays down costs one push, not one per 2s poll. In-memory → a restart re-arms (fails toward
     # notifying, never toward a silent missed alert).
     monitor = watchdog_mod.Watchdog()
-    provider = build_provider(cfg, dashboard_desk, monitor)
+    # This process's code identity, stamped ONCE, right here at boot (issue #136) — before a single
+    # request is served, so it is unambiguously the code this process loaded rather than whatever the
+    # checkout drifts to later. That is the whole trick: static assets are re-read from disk on every
+    # request, but this Python is frozen at import, and on 2026-07-14 the gap between the two served
+    # the owner a RAMP SWEEP button his day-old server had no route for. From here on the server can
+    # see that gap itself and say so.
+    code_version = version_mod.Version(_ROOT)
+    provider = build_provider(cfg, dashboard_desk, monitor, code_version)
     # The verbs (Task 6) — the only GitHub writes in the product. They take the RAW gh adapter, never
     # the slow read-cache (a label change must land now, not on the next 30s tick — CachedGh caches
     # only reads). The allow-list is exactly the configured slugs, so a tap can only ever steer a repo
@@ -160,7 +170,7 @@ def main(argv):
         httpd = server.build_server(provider, static_dir, port=cfg["port"], actions=verbs,
                                     desk=dashboard_desk, tidy=tidy, restart=restart, janitor=janitor,
                                     replay_provider=replay_provider,
-                                    digest_provider=digest_provider)
+                                    digest_provider=digest_provider, version=code_version)
     except OSError as e:
         sys.stderr.write(_bind_error_line(cfg["port"], e))
         return EXIT_BIND_FAILED

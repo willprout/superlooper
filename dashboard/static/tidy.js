@@ -99,7 +99,7 @@
       .then(function (res) {
         if (myGen !== gen || !isOpen()) return;    // superseded / closed → ignore this stale reply
         var b = res.body || {};
-        if (res.status !== 200 || !b.ok) { renderError(b.error, false, repo); return; }
+        if (res.status !== 200 || !b.ok) { renderError(b.error, false, repo, b.skew); return; }
         listedRepo = repo;                         // THIS repo's windows are the ones now on screen
         renderList(b.windows || []);
       })
@@ -121,7 +121,7 @@
         busy = false;
         if (myGen !== gen || !isOpen()) return;    // a re-open superseded this / dialog closed
         var b = res.body || {};
-        if (res.status !== 200 || !b.ok) { renderError(b.error, true, repo); return; }
+        if (res.status !== 200 || !b.ok) { renderError(b.error, true, repo, b.skew); return; }
         renderDone(b.closed || 0);
       })
       .catch(function () {
@@ -171,9 +171,14 @@
   // that failed (nothing ran), offer a Retry — a transient CLI hiccup shouldn't force reopening;
   // when the EXECUTE failed, just a dismiss (re-running could re-close, so the owner reopens
   // deliberately). The Retry re-lists the SAME repo that failed, under a fresh generation.
-  function renderError(message, wasExecute, repo) {
+  //
+  // `skew` (issue #136) is the server telling us it is running an older build than the code on disk
+  // and has no route for this button. A Retry then re-asks the SAME old server the SAME question it
+  // has no route for — it can never succeed, so it must not be offered. (Janitor is where this bit
+  // live on 2026-07-14; Tidy carries the identical Retry shape and so inherits the identical trap.)
+  function renderError(message, wasExecute, repo, skew) {
     var msg = message || (wasExecute ? "tidy failed — nothing was closed" : "couldn’t list the windows");
-    var retry = (!wasExecute && repo)
+    var retry = (!wasExecute && repo && !skew)
       ? '<button class="btn ghost" data-tidy-retry="' + esc(repo) + '">Retry</button>' : "";
     setBody(
       '<div class="cc-tidy-result err">⚠ ' + esc(msg) + '</div>' +

@@ -138,6 +138,51 @@ def runner_lock_pid(state_home):
         return None
 
 
+def dashboard_restart_decision(url, snapshot):
+    """The pure decision behind ``liftoff --restart-dashboard`` (issue #136): what to do about a
+    dashboard that is running an older build than the checkout on disk.
+
+    This flag exists because liftoff's normal path is idempotent BY CONTRACT — it verifies an
+    already-serving dashboard and leaves it alone — which is right for starting and useless for
+    healing: a routine liftoff never clears the skew. And the remedy has to live here, in a command
+    read fresh from disk, rather than in a dashboard button: a stale server is stale precisely
+    because it lacks the newly merged routes, so a restart ENDPOINT would 404 on exactly the servers
+    that need it.
+
+    ``snapshot`` is the live dashboard's ``/api/snapshot`` (already probed and shape-verified by the
+    composition root) or ``None`` if nothing of ours is serving. Returns ``{action, pid, message}``:
+
+    * ``start`` — nothing is serving; just bring one up.
+    * ``stop-then-start`` — stop ``pid``, wait for it to actually go, then start fresh. The pid comes
+      from the snapshot of the process that answered OUR shape check, which is the only
+      identification that cannot name a stranger: a pattern kill (``pkill -f``) once
+      collateral-killed William's live dashboard (2026-07-07), and even the port-holder is not safe
+      — ``_dashboard_up``'s own contract admits an unrelated app can squat the port.
+    * ``refuse`` — something is serving but will not say which process it is (a server predating this
+      issue). Guessing a kill target is exactly the failure above, so liftoff stops and tells the
+      owner how to finish by hand.
+
+    A dashboard that is already current still restarts: the flag is the owner's explicit act, not a
+    repair the machine talks itself into. The message just says so.
+    """
+    if snapshot is None:
+        return {"action": "start", "pid": None,
+                "message": "nothing is serving at %s — starting a fresh dashboard" % url}
+    version = (snapshot.get("version") or {}) if isinstance(snapshot, dict) else {}
+    pid = version.get("pid")
+    # bool is an int in Python — screen it out explicitly, or `True` reads as pid 1.
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return {"action": "refuse", "pid": None,
+                "message": ("a dashboard is serving at %s but does not report its pid — it predates "
+                            "--restart-dashboard, so liftoff cannot tell which process it is and "
+                            "will not guess.\n"
+                            "  Stop it by hand (Ctrl-C in the tab running it, or close that tab), "
+                            "then run: liftoff --restart-dashboard" % url)}
+    was = "stale" if version.get("skew") else "already current"
+    return {"action": "stop-then-start", "pid": pid,
+            "message": "restarting the dashboard at %s (pid %d — its build is %s)" % (url, pid, was)}
+
+
 def make_plan(repo, url, dashboard_argv_, runner_argv_, *, dashboard_up, runner_pid):
     """The idempotent plan: what to start, what to leave, and the plain line to print for each.
 

@@ -22,8 +22,10 @@ Run:  bin/liftoff [config.json] [--repo <slug|name|path>]   (default config: ./c
 import errno
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -42,9 +44,21 @@ import liftoff as liftoff_mod  # noqa: E402
 import server                 # noqa: E402
 
 _COMMAND_CENTER = str(_ROOT / "bin" / "command-center")
-_USAGE = ("usage: liftoff [config.json] [--repo <slug|name|path>]\n"
+_USAGE = ("usage: liftoff [config.json] [--repo <slug|name|path>] [--restart-dashboard]\n"
           "  Brings up (or verifies) the dashboard + one watched repo's runner. Run inside a cmux "
-          "tab.\n")
+          "tab.\n"
+          "  --restart-dashboard  Stop the running dashboard and start it again on the current\n"
+          "                       build, then exit. Use when the dashboard reports a stale tower:\n"
+          "                       a running server keeps the Python it loaded at boot, so a merge\n"
+          "                       lands new buttons in the browser that its router never learned.\n"
+          "                       Dashboard only — never touches the runner, never claims the tab.\n")
+
+# How long to wait for a stopped dashboard to actually stop answering, before refusing to start a
+# replacement beside it. A localhost server with no in-flight work goes in well under a second; the
+# ceiling only has to outlast a slow shutdown, and overshooting it costs nothing but a moment of the
+# owner's patience — whereas giving up too early would be a double start, the one outcome barred.
+_STOP_TIMEOUT = 10.0
+_STOP_POLL = 0.2
 
 
 class _Usage(Exception):
@@ -57,9 +71,10 @@ class _Usage(Exception):
 
 
 def _parse_args(argv):
-    """``(config_path, repo_arg)`` from ``argv``. Manual parse (like bin/command-center) so a bad
-    flag fails through our own friendly path, never argparse's bare SystemExit."""
-    config_path, repo_arg = None, None
+    """``(config_path, repo_arg, restart_dashboard)`` from ``argv``. Manual parse (like
+    bin/command-center) so a bad flag fails through our own friendly path, never argparse's bare
+    SystemExit."""
+    config_path, repo_arg, restart_dashboard = None, None, False
     rest = argv[1:]
     i = 0
     while i < len(rest):
@@ -72,7 +87,9 @@ def _parse_args(argv):
             repo_arg = rest[i + 1]
             i += 2
             continue
-        if a.startswith("--repo="):
+        if a == "--restart-dashboard":
+            restart_dashboard = True
+        elif a.startswith("--repo="):
             repo_arg = a.split("=", 1)[1]
         elif a.startswith("-"):
             raise _Usage("liftoff: unknown option %r\n%s" % (a, _USAGE))
@@ -83,7 +100,7 @@ def _parse_args(argv):
         i += 1
     if config_path is None:
         config_path = os.environ.get("CC_CONFIG", "config.json")
-    return config_path, repo_arg
+    return config_path, repo_arg, restart_dashboard
 
 
 def _state_base():
@@ -92,20 +109,44 @@ def _state_base():
     return os.environ.get("SL_HOME") or os.path.expanduser("~/.superlooper")
 
 
-def _dashboard_up(host, port):
-    """True ONLY if command-center ITSELF is already serving on ``host:port`` — verified by a GET to
-    ``/api/snapshot`` returning our JSON shape, not merely that some process holds the port. So an
-    UNRELATED app squatting the port reads as "not up": liftoff then tries to start the dashboard and
-    the dashboard's own bind-failed guard (issue #34) reports the conflict on that port — never a
-    false "already serving" that leaves the operator with no dashboard. A short timeout keeps the
-    probe cheap; any error (refused, timeout, non-200, non-JSON, wrong shape) ⇒ not our dashboard."""
+def _dashboard_snapshot(host, port):
+    """The live command-center's ``/api/snapshot`` as a dict, or ``None`` if what answers on
+    ``host:port`` is not ours. Verified by SHAPE, not merely by something holding the port — so an
+    UNRELATED app squatting it reads as "not ours". A short timeout keeps the probe cheap; any error
+    (refused, timeout, non-200, non-JSON, wrong shape) ⇒ None.
+
+    This shape check is what makes ``--restart-dashboard`` safe to give a kill target: the pid it
+    reads comes from the very process that answered as OUR dashboard, so liftoff can never signal a
+    stranger. (issue #136)"""
     url = "http://%s:%d/api/snapshot" % (host, port)
     try:
         with urllib.request.urlopen(url, timeout=1.0) as resp:   # HTTPError (>=400) raises → caught
             body = json.loads(resp.read())
     except (OSError, ValueError):
-        return False
-    return isinstance(body, dict) and "generated_at" in body and "repos" in body
+        return None
+    if isinstance(body, dict) and "generated_at" in body and "repos" in body:
+        return body
+    return None
+
+
+def _dashboard_up(host, port):
+    """True ONLY if command-center ITSELF is already serving on ``host:port`` — see
+    :func:`_dashboard_snapshot` for the shape check. A false "already serving" would leave the
+    operator with no dashboard, so a squatter reads as not-up: liftoff then tries to start ours and
+    the dashboard's own bind-failed guard (issue #34) reports the port conflict honestly."""
+    return _dashboard_snapshot(host, port) is not None
+
+
+def _stop_process(pid):
+    """Ask the dashboard to stop: SIGTERM to EXACTLY the pid it reported for itself (never a name or
+    pattern — ``pkill -f bin/command-center`` also matches William's own live dashboard, and did kill
+    it, 2026-07-07). An already-dead pid is success, not an error."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass          # already gone — that is the outcome we wanted
+    except OSError as e:
+        raise e
 
 
 def _pid_alive(pid):
@@ -146,11 +187,60 @@ def _exec_runner(argv):
     os.execvp(argv[0], argv)
 
 
+def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, stop_process,
+                       spawn_dashboard, sleep):
+    """``--restart-dashboard`` (issue #136): stop the running dashboard and start it again on the
+    current build. Dashboard only — the runner is never touched and this tab is never claimed.
+
+    The never-double-start guarantee is kept the only way it can be: the replacement is spawned ONLY
+    after the old process is confirmed GONE — by re-probing the port, which is the same evidence
+    "it's up" was ever based on, not by trusting a signal to have landed. If the old one is still
+    answering when we give up waiting, liftoff starts NOTHING and says so: two dashboards racing for
+    one port means one dies at bind and the owner cannot tell which one is answering them.
+    """
+    decision = liftoff_mod.dashboard_restart_decision(url, dashboard_snapshot(server.BIND_HOST,
+                                                                             cfg["port"]))
+    out.write("liftoff: %s\n" % decision["message"])
+    if decision["action"] == "refuse":
+        return EXIT_LAUNCH_FAILED
+
+    if decision["action"] == "stop-then-start":
+        pid = decision["pid"]
+        try:
+            stop_process(pid)
+        except OSError as e:
+            out.write("liftoff: could not stop the dashboard (pid %d): %s\n" % (pid, e))
+            return EXIT_LAUNCH_FAILED
+        deadline = time.monotonic() + _STOP_TIMEOUT
+        while dashboard_snapshot(server.BIND_HOST, cfg["port"]) is not None:
+            if time.monotonic() >= deadline:
+                out.write(
+                    "liftoff: the dashboard (pid %d) is still answering on port %d after %ds — "
+                    "starting nothing.\n"
+                    "  Two dashboards cannot share a port. Stop it by hand (kill %d), then run: "
+                    "liftoff --restart-dashboard\n" % (pid, cfg["port"], int(_STOP_TIMEOUT), pid))
+                return EXIT_LAUNCH_FAILED
+            sleep(_STOP_POLL)
+        out.write("liftoff: the old dashboard has stopped\n")
+
+    log_path = os.path.join(_state_base(), "command-center.log")
+    try:
+        spawn_dashboard(liftoff_mod.dashboard_argv(sys.executable, _COMMAND_CENTER, config_path),
+                        log_path)
+    except OSError as e:
+        out.write("liftoff: could not start the dashboard (%s)\n" % e)
+        return EXIT_LAUNCH_FAILED
+    out.write("liftoff: started the dashboard on the current build → %s (logging to %s)\n"
+              % (url, log_path))
+    return 0
+
+
 def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pid,
-         spawn_dashboard=_spawn_dashboard, exec_runner=_exec_runner, out=None):
+         spawn_dashboard=_spawn_dashboard, exec_runner=_exec_runner, out=None,
+         dashboard_snapshot=_dashboard_snapshot, stop_process=_stop_process, sleep=time.sleep):
     out = out if out is not None else sys.stderr
     try:
-        config_path, repo_arg = _parse_args(argv)
+        config_path, repo_arg, restart_dashboard = _parse_args(argv)
     except _Usage as e:
         out.write(str(e))
         return e.code
@@ -179,6 +269,17 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
     except (FileNotFoundError, ValueError) as e:
         out.write("liftoff: %s\n" % e)
         return EXIT_CONFIG_ERROR
+
+    # --restart-dashboard is a focused, dashboard-only verb and returns here: it never resolves a
+    # repo (it steers no runner, so --repo would be a question with no purpose), never execs, and
+    # never claims this tab. That is what makes it safe to run from whatever terminal the owner
+    # happens to be reading the stale-tower notice in.
+    if restart_dashboard:
+        return _restart_dashboard(cfg, config_path,
+                                  "http://%s:%d" % (server.BIND_HOST, cfg["port"]), out,
+                                  dashboard_snapshot=dashboard_snapshot, stop_process=stop_process,
+                                  spawn_dashboard=spawn_dashboard, sleep=sleep)
+
     try:
         repo = liftoff_mod.resolve_repo(cfg, repo_arg)
     except ValueError as e:
