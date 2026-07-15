@@ -13,19 +13,25 @@ normal path's never-double-start guarantee is untouched by it.
 
 The three properties that matter, in order of how badly each would hurt:
 
-  * **never double-start** — the fresh dashboard is spawned only after the old process is confirmed
-    GONE. If the old one won't die, liftoff starts nothing and says so. Two dashboards on one port
-    means one of them dies at bind and the owner can't tell which is answering.
-  * **never a pattern kill** — the pid comes from the snapshot of the process that answered our own
-    shape check, so it can only ever name OUR dashboard. ``pkill -f`` collateral-killed William's
-    live dashboard once already (2026-07-07); the port-holder is not good enough either, since
-    ``_dashboard_up``'s own contract admits a stranger can squat the port.
+  * **never double-start** — the fresh dashboard is spawned only once the PORT is confirmed free.
+    Two dashboards on one port means one dies at bind and the owner can't tell which is answering,
+    so the contended resource itself is the arbiter. Both softer proxies were tried and both were
+    wrong in one direction (fresh review, issue #136): the snapshot probe going quiet counts a
+    wedged-but-alive server as gone, and process liveness counts an exited-but-unreaped zombie —
+    which holds no socket — as still here. A raw TCP connect is right in both cases.
+  * **never a pattern kill** — the SIGTERM goes to the pid the dashboard published for itself,
+    alongside an explicit ``product`` claim; a responder that merely *resembles* a snapshot is
+    refused rather than signalled. ``pkill -f`` collateral-killed William's live dashboard once
+    already (2026-07-07), and the port-holder is no safer — ``_dashboard_up``'s own contract admits
+    a stranger can squat the port. Note the asymmetry these tests pin: the port decides whether to
+    START, the published identity decides whom to SIGNAL. Neither question answers the other.
   * **dashboard-only** — the flag never touches the runner and never claims the tab, so it is safe to
     run from any terminal.
 """
 import importlib.util
 import io
 import json
+import socket
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -302,6 +308,70 @@ def test_restart_does_not_exec_the_runner_even_when_none_is_live(cfg):
 def test_restart_reports_the_stale_build_it_healed(cfg):
     rc, text, stop, spawn, execr = _run(cfg, probe=_Probe([_snap(skew=True), None]))
     assert "stale" in text
+
+
+# =============================== the port probe itself (a real socket, no network) ===============================
+
+def test_port_busy_reads_a_free_port_as_free():
+    """If this ever read a free port as held, --restart-dashboard could never start anything."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    assert lo._port_busy("127.0.0.1", port) is False
+
+
+def test_port_busy_reads_a_live_listener_as_held():
+    """The wedged-dashboard case: a listener that never answers HTTP still holds the socket, and the
+    kernel says so even when the snapshot probe cannot."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    try:
+        assert lo._port_busy("127.0.0.1", srv.getsockname()[1]) is True
+    finally:
+        srv.close()
+
+
+def test_port_busy_treats_a_connect_timeout_as_HELD_not_free(monkeypatch):
+    """The last P0 of the review (issue #136): only a refusal proves a port is free.
+
+    A listener whose accept backlog is full still owns the port while new connects hang. On loopback
+    an unbound port is refused instantly — there is nothing to wait for — so a TIMEOUT is evidence
+    that something IS bound and simply not getting to us. Reading it as free lets liftoff spawn onto
+    a taken port, watch the child die at bind, and report success.
+    """
+    def hangs(addr, timeout=None):
+        raise socket.timeout("timed out")
+    monkeypatch.setattr(lo.socket, "create_connection", hangs)
+    assert lo._port_busy("127.0.0.1", 8611) is True, (
+        "a connect that times out must read as HELD — never double-start on a guess")
+
+
+def test_port_busy_treats_an_unclear_oserror_as_HELD(monkeypatch):
+    """Anything that is not a clean refusal fails toward "held": one honest message asking the owner
+    to look, rather than a silent double start."""
+    def weird(addr, timeout=None):
+        raise OSError("something unclear")
+    monkeypatch.setattr(lo.socket, "create_connection", weird)
+    assert lo._port_busy("127.0.0.1", 8611) is True
+
+
+def test_port_busy_does_not_mistake_time_wait_for_a_listener():
+    """A finished connection leaves TIME_WAIT behind, but no listener — so a connect is refused and
+    the port is correctly free. Reading TIME_WAIT as held would block a legitimate restart."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+    client = socket.create_connection(("127.0.0.1", port))
+    conn, _ = srv.accept()
+    client.close()
+    conn.close()
+    srv.close()
+    assert lo._port_busy("127.0.0.1", port) is False
 
 
 # =============================== the normal path is untouched ===============================

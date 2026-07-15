@@ -162,13 +162,22 @@ def _port_busy(host, port):
       no socket; refusing to start over one strands the owner with no dashboard at all.
 
     The kernel's listen socket has neither confusion: a wedged server still accepts, a zombie does
-    not. The port is the contended resource, so the port is what we ask about. On loopback a connect
-    either completes or is refused at once, so this stays instant."""
+    not. The port is the contended resource, so the port is what we ask about.
+
+    Only an outright REFUSAL counts as free. On loopback a connect to an unbound port is refused
+    instantly — there is nothing to wait for — so a timeout does not mean "empty", it means something
+    is bound and not getting to us (a full accept backlog, a thoroughly wedged process). Reading that
+    as free is how you spawn a second dashboard onto a taken port. Everything that is not a clean
+    refusal is therefore treated as held: the cost of being wrong that way is one honest message
+    asking the owner to look, and the cost of being wrong the other way is the silent double start
+    this flag exists to prevent."""
     try:
         with socket.create_connection((host, port), timeout=1.0):
             return True
-    except OSError:      # refused / unreachable / timed out ⇒ nothing is holding it
-        return False
+    except ConnectionRefusedError:
+        return False     # the kernel says nothing is listening — the only proof of "free"
+    except OSError:
+        return True      # timeout / anything unclear ⇒ assume held, never double-start on a guess
 
 
 def _stop_process(pid):
