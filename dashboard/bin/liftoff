@@ -16,13 +16,24 @@ Two boundaries (see lib/liftoff.py):
     double-starts either; each side's own guard (the dashboard's bind-failed exit, issue #34; the
     runner's pidfile singleton) is the backstop, so even a racing probe is safe.
 
+``--restart-dashboard`` (issue #136) is the one exception to "verify, leave alone": it stops the
+running dashboard and starts it again on the CURRENT build. A server keeps the Python it loaded at
+boot while serving static files from disk every request, so a merge to the dashboard's own face lands
+new buttons in a running dashboard's browser that its router never learned — and the idempotent path
+above can never heal that, because leaving an up dashboard alone is precisely its contract. The
+remedy lives here, in a command read fresh from disk, rather than in a dashboard button: a stale
+server is stale BECAUSE it lacks the newly merged routes, so a restart endpoint would 404 on exactly
+the servers that need it. Dashboard-only — it never touches the runner and never claims the tab.
+
 Run:  bin/liftoff [config.json] [--repo <slug|name|path>]   (default config: ./config.json, or $CC_CONFIG)
       With one watched repo, --repo is optional. With several, name which runner to start.
+      bin/liftoff --restart-dashboard   (restart a STALE TOWER on the current build, then exit)
 """
 import errno
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -137,6 +148,29 @@ def _dashboard_up(host, port):
     return _dashboard_snapshot(host, port) is not None
 
 
+def _port_busy(host, port):
+    """Is ANYTHING accepting TCP on ``host:port``? A raw connect — no HTTP, no shape check, no
+    opinion about what is listening (issue #136).
+
+    This is the question that actually governs a restart, and the two richer probes each answer it
+    wrongly in one direction:
+
+    * ``_dashboard_snapshot`` says "no" for a timeout or a truncated body — i.e. for a dashboard that
+      is WEDGED BUT ALIVE and still holding the port. Start a replacement on that "no" and it dies at
+      bind while the stale server keeps answering.
+    * ``os.kill(pid, 0)`` says "yes" for a process that has exited but not been reaped. A zombie holds
+      no socket; refusing to start over one strands the owner with no dashboard at all.
+
+    The kernel's listen socket has neither confusion: a wedged server still accepts, a zombie does
+    not. The port is the contended resource, so the port is what we ask about. On loopback a connect
+    either completes or is refused at once, so this stays instant."""
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:      # refused / unreachable / timed out ⇒ nothing is holding it
+        return False
+
+
 def _stop_process(pid):
     """Ask the dashboard to stop: SIGTERM to EXACTLY the pid it reported for itself (never a name or
     pattern — ``pkill -f bin/command-center`` also matches William's own live dashboard, and did kill
@@ -188,21 +222,23 @@ def _exec_runner(argv):
 
 
 def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, stop_process,
-                       spawn_dashboard, sleep, pid_alive):
+                       spawn_dashboard, sleep, port_busy):
     """``--restart-dashboard`` (issue #136): stop the running dashboard and start it again on the
     current build. Dashboard only — the runner is never touched and this tab is never claimed.
 
-    The never-double-start guarantee is kept the only way it can be: the replacement is spawned ONLY
-    once the old PROCESS is confirmed dead — ``os.kill(pid, 0)``, the authoritative answer, not the
-    snapshot probe going quiet. The probe is emphatically NOT proof of death: it returns "no" for a
-    timeout, a transient 500, a truncated body — every symptom of a dashboard that is *hung but very
-    much alive and still holding the port*. Treating that as "it's gone" would spawn a replacement
-    beside it that dies at bind, leaving the stale server answering while liftoff reported success:
-    the exact failure this flag exists to fix, now with a cheerful message on top. A process we could
-    not kill gets no second dashboard started next to it.
+    The never-double-start guarantee rests on ONE question, asked of the kernel: **is the port still
+    taken?** Nothing is spawned until it is free. Two dashboards cannot share a port — one dies at
+    bind, and the owner cannot tell which one is answering them — so "free" is the whole precondition,
+    and every softer proxy for it gets this wrong somewhere (see :func:`_port_busy`).
+
+    A silent port is not the same as an empty one, either: the snapshot probe answers ``None`` for a
+    wedged-but-alive server that never let go of the socket, so "nothing is serving" has to mean the
+    kernel refused the connection, not merely that nobody said hello.
     """
-    decision = liftoff_mod.dashboard_restart_decision(url, dashboard_snapshot(server.BIND_HOST,
-                                                                              cfg["port"]))
+    port = cfg["port"]
+    decision = liftoff_mod.dashboard_restart_decision(
+        url, dashboard_snapshot(server.BIND_HOST, port),
+        port_busy=port_busy(server.BIND_HOST, port))
     out.write("liftoff: %s\n" % decision["message"])
     if decision["action"] == "refuse":
         return EXIT_LAUNCH_FAILED
@@ -217,16 +253,17 @@ def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, stop_p
                       % (pid, e))
             return EXIT_LAUNCH_FAILED
         deadline = time.monotonic() + _STOP_TIMEOUT
-        while pid_alive(pid):
+        while port_busy(server.BIND_HOST, port):
             if time.monotonic() >= deadline:
                 out.write(
-                    "liftoff: the dashboard (pid %d) is still alive %ds after being asked to stop — "
-                    "starting nothing.\n"
-                    "  Two dashboards cannot share port %d. Stop it by hand (kill -9 %d), then run: "
-                    "liftoff --restart-dashboard\n" % (pid, int(_STOP_TIMEOUT), cfg["port"], pid))
+                    "liftoff: port %d is still held %ds after the dashboard (pid %d) was asked to "
+                    "stop — starting nothing.\n"
+                    "  Two dashboards cannot share a port. Stop it by hand (kill -9 %d), then run: "
+                    "liftoff --restart-dashboard\n" % (port, int(_STOP_TIMEOUT), pid, pid))
                 return EXIT_LAUNCH_FAILED
             sleep(_STOP_POLL)
-        out.write("liftoff: the old dashboard (pid %d) has stopped\n" % pid)
+        out.write("liftoff: the old dashboard (pid %d) has stopped and released port %d\n"
+                  % (pid, port))
 
     log_path = os.path.join(_state_base(), "command-center.log")
     try:
@@ -243,7 +280,7 @@ def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, stop_p
 def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pid,
          spawn_dashboard=_spawn_dashboard, exec_runner=_exec_runner, out=None,
          dashboard_snapshot=_dashboard_snapshot, stop_process=_stop_process, sleep=time.sleep,
-         pid_alive=_pid_alive):
+         port_busy=_port_busy):
     out = out if out is not None else sys.stderr
     try:
         config_path, repo_arg, restart_dashboard = _parse_args(argv)
@@ -284,7 +321,7 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
         return _restart_dashboard(cfg, config_path,
                                   "http://%s:%d" % (server.BIND_HOST, cfg["port"]), out,
                                   dashboard_snapshot=dashboard_snapshot, stop_process=stop_process,
-                                  spawn_dashboard=spawn_dashboard, sleep=sleep, pid_alive=pid_alive)
+                                  spawn_dashboard=spawn_dashboard, sleep=sleep, port_busy=port_busy)
 
     try:
         repo = liftoff_mod.resolve_repo(cfg, repo_arg)

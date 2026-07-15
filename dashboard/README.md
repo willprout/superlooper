@@ -130,6 +130,7 @@ is the anchor.)
 bin/liftoff                        # from the dashboard directory: reads ./config.json
 bin/liftoff --repo owner/name      # several watched repos: name whose runner to start
 bin/liftoff /path/to/config.json   # from anywhere: name the config (or set CC_CONFIG)
+bin/liftoff --restart-dashboard    # the dashboard says STALE TOWER: restart it on the current build
 ```
 
 - **Where it finds the config.** With no path argument, `liftoff` reads `./config.json` **relative
@@ -140,6 +141,18 @@ bin/liftoff /path/to/config.json   # from anywhere: name the config (or set CC_C
 - **Idempotent — a second run double-starts neither.** It checks the dashboard's `port` (already
   serving ⇒ left alone) and the runner's pidfile (a live runner ⇒ left alone), then starts only
   what's missing. So `liftoff` is equally *"bring the pair up"* and *"confirm the pair is up."*
+- **`--restart-dashboard` — when the dashboard posts a STALE TOWER notice.** A running server keeps
+  the Python it loaded at boot, but it serves the static files from disk on every request. So when
+  the loop merges an improvement to the dashboard's own face while your dashboard is up, your next
+  reload shows the new buttons and its router has never heard of them — the tap comes back as a
+  refusal. The server notices this itself and posts one amber NOTAM naming this command; the routine
+  `liftoff` above can't help, because "already serving ⇒ left alone" is exactly its contract.
+  This flag stops the running dashboard and starts it again on the current build, and it is
+  **dashboard-only** — it never touches the runner and never claims the tab, so run it from wherever
+  you happen to be. Nothing restarts on its own: the notice waits for you.
+  It stops **exactly** the pid the dashboard reports for itself (never a name or pattern), and
+  starts the replacement only once that process is confirmed gone — if it can't stop the old one, it
+  starts nothing and tells you, rather than leaving two dashboards fighting over one port.
 - **The runner start rides the config contract.** `liftoff` shells the engine's own documented
   `superlooper run` through the config's **`superlooper_cli`** — the dashboard names the engine's
   CLI, the engine never names the dashboard. Nothing engine-specific is hardcoded here.

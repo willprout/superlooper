@@ -138,7 +138,7 @@ def runner_lock_pid(state_home):
         return None
 
 
-def dashboard_restart_decision(url, snapshot):
+def dashboard_restart_decision(url, snapshot, port_busy=False):
     """The pure decision behind ``liftoff --restart-dashboard`` (issue #136): what to do about a
     dashboard that is running an older build than the checkout on disk.
 
@@ -150,9 +150,11 @@ def dashboard_restart_decision(url, snapshot):
     that need it.
 
     ``snapshot`` is the live dashboard's ``/api/snapshot`` (already probed and shape-verified by the
-    composition root) or ``None`` if nothing of ours is serving. Returns ``{action, pid, message}``:
+    composition root) or ``None`` if nothing of ours ANSWERED. ``port_busy`` is the kernel's separate,
+    dumber answer to "is anything accepting TCP on that port": the two together are what let a silent
+    port be told apart from an empty one. Returns ``{action, pid, message}``:
 
-    * ``start`` — nothing is serving; just bring one up.
+    * ``start`` — the port is free and nothing is serving; just bring one up.
     * ``stop-then-start`` — stop ``pid``, wait for it to actually go, then start fresh. The pid is
       trusted ONLY when the responder also carries the ``product`` marker naming itself a
       command-center. A pid is just a number anything could print, and the snapshot's general shape
@@ -170,6 +172,19 @@ def dashboard_restart_decision(url, snapshot):
     repair the machine talks itself into. The message just says so.
     """
     if snapshot is None:
+        if port_busy:
+            # Silent is not empty. The snapshot probe answers None for a timeout or a truncated body
+            # — exactly how a WEDGED BUT ALIVE dashboard looks, still holding the socket. Spawning
+            # over that gives the owner a replacement that dies at bind while the stale server keeps
+            # answering, and a liftoff that cheerfully reported success. We cannot identify it (it
+            # never told us its pid), so we cannot stop it, so we start nothing.
+            return {"action": "refuse", "pid": None,
+                    "message": ("something is holding %s but will not answer as a command-center — "
+                                "it may be a wedged dashboard, or another app on that port. liftoff "
+                                "cannot identify it, so it will not signal it and will not start a "
+                                "second dashboard beside it.\n"
+                                "  Stop it by hand (Ctrl-C in the tab running it, or close that "
+                                "tab), then run: liftoff --restart-dashboard" % url)}
         return {"action": "start", "pid": None,
                 "message": "nothing is serving at %s — starting a fresh dashboard" % url}
     version = (snapshot.get("version") or {}) if isinstance(snapshot, dict) else {}

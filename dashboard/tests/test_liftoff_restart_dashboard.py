@@ -62,10 +62,25 @@ def _snap(pid=4242, skew=True, product="command-center"):
 
 # =============================== the pure decision ===============================
 
-def test_nothing_serving_just_starts():
-    d = liftoff_mod.dashboard_restart_decision(URL, None)
+def test_nothing_serving_and_a_free_port_just_starts():
+    d = liftoff_mod.dashboard_restart_decision(URL, None, port_busy=False)
     assert d["action"] == "start"
     assert d["pid"] is None
+
+
+def test_a_silent_port_that_is_still_HELD_is_refused_not_treated_as_empty():
+    """Round 2's P0 (issue #136): silent is not empty.
+
+    A dashboard wedged before the first probe answers nothing yet still holds the socket. If that
+    read as "nothing serving", liftoff would spawn a replacement that dies at bind, leave the stale
+    server answering, and return 0 — the exact failure this flag exists to fix, wearing a success
+    message. We cannot identify it (it never told us its pid), so we cannot stop it, so we start
+    nothing.
+    """
+    d = liftoff_mod.dashboard_restart_decision(URL, None, port_busy=True)
+    assert d["action"] == "refuse"
+    assert d["pid"] is None, "never signal something that never identified itself"
+    assert "Ctrl-C" in d["message"]
 
 
 def test_a_live_dashboard_is_stopped_then_started():
@@ -161,20 +176,21 @@ class _Probe:
         return self._snaps[min(self.calls - 1, len(self._snaps) - 1)]
 
 
-class _Life:
-    """Process liveness, staged: alive for the first ``alive_for`` checks, then dead. ``alive_for=None``
-    means it never dies (the hung-dashboard case)."""
+class _Port:
+    """The kernel's answer to "is anything accepting on that port", staged: held for the first
+    ``held_for`` checks, then free. ``held_for=None`` means it is never released (the wedged
+    dashboard); ``held_for=0`` means free from the start (nothing there)."""
 
-    def __init__(self, alive_for=0):
-        self._n = alive_for
+    def __init__(self, held_for=0):
+        self._n = held_for
         self.calls = 0
 
-    def __call__(self, pid):
+    def __call__(self, host, port):
         self.calls += 1
         return True if self._n is None else self.calls <= self._n
 
 
-def _run(cfg_path, *, probe, stop=None, spawn=None, execr=None, sleep=None, alive=None):
+def _run(cfg_path, *, probe, stop=None, spawn=None, execr=None, sleep=None, port=None):
     spawn = spawn if spawn is not None else _Recorder()
     execr = execr if execr is not None else _Recorder()
     stop = stop if stop is not None else _Recorder()
@@ -182,7 +198,8 @@ def _run(cfg_path, *, probe, stop=None, spawn=None, execr=None, sleep=None, aliv
     rc = lo.main([str(_BIN), str(cfg_path), "--restart-dashboard"],
                  dashboard_snapshot=probe, stop_process=stop,
                  spawn_dashboard=spawn, exec_runner=execr,
-                 pid_alive=(alive if alive is not None else _Life(alive_for=0)),
+                 # held for the opening decision probe, released once stopped — the normal case
+                 port_busy=(port if port is not None else _Port(held_for=1)),
                  sleep=(sleep if sleep is not None else _Recorder()), out=out)
     return rc, out.getvalue(), stop, spawn, execr
 
@@ -196,33 +213,47 @@ def test_restart_stops_exactly_the_reported_pid_then_starts_a_fresh_one(cfg):
     assert execr.calls == [], "--restart-dashboard must never touch the runner"
 
 
-def test_restart_never_double_starts_when_the_old_one_will_not_die(cfg):
-    """The whole point of the guarantee: if the old process survives, spawning a second one gives two
-    dashboards racing for one port. Start nothing, say so."""
+def test_restart_never_double_starts_when_the_port_is_never_released(cfg):
+    """The whole point of the guarantee: if the old server keeps the socket, spawning a second one
+    gives two dashboards racing for one port. Start nothing, say so."""
     rc, text, stop, spawn, execr = _run(cfg, probe=_Probe([_snap(pid=4242)]),
-                                        alive=_Life(alive_for=None))   # never dies
+                                        port=_Port(held_for=None))   # never released
     assert rc == lo.EXIT_LAUNCH_FAILED
-    assert spawn.calls == [], "must NOT start a second dashboard while the old one is still alive"
-    assert "still alive" in text
+    assert spawn.calls == [], "must NOT start a second dashboard while the port is still held"
+    assert "still held" in text
     assert "4242" in text, "the owner needs the pid to finish the job by hand"
 
 
 def test_a_hung_dashboard_that_stops_answering_is_not_mistaken_for_a_dead_one(cfg):
-    """The P0 the fresh review caught (issue #136).
+    """Round 1's P0 (issue #136): the snapshot probe going quiet is not death.
 
-    The snapshot probe returns None for a timeout, a transient 500, a truncated body — every symptom
-    of a dashboard that is HUNG BUT ALIVE and still holding the port. If probe-silence counted as
-    death, liftoff would spawn a replacement beside it; the new process would die at bind, the stale
-    server would keep answering, and liftoff would report success. Death is decided by the PROCESS,
-    never by the port going quiet.
+    It answers None for a timeout or a truncated body — every symptom of a dashboard HUNG BUT ALIVE
+    and still holding the port. If probe-silence counted as gone, liftoff would spawn a replacement,
+    the new process would die at bind, the stale server would keep answering, and liftoff would
+    report success. The kernel's listen socket is the arbiter, not the HTTP handler.
     """
-    probe = _Probe([_snap(pid=4242), None])          # stops answering immediately after the stop…
-    rc, text, stop, spawn, execr = _run(cfg, probe=probe, alive=_Life(alive_for=None))  # …but lives
+    probe = _Probe([_snap(pid=4242), None])           # stops answering right after the stop…
+    rc, text, stop, spawn, execr = _run(cfg, probe=probe, port=_Port(held_for=None))  # …still holds
     assert rc == lo.EXIT_LAUNCH_FAILED
     assert spawn.calls == [], (
         "a silent-but-alive dashboard still holds the port — starting a second one is the double "
         "start this flag exists to avoid")
-    assert "still alive" in text
+    assert "still held" in text
+
+
+def test_a_dashboard_that_exits_without_being_reaped_does_not_block_the_restart(cfg):
+    """Round 2's P1 (issue #136): a zombie holds no socket.
+
+    The old dashboard was spawned by a previous liftoff, whose process then became the runner via
+    exec. If that parent never reaps it, ``os.kill(pid, 0)`` keeps reporting the exited process as
+    alive — so gating the restart on process liveness would refuse to start, and strand the owner
+    with NO dashboard at all, over a process that had already released the port. Asking the port
+    instead is right in both directions.
+    """
+    probe = _Probe([_snap(pid=4242), None])
+    rc, text, stop, spawn, execr = _run(cfg, probe=probe, port=_Port(held_for=1))  # freed after stop
+    assert rc == 0
+    assert len(spawn.calls) == 1, "the port is free — a zombie must not block the replacement"
 
 
 def test_a_dashboard_we_could_not_signal_never_gets_a_replacement_beside_it(cfg):
@@ -236,10 +267,19 @@ def test_a_dashboard_we_could_not_signal_never_gets_a_replacement_beside_it(cfg)
 
 
 def test_restart_with_nothing_serving_just_starts_one(cfg):
-    rc, text, stop, spawn, execr = _run(cfg, probe=_Probe([None]))
+    rc, text, stop, spawn, execr = _run(cfg, probe=_Probe([None]), port=_Port(held_for=0))
     assert rc == 0
     assert stop.calls == [], "nothing to stop — never signal a pid we never saw"
     assert len(spawn.calls) == 1
+
+
+def test_restart_refuses_a_port_held_by_something_that_never_answers(cfg):
+    """Wedged from the very first probe: never answered, never released. Nothing to identify, so
+    nothing to signal — and nothing started beside it."""
+    rc, text, stop, spawn, execr = _run(cfg, probe=_Probe([None]), port=_Port(held_for=None))
+    assert rc == lo.EXIT_LAUNCH_FAILED
+    assert stop.calls == [], "never signal a process we could not identify"
+    assert spawn.calls == [], "never start a second dashboard on a port that is still held"
 
 
 def test_restart_refuses_a_dashboard_that_reports_no_pid(cfg):
