@@ -535,6 +535,19 @@ def test_launch_env_uses_per_issue_model_override(rig):
     assert env["SL_EFFORT"] == ""                      # no effort label -> nothing sent
 
 
+def test_launch_env_uses_per_issue_sonnet_model_override(rig):
+    # issue #134: model:sonnet is a first-class seeded knob, so the label an owner drops must
+    # reach the worker's SL_MODEL exactly like the other model:* values (no allowlist, no mapping).
+    rig.r.tick(now=NOW)
+    _relabel_parsed(rig, "i101", ["model:sonnet"])
+    rig.calls.clear()
+    out = rig.r._execute(_launch_action(), NOW)
+    assert out == "ok"
+    env = rig.calls[-1]["env"]
+    assert env["SL_MODEL"] == "sonnet"                 # per-issue label, not config's "opus"
+    assert env["SL_EFFORT"] == ""
+
+
 def test_launch_env_carries_explicit_codex_agent_without_changing_protocol(rig):
     # Runner-level selection only: the same launch action / labels / issue selection path is used,
     # but Codex defaults to its own model unless an explicit label/env override is present.

@@ -97,6 +97,7 @@ LABELS = [
     ("model:opus", "0366d6", "per-issue worker model: latest Opus (~200K context)"),
     ("model:opus[1m]", "0366d6", "per-issue worker model: latest Opus + 1M context"),
     ("model:fable", "0366d6", "per-issue worker model: Fable"),
+    ("model:sonnet", "0366d6", "per-issue worker model: latest Sonnet"),
     ("effort:low", "8256d0", "per-issue worker effort: low"),
     ("effort:medium", "8256d0", "per-issue worker effort: medium"),
     ("effort:high", "8256d0", "per-issue worker effort: high"),
