@@ -15,8 +15,11 @@ test notification through the configured `notify` channel to prove it can actual
 the `notify channel` block below). It does not install, repair, source, log in, write config,
 create tabs, or spend model calls. It prints one status line per machine block and exits nonzero
 only when a block **FAILs**. A block may also be a **WARN** — an advisory that does not fail the
-stack, used for a tool that is only conditionally needed on this machine (a missing Codex CLI on a
-Claude-only machine is the standing example; see `codex CLI` below).
+stack. A WARN is used for something that is only conditionally needed on this machine (a missing
+Codex CLI on a Claude-only machine; see `codex CLI` below), for something that costs session
+*quality* rather than correctness (a missing `superlooper plugin`), and for a state the doctor
+could not actually read (it never fails the stack on a fact it could not determine). A WARN carries
+its whole story on its own line — only a FAIL prints a separate `Fix:` line.
 
 ## Tier 1: Loop User
 
@@ -41,6 +44,13 @@ A loop user needs enough local stack for a worker session to launch, work, repor
   operation, so a configured-cmux-only setup still FAILs.
 - `launch shim sourced` - `~/.superlooper/launch-shim.zsh` must be installed and sourced from
   `.zshrc`, so new cmux tabs self-run the dropped worker command without keystrokes.
+- `superlooper plugin` - the `superlooper@superlooper` plugin should be installed and enabled, so
+  planning and worker sessions on this machine load the superlooper ops, write-issue and debugger
+  skills. This is a **WARN**, never a FAIL: the runner does not depend on the skills being
+  installed — every brief it writes is self-contained, so a machine without the plugin still runs
+  the loop correctly, just with less capable sessions. The doctor reads the state from
+  `claude plugin list --json` (the documented CLI); if it cannot read it, it says so and still
+  passes.
 
 Run:
 
@@ -93,3 +103,8 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   is signed in, the recipient is valid, and the one-time macOS permission click is granted.
 - `launch shim sourced`: run `skills/superlooper/skill/bin/install-launch-shim.sh`, then open a new
   cmux tab or source `.zshrc`.
+- `superlooper plugin`: install it with `claude plugin marketplace add willprout/superlooper` then
+  `claude plugin install superlooper@superlooper --scope user`; if it is installed but disabled, run
+  `claude plugin enable superlooper@superlooper`. Always a WARN — the loop runs correctly without
+  it, so it never fails the stack. Override the checked plugin id with `SL_PLUGIN_ID` (for a fork or
+  a differently-named marketplace).

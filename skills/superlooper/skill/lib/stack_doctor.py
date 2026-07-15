@@ -642,6 +642,100 @@ def check_engine_drift(probe, repo_path=None, dev_branch="main"):
     return CheckResult(name, True, d["detail"])           # in_sync / skipped -> a plain ok line
 
 
+# --- superlooper plugin presence (issue #90) ---------------------------------------------------
+# After the plugin restructure (design D10), the loop's SKILL CONTENT ships as a plugin, not inside
+# the gated engine payload. A machine without it silently loses the ops / write-issue / debugger
+# skills in planning and worker sessions — nothing errors, the sessions are just dumber. This block
+# makes that absence visible.
+_PLUGIN_ID = "superlooper@superlooper"
+_PLUGIN_INSTALL = (
+    "install it with `claude plugin marketplace add willprout/superlooper` then "
+    "`claude plugin install superlooper@superlooper --scope user`"
+)
+
+
+def _plugin_rows(probe, claude):
+    """(rows, problem) from `claude plugin list --json` — the DOCUMENTED CLI surface for plugin
+    state (plugins reference → `plugin list`), which reports install AND enable state in one call.
+
+    We deliberately do NOT read ~/.claude/plugins/installed_plugins.json: that file appears nowhere
+    in the official plugin docs, so its shape is an internal detail that could change under us and
+    turn this block into a confident liar. The CLI's --json *schema* is itself only half-documented
+    (the flag is documented, the output shape is not), so every unexpected shape degrades to a
+    `problem` string — an honest "could not determine" — rather than a fabricated verdict.
+
+    Returns (list_of_rows, None) on a clean read, or (None, problem) when the state is unreadable."""
+    proc = probe.run([claude, "plugin", "list", "--json"], timeout=10)
+    if getattr(proc, "returncode", 1) != 0:
+        return None, "`claude plugin list --json` exited %s: %s" % (
+            getattr(proc, "returncode", "?"), _out(proc) or "no output")
+    try:
+        data = json.loads(getattr(proc, "stdout", "") or "")
+    except (TypeError, ValueError):
+        return None, "`claude plugin list --json` did not return parseable JSON"
+    if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+        return None, ("`claude plugin list --json` returned an unexpected shape (%s) — the CLI's "
+                      "JSON schema is not documented and may have changed" % type(data).__name__)
+    return data, None
+
+
+def check_superlooper_plugin(probe):
+    """doctor --stack's superlooper-plugin presence line. WARN-only, NEVER a FAIL: the runner does
+    not depend on the skills being installed (every brief the runner writes is self-contained), so a
+    missing plugin must not block an otherwise-healthy stack from passing — it costs session quality,
+    not correctness. An undeterminable state (no `claude` CLI, a nonzero list, an unexpected JSON
+    shape) also WARNs; we never assert an absence we could not actually read.
+
+    The whole story rides in `detail` because format_results prints `fix` only for a FAIL — a WARN
+    that named a problem with no cure would be worse than silence."""
+    name = "superlooper plugin"
+    env = getattr(probe, "env", {}) or {}
+    plugin_id = env.get("SL_PLUGIN_ID") or _PLUGIN_ID
+
+    claude = probe.command("claude", envvar="SL_CLAUDE")
+    if not claude:
+        return CheckResult(
+            name, True,
+            "no `claude` CLI found to read plugin state — cannot tell whether %s is installed. The "
+            "claude login block above names the real problem; fix that first." % plugin_id,
+            warn=True)
+
+    rows, problem = _plugin_rows(probe, claude)
+    if problem:
+        return CheckResult(
+            name, True,
+            "%s — cannot tell whether %s is installed this run. Check by hand with `claude plugin "
+            "list`." % (problem, plugin_id),
+            warn=True)
+
+    row = next((r for r in rows if r.get("id") == plugin_id), None)
+    if row is None:
+        return CheckResult(
+            name, True,
+            "%s is not installed — planning and worker sessions on this machine lose the "
+            "superlooper ops, write-issue and debugger skills (they still RUN: briefs are "
+            "self-contained, so this never fails the stack). To fix, %s."
+            % (plugin_id, _PLUGIN_INSTALL),
+            warn=True)
+
+    scope = row.get("scope")
+    where = " at %s scope" % scope if _nonempty_string(scope) else ""
+    if row.get("enabled") is True:
+        version = row.get("version")
+        stamp = " v%s" % version if _nonempty_string(version) else ""
+        return CheckResult(name, True, "%s installed and enabled%s%s" % (plugin_id, where, stamp))
+
+    # Installed but not enabled — the same silent skill loss as absence, but a different cure:
+    # re-installing would not help, enabling would.
+    return CheckResult(
+        name, True,
+        "%s is installed%s but DISABLED — its skills do not load, so planning and worker sessions "
+        "lose the superlooper ops, write-issue and debugger skills (they still RUN: briefs are "
+        "self-contained, so this never fails the stack). To fix, run `claude plugin enable %s`."
+        % (plugin_id, where, plugin_id),
+        warn=True)
+
+
 def check_stack(config, config_error=None, probe=None, sender=None, announce=None, repo_path=None):
     probe = probe or Probe()
     cfg = config if isinstance(config, dict) else {}
@@ -658,6 +752,7 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_cmux_app_nap(probe),
         check_runner_anchor(probe, config),
         check_engine_drift(probe, repo_path=repo_path, dev_branch=dev),
+        check_superlooper_plugin(probe),
     ]
 
 

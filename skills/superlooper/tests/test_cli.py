@@ -315,11 +315,20 @@ def _stack_env(rig, *, gh_remaining=4999):
         "fi\n"
         "exit 64\n",
     )
+    # The `claude` stub must answer `plugin list --json` too (issue #90): the stack doctor asks it
+    # whether the superlooper plugin is installed, and cmd_stack_doctor builds a REAL Probe. Without
+    # this arm the stub exits 64, the block degrades to its "could not determine" WARN, and the CLI
+    # test would never exercise the real PASS path. Report the plugin installed+enabled, shaped as
+    # the real CLI emits it, so the healthy stack is genuinely green everywhere.
     claude = _write_exe(
         bindir / "claude",
         "#!/bin/sh\n"
         "if [ \"$1\" = auth ] && [ \"$2\" = status ] && [ \"$3\" = --json ]; then\n"
         "  printf '%s\\n' '{\"loggedIn\": true, \"authMethod\": \"claude.ai\"}'; exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = plugin ] && [ \"$2\" = list ] && [ \"$3\" = --json ]; then\n"
+        "  printf '%s\\n' '[{\"id\": \"superlooper@superlooper\", \"version\": \"1.0.0\","
+        " \"scope\": \"user\", \"enabled\": true}]'; exit 0\n"
         "fi\n"
         "exit 64\n",
     )
@@ -364,8 +373,10 @@ def test_doctor_stack_ok_uses_fake_commands_and_mutates_nothing(rig):
     out = r.stdout
     for name in ("codex CLI", "cmux present", "claude login", "gh auth",
                  "gh API headroom", "notify channel", "launch shim sourced",
-                 "cmux App Nap disabled"):
+                 "cmux App Nap disabled", "superlooper plugin"):
         assert name in out
+    # the plugin block resolved to a real ok (not its "could not determine" WARN) through the stub
+    assert "ok   superlooper plugin" in out
     assert "required_checks" not in out
     # the one deliberate side effect is announced before it fires
     assert "sending" in out.lower() and "test" in out.lower()
