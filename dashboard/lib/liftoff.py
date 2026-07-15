@@ -138,6 +138,72 @@ def runner_lock_pid(state_home):
         return None
 
 
+def dashboard_restart_decision(url, snapshot, port_busy=False):
+    """The pure decision behind ``liftoff --restart-dashboard`` (issue #136): what to do about a
+    dashboard that is running an older build than the checkout on disk.
+
+    This flag exists because liftoff's normal path is idempotent BY CONTRACT — it verifies an
+    already-serving dashboard and leaves it alone — which is right for starting and useless for
+    healing: a routine liftoff never clears the skew. And the remedy has to live here, in a command
+    read fresh from disk, rather than in a dashboard button: a stale server is stale precisely
+    because it lacks the newly merged routes, so a restart ENDPOINT would 404 on exactly the servers
+    that need it.
+
+    ``snapshot`` is the live dashboard's ``/api/snapshot`` (already probed and shape-verified by the
+    composition root) or ``None`` if nothing of ours ANSWERED. ``port_busy`` is the kernel's separate,
+    dumber answer to "is anything accepting TCP on that port": the two together are what let a silent
+    port be told apart from an empty one. Returns ``{action, pid, message}``:
+
+    * ``start`` — the port is free and nothing is serving; just bring one up.
+    * ``stop-then-start`` — stop ``pid``, wait for it to actually go, then start fresh. The pid is
+      trusted ONLY when the responder also carries the ``product`` marker naming itself a
+      command-center. A pid is just a number anything could print, and the snapshot's general shape
+      (``generated_at`` + ``repos``) is a resemblance, not a proof — without the explicit claim, any
+      localhost responder could aim a SIGTERM at a process of its choosing. A signal is the one
+      irreversible thing done to another process here, and it has bitten this project before: a
+      pattern kill (``pkill -f``) collateral-killed William's live dashboard (2026-07-07), and the
+      port-holder is no safer — ``_dashboard_up``'s own contract admits an unrelated app can squat
+      the port.
+    * ``refuse`` — something is serving but will not identify itself as a command-center with a pid
+      (a server predating this issue, or a stranger on the port). Guessing a kill target is exactly
+      the failure above, so liftoff stops and tells the owner how to finish by hand.
+
+    A dashboard that is already current still restarts: the flag is the owner's explicit act, not a
+    repair the machine talks itself into. The message just says so.
+    """
+    if snapshot is None:
+        if port_busy:
+            # Silent is not empty. The snapshot probe answers None for a timeout or a truncated body
+            # — exactly how a WEDGED BUT ALIVE dashboard looks, still holding the socket. Spawning
+            # over that gives the owner a replacement that dies at bind while the stale server keeps
+            # answering, and a liftoff that cheerfully reported success. We cannot identify it (it
+            # never told us its pid), so we cannot stop it, so we start nothing.
+            return {"action": "refuse", "pid": None,
+                    "message": ("something is holding %s but will not answer as a command-center — "
+                                "it may be a wedged dashboard, or another app on that port. liftoff "
+                                "cannot identify it, so it will not signal it and will not start a "
+                                "second dashboard beside it.\n"
+                                "  Stop it by hand (Ctrl-C in the tab running it, or close that "
+                                "tab), then run: liftoff --restart-dashboard" % url)}
+        return {"action": "start", "pid": None,
+                "message": "nothing is serving at %s — starting a fresh dashboard" % url}
+    version = (snapshot.get("version") or {}) if isinstance(snapshot, dict) else {}
+    pid = version.get("pid")
+    # bool is an int in Python — screen it out explicitly, or `True` reads as pid 1.
+    identified = (version.get("product") == "command-center"
+                  and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0)
+    if not identified:
+        return {"action": "refuse", "pid": None,
+                "message": ("something is serving at %s but does not identify itself as a "
+                            "command-center with a pid — either it predates --restart-dashboard or "
+                            "it is not ours. liftoff will not guess which process to signal.\n"
+                            "  Stop it by hand (Ctrl-C in the tab running it, or close that tab), "
+                            "then run: liftoff --restart-dashboard" % url)}
+    was = "stale" if version.get("skew") else "already current"
+    return {"action": "stop-then-start", "pid": pid,
+            "message": "restarting the dashboard at %s (pid %d — its build is %s)" % (url, pid, was)}
+
+
 def make_plan(repo, url, dashboard_argv_, runner_argv_, *, dashboard_up, runner_pid):
     """The idempotent plan: what to start, what to leave, and the plain line to print for each.
 

@@ -115,7 +115,7 @@
       .then(function (res) {
         if (myGen !== gen || !isOpen()) return;    // superseded / closed → ignore this stale reply
         var b = res.body || {};
-        if (res.status !== 200 || !b.ok) { renderError(b.error, false, repo); return; }
+        if (res.status !== 200 || !b.ok) { renderError(b.error, false, repo, b.skew); return; }
         listedRepo = repo;                         // THIS repo's proposals are the ones now on screen
         selected = {};                             // a fresh listing selects nothing
         renderProposals(b.groups || [], b.held || []);
@@ -139,7 +139,7 @@
         busy = false;
         if (myGen !== gen || !isOpen()) return;    // a re-open superseded this / dialog closed
         var b = res.body || {};
-        if (res.status !== 200 || !b.ok) { renderError(b.error, true, repo); return; }
+        if (res.status !== 200 || !b.ok) { renderError(b.error, true, repo, b.skew); return; }
         renderResults(b);
       })
       .catch(function () {
@@ -284,10 +284,17 @@
   // A command failure is never a silent success: show the honest error. A failed PROPOSE (nothing
   // ran) offers a Retry that re-lists the same repo under a fresh generation; a failed EXECUTE offers
   // only dismiss (re-running could re-sweep, so the owner reopens deliberately).
-  function renderError(message, wasExecute, repo) {
+  //
+  // `skew` (issue #136) is the server telling us it is running an older build than the code on disk
+  // and has no route for this button — which is exactly how this dialog failed live on 2026-07-14,
+  // the day the loop merged RAMP SWEEP under the owner's day-old dashboard. Then the Retry must go:
+  // it would re-ask the SAME old server the SAME question it has no route for, forever. The server's
+  // message already names the remedy (restart the dashboard), and that is a thing only the owner can
+  // do — so the honest offer here is Close, not a button that cannot work.
+  function renderError(message, wasExecute, repo, skew) {
     var msg = message || (wasExecute ? "the sweep failed — nothing was cleared"
                                      : "couldn’t read the apron");
-    var retry = (!wasExecute && repo)
+    var retry = (!wasExecute && repo && !skew)
       ? '<button class="btn ghost" data-jan-retry="' + esc(repo) + '">Retry</button>' : "";
     setBody(
       '<div class="cc-jan-result err">⚠ ' + esc(msg) + '</div>' +

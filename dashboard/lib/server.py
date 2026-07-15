@@ -40,6 +40,7 @@ import pollers
 import readers
 import replay as replay_mod
 import tower as tower_mod
+import version as version_mod
 
 # The one address this server may ever bind. It writes labels; off-machine reachability is a
 # bright line, so the host is validated against exactly this (decision B.3 / loop contract).
@@ -300,14 +301,44 @@ def _route_janitor(clean, body_bytes, janitor):
     return _json_resp(200, janitor.execute(repo, keys))
 
 
+def _unroutable(clean, version):
+    """The answer to a POST this router has no route for — the dashboard's own publish drift (issue
+    #136).
+
+    ``no such action`` is technically true and practically a lie. On 2026-07-14 the owner's day-old
+    server served the freshly merged RAMP SWEEP button (static assets are read from disk every
+    request) and answered the tap with exactly that string, beside a Retry that could never succeed:
+    it read as "this button is broken" when the truth was "this button is newer than me".
+
+    So when the server KNOWS it is stale, say so and name the remedy — a **409**, not a 404, because
+    the two cases need different reactions and every client should be able to tell them apart
+    mechanically: 409 ⇒ this server is behind the disk, restart it; 404 ⇒ this route never existed,
+    which is a real bug. An unstale server (or one with no ``version`` surface wired) keeps the exact
+    old 404 — laundering a genuine bug into a reassuring "you're just stale" would trade one lie for
+    another.
+
+    Never raises: the stamp walks the filesystem, and no failure to take it may become a 500 on the
+    button path. A bug in our own bookkeeping must degrade to the plain old 404 — the same
+    fail-toward-the-old-behavior posture the snapshot route takes with its provider.
+    """
+    try:
+        stale = version is not None and version.skew()
+    except Exception:                    # a stamp bug must never break a button that would 404 anyway
+        stale = False
+    if not stale:
+        return _json_resp(404, {"ok": False, "error": "no such action"})
+    return _json_resp(409, {"ok": False, "skew": True,
+                            "error": version_mod.stale_action_message(clean)})
+
+
 def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, desk=None, tidy=None,
-                restart=None, janitor=None):
+                restart=None, janitor=None, version=None):
     """The pure POST router. Order is deliberate: cross-origin → 403 (before any parsing, for every
     POST); the Tidy local-command endpoints (need only ``tidy``); the dashboard-local tower-seen
     write (needs only ``desk``); then the gh verbs — writes-disabled → 405; unknown action path →
-    404; body validation → 400; then dispatch → 200 with the action's honest ``{ok, …}`` result (a
-    gh/command failure is a truthful ``ok: false``, not an HTTP error — the request itself was
-    fine)."""
+    404 (or, on a known-stale server, a 409 that explains the skew — issue #136); body validation →
+    400; then dispatch → 200 with the action's honest ``{ok, …}`` result (a gh/command failure is a
+    truthful ``ok: false``, not an HTTP error — the request itself was fine)."""
     if not _is_allowed_origin(origin, host):
         return _json_resp(403, {"ok": False, "error": "cross-origin write refused"})
     if clean in _TIDY_PATHS:
@@ -321,7 +352,7 @@ def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, des
     if actions is None:                  # gh writes not wired → method not allowed (Task 5 contract)
         return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
     if clean not in _ACTION_PATHS:
-        return _json_resp(404, {"ok": False, "error": "no such action"})
+        return _unroutable(clean, version)
 
     payload, err = _parse_json_body(body_bytes)
     if err is not None:
@@ -379,7 +410,7 @@ def _provider_get(provider, params):
 
 def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"", origin=None,
           host=None, desk=None, tidy=None, restart=None, janitor=None, replay_provider=None,
-          digest_provider=None):
+          digest_provider=None, version=None):
     """Map one request to a :class:`Response`, with no socket in sight (unit-testable with an
     injected ``snapshot_provider`` and ``actions``). ``POST`` drives the six mechanical verbs
     (Task 6) plus the dashboard-local tower-seen write (Task 9) via :func:`_route_post`;
@@ -390,11 +421,14 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
     survives. Every other ``GET`` serves a static file (traversal-safe). ``HEAD`` routes like ``GET``
     (the handler omits the body); any other method is a clean 405. ``tidy`` (a ``lib.tidy.Tidy``)
     backs the Tidy local-command endpoints (issue #41) and ``janitor`` (a ``lib.janitor.Janitor``)
-    the Janitor GitHub-sweep endpoints (issue #121); ``None`` leaves that surface off (405)."""
+    the Janitor GitHub-sweep endpoints (issue #121); ``None`` leaves that surface off (405).
+    ``version`` (a ``lib.version.Version``) is the server's own code identity, captured at boot: it
+    turns a bare ``no such action`` into an honest "this server is older than that button" when the
+    checkout has moved on under a running process (issue #136); ``None`` keeps the plain old 404."""
     clean = path.split("?", 1)[0]
     if method == "POST":
         return _route_post(clean, body, origin, host, actions, snapshot_provider, desk, tidy,
-                           restart, janitor)
+                           restart, janitor, version)
     if method not in ("GET", "HEAD"):
         return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
 
@@ -419,7 +453,7 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
 # =============================== the server (loopback only) ===============================
 
 def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=None, restart=None,
-                 janitor=None, replay_provider=None, digest_provider=None):
+                 janitor=None, replay_provider=None, digest_provider=None, version=None):
     """A ``BaseHTTPRequestHandler`` subclass that delegates to :func:`route`. Kept thin: the socket
     machinery lives here (reading the POST body + Origin), every decision lives in the pure router
     above. ``actions`` (an ``lib.actions.Actions``) enables the POST verbs; ``desk`` (a
@@ -467,13 +501,15 @@ def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=N
             self._write(route(self.command, self.path, snapshot_provider, static_root,
                               actions=actions, body=self._read_body(),
                               origin=self.headers.get("Origin"), host=self.headers.get("Host"),
-                              desk=desk, tidy=tidy, restart=restart, janitor=janitor))
+                              desk=desk, tidy=tidy, restart=restart, janitor=janitor,
+                              version=version))
 
     return _Handler
 
 
 def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, actions=None, desk=None,
-                 tidy=None, restart=None, janitor=None, replay_provider=None, digest_provider=None):
+                 tidy=None, restart=None, janitor=None, replay_provider=None, digest_provider=None,
+                 version=None):
     """Construct (do NOT start) the loopback HTTP server. Refuses any non-loopback ``host`` with a
     ``ValueError`` — binding ``0.0.0.0`` or a LAN interface would expose a label-writing (and now
     local-command-running, issue #41) server off the machine, a bright line (decision B.3).
@@ -481,7 +517,8 @@ def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, acti
     9); ``tidy`` wires the Tidy local-command endpoints (issue #41); ``restart`` wires the Restart
     local-command endpoints (issue #116); ``janitor`` wires the Janitor GitHub-sweep endpoints (issue
     #121); ``replay_provider`` / ``digest_provider`` wire the on-demand replay + digest GETs (Task
-    11); omit any for a surface that stays off. ``port=0`` binds an ephemeral port (tests). Call
+    11); ``version`` (a ``lib.version.Version``) wires the boot-identity/skew honesty (issue #136);
+    omit any for a surface that stays off. ``port=0`` binds an ephemeral port (tests). Call
     ``.serve_forever()`` to run it."""
     if host != BIND_HOST:
         raise ValueError(
@@ -489,7 +526,8 @@ def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, acti
             "never be reachable off the machine" % (BIND_HOST, host))
     return ThreadingHTTPServer((host, port),
                                make_handler(snapshot_provider, static_root, actions, desk, tidy,
-                                            restart, janitor, replay_provider, digest_provider))
+                                            restart, janitor, replay_provider, digest_provider,
+                                            version))
 
 
 # =============================== CachedGh — the gh slow clock (decision B.2) ===============================
@@ -1400,7 +1438,7 @@ def _live_cargo(all_flights):
 
 
 def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=None, desk=None,
-                      concluded=None):
+                      concluded=None, version=None):
     """Compose the whole snapshot the front-end binds. Reads FRESH local state every call; ``gh_mod``
     and ``usage`` are inputs so GitHub + usage egress ride the slow clock (decision B.2). With
     ``gh_mod=None`` the snapshot is honest but title-less — exactly what a poll produces when GitHub
@@ -1408,8 +1446,10 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
     persisted tower watermark that draws the "since you last looked" divider (§4). ``concluded`` (a
     ``ConcludedFlights``, created once per dashboard run) makes a concluded flight's settled GitHub
     facts a once-per-run fetch instead of a forever poll (issue #48); ``None`` keeps the old
-    per-poll behavior (embedders/tests that don't wire it). Semantics all route through the tested
-    ``lib/`` functions (design record B.1)."""
+    per-poll behavior (embedders/tests that don't wire it). ``version`` (a ``lib.version.Version``,
+    created once at boot) carries this server's own code identity so the UI can see it has gone stale
+    under a moving checkout (issue #136); ``None`` omits the block entirely. Semantics all route
+    through the tested ``lib/`` functions (design record B.1)."""
     now = time.time() if now is None else now
     diff_reader = pollers.diff_stat if diff_reader is None else diff_reader
     last_seen = desk.tower_last_seen() if desk is not None else None
@@ -1455,7 +1495,7 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
     # newer record off the tail (a per-repo append + slice is not a global tail).
     all_journal.sort(key=lambda r: r["ts"] if _finite(r["ts"]) else 0)
 
-    return {
+    snap = {
         "generated_at": now,
         "clock": _hhmm(now),
         "daypart": flights.daypart(now),   # the living clock (§7) — lighting only, never weather
@@ -1483,6 +1523,17 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
         "flights": all_flights,
         "journal_tail": all_journal[-500:],
     }
+    # This server's own code identity (issue #136) — the one block that describes the DASHBOARD
+    # rather than the field. Taken here, on the poll, because a stale server can only notice it has
+    # gone stale by re-reading disk; the stamp is cached behind a stat signature so an unchanged
+    # checkout costs ~40 stats, not a megabyte of reads. Never allowed to fail the whole snapshot:
+    # if the identity can't be taken, the field is still the truth the owner came for.
+    if version is not None:
+        try:
+            snap["version"] = version.state()
+        except Exception:   # the field is the truth the owner came for; never 500 the poll over a stamp
+            pass
+    return snap
 
 
 # =============================== on-demand replay + digest (Task 11 / design record §4) ===============================

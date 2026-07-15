@@ -570,6 +570,48 @@ html, body {
 }
 .conn-warn[hidden] { display: none; }
 
+/* the stale-tower NOTAM (issue #136) — the one strip that reports the TOWER rather than the field:
+   this server booted before the current build landed, so controls the browser has already been handed
+   may hit a router that never learned them.
+
+   Deliberately AMBER, not the red above. Red is for trouble on the field — a dead runner, a lost
+   link. Nothing is broken here: every flight is flying, every button this build has still works, the
+   tower is just reading yesterday's book. Borrowing the red would cry wolf, and a notice that cries
+   wolf is the one the owner learns to wave off before the day it matters. Slim, posted, out of the
+   way (§0.2) — and dismissible; the ✕ is the whole interaction.
+
+   Anchored bottom-LEFT, deliberately out of the centred lane .cc-toast owns (fixed, left:50%,
+   bottom:26px). A toast is a transient shout about something you just did; this is a standing note
+   about the building. Sharing the centre would land every Approve toast squarely on top of it. */
+.cc-notam {
+  position: fixed; left: 16px; bottom: 14px; z-index: 59;
+  max-width: min(520px, calc(100vw - 32px));
+  display: flex; align-items: flex-start; gap: 9px; padding: 8px 10px 8px 10px;
+  background: #3A3222; border: 1px solid #6B5324; border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(12, 10, 6, 0.34);
+}
+.cc-notam[hidden] { display: none; }
+.cc-notam-tag {
+  flex: none; align-self: flex-start; margin-top: 1px;
+  font: 700 10px var(--sans); letter-spacing: 1.4px; color: #1E1810;
+  background: #FFC24D; border-radius: 3px; padding: 2px 6px;
+}
+.cc-notam-body { font: 500 12px/1.5 var(--mono); color: #F2DDA8; }
+.cc-notam-body b { color: #FFD277; font-weight: 700; letter-spacing: 0.4px; }
+/* nowrap: the remedy is meant to be READ AND TYPED, and the strip is narrow enough that the default
+   would break it across lines mid-command ("bin/liftoff" / "--restart-dashboard") — which is exactly
+   how a command gets mistyped. It wraps as one unit or not at all. */
+.cc-notam-body code {
+  font: 500 12px var(--mono); color: #FFEFC9; white-space: nowrap;
+  background: rgba(255, 255, 255, 0.08); padding: 1px 5px; border-radius: 4px;
+}
+.cc-notam-x {
+  flex: none; margin-left: 2px; align-self: flex-start;
+  background: none; border: 0; cursor: pointer;
+  font: 600 12px var(--mono); color: #C7A96B; padding: 2px 4px; border-radius: 4px;
+}
+.cc-notam-x:hover { color: #FFEFC9; background: rgba(255, 255, 255, 0.08); }
+
 /* first-paint failure (issue #34) — the honest "can't reach the tower" surface shown when the FIRST
    poll fails, before any snapshot has ever painted (so there is no shell to hang the conn-warn banner
    on). Reuses the connection-trouble palette so it reads as honest trouble, not a dead page; self-heals

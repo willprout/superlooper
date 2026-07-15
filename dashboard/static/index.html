@@ -40,6 +40,10 @@
        locally to clear GitHub debris). Loaded before shell.js so window.CCJanitor exists when the
        button binds it. -->
   <script src="/janitor.js"></script>
+  <!-- Issue #136: the stale-tower NOTAM — the one surface that reports the TOWER, not the field
+       (this server booted before the current build landed). Loaded before shell.js so window.CCNotam
+       exists when updateChrome binds it. -->
+  <script src="/notam.js"></script>
   <script src="/shell.js"></script>
 </body>
 </html>
