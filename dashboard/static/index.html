@@ -40,6 +40,11 @@
        locally to clear GitHub debris). Loaded before shell.js so window.CCJanitor exists when the
        button binds it. -->
   <script src="/janitor.js"></script>
+  <!-- Issue #141: the Deploy Fixer note box — the ops-verb overlay behind the trouble banner's
+       button (the server composes a prompt from the board + the owner's note and launches ONE
+       interactive sl-debugger session through the engine's shim; no AI runs in this dashboard).
+       Loaded before shell.js so window.CCFixer exists when the banner binds it. -->
+  <script src="/fixer.js"></script>
   <!-- Issue #136: the stale-tower NOTAM — the one surface that reports the TOWER, not the field
        (this server booted before the current build landed). Loaded before shell.js so window.CCNotam
        exists when updateChrome binds it. -->

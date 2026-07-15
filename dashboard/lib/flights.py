@@ -483,6 +483,14 @@ _CONDITION_RANK = {
 }
 
 
+def condition_rank(kind):
+    """The attention rank of one condition — the public read of the table above, so anything that
+    needs to order trouble (the pill, and the Deploy Fixer prompt's worst-first list, issue #141)
+    shares ONE ranking. A second copy of these numbers is how "the worst thing" would come to mean
+    two different things on one screen. An unknown kind ranks 0 (not trouble)."""
+    return _CONDITION_RANK.get(kind, 0)
+
+
 # State-home format versions this build of the dashboard knows how to read (issue #45). It reads a
 # state home field-by-field and every reader fails CLOSED to empty, so an engine that changes the
 # on-disk SHAPE would silently BLANK the field. The engine stamps the version it wrote; a stamp

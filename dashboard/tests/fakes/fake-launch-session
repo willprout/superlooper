@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""A stand-in for the ENGINE's `launch-session.sh` — the harness the Deploy Fixer button's adapter
+(``lib/fixer.py``, issue #141) runs against so no test ever reaches the REAL shim.
+
+This is the most dangerous binary the dashboard shells: the real shim opens a cmux tab and starts a
+live interactive Claude session. A stray real call in a test would spawn an agent on William's
+machine. The conftest guard points ``SL_LAUNCH_SESSION`` at an absent path by default; a fixer test
+overrides it in-body to THIS executable.
+
+It models the ONE invocation shape the dashboard produces — the same `--cwd` form the engine's own
+watchdog uses for its unattended debugger sessions (`superlooper` ▸ `_watchdog_launch`):
+
+    launch-session.sh --cwd <repo-checkout> d<N>
+
+with the session's identity carried in the ENVIRONMENT (SL_RUN_ROOT, SL_PANE, SL_MODEL, SL_EFFORT,
+SL_AGENT, SL_LAUNCH_VERIFY_SECONDS), and the session's PROMPT read from `$SL_RUN_ROOT/briefs/<id>.md`
+— which `start-session.sh` cats straight into the interactive agent as its opening message.
+
+Every invocation records to ``$SL_FIXER_FIXTURES/launches.jsonl``: the full argv, the SL_* env the
+adapter built, and — crucially — the brief's CONTENTS read back off disk. That last one is what lets
+a test prove the owner's note actually reaches the session's prompt, rather than merely proving the
+adapter wrote a file somewhere.
+
+The real shim REQUIRES the brief to exist and exits 1 if it doesn't (`[ -f "$BRIEF" ] || { echo
+"[$ID] missing brief" ...; exit 1; }`), so this models that too — a test that forgets to compose the
+brief fails here exactly as it would in production.
+
+Fail injection (exercises the adapter's fail-closed paths):
+- ``SL_FIXER_SLEEP=<secs>``  makes the launch hang, so a short adapter timeout trips (rc 124 path).
+- ``SL_FIXER_RC=<n>``        makes the launch exit <n> with a stderr line (delivery NOT verified —
+                             the shim's own contract: rc 0 means the tab took the prompt).
+
+Mirrors ``tests/fakes/fake-superlooper`` / ``tests/fakes/fake-gh``.
+"""
+import json
+import os
+import sys
+import time
+
+ARGS = sys.argv[1:]
+FIX = os.environ.get("SL_FIXER_FIXTURES") or ""
+
+# The SL_* env the adapter is contracted to build. Recorded verbatim so a test pins the exact
+# handshake the real shim reads (a missing SL_RUN_ROOT/SL_PANE makes the real one abort).
+_ENV_KEYS = ("SL_RUN_ROOT", "SL_PANE", "SL_MODEL", "SL_EFFORT", "SL_AGENT",
+             "SL_LAUNCH_VERIFY_SECONDS")
+
+
+def die(msg, code=1):
+    sys.stderr.write("fake-launch-session: %s\n" % msg)
+    sys.exit(code)
+
+
+def main():
+    if ARGS[:1] != ["--cwd"] or len(ARGS) < 3:
+        die("unhandled invocation: %s (expected --cwd <dir> <id>)" % " ".join(ARGS))
+    cwd, sid = ARGS[1], ARGS[2]
+
+    run_root = os.environ.get("SL_RUN_ROOT") or ""
+    brief_path = os.path.join(run_root, "briefs", "%s.md" % sid)
+    brief = None
+    if os.path.isfile(brief_path):
+        with open(brief_path) as f:
+            brief = f.read()
+
+    if FIX:
+        rec = {"argv": ARGS, "cwd_arg": cwd, "id": sid,
+               "env": {k: os.environ.get(k) for k in _ENV_KEYS},
+               "brief_path": brief_path, "brief": brief}
+        with open(os.path.join(FIX, "launches.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    if os.environ.get("SL_FIXER_SLEEP"):
+        time.sleep(float(os.environ["SL_FIXER_SLEEP"]))
+
+    rc = os.environ.get("SL_FIXER_RC")
+    if rc and rc != "0":
+        die("forced launch failure", int(rc))
+
+    # The real shim aborts when the brief is missing — model it, so an adapter that skips composing
+    # the prompt fails in tests exactly as it would in production.
+    if brief is None:
+        die("[%s] missing brief %s" % (sid, brief_path))
+
+    sys.stdout.write("[%s] delivered\n" % sid)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

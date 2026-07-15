@@ -298,11 +298,24 @@
     '</div>';
   }
 
+  // The trouble banner — and, since issue #141, the Deploy Fixer button. This is the ONE surface
+  // that renders for every condition a fixer answers (runner down, ALERT, parks, frozen/stranded/
+  // spinning flights, paused landings) and it is camera-independent (§4/§5), so an off-screen
+  // problem still offers its fix right where it is named: tap-where-you-read (§0.3). No trouble ⇒
+  // no banner ⇒ no button, which is why the early return sits above it.
   function troubleHTML(s) {
     var t = s.trouble || { present: false };
     if (!t.present) return '<div class="trouble" hidden></div>';
     var cls = t.level === "alert" ? "trouble alert" : "trouble";
-    return '<div class="' + cls + '"><span class="dot"></span>' + esc(t.text) + '</div>';
+    // The button targets t.offender — the SERVER's slug for the repo the banner is naming — never
+    // the currently-viewed repo, so the fixer always lands on the patient being reported.
+    var fix = t.offender
+      ? '<button class="trouble-fix" data-act="fixer-open" data-repo="' + esc(t.offender) + '"' +
+          ' title="Deploy a fixer — launches one interactive sl-debugger session in its own cmux' +
+          ' tab, pointed at this trouble (no AI runs in this dashboard)">\u{1F527} Deploy Fixer</button>'
+      : "";
+    return '<div class="' + cls + '"><span class="dot"></span>' +
+             '<span class="trouble-text">' + esc(t.text) + '</span>' + fix + '</div>';
   }
 
   function needsYouHTML(s) {
@@ -490,6 +503,7 @@
     if (act === "tidy-open") { if (window.CCTidy) window.CCTidy.open(repo); return; }
     if (act === "restart-open") { if (window.CCRestart) window.CCRestart.open(repo); return; }
     if (act === "janitor-open") { if (window.CCJanitor) window.CCJanitor.open(repo); return; }
+    if (act === "fixer-open") { if (window.CCFixer) window.CCFixer.open(repo); return; }
     if (act === "replay-open") { if (window.CCReplay) window.CCReplay.open(repo, state.snapshot && state.snapshot.fun); return; }
     if (act === "digest-open") { if (window.CCDigest) window.CCDigest.open(repo); return; }
     if (act === "discuss") { doDiscuss(repo, num); return; }

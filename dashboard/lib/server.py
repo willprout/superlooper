@@ -161,6 +161,11 @@ _RESTART_PATHS = {"/api/restart/check": "preflight", "/api/restart": "execute"}
 # tapped. Backed by a ``lib.janitor.Janitor`` — like Tidy, it drives the CLI so the janitor's whole
 # safety contract stays the single source of truth (the dashboard re-derives none of it).
 _JANITOR_PATHS = {"/api/janitor/propose": "propose", "/api/janitor": "execute"}
+# ``/api/fixer/check`` is the note box's preflight (is a fixer already live? what trouble will ride
+# into the prompt?); ``/api/fixer`` composes the prompt and launches ONE interactive sl-debugger
+# session through the engine's shim (issue #141). Both are POST-only and same-origin gated: this is
+# the most consequential endpoint in the product — it starts an agent on the owner's machine.
+_FIXER_PATHS = {"/api/fixer/check": "preflight", "/api/fixer": "execute"}
 
 
 def _is_allowed_origin(origin, host):
@@ -332,8 +337,49 @@ def _unroutable(clean, version):
                             "error": version_mod.stale_action_message(clean)})
 
 
+def _route_fixer(clean, body_bytes, fixer, snapshot_provider):
+    """The Deploy Fixer endpoints (issue #141) — a LOCAL SESSION LAUNCH, the same button class as
+    Tidy/Restart/Janitor. Same-origin is already enforced by the caller (a foreign page must not be
+    able to start an AI session on this machine any more than it could drive the label writer).
+    ``fixer=None`` (a read-only embedder, or writes disabled) → 405.
+
+    The CONTEXT is read here, from the server's own snapshot provider at TAP TIME — never taken from
+    the request body. That is what makes the composed prompt honest: it describes the board the owner
+    was actually looking at, and a client that could name the trouble could lie about it. A provider
+    that raises fails closed to a refusal (no context ⇒ no launch), never a 500 and never a launch
+    with a blank picture.
+
+    Dispatches to the tested pure ``lib.fixer.Fixer``: ``preflight`` reports whether a fixer is
+    already live (writes nothing), ``execute`` composes the brief and launches on the owner's tap. A
+    live-fixer refusal or a failed launch is the verb's own honest ``ok: false`` body at 200 — the
+    request itself was fine — never an HTTP error, never a silent success."""
+    if fixer is None:
+        return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
+    payload, err = _parse_json_body(body_bytes)
+    if err is not None:
+        return err
+    repo = payload.get("repo")
+    if not isinstance(repo, str) or not repo.strip():
+        return _json_resp(400, {"ok": False, "error": "missing 'repo'"})
+    try:
+        snapshot = snapshot_provider()
+    except Exception:
+        return _json_resp(200, {"ok": False, "verb": "fixer",
+                                "error": "the dashboard can't read this loop's state right now — "
+                                         "nothing launched"})
+    if clean == "/api/fixer/check":
+        return _json_resp(200, fixer.preflight(repo, snapshot))
+    # execute: the note is OPTIONAL (the box is skippable — DoD), so an absent note is an empty
+    # one, never a bad request. A non-string note IS refused: the client is broken, and coercing it
+    # would put junk in the session's opening prompt.
+    note = payload.get("note", "")
+    if not isinstance(note, str):
+        return _json_resp(400, {"ok": False, "error": "'note' must be a string"})
+    return _json_resp(200, fixer.execute(repo, note, snapshot))
+
+
 def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, desk=None, tidy=None,
-                restart=None, janitor=None, version=None):
+                restart=None, janitor=None, version=None, fixer=None):
     """The pure POST router. Order is deliberate: cross-origin → 403 (before any parsing, for every
     POST); the Tidy local-command endpoints (need only ``tidy``); the dashboard-local tower-seen
     write (needs only ``desk``); then the gh verbs — writes-disabled → 405; unknown action path →
@@ -348,6 +394,8 @@ def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, des
         return _route_restart(clean, body_bytes, restart)
     if clean in _JANITOR_PATHS:
         return _route_janitor(clean, body_bytes, janitor)
+    if clean in _FIXER_PATHS:
+        return _route_fixer(clean, body_bytes, fixer, snapshot_provider)
     if clean == "/api/tower-seen":
         return _route_tower_seen(body_bytes, desk)
     if actions is None:                  # gh writes not wired → method not allowed (Task 5 contract)
@@ -411,7 +459,7 @@ def _provider_get(provider, params):
 
 def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"", origin=None,
           host=None, desk=None, tidy=None, restart=None, janitor=None, replay_provider=None,
-          digest_provider=None, version=None):
+          digest_provider=None, version=None, fixer=None):
     """Map one request to a :class:`Response`, with no socket in sight (unit-testable with an
     injected ``snapshot_provider`` and ``actions``). ``POST`` drives the six mechanical verbs
     (Task 6) plus the dashboard-local tower-seen write (Task 9) via :func:`_route_post`;
@@ -425,11 +473,13 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
     the Janitor GitHub-sweep endpoints (issue #121); ``None`` leaves that surface off (405).
     ``version`` (a ``lib.version.Version``) is the server's own code identity, captured at boot: it
     turns a bare ``no such action`` into an honest "this server is older than that button" when the
-    checkout has moved on under a running process (issue #136); ``None`` keeps the plain old 404."""
+    checkout has moved on under a running process (issue #136); ``None`` keeps the plain old 404.
+    ``fixer`` (a ``lib.fixer.Fixer``) backs the Deploy Fixer endpoints (issue #141), which compose a
+    prompt from the CURRENT snapshot and launch one interactive sl-debugger session."""
     clean = path.split("?", 1)[0]
     if method == "POST":
         return _route_post(clean, body, origin, host, actions, snapshot_provider, desk, tidy,
-                           restart, janitor, version)
+                           restart, janitor, version, fixer)
     if method not in ("GET", "HEAD"):
         return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
 
@@ -454,7 +504,8 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
 # =============================== the server (loopback only) ===============================
 
 def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=None, restart=None,
-                 janitor=None, replay_provider=None, digest_provider=None, version=None):
+                 janitor=None, replay_provider=None, digest_provider=None, version=None,
+                 fixer=None):
     """A ``BaseHTTPRequestHandler`` subclass that delegates to :func:`route`. Kept thin: the socket
     machinery lives here (reading the POST body + Origin), every decision lives in the pure router
     above. ``actions`` (an ``lib.actions.Actions``) enables the POST verbs; ``desk`` (a
@@ -503,24 +554,25 @@ def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=N
                               actions=actions, body=self._read_body(),
                               origin=self.headers.get("Origin"), host=self.headers.get("Host"),
                               desk=desk, tidy=tidy, restart=restart, janitor=janitor,
-                              version=version))
+                              version=version, fixer=fixer))
 
     return _Handler
 
 
 def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, actions=None, desk=None,
                  tidy=None, restart=None, janitor=None, replay_provider=None, digest_provider=None,
-                 version=None):
+                 version=None, fixer=None):
     """Construct (do NOT start) the loopback HTTP server. Refuses any non-loopback ``host`` with a
     ``ValueError`` — binding ``0.0.0.0`` or a LAN interface would expose a label-writing (and now
     local-command-running, issue #41) server off the machine, a bright line (decision B.3).
     ``actions`` wires the POST verbs (Task 6); ``desk`` wires the tower-seen watermark write (Task
     9); ``tidy`` wires the Tidy local-command endpoints (issue #41); ``restart`` wires the Restart
     local-command endpoints (issue #116); ``janitor`` wires the Janitor GitHub-sweep endpoints (issue
-    #121); ``replay_provider`` / ``digest_provider`` wire the on-demand replay + digest GETs (Task
-    11); ``version`` (a ``lib.version.Version``) wires the boot-identity/skew honesty (issue #136);
-    omit any for a surface that stays off. ``port=0`` binds an ephemeral port (tests). Call
-    ``.serve_forever()`` to run it."""
+    #121); ``fixer`` wires the Deploy Fixer session-launch endpoints (issue #141); ``replay_provider``
+    / ``digest_provider`` wire the on-demand replay + digest GETs (Task 11); ``version`` (a
+    ``lib.version.Version``) wires the boot-identity/skew honesty (issue #136); omit any for a
+    surface that stays off. ``port=0`` binds an ephemeral port (tests). Call ``.serve_forever()`` to
+    run it."""
     if host != BIND_HOST:
         raise ValueError(
             "command center binds %s only (refusing %r) — it can write GitHub labels, so it must "
@@ -528,7 +580,7 @@ def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, acti
     return ThreadingHTTPServer((host, port),
                                make_handler(snapshot_provider, static_root, actions, desk, tidy,
                                             restart, janitor, replay_provider, digest_provider,
-                                            version))
+                                            version, fixer))
 
 
 # =============================== CachedGh — the gh slow clock (decision B.2) ===============================
