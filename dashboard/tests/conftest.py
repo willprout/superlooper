@@ -30,6 +30,13 @@ William's live cmux). Each MUST resolve through an env-var override:
                    ``lib/tidy`` lets THIS var override it exactly so the fixture can point every
                    test at an absent binary — `tidy` closes cmux windows, so a test must never
                    reach the real one; a tidy test injects tests/fakes/fake-superlooper in-body.
+    SL_LAUNCH_SESSION the engine's launch shim (lib/fixer.py — the Deploy Fixer button, issue #141).
+                   The shim OPENS A REAL CMUX TAB and starts an interactive Claude session, so a
+                   stray real call in a test would spawn a live agent on William's machine — the
+                   most expensive stray call in this repo. Same name the ENGINE's own watchdog
+                   resolves it by, so the dashboard and the engine agree on the override; the
+                   runtime default is derived from config's ``superlooper_cli`` (a sibling in the
+                   engine's bin/). A fixer test injects tests/fakes/fake-launch-session in-body.
 
 The autouse fixture points every one at a guaranteed-absent path **unconditionally** — even a
 real value exported into the caller's shell is overridden — so the suite is fail-closed by
@@ -66,6 +73,7 @@ NEUTRALIZED_BINARIES = {
     "SL_OSASCRIPT": "/nonexistent/command-center-test-osascript",
     "SL_SECURITY": "/nonexistent/command-center-test-security",
     "SL_SUPERLOOPER": "/nonexistent/command-center-test-superlooper",
+    "SL_LAUNCH_SESSION": "/nonexistent/command-center-test-launch-session",
 }
 
 # Set ONLY by the autouse fixture below — the guard asserts it, so deleting the fixture cannot
