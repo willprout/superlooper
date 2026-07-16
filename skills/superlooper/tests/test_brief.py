@@ -88,7 +88,11 @@ def test_ship_instructions_with_ship_cmd(_sl_home):
 def test_ship_instructions_without_ship_cmd(_sl_home):
     out = brief.build(_issue(), _cfg(_sl_home, ship_cmd=None))
     assert "gh pr create" in out
-    assert "<!-- superlooper-review -->" in out, "no-pipeline repos must require the review verdict comment"
+    # the marker the brief teaches must be the PINNED form the gate actually parses (#154) — an
+    # unpinned verdict cannot prove which diff it reviewed and never satisfies the gate, so a
+    # brief teaching the legacy form would walk every worker into a nudge->park.
+    assert "<!-- superlooper-review sha=" in out, \
+        "no-pipeline repos must require a review verdict pinned to the reviewed head"
     assert "fresh-agent review" in out or "wrote none of it" in out
 
 

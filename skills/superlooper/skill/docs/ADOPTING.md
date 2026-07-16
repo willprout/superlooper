@@ -135,9 +135,19 @@ unless you specifically want this build-vs-investigation split.)
 | `report_required_sections` | `["Tests", "Review"]` | H2 headings a worker's final report must contain, each with real prose — the runner checks their presence mechanically as part of the gate. The default is deliberately **web-agnostic**: every worker can produce passing **Tests** and a fresh-agent **Review**, so a CLI/library/service repo is never nudged-then-parked for evidence it cannot give. Web/UI repos opt into richer evidence explicitly (see below). |
 | `bright_lines` | `[]` | Prose rules injected **verbatim** into every worker brief (e.g. "force-push forbidden", "ship only via ship.sh"). The skill hardcodes none; the repo's adaptation fills these. |
 
-**Review is always mechanically gated.** On a repo with its own pipeline (`ship_cmd` set), that
-pipeline owns review. On a repo without one, the gate refuses to merge until a fresh agent that
-wrote none of the code posts a review verdict as a PR comment beginning `<!-- superlooper-review -->`.
+**Review is always mechanically gated, and pinned to the diff it reviewed.** On a repo with its own
+pipeline (`ship_cmd` set), that pipeline owns review. On a repo without one, the gate refuses to
+merge until a fresh agent that wrote none of the code posts a review verdict as a PR comment
+beginning `<!-- superlooper-review sha=<reviewed head oid> -->` — in practice
+`<!-- superlooper-review sha=$(git rev-parse HEAD) -->`, posted after the last push. The `sha=`
+names the commit the reviewer actually saw, and the gate honors the verdict only while the PR's
+head still matches it (a 7+ hex abbreviation is fine). A verdict for a superseded diff stops
+counting: when a PR is rebuilt or pushed to again, the old verdict no longer merges the new code,
+and the worker is nudged to re-review what is on the PR now. The runner's own mechanical
+merge-update is the one head move that carries a verdict forward — it merges the dev branch in
+without touching the authored diff (and `ship_recheck_cmd` plus CI still re-run on the result).
+An unpinned legacy marker (`<!-- superlooper-review -->`, no `sha=`) cannot prove which diff it
+reviewed and so never satisfies the gate — it fails closed to the same nudge-then-park.
 Either way, no code merges unreviewed — and the reviewer is never the author.
 
 **Adding browser evidence (web/UI repos) — opt-in.** The default `report_required_sections` asks only

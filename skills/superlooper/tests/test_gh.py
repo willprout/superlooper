@@ -81,7 +81,7 @@ def test_pr_for_branch_shape(ghenv):
 def test_pr_comments_has_review_marker(ghenv):
     cr = gh.pr_comments(555)
     assert cr.ok is True
-    assert any(c["body"].startswith("<!-- superlooper-review -->") for c in cr.comments)
+    assert any(c["body"].startswith("<!-- superlooper-review sha=") for c in cr.comments)
 
 
 # --------------------------- comment reads: refused != answered-empty (issue #21) ----------

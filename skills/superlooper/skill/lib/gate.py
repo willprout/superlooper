@@ -19,8 +19,34 @@ import config as _config   # pure sibling; used only for path_to_area in gate_de
 # The two marker-comment contracts (cross-review C1 + plan approval fix (a)). These strings are
 # load-bearing: the brief (Task 7) instructs workers to post them, and THIS module is the only
 # consumer — the fresh-agent-review standing rule verified mechanically, never LLM-remembered.
-REVIEW_MARKER = "<!-- superlooper-review -->"
+REVIEW_MARKER = "<!-- superlooper-review -->"          # the legacy UNPINNED form (see below)
 INVESTIGATION_MARKER = "<!-- superlooper-investigation -->"
+
+# A review verdict must name the diff it reviewed (issue #154). The marker rides in two forms:
+#
+#   pinned  <!-- superlooper-review sha=<7-40 hex> -->   names the head oid it reviewed
+#   legacy  <!-- superlooper-review -->                  unpinned: cannot prove WHAT it reviewed
+#
+# Only a PIN that matches the PR's current head is a verdict for the code being merged. Without
+# this, `review_evidence_ok` accepted any marker comment on the PR regardless of diff: reapprove
+# preserves the branch, so a rebuilt gen-2 PR still carried its gen-1 review comment and the gate
+# mechanically vouched for code no reviewer ever saw — the README bright line ("no verdict, no
+# merge") silently void for every post-reapprove generation. Caught before it fired a bad merge.
+# The legacy form is accepted as a SHAPE (so the gate can say "repin it" instead of "no review at
+# all") but never as EVIDENCE — back-compat here is fail-closed, like every other unreadable input.
+_REVIEW_MARKER_RE = re.compile(
+    r"<!--\s*superlooper-review(?:\s+sha=([0-9a-fA-F]{7,40}))?\s*-->", re.IGNORECASE)
+# A readable git oid. Abbreviations are honored (a worker reaches for `git rev-parse --short
+# HEAD`); 7 hex is git's own default abbreviation and identifies a commit unambiguously on a
+# single PR. Shorter than 7 is not an oid — it fails closed rather than prefix-matching loosely.
+_OID_RE = re.compile(r"[0-9a-fA-F]{7,40}")
+
+
+def pinned_review_marker(sha):
+    """The pinned review marker a worker posts: the verdict names the diff it reviewed. ONE
+    source of truth for the string — the brief, the nudge, and the conflict brief all render it
+    from here, so the form the worker is taught can never drift from the form the gate parses."""
+    return f"<!-- superlooper-review sha={sha} -->"
 
 # Paths that define the loop's live referee. Unlike ordinary wander areas, a merged change here
 # immediately changes the rules that judge worker PRs, so these paths are owner-only stops.
@@ -78,14 +104,78 @@ def _any_comment_begins(comments, marker):
     return False
 
 
-def review_evidence_ok(config, pr_comments):
-    """§C.4 step 2b — the fresh-agent-review standing rule, verified MECHANICALLY: either the
-    repo's own pipeline owns review (`ship_cmd` set — e.g. the eApp's diff-pinned
-    review/local-gate) OR a fresh-agent verdict exists as a PR comment beginning REVIEW_MARKER."""
+def _review_pins(comments):
+    """Every review-marker comment's pin, in order: a hex sha string, or None for the legacy
+    unpinned form. The marker must BEGIN the comment (same contract as _any_comment_begins —
+    quoting it mid-text is not a verdict). Anything unreadable simply doesn't appear."""
+    out = []
+    for c in comments if isinstance(comments, list) else []:
+        body = c.get("body") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+        if isinstance(body, str):
+            m = _REVIEW_MARKER_RE.match(body.lstrip())
+            if m:
+                out.append(m.group(1))
+    return out
+
+
+def _oid(v):
+    """A readable git oid, lowercased for comparison — else None (fail closed). fullmatch, so a
+    string that merely CONTAINS hex ('sha: abc1234!') is not an oid."""
+    return v.lower() if isinstance(v, str) and _OID_RE.fullmatch(v) else None
+
+
+def review_evidence_state(config, pr_comments, head_oid, review_carry=None):
+    """§C.4 step 2b — the fresh-agent-review standing rule, verified MECHANICALLY *and* pinned to
+    the diff it vouched for (issue #154). Returns one of:
+
+      "ship"           — the repo's own pipeline owns review (`ship_cmd` set, e.g. the eApp's
+                         diff-pinned review/local-gate); the marker contract does not apply.
+      "ok"             — a verdict pinned to the PR's current head (or to a head the runner
+                         mechanically carried it across — see review_carry below).
+      "unread"         — the comments read was REFUSED or starved (key absent / wrong-typed).
+                         NOT "no review": the caller must WAIT, never park on it (issue #78).
+      "absent"         — a clean read with no review-marker comment at all.
+      "head_unreadable" — a marker exists but the PR view carries no readable head oid: a corrupt
+                         view, so the pin cannot be judged. Fail closed (the caller waits).
+      "unpinned"       — only legacy (no `sha=`) markers: cannot prove which diff was reviewed.
+      "stale"          — a pinned verdict, but for a superseded diff — the head has moved since.
+
+    `review_carry` is the runner's record of its OWN mechanical merge-update: {"from": the
+    reviewed oid, "to": the head that update produced}. A merge-update merges dev into the branch
+    and pushes — it moves the head WITHOUT touching the worker's authored diff, so the verdict
+    must ride across it or every merge-updated PR would false-park on the review it actually has.
+    The carry is bound to the head it was carried TO: the moment a WORKER pushes past it, the
+    head no longer matches `to` and the pin re-stales. That binding is what keeps the carry from
+    becoming a blanket re-attestation of whatever lands on the branch next.
+    """
     ship_cmd = (config or {}).get("ship_cmd") if isinstance(config, dict) else None
     if isinstance(ship_cmd, str) and ship_cmd.strip():
-        return True
-    return _any_comment_begins(pr_comments, REVIEW_MARKER)
+        return "ship"
+    if not isinstance(pr_comments, list):
+        return "unread"
+    pins = _review_pins(pr_comments)
+    if not pins:
+        return "absent"
+    head = _oid(head_oid)
+    if head is None:
+        return "head_unreadable"
+    attested = {head}
+    carry = review_carry if isinstance(review_carry, dict) else {}
+    c_from, c_to = _oid(carry.get("from")), _oid(carry.get("to"))
+    if c_from and c_to and c_to == head:
+        attested.add(c_from)
+    for pin in pins:
+        p = pin.lower() if isinstance(pin, str) else None
+        if p and any(a.startswith(p) for a in attested):
+            return "ok"
+    return "unpinned" if all(p is None for p in pins) else "stale"
+
+
+def review_evidence_ok(config, pr_comments, head_oid=None, review_carry=None):
+    """The boolean face of review_evidence_state: True only for a verdict that provably covers
+    the PR's current head (or a ship_cmd repo). Every not-ok state — unread, absent, unpinned,
+    stale, unreadable head — is False here; gate_decision distinguishes them (wait vs nudge)."""
+    return review_evidence_state(config, pr_comments, head_oid, review_carry) in ("ship", "ok")
 
 
 def investigation_done(issue_comments):
@@ -393,13 +483,35 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     # ship_cmd (else review_evidence_ok would be True), so the comments read is genuinely load-
     # bearing. A CLEAN read — a real list, even empty — keeps the nudge->park ladder intact; only
     # an unreadable/absent read waits, mirroring step-3's unreadable-files WAIT.
-    if not review_evidence_ok(cfg, pv.get("comments")):
-        if not isinstance(pv.get("comments"), list):
+    # The verdict must also PIN the diff it reviewed (issue #154): reapprove preserves the branch,
+    # so a gen-1 review comment outlives the code it vouched for and would merge a gen-2 rebuild
+    # the reviewer never saw. A pin for a superseded head is not evidence — it takes the same
+    # nudge->park ladder as no evidence at all, under its own key so each cause gets its one nudge.
+    rstate = review_evidence_state(cfg, pv.get("comments"), pv.get("headRefOid"),
+                                   ist.get("review_carry"))
+    if rstate not in ("ship", "ok"):
+        if rstate == "unread":
             return {"action": "wait", "comments_unread": True,
                     "reason": "PR comments unread (refused or starved) — waiting for a "
                               "trustworthy read before judging review evidence"}
-        return nudge_or_park("review",
-                             "no review evidence (no ship pipeline and no review-marker comment)")
+        if rstate == "head_unreadable":
+            # a marker exists but the view has no readable head to pin it against: corrupt view,
+            # same discipline as step 3's unreadable-files WAIT — refetch, never guess.
+            return {"action": "wait",
+                    "reason": "PR head oid unreadable — refetching before judging the review "
+                              "verdict against the diff it reviewed"}
+        if rstate == "absent":
+            return nudge_or_park(
+                "review", "no review evidence (no ship pipeline and no review-marker comment)")
+        if rstate == "unpinned":
+            return nudge_or_park(
+                "review_stale",
+                "the review verdict is unpinned (a legacy marker with no `sha=`), so it cannot "
+                "prove which diff it reviewed")
+        return nudge_or_park(
+            "review_stale",
+            "the review verdict is pinned to a superseded diff — the PR's head has moved since "
+            "it was reviewed, so nothing vouches for the code being merged")
 
     # step 3: touch verification from the PR's ACTUAL files (declared touches are a promise;
     # the diff is the truth). Wander only journals; an overlap with a live lane holds the merge.

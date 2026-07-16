@@ -176,8 +176,18 @@ NUDGE_MESSAGES = {
                 "Rewrite the report with substantive text under every required H2, then finish "
                 "again — the runner checks mechanically.",
     "review": "The gate found no review evidence. Get a fresh-agent review of your diff and "
-              "post its verdict as a PR comment BEGINNING `<!-- superlooper-review -->` "
-              "(what was reviewed + P0/P1 outcome). The runner will not merge without it.",
+              "post its verdict as a PR comment BEGINNING "
+              "`<!-- superlooper-review sha=$(git rev-parse HEAD) -->` (what was reviewed + "
+              "P0/P1 outcome). The runner will not merge without it.",
+    # issue #154: the verdict exists but does not provably cover the head being merged — either
+    # unpinned (legacy form) or pinned to a superseded diff (the post-reapprove rebuild case).
+    # The remedy is the same for both: review what is on the PR NOW and pin the verdict to it.
+    "review_stale": "Your PR carries a review verdict that does not name the code now on it — it "
+                    "is either unpinned or pinned to an older commit, and the head has moved "
+                    "since (a rebuild or a new push). Re-review the CURRENT diff with a fresh "
+                    "agent and post a verdict pinned to the current head: a PR comment BEGINNING "
+                    "`<!-- superlooper-review sha=$(git rev-parse HEAD) -->`. The runner will not "
+                    "merge code that nothing vouches for.",
     "checks": "A required check failed on your PR. Investigate the failure, fix it, and push — "
               "the gate re-runs automatically.",
     "investigation": "Post your root-cause report as an issue comment BEGINNING "
@@ -1021,6 +1031,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             g = gate.gate_decision(
                 {"type": itype, "conflicts": conflicts, "nudged": nudged,
                  "declared_touches": declared, "update_result": update_result,
+                 "review_carry": ist.get("review_carry"),
                  "investigation_done": inv_done},
                 pv, reports.get(iid), cfg, bool(frozen), inflight)
 

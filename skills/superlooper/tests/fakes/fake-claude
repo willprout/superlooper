@@ -232,9 +232,14 @@ def do_pr(spec, contract):
 
 
 def do_review_comment(spec, pr):
+    # #154: the verdict names the head it reviewed, and is posted AFTER the last push — exactly
+    # the discipline the brief teaches a real worker. A verdict pinned to a superseded diff (or
+    # an unpinned legacy one) does not satisfy the gate, so a scenario that pushes again must
+    # re-review and re-post, just like a real worker would.
+    head = sh("git", "rev-parse", "HEAD", check=False).stdout.strip()
     body = spec.get("review_body",
-                    "<!-- superlooper-review --> Fresh-agent review of the full diff (simulated "
-                    "reviewer, wrote none of it): no P0/P1 findings; ship.")
+                    "<!-- superlooper-review sha=%s --> Fresh-agent review of the full diff "
+                    "(simulated reviewer, wrote none of it): no P0/P1 findings; ship." % head)
     sh(GH, "pr", "comment", pr, "--body", body)
 
 

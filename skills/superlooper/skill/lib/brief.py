@@ -79,8 +79,11 @@ _SHIP_WITH_CMD = ("Run the repo's own review pipeline and ship EXCLUSIVELY via `
 _SHIP_NO_CMD = ("Get a fresh-agent review of your diff (an agent that wrote none of it), address the "
                 "P0/P1 findings, push the branch, then `gh pr create --fill --body 'Closes "
                 "#{issue_num}'`. Post the reviewer's verdict as a PR comment BEGINNING "
-                "`<!-- superlooper-review -->`, naming what was reviewed and the P0/P1 outcome — the "
-                "runner mechanically refuses to merge without that comment.")
+                "`<!-- superlooper-review sha=$(git rev-parse HEAD) -->`, naming what was reviewed "
+                "and the P0/P1 outcome — the runner mechanically refuses to merge without that "
+                "comment. The `sha=` names the commit that was reviewed, so post the verdict AFTER "
+                "your last push: a verdict for a superseded diff does not count, and if you push "
+                "again you must get the new diff reviewed and post a verdict pinned to it.")
 
 
 def _slug(title):

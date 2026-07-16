@@ -138,7 +138,9 @@ its conflict IN PLACE, in this worktree on branch `{branch}`.
    rewrite history; a plain `git push` is the only push you may make.
 2. Run the tests; fix what the merge broke.
 3. Get a fresh-agent review of the RESOLVED diff (an agent that wrote none of it) and post its
-   verdict as a PR comment BEGINNING `<!-- superlooper-review -->`.
+   verdict as a PR comment BEGINNING `<!-- superlooper-review sha=$(git rev-parse HEAD) -->` —
+   post it AFTER your final push, so the `sha=` names the resolved commit that was reviewed.
+   The gate ignores the pre-conflict verdict already on this PR: it reviewed a different diff.
 4. Rewrite your report at {report_path} with the required sections ({report_sections}) — the
    full ship gate re-runs on this PR from scratch.
 
@@ -945,9 +947,14 @@ class Runner:
                 # evidence yet (a late review marker must reach the gate before it nudges+parks);
                 # skip once reviewed or no longer OPEN. Bounded on two sides: this OPEN-no-review
                 # set self-clears when the marker lands or the PR closes, and the terminal-status
-                # skip above drops an issue the moment it parks.
+                # skip above drops an issue the moment it parks. The evidence question is the
+                # DIFF-PINNED one (#154): a PR carrying only a stale gen-1 verdict still has no
+                # evidence for its current head, so it stays in the re-fetch set until the worker
+                # posts a verdict pinned to the code it actually rebuilt.
                 if (cached.get("state") != "OPEN"
-                        or gate.review_evidence_ok(self.config, cached.get("comments"))):
+                        or gate.review_evidence_ok(self.config, cached.get("comments"),
+                                                   cached.get("headRefOid"),
+                                                   ist.get("review_carry"))):
                     continue
             branch = ist.get("branch")
             if not (isinstance(branch, str) and branch.strip()):
@@ -2016,6 +2023,7 @@ class Runner:
                 i[k] = 0
             i.update({"status": "ready", "requeue_front": False, "recheck_failed": False,
                       "update_result": None, "update_head_oid": None, "nudged": [], "pr": None,
+                      "review_carry": None,            # a rebuild is reviewed on its own diff (#154)
                       "read_waited": False, "checks_pending_since": None,
                       "wildcard_hold_journaled": False,   # a fresh approval re-journals its own hold (#36)
                       "launch_hold_reason": None,      # ...and re-journals an eligibility hold (#150)
@@ -2254,6 +2262,32 @@ class Runner:
             self._teardown_session(iid, remove_worktree=True)
         return "ok"
 
+    def _review_carry(self, iid, head, wt):
+        """Carry the PR's review verdict across the runner's OWN merge-update (issue #154).
+
+        A merge-update merges dev into the branch and plain-pushes: the head moves, but the
+        worker's AUTHORED diff is untouched — so the fresh-agent verdict pinned to the pre-merge
+        head still vouches for exactly the code being merged. Without this record the gate's
+        diff-pin would read the new head as "reviewed at a superseded diff" and nudge->park every
+        PR the runner itself updated. The safety of carrying rests on what already guards a clean
+        merge-update: `ship_recheck_cmd` runs against the merged tree and parks on failure, and CI
+        re-runs on the new head before step 5 lets anything merge.
+
+        Reaching here means the gate returned `update`, which sits BELOW step 2b — so review
+        evidence was valid for `head` at decision time, either pinned to it directly or carried
+        onto it by a previous update. `from` therefore keeps the ORIGINALLY reviewed oid across a
+        chain of updates; only `to` advances. Fails closed: an unreadable new head records no
+        carry at all (the gate then asks for a re-review rather than trusting a guess).
+        """
+        new_head = gitops.head_oid(wt)
+        if not (isinstance(head, str) and head and new_head):
+            return None
+        prev = self._issue_field(iid, "review_carry")
+        reviewed = head
+        if isinstance(prev, dict) and prev.get("to") == head and isinstance(prev.get("from"), str):
+            reviewed = prev["from"]        # a chain of updates keeps naming the oid actually reviewed
+        return {"from": reviewed, "to": new_head}
+
     def _exec_update(self, a, now):
         iid, head = a["id"], a.get("head_oid")
         wt = self._worktree(iid)
@@ -2266,7 +2300,8 @@ class Runner:
                     return "recheck failed after merge-update — parking via decide"
             if gitops.plain_push(wt):
                 self._update_issue(iid, {"update_result": "clean", "update_head_oid": head,
-                                         "update_errors": 0})
+                                         "update_errors": 0,
+                                         "review_carry": self._review_carry(iid, head, wt)})
                 return "ok"
             res = "error"                              # push refused/failed: infra, retry
         if res == "conflict":
@@ -2304,6 +2339,7 @@ class Runner:
         self._update_issue(iid, {"status": "ready", "branch": a.get("new_branch"),
                                  "conflicts": a.get("conflicts"), "requeue_front": True,
                                  "update_result": None, "update_head_oid": None,
+                                 "review_carry": None,   # fresh branch, fresh review (#154)
                                  "nudged": [], "pr": None, "recheck_failed": False,
                                  "checks_pending_since": None, "merge_refusals": 0,
                                  "merge_refusal_reason": None,
@@ -2350,7 +2386,8 @@ class Runner:
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,
-                                     "update_head_oid": None, "nudged": []})
+                                     "update_head_oid": None, "review_carry": None,
+                                     "nudged": []})
             self._delivery_cleared()                   # a verified delivery proves the anchor is live (#24)
             return "ok"
         self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
