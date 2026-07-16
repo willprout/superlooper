@@ -90,6 +90,15 @@ WAKE_GRACE_SECONDS = 300
 # and falls back loudly).
 STATE_FORMAT_VERSION = 2
 USAGE_REFRESH_SECONDS = 60
+# Account-auth probe cadence (issue #159 / forensics U3). The probe (`claude auth status` + the
+# credential keychain mtime) bounds `claude` spawns to at most one per this many seconds while a
+# spend is pending; the ~30-min capture is the durable forensic flight recorder for the auth-death
+# class (i336), the ONLY on-disk record of auth state over time. The history file is bounded so it
+# can never grow without limit (the #41 growth discipline).
+AUTH_REFRESH_SECONDS = 60
+AUTH_CAPTURE_SECONDS = 1800
+AUTH_HISTORY_MAX_LINES = 2000
+AUTH_HISTORY_FILENAME = "auth_history.jsonl"
 GH_POLL_SECONDS = 90
 JOURNAL_ROTATE_SECONDS = 6 * 3600   # how often to archive the journal's stale tail (issue #41): the
                                     # first tick rotates (migrates a pre-existing large journal),
@@ -517,6 +526,10 @@ class Runner:
         self._wake_grace_until = 0.0
         self._usage = {"last_ok": {}, "last_ok_at": None, "first_attempt_at": None,
                        "checked_at": 0}
+        # Cached account-auth snapshot (issue #159): the last `claude auth status` + keychain-mtime
+        # read, refreshed on a cadence and handed to decide when a spend is pending. captured_at is
+        # the flight-recorder clock (0 => the first tick captures a boot-time sample).
+        self._auth = {"snapshot": None, "checked_at": 0.0, "captured_at": 0.0}
         self.emitted = self._rebuild_emitted()
 
     def _read_heartbeat(self):
@@ -854,6 +867,88 @@ class Runner:
         return {**self._usage["last_ok"],
                 "last_ok_at": self._usage["last_ok_at"],
                 "first_attempt_at": self._usage["first_attempt_at"]}
+
+    # ------------------------- account auth (issue #159) -------------------------
+    # A fresh launch or a recovery relaunch inherits the SAME credential keychain the runner reads;
+    # if account auth is dead, the new session starts LOGGED OUT and the spend is burned (the i336
+    # class the in-window `logged_out` state catches only AFTER a session is up). So the runner probes
+    # `claude auth status` + the credential keychain mtime — a status read, never a metered session —
+    # caches the snapshot for decide's pre-spend gate, and lays down a durable ~30-min flight recorder
+    # so the auth-death class is knowable from disk next time. Both are agent-specific (the agent
+    # boundary), so the whole path is Claude-only; a Codex lane's auth is out of scope.
+
+    def _probe_auth(self):                             # default; overridden per-instance in tests
+        return usage_mod.probe_auth()
+
+    def _refresh_auth(self, now, force=False):
+        """Refresh the cached auth snapshot on a cadence (bounds `claude` spawns). Self-guarded: a
+        probe failure leaves the last-good snapshot and fails OPEN downstream (a dark probe never
+        blocks the loop — the #46/#76 asymmetry). Claude-only."""
+        if self.agent != "claude":
+            return
+        if (not force and self._auth["checked_at"]
+                and now - self._auth["checked_at"] < AUTH_REFRESH_SECONDS):
+            return
+        self._auth["checked_at"] = now
+        try:
+            snap = self._probe_auth()
+        except Exception:
+            return
+        if isinstance(snap, dict):
+            self._auth["snapshot"] = {**snap, "checked_at": int(now)}
+            try:
+                loopstate.save(os.path.join(self.state, "auth_probe.json"), self._auth["snapshot"])
+            except Exception:
+                pass
+
+    def auth_view(self):
+        return self._auth["snapshot"]
+
+    def _capture_auth(self, now):
+        """The ~30-min auth FLIGHT RECORDER (forensics U3): append `claude auth status` + the
+        credential keychain mtime to a durable append-only file, so the next in-process auth death
+        (i336) is knowable from disk instead of unknowable. Forces a genuinely-timed fresh sample at
+        each capture boundary; bounded (the #41 growth discipline); self-guarded (a capture failure
+        never costs the tick). Claude-only."""
+        if self.agent != "claude":
+            return
+        if self._auth["captured_at"] and now - self._auth["captured_at"] < AUTH_CAPTURE_SECONDS:
+            return
+        self._refresh_auth(now, force=True)            # a fresh, genuinely-30-min-spaced sample
+        snap = self._auth["snapshot"]
+        if not isinstance(snap, dict):
+            return                                     # probe never produced a snapshot
+        self._auth["captured_at"] = now
+        line = json.dumps({"at": int(now), **snap}, sort_keys=True)
+        try:
+            path = os.path.join(self.state, AUTH_HISTORY_FILENAME)
+            lines = []
+            if os.path.exists(path):
+                with open(path) as f:
+                    lines = f.read().splitlines()
+            lines.append(line)
+            if len(lines) > AUTH_HISTORY_MAX_LINES:    # bound the recorder: keep the recent tail
+                lines = lines[-(AUTH_HISTORY_MAX_LINES // 2):]
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
+    def _wants_session_start(self):
+        """True when a launch OR a recovery relaunch may happen this tick — fresh-queue demand
+        (_wants_launch) OR any lane awaiting relaunch (a state/exited/<id> marker). Gates the
+        auth-probe FEED into decide's view (issue #159), mirroring _wants_launch for the anchor: the
+        auth gate/alert can only fire when a spend is actually pending, so an idle runner is never
+        told its auth is dead and never shells out to `claude` with nothing to launch."""
+        if self._wants_launch():
+            return True
+        try:
+            return any(actions._iid_num(n) is not None
+                       for n in os.listdir(os.path.join(self.state, "exited")))
+        except OSError:
+            return False
 
     def _poll_github(self, now):
         if now - self._last_poll < GH_POLL_SECONDS and self._last_poll:
@@ -1376,6 +1471,7 @@ class Runner:
                                        "grace_until": int(self._wake_grace_until)}, now)
         self._last_tick_now = now
         self._refresh_usage(now)
+        self._capture_auth(now)                        # #159 auth flight recorder: a ~30-min sample, always
         try:
             self._poll_github(now)
         except Exception as e:
@@ -1423,6 +1519,15 @@ class Runner:
         disk["launch_fail_at"] = self._launch_fail_at    # the #115 canary retry clock (decide reads it)
         if self._wants_launch():
             disk["launch_anchor"] = self._anchor_status()
+        # Account-auth gate (issue #159): hand decide a fresh-ish `claude auth status` + keychain
+        # snapshot ONLY when a spend is pending (a launch OR a relaunch), so it holds a launch/relaunch
+        # into dead auth and alerts — but an idle runner never probes or alarms. Fail-open lives in
+        # decide: only a definitive `valid is False` blocks; an absent/unknown snapshot launches.
+        if self._wants_session_start():
+            self._refresh_auth(now)
+            auth_snap = self.auth_view()
+            if isinstance(auth_snap, dict):
+                disk["auth_probe"] = auth_snap
 
         lane_state = actions.lane_state_from(st)
         acts = actions.decide(now, self.config, self.usage_view(),

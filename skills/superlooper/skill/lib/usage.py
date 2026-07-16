@@ -11,11 +11,17 @@ below to the current `claude-code/<version>` (a stale User-Agent is silently ref
 """
 import datetime
 import json
+import re
 import subprocess
 import urllib.request
 import urllib.error
 
 USER_AGENT_VERSION = "2.1.90"  # keep current-ish or the endpoint 403s
+
+# The macOS login-keychain item Claude Code stores its OAuth credentials in. Agent-specific by
+# construction (this whole file is inside the agent boundary), and shared with fetch_claude_usage
+# below so the probe and the meter read the SAME credential.
+CRED_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
 def iso_to_epoch(iso):
@@ -27,6 +33,92 @@ def iso_to_epoch(iso):
         return int(datetime.datetime.fromisoformat(s).timestamp())
     except (ValueError, AttributeError):
         return None
+
+
+# The `security` <timedate> attribute renders as e.g. "20260716063543Z" (UTC). Its epoch is the
+# credential keychain item's modification time — the piece the i336 forensics (U3) needed and could
+# not get from disk: a token that silently rotated/expired mid-run would move this mtime.
+_KEYCHAIN_MDAT = re.compile(r'"mdat"<timedate>=\S*\s+"(\d{14})Z', re.I)
+# The stable auth-death phrases Claude Code prints when it is NOT in a JSON-status build. Kept in
+# sync (in spirit) with pane_state._LOGGED_OUT_PATTERNS — the in-window siblings of this account
+# probe — so a prose render still reads as logged-out and never silently reopens i336.
+_CLI_LOGGED_OUT = re.compile(r"not logged in|please run /login|run claude auth login|logged out",
+                             re.I)
+
+
+def _keychain_ts_to_epoch(s):
+    """'20260716063543' (a `security` <timedate>, UTC) -> int epoch seconds. None on None/garbage
+    (never raises)."""
+    try:
+        dt = datetime.datetime.strptime(s, "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def _credential_keychain_state(timeout=5):
+    """(present, mtime_epoch) for the Claude Code credential keychain item, reading its ATTRIBUTES
+    only — never `-w`, so the OAuth secret is never dumped. present is False on a definitive absence
+    (nonzero rc), None when `security` could not be run at all (fail-open ambiguity), True otherwise.
+    mtime_epoch is the item's `mdat` in epoch seconds, or None."""
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", CRED_KEYCHAIN_SERVICE],
+            capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None, None
+    if r.returncode != 0:
+        return False, None                     # item is gone: a fresh launch would have no creds
+    m = _KEYCHAIN_MDAT.search((r.stdout or "") + (r.stderr or ""))
+    return True, (_keychain_ts_to_epoch(m.group(1)) if m else None)
+
+
+def probe_auth(timeout=5) -> dict:
+    """The cheap, agent-specific, NEVER-metered auth probe (issue #159 / forensics U3).
+
+    Runs `claude auth status` (a STATUS read — not a headless `claude -p` session, so it is inside
+    the owner's no-headless-metering rule) and reads the credential keychain item's mtime. Returns:
+        cli              -> "logged_in" | "logged_out" | "unknown"
+        keychain_present -> True | False | None
+        keychain_mtime   -> int epoch seconds | None
+        status_raw       -> the (bounded) `claude auth status` text, for the forensic capture
+        valid            -> True | False | None
+    `valid` is the launch-gating verdict: False ONLY on a DEFINITIVE dead reading (the CLI reports
+    not-logged-in, or the credential keychain item is gone) — those are exactly the states in which a
+    fresh launch or a recovery relaunch would start LOGGED OUT and burn the spend (the i336 class).
+    Anything unreadable (binary missing, hang, unrecognized output, keychain unreadable) -> None ->
+    the caller FAILS OPEN: a probe we merely could not run must never freeze the whole loop (the
+    #46/#76 dark-meter asymmetry, applied to auth)."""
+    cli = "unknown"
+    status_raw = ""
+    try:
+        r = subprocess.run(["claude", "auth", "status"],
+                           capture_output=True, text=True, timeout=timeout)
+        status_raw = ((r.stdout or "") + (r.stderr or "")).strip()
+        parsed = None
+        try:
+            parsed = json.loads(r.stdout or "")
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("loggedIn"), bool):
+            cli = "logged_in" if parsed["loggedIn"] else "logged_out"
+        elif _CLI_LOGGED_OUT.search(status_raw):
+            cli = "logged_out"                 # prose render: the stable auth-death phrase
+    except Exception:
+        cli = "unknown"                        # binary missing / hang -> unknown, never invalid
+
+    keychain_present, keychain_mtime = _credential_keychain_state(timeout=timeout)
+
+    if cli == "logged_out" or keychain_present is False:
+        valid = False                          # definitive: block the spend, alert the owner
+    elif cli == "logged_in":
+        valid = True
+    else:
+        valid = None                           # unknown -> fail open (never block on a dark probe)
+
+    return {"cli": cli, "keychain_present": keychain_present,
+            "keychain_mtime": keychain_mtime, "valid": valid,
+            "status_raw": status_raw[:1000]}
 
 
 def fetch_claude_usage() -> dict:
@@ -48,7 +140,7 @@ def fetch_claude_usage() -> dict:
     try:
         # 1. Pull the Claude Code OAuth token from the macOS Keychain.
         token_raw = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            ["security", "find-generic-password", "-s", CRED_KEYCHAIN_SERVICE, "-w"],
             capture_output=True, text=True, timeout=5,
         )
         if token_raw.returncode != 0:

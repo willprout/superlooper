@@ -651,6 +651,134 @@ def test_launch_anchor_and_fail_ids_wrong_typed_never_raise_or_falsely_degrade()
             assert only(out, "alert") == []
 
 
+# =========================== account auth probe before a spend (#159) ===========================
+# The i336 class (forensics U3): a session's auth died in-process and the runner burned 94 minutes
+# nudging a dead-auth pane. The pane 'logged_out' state (#151) catches that AFTER a session is up;
+# THIS gate catches it BEFORE — a fresh launch or a recovery relaunch into DEAD ACCOUNT AUTH would
+# start logged out and waste the spend. The runner hands decide a `claude auth status` + keychain
+# snapshot in disk["auth_probe"] only when a spend is pending; decide HOLDS the spend and ALERTS
+# once on a DEFINITIVE dead reading, and FAILS OPEN on anything unreadable (never freeze the loop
+# on a probe we merely could not run — the #46/#76 dark-meter asymmetry applied to auth).
+
+def _auth_dead():
+    return {"valid": False, "cli": "logged_out", "keychain_present": True,
+            "keychain_mtime": NOW - 3600}
+
+
+def _auth_unknown():
+    return {"valid": None, "cli": "unknown", "keychain_present": True, "keychain_mtime": None}
+
+
+def _auth_ok():
+    return {"valid": True, "cli": "logged_in", "keychain_present": True, "keychain_mtime": NOW - 60}
+
+
+def test_dead_auth_holds_fresh_launch_and_alerts_once():
+    dsk = disk(auth_probe=_auth_dead())
+    out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
+    assert only(out, "launch") == []                       # every fresh launch held
+    assert only(out, "park") == []                         # nothing parked: the queue is intact
+    assert only(out, "relabel") == []                      # agent-ready never stripped
+    a = only(out, "alert")
+    assert len(a) == 1 and a[0]["reasons"] == ["auth_dead"]
+    assert len(only(out, "notify")) == 1                   # exactly one notify (the alert)
+
+
+def test_dead_auth_alert_dedupes_across_ticks():
+    dsk = disk(auth_probe=_auth_dead(), alert={"reasons": ["auth_dead"]})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert only(out, "alert") == [] and not has_notify(out)   # already alerted: no repeat
+    assert only(out, "launch") == []
+
+
+def test_unknown_auth_probe_fails_open_and_launches():
+    dsk = disk(auth_probe=_auth_unknown())
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "launch")) == 1                   # dark probe -> fail open, launch normally
+    assert only(out, "alert") == []
+
+
+def test_valid_auth_probe_launches_normally():
+    dsk = disk(auth_probe=_auth_ok())
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "launch")) == 1 and only(out, "alert") == []
+
+
+def test_absent_auth_probe_launches_normally():
+    # No auth_probe in the view (the runner saw no launch demand, or agent!=claude): fail open.
+    out = decide(parsed_issues=[parsed(5)])
+    assert len(only(out, "launch")) == 1 and only(out, "alert") == []
+
+
+def test_wrong_typed_auth_probe_never_raises_or_falsely_degrades():
+    for bad in (None, "dead", 0, [], {"valid": "no"}, {"valid": 0}, {"valid": None}, {}):
+        dsk = disk(auth_probe=bad)
+        out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+        assert len(only(out, "launch")) == 1, bad          # only a literal False blocks
+        assert only(out, "alert") == [], bad
+
+
+def test_dead_auth_with_nothing_queued_does_not_alert():
+    # Idle: dead auth with no approved issue to launch and no lane awaiting relaunch is not yet
+    # harmful — no alert, no noise (mirrors the idle dead-anchor rule).
+    dsk = disk(auth_probe=_auth_dead())
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=dsk)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_dead_auth_holds_exited_relaunch_and_never_parks():
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    # Even at the retry cap, dead auth HOLDS rather than parks: auth is the owner's to fix and the
+    # lane resumes the tick it reads healthy again (a park would need a re-approval).
+    dsk = disk(auth_probe=_auth_dead(), exited={"i5": "x rc=1"},
+               issues_state={"version": 1, "issues": {"i5": ist("running", retries=2)}})
+    out = decide(parsed_issues=[p5], dsk=dsk)
+    assert only(out, "recover") == []                      # no relaunch into dead auth
+    assert only(out, "park") == []                         # held, not parked
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i5" and "auth" in h[0]["reason"].lower()
+    a = only(out, "alert")
+    assert len(a) == 1 and a[0]["reasons"] == ["auth_dead"]
+
+
+def test_valid_auth_still_relaunches_an_exited_lane():
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    dsk = disk(auth_probe=_auth_ok(), exited={"i5": "x rc=1"},
+               issues_state={"version": 1, "issues": {"i5": ist("running", retries=1)}})
+    out = decide(parsed_issues=[p5], dsk=dsk)
+    r = only(out, "recover")
+    assert len(r) == 1 and r[0]["tier"] == "exited" and only(out, "alert") == []
+
+
+def test_dead_auth_holds_orphan_resume():
+    p8 = parsed(8, labels=("in-progress", "type:build"))
+    g = ghv(prs={"i8": pr_view(num=88, branch="sl/i8-issue-8")})
+    dsk = disk(auth_probe=_auth_dead())
+    out = decide(parsed_issues=[p8], dsk=dsk, gh_view=g)
+    assert only(out, "launch") == []                       # the orphan resume is held
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i8" and "auth" in h[0]["reason"].lower()
+
+
+def test_dead_auth_does_not_block_gating_or_merging():
+    # Auth gates SPENDS (launch/relaunch), never merge mechanics: a finished, clean PR still merges
+    # while auth is dead — merging spends no session (mirrors the dead-anchor rule).
+    d, g = _gating()                                       # i5 finished, clean PR
+    d["auth_probe"] = _auth_dead()
+    out = decide(parsed_issues=[parsed(9)], dsk=d, gh_view=g)   # i9 queued behind dead auth
+    assert len(only(out, "merge")) == 1                    # the gate still merges the finished PR
+    assert only(out, "launch") == []                       # but the queued launch is held
+    assert only(out, "alert")[0]["reasons"] == ["auth_dead"]
+
+
+def test_dead_auth_and_dead_anchor_both_named_sorted():
+    dsk = disk(auth_probe=_auth_dead(), launch_anchor=_anchor_down())
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    a = only(out, "alert")
+    assert len(a) == 1 and a[0]["reasons"] == ["auth_dead", "launch_anchor_down"]   # sorted
+    assert only(out, "launch") == [] and only(out, "park") == []
+
+
 # =========================== canary re-arm of the systemic hold (#115) ===========================
 # The 2026-07-13 incident: three launch deliveries failed back-to-back, #24's breaker tripped
 # correctly (one park raced the streak, one alert, launches HELD) — but the hold never released on

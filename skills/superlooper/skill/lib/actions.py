@@ -229,6 +229,14 @@ ALERT_MESSAGES = {
                                "(or re-run bin/install-launch-shim.sh), then FULLY QUIT and "
                                "relaunch cmux in a visible tab and restart the runner — the flag is "
                                "read only at app launch. If it persists, check the cmux anchor.",
+    "auth_dead": "the account AUTH probe reads DEAD — `claude auth status` reports not-logged-in "
+                 "(or the Claude Code credential keychain item is gone), so a fresh launch or a "
+                 "recovery relaunch would start LOGGED OUT and burn the spend (the i336 class). "
+                 "Launches and relaunches are HELD (the queue is intact, nothing parked) and "
+                 "resume automatically once auth reads healthy again. Re-login: run `claude` (or "
+                 "`claude auth login`) in a terminal signed into the loop's subscription account. "
+                 "This is the PRE-LAUNCH sibling of the in-window 'Not logged in' state "
+                 "(session_logged_out): it catches dead auth BEFORE a session is spent, not after.",
 }
 
 
@@ -791,14 +799,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         filters candidates on launch_ok."""
         return scheduler.launch_ok(p, closed_nums, bool(frozen), usage_sched, resume=resume)
 
-    def launch_hold(iid, num, p):
-        """start_ok said no: HOLD, legibly — never a silent launch (D8), and never a park. This is a
-        WAIT, not a verdict: the retry cap and park semantics are untouched (a boundary of #150), the
-        marker/labels stay exactly as they are, and the restart fires on the tick the gate passes.
-        Journal ONCE per CAUSE — dedup on the reason the executor stamps durably, so a standing hold
-        can't spam a 15s tick, while a CHANGED cause (the blocker closed but the labels went
-        ambiguous) still speaks rather than leaving stale prose on the board."""
-        reason = _launch_gate_reason(p, closed_nums, usage_sched)
+    def launch_hold(iid, num, p, reason=None):
+        """start_ok (or the #159 auth gate) said no: HOLD, legibly — never a silent launch (D8), and
+        never a park. This is a WAIT, not a verdict: the retry cap and park semantics are untouched (a
+        boundary of #150), the marker/labels stay exactly as they are, and the restart fires on the
+        tick the gate passes. Journal ONCE per CAUSE — dedup on the reason the executor stamps
+        durably, so a standing hold can't spam a 15s tick, while a CHANGED cause (the blocker closed
+        but the labels went ambiguous) still speaks rather than leaving stale prose on the board. An
+        explicit `reason` overrides the usage/eligibility reason (the auth gate names auth)."""
+        reason = reason if isinstance(reason, str) and reason \
+            else _launch_gate_reason(p, closed_nums, usage_sched)
         if ist_of(iid).get("launch_hold_reason") == reason:
             return
         out.append({"act": "launch_hold", "id": iid, "num": num, "reason": reason})
@@ -835,6 +845,24 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # One degraded mode for both detectors: hold every fresh launch and suppress the per-issue
     # launch-cap park (phases D+E), so the queue is left intact for when the anchor resolves.
     launch_degraded = anchor_down or systemic_launch
+    # Account-level AUTH gate (issue #159 / forensics U3). The runner hands us a `claude auth status`
+    # + credential-keychain snapshot when a spend is pending; a DEFINITIVE dead reading (valid is
+    # literally False — the CLI is not-logged-in, or the keychain item is gone) means a fresh launch
+    # or a recovery relaunch would start LOGGED OUT and burn the spend (the i336 class the in-window
+    # 'logged_out' state catches only AFTER a session is up). Fail OPEN on anything unreadable (valid
+    # None/absent/wrong-typed): a probe we merely could not run must never freeze the whole loop — the
+    # #46/#76 dark-meter asymmetry, applied to auth. auth_invalid holds fresh launches AND recovery
+    # relaunches (below) and, when there is real spend demand, raises the auth_dead ALERT.
+    auth_probe = dsk.get("auth_probe")
+    auth_invalid = isinstance(auth_probe, dict) and auth_probe.get("valid") is False
+    # A lane awaiting relaunch is spend demand too — a dead-auth reading with only an exited lane must
+    # still surface (i336 was a recovery scenario). Loose by design (an exited marker for a tracked
+    # issue): over-surfacing dead auth is fail-safe, and a terminal lane's marker is cleaned anyway.
+    has_exited_demand = any(_iid_num(k) is not None for k in exited)
+    # launches_held folds auth into the same fresh-launch suppression the anchor/systemic detectors
+    # use, so the queue is held intact (never parked) while auth is dead, exactly as under a dead
+    # anchor. The recovery-relaunch and orphan-resume holds are applied per-issue below.
+    launches_held = launch_degraded or auth_invalid
     # prev_systemic: was a systemic-launch hold ALREADY established? The launch_systemic_failure
     # ALERT is DURABLE (survives a runner restart), so its presence on disk is the episode marker —
     # the same durable-marker discipline usage's prev_dark uses. Its falling edge (prev_systemic and
@@ -897,6 +925,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         reasons.append("launch_anchor_down")
     if systemic_launch:
         reasons.append("launch_systemic_failure")
+    if auth_invalid and (has_pending_launch or has_exited_demand):   # dead auth only matters with a
+        reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
     reasons.sort()
     if reasons:
         existing = alert_on_disk.get("reasons") if alert_on_disk else None
@@ -1384,7 +1414,15 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # name it in whichever exited-park memo fires, so the operator sees the actual error and
             # not just the relaunch count.
             stderr_memo = _launch_stderr_memo(launch_stderr.get(iid))
-            if type(retries) is not int:               # corrupt counter -> to William, not a loop
+            if auth_invalid:
+                # Account auth is dead (issue #159): a relaunch would start LOGGED OUT and burn the
+                # spend. HOLD (the auth_dead ALERT above names it) — never park (auth is the owner's
+                # to fix, and the lane resumes the tick it reads healthy). Checked FIRST so a lane
+                # already at its retry cap holds too, rather than parking under a fault that is not
+                # its own; the relaunch charges no attempt because it never fires.
+                launch_hold(iid, num, p,
+                            reason="account auth is not valid — relaunch held (see the auth_dead alert)")
+            elif type(retries) is not int:             # corrupt counter -> to William, not a loop
                 park(iid, num, "exited, and the retry counter is unreadable — parking" + stderr_memo,
                      cause="exited_cap")
             elif retries >= retry_cap:
@@ -1508,10 +1546,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # status is None/"ready" from here on
         launch_fails, corrupt = _counter(ist, "launch_failures")
         if "agent-ready" in labels and (corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
-            if launch_degraded:
-                continue                               # SYSTEMIC launch fault (#24): hold, never
-                                                       # park per-issue — the queue stays intact for
-                                                       # when the anchor resolves (the alert stands)
+            if launches_held:
+                continue                               # SYSTEMIC launch fault (#24) or dead auth
+                                                       # (#159): hold, never park per-issue — the
+                                                       # queue stays intact for when it resolves
+                                                       # (the alert stands)
             # The evidence the runner captured at the MOMENT the launch failed (issue #152) — the
             # launcher's own stderr, stamped into loopstate by _exec_launch. This is what lets the
             # memo below name the component actually at fault instead of guessing one.
@@ -1553,7 +1592,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                          and "superseded" not in gate._pr_labels(pv)
                          and (not isinstance(stamped, str) or not stamped.strip()
                               or stamped == branch))
-            if resumable and not start_ok(p):
+            if resumable and auth_invalid:
+                # Account auth is dead (issue #159): resuming the orphan on its PR branch would start
+                # LOGGED OUT and burn the spend. HOLD in place (never reclaim — reclaim would orphan
+                # the pushed work, same reasoning as the gate-hold below); the auth_dead ALERT names
+                # it and the resume fires the tick auth reads healthy again.
+                launch_hold(iid, num, p,
+                            reason="account auth is not valid — resume held (see the auth_dead alert)")
+            elif resumable and not start_ok(p):
                 # (#150 / D8) The restart rebuild resumes an in-progress issue's session on its open
                 # PR's branch — and asked NO gate at all: not eligibility, not even usage. HOLD in
                 # place rather than reclaim: this orphan resume is the ONLY path that re-attaches the
@@ -1612,7 +1658,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         branch = ist_of(iid).get("branch")
         return branch if isinstance(branch, str) and branch.strip() else brief.branch_for(parsed_by_id[iid])
 
-    if not gh_stale and not issue_state_corrupt_for_launches and not launch_degraded:
+    if not gh_stale and not issue_state_corrupt_for_launches and not launches_held:
         candidates = []
         for iid, p, ist in _eligible_launch_ids():
             if _needs_touches(p):
@@ -1641,11 +1687,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 continue
             out.append({"act": "wildcard_hold", "id": hid, "num": h.get("num"),
                         "blocker": h.get("blocker_id"), "reason": _wildcard_hold_reason(h)})
-    elif (systemic_launch and not anchor_down
+    elif (systemic_launch and not anchor_down and not auth_invalid
             and not gh_stale and not issue_state_corrupt_for_launches):
         # Canary re-arm of the SYSTEMIC hold (issue #115). The streak-based hold cannot clear itself,
         # so once per CANARY_RETRY_SECONDS since the last delivery failure, probe with ONE canary
-        # launch of the front-of-queue issue. A verified delivery clears the streak (runner) and normal
+        # launch of the front-of-queue issue. Suppressed while auth reads DEAD (#159): a canary into
+        # dead account auth would just start logged-out and re-fail — hold until auth recovers.
+        # A verified delivery clears the streak (runner) and normal
         # launching resumes next tick; a failed canary re-enters the hold — the runner charges NO
         # per-issue cap and this decide emits no park. Skipped while the pane probe itself reports the
         # anchor DEAD (anchor_down): that detector self-re-arms via its per-tick probe, and a canary
