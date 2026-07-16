@@ -118,14 +118,17 @@ RECOVER_RETRY_SECONDS = 600        # frozen-session recovery ladder re-fires at 
 # and far inside the 94-minute class of silence this issue exists to end.
 AT_DIALOG_ALERT_SECONDS = 1800
 LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LAUNCHVERIFY x2)
-# A dead LAUNCH ANCHOR (the cmux pane every worker tab is born in) is a RUNNER-level fault, never
-# N per-issue parks (incident 2026-07-09: a dead anchor walked 10 approved issues into 10 parks in
-# ~8 min). When this many DISTINCT issues fail launch-delivery back-to-back — the runner's streak,
-# any verified delivery clears it — it is systemic, not issue-specific: hold launches, one alert,
-# the queue left intact. 2 distinct issues failing consecutively already outstrips any single bad
-# issue (which the per-issue LAUNCH_FAILURE_CAP handles), so the trip is early and the queue is
-# spared. Kept below/at the pane-probe path (`launch_anchor`), which catches a dead anchor directly.
-SYSTEMIC_LAUNCH_FAILURE_CAP = 2    # >= this many DISTINCT issues failing delivery -> systemic (#24)
+# A dead DELIVERY CHANNEL — the cmux launch anchor (the pane every worker tab is born in), the
+# launch shim, or the launch machinery — is a RUNNER-level fault, never N per-issue parks (incident
+# 2026-07-09: a dead anchor walked 10 approved issues into 10 parks in ~8 min). The runner records
+# ONLY channel-attributable launch failures in this streak (evidence.is_channel_fault gates it; a
+# per-issue fault like base_missing parks its own issue and never enters here — issue #153), so a
+# single entry already means the channel is down. The FIRST such failure is therefore systemic:
+# hold launches, one alert, the queue left intact — no issue absorbs the blame, not even the first.
+# (The earlier design waited for a SECOND distinct issue to infer "channel" by counting; reading the
+# evidence reason tells us on the first failure, so the count threshold is 1.) Kept beside the
+# pane-probe path (`launch_anchor`), which catches a dead anchor before a launch is even attempted.
+SYSTEMIC_LAUNCH_FAILURE_CAP = 1    # >= this many channel-attributable failures -> systemic (#24/#153)
 # A tripped systemic-launch breaker (#24) cannot clear itself: the streak clears ONLY on a VERIFIED
 # delivery, yet the hold suppresses every delivery, so the loop sits healthy-but-frozen until a
 # manual restart (live 2026-07-13 — three failures held, the owner's 20:21 re-approve launched
@@ -210,9 +213,10 @@ ALERT_MESSAGES = {
     "launch_anchor_down": "launch anchor gone — restart superlooper in a visible cmux tab. The "
                           "launch queue is held intact; every approved issue keeps agent-ready and "
                           "launches resume automatically once the tab's pane resolves again.",
-    "launch_systemic_failure": "launches are failing delivery across multiple issues — a systemic "
-                               "launch fault, not an issue-specific one. The queue is held intact "
-                               "(nothing parked). The usual cause when this trips after you walk "
+    "launch_systemic_failure": "a launch is failing DELIVERY to the channel — the cmux anchor or the "
+                               "launch shim — not to any one issue: a systemic launch fault. The "
+                               "queue is held intact (nothing parked, no issue charged). The usual "
+                               "cause when this trips after you walk "
                                "away is macOS App Nap suspending an idle/occluded cmux: it still "
                                "answers new-surface but defers spawning the tab's shell past the "
                                "verify window, so no worker starts. Fix: run "
@@ -778,9 +782,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     #   * launch_anchor: the per-tick pane probe. ONLY an EXPLICIT ok is False degrades — a missing or
     #     wrong-typed probe is treated as ok (fail SAFE for launches: never wedge the whole queue on
     #     absent probe data; the streak below still backstops a truly dead anchor).
-    #   * launch_fail_ids: the DISTINCT issues in the current unbroken run of launch-delivery failures
-    #     (runner-maintained; any verified delivery clears it). >= SYSTEMIC_LAUNCH_FAILURE_CAP distinct
-    #     issues failing back-to-back is systemic; one issue at its own cap is not (and still parks).
+    #   * launch_fail_ids: the DISTINCT issues whose launch failed for a CHANNEL reason (the anchor,
+    #     the shim, the launch machinery — the runner classifies via evidence.is_channel_fault before
+    #     recording; a per-issue fault never enters here and still parks its own issue). Any verified
+    #     delivery clears it. Because the streak is channel-only, its FIRST entry already means the
+    #     channel is down: >= SYSTEMIC_LAUNCH_FAILURE_CAP (1) is systemic (issue #153).
     anchor = dsk.get("launch_anchor")
     anchor_down = isinstance(anchor, dict) and anchor.get("ok") is False
     raw_fail_ids = dsk.get("launch_fail_ids")

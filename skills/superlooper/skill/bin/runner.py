@@ -467,9 +467,13 @@ class Runner:
         self._consecutive_tick_errors = 0    # reset on the first clean tick (incident 2026-07-07)
         self._tick_alert_on_disk = False     # the wedge ALERT is confirmed written (retry until so)
         self._tick_alert_notified = False    # the wedge notify+journal fired once this episode
-        # DISTINCT issues in the current unbroken run of launch-delivery failures (issue #24). Any
-        # verified delivery clears it; >= actions.SYSTEMIC_LAUNCH_FAILURE_CAP distinct ids is a
-        # SYSTEMIC launch fault (dead anchor), not N per-issue parks. In-memory on purpose (like
+        # DISTINCT issues whose launch failed for a DELIVERY-CHANNEL reason — the anchor, the shim, or
+        # the launch machinery, never the issue's own state (issue #24, refined by #153). A per-issue
+        # fault (base_missing, worktree_create_failed, ...) NEVER enters this streak: _exec_launch
+        # classifies via evidence.is_channel_fault before recording. Any verified delivery clears it;
+        # >= actions.SYSTEMIC_LAUNCH_FAILURE_CAP entries is a SYSTEMIC launch fault (a dead channel),
+        # held once for the whole queue, never N per-issue parks. Because the streak is channel-only,
+        # its FIRST entry already means the channel is down. In-memory on purpose (like
         # _consecutive_tick_errors): it is live runtime health, and a restart — the documented
         # recovery for a wedged anchor — is exactly when it should reset to a clean slate.
         self._launch_fail_ids = set()
@@ -1857,6 +1861,27 @@ class Runner:
         self._launch_fail_ids.clear()
         self._launch_fail_at = 0
 
+    def _charge_launch_failure(self, iid, ev, now, canary=False, fields=None):
+        """Charge ONE non-verified launch delivery to whoever is actually at fault (issue #153), the
+        single decision every launch-delivery path shares (fresh launch, recover-exited relaunch,
+        resolve-conflict relaunch) so the invariant is mechanical and can't drift between them.
+
+        A DELIVERY-CHANNEL fault — the cmux anchor, the launch shim, or the launch machinery itself
+        (evidence.is_channel_fault) — or a #115 canary probe is charged to the CHANNEL: it feeds the
+        systemic streak and the retry clock and NEVER bumps the per-issue launch cap, so no issue
+        absorbs a fault none of them caused and a dead channel is detected even when only in-flight
+        work is being relaunched. Every OTHER (per-issue) fault bumps the cap so the issue parks.
+        `fields` are the caller's path-specific loopstate fields; launch_evidence is always stamped.
+        Returns True when charged to the channel (held), False when charged to the issue."""
+        merged = dict(fields or {}, launch_evidence=ev)
+        if canary or evidence.is_channel_fault(ev):
+            self._launch_fail_at = now
+            self._launch_fail_ids.add(iid)
+            self._update_issue(iid, merged)
+            return True
+        self._update_issue(iid, merged, fn=lambda st, i: self._bump(i, "launch_failures"))
+        return False
+
     def _exec_launch(self, a, now):
         iid, num, branch = a["id"], a.get("num"), a.get("branch")
         canary = bool(a.get("canary"))                 # a systemic re-arm probe (#115), not charged
@@ -1932,24 +1957,19 @@ class Runner:
                                fn=None if canary else (lambda st, i: self._bump(i, "launch_failures")))
             verb = "canary launch" if canary else "launch"
             return self._failed("launch", rc, f"{verb} rc={rc} (worktree base branch missing)", ev=ev)
-        # Delivery NOT verified. Stamp the #115 canary retry clock so the next probe waits a full
-        # interval, and record this id in the runner-level anchor streak (issue #24) — decide reads
-        # the streak to tell a dead anchor (many distinct ids) from a genuinely bad issue (one).
-        self._launch_fail_at = now
-        self._launch_fail_ids.add(iid)
-        if canary:
-            # A SYSTEMIC probe (issue #115), NEVER charged to the issue: no per-issue launch-cap bump
-            # and no park. The streak above already stands at/over the systemic cap, so the hold
-            # persists; the issue stays queued (ready, agent-ready never moved) for the next probe or
-            # the eventual resume.
-            self._update_issue(iid, {"status": "ready", "launch_error": None,
-                                     "launch_evidence": ev})
+        # Delivery NOT verified. WHO is at fault decides how it is charged (issue #153): a
+        # DELIVERY-CHANNEL fault (the cmux anchor, the launch shim, the launch machinery — or a #115
+        # canary probe) feeds the systemic streak and charges NO per-issue cap, so the queue holds
+        # systemically on the FIRST such failure and no issue absorbs the blame; a PER-ISSUE fault (a
+        # git-level worktree failure, unusable issue state, a missing brief) bumps the cap so it parks
+        # with the evidence-named memo (#152). The shared helper is the one place that decision lives.
+        if self._charge_launch_failure(iid, ev, now, canary=canary,
+                                       fields={"status": "ready", "launch_error": None}):
+            note = ("systemic hold persists" if canary
+                    else "channel fault — the queue is held systemically, no issue charged")
+            verb = "canary launch" if canary else "launch"
             return self._failed("launch", rc, ev=ev,
-                                text=f"canary launch rc={rc} (delivery not verified — systemic hold persists)")
-        # Stamp the evidence beside the counter that will eventually park this issue, so decide's
-        # park memo can name what actually happened instead of asking about the shim (issue #152).
-        self._update_issue(iid, {"status": "ready", "launch_error": None, "launch_evidence": ev},
-                           fn=lambda st, i: self._bump(i, "launch_failures"))
+                                text=f"{verb} rc={rc} (delivery not verified — {note})")
         return self._failed("launch", rc, f"launch rc={rc} (delivery not verified)", ev=ev)
 
     def _operator(self):
@@ -2269,9 +2289,12 @@ class Runner:
                 self._delivery_cleared()               # a verified delivery proves the anchor is live (#24)
                 return "ok"
             ev = self._evidence("launch", rc, tier=tier)
-            self._update_issue(iid, {"launch_evidence": ev},
-                               fn=lambda st, i: self._bump(i, "launch_failures"))
-            return self._failed("launch", rc, f"relaunch rc={rc}", ev=ev)
+            # Same #153 charge rule as the fresh launch: a channel fault is held systemically and
+            # charges no per-issue cap; a per-issue fault bumps the cap. A dead channel that surfaces
+            # ONLY here (all work in-flight, nothing fresh to launch) still trips the systemic hold.
+            held = self._charge_launch_failure(iid, ev, now)
+            tag = "channel fault — held systemically" if held else "issue charged"
+            return self._failed("launch", rc, f"relaunch rc={rc} ({tag})", ev=ev)
         # ---- the pid pulse, BEFORE any screen tier (issue #151) ----
         # Ground truth first: if the worker process is gone, nothing the pane renders can change
         # that, and asking the screen is how i160 lost 43 minutes to an unclassifiable one. Only a
@@ -2617,11 +2640,12 @@ class Runner:
             self._delivery_cleared()                   # a verified delivery proves the anchor is live (#24)
             return "ok"
         # This launch failure is journaled too, so it carries evidence like every other (#152), and
-        # stamps it beside the counter — the same contract _exec_launch/_exec_recover follow.
+        # follows the same #153 charge rule as _exec_launch/_exec_recover: a channel fault is held
+        # systemically (no per-issue cap), a per-issue fault bumps the cap so it parks.
         ev = self._evidence("launch", rc)
-        self._update_issue(iid, {"launch_evidence": ev},
-                           fn=lambda st, i: self._bump(i, "launch_failures"))
-        return self._failed("launch", rc, f"conflict-session launch rc={rc}", ev=ev)
+        held = self._charge_launch_failure(iid, ev, now)
+        tag = "channel fault — held systemically" if held else "issue charged"
+        return self._failed("launch", rc, f"conflict-session launch rc={rc} ({tag})", ev=ev)
 
     def _exec_close_investigate(self, a, now):
         iid, num = a["id"], a.get("num")
