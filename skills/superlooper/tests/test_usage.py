@@ -111,7 +111,8 @@ def _claude_status(logged_in=True, extra="", rc=0):
 
 def _keychain_attrs(present=True, ts="20260716063543"):
     if not present:
-        return mock.Mock(returncode=1, stdout="", stderr="password not found")
+        # errSecItemNotFound — the code `security` returns for a missing item (rc 44).
+        return mock.Mock(returncode=44, stdout="", stderr="password not found")
     attrs = (
         '    "acct"<blob>="willprout"\n'
         f'    "cdat"<timedate>=0x3230 "20260326231749Z\\000"\n'
@@ -189,6 +190,41 @@ def test_probe_auth_never_dumps_the_secret():
     assert security_calls, "probe_auth must read the credential keychain item"
     for c in security_calls:
         assert "-w" not in c, "probe_auth must never dump the keychain secret"
+
+
+def test_probe_auth_json_with_a_trailing_banner_stays_logged_in():
+    # A healthy JSON status followed by a trailing stdout banner (an update / token-refresh notice)
+    # must NOT drop to the prose fallback and match its "run claude auth login" phrase -> a false
+    # logged-out block on a live account (fresh-review P1). raw_decode reads the LEADING JSON.
+    trailing = _claude_status(True, extra="\nRun `claude auth login` to refresh your expiring token.")
+    with mock.patch("usage.subprocess.run",
+                    side_effect=[trailing, _keychain_attrs(True)]):
+        r = usage.probe_auth()
+    assert r["cli"] == "logged_in" and r["valid"] is True
+
+
+def test_probe_auth_json_false_with_trailing_text_stays_logged_out():
+    trailing = _claude_status(False, extra="\nsome trailing note")
+    with mock.patch("usage.subprocess.run",
+                    side_effect=[trailing, _keychain_attrs(True)]):
+        r = usage.probe_auth()
+    assert r["cli"] == "logged_out" and r["valid"] is False
+
+
+def test_probe_auth_other_security_error_is_unknown_not_absent():
+    # errSecItemNotFound (rc 44) is definitive-absent -> block; ANY OTHER nonzero rc is a read we
+    # cannot trust (keychain DB error, keychain not in the search list) -> UNKNOWN -> fail open.
+    other = mock.Mock(returncode=1, stdout="", stderr="SecKeychainSearchCopyNext error")
+    with mock.patch("usage.subprocess.run",
+                    side_effect=[_claude_status(True), other]):
+        r = usage.probe_auth()
+    assert r["keychain_present"] is None
+    assert r["valid"] is True                # cli says logged_in, keychain unknown -> not blocked
+    # ...and when the CLI is ALSO unreadable, an untrusted keychain read stays fail-open (None).
+    with mock.patch("usage.subprocess.run",
+                    side_effect=[OSError("no claude"), other]):
+        r = usage.probe_auth()
+    assert r["keychain_present"] is None and r["valid"] is None
 
 
 def test_probe_auth_status_raw_is_bounded():

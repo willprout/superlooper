@@ -718,12 +718,22 @@ def test_wrong_typed_auth_probe_never_raises_or_falsely_degrades():
         assert only(out, "alert") == [], bad
 
 
-def test_dead_auth_with_nothing_queued_does_not_alert():
-    # Idle: dead auth with no approved issue to launch and no lane awaiting relaunch is not yet
-    # harmful — no alert, no noise (mirrors the idle dead-anchor rule).
+def test_dead_auth_with_nothing_to_spend_does_not_alert():
+    # Idle: dead auth with NO approved queue, NO in-flight lane, and NO exited marker is not yet
+    # harmful — no alert, no noise (mirrors the idle dead-anchor rule). The issue here is neither
+    # agent-ready (no fresh launch) nor in-progress (no relaunch), so there is nothing to spend.
     dsk = disk(auth_probe=_auth_dead())
-    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=dsk)
+    out = decide(parsed_issues=[parsed(5, labels=("type:build",))], dsk=dsk)
     assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_dead_auth_alerts_when_only_an_in_flight_lane_is_present():
+    # A recovery relaunch is spend demand too (fresh-review P1 sub-note): a dead-auth reading with an
+    # in-flight lane and no fresh queue must SURFACE, never hold silently.
+    dsk = disk(auth_probe=_auth_dead())
+    out = decide(parsed_issues=[parsed(8, labels=("in-progress", "type:build"))],
+                 dsk=dsk, gh_view=ghv(prs={"i8": {}}))
+    assert only(out, "alert")[0]["reasons"] == ["auth_dead"] and has_notify(out)
 
 
 def test_dead_auth_holds_exited_relaunch_and_never_parks():
@@ -755,9 +765,10 @@ def test_dead_auth_holds_orphan_resume():
     g = ghv(prs={"i8": pr_view(num=88, branch="sl/i8-issue-8")})
     dsk = disk(auth_probe=_auth_dead())
     out = decide(parsed_issues=[p8], dsk=dsk, gh_view=g)
-    assert only(out, "launch") == []                       # the orphan resume is held
+    assert only(out, "launch") == []                       # the orphan resume is held, not spent
     h = only(out, "launch_hold")
     assert len(h) == 1 and h[0]["id"] == "i8" and "auth" in h[0]["reason"].lower()
+    assert only(out, "alert")[0]["reasons"] == ["auth_dead"]   # and it is NOT a silent hold
 
 
 def test_dead_auth_does_not_block_gating_or_merging():
@@ -1724,6 +1735,20 @@ def test_preserve_label_hires_a_conflict_resolution_session():
     rc = only(out, "resolve_conflict")
     assert len(rc) == 1 and rc[0]["pr"] == 555
     assert only(out, "regenerate") == []
+
+
+def test_dead_auth_holds_the_conflict_resolver_and_alerts():
+    # A conflict resolver is a session START (#159): dead account auth would spawn it logged-out and
+    # burn the spend, so it holds (never a resolve_conflict, never a park) and the auth_dead alert
+    # surfaces (an in-flight lane is relaunch demand).
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING", labels=[{"name": "preserve"}]))
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1")
+    d["auth_probe"] = _auth_dead()
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    assert only(out, "resolve_conflict") == []             # not spent into dead auth
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i5" and "auth" in h[0]["reason"].lower()
+    assert only(out, "alert")[0]["reasons"] == ["auth_dead"]
 
 
 def test_update_error_retries_and_persistent_errors_alert():

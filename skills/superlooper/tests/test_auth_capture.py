@@ -174,6 +174,19 @@ def test_capture_survives_a_throwing_probe(rig):
     assert _history_lines(rig) == []                          # no snapshot -> nothing recorded
 
 
+def test_capture_never_records_a_stale_line_when_the_probe_throws(rig):
+    # A flight recorder must not stamp a stale reading with a fresh timestamp: on a capture-tick
+    # whose forced probe RAISES, the last-good snapshot must NOT be re-written as if fresh
+    # (fresh-review). It records nothing, and the next attempt is a full cadence out (never hammered).
+    rig.r._probe_auth = lambda: _ok()
+    rig.r._capture_auth(NOW)                                  # a real, fresh sample
+    assert len(_history_lines(rig)) == 1
+    rig.r._probe_auth = lambda: (_ for _ in ()).throw(OSError("boom"))
+    rig.r._capture_auth(NOW + runner_mod.AUTH_CAPTURE_SECONDS + 1)   # past cadence, but probe throws
+    assert len(_history_lines(rig)) == 1                      # no stale second line
+    assert rig.r._auth["captured_at"] == NOW + runner_mod.AUTH_CAPTURE_SECONDS + 1   # attempt marked
+
+
 # --------------------------- Claude-only (agent boundary) ---------------------------
 
 def test_codex_agent_never_probes_or_captures(tmp_path, monkeypatch):
@@ -206,6 +219,16 @@ def test_wants_session_start_true_on_queue_or_exited(rig):
     exdir = _state(rig, "exited"); exdir.mkdir(parents=True, exist_ok=True)
     (exdir / "i7").write_text("x rc=1")
     rig.r._parsed_by_id = {}                                  # clear the queue
+    assert rig.r._wants_session_start() is True
+
+
+def test_wants_session_start_true_on_an_in_progress_lane(rig):
+    # An ORPHAN RESUME after a restart is an in-progress lane with an open PR and NO exited marker
+    # (fresh-review P1): the probe MUST be fed for it, or decide's orphan-resume auth hold is dead
+    # code at runtime and a fresh session is spawned into dead auth. An in-progress label is the
+    # signal — no agent-ready (so _wants_launch is False) and no exited marker.
+    rig.r._parsed_by_id = {"i8": {"num": 8, "id": "i8", "labels": ["in-progress"]}}
+    assert rig.r._wants_launch() is False
     assert rig.r._wants_session_start() is True
 
 

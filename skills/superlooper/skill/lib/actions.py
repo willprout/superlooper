@@ -855,10 +855,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # relaunches (below) and, when there is real spend demand, raises the auth_dead ALERT.
     auth_probe = dsk.get("auth_probe")
     auth_invalid = isinstance(auth_probe, dict) and auth_probe.get("valid") is False
-    # A lane awaiting relaunch is spend demand too — a dead-auth reading with only an exited lane must
-    # still surface (i336 was a recovery scenario). Loose by design (an exited marker for a tracked
-    # issue): over-surfacing dead auth is fail-safe, and a terminal lane's marker is cleaned anyway.
-    has_exited_demand = any(_iid_num(k) is not None for k in exited)
+    # A recovery relaunch is spend demand too — a dead-auth reading with no fresh queue but an
+    # in-flight lane (an ORPHAN RESUME after a restart, a crash relaunch, a conflict resolve) must
+    # still surface and never hold SILENTLY (fresh-review P1 sub-note; i336 was a recovery scenario).
+    # `in-progress`-labelled == an in-flight lane that may relaunch this tick; the exited marker is a
+    # backstop for a lane whose label move hasn't landed. Loose by design: over-surfacing dead auth is
+    # fail-safe, it auto-clears on the next healthy probe, and a terminal lane's marker is cleaned.
+    has_relaunch_demand = (
+        any(isinstance(p, dict) and "in-progress" in (p.get("labels") or [])
+            for p in parsed_by_id.values())
+        or any(_iid_num(k) is not None for k in exited))
     # launches_held folds auth into the same fresh-launch suppression the anchor/systemic detectors
     # use, so the queue is held intact (never parked) while auth is dead, exactly as under a dead
     # anchor. The recovery-relaunch and orphan-resume holds are applied per-issue below.
@@ -925,7 +931,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         reasons.append("launch_anchor_down")
     if systemic_launch:
         reasons.append("launch_systemic_failure")
-    if auth_invalid and (has_pending_launch or has_exited_demand):   # dead auth only matters with a
+    if auth_invalid and (has_pending_launch or has_relaunch_demand):   # dead auth only matters with a
         reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
     reasons.sort()
     if reasons:
@@ -1269,8 +1275,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # (#150 / D8) The gate's verdict is "hire a session to resolve this conflict" — a
                 # session START, so it owes the same eligibility every other start owes. It asked
                 # nothing before. Held (never parked) so the issue keeps its preserve-labeled PR and
-                # the resolver hires the tick the gate passes.
-                if start_ok(p):
+                # the resolver hires the tick the gate passes. Dead account auth (#159) holds it too:
+                # a conflict resolver spawned into logged-out auth would burn the spend like any start.
+                if auth_invalid:
+                    launch_hold(iid, num, p,
+                                reason="account auth is not valid — conflict resolve held (see the auth_dead alert)")
+                elif start_ok(p):
                     out.append({"act": "resolve_conflict", "id": iid, "num": num,
                                 "pr": pv.get("number"), "wander": wander})
                 else:

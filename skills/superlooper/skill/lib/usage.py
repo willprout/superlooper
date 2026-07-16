@@ -44,6 +44,10 @@ _KEYCHAIN_MDAT = re.compile(r'"mdat"<timedate>=\S*\s+"(\d{14})Z', re.I)
 # probe — so a prose render still reads as logged-out and never silently reopens i336.
 _CLI_LOGGED_OUT = re.compile(r"not logged in|please run /login|run claude auth login|logged out",
                              re.I)
+# `security`'s exit code for errSecItemNotFound — the DEFINITIVE "the credential item is gone" case.
+# Any OTHER nonzero rc (a keychain DB error, the login keychain not in the search list) is a read we
+# could not TRUST, not proof of absence, so it fails OPEN (unknown) rather than blocking every launch.
+_SEC_ITEM_NOT_FOUND = 44
 
 
 def _keychain_ts_to_epoch(s):
@@ -67,8 +71,10 @@ def _credential_keychain_state(timeout=5):
             capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None, None
+    if r.returncode == _SEC_ITEM_NOT_FOUND:
+        return False, None                     # item is GONE: a fresh launch would have no creds
     if r.returncode != 0:
-        return False, None                     # item is gone: a fresh launch would have no creds
+        return None, None                      # some other security error -> UNKNOWN (fail open)
     m = _KEYCHAIN_MDAT.search((r.stdout or "") + (r.stderr or ""))
     return True, (_keychain_ts_to_epoch(m.group(1)) if m else None)
 
@@ -97,13 +103,19 @@ def probe_auth(timeout=5) -> dict:
         status_raw = ((r.stdout or "") + (r.stderr or "")).strip()
         parsed = None
         try:
-            parsed = json.loads(r.stdout or "")
+            # raw_decode reads a LEADING JSON object and IGNORES any trailing text (an update
+            # banner / token-refresh notice printed after the status blob). A plain json.loads would
+            # raise 'Extra data' on that trailing text and drop a healthy logged-IN read to the prose
+            # fallback below — which could then match an auth-login phrase inside that very banner and
+            # FALSELY read logged-out, freezing launches on a live account (fresh-review P1). So JSON
+            # wins whenever the output STARTS with it; the prose fallback is only for non-JSON renders.
+            parsed, _ = json.JSONDecoder().raw_decode((r.stdout or "").lstrip())
         except (ValueError, TypeError):
             parsed = None
         if isinstance(parsed, dict) and isinstance(parsed.get("loggedIn"), bool):
             cli = "logged_in" if parsed["loggedIn"] else "logged_out"
         elif _CLI_LOGGED_OUT.search(status_raw):
-            cli = "logged_out"                 # prose render: the stable auth-death phrase
+            cli = "logged_out"                 # non-JSON render: the stable auth-death phrase
     except Exception:
         cli = "unknown"                        # binary missing / hang -> unknown, never invalid
 

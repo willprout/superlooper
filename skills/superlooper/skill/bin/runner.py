@@ -914,11 +914,15 @@ class Runner:
             return
         if self._auth["captured_at"] and now - self._auth["captured_at"] < AUTH_CAPTURE_SECONDS:
             return
+        self._auth["captured_at"] = now                # mark the attempt: the next sample is ~30 min
+                                                       # out even if this probe fails (never hammer)
         self._refresh_auth(now, force=True)            # a fresh, genuinely-30-min-spaced sample
         snap = self._auth["snapshot"]
-        if not isinstance(snap, dict):
-            return                                     # probe never produced a snapshot
-        self._auth["captured_at"] = now
+        if not isinstance(snap, dict) or snap.get("checked_at") != int(now):
+            return                                     # the forced probe did not land a FRESH sample
+                                                       # this tick (it raised) — record NOTHING rather
+                                                       # than stamp a stale reading with a fresh time
+                                                       # (a flight recorder must not lie; fresh-review)
         line = json.dumps({"at": int(now), **snap}, sort_keys=True)
         try:
             path = os.path.join(self.state, AUTH_HISTORY_FILENAME)
@@ -937,13 +941,21 @@ class Runner:
             pass
 
     def _wants_session_start(self):
-        """True when a launch OR a recovery relaunch may happen this tick — fresh-queue demand
-        (_wants_launch) OR any lane awaiting relaunch (a state/exited/<id> marker). Gates the
-        auth-probe FEED into decide's view (issue #159), mirroring _wants_launch for the anchor: the
-        auth gate/alert can only fire when a spend is actually pending, so an idle runner is never
-        told its auth is dead and never shells out to `claude` with nothing to launch."""
+        """True when a launch OR a recovery relaunch may happen this tick — the condition under which
+        decide's auth gate/alert (issue #159) can act, so the probe is fed to the view only then (an
+        idle runner never shells out to `claude` and is never told its auth is dead). Demand is:
+          * fresh-queue demand (_wants_launch: agent-ready, not in-progress); OR
+          * ANY in-flight lane — an `in-progress`-labelled issue. This is the load-bearing breadth
+            (fresh-review P1): an ORPHAN RESUME after a restart is an in-progress lane with an open PR
+            and NO exited marker, and a crash relaunch and a conflict resolve are in-progress too. An
+            exited marker alone (a lane whose label move hasn't landed yet) is caught as a backstop.
+        Over-feeding is harmless: decide only HOLDS/ALERTS when it is actually about to spend."""
         if self._wants_launch():
             return True
+        for p in self._parsed_by_id.values():
+            labels = [l for l in (p.get("labels") or []) if isinstance(l, str)]
+            if "in-progress" in labels:
+                return True
         try:
             return any(actions._iid_num(n) is not None
                        for n in os.listdir(os.path.join(self.state, "exited")))
