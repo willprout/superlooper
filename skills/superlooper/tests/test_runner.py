@@ -3497,3 +3497,107 @@ def test_reclaim_early_out_survives_an_unhashable_status(rig, monkeypatch):
     st = {"issues": {"i1": {"status": []}, "i2": {"status": {}}, "i9": {"status": "parked"}}}
     rig.r._reclaim_terminal_worktrees(st)              # must not raise on the [] / {} statuses
     assert removed == [str(rig.r._worktree("i9"))]     # corrupt skipped, valid parked still reclaimed
+
+
+# ============ the one launch-eligibility gate, end to end (issue #150 / D8) ============
+# Fixture i103 declares `blocked-by: #101, #102` in its Loop metadata and neither is closed, so no
+# session may start for it BY ANY PATH. These drive the real Runner (real decide, real executors,
+# recording run_script) and assert on launch-session.sh itself — the thing that starts a session —
+# rather than on decide's action list.
+
+def _blocked_and_exited(rig, now):
+    """Poll i103 into the view, then strand it: an in-flight session that died, blockers still open."""
+    rig.r.tick(now=now)                                # i101/i102 launch; i103 is blocked, so waits
+    (rig.home / "state" / "exited" / "i103").write_text("1751000000 rc=1\n")
+    seed_issue(rig, "i103", status="running", branch="sl/i103-wire-widget-to-api")
+    rig.calls.clear()
+
+
+def _launches_of(rig, iid):
+    return [c for c in rig.calls
+            if c["args"][0].endswith("launch-session.sh") and iid in c["args"]]
+
+
+def test_crash_recovery_never_launches_a_session_past_an_open_blocker(rig):
+    _blocked_and_exited(rig, NOW)
+    rig.r.tick(now=NOW + 60)
+    assert _launches_of(rig, "i103") == []              # THE bug: this used to relaunch regardless
+    ist = issue_state(rig, "i103")
+    assert ist["status"] == "running"                   # held in place: not parked, not requeued
+    assert "#101" in ist["launch_hold_reason"] and "#102" in ist["launch_hold_reason"]
+    held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
+    assert len(held) == 1 and "blocked-by" in held[0]["outcome"]     # the hold says WHY
+
+
+def test_a_held_restart_relaunches_the_moment_its_blockers_close(rig):
+    # The other half: the gate is a WAIT, not a verdict. Close #101/#102 in the fixture world and
+    # the same stranded session recovers on the next tick, with no re-approval by William.
+    _blocked_and_exited(rig, NOW)
+    rig.r.tick(now=NOW + 60)
+    assert _launches_of(rig, "i103") == []
+    (rig.fixdir / "issue_list_closed.json").write_text(
+        json.dumps([{"number": 41}, {"number": 52}, {"number": 101}, {"number": 102}]))
+    rig.calls.clear()
+    rig.r.tick(now=NOW + 200)                          # >GH_POLL_SECONDS: the new closed set lands
+    assert len(_launches_of(rig, "i103")) == 1         # recovered, unblocked, no owner touch
+    assert issue_state(rig, "i103")["launch_hold_reason"] is None    # the hold episode is over
+
+
+def test_a_standing_hold_does_not_re_journal_every_tick(rig):
+    # A 15s tick against a long-open blocker must not walk the journal.
+    _blocked_and_exited(rig, NOW)
+    for i in range(4):
+        rig.r.tick(now=NOW + 60 + i * 20)
+    held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
+    assert len(held) == 1
+    assert _launches_of(rig, "i103") == []
+
+
+def test_a_github_outage_does_not_strand_a_crash_recovery(rig, monkeypatch):
+    # The gate reads eligibility from the POLLED view, so the obvious way to break the loop with it
+    # is a GitHub blip that reads as "the issue is gone" and strands every recovery behind it. It
+    # can't: a failed poll returns before touching the parsed view, so the last good parse AND
+    # closed set survive, and an unblocked issue still recovers mid-outage — off exactly the data a
+    # fresh launch would have used.
+    rig.r.tick(now=NOW)                                # one good poll: i101 lands in the view
+    (rig.home / "state" / "exited" / "i101").write_text("1751000000 rc=1\n")
+    seed_issue(rig, "i101", status="running", branch="sl/i101-render-the-widget")
+    monkeypatch.setenv("GH_FAIL", "1")                 # GitHub goes dark
+    rig.calls.clear()
+    rig.r.tick(now=NOW + 200)
+    assert len(_launches_of(rig, "i101")) == 1         # recovered anyway
+    assert issue_state(rig, "i101").get("launch_hold_reason") is None
+
+
+def test_a_failed_relaunch_does_not_leave_a_stale_hold_reason_or_silence_the_next_one(rig):
+    # Fresh-agent review P2-2: the hold episode ends when the GATE passes, not when the launch
+    # lands. Clearing the stamp only on a verified delivery left a failed relaunch wearing a stale
+    # "waiting on #101" against blockers that had since CLOSED — and worse, silenced the next
+    # episode, because decide dedups on this very stamp.
+    _blocked_and_exited(rig, NOW)
+    rig.r.tick(now=NOW + 60)                           # held: #101/#102 open
+    assert issue_state(rig, "i103")["launch_hold_reason"]
+    (rig.fixdir / "issue_list_closed.json").write_text(
+        json.dumps([{"number": 41}, {"number": 52}, {"number": 101}, {"number": 102}]))
+    rig.rc_queue.append(1)                             # the relaunch FAILS to deliver
+    rig.r.tick(now=NOW + 200)
+    assert issue_state(rig, "i103")["launch_hold_reason"] is None   # gate passed -> episode over
+
+
+def test_a_refused_closed_read_holds_without_claiming_the_blockers_are_open(rig):
+    # Fresh-agent review P2-1. gh's closed-list read fails CLOSED to an empty set, while `probe`
+    # (rate_limit) is exempt from throttling — so a THROTTLED poll still stamps the view fresh while
+    # every blocked-by reads as unmet. REFUSING the restart is right (a fresh launch does the same,
+    # and it self-heals on the next clean read). Durably stamping the board and journal with
+    # "#101, #102 still open" — a closure state the loop never observed — is the refused≠empty trap
+    # of #21/#61/#78/#92/#108. It must hold honestly instead.
+    (rig.fixdir / "issue_list_closed.json").write_text(
+        json.dumps([{"number": 41}, {"number": 52}, {"number": 101}, {"number": 102}]))
+    (rig.fixdir / "fail_rules.json").write_text(
+        json.dumps([{"match": "--state closed", "times": 9}]))   # only the closed list is throttled
+    _blocked_and_exited(rig, NOW)
+    rig.r.tick(now=NOW + 60)
+    reason = issue_state(rig, "i103")["launch_hold_reason"]
+    assert _launches_of(rig, "i103") == []              # still refuses: same as a fresh launch
+    assert "still open" not in reason                   # ...but never asserts what it didn't observe
+    assert "not confirmed closed" in reason and "#101" in reason

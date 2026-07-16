@@ -155,14 +155,25 @@ def parse_issue(gh_issue):
     }
 
 
-def eligible(parsed, closed_issue_nums, frozen):
+def eligible(parsed, closed_issue_nums, frozen, resume=False):
     """Is this issue launchable NOW? Approved (`agent-ready`) AND a valid type AND every
     `blocked-by` issue is closed.
 
     `frozen` is accepted for interface symmetry with the scheduler and to make the constitutional
     rule EXPLICIT and testable: a frozen mainline stops MERGES, not builds (frozen-but-building is
-    the safe idle state, §C.4), so freeze deliberately does NOT gate eligibility."""
-    if "agent-ready" not in parsed["labels"]:
+    the safe idle state, §C.4), so freeze deliberately does NOT gate eligibility.
+
+    `resume` — the caller is RESTARTING a session this loop already approved and launched (issue
+    #150 / D8: crash recovery, the restart orphan resume, the conflict-resolution relaunch). It
+    changes exactly ONE thing: WHICH label counts as the approval. A launch moves `agent-ready` ->
+    `in-progress`, so a session being restarted never carries `agent-ready` and demanding it would
+    refuse every recovery; the runner's own `in-progress` stamp is the approval it already acted
+    on. Every other condition below is untouched and answers identically on both paths — that
+    sameness IS the fix: D8's relaunch tier skipped this predicate entirely and started a worker
+    past its open `blocked-by`. If William has taken BOTH tokens away (parked it mid-flight), no
+    approval stands and the restart is refused."""
+    approved = "agent-ready" in parsed["labels"] or (resume and "in-progress" in parsed["labels"])
+    if not approved:
         return False
     if parsed["type"] not in VALID_TYPES:
         return False

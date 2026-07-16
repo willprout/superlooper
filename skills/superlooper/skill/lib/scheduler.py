@@ -16,6 +16,8 @@ Three gates, in order:
      soft affinity the overlap is allowed and flagged (symmetrically) for the journal.
 
 Eligibility itself (agent-ready, valid type, blocked-by closed) lives in issues.eligible.
+`launch_ok` welds that to the usage rule as the ONE gate every path that starts or restarts a
+session asks — fresh launch, crash recovery, restart orphan resume, conflict relaunch (issue #150).
 """
 import math
 
@@ -70,6 +72,35 @@ def usage_ok(usage):
     gates on the SAME rule as fresh launches — one rule, one name, so the two paths can never
     drift apart."""
     return _usage_ok(usage)
+
+
+def launch_ok(parsed, closed_nums, frozen, usage, resume=False):
+    """THE launch-eligibility gate (issue #150 / D8) — the ONE predicate every path that starts or
+    restarts a session must pass: usage headroom (fail closed) AND issues.eligible (approved, valid
+    type, no control-label conflict, every `blocked-by` closed).
+
+    It exists because those two halves used to be asked separately, by different callers, in
+    different combinations: fresh phase-E launches asked both, crash recovery asked only usage, and
+    the restart orphan resume plus the conflict relaunch asked NEITHER — so a recovery could start a
+    worker straight past an open blocker, contained only by the worker's own step-0 reconcile
+    bounce. Every caller now asks THIS, so the paths cannot drift: a condition added here binds
+    recovery the same tick it binds a fresh launch.
+
+    Fails CLOSED on a missing or wrong-typed `parsed` (the recovery paths can reach this for an
+    issue absent from the GitHub view): with no issue to read, not one of the conditions can be
+    affirmed, and an unverifiable start is exactly what this gate exists to refuse. `_exec_launch`
+    already applies this same rule to fresh launches ("skipped: issue not in the current GitHub
+    view") — recovery now matches it rather than relaunching blind.
+
+    See issues.eligible for `resume`, which changes only WHICH label counts as the approval."""
+    if not _usage_ok(usage):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    try:
+        return issues.eligible(parsed, closed_nums, frozen, resume=resume)
+    except (KeyError, TypeError):        # a malformed parse (missing/wrong-typed labels, type, ...)
+        return False                     # -> unreadable eligibility -> fail closed, never launch
 
 
 def _is_wildcard(touches):
@@ -200,10 +231,14 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
     claim_occupied = [{"id": claim.get("id"), "touches": claim.get("touches", []),
                        "type": claim.get("type")} for claim in claims_in]
 
+    # The fresh path asks launch_ok — the SAME function every restart path asks (issue #150) — and
+    # not a private re-implementation of half of it. The usage half is already settled by the
+    # early-out above (which must stay: it also means "no holds"), so this re-asks it per candidate
+    # for free; the point is that ONE predicate answers for both kinds of launch.
     candidates = [p for p in parsed_issues
                   if p.get("id") not in running_ids
                   and p.get("id") not in claimed_ids
-                  and issues.eligible(p, closed_nums, frozen)]
+                  and launch_ok(p, closed_nums, frozen, usage)]
     candidates.sort(key=lambda p: issues.sort_key(p, p.get("requeue_front", False)))
 
     selected_ids = set(running_ids) | set(claimed_ids)

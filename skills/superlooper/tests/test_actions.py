@@ -982,9 +982,12 @@ def test_stale_answer_without_a_record_is_ignored():
 
 
 def test_blocked_with_exited_marker_recovers_instead_of_hiring():
+    # The issue is in the view because a real in-flight one always is (open, `in-progress`): since
+    # #150 every restart reads its eligibility there, and an unreadable one holds rather than
+    # relaunching blind.
     dsk = disk(blocked={"i7": "q?"}, exited={"i7": "1751000000 rc=1"},
                issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
-    out = decide(dsk=dsk)
+    out = decide(parsed_issues=[parsed(7, labels=("in-progress", "type:build"))], dsk=dsk)
     assert only(out, "hire_answerer") == []
     r = only(out, "recover")
     assert len(r) == 1 and r[0]["tier"] == "exited"
@@ -1033,14 +1036,15 @@ def test_still_frozen_status_re_recovers_only_after_the_interval():
 
 
 def test_exited_marker_relaunches_under_cap_and_parks_at_cap():
+    p5 = parsed(5, labels=("in-progress", "type:build"))   # in the view, as an in-flight issue is
     under = disk(exited={"i5": "x rc=1"},
                  issues_state={"version": 1, "issues": {"i5": ist("running", retries=1)}})
-    out = decide(dsk=under)
+    out = decide(parsed_issues=[p5], dsk=under)
     r = only(out, "recover")
     assert len(r) == 1 and r[0]["tier"] == "exited"
     at_cap = disk(exited={"i5": "x rc=1"},
                   issues_state={"version": 1, "issues": {"i5": ist("running", retries=2)}})
-    out = decide(dsk=at_cap)
+    out = decide(parsed_issues=[p5], dsk=at_cap)
     assert only(out, "recover") == []
     assert len(only(out, "park")) == 1 and has_notify(out)
 
@@ -1361,7 +1365,9 @@ def test_conflict_cap_parks_needs_william_with_notify():
 def test_preserve_label_hires_a_conflict_resolution_session():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING", labels=[{"name": "preserve"}]))
     d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1")
-    out = decide(dsk=d, gh_view=g)
+    # Hiring the resolver is a session START, so since #150 it reads this issue's eligibility from
+    # the view — where a real gating issue always is.
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
     rc = only(out, "resolve_conflict")
     assert len(rc) == 1 and rc[0]["pr"] == 555
     assert only(out, "regenerate") == []
@@ -1964,6 +1970,126 @@ def test_orphan_with_a_branch_mismatch_reclaims_on_the_stamped_branch_instead():
     out = decide(parsed_issues=[p8], dsk=d, gh_view=g)
     assert only(out, "launch") == []
     assert only(out, "reclaim") == [{"act": "reclaim", "id": "i8", "num": 8}]
+
+
+# =============== the one launch-eligibility gate (issue #150 / D8) ===============
+# The 07-15 marathon's D8: only fresh phase-E launches routed through issues.eligible. The
+# liveness relaunch tier, the restart orphan resume and the conflict-resolution relaunch all
+# started a session WITHOUT re-checking it, so a recovery could launch a worker straight past an
+# open `blocked-by` — contained only by the worker's own step-0 reconcile bounce. These pin the
+# rule from the other side: EVERY path that starts or restarts a session asks the SAME predicate
+# first, and a refusal HOLDS legibly instead of launching silently.
+
+def _blocked_exited(blocked_by=(41,), **ist_over):
+    """An in-flight issue whose session died, and whose `blocked-by` is NOT closed."""
+    p5 = parsed(5, labels=("in-progress", "type:build"), blocked_by=list(blocked_by))
+    d = disk(exited={"i5": "x rc=1"},
+             issues_state={"version": 1, "issues": {"i5": ist("running", **ist_over)}})
+    return p5, d
+
+
+def test_exited_recovery_never_relaunches_past_an_open_blocker():
+    p5, d = _blocked_exited()
+    out = decide(parsed_issues=[p5], dsk=d, gh_view=ghv(closed_nums=set()))
+    assert only(out, "recover") == []                  # blocker 41 still open -> no session
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i5" and "41" in h[0]["reason"]   # held, and it says why
+    assert only(out, "park") == [] and not has_notify(out)   # a hold is not a park (retry cap intact)
+
+
+def test_exited_recovery_resumes_the_moment_the_blocker_closes():
+    # The hold is a WAIT, not a verdict: the same inputs with the dependency closed relaunch.
+    p5, d = _blocked_exited()
+    out = decide(parsed_issues=[p5], dsk=d, gh_view=ghv(closed_nums={41}))
+    r = only(out, "recover")
+    assert len(r) == 1 and r[0]["tier"] == "exited"
+    assert only(out, "launch_hold") == []
+
+
+def test_exited_recovery_refuses_an_unapproved_or_mislabeled_issue():
+    # The recovery path owes every condition the fresh path owes, not just blocked-by: an issue
+    # William has since un-approved (no `agent-ready`, no `in-progress`), and one whose control
+    # labels now conflict, both hold rather than relaunch.
+    for labels in (("type:build",),                            # approval withdrawn
+                   ("in-progress", "type:build", "type:investigate")):   # invalid type
+        p5 = parsed(5, labels=labels)
+        d = disk(exited={"i5": "x rc=1"},
+                 issues_state={"version": 1, "issues": {"i5": ist("running")}})
+        out = decide(parsed_issues=[p5], dsk=d)
+        assert only(out, "recover") == [], labels
+        assert len(only(out, "launch_hold")) == 1, labels
+
+
+def test_exited_recovery_holds_when_the_issue_is_absent_from_the_github_view():
+    # No parsed issue = eligibility is UNREADABLE, so none of the five conditions can be affirmed.
+    # Fail closed exactly as _exec_launch already does for a fresh launch ("skipped: issue not in
+    # the current GitHub view") rather than relaunching a session blind.
+    d = disk(exited={"i5": "x rc=1"},
+             issues_state={"version": 1, "issues": {"i5": ist("running")}})
+    out = decide(dsk=d)
+    assert only(out, "recover") == []
+    assert len(only(out, "launch_hold")) == 1
+
+
+def test_orphan_resume_never_relaunches_past_an_open_blocker():
+    # The restart rebuild resumes an in-progress issue's session on its open PR's branch. It went
+    # straight to `launch` with no gate at all — not eligibility, and not even usage.
+    p8 = parsed(8, labels=("in-progress", "type:build"), blocked_by=[41])
+    g = ghv(prs={"i8": pr_view(num=88, branch="sl/i8-issue-8")}, closed_nums=set())
+    out = decide(parsed_issues=[p8], gh_view=g)
+    assert only(out, "launch") == []
+    assert only(out, "reclaim") == []                  # held in place: the orphan resume is what
+                                                       # re-attaches the PR branch, so don't requeue
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and "41" in h[0]["reason"]
+
+
+def test_orphan_resume_proceeds_once_the_blocker_closes():
+    p8 = parsed(8, labels=("in-progress", "type:build"), blocked_by=[41])
+    g = ghv(prs={"i8": pr_view(num=88, branch="sl/i8-issue-8")}, closed_nums={41})
+    out = decide(parsed_issues=[p8], gh_view=g)
+    launches = only(out, "launch")
+    assert len(launches) == 1 and launches[0]["orphan"] is True
+    assert only(out, "launch_hold") == []
+
+
+def test_resolve_conflict_relaunch_never_starts_past_an_open_blocker():
+    p5 = parsed(5, labels=("in-progress", "type:build"), blocked_by=[41])
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING", labels=[{"name": "preserve"}]))
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1")
+    out = decide(parsed_issues=[p5], dsk=d, gh_view=dict(g, closed_nums=set()))
+    assert only(out, "resolve_conflict") == []
+    assert len(only(out, "launch_hold")) == 1
+
+
+def test_usage_fails_closed_identically_on_every_restart_path():
+    # DoD: no drift between fresh and recovery. Fresh launches have always failed closed on a
+    # missing/unhealthy meter; the orphan resume and the conflict relaunch never asked at all.
+    dead_meter = {"auth_status": "expired", "five_hour_pct": None, "seven_day_pct": None,
+                  "last_ok_at": NOW - 60, "first_attempt_at": NOW - 120}
+    p8 = parsed(8, labels=("in-progress", "type:build"))
+    g = ghv(prs={"i8": pr_view(num=88, branch="sl/i8-issue-8")})
+    assert only(decide(parsed_issues=[p8], usage=dead_meter, gh_view=g), "launch") == []
+
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    d, gc = _gating(pv=pr_view(mergeable="CONFLICTING", labels=[{"name": "preserve"}]))
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1")
+    assert only(decide(parsed_issues=[p5], usage=dead_meter, dsk=d, gh_view=gc),
+                "resolve_conflict") == []
+
+
+def test_a_continuous_launch_hold_journals_once_but_re_journals_a_new_reason():
+    # Bounded like the wildcard hold (#36): a 15s tick must not re-journal the same standing hold
+    # forever — but the reason on the board must never go stale either, so a CHANGED cause speaks.
+    p5, d = _blocked_exited()
+    d["issues_state"]["issues"]["i5"]["launch_hold_reason"] = \
+        only(decide(parsed_issues=[p5], dsk=d, gh_view=ghv(closed_nums=set())),
+             "launch_hold")[0]["reason"]
+    assert only(decide(parsed_issues=[p5], dsk=d, gh_view=ghv(closed_nums=set())),
+                "launch_hold") == []                   # same standing hold: silent
+    p5b = parsed(5, labels=("type:build",), blocked_by=[41])   # approval withdrawn: a NEW cause
+    assert len(only(decide(parsed_issues=[p5b], dsk=d, gh_view=ghv(closed_nums=set())),
+                    "launch_hold")) == 1
 
 
 def test_cold_restart_reconstructs_a_finished_issue_straight_to_merge():

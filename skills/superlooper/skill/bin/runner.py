@@ -1686,7 +1686,8 @@ class Runner:
             self._launch_fail_at = now
         self._update_issue(iid, {"branch": branch, "num": num, "type": p.get("type"),
                                  "declared_touches": list(p.get("touches") or []),
-                                 "wildcard_hold_journaled": False})   # launch ends the hold episode (#36)
+                                 "wildcard_hold_journaled": False,    # launch ends the hold episode (#36)
+                                 "launch_hold_reason": None})         # ...and the eligibility hold (#150)
         # NB: the per-issue model/effort override is stamped into durable state by _worker_env below
         # (it refreshes on EVERY worker launch so the stamp tracks William's current labels) — see
         # its docstring. Kept in one place so recover/resolve_conflict relaunches stamp identically.
@@ -2017,6 +2018,7 @@ class Runner:
                       "update_result": None, "update_head_oid": None, "nudged": [], "pr": None,
                       "read_waited": False, "checks_pending_since": None,
                       "wildcard_hold_journaled": False,   # a fresh approval re-journals its own hold (#36)
+                      "launch_hold_reason": None,      # ...and re-journals an eligibility hold (#150)
                       "merge_refusal_reason": None,    # paired with merge_refusals=0 above (#27)
                       "pr_read_pending_since": None,   # a re-run's refused-read hold times fresh (#61)
                       "comments_read_pending_since": None,   # ...and its comments-read hold too (#78)
@@ -2051,6 +2053,14 @@ class Runner:
     def _exec_recover(self, a, now):
         iid, tier = a["id"], a.get("tier")
         if tier == "exited":
+            # The eligibility-hold episode ends when the GATE PASSES, not when the launch lands —
+            # decide only emits recover after start_ok, so by here the hold is already over. Clear
+            # the stamp BEFORE the attempt, exactly as _exec_launch does (fresh-agent review P2-2):
+            # clearing it only on a verified delivery left a failed relaunch wearing a stale "waiting
+            # on #101" against blockers that had since closed, AND silenced the next episode's
+            # journal — decide dedups on this stamp, so a genuinely new hold whose reason still
+            # matched it never spoke.
+            self._update_issue(iid, {"launch_hold_reason": None})
             rc = self._run_script([self._script("launch-session.sh"), iid],
                                   env=self._worker_env(iid),
                                   timeout=LAUNCH_TIMEOUT)
@@ -2180,6 +2190,16 @@ class Runner:
         so a later, fresh episode re-journals. Journal-only: no label move, no notify."""
         self._update_issue(a["id"], {"wildcard_hold_journaled": True})
         return a.get("reason", "launch held by a no-touches wildcard — the lane serializes")
+
+    def _exec_launch_hold(self, a, now):
+        """Issue #150 (D8): the one launch gate refused to start/restart this session. decide emitted
+        this ONCE per CAUSE (deduped on the stamped reason); stamp it so the same standing hold does
+        not re-journal every tick, and return the reason so the journal outcome carries the WHY. The
+        stamp clears on launch (_exec_launch) and on reapprove, so a later episode speaks again; a
+        CHANGED cause re-journals immediately because the reason no longer matches. Journal-only: no
+        label move, no notify, no status change — a hold is a WAIT, not a park."""
+        self._update_issue(a["id"], {"launch_hold_reason": a.get("reason")})
+        return a.get("reason", "launch held by the eligibility gate")
 
     def _exec_hold(self, a, now):
         self._update_issue(a["id"], {"status": "holding"})
@@ -2323,6 +2343,9 @@ class Runner:
         # first, else this relaunch can't take the singleton and (status stays 'gating') retries
         # forever. Only reached with a report present, so the recorded pane is a finished session.
         self._close_stale_session(iid)
+        # The eligibility-hold episode ended when start_ok passed, not when this launch lands — clear
+        # the stamp before the attempt, as _exec_launch/_exec_recover do (review P2-2, #150).
+        self._update_issue(iid, {"launch_hold_reason": None})
         rc = self._run_script([self._script("launch-session.sh"), iid],
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
