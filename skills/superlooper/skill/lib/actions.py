@@ -1204,6 +1204,45 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 out.append({"act": "clear_park_marker", "id": iid})
             continue
 
+        # ---- in flight: absorb a PR that concluded OUT OF BAND (issue #155) ----
+        # The lane is still building, so nothing below here would ever look at its PR — which is how
+        # i328 stalled the afternoon queue for two hours: its PR was merged out-of-band while the
+        # runner, which associated branch->PR only when an issue FINISHED, carried pr: null and never
+        # learned the PR existed. _refresh_inflight_prs now reconciles every in-flight lane each
+        # tick, so the fact is in the view; this acts on it. Checked BEFORE the blocked/answerer and
+        # frozen/idle lifecycles below, so a concluded lane stops spinning them (that spinning WAS
+        # the stall) — and only on a POSITIVE answer about this lane's ACTIVE branch:
+        #   * a FRESH view, and the read PRESENT (`iid in prs`). The refused!=empty discipline (#61):
+        #     the poll and the refresh OMIT a refused lookup, so presence == "GitHub answered".
+        #   * a real PR number. Answered-empty ({}) is the NORMAL mid-build state — the worker has
+        #     not pushed yet — so it means KEEP BUILDING. It is never "no PR exists", never a park.
+        #   * not `superseded` — that PR is dead history the runner itself retired (the orphan sweep
+        #     applies the same rule). Only a half-executed regenerate could leave one on the active
+        #     branch, and acting on it would park the very lane the runner just rebuilt.
+        if status in INFLIGHT_STATUSES and not gh_stale and iid in prs:
+            pv = prs.get(iid) if isinstance(prs.get(iid), dict) else {}
+            if pv.get("number") and "superseded" not in gate._pr_labels(pv):
+                if pv.get("state") == "MERGED":
+                    # The work LANDED, whatever this lane still thinks it is doing. absorb_merged is
+                    # idempotent and tears the session down in order (#149), which frees the slot.
+                    out.append({"act": "absorb_merged", "id": iid, "num": num})
+                    continue
+                if pv.get("state") == "CLOSED":
+                    # Out-of-band BY CONSTRUCTION: the runner never closes its own PR — a regenerate
+                    # supersedes it, leaving it OPEN on a preserved branch, and stamps the new branch
+                    # first — so a CLOSED PR on the ACTIVE branch is somebody's deliberate call. Why
+                    # is unknowable here, and both guesses are wrong: rebuilding loops against that
+                    # call, and merging is not ours to make. Hand it back ONCE (notify-once per cause)
+                    # and stand the lane down. No LLM asked, no retry ladder, no coaching around it.
+                    park(iid, num,
+                         f"PR #{pv.get('number')} for branch '{ist.get('branch') or '?'}' was CLOSED "
+                         "outside the loop while this issue was still building. The runner never "
+                         "closes its own PR, so that was a deliberate call by someone — the lane is "
+                         "stood down rather than rebuilt over it. Re-approve to rebuild the issue "
+                         "from scratch on a fresh branch.",
+                         needs_william=True, cause="pr_closed")
+                    continue
+
         # ---- blocked marker present (and no report): bounce or the answerer lifecycle ----
         if blocked_text is not None and not has_exited:
             if blocked_text.lstrip().startswith("BOUNCED:"):

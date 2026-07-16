@@ -2328,6 +2328,89 @@ def test_refresh_does_not_write_empty_when_lookup_finds_nothing(rig, monkeypatch
         assert "i9" not in rig.r.gh_view["prs"]                        # no {} stored; next tick can still find it
 
 
+# --------- issue #155: every IN-FLIGHT lane reconciles branch->PR each tick ---------
+
+def test_refresh_inflight_prs_records_the_pr_for_a_still_building_lane(rig, monkeypatch):
+    """The read half of #155. A lane that is STILL BUILDING gets one branch->PR lookup per tick, so
+    a PR that appears (or concludes) mid-flight is recorded as soon as it exists — the poll's
+    want-set can't do this, because an out-of-band merge closes the issue and drops it from both
+    open-issue lists. FINISHING lanes are left to _refresh_finishing_prs: the two sets are disjoint,
+    so no lane is ever looked up twice in one tick."""
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7)   # in flight, no report
+    seed_issue(rig, "i8", status="gating", branch="sl/i8-y", num=8)    # finishing -> the other path
+    (rig.home / "reports" / "i8.md").write_text("# done\n## Tests\nok\n")
+    rig.r.gh_view = {"stale": False, "prs": {}, "issue_comments": {}}
+
+    looked = []
+
+    def fake_pr_for_branch(branch):
+        looked.append(branch)
+        return runner_mod.gh.PrRead({"number": 42, "state": "MERGED", "headRefName": branch}, True)
+
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch", fake_pr_for_branch)
+    ist_map = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
+    rig.r._refresh_inflight_prs(ist_map)
+
+    assert looked == ["sl/i7-x"]                       # ONE lookup, and only for the building lane
+    assert rig.r.gh_view["prs"]["i7"]["state"] == "MERGED"
+    assert "i8" not in rig.r.gh_view["prs"]            # finishing lanes belong to the sibling refresh
+
+
+def test_refresh_inflight_prs_never_downgrades_a_known_pr(rig, monkeypatch):
+    """POSITIVE-FIND only, exactly as _refresh_finishing_prs: neither a REFUSED lookup nor a clean
+    answered-empty may erase a PR the runner already knows about."""
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7)
+    for read in (runner_mod.gh.PrRead({}, False), runner_mod.gh.PrRead({}, True)):
+        rig.r.gh_view = {"stale": False, "prs": {"i7": {"number": 9, "state": "OPEN"}}}
+        monkeypatch.setattr(runner_mod.gh, "pr_for_branch", lambda b, read=read: read)
+        ist_map = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
+        rig.r._refresh_inflight_prs(ist_map)
+        assert rig.r.gh_view["prs"]["i7"]["number"] == 9
+
+
+def test_refresh_inflight_prs_skips_terminal_and_investigate_lanes(rig, monkeypatch):
+    """Boundedness: the reconcile set is exactly the concurrently-building lanes. A terminal issue
+    is done being gated, and an investigate issue never opens a PR at all (#21)."""
+    seed_issue(rig, "i7", status="merged", branch="sl/i7-x", num=7)
+    seed_issue(rig, "i8", status="parked", branch="sl/i8-y", num=8)
+    seed_issue(rig, "i9", status="running", branch="sl/i9-z", num=9, type="investigate")
+    rig.r.gh_view = {"stale": False, "prs": {}}
+    called = []
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: called.append(b) or runner_mod.gh.PrRead({}, True))
+    rig.r._refresh_inflight_prs(loopstate.load(str(rig.home / "state" / "issues.json"))["issues"])
+    assert called == []
+
+
+def test_externally_merged_pr_settles_a_building_lane_without_a_park(rig, monkeypatch):
+    """The #155 DoD, driven through all three real components in tick order: the reconcile READ
+    (_refresh_inflight_prs), the DECISION (actions.decide), and the SETTLE (_exec_absorb_merged).
+    i328's exact shape — status 'running', no report, and NO parsed issue, because the out-of-band
+    merge closed it and dropped it from every open-issue list the poll reads."""
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7)
+    rig.r.gh_view = {"stale": False, "consecutive_failures": 0, "closed_nums": set(),
+                     "prs": {}, "issue_comments": {}, "dev_checks": []}
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead(
+                            {"number": 42, "state": "MERGED", "headRefName": b, "labels": []}, True))
+    monkeypatch.setattr(rig.r, "_teardown_session", lambda *a, **k: True)
+
+    ist_map = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
+    rig.r._refresh_inflight_prs(ist_map)                       # tick step 1: reconcile the read
+
+    dsk = rig.r.disk_view(NOW)
+    acts = runner_mod.actions.decide(                          # tick step 2: decide on it
+        NOW, rig.r.config, rig.r.usage_view(), [],
+        runner_mod.actions.lane_state_from(dsk["issues_state"]), [], dsk, rig.r.gh_view)
+    assert [a for a in acts if a["act"] == "park"] == []       # no park, false or otherwise
+    absorb = [a for a in acts if a["act"] == "absorb_merged"]
+    assert absorb == [{"act": "absorb_merged", "id": "i7", "num": 7}]
+
+    rig.r._execute(absorb[0], NOW)                             # tick step 3: settle it
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))
+    assert st["issues"]["i7"]["status"] == "merged"            # the lane is settled and free
+
+
 # --------- issue #78: the build-path comments attachment obeys the #21/#61 read discipline -------
 
 def test_poll_attaches_comments_only_on_a_clean_read(rig, monkeypatch):

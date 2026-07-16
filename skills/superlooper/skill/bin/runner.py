@@ -989,6 +989,60 @@ class Runner:
         if changed:
             self.gh_view = {**self.gh_view, "prs": prs}
 
+    def _refresh_inflight_prs(self, ist_map):
+        """Reconcile branch -> PR for every IN-FLIGHT lane, every tick (issue #155).
+
+        Before this, the runner associated a branch with its PR only once an issue FINISHED, so a PR
+        that CONCLUDED while its lane was still building was invisible. i328 cost the afternoon queue
+        two hours on exactly that: its PR was merged out-of-band, which closed the issue ("Closes
+        #328"), which dropped it from BOTH open-issue lists the poll reads — and the poll's want-set
+        reaches a building lane only through its `in-progress` LABEL, which is read off those very
+        lists. So the lookup stopped happening at the moment it started to matter, `pr` stayed null,
+        and the lane held its slot until a human noticed.
+
+        Keying off LOCAL STATE rather than GitHub's open lists is what closes that hole: loopstate
+        still says `running` and still carries the branch stamp long after GitHub has forgotten the
+        issue ever existed.
+
+        The disciplines are _refresh_finishing_prs's, for its reasons:
+          - POSITIVE-FIND only. Neither a REFUSED lookup (PrRead ok=False, issue #61) nor a clean
+            answered-empty writes anything — so this path structurally CANNOT manufacture the "no PR
+            exists" answer that false-parks live work. Answered-empty still enters the view through
+            the poll's from-scratch snapshot, exactly as before.
+          - FINISHING lanes are SKIPPED — they are _refresh_finishing_prs's, and it also buys the
+            comments the gate needs. The two sets are disjoint, so no lane is looked up twice in one
+            tick and a comments-bearing entry is never overwritten by a comment-less one here.
+        No comments sub-read: an in-flight lane is not being gated, so the only fact worth buying is
+        the PR's state — ONE lookup per building lane per tick, the issue's cost bound. Called only
+        on a FRESH view (tick() gates on not-stale), so an outage degrades to the existing wait."""
+        if not isinstance(ist_map, dict):
+            return
+        prs = dict(self.gh_view.get("prs") or {})
+        changed = False
+        for iid, ist in ist_map.items():
+            if actions._iid_num(iid) is None:
+                continue
+            ist = ist if isinstance(ist, dict) else {}
+            # An investigate issue never opens a PR — its completion signal is the marker COMMENT,
+            # so a pr_for_branch lookup on one is pure waste (issue #21).
+            if ist.get("type") == "investigate":
+                continue
+            status = actions._status_of(ist)   # hash-safe: a wrong-typed status won't raise here (#95)
+            if status not in actions.INFLIGHT_STATUSES:
+                continue                       # terminal / ready / gating / holding: not this path's
+            if os.path.exists(os.path.join(self.home, "reports", f"{iid}.md")):
+                continue                       # the report landed but status has not moved yet:
+                                               # finishing, so _refresh_finishing_prs owns it
+            branch = ist.get("branch")
+            if not (isinstance(branch, str) and branch.strip()):
+                continue                       # no branch stamp yet — nothing to reconcile against
+            pv = gh.pr_for_branch(branch).pr   # a refused read has no pr by construction
+            if pv.get("number"):               # POSITIVE find only: refused/empty never erase a
+                prs[iid] = pv                  # cache entry, and never fabricate a PR-less answer
+                changed = True
+        if changed:
+            self.gh_view = {**self.gh_view, "prs": prs}
+
     def _refresh_finishing_investigation_comments(self, ist_map):
         """Budget-exempt sibling of _refresh_finishing_prs, for INVESTIGATE issues (issue #21 (b)).
         The 90s poll walks its want-set under a fixed call budget in sorted order, so a finished
@@ -1282,8 +1336,13 @@ class Runner:
         # FINISHED issue (report on disk, or gating/holding) so the gate's terminal calls never rest
         # on a >poll-window-old cache. Cheap: one gh lookup per finishing issue, only when GitHub is
         # reachable (a stale/unreachable view is left untouched — the gate then waits, never parks).
+        # ...and every IN-FLIGHT lane reconciles its branch to its PR each tick (#155), so a PR that
+        # CONCLUDES mid-build — an out-of-band merge or close — is absorbed instead of stalling the
+        # lane: the poll cannot see one, because an out-of-band merge closes the issue and drops it
+        # from the open-issue lists the want-set is built from (i328: two hours of queue).
         if not self.gh_view.get("stale"):
             self._refresh_finishing_prs(ist_map)
+            self._refresh_inflight_prs(ist_map)
             self._refresh_finishing_investigation_comments(ist_map)
 
         # Launch-anchor liveness (issue #24): hand decide the runner-level launch-health signals it
