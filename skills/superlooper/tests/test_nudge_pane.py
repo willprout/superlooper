@@ -206,3 +206,60 @@ def test_a_genuine_menu_still_defers_with_the_original_code(tmp_path):
              screen=_screen_fixture("claude-trust-folder.txt"))
     assert r.returncode == 3, f"a genuine menu must still return 3, got {r.returncode}"
     assert "send" not in log.read_text()
+
+
+# --------------------------- evidence on refusal (issue #152) ---------------------------
+# A nudge rc=3 record carried no verdict and no screen: i160 sat 43 minutes on an ambiguous defer
+# that nobody could classify afterwards, because the screen that produced it was never kept. Only
+# this script can see the screen, so this is where the evidence must be captured.
+
+MENU_SCREEN = "Do you want to proceed?\n1. Yes\n2. No, tell Claude what to do differently"
+
+
+def test_a_deferral_prints_the_verdict_and_the_screen_it_read(tmp_path):
+    run_root, cmux, log = _setup(tmp_path)
+    r = _run(run_root, cmux, log, "SURF-9", "i1", "hello", screen=MENU_SCREEN)
+    assert r.returncode == 3
+    assert "menu" in r.stderr.lower()                  # the classifier's verdict
+    assert "1. Yes" in r.stderr                        # the screen text it was drawn from
+    assert "state=menu" in r.stderr                    # named, machine-readably, for the record
+
+
+def test_a_dead_pane_refusal_also_carries_its_screen(tmp_path):
+    run_root, cmux, log = _setup(tmp_path)
+    (run_root / "state" / "exited" / "i1").write_text("123 rc=0")
+    r = _run(run_root, cmux, log, "SURF-9", "i1", "hello", screen="$ ")
+    assert r.returncode == 4
+    assert "state=dead" in r.stderr
+
+
+def test_the_captured_screen_is_bounded(tmp_path):
+    # Cap sizes (the 2026-07-07 binary-in-reports incident): a screen snippet rides into a journal
+    # record and a GitHub memo, so it can never be an unbounded dump.
+    run_root, cmux, log = _setup(tmp_path)
+    huge = "Do you want to proceed?\n1. Yes\n" + ("filler line\n" * 4000)
+    r = _run(run_root, cmux, log, "SURF-9", "i1", "hello", screen=huge)
+    assert r.returncode == 3
+    assert len(r.stderr) < 3000, f"stderr must stay bounded, got {len(r.stderr)}"
+
+
+def test_a_successful_send_stays_quiet(tmp_path):
+    # Evidence is the account of a refusal. A delivered nudge has nothing to explain.
+    run_root, cmux, log = _setup(tmp_path)
+    r = _run(run_root, cmux, log, "SURF-9", "i1", "hello")
+    assert r.returncode == 0 and r.stderr.strip() == ""
+
+
+def test_the_snippet_stays_valid_utf8_when_the_screen_is_cut(tmp_path):
+    """A byte-wise cut (`tail -c`) splits a multi-byte glyph — and a TUI screen is nothing but box
+    characters. The runner captures this stderr with text=True, so invalid UTF-8 here raises
+    UnicodeDecodeError inside the tick that was only trying to explain itself. Caught live: the
+    first cut of this evidence path did exactly that. bound() slices by CHARACTER."""
+    run_root, cmux, log = _setup(tmp_path)
+    screen = "Do you want to proceed?\n1. Yes\n" + "╰────────────╯ こんにちは\n" * 400
+    r = subprocess.run([NUDGE, "SURF-9", "i1", "hello"],
+                       env={**os.environ, "SL_RUN_ROOT": str(run_root), "SL_CMUX": str(cmux),
+                            "STUB_LOG": str(log), "STUB_SCREEN": screen},
+                       capture_output=True, timeout=30)          # BYTES, not text: decode ourselves
+    assert r.returncode == 3
+    r.stderr.decode("utf-8")                                     # raises if a glyph was sliced

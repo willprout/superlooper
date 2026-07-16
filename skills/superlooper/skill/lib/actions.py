@@ -86,6 +86,7 @@ import math
 import brief
 import config as _config
 import events as events_mod
+import evidence
 import gate
 import issues as issues_mod
 import scheduler
@@ -270,6 +271,23 @@ def _launch_stderr_memo(tail):
     if len(t) > LAUNCH_STDERR_MEMO_MAX:
         t = "…" + t[-LAUNCH_STDERR_MEMO_MAX:]
     return "\n\nlaunch stderr (tail — the agent's own error just before it exited):\n" + t
+
+
+def _captured_addendum(ev):
+    """The captured-stderr addendum for a memo that already names its own cause (issue #152).
+
+    Used where the memo's wording is ALREADY right — the #28 base-missing memo — to show the
+    launcher's own words underneath it, so the operator can check the runner's reading instead of
+    trusting it. Fail-open on wrong-typed/absent evidence (never raise into a park): no record, no
+    addendum. Where the memo must be DERIVED from the evidence, use evidence.park_memo instead.
+    """
+    if not isinstance(ev, dict):
+        return ""
+    captured = ev.get("captured")
+    if not isinstance(captured, str) or not captured.strip() or captured == evidence.CAPTURED_NONE:
+        return ""
+    return ("\n\ncaptured at the point of failure (stderr tail — the launcher's own account):\n"
+            + evidence.bound(captured, limit=evidence.PARK_MEMO_CAPTURED_MAX))
 
 
 def _fail_open_reason(dark_age):
@@ -1406,21 +1424,34 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 continue                               # SYSTEMIC launch fault (#24): hold, never
                                                        # park per-issue — the queue stays intact for
                                                        # when the anchor resolves (the alert stands)
+            # The evidence the runner captured at the MOMENT the launch failed (issue #152) — the
+            # launcher's own stderr, stamped into loopstate by _exec_launch. This is what lets the
+            # memo below name the component actually at fault instead of guessing one.
+            launch_ev = ist.get("launch_evidence")
             if ist.get("launch_error") == "base_missing":
                 # issue #28: launch-session.sh could not create the worktree because its base ref
                 # origin/<dev_branch> does not exist. Name the REAL cause — the missing base branch
                 # — instead of sending the newcomer to debug the launch shim (the wrong component).
+                # The captured stderr rides along (#152) so the operator can check this reading
+                # against the launcher's own words rather than take the runner's word for it.
                 park(iid, num, f"launch never delivered: the worktree base branch "
                                f"'origin/{dev_branch}' does not exist, so every worktree creation "
                                f"fails before Claude starts — a repo/config fault, not a "
                                f"launch-delivery problem. Set `dev_branch` in "
                                f".superlooper/config.json to the repo's real default branch "
                                f"(`superlooper adopt` detects it; `superlooper doctor` validates "
-                               f"it), then re-approve.", cause="launch_base_missing")
+                               f"it), then re-approve." + _captured_addendum(launch_ev),
+                     cause="launch_base_missing")
             else:
-                park(iid, num, f"launch was never delivered ({LAUNCH_FAILURE_CAP} verified "
-                               "attempts, or the attempt counter is unreadable) — is the launch "
-                               "shim installed? (bin/install-launch-shim.sh)",
+                # (#152) This memo used to ask "is the launch shim installed?" for EVERY non-base
+                # cause. On 2026-07-09 it said that to ten issues in a row while the real fault —
+                # a launch anchor pointing at a deleted cmux workspace — sat in the stderr the
+                # runner had already read and dropped. The shim was installed, and innocent; the
+                # launch never reached it. Now the memo speaks from the evidence: it names the
+                # anchor when the anchor is dead, still names the shim when rc=2 says the shim
+                # genuinely never fired, and admits "reason unknown" when nothing was captured —
+                # which is the one thing the old memo could never bring itself to do.
+                park(iid, num, evidence.park_memo(launch_ev, attempts=LAUNCH_FAILURE_CAP),
                      cause="launch_delivery")
             continue
         if "in-progress" in labels and iid not in live_locks and not gh_stale and iid in prs:

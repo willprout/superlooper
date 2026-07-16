@@ -17,8 +17,11 @@ Contract highlights under test:
 """
 import copy
 
+import pytest
+
 import actions
 import brief
+import evidence
 
 
 NOW = 1_750_000_000
@@ -409,14 +412,65 @@ def test_base_missing_launch_failure_parks_naming_the_branch_not_the_shim():
     assert has_notify(out)
 
 
-def test_generic_launch_failure_cap_still_blames_the_shim():
-    # The default (no base_missing cause) memo is unchanged: a plain non-delivery still points at
-    # the launch shim, so the base-missing branch doesn't swallow the ordinary failure mode.
-    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures=2)}})
-    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
-    parks = only(out, "park")
+def _launch_ev(rc, captured):
+    """The evidence record _exec_launch stamps into loopstate at the moment a launch fails."""
+    return evidence.build("launch", rc=rc, captured=captured)
+
+
+def test_a_shim_not_fired_cap_names_the_shim_because_that_is_what_the_evidence_says():
+    # The shim question is not banned — it is EARNED. rc=2 means a tab was created and no worker
+    # ever started in it, which is precisely the shim's failure, so the memo still asks about it.
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist(
+        "ready", launch_failures=2,
+        launch_evidence=_launch_ev(2, "[i5] LAUNCH NOT DELIVERED: no worker started in tab"))}})
+    parks = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")
     assert len(parks) == 1
     assert "shim" in parks[0]["memo"].lower()
+    assert "install-launch-shim.sh" in parks[0]["memo"]
+
+
+def test_the_storm_park_memo_names_the_dead_anchor_and_never_the_shim():
+    """THE case this issue exists for (2026-07-09). Ten issues parked asking "is the launch shim
+    installed?" while cmux had told the launcher, in words, that the anchor's workspace was gone."""
+    captured = ("[i5] could not parse a surface UUID from new-surface output: "
+                "Error: not_found: Pane or workspace not found")
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist(
+        "ready", launch_failures=2, launch_evidence=_launch_ev(1, captured))}})
+    parks = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")
+    assert len(parks) == 1
+    memo = parks[0]["memo"]
+    assert "workspace" in memo.lower()             # the REAL cause, named
+    assert "not_found" in memo                     # the captured diagnostic itself, verbatim
+    assert "is the shim installed" not in memo.lower()      # the wrong-component directive is gone
+    assert "install-launch-shim" not in memo
+
+
+def test_a_cap_with_no_evidence_admits_it_rather_than_guessing_a_component():
+    # Fail-closed: a runner that captured nothing must SAY so. The 07-09 memo's sin was not that it
+    # lacked evidence — it was that it sounded certain anyway and named an innocent component.
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures=2)}})
+    parks = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")
+    assert len(parks) == 1
+    memo = parks[0]["memo"]
+    assert evidence.CAPTURED_NONE in memo
+    assert "install-launch-shim" not in memo        # no guessing at a component
+
+
+@pytest.mark.parametrize("bad", [3, "boom", [], {"kind": "launch"}, {"detail": None}])
+def test_a_corrupt_evidence_record_never_breaks_the_park(bad):
+    # Wrong-typed state must cost wording, never the hand-back (the project's fail-open-on-type rule).
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("ready", launch_failures=2, launch_evidence=bad)}})
+    parks = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")
+    assert len(parks) == 1 and parks[0]["memo"].strip()
+
+
+def test_the_park_memo_is_bounded_against_a_runaway_stderr():
+    # Cap sizes (the 2026-07-07 binary-in-reports incident): a memo is a GitHub comment, never a dump.
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist(
+        "ready", launch_failures=2, launch_evidence=_launch_ev(1, "x" * 100_000))}})
+    parks = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")
+    assert len(parks[0]["memo"]) < 4000
 
 
 def test_reapproving_a_parked_at_cap_issue_reapproves_and_does_not_relaunch_yet():
