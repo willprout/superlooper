@@ -535,6 +535,13 @@ class Runner:
         # probe waits a full interval after the trip and each failed canary re-spaces the next. Reset
         # to 0 on any verified delivery. In-memory like the streak — a restart re-arms from scratch.
         self._launch_fail_at = 0
+        # Reclaim-hold dedup (issue #190): {iid: reason} for park-family lanes whose worktree the
+        # reclaim guard REFUSED to prune because it held unsaved work. The reaper sweeps every lane
+        # every tick, so a lane stuck with unsaved work would journal its refusal ~4x/min without
+        # this — we journal only on a NEW (iid, reason) and drop the entry once the prune finally
+        # lands (a later re-park then re-journals). In-memory like the launch streak: the durable
+        # record is the journal line + the preserved worktree itself, not this dedup cache.
+        self._reclaim_held = {}
 
         self.state = os.path.join(self.home, "state")
         self.issues_path = os.path.join(self.state, "issues.json")
@@ -1512,7 +1519,10 @@ class Runner:
             # CLOSE_TIMEOUT and is a fast no-op on an already-dead surface). Disk hygiene has no
             # deadline — a lane whose CLI is still unwinding is reclaimed on the next sweep, by
             # which time the pane close issued here has landed.
-            self._teardown_session(iid, remove_worktree=True, exit_timeout=0)
+            # guard_worktree=True (#190): these park-family lanes are NOT merged, so their worktree
+            # may hold the worker's only copy of its output (the i153/i163 loss). Refuse to prune a
+            # dirty/unpushed checkout; reclaim it once the work is committed AND pushed.
+            self._teardown_session(iid, remove_worktree=True, exit_timeout=0, guard_worktree=True)
 
     # ------------------------- the tick -------------------------
 
@@ -1859,14 +1869,29 @@ class Runner:
             args += ["--workspace", ws]
         self._run_script(args, timeout=CLOSE_TIMEOUT)
 
-    def _teardown_session(self, iid, remove_worktree=False, exit_timeout=None):
+    def _teardown_session(self, iid, remove_worktree=False, exit_timeout=None, guard_worktree=False):
         """THE one ordered teardown for every session end (issue #149). Every path that ends a
         lane's session comes through here, so the ordering below is stated once and cannot drift.
 
             1. close the pane          — ask the CLI to go; its EXIT trap frees worker.<id>.lock
             2. observe it actually go  — bounded (only when we intend to prune; see below)
             3. clear pane markers + the lock, together (D9: no marker outlives its session)
-            4. only THEN prune the worktree
+            4. (guarded callers only) refuse if the worktree holds unsaved work — see below
+            5. only THEN prune the worktree
+
+        `guard_worktree=True` (the disk-hygiene reclaim: the parked reaper and its declined-prune
+        drain, for park-family lanes) refuses to prune a worktree that still holds the ONLY copy of
+        the worker's output — uncommitted changes, or commits on no remote ref (issue #190). The
+        overnight i153/i163 regression pruned exactly this: parked lanes sitting at origin/main with
+        the worker's report-described harness uncommitted, deleted with the checkout. The refusal is
+        journaled once per state (_hold_reclaim) and the worktree preserved; the every-tick reaper
+        is the retry, so the moment the work is committed AND pushed the next sweep reclaims it. The
+        session markers ARE still cleared here (the worker is verified gone by step 2 — only the
+        checkout is kept, so William can recover the work). The deliberate-throwaway paths
+        (regenerate/reapprove — a fresh rebuild from the issue) and the merge paths (work already on
+        the mainline) pass guard_worktree=False and prune unconditionally, exactly as before: a
+        conflict-regenerated worktree is usually dirty by design, and guarding it would livelock the
+        rebuild it exists to enable.
 
         WHY THE ORDER IS THE WHOLE POINT (the D14 family, 07-15 forensics r2/U4). The agent CLI
         spawns its hooks with an EXPLICIT cwd — the worker's worktree. Prune that worktree while
@@ -1915,13 +1940,33 @@ class Runner:
                   os.path.join(self.state, f"worker.{iid}.lock")):
             _rm(p)
         if remove_worktree:
+            # (#190) The unsaved-work guard, for the disk-hygiene reclaim only. The worker is gone
+            # (step 2), so the checkout is nobody's cwd — but if it still holds the sole copy of the
+            # work (dirty tree, or commits on no remote ref), pruning it here is the silent data loss
+            # this guard exists to stop. Refuse: journal once, PRESERVE the worktree (its markers are
+            # already cleared above), and let the every-tick reaper retry once the work is saved.
+            if guard_worktree:
+                block = gitops.worktree_reclaim_block(self._worktree(iid))
+                if block:
+                    self._hold_reclaim(iid, block)
+                    return True                            # lane clear of a live worker; work kept
             # Clear the deferral only once the worktree is truly gone; a failed remove keeps the
             # marker so the drain retries the removal on a later tick.
             if gitops.worktree_remove(self.repo, self._worktree(iid)):
                 _rm(os.path.join(self.state, "pending_teardown", iid))
+                self._reclaim_held.pop(iid, None)          # saved & gone: a later re-park re-journals
             else:
                 self._defer_teardown(iid, pid)
         return True
+
+    def _hold_reclaim(self, iid, reason):
+        """Journal a reclaim refusal — bounded to ONE line per (iid, reason) so the every-tick
+        reaper never storms the log (issue #190). The record + the preserved worktree are the
+        durable surface; this dedup is in-memory (a restart re-journals once, still bounded)."""
+        if self._reclaim_held.get(iid) == reason:
+            return
+        self._reclaim_held[iid] = reason
+        journal.append(self.home, {"act": "reclaim_held", "id": iid, "reason": reason})
 
     def _defer_teardown(self, iid, pid):
         """Record a declined prune so a later tick retries it. Fail-silent: a marker we cannot
@@ -1959,12 +2004,22 @@ class Runner:
             if not isinstance(status, str):
                 continue                                   # unknown lane: fail closed, keep waiting
             if status in actions.TERMINAL_STATUSES:
-                self._teardown_session(iid, remove_worktree=True, exit_timeout=0)
+                # (#190) Inherit the reaper's unsaved-work guard for park-family lanes: a declined
+                # prune deferred here can be a parked lane whose worktree still holds the only copy
+                # of its work. A MERGED lane never guards — its work is on the mainline by
+                # definition — so the merge-path cleanup this drain exists to retry is untouched.
+                guard = status in actions.REAPPROVAL_STATUSES
+                self._teardown_session(iid, remove_worktree=True, exit_timeout=0, guard_worktree=guard)
             else:
                 # Back in flight (relaunched/regenerated since the decline): the worktree at this
                 # path is a LIVE lane's now, rebuilt by its own launch. Drop the stale marker —
                 # draining here would tear down a running worker, the exact bug we prevent.
                 _rm(os.path.join(d, iid))
+                # ...and drop any reclaim-hold dedup for it (#190): a lane that left park-family
+                # without its worktree being pruned here must, if it later re-parks with the same
+                # cause, journal that refusal afresh — the entry is popped on a real prune, so this
+                # covers the marker-dropped-without-a-prune path.
+                self._reclaim_held.pop(iid, None)
 
     def _close_stale_session(self, iid):
         """D4: a relaunch (conflict-regenerate, or a retry) targets an id whose PRIOR session may

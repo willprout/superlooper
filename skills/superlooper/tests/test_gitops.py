@@ -233,3 +233,99 @@ def test_worktree_remove_dirty_stale_worktree(repos, tmp_path):
 def test_worktree_add_fails_closed_on_bad_start_point(repos, tmp_path):
     assert gitops.worktree_add(repos["wt"], tmp_path / "lanes" / "bad",
                                "sl/i9-bad", "origin/does-not-exist") is False
+
+
+# --------------------------- worktree_reclaim_block: the unpushed-work guard (issue #190) ---------------------------
+# The detector the reclaim path consults BEFORE it prunes: pruning is rmtree, so a worktree whose
+# work exists nowhere else (uncommitted, or committed-but-never-pushed) would be destroyed outright.
+# These build REAL linked worktrees (exactly what the runner reclaims), not bare dirs.
+
+def test_reclaim_block_none_when_clean_and_at_origin(repos, tmp_path):
+    # a fresh lane at origin/main: nothing uncommitted, no commit missing from a remote -> safe.
+    lane = tmp_path / "lanes" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    assert gitops.worktree_reclaim_block(lane) is None
+
+
+def test_reclaim_block_flags_a_dirty_tracked_edit(repos, tmp_path):
+    lane = tmp_path / "lanes" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    (lane / "shared.txt").write_text("uncommitted edit\n")
+    assert gitops.worktree_reclaim_block(lane) == "dirty"
+
+
+def test_reclaim_block_flags_untracked_files_as_work(repos, tmp_path):
+    # the i153 shape: the worker created NEW files and never `git add`ed them. Untracked output
+    # IS the only copy of the work — a bare `git worktree remove` would delete it. Must block.
+    lane = tmp_path / "lanes" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    (lane / "invariant_harness.py").write_text("the report says this exists; it lives only here\n")
+    assert gitops.worktree_reclaim_block(lane) == "dirty"
+
+
+def test_reclaim_block_flags_a_committed_but_unpushed_branch(repos, tmp_path):
+    # committed, so the tree is clean — but the commit is on no remote ref. Pruning loses it.
+    lane = tmp_path / "lanes" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    _commit_file(lane, "feature.txt", "issue work\n", "issue work (never pushed)")
+    assert _sh(lane, "status", "--porcelain") == ""          # clean tree...
+    assert gitops.worktree_reclaim_block(lane) == "unpushed"  # ...but the work is unpushed
+
+
+def test_reclaim_block_clears_once_the_branch_is_pushed(repos, tmp_path):
+    lane = tmp_path / "lanes" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    _commit_file(lane, "feature.txt", "issue work\n", "issue work")
+    assert gitops.worktree_reclaim_block(lane) == "unpushed"
+    assert gitops.plain_push(lane, "sl/i2-y") is True
+    assert gitops.worktree_reclaim_block(lane) is None        # now on a remote ref -> safe
+
+
+def test_reclaim_block_reports_both_causes_together(repos, tmp_path):
+    lane = tmp_path / "lanes" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    _commit_file(lane, "feature.txt", "committed but unpushed\n", "unpushed commit")
+    (lane / "wip.txt").write_text("and uncommitted on top\n")
+    assert gitops.worktree_reclaim_block(lane) == "dirty+unpushed"
+
+
+def test_reclaim_block_none_on_a_missing_directory():
+    # already gone: nothing to protect, and the caller's prune just clears a stale registration.
+    assert gitops.worktree_reclaim_block("/no/such/worktree/anywhere") is None
+
+
+def test_reclaim_block_none_on_a_non_git_directory(tmp_path):
+    # not a git worktree at all -> outside this git-state guard's mandate; do not wedge the prune.
+    d = tmp_path / "plain"
+    d.mkdir()
+    (d / "loose.txt").write_text("not under git")
+    assert gitops.worktree_reclaim_block(d) is None
+
+
+def test_reclaim_block_fails_closed_when_a_real_worktree_cannot_be_read(repos, tmp_path, monkeypatch):
+    # a REAL worktree whose git state can't be read (a status error / corrupt index) must NOT be
+    # pruned — we never destroy what we could not verify is saved. Distinct from a non-git dir.
+    lane = tmp_path / "lanes" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    real_git = gitops._git
+
+    def flaky(cwd, *args, **kw):
+        if args[:1] == ("status",):
+            return (128, "fatal: could not read the index")
+        return real_git(cwd, *args, **kw)
+
+    monkeypatch.setattr(gitops, "_git", flaky)
+    assert gitops.worktree_reclaim_block(lane) == "unreadable"
+
+
+def test_reclaim_block_never_reads_a_broken_git_as_safe(repos, tmp_path, monkeypatch):
+    # THE data-loss window the guard must close: on a REAL worktree (a .git entry is present) a
+    # WHOLESALE git failure — a timeout, a missing binary, a PATH loss — must fail CLOSED, never
+    # return None. None here would send worktree_remove's unconditional rmtree at a checkout still
+    # holding the only copy of the work. The .git-entry test (a filesystem fact) is what keeps a
+    # broken `git` from ever being mistaken for 'not a worktree, safe to prune'.
+    lane = tmp_path / "lanes" / "i2"
+    assert gitops.worktree_add(repos["wt"], lane, "sl/i2-y", "origin/main") is True
+    (lane / "only_copy.txt").write_text("unsaved work")           # dirty + real
+    monkeypatch.setattr(gitops, "_git", lambda *a, **k: (127, "git: command not found"))
+    assert gitops.worktree_reclaim_block(lane) == "unreadable"    # NOT None
