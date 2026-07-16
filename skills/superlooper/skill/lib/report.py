@@ -374,6 +374,35 @@ def _watchdog(records, window_start):
     return lines
 
 
+def _resurrection(records, window_start):
+    """Runner resurrection activity (issue #208): every automatic RESTART of a provably-gone runner —
+    succeeded, failed, or cap-paused — reaches the owner's morning surface. The runner going down and
+    restarting itself overnight is exactly what the owner must never coffee past."""
+    lines = []
+    for r in records:
+        if r.get("act") != "runner_resurrect" or not _in_window(r, window_start):
+            continue
+        sigs = ", ".join(s for s in (r.get("signals") or []) if isinstance(s, str)) \
+            or "(signal unrecorded)"
+        outcome = r.get("outcome")
+        if outcome == "resurrected":
+            lines.append(f"- Runner was down and AUTOMATICALLY RESTARTED ({r.get('id')}) — signals: "
+                         f"{sigs}. It reconciled from GitHub + disk like a manual restart.")
+        elif outcome == "resurrect_failed":
+            lines.append(f"- Automatic runner restart {r.get('id')} FAILED (rc={r.get('rc')}) — the "
+                         "loop was down and could not restart itself (its cmux tab is likely gone).")
+        elif outcome == "resurrect_capped":
+            if r.get("max_per_hour") == 0:
+                lines.append("- Runner is DOWN and auto-restart is DISABLED "
+                             "(watchdog.resurrection_max_per_hour = 0) — it will stay down until you "
+                             "restart it.")
+            else:
+                lines.append(f"- Runner auto-restart PAUSED — it was restarted {r.get('attempts')} "
+                             "time(s) in an hour and kept going down. A repeatedly-dying runner is a "
+                             "real incident, not a flap; the loop needs you.")
+    return lines
+
+
 def _freeze(view):
     frozen = view.get("frozen")
     if isinstance(frozen, dict) and frozen:
@@ -464,6 +493,7 @@ def morning(journal_records, gh_view, ledger, config):
     regens = _regenerations(records, week_start)
     wanders = _wanders(records, overnight_start)
     watchdog = _watchdog(records, overnight_start)
+    resurrections = _resurrection(records, overnight_start)     # runner auto-restarts (#208)
     questions, q_total = _questions(records, overnight_start)   # owner-question rate (#163)
     frozen = isinstance(view.get("frozen"), dict) and bool(view.get("frozen"))
     queue = [q for q in view.get("queue") if isinstance(q, dict)] if isinstance(view.get("queue"), list) else []
@@ -472,7 +502,8 @@ def morning(journal_records, gh_view, ledger, config):
     # runs EVERY night, so counting it here would mean no night is ever quiet. A RED nightly shows
     # up as `frozen` instead, which does break quiet. An unattended debugger LAUNCH (or a launch
     # that failed) always breaks quiet — the owner must never coffee past one (issue #66).
-    quiet = not any((merged, parked, bounces, regens, wanders, watchdog, questions, queue, frozen))
+    quiet = not any((merged, parked, bounces, regens, wanders, watchdog, resurrections,
+                     questions, queue, frozen))
     summary = ("Nothing happened overnight — queue empty." if quiet else
                f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · "
@@ -496,6 +527,7 @@ def morning(journal_records, gh_view, ledger, config):
         _section("Conflict regenerations (last 7 days)", regens),
         _section("Wanders", wanders),
         _section("Unattended debugger", watchdog, "None — the watchdog launched nothing."),
+        _section("Runner resurrection", resurrections, "None — the runner did not go down."),
         _section("Gate health", _gate_health(records, week_start, ledger, cfg)),
         "## Freeze state\n" + "\n".join(_freeze(view)) + "\n",
         _section("Usage / queue", _usage_queue(view)),

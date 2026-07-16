@@ -476,6 +476,37 @@ def test_watchdog_notify_only_episodes_stay_quiet():
     assert "nothing happened" in out.lower()
 
 
+# --------------------------- runner resurrection (issue #208) ---------------------------
+
+def test_runner_resurrection_renders_and_breaks_quiet():
+    j = [_rec(1030, "runner_resurrect", outcome="resurrected", id="r1",
+              signals=["heartbeat_stale"])]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "## Runner resurrection" in out
+    assert "RESTARTED" in out and "r1" in out and "heartbeat_stale" in out
+    assert "nothing happened" not in out.lower()      # the runner going down is never a quiet night
+
+
+def test_runner_resurrection_failure_and_cap_are_honest():
+    j = [_rec(1030, "runner_resurrect", outcome="resurrect_failed", id="r4", rc="no_pane",
+              signals=["heartbeat_stale"]),
+         _rec(1040, "runner_resurrect", outcome="resurrect_capped", attempts=5, max_per_hour=5,
+              signals=["heartbeat_stale"])]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "FAILED" in out and "no_pane" in out
+    assert "PAUSED" in out and "5 time" in out
+    assert "nothing happened" not in out.lower()
+
+
+def test_runner_resurrection_disabled_report_line_is_honest():
+    # max_per_hour=0 (auto-restart disabled): the report must say DISABLED, not "restarted 0 time(s)".
+    j = [_rec(1040, "runner_resurrect", outcome="resurrect_capped", attempts=0, max_per_hour=0,
+              signals=["heartbeat_stale"])]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "DISABLED" in out and "0 time" not in out
+    assert "nothing happened" not in out.lower()
+
+
 # --------------------------- notify-channel canary (issue #164) ---------------------------
 # The daily morning push doubles as the channel heartbeat: the runner journals its delivery result
 # as `notify_canary`, and the report surfaces it here — the owner-read, out-of-band surface a

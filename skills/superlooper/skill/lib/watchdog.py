@@ -8,6 +8,14 @@ exists anywhere in this module and it makes no repair decisions: it detects, not
 waits, launches, journals. All judgment lives in the launched session (the sl-debugger
 skill's unattended contract).
 
+This module ALSO owns RUNNER RESURRECTION (issue #208): when a runner is PROVABLY GONE —
+heartbeat stale AND its recorded pid dead — the check RESTARTS `superlooper run` (a
+deterministic, zero-token process, never an LLM) instead of hiring a debugger for a wedge. A
+corpse needs restarting, not diagnosing. That path (`_resurrection`, `after_resurrect`) reroutes
+heartbeat_stale away from the debugger episode, caps restarts per rolling hour (then escalates
+loudly), and settles the reborn-but-booting runner. It is still pure: the CLI resolves the
+recorded anchor pane and executes the restart through resurrect-runner.sh.
+
 Three signals, per the heartbeat/ALERT contract in plugin/skills/superlooper/references/runner-ops.md:
   heartbeat_stale  state/runner.heartbeat older than the configured bound. The heartbeat
                    marks tick PROGRESS (stamped at the END of a successful tick), so a
@@ -68,6 +76,18 @@ HEARTBEAT_STALE_MINUTES_DEFAULT = 20   # comfortably past the longest legitimate
 NO_PROGRESS_MINUTES_DEFAULT = 30
 LAUNCH_ATTEMPT_CAP = 3                 # failed-launch retries per episode; then hold (no storm)
 
+# Runner resurrection (issue #208). A runner that is PROVABLY GONE — heartbeat stale AND its
+# recorded pid dead — is a deterministic zero-token process that should just restart, as often as
+# it needs to, rather than wait for a debugger or the morning. But a runner that keeps dying is a
+# real incident: cap the restarts in a rolling hour, then escalate loudly instead of flapping.
+RESURRECTION_MAX_PER_HOUR_DEFAULT = 5  # restarts per rolling hour before we stop and escalate
+RESURRECTION_WINDOW_SECONDS = 3600     # the rolling window the cap counts over
+RESURRECTION_SETTLE_SECONDS = 300      # after a restart the reborn runner is booting/catching up;
+                                       # a stale heartbeat with a LIVE pid inside this window is the
+                                       # new runner not having stamped its first tick yet, NOT a
+                                       # wedge — so it must not open a debugger episode. Ticks are
+                                       # ~15s, so one settled tick lands far inside 5 min.
+
 KILL_SWITCH_FILENAME = "WATCHDOG_OFF"  # state/WATCHDOG_OFF disables the whole path
 STATE_FILENAME = "watchdog.json"       # state/watchdog.json — episode + no-progress clocks
 
@@ -79,13 +99,21 @@ _FIVE_HOUR_CEILING = 90
 _SEVEN_DAY_CEILING = 96
 
 
+def _new_resurrection():
+    # issue #208: `attempts` are the restart timestamps in the rolling window (the crash-loop cap
+    # counts these); `capped_notified` / `failure_notified` dedup the escalation and failed-restart
+    # texts for one down-streak (cleared when the runner is observed healthy again).
+    return {"attempts": [], "capped_notified": False, "failure_notified": False}
+
+
 def new_state():
     # disabled_observed: the signal set the last kill-switched check journaled, so a standing
     # kill-switch journals once per DISTINCT observation instead of once per check (an
     # overnight switch at a 5-min interval must not write ~96 identical lines — the
     # 2026-07-08 unbounded-repetition class). None = not currently disabled-deduping.
     return {"episode": None, "no_progress_since": {}, "next_debugger": 1,
-            "disabled_observed": None}
+            "disabled_observed": None, "resurrection": _new_resurrection(),
+            "next_resurrection": 1}
 
 
 def coerce_state(raw):
@@ -109,6 +137,19 @@ def coerce_state(raw):
     dob = raw.get("disabled_observed")
     if isinstance(dob, list) and all(isinstance(x, str) for x in dob):
         st["disabled_observed"] = dob
+    res = raw.get("resurrection")
+    if isinstance(res, dict):
+        r = _new_resurrection()
+        at = res.get("attempts")
+        if isinstance(at, list):
+            r["attempts"] = [t for t in at
+                             if isinstance(t, (int, float)) and not isinstance(t, bool)]
+        r["capped_notified"] = res.get("capped_notified") is True
+        r["failure_notified"] = res.get("failure_notified") is True
+        st["resurrection"] = r
+    nr = raw.get("next_resurrection")
+    if type(nr) is int and nr >= 1:
+        st["next_resurrection"] = nr
     return st
 
 
@@ -128,13 +169,18 @@ def _wcfg(config):
         authority = AUTHORITY_DEFAULT
     allowlist = w.get("allowlist")
     allowlist = [x for x in allowlist if isinstance(x, str)] if isinstance(allowlist, list) else []
+    rmax = w.get("resurrection_max_per_hour")
+    # >= 0 (0 disables resurrection -> escalate immediately); anything else falls to the default.
+    if not (isinstance(rmax, int) and not isinstance(rmax, bool) and rmax >= 0):
+        rmax = RESURRECTION_MAX_PER_HOUR_DEFAULT
     return {"authority": authority, "allowlist": allowlist,
             "grace_seconds": _minutes("grace_minutes", GRACE_MINUTES_DEFAULT) * 60,
             "heartbeat_stale_seconds":
                 _minutes("heartbeat_stale_minutes", HEARTBEAT_STALE_MINUTES_DEFAULT) * 60,
             "no_progress_seconds":
                 _minutes("no_progress_minutes", NO_PROGRESS_MINUTES_DEFAULT) * 60,
-            "grace_minutes": _minutes("grace_minutes", GRACE_MINUTES_DEFAULT)}
+            "grace_minutes": _minutes("grace_minutes", GRACE_MINUTES_DEFAULT),
+            "resurrection_max_per_hour": rmax}
 
 
 def usage_reads_exhausted(usage):
@@ -271,6 +317,97 @@ def _rec(outcome, signals, **extra):
     return {"act": "watchdog", "outcome": outcome, "signals": list(signals), **extra}
 
 
+def _rrec(outcome, signals, **extra):
+    """A resurrection journal record — a DISTINCT act (issue #208) so the morning report and
+    journal greps separate runner restarts from debugger episodes (`watchdog`) and from the
+    live runner's own self-restart (`runner_restart`, issue #116)."""
+    return {"act": "runner_resurrect", "outcome": outcome, "signals": list(signals), **extra}
+
+
+def _without(sigs, details, drop):
+    """(sigs, details) with `drop` removed — the two lists are index-aligned (built together in
+    _signals), so a signal's detail string is dropped with it."""
+    kept = [(s, d) for s, d in zip(sigs, details) if s != drop]
+    return [s for s, _ in kept], [d for _, d in kept]
+
+
+def _resurrection(now, view, w, sigs, details, new_state):
+    """The provably-gone-runner restart decision (issue #208), folded into the mechanical check.
+
+    Returns (sigs, details, resurrect, journal, notify, new_state). `runner_dead` in the view is
+    the CLI's "state/runner.lock names a DEAD pid" read — a CRASH leaves the pidfile behind, a
+    clean stop removes it, so it distinguishes 'provably gone' from 'deliberately stopped'.
+
+      * heartbeat stale AND runner_dead -> the loop is a corpse: restarting it (a deterministic,
+        zero-token process) is the fix, NOT hiring a debugger. heartbeat_stale is REMOVED from the
+        signal set the debugger episode sees, and — under the rolling-hour cap — a resurrect request
+        is emitted; past the cap a repeatedly-dying runner escalates LOUDLY, once, and stops.
+      * heartbeat stale AND the pid is ALIVE, shortly after a restart -> the reborn runner is still
+        booting and has not stamped its first tick, so the OLD heartbeat still reads stale. Inside
+        the settle window that is catching-up, NOT a wedge: suppress it (no debugger episode). After
+        the settle window a still-stale heartbeat is a genuine wedge and the debugger path engages.
+
+    Both required (the DoD): a fresh heartbeat with a dead pid is a runner that crashed seconds ago,
+    and we wait the heartbeat-stale bound (giving a human first crack) before stepping in."""
+    r = dict(new_state.get("resurrection") or _new_resurrection())
+    r.setdefault("attempts", [])
+    r.setdefault("capped_notified", False)
+    r.setdefault("failure_notified", False)
+    resurrect, journal, notify = None, [], []
+    runner_dead = bool(view.get("runner_dead"))
+    hb_stale = HEARTBEAT_STALE in sigs
+
+    # A healthy runner (heartbeat fresh, pid alive) closes the down-streak: re-arm the dedup flags
+    # so a genuinely NEW incident texts again. (Booting — stale hb, live pid — is NOT healthy, so
+    # its heartbeat_stale keeps this from firing mid-recovery.)
+    if not hb_stale and not runner_dead:
+        r["capped_notified"] = False
+        r["failure_notified"] = False
+
+    attempts = [t for t in r["attempts"]
+                if isinstance(t, (int, float)) and not isinstance(t, bool)]
+
+    if hb_stale and runner_dead:
+        present = sorted(sigs)                              # capture BEFORE filtering, for the memo
+        sigs, details = _without(sigs, details, HEARTBEAT_STALE)
+        recent = [t for t in attempts if now - t < RESURRECTION_WINDOW_SECONDS]
+        cap = w["resurrection_max_per_hour"]
+        if len(recent) >= cap:
+            r["attempts"] = recent
+            if not r["capped_notified"]:                   # escalate once per capped streak (no storm)
+                r["capped_notified"] = True
+                journal.append(_rrec("resurrect_capped", present,
+                                     attempts=len(recent), max_per_hour=cap))
+                if cap == 0:                               # auto-restart disabled by config
+                    notify.append((
+                        "superlooper runner is DOWN — auto-restart is DISABLED",
+                        "the runner is provably gone (heartbeat stale, pid dead) but automatic "
+                        "restart is disabled (watchdog.resurrection_max_per_hour = 0). The loop is "
+                        "down and will stay down until you restart it."))
+                else:                                      # genuine crash-loop cap hit
+                    notify.append((
+                        "superlooper runner keeps dying — auto-restart PAUSED",
+                        f"the runner has been auto-restarted {len(recent)} time(s) in the last hour "
+                        "and is still going down. That is a real incident, not a flap, so automatic "
+                        "resurrection is paused — the loop needs you."))
+        else:
+            n = new_state.get("next_resurrection", 1)
+            resurrect = {"id": f"r{n}", "signals": present}
+            new_state["next_resurrection"] = n + 1
+            r["attempts"] = recent + [now]
+            r["capped_notified"] = False
+    elif hb_stale and not runner_dead:
+        last = max(attempts, default=None)
+        if last is not None and now - last < RESURRECTION_SETTLE_SECONDS:
+            sigs, details = _without(sigs, details, HEARTBEAT_STALE)   # reborn runner still booting
+        r["attempts"] = attempts
+    else:
+        r["attempts"] = attempts
+
+    new_state = dict(new_state, resurrection=r)
+    return sigs, details, resurrect, journal, notify, new_state
+
+
 def evaluate(now, config, view, state):
     """One mechanical check. Returns {"state", "journal", "notify", "launch"}:
       state    the new state to persist (episode + no-progress clocks + id counter);
@@ -287,15 +424,24 @@ def evaluate(now, config, view, state):
 
     if view.get("kill_switch"):
         # Observe + journal + change nothing else: no episode opens, no clock advances, no
-        # launch. The journal record dedups on the OBSERVED signal set (review P1-2): a
-        # standing switch writes one line per distinct observation, never one per check.
+        # launch, NO resurrection (WATCHDOG_OFF is the whole-path kill switch). The journal record
+        # dedups on the OBSERVED signal set (review P1-2): a standing switch writes one line per
+        # distinct observation, never one per check.
         if sigs == state.get("disabled_observed"):
-            return {"state": state, "notify": [], "launch": None, "journal": []}
+            return {"state": state, "notify": [], "launch": None, "journal": [], "resurrect": None}
         return {"state": dict(state, disabled_observed=sigs), "notify": [], "launch": None,
-                "journal": [_rec("disabled", sigs)]}
+                "journal": [_rec("disabled", sigs)], "resurrect": None}
 
     new_state = dict(state, no_progress_since=since, disabled_observed=None)
     journal, notify, launch = [], [], None
+
+    # Runner resurrection (issue #208) runs BEFORE the debugger-episode logic: it may reroute a
+    # provably-gone runner's heartbeat_stale away from the episode (a corpse needs restarting, not
+    # diagnosing) and emit a resurrect request or a loud escalation.
+    sigs, details, resurrect, res_journal, res_notify, new_state = _resurrection(
+        now, view, w, sigs, details, new_state)
+    journal.extend(res_journal)
+    notify.extend(res_notify)
     ep = state.get("episode")
 
     if not sigs:
@@ -310,12 +456,14 @@ def evaluate(now, config, view, state):
                 # OBSERVED clear stands it down below. Quiet: no notify, no launch, no journal line
                 # (a long outage at a 5-min interval must not write a record per check).
                 new_state["episode"] = ep
-                return {"state": new_state, "journal": [], "notify": [], "launch": None}
+                return {"state": new_state, "journal": journal, "notify": notify,
+                        "launch": None, "resurrect": resurrect}
             # Self-recovery or owner intervention during (or after) the grace: stand down
             # SILENTLY — the journal keeps the record, the phone stays quiet.
             journal.append(_rec("stand_down", ep_signals))
         new_state["episode"] = None
-        return {"state": new_state, "journal": journal, "notify": notify, "launch": launch}
+        return {"state": new_state, "journal": journal, "notify": notify, "launch": launch,
+                "resurrect": resurrect}
 
     if ep is None:
         ep = {"signals": sigs, "opened_at": now, "detail": "; ".join(details),
@@ -347,7 +495,8 @@ def evaluate(now, config, view, state):
                       "authority": w["authority"], "allowlist": list(w["allowlist"])}
             new_state["next_debugger"] = n + 1
 
-    return {"state": new_state, "journal": journal, "notify": notify, "launch": launch}
+    return {"state": new_state, "journal": journal, "notify": notify, "launch": launch,
+            "resurrect": resurrect}
 
 
 def after_launch(now, config, state, launch, rc):
@@ -385,6 +534,42 @@ def after_launch(now, config, state, launch, rc):
                            "The tripped signal still stands: " + ", ".join(sigs)
                            + ". The loop needs you."))
     return {"state": dict(state, episode=ep), "journal": journal, "notify": notify}
+
+
+def after_resurrect(now, config, state, resurrect, rc):
+    """Record the outcome of an executed resurrect request (issue #208). rc==0 (the runner came up —
+    the launcher VERIFIED a live pidfile) TEXTS THE OWNER: a dead runner restarting itself is a loud
+    event, not a silent one (the DoD). A nonzero rc journals the failure and texts ONCE per down-
+    streak (the reborn tab could not be placed — its pane is gone, or the shim did not run), then
+    later checks retry up to the rolling-hour cap. `config` is accepted for call-site symmetry with
+    after_launch; this reads no config knob (the cap already gated the request in evaluate).
+
+    The attempt itself was recorded in evaluate (so a launch that fails to VERIFY still counts toward
+    the cap — a runner whose tab is gone must not retry forever); after_resurrect only journals the
+    outcome and manages the failure-text dedup."""
+    state = coerce_state(state)
+    r = dict(state.get("resurrection") or _new_resurrection())
+    journal, notify = [], []
+    sigs = list(resurrect.get("signals") or [])
+    rid = resurrect.get("id")
+    if rc == 0:
+        r["failure_notified"] = False
+        journal.append(_rrec("resurrected", sigs, id=rid))
+        notify.append((
+            "superlooper runner was down — restarted it",
+            f"the runner was provably gone (signals: {', '.join(sigs) or 'heartbeat_stale'}) and "
+            f"has been automatically restarted ({rid}) in its cmux tab. It reconciles from GitHub + "
+            "disk exactly like a manual restart — no work lost, no counters reset."))
+    else:
+        journal.append(_rrec("resurrect_failed", sigs, id=rid, rc=rc))
+        if not r.get("failure_notified"):
+            r["failure_notified"] = True
+            notify.append((
+                "superlooper could NOT restart the runner",
+                f"the runner is down and the automatic restart ({rid}) failed (rc={rc}) — most "
+                "likely its cmux tab/pane is gone, so a new one cannot be placed without you. The "
+                "loop is not running."))
+    return {"state": dict(state, resurrection=r), "journal": journal, "notify": notify}
 
 
 def render_brief(template, mapping):

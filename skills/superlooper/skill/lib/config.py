@@ -108,8 +108,14 @@ _NESTED_DEFAULTS = {
     # sl-debugger skill's unattended contract, never relaxed here. `allowlist` names the
     # exact repair verbs permitted at the `allowlist` tier. grace_minutes is the text->launch
     # wait; the two *_minutes bounds tune the stale-heartbeat and no-progress detectors.
+    # resurrection_max_per_hour (issue #208): a runner that is PROVABLY GONE (heartbeat stale AND
+    # its recorded pid dead) is automatically restarted — the runner is a deterministic, zero-token
+    # process, so it should restart as often as it needs to. This caps the restarts in a rolling
+    # hour; hitting the cap escalates loudly and pauses (a repeatedly-dying runner is an incident,
+    # not a flap). 0 disables auto-restart (escalate on the first provably-gone check instead).
     "watchdog": {"authority": "full", "allowlist": [], "grace_minutes": 30,
-                 "heartbeat_stale_minutes": 20, "no_progress_minutes": 30},
+                 "heartbeat_stale_minutes": 20, "no_progress_minutes": 30,
+                 "resurrection_max_per_hour": 5},
 }
 
 _ALLOWED_TOP = set(_TOP_DEFAULTS) | set(_NESTED_DEFAULTS) | {"repo", "operator"}
@@ -368,9 +374,10 @@ def _validate_and_fill(raw):
     if not isinstance(wd["allowlist"], list) or any(not isinstance(x, str) for x in wd["allowlist"]):
         _err(f"'watchdog.allowlist' must be a list of strings, got {wd['allowlist']!r}")
     # grace may be 0 (launch on the tripping check); the detection bounds must be >= 1 —
-    # a zero bound would trip on any instantaneous glimpse of the condition.
+    # a zero bound would trip on any instantaneous glimpse of the condition. resurrection_max_per_hour
+    # may be 0 (disables auto-restart -> escalate immediately on a provably-gone runner).
     for wk, lo in (("grace_minutes", 0), ("heartbeat_stale_minutes", 1),
-                   ("no_progress_minutes", 1)):
+                   ("no_progress_minutes", 1), ("resurrection_max_per_hour", 0)):
         v = wd[wk]
         if isinstance(v, bool) or not isinstance(v, int) or v < lo:
             _err(f"'watchdog.{wk}' must be an integer >= {lo}, got {v!r}")
