@@ -19,6 +19,7 @@ import copy
 
 import actions
 import brief
+import gate
 
 
 NOW = 1_750_000_000
@@ -92,13 +93,22 @@ def ghv(**over):
     return g
 
 
+# Well-formed 40-hex head oids. The gate parses the real shape (#154: the review verdict is pinned
+# to the head it reviewed), so a fixture oid must BE an oid — but these stay readable rather than
+# random so "the head moved" is legible in a test.
+HEAD1 = "1" * 40
+HEAD2 = "2" * 40
+
+
 def pr_view(num=555, branch="sl/i5-issue-5", mergeable="MERGEABLE", state="OPEN",
-            rollup=None, files=(), labels=(), comments=None, oid="head1"):
+            rollup=None, files=(), labels=(), comments=None, oid=HEAD1):
+    # the default comments carry a verdict PINNED to this PR's head — the shape a worker posts,
+    # and the only shape the gate accepts as evidence for the code being merged (#154).
     return {"number": num, "state": state, "mergeable": mergeable, "headRefName": branch,
             "headRefOid": oid, "labels": list(labels),
             "statusCheckRollup": list(GREEN) if rollup is None else rollup,
             "files": [{"path": p} for p in files],
-            "comments": [{"body": "<!-- superlooper-review --> reviewed, no P0/P1"}]
+            "comments": [{"body": f"{gate.pinned_review_marker(oid)} reviewed, no P0/P1"}]
                         if comments is None else comments}
 
 
@@ -1325,26 +1335,26 @@ def test_conflicting_pr_gets_a_mechanical_update():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING"))
     out = decide(dsk=d, gh_view=g)
     u = only(out, "update")
-    assert len(u) == 1 and u[0]["pr"] == 555 and u[0]["head_oid"] == "head1"
+    assert len(u) == 1 and u[0]["pr"] == 555 and u[0]["head_oid"] == HEAD1
 
 
 def test_clean_update_result_waits_for_github_to_recompute():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING"))
-    d["issues_state"]["issues"]["i5"].update(update_result="clean", update_head_oid="head1")
+    d["issues_state"]["issues"]["i5"].update(update_result="clean", update_head_oid=HEAD1)
     out = decide(dsk=d, gh_view=g)
     assert only(out, "update") == [] and only(out, "regenerate") == []
 
 
 def test_head_change_invalidates_a_stale_update_result():
-    d, g = _gating(pv=pr_view(mergeable="CONFLICTING", oid="head2"))
-    d["issues_state"]["issues"]["i5"].update(update_result="clean", update_head_oid="head1")
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING", oid=HEAD2))
+    d["issues_state"]["issues"]["i5"].update(update_result="clean", update_head_oid=HEAD1)
     out = decide(dsk=d, gh_view=g)
     assert len(only(out, "update")) == 1              # stale verdict discarded, retry the update
 
 
 def test_real_conflict_under_cap_regenerates_on_a_fresh_generation_branch():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING"))
-    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1",
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid=HEAD1,
                                              conflicts=0)
     out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
     r = only(out, "regenerate")
@@ -1355,7 +1365,7 @@ def test_real_conflict_under_cap_regenerates_on_a_fresh_generation_branch():
 
 def test_conflict_cap_parks_needs_william_with_notify():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING"))
-    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1",
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid=HEAD1,
                                              conflicts=1)
     out = decide(dsk=d, gh_view=g)
     p = only(out, "park")
@@ -1364,7 +1374,7 @@ def test_conflict_cap_parks_needs_william_with_notify():
 
 def test_preserve_label_hires_a_conflict_resolution_session():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING", labels=[{"name": "preserve"}]))
-    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1")
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid=HEAD1)
     # Hiring the resolver is a session START, so since #150 it reads this issue's eligibility from
     # the view — where a real gating issue always is.
     out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
@@ -1375,7 +1385,7 @@ def test_preserve_label_hires_a_conflict_resolution_session():
 
 def test_update_error_retries_and_persistent_errors_alert():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING"))
-    d["issues_state"]["issues"]["i5"].update(update_result="error", update_head_oid="head1",
+    d["issues_state"]["issues"]["i5"].update(update_result="error", update_head_oid=HEAD1,
                                              update_errors=1)
     out = decide(dsk=d, gh_view=g)
     assert len(only(out, "update")) == 1              # an infra blip is retried, never a conflict
@@ -2056,7 +2066,7 @@ def test_orphan_resume_proceeds_once_the_blocker_closes():
 def test_resolve_conflict_relaunch_never_starts_past_an_open_blocker():
     p5 = parsed(5, labels=("in-progress", "type:build"), blocked_by=[41])
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING", labels=[{"name": "preserve"}]))
-    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1")
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid=HEAD1)
     out = decide(parsed_issues=[p5], dsk=d, gh_view=dict(g, closed_nums=set()))
     assert only(out, "resolve_conflict") == []
     assert len(only(out, "launch_hold")) == 1
@@ -2073,7 +2083,7 @@ def test_usage_fails_closed_identically_on_every_restart_path():
 
     p5 = parsed(5, labels=("in-progress", "type:build"))
     d, gc = _gating(pv=pr_view(mergeable="CONFLICTING", labels=[{"name": "preserve"}]))
-    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1")
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid=HEAD1)
     assert only(decide(parsed_issues=[p5], usage=dead_meter, dsk=d, gh_view=gc),
                 "resolve_conflict") == []
 

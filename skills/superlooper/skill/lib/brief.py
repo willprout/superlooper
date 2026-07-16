@@ -20,15 +20,17 @@ shipping a build brief.
 import re
 from pathlib import Path
 
+import gate                      # pure sibling: the review-marker contract is rendered, never retyped
 from config import state_home, operator as _operator
 
 _TYPES = ("build", "investigate", "diagnose-and-fix")
 
 # A comment whose body BEGINS with this prefix is one of the runner's own mechanical protocol
-# markers (`<!-- superlooper-review -->`, `<!-- superlooper-investigation -->`), never a human
-# amendment. On these repos every comment shares one gh identity (workers, runner, and William all
-# post as the same login), so the owner check alone would embed the runner's markers as "William's
-# binding amendment" — skip them by their machine signature instead.
+# markers (the review verdict — gate.pinned_review_marker() — and gate.INVESTIGATION_MARKER),
+# never a human amendment. On these repos every comment shares one gh identity (workers, runner,
+# and William all post as the same login), so the owner check alone would embed the runner's
+# markers as "William's binding amendment" — skip them by their machine signature instead.
+# Deliberately a PREFIX, so it still catches the review marker now that it carries a `sha=` pin.
 _MARKER_PREFIX = "<!-- superlooper-"
 
 _FOOTER_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "brief-footer.md").read_text()
@@ -79,8 +81,15 @@ _SHIP_WITH_CMD = ("Run the repo's own review pipeline and ship EXCLUSIVELY via `
 _SHIP_NO_CMD = ("Get a fresh-agent review of your diff (an agent that wrote none of it), address the "
                 "P0/P1 findings, push the branch, then `gh pr create --fill --body 'Closes "
                 "#{issue_num}'`. Post the reviewer's verdict as a PR comment BEGINNING "
-                "`<!-- superlooper-review -->`, naming what was reviewed and the P0/P1 outcome — the "
-                "runner mechanically refuses to merge without that comment.")
+                f"`{gate.pinned_review_marker()}`, naming what was reviewed and the P0/P1 outcome "
+                "— the runner mechanically refuses to merge without that comment. Replace "
+                f"{gate.REVIEW_PIN_PLACEHOLDER} with the oid `git rev-parse HEAD` prints after "
+                "your LAST push, pasted in literally — run it and paste the oid, because a shell "
+                "substitution is NOT expanded inside a single-quoted `gh pr comment --body` and "
+                "the gate reads the unexpanded text as no verdict. "
+                "The pin names the commit that was reviewed, so a verdict for a superseded diff "
+                "does not count: if you push again, get the new diff reviewed and post a verdict "
+                "pinned to the new head.")
 
 
 def _slug(title):

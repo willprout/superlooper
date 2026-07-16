@@ -455,8 +455,14 @@ def test_happy_path_issue_to_merged(sim_factory):
     assert "in-progress" not in sim.issue(num)["labels"]
     # the merge REALLY landed on the origin's dev branch
     assert sim.origin_file("src/%s.txt" % sid) is not None
-    # review evidence was a PR comment beginning the exact marker
-    assert any(c["body"].startswith("<!-- superlooper-review -->") for c in pr["comments"])
+    # review evidence was a PR comment beginning the exact marker, and the verdict was PINNED to
+    # the head it reviewed (#154) — assert the pin against the PR's real head, not just the string
+    # shape, so this proves end-to-end that what a worker posts is what the gate honors.
+    pins = [c["body"].split("sha=")[1].split()[0].rstrip("-->").strip()
+            for c in pr["comments"] if c["body"].startswith("<!-- superlooper-review sha=")]
+    assert pins, "no pinned review verdict on the merged PR"
+    assert any(pr["headRefOid"].startswith(p) for p in pins), \
+        "the merged PR's review verdict pins %s but its head is %s" % (pins, pr["headRefOid"])
     # the runner journaled the lifecycle
     assert [r for r in sim.journal("launch") if r.get("outcome") == "ok"]
     assert [r for r in sim.journal("merge") if r.get("outcome") == "ok"]
@@ -1254,7 +1260,7 @@ def test_preserve_labeled_pr_resolved_in_place_never_regenerated(sim_factory):
     assert pr_b["state"] == "MERGED" and "superseded" not in pr_b["labels"]
     # the re-run gate demanded FRESH review evidence of the resolved diff
     assert sum(1 for c in pr_b["comments"]
-               if c["body"].startswith("<!-- superlooper-review -->")) >= 2
+               if c["body"].startswith("<!-- superlooper-review sha=")) >= 2
 
 
 # =====================================================================================
@@ -1335,7 +1341,7 @@ def test_review_marker_after_pr_cached_still_merges(sim_factory):
     sync.write_text("go")
     deadline = time.time() + 30
     while time.time() < deadline:
-        if any(c["body"].startswith("<!-- superlooper-review -->")
+        if any(c["body"].startswith("<!-- superlooper-review sha=")
                for p in sim.prs_for() for c in p.get("comments", [])):
             break
         time.sleep(0.05)

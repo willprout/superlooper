@@ -412,7 +412,7 @@ def test_poll_builds_a_fresh_gh_view(rig):
     assert gv["stale"] is False and gv["consecutive_failures"] == 0
     assert gv["closed_nums"] == {41, 52}
     assert "i123" in gv["prs"] and gv["prs"]["i123"]["number"] == 555
-    assert any(c["body"].startswith("<!-- superlooper-review -->")
+    assert any(c["body"].startswith("<!-- superlooper-review sha=")
                for c in gv["prs"]["i123"]["comments"])
     assert isinstance(gv["dev_checks"], list) and gv["dev_checks"]
 
@@ -1577,6 +1577,123 @@ def test_update_executor_records_each_outcome(rig, monkeypatch):
     assert ist["update_result"] == "error" and ist["update_errors"] == 2
 
 
+OID_A = "a" * 40      # the head a worker reviewed
+OID_B = "b" * 40      # the head the runner's merge-update produced
+OID_C = "c" * 40      # ...and a second merge-update's head
+
+
+def _clean_update(monkeypatch, new_head, pre_head=None, pushed=True):
+    """A clean merge-update. `head_oid` answers `pre_head` before the merge and `new_head` after,
+    mirroring the real sequence: the runner reads HEAD, merges dev in, reads HEAD again."""
+    reads = iter([pre_head if pre_head is not None else OID_A, new_head])
+    monkeypatch.setattr(runner_mod.gitops, "merge_update", lambda wt, dev: "clean")
+    monkeypatch.setattr(runner_mod.gitops, "plain_push", lambda wt, branch=None: pushed)
+    monkeypatch.setattr(runner_mod.gitops, "head_oid", lambda wt: next(reads, new_head))
+
+
+def test_update_executor_carries_the_review_across_its_own_merge_update(rig, monkeypatch):
+    """#154: a merge-update moves the head without touching the AUTHORED diff, so the verdict
+    pinned to the pre-merge head still vouches for the code being merged. The runner records that
+    carry; without it the gate's diff-pin would false-park every PR the runner itself updated."""
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _clean_update(monkeypatch, OID_B)
+    assert rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555,
+                           "head_oid": OID_A}, NOW) == "ok"
+    assert issue_state(rig, "i5")["review_carry"] == {"from": OID_A, "to": OID_B}
+
+
+def test_update_carry_keeps_naming_the_oid_actually_reviewed_across_a_chain(rig, monkeypatch):
+    """A second merge-update advances `to` but must NOT re-point `from` at an intermediate head
+    the reviewer never saw — `from` stays the oid the fresh agent actually reviewed."""
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x",
+               review_carry={"from": OID_A, "to": OID_B})
+    # the first update left the worktree (and the PR head) on B; the gate judged B and re-updates
+    _clean_update(monkeypatch, OID_C, pre_head=OID_B)
+    rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_B}, NOW)
+    assert issue_state(rig, "i5")["review_carry"] == {"from": OID_A, "to": OID_C}
+
+
+def test_update_carry_refuses_when_the_worktree_is_not_at_the_reviewed_head(rig, monkeypatch):
+    """P0 from the fresh review of #154. The carry's ENTIRE claim is "the new head is the REVIEWED
+    head plus dev, and nothing else". The runner never verified that premise: it paired the head
+    the GATE judged with whatever the worktree happened to be sitting on.
+
+    The sequence needs no adversarial worker. A worker commits A, pushes A, posts `sha=A`, writes
+    its report — then makes one more local commit B and never pushes it (an agent tidying up, or a
+    push that failed). The gate sees head A, pin A -> ok, and CONFLICTING -> update(head_oid=A).
+    `merge_update` merges dev into **B**, and `plain_push` fast-forwards the remote A -> C, pushing
+    B along with it. If the carry is recorded, {from: A, to: C} makes the gen-A verdict vouch for
+    commit B, which no reviewer ever saw.
+
+    So: read HEAD BEFORE the merge, and carry nothing unless it IS the head the gate judged.
+    """
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _clean_update(monkeypatch, OID_C, pre_head=OID_B)      # worktree sits on B, gate judged A
+    rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}, NOW)
+    assert issue_state(rig, "i5").get("review_carry") is None, \
+        "carried a verdict across a worktree that was never at the reviewed head"
+
+
+def test_update_carry_is_recorded_even_when_the_push_reports_failure(rig, monkeypatch):
+    """A push can LAND and still report nonzero (a network drop after the ref update). The carry is
+    a claim about LINEAGE — "this new head is the reviewed head plus dev" — not about whether the
+    push succeeded, and it stays inert unless the PR's head actually becomes `to`. Recording it
+    only on a push that REPORTS success would park correctly-reviewed work: the head moves on
+    GitHub, no carry exists, and step 2b sits ABOVE the update retry, so the gate parks on
+    `review_stale` before the retry could heal it."""
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _clean_update(monkeypatch, OID_C, pre_head=OID_A, pushed=False)
+    rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}, NOW)
+    ist = issue_state(rig, "i5")
+    assert ist["review_carry"] == {"from": OID_A, "to": OID_C}
+    assert ist["update_result"] == "error"                 # still an infra error -> retried
+
+
+def test_update_retry_after_a_failed_push_never_wipes_a_good_carry(rig, monkeypatch):
+    """Second fresh review, P1 — a false-park the FIRST fix let in through a different door.
+
+    Recording the carry unconditionally means a `None` result OVERWRITES a correct carry:
+      tick 1  worktree at A (reviewed), gate says update(A) -> merge -> carry {A->C} -> push FAILS
+      tick 2  PR head is still A, so the gate judges A again -> update(A). But the worktree is
+              ALREADY merged, so pre = C != A -> _review_carry returns None -> {A->C} is WIPED.
+              This push succeeds; the head becomes C.
+      tick 3  head C, pin A, no carry -> stale -> nudge -> park of correctly-reviewed work.
+
+    Only ever WRITE a carry you actually computed. Never wiping is safe: a stale {A->C} can only
+    fire if the head becomes exactly C, and only that merge can produce C — so the claim is true.
+    """
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    a = {"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}
+
+    _clean_update(monkeypatch, OID_C, pre_head=OID_A, pushed=False)      # tick 1: push fails
+    rig.r._execute(a, NOW)
+    assert issue_state(rig, "i5")["review_carry"] == {"from": OID_A, "to": OID_C}
+
+    # tick 2: the retry re-merges an ALREADY-merged worktree, so pre is C, not the judged head A
+    _clean_update(monkeypatch, OID_C, pre_head=OID_C, pushed=True)
+    rig.r._execute(a, NOW + 1)
+    assert issue_state(rig, "i5")["review_carry"] == {"from": OID_A, "to": OID_C}, \
+        "the retry wiped the carry that vouches for the head it is about to push"
+
+
+def test_update_carry_fails_closed_when_the_new_head_is_unreadable(rig, monkeypatch):
+    """No carry beats a guessed one: the gate then asks for a re-review rather than vouching for
+    a head the runner could not name."""
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _clean_update(monkeypatch, None)                    # git could not answer
+    rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}, NOW)
+    assert issue_state(rig, "i5").get("review_carry") is None
+
+
+def test_update_carry_is_not_recorded_on_a_conflict_or_error(rig, monkeypatch):
+    """Only a clean, pushed merge-update carries a verdict forward."""
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    monkeypatch.setattr(runner_mod.gitops, "head_oid", lambda wt: OID_B)
+    monkeypatch.setattr(runner_mod.gitops, "merge_update", lambda wt, dev: "conflict")
+    rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}, NOW)
+    assert issue_state(rig, "i5").get("review_carry") is None
+
+
 def test_update_recheck_failure_sets_the_flag_and_never_pushes(rig, monkeypatch):
     rig.r.config = make_config(ship_recheck_cmd="./recheck.sh")
     seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
@@ -1786,6 +1903,10 @@ def test_resolve_conflict_launches_in_the_prs_own_branch(rig):
     assert out == "ok"
     b = (rig.home / "briefs" / "i123.md").read_text()
     assert "conflict" in b.lower() and "sl/i123-render-the-widget" in b
+    # #154: the resolver re-reviews a RESOLVED diff, so the brief must teach the pinned marker —
+    # rendered from gate, never retyped — and must not teach a `$(...)` gh will not expand.
+    assert runner_mod.gate.pinned_review_marker() in b
+    assert "$(" not in b, "the conflict brief tells the worker to post a substitution"
     assert "force" not in [w for w in b.lower().split() if w == "force"] or "never force" in b.lower()
     close_idx = next((i for i, c in enumerate(rig.calls) if "close-surface" in c["args"]), None)
     launch_idx = next((i for i, c in enumerate(rig.calls)
@@ -1964,7 +2085,8 @@ def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(ri
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: removed.append(str(path)) or True)
     seed_issue(rig, "i5", status="needs_william", launch_failures=2, recheck_failed=True,
-               update_result="conflict", update_head_oid="deadbeef", nudged=["review"], pr=99)
+               update_result="conflict", update_head_oid="deadbeef", nudged=["review"], pr=99,
+               review_carry={"from": "a" * 40, "to": "b" * 40})
     (rig.home / "reports" / "i5.md").write_text("## Tests\nstale report")
     for sub in ("blocked", "exited", "awaiting", "started"):
         (rig.home / "state" / sub / "i5").write_text("stale")
@@ -1981,6 +2103,10 @@ def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(ri
     ist = issue_state(rig, "i5")
     assert ist["recheck_failed"] is False and ist["update_result"] is None
     assert ist["update_head_oid"] is None and ist["nudged"] == [] and ist["pr"] is None
+    # #154: the carry is the runner's own "I moved this head, the reviewed diff is unchanged"
+    # record. A rebuild's diff is NOT that diff — a surviving carry would let a gen-1 verdict
+    # ride onto gen-2 code, the exact hole the diff-pin closes.
+    assert ist["review_carry"] is None
     st = loopstate.load(str(rig.home / "state" / "issues.json"))
     assert st["answerers"] == {}                                    # active answerer dropped
 
@@ -2287,8 +2413,8 @@ def test_refresh_skips_a_cached_pr_that_already_has_review_evidence(rig, monkeyp
     seed_issue(rig, "i7", status="gating", branch="sl/i7-x", num=7)
     (rig.home / "reports" / "i7.md").write_text("# done\n## Tests\nok\n")
     rig.r.gh_view = {"stale": False, "prs": {"i7": {
-        "number": 5, "state": "OPEN", "headRefName": "sl/i7-x",
-        "comments": [{"body": "<!-- superlooper-review -->\nAPPROVE"}]}}}
+        "number": 5, "state": "OPEN", "headRefName": "sl/i7-x", "headRefOid": GREEN_OID,
+        "comments": [{"body": f"{runner_mod.gate.pinned_review_marker(GREEN_OID)}\nAPPROVE"}]}}}
 
     called = []
     monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
@@ -3216,13 +3342,18 @@ def _build_issue(num):
             "labels": ["in-progress", "type:build"], "body": _BUILD_BODY, "comments": []}
 
 
+GREEN_OID = "d" * 40      # the head a gate-green PR sits on (a real oid shape — #154)
+
+
 def _green_pr(num, branch, body=""):
-    """A gate-green PR: mergeable, required check 'ci' green, review marker present."""
+    """A gate-green PR: mergeable, required check 'ci' green, and a review verdict PINNED to the
+    head it reviewed (#154 — an unpinned verdict proves nothing about the diff and never merges)."""
     return {"number": num, "title": f"pr {num}", "body": body, "state": "OPEN",
-            "headRefName": branch, "headRefOid": "oid1", "mergeable": "MERGEABLE",
+            "headRefName": branch, "headRefOid": GREEN_OID, "mergeable": "MERGEABLE",
             "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}],
             "files": [{"path": "x.py"}], "labels": [],
-            "comments": [{"body": "<!-- superlooper-review -->\nreviewed, no P0/P1"}]}
+            "comments": [{"body": f"{runner_mod.gate.pinned_review_marker(GREEN_OID)}\n"
+                                  "reviewed, no P0/P1"}]}
 
 
 def _finished_build(rig, iid="i5", num=5, branch="sl/i5-x"):
