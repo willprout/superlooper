@@ -25,6 +25,14 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parents[3]
 _WRITE_ISSUE = _REPO / "plugin" / "skills" / "write-issue" / "SKILL.md"
 _OLD_REFERENCE = _REPO / "skills" / "superlooper" / "skill" / "references" / "issue-writing.md"
+_APPROVAL_PROTOCOL = (_REPO / "plugin" / "skills" / "superlooper"
+                      / "references" / "approval-protocol.md")
+
+# The distinct label that records the owner's referee-path pre-authorization (issue #165). Pinned
+# as a string here because lib/gate.py (PREAUTHORIZED_REFEREE_LABEL) and the two skills MUST agree
+# on it verbatim — the launch/merge gates key off exactly this label, so a doc that taught a
+# different spelling would send William to apply a label the machinery never reads.
+_PREAUTH_LABEL = "pre-authorized:referee"
 
 # The corrected cross-reference form: approval-protocol.md is now the sibling superlooper skill's
 # reference, so write-issue names it by that skill rather than as a bare local filename.
@@ -165,13 +173,39 @@ def test_distinctive_incident_tokens_preserved():
 
 def test_approval_protocol_references_repointed_to_sibling():
     text = _read()
-    # approval-protocol.md is the sibling superlooper skill's reference now, not a local file.
-    assert text.count("references/approval-protocol.md") == 2, (
-        "both approval-protocol references must survive the move"
+    # approval-protocol.md is the sibling superlooper skill's reference now, not a local file. The
+    # original two references from the #84 move, plus the third added by #165 (the foreseeable
+    # referee-stop pre-authorization rule points at the approval protocol), all name the sibling.
+    assert text.count("references/approval-protocol.md") == 3, (
+        "every approval-protocol reference must survive the move"
     )
-    assert text.count(_SIBLING_APPROVAL_REF) == 2, (
-        "both approval references must name the sibling superlooper skill's reference"
+    assert text.count(_SIBLING_APPROVAL_REF) == 3, (
+        "every approval reference must name the sibling superlooper skill's reference"
     )
     # No broken bare pointer to a local approval-protocol.md may remain.
     assert "(see `approval-protocol.md`)" not in text, "stale bare approval pointer"
     assert "(`approval-protocol.md`)" not in text, "stale bare approval pointer"
+
+
+# ---- issue #165: foreseeable referee-stop pre-authorization is documented, label spelled right ----
+
+def test_write_issue_teaches_foreseeable_referee_preauthorization():
+    text = _read()
+    assert _PREAUTH_LABEL in text, (
+        "write-issue must name the exact pre-authorization label the launch/merge gates read"
+    )
+    # the rule must name a referee path and the pre-authorize-at-approval doctrine (not just the
+    # label in isolation), so a drafter understands WHEN to surface it.
+    assert ".superlooper/**" in text or ".github/workflows/**" in text
+    assert "pre-authorize" in text.lower()
+
+
+def test_approval_protocol_documents_the_preauthorization_ceremony():
+    assert _APPROVAL_PROTOCOL.is_file(), f"approval protocol must exist at {_APPROVAL_PROTOCOL}"
+    text = _APPROVAL_PROTOCOL.read_text(encoding="utf-8")
+    assert _PREAUTH_LABEL in text, "the approval protocol must name the exact pre-auth label"
+    # it stays William's word (a distinct label, never folded into agent-ready) and it consumes
+    # ONLY the referee stop — both properties are load-bearing and must be stated.
+    assert "still his word" in text or "still His word" in text or "still William's word" in text \
+        or "still his say-so" in text.lower()
+    assert "referee" in text.lower()

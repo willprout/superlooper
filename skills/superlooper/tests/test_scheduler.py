@@ -617,3 +617,44 @@ def test_fresh_launches_ask_launch_ok_too_so_the_paths_cannot_drift():
     finally:
         scheduler.launch_ok = real
     assert _nums(out) == [1] and seen == [1]
+
+
+# ---- foreseeable referee stop: not launched unattended without pre-authorization (issue #165) ----
+
+# A repo that schedules referee work declares a referee area; an issue that will touch referee says
+# so in touches:. That declaration makes a needs-owner park CERTAIN at the gate — so the launch gate
+# refuses to burn a lane reaching it, UNLESS the owner pre-authorized it up front.
+_REF_CFG = {"lanes": 2, "affinity": "hard",
+            "areas": {"frontend": ["src/components/**"], "loop_rules": [".superlooper/**"]}}
+_PREAUTH = "pre-authorized:referee"
+
+
+def test_launch_ok_holds_foreseeable_referee_without_preauth():
+    p = _issue(1, touches=["loop_rules"])                          # declares a referee touch, no preauth
+    assert scheduler.launch_ok(p, set(), False, OK, config=_REF_CFG) is False
+    # every OTHER launch condition holds — usage ok, approved, valid type, no open deps — so the
+    # referee gate is the ONLY thing refusing this start (it waits for the owner, not a lane).
+    assert scheduler.launch_ok(p, set(), False, OK) is True        # no config -> gate-park fallback
+
+
+def test_launch_ok_allows_foreseeable_referee_with_preauth():
+    p = _issue(1, touches=["loop_rules"], labels=("type:build", "agent-ready", _PREAUTH))
+    assert scheduler.launch_ok(p, set(), False, OK, config=_REF_CFG) is True
+    # the pre-authorization survives a recovery relaunch too (agent-ready has moved to in-progress)
+    r = _issue(1, touches=["loop_rules"], labels=("type:build", "in-progress", _PREAUTH))
+    assert scheduler.launch_ok(r, set(), False, OK, resume=True, config=_REF_CFG) is True
+
+
+def test_launch_ok_non_referee_issue_unaffected_by_referee_gate():
+    p = _issue(1, touches=["frontend"])
+    assert scheduler.launch_ok(p, set(), False, OK, config=_REF_CFG) is True
+
+
+def test_launchable_excludes_foreseeable_referee_without_preauth():
+    q = [_issue(1, touches=["loop_rules"]), _issue(2, touches=["frontend"])]
+    # only the non-referee issue launches; the un-authorized referee issue waits for the owner
+    assert _nums(scheduler.launchable(q, [], _REF_CFG, OK, set(), False)) == [2]
+    # grant the pre-authorization and the referee issue launches too
+    q2 = [_issue(1, touches=["loop_rules"], labels=("type:build", "agent-ready", _PREAUTH)),
+          _issue(2, touches=["frontend"])]
+    assert sorted(_nums(scheduler.launchable(q2, [], _REF_CFG, OK, set(), False))) == [1, 2]

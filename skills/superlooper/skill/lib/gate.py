@@ -71,6 +71,15 @@ def pinned_review_marker(sha=REVIEW_PIN_PLACEHOLDER):
 # immediately changes the rules that judge worker PRs, so these paths are owner-only stops.
 _REFEREE_PREFIXES = (".superlooper/", ".github/workflows/")
 
+# The owner's referee pre-authorization (issue #165). A referee-path touch can ONLY ever end in a
+# needs-owner stop; when that stop is FORESEEABLE at approval, William can grant his word up front
+# and it is recorded as THIS label (a distinct label, never `agent-ready` — the same discipline as
+# `auto-approved:nightly-red`, so the audit trail always shows HOW the referee touch was cleared).
+# The gate consumes it to merge a referee-touching diff instead of re-parking, and the launch gate
+# consumes it to start a foreseeable-referee issue unattended. Its ABSENCE is the bright line: an
+# un-authorized referee diff still parks needs-william, never auto-merges.
+PREAUTHORIZED_REFEREE_LABEL = "pre-authorized:referee"
+
 # A required H2 section must carry at least this many NON-WHITESPACE characters of prose.
 # Cross-review C3: a report whose headings exist but whose bodies are empty once looked
 # "complete" to a headings-only check — empty headings must never merge.
@@ -229,6 +238,50 @@ def _referee_paths(paths):
     return sorted({p for p in paths if isinstance(p, str)
                    and (p == ".superlooper" or p == ".github/workflows"
                         or any(p.startswith(prefix) for prefix in _REFEREE_PREFIXES))})
+
+
+def preauthorized_referee(labels):
+    """True iff an issue's label set carries the owner's explicit referee pre-authorization
+    (issue #165). This is William's WORD, recorded at approval — the ONE thing that lets the gate
+    merge a referee-touching diff (instead of parking it needs-william) and the ONE thing that lets
+    the launch gate start a foreseeable-referee issue unattended. Fail closed on any wrong-typed
+    label set (None, a bare string, non-string entries): an unreadable set is never pre-authorized,
+    so the bright line holds by default."""
+    if not isinstance(labels, list):
+        return False
+    return PREAUTHORIZED_REFEREE_LABEL in [x for x in labels if isinstance(x, str)]
+
+
+def _glob_targets_referee(glob):
+    """Does a config `areas` glob live INSIDE a referee subtree — so a file matching it is CERTAIN
+    to be a referee path? True for `.superlooper/**`, `.github/workflows/*.yml`, and the bare dir
+    names; False for `src/**` and for a merely-broad glob like `.github/**` (which COULD reach the
+    workflows dir but is not certain to, so it is not a foreseeable stop — the gate's own diff-time
+    park catches it if the worker actually lands there)."""
+    if not isinstance(glob, str):
+        return False
+    prefix = re.split(r"[*?\[]", glob, maxsplit=1)[0]   # the literal head, up to the first wildcard
+    return any(prefix.startswith(ref) for ref in _REFEREE_PREFIXES) \
+        or glob in (".superlooper", ".github/workflows")
+
+
+def foreseeable_referee_stop(declared_touches, config):
+    """§C.4 / issue #165: is a referee owner-stop FORESEEABLE from this issue's DECLARATION alone,
+    at approval time? True when any declared touch AREA resolves (via config.areas globs) to a
+    referee subtree — i.e. building the issue will, by its own `touches:`, reach .superlooper/** or
+    .github/workflows/**, a stop that can only ever end by handing to the owner. This is what makes
+    the stop pre-authorizable up front (and what lets the launch gate refuse to burn a lane
+    reaching a certain, un-authorized park). Fail closed to False on any wrong-typed input: an
+    unreadable declaration/config is simply 'not foreseeable' — the gate's referee park over the
+    ACTUAL diff remains the bright line for everything this cannot see in advance."""
+    areas = config.get("areas") if isinstance(config, dict) else None
+    if not isinstance(areas, dict):
+        return False
+    for area in declared_touches if isinstance(declared_touches, list) else []:
+        globs = areas.get(area) if isinstance(area, str) else None
+        if isinstance(globs, list) and any(_glob_targets_referee(g) for g in globs):
+            return True
+    return False
 
 
 def touch_verdict(declared, actual_areas, inflight):
@@ -554,13 +607,21 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     verdict = touch_verdict(ist.get("declared_touches"), actual_areas, inflight)
     wander = verdict["wander"]
     referee = _referee_paths(paths)
-    if referee:
+    referee_preauthorized = bool(referee) and ist.get("pre_authorized_referee") is True
+    if referee and not referee_preauthorized:
         joined = ", ".join(referee)
         return {"action": "park", "needs_william": True, "wander": wander,
                 "referee_paths": referee,
                 "reason": "diff reaches live referee path(s): "
                           f"{joined} — needs-owner; never auto-merging changes to "
-                          ".superlooper/** or .github/workflows/**"}
+                          ".superlooper/** or .github/workflows/** without the owner's explicit "
+                          f"`{PREAUTHORIZED_REFEREE_LABEL}` pre-authorization"}
+    # referee_preauthorized: the owner pre-authorized this foreseeable stop at approval (issue
+    # #165) — CONSUME his word and fall through to the ordinary merge mechanics instead of
+    # re-parking. It consumes ONLY the referee stop: every remaining gate (overlap, freeze, checks,
+    # mergeability) still runs, so a pre-authorized PR merges only when everything ELSE is green
+    # too. The paths ride onto the final decision (below) so the merge journal records that a
+    # referee-touching diff merged under pre-authorization — never a silent auto-merge.
     if verdict["overlap_lane"] is not None:
         lane = verdict["overlap_lane"]
         if verdict.get("overlap_wildcard"):
@@ -636,7 +697,15 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     if mergeable == "MERGEABLE":
         # step 7: everything green — squash-merge (close-by-Closes, labels, journal are the
         # runner's executor mechanics).
-        return {"action": "merge", "wander": wander,
-                "reason": "gate green: PR + report + review evidence + checks + mergeable"}
+        out = {"action": "merge", "wander": wander,
+               "reason": "gate green: PR + report + review evidence + checks + mergeable"}
+        if referee_preauthorized:
+            # record that a referee-touching diff merged under the owner's pre-authorization, so the
+            # merge journal names the paths — a pre-authorized merge is never a silent auto-merge.
+            out["referee_preauthorized"] = True
+            out["referee_paths"] = referee
+            out["reason"] += (f" (referee path(s) {', '.join(referee)} merged under the owner's "
+                              f"`{PREAUTHORIZED_REFEREE_LABEL}` pre-authorization)")
+        return out
     return {"action": "wait", "wander": wander,
             "reason": f"mergeability {mergeable!r} not computed yet — waiting on GitHub"}
