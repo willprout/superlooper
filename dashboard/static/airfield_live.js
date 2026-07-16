@@ -16,7 +16,7 @@
    model = { time: 'day'|'dusk'|'night', status: 'ok'|'attention'|'alert', dim: bool,
              link: 'ok'|'lost' (GitHub data link — 'lost' darkens the tower beacon, issue #38),
              resetKey: string (repo switch clears sprite state),
-             banner: {num, text}|null (towed behind that flight while on the leg),
+             banners: [{num, text}] (a name cloth towed behind EACH downwind leg plane, issue #204),
              flights: [{num, label, stage, circuitStage, runway, contrail, spinning, trouble,
                         tail}] }
 
@@ -52,6 +52,18 @@
   var WANDER = { x: 4, y: 3 };
   var WANDER_STAGES = { downwind: 1 };
   var SEP_MIN = 38;
+
+  // The towed name banners (issue #204). EVERY plane on the downwind leg tows its own name cloth
+  // (server-chosen list, repo.field_banners) so no in-flight plane is nameless. A single westward
+  // tow at leg altitude covered the western neighbour (the observed occlusion), so the cloths stagger
+  // into two horizontal lanes just BELOW the leg — occlusion-free by construction (the pure geometry
+  // is airfield_motion.bannerRects). Each cloth is PINNED to its plane's stable anchor, never the
+  // wandering hull (issue #203): the hull keeps its idle wander while the cloth — and its pinned
+  // HTML text — hold still, so the text never slides off the cloth; a short leader flexes between
+  // them. 74×14 cloth, lanes at y 50 and 66, towed 10px west of the hull's west edge. The top lane
+  // (y=50) clears the downwind hull's bottom (46.5) even at full down-wander (+3 ⇒ 49.5), so no
+  // cloth ever covers a plane — at rest OR drifting (review fix, issue #204).
+  var BANNER = { bw: 74, bh: 14, laneY: 50, laneH: 16, tow: 10 };
 
   // Discrete anchors: placement stage -> slot list (per runway where the stage is runway-owned).
   // Each entry: [x, y, dir, air, small]. Slots beyond the first fan out deterministically.
@@ -124,8 +136,9 @@
 
     var base = document.createElement('canvas');
     var baseKey = '';
-    var model = { time: 'day', status: 'ok', dim: false, link: 'ok', flights: [], banner: null, resetKey: '' };
+    var model = { time: 'day', status: 'ok', dim: false, link: 'ok', flights: [], banners: [], resetKey: '' };
     var sprites = {};          // num -> persistent sprite state (cur pos, trail, transit)
+    var bannerCache = [];      // pinned cloth rects for this poll (issue #204) — shared by update/draw/separate
     var raf = 0, last = 0, frame = 0;
     var holdBase = 0;          // shared holding-pattern angle: every holder renders at holdBase + its phase
 
@@ -197,12 +210,13 @@
         }
         s.target = anchor;
         // A live downwind-leg plane drifts within its box (issue #203); the ground and the off-path
-        // states (awaiting/frozen/stranded — their stage is not in WANDER_STAGES) stay still. The
-        // flight TOWING the banner is held still too, so its drawn cloth stays aligned with the
-        // banner's HTML text (which is pinned to the stable anchor) — a wandering cloth under a
-        // pinned label would read as the text sliding off the banner.
-        s.wanders = anchor.air && !anchor.orbit && !!WANDER_STAGES[f.stage] &&
-                    !(m.banner && m.banner.num === f.num);
+        // states (awaiting/frozen/stranded — their stage is not in WANDER_STAGES) stay still. Every
+        // downwind plane now tows a name banner (issue #204), yet it still wanders: the drawn cloth
+        // is PINNED to the stable anchor (bannerLayout), not the wandering hull, so the cloth and its
+        // pinned HTML text stay aligned no matter how the hull drifts — the leader between them just
+        // flexes. (This supersedes #203's "hold the banner plane still": pinning the cloth keeps the
+        // text from sliding off WITHOUT costing the leg its life.)
+        s.wanders = anchor.air && !anchor.orbit && !!WANDER_STAGES[f.stage];
 
         // Overlay tags at the STABLE target anchor (never chasing the animation).
         var box = spriteBox(anchor.dir, anchor.small);
@@ -246,18 +260,10 @@
                           text: standXs.length + ' AT THE STAND' });
       }
 
-      var banner = null;
-      if (m.banner && sprites[m.banner.num]) {
-        var bs = sprites[m.banner.num];
-        // no banner while the plane is mid-transit — the text overlay must never float clothless
-        if (!bs.path && placementOf(bs.flight) === 'downwind') {
-          var bw = spriteBox(bs.target.dir, bs.target.small).w;
-          banner = { x: bs.target.x - bw / 2 - 84, y: bs.target.y - 4, w: 74, h: 14 };
-        }
-      }
+      bannerCache = bannerLayout();     // pinned cloth rects for this poll (issue #204)
 
       if (reduced) draw(performance.now());                    // one honest still per poll
-      return { tags: layoutTags, banner: banner, landmarks: landmarkFlags() };
+      return { tags: layoutTags, banners: bannerCache, landmarks: landmarkFlags() };
     }
 
     function landmarkFlags() {
@@ -333,14 +339,20 @@
       s.dir = s.target.dir;
     }
 
-    // The banner cloth the featured downwind flight tows, as a rect in logical coords — mirrors the
-    // draw() geometry exactly (84px behind the hull, 74×14). Wandering planes are kept off it.
-    function bannerRect() {
-      if (!model.banner || !sprites[model.banner.num]) return null;
-      var bs = sprites[model.banner.num];
-      if (bs.path || placementOf(bs.flight) !== 'downwind') return null;
-      var bw = spriteBox(bs.target.dir, bs.target.small).w;
-      return { x: bs.cur.x - bw / 2 - 84, y: bs.cur.y - 4, w: 74, h: 14 };
+    // The pinned cloth rects for the towed name banners (issue #204), in logical coords — one per
+    // server-listed banner whose plane is present, SETTLED (not mid-transit — the text overlay must
+    // never float clothless), and actually on the downwind leg. Anchored to the STABLE target x
+    // (never the wandering hull) so the drawn cloth stays aligned with its pinned HTML text; the
+    // occlusion-free staggering into lanes is the pure module's (M.bannerRects). Same rects feed the
+    // draw, the HTML text layout, and the wander-separation pass, so all three agree exactly.
+    function bannerLayout() {
+      var planes = [];
+      (model.banners || []).forEach(function (b) {
+        var s = sprites[b.num];
+        if (!s || s.path || placementOf(s.flight) !== 'downwind') return;
+        planes.push({ num: b.num, x: s.target.x, halfW: spriteBox(s.target.dir, s.target.small).w / 2 });
+      });
+      return M.bannerRects(planes, BANNER);
     }
 
     // Separation (issue #203, owner ruling #2): after everyone has wandered, nudge any two whose
@@ -364,9 +376,9 @@
         }
       });
       if (!wanderCount) return;
-      var bnr = bannerRect();
-      if (movers.length < 2 && !bnr) return;             // a lone wanderer with no banner can't collide
-      M.separate(movers, SEP_MIN, bnr);
+      var bnrs = bannerCache;                            // pinned cloth rects (issue #204)
+      if (movers.length < 2 && !(bnrs && bnrs.length)) return;   // a lone wanderer, no cloth: can't collide
+      M.separate(movers, SEP_MIN, bnrs);
       movers.forEach(function (m) {
         if (m.n < 0) return;                             // repulsor: never written back
         sprites[m.n].cur.x = m.x; sprites[m.n].cur.y = m.y;
@@ -511,6 +523,18 @@
       ctx.restore();
     }
 
+    // A faint dotted tow-rope from a hull's tail to its pinned banner cloth (issue #204). Plotted as
+    // discrete pixels (matching the pixel-art banner rope) so the flexing diagonal reads cleanly
+    // without smoothing. The hull end moves with the wander; the cloth end is fixed, so it stretches.
+    function drawLeader(x0, y0, x1, y1) {
+      var dx = x1 - x0, dy = y1 - y0, len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 1) return;
+      ctx.fillStyle = 'rgba(232,224,207,0.55)';
+      for (var d = 2; d < len; d += 3) {
+        ctx.fillRect(Math.round(x0 + dx * (d / len)), Math.round(y0 + dy * (d / len)), 1, 1);
+      }
+    }
+
     function draw(now) {
       if (!reduced && !canvas.isConnected) {   // boring mode detached us — idle, don't paint
         raf = requestAnimationFrame(draw);
@@ -584,15 +608,19 @@
         if (model.dim && f.trouble) spotlit.push({ x: s.cur.x, y: s.cur.y });
       });
 
-      // towed banner behind the featured leg flight (the drawn cloth; text is an HTML overlay)
-      if (model.banner && sprites[model.banner.num]) {
-        var bs = sprites[model.banner.num];
-        if (!bs.path && placementOf(bs.flight) === 'downwind') {
-          var bbox = spriteBox(bs.dir, bs.target.small);
-          var bx = Math.round(bs.cur.x - bbox.w / 2);
-          A.live.banner(ctx, bx, Math.round(bs.cur.y), bx - 84, Math.round(bs.cur.y) - 4, 74, 14);
-        }
-      }
+      // towed name banners — one per downwind leg plane (issue #204). Each cloth is PINNED to its
+      // plane's stable anchor (bannerCache), staggered into lanes so no cloth covers a plane or
+      // another cloth; a leader flexes from the wandering hull's tail down to the cloth. The text is
+      // an HTML overlay (field.js) pinned to the same anchor, so cloth and label never separate.
+      bannerCache.forEach(function (r) {
+        var s = sprites[r.num];
+        if (!s) return;
+        var box = spriteBox(s.dir, s.target.small);
+        var tp = tailPoint(s.cur.x, s.cur.y, s.dir, box);      // wandering hull's tail
+        var nearX = r.x + r.w, nearY = r.y + Math.floor(r.h / 2);   // cloth's east-mid (plane side)
+        drawLeader(Math.round(tp.x), Math.round(tp.y), nearX, nearY);
+        A.live.banner(ctx, nearX + 3, nearY, Math.round(r.x), Math.round(r.y), r.w, r.h);
+      });
 
       towerFX(now);
 

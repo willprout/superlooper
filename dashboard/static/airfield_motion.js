@@ -87,12 +87,13 @@
   //   movers: [{x, y, xlo, xhi, ylo, yhi}]  — x/y current centre, [xlo,xhi]/[ylo,yhi] the span.
   //           Give an IMMOVABLE obstacle (e.g. a holder) an equal lo==hi==its position: it stays
   //           put and hands its full share of the push to the movable partner.
-  //   banner: {x, y, w, h} | null           — a towed cloth a wanderer must not drift onto. This is
-  //           best-effort within the mover's bound: a plane whose ANCHOR already sits under the
-  //           cloth can't clear it in ±bound (that static overlap is banner-placement's concern,
-  //           sibling issue #204) — the guarantee here is only that the WANDER never drives a plane
-  //           further onto the cloth than its anchor already was.
-  function separate(movers, minDist, banner) {
+  //   banners: [{x, y, w, h}] | {x,y,w,h} | null  — towed cloths a wanderer must not drift onto (one
+  //           per downwind leg plane, issue #204; a lone rect is still accepted). Best-effort within
+  //           the mover's bound: a plane whose ANCHOR already sits under a cloth can't clear it in
+  //           ±bound (that static overlap is banner-PLACEMENT's concern — bannerRects keeps every
+  //           cloth below the hulls so it never arises) — the guarantee here is only that the WANDER
+  //           never drives a plane further onto a cloth than its anchor already was.
+  function separate(movers, minDist, banners) {
     for (var i = 0; i < movers.length; i++) {
       for (var j = i + 1; j < movers.length; j++) {
         var a = movers[i], b = movers[j];
@@ -110,14 +111,55 @@
         b.x += ux * need * (wb / (wa + wb)); b.y += uy * need * (wb / (wa + wb));
       }
     }
-    if (banner) {
-      for (var k = 0; k < movers.length; k++) if (movable(movers[k])) pushOutOfRect(movers[k], banner);
+    if (banners) {
+      var rects = banners.length === undefined ? [banners] : banners;   // accept one rect or a list
+      for (var r = 0; r < rects.length; r++) {
+        for (var k = 0; k < movers.length; k++) if (movable(movers[k])) pushOutOfRect(movers[k], rects[r]);
+      }
     }
     for (var m = 0; m < movers.length; m++) {
       movers[m].x = clamp(movers[m].x, movers[m].xlo, movers[m].xhi);
       movers[m].y = clamp(movers[m].y, movers[m].ylo, movers[m].yhi);
     }
     return movers;
+  }
+
+  // ---- 3. towed-banner placement (issue #204, owner ruling #3) ---------------------------------
+  // Every plane on the downwind leg tows a name cloth. A single westward tow AT leg altitude would
+  // cover the western neighbour (the exact bug #204 fixes — the one cloth hid a neighbouring plane
+  // that itself showed no name), so the cloths STAGGER into two horizontal lanes just BELOW the
+  // leg. Occlusion-free BY CONSTRUCTION for any subset of the four downwind slots:
+  //
+  //   * Both lanes sit below every hull (laneY ≥ hull bottom + the #203 ±3 down-wander), so NO cloth
+  //     ever overlaps a plane — at rest OR drifting.
+  //   * The four downwind anchors are ≥54px apart. Sorting the towing planes by x and alternating
+  //     lanes (index parity) puts every ADJACENT pair — the only pairs closer than 108px — in
+  //     DIFFERENT lanes (different y ⇒ can't overlap), while any two planes SHARING a lane are ≥2
+  //     apart in x-order, hence ≥108px apart — wider than the 74px cloth (the widest same-lane
+  //     gap-closer: 108 − 74 = 34px clear). So no two cloths overlap either.
+  //
+  //   planes: [{num, x, halfW}]  x = STABLE anchor centre-x; halfW = hull half-width (tow clearance)
+  //   cfg:    {bw, bh, laneY, laneH, tow}  cloth w/h · top-lane y · lane pitch · gap west of the hull
+  // Returns [{num, x, y, w, h, lane}] — one cloth rect per input plane, in INPUT order (the caller
+  // maps back by num). The rects are anchored to the STABLE x (never the wandering hull) so the
+  // drawn cloth stays aligned with its pinned HTML text while the plane drifts (issue #203 wander).
+  function bannerRects(planes, cfg) {
+    var lane = {};
+    planes.map(function (p, i) { return { x: p.x, num: p.num, i: i }; })
+      .sort(function (a, b) { return a.x - b.x || a.num - b.num; })
+      .forEach(function (o, k) { lane[o.i] = k % 2; });
+    return planes.map(function (p, i) {
+      var ln = lane[i];
+      var right = p.x - p.halfW - cfg.tow;         // cloth's east edge, a hair west of the hull
+      return { num: p.num, x: right - cfg.bw, y: cfg.laneY + ln * cfg.laneH,
+               w: cfg.bw, h: cfg.bh, lane: ln };
+    });
+  }
+
+  // Axis-aligned overlap test (a shared helper so the live engine and the node harness ask the same
+  // question): do rects a and b share any area? Touching edges (== ) do NOT count as overlap.
+  function rectsOverlap(a, b) {
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
   }
 
   function movable(p) { return p.xlo !== p.xhi || p.ylo !== p.yhi; }
@@ -142,6 +184,8 @@
     angleDelta: angleDelta,
     wanderOffset: wanderOffset,
     axisSpan: axisSpan,
-    separate: separate
+    separate: separate,
+    bannerRects: bannerRects,
+    rectsOverlap: rectsOverlap
   };
 });
