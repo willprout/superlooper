@@ -65,7 +65,10 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["qa"] == {"nightly_cmd": None, "results_glob": None, "retry_once": True,
                          "quarantine": [], "nightly_time": "02:00"}
     assert cfg["cleanup_merged_worktrees"] is True
-    assert cfg["notify"] == {"imessage_to": None, "cmd": None}
+    # notify.quiet_hours (issue #164) defaults ON (21:00–08:00): routine owner-decision pages are
+    # batched to the morning report during these hours; an explicit null disables the batching.
+    assert cfg["notify"] == {"imessage_to": None, "cmd": None,
+                             "quiet_hours": {"start": "21:00", "end": "08:00"}}
     assert cfg["codex"] == {"dangerous_bypass": False, "bypass_hook_trust": True,
                             "no_alt_screen": True}
     assert cfg["report_time"] == "08:45"
@@ -231,6 +234,32 @@ def test_deep_merge_keeps_sibling_nested_defaults(tmp_path):
     assert cfg["session"]["retry_cap"] == 5           # overridden
     assert cfg["session"]["idle_seconds"] == 480      # sibling default preserved
     assert cfg["session"]["conflict_cap"] == 2
+
+
+# --------------------------- notify.quiet_hours (issue #164) ---------------------------
+
+def test_quiet_hours_can_be_overridden_and_disabled(tmp_path):
+    _write_cfg(tmp_path, {"repo": "me/tool",
+                          "notify": {"quiet_hours": {"start": "22:30", "end": "07:15"}}})
+    cfg = config.load(tmp_path)
+    assert cfg["notify"]["quiet_hours"] == {"start": "22:30", "end": "07:15"}
+    assert cfg["notify"]["imessage_to"] is None       # sibling notify default preserved
+
+    _write_cfg(tmp_path, {"repo": "me/tool", "notify": {"quiet_hours": None}})
+    assert config.load(tmp_path)["notify"]["quiet_hours"] is None   # explicit disable is allowed
+
+
+def test_quiet_hours_rejects_malformed_windows(tmp_path):
+    for bad in ({"start": "22:00"},                    # missing end
+                {"start": "22:00", "end": "7:00"},     # not zero-padded HH:MM
+                {"start": "25:00", "end": "07:00"},    # hour out of range
+                {"start": "²³:00", "end": "07:00"},  # unicode "digits" (isdigit True) rejected, never raised
+                {"start": "22:00", "end": "07:00", "middle": "00:00"},  # unknown sub-key
+                "22:00-07:00"):                        # not an object
+        _write_cfg(tmp_path, {"repo": "me/tool", "notify": {"quiet_hours": bad}})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "quiet_hours" in str(e.value)
 
 
 # --------------------------- validation ---------------------------

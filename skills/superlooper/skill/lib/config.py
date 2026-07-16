@@ -12,6 +12,11 @@ import json
 import os
 from pathlib import Path
 
+# The night window during which routine owner-DECISION pages are batched to the morning report
+# (issue #164). The ONE source of truth: the notify default below embeds it, and actions.py imports
+# it as the fallback for an OLD config.json that predates the key — so the two can never drift.
+DEFAULT_QUIET_HOURS = {"start": "21:00", "end": "08:00"}
+
 # Top-level scalar/structural fields and their defaults (§C.1). `repo` is the ONLY required
 # field (no sensible default — it names the GitHub repo and the state home). `areas` and
 # `required_checks` default EMPTY: they are per-repo declarations the example fills in, not
@@ -84,7 +89,13 @@ _NESTED_DEFAULTS = {
                 "checks_pending_cap": 10800},
     "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
            "quarantine": [], "nightly_time": "02:00"},
-    "notify": {"imessage_to": None, "cmd": None},
+    # notify.quiet_hours (issue #164): the window during which routine owner-DECISION pages (a park,
+    # a bounce, a durable question) are BATCHED to the morning report instead of pushed — nobody
+    # answers a 3am page and a park is a safe state. Systemic-stop ALERTs (runner/auth dead, whole
+    # queue stalled) and the merge-freeze notice always push; only the owner-decision hand-backs are
+    # held. Defaults ON, 21:00–08:00 (end EXCLUSIVE, wraps midnight); an explicit null DISABLES the
+    # batching (every hand-back pages immediately, the pre-#164 behaviour).
+    "notify": {"imessage_to": None, "cmd": None, "quiet_hours": dict(DEFAULT_QUIET_HOURS)},
     # janitor.aged_park_days (issue #62): how long a parked / needs-william issue may sit with
     # NO activity (GitHub updatedAt) before `superlooper janitor` proposes closing it. A
     # proposal only — nothing closes without the owner's explicit approval in the janitor's
@@ -118,6 +129,39 @@ _WATCHDOG_AUTHORITIES = {"diagnose-only", "allowlist", "full"}
 
 def _err(msg):
     raise ValueError(f"invalid .superlooper/config.json: {msg}")
+
+
+_ASCII_DIGITS = frozenset("0123456789")
+
+
+def _valid_hhmm(v):
+    """A zero-padded 24h clock time "HH:MM" in range — the shape quiet_hours (issue #164) needs, and
+    what the runner's `time.strftime('%H:%M')` local clock always produces, so the actions-side
+    lexical compare is a true time-of-day order. ASCII digits only: `str.isdigit()` is True for
+    superscripts/other Unicode numerics that would then RAISE in int() (and compare wrongly against
+    the ASCII clock), so membership against 0-9 is used instead of isdigit()."""
+    return (isinstance(v, str) and len(v) == 5 and v[2] == ":"
+            and set(v[:2]) <= _ASCII_DIGITS and set(v[3:]) <= _ASCII_DIGITS
+            and 0 <= int(v[:2]) <= 23 and 0 <= int(v[3:]) <= 59)
+
+
+def _validate_quiet_hours(qh):
+    """`notify.quiet_hours` is EITHER null (batching disabled — every hand-back pages immediately) OR
+    an object {"start": "HH:MM", "end": "HH:MM"}. Fails loud + specific: a typo'd time or a missing
+    side is a clear adopt-time error, never a window that silently never matches (issue #164)."""
+    if qh is None:
+        return
+    if not isinstance(qh, dict):
+        _err("'notify.quiet_hours' must be null or an object "
+             '{"start": "HH:MM", "end": "HH:MM"}, got %r' % (qh,))
+    for k in qh:
+        if k not in ("start", "end"):
+            _err(f"unknown key 'notify.quiet_hours.{k}' (allowed: start, end)")
+    for k in ("start", "end"):
+        if k not in qh:
+            _err(f"'notify.quiet_hours' must set both 'start' and 'end' (missing: {k})")
+        if not _valid_hhmm(qh[k]):
+            _err(f"'notify.quiet_hours.{k}' must be a zero-padded 24h time \"HH:MM\", got {qh[k]!r}")
 
 
 def _validate_lanes(v):
@@ -313,6 +357,7 @@ def _validate_and_fill(raw):
         v = out["notify"][nk]
         if v is not None and (not isinstance(v, str) or not v.strip()):
             _err(f"'notify.{nk}' must be null or a non-empty string, got {v!r}")
+    _validate_quiet_hours(out["notify"]["quiet_hours"])
     for ck in ("dangerous_bypass", "bypass_hook_trust", "no_alt_screen"):
         if not isinstance(out["codex"][ck], bool):
             _err(f"'codex.{ck}' must be true or false, got {out['codex'][ck]!r}")

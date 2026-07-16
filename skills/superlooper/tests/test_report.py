@@ -474,3 +474,45 @@ def test_watchdog_notify_only_episodes_stay_quiet():
          _rec(1040, "watchdog", outcome="stand_down", signals=["heartbeat_stale"])]
     out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
     assert "nothing happened" in out.lower()
+
+
+# --------------------------- notify-channel canary (issue #164) ---------------------------
+# The daily morning push doubles as the channel heartbeat: the runner journals its delivery result
+# as `notify_canary`, and the report surfaces it here — the owner-read, out-of-band surface a
+# silently-dead channel could never reach (once dead for days, found only by reading the journal).
+
+def test_dead_notify_channel_is_surfaced_loudly_in_the_report():
+    j = [_rec(1000, "notify_canary", ok=False, channel="imessage", rc=1,
+              detail="osascript: not authorized to send", outcome="ok")]
+    out = report.morning(j, _view(), ledger={}, config=_cfg())
+    low = out.lower()
+    assert "notify channel" in low
+    # the owner must read that pushes are NOT reaching the phone, with the failing channel + reason
+    assert "imessage" in low and ("not reaching" in low or "dead" in low or "not deliver" in low)
+    assert "osascript: not authorized" in out
+
+
+def test_healthy_notify_channel_reads_as_confirmed():
+    j = [_rec(1000, "notify_canary", ok=True, channel="cmd", rc=0, detail="", outcome="ok")]
+    out = report.morning(j, _view(), ledger={}, config=_cfg())
+    low = out.lower()
+    assert "notify channel" in low and ("healthy" in low or "delivered" in low or "confirmed" in low)
+
+
+def test_log_only_channel_is_named_as_unconfigured_not_healthy():
+    # log-only means NOTHING is configured — reporting that as "healthy" would hide the real gap.
+    j = [_rec(1000, "notify_canary", ok=True, channel="log-only", rc=0, detail="", outcome="ok")]
+    out = report.morning(j, _view(), ledger={}, config=_cfg())
+    low = out.lower()
+    assert "notify channel" in low and "no" in low and "configured" in low
+
+
+def test_latest_canary_wins_and_absence_reads_as_not_verified():
+    # newest record wins; with no canary at all the report says so honestly (never a false green).
+    j = [_rec(1000, "notify_canary", ok=False, channel="imessage", rc=1, detail="x", outcome="ok"),
+         _rec(1005, "notify_canary", ok=True, channel="imessage", rc=0, detail="", outcome="ok")]
+    out = report.morning(j, _view(), ledger={}, config=_cfg())
+    assert "not reaching" not in out.lower() and "dead" not in out.lower()   # latest is healthy
+
+    none_out = report.morning([], _view(now=0, queue=[], usage=None), ledger={}, config=_cfg())
+    assert "notify channel" in none_out.lower() and "not verified" in none_out.lower()

@@ -729,7 +729,19 @@ def cmd_morning_report(args):
         f.write(text)
     summary = next((ln for ln in text.splitlines()
                     if ln.strip() and not ln.startswith("#")), "morning report ready")
-    outcome = notify.send(cfg, f"superlooper morning report — {date}", summary)
+    # The push doubles as the notify-channel canary (issue #164) — send_test sends the SAME message
+    # and returns its delivery result, journaled as `notify_canary` so the next report surfaces a
+    # silently dead channel. Kept in parity with runner.py's _morning_report_hook.
+    r = notify.send_test(cfg, f"superlooper morning report — {date}", summary)
+    try:
+        journal.append(home, {"act": "notify_canary", "date": date, "ok": bool(r.ok),
+                              "channel": r.channel, "rc": r.rc,
+                              "detail": (r.stderr or "")[:200], "outcome": "ok"}, time.time())
+    except (OSError, ValueError):
+        pass
+    outcome = ("log-only" if r.channel == "log-only"
+               else "sent via %s" % r.channel if r.ok
+               else "%s send failed (rc=%s)" % (r.channel, r.rc))
     print(f"wrote {out_path}\nnotify: {outcome}")
     return 0
 
