@@ -3601,3 +3601,207 @@ def test_a_refused_closed_read_holds_without_claiming_the_blockers_are_open(rig)
     assert _launches_of(rig, "i103") == []              # still refuses: same as a fresh launch
     assert "still open" not in reason                   # ...but never asserts what it didn't observe
     assert "not confirmed closed" in reason and "#101" in reason
+
+
+# ---------------------------------------------------------------------------
+# Issue #151: honest session-state sensing.
+# ---------------------------------------------------------------------------
+
+def test_probe_pid_is_a_tri_state_that_never_guesses_dead(rig):
+    """DoD: `kill -0` on the recorded pid is ground truth for alive/dead, and when the probe itself
+    CANNOT be run it must land on a typed refusal ('unknown'), never on 'dead'. The asymmetry is
+    the whole point: 'dead' authorises a relaunch, so a probe that cannot answer must not be able
+    to manufacture one out of a corrupt lock."""
+    assert runner_mod._probe_pid(os.getpid()) == "alive"
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()                                             # exited AND reaped -> genuinely gone
+    assert runner_mod._probe_pid(p.pid) == "dead"
+    # Cannot name a process at all -> unknown, NOT dead.
+    for junk in (2 ** 31, 2 ** 64, "nonsense", None, 0, -1):
+        assert runner_mod._probe_pid(junk) == "unknown", junk
+
+
+def test_probe_pid_reads_a_foreign_process_as_alive(rig, monkeypatch):
+    """PermissionError means the process EXISTS and is someone else's — alive, not dead (#149:
+    reading it dead is what would prune a worktree under a running CLI)."""
+    def boom(pid, sig):
+        raise PermissionError()
+    monkeypatch.setattr(runner_mod.os, "kill", boom)
+    assert runner_mod._probe_pid(4321) == "alive"
+
+
+def test_pid_alive_bool_contract_is_unchanged_by_the_tri_state(rig):
+    """_pid_alive gates every worktree prune (#149). Refactoring it onto _probe_pid must not shift
+    a single verdict: only a probe that says 'alive' may hold a prune off."""
+    assert runner_mod._pid_alive(os.getpid()) is True
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    assert runner_mod._pid_alive(p.pid) is False
+    # 0 and -1 included deliberately (fresh-review P2): they are the ONLY inputs whose verdict this
+    # refactor changes (True -> False), so a junk tuple that omitted them would be pinning the
+    # contract everywhere except where it moved. The change is correct — os.kill(0, 0) "succeeds"
+    # by signalling the CALLER's own process group and os.kill(-1, 0) every process the user owns,
+    # so the old True was never evidence a worker lived — and it only reaches here from a corrupt
+    # lock, since _lock_pid already maps pid <= 0 to None.
+    for junk in (2 ** 31, 2 ** 64, "nonsense", None, 0, -1):
+        assert runner_mod._pid_alive(junk) is False
+
+
+def test_worker_liveness_reads_the_lock_pid(rig):
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+    assert rig.r._worker_liveness("i5") == "alive"
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{p.pid}\n")
+    assert rig.r._worker_liveness("i5") == "dead"
+
+
+def test_worker_liveness_without_a_lock_is_unknown_never_dead(rig):
+    """No lock names nobody: the probe cannot be run, so it refuses. Reading a missing lock as
+    'dead' would let a launch that has not yet written its lock be relaunched on top of itself."""
+    seed_issue(rig, "i5", status="running")
+    assert rig.r._worker_liveness("i5") == "unknown"
+    (rig.home / "state" / "worker.i5.lock").write_text("garbage\n")
+    assert rig.r._worker_liveness("i5") == "unknown"
+    (rig.home / "state" / "worker.i5.lock").write_text("")
+    assert rig.r._worker_liveness("i5") == "unknown"
+
+
+def test_dead_pid_short_circuits_the_ambiguous_screen_defer(rig):
+    """THE i160 fix: an interrupted-but-open CLI read as an ambiguous rc=3 defer for 43 minutes,
+    because liveness was inferred from the screen instead of from whether the process is alive.
+    With a dead lock pid, the runner must not even ask the screen — it marks the lane exited for
+    relaunch, and never spends a nudge."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{p.pid}\n")
+    rig.rc_queue.append(3)                               # the screen would say "ambiguous — defer"
+    out = rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert (rig.home / "state" / "exited" / "i5").exists()
+    assert "dead" in out
+    # and the ambiguous screen was never consulted: no nudge-pane.sh call was spent on it
+    assert not [c for c in rig.calls if c["args"][0].endswith("nudge-pane.sh")]
+
+
+def test_live_pid_still_lets_the_screen_tiers_run(rig):
+    """The probe is a short-circuit for DEAD only. A live worker must still be nudged normally —
+    the pid proves the process exists, not that it is making progress."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+    rig.rc_queue.append(0)
+    out = rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert out == "ok"
+    assert rig.calls[-1]["args"][0].endswith("nudge-pane.sh")
+
+
+def test_unknown_pid_does_not_short_circuit_into_a_relaunch(rig):
+    """A lock we cannot read must leave behaviour exactly as it is today (screen-scrape tiers),
+    never manufacture an exited marker."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text("garbage\n")
+    rig.rc_queue.append(3)
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert not (rig.home / "state" / "exited" / "i5").exists()
+
+
+def test_logged_out_pane_is_recorded_and_is_never_marked_exited(rig):
+    """i336: auth died in-process. The classifier refuses to type (that is enforced in pane_state);
+    the runner's job is to stop treating it as a liveness problem and record what is true, so the
+    alert can be raised BY decide. The executor deliberately does not write the ALERT file itself:
+    decide owns that file and recomputes it from disk every tick, so an executor-written one would
+    be cleared on the very next tick (see test_decide_alerts_on_a_logged_out_session)."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+    rig.rc_queue.append(5)                               # nudge-pane: logged_out
+    out = rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert "logged" in out.lower()
+    assert issue_state(rig, "i5")["sensed_state"] == "logged_out"
+    # a logged-out session is NOT dead: relaunching it would just re-enter dead auth
+    assert not (rig.home / "state" / "exited" / "i5").exists()
+
+
+def test_at_dialog_is_surfaced_and_does_not_march_toward_a_park(rig):
+    """i280: a worker blocked on its own AskUserQuestion classified as frozen, and the ladder
+    exhausted into a false park of a LIVE lane. The runner must record what is actually true —
+    the session is asking something in-window — and must not escalate it."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+    rig.rc_queue.append(6)                               # nudge-pane: at_dialog
+    out = rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert "asking" in out.lower()
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_state"] == "at_dialog"
+    assert not (rig.home / "state" / "exited" / "i5").exists()   # never walked toward relaunch/park
+
+
+def test_sensed_state_clears_once_the_session_answers(rig):
+    """The sensed state is a live reading, not a sticky label: a lane that has gone back to
+    nudgeable must not keep wearing 'at_dialog' (a stale one would mute a later real freeze)."""
+    seed_issue(rig, "i5", status="running", sensed_state="at_dialog")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+    rig.rc_queue.append(0)                               # nudge delivered -> the dialog is gone
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert issue_state(rig, "i5")["sensed_state"] is None
+
+
+def test_the_gate_nudge_spends_its_key_on_a_logged_out_pane(rig):
+    """FRESH-REVIEW P1 — a regression this issue introduced. rc=5 is unsendable-FOREVER, which is
+    the exact property rc=4 is spent for: a logged-out session cannot answer, so the gate's one
+    nudge is gone and gate.nudge_or_park must park on the next pass.
+
+    Before #151 this screen classified as 'idle' -> nudge-pane typed -> rc=0 -> key spent -> park
+    -> the owner heard about it. Teaching the classifier to recognise it, without teaching this
+    executor the new code, would have made a logged-out lane re-nudge every tick forever and never
+    park — a lane that used to reach the owner going permanently silent. `gating` is a settled
+    status, so nothing else would have sensed it either.
+
+    rc=6 (at_dialog) is deliberately NOT spent: a dialog is transient — the session answers it and
+    the nudge lands on a later pass. That is a defer, exactly like rc=3."""
+    seed_issue(rig, "i5", status="gating", nudged=[])
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    a = {"act": "nudge", "id": "i5", "nudge_key": "sections", "message": "fix the report"}
+    rig.rc_queue.append(5)                               # logged out: unsendable forever
+    rig.r._execute(a, NOW)
+    assert issue_state(rig, "i5")["nudged"] == ["sections"], "a logged-out pane must spend the key"
+
+    seed_issue(rig, "i6", status="gating", nudged=[])
+    (rig.home / "state" / "panes" / "i6").write_text("surf-uuid")
+    rig.rc_queue.append(6)                               # at a dialog: transient -> retry later
+    rig.r._execute({"act": "nudge", "id": "i6", "nudge_key": "sections", "message": "m"}, NOW)
+    assert issue_state(rig, "i6")["nudged"] == [], "a dialog is transient — do not spend the key"
+
+
+def test_the_sensed_stamp_measures_the_episode_not_the_last_look(rig):
+    """`sensed_since` must survive re-senses of the SAME state. The recover re-fires every 10 min,
+    so a stamp that reset on each look would keep the at_dialog alert bound perpetually 10 minutes
+    from elapsing — the alert would never fire and the lane would be silent forever, which is the
+    hole the bound exists to close. A CHANGED reading starts a fresh episode."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+
+    rig.rc_queue.append(6)
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert issue_state(rig, "i5")["sensed_since"] == NOW
+
+    rig.rc_queue.append(6)                               # still at the dialog, 20 min later
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 1200)
+    assert issue_state(rig, "i5")["sensed_since"] == NOW, "the episode clock must not restart"
+
+    rig.rc_queue.append(5)                               # a DIFFERENT reading -> new episode
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 2400)
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_state"] == "logged_out" and ist["sensed_since"] == NOW + 2400
+
+    rig.rc_queue.append(0)                               # healthy again -> both cleared
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 3000)
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_state"] is None and ist["sensed_since"] is None

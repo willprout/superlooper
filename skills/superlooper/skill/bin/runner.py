@@ -200,25 +200,46 @@ def _rm(path):
         pass
 
 
-def _pid_alive(pid):
-    """True when `pid` names a live process. Signal 0 is the same probe start-session.sh's own
-    acquire_worker uses (`kill -0`), so the runner and the shell agree on liveness.
+def _probe_pid(pid):
+    """The pid pulse: 'alive' | 'dead' | 'unknown'. Signal 0 is the same probe start-session.sh's
+    own acquire_worker uses (`kill -0`), so the runner and the shell agree on liveness.
+
+    Three states, not two, because the two answers are not equally safe to guess (issue #151).
+    'dead' AUTHORISES action — a relaunch, a prune — so it is returned ONLY on a definitive
+    ProcessLookupError: this pid was probed and nothing is there. Everything else that stops the
+    probe from answering — a huge int (OverflowError: os.kill's C int conversion, NOT an OSError,
+    so it must be caught explicitly or it escapes into the tick), a non-int, an empty/garbage lock,
+    an unexpected errno — is 'unknown': the check could not be run, which is never evidence of
+    death. A corrupt lock must cost a probe, not a session.
 
     PermissionError means the process EXISTS and is someone else's — that is ALIVE, not dead
-    (#149: reading it dead is what would prune a worktree under a running CLI). Anything that
-    cannot name a process — a huge int (OverflowError: os.kill's C int conversion, NOT an OSError,
-    so it must be caught explicitly or it escapes into the tick), a non-int, a bad value — names
-    nobody: False, never a raise. This probe gates every worktree prune and runs inside the tick,
-    which must never raise (it would wedge the loop before the heartbeat stamp)."""
+    (#149: reading it dead is what would prune a worktree under a running CLI).
+
+    pid <= 0 is refused WITHOUT probing: os.kill(0, 0) signals the caller's whole process group and
+    os.kill(-1, 0) every process the user owns, so both would "succeed" and read back as a live
+    worker that does not exist. No worker ever has such a pid; a lock holding one is corrupt.
+
+    This runs inside the tick, which must never raise (it would wedge the loop before the heartbeat
+    stamp), so it returns a state for every input and lets nothing escape."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return "unknown"
     try:
         os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, ValueError, TypeError, OverflowError):
-        return False
+        return "alive"
+    except ProcessLookupError:
+        return "dead"                  # probed, and nothing is there: the only definitive answer
     except PermissionError:
-        return True
-    except OSError:
-        return False
+        return "alive"                 # exists, owned by someone else
+    except (ValueError, TypeError, OverflowError, OSError):
+        return "unknown"               # the probe could not be run — never read as death
+
+
+def _pid_alive(pid):
+    """True when `pid` names a live process. The bool face of _probe_pid, kept because it gates
+    every worktree prune (#149) and its contract is load-bearing there: ONLY a definite 'alive'
+    holds a prune off, so anything that names nobody (garbage, a huge int, None) stays False —
+    a probe result, never a raise."""
+    return _probe_pid(pid) == "alive"
 
 
 # ------------------------- restart request marker (issue #116) -------------------------
@@ -1478,6 +1499,22 @@ class Runner:
             return None
         return pid if pid > 0 else None
 
+    def _worker_liveness(self, iid):
+        """Is this lane's worker process actually alive? 'alive' | 'dead' | 'unknown' (issue #151).
+
+        The lane's ground truth, and the reason it outranks the screen: start-session.sh holds
+        worker.<id>.lock for the whole life of the CLI and frees it from its EXIT trap, so the pid
+        in there is the process itself — not an inference drawn from what the pane happens to be
+        rendering. i160 is the cost of the inference: an interrupted-but-open CLI rendered a screen
+        nobody could classify, so the runner sat on an ambiguous rc=3 defer for 43 minutes while
+        the answer ('the process is right there, alive') was one kill -0 away the whole time.
+
+        NO lock is 'unknown', not 'dead'. The lock is written moments AFTER the process starts, so
+        a launch that has not reached it yet has no lock and is very much alive — reading that as
+        death would relaunch a worker on top of itself. Absence of evidence is not evidence here;
+        state/exited/<id> is the deterministic signal for a session that genuinely ended."""
+        return _probe_pid(self._lock_pid(iid))
+
     def _await_worker_exit(self, iid, pid, timeout=None):
         """Observe the worker CLI go, bounded. Returns True when it is gone (or was never there),
         False when it outlived the wait.
@@ -2070,6 +2107,15 @@ class Runner:
                 return "ok"
             self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
             return f"relaunch rc={rc}"
+        # ---- the pid pulse, BEFORE any screen tier (issue #151) ----
+        # Ground truth first: if the worker process is gone, nothing the pane renders can change
+        # that, and asking the screen is how i160 lost 43 minutes to an unclassifiable one. Only a
+        # DEFINITE 'dead' short-circuits — 'unknown' falls through to the screen tiers exactly as
+        # before, so a corrupt lock costs a probe and never manufactures a relaunch.
+        if self._worker_liveness(iid) == "dead":
+            self._mark_exited(iid, f"{tier} with a dead worker pid", now)
+            return "dead worker pid — marked exited for relaunch"
+
         if tier == "frozen":
             self._update_issue(iid, {"status": "frozen", "last_recover_at": now})
             surface = self._surface(iid)
@@ -2084,7 +2130,7 @@ class Runner:
             if rc == 4:
                 self._mark_exited(iid, "dead pane found by frozen recovery", now)
                 return "dead pane — marked exited for relaunch"
-            return "ok" if rc == 0 else f"nudge rc={rc}"
+            return self._record_sensed(iid, rc, now)
         # idle: the safe peek — a gentle status ask, never a blind action
         surface = self._surface(iid)
         if not surface:
@@ -2093,6 +2139,36 @@ class Runner:
                "background work, touch your awaiting marker (see your brief).")
         rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
                               env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
+        return self._record_sensed(iid, rc, now)
+
+    def _record_sensed(self, iid, rc, now):
+        """Turn a nudge-pane rc into the lane's honest sensed state (issue #151). Shared by BOTH
+        liveness tiers so their reading of the same rc can never drift apart.
+
+        nudge-pane refuses to TYPE into these panes — that enforcement lives in pane_state, at the
+        only place that can actually see the screen. What lands here is the caller's half: naming
+        what was seen so decide can act on it (alert the owner; never park a lane that is alive)
+        instead of re-firing a nudge every 10 minutes at a pane that cannot answer (i336) or
+        marching a live one to a park (i280).
+
+        sensed_state is a LIVE READING, not a label: any other rc clears it, and the recover that
+        produced this rc keeps firing (decide suppresses the park, not the re-sense), so the reading
+        cannot outlive what it describes. A sticky one would mute the next genuine freeze.
+
+        `sensed_since` stamps when the CURRENT reading began and is preserved while it holds, so the
+        alert bound measures the episode rather than resetting every re-sense. It is what stops a
+        lane sitting silently at an unanswerable in-window question forever."""
+        sensed = {5: "logged_out", 6: "at_dialog"}.get(rc)
+
+        def m(st, i):
+            if i.get("sensed_state") != sensed:
+                i["sensed_state"] = sensed
+                i["sensed_since"] = now if sensed else None
+        self._update_issue(iid, fn=m)
+        if sensed == "logged_out":
+            return "logged out in-window — alerting the owner, not nudging"
+        if sensed == "at_dialog":
+            return "session is asking something in-window — leaving it alone"
         return "ok" if rc == 0 else f"nudge rc={rc}"
 
     # --- the gate's executors ---
@@ -2214,9 +2290,20 @@ class Runner:
             rc = self._run_script([self._script("nudge-pane.sh"), surface, iid,
                                    f"[superlooper gate] {a.get('message', '')}"],
                                   env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
-        if rc in (0, 4):
-            # sent, or unsendable-forever (dead pane): either way the one nudge is spent —
-            # gate.nudge_or_park parks on the next pass (never an unbounded nudge loop)
+        if rc in (0, 4, 5):
+            # sent, or unsendable-FOREVER (4 = dead pane; 5 = logged out in-window, issue #151):
+            # either way the one nudge is spent — gate.nudge_or_park parks on the next pass (never
+            # an unbounded nudge loop). rc=5 belongs here and not with the defers: a session whose
+            # auth is dead can never answer, and before #151 taught the classifier to see it, this
+            # screen read as 'idle' and was typed into for rc=0 — which spent the key and reached
+            # the owner. Leaving 5 out would have made a logged-out lane re-nudge every tick and
+            # never park: strictly worse than the bug being fixed.
+            # rc=6 (at_dialog) is NOT here on purpose: the pane is LIVE, and a dialog that gets
+            # answered leaves the next pass free to deliver, so spending the lane's one nudge on a
+            # refusal would burn it for nothing. It defers exactly like rc=3 — and inherits rc=3's
+            # unbounded-retry shape, which is pre-existing and should be bounded for both together
+            # if the gate's defer is ever capped. (Not "the session answers it" — nobody may:
+            # the liveness tier's session_at_dialog alert is what catches a dialog nobody answers.)
             def m(st):
                 i = st["issues"].setdefault(iid, loopstate.new_issue())
                 nudged = i.get("nudged")
@@ -2227,7 +2314,10 @@ class Runner:
                 i["nudged"] = nudged
                 i["status"] = "gating"
             loopstate.update(self.issues_path, m)
-            return "ok" if rc == 0 else "dead pane — nudge spent, gate parks next pass"
+            if rc == 0:
+                return "ok"
+            why = "logged out in-window" if rc == 5 else "dead pane"
+            return f"{why} — nudge spent, gate parks next pass"
         return f"nudge rc={rc} (retrying next tick)"
 
     def _exec_merge(self, a, now):

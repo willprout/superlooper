@@ -1,0 +1,28 @@
+│                 Welcome back Will!                 │ started                │
+│                                                    │ Run /init to create a… │
+│                       ▐▛███▜▌                      │ ────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new             │
+│                        ▘▘ ▝▝                       │ Added `--forward-suba… │
+│      Fable 5 with high effort · Claude Max ·       │ Fixed permission prev… │
+│      dev@example.com's Organization      │ Fixed auto mode overr… │
+│                /…/scratchpad/probe                 │ /release-notes for mo… │
+╰─────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 3 MCP servers need authentication · run /mcp
+
+❯ Use your AskUserQuestion tool right now to ask me which colour I prefer,     
+  with options Red and Blue. Do not do anything else first.                    
+───────────────────────────────────────────────────────────────────────────────
+ ☐ Colour 
+
+Which colour do you prefer?
+
+❯ 1. Red
+     You prefer red.
+  2. Blue
+     You prefer blue.
+  3. Type something.
+───────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

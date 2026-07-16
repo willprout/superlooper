@@ -1,7 +1,7 @@
 """Pure classification of a cmux pane's screen into a send-safety state. No I/O.
 
 classify_screen(text, exited_marker=False, orchestrator=False, agent='claude')
-  Claude -> 'dead' | 'menu' | 'busy' | 'idle'
+  Claude -> 'dead' | 'logged_out' | 'menu' | 'at_dialog' | 'busy' | 'idle'
   Codex  -> 'dead' | 'busy' | 'idle' | 'trust_blocked' | 'permission_blocked' |
             'quota_blocked' | 'unknown'
 
@@ -9,8 +9,14 @@ The single decision behind every write into a pane (the doorbell AND the orchest
 resume/answer/nudge), via bin/nudge-pane.sh:
   - 'dead'  -> the Claude process is gone; the pane is a bash shell. NEVER type (a nudge would
               run as a shell command, permission-bypassed). Caller restarts instead.
+  - 'logged_out' -> auth died IN-PROCESS; the TUI is alive but every turn is refused. NEVER type:
+              it cannot act, and a nudge just accrues silent failures. Caller alerts the owner.
   - 'menu'  -> an interactive selection/confirm/trust prompt is showing; pressing Enter would
               SELECT an item and corrupt state. Defer (retry later).
+  - 'at_dialog' -> the session raised its OWN question dialog (AskUserQuestion) and is waiting on
+              an answer. Also never typed into (a stray Enter would SELECT an option) — the
+              distinction from 'menu' is for the CALLER: this is a live, working session asking
+              something in-window, not a stuck one to escalate.
   - 'busy'  -> Claude is mid-generation. Safe to send: Claude QUEUES the input and takes it after
               the current turn.
   - 'idle'  -> a normal Claude input prompt. Safe to send.
@@ -66,6 +72,80 @@ _MENU_PATTERNS_STRICT = _MENU_PATTERNS + [
     # Genuine numbered menus stay caught by `❯\s*\d+[.\)]` in _MENU_PATTERNS above.
     re.compile(r"❯\s*[/@]"),                     # a slash/@ autocomplete dropdown (NOT idle "❯ ")
     re.compile(r"▶\s|»\s"),
+]
+
+# These two states are matched PER LINE and must be the WHOLE line, not a substring of the screen
+# (fresh-review P1). A worker session renders its own conversation — the files it reads, the diff it
+# writes, the issue it was briefed on — so a bare substring search means the worker assigned this
+# very issue reads its own screen as a broken session and disables its own lane. Verified before the
+# fix: a 40-line window of THIS file, of actions.py, and of test_pane_state.py each classified as
+# 'logged_out'. A banner is a line the TUI draws; a sentence containing the words is someone talking
+# ABOUT it.
+#
+# What may sit AROUND a banner: box rules, and the leading status glyph Claude renders these behind.
+# The glyphs are here on evidence, not superstition — our own captured dialog carries
+# "⚠ 3 MCP servers need authentication · run /mcp", i.e. an auth-adjacent warning behind a ⚠ with a
+# '·'-separated tail, and the bundle builds a ⏺/● status dot on the default render path (our exact
+# string escapes it only via an early return). Missing a glyph-prefixed banner would be SILENT and
+# would simply restore i336, so the leading glyph is allowed.
+#
+# "❯"/"⎿" are in the set for the same reason, and they are only safe because the match is a WHOLE-
+# LINE fullmatch: an agent line whose entire content is exactly and only this banner is vanishingly
+# rare, and since the recover keeps re-sensing, a false positive costs one self-clearing 10-minute
+# cycle while a miss costs 94 minutes of typing into a dead pane.
+#
+# "|" is deliberately NOT here: it is a markdown table delimiter far more often than TUI chrome
+# (Claude draws boxes with "│"), and a worker's screen is full of markdown.
+_BANNER_DECOR = " \t│┃╭╮╰╯┌┐└┘─━═⏺●○◆◈⚠✗✘✳✻✽⎿❯▪•"
+
+
+def _banner_lines(raw):
+    for ln in raw.splitlines():
+        s = ln.strip().strip(_BANNER_DECOR).strip()
+        if s:
+            yield s
+
+
+# AUTH DEATH (issue #151 / incident i336). Claude Code renders these INSIDE a live TUI frame, so
+# the pane looks like a perfectly normal idle composer and classified as 'idle' = safe-to-send —
+# the runner then typed into a pane that could not act for 94 minutes.
+#
+# The DoD named ONE "exact stable string": "Not logged in · Please run /login" (U+00B7 separator),
+# and it is the first pattern below. But grepping the installed Claude Code binary (2.1.211) turned
+# up FOUR auth-death messages, not one — the bundle carries "Not logged in · Please run /login",
+# "Not logged in · Run /login", "Session expired. Please run /login to sign in again." and
+# "Not logged in. Run claude auth login to authenticate.". An exact-only match would leave the
+# other three reading as 'idle', which is precisely the bug. So the exact string is the anchor and
+# its siblings are covered too; the separator is matched loosely (\W) because only the WORDS are
+# stable — a render that swaps "·" for "-" must not silently reopen the hole. That looseness is
+# safe ONLY because these are fullmatched against a single line.
+_LOGGED_OUT_PATTERNS = [
+    re.compile(r"not logged in\s*\W\s*please run /login", re.I),   # the DoD's exact string
+    re.compile(r"not logged in\s*\W\s*run /login", re.I),
+    re.compile(r"not logged in\W+run claude auth login to authenticate\W*", re.I),
+    re.compile(r"session expired\W+please run /login to sign in again\W*", re.I),
+]
+
+# THE SESSION'S OWN QUESTION DIALOG (issue #151 / incident i280). A worker blocked on its own
+# AskUserQuestion went stale, tripped the frozen tier, and the nudge ladder walked a LIVE, working
+# lane into a false park.
+#
+# These two patterns are deliberately POSITIVE anchors, not "a menu without permission wording".
+# Real captures of both screens (tests/fixtures/screens/, taken from Claude Code 2.1.211 driven in
+# a live cmux pane) show why: the folder-trust prompt renders "❯ 1. Yes, I trust this folder" under
+# an "Enter to confirm · Esc to cancel" footer and contains NO "do you want to"/"do you trust"
+# wording at all — so any exclusion rule would have mis-read a genuine trust menu as a question and
+# quietly stopped escalating it. What the question dialog has and no permission menu ever does is
+# its two tail rows: the free-text "Other" row (rendered with the placeholder "Type something." —
+# in the bundle, `multiSelect ? "Type something" : "Type something."`) and the "Chat about this"
+# escape row. Both are stable literals in the bundle.
+#
+# Fullmatched against a WHOLE line (with the option cursor allowed to lead it), so a row is a row:
+# the sentence "ask me to type something", a doc table naming the row, and this file's own source
+# all fail to match where a bare substring search would have fired (fresh-review P1).
+_AT_DIALOG_ROWS = [
+    re.compile(r"[❯\s]*\d+\s*[.)]\s*type something\.?\s*", re.I),
+    re.compile(r"[❯\s]*\d+\s*[.)]\s*chat about this\s*", re.I),
 ]
 
 # Codex-specific screen clues. Keep these out of the Claude path: a bare "›" is Codex's idle
@@ -140,8 +220,29 @@ def classify_screen(text, exited_marker=False, orchestrator=False, agent="claude
         # (e.g. a hard-killed session whose exited marker didn't get written). Deferring a doorbell/
         # nudge one cycle is far cheaper than a stray command into a permission-bypassed bash shell.
         return "menu"
+    # LOGGED_OUT before BUSY (issue #151): 'busy' is a SAFE-TO-SEND state (Claude queues input), so
+    # a stale generation footer lingering under an auth-death banner would otherwise hand back a
+    # green light on a pane that cannot act. Refusing a genuinely-busy pane costs one retry; typing
+    # into dead auth is the 94-minute failure this state exists to end.
+    lines = list(_banner_lines(raw))
+    for pat in _LOGGED_OUT_PATTERNS:
+        if any(pat.fullmatch(ln) for ln in lines):
+            return "logged_out"
     if _BUSY.search(flat):
         return "busy"
+
+    # AT_DIALOG before the menu table (issue #151): the question dialog's own footer reads
+    # "Enter to select · ↑/↓ to navigate · Esc to cancel", which the generic menu patterns match —
+    # so checking it after would mean this state could never fire. Safe to put first because the
+    # anchors are AskUserQuestion-only rows (see _AT_DIALOG_PATTERNS): no permission/trust menu
+    # renders them, which the real trust-screen fixture pins as a regression test.
+    #
+    # The ORCHESTRATOR surface is excluded and keeps failing closed to 'menu' (review A5): a stray
+    # Enter there corrupts the brain of the whole run, and no caller acts on at_dialog for it.
+    if not orchestrator:
+        for pat in _AT_DIALOG_ROWS:
+            if any(pat.fullmatch(ln) for ln in lines):
+                return "at_dialog"
 
     patterns = _MENU_PATTERNS_STRICT if orchestrator else _MENU_PATTERNS
     for pat in patterns:
