@@ -125,15 +125,31 @@ _NO_EVIDENCE = ("The runner recorded no structured evidence for this decision �
                 "everything the journal carries.")
 
 
-def _last_handback_record(journal_slice):
-    """The hand-back record this decision came from — the LAST ``park`` or ``bounce``, exactly as
-    ``flights._flight_memo`` picks the memo, so the dossier and the memo always describe the SAME
-    hand-back. Selecting only parks let a settled bounce show an older park's evidence beside the
-    bounce's own memo — two decisions presented as one (Codex cross-review, issue #162)."""
+def _last_handback_record(journal_slice, memo):
+    """The journal record for the hand-back whose words are ON THE CARD — or ``None``.
+
+    THE INVARIANT (both halves found by Codex cross-review, issue #162): the dossier describes the
+    same decision as the memo above it, or it describes nothing. Two ways that broke:
+
+    * Selecting only ``park`` records made a SETTLED bounce show an older park's evidence beside the
+      bounce's own memo. So the scan mirrors ``flights._flight_memo`` exactly — the last ``park`` or
+      ``bounce`` **that has a memo** (a memo-less record is not a hand-back either reader will show).
+    * The card's text does not always come from the journal at all: in the window between the worker
+      writing ``state/blocked/<id>`` and the runner's next tick, ``_flight_memo`` shows the MARKER's
+      text and no ``bounce`` record exists yet — so the newest journalled hand-back is a DIFFERENT,
+      older decision. Borrowing its evidence pairs one question with another's answer.
+
+    Hence the match: the record must carry the exact text being shown. Anything else fails closed to
+    "no structured evidence", which the card then says out loud.
+    """
     found = None
     for r in journal_slice or []:
-        if isinstance(r, dict) and r.get("act") in flights.HANDBACK_ACTS:
+        if isinstance(r, dict) and r.get("act") in flights.HANDBACK_ACTS and r.get("memo"):
             found = r
+    if found is None:
+        return None
+    if (found.get("memo") or "").strip() != (memo or "").strip():
+        return None
     return found
 
 
@@ -189,7 +205,7 @@ def decision_dossier(flight, journal_slice):
     at the hand-back, and the go-around count — so the card is useful today and richer the moment
     #152 lands.
     """
-    rec = _last_handback_record(journal_slice) or {}
+    rec = _last_handback_record(journal_slice, flight.get("memo")) or {}
     items, captured = _evidence_items(rec)
 
     # The runner's own episode key — a terse machine classification (`answerer_escalated`,
@@ -349,11 +365,17 @@ def _clearance(flight):
 
 def _memo_history(flight, journal_slice):
     """Every distinct memo this flight accrued, in journal order (design record §4 — "memo
-    history"): each ``park`` memo, plus the flight's current memo (a bounce marker's text) when it
-    isn't already the last park memo. Order preserved, duplicates collapsed."""
+    history"): each HAND-BACK memo — ``park`` or ``bounce`` — plus the flight's current memo (a live
+    bounce marker's text) when it isn't already the last of them. Order preserved, duplicates
+    collapsed.
+
+    Bounces belong here (Codex cross-review, issue #162): reading only parks made a
+    ``bounce -> park`` history list just the park, hiding that the worker ever pushed back — and the
+    drawer is meant to be the flight's whole story.
+    """
     memos = []
     for r in journal_slice:
-        if isinstance(r, dict) and r.get("act") == "park" and r.get("memo"):
+        if isinstance(r, dict) and r.get("act") in flights.HANDBACK_ACTS and r.get("memo"):
             m = r["memo"]
             if m not in memos:
                 memos.append(m)

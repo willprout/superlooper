@@ -275,7 +275,7 @@ def test_dossier_surfaces_the_structured_evidence_the_runner_captured():
     jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "delivery not verified",
                "evidence": {"reason": "Workspace not found", "rc": 1,
                             "stderr_tail": "launch-session.sh: workspace 'will-titan' is gone"}}]
-    d = cards.decision_dossier(_flight(), jslice)
+    d = cards.decision_dossier(_flight(memo="delivery not verified"), jslice)
     assert d["captured"] is True
     pairs = {i["label"]: i["value"] for i in d["items"]}
     assert pairs["reason"] == "Workspace not found"
@@ -289,14 +289,14 @@ def test_dossier_renders_evidence_captured_as_a_bare_string_as_is():
     # test_evidence_captured_means_STRUCTURED_evidence_only — it does not.
     jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m",
                "evidence": "captured: none, reason unknown"}]
-    d = cards.decision_dossier(_flight(), jslice)
+    d = cards.decision_dossier(_flight(memo="m"), jslice)
     assert d["items"][0]["value"] == "captured: none, reason unknown"
 
 
 def test_dossier_is_honest_when_the_runner_captured_no_evidence():
     # #152 has not landed for every path. The card must SAY so rather than imply the reason is
     # everything the machine saw — an honest empty, never a fabricated dossier.
-    d = cards.decision_dossier(_flight(), [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m"}])
+    d = cards.decision_dossier(_flight(memo="m"), [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m"}])
     assert d["captured"] is False
     assert d["note"]                                  # a plain sentence naming the absence
     assert "no structured evidence" in d["note"].lower()
@@ -336,7 +336,7 @@ def test_dossier_counts_the_go_arounds_on_a_conflict_cap():
 def test_needs_you_card_carries_its_dossier():
     jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m",
                "evidence": {"reason": "Workspace not found"}}]
-    card = cards.needs_you_card(_flight(), "r/s", journal_slice=jslice)
+    card = cards.needs_you_card(_flight(memo="m"), "r/s", journal_slice=jslice)
     assert card["dossier"]["captured"] is True
     assert card["dossier"]["items"][0]["value"] == "Workspace not found"
 
@@ -432,7 +432,7 @@ def test_drawer_decision_carries_the_same_consequence_named_actions():
 def test_drawer_carries_the_dossier_too():
     jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m",
                "evidence": {"reason": "Workspace not found"}}]
-    d = cards.flight_drawer(_flight(), jslice, "r", "Air")
+    d = cards.flight_drawer(_flight(memo="m"), jslice, "r", "Air")
     assert d["dossier"]["captured"] is True
 
 
@@ -498,21 +498,21 @@ def test_evidence_captured_means_STRUCTURED_evidence_only():
     # `captured=True` suppressed the honest-empty note and reported an ABSENCE of evidence as
     # evidence. Only a structured (dict) capture counts; a bare string is still shown, but the card
     # keeps saying no structured evidence was recorded.
-    d = cards.decision_dossier(_flight(), [
+    d = cards.decision_dossier(_flight(memo="m"), [
         {"ts": 1, "act": "park", "id": "i7", "num": 7, "memo": "m",
          "evidence": "captured: none, reason unknown"}])
     assert d["captured"] is False
     assert d["note"], "the honest-empty note must survive a fail-closed string"
     assert d["items"][0]["value"] == "captured: none, reason unknown"   # still shown, not hidden
 
-    rich = cards.decision_dossier(_flight(), [
+    rich = cards.decision_dossier(_flight(memo="m"), [
         {"ts": 1, "act": "park", "id": "i7", "num": 7, "memo": "m", "evidence": {"reason": "x"}}])
     assert rich["captured"] is True and rich["note"] is None
 
 
 def test_evidence_of_an_unexpected_shape_is_ignored_not_rendered_as_a_repr():
     for junk in ([1, 2], 7, True, {}, ""):
-        d = cards.decision_dossier(_flight(), [
+        d = cards.decision_dossier(_flight(memo="m"), [
             {"ts": 1, "act": "park", "id": "i7", "num": 7, "memo": "m", "evidence": junk}])
         assert d["captured"] is False
         assert all("[1, 2]" not in i["value"] for i in d["items"])
@@ -542,3 +542,46 @@ def test_the_card_threads_its_slug_into_the_armed_caption():
     card = cards.needs_you_card(_flight(), "will-titan/sandbox")
     drop = [a for a in card["actions"] if a["act"] == "drop"][0]
     assert "will-titan/sandbox" in drop["armed_caption"]
+
+
+def test_a_live_bounce_marker_never_borrows_an_older_parks_evidence():
+    # Codex cross-review ROUND 2, P0. Between the worker writing `state/blocked/<id>` and the
+    # runner's next tick, the marker holds the amendment but NO bounce record exists yet — so
+    # `_flight_memo` shows the MARKER's text while the dossier still found the last park and
+    # attached its evidence. The card then paired one hand-back's question with another's evidence.
+    # The invariant: the dossier describes the hand-back whose words are on the card, or nothing.
+    jslice = [{"ts": 100, "act": "park", "id": "i7", "num": 7, "memo": "an older park",
+               "cause": "launch_delivery", "evidence": {"reason": "STALE — a different decision"}}]
+    live = _flight(stage=flights.AWAITING, awaiting_reason="bounced",
+                   memo="BOUNCED: a brand-new amendment the runner has not journalled yet")
+    d = cards.decision_dossier(live, jslice)
+    assert d["captured"] is False
+    assert d["note"], "with no record for these words, say so — never borrow another decision's"
+    assert all("STALE" not in i["value"] for i in d["items"])
+    assert "recorded cause" not in {i["label"] for i in d["items"]}
+
+
+def test_the_dossier_matches_the_memo_exactly_as_flight_memo_picks_it():
+    # Codex ROUND 2, P1: `_flight_memo` only accepts hand-backs that HAVE a memo. A later malformed
+    # memo-less bounce made the card fall back to the older park's memo while the dossier used the
+    # later bounce's evidence — the two describing different decisions again.
+    jslice = [
+        {"ts": 100, "act": "park", "id": "i7", "num": 7, "memo": "the park being shown",
+         "evidence": {"reason": "the right evidence"}},
+        {"ts": 200, "act": "bounce", "id": "i7", "num": 7, "evidence": {"reason": "no memo here"}},
+    ]
+    d = cards.decision_dossier(_flight(memo="the park being shown"), jslice)
+    pairs = {i["label"]: i["value"] for i in d["items"]}
+    assert pairs["reason"] == "the right evidence"
+
+
+def test_memo_history_carries_bounces_too():
+    # Codex ROUND 2, P2: bounces are first-class hand-backs now, so the drawer's memo HISTORY must
+    # show them — a `bounce -> park` history that lists only the park hides that the worker ever
+    # pushed back.
+    jslice = [
+        {"ts": 100, "act": "bounce", "id": "i7", "num": 7, "memo": "BOUNCED: an earlier push-back"},
+        {"ts": 200, "act": "park", "id": "i7", "num": 7, "memo": "a later park reason"},
+    ]
+    d = cards.flight_drawer(_flight(memo="a later park reason"), jslice, "r", "Air")
+    assert d["memos"] == ["BOUNCED: an earlier push-back", "a later park reason"]
