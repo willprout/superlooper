@@ -1490,9 +1490,18 @@ class Runner:
         The converse is weaker, and deliberately so: a LIVE pid does not prove OUR worker lives. A
         SIGKILLed start-session.sh never runs its trap, so its lock outlives it, and pids recycle
         (~99999 on macOS) — an unrelated process can inherit that number and hold this lane's prune
-        off for its lifetime. That costs disk and nothing else, and start-session.sh's own
-        acquire_worker carries the identical exposure by design, so both ends agree. The asymmetry
-        is the point: we err toward not pruning, because the other error kills a lane's stamp."""
+        off for its whole lifetime. We accept that asymmetry: we err toward not pruning, because
+        the other error kills a lane's stamp (D14).
+
+        Do not read that as costless. A stale lock naming a reused pid does NOT just cost disk: it
+        makes _exec_reapprove/_exec_regenerate defer forever (they must not rebuild over a worktree
+        they cannot clear), and decide re-emits them every tick while `reapproved_now` holds back
+        the very launch whose _close_stale_session would drop the stale lock. The lane livelocks —
+        journaled each tick via the executor's outcome, but uncapped and un-alerted, and only
+        removing the lock frees it. Nor is this symmetric with start-session.sh's acquire_worker:
+        that refusal is counted and eventually parks the issue with a memo; this one is not counted
+        at all. Bounding it is issue #169 — do not talk yourself out of that on the strength of
+        'it only costs disk'."""
         if not pid:
             return True                                    # no lock -> no live worker to wait for
         deadline = time.monotonic() + (WORKER_EXIT_TIMEOUT if timeout is None else timeout)
