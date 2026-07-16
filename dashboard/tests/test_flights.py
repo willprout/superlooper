@@ -812,6 +812,48 @@ def test_build_flight_awaiting_marker_does_not_make_it_amber():
     assert f["awaiting_reason"] is None
 
 
+# =============================== corruption guard — a wrong-typed status never dies into the poll (issue #139) ===============================
+# The engine already folds a wrong-typed/unhashable status to a no-set sentinel (actions.py
+# _status_of / _CORRUPT_STATUS, engine #95) precisely so a `status in <SET>` membership test can't
+# throw. The dashboard's build_flight ran one such test — `status in _LAUNCHED_STATUSES` (a set) —
+# on the RAW loopstate status. A single well-formed issues.json entry whose status VALUE was
+# unhashable (a list, a dict) therefore raised TypeError inside the snapshot poll, taking down the
+# WHOLE board: every repo, every flight, not merely its own row. The guard mirrors the engine's fold.
+
+def test_status_of_folds_a_wrong_typed_status_to_a_no_set_sentinel():
+    # None and str pass through unchanged (None is a legitimate never-launched status); a list/dict
+    # (unhashable) or any other non-str folds to the sentinel that belongs to no status set — and the
+    # sentinel is itself hashable, so testing it against the launched-statuses SET never raises.
+    assert flights._status_of(None) is None
+    assert flights._status_of("running") == "running"
+    assert flights._status_of([]) is flights._CORRUPT_STATUS
+    assert flights._status_of({}) is flights._CORRUPT_STATUS
+    assert flights._status_of(5) is flights._CORRUPT_STATUS
+    assert (flights._status_of([]) in flights._LAUNCHED_STATUSES) is False
+
+
+def test_build_flight_survives_an_unhashable_status_without_dying_into_the_poll():
+    # issue #139: an unhashable status value with NO activity file (session_started False) used to
+    # reach `status in _LAUNCHED_STATUSES` and raise TypeError inside the poll. It must fail CLOSED
+    # instead — the corrupt flight reads as never-launched (at-stand), never crashing the board.
+    for bad in ([], {}):
+        issue = {"id": "i52", "num": 52, "status": bad, "activity_mtime": None, "journal": []}
+        f = flights.build_flight(issue, _REPO)   # must not raise
+        assert f["stage"] == flights.AT_STAND
+        assert f["circuit_stage"] == flights.AT_STAND
+        assert f["merged"] is False
+        assert f["on_circuit"] is True           # at-stand IS an on-circuit stage
+
+
+def test_build_flight_unhashable_status_with_a_launch_event_still_reads_launched():
+    # The fold only makes the status membership test hash-safe; a journalled launch event still
+    # counts, so a corrupt-status flight that DID launch isn't mis-shown as stuck at the stand.
+    issue = {"id": "i52", "num": 52, "status": [], "activity_mtime": None,
+             "journal": [{"act": "launch", "id": "i52", "ts": 1}]}
+    f = flights.build_flight(issue, _REPO)
+    assert f["circuit_stage"] == flights.TAKEOFF   # launched, no session/report yet
+
+
 # =============================== round-1 review fixes (Codex cross-review) ===============================
 
 def test_landed_clean_requires_a_successful_unwandered_merge():
