@@ -1303,6 +1303,54 @@ def test_pr_opened_between_polls_merges_never_false_parks(sim_factory):
     assert len(sim.mutations("merge_pr")) == 1
 
 
+def test_out_of_band_merge_of_an_inflight_lane_is_absorbed_never_stalls(sim_factory):
+    """Issue #155 / i328, against REAL ticks. The worker has pushed and opened its PR and is STILL
+    BUILDING (held on the sync file, no report) when the PR is merged OUT OF BAND — which, exactly
+    like the real service, squash-merges into origin/main and CLOSES the issue via `Closes #N`.
+
+    That close is the trap: it drops the issue from BOTH open-issue lists the poll's want-set is
+    built from, and a building lane reaches that want-set only through its `in-progress` LABEL,
+    read off those very lists. So the lookup stopped happening at the moment it began to matter —
+    `pr` stayed null, the lane held its slot, and the queue behind it waited two hours. The
+    per-tick reconcile must absorb the merge instead: settle to merged, free the lane, never park.
+    """
+    sim = sim_factory()
+    sync = sim.tmp / "hold-the-worker"          # the worker waits here: PR open, report unwritten
+    num = sim.add_issue(title="Merged out from under a building lane",
+                        scenario={"scenario": "happy", "wait_for": str(sync)})
+    sid = "i%d" % num
+
+    sim.tick()
+    assert sim.loop_issue(sid).get("status") == "running", sim.journal()
+
+    # the worker really opened its PR on (fake) GitHub, and is still building behind it
+    assert sim.tick_until(lambda: sim.prs_for()), \
+        "worker never opened a PR: %s" % sim.journal()
+    pr = sim.prs_for()[0]
+    assert pr["state"] == "OPEN"
+    assert not os.path.exists(os.path.join(sim.home, "reports", "%s.md" % sid))   # not finished
+    assert sim.loop_issue(sid).get("status") == "running"                         # in flight
+
+    # ---- somebody merges the PR by hand, outside the loop ----
+    _run([os.path.join(FAKES, "fake-gh"), "pr", "merge", str(pr["number"]), "--squash"])
+    assert sim.prs_for()[0]["state"] == "MERGED"
+    assert sim.issue(num)["state"] == "closed"       # ...and GitHub closed the issue (Closes #N)
+    merges = len(sim.mutations("merge_pr"))          # == 1: the hand-merge just above, not the loop's
+
+    # ---- the runner must learn this and settle, within a tick or two ----
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged", ticks=3), \
+        "never absorbed the out-of-band merge: %s" % [
+            (r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert [r for r in sim.journal("absorb_merged") if r.get("outcome") == "ok"]
+    assert not sim.journal("park"), "a lane whose PR merged out of band must never park"
+    assert len(sim.mutations("merge_pr")) == merges, \
+        "the runner must absorb an already-merged PR, never re-merge it"
+    assert "in-progress" not in sim.issue(num)["labels"]
+    assert not os.path.isdir(os.path.join(sim.home, "worktrees", sid))   # lane freed, worktree gone
+
+    sync.write_text("go\n")                          # release the held worker for teardown
+
+
 def test_review_marker_after_pr_cached_still_merges(sim_factory):
     # D6 (live 2026-07-04): a `<!-- superlooper-review -->` marker comment posted AFTER the poll
     # first cached the PR was invisible to the gate until the next 90s poll — and the gate

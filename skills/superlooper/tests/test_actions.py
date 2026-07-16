@@ -1900,6 +1900,143 @@ def test_merged_pr_state_is_absorbed_not_wedged():
     assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
 
 
+# =============== in-flight branch->PR reconcile (issue #155) ===============
+# Until #155 the ONLY path that consulted a PR's state was the finished/gating branch above, so a
+# lane whose PR concluded WHILE IT WAS STILL BUILDING never learned of it. i328: the PR was merged
+# out-of-band, which closed the issue ("Closes #328"), which dropped it from both open-issue lists,
+# which kept the poll's want-set from ever looking it up — pr: null forever, and the lane held its
+# slot for two hours. These pin the reconcile: act on a POSITIVE merged/closed answer, and on
+# nothing else (a refused or answered-empty lookup means "keep building", never a park).
+
+def _inflight(pv=None, status="running", **ist_over):
+    """A lane IN FLIGHT — building, no report on disk. `pv=None` leaves the PR view with NO entry
+    for it (exactly how the poll OMITS a refused lookup); `pv={}` is GitHub's answered 'no PR'."""
+    d = disk(issues_state={"version": 1, "issues": {
+        "i5": ist(status, branch="sl/i5-issue-5", **ist_over)}})
+    return d, ghv(prs={} if pv is None else {"i5": pv})
+
+
+def test_inflight_lane_absorbs_an_out_of_band_merge():
+    # The i328 shape: no report, no parsed issue (the merge auto-closed it), status still 'running'.
+    # A MERGED PR on this lane's active branch is the truth — settle it and free the lane.
+    d, g = _inflight(pv=pr_view(state="MERGED"), pr=555)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
+    assert only(out, "park") == []
+
+
+def test_an_out_of_band_merge_absorbs_even_if_the_lane_never_saw_the_pr_open():
+    # MERGED is deliberately NOT episode-scoped the way CLOSED is (below). A merge is a LANDED fact
+    # about the branch — the work is in the mainline no matter which episode opened the PR — so it
+    # is absorbed whether or not this lane ever recorded the number. Load-bearing for the wake-gap:
+    # the runner can sleep through an entire open->merge (the laptop shuts) and must still settle
+    # rather than stall, which is the whole point of i328.
+    d, g = _inflight(pv=pr_view(state="MERGED"), pr=None)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
+    assert only(out, "park") == []
+
+
+def test_inflight_lane_records_its_pr_number_as_soon_as_one_exists():
+    # DoD: "records the number as soon as a PR exists". i328's report was that the runner "still
+    # carried pr: null" — this is that field. It also makes the CLOSED hand-back episode-scoped.
+    d, g = _inflight(pv=pr_view(state="OPEN"), pr=None)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "record_pr") == [{"act": "record_pr", "id": "i5", "pr": 555}]
+
+
+def test_inflight_lane_does_not_re_record_a_pr_it_already_knows():
+    d, g = _inflight(pv=pr_view(state="OPEN"), pr=555)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "record_pr") == []
+
+
+def test_inflight_lane_hands_back_the_close_of_the_pr_it_opened():
+    # A CLOSED PR is out-of-band by construction: the runner never closes its own (regenerate
+    # supersedes and leaves it OPEN on a preserved branch, stamping the NEW branch first; the
+    # janitor's close path vetoes every claimed lane). Why it was closed is unknowable here and
+    # both guesses are wrong — rebuilding loops against the call, merging is not ours — so hand it
+    # back once. Matches the gate's own long-standing verdict for a closed PR (gate.py).
+    d, g = _inflight(pv=pr_view(state="CLOSED"), pr=555)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "absorb_merged") == []
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["needs_william"] is True and p[0]["cause"] == "pr_closed"
+
+
+def test_a_stale_closed_pr_from_a_previous_episode_never_parks_a_relaunched_lane():
+    """THE regression the fresh-agent review caught, and the reason the CLOSED hand-back is scoped
+    to the PR this episode actually opened.
+
+    A park hands the issue to the owner; re-approving clears `pr` but KEEPS the branch stamp, and
+    the relaunch builds on that same branch. A CLOSED PR does NOT stop a new PR on the same head
+    (GitHub refuses only a second OPEN one) — so pre-#155 the worker simply opened a fresh PR and
+    the newest-first lookup returned it. Recovery worked. An unscoped CLOSED park breaks that: it
+    fires a tick after launch, BEFORE the worker can push, so the stale closed PR is the only
+    answer and the lane re-parks forever — an inescapable trap, with the owner's only remedy being
+    the one thing the memo told them to do. `pr: None` means this episode owns no PR yet: ignore
+    the ghost and let the worker open its own."""
+    d, g = _inflight(pv=pr_view(state="CLOSED"), pr=None)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "park") == []                    # no trap: the lane keeps building...
+    assert only(out, "record_pr") == []               # ...and a closed ghost is never recorded
+
+
+def test_inflight_lane_with_an_open_pr_just_keeps_building():
+    d, g = _inflight(pv=pr_view(state="OPEN"), pr=555)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "absorb_merged") == [] and only(out, "park") == []
+
+
+def test_inflight_reconcile_never_parks_on_a_refused_lookup():
+    # The refused!=empty discipline (#61) on the reconcile path: a lookup the poll OMITTED must
+    # read as "unknown, keep building" — never as "no PR exists", and never as a park.
+    d, g = _inflight(pv=None)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "park") == [] and only(out, "absorb_merged") == []
+
+
+def test_inflight_reconcile_never_parks_when_github_answers_no_pr():
+    # answered-empty mid-build is the NORMAL case (the worker hasn't pushed yet) — not a fault.
+    d, g = _inflight(pv={})
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "park") == [] and only(out, "absorb_merged") == []
+
+
+def test_inflight_reconcile_ignores_a_stale_view():
+    # A stale/unreachable view degrades to the existing wait (the issue's boundary), never acts.
+    d, g = _inflight(pv=pr_view(state="MERGED"), pr=555)
+    g["stale"] = True
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "absorb_merged") == [] and only(out, "park") == []
+
+
+def test_inflight_reconcile_ignores_a_superseded_pr():
+    # Defense in depth: a `superseded` PR is dead history the runner itself retired (the orphan
+    # sweep applies the same rule). It can only reach the ACTIVE branch through a half-executed
+    # regenerate — act on it and we'd park the lane the runner just rebuilt.
+    d, g = _inflight(pv=pr_view(state="CLOSED", labels=["superseded"]), pr=555)
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "park") == [] and only(out, "absorb_merged") == []
+
+
+def test_absorbed_merge_wins_over_the_answerer_lifecycle():
+    # The stall itself: i328's lane sat in the blocked/answerer machinery while its PR was ALREADY
+    # merged. The merged fact must win over every lifecycle the lane would otherwise keep spinning.
+    d, g = _inflight(pv=pr_view(state="MERGED"), status="blocked", pr=555)
+    d["blocked"] = {"i5": "which approach should I take?"}
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
+    assert only(out, "hire_answerer") == []
+
+
+def test_inflight_reconcile_leaves_a_not_yet_launched_issue_alone():
+    # status None/'ready' is not in flight: no branch, nothing to reconcile.
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist(None)}})
+    out = decide(dsk=d, gh_view=ghv(prs={"i5": pr_view(state="MERGED")}))
+    assert only(out, "absorb_merged") == [] and only(out, "park") == []
+
+
 def test_recheck_failure_parks_needs_william():
     d, g = _gating()
     d["issues_state"]["issues"]["i5"]["recheck_failed"] = True
