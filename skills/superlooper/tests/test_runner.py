@@ -3081,3 +3081,58 @@ def test_reclaim_early_out_survives_an_unhashable_status(rig, monkeypatch):
     st = {"issues": {"i1": {"status": []}, "i2": {"status": {}}, "i9": {"status": "parked"}}}
     rig.r._reclaim_terminal_worktrees(st)              # must not raise on the [] / {} statuses
     assert removed == [str(rig.r._worktree("i9"))]     # corrupt skipped, valid parked still reclaimed
+
+
+# ============ the one launch-eligibility gate, end to end (issue #150 / D8) ============
+# Fixture i103 declares `blocked-by: #101, #102` in its Loop metadata and neither is closed, so no
+# session may start for it BY ANY PATH. These drive the real Runner (real decide, real executors,
+# recording run_script) and assert on launch-session.sh itself — the thing that starts a session —
+# rather than on decide's action list.
+
+def _blocked_and_exited(rig, now):
+    """Poll i103 into the view, then strand it: an in-flight session that died, blockers still open."""
+    rig.r.tick(now=now)                                # i101/i102 launch; i103 is blocked, so waits
+    (rig.home / "state" / "exited" / "i103").write_text("1751000000 rc=1\n")
+    seed_issue(rig, "i103", status="running", branch="sl/i103-wire-widget-to-api")
+    rig.calls.clear()
+
+
+def _launches_of(rig, iid):
+    return [c for c in rig.calls
+            if c["args"][0].endswith("launch-session.sh") and iid in c["args"]]
+
+
+def test_crash_recovery_never_launches_a_session_past_an_open_blocker(rig):
+    _blocked_and_exited(rig, NOW)
+    rig.r.tick(now=NOW + 60)
+    assert _launches_of(rig, "i103") == []              # THE bug: this used to relaunch regardless
+    ist = issue_state(rig, "i103")
+    assert ist["status"] == "running"                   # held in place: not parked, not requeued
+    assert "#101" in ist["launch_hold_reason"] and "#102" in ist["launch_hold_reason"]
+    held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
+    assert len(held) == 1 and "blocked-by" in held[0]["outcome"]     # the hold says WHY
+
+
+def test_a_held_restart_relaunches_the_moment_its_blockers_close(rig):
+    # The other half: the gate is a WAIT, not a verdict. Close #101/#102 in the fixture world and
+    # the same stranded session recovers on the next tick, with no re-approval by William.
+    _blocked_and_exited(rig, NOW)
+    rig.r.tick(now=NOW + 60)
+    assert _launches_of(rig, "i103") == []
+    (rig.fixdir / "issue_list_closed.json").write_text(
+        json.dumps([{"number": 41}, {"number": 52}, {"number": 101}, {"number": 102}]))
+    rig.r._poll_at = 0                                 # force a fresh poll: the closed set changed
+    rig.calls.clear()
+    rig.r.tick(now=NOW + 200)
+    assert len(_launches_of(rig, "i103")) == 1         # recovered, unblocked, no owner touch
+    assert issue_state(rig, "i103")["launch_hold_reason"] is None    # the hold episode is over
+
+
+def test_a_standing_hold_does_not_re_journal_every_tick(rig):
+    # A 15s tick against a long-open blocker must not walk the journal.
+    _blocked_and_exited(rig, NOW)
+    for i in range(4):
+        rig.r.tick(now=NOW + 60 + i * 20)
+    held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
+    assert len(held) == 1
+    assert _launches_of(rig, "i103") == []

@@ -1500,7 +1500,8 @@ class Runner:
             self._launch_fail_at = now
         self._update_issue(iid, {"branch": branch, "num": num, "type": p.get("type"),
                                  "declared_touches": list(p.get("touches") or []),
-                                 "wildcard_hold_journaled": False})   # launch ends the hold episode (#36)
+                                 "wildcard_hold_journaled": False,    # launch ends the hold episode (#36)
+                                 "launch_hold_reason": None})         # ...and the eligibility hold (#150)
         # NB: the per-issue model/effort override is stamped into durable state by _worker_env below
         # (it refreshes on EVERY worker launch so the stamp tracks William's current labels) — see
         # its docstring. Kept in one place so recover/resolve_conflict relaunches stamp identically.
@@ -1822,6 +1823,7 @@ class Runner:
                       "update_result": None, "update_head_oid": None, "nudged": [], "pr": None,
                       "read_waited": False, "checks_pending_since": None,
                       "wildcard_hold_journaled": False,   # a fresh approval re-journals its own hold (#36)
+                      "launch_hold_reason": None,      # ...and re-journals an eligibility hold (#150)
                       "merge_refusal_reason": None,    # paired with merge_refusals=0 above (#27)
                       "pr_read_pending_since": None,   # a re-run's refused-read hold times fresh (#61)
                       "comments_read_pending_since": None,   # ...and its comments-read hold too (#78)
@@ -1860,7 +1862,9 @@ class Runner:
                                   env=self._worker_env(iid),
                                   timeout=LAUNCH_TIMEOUT)
             if rc == 0:
-                self._update_issue(iid, {"status": "running"})
+                # launch_hold_reason: a relaunch that DELIVERS ends the eligibility-hold episode, so
+                # the board never shows "waiting on #101" against a session that is running (#150).
+                self._update_issue(iid, {"status": "running", "launch_hold_reason": None})
                 self._delivery_cleared()               # a verified delivery proves the anchor is live (#24)
                 return "ok"
             self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
@@ -1985,6 +1989,16 @@ class Runner:
         so a later, fresh episode re-journals. Journal-only: no label move, no notify."""
         self._update_issue(a["id"], {"wildcard_hold_journaled": True})
         return a.get("reason", "launch held by a no-touches wildcard — the lane serializes")
+
+    def _exec_launch_hold(self, a, now):
+        """Issue #150 (D8): the one launch gate refused to start/restart this session. decide emitted
+        this ONCE per CAUSE (deduped on the stamped reason); stamp it so the same standing hold does
+        not re-journal every tick, and return the reason so the journal outcome carries the WHY. The
+        stamp clears on launch (_exec_launch) and on reapprove, so a later episode speaks again; a
+        CHANGED cause re-journals immediately because the reason no longer matches. Journal-only: no
+        label move, no notify, no status change — a hold is a WAIT, not a park."""
+        self._update_issue(a["id"], {"launch_hold_reason": a.get("reason")})
+        return a.get("reason", "launch held by the eligibility gate")
 
     def _exec_hold(self, a, now):
         self._update_issue(a["id"], {"status": "holding"})
@@ -2119,7 +2133,8 @@ class Runner:
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,
-                                     "update_head_oid": None, "nudged": []})
+                                     "update_head_oid": None, "nudged": [],
+                                     "launch_hold_reason": None})   # the hold episode ends (#150)
             self._delivery_cleared()                   # a verified delivery proves the anchor is live (#24)
             return "ok"
         self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))

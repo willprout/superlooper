@@ -388,6 +388,39 @@ def _touches_required_memo(num):
             "`touches:` line to the Loop metadata and re-approve.")
 
 
+def _launch_gate_reason(p, closed_nums, usage):
+    """WHY the one launch gate (scheduler.launch_ok) refused to start or restart this session —
+    the SPECIFIC failing condition, named. This is what makes a refusal a legible hold instead of
+    the silent launch D8 caught: the board and the journal say which dependency is open, or which
+    label went ambiguous, not merely "held". Conditions are tested in launch_ok's own order so the
+    prose always names the one that actually decided."""
+    if not scheduler.usage_ok(usage):
+        return ("no usage headroom (the meter is unreadable/unhealthy, or at-or-over a ceiling) — "
+                "the restart waits for quota, exactly as a fresh launch does")
+    if not isinstance(p, dict):
+        return ("the issue is not in the current GitHub view, so its approval, type and "
+                "`blocked-by` cannot be read — a session is never restarted on eligibility that "
+                "cannot be verified")
+    labels = p.get("labels") if isinstance(p.get("labels"), list) else []
+    if "agent-ready" not in labels and "in-progress" not in labels:
+        return ("the approval is gone — the issue carries neither `agent-ready` nor the loop's own "
+                "`in-progress` stamp, so restarting it is nobody's word")
+    if p.get("type") not in issues_mod.VALID_TYPES:
+        return ("its `type:` labels are missing, unknown or doubled, so what to build is ambiguous "
+                "— a restart waits for the labels to be fixed, exactly as a fresh launch does")
+    if p.get("label_conflict"):
+        return ("its control labels conflict (2+ `model:*` or 2+ `effort:*`), so which model/effort "
+                "to restart under is ambiguous — waiting for the labels to be fixed")
+    deps = p.get("blocked_by") if isinstance(p.get("blocked_by"), list) else []
+    open_deps = [d for d in deps if d not in closed_nums]
+    if open_deps:
+        return ("its `blocked-by` is no longer satisfied: "
+                + ", ".join("#%s" % d for d in open_deps)
+                + " still open. The restart waits for the dependency to close — a recovery never "
+                  "carries a session past a blocker a fresh launch would respect.")
+    return "the launch gate refused this start (no single condition named)"
+
+
 def _wildcard_hold_reason(h):
     """Prose for a wildcard launch-suppression (issue #36): why this approved issue could not
     co-schedule and the lane serialized. Names which side is the no-touches wildcard."""
@@ -608,7 +641,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     usage_sched = dict(usage_view)
     usage_sched["stale"] = bool(usage_view.get("stale")) or usage_age > USAGE_STALE_SECONDS
     usage_sched["fail_open"] = failing_open
-    usage_launchable = scheduler.usage_ok(usage_sched)
+    # (#150) The usage rule is no longer asked on its own here: it is one half of scheduler.launch_ok,
+    # the single gate start_ok() puts in front of EVERY start and restart. Asking it separately is
+    # what let the recovery tier obey usage while skipping eligibility — the D8 drift itself.
     filed = _dget(dsk, "filed_fingerprints", dict)
 
     gv = gh_view if isinstance(gh_view, dict) else {}
@@ -665,6 +700,24 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         who = "needs-owner" if needs_william else "parked"
         notify(f"superlooper: {iid} {who}", memo)
         out.append(act)
+
+    def start_ok(p, resume=True):
+        """THE gate, asked identically by every path that starts or restarts a session (issue #150 /
+        D8). Fresh phase-E launches reach the same predicate through scheduler.launchable, which
+        filters candidates on launch_ok."""
+        return scheduler.launch_ok(p, closed_nums, bool(frozen), usage_sched, resume=resume)
+
+    def launch_hold(iid, num, p):
+        """start_ok said no: HOLD, legibly — never a silent launch (D8), and never a park. This is a
+        WAIT, not a verdict: the retry cap and park semantics are untouched (a boundary of #150), the
+        marker/labels stay exactly as they are, and the restart fires on the tick the gate passes.
+        Journal ONCE per CAUSE — dedup on the reason the executor stamps durably, so a standing hold
+        can't spam a 15s tick, while a CHANGED cause (the blocker closed but the labels went
+        ambiguous) still speaks rather than leaving stale prose on the board."""
+        reason = _launch_gate_reason(p, closed_nums, usage_sched)
+        if ist_of(iid).get("launch_hold_reason") == reason:
+            return
+        out.append({"act": "launch_hold", "id": iid, "num": num, "reason": reason})
 
     # ---- launch-anchor liveness (issue #24): a dead launch anchor must never walk the queue ----
     # The runner launches every worker as a cmux tab in ONE pane (the anchor). When that pane stops
@@ -1076,8 +1129,15 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                             "new_branch": brief.branch_for(src, generation=new_conflicts),
                             "conflicts": new_conflicts, "wander": wander})
             elif act == "resolve_conflict":
-                out.append({"act": "resolve_conflict", "id": iid, "num": num,
-                            "pr": pv.get("number"), "wander": wander})
+                # (#150 / D8) The gate's verdict is "hire a session to resolve this conflict" — a
+                # session START, so it owes the same eligibility every other start owes. It asked
+                # nothing before. Held (never parked) so the issue keeps its preserve-labeled PR and
+                # the resolver hires the tick the gate passes.
+                if start_ok(p):
+                    out.append({"act": "resolve_conflict", "id": iid, "num": num,
+                                "pr": pv.get("number"), "wander": wander})
+                else:
+                    launch_hold(iid, num, p)
             elif act == "close_investigate":
                 out.append({"act": "close_investigate", "id": iid, "num": num})
             # "wait" -> no action this tick
@@ -1159,9 +1219,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             elif retries >= retry_cap:
                 park(iid, num, f"exited and already relaunched {retries} times (cap "
                                f"{retry_cap}) — parking" + stderr_memo, cause="exited_cap")
-            elif usage_launchable:
+            elif start_ok(p):
                 out.append({"act": "recover", "id": iid, "tier": "exited"})
-            # no usage headroom -> the marker persists; relaunch resumes with the quota
+            else:
+                # (#150 / D8) This tier used to ask usage ALONE, so a crash recovery relaunched a
+                # worker straight past a `blocked-by` that had since reopened — the only thing that
+                # stopped it was the worker's own step-0 reconcile bouncing itself. It now asks the
+                # WHOLE gate. Usage is unchanged (start_ok's usage half IS usage_launchable's rule):
+                # no headroom still means the marker persists and the relaunch resumes with the
+                # quota — only now the wait says why, instead of passing silently.
+                launch_hold(iid, num, p)
             continue
         if iid in frozen_ids or status == "frozen":
             if in_wake_grace:
@@ -1225,7 +1292,15 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                          and "superseded" not in gate._pr_labels(pv)
                          and (not isinstance(stamped, str) or not stamped.strip()
                               or stamped == branch))
-            if resumable:
+            if resumable and not start_ok(p):
+                # (#150 / D8) The restart rebuild resumes an in-progress issue's session on its open
+                # PR's branch — and asked NO gate at all: not eligibility, not even usage. HOLD in
+                # place rather than reclaim: this orphan resume is the ONLY path that re-attaches the
+                # existing PR branch to a worktree (`orphan: True`), so requeueing to the fresh-launch
+                # path would later try to build the branch afresh and orphan the pushed work. Held,
+                # the issue keeps its PR and resumes properly the tick the gate passes.
+                launch_hold(iid, num, p)
+            elif resumable:
                 touches = p.get("touches") if isinstance(p.get("touches"), list) else []
                 out.append({"act": "launch", "id": iid, "num": num, "branch": branch,
                             "touches": touches, "soft_overlap": False, "orphan": True})

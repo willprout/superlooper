@@ -576,3 +576,44 @@ def test_usage_ok_is_public_for_the_runner_relaunch_gate():
     assert scheduler.usage_ok(None) is False
     assert scheduler.usage_ok({"auth_status": "ok", "five_hour_pct": float("nan"),
                                "seven_day_pct": 1.0}) is False
+
+
+# ---- launch_ok: the ONE gate every start and restart asks (issue #150 / D8) ----
+
+def test_launch_ok_is_usage_and_eligibility_together():
+    # One predicate, so a recovery path cannot obey half the rule. Both halves must hold.
+    p = _issue(1)
+    assert scheduler.launch_ok(p, set(), False, OK) is True
+    assert scheduler.launch_ok(p, set(), False, None) is False            # usage unreadable
+    assert scheduler.launch_ok(p, set(), False, {"auth_status": "ok", "five_hour_pct": 99.0,
+                                                 "seven_day_pct": 1.0}) is False   # over ceiling
+    assert scheduler.launch_ok(_issue(2, blocked_by=[41]), set(), False, OK) is False
+    assert scheduler.launch_ok(_issue(2, blocked_by=[41]), {41}, False, OK) is True
+
+
+def test_launch_ok_carries_resume_through_to_eligibility():
+    restarting = _issue(3, labels=("type:build", "in-progress"))
+    assert scheduler.launch_ok(restarting, set(), False, OK) is False           # fresh: unapproved
+    assert scheduler.launch_ok(restarting, set(), False, OK, resume=True) is True
+    # ...and resume never buys a way past an open dependency — the D8 defect itself.
+    blocked = _issue(4, labels=("type:build", "in-progress"), blocked_by=[41])
+    assert scheduler.launch_ok(blocked, set(), False, OK, resume=True) is False
+
+
+def test_launch_ok_fails_closed_on_a_missing_or_wrong_typed_issue():
+    # The recovery paths can reach this with no parsed issue (absent from the GitHub view).
+    for bad in (None, "i5", 7, []):
+        assert scheduler.launch_ok(bad, set(), False, OK, resume=True) is False, bad
+
+
+def test_fresh_launches_ask_launch_ok_too_so_the_paths_cannot_drift():
+    # The DoD's "single predicate ... is the one gate": the scheduler's own selection walk must
+    # route through the SAME function the recovery paths call, not a parallel re-implementation.
+    seen = []
+    real = scheduler.launch_ok
+    scheduler.launch_ok = lambda *a, **k: (seen.append(a[0].get("num")), real(*a, **k))[1]
+    try:
+        out = scheduler.launchable([_issue(1)], [], _cfg(lanes=1), OK, set(), False)
+    finally:
+        scheduler.launch_ok = real
+    assert _nums(out) == [1] and seen == [1]

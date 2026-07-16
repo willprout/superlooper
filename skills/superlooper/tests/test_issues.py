@@ -243,6 +243,39 @@ def test_eligible_requires_agent_ready():
     assert issues.eligible(_ready(labels=["type:build"]), set(), frozen=False) is False
 
 
+# ---- resume: the SAME predicate serves every restart path (issue #150 / D8) ----
+
+def test_resume_accepts_the_runners_own_in_progress_stamp_as_the_approval():
+    # A launch moves `agent-ready` -> `in-progress`, so a session the runner is RESTARTING never
+    # carries `agent-ready`. Demanding it would refuse every recovery; the runner's own stamp is
+    # the approval it already acted on. Fresh launches are untouched by this — they still demand
+    # `agent-ready`.
+    p = _ready(labels=["type:build", "in-progress"])
+    assert issues.eligible(p, set(), frozen=False) is False                  # fresh: not approved
+    assert issues.eligible(p, set(), frozen=False, resume=True) is True      # restart: approved
+
+
+def test_resume_still_demands_every_other_condition():
+    # The whole point of D8: `resume` relaxes WHICH approval token is accepted and nothing else.
+    open_dep = _ready(labels=["type:build", "in-progress"],
+                      body="## Loop metadata\nblocked-by: #41\n")
+    assert issues.eligible(open_dep, set(), frozen=False, resume=True) is False
+    assert issues.eligible(open_dep, {41}, frozen=False, resume=True) is True
+
+    bad_type = _ready(labels=["type:build", "type:investigate", "in-progress"])
+    assert issues.eligible(bad_type, set(), frozen=False, resume=True) is False
+
+    conflicted = _ready(labels=["type:build", "in-progress"])
+    conflicted["label_conflict"] = True
+    assert issues.eligible(conflicted, set(), frozen=False, resume=True) is False
+
+
+def test_resume_refuses_an_issue_with_no_approval_token_at_all():
+    # William parked it mid-flight (both tokens gone): a restart is not his word to continue.
+    assert issues.eligible(_ready(labels=["type:build", "parked"]), set(), frozen=False,
+                           resume=True) is False
+
+
 def test_eligible_requires_valid_type():
     assert issues.eligible(_ready(labels=["agent-ready"]), set(), frozen=False) is False
     assert issues.eligible(_ready(labels=["type:build", "type:investigate", "agent-ready"]),
