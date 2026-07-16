@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+import evidence
 import issues
 import journal
 import loopstate
@@ -3965,3 +3966,167 @@ def test_a_reapproved_lane_is_not_re_parked_by_its_previous_episodes_closed_pr(r
         NOW, rig.r.config, rig.r.usage_view(), [],
         runner_mod.actions.lane_state_from(dsk["issues_state"]), [], dsk, rig.r.gh_view)
     assert [a for a in acts if a["act"] == "park"] == []       # no trap: the lane keeps building
+
+
+# --------------------------- evidence on every non-success outcome (issue #152) ---------------------------
+# The 2026-07-09 storm: 10 issues parked under "is the launch shim installed?" while the real cause
+# — a launch anchor pointing at a deleted cmux workspace — reached the runner's stderr and was
+# dropped on the floor by _run_script, which returned an int. These pin that the reason now travels.
+
+_STORM_STDERR = ("[i101] could not parse a surface UUID from new-surface output: "
+                 "Error: not_found: Pane or workspace not found")
+
+
+def _exec_and_journal(rig, action, now=NOW):
+    """Run one action exactly as tick() does — execute, then journal the outcome — and hand back
+    the record that was written. tick() drives these two through the runner's own methods; a test
+    that only called _execute would be asserting against a record nobody wrote."""
+    rig.r._journal_outcome(action, rig.r._execute(action, now), now)
+    recs = [r for r in journal.read(rig.home) if r.get("act") == action["act"]]
+    assert recs, f"no journal record for {action['act']!r}"
+    return recs[-1]
+
+
+def test_run_script_carries_the_stderr_that_names_the_cause(rig):
+    """The seam the storm fell through. The REAL _run_script (not the rig's stub) must return an rc
+    that still compares/formats as an int AND carries what the script said on its way down."""
+    r = runner_mod.Runner(repo=str(rig.repo), config=make_config(),
+                          state_home=str(rig.home / "x"), pane="p", fetch_usage=lambda: {})
+    rc = r._run_script(["/bin/sh", "-c", "echo 'Error: not_found: Pane or workspace not found' >&2; exit 1"])
+    assert rc == 1 and int(rc) == 1 and f"rc={rc}" == "rc=1"      # still an int everywhere it is read
+    assert "not_found" in rc.stderr_tail                          # ...and now it carries the reason
+
+
+def test_run_script_stderr_tail_is_bounded(rig):
+    r = runner_mod.Runner(repo=str(rig.repo), config=make_config(),
+                          state_home=str(rig.home / "x"), pane="p", fetch_usage=lambda: {})
+    rc = r._run_script(["/bin/sh", "-c", "python3 -c \"print('x'*100000)\" >&2; exit 1"])
+    assert 0 < len(rc.stderr_tail) <= evidence.STDERR_TAIL_MAX + 1
+
+
+def test_a_failed_launch_journals_the_dead_anchor_not_a_bare_code(rig):
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(runner_mod.ScriptRC(1, _STORM_STDERR))
+    ev = _exec_and_journal(rig, _launch_action())["evidence"]
+    assert ev["reason"] == "anchor_workspace_missing"
+    assert "not_found" in ev["captured"]             # the diagnostic itself rode along
+    assert ev["rc"] == 1
+    evidence.validate(ev)                            # and it is a well-formed record
+
+
+def test_rc1_and_rc2_launch_failures_journal_different_reasons(rig):
+    """The distinction launch-session.sh draws and the journal used to flatten to
+    'delivery not verified'."""
+    rig.r.tick(now=NOW)
+    seen = {}
+    for rc, tail in ((1, _STORM_STDERR), (2, "[i101] LAUNCH NOT DELIVERED: no worker started")):
+        rig.rc_queue.append(runner_mod.ScriptRC(rc, tail))
+        seen[rc] = _exec_and_journal(rig, _launch_action())["evidence"]["reason"]
+    assert seen[1] != seen[2]
+    assert seen[2] == "shim_not_fired"
+
+
+def test_a_failed_launch_stamps_evidence_for_the_park_memo(rig):
+    rig.r.tick(now=NOW)
+    rig.rc_queue.append(runner_mod.ScriptRC(1, _STORM_STDERR))
+    rig.r._execute(_launch_action(), NOW)
+    ev = issue_state(rig, "i101")["launch_evidence"]
+    assert ev["reason"] == "anchor_workspace_missing"
+
+
+def test_a_verified_delivery_clears_stale_launch_evidence(rig):
+    """The #40 staleness lesson: a fixed anchor must not leave last week's cause to name the wrong
+    component in a later, unrelated park."""
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", launch_evidence={"kind": "launch", "rc": 1, "reason": "old",
+                                             "detail": "d", "captured": "stale"})
+    rig.calls.clear()                                # rc_queue empty -> rc 0 (verified delivery)
+    assert rig.r._execute(_launch_action(), NOW) == "ok"
+    assert issue_state(rig, "i101")["launch_evidence"] is None
+
+
+def test_a_launch_failure_with_no_captured_text_fails_closed_to_an_admission(rig):
+    """An injected/plain int rc captured nothing. The record must still SAY so — never omit the
+    field, which would read as 'nothing went wrong'."""
+    rig.r.tick(now=NOW)
+    rig.rc_queue.append(2)                           # a bare int: no evidence available at all
+    ev = _exec_and_journal(rig, _launch_action())["evidence"]
+    assert ev["captured"] == evidence.CAPTURED_NONE
+    evidence.validate(ev)
+
+
+def test_a_nudge_refusal_journals_the_verdict_and_the_screen(rig):
+    """nudge rc=3 records carried no classifier verdict and no screen text — the 43-minute
+    ambiguous defer (i160) had nothing to read back."""
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="running")
+    (rig.home / "state" / "panes" / "i101").write_text("surf-1")
+    rig.rc_queue.append(runner_mod.ScriptRC(
+        3, "[nudge] i101 pane at a menu/ambiguous — deferring\nscreen: 1. Yes  2. No"))
+    ev = _exec_and_journal(rig, {"act": "recover", "id": "i101", "tier": "idle"})["evidence"]
+    assert ev["reason"] == "pane_deferred"
+    assert "1. Yes" in ev["captured"]                # the screen snippet the verdict was drawn from
+    assert ev["tier"] == "idle"                      # ...and which recovery tier observed it
+
+
+def test_a_recovery_records_the_tier_that_observed_it(rig):
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="running")
+    (rig.home / "state" / "panes" / "i101").write_text("surf-1")
+    rig.rc_queue.append(runner_mod.ScriptRC(5, "[nudge] i101 session is LOGGED OUT in-window"))
+    ev = _exec_and_journal(rig, {"act": "recover", "id": "i101", "tier": "frozen"})["evidence"]
+    assert ev["tier"] == "frozen" and ev["reason"] == "pane_logged_out"
+
+
+def test_a_failed_relaunch_journals_launch_evidence(rig):
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="running")
+    rig.rc_queue.append(runner_mod.ScriptRC(1, _STORM_STDERR))
+    ev = _exec_and_journal(rig, {"act": "recover", "id": "i101", "tier": "exited"})["evidence"]
+    assert ev["reason"] == "anchor_workspace_missing" and ev["tier"] == "exited"
+
+
+def test_a_failed_answer_delivery_journals_the_pane_verdict(rig):
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="blocked")
+    (rig.home / "state" / "panes" / "i101").write_text("surf-1")
+    rig.rc_queue.append(runner_mod.ScriptRC(3, "[nudge] i101 pane at a menu/ambiguous — deferring"))
+    ev = _exec_and_journal(rig, {"act": "deliver_answer", "id": "i101",
+                                "answerer_id": "a1", "text": "yes"})["evidence"]
+    assert ev["reason"] == "pane_deferred"
+
+
+def test_a_successful_outcome_journals_no_evidence_field(rig):
+    """Evidence is the account of a FAILURE. A clean launch has nothing to explain, and a stray
+    empty record would train readers to ignore the field."""
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    assert "evidence" not in _exec_and_journal(rig, _launch_action())
+
+
+def test_a_failed_conflict_session_launch_journals_evidence(rig):
+    """The preserve-path conflict resolver relaunches a worker; its launch failure is journaled too,
+    so it must carry evidence like every other non-success outcome (fresh-review P2)."""
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i123", status="gating", branch="sl/i123-x", update_result="conflict")
+    rig.rc_queue.append(runner_mod.ScriptRC(1, _STORM_STDERR.replace("i101", "i123")))
+    ev = _exec_and_journal(rig, {"act": "resolve_conflict", "id": "i123", "num": 123,
+                                 "pr": 5})["evidence"]
+    assert ev["reason"] == "anchor_workspace_missing"
+    assert issue_state(rig, "i123")["launch_evidence"]["reason"] == "anchor_workspace_missing"
+
+
+def test_a_recovered_relaunch_clears_both_stale_launch_fields(rig):
+    """launch_error and launch_evidence are set together on failure and name the same event, so a
+    verified relaunch delivery must clear BOTH — a survivor would disagree with the other in a later
+    park memo (fresh-review P2)."""
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="running", launch_error="base_missing",
+               launch_evidence={"kind": "launch", "rc": 3, "reason": "base_missing",
+                                "detail": "d", "captured": "old"})
+    (rig.home / "state" / "exited" / "i101").write_text("1 rc=?")
+    rig.calls.clear()                                # rc_queue empty -> rc 0 (verified delivery)
+    rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
+    ist = issue_state(rig, "i101")
+    assert ist["launch_error"] is None and ist["launch_evidence"] is None

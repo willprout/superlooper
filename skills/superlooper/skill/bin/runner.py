@@ -33,6 +33,7 @@ for _p in (os.path.join(_HERE, "..", "lib"),):
 import actions
 import brief
 import events as events_mod
+import evidence
 import gate
 import gh
 import gitops
@@ -101,6 +102,39 @@ LAUNCH_TIMEOUT = 120           # launch-session.sh verifies delivery within ~30s
 # memo can name the branch instead of the launch shim. Must match launch-session.sh's `exit 3`.
 LAUNCH_BASE_MISSING_RC = 3
 NUDGE_TIMEOUT = 60
+
+
+class ScriptRC(int):
+    """An exit code that still carries what the script SAID on its way down (issue #152).
+
+    An int subclass on purpose, and the whole trick: `rc == 0`, `rc == LAUNCH_BASE_MISSING_RC`,
+    `f"rc={rc}"` and json all keep working byte-for-byte, so every existing caller and every test
+    that injects a plain int rc is untouched — while the callers that need the reason can read
+    `.stderr_tail`. Readers MUST use `getattr(rc, "stderr_tail", "")`: an injected/stubbed plain int
+    genuinely captured nothing, and that path must fail CLOSED to "captured: none" rather than
+    inherit some other call's text (a memo naming the wrong component is the exact bug this fixes).
+
+    Bounded at construction — captured text is caller-controlled and a raw binary in a report once
+    wedged the runner outright (incident 2026-07-07).
+    """
+    def __new__(cls, rc, stderr=""):
+        o = super().__new__(cls, rc)
+        o.stderr_tail = evidence.bound(stderr)
+        return o
+
+
+class Outcome(str):
+    """An executor's human outcome line, carrying the structured evidence behind it (issue #152).
+
+    A str subclass for the same reason ScriptRC is an int: the journal writes `outcome` as a plain
+    string and `status` renders it, so nothing downstream changes shape. The evidence rides beside
+    it and is journaled as its own field. Built ONLY via Runner._failed() so a failure record can
+    never be assembled without going through the schema.
+    """
+    def __new__(cls, text, evidence_rec=None):
+        o = super().__new__(cls, text)
+        o.evidence = evidence_rec
+        return o
 RECHECK_TIMEOUT = 600
 CLOSE_TIMEOUT = 15             # bound the best-effort close of a stale session's pane (D4)
 # (#149) After the pane close, how long teardown waits to OBSERVE the worker CLI actually go before
@@ -1377,7 +1411,7 @@ class Runner:
                 outcome = self._execute(a, now)
             except Exception as e:
                 outcome = f"executor error: {_short_repr(e)}"   # bound the repr (incident 2026-07-07)
-            journal.append(self.home, dict(a, outcome=outcome), now)
+            self._journal_outcome(a, outcome, now)
 
         for path in written:                           # acted on -> archive for restart rebuilds
             dest = os.path.join(self._events_dir(), "processed", os.path.basename(path))
@@ -1427,11 +1461,16 @@ class Runner:
             r = subprocess.run([str(a) for a in args], env={**os.environ, **(env or {})},
                                capture_output=True, text=True, timeout=timeout)
             self._log((r.stdout or "") + (r.stderr or ""))
-            return r.returncode
+            # Carry the stderr — the ONLY account of WHY (issue #152). It used to stop here, at
+            # `return r.returncode`: runner.log kept the reason and every caller got a bare int, so
+            # the 07-09 storm's "Pane or workspace not found" was written to a file nobody read
+            # while the park memo guessed (wrongly) at the shim. The scripts diagnose themselves
+            # loudly on stderr; this just stops throwing that away.
+            return ScriptRC(r.returncode, r.stderr)
         except subprocess.TimeoutExpired:
-            return 124
-        except OSError:
-            return 127
+            return ScriptRC(124, "")     # a hang leaves no exit reason to read — evidence says so
+        except OSError as e:
+            return ScriptRC(127, f"could not execute {args[0] if args else '?'}: {e}")
 
     def _run_cmd(self, cmd, cwd, timeout=RECHECK_TIMEOUT):           # injectable (recheck)
         try:
@@ -1766,11 +1805,47 @@ class Runner:
         except OSError:
             pass
 
+    def _evidence(self, kind, rc, **extra):
+        """The structured account of one failed script call: its rc-distinct reason plus whatever
+        the script said on its way down. `getattr(..., "stderr_tail", "")` is the fail-closed half:
+        a plain int rc (an injected stub, or a caller that never captured) genuinely has no
+        evidence, and build() turns that into an honest CAPTURED_NONE rather than borrowing text
+        from some other call. validate() raises on a malformed record — loudly, at the programmer,
+        exactly as journal's own write path does."""
+        return evidence.validate(
+            evidence.build(kind, int(rc), getattr(rc, "stderr_tail", ""), **extra))
+
+    def _failed(self, kind, rc, text, ev=None, **extra):
+        """The ONE way a non-success script outcome becomes a record (issue #152).
+
+        Every failing launch/nudge path returns through here, so an evidence-free failure record
+        cannot be written by construction. Pass `ev` when the caller already built the record to
+        stamp into loopstate, so the journal and the state carry the SAME account rather than two
+        independently-derived ones. The human line names the reason too, so a reader skimming
+        `superlooper status` sees "anchor_workspace_missing", never just "rc=1".
+        """
+        ev = ev if ev is not None else self._evidence(kind, rc, **extra)
+        return Outcome(f"{text} ({ev['reason']})", ev)
+
     def _execute(self, a, now):
         fn = getattr(self, "_exec_" + str(a.get("act")), None)
         if fn is None:
             return f"no executor for {a.get('act')!r}"
         return fn(a, now)
+
+    def _journal_outcome(self, a, outcome, now):
+        """Write the action's record: what was decided, what happened, and — when it failed — WHY.
+
+        An outcome that failed carries its evidence (issue #152); it lands as its own field so the
+        record answers why, not just what. A SUCCESSFUL outcome stays evidence-free on purpose: it
+        has nothing to explain, and a stray empty record on every `ok` would train the reader to
+        skip the field on the one tick it matters.
+        """
+        rec = dict(a, outcome=str(outcome))
+        ev = getattr(outcome, "evidence", None)
+        if ev is not None:
+            rec["evidence"] = ev
+        journal.append(self.home, rec, now)
 
     # --- launches ---
 
@@ -1835,11 +1910,16 @@ class Runner:
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             gh.set_labels(num, add=["in-progress"], remove=["agent-ready"])
-            # clear any stale base-missing cause: a verified delivery proves the base now exists
-            self._update_issue(iid, {"status": "running", "launch_error": None})
+            # clear any stale base-missing cause: a verified delivery proves the base now exists.
+            # launch_evidence clears with it (#152) for the same reason and the #40 staleness lesson
+            # (review P1-1): a fixed anchor must not leave last week's cause behind to name the wrong
+            # component in a later, unrelated park.
+            self._update_issue(iid, {"status": "running", "launch_error": None,
+                                     "launch_evidence": None})
             self._delivery_cleared()                   # a verified delivery proves the anchor is live
             return "ok"                                # (a verified canary IS a real launch: the issue
                                                        #  runs and the systemic hold lifts — issue #115)
+        ev = self._evidence("launch", rc)
         if rc == LAUNCH_BASE_MISSING_RC:
             # The worktree base branch is missing (issue #28): a per-repo CONFIG fault, not a dead
             # launch anchor. Record the cause so decide's park memo names the branch, and DELIBERATELY
@@ -1847,10 +1927,11 @@ class Runner:
             # anchor). Still counts toward the per-issue launch cap, so it parks (with the right memo)
             # — UNLESS this was a #115 canary probe, which is never charged to the issue (the clock is
             # already re-spaced above; the hold persists on the existing streak).
-            self._update_issue(iid, {"status": "ready", "launch_error": "base_missing"},
+            self._update_issue(iid, {"status": "ready", "launch_error": "base_missing",
+                                     "launch_evidence": ev},
                                fn=None if canary else (lambda st, i: self._bump(i, "launch_failures")))
             verb = "canary launch" if canary else "launch"
-            return f"{verb} rc={rc} (worktree base branch missing)"
+            return self._failed("launch", rc, f"{verb} rc={rc} (worktree base branch missing)", ev=ev)
         # Delivery NOT verified. Stamp the #115 canary retry clock so the next probe waits a full
         # interval, and record this id in the runner-level anchor streak (issue #24) — decide reads
         # the streak to tell a dead anchor (many distinct ids) from a genuinely bad issue (one).
@@ -1861,11 +1942,15 @@ class Runner:
             # and no park. The streak above already stands at/over the systemic cap, so the hold
             # persists; the issue stays queued (ready, agent-ready never moved) for the next probe or
             # the eventual resume.
-            self._update_issue(iid, {"status": "ready", "launch_error": None})
-            return f"canary launch rc={rc} (delivery not verified — systemic hold persists)"
-        self._update_issue(iid, {"status": "ready", "launch_error": None},
+            self._update_issue(iid, {"status": "ready", "launch_error": None,
+                                     "launch_evidence": ev})
+            return self._failed("launch", rc, ev=ev,
+                                text=f"canary launch rc={rc} (delivery not verified — systemic hold persists)")
+        # Stamp the evidence beside the counter that will eventually park this issue, so decide's
+        # park memo can name what actually happened instead of asking about the shim (issue #152).
+        self._update_issue(iid, {"status": "ready", "launch_error": None, "launch_evidence": ev},
                            fn=lambda st, i: self._bump(i, "launch_failures"))
-        return f"launch rc={rc} (delivery not verified)"
+        return self._failed("launch", rc, f"launch rc={rc} (delivery not verified)", ev=ev)
 
     def _operator(self):
         """The operator display name (issue #58) — config.operator over this repo's config, so
@@ -1905,7 +1990,7 @@ class Runner:
             return "ok"
         self._update_issue(iid, {"status": "blocked"},
                            fn=lambda st, i: self._bump(i, "answerer_failures"))
-        return f"answerer launch rc={rc}"
+        return self._failed("launch", rc, f"answerer launch rc={rc}")
 
     def _exec_deliver_answer(self, a, now):
         iid, aid = a["id"], a["answerer_id"]
@@ -1936,7 +2021,7 @@ class Runner:
             self._mark_exited(iid, "dead pane on answer delivery", now)
         self._update_issue(iid, {"last_delivery_attempt": now},
                            fn=lambda st, i: self._bump(i, "answer_delivery_failures"))
-        return f"nudge rc={rc}"
+        return self._failed("nudge", rc, f"nudge rc={rc}")
 
     # --- bounce / park / labels ---
 
@@ -2176,11 +2261,17 @@ class Runner:
                                   env=self._worker_env(iid),
                                   timeout=LAUNCH_TIMEOUT)
             if rc == 0:
-                self._update_issue(iid, {"status": "running"})
+                # Clear BOTH stale launch fields together (#152): they are set together on failure
+                # and name the same event, so a verified delivery must not leave one behind to
+                # disagree with the other in a later, unrelated park memo.
+                self._update_issue(iid, {"status": "running", "launch_error": None,
+                                         "launch_evidence": None})
                 self._delivery_cleared()               # a verified delivery proves the anchor is live (#24)
                 return "ok"
-            self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
-            return f"relaunch rc={rc}"
+            ev = self._evidence("launch", rc, tier=tier)
+            self._update_issue(iid, {"launch_evidence": ev},
+                               fn=lambda st, i: self._bump(i, "launch_failures"))
+            return self._failed("launch", rc, f"relaunch rc={rc}", ev=ev)
         # ---- the pid pulse, BEFORE any screen tier (issue #151) ----
         # Ground truth first: if the worker process is gone, nothing the pane renders can change
         # that, and asking the screen is how i160 lost 43 minutes to an unclassifiable one. Only a
@@ -2203,8 +2294,8 @@ class Runner:
                                   env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
             if rc == 4:
                 self._mark_exited(iid, "dead pane found by frozen recovery", now)
-                return "dead pane — marked exited for relaunch"
-            return self._record_sensed(iid, rc, now)
+                return self._failed("nudge", rc, "dead pane — marked exited for relaunch", tier=tier)
+            return self._record_sensed(iid, rc, now, tier=tier)
         # idle: the safe peek — a gentle status ask, never a blind action
         surface = self._surface(iid)
         if not surface:
@@ -2213,9 +2304,9 @@ class Runner:
                "background work, touch your awaiting marker (see your brief).")
         rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
                               env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
-        return self._record_sensed(iid, rc, now)
+        return self._record_sensed(iid, rc, now, tier="idle")
 
-    def _record_sensed(self, iid, rc, now):
+    def _record_sensed(self, iid, rc, now, tier=None):
         """Turn a nudge-pane rc into the lane's honest sensed state (issue #151). Shared by BOTH
         liveness tiers so their reading of the same rc can never drift apart.
 
@@ -2239,11 +2330,18 @@ class Runner:
                 i["sensed_state"] = sensed
                 i["sensed_since"] = now if sensed else None
         self._update_issue(iid, fn=m)
+        if rc == 0:
+            return "ok"
+        # Every refusal is journaled WITH the classifier's verdict and the screen it read (#152).
+        # A nudge rc=3 record used to carry neither: i160 sat 43 minutes on an ambiguous defer that
+        # nobody could classify afterwards, because the screen that produced it was never kept.
         if sensed == "logged_out":
-            return "logged out in-window — alerting the owner, not nudging"
+            return self._failed("nudge", rc, "logged out in-window — alerting the owner, not nudging",
+                                tier=tier)
         if sensed == "at_dialog":
-            return "session is asking something in-window — leaving it alone"
-        return "ok" if rc == 0 else f"nudge rc={rc}"
+            return self._failed("nudge", rc, "session is asking something in-window — leaving it alone",
+                                tier=tier)
+        return self._failed("nudge", rc, f"nudge rc={rc}", tier=tier)
 
     # --- the gate's executors ---
 
@@ -2514,11 +2612,16 @@ class Runner:
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,
-                                     "update_head_oid": None, "nudged": []})
+                                     "update_head_oid": None, "nudged": [],
+                                     "launch_error": None, "launch_evidence": None})
             self._delivery_cleared()                   # a verified delivery proves the anchor is live (#24)
             return "ok"
-        self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
-        return f"conflict-session launch rc={rc}"
+        # This launch failure is journaled too, so it carries evidence like every other (#152), and
+        # stamps it beside the counter — the same contract _exec_launch/_exec_recover follow.
+        ev = self._evidence("launch", rc)
+        self._update_issue(iid, {"launch_evidence": ev},
+                           fn=lambda st, i: self._bump(i, "launch_failures"))
+        return self._failed("launch", rc, f"conflict-session launch rc={rc}", ev=ev)
 
     def _exec_close_investigate(self, a, now):
         iid, num = a["id"], a.get("num")

@@ -67,30 +67,67 @@ fi
 # --workspace — ONLY --surface. `send`/`send-key` below KEEP --workspace (they accept it and need it
 # for cross-workspace addressing). Do NOT "restore symmetry" by adding --workspace back here.
 SCREEN_B64="$("$CMUX" read-screen --surface "$SURF" --lines 40 2>/dev/null | base64 || true)"
-STATE="$(EXITED="$EXITED" SCREEN_B64="$SCREEN_B64" python3 - "$HERE/../lib" <<'PY'
+# ONE python3 call returns BOTH halves of the judgement (issue #152): the verdict, and the bounded
+# screen snippet it was read from. They come from the same read of the same screen, so the evidence
+# can never describe a different screen than the one that was classified.
+#
+# The snippet is bounded by lib/evidence.bound — the SAME function the runner's records use, not a
+# second implementation in shell. That is not tidiness: a `tail -c` byte cut splits a multi-byte
+# character (a TUI screen is full of box-drawing glyphs) and emits invalid UTF-8, which raises
+# UnicodeDecodeError inside the runner's own subprocess capture and takes down the tick that was
+# only trying to explain itself. Python slices by CHARACTER, and bound() strips the control bytes.
+CLASSIFY="$(EXITED="$EXITED" SCREEN_B64="$SCREEN_B64" python3 - "$HERE/../lib" <<'PY'
 import sys, os, base64
 sys.path.insert(0, sys.argv[1])
-import pane_state
+import pane_state, evidence
 raw = base64.b64decode(os.environ.get("SCREEN_B64", "") or "").decode("utf-8", "replace")
 print(pane_state.classify_screen(
     raw,
     exited_marker=(os.environ.get("EXITED") == "1"),
     agent=os.environ.get("SL_AGENT", "claude"),
 ))
+print("---8<--- screen ---8<---")
+print(evidence.bound(raw, limit=evidence.SCREEN_SNIPPET_MAX))
 PY
 )"
+STATE="$(printf '%s\n' "$CLASSIFY" | sed -n 1p)"
+
+# Every refusal below is EVIDENCE the caller records (issue #152), so it must carry both halves of
+# the judgement: the classifier's verdict AND the screen text it was drawn from. A bare "deferring"
+# is unfalsifiable after the fact — i160 sat 43 minutes on an ambiguous defer that nobody could
+# re-classify later, because the screen that produced it was never kept. This script is the only
+# place that can see the screen, so this is the only place the snippet can be captured.
+#
+# `state=<verdict>` is machine-readable on purpose (the runner's evidence record reads it back);
+# the sentence after it is for the human reading the park memo.
+#
+# The snippet was already bounded and sanitized by lib/evidence.bound in the classify call above.
+# An EMPTY screen still refuses (pane_state defers an unreadable read) and must say so honestly
+# rather than print nothing — "captured: none, reason unknown" is a finding; silence is not.
+refuse() {                             # refuse <exit-code> <state> <human sentence>
+  code="$1"; state="$2"; why="$3"
+  echo "[nudge] $ID state=$state — $why" >&2
+  snip="$(printf '%s\n' "$CLASSIFY" | sed '1,2d')"
+  if [ -n "$(printf '%s' "$snip" | tr -d '[:space:]')" ]; then
+    echo "[nudge] $ID screen (bounded tail — what the verdict was read from):" >&2
+    printf '%s\n' "$snip" >&2
+  else
+    echo "[nudge] $ID screen: captured: none, reason unknown (empty or unreadable read)" >&2
+  fi
+  exit "$code"
+}
 
 case "$STATE" in
-  dead) echo "[nudge] $ID pane is DEAD — not typing; caller must restart" >&2; exit 4 ;;
-  logged_out) echo "[nudge] $ID session is LOGGED OUT in-window — not typing; caller must alert the owner" >&2; exit 5 ;;
-  at_dialog) echo "[nudge] $ID session is asking a question in-window — not typing; live, not stuck" >&2; exit 6 ;;
-  menu) echo "[nudge] $ID pane at a menu/ambiguous — deferring" >&2; exit 3 ;;
-  trust_blocked) echo "[nudge] $ID Codex pane is waiting for directory trust — deferring" >&2; exit 3 ;;
-  permission_blocked) echo "[nudge] $ID Codex pane is waiting for permission approval — deferring" >&2; exit 3 ;;
-  quota_blocked) echo "[nudge] $ID Codex pane is usage/quota blocked — deferring" >&2; exit 3 ;;
-  unknown) echo "[nudge] $ID Codex pane state is unknown — deferring" >&2; exit 3 ;;
+  dead) refuse 4 dead "pane is DEAD (the agent process is gone; the pane is a bare shell) — not typing; caller must restart" ;;
+  logged_out) refuse 5 logged_out "session is LOGGED OUT in-window — not typing; caller must alert the owner" ;;
+  at_dialog) refuse 6 at_dialog "session is asking a question in-window — not typing; live, not stuck" ;;
+  menu) refuse 3 menu "pane at a menu/ambiguous — deferring" ;;
+  trust_blocked) refuse 3 trust_blocked "Codex pane is waiting for directory trust — deferring" ;;
+  permission_blocked) refuse 3 permission_blocked "Codex pane is waiting for permission approval — deferring" ;;
+  quota_blocked) refuse 3 quota_blocked "Codex pane is usage/quota blocked — deferring" ;;
+  unknown) refuse 3 unknown "Codex pane state is unknown — deferring" ;;
   busy|idle) : ;;                      # safe to send
-  *)    echo "[nudge] $ID unknown pane state '$STATE' — deferring" >&2; exit 3 ;;
+  *)    refuse 3 "${STATE:-unclassified}" "unknown pane state — deferring" ;;
 esac
 
 # 3. Send text, then a separate Enter (spike A2: `send` types, `send-key Enter` submits). Both carry
