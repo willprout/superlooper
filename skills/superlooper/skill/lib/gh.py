@@ -291,6 +291,14 @@ def pr_for_branch(branch):
         # consumer identifies the PR by it, and a numberless entry would read as trustworthy and
         # then park at the gate as "no PR exists" (the fail-OPEN-on-wrong-typed defect class,
         # Codex review C2). Anything else is a wrong-shaped body -> refused.
+        #
+        # headRefOid is deliberately NOT validated here, though #154 made it load-bearing (the gate
+        # pins the review verdict to it). Validating it in this shared read would refuse the whole
+        # PR for every consumer — the janitor's branch sweep reads the same function and does not
+        # need a well-formed oid to decide a PR is MERGED — and GraphQL types headRefOid non-null,
+        # so it buys nothing reachable. gate.review_evidence_state owns that judgement for its own
+        # pure inputs instead ("head_unreadable" -> wait, never merge), which is the same
+        # unreachable-but-fail-closed shape step 3 already uses for an unreadable `files`.
         first = lst[0]
         if isinstance(first, dict) and type(first.get("number")) is int and first["number"] > 0:
             return PrRead(first, True)
@@ -524,13 +532,26 @@ def _merge_refusal_reason(stderr):
     return s[-MERGE_REFUSAL_REASON_CHARS:] if s else ""
 
 
-def merge_pr(num, method="squash"):
+def merge_pr(num, method="squash", head_oid=None):
     """Merge a PR with the configured method (squash default, §B.4). Returns (ok, reason): (True,
     "") on success, (False, <bounded gh stderr tail>) when GitHub REFUSES the merge — ordinary
     branch protection (required approvals / strict up-to-date) or a token without merge rights
     (issue #27). The caller counts refusals and, at the cap, parks the issue to William with the
     reason. There is no force path anywhere — the runner never force-pushes, and never bypasses
-    branch protection; it surfaces the refusal so the owner can act on it."""
+    branch protection; it surfaces the refusal so the owner can act on it.
+
+    `head_oid` pins the merge to the exact commit the gate judged (#154). The gate matches the
+    review verdict against a POLLED snapshot of the head (up to GH_POLL_SECONDS old), but the
+    merge lands on whatever the head is NOW: without this the verdict is verified against one
+    commit and enforced against none, so a worker pushing inside the poll window lands unreviewed
+    code under a perfectly matching pin. `--match-head-commit` makes GitHub refuse when the head
+    moved, which is the honest answer — the refusal ladder above counts it, and the next poll sees
+    the new head and asks for a re-review (review_stale) rather than merging. A caller with no
+    readable oid sends no constraint (gh rejects an empty value; an unconstrained merge is exactly
+    the pre-#154 behaviour, never worse)."""
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}.get(method, "--squash")
-    rc, _, err = _run_full(["pr", "merge", str(num), flag])
+    argv = ["pr", "merge", str(num), flag]
+    if isinstance(head_oid, str) and head_oid.strip():
+        argv += ["--match-head-commit", head_oid.strip()]
+    rc, _, err = _run_full(argv)
     return (True, "") if rc == 0 else (False, _merge_refusal_reason(err))

@@ -197,8 +197,22 @@ NUDGE_MESSAGES = {
                 "Rewrite the report with substantive text under every required H2, then finish "
                 "again — the runner checks mechanically.",
     "review": "The gate found no review evidence. Get a fresh-agent review of your diff and "
-              "post its verdict as a PR comment BEGINNING `<!-- superlooper-review -->` "
-              "(what was reviewed + P0/P1 outcome). The runner will not merge without it.",
+              f"post its verdict as a PR comment BEGINNING `{gate.pinned_review_marker()}` "
+              f"(what was reviewed + P0/P1 outcome), with {gate.REVIEW_PIN_PLACEHOLDER} replaced "
+              "by the output of `git rev-parse HEAD`. The runner will not merge without it.",
+    # issue #154: the verdict exists but does not provably cover the head being merged — either
+    # it carries no readable pin, or it pins a superseded diff (the post-reapprove rebuild case).
+    # The remedy is the same for both: review what is on the PR NOW and pin the verdict to it.
+    "review_stale": "Your PR carries a review verdict that does not name the code now on it — it "
+                    "either has no readable `sha=` pin or pins an older commit, and the head has "
+                    "moved since (a rebuild or a new push). Re-review the CURRENT diff with a "
+                    "fresh agent and post a verdict pinned to the current head: a PR comment "
+                    f"BEGINNING `{gate.pinned_review_marker()}`, where "
+                    f"{gate.REVIEW_PIN_PLACEHOLDER} is the literal oid `git rev-parse HEAD` "
+                    "prints after your last push — run it, then paste the oid in. A shell "
+                    "substitution is NOT expanded inside a single-quoted `gh pr comment --body`, "
+                    "and the unexpanded text pins nothing. The runner will not merge code that "
+                    "nothing vouches for.",
     "checks": "A required check failed on your PR. Investigate the failure, fix it, and push — "
               "the gate re-runs automatically.",
     "investigation": "Post your root-cause report as an issue comment BEGINNING "
@@ -1168,6 +1182,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             g = gate.gate_decision(
                 {"type": itype, "conflicts": conflicts, "nudged": nudged,
                  "declared_touches": declared, "update_result": update_result,
+                 "review_carry": ist.get("review_carry"),
                  "investigation_done": inv_done},
                 pv, reports.get(iid), cfg, bool(frozen), inflight)
 
@@ -1254,8 +1269,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     continue
                 method = cfg.get("merge_method")
                 method = method if method in ("squash", "merge", "rebase") else "squash"
+                # head_oid pins the merge to the commit this decision actually judged (#154): the
+                # review verdict was matched against THIS head, so the merge must land on it or be
+                # refused — never on whatever the branch grew since the last poll.
                 out.append({"act": "merge", "id": iid, "num": num, "pr": pv.get("number"),
-                            "method": method, "wander": wander})
+                            "method": method, "head_oid": head, "wander": wander})
             elif act == "update":
                 out.append({"act": "update", "id": iid, "num": num, "pr": pv.get("number"),
                             "head_oid": head, "wander": wander})

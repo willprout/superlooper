@@ -6,6 +6,17 @@ never on a raised exception into the tick.
 """
 import gate
 
+# Three distinct, well-formed head oids. HEAD is "the PR's current head" everywhere below;
+# OTHER stands for a superseded (gen-1) head, THIRD for a later worker push.
+HEAD = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+OTHER = "b9c8d7e6f5a41302f1e0d9c8b7a6958473625140"
+THIRD = "c0ffee11deadbeef2222333344445555666677fe"
+
+
+def _marker(sha):
+    """The pinned review marker a worker posts: the verdict names the diff it reviewed."""
+    return gate.pinned_review_marker(sha)
+
 
 def _cfg(**over):
     """A §C.1-shaped config (the fields gate.py reads), defaults matching config.py."""
@@ -37,9 +48,10 @@ def _pr(**over):
     """A pr_view: gh.pr_for_branch(...) merged with comments (the runner attaches
     gh.pr_comments(num) under 'comments')."""
     base = {"number": 555, "state": "OPEN", "mergeable": "MERGEABLE", "labels": [],
+            "headRefOid": HEAD,
             "statusCheckRollup": [{"context": "quality-gate", "state": "SUCCESS"}],
             "files": [{"path": "src/components/Widget.tsx"}],
-            "comments": [{"body": "<!-- superlooper-review --> fresh-agent review: "
+            "comments": [{"body": f"{_marker(HEAD)} fresh-agent review: "
                                   "diff reviewed, no P0/P1 findings"}]}
     base.update(over)
     return base
@@ -137,23 +149,155 @@ def test_new_default_sections_flow_through_the_unchanged_check(tmp_path):
 
 def test_review_evidence_ship_cmd_repo_owns_review():
     # ship_cmd set -> the repo pipeline owns review (eApp: ship.sh's diff-pinned review/local-gate)
-    assert gate.review_evidence_ok(_cfg(ship_cmd="scripts/ship.sh"), []) is True
+    assert gate.review_evidence_ok(_cfg(ship_cmd="scripts/ship.sh"), [], HEAD) is True
 
 
-def test_review_evidence_marker_comment():
-    ok = [{"body": "<!-- superlooper-review --> reviewed; P0/P1: none"}]
-    assert gate.review_evidence_ok(_cfg(), ok) is True
-    assert gate.review_evidence_ok(_cfg(), []) is False
+def test_review_evidence_marker_comment_pinned_to_head():
+    ok = [{"body": f"{_marker(HEAD)} reviewed; P0/P1: none"}]
+    assert gate.review_evidence_ok(_cfg(), ok, HEAD) is True
+    assert gate.review_evidence_ok(_cfg(), [], HEAD) is False
     # the marker must BEGIN the comment — quoting it mid-text (e.g. discussing the contract) is
     # not a verdict
-    mid = [{"body": "the gate wants <!-- superlooper-review --> at the start"}]
-    assert gate.review_evidence_ok(_cfg(), mid) is False
+    mid = [{"body": f"the gate wants {_marker(HEAD)} at the start"}]
+    assert gate.review_evidence_ok(_cfg(), mid, HEAD) is False
+
+
+def test_review_evidence_pin_may_be_abbreviated_and_is_case_insensitive():
+    """`git rev-parse --short HEAD` is what a worker reaches for — a 7+ hex prefix of the head
+    identifies the reviewed commit as unambiguously as the full oid on a single PR."""
+    for pin in (HEAD, HEAD[:7], HEAD[:12], HEAD.upper()):
+        c = [{"body": f"{_marker(pin)} reviewed"}]
+        assert gate.review_evidence_ok(_cfg(), c, HEAD) is True, pin
+    # a prefix of the WRONG sha never matches
+    assert gate.review_evidence_ok(_cfg(), [{"body": _marker(OTHER[:7])}], HEAD) is False
+
+
+def test_review_evidence_stale_pin_does_not_satisfy_the_gate():
+    """The defect this issue exists for: a verdict for a superseded diff must stop counting."""
+    stale = [{"body": f"{_marker(OTHER)} reviewed gen-1"}]
+    assert gate.review_evidence_ok(_cfg(), stale, HEAD) is False
+    assert gate.review_evidence_state(_cfg(), stale, HEAD) == "stale"
+
+
+def test_review_evidence_unpinned_legacy_marker_fails_closed():
+    """Back-compat is FAIL-CLOSED: an unpinned marker cannot prove which diff it reviewed, so it
+    never satisfies the gate — the safe branch (nudge->park), never a silent merge."""
+    legacy = [{"body": "<!-- superlooper-review --> reviewed; P0/P1: none"}]
+    assert gate.review_evidence_ok(_cfg(), legacy, HEAD) is False
+    assert gate.review_evidence_state(_cfg(), legacy, HEAD) == "unpinned"
+
+
+def test_review_evidence_malformed_pin_is_unpinned_never_absent():
+    """Fresh-review P1-3. A marker whose pin is unreadable must be diagnosed as a marker needing a
+    REPIN — not as "no review evidence at all". The difference is a false-park loop: the "absent"
+    nudge prints the marker to post, so a worker that posted an unexpanded `$(...)` (the natural
+    result of `gh pr comment --body '<!-- ... -->'`, since single quotes do not substitute) would
+    be told to post the exact text it just posted, repost it, and park."""
+    for bad in ("$(git rev-parse HEAD)",            # the substitution gh never expanded
+                gate.REVIEW_PIN_PLACEHOLDER,        # the placeholder pasted verbatim
+                "abc12",                            # too short to be an oid
+                "zzzzzzzz",                         # not hex
+                "<HEAD-OID>"):                      # an angle-bracketed placeholder
+        c = [{"body": f"<!-- superlooper-review sha={bad} --> reviewed"}]
+        assert gate.review_evidence_state(_cfg(), c, HEAD) == "unpinned", bad
+        assert gate.review_evidence_ok(_cfg(), c, HEAD) is False, bad
+
+
+def test_review_evidence_a_sibling_marker_is_not_a_verdict():
+    """Second fresh review, P2-a. Loosening the marker match to diagnose bad pins must not loosen
+    WHICH marker counts: `<!-- superlooper-` is a family prefix, and a sibling must never vouch for
+    a diff. The payload has to be whitespace-separated, or `superlooper-review-notes` reads as a
+    full verdict — fail-OPEN on the one property this module protects."""
+    for name in ("superlooper-review-notes", "superlooper-reviewer", "superlooper-review2"):
+        c = [{"body": f"<!-- {name} sha={HEAD} --> not a verdict"}]
+        assert gate.review_evidence_state(_cfg(), c, HEAD) == "absent", name
+    # ...while the payload-less real marker still parses (and never raises on a None payload)
+    assert gate.review_evidence_state(_cfg(), [{"body": "<!-- superlooper-review-->"}],
+                                      HEAD) == "unpinned"
+
+
+def test_review_evidence_a_marker_among_junk_pins_still_reads_stale_not_unpinned():
+    """A readable pin that simply doesn't match is STALE (re-review the current diff); only the
+    total absence of a readable pin is UNPINNED. Mixing the two must not mask a real stale pin."""
+    c = [{"body": "<!-- superlooper-review --> legacy"},
+         {"body": f"{_marker(OTHER)} reviewed gen-1"}]
+    assert gate.review_evidence_state(_cfg(), c, HEAD) == "stale"
+
+
+def test_no_engine_source_retypes_the_review_marker_by_hand():
+    """Fresh-review P1-4: the "one source of truth" comment on pinned_review_marker() was false —
+    all four teaching sites hardcoded the literal, so the drift it declared impossible was exactly
+    as possible as before. Enforce the claim by ABSENCE (this repo's standing discipline): no
+    engine source may spell the marker out; it renders from gate.pinned_review_marker() or it is a
+    second copy waiting to drift out of step with the regex that parses it."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent / "skill"
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name == "gate.py":
+            continue                     # gate.py IS the source of truth (regex + renderer)
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            if "superlooper-review" in line:
+                offenders.append(f"{path.relative_to(root)}:{n}: {line.strip()[:70]}")
+    assert not offenders, (
+        "these render the review marker by hand instead of gate.pinned_review_marker():\n  "
+        + "\n  ".join(offenders))
+
+
+def test_no_worker_facing_text_tells_a_worker_to_post_a_substitution():
+    """Second fresh review, P2-b: ADOPTING.md went on teaching `sha=$(git rev-parse HEAD)` after
+    the fix round declared that form broken, because the *.py guard above could not see it.
+
+    A file-wide grep is the wrong instrument — it cannot tell teaching the form from WARNING
+    against it, and prose must stay free to say "do not write `sha=$(...)`". So guard the
+    ARTIFACTS a worker actually receives instead: a worker who obeys a `$(...)` posts it
+    unexpanded, pins nothing, and earns a nudge it cannot satisfy by obeying (the P1-3 loop).
+    The brief's own half of this lives in test_brief.py, over brief.build()'s real output."""
+    import actions
+    for key, text in actions.NUDGE_MESSAGES.items():
+        assert "$(" not in text, f"nudge {key!r} tells the worker to post a substitution"
+    # ...and the two review nudges still teach the real marker, from the one source of truth
+    for key in ("review", "review_stale"):
+        assert gate.pinned_review_marker() in actions.NUDGE_MESSAGES[key]
+
+
+def test_review_marker_taught_everywhere_is_the_marker_the_gate_parses():
+    """Fresh-review P1-4. The helper claims to be the one source of truth for the string; prove the
+    round trip so the claim is enforced, not asserted — the rendered marker must parse back."""
+    rendered = gate.pinned_review_marker(HEAD)
+    assert gate.review_evidence_ok(_cfg(), [{"body": rendered + " reviewed"}], HEAD) is True
+    # ...and the placeholder form the briefs render is recognised as a marker needing a repin,
+    # never as "no review evidence at all"
+    placeholder = gate.pinned_review_marker()
+    assert gate.REVIEW_PIN_PLACEHOLDER in placeholder
+    assert gate.review_evidence_state(_cfg(), [{"body": placeholder}], HEAD) == "unpinned"
+
+
+def test_review_evidence_unreadable_head_never_merges():
+    """A head oid the runner could not read is a corrupt view, not a verdict — fail closed."""
+    ok = [{"body": _marker(HEAD)}]
+    for bad in (None, "", 42, "nothex", HEAD[:4]):
+        assert gate.review_evidence_ok(_cfg(), ok, bad) is False, bad
 
 
 def test_review_evidence_tolerates_wrong_typed_comments():
     junk = [None, 42, {"nobody": "x"}, {"body": None}]
-    assert gate.review_evidence_ok(_cfg(), junk) is False
-    assert gate.review_evidence_ok(_cfg(), None) is False
+    assert gate.review_evidence_ok(_cfg(), junk, HEAD) is False
+    assert gate.review_evidence_ok(_cfg(), None, HEAD) is False
+
+
+def test_review_evidence_carry_honors_a_runner_merge_update():
+    """The runner's OWN mechanical merge-update moves the head without touching the authored
+    diff. It records the carry {from: reviewed oid, to: new head}; the verdict rides across it,
+    or every merge-updated PR would false-park on the review it actually has."""
+    reviewed = [{"body": f"{_marker(OTHER)} reviewed"}]
+    carry = {"from": OTHER, "to": HEAD}
+    assert gate.review_evidence_ok(_cfg(), reviewed, HEAD, carry) is True
+    # ...but the carry is bound to the head it was carried TO: a worker push past it re-stales.
+    assert gate.review_evidence_ok(_cfg(), reviewed, THIRD, carry) is False
+    # ...and a wrong-typed / half-written carry never rescues a stale pin (fail closed)
+    for bad in (None, {}, {"from": OTHER}, {"to": HEAD}, {"from": 1, "to": HEAD}, "x"):
+        assert gate.review_evidence_ok(_cfg(), reviewed, HEAD, bad) is False, bad
 
 
 # --------------------------- investigation_done (cross-review C1) ---------------------------
@@ -391,6 +535,42 @@ def test_gate_review_evidence_nudge_once_then_park():            # step 2b
     assert d.get("comments_unread") is None
     d2 = _decide(issue=_issue(nudged=["review"]), pr=pr)
     assert d2["action"] == "park"
+
+
+def test_gate_stale_verdict_never_merges_rebuilt_code():         # step 2b (issue #154)
+    """THE reproduction (#154 DoD). The real 07-15 sequence, end to end at the gate:
+
+      review at gen-1 head -> park -> reapprove -> a fresh worker rebuilds on the SAME branch
+      and pushes new commits -> the PR head moves, the gen-1 review comment survives on the PR.
+
+    Before diff-pinning, `review_evidence_ok` accepted any marker comment on the PR regardless of
+    which diff it reviewed, so this decided `merge`: a gen-1 verdict mechanically vouching for
+    gen-2 code no reviewer ever saw — the README bright line ("no verdict, no merge") silently
+    void for every post-reapprove generation. It must now take the safe branch, never merge.
+    """
+    rebuilt = _pr(headRefOid=HEAD,                       # gen-2 head after the rebuild's push
+                  comments=[{"body": f"{_marker(OTHER)} gen-1: reviewed, no P0/P1"}])
+    d = _decide(pr=rebuilt)
+    assert d["action"] != "merge"
+    assert d["action"] == "nudge" and d["nudge_key"] == "review_stale"
+    # and it still marches to park rather than nudging forever
+    d2 = _decide(issue=_issue(nudged=["review_stale"]), pr=rebuilt)
+    assert d2["action"] == "park"
+
+
+def test_gate_matching_verdict_still_merges():                   # step 2b (issue #154)
+    """The other half of the DoD: pinning must not block the unchanged-diff case — that reuse is
+    exactly what Wave 2's 'resume at gate' will read."""
+    d = _decide(pr=_pr(headRefOid=HEAD, comments=[{"body": f"{_marker(HEAD)} reviewed"}]))
+    assert d["action"] == "merge"
+
+
+def test_gate_merge_update_carry_keeps_a_reviewed_pr_merging():  # step 2b (issue #154)
+    """The runner's own merge-update moves the head; the review it already has must ride across,
+    or the gate would park PRs the runner itself updated."""
+    pr = _pr(headRefOid=HEAD, comments=[{"body": f"{_marker(OTHER)} reviewed"}])
+    d = _decide(issue=_issue(review_carry={"from": OTHER, "to": HEAD}), pr=pr)
+    assert d["action"] == "merge"
 
 
 def test_gate_comments_absent_waits_never_nudges():              # step 2b (issue #78)
