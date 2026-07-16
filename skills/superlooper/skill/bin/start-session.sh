@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs INSIDE each session's cmux pane. Seeds an interactive coding-agent session with the brief.
 # When the agent exits, the pane's shell persists — THIS launcher never closes it. (The runner
-# auto-closes a lane's window only after a SUCCESSFUL merge — owner ruling 2026-07-16 / #168, config
-# auto_close_merged_windows — and NEVER for parked/stalled work; see runner.py _teardown_session.)
+# auto-closes a lane's window after a SUCCESSFUL merge — owner ruling 2026-07-16 / #168, config
+# auto_close_merged_windows — and never while a parked/needs-william/bounced session is still live;
+# see runner.py _teardown_session / _reclaim_terminal_worktrees.)
 # SL_ISSUE_ID + SL_RUN_ROOT arrive in the environment (set by launch-session.sh's --command prefix);
 # re-export them so agent hook children inherit them.
 #

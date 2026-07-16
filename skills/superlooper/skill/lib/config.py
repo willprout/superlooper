@@ -51,8 +51,10 @@ _TOP_DEFAULTS = {
     # SUCCESSFULLY MERGED and landed — owner ruling 2026-07-16 (#168). Default True: a merged lane is
     # truly done and never resurrected, so its finished session need not linger. Set false to keep
     # merged windows/worktrees for inspection — the pre-#149 "nothing auto-closed" posture as an
-    # explicit opt-out; `superlooper tidy` then remains the owner's explicit word to close them.
-    # This is the ONLY automatic window close: park-family lanes are NEVER auto-closed (see below).
+    # explicit opt-out; `superlooper tidy` then remains the owner's explicit word to close the WINDOW
+    # (tidy closes windows only, never prunes a worktree, so the merged checkout then stays on disk
+    # for manual inspection). This is the only #149-family auto-close of a merged lane; park-family
+    # lanes are NEVER auto-closed while live (see below).
     "auto_close_merged_windows": True,
     # Reclaim the worktrees of park-family terminal issues (parked/needs-william/bounced) on every
     # tick. Owner ruling 2026-07-16 (#168): DEFAULT FALSE — the owner must be able to open the window

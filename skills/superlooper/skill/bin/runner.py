@@ -2002,7 +2002,8 @@ class Runner:
         Composed (AND) with the pre-existing `cleanup_merged_worktrees` so a repo that set EITHER knob
         to keep its finished checkouts is honored; #178 tracks unifying the overlapping pair. Off, the
         merged window — and, since a prune can never run under the live CLI it would leave open (#149),
-        its worktree — persists until `superlooper tidy` (the owner's explicit word)."""
+        its worktree — persists; `superlooper tidy` is the owner's explicit word to close the WINDOW
+        (tidy never prunes a worktree, so the checkout then stays on disk for manual inspection)."""
         return (self.config.get("auto_close_merged_windows", True)
                 and self.config.get("cleanup_merged_worktrees", True))
 
