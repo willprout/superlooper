@@ -41,17 +41,26 @@ _CODE = _strip_js_comments(_NEEDS_JS)
 
 # =============================== the whole question, never truncated ===============================
 
+def _all_rule_bodies(css, needle):
+    """EVERY declaration block whose selector mentions ``needle`` — not just the first. A guard that
+    reads only the first matching rule can be defeated by a later override that re-clamps the memo
+    (Codex cross-review); the cascade is what the owner actually sees, so check all of it."""
+    return [m.group(2) for m in re.finditer(r"([^{}]*)\{([^}]*)\}", css)
+            if needle in m.group(1)]
+
+
 def test_the_memo_well_has_no_height_clamp():
     # THE #162 pixel fix. A long question must GROW the card, never hide in a scroll box: the owner
     # reads the decision he is being asked to make without discovering there is more.
-    body = _rule_body(_CSS, ".card .memo")
-    assert body, ".card .memo must still be styled"
-    assert "max-height" not in body, "a height clamp truncates the question — #162 forbids it"
-    assert "-webkit-line-clamp" not in body and "line-clamp" not in body
-    assert "overflow: hidden" not in body and "overflow:hidden" not in body
-    assert "text-overflow" not in body, "an ellipsis is truncation by another name"
+    bodies = _all_rule_bodies(_CSS, ".card .memo")
+    assert bodies, ".card .memo must still be styled"
+    for body in bodies:                       # every rule in the cascade, not merely the first
+        assert "max-height" not in body, "a height clamp truncates the question — #162 forbids it"
+        assert "-webkit-line-clamp" not in body and "line-clamp" not in body
+        assert "overflow: hidden" not in body and "overflow:hidden" not in body
+        assert "text-overflow" not in body, "an ellipsis is truncation by another name"
     # and the text must still wrap rather than run off the card
-    assert "pre-wrap" in body
+    assert any("pre-wrap" in b for b in bodies)
 
 
 def test_the_needs_panel_does_not_re_clamp_the_card_from_outside():

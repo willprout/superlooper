@@ -283,12 +283,13 @@ def test_dossier_surfaces_the_structured_evidence_the_runner_captured():
     assert "workspace 'will-titan' is gone" in pairs["stderr_tail"]
 
 
-def test_dossier_accepts_evidence_captured_as_a_bare_string():
-    # #152 fail-closes to a plain "captured: none, reason unknown" string; render it as-is, never crash.
+def test_dossier_renders_evidence_captured_as_a_bare_string_as_is():
+    # #152 fail-closes to a plain "captured: none, reason unknown" string; render it as-is, never
+    # crash. Whether that counts as CAPTURED is pinned separately, in
+    # test_evidence_captured_means_STRUCTURED_evidence_only — it does not.
     jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m",
                "evidence": "captured: none, reason unknown"}]
     d = cards.decision_dossier(_flight(), jslice)
-    assert d["captured"] is True
     assert d["items"][0]["value"] == "captured: none, reason unknown"
 
 
@@ -433,3 +434,111 @@ def test_drawer_carries_the_dossier_too():
                "evidence": {"reason": "Workspace not found"}}]
     d = cards.flight_drawer(_flight(), jslice, "r", "Air")
     assert d["dossier"]["captured"] is True
+
+
+# =============================== Codex cross-review fixes (issue #162) ===============================
+
+def test_the_dossier_follows_the_bounce_not_a_stale_park():
+    # Codex P0: `_exec_bounce` clears the blocked marker and settles `bounced`, so a bounced card's
+    # evidence must come from the BOUNCE record. Selecting "the last park" showed an older park's
+    # evidence beside the bounce's memo — two different hand-backs, presented as one decision.
+    jslice = [
+        {"ts": 100, "act": "park", "id": "i7", "num": 7, "memo": "old launch failed",
+         "cause": "launch_delivery", "evidence": {"reason": "cmux dead"}},
+        {"ts": 200, "act": "reapprove", "id": "i7"},
+        {"ts": 300, "act": "bounce", "id": "i7", "num": 7, "memo": "BOUNCED: premise gone",
+         "cause": "bounce", "evidence": {"reason": "the issue's premise already shipped"}},
+    ]
+    d = cards.decision_dossier(_flight(memo="BOUNCED: premise gone"), jslice)
+    pairs = {i["label"]: i["value"] for i in d["items"]}
+    assert pairs["reason"] == "the issue's premise already shipped"
+    assert "cmux dead" not in pairs.values()          # the stale park's evidence must not appear
+
+
+def test_the_dossier_does_not_echo_an_episode_key_that_only_names_the_act():
+    # `cause` is the runner's notify-dedup key. On a bounce it is the literal "bounce" — which the
+    # BOUNCED badge already says. A machine key that adds real information still shows.
+    d = cards.decision_dossier(_flight(memo="m"), [
+        {"ts": 1, "act": "bounce", "id": "i7", "num": 7, "memo": "m", "cause": "bounce"}])
+    assert "recorded cause" not in {i["label"] for i in d["items"]}
+    d2 = cards.decision_dossier(_flight(memo="m"), [
+        {"ts": 1, "act": "park", "id": "i7", "num": 7, "memo": "m", "cause": "answerer_escalated"}])
+    assert {i["label"]: i["value"] for i in d2["items"]}["recorded cause"] == "answerer_escalated"
+
+
+def test_the_rebuild_consequence_does_not_claim_work_that_may_not_exist():
+    # Codex P0: `needs_william` can be raised BEFORE any launch (e.g. a touches_missing park), where
+    # there is no worktree and no filed report. The old sentence asserted both existed and would be
+    # discarded. The engine removes them IF PRESENT — so the sentence must be conditional, and must
+    # still warn that finished work is not resumed.
+    for f in (_flight(stage=flights.PARKED), _flight(stage=flights.AWAITING),
+              _flight(stage=flights.AWAITING, awaiting_reason="bounced")):
+        yes = [a for a in cards.decision_actions(f) if a["act"] in ("approve", "bounce-yes")][0]
+        low = yes["consequence"].lower()
+        assert "any" in low, "the discard must be conditional — it may not exist yet"
+        assert not ("discards this issue's worktree and filed report" in low), "no unconditional claim"
+        assert "rebuild" in yes["label"].lower()
+
+
+def test_the_dossier_is_fail_closed_on_a_malformed_flight():
+    # Codex P1: this is a pure lib over an arbitrary dict; a malformed `attempt` must not crash the
+    # whole Needs You panel (one bad flight would blank the owner's entire inbox).
+    for bad in (None, "2", 2.5, True, float("nan")):
+        d = cards.decision_dossier(_flight(attempt=bad), [])
+        assert isinstance(d["items"], list)
+        cards.decision_actions(_flight(attempt=bad))
+        cards.card_kind(_flight(attempt=bad))
+    # a real int still counts honestly
+    assert {i["label"]: i["value"] for i in cards.decision_dossier(_flight(attempt=3), [])["items"]
+            }["rebuilt after conflicts"] == "2 times"
+
+
+def test_evidence_captured_means_STRUCTURED_evidence_only():
+    # Codex P1: #152 fail-closes to a bare "captured: none, reason unknown" string. Treating that as
+    # `captured=True` suppressed the honest-empty note and reported an ABSENCE of evidence as
+    # evidence. Only a structured (dict) capture counts; a bare string is still shown, but the card
+    # keeps saying no structured evidence was recorded.
+    d = cards.decision_dossier(_flight(), [
+        {"ts": 1, "act": "park", "id": "i7", "num": 7, "memo": "m",
+         "evidence": "captured: none, reason unknown"}])
+    assert d["captured"] is False
+    assert d["note"], "the honest-empty note must survive a fail-closed string"
+    assert d["items"][0]["value"] == "captured: none, reason unknown"   # still shown, not hidden
+
+    rich = cards.decision_dossier(_flight(), [
+        {"ts": 1, "act": "park", "id": "i7", "num": 7, "memo": "m", "evidence": {"reason": "x"}}])
+    assert rich["captured"] is True and rich["note"] is None
+
+
+def test_evidence_of_an_unexpected_shape_is_ignored_not_rendered_as_a_repr():
+    for junk in ([1, 2], 7, True, {}, ""):
+        d = cards.decision_dossier(_flight(), [
+            {"ts": 1, "act": "park", "id": "i7", "num": 7, "memo": "m", "evidence": junk}])
+        assert d["captured"] is False
+        assert all("[1, 2]" not in i["value"] for i in d["items"])
+
+
+def test_the_armed_drop_caption_is_the_servers_words():
+    # Codex P1 / design record B.1: the caption is a SEMANTIC (it names a destructive consequence),
+    # so it belongs server-side beside the label it warns about — not hard-coded in the JS where the
+    # two can drift. It names the UNIQUE target: repo AND number (issue #44 — Needs You is
+    # whole-field, so two repos can each carry a #7).
+    drop = [a for a in cards.decision_actions(_flight(), slug="will-titan/sandbox")
+            if a["act"] == "drop"][0]
+    cap = drop["armed_caption"]
+    assert "will-titan/sandbox" in cap and "#7" in cap
+    for phrase in ("for good", "never-mind", "not release"):
+        assert phrase in cap.lower()
+
+
+def test_the_armed_caption_is_absent_without_a_slug_never_a_half_named_target():
+    # No slug ⇒ no caption at all, rather than one naming an ambiguous target (issue #44's whole
+    # point). The card always has its slug; a caller that does not must not get a misleading warning.
+    drop = [a for a in cards.decision_actions(_flight()) if a["act"] == "drop"][0]
+    assert drop.get("armed_caption") is None
+
+
+def test_the_card_threads_its_slug_into_the_armed_caption():
+    card = cards.needs_you_card(_flight(), "will-titan/sandbox")
+    drop = [a for a in card["actions"] if a["act"] == "drop"][0]
+    assert "will-titan/sandbox" in drop["armed_caption"]

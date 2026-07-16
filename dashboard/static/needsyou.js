@@ -70,15 +70,19 @@
 
     // The armed (second-tap) Drop names its CONSEQUENCE in plain words (issue #44): drop CLOSES the
     // issue for good — "never-mind", the far pole from approve's "release to build". The caption
-    // rides ABOVE the actions so a mid-confirm Drop can never be mistaken for an Approve. It names
-    // the UNIQUE destructive target — repo AND number: Needs You is WHOLE-FIELD, so two repos can
-    // each carry a #7, and the number alone would not say which one closes (Codex review, issue #44).
+    // rides ABOVE the actions so a mid-confirm Drop can never be mistaken for an Approve. Its WORDS
+    // are the server's `armed_caption` (issue #162 / B.1) — a destructive consequence is a semantic,
+    // and hard-coding it here let it drift from the label it warns about. It names the UNIQUE
+    // destructive target — repo AND number: Needs You is WHOLE-FIELD, so two repos can each carry a
+    // #7, and the number alone would not say which one closes (Codex review, issue #44).
     // Plain visible text, no aria-live role: #root is rebuilt whole every 2s poll while the confirm
     // stays armed, so a live region would re-announce every tick (Codex review). It is never a browser
     // confirm() — the state survives that re-render (§4).
-    var dropConsequence = confirming
-      ? '<div class="drop-consequence">✕ Closes ' + esc(c.repo) + ' #' + esc(c.num) +
-        ' for good — never-mind, not release.</div>'
+    var armedAct = confirming
+      ? (c.actions || []).filter(function (a) { return a.destructive && a.armed_caption; })[0]
+      : null;
+    var dropConsequence = armedAct
+      ? '<div class="drop-consequence">' + esc(armedAct.armed_caption) + '</div>'
       : "";
 
     // Every button's LABEL, tone, order and consequence sentence come from the server (issue #162 /

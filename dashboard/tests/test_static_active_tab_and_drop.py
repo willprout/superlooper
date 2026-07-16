@@ -129,29 +129,38 @@ def test_shell_marks_only_the_active_tab_as_aria_current():
 # =============================== the drop confirm (states its consequence) ========================
 
 def _drop_consequence_branch(code):
-    """The STRING the confirming ternary builds for the .drop-consequence caption — the truthy arm of
-    ``dropConsequence = confirming ? <this> : ""``. Binding guards to this captured arm (not to the
+    """The STRING the armed ternary builds for the .drop-consequence caption — the truthy arm of
+    ``dropConsequence = armedAct ? <this> : ""``. Binding guards to this captured arm (not to the
     whole file) means a phrase moved out of the rendered caption fails the guard (Codex review)."""
-    m = re.search(r"dropConsequence\s*=\s*confirming\s*\?(.*?):\s*\"\"", code, re.S)
+    m = re.search(r"dropConsequence\s*=\s*armedAct\s*\?(.*?):\s*\"\"", code, re.S)
     return m.group(1) if m else ""
 
 
 def test_drop_confirm_names_the_consequence_in_plain_language():
     # The armed state must raise a plain-language consequence caption (a .drop-consequence element)
-    # built in the truthy branch of `confirming`, naming the meaning: drop CLOSES it for good —
-    # never-mind, NOT release (the far pole from approve). "Drop — tap again" alone named the gesture
-    # but not the meaning (issue #44). Bind to the CAPTURED branch, never to co-located prose.
+    # naming the meaning: drop CLOSES it for good — never-mind, NOT release (the far pole from
+    # approve). "Drop — tap again" alone named the gesture but not the meaning (issue #44).
+    #
+    # Issue #162 moved the caption's WORDS server-side (`armed_caption`): a destructive consequence
+    # is a semantic (design record B.1), and hard-coding it here let it drift from the label it warns
+    # about. So the wording — "for good" / "never-mind" / "not release", and the repo AND number that
+    # make the destructive target unique — is pinned in tests/test_cards
+    # (test_the_armed_drop_caption_is_the_servers_words). What this guard binds is that the JS still
+    # RENDERS that caption, in the armed branch, and never substitutes words of its own.
     branch = _drop_consequence_branch(_NEEDS_CODE)
-    assert branch, "needsyou.js must build a dropConsequence caption in the confirming branch (issue #44)"
-    assert "drop-consequence" in branch, "the confirming branch must render a .drop-consequence caption"
-    for phrase in ("for good", "never-mind", "not release"):
-        assert phrase in branch, (
-            "the drop consequence must say %r in plain words, in the rendered caption (issue #44)" % phrase)
-    # It names the UNIQUE destructive target — repo AND number. Needs You is whole-field, so two repos
-    # can each carry a #7; the number alone is ambiguous (Codex review, issue #44).
-    assert "c.num" in branch, "the consequence caption must name the issue number (issue #44)"
-    assert "c.repo" in branch, (
-        "the consequence caption must name the repo so the destructive target is unique (issue #44)")
+    assert branch, "needsyou.js must build a dropConsequence caption in the armed branch (issues #44/#162)"
+    assert "drop-consequence" in branch, "the armed branch must render a .drop-consequence caption"
+    assert "armed_caption" in branch, (
+        "the caption must be the SERVER's armed_caption, so it cannot drift from the label it warns "
+        "about (issues #44/#162)")
+    for invented in ("for good", "never-mind", "not release"):
+        assert invented not in branch, (
+            "the caption's words belong to the server now — %r must not be re-hard-coded here "
+            "(issue #162)" % invented)
+    # The armed caption is raised only by a verb the SERVER marked destructive — so a future
+    # destructive verb inherits the warning instead of being forgotten.
+    assert re.search(r"armedAct\s*=\s*confirming[\s\S]{0,160}a\.destructive", _NEEDS_CODE), (
+        "the armed caption must key off `confirming` AND the server's destructive flag (issue #162)")
 
 
 def test_drop_confirm_keeps_the_two_tap_gesture_and_survives_the_poll():
@@ -169,7 +178,10 @@ def test_drop_confirm_keeps_the_two_tap_gesture_and_survives_the_poll():
     assert re.search(r"armed\s*\?[^;]*armed_label", _NEEDS_CODE), (
         "the armed drop button must render the server's armed_label, which names the two-tap "
         "gesture ('tap again' — pinned in tests/test_cards) (issues #44/#162)")
-    assert 'data-act="' in _NEEDS_CODE, "the buttons must still fire their server-named data-act verb"
+    # Bind the BINDING, not the attribute name (Codex review): `data-act="` alone would still pass
+    # if every button were hard-coded to one verb — the drop would silently become an approve.
+    assert re.search(r'data-act="\'\s*\+\s*esc\(a\.act\)', _NEEDS_CODE), (
+        "each button's verb must be the server's a.act, never a hard-coded literal (issues #44/#162)")
     assert re.search(r"confirming\s*=\s*confirmingDrop\s*===\s*\(\s*c\.repo", _NEEDS_CODE), (
         "the confirming flag must still derive from the caller-threaded confirmingDrop === repo#num, "
         "so the poll re-render preserves a mid-confirm Drop (design record §4)")

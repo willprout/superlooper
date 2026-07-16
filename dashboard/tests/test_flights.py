@@ -1340,3 +1340,46 @@ def test_cap_arrivals_page_size_default_matches_the_solari_board():
     assert inspect.signature(flights.cap_arrivals).parameters["page_size"].default == 5
     assert inspect.signature(flights.cap_arrivals).parameters["max_pages"].default == 5
     assert inspect.signature(flights.cap_arrivals).parameters["max_age_days"].default == 3
+
+
+def test_a_settled_bounce_still_shows_its_own_memo_not_a_stale_park_memo():
+    # Codex cross-review P0 (issue #162). `_exec_bounce` REMOVES `state/blocked/<id>` and settles
+    # status to `bounced`, so once the bounce settles the marker holding the amendment is gone and
+    # the text survives only in the journal's `bounce` record. Reading only `park` records made a
+    # bounced card show an OLDER park's memo — the owner would read the wrong question entirely and
+    # accept an amendment he never saw. The most recent hand-back (park OR bounce) wins.
+    journal = [
+        {"ts": 100, "act": "park", "id": "i8", "num": 8, "memo": "old launch failed"},
+        {"ts": 200, "act": "reapprove", "id": "i8"},
+        {"ts": 300, "act": "bounce", "id": "i8", "num": 8,
+         "memo": "BOUNCED: the premise is gone. Proposed amendment: restyle."},
+    ]
+    f = flights.build_flight(
+        {"id": "i8", "num": 8, "status": "bounced", "branch": "sl/i8", "blocked": None,
+         "activity_mtime": None, "journal": journal},
+        {"now": 1000, "idle_seconds": 480, "freeze_seconds": 2700, "required_checks": []})
+    assert f["stage"] == flights.AWAITING
+    assert f["memo"] == "BOUNCED: the premise is gone. Proposed amendment: restyle."
+
+
+def test_a_live_bounce_marker_still_wins_over_the_journal():
+    # Before the bounce settles, the marker IS the freshest truth — unchanged behaviour.
+    journal = [{"ts": 300, "act": "bounce", "id": "i8", "num": 8, "memo": "the journal copy"}]
+    f = flights.build_flight(
+        {"id": "i8", "num": 8, "status": "blocked", "branch": "sl/i8",
+         "blocked": "BOUNCED: the marker copy", "activity_mtime": None, "journal": journal},
+        {"now": 1000, "idle_seconds": 480, "freeze_seconds": 2700, "required_checks": []})
+    assert f["memo"] == "BOUNCED: the marker copy"
+
+
+def test_a_park_after_a_bounce_still_wins():
+    # Ordering, not act-preference: whichever hand-back happened LAST is the one being answered.
+    journal = [
+        {"ts": 100, "act": "bounce", "id": "i8", "num": 8, "memo": "an old bounce"},
+        {"ts": 300, "act": "park", "id": "i8", "num": 8, "memo": "the current park reason"},
+    ]
+    f = flights.build_flight(
+        {"id": "i8", "num": 8, "status": "parked", "branch": "sl/i8", "blocked": None,
+         "activity_mtime": None, "journal": journal},
+        {"now": 1000, "idle_seconds": 480, "freeze_seconds": 2700, "required_checks": []})
+    assert f["memo"] == "the current park reason"

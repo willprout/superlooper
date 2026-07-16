@@ -69,7 +69,7 @@ def card_kind(flight):
     case, whatever its underlying stage — the go-around cap is the story that needs telling (§3).
     Otherwise: ``parked`` (the machine gave up), or an amber decision that is a ``bounced`` push-back
     or a plain ``needs-owner``."""
-    if flight.get("attempt", 1) >= 2:
+    if _attempt(flight) >= 2:
         return "conflict-cap"
     if flight.get("stage") == flights.PARKED:
         return "parked"
@@ -107,8 +107,8 @@ def _collision_sentence(flight):
     """The one plain sentence naming the collision on a conflict-cap card (§3: "names the collision
     in one plain sentence and offers reasoned choices, never a bare badge"). Built from real facts —
     the go-around count — so it never overclaims what happened."""
-    attempt = flight.get("attempt", 1)
-    go_arounds = max(0, attempt - 1)
+    attempt = _attempt(flight)
+    go_arounds = attempt - 1
     times = "once" if go_arounds == 1 else "%d times" % go_arounds
     return ("%s kept colliding with work that landed first — rebuilt %s, %d attempts used, and it "
             "still couldn't merge cleanly." % (flight.get("label") or ("SL-%s" % flight.get("num")),
@@ -125,30 +125,47 @@ _NO_EVIDENCE = ("The runner recorded no structured evidence for this decision �
                 "everything the journal carries.")
 
 
-def _last_park_record(journal_slice):
-    """The park record this hand-back came from — the last one wins, exactly as ``_flight_memo``
-    picks the memo, so the dossier and the memo can never describe different parks."""
+def _last_handback_record(journal_slice):
+    """The hand-back record this decision came from — the LAST ``park`` or ``bounce``, exactly as
+    ``flights._flight_memo`` picks the memo, so the dossier and the memo always describe the SAME
+    hand-back. Selecting only parks let a settled bounce show an older park's evidence beside the
+    bounce's own memo — two decisions presented as one (Codex cross-review, issue #162)."""
     found = None
     for r in journal_slice or []:
-        if isinstance(r, dict) and r.get("act") == "park":
+        if isinstance(r, dict) and r.get("act") in flights.HANDBACK_ACTS:
             found = r
     return found
 
 
-def _evidence_items(park):
-    """The structured evidence the runner captured (issue #152), as ordered label/value rows.
+def _evidence_items(rec):
+    """The evidence the runner captured (issue #152) on this hand-back, as ordered label/value rows,
+    plus whether that capture was STRUCTURED.
 
-    #152 is the producer and has not landed on every path, so this reads DEFENSIVELY: a dict becomes
-    one row per field (insertion order — the runner writes cause-first), a bare string becomes a
-    single row (that issue's own fail-closed ``"captured: none, reason unknown"`` shape), and
-    anything else is ignored rather than rendered as Python repr at the owner.
+    #152 is the producer and has not landed on every path, so this reads DEFENSIVELY. A dict is a
+    real structured capture: one row per field (insertion order — the runner writes cause-first). A
+    bare string is that issue's own fail-closed ``"captured: none, reason unknown"`` shape — it is
+    SHOWN, but it is the report of an absence, not evidence, so it does not count as captured
+    (Codex cross-review: counting it suppressed the honest-empty note and dressed "we saw nothing"
+    up as something the machine saw). Anything else is ignored rather than rendered as a Python
+    repr at the owner.
     """
-    ev = park.get("evidence") if isinstance(park, dict) else None
+    ev = rec.get("evidence") if isinstance(rec, dict) else None
     if isinstance(ev, dict):
-        return [{"label": str(k), "value": _plain(v)} for k, v in ev.items() if _plain(v)]
+        rows = [{"label": str(k), "value": _plain(v)} for k, v in ev.items() if _plain(v)]
+        return rows, bool(rows)
     if isinstance(ev, str) and ev.strip():
-        return [{"label": "captured", "value": ev.strip()}]
-    return []
+        return [{"label": "captured", "value": ev.strip()}], False
+    return [], False
+
+
+def _attempt(flight):
+    """This flight's attempt count, fail-closed to 1. ``build_flight`` normalizes it, but this layer
+    is pure over an arbitrary dict and one malformed flight must never blank the owner's whole inbox
+    (Codex cross-review, issue #162). A bool is not a count; NaN/inf and non-ints are not counts."""
+    a = flight.get("attempt", 1)
+    if isinstance(a, bool) or not isinstance(a, int):
+        return 1
+    return a if a >= 1 else 1
 
 
 def _plain(v):
@@ -172,15 +189,18 @@ def decision_dossier(flight, journal_slice):
     at the hand-back, and the go-around count — so the card is useful today and richer the moment
     #152 lands.
     """
-    park = _last_park_record(journal_slice) or {}
-    items = _evidence_items(park)
-    captured = bool(items)
+    rec = _last_handback_record(journal_slice) or {}
+    items, captured = _evidence_items(rec)
 
-    # The runner's own episode key. It is usually the memo verbatim (``park()`` defaults cause=memo),
-    # and echoing the memo back under a second heading is noise — so it appears only when it differs.
-    cause = park.get("cause")
-    if isinstance(cause, str) and cause.strip() and cause.strip() != (flight.get("memo") or "").strip():
-        items.append({"label": "recorded cause", "value": cause.strip()})
+    # The runner's own episode key — a terse machine classification (`answerer_escalated`,
+    # `checks_pending`, `launch_delivery`). It is usually the memo verbatim (``park()`` defaults
+    # cause=memo), and on a bounce it is the literal "bounce" — which the BOUNCED badge already says.
+    # Echoing either back under a heading is noise, so a key that only repeats the memo or names its
+    # own act is dropped; a key that classifies something the memo does not is real evidence.
+    cause = rec.get("cause")
+    cause = cause.strip() if isinstance(cause, str) else ""
+    if cause and cause != (flight.get("memo") or "").strip() and cause != rec.get("act"):
+        items.append({"label": "recorded cause", "value": cause})
 
     # What the gate READ at the hand-back, under the four real check names (§3). Only the checks that
     # were RED are evidence — a green check explains nothing about why this stopped.
@@ -189,7 +209,7 @@ def decision_dossier(flight, journal_slice):
     if red:
         items.append({"label": "gate at hand-back", "value": "not yet: " + ", ".join(red)})
 
-    go_arounds = max(0, flight.get("attempt", 1) - 1)
+    go_arounds = _attempt(flight) - 1
     if go_arounds:
         items.append({"label": "rebuilt after conflicts",
                       "value": "%d time%s" % (go_arounds, "" if go_arounds == 1 else "s")})
@@ -209,17 +229,24 @@ def decision_dossier(flight, journal_slice):
 # verb (resume-at-the-gate vs rebuild-from-scratch); until that lands, these labels name what the
 # engine REALLY does today, because a label that flatters is worse than no label.
 
-_DISCARDS = ("The runner discards this issue's worktree and filed report, zeroes its attempt "
-             "counters, and starts a fresh session from the issue.")
+# Conditional, because a hand-back can happen BEFORE any work exists: a `needs_william` park can be
+# raised at approval time (a missing `touches:` declaration, say), where there is no worktree and no
+# report to throw away. `_exec_reapprove` removes them IF PRESENT — so the sentence says "any",
+# never asserting work exists (Codex cross-review, issue #162). What it must never soften is the
+# warning itself: nothing is resumed, and anything already built is not kept.
+_DISCARDS = ("Any worktree and filed report this issue already has are discarded — nothing is "
+             "resumed — its attempt counters are zeroed, and a fresh session starts from the issue.")
 
 
-def decision_actions(flight):
+def decision_actions(flight, slug=None):
     """The ordered buttons for a waiting flight, each naming its consequence (issue #162).
 
-    Each item is ``{act, label, consequence, tone, destructive}`` — plus ``armed_label`` on the one
-    destructive verb, whose second tap the client arms. ``act`` is the wire verb the server's
-    executor already knows; the client binds these strings and derives none of them (design record
-    B.1), so the card and the drawer can never drift apart or drift from the engine.
+    Each item is ``{act, label, consequence, tone, destructive}`` — plus ``armed_label`` and
+    ``armed_caption`` on a destructive verb, whose second tap the client arms. ``act`` is the wire
+    verb the server's executor already knows; the client binds these strings and derives none of
+    them (design record B.1), so the card and the drawer can never drift apart or drift from the
+    engine. ``slug`` names the destructive verb's unique target in its caption; without one the
+    caption is omitted rather than naming an ambiguous target (issue #44).
     """
     kind = card_kind(flight)
     bounced = flight.get("awaiting_reason") == "bounced" or kind == "bounced"
@@ -234,8 +261,14 @@ def decision_actions(flight):
                               + _DISCARDS}
     yes.update({"tone": "ghost" if kind == "conflict-cap" else "primary", "destructive": False})
 
+    # The armed caption is a SEMANTIC — it names a destructive consequence — so it lives here beside
+    # the label it warns about, never hard-coded in the JS where the two could drift (B.1 / Codex
+    # cross-review). It names the UNIQUE target, repo AND number: Needs You is whole-field, so two
+    # repos can each carry a #7 and the number alone would not say which one closes (issue #44).
     drop = {"act": "drop", "label": "Drop — closes the issue for good",
             "armed_label": "Tap again to close #%s for good" % num,
+            "armed_caption": ("✕ Closes %s #%s for good — never-mind, not release." % (slug, num)
+                              if slug else None),
             "consequence": "Closes the issue on GitHub with your audit comment. This is never-mind, "
                            "not release — nothing gets built.",
             "tone": "ghost", "destructive": True}
@@ -274,7 +307,7 @@ def needs_you_card(flight, slug, journal_slice=None):
         "memo": flight.get("memo"),
         "issue_url": "%s/%s/issues/%s" % (_GH, slug, flight.get("num")),
         "dossier": decision_dossier(flight, journal_slice or []),
-        "actions": decision_actions(flight),
+        "actions": decision_actions(flight, slug=slug),
         "collision": _collision_sentence(flight) if is_conflict else None,
         # Discuss is the highlighted default ONLY on the conflict-cap card — everywhere else Approve
         # leads. This is the §8 guard against a blind Approve press on a collision card.
@@ -406,6 +439,6 @@ def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, oper
         "cargo": _cargo(flight),
         "journal": journal,
         "decision": decision,
-        "attempt": flight.get("attempt", 1),
-        "go_arounds": max(0, flight.get("attempt", 1) - 1),
+        "attempt": _attempt(flight),
+        "go_arounds": _attempt(flight) - 1,
     }
