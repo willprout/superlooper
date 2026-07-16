@@ -55,7 +55,11 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["ship_cmd"] is None and cfg["ship_recheck_cmd"] is None
     assert cfg["report_required_sections"] == ["Tests", "Review"]   # issue #57: web-agnostic default
     assert cfg["bright_lines"] == []
-    assert cfg["models"] == {"worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": None}
+    # reviewer/reviewer_effort (issue #158): the cross-reviewer's pin. Unlike worker_effort (null =
+    # no flag), BOTH default to concrete non-null values so the review is NEVER invoked bare and
+    # never inherits the machine-global ~/.codex/config.toml — the 2026-07-14→15 incident's root cause.
+    assert cfg["models"] == {"worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": None,
+                             "reviewer": "gpt-5.5", "reviewer_effort": "medium"}
     assert cfg["session"] == {"idle_seconds": 480, "freeze_seconds": 2700,
                               "retry_cap": 2, "conflict_cap": 2, "checks_pending_cap": 10800}
     assert cfg["qa"] == {"nightly_cmd": None, "results_glob": None, "retry_once": True,
@@ -179,6 +183,45 @@ def test_worker_effort_default_is_null_and_settable(tmp_path):
     cfg = config.load(tmp_path)
     assert cfg["models"]["worker_effort"] == "high"
     assert cfg["models"]["worker"] == "opus[1m]" and cfg["models"]["answerer"] == "opus[1m]"
+
+
+def test_reviewer_model_and_effort_default_and_settable(tmp_path):
+    # issue #158: the cross-reviewer's model + reasoning-effort are pinned per repo so a review can
+    # never silently inherit the owner's machine-global Codex config (the incident that aged workers
+    # past the freeze threshold). The shipped defaults are concrete (a codex model + a bounded effort),
+    # and a repo overrides either without wiping the sibling model defaults (deep-merge).
+    _write_cfg(tmp_path, {"repo": "a/b"})
+    cfg = config.load(tmp_path)
+    assert cfg["models"]["reviewer"] == "gpt-5.5"
+    assert cfg["models"]["reviewer_effort"] == "medium"
+    _write_cfg(tmp_path, {"repo": "a/b",
+                          "models": {"reviewer": "o4-mini", "reviewer_effort": "high"}})
+    cfg = config.load(tmp_path)
+    assert cfg["models"]["reviewer"] == "o4-mini"
+    assert cfg["models"]["reviewer_effort"] == "high"
+    assert cfg["models"]["worker"] == "opus[1m]" and cfg["models"]["answerer"] == "opus[1m]"
+
+
+def test_reviewer_must_be_a_nonempty_string(tmp_path):
+    # Unlike worker_effort, reviewer has NO valid null: a null model would omit `-m` and let codex
+    # read the machine-global model — exactly the ambient-poison the pin exists to end. So null/blank
+    # fails loud at load, like worker/answerer.
+    for bad in (None, "", "   ", 5):
+        _write_cfg(tmp_path, {"repo": "a/b", "models": {"reviewer": bad}})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "models.reviewer" in str(e.value)
+
+
+def test_reviewer_effort_must_be_a_nonempty_string(tmp_path):
+    # reviewer_effort ALSO forbids null (the key difference from worker_effort): a null effort would
+    # omit `-c model_reasoning_effort=` and let codex read the machine-global effort — the ultra-effort
+    # timeout that started the 2026-07-14→15 incident. Only a concrete, pinned effort is accepted.
+    for bad in (None, "", "\t", 3):
+        _write_cfg(tmp_path, {"repo": "a/b", "models": {"reviewer_effort": bad}})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "models.reviewer_effort" in str(e.value)
 
 
 def test_deep_merge_keeps_sibling_nested_defaults(tmp_path):
