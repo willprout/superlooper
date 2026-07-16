@@ -4313,6 +4313,19 @@ def test_boot_migration_skips_on_a_refused_label_read(rig):
     assert _alert(rig) is None
 
 
+def test_boot_migration_skips_on_a_wrong_typed_label_read(rig, monkeypatch):
+    # cross-review P1: _apply_boot_migrations is contract-bound to NEVER raise, so a wrong-TYPED
+    # read (a non-ReadHealth stub / a future adapter regression returning None or a bare object)
+    # must fail CLOSED to a SKIP — it must not raise on `.ok`/`.value` and crash the boot. A read
+    # anomaly is indistinguishable from a refused read: skip, never mutate off garbage, never wedge.
+    for bad in (None, object(), {"ok": True}):
+        (rig.fixdir / "mutations.jsonl").unlink(missing_ok=True)
+        monkeypatch.setattr(runner_mod.gh, "labels_health", lambda *a, **k: bad)
+        assert rig.r._apply_boot_migrations(now=NOW) is True
+        assert not [m for m in mutations(rig) if m["kind"] in ("create_label", "rename_label")]
+        assert _alert(rig) is None
+
+
 def test_boot_migration_holds_when_a_create_fails(rig):
     # a migration that cannot be applied HOLDS: a legible systemic hold (state/ALERT naming the
     # migration) + a migration_hold journal record, rather than booting into a repo where the

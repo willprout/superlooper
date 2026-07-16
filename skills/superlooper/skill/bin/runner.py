@@ -711,14 +711,22 @@ class Runner:
         import labels as labels_lib
         import config as config_lib
         now = time.time() if now is None else now
+        # Read the label set inside the guard AND extract ok/value DEFENSIVELY (getattr, not
+        # attribute access): a wrong-TYPED read — a non-ReadHealth stub, a future adapter regression
+        # returning None/a dict — must fail CLOSED to a SKIP, never raise past here. This method's
+        # "never raises" contract is what protects the boot, and a read anomaly is indistinguishable
+        # from a refused read: skip (the #92 refused-vs-answered-empty discipline — never wedge a
+        # restart on a blip, and never read garbage as "every label missing" and mutate off it).
         try:
             health = gh.labels_health()
-        except Exception as e:                 # labels_health never raises by contract; fail OPEN
+            ok = bool(getattr(health, "ok", False))
+            value = getattr(health, "value", None)
+        except Exception as e:                 # labels_health never raises by contract; belt + braces
             self._log(f"boot migration: label read errored, skipped: {_short_repr(e)}")
             return True
-        if not health.ok:
-            return True                        # refused/transient read -> skip; never block a restart
-        plan = labels_lib.label_migration_plan(health.value)
+        if not ok:
+            return True                        # refused/transient/wrong-typed read -> skip
+        plan = labels_lib.label_migration_plan(value)
         if not plan:
             return True                        # already applied -> a true no-op boot
         op = config_lib.operator(self.config)
