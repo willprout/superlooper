@@ -2261,7 +2261,11 @@ class Runner:
                                   env=self._worker_env(iid),
                                   timeout=LAUNCH_TIMEOUT)
             if rc == 0:
-                self._update_issue(iid, {"status": "running", "launch_evidence": None})
+                # Clear BOTH stale launch fields together (#152): they are set together on failure
+                # and name the same event, so a verified delivery must not leave one behind to
+                # disagree with the other in a later, unrelated park memo.
+                self._update_issue(iid, {"status": "running", "launch_error": None,
+                                         "launch_evidence": None})
                 self._delivery_cleared()               # a verified delivery proves the anchor is live (#24)
                 return "ok"
             ev = self._evidence("launch", rc, tier=tier)
@@ -2608,11 +2612,16 @@ class Runner:
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,
-                                     "update_head_oid": None, "nudged": []})
+                                     "update_head_oid": None, "nudged": [],
+                                     "launch_error": None, "launch_evidence": None})
             self._delivery_cleared()                   # a verified delivery proves the anchor is live (#24)
             return "ok"
-        self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
-        return f"conflict-session launch rc={rc}"
+        # This launch failure is journaled too, so it carries evidence like every other (#152), and
+        # stamps it beside the counter — the same contract _exec_launch/_exec_recover follow.
+        ev = self._evidence("launch", rc)
+        self._update_issue(iid, {"launch_evidence": ev},
+                           fn=lambda st, i: self._bump(i, "launch_failures"))
+        return self._failed("launch", rc, f"conflict-session launch rc={rc}", ev=ev)
 
     def _exec_close_investigate(self, a, now):
         iid, num = a["id"], a.get("num")

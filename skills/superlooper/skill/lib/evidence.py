@@ -174,9 +174,16 @@ def build(kind, rc, captured, **extra):
     screen snippet). When it is empty/None/wrong-typed the field falls back to CAPTURED_NONE —
     fail-closed to an honest admission rather than an absent field. The output always survives
     validate(); that pairing is what makes an evidence-free failure record unwritable.
+
+    Per-surface SIZING happens at the point of capture — nudge-pane.sh bounds the screen to
+    SCREEN_SNIPPET_MAX, ScriptRC bounds a launch stderr to STDERR_TAIL_MAX — and build applies only
+    the uniform final SAFETY cap. It must NOT re-bound tighter: bound() keeps the TAIL, and a nudge
+    refusal puts its `state=<verdict>` line FIRST (the one carrier of which of rc=3's five screen
+    verdicts fired — menu/trust/permission/quota/unknown, all one `reason`), so a tighter tail-cut
+    on a large screen would silently drop the verdict, re-creating the i160 "defer nobody could
+    re-classify" it exists to end (fresh-review P1). STDERR_TAIL_MAX clears the whole composite.
     """
-    limit = SCREEN_SNIPPET_MAX if kind == "nudge" else STDERR_TAIL_MAX
-    text = bound(captured, limit=limit)
+    text = bound(captured, limit=STDERR_TAIL_MAX)
     reason, detail = _classify(kind, rc, text)
     rec = {"kind": str(kind), "rc": rc, "reason": reason, "detail": detail,
            "captured": text or CAPTURED_NONE}

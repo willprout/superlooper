@@ -85,6 +85,20 @@ def test_build_bounds_the_captured_text_itself():
     assert len(rec["captured"]) <= evidence.STDERR_TAIL_MAX + 1
 
 
+def test_a_large_nudge_screen_keeps_the_verdict_line_the_rc_cannot_carry():
+    """rc=3 maps to ONE reason for five screen verdicts (menu/trust/permission/quota/unknown); the
+    only carrier of WHICH is the `state=` line nudge-pane.sh prints FIRST. bound() keeps the tail,
+    so a big screen must not push the verdict off the front of the record — the i160 case: the
+    ambiguous defer nobody could re-classify afterwards (fresh-review P1)."""
+    composite = ("[nudge] i5 state=quota_blocked — Codex pane is usage/quota blocked — deferring\n"
+                 "[nudge] i5 screen (bounded tail — what the verdict was read from):\n"
+                 + "busy filler line of screen text\n" * 30)          # > SCREEN_SNIPPET_MAX
+    assert len(composite) > evidence.SCREEN_SNIPPET_MAX
+    rec = evidence.build("nudge", rc=3, captured=composite)
+    assert "state=quota_blocked" in rec["captured"]                   # the verdict survived
+    assert len(rec["captured"]) <= evidence.STDERR_TAIL_MAX + 1       # still bounded
+
+
 # ---------------------------------------------------------------- launch classification
 
 def test_the_storm_names_the_dead_anchor_and_never_the_shim():

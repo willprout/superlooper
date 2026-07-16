@@ -4103,3 +4103,30 @@ def test_a_successful_outcome_journals_no_evidence_field(rig):
     rig.r.tick(now=NOW)
     rig.calls.clear()
     assert "evidence" not in _exec_and_journal(rig, _launch_action())
+
+
+def test_a_failed_conflict_session_launch_journals_evidence(rig):
+    """The preserve-path conflict resolver relaunches a worker; its launch failure is journaled too,
+    so it must carry evidence like every other non-success outcome (fresh-review P2)."""
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i123", status="gating", branch="sl/i123-x", update_result="conflict")
+    rig.rc_queue.append(runner_mod.ScriptRC(1, _STORM_STDERR.replace("i101", "i123")))
+    ev = _exec_and_journal(rig, {"act": "resolve_conflict", "id": "i123", "num": 123,
+                                 "pr": 5})["evidence"]
+    assert ev["reason"] == "anchor_workspace_missing"
+    assert issue_state(rig, "i123")["launch_evidence"]["reason"] == "anchor_workspace_missing"
+
+
+def test_a_recovered_relaunch_clears_both_stale_launch_fields(rig):
+    """launch_error and launch_evidence are set together on failure and name the same event, so a
+    verified relaunch delivery must clear BOTH — a survivor would disagree with the other in a later
+    park memo (fresh-review P2)."""
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="running", launch_error="base_missing",
+               launch_evidence={"kind": "launch", "rc": 3, "reason": "base_missing",
+                                "detail": "d", "captured": "old"})
+    (rig.home / "state" / "exited" / "i101").write_text("1 rc=?")
+    rig.calls.clear()                                # rc_queue empty -> rc 0 (verified delivery)
+    rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
+    ist = issue_state(rig, "i101")
+    assert ist["launch_error"] is None and ist["launch_evidence"] is None
