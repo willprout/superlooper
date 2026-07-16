@@ -1858,13 +1858,19 @@ class Runner:
     def _exec_recover(self, a, now):
         iid, tier = a["id"], a.get("tier")
         if tier == "exited":
+            # The eligibility-hold episode ends when the GATE PASSES, not when the launch lands —
+            # decide only emits recover after start_ok, so by here the hold is already over. Clear
+            # the stamp BEFORE the attempt, exactly as _exec_launch does (fresh-agent review P2-2):
+            # clearing it only on a verified delivery left a failed relaunch wearing a stale "waiting
+            # on #101" against blockers that had since closed, AND silenced the next episode's
+            # journal — decide dedups on this stamp, so a genuinely new hold whose reason still
+            # matched it never spoke.
+            self._update_issue(iid, {"launch_hold_reason": None})
             rc = self._run_script([self._script("launch-session.sh"), iid],
                                   env=self._worker_env(iid),
                                   timeout=LAUNCH_TIMEOUT)
             if rc == 0:
-                # launch_hold_reason: a relaunch that DELIVERS ends the eligibility-hold episode, so
-                # the board never shows "waiting on #101" against a session that is running (#150).
-                self._update_issue(iid, {"status": "running", "launch_hold_reason": None})
+                self._update_issue(iid, {"status": "running"})
                 self._delivery_cleared()               # a verified delivery proves the anchor is live (#24)
                 return "ok"
             self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))
@@ -2129,12 +2135,14 @@ class Runner:
         # first, else this relaunch can't take the singleton and (status stays 'gating') retries
         # forever. Only reached with a report present, so the recorded pane is a finished session.
         self._close_stale_session(iid)
+        # The eligibility-hold episode ended when start_ok passed, not when this launch lands — clear
+        # the stamp before the attempt, as _exec_launch/_exec_recover do (review P2-2, #150).
+        self._update_issue(iid, {"launch_hold_reason": None})
         rc = self._run_script([self._script("launch-session.sh"), iid],
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,
-                                     "update_head_oid": None, "nudged": [],
-                                     "launch_hold_reason": None})   # the hold episode ends (#150)
+                                     "update_head_oid": None, "nudged": []})
             self._delivery_cleared()                   # a verified delivery proves the anchor is live (#24)
             return "ok"
         self._update_issue(iid, fn=lambda st, i: self._bump(i, "launch_failures"))

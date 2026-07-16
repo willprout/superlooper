@@ -414,10 +414,16 @@ def _launch_gate_reason(p, closed_nums, usage):
     deps = p.get("blocked_by") if isinstance(p.get("blocked_by"), list) else []
     open_deps = [d for d in deps if d not in closed_nums]
     if open_deps:
-        return ("its `blocked-by` is no longer satisfied: "
+        # Says "not confirmed closed", never "still open" (fresh-agent review P2-1). gh's closed-list
+        # read fails CLOSED to an empty set, and `probe` (rate_limit) is exempt from throttling — so
+        # a THROTTLED poll still stamps the view fresh while every dependency reads as unmet. The
+        # refusal to launch is right either way (a fresh launch does the same, and it self-heals on
+        # the next clean read), but the loop must not durably stamp the board and the journal with a
+        # closure state it did not actually observe — the refused≠empty trap of #21/#61/#78/#92/#108.
+        return ("its `blocked-by` is not satisfied in the latest GitHub read: "
                 + ", ".join("#%s" % d for d in open_deps)
-                + " still open. The restart waits for the dependency to close — a recovery never "
-                  "carries a session past a blocker a fresh launch would respect.")
+                + " not confirmed closed. The restart waits for the dependency to close — a recovery "
+                  "never carries a session past a blocker a fresh launch would respect.")
     return "the launch gate refused this start (no single condition named)"
 
 
