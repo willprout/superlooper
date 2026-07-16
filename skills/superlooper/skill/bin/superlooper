@@ -54,6 +54,10 @@ import gh
 import gitops
 import issues as issues_lib
 import janitor as janitor_lib
+# The §C.2 label set + the runner-managed subset live in a shared lib module (issue #160) so the
+# CLI's adopt/doctor and the runner's boot migration build on ONE source of truth. Re-exported here
+# by name so existing callers (and the unit tests that import them off this module) keep resolving.
+from labels import LABELS, missing_runner_labels, runner_managed_labels
 import journal
 import ledger as ledger_lib
 import loopstate
@@ -71,72 +75,13 @@ _TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
 _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"   # SL_CMUX overrides (tests)
 _CLOSE_TIMEOUT = 15            # bound the best-effort close of a finished session's pane
 
-# The §C.2 label set, colors included so a fresh repo reads well at a glance. adopt creates
-# all of them idempotently (--force). Runner-managed labels say so — humans learn the loop's
-# vocabulary from the label descriptions. `{operator}` in a description is substituted with the
-# configured operator name at adopt time (issue #58), so a stranger's own labels sign their name.
-LABELS = [
-    ("agent-ready", "0e8a16", "{operator}'s approval: the runner may launch this issue"),
-    ("in-progress", "fbca04", "claimed by a loop session (runner-managed)"),
-    ("needs-owner", "d93f0b", "parked for an owner decision (runner-managed)"),
-    ("parked", "c2e0c6", "handed back to {operator} with a memo (runner-managed)"),
-    ("expedite", "b60205", "queue-bypass lane: the next free lane takes this first"),
-    ("preserve", "5319e7", "on a PR: resolve conflicts in-branch instead of regenerating"),
-    ("auto-approved:nightly-red", "e99695",
-     "standing rule: auto-filed fix for a red nightly/dev (scoped to restoring green)"),
-    ("superseded", "cccccc", "on a PR: replaced by a rebuild; branch preserved, nothing auto-closed"),
-    ("priority:high", "ff9500", "front of the normal queue"),
-    ("priority:low", "0075ca", "back of the queue"),
-    ("type:build", "1d76db", "build issue"),
-    ("type:investigate", "6f42c1", "investigation issue (report + children, no PR)"),
-    ("type:diagnose-and-fix", "0052cc", "diagnose-and-fix issue (scope check first)"),
-    # Per-issue control knobs (owner ruling 2026-07-07): William drops one on an issue to run its
-    # worker sessions on a specific model/effort. gh refuses to apply a label that doesn't exist, so
-    # these are a STARTER set — the runner has no allowlist, so any `model:<x>`/`effort:<x>` label
-    # you create and apply works (an unknown value fails the launch loudly and parks the issue).
-    ("model:opus", "0366d6", "per-issue worker model: latest Opus (~200K context)"),
-    ("model:opus[1m]", "0366d6", "per-issue worker model: latest Opus + 1M context"),
-    ("model:fable", "0366d6", "per-issue worker model: Fable"),
-    ("model:sonnet", "0366d6", "per-issue worker model: latest Sonnet"),
-    ("effort:low", "8256d0", "per-issue worker effort: low"),
-    ("effort:medium", "8256d0", "per-issue worker effort: medium"),
-    ("effort:high", "8256d0", "per-issue worker effort: high"),
-    ("effort:xhigh", "8256d0", "per-issue worker effort: xhigh"),
-    ("effort:max", "8256d0", "per-issue worker effort: max"),
-]
-
-
-# Runner-managed label preflight (issue #108). RATIONALE — FAIL LOUD, never auto-create:
-# `in-progress` / `needs-owner` / `parked` are the labels the RUNNER itself ADDS as machinery when
-# it hands an issue back to the owner (park/bounce) or claims one (launch). `gh` refuses to apply a
-# label that does not exist, so if one is missing every hand-back label move FAILS and — before
-# issue #108's bounce/park guards — retried FOREVER (the 2026-07-13 storm: #58 renamed
-# needs-william->needs-owner inside adopt, nobody re-ran adopt after the republish, and the bounce
-# executor re-fired the owner text every ~18s until the label was hand-created). `doctor` checks the
-# whole label set, but nothing forces a doctor run after a republish, so the runner must defend
-# itself at boot. It FAILS LOUD (returns nonzero, naming the label + the exact `superlooper adopt`
-# remediation) rather than auto-creating the labels: `adopt` is the sole label-mutation authority
-# (see CLAUDE.md ▸ the adopt/doctor split and "facts enter through the config contract") — a boot
-# that silently created labels would fork that authority and mask a broken adoption — and refusing
-# to start in a broken state mirrors the established boot-preflight discipline (preflight_pane, the
-# FAILS-HARD-when-empty required_checks check, issue #104's missing-config start-up error). The
-# runner-managed SUBSET is derived from the "(runner-managed)" tag in each LABELS description, so
-# LABELS stays the single source of truth. (`agent-ready` is the owner's word, not runner-managed,
-# and `superseded` is best-effort — regenerate proceeds even if its add fails — so neither storms.)
-
-
-def runner_managed_labels():
-    """The runner-managed subset of LABELS — the labels the RUNNER writes as machinery, tagged
-    '(runner-managed)' in their descriptions (in-progress, needs-owner, parked)."""
-    return [name for name, _color, desc in LABELS if "(runner-managed)" in desc]
-
-
-def missing_runner_labels(existing):
-    """The runner-managed labels ABSENT from `existing` (a set/list of label names), in LABELS
-    order. Fails closed on a wrong-typed `existing` (treats it as empty -> every one missing), so a
-    garbage gh read never masquerades as 'all present'."""
-    have = set(existing) if isinstance(existing, (set, list, tuple, frozenset)) else set()
-    return [n for n in runner_managed_labels() if n not in have]
+# The §C.2 label set (LABELS) and the runner-managed subset (runner_managed_labels /
+# missing_runner_labels) now live in lib/labels.py and are imported above. They moved there for
+# issue #160: the runner's boot migration self-heals a missing runner-managed label by CREATING it
+# at boot, and it cannot import this extensionless CLI script — so the label vocabulary lives in a
+# pure lib module both build on. `adopt` still owns creating + verifying the WHOLE set; the runner
+# only self-heals the runner-managed subset (`in-progress` / `needs-owner` / `parked`), the labels
+# the RUNNER writes as machinery whose absence storms (issue #108 / the 2026-07-13 bounce storm).
 
 _CHECKS_REQUIREMENT = (
     "REQUIREMENT: `required_checks` must name at least one CI check that runs this repo's\n"
@@ -281,27 +226,14 @@ def cmd_run(args):
               "automatically (no --pane needed). Only pass --pane / $SL_PANE to override.",
               file=sys.stderr)
         return 2
-    # Runner-managed label preflight (issue #108 — rationale in the LABELS section above): the
-    # runner MOVES needs-owner/parked/in-progress as machinery; if one is missing it cannot hand
-    # issues back, so refuse to start and NAME the fix. But a transient blip at boot must NEVER block
-    # a restart, so this fails loud ONLY on a POSITIVE proof of absence — a CLEAN, well-typed label
-    # read (`labels_health().ok`) that genuinely lacks a runner-managed label. A refused read fails
-    # closed to an empty set (ok=False) and SKIPS the check, exactly like an unreachable gh. This is
-    # the #92 refused-vs-answered-empty discipline: `gh api rate_limit` (probe) is EXEMPT from rate
-    # limiting, so it reads OK while the core label read is throttled — reading that throttled-empty
-    # as "every label missing" would wedge the boot during the very rate-limit window it must survive.
-    labels = gh.labels_health()
-    if labels.ok:
-        missing = missing_runner_labels(labels.value)
-        if missing:
-            print(f"FATAL: runner-managed label(s) missing from {cfg.get('repo')}: "
-                  f"{', '.join(missing)}", file=sys.stderr)
-            print("These are how the runner hands issues back (park/bounce) and claims them "
-                  "(launch); gh refuses to apply a label that doesn't exist, so every hand-back "
-                  "would fail and retry. Create them (adopt is idempotent — it updates existing "
-                  f"labels in place, never duplicates):\n  superlooper adopt --repo {args.repo}",
-                  file=sys.stderr)
-            return 2
+    # Runner-managed label migration + every other pending per-repo migration is applied INSIDE
+    # run() at boot (issue #160, extending #108's direction): the runner CREATES a missing
+    # runner-managed label — an already-approved, already-installed migration step, not new code
+    # execution — instead of #108's fail-loud refusal, and it applies the #58 needs-william ->
+    # needs-owner rename. It HOLDS with a legible systemic hold + one notification only if a
+    # migration cannot be applied, rather than letting the loop run against an un-migrated repo and
+    # storm a failing write every tick. It lives in run() (after the singleton is won) so only the
+    # LIVE runner ever mutates labels — a duplicate/preflight-failing start never does.
     return r.run(max_ticks=args.ticks)
 
 

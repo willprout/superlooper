@@ -4250,3 +4250,106 @@ def test_a_recovered_relaunch_clears_both_stale_launch_fields(rig):
     rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
     ist = issue_state(rig, "i101")
     assert ist["launch_error"] is None and ist["launch_evidence"] is None
+
+
+# --------------------------- boot migrations (issue #160) ---------------------------
+# The runner applies pending per-repo migrations (runner-managed labels, the #58 rename) at boot,
+# idempotently — closing the merged+installed -> applied gap that caused the 2026-07-13 bounce
+# storm — and HOLDS with a legible systemic hold if one cannot be applied, rather than booting into
+# an un-migrated repo where a failing label write storms every tick.
+
+def _set_repo_labels(rig, names):
+    (rig.fixdir / "label_list.json").write_text(json.dumps([{"name": n} for n in names]))
+
+
+def _fail_gh(rig, match, times=9):
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps([{"match": match, "times": times}]))
+
+
+def _alert(rig):
+    p = rig.home / "state" / "ALERT"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def test_boot_creates_a_missing_runner_managed_label(rig):
+    # a repo missing a runner-managed label has it CREATED at boot (issue #160), not #108's
+    # fail-loud refusal — an already-installed migration step, applied idempotently (--force).
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "parked"])       # needs-owner MISSING
+    assert rig.r._apply_boot_migrations(now=NOW) is True
+    created = [m for m in mutations(rig) if m["kind"] == "create_label"]
+    assert [m["name"] for m in created] == ["needs-owner"]
+    assert created[0]["force"] is True                                    # idempotent create-or-update
+    assert _alert(rig) is None                                            # success -> no hold
+
+
+def test_boot_migration_applies_the_needs_william_rename(rig):
+    # the 2026-07-13 storm's exact repo shape: still carries the OLD needs-william and lacks the NEW
+    # needs-owner. Boot renames IN PLACE (preserving every issue that carries it) and does NOT then
+    # also create needs-owner (the rename already produced it).
+    _set_repo_labels(rig, ["agent-ready", "needs-william", "in-progress", "parked"])
+    assert rig.r._apply_boot_migrations(now=NOW) is True
+    muts = mutations(rig)
+    assert [m for m in muts if m["kind"] == "rename_label"] == \
+        [{"kind": "rename_label", "old": "needs-william", "new": "needs-owner"}]
+    assert not [m for m in muts if m["kind"] == "create_label" and m["name"] == "needs-owner"]
+
+
+def test_boot_migration_is_a_noop_when_already_applied(rig):
+    # the default fixture already carries every runner-managed label -> empty plan, zero writes,
+    # no hold. Re-applying an already-applied migration is a true no-op (idempotency).
+    assert rig.r._apply_boot_migrations(now=NOW) is True
+    assert not [m for m in mutations(rig) if m["kind"] in ("create_label", "rename_label")]
+    assert _alert(rig) is None
+
+
+def test_boot_migration_skips_on_a_refused_label_read(rig):
+    # a transient boot-time gh blip must NEVER block a restart: a REFUSED label read (ok=False)
+    # SKIPS every migration and proceeds, exactly like #108 (the #92 refused-vs-answered-empty
+    # class). No create attempted, no hold — the loop's own poll then marks the view stale + waits.
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "parked"])       # needs-owner missing...
+    _fail_gh(rig, "label list")                                           # ...but the READ is refused
+    assert rig.r._apply_boot_migrations(now=NOW) is True
+    assert not [m for m in mutations(rig) if m["kind"] == "create_label"]
+    assert _alert(rig) is None
+
+
+def test_boot_migration_holds_when_a_create_fails(rig):
+    # a migration that cannot be applied HOLDS: a legible systemic hold (state/ALERT naming the
+    # migration) + a migration_hold journal record, rather than booting into a repo where the
+    # failing write would storm every tick.
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "parked"])       # needs-owner missing
+    _fail_gh(rig, "label create")                                         # and its create fails
+    assert rig.r._apply_boot_migrations(now=NOW) is False
+    alert = _alert(rig)
+    assert alert is not None
+    assert any("migration_hold" in r and "needs-owner" in r for r in alert["reasons"])
+    assert any(rec.get("act") == "migration_hold" for rec in journal.read(str(rig.home)))
+
+
+def test_boot_migration_that_raises_holds_and_notifies_once_not_a_storm(rig, monkeypatch):
+    # THE issue #160 DoD case: a migration that RAISES produces a HOLD, not a per-tick storm.
+    # Booting is held, so the loop NEVER ticks (no heartbeat) and the owner is notified exactly
+    # ONCE — never the ~15-text storm a failing per-tick write produces.
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "parked"])       # needs-owner missing
+    def boom(*a, **k):
+        raise RuntimeError("gh create_label exploded")
+    monkeypatch.setattr(runner_mod.gh, "create_label", boom)
+    import notify as notify_mod
+    sent = []
+    monkeypatch.setattr(notify_mod, "send", lambda *a, **k: sent.append(a) or "sent")
+    rc = rig.r.run(max_ticks=5, sleep=lambda s: None)
+    assert rc == 2                                                        # a boot fault, not a clean 0
+    assert not (rig.home / "state" / "runner.heartbeat").exists()         # the loop NEVER ticked
+    assert len(sent) == 1                                                 # ONE notification, not per-tick
+    assert _alert(rig) is not None                                        # the legible systemic hold
+
+
+def test_a_recovered_migration_lets_a_clean_tick_clear_the_hold(rig):
+    # the reuse of state/ALERT self-heals on recovery: a boot whose migration now succeeds runs the
+    # loop, and the first clean tick's decide reclaims ALERT from its OWN reasons — which never
+    # include a migration_hold code — so a stale migration hold does not survive a healthy tick.
+    loopstate.save(str(rig.home / "state" / "ALERT"),
+                   {"reasons": ["migration_hold:create:needs-owner"], "since": NOW - 100})
+    rig.r.tick(now=NOW)
+    alert = _alert(rig)
+    assert alert is None or not any("migration_hold" in r for r in alert.get("reasons", []))

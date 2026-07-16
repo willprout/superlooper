@@ -678,6 +678,109 @@ class Runner:
         except OSError as e:
             self._log(f"state_format stamp skipped: {_short_repr(e)}")
 
+    # ------------------------- boot migrations (issue #160) -------------------------
+
+    def _apply_boot_migrations(self, now=None):
+        """Apply pending per-repo migrations idempotently at boot, so a migration that has merged +
+        installed never sits UNAPPLIED until a human remembers to re-run `adopt`. Returns True if
+        the boot may proceed to the tick loop; False if a migration could NOT be applied and the
+        boot is HELD (see _hold_boot_migration) — which is what stops the loop running against an
+        un-migrated repo and STORMING a failing write every tick.
+
+        The 2026-07-13 bounce storm (~15 texts) is the exact gap this closes: the #58
+        needs-william -> needs-owner label rename had merged INTO adopt, but the repo was never
+        re-adopted after the republish, so every bounce label-move wrote a needs-owner that did not
+        exist, failed, and re-notified every ~18s. A merged, owner-approved, already-installed
+        migration step is not new code execution — the runner self-heals the merged -> applied gap.
+
+        Two boot migrations, both idempotent:
+          * state-format stamp — _stamp_state_format(), run just above in run(); always re-applied.
+          * runner-managed LABEL migrations — this method: the #58 rename + creating any missing
+            runner-managed label (in-progress / needs-owner / parked). This EXTENDS #108's boot
+            preflight from a fail-loud refusal to a self-heal (owner ruling, issue #160), keeping
+            #108's read-health discipline: a REFUSED label read SKIPS every migration and proceeds,
+            so a transient boot-time gh blip can never wedge a restart (the #92 refused-vs-answered-
+            empty class); the loop's own poll then marks the view stale and simply waits, and
+            doctor/adopt stay the backstop until a boot whose label read lands.
+
+        Reached ONLY by the LIVE runner (run() calls it after the singleton is won), so a duplicate
+        or preflight-failing start never mutates labels — the same discipline _stamp_state_format
+        documents. Never raises: a migration STEP that raises is caught and held exactly like one
+        that returns failure, and an unexpected read error fails OPEN to a skip (a framework bug
+        must never brick the runner out of ever starting)."""
+        import labels as labels_lib
+        import config as config_lib
+        now = time.time() if now is None else now
+        try:
+            health = gh.labels_health()
+        except Exception as e:                 # labels_health never raises by contract; fail OPEN
+            self._log(f"boot migration: label read errored, skipped: {_short_repr(e)}")
+            return True
+        if not health.ok:
+            return True                        # refused/transient read -> skip; never block a restart
+        plan = labels_lib.label_migration_plan(health.value)
+        if not plan:
+            return True                        # already applied -> a true no-op boot
+        op = config_lib.operator(self.config)
+        failures = []
+        for step in plan:
+            label = (f"{step.get('old')}->{step.get('new')}" if step.get("kind") == "rename"
+                     else step.get("name"))
+            try:
+                if step["kind"] == "rename":
+                    ok = gh.rename_label(step["old"], step["new"])
+                else:
+                    spec = labels_lib.label_spec(step["name"])
+                    ok = bool(spec) and gh.create_label(
+                        step["name"], spec[0], spec[1].replace("{operator}", op))
+            except Exception as e:             # a migration that RAISES holds, exactly like one
+                ok = False                     # that returns failure — never let it escape into run()
+                self._log(f"boot migration {step.get('kind')} {label} raised: {_short_repr(e)}")
+            try:
+                journal.append(self.home, {"act": "migration", "kind": step.get("kind"),
+                                           "label": label, "ok": bool(ok)}, now)
+            except Exception:
+                pass
+            if not ok:
+                failures.append((step.get("kind"), label))
+        if failures:
+            self._hold_boot_migration(failures, now)
+            return False
+        return True
+
+    def _hold_boot_migration(self, failures, now):
+        """Hold the boot on a migration that could not be applied (issue #160): write the LEGIBLE
+        systemic hold (state/ALERT — the surface `status` and the dashboard already render) and
+        notify ONCE, after which run() refuses to enter the tick loop. Holding the BOOT (not
+        ticking at all) is what makes 'not a per-tick storm' structural: the loop never runs, so the
+        failing label write is never retried — and re-notified — every tick.
+
+        Reuses state/ALERT on purpose: it is THE systemic-hold surface, and the reuse self-heals on
+        recovery. A later restart re-applies the migration; if it lands, the loop runs and the first
+        clean tick's decide reclaims ALERT from its OWN reasons — which never include a
+        migration_hold code — so a recovered migration clears this hold with no extra bookkeeping.
+        Every side effect is guarded: a hold must REPORT the fault, never raise."""
+        reasons = sorted("migration_hold:%s:%s" % (kind or "?", label) for kind, label in failures)
+        named = ", ".join(label for _kind, label in failures)
+        try:
+            loopstate.save(os.path.join(self.state, "ALERT"), {"reasons": reasons, "since": now})
+        except Exception as e:
+            self._log(f"migration hold ALERT write failed: {_short_repr(e)}")
+        try:
+            journal.append(self.home, {"act": "migration_hold", "reasons": reasons}, now)
+        except Exception:
+            pass
+        try:
+            import notify
+            notify.send(self.config, "superlooper HELD — a repo migration could not be applied",
+                        f"a pending per-repo migration failed to apply at boot ({named}); the loop "
+                        "is HELD rather than running against an un-migrated repo and storming a "
+                        "failing write every tick. Check gh auth / re-run `superlooper adopt` "
+                        "(idempotent), then restart the runner.")
+        except Exception:
+            pass
+        self._log(f"BOOT HELD: migration could not be applied: {named}")
+
     def _view_path(self):
         return os.path.join(self.state, "gh_view.json")
 
@@ -746,6 +849,15 @@ class Runner:
         signal.signal(signal.SIGINT, self._handle_signal)
         ticks = 0
         try:
+            # Apply pending per-repo migrations before the first tick (issue #160). Inside the try
+            # so a HELD boot still releases the singleton + clears the anchor via the finally below;
+            # a hold refuses the tick loop rather than let it storm a failing write against an
+            # un-migrated repo. run() returns 2 (a boot fault, like the pane preflight), not 0.
+            if not self._apply_boot_migrations():
+                print("BOOT HELD: a pending per-repo migration could not be applied — see the "
+                      "ALERT and the notification. Fix it (check gh auth / re-run `superlooper "
+                      "adopt`, both idempotent) and restart the runner.", file=sys.stderr)
+                return 2
             while not self.stop and (max_ticks is None or ticks < max_ticks):
                 try:
                     self.tick()

@@ -1049,20 +1049,39 @@ def test_missing_runner_labels_pure():
     assert set(sl.missing_runner_labels("garbage")) == {"in-progress", "needs-owner", "parked"}
 
 
-def test_run_fails_loud_when_a_runner_managed_label_is_missing(rig):
-    # the 2026-07-13 incident: `needs-owner` did not exist, so every bounce/park label move retried
-    # forever. The runner defends itself at boot — FAIL LOUD, naming the label AND the exact adopt
-    # remediation, rather than boot into a repo where it cannot hand issues back.
+def test_run_creates_a_missing_runner_managed_label_at_boot(rig):
+    # issue #160 (extends #108): the 2026-07-13 incident was `needs-owner` not existing, so every
+    # bounce/park label move retried forever. The runner now SELF-HEALS at boot — it CREATES the
+    # missing runner-managed label (an already-installed migration step, applied idempotently) —
+    # instead of #108's fail-loud refusal, then boots and ticks normally.
     (rig.fixdir / "label_list.json").write_text(json.dumps(
         [{"name": n} for n in ALL_LABELS if n != "needs-owner"]))
     r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
             env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    created = {m["name"] for m in mutations(rig) if m["kind"] == "create_label"}
+    assert "needs-owner" in created                        # the missing label was created at boot
+    # it booted and made progress: a heartbeat is written
+    assert (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+
+
+def test_run_holds_when_a_boot_migration_cannot_apply(rig):
+    # issue #160: a migration that cannot be applied HOLDS the boot rather than storming. The
+    # needs-owner create is forced to fail, so the runner refuses the tick loop (no heartbeat) and
+    # writes a legible systemic hold (state/ALERT naming the migration) — one signal, not a per-tick
+    # storm of failing writes.
+    (rig.fixdir / "label_list.json").write_text(json.dumps(
+        [{"name": n} for n in ALL_LABELS if n != "needs-owner"]))
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "label create", "times": 9}]))
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
     assert r.returncode != 0, r.stdout + r.stderr
-    out = r.stdout + r.stderr
-    assert "needs-owner" in out                            # names the missing label
-    assert "adopt" in out and str(rig.repo) in out         # names the exact remediation
-    # it never started: no heartbeat written
-    assert not (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+    assert "HELD" in (r.stdout + r.stderr)                 # names the hold
+    home = rig.tmp / "slhome" / "o__r"
+    assert not (home / "state" / "runner.heartbeat").exists()   # the loop never ticked
+    alert = json.loads((home / "state" / "ALERT").read_text())
+    assert any("migration_hold" in x and "needs-owner" in x for x in alert["reasons"])
 
 
 def test_run_boots_when_all_runner_managed_labels_present(rig):
