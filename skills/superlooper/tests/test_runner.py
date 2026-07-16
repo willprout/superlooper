@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 import evidence
+import events
 import issues
 import journal
 import loopstate
@@ -1243,6 +1244,125 @@ def test_wake_gap_holds_the_usage_stale_alert_then_rearms_if_still_dark(rig):
     rig.r.tick(now=big + runner_mod.WAKE_GRACE_SECONDS + 1)    # past the wake grace, meter still dark
     alert = json.loads((rig.home / "state" / "ALERT").read_text())
     assert alert["reasons"] == ["usage_stale"]                # a genuinely dark meter re-arms
+
+
+# --------------------------- the progress-stall probe ladder (#157) ---------------------------
+
+def _probe_calls(rig):
+    return [c for c in rig.calls if c["args"][0].endswith("nudge-pane.sh")
+            and "PROGRESS PROBE" in c["args"][3]]
+
+
+def test_exec_probe_delivers_a_machine_readable_ask_and_stamps_bookkeeping(rig):
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    out = rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 1}, NOW)
+    assert out == "ok"
+    msg = _probe_calls(rig)[-1]["args"][3]
+    assert "PROGRESS PROBE" in msg and "state/ack/i5" in msg               # names the ack FILE path
+    for state in ("DONE", "WORKING", "WAITING", "STUCK"):
+        assert state in msg                                                # the four machine states
+    st = issue_state(rig, "i5")
+    assert st["probe_attempts"] == 1 and st["probe_sent_at"] == NOW
+    assert st["probe_nonce"] and str(int(NOW)) in st["probe_nonce"]
+    assert st["probe_nonce"] in msg                                        # the SAME nonce is demanded
+
+
+def test_exec_probe_counts_the_attempt_even_when_delivery_defers(rig):
+    # The bookkeeping is stamped BEFORE the send, so a probe that DEFERS (rc 3, an unreadable pane)
+    # still counts toward the cap — the ladder escalates; it never loops because a send kept failing.
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    rig.rc_queue.append(3)
+    rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 1}, NOW)
+    assert issue_state(rig, "i5")["probe_attempts"] == 1
+
+
+def test_exec_probe_marks_a_no_pane_lane_exited(rig):
+    # A running lane whose progress clock is live but whose pane marker is gone must NOT no-op: that
+    # would leave decide re-emitting a probe every tick forever (never advancing the cap). Mirror
+    # the frozen tier — mark it exited for relaunch — so the ladder stays bounded.
+    seed_issue(rig, "i5", status="running")
+    out = rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 1}, NOW)
+    assert (rig.home / "state" / "exited" / "i5").exists()
+    assert _probe_calls(rig) == []                              # nothing typed at a paneless lane
+
+
+def test_exec_probe_marks_a_dead_pane_exited(rig):
+    # rc 4 = the Claude process is gone; the safe-send primitive refuses to type. The probe must
+    # mark the lane exited for relaunch, exactly as the frozen recover does — never type into it.
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    rig.rc_queue.append(4)
+    rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 1}, NOW)
+    assert (rig.home / "state" / "exited" / "i5").exists()
+
+
+def test_exec_progress_advance_anchors_and_resets_the_episode_on_change(rig):
+    seed_issue(rig, "i5", status="running", progress_sig="OLD", progress_since=NOW - 100000,
+               probe_attempts=2, probe_nonce="n2", probe_sent_at=NOW - 500)
+    (rig.home / "state" / "ack").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "ack" / "i5").write_text("WORKING n2")
+    rig.r._execute({"act": "progress_advance", "id": "i5", "sig": "NEW"}, NOW)
+    st = issue_state(rig, "i5")
+    assert st["progress_sig"] == "NEW" and st["progress_since"] == NOW
+    assert st["probe_attempts"] == 0 and st["probe_nonce"] is None
+    assert not (rig.home / "state" / "ack" / "i5").exists()      # stale ack cleared on a new episode
+
+
+def test_exec_progress_advance_repairs_since_without_clobbering_probes(rig):
+    # Same sig (a corrupt-since repair, NOT real progress): re-stamp the clock but KEEP the probe
+    # episode — a mere repair must not silently reset an in-flight escalation.
+    seed_issue(rig, "i5", status="running", progress_sig="S", progress_since="junk",
+               probe_attempts=2, probe_nonce="n2")
+    (rig.home / "state" / "ack").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "ack" / "i5").write_text("WORKING n2")
+    rig.r._execute({"act": "progress_advance", "id": "i5", "sig": "S"}, NOW)
+    st = issue_state(rig, "i5")
+    assert st["progress_since"] == NOW and st["probe_attempts"] == 2
+    assert (rig.home / "state" / "ack" / "i5").exists()          # ack NOT cleared on a mere repair
+
+
+def test_relaunch_resets_the_progress_clock(rig):
+    # A relaunch is a fresh episode: stale progress bookkeeping from the dead session must clear, or
+    # the first tick after relaunch would immediately look stalled and re-probe a healthy new lane.
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", progress_sig="OLD", progress_since=NOW - 100000,
+               probe_attempts=3, probe_nonce="n3", probe_sent_at=NOW - 400)
+    out = rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
+    assert out == "ok"
+    st = issue_state(rig, "i101")
+    assert st["progress_sig"] is None and st["progress_since"] is None
+    assert (st.get("probe_attempts") or 0) == 0 and st["probe_nonce"] is None
+
+
+def test_progress_stall_ladder_probes_then_parks_end_to_end(rig):
+    # THE real drive: a running lane whose progress clock is FROZEN every tick but whose activity is
+    # FRESH every tick (it is taking turns — the i328 shape). The old idle nudge looped forever; the
+    # ladder must deliver a BOUNDED number of machine-readable probes, then park with a dossier.
+    st_clock = {"id": "i5", "ts": NOW, "cwd": "/w", "head": "abc123def456789",
+                "dirty": False, "report": False, "blocked": False}
+    sig = events.progress_signature(st_clock)
+    seed_issue(rig, "i5", status="running", progress_sig=sig, progress_since=NOW - 100000)
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "status").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "status" / "i5.json").write_text(json.dumps(st_clock))
+
+    now, parked = NOW, False
+    for _ in range(12):                       # bounded: this MUST terminate in a park
+        _activity(rig, "i5", now)             # fresh every tick: the session is taking turns
+        rig.r.tick(now=now)
+        if issue_state(rig, "i5")["status"] in ("parked", "needs_william"):
+            parked = True
+            break
+        now += 300
+    assert parked, "the ladder never parked — it looped (the i328 bug)"
+    calls = _probe_calls(rig)
+    assert 1 <= len(calls) <= 3               # bounded probes, never an infinite nudge loop
+    msg = calls[0]["args"][3]
+    assert "state/ack/i5" in msg and "nonce" in msg.lower()      # machine-readable, not prose-only
+    # the dossier reached GitHub as a park comment
+    assert any(m["kind"] == "comment" and "progress" in m["body"].lower() for m in mutations(rig))
 
 
 def test_hire_answerer_env_brief_and_record(rig):

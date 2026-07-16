@@ -110,6 +110,15 @@ USAGE_FAIL_OPEN_GRACE_SECONDS = 1800
 GH_ALERT_FAILURES = 10             # consecutive failed poll cycles (~15 min at 90 s) -> ALERT
 ANSWERER_TIMEOUT_SECONDS = 900     # the answerer's 15-min freeze tier = its timeout
 RECOVER_RETRY_SECONDS = 600        # frozen-session recovery ladder re-fires at most every 10 min
+# The bounded probe ladder (issue #157), keyed on the PROGRESS clock, not activity staleness. A lane
+# that takes turns but makes no commit/marker/HEAD change for PROGRESS_STALL_SECONDS is probed for a
+# machine-readable ack, at most PROBE_CAP times spaced PROBE_RETRY_SECONDS apart, then escalated to a
+# classified park. Total stall->park is bounded (~STALL + (CAP-1)*RETRY), never the i328 infinite
+# nudge loop; a lane that makes ANY real progress resets the episode and is never parked. Config
+# overrides live under session.* (progress_stall_seconds / probe_retry_seconds / probe_cap).
+PROGRESS_STALL_SECONDS = 900       # no commit/marker/HEAD change (turns still taken) this long -> probe
+PROBE_RETRY_SECONDS = 300          # min spacing between probes within one progress-stall episode
+PROBE_CAP = 3                      # probes per episode before a classified progress-stall park
 # How long a session may sit at its OWN in-window question before the owner is told (issue #151).
 # A lane at a dialog is never parked — it is alive — but it must not be SILENT either: the loop's
 # channel for "worker needs input" is state/blocked/<id> -> hire_answerer, and an in-window
@@ -271,6 +280,26 @@ def _launch_stderr_memo(tail):
     if len(t) > LAUNCH_STDERR_MEMO_MAX:
         t = "…" + t[-LAUNCH_STDERR_MEMO_MAX:]
     return "\n\nlaunch stderr (tail — the agent's own error just before it exited):\n" + t
+
+
+def _progress_stall_memo(iid, clock, stall_secs, attempts, ack_state):
+    """The dossier for a progress-stall park (issue #157). Names the evidence William reads instead
+    of an unbounded nudge loop: how long the progress clock has been frozen, the frozen HEAD, how
+    many probes went unanswered-or-lied-to, and the worker's OWN last self-report. Fail-open on
+    wrong-typed inputs (never raise into a park)."""
+    head = clock.get("head") if isinstance(clock, dict) else None
+    head_s = head[:12] if isinstance(head, str) and head else "unknown"
+    mins = int(stall_secs // 60) if isinstance(stall_secs, (int, float)) else 0
+    n = attempts if type(attempts) is int and attempts >= 0 else 0
+    said = {
+        "DONE": "the worker acked DONE, but produced no report/PR the loop can see",
+        "WORKING": "the worker acked WORKING, but the progress clock disagrees (the i328 shape)",
+        "WAITING": "the worker acked WAITING on background work — verify it is real, not a stall",
+        "STUCK": "the worker acked STUCK and asked for help",
+    }.get(ack_state, "the worker never answered a probe with a valid ack")
+    return (f"{iid}: progress-stall park (issue #157). No new commit/marker/HEAD change for "
+            f"~{mins} min (HEAD {head_s}) across {n} probe(s) — {said}. The lane took turns without "
+            f"progressing, so it was escalated instead of nudged forever (the i328 infinite loop).")
 
 
 def _captured_addendum(ev):
@@ -619,6 +648,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     operator = _config.operator(cfg)          # the owner name every hand-back memo/notify uses (#58)
     session = _dget(cfg, "session", dict)
     retry_cap = _count(session.get("retry_cap"), 2)
+    progress_stall_secs = _count(session.get("progress_stall_seconds"), PROGRESS_STALL_SECONDS)
+    probe_retry_secs = _count(session.get("probe_retry_seconds"), PROBE_RETRY_SECONDS)
+    probe_cap = _count(session.get("probe_cap"), PROBE_CAP)
     dev_branch = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
 
     plist = parsed_issues if isinstance(parsed_issues, list) else []
@@ -643,6 +675,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     answers = _dget(dsk, "answers", dict)
     exited = _dget(dsk, "exited", dict)
     launch_stderr = _dget(dsk, "launch_stderr", dict)   # {id: bounded stderr tail} (issue #40)
+    status_clocks = _dget(dsk, "status_clocks", dict)   # {id: parsed status.json} — the #157 progress clock
+    acks = _dget(dsk, "acks", dict)                      # {id: raw ack text} — the worker's probe reply
+    awaiting = _dget(dsk, "awaiting", dict)              # {id: marker} — worker flagged long background work
     frozen = dsk.get("frozen") if isinstance(dsk.get("frozen"), dict) else None
     alert_on_disk = dsk.get("alert") if isinstance(dsk.get("alert"), dict) else None
     raw_locks = dsk.get("live_lock_ids")
@@ -1405,7 +1440,60 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 if now - last_rec >= RECOVER_RETRY_SECONDS:
                     out.append({"act": "recover", "id": iid, "tier": "frozen"})
             continue
-        if iid in idle_ids:
+
+        # ---- progress-stall probe ladder (issue #157): keyed on the PROGRESS clock, not activity ----
+        # THE i328 fix. The idle peek below keys on activity_mtime, which the nudge itself refreshes —
+        # so it could never escalate (8 nudges ~497s apart, forever). This tier keys on
+        # state/status/<id>.json (HEAD + the report/blocked markers), which move ONLY on real
+        # progress and are immune to a probe or its ack. A lane making progress re-anchors and is
+        # NEVER parked; a lane taking turns without progressing is probed a BOUNDED number of times
+        # (each demanding a machine-readable ack file), then escalated with a dossier. The frozen
+        # tier above already claimed dead/frozen lanes, so a lane reaching here is ALIVE (taking
+        # turns) — "turns taken but no progress" is exactly what this measures.
+        clock = status_clocks.get(iid)
+        cur_sig = events_mod.progress_signature(clock)
+        have_clock = cur_sig is not None
+        if have_clock and status in INFLIGHT_STATUSES and not in_wake_grace and iid not in awaiting:
+            since = ist.get("progress_since")
+            if ist.get("progress_sig") != cur_sig or not _since_ok(since, now):
+                # first sight / real progress / a corrupt clock: re-anchor and (on a genuine change)
+                # reset the episode. The executor clears the probe counters ONLY when the signature
+                # actually changed, so a mere since-repair never drops an in-flight escalation.
+                out.append({"act": "progress_advance", "id": iid, "sig": cur_sig})
+                continue
+            if now - since >= progress_stall_secs:
+                # STALLED: turns taken, no commit/marker/HEAD change for the whole window.
+                nonce = ist.get("probe_nonce")
+                ack_state = events_mod.parse_ack(acks.get(iid), nonce) if isinstance(nonce, str) else None
+                attempts, attempts_corrupt = _counter(ist, "probe_attempts")
+                if attempts_corrupt:
+                    # A wrong-typed probe counter means the cap can't be trusted — fail CLOSED to a
+                    # park (the same discipline retries/merge_refusals/answerer_failures hold), never
+                    # re-read it as 0 and re-probe (that is the fail-OPEN-on-wrong-typed defect class).
+                    park(iid, num, f"{iid}: progress-stall park (issue #157) — the probe-attempt "
+                                   f"counter is unreadable (corrupt state), so the bounded ladder "
+                                   f"cannot be trusted; parking for review.", cause="progress_stall")
+                    continue
+                if ack_state == "STUCK" or (type(probe_cap) is int and attempts >= probe_cap):
+                    # cap exhausted, OR the worker explicitly asked for help: escalate to a
+                    # classified park with a dossier — never an infinite loop, never a false park of
+                    # a lane still making progress (a progressing lane re-anchored above). STUCK /
+                    # WAITING reach the OWNER (a live worker needing a human); a silent or
+                    # WORKING-lying lane goes to the parked queue for review.
+                    memo = _progress_stall_memo(iid, clock, now - since, attempts, ack_state)
+                    park(iid, num, memo, needs_william=ack_state in ("STUCK", "WAITING"),
+                         cause="progress_stall")
+                else:
+                    last_probe = ist.get("probe_sent_at")
+                    if not _real(last_probe) or now - last_probe >= probe_retry_secs:
+                        out.append({"act": "probe", "id": iid, "num": num, "attempt": attempts + 1})
+                continue                                    # a stalled lane is fully handled here
+            # progress fresh: fall through to label reconciliation; the idle fallback below is gated
+            # on `not have_clock`, so a clock-bearing lane is never nudged on activity staleness.
+        if iid in idle_ids and not have_clock:
+            # fallback ONLY when there is no progress clock (an install/session that never stamped
+            # state/status/<id>.json — the pre-#148 shape, or a hook that failed): the old activity
+            # peek, degraded-but-safe. A clock-bearing lane is handled by the tier above instead.
             out.append({"act": "recover", "id": iid, "tier": "idle"})
             continue
 
