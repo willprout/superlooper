@@ -26,6 +26,7 @@ None — the watchdog launched nothing.
 ## Gate health
 - Nightly: no runs recorded in the last 7 days.
 - Quarantine: 1 test(s). Accepted known failures: 0.
+- Notify channel: not verified this cycle (no canary recorded).
 
 ## Freeze state
 Merges flowing.

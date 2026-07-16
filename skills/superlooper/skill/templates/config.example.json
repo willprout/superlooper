@@ -32,6 +32,7 @@
   "janitor": { "aged_park_days": 14 },
   "watchdog": { "authority": "full", "allowlist": [], "grace_minutes": 30,
                 "heartbeat_stale_minutes": 20, "no_progress_minutes": 30 },
-  "notify": { "imessage_to": null, "cmd": null },
+  "notify": { "imessage_to": null, "cmd": null,
+              "quiet_hours": { "start": "21:00", "end": "08:00" } },
   "report_time": "08:45"
 }

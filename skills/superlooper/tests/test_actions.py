@@ -3331,3 +3331,120 @@ def test_a_dialog_alert_needs_a_real_stamp_and_a_live_lane():
                                "issues": {"i5": ist(status, sensed_state="at_dialog",
                                                     sensed_since=NOW - 99999)}})
         assert only(decide(dsk=d), "alert") == [], status
+
+
+# ============ night-batching: routine owner decisions don't page at night (issue #164) ============
+# The founding standard: nobody answers a 3am page and a park is a safe state. So a routine
+# owner-DECISION hand-back (park / bounce / durable question) is BATCHED to the morning report
+# during quiet hours instead of pushed; only SYSTEMIC-STOP alerts (runner/auth dead, whole queue
+# stalled) keep paging. Quiet hours default on (21:00–08:00); an explicit `null` disables them.
+
+
+def _recheck_park_dsk(local_hhmm):
+    # recheck_failed is the cleanest routine needs-owner park: it fires before any gate re-run and
+    # needs no GitHub/PR view — exactly the "I can't proceed without your decision" class this issue
+    # is about. (needs_william=True, cause="recheck".)
+    return disk(local_hhmm=local_hhmm,
+                issues_state={"version": 1, "issues": {"i5": ist("running", recheck_failed=True)}})
+
+
+def test_routine_needs_owner_park_does_not_push_at_night():
+    out = decide(dsk=_recheck_park_dsk("23:30"))
+    parks = only(out, "park")
+    assert len(parks) == 1 and parks[0]["id"] == "i5" and parks[0]["needs_william"] is True
+    assert not has_notify(out), "a routine owner-decision park must NOT page at night"
+
+
+def test_the_same_park_during_the_day_still_pushes_immediately():
+    out = decide(dsk=_recheck_park_dsk("12:00"))
+    assert len(only(out, "park")) == 1
+    assert has_notify(out), "during the day the owner is awake — the park pages promptly"
+
+
+def test_park_early_morning_boundary_pushes_after_quiet_hours_end():
+    # end is EXCLUSIVE: 08:00 is already daytime, so the park pages (and appears in the 08:45 report).
+    assert has_notify(decide(dsk=_recheck_park_dsk("08:00")))
+    assert not has_notify(decide(dsk=_recheck_park_dsk("07:59")))
+
+
+def test_bounce_does_not_push_at_night_but_still_hands_back():
+    dsk = disk(local_hhmm="02:00",
+               blocked={"i7": "BOUNCED: already fixed on dev; propose closing"},
+               issues_state={"version": 1, "issues": {"i7": ist("running")}})
+    out = decide(dsk=dsk)
+    assert len(only(out, "bounce")) == 1, "the bounce (hand-back) still fires — only the page is held"
+    assert not has_notify(out)
+
+
+def test_bounce_during_the_day_pushes():
+    dsk = disk(local_hhmm="14:00",
+               blocked={"i7": "BOUNCED: already fixed on dev; propose closing"},
+               issues_state={"version": 1, "issues": {"i7": ist("running")}})
+    out = decide(dsk=dsk)
+    assert len(only(out, "bounce")) == 1 and has_notify(out)
+
+
+def test_owner_question_does_not_push_at_night_but_is_posted_durably():
+    dsk = disk(local_hhmm="03:15",
+               blocked={"i7": "QUESTION: approach A or B?\nRECOMMENDATION: A"},
+               issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
+    out = decide(dsk=dsk)
+    assert len(only(out, "post_question")) == 1, "the question is still posted durably to GitHub"
+    assert not has_notify(out), "but the owner is not paged at 3am — it batches to the report"
+
+
+def test_owner_question_during_the_day_pushes():
+    dsk = disk(local_hhmm="10:00",
+               blocked={"i7": "QUESTION: approach A or B?\nRECOMMENDATION: A"},
+               issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
+    out = decide(dsk=dsk)
+    assert len(only(out, "post_question")) == 1 and has_notify(out)
+
+
+def test_systemic_stop_alert_still_pages_at_3am():
+    # dead account auth with a spend pending is a SYSTEMIC stop — nothing can run — so it MUST keep
+    # paging even in the dead of night. The safety layer is never quieted.
+    dsk = disk(local_hhmm="03:00", auth_probe={"valid": False},
+               issues_state={"version": 1, "issues": {"i5": ist(None)}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    alerts = only(out, "alert")
+    assert alerts and "auth_dead" in alerts[0]["reasons"]
+    assert has_notify(out), "a systemic stop pages regardless of the hour"
+
+
+def test_quiet_hours_null_restores_the_old_always_push_behaviour():
+    out = decide(config=cfg(notify={"imessage_to": None, "cmd": None, "quiet_hours": None}),
+                 dsk=_recheck_park_dsk("23:30"))
+    assert len(only(out, "park")) == 1 and has_notify(out), "explicit null disables night-batching"
+
+
+def test_park_at_night_still_journals_and_lands_in_the_morning_report():
+    # The end-to-end DoD assertion: a routine needs-owner park at night does NOT page AND does appear
+    # in the morning report. We drive decide() for the (silent) park, journal exactly that action the
+    # way the runner does (adds outcome + ts), then render the report from it.
+    import report
+    out = decide(dsk=_recheck_park_dsk("23:30"))
+    park = only(out, "park")[0]
+    assert not has_notify(out)                              # no 3am page
+    record = dict(park, outcome="ok", ts=NOW)               # what runner._journal_outcome persists
+    md = report.morning([record], {"date": "2026-07-02", "now": NOW + 10}, ledger={},
+                        config={"repo": "o/r"})
+    parked_section = md.split("## Parked / needs-owner")[1].split("\n## ")[0]
+    assert "#5" in parked_section and "needs-owner" in parked_section.lower()
+
+
+def test_quiet_hours_helper_windows_and_disable():
+    q = {"start": "21:00", "end": "08:00"}                  # wraps midnight (the night window)
+    assert actions._in_quiet_hours("23:30", q) and actions._in_quiet_hours("02:00", q)
+    assert actions._in_quiet_hours("21:00", q)              # start inclusive
+    assert not actions._in_quiet_hours("08:00", q)          # end exclusive
+    assert not actions._in_quiet_hours("12:00", q)
+    day = {"start": "09:00", "end": "17:00"}                # same-day window (no wrap)
+    assert actions._in_quiet_hours("12:00", day) and not actions._in_quiet_hours("18:00", day)
+    # disabled / malformed / missing clock all fail toward PUSHING (never quiet), never RAISE
+    assert not actions._in_quiet_hours("03:00", None)
+    assert not actions._in_quiet_hours("03:00", {"start": "oops", "end": "08:00"})
+    assert not actions._in_quiet_hours(None, q)
+    assert not actions._in_quiet_hours("03:00", {"start": "06:00", "end": "06:00"})
+    assert not actions._in_quiet_hours("²³:00", q)          # unicode "digits": False, never int() raise
+    assert not actions._in_quiet_hours("03:00", {"start": "²³:00", "end": "08:00"})
