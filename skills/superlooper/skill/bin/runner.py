@@ -138,9 +138,10 @@ its conflict IN PLACE, in this worktree on branch `{branch}`.
    rewrite history; a plain `git push` is the only push you may make.
 2. Run the tests; fix what the merge broke.
 3. Get a fresh-agent review of the RESOLVED diff (an agent that wrote none of it) and post its
-   verdict as a PR comment BEGINNING `<!-- superlooper-review sha=$(git rev-parse HEAD) -->` —
-   post it AFTER your final push, so the `sha=` names the resolved commit that was reviewed.
-   The gate ignores the pre-conflict verdict already on this PR: it reviewed a different diff.
+   verdict as a PR comment BEGINNING `{review_marker}` — post it AFTER your final push, and
+   replace {pin_placeholder} with the oid `git rev-parse HEAD` then prints (paste the literal
+   oid; `gh pr comment --body '...'` will not expand a `$(...)`). The gate ignores the
+   pre-conflict verdict already on this PR: it reviewed a different diff.
 4. Rewrite your report at {report_path} with the required sections ({report_sections}) — the
    full ship gate re-runs on this PR from scratch.
 
@@ -2240,7 +2241,7 @@ class Runner:
 
     def _exec_merge(self, a, now):
         iid, num, pr = a["id"], a.get("num"), a.get("pr")
-        ok, reason = gh.merge_pr(pr, a.get("method", "squash"))
+        ok, reason = gh.merge_pr(pr, a.get("method", "squash"), head_oid=a.get("head_oid"))
         if not ok:
             # GitHub REFUSED the merge of a gate-green PR — ordinary branch protection (required
             # approvals / strict up-to-date) or a token without merge rights (issue #27). Count the
@@ -2262,35 +2263,49 @@ class Runner:
             self._teardown_session(iid, remove_worktree=True)
         return "ok"
 
-    def _review_carry(self, iid, head, wt):
+    def _review_carry(self, iid, head, pre, wt):
         """Carry the PR's review verdict across the runner's OWN merge-update (issue #154).
 
         A merge-update merges dev into the branch and plain-pushes: the head moves, but the
         worker's AUTHORED diff is untouched — so the fresh-agent verdict pinned to the pre-merge
         head still vouches for exactly the code being merged. Without this record the gate's
         diff-pin would read the new head as "reviewed at a superseded diff" and nudge->park every
-        PR the runner itself updated. The safety of carrying rests on what already guards a clean
-        merge-update: `ship_recheck_cmd` runs against the merged tree and parks on failure, and CI
-        re-runs on the new head before step 5 lets anything merge.
+        PR the runner itself updated.
+
+        That claim — "the new head is the REVIEWED head plus dev, and nothing else" — is only true
+        if the worktree was ACTUALLY sitting on the reviewed head when we merged, so `pre` (HEAD
+        read before the merge) must equal `head` (the oid the gate judged) or we carry nothing.
+        Without that check the carry asserts a fact it never verified: a worker that committed
+        locally without pushing (or pushed inside the ~90s poll window) leaves the worktree ahead
+        of the head the gate saw, `plain_push` fast-forwards those commits onto the remote, and the
+        carry would attest code no reviewer read. `ship_recheck_cmd` and CI do NOT close that hole
+        — they prove the merged tree's TESTS pass, never that a fresh agent read the diff, which is
+        the whole distinction #154 exists to draw. (Fresh-review finding, P0-1.)
 
         Reaching here means the gate returned `update`, which sits BELOW step 2b — so review
         evidence was valid for `head` at decision time, either pinned to it directly or carried
         onto it by a previous update. `from` therefore keeps the ORIGINALLY reviewed oid across a
-        chain of updates; only `to` advances. Fails closed: an unreadable new head records no
-        carry at all (the gate then asks for a re-review rather than trusting a guess).
+        chain of updates; only `to` advances. Fails closed everywhere: an unreadable head on either
+        side records no carry at all (the gate then asks for a re-review rather than trust a guess).
         """
         new_head = gitops.head_oid(wt)
-        if not (isinstance(head, str) and head and new_head):
+        if not (isinstance(head, str) and head and new_head and pre):
             return None
+        if pre.lower() != head.lower():
+            return None          # the worktree was NOT at the reviewed head — vouch for nothing
         prev = self._issue_field(iid, "review_carry")
         reviewed = head
-        if isinstance(prev, dict) and prev.get("to") == head and isinstance(prev.get("from"), str):
+        if isinstance(prev, dict) and isinstance(prev.get("from"), str) \
+                and isinstance(prev.get("to"), str) and prev["to"].lower() == head.lower():
             reviewed = prev["from"]        # a chain of updates keeps naming the oid actually reviewed
         return {"from": reviewed, "to": new_head}
 
     def _exec_update(self, a, now):
         iid, head = a["id"], a.get("head_oid")
         wt = self._worktree(iid)
+        # HEAD *before* the merge: the carry's premise is that we merged dev into the head the gate
+        # judged, and that is only checkable from here (afterwards the merge has already moved it).
+        pre = gitops.head_oid(wt)
         res = gitops.merge_update(wt, self.config.get("dev_branch", "main"))
         if res == "clean":
             recheck = self.config.get("ship_recheck_cmd")
@@ -2298,10 +2313,17 @@ class Runner:
                 if self._run_cmd(recheck, cwd=wt) != 0:
                     self._update_issue(iid, {"recheck_failed": True})
                     return "recheck failed after merge-update — parking via decide"
+            # Record the carry BEFORE the push, and independent of its outcome. The carry states a
+            # LINEAGE fact ("this new head is the reviewed head plus dev"), not "the push landed",
+            # and it is inert unless the PR's head actually becomes `to`. Recording it only on a
+            # push that REPORTS success would park correctly-reviewed work when a push lands but
+            # reports nonzero (a network drop after the ref update): the head moves on GitHub, no
+            # carry exists, and step 2b sits ABOVE the update retry — so the gate parks on
+            # `review_stale` before the retry could heal it. (Fresh-review finding, P0-1 related.)
+            self._update_issue(iid, {"review_carry": self._review_carry(iid, head, pre, wt)})
             if gitops.plain_push(wt):
                 self._update_issue(iid, {"update_result": "clean", "update_head_oid": head,
-                                         "update_errors": 0,
-                                         "review_carry": self._review_carry(iid, head, wt)})
+                                         "update_errors": 0})
                 return "ok"
             res = "error"                              # push refused/failed: infra, retry
         if res == "conflict":
@@ -2371,6 +2393,10 @@ class Runner:
             "dev_branch": self.config.get("dev_branch", "main"),
             "report_path": os.path.join(self.home, "reports", f"{iid}.md"),
             "report_sections": secs,
+            # rendered from gate, never retyped: the form taught here cannot drift from the form
+            # the gate parses (#154)
+            "review_marker": gate.pinned_review_marker(),
+            "pin_placeholder": gate.REVIEW_PIN_PLACEHOLDER,
             "blocked_path": os.path.join(self.state, "blocked", iid)})
         with open(os.path.join(self.home, "briefs", f"{iid}.md"), "w") as f:
             f.write(text)

@@ -202,6 +202,18 @@ def test_pr_for_branch_wrong_typed_body_is_refused(ghenv):
         assert rd.ok is False and rd.pr == {}, body
 
 
+def test_pr_for_branch_keeps_a_pr_whose_head_oid_is_unreadable(ghenv):
+    """The read layer validates `number` and stops there — it deliberately does NOT reject a PR for
+    an unreadable headRefOid, even though #154 made that oid load-bearing at the gate. This read is
+    SHARED: the janitor's branch sweep needs the same PR view and does not care about the oid, so
+    refusing here would break an unrelated consumer to serve the gate's need. The gate fails closed
+    on its own inputs instead (review_evidence_state -> "head_unreadable" -> wait, never merge)."""
+    (ghenv / "pr_list.json").write_text(
+        '[{"number": 555, "state": "MERGED", "headRefName": "sl/i5-x", "headRefOid": null}]')
+    rd = gh.pr_for_branch("sl/i5-x")
+    assert rd.ok is True and rd.pr["number"] == 555
+
+
 def test_branch_checks_normalized(ghenv):
     # with no commit-status fixture, the /status endpoint fails closed to nothing, so the dev
     # view is exactly the check-runs (the pre-#23 shape stays a subset — a missing status
@@ -331,6 +343,28 @@ def test_comment_records(ghenv):
 def test_pr_comment_records(ghenv):
     assert gh.pr_comment(555, "cross-linked to #5") is True
     assert _mutations(ghenv)[-1]["kind"] == "pr_comment"
+
+
+def test_merge_pr_pins_the_merge_to_the_reviewed_head(ghenv):
+    """#154 (fresh-review P1-2): the gate matches the review pin against a POLLED snapshot of the
+    head (up to GH_POLL_SECONDS old), but `gh pr merge` merges whatever the LIVE head is. Without
+    a head constraint the pin is verified against one commit and enforced against none — a worker
+    pushing inside the poll window lands unreviewed code under a perfectly matching verdict.
+    `--match-head-commit` makes the merge atomic with respect to the reviewed oid: GitHub refuses
+    if the head moved, and the existing refusal ladder (#27) degrades that safely."""
+    oid = "a" * 40
+    ok, _ = gh.merge_pr(555, "squash", head_oid=oid)
+    assert ok is True
+    assert _after(_calls(ghenv)[-1], "--match-head-commit") == oid
+
+
+def test_merge_pr_without_a_head_oid_sends_no_match_flag(ghenv):
+    """Fail-closed the other way: never send an EMPTY/None constraint (gh would reject the call and
+    every merge would break); a caller with no readable head simply merges unconstrained, exactly
+    as before #154."""
+    for bad in (None, "", 42):
+        gh.merge_pr(555, "squash", head_oid=bad)
+        assert _after(_calls(ghenv)[-1], "--match-head-commit") is None, bad
 
 
 def test_merge_pr_records_method(ghenv):

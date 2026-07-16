@@ -1582,10 +1582,13 @@ OID_B = "b" * 40      # the head the runner's merge-update produced
 OID_C = "c" * 40      # ...and a second merge-update's head
 
 
-def _clean_update(monkeypatch, new_head):
+def _clean_update(monkeypatch, new_head, pre_head=None, pushed=True):
+    """A clean merge-update. `head_oid` answers `pre_head` before the merge and `new_head` after,
+    mirroring the real sequence: the runner reads HEAD, merges dev in, reads HEAD again."""
+    reads = iter([pre_head if pre_head is not None else OID_A, new_head])
     monkeypatch.setattr(runner_mod.gitops, "merge_update", lambda wt, dev: "clean")
-    monkeypatch.setattr(runner_mod.gitops, "plain_push", lambda wt, branch=None: True)
-    monkeypatch.setattr(runner_mod.gitops, "head_oid", lambda wt: new_head)
+    monkeypatch.setattr(runner_mod.gitops, "plain_push", lambda wt, branch=None: pushed)
+    monkeypatch.setattr(runner_mod.gitops, "head_oid", lambda wt: next(reads, new_head))
 
 
 def test_update_executor_carries_the_review_across_its_own_merge_update(rig, monkeypatch):
@@ -1604,9 +1607,46 @@ def test_update_carry_keeps_naming_the_oid_actually_reviewed_across_a_chain(rig,
     the reviewer never saw — `from` stays the oid the fresh agent actually reviewed."""
     seed_issue(rig, "i5", status="gating", branch="sl/i5-x",
                review_carry={"from": OID_A, "to": OID_B})
-    _clean_update(monkeypatch, OID_C)
+    # the first update left the worktree (and the PR head) on B; the gate judged B and re-updates
+    _clean_update(monkeypatch, OID_C, pre_head=OID_B)
     rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_B}, NOW)
     assert issue_state(rig, "i5")["review_carry"] == {"from": OID_A, "to": OID_C}
+
+
+def test_update_carry_refuses_when_the_worktree_is_not_at_the_reviewed_head(rig, monkeypatch):
+    """P0 from the fresh review of #154. The carry's ENTIRE claim is "the new head is the REVIEWED
+    head plus dev, and nothing else". The runner never verified that premise: it paired the head
+    the GATE judged with whatever the worktree happened to be sitting on.
+
+    The sequence needs no adversarial worker. A worker commits A, pushes A, posts `sha=A`, writes
+    its report — then makes one more local commit B and never pushes it (an agent tidying up, or a
+    push that failed). The gate sees head A, pin A -> ok, and CONFLICTING -> update(head_oid=A).
+    `merge_update` merges dev into **B**, and `plain_push` fast-forwards the remote A -> C, pushing
+    B along with it. If the carry is recorded, {from: A, to: C} makes the gen-A verdict vouch for
+    commit B, which no reviewer ever saw.
+
+    So: read HEAD BEFORE the merge, and carry nothing unless it IS the head the gate judged.
+    """
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _clean_update(monkeypatch, OID_C, pre_head=OID_B)      # worktree sits on B, gate judged A
+    rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}, NOW)
+    assert issue_state(rig, "i5")["review_carry"] is None, \
+        "carried a verdict across a worktree that was never at the reviewed head"
+
+
+def test_update_carry_is_recorded_even_when_the_push_reports_failure(rig, monkeypatch):
+    """A push can LAND and still report nonzero (a network drop after the ref update). The carry is
+    a claim about LINEAGE — "this new head is the reviewed head plus dev" — not about whether the
+    push succeeded, and it stays inert unless the PR's head actually becomes `to`. Recording it
+    only on a push that REPORTS success would park correctly-reviewed work: the head moves on
+    GitHub, no carry exists, and step 2b sits ABOVE the update retry, so the gate parks on
+    `review_stale` before the retry could heal it."""
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _clean_update(monkeypatch, OID_C, pre_head=OID_A, pushed=False)
+    rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}, NOW)
+    ist = issue_state(rig, "i5")
+    assert ist["review_carry"] == {"from": OID_A, "to": OID_C}
+    assert ist["update_result"] == "error"                 # still an infra error -> retried
 
 
 def test_update_carry_fails_closed_when_the_new_head_is_unreadable(rig, monkeypatch):

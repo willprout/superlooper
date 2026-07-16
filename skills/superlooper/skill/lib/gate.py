@@ -19,7 +19,6 @@ import config as _config   # pure sibling; used only for path_to_area in gate_de
 # The two marker-comment contracts (cross-review C1 + plan approval fix (a)). These strings are
 # load-bearing: the brief (Task 7) instructs workers to post them, and THIS module is the only
 # consumer — the fresh-agent-review standing rule verified mechanically, never LLM-remembered.
-REVIEW_MARKER = "<!-- superlooper-review -->"          # the legacy UNPINNED form (see below)
 INVESTIGATION_MARKER = "<!-- superlooper-investigation -->"
 
 # A review verdict must name the diff it reviewed (issue #154). The marker rides in two forms:
@@ -34,18 +33,34 @@ INVESTIGATION_MARKER = "<!-- superlooper-investigation -->"
 # merge") silently void for every post-reapprove generation. Caught before it fired a bad merge.
 # The legacy form is accepted as a SHAPE (so the gate can say "repin it" instead of "no review at
 # all") but never as EVIDENCE — back-compat here is fail-closed, like every other unreadable input.
-_REVIEW_MARKER_RE = re.compile(
-    r"<!--\s*superlooper-review(?:\s+sha=([0-9a-fA-F]{7,40}))?\s*-->", re.IGNORECASE)
+#
+# The marker match is deliberately LOOSE about what rides between `superlooper-review` and `-->`,
+# and the pin is validated separately. An all-or-nothing regex made a MALFORMED pin read as
+# "absent" — no review evidence at all — and the nudge for "absent" prints the very marker the
+# worker just posted, so it reposts it and parks: a false-park loop with no way out. Recognising
+# the marker and rejecting only the PIN lets the gate say "repin this", which is the truth and is
+# actionable. (Fresh-review finding, P1-3.)
+_REVIEW_MARKER_RE = re.compile(r"<!--\s*superlooper-review\b([^\n]*?)-->", re.IGNORECASE)
+_REVIEW_PIN_RE = re.compile(r"\bsha\s*=\s*(\S+)", re.IGNORECASE)
 # A readable git oid. Abbreviations are honored (a worker reaches for `git rev-parse --short
 # HEAD`); 7 hex is git's own default abbreviation and identifies a commit unambiguously on a
 # single PR. Shorter than 7 is not an oid — it fails closed rather than prefix-matching loosely.
 _OID_RE = re.compile(r"[0-9a-fA-F]{7,40}")
 
+# What the briefs and nudges render inside the marker where the oid belongs. Deliberately NOT a
+# shell substitution: the natural way to hand `gh pr comment` a body full of `<!--` and `-->` is
+# single quotes, which do NOT expand `$(...)`. A worker taught `sha=$(git rev-parse HEAD)` posts
+# that text verbatim, pinning nothing — so teach paste-the-oid instead. A worker who pastes THIS
+# placeholder literally still lands somewhere honest: it parses as a marker with an unreadable
+# pin, and the nudge says "repin it with the real oid". (Fresh-review finding, P1-3.)
+REVIEW_PIN_PLACEHOLDER = "REVIEWED_HEAD_OID"
 
-def pinned_review_marker(sha):
-    """The pinned review marker a worker posts: the verdict names the diff it reviewed. ONE
-    source of truth for the string — the brief, the nudge, and the conflict brief all render it
-    from here, so the form the worker is taught can never drift from the form the gate parses."""
+
+def pinned_review_marker(sha=REVIEW_PIN_PLACEHOLDER):
+    """The pinned review marker a worker posts: the verdict names the diff it reviewed. THE one
+    source of truth for the string — every place that teaches it (the brief, the review nudge, the
+    conflict brief) renders it from here, so the form the worker is taught cannot drift from the
+    form this module parses."""
     return f"<!-- superlooper-review sha={sha} -->"
 
 # Paths that define the loop's live referee. Unlike ordinary wander areas, a merged change here
@@ -105,16 +120,18 @@ def _any_comment_begins(comments, marker):
 
 
 def _review_pins(comments):
-    """Every review-marker comment's pin, in order: a hex sha string, or None for the legacy
-    unpinned form. The marker must BEGIN the comment (same contract as _any_comment_begins —
-    quoting it mid-text is not a verdict). Anything unreadable simply doesn't appear."""
+    """Every review-marker comment's pin, in order, as the RAW string it claims (validated by the
+    caller) — or None for a marker carrying no `sha=` at all. The marker must BEGIN the comment
+    (same contract as _any_comment_begins — quoting it mid-text is not a verdict). Anything
+    unreadable simply doesn't appear: a wrong-typed list/entry contributes nothing (fail closed)."""
     out = []
     for c in comments if isinstance(comments, list) else []:
         body = c.get("body") if isinstance(c, dict) else (c if isinstance(c, str) else None)
         if isinstance(body, str):
             m = _REVIEW_MARKER_RE.match(body.lstrip())
             if m:
-                out.append(m.group(1))
+                pin = _REVIEW_PIN_RE.search(m.group(1))
+                out.append(pin.group(1) if pin else None)
     return out
 
 
@@ -137,8 +154,10 @@ def review_evidence_state(config, pr_comments, head_oid, review_carry=None):
       "absent"         — a clean read with no review-marker comment at all.
       "head_unreadable" — a marker exists but the PR view carries no readable head oid: a corrupt
                          view, so the pin cannot be judged. Fail closed (the caller waits).
-      "unpinned"       — only legacy (no `sha=`) markers: cannot prove which diff was reviewed.
-      "stale"          — a pinned verdict, but for a superseded diff — the head has moved since.
+      "unpinned"       — a marker exists but carries no READABLE pin: the legacy no-`sha=` form, a
+                         placeholder never substituted, or an unexpanded `$(...)`. It cannot prove
+                         which diff it reviewed, so it is a shape, never evidence.
+      "stale"          — a readable pin, but for a superseded diff — the head has moved since.
 
     `review_carry` is the runner's record of its OWN mechanical merge-update: {"from": the
     reviewed oid, "to": the head that update produced}. A merge-update merges dev into the branch
@@ -164,11 +183,13 @@ def review_evidence_state(config, pr_comments, head_oid, review_carry=None):
     c_from, c_to = _oid(carry.get("from")), _oid(carry.get("to"))
     if c_from and c_to and c_to == head:
         attested.add(c_from)
-    for pin in pins:
-        p = pin.lower() if isinstance(pin, str) else None
+    # validate each claimed pin: None here means "no readable oid" (absent `sha=`, a placeholder,
+    # an unexpanded substitution) — a shape the gate can name, never evidence it can act on.
+    valid = [_oid(p) for p in pins]
+    for p in valid:
         if p and any(a.startswith(p) for a in attested):
             return "ok"
-    return "unpinned" if all(p is None for p in pins) else "stale"
+    return "unpinned" if all(p is None for p in valid) else "stale"
 
 
 def review_evidence_ok(config, pr_comments, head_oid=None, review_carry=None):
@@ -506,8 +527,9 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
         if rstate == "unpinned":
             return nudge_or_park(
                 "review_stale",
-                "the review verdict is unpinned (a legacy marker with no `sha=`), so it cannot "
-                "prove which diff it reviewed")
+                "the review verdict carries no readable `sha=` pin (a legacy marker, or a "
+                "placeholder/`$(...)` that was never substituted), so it cannot prove which diff "
+                "it reviewed")
         return nudge_or_park(
             "review_stale",
             "the review verdict is pinned to a superseded diff — the PR's head has moved since "

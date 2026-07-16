@@ -14,6 +14,7 @@ import pytest
 
 import brief
 import config as configlib
+import gate
 
 
 def _cfg(tmp_home, **over):
@@ -91,9 +92,14 @@ def test_ship_instructions_without_ship_cmd(_sl_home):
     # the marker the brief teaches must be the PINNED form the gate actually parses (#154) — an
     # unpinned verdict cannot prove which diff it reviewed and never satisfies the gate, so a
     # brief teaching the legacy form would walk every worker into a nudge->park.
-    assert "<!-- superlooper-review sha=" in out, \
+    assert gate.pinned_review_marker() in out, \
         "no-pipeline repos must require a review verdict pinned to the reviewed head"
     assert "fresh-agent review" in out or "wrote none of it" in out
+    # ...and it must NOT teach a shell substitution: `gh pr comment --body '<!-- ... -->'` needs
+    # single quotes for a body full of `<!--`/`-->`, and single quotes never expand `$(...)`. A
+    # worker following that literally posts unexpanded text that pins nothing (fresh-review P1-3).
+    assert "$(git rev-parse HEAD)" not in out, \
+        "the brief must teach paste-the-oid, not a substitution gh will not expand"
 
 
 # --------------------------------------------------------------------------- type variants

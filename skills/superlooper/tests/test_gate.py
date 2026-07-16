@@ -187,6 +187,62 @@ def test_review_evidence_unpinned_legacy_marker_fails_closed():
     assert gate.review_evidence_state(_cfg(), legacy, HEAD) == "unpinned"
 
 
+def test_review_evidence_malformed_pin_is_unpinned_never_absent():
+    """Fresh-review P1-3. A marker whose pin is unreadable must be diagnosed as a marker needing a
+    REPIN — not as "no review evidence at all". The difference is a false-park loop: the "absent"
+    nudge prints the marker to post, so a worker that posted an unexpanded `$(...)` (the natural
+    result of `gh pr comment --body '<!-- ... -->'`, since single quotes do not substitute) would
+    be told to post the exact text it just posted, repost it, and park."""
+    for bad in ("$(git rev-parse HEAD)",            # the substitution gh never expanded
+                gate.REVIEW_PIN_PLACEHOLDER,        # the placeholder pasted verbatim
+                "abc12",                            # too short to be an oid
+                "zzzzzzzz",                         # not hex
+                "<HEAD-OID>"):                      # an angle-bracketed placeholder
+        c = [{"body": f"<!-- superlooper-review sha={bad} --> reviewed"}]
+        assert gate.review_evidence_state(_cfg(), c, HEAD) == "unpinned", bad
+        assert gate.review_evidence_ok(_cfg(), c, HEAD) is False, bad
+
+
+def test_review_evidence_a_marker_among_junk_pins_still_reads_stale_not_unpinned():
+    """A readable pin that simply doesn't match is STALE (re-review the current diff); only the
+    total absence of a readable pin is UNPINNED. Mixing the two must not mask a real stale pin."""
+    c = [{"body": "<!-- superlooper-review --> legacy"},
+         {"body": f"{_marker(OTHER)} reviewed gen-1"}]
+    assert gate.review_evidence_state(_cfg(), c, HEAD) == "stale"
+
+
+def test_no_engine_source_retypes_the_review_marker_by_hand():
+    """Fresh-review P1-4: the "one source of truth" comment on pinned_review_marker() was false —
+    all four teaching sites hardcoded the literal, so the drift it declared impossible was exactly
+    as possible as before. Enforce the claim by ABSENCE (this repo's standing discipline): no
+    engine source may spell the marker out; it renders from gate.pinned_review_marker() or it is a
+    second copy waiting to drift out of step with the regex that parses it."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent / "skill"
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name == "gate.py":
+            continue                     # gate.py IS the source of truth (regex + renderer)
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            if "superlooper-review" in line:
+                offenders.append(f"{path.relative_to(root)}:{n}: {line.strip()[:70]}")
+    assert not offenders, (
+        "these render the review marker by hand instead of gate.pinned_review_marker():\n  "
+        + "\n  ".join(offenders))
+
+
+def test_review_marker_taught_everywhere_is_the_marker_the_gate_parses():
+    """Fresh-review P1-4. The helper claims to be the one source of truth for the string; prove the
+    round trip so the claim is enforced, not asserted — the rendered marker must parse back."""
+    rendered = gate.pinned_review_marker(HEAD)
+    assert gate.review_evidence_ok(_cfg(), [{"body": rendered + " reviewed"}], HEAD) is True
+    # ...and the placeholder form the briefs render is recognised as a marker needing a repin,
+    # never as "no review evidence at all"
+    placeholder = gate.pinned_review_marker()
+    assert gate.REVIEW_PIN_PLACEHOLDER in placeholder
+    assert gate.review_evidence_state(_cfg(), [{"body": placeholder}], HEAD) == "unpinned"
+
+
 def test_review_evidence_unreadable_head_never_merges():
     """A head oid the runner could not read is a corrupt view, not a verdict — fail closed."""
     ok = [{"body": _marker(HEAD)}]
