@@ -4,7 +4,7 @@
       "id": "PC_1",
       "author": {"login": "fresh-reviewer"},
       "authorAssociation": "NONE",
-      "body": "<!-- superlooper-review -->\nReviewed the full diff (Widget.tsx, widget.py). No P0/P1 findings; two nits addressed. Approving.",
+      "body": "<!-- superlooper-review sha=abc123def456 -->\nReviewed the full diff (Widget.tsx, widget.py). No P0/P1 findings; two nits addressed. Approving.",
       "createdAt": "2026-07-02T14:10:00Z",
       "url": "https://github.com/fake/repo/pull/555#issuecomment-9"
     }

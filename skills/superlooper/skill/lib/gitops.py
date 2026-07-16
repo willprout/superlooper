@@ -33,6 +33,15 @@ def fetch(worktree):
     return rc == 0
 
 
+def head_oid(worktree):
+    """The worktree's current HEAD oid, or None if git could not answer (fail closed: the caller
+    records no carry rather than a wrong one — issue #154). Used after a merge-update to name the
+    head the reviewed diff was carried onto."""
+    rc, out = _git(worktree, "rev-parse", "HEAD")
+    oid = (out or "").strip()
+    return oid if rc == 0 and len(oid) == 40 and all(c in "0123456789abcdef" for c in oid) else None
+
+
 def merge_update(worktree, dev_branch):
     """Ladder step (a): fetch, then merge origin/<dev_branch> into the issue branch.
 

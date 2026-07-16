@@ -275,6 +275,14 @@ def _pr_view(st, pr, want_fields):
             out[f] = _rollup(st, pr)
         elif f == "files":
             out[f] = _pr_files(st, pr)
+        elif f == "headRefOid":
+            # LIVE from the branch tip, like mergeable/files — GitHub recomputes it on every read,
+            # and a worker that pushes again after `pr create` moves it. The gate pins the review
+            # verdict to this oid (#154), so a frozen create-time snapshot would make the fake lie
+            # about the exact field under test and a stale-verdict scenario could never be
+            # simulated honestly. Falls back to the snapshot once the branch is gone (merged or
+            # deleted), which is what the real API still reports.
+            out[f] = _tip(pr.get("headRefName", "")) or pr.get(f)
         elif f == "labels":
             out[f] = [{"name": n} for n in pr.get("labels", [])]
         else:
@@ -546,6 +554,17 @@ def main_stateful():
             pr = st.get("prs", {}).get(ARGS[2])
             if pr is None or pr.get("state") != "OPEN":
                 die("pr %s is not open" % ARGS[2])
+            # --match-head-commit, enforced like the real service (#154): the caller names the oid
+            # it judged and GitHub REFUSES if the head has moved since. The runner pins the merge
+            # to the head its review verdict covers, so a fake that ignored the flag would sail a
+            # merge-the-live-head bug straight through the rehearsal — the same reason branch
+            # protection is enforced below rather than assumed.
+            want_head = opt("--match-head-commit")
+            if want_head:
+                live = _tip(pr.get("headRefName", "")) or pr.get("headRefOid") or ""
+                if live != want_head:
+                    die("pr %s: head commit %s does not match expected %s"
+                        % (ARGS[2], live[:12], want_head[:12]))
             # Branch protection blocks on the PROTECTED checks (state.check_names — the same
             # names the sim config requires), like the real service: an optional red check
             # must not false-refuse a legitimate merge (Codex round-2). Fail CLOSED on a
