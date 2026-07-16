@@ -156,6 +156,29 @@ _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"   # SL_CMUX
 # `request-restart` command, exactly as it shells `superlooper tidy`; the engine names no such UI.)
 RESTART_MARKER = "runner.restart"
 
+# Durable owner-question protocol markers (#163). Both begin with brief._MARKER_PREFIX
+# ("<!-- superlooper-"), so brief.build's amendments logic SKIPS them: the runner's own question
+# comment is never mistaken for a binding owner amendment, and a marked answer is embedded once via
+# the Q&A block, not twice. A plain (un-marked) owner reply carries no marker and rides the
+# amendments block instead — either path reaches the relaunched worker.
+QUESTION_MARKER = "<!-- superlooper-question -->"
+ANSWER_MARKER = "<!-- superlooper-answer -->"
+
+
+def _latest_answer(comments):
+    """The owner's typed answer: the body of the LAST ANSWER_MARKER comment, marker line stripped.
+    Returns "" when there is none — a plain GitHub-client reply carries no marker, so its text rides
+    the brief's amendments block instead, and the fresh session still gets the question from qa_log.
+    Fail-closed on any wrong-typed comment/body (a garbage thread yields no answer, never a raise)."""
+    if not isinstance(comments, list):
+        return ""
+    for c in reversed(comments):
+        body = c.get("body") if isinstance(c, dict) else None
+        if isinstance(body, str) and body.lstrip().startswith(ANSWER_MARKER):
+            return body.split(ANSWER_MARKER, 1)[1].strip()
+    return ""
+
+
 _TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
 
 # The conflict-resolution session's brief (§C.4 6c — the `preserve` escape). Inline: it is
@@ -1891,8 +1914,14 @@ class Runner:
         # A refused read (ok=False) carries comments=[] — the same fail-closed "no amendments" the
         # old contract gave, so brief-building never blocks on a supplementary channel (issue #21).
         comments = gh.issue_comments(num).comments
+        # The answered-question trail (#163): a relaunch after an owner's answer embeds the full Q&A
+        # so the fresh session inherits every settled decision. Empty/absent qa_log -> no Q&A block,
+        # a brief byte-identical to a first launch. Reused across recover/regenerate/answer_relaunch
+        # (all route through here), so a WIP that had to be conflict-rebuilt still carries the Q&A.
+        qa = self._issue_field(iid, "qa_log")
+        qa = qa if isinstance(qa, list) else None
         try:
-            text = brief.build(pb, self.config, comments=comments)
+            text = brief.build(pb, self.config, comments=comments, qa=qa)
         except ValueError as e:
             return f"brief failed: {e}"
         with open(os.path.join(self.home, "briefs", f"{iid}.md"), "w") as f:
@@ -1959,69 +1988,81 @@ class Runner:
         import config as config_lib
         return config_lib.operator(self.config)
 
-    def _exec_hire_answerer(self, a, now):
-        iid, aid, question = a["id"], a["answerer_id"], a["question"]
-        _, answerer_model = self._models()
-        answers_dir = os.path.join(self.home, "answers")
-        _rm(os.path.join(answers_dir, f"{iid}.md"))    # a stale answer must never answer a NEW question
-        template = _read(os.path.join(_TEMPLATES, "answerer-brief.md")) or ""
-        body = (self._raw_by_id.get(iid) or {}).get("body", "")
-        text = _sub(template, {"issue_num": str(a.get("num")), "issue_body": body,
-                               "question": question, "worktree": self._worktree(iid),
-                               "answer_path": os.path.join(answers_dir, f"{iid}.md"),
-                               "operator": self._operator()})
-        with open(os.path.join(self.home, "briefs", f"{aid}.md"), "w") as f:
-            f.write(text)
-        answerer_effort = ""
-        if self.agent == "codex":
-            answerer_model = os.environ.get("SL_MODEL", "")
-            answerer_effort = os.environ.get("SL_EFFORT", "")
-        rc = self._run_script([self._script("launch-session.sh"), "--cwd", answers_dir, aid],
-                              env=self._script_env(answerer_model, answerer_effort), timeout=LAUNCH_TIMEOUT)
-        if rc == 0:
-            def m(st):
-                recs = st.setdefault("answerers", {})
-                recs[aid] = {"for": iid, "launched_at": now}
-                n = int(aid[1:]) if aid[1:].isdigit() else 0
-                st["next_answerer"] = max(st.get("next_answerer", 1)
-                                          if type(st.get("next_answerer")) is int else 1, n + 1)
-                st["issues"].setdefault(iid, loopstate.new_issue())["status"] = "blocked"
-            loopstate.update(self.issues_path, m)
-            return "ok"
-        self._update_issue(iid, {"status": "blocked"},
-                           fn=lambda st, i: self._bump(i, "answerer_failures"))
-        return self._failed("launch", rc, f"answerer launch rc={rc}")
+    def _render_question(self, question):
+        """The durable question comment (#163): the machine marker FIRST (so brief.build skips it as
+        the runner's own marker, never a binding owner amendment), then the worker's verbatim
+        question, then how to answer. Signs the owner's own name (config.operator, #58)."""
+        op = self._operator()
+        return (f"{QUESTION_MARKER}\n"
+                f"**A superlooper worker paused this issue to ask {op} a decision, then exited "
+                "cleanly** — its work-in-progress branch is pushed and its lane is released, so "
+                "nothing sits frozen waiting on an answer.\n\n"
+                f"{question}\n\n"
+                f"_{op}: answer from the dashboard's Questions list, or reply here and re-apply "
+                "`agent-ready` — a fresh session then resumes this issue with your answer in its "
+                "brief, reusing the pushed branch if it still applies cleanly._")
 
-    def _exec_deliver_answer(self, a, now):
-        iid, aid = a["id"], a["answerer_id"]
-        last = self._issue_field(iid, "last_delivery_attempt", 0)
-        if isinstance(last, (int, float)) and now - last < DELIVERY_RETRY_SECONDS:
-            return "deferred (delivery rate limit)"
-        surface = self._surface(iid)
-        if not surface:
-            self._mark_exited(iid, "no pane recorded", now)
-            return "no pane recorded — marked exited for relaunch"
-        msg = (f"[superlooper] Answer from a fresh answerer to your blocked question:\n"
-               f"{a.get('text', '')}\n"
-               f"Your blocked marker has been cleared — continue with the issue.")
-        rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
-                              env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
-        if rc == 0:
-            _rm(os.path.join(self.state, "blocked", iid))
-            def m(st):
-                recs = st.get("answerers")
-                if isinstance(recs, dict):
-                    recs.pop(aid, None)
-                i = st["issues"].setdefault(iid, loopstate.new_issue())
-                i["status"] = "running"
-                i["answer_delivery_failures"] = 0
-            loopstate.update(self.issues_path, m)
-            return "ok"
-        if rc == 4:
-            self._mark_exited(iid, "dead pane on answer delivery", now)
-        self._update_issue(iid, {"last_delivery_attempt": now},
-                           fn=lambda st, i: self._bump(i, "answer_delivery_failures"))
-        return self._failed("nudge", rc, f"nudge rc={rc}")
+    def _exec_post_question(self, a, now):
+        """#163: turn a worker's blocked-file question into a DURABLE GitHub comment, close the live
+        window, and RELEASE the lane (awaiting_answer). This replaces the live-frozen-session-plus-
+        answerer model — the one that died with i336's in-process auth death and i280's zombie window
+        — with an exit-clean hand-back the owner answers on his own clock.
+
+        Idempotent and self-healing. The blocked marker is the durable "still needs processing"
+        signal, removed ONLY in the final settle, so a crash at any earlier step re-derives this same
+        action next tick and converges: the comment posts ONCE (question_posted stamp), the label
+        move retries (set_labels is idempotent), the window close is a no-op on an already-closed
+        pane. The worktree is PRESERVED (remove_worktree=False, the no-stall D4 close) so the relaunch
+        reuses the WIP; the worker has also pushed it to origin, so no live window is the only copy."""
+        iid, num, question = a["id"], a.get("num"), a.get("question", "")
+        # 1. post the durable question ONCE. Stamp AFTER it lands so a failed post retries next tick;
+        #    a re-derived tick (the label move retrying) skips the post and never double-comments.
+        if not self._issue_field(iid, "question_posted"):
+            if not gh.comment(num, self._render_question(question)):
+                return "question comment failed (will retry next tick)"
+            self._update_issue(iid, {"question_posted": True})
+        # 2. the issue is now waiting on the owner, not building.
+        if not gh.set_labels(num, add=["awaiting-answer"], remove=["in-progress"]):
+            return "label move failed (will retry silently next tick)"
+        self._forget_cached_label(iid, "in-progress")
+        # 3. close the live window, PRESERVING the WIP worktree for the relaunch.
+        self._teardown_session(iid, remove_worktree=False)
+        # 4. settle terminal-for-now: awaiting_answer, bump the 2-capped question counter, reset the
+        #    post-once stamp for the NEXT question, and consume the blocked/exited markers LAST.
+        def settle(st, i):
+            i["status"] = "awaiting_answer"
+            i["pending_question"] = question
+            prev = i.get("questions_asked")
+            i["questions_asked"] = (prev if type(prev) is int else 0) + 1
+            i["question_posted"] = False
+        self._update_issue(iid, fn=settle)
+        _rm(os.path.join(self.state, "blocked", iid))
+        _rm(os.path.join(self.state, "exited", iid))   # a stray turn-end stamp must not recover-launch
+        return "ok"
+
+    def _exec_answer_relaunch(self, a, now):
+        """#163: the owner answered a durable question (the approval verb re-applied). Record the Q&A
+        into the durable qa_log the relaunch brief embeds, then re-release the issue to ready+requeue
+        so phase-E relaunches a FRESH session — reusing the preserved WIP worktree, or (if the WIP no
+        longer applies cleanly) letting the mechanical gate conflict-ladder rebuild it with the Q&A
+        carried forward. questions_asked is deliberately NOT reset: the 2-cap spans the issue's life,
+        so a re-approval-to-answer must never silently reopen an unbounded round-trip."""
+        iid, num = a["id"], a.get("num")
+        answer = _latest_answer(gh.issue_comments(num).comments)
+        q = self._issue_field(iid, "pending_question") or ""
+        def settle(st, i):
+            log = i.get("qa_log")
+            log = log if isinstance(log, list) else []
+            log.append({"question": q, "answer": answer})
+            i["qa_log"] = log
+            i["pending_question"] = None
+            i["status"] = "ready"
+            i["requeue_front"] = True
+        self._update_issue(iid, fn=settle)
+        _rm(os.path.join(self.state, "exited", iid))   # a stray turn-end stamp must not recover-launch
+        ok = gh.set_labels(num, add=["agent-ready"], remove=["awaiting-answer"])
+        self._forget_cached_label(iid, "awaiting-answer")
+        return "ok" if ok else "answer recorded; label move will retry (orphan sweep reconciles)"
 
     # --- bounce / park / labels ---
 
@@ -2171,14 +2212,15 @@ class Runner:
     # park. (The paired `merge_refusal_reason` string is cleared in the reset block below, not
     # here — this tuple is int counters only, zeroed with `i[k] = 0`.)
     _REAPPROVE_COUNTERS = ("launches", "retries", "conflicts", "launch_failures",
-                           "answerer_failures", "answer_delivery_failures", "merge_refusals")
+                           "answerer_failures", "answer_delivery_failures", "merge_refusals",
+                           "questions_asked")   # a fresh approval resets the 2-question cap too (#163)
 
     def _exec_reapprove(self, a, now):
         """D7-sibling operator fix: William re-approving a parked/needs-william/bounced issue (a
         fresh `agent-ready`) is a FRESH cap AND a clean slate. The next tick must launch the issue
         from scratch — so, exactly like `_exec_regenerate`, clear every stale finished/in-flight
         artifact FIRST (a leftover report would re-gate, an `exited` marker would `recover` and
-        double-launch, a `blocked` marker would re-enter the answerer flow, a `recheck_failed`
+        double-launch, a `blocked` marker would re-enter the question flow, a `recheck_failed`
         field would re-park immediately). Then zero the attempt counters (`launches` MUST reset —
         launch-session.sh derives `retries = launches - 1`, so a non-zero launches would restore
         the retry count and re-park at cap) and re-release to `ready`. The old counters are
@@ -2219,7 +2261,9 @@ class Runner:
                       "pr_read_pending_since": None,   # a re-run's refused-read hold times fresh (#61)
                       "comments_read_pending_since": None,   # ...and its comments-read hold too (#78)
                       "park_notify_cause": None, "park_notify_at": None,
-                      "park_comment_posted": False})   # ...and its own park (if any) texts again (#61)
+                      "park_comment_posted": False,    # ...and its own park (if any) texts again (#61)
+                      "pending_question": None, "qa_log": [],   # a clean-slate rebuild drops the
+                      "question_posted": False})       # prior Q&A trail and the post-once stamp (#163)
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()

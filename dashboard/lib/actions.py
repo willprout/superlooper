@@ -34,6 +34,12 @@ NEEDS_OWNER = "needs-owner"
 NEEDS_OWNER_LEGACY = "needs-william"
 EXPEDITE = "expedite"
 FLAG = "flag"
+# The durable-question labels/marker (#163). `awaiting-answer` is the control label the engine puts
+# on an issue whose worker exited on an owner-decision question; the Answer verb clears it and
+# re-applies agent-ready. ANSWER_MARKER mirrors the engine's runner.ANSWER_MARKER: the engine reads
+# the LATEST comment carrying it as the owner's answer and embeds the Q&A in the relaunched brief.
+AWAITING_ANSWER = "awaiting-answer"
+ANSWER_MARKER = "<!-- superlooper-answer -->"
 
 # The flag label, created-or-updated on first use so a fresh repo's first flag just works (the gh
 # adapter's create_label uses --force, so this is idempotent — never an error on a repo that already
@@ -159,6 +165,27 @@ class Actions:
         commented = self._gh.comment(repo, num, bounce_comment(self._operator, self._date()))
         return {"ok": bool(labeled and commented), "verb": "bounce-yes",
                 "labeled": bool(labeled), "commented": bool(commented)}
+
+    def answer(self, repo, text, num):
+        """Answer a durable owner-decision question (#163): post the owner's typed answer VERBATIM as
+        a marked comment and re-apply ``agent-ready`` (William's word — this tap IS his word),
+        clearing ``awaiting-answer``. The runner then relaunches a fresh session with the full Q&A in
+        its brief, reusing the pushed WIP branch if it still applies cleanly. Two existing mechanical
+        primitives only — a comment and a label move — no AI, no new machinery, no summarizing.
+
+        ``ok`` requires BOTH the durable answer comment AND the re-approval: ``agent-ready`` is
+        William's word only when the answer that earned it is on the record (the agent-ready bright
+        line + the audit-trail contract)."""
+        if repo not in self._allowed:
+            return self._refuse("answer")
+        text = (text or "").strip()
+        if not text:
+            return {"ok": False, "verb": "answer", "error": "empty answer"}
+        commented = self._gh.comment(repo, num, "%s\n%s" % (ANSWER_MARKER, text))
+        labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
+                                      remove=[AWAITING_ANSWER, NEEDS_OWNER, NEEDS_OWNER_LEGACY])
+        return {"ok": bool(commented and labeled), "verb": "answer",
+                "commented": bool(commented), "labeled": bool(labeled)}
 
     def flag(self, repo, text):
         """Flag: file the raw text VERBATIM as a new issue labeled ``flag`` (no AI, no summarizing),

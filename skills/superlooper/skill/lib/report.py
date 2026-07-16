@@ -253,6 +253,34 @@ def _wanders(records, window_start):
     return lines
 
 
+def _questions(records, window_start):
+    """Owner-decision questions asked overnight (#163) — the question-rate the DoD tracks from day
+    one. Each successful `post_question` is one durable question a worker handed to the owner before
+    exiting cleanly; a climbing rate means work is reaching the loop under-specified. Counted per
+    issue (most recent id label wins). Returns (lines, total)."""
+    counts = {}
+    total = 0
+    for r in sorted(records, key=lambda x: _ts(x) or 0):
+        if r.get("act") == "post_question" and _ok(r):
+            ts = _ts(r)
+            if ts is not None and ts < window_start:
+                continue
+            num = _num(r.get("num"))
+            if num is None:
+                continue
+            entry = counts.setdefault(num, [0, r.get("id")])
+            entry[0] += 1
+            if r.get("id"):
+                entry[1] = r.get("id")
+            total += 1
+    lines = []
+    for num in sorted(counts):
+        n, iid = counts[num]
+        tag = f" ({iid})" if iid else ""
+        lines.append(f"- #{num}{tag} — asked {n} owner question(s)")
+    return lines, total
+
+
 def _gate_health(records, window_start, ledger, config):
     nightlies = [r for r in records if r.get("act") == "nightly"
                  and (_ts(r) is None or _ts(r) >= window_start)]
@@ -406,6 +434,7 @@ def morning(journal_records, gh_view, ledger, config):
     regens = _regenerations(records, week_start)
     wanders = _wanders(records, overnight_start)
     watchdog = _watchdog(records, overnight_start)
+    questions, q_total = _questions(records, overnight_start)   # owner-question rate (#163)
     frozen = isinstance(view.get("frozen"), dict) and bool(view.get("frozen"))
     queue = [q for q in view.get("queue") if isinstance(q, dict)] if isinstance(view.get("queue"), list) else []
 
@@ -413,10 +442,11 @@ def morning(journal_records, gh_view, ledger, config):
     # runs EVERY night, so counting it here would mean no night is ever quiet. A RED nightly shows
     # up as `frozen` instead, which does break quiet. An unattended debugger LAUNCH (or a launch
     # that failed) always breaks quiet — the owner must never coffee past one (issue #66).
-    quiet = not any((merged, parked, bounces, regens, wanders, watchdog, queue, frozen))
+    quiet = not any((merged, parked, bounces, regens, wanders, watchdog, questions, queue, frozen))
     summary = ("Nothing happened overnight — queue empty." if quiet else
                f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
-               f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · queue: {len(queue)}.")
+               f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · "
+               f"{q_total} question(s) · queue: {len(queue)}.")
 
     parts = [
         f"# superlooper morning report — {date}\n",
@@ -432,6 +462,7 @@ def morning(journal_records, gh_view, ledger, config):
         _section("Merged", merged, "Nothing merged."),
         _section("Parked / needs-owner", parked),
         _section("Bounces", bounces),
+        _section("Owner questions", questions, "None — no worker needed an owner decision."),
         _section("Conflict regenerations (last 7 days)", regens),
         _section("Wanders", wanders),
         _section("Unattended debugger", watchdog, "None — the watchdog launched nothing."),

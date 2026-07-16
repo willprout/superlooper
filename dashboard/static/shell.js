@@ -507,6 +507,7 @@
     if (act === "replay-open") { if (window.CCReplay) window.CCReplay.open(repo, state.snapshot && state.snapshot.fun); return; }
     if (act === "digest-open") { if (window.CCDigest) window.CCDigest.open(repo); return; }
     if (act === "discuss") { doDiscuss(repo, num); return; }
+    if (act === "answer") { doAnswer(el, repo, num); return; }
     if (act === "approve") {
       var owner = (state.snapshot && state.snapshot.operator) || "the owner";
       postVerb("/api/approve", repo, num, "Approved SL-" + num + " — " + owner + "'s word is recorded");
@@ -542,6 +543,25 @@
         if (res.status === 200 && res.body && res.body.ok) {
           toast(okMsg, "ok");
           refresh();     // re-poll so the field reflects the new GitHub state as the runner acts
+        } else {
+          toast((res.body && res.body.error) || "GitHub write failed — nothing changed", "err");
+        }
+      })
+      .catch(function () { toast("couldn't reach the command center", "err"); });
+  }
+
+  // #163: Answer a durable owner-decision question — read the operator's typed answer from the field
+  // beside this button (its own `.act` container, so two cards can never cross wires) and post the
+  // one mechanical verb (a comment + the approval label). Empty is refused client-side with a nudge.
+  function doAnswer(btn, repo, num) {
+    var field = btn && btn.parentNode ? btn.parentNode.querySelector("textarea.answer-field") : null;
+    var text = field ? String(field.value || "").trim() : "";
+    if (!text) { toast("Type an answer first — it becomes your word on the issue", "err"); if (field) field.focus(); return; }
+    postJSON("/api/answer", { repo: repo, num: Number(num), text: text })
+      .then(function (res) {
+        if (res.status === 200 && res.body && res.body.ok) {
+          toast("Answered SL-" + num + " — a fresh session resumes with your answer", "ok");
+          refresh();
         } else {
           toast((res.body && res.body.error) || "GitHub write failed — nothing changed", "err");
         }

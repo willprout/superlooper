@@ -146,8 +146,8 @@ def test_launches_come_last_in_the_action_list():
                    "i7": ist("blocked", type="investigate")}})
     out = decide(parsed_issues=[parsed(5)], dsk=dsk)
     kinds = [a["act"] for a in out]
-    assert "launch" in kinds and "hire_answerer" in kinds
-    assert kinds.index("hire_answerer") < kinds.index("launch")
+    assert "launch" in kinds and "post_question" in kinds
+    assert kinds.index("post_question") < kinds.index("launch")
 
 
 def test_usage_stale_within_grace_launches_nothing_but_everything_else_proceeds():
@@ -159,7 +159,7 @@ def test_usage_stale_within_grace_launches_nothing_but_everything_else_proceeds(
     out = decide(usage=stale_usage, parsed_issues=[parsed(5)], dsk=dsk)
     assert only(out, "launch") == []
     assert only(out, "fail_open") == []             # within the grace: not yet failing open
-    assert len(only(out, "hire_answerer")) == 1     # everything else proceeds
+    assert len(only(out, "post_question")) == 1     # everything else proceeds
 
 
 def test_usage_fail_closed_shapes_never_launch_and_never_raise():
@@ -936,122 +936,131 @@ def test_bounced_marker_emits_bounce_with_verbatim_memo_and_notify():
     assert len(b) == 1 and b[0]["id"] == "i7" and b[0]["num"] == 7
     assert b[0]["memo"] == memo                       # quoted verbatim, never paraphrased
     assert has_notify(out)                            # needs-william transition
-    assert only(out, "hire_answerer") == []           # a bounce skips the answerer entirely
+    assert only(out, "post_question") == []           # a bounce is not a question — never posts one
 
 
 def test_bounced_already_processed_is_silent():
     dsk = disk(blocked={"i7": "BOUNCED: x"},
                issues_state={"version": 1, "issues": {"i7": ist("bounced")}})
     out = decide(dsk=dsk)
-    assert only(out, "bounce") == [] and only(out, "hire_answerer") == []
+    assert only(out, "bounce") == [] and only(out, "post_question") == []
 
 
-# =========================== answerer lifecycle ===========================
+# =========================== durable-question lifecycle (#163) ===========================
 
-def test_blocked_question_hires_an_answerer():
-    dsk = disk(blocked={"i7": "should I use approach A or B?"},
+def test_blocked_question_posts_durably_and_notifies():
+    # A worker's owner-decision question (a plain blocked marker) becomes a DURABLE GitHub comment
+    # and releases the lane — never a live-frozen session waiting on an answerer (#163).
+    dsk = disk(blocked={"i7": "QUESTION: approach A or B?\nRECOMMENDATION: A"},
                issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
     out = decide(dsk=dsk)
-    h = only(out, "hire_answerer")
-    assert len(h) == 1
-    assert h[0] == {"act": "hire_answerer", "id": "i7", "num": 7,
-                    "answerer_id": "a1", "question": "should I use approach A or B?"}
+    q = only(out, "post_question")
+    assert len(q) == 1
+    assert q[0] == {"act": "post_question", "id": "i7", "num": 7,
+                    "question": "QUESTION: approach A or B?\nRECOMMENDATION: A"}
+    assert has_notify(out)                             # the owner is told a question is waiting
 
 
-def test_active_answerer_record_prevents_a_duplicate_hire():
+def test_already_posted_question_does_not_renotify():
+    # question_posted is the once-per-question stamp: the durable comment already went out, so a
+    # re-derived tick (e.g. the label move is retrying) must not re-text the owner.
     dsk = disk(blocked={"i7": "q?"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked")},
-                             "answerers": {"a1": {"for": "i7", "launched_at": NOW - 60}},
-                             "next_answerer": 2})
+               issues_state={"version": 1, "issues": {"i7": ist("blocked", question_posted=True)}})
     out = decide(dsk=dsk)
-    assert only(out, "hire_answerer") == []
+    assert len(only(out, "post_question")) == 1        # still re-derives the (idempotent) action
+    assert not has_notify(out)                          # but never re-texts
 
 
-def test_two_blocked_issues_get_distinct_answerer_ids():
+def test_two_blocked_issues_each_post_their_question():
     dsk = disk(blocked={"i7": "q7?", "i8": "q8?"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked"), "i8": ist("blocked")},
-                             "next_answerer": 3})
+               issues_state={"version": 1, "issues": {"i7": ist("blocked"), "i8": ist("blocked")}})
     out = decide(dsk=dsk)
-    ids = [a["answerer_id"] for a in only(out, "hire_answerer")]
-    assert sorted(ids) == ["a3", "a4"]
+    ids = sorted(a["id"] for a in only(out, "post_question"))
+    assert ids == ["i7", "i8"]
 
 
-def test_answer_file_with_active_record_delivers():
-    dsk = disk(blocked={"i7": "q?"}, answers={"i7": "Use approach A; B breaks migrations."},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked")},
-                             "answerers": {"a1": {"for": "i7", "launched_at": NOW - 120}}})
+def test_third_question_parks_as_a_scoping_problem():
+    # At most TWO questions per issue; a THIRD is a scoping problem only the owner can untangle (#163).
+    dsk = disk(blocked={"i7": "a third question"},
+               issues_state={"version": 1, "issues": {"i7": ist("blocked", questions_asked=2)}})
     out = decide(dsk=dsk)
-    d = only(out, "deliver_answer")
-    assert len(d) == 1
-    assert d[0]["id"] == "i7" and d[0]["answerer_id"] == "a1"
-    assert d[0]["text"] == "Use approach A; B breaks migrations."
-
-
-def test_park_prefixed_answer_parks_with_notify():
-    dsk = disk(blocked={"i7": "q?"}, answers={"i7": "PARK: this needs William's pricing call"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked")},
-                             "answerers": {"a1": {"for": "i7", "launched_at": NOW - 120}}})
-    out = decide(dsk=dsk)
-    assert only(out, "deliver_answer") == []
+    assert only(out, "post_question") == []
     p = only(out, "park")
-    assert len(p) == 1 and p[0]["needs_william"] is True
-    assert "PARK: this needs William's pricing call" in p[0]["memo"]
-    assert "q?" in p[0]["memo"]                       # memo quotes the question
-    assert has_notify(out)
+    assert len(p) == 1 and p[0]["id"] == "i7" and p[0]["needs_william"] is True
+    assert "a third question" in p[0]["memo"] and has_notify(out)
 
 
-def test_answerer_timeout_parks_with_notify():
+def test_corrupt_questions_asked_parks_not_posts():
+    # A wrong-typed counter is UNREADABLE — fail closed to a park, never re-allow an unbounded
+    # round-trip (the _counter fail-closed contract).
     dsk = disk(blocked={"i7": "q?"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked")},
-                             "answerers": {"a1": {"for": "i7", "launched_at": NOW - 901}}})
+               issues_state={"version": 1, "issues": {"i7": ist("blocked", questions_asked="lots")}})
     out = decide(dsk=dsk)
-    p = only(out, "park")
-    assert len(p) == 1 and p[0]["id"] == "i7" and has_notify(out)
-    assert only(out, "hire_answerer") == []
+    assert only(out, "post_question") == []
+    assert len(only(out, "park")) == 1
 
 
-def test_answerer_hire_failures_cap_parks_instead_of_rehiring():
-    dsk = disk(blocked={"i7": "q?"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked", answerer_failures=2)}})
+def test_second_question_still_posts():
+    # One prior answered question (questions_asked=1) is under the cap — the second still posts.
+    dsk = disk(blocked={"i7": "second question"},
+               issues_state={"version": 1, "issues": {"i7": ist("blocked", questions_asked=1)}})
     out = decide(dsk=dsk)
-    assert only(out, "hire_answerer") == []
-    assert len(only(out, "park")) == 1 and has_notify(out)
+    assert len(only(out, "post_question")) == 1
+    assert only(out, "park") == []
 
 
-def test_answer_delivery_failures_cap_parks_instead_of_redelivering():
-    dsk = disk(blocked={"i7": "q?"}, answers={"i7": "answer"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked", answer_delivery_failures=3)},
-                             "answerers": {"a1": {"for": "i7", "launched_at": NOW - 60}}})
-    out = decide(dsk=dsk)
-    assert only(out, "deliver_answer") == []
-    assert len(only(out, "park")) == 1 and has_notify(out)
+def test_awaiting_answer_with_agent_ready_relaunches():
+    # The owner's answer = the approval verb (agent-ready re-applied) on an awaiting_answer issue.
+    # It triggers a FRESH session (answer_relaunch), never a nudge into a frozen pane (#163).
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("awaiting_answer")}})
+    out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "type:build"))], dsk=dsk)
+    r = only(out, "answer_relaunch")
+    assert len(r) == 1 and r[0] == {"act": "answer_relaunch", "id": "i5", "num": 5}
 
 
-def test_stale_answer_without_a_record_is_ignored():
-    dsk = disk(blocked={"i7": "a NEW question"}, answers={"i7": "answer to an OLD question"},
-               issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
-    out = decide(dsk=dsk)
-    assert only(out, "deliver_answer") == []
-    assert len(only(out, "hire_answerer")) == 1       # the new question still gets an answerer
+def test_awaiting_answer_without_agent_ready_is_inert():
+    # No answer yet: the issue sits idle, exempt from every liveness/recovery/launch path — no
+    # relaunch, no nudge, no park (the whole point: a waiting question holds no live window).
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("awaiting_answer")}},
+               exited={"i5": "1751000000 rc=0"})        # a stray turn-end exited stamp is ignored
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=dsk)
+    assert only(out, "answer_relaunch") == []
+    assert only(out, "recover") == []
+    assert only(out, "post_question") == []
+    assert only(out, "park") == []
 
 
-def test_blocked_with_exited_marker_recovers_instead_of_hiring():
-    # The issue is in the view because a real in-flight one always is (open, `in-progress`): since
-    # #150 every restart reads its eligibility there, and an unreadable one holds rather than
-    # relaunching blind.
-    dsk = disk(blocked={"i7": "q?"}, exited={"i7": "1751000000 rc=1"},
+def test_awaiting_answer_occupies_no_lane():
+    # awaiting_answer is NOT an in-flight status: the worker exited and the lane is free.
+    st = {"version": 1, "issues": {"i5": ist("awaiting_answer")}}
+    assert actions.lane_state_from(st) == []
+
+
+def test_blocked_question_posts_even_with_an_exited_marker():
+    # #163: the worker EXITS right after writing its question, so start-session.sh stamps an `exited`
+    # marker alongside the blocked marker. That is the normal hand-off — the question is posted, NOT
+    # mistaken for a crash to recover-relaunch (which would loop forever re-asking).
+    dsk = disk(blocked={"i7": "QUESTION: A or B?"}, exited={"i7": "1751000000 rc=0"},
                issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
     out = decide(parsed_issues=[parsed(7, labels=("in-progress", "type:build"))], dsk=dsk)
-    assert only(out, "hire_answerer") == []
-    r = only(out, "recover")
-    assert len(r) == 1 and r[0]["tier"] == "exited"
+    assert only(out, "recover") == []
+    assert len(only(out, "post_question")) == 1
 
 
-def test_blocked_with_report_goes_to_gate_not_answerer():
+def test_bounce_marker_wins_over_an_exited_marker():
+    # A BOUNCED worker also exits — the bounce still fires, never a recover.
+    dsk = disk(blocked={"i7": "BOUNCED: premise gone"}, exited={"i7": "1751000000 rc=0"},
+               issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
+    out = decide(parsed_issues=[parsed(7, labels=("in-progress", "type:build"))], dsk=dsk)
+    assert only(out, "recover") == []
+    assert len(only(out, "bounce")) == 1
+
+
+def test_blocked_with_report_goes_to_gate_not_question():
     dsk = disk(blocked={"i7": "q?"}, reports={"i7": GOOD_REPORT},
                issues_state={"version": 1, "issues": {"i7": ist("blocked")}})
     out = decide(dsk=dsk)
-    assert only(out, "hire_answerer") == []
+    assert only(out, "post_question") == []
     assert len(only(out, "gate")) == 1
 
 
@@ -2074,14 +2083,14 @@ def test_inflight_reconcile_ignores_a_superseded_pr():
     assert only(out, "park") == [] and only(out, "absorb_merged") == []
 
 
-def test_absorbed_merge_wins_over_the_answerer_lifecycle():
-    # The stall itself: i328's lane sat in the blocked/answerer machinery while its PR was ALREADY
+def test_absorbed_merge_wins_over_the_question_lifecycle():
+    # The stall itself: i328's lane sat in the blocked/question machinery while its PR was ALREADY
     # merged. The merged fact must win over every lifecycle the lane would otherwise keep spinning.
     d, g = _inflight(pv=pr_view(state="MERGED"), status="blocked", pr=555)
     d["blocked"] = {"i5": "which approach should I take?"}
     out = decide(dsk=d, gh_view=g)
     assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
-    assert only(out, "hire_answerer") == []
+    assert only(out, "post_question") == []
 
 
 def test_inflight_reconcile_leaves_a_not_yet_launched_issue_alone():
@@ -2295,7 +2304,7 @@ def test_cold_restart_reconstructs_a_finished_issue_straight_to_merge():
 def test_cold_restart_reconstructs_a_blocked_issue():
     d = disk(blocked={"i7": "q?"})
     out = decide(parsed_issues=[parsed(7, labels=("in-progress", "type:build"))], dsk=d)
-    assert len(only(out, "hire_answerer")) == 1
+    assert len(only(out, "post_question")) == 1
 
 
 # =========================== red dev: freeze + fix-forward ===========================
@@ -2534,18 +2543,12 @@ def test_corrupt_cap_counters_park_instead_of_proceeding():
     assert only(out, "launch") == []
     assert len(only(out, "park")) == 1 and has_notify(out)
 
+    # A corrupt questions_asked (a bool is an int subclass but never a real count) is unreadable —
+    # fail closed to a park, never re-open an unbounded question round-trip (#163).
     d = disk(blocked={"i7": "q?"},
-             issues_state={"version": 1, "issues": {"i7": ist("blocked", answerer_failures=True)}})
+             issues_state={"version": 1, "issues": {"i7": ist("blocked", questions_asked=True)}})
     out = decide(dsk=d)
-    assert only(out, "hire_answerer") == []
-    assert len(only(out, "park")) == 1 and has_notify(out)
-
-    d = disk(blocked={"i7": "q?"}, answers={"i7": "answer"},
-             issues_state={"version": 1,
-                           "issues": {"i7": ist("blocked", answer_delivery_failures="9")},
-                           "answerers": {"a1": {"for": "i7", "launched_at": NOW - 60}}})
-    out = decide(dsk=d)
-    assert only(out, "deliver_answer") == []
+    assert only(out, "post_question") == []
     assert len(only(out, "park")) == 1 and has_notify(out)
 
 
@@ -2892,8 +2895,8 @@ def test_a_logged_out_alert_stops_once_the_lane_is_terminal():
 def test_a_lane_stuck_at_its_own_dialog_eventually_reaches_the_owner():
     """FRESH-REVIEW P1 — the hole the first fix opened. 'It is waiting on a human' was wrong: there
     is NO human at that pane. The loop's channel for 'worker needs input' is state/blocked/<id> ->
-    hire_answerer -> deliver_answer; an in-window AskUserQuestion is OFF that channel, so by
-    construction nobody will ever answer it.
+    a durable GitHub question comment (the worker exits, the owner answers); an in-window
+    AskUserQuestion is OFF that channel, so by construction nobody will ever answer it.
 
     So at_dialog-forever is not a live lane, it is a stalled one the loop cannot serve — and
     because 'frozen' is an INFLIGHT status, refusing to park it leaks the lane's slot silently and

@@ -16,9 +16,16 @@ becomes a NEW issue labeled `needs-owner`, never a code comment.
 
 {work_block}
 
-{bright_lines}**Blocked?** Write your single, specific question to {blocked_path} and end your turn. A
-fresh answerer will reply into this session. If you can safely proceed on one reasonable
-assumption, {assumption_hint}
+{bright_lines}**Blocked — need an owner decision?** Do NOT sit waiting at the prompt (a waiting
+session is a session that dies). Write your question to {blocked_path} as three parts — `QUESTION:`
+the one specific decision, `OPTIONS:` the choices you see, and `RECOMMENDATION:` the one you would
+take if forced — then commit and push your work-in-progress on `{branch}` (`git push -u origin
+HEAD`) and END your session. The runner posts your question as a durable comment on issue
+#{issue_num}, releases your lane, and closes your window; when {operator} answers, a FRESH session
+resumes this issue with your question and his answer in its brief, reusing your pushed branch if it
+still applies cleanly. You get at most TWO questions on one issue — a third hands the issue to
+{operator} as a scoping problem. If you can safely proceed on one reasonable assumption,
+{assumption_hint}
 
 **Long background wait?** touch {awaiting_path} first, and remove it when you resume.
 

@@ -27,6 +27,23 @@ def test_default_issue_schema():
     assert d["requeue_front"] is False
     assert d["declared_touches"] == []
     assert "ready" in loopstate.VALID and "merged" in loopstate.VALID
+    # Durable-question fields (#163): a blocked worker exits cleanly and the runner tracks the
+    # question count (2-cap), the pending question, and the answered Q&A history embedded in a
+    # relaunch brief. qa_log is a MUTABLE list, so new_issue must deep-copy it (like declared_touches).
+    assert d["questions_asked"] == 0
+    assert d["pending_question"] is None
+    assert d["qa_log"] == []
+    assert "awaiting_answer" in loopstate.VALID
+
+
+def test_qa_log_is_deep_copied_not_shared():
+    # qa_log is a mutable list on the template — new_issue() must deep-copy it so two issues never
+    # alias one shared Q&A history (the declared_touches aliasing class, #163).
+    a = loopstate.new_issue()
+    b = loopstate.new_issue()
+    a["qa_log"].append({"question": "q", "answer": "a"})
+    assert b["qa_log"] == []
+    assert loopstate.DEFAULT_ISSUE["qa_log"] == []
 
 
 def test_roundtrip_and_default(tmp_path):

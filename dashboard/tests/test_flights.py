@@ -190,6 +190,24 @@ def test_bounced_marker_makes_a_blocked_flight_awaiting():
     assert flights.flight_stage("blocked", bounced=True) == flights.AWAITING
 
 
+def test_awaiting_answer_is_awaiting_amber():
+    # #163: a worker that exited on a durable owner-decision question is amber — a person is needed.
+    assert flights.flight_stage("awaiting_answer") == flights.AWAITING
+
+
+def test_build_flight_awaiting_answer_is_a_question_with_the_question_as_memo():
+    issue = {
+        "id": "i9", "num": 9, "status": "awaiting_answer", "branch": "sl/i9-x",
+        "pending_question": "QUESTION: approach A or B?\nRECOMMENDATION: A",
+        "activity_mtime": None, "journal": [],
+    }
+    f = flights.build_flight(issue, _REPO)
+    assert f["stage"] == flights.AWAITING
+    assert f["awaiting_reason"] == "question"
+    assert f["memo"] == "QUESTION: approach A or B?\nRECOMMENDATION: A"
+    assert f["question"] == "QUESTION: approach A or B?\nRECOMMENDATION: A"
+
+
 def test_plain_blocked_keeps_flying_not_amber():
     # A worker blocked on a question the answerer is handling is still in the air (a radio call),
     # NOT an amber owner-decision — those demand opposite responses and must never share a look.

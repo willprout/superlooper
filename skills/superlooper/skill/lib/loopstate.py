@@ -26,7 +26,11 @@ LOCK_STALE_SECONDS = 120
 # The per-issue lifecycle statuses the runner tracks (replaces autocode's run/PR status set):
 #   ready    - eligible, not yet launched
 #   running  - a worker session is live in a lane
-#   blocked  - worker asked a question (state/blocked/<id>); slot held until answered
+#   blocked  - worker asked a question (state/blocked/<id>); transient — the runner posts the
+#              question durably and moves the issue to awaiting_answer within a tick (#163)
+#   awaiting_answer - worker exited cleanly on an owner-decision question (durable GitHub comment);
+#              the lane is RELEASED and the window CLOSED — nothing relaunches until the owner
+#              answers (re-applies agent-ready). Exempt from every liveness/recovery path (#163).
 #   frozen   - activity stale past FREEZE_SECONDS; in the recovery ladder
 #   exited   - the Claude process returned to the shell; awaiting relaunch
 #   gating   - finished (report exists); the mechanical ship gate is running
@@ -35,20 +39,25 @@ LOCK_STALE_SECONDS = 120
 #   parked   - handed back to William with a memo (terminal-until-William)
 #   needs_william - an owner decision is required (bounce / cap hit / recheck fail)
 #   bounced  - the worker rejected the issue's premise (BOUNCED: marker); runner posted the memo
-VALID = ["ready", "running", "blocked", "frozen", "exited",
+VALID = ["ready", "running", "blocked", "awaiting_answer", "frozen", "exited",
          "gating", "holding", "merged", "parked", "needs_william", "bounced"]
 
 # One issue's initial state TEMPLATE. `launches` is stamped mechanically by launch-session.sh at
 # the moment a worker's delivery is VERIFIED (the only honest point); retries = launches - 1.
 # `pr` caches the discovered PR number; `declared_touches` is the areas the issue claims (for
 # anti-affinity vs in-flight lanes); `requeue_front` re-front-queues a conflict-regenerated issue.
-# NEVER copy this with dict(DEFAULT_ISSUE): `declared_touches` is a MUTABLE list, so a shallow
-# copy would alias one shared list across every issue and the template (the DEFAULT_PR aliasing
-# class of bug — but DEFAULT_PR was all scalars, so it got away with a shallow copy; this one
+# NEVER copy this with dict(DEFAULT_ISSUE): `declared_touches` AND `qa_log` are MUTABLE lists, so a
+# shallow copy would alias one shared list across every issue and the template (the DEFAULT_PR
+# aliasing class of bug — but DEFAULT_PR was all scalars, so it got away with a shallow copy; these
 # can't). Construct fresh issues with new_issue(), which deep-copies (cross-review, Task 1).
+# Durable-question fields (#163): `questions_asked` is the per-issue question count (capped at 2 — a
+# third is a scoping park); `pending_question` holds the question the owner has not yet answered;
+# `qa_log` is the answered [{question, answer}] history embedded into every relaunch brief so a fresh
+# session inherits the full decision trail.
 DEFAULT_ISSUE = {"status": "ready", "branch": None, "lane": None,
                  "launches": 0, "retries": 0, "conflicts": 0,
-                 "requeue_front": False, "declared_touches": [], "pr": None}
+                 "requeue_front": False, "declared_touches": [], "pr": None,
+                 "questions_asked": 0, "pending_question": None, "qa_log": []}
 
 
 def new_issue():

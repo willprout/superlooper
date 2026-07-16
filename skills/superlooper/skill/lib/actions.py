@@ -61,7 +61,7 @@ The view contract (assembled by runner.py each tick):
                   absent = not fetched)}
 
 Action vocabulary (the executor contract, one journal record each):
-  launch, hire_answerer, deliver_answer, bounce, recover(tier=idle|frozen|exited), gate,
+  launch, post_question, answer_relaunch, bounce, recover(tier=idle|frozen|exited), gate,
   merge, update, nudge, hold, await_read, await_pr_read, clear_pr_read, await_comments_read,
   clear_comments_read, note_checks_pending,
   clear_checks_pending, park, clear_park_marker, regenerate, resolve_conflict,
@@ -108,7 +108,6 @@ USAGE_STALE_SECONDS = 300          # no fresh usage for 5 min -> cached reading 
 # at/over the ceiling) is unaffected — that still fails CLOSED; only an UNREADABLE meter fails open.
 USAGE_FAIL_OPEN_GRACE_SECONDS = 1800
 GH_ALERT_FAILURES = 10             # consecutive failed poll cycles (~15 min at 90 s) -> ALERT
-ANSWERER_TIMEOUT_SECONDS = 900     # the answerer's 15-min freeze tier = its timeout
 RECOVER_RETRY_SECONDS = 600        # frozen-session recovery ladder re-fires at most every 10 min
 # How long a session may sit at its OWN in-window question before the owner is told (issue #151).
 # A lane at a dialog is never parked — it is alive — but it must not be SILENT either: the loop's
@@ -136,8 +135,10 @@ SYSTEMIC_LAUNCH_FAILURE_CAP = 2    # >= this many DISTINCT issues failing delive
 # genuinely dead anchor — and the interval is measured from the LAST delivery failure, so the first
 # canary waits a full interval after the trip rather than firing the instant the hold engages (#115).
 CANARY_RETRY_SECONDS = 300
-ANSWERER_FAILURE_CAP = 2           # answerer hire failed twice -> park the issue
-DELIVERY_FAILURE_CAP = 3           # answer would not deliver to the pane -> park the issue
+# At most TWO owner-decision questions per issue (#163). A worker that would ask a THIRD is no longer
+# stuck on a decision — it is stuck on SCOPE, which only the owner can untangle; so the third hands
+# the issue back (needs-owner) with the question quoted, rather than posting a third round-trip.
+QUESTION_CAP = 2
 MERGE_REFUSAL_CAP = 2              # gate-green PR's merge refused this many ticks -> park (#27)
 UPDATE_ERROR_ALERT = 4             # persistent merge-update infra errors -> ALERT (never regenerate)
 RUNAWAY_THRESHOLD = 4              # retries far past the cap -> ALERT (events.retry_runaway)
@@ -323,10 +324,12 @@ def _since_ok(since, now):
 
 
 def _in_owner_handback_episode(ist, blocked_text):
-    """True iff the issue is in an owner-handback episode — a park or a bounce that is handing the
-    issue back to the owner (issue #108). Either it has already SETTLED into an owner-decision
-    status, or it is mid-handback with the durable marker / BOUNCED memo present (the storm states,
-    where a label move keeps failing and status has not settled). Scopes external-close absorption
+    """True iff the issue is in an owner-handback episode — a park, a bounce, OR a durable question
+    (#163) that is handing the issue back to the owner (issue #108). Either it has already SETTLED
+    into an owner-decision status (parked / needs_william / bounced / awaiting_answer), or it is
+    mid-handback with the durable marker / BOUNCED memo present (the storm states, where a label move
+    keeps failing and status has not settled). awaiting_answer counts so the owner CLOSING a waiting
+    question on GitHub (his Drop) is absorbed like any other hand-back close, freeing the worktree. Scopes external-close absorption
     to exactly these episodes, so a normal merge-close (status 'merged') or a plain running build is
     never mistaken for the owner's Drop. A 'merged' status short-circuits to False FIRST: it is the
     settled-DONE bucket (a real landing, an absorbed out-of-band merge, OR this issue's own
@@ -337,7 +340,7 @@ def _in_owner_handback_episode(ist, blocked_text):
     status = ist.get("status")
     if status == "merged":
         return False
-    if status in ("bounced", "parked", "needs_william"):
+    if status in ("bounced", "parked", "needs_william", "awaiting_answer"):
         return True
     if isinstance(blocked_text, str) and blocked_text.lstrip().startswith("BOUNCED:"):
         return True
@@ -640,7 +643,6 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     ist_map = _dget(issues_state, "issues", dict)
     blocked = _dget(dsk, "blocked", dict)
     reports = _dget(dsk, "reports", dict)
-    answers = _dget(dsk, "answers", dict)
     exited = _dget(dsk, "exited", dict)
     launch_stderr = _dget(dsk, "launch_stderr", dict)   # {id: bounded stderr tail} (issue #40)
     frozen = dsk.get("frozen") if isinstance(dsk.get("frozen"), dict) else None
@@ -701,18 +703,6 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     issue_comments = _dget(gv, "issue_comments", dict)
     raw_closed = gv.get("closed_nums")
     closed_nums = set(raw_closed) if isinstance(raw_closed, (set, frozenset, list, tuple)) else set()
-
-    # answerer bookkeeping: an active record per issue; the next id must never collide with an
-    # existing one even if the counter is corrupt (scan wins over a wrong-typed counter).
-    answerers = _dget(issues_state, "answerers", dict)
-    active_answerer = {}
-    max_aid = 0
-    for aid, rec in answerers.items():
-        if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
-            max_aid = max(max_aid, int(aid[1:]))
-        if isinstance(rec, dict) and isinstance(rec.get("for"), str):
-            active_answerer[rec["for"]] = (aid, rec)
-    next_aid = max(_count(issues_state.get("next_answerer"), 1), max_aid + 1)
 
     out = []
     parked_now = set()
@@ -1000,6 +990,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         has_exited = iid in exited
         retries = ist.get("retries", 0)
 
+        # ---- awaiting a durable question's answer (#163): the worker exited cleanly, the question
+        #      is a durable GitHub comment, the window is closed and the lane is free. Nothing here
+        #      relaunches, recovers, or nudges — an owner-question issue holds NO live window. The
+        #      ONE thing that moves it is the owner's answer: the approval verb (a fresh `agent-ready`
+        #      on this awaiting_answer issue) -> a fresh session that embeds the Q&A in its brief and
+        #      reuses the pushed WIP. `continue` here keeps it exempt from every liveness/recovery/
+        #      launch path below (including a stray turn-end `exited` stamp left by the closed pane). ----
+        if status == "awaiting_answer":
+            labels = p.get("labels") if isinstance(p, dict) and isinstance(p.get("labels"), list) else []
+            if "agent-ready" in labels:
+                out.append({"act": "answer_relaunch", "id": iid, "num": num})
+            continue
+
         # ---- recheck failure: an owner decision, checked before any gate re-run ----
         if ist.get("recheck_failed"):
             park(iid, num, "ship_recheck_cmd failed after the mechanical merge-update — "
@@ -1286,8 +1289,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # and recording one would let a ghost masquerade as this episode's own.
                     out.append({"act": "record_pr", "id": iid, "pr": pr_num})
 
-        # ---- blocked marker present (and no report): bounce or the answerer lifecycle ----
-        if blocked_text is not None and not has_exited:
+        # ---- blocked marker present: bounce, or a durable owner-decision question ----
+        # A question or a bounce is handled EVEN IF an `exited` marker is also present: in the #163
+        # model the worker EXITS right after writing its question (start-session.sh then stamps
+        # `exited`), so blocked+exited is the NORMAL hand-off, not a crash. The blocked branch owns
+        # it and `continue`s, so the exited-recovery ladder below never mistakes a clean question-exit
+        # for a crash to relaunch. (post_question / bounce consume the marker, so this cannot loop.)
+        if blocked_text is not None:
             if blocked_text.lstrip().startswith("BOUNCED:"):
                 # Notify-once per bounce (issue #108, mirroring #61's park guard). A bounce hands the
                 # issue back to the owner via a needs-owner label move; when that move keeps failing
@@ -1308,39 +1316,28 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 notify(f"superlooper: {iid} bounced (needs-owner)", blocked_text)
                 out.append(act)
                 continue
-            aid_rec = active_answerer.get(iid)
-            answer = answers.get(iid) if isinstance(answers.get(iid), str) else None
-            if aid_rec and answer is not None:
-                deliveries, corrupt = _counter(ist, "answer_delivery_failures")
-                if corrupt or deliveries >= DELIVERY_FAILURE_CAP:
-                    park(iid, num, f"the answer would not deliver to the session pane "
-                                   f"({DELIVERY_FAILURE_CAP} attempts, or the attempt counter "
-                                   f"is unreadable). question was: {blocked_text!r}",
-                         cause="answer_delivery")
-                elif answer.lstrip().startswith("PARK:"):
-                    park(iid, num, f"answerer escalated to {operator}. question: "
-                                   f"{blocked_text!r} — answer: {answer!r}",
-                         needs_william=True, cause="answerer_escalated")
-                else:
-                    out.append({"act": "deliver_answer", "id": iid,
-                                "answerer_id": aid_rec[0], "text": answer})
-            elif aid_rec:
-                launched_at = aid_rec[1].get("launched_at")
-                age = (now - launched_at) if _real(launched_at) else math.inf
-                if age >= ANSWERER_TIMEOUT_SECONDS:
-                    park(iid, num, f"answerer {aid_rec[0]} timed out after "
-                                   f"{ANSWERER_TIMEOUT_SECONDS // 60} min. question was: "
-                                   f"{blocked_text!r}", cause="answerer_timeout")
+            # A real owner-decision question (#163). The worker has posted a structured question to
+            # its blocked file, pushed its WIP, and ended its turn. Instead of hiring an answerer to
+            # nudge a live-frozen pane (the model that died with i336's auth death and i280's zombie
+            # window), the runner posts the question DURABLY as a GitHub comment, closes the window,
+            # and releases the lane (post_question). The owner's answer — the approval verb — later
+            # relaunches a fresh session with the Q&A embedded. At most QUESTION_CAP questions per
+            # issue; a corrupt/at-cap counter means a THIRD, which is a scoping problem only the owner
+            # can untangle, so it hands back to needs-owner with the question quoted (never a third
+            # round-trip). The notify fires once per question (gated on the post-once stamp), so a
+            # re-derived tick — the label move retrying — never re-texts.
+            asked, corrupt = _counter(ist, "questions_asked")
+            if corrupt or asked >= QUESTION_CAP:
+                park(iid, num, f"third owner question on issue #{num} (cap {QUESTION_CAP}) — a "
+                               f"scoping problem only {operator} can untangle, not another "
+                               f"round-trip. latest question: {blocked_text!r}",
+                     needs_william=True, cause="question_cap")
             else:
-                hires, corrupt = _counter(ist, "answerer_failures")
-                if corrupt or hires >= ANSWERER_FAILURE_CAP:
-                    park(iid, num, f"could not launch an answerer ({ANSWERER_FAILURE_CAP} "
-                                   f"attempts, or the attempt counter is unreadable). "
-                                   f"question was: {blocked_text!r}", cause="answerer_hire")
-                else:
-                    out.append({"act": "hire_answerer", "id": iid, "num": num,
-                                "answerer_id": f"a{next_aid}", "question": blocked_text})
-                    next_aid += 1
+                if not ist.get("question_posted"):
+                    notify(f"superlooper: {iid} needs an answer",
+                           f"a worker exited on a question and is waiting for {operator}:\n\n"
+                           f"{blocked_text}")
+                out.append({"act": "post_question", "id": iid, "num": num, "question": blocked_text})
             continue
 
         # ---- liveness recovery: exited beats frozen beats idle ----

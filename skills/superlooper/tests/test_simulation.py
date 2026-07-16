@@ -832,73 +832,61 @@ def test_external_close_of_a_parked_issue_absorbs_and_concludes(sim_factory):
 
 
 # =====================================================================================
-# blocked -> a real answerer session -> answer nudged in -> resumed -> merged
+# blocked -> a DURABLE GitHub question -> the worker EXITS + the lane frees -> the owner
+# answers -> a FRESH session resumes with the Q&A in its brief -> merged (#163)
 # =====================================================================================
 
-def test_blocked_answerer_roundtrip_resumes_and_merges(sim_factory):
+def _owner_answers(sim, num, answer_text):
+    """Simulate the owner answering a durable question: a marked answer comment + the approval verb
+    (re-add agent-ready, drop awaiting-answer). This is exactly what the dashboard's Answer button
+    does mechanically (a comment + a label move), and what a GitHub-client reply + re-approve does."""
+    def fn(st):
+        issue = st["issues"][str(num)]
+        issue.setdefault("comments", []).append(
+            {"body": "<!-- superlooper-answer -->\n%s" % answer_text,
+             "author": {"login": "o"}, "authorAssociation": "OWNER",
+             "createdAt": "2026-07-02T15:00:00Z"})
+        labs = issue.setdefault("labels", [])
+        if "agent-ready" not in labs:
+            labs.append("agent-ready")
+        if "awaiting-answer" in labs:
+            labs.remove("awaiting-answer")
+    sim.edit_gh_state(fn)
+
+
+def test_blocked_question_durable_roundtrip_resumes_and_merges(sim_factory):
     sim = sim_factory()
-    question = "Should the simulated widget use approach A or B? One line is enough."
+    question = ("QUESTION: Should the simulated widget use approach A or B?\n"
+                "OPTIONS:\n- A (matches the pattern)\n- B (new dependency)\nRECOMMENDATION: A")
     num = sim.add_issue(title="Blocks on a question",
                         scenario={"scenario": "blocked", "question": question})
     sid = "i%d" % num
-    sim.set_scenario("a1", {"scenario": "answerer",
-                            "answer": "Use approach A — it matches the existing pattern."})
+
+    # tick 1: the worker asks, pushes its WIP, and EXITS. The runner posts a DURABLE question
+    # comment, closes the window, and RELEASES the lane (awaiting_answer) — no live-frozen session,
+    # no answerer, no lane held on the question.
     sim.tick()
-    assert sim.wait_file(os.path.join(sim.home, "state", "blocked", sid))
-
-    # the answerer is HIRED through the same delivery-verified stack, in the answers dir
-    assert sim.tick_until(
-        lambda: os.path.exists(os.path.join(sim.home, "answers", "%s.md" % sid)), ticks=10), \
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "awaiting_answer"), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
-    assert os.path.exists(os.path.join(sim.home, "briefs", "a1.md"))
-    assert not os.path.isdir(os.path.join(sim.home, "worktrees", "a1")), \
-        "an answerer launches --cwd, never a worktree"
+    qcomments = [m for m in sim.mutations("comment")
+                 if m["body"].startswith("<!-- superlooper-question -->")]
+    assert qcomments and "approach A or B" in qcomments[0]["body"], "the question must be durable"
+    assert "awaiting-answer" in sim.issue(num)["labels"]
+    assert not os.path.exists(os.path.join(sim.home, "state", "blocked", sid)), "marker consumed"
+    assert os.path.isdir(os.path.join(sim.home, "worktrees", sid)), "the WIP worktree is preserved"
 
-    # answer delivered into the worker pane; marker cleared; the worker resumes and ships
+    # the owner answers (a marked reply + the approval verb) — no live window was ever the only copy
+    # of the question OR the answer.
+    _owner_answers(sim, num, "Use approach A — it matches the existing pattern.")
+
+    # the runner relaunches a FRESH session; its brief carries the Q&A; it finishes and merges.
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged"), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
-    deliveries = [s for s in sim.sends()
-                  if "Answer from a fresh answerer" in s.get("text", "")]
-    assert deliveries and "approach A" in deliveries[0]["text"]
-    assert not os.path.exists(os.path.join(sim.home, "state", "blocked", sid))
+    assert [r for r in sim.journal("answer_relaunch") if r.get("id") == sid], \
+        "the owner's answer must have triggered an answer_relaunch"
     assert len(sim.mutations("merge_pr")) == 1
-    # the answerer session was a REAL second launch (worker tab + answerer tab)
-    assert len(sim.surfaces()) == 2
-
-
-def test_answerer_park_escalates_to_william(sim_factory):
-    # the answerer refuses to guess: a PARK: answer parks the issue needs-owner with the
-    # question quoted in the memo.
-    sim = sim_factory()
-    question = "May I spend money on a paid API for this?"
-    num = sim.add_issue(title="Owner question",
-                        scenario={"scenario": "blocked", "question": question})
-    sid = "i%d" % num
-    sim.set_scenario("a1", {"scenario": "answerer-park"})
-    sim.tick()
-    assert sim.wait_file(os.path.join(sim.home, "state", "blocked", sid))
-    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "needs_william")
-    assert "needs-owner" in sim.issue(num)["labels"]
-    memos = [m for m in sim.mutations("comment") if question in m["body"]]
-    assert memos, "the park memo must quote the worker's question"
-    assert not sim.mutations("merge_pr")
-
-
-def test_answerer_timeout_parks_with_question(sim_factory):
-    # a hired answerer that never writes its file: the 15-minute (virtual) freeze tier is its
-    # timeout — the issue parks with the question quoted, never wedges the lane forever.
-    sim = sim_factory()
-    question = "What color should the widget be?"
-    num = sim.add_issue(title="Silent answerer",
-                        scenario={"scenario": "blocked", "question": question})
-    sid = "i%d" % num
-    sim.set_scenario("a1", {"scenario": "answerer-silent"})
-    sim.tick()
-    assert sim.wait_file(os.path.join(sim.home, "state", "blocked", sid))
-    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked",
-                          ticks=15, advance=181)     # ~15 virtual minutes pass quickly
-    memos = [m for m in sim.mutations("comment") if "timed out" in m["body"]]
-    assert memos and question in memos[0]["body"]
+    # the relaunch reused the SAME issue worktree (never an answerer's --cwd session)
+    assert not os.path.isdir(os.path.join(sim.home, "worktrees", "a1"))
 
 
 # =====================================================================================
@@ -1731,7 +1719,6 @@ def test_orphaned_pushed_branch_no_pr_blocks_and_preserves_remote_work(sim_facto
     num = sim.add_issue(title="Orphaned push", labels=("type:build", "in-progress"),
                         scenario={"scenario": "happy"})
     sid = "i%d" % num
-    sim.set_scenario("a1", {"scenario": "answerer-park"})
 
     # the dead prior worker's legacy: its branch IS on the remote, with real work, and no PR.
     # branch_for(title "Orphaned push") == sl/i1-orphaned-push — the SAME name a requeued
@@ -1754,17 +1741,21 @@ def test_orphaned_pushed_branch_no_pr_blocks_and_preserves_remote_work(sim_facto
     assert "agent-ready" in sim.issue(num)["labels"]
 
     # tick 2: the fresh worker launches, builds from current dev on the SAME branch name,
-    # and its plain push is REFUSED (no force path exists anywhere) -> it blocks
+    # and its plain push is REFUSED (no force path exists anywhere) -> it asks a question
     sim.tick()
     assert sim.wait_file(os.path.join(sim.home, "state", "blocked", sid)), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
     blocked_q = open(os.path.join(sim.home, "state", "blocked", sid)).read()
     assert "refused" in blocked_q and "force" in blocked_q
 
-    # the answerer recognizes an owner call -> the issue parks needs-owner with the question
-    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "needs_william"), \
+    # #163: the refusal becomes a DURABLE question and the lane is released (awaiting_answer) — no
+    # answerer, no needs-owner park; the owner decides how to reconcile the orphaned branch.
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "awaiting_answer"), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
-    assert "needs-owner" in sim.issue(num)["labels"]
+    assert "awaiting-answer" in sim.issue(num)["labels"]
+    qcomments = [m for m in sim.mutations("comment")
+                 if m["body"].startswith("<!-- superlooper-question -->") and "refused" in m["body"]]
+    assert qcomments, "the push-refusal question must be durable on the issue"
 
     # THE INVARIANT THE POKE EXISTS FOR: the pushed work was never clobbered or lost
     assert sim.origin_tip("sl/i%d-orphaned-push" % num) == orphan_tip

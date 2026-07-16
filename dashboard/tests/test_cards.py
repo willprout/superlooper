@@ -46,6 +46,38 @@ def test_a_decision_that_went_around_is_a_conflict_cap_card():
     assert cards.card_kind(_flight(stage=flights.PARKED, attempt=2)) == "conflict-cap"
 
 
+def test_a_durable_question_is_a_question_card():
+    # #163: a durable owner-decision question is its own kind and takes precedence over the go-around
+    # count — it is ANSWERED, not approved.
+    assert cards.card_kind(_flight(stage=flights.AWAITING, awaiting_reason="question")) == "question"
+    assert cards.card_kind(_flight(stage=flights.AWAITING, awaiting_reason="question",
+                                   attempt=3)) == "question"
+
+
+def test_question_card_offers_a_typed_answer_action():
+    # The primary verb on a question card is Answer — a mechanical comment+label that takes the
+    # operator's typed text (input: "answer"), plus Discuss and Drop. Never a bare Approve.
+    card = cards.needs_you_card(_flight(stage=flights.AWAITING, awaiting_reason="question",
+                                        memo="QUESTION: A or B?"), "will-titan/sandbox")
+    assert card["kind"] == "question" and card["badge_base"] == "QUESTION"
+    assert card["memo"] == "QUESTION: A or B?"           # the whole question rides on the card
+    acts = card["actions"]
+    answer = [a for a in acts if a["act"] == "answer"]
+    assert answer and answer[0]["input"] == "answer" and answer[0]["tone"] == "primary"
+    verbs = {a["act"] for a in acts}
+    assert "answer" in verbs and "discuss" in verbs and "drop" in verbs
+    assert "approve" not in verbs and "bounce-yes" not in verbs   # a question is answered, not approved
+
+
+def test_question_dossier_omits_the_mid_build_gate_row():
+    # A question flight paused MID-build, so every gate check is naturally not-yet — showing "gate at
+    # hand-back: not yet: ..." would imply the question is about a failed gate. It must be omitted;
+    # the question text is the whole evidence.
+    dossier = cards.decision_dossier(
+        _flight(stage=flights.AWAITING, awaiting_reason="question", memo="QUESTION: A or B?"), [])
+    assert not any("gate at hand-back" in (it["label"] or "") for it in dossier["items"])
+
+
 # =============================== the card — plain gloss leads, literal term secondary ===============================
 
 def test_parked_card_leads_with_a_plain_headline_and_a_hover_term():

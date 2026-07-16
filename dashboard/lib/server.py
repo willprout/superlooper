@@ -146,7 +146,7 @@ _LABEL_VERBS = {
     "/api/expedite": "expedite",
     "/api/bounce-yes": "bounce_yes",
 }
-_ACTION_PATHS = set(_LABEL_VERBS) | {"/api/flag", "/api/discuss"}
+_ACTION_PATHS = set(_LABEL_VERBS) | {"/api/flag", "/api/discuss", "/api/answer"}
 
 # The Tidy endpoints (issue #41) — the dashboard's SECOND button class: a LOCAL COMMAND execution
 # (``superlooper tidy``), not a GitHub write. Two steps, two paths: dry-run lists what WOULD close
@@ -418,6 +418,15 @@ def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, des
         if not isinstance(text, str):
             return _json_resp(400, {"ok": False, "error": "missing 'text'"})
         return _json_resp(200, actions.flag(repo, text))
+
+    if clean == "/api/answer":           # #163: post the owner's typed answer + re-approve
+        text = payload.get("text")
+        if not isinstance(text, str):
+            return _json_resp(400, {"ok": False, "error": "missing 'text'"})
+        num = _num_of(payload)
+        if num is None:
+            return _json_resp(400, {"ok": False, "error": "missing or bad 'num'"})
+        return _json_resp(200, actions.answer(repo, text, num))
 
     if clean == "/api/discuss":
         num = _num_of(payload)
@@ -1368,6 +1377,9 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
             "review_present": _review_present(source, slug, pr, mem), "journal": jslice,
             "pr_facts": pr_facts, "cargo": cargo, "diff_delta": None,
             "closed": is_closed,
+            # #163: the durable owner-decision question this flight is waiting on (loopstate), so the
+            # Questions surface can show it and offer the Answer action.
+            "pending_question": st.get("pending_question"),
         }
         f = flights.build_flight(issue, flight_repo)
         f["display"] = _project_display(f, name, jslice, issue["activity_mtime"], now)

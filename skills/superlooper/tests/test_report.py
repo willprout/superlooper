@@ -38,6 +38,10 @@ def _full_journal():
         _rec(1013, "regenerate", id="i7", num=7, pr=12,
              new_branch="sl/i7-widget-r2", conflicts=1, outcome="ok"),
         _rec(1014, "merge", id="i12", num=12, pr=20, wander=True, outcome="ok"),
+        _rec(1015, "post_question", id="i13", num=13,
+             question="QUESTION: approach A or B?", outcome="ok"),
+        _rec(1016, "post_question", id="i13", num=13,
+             question="QUESTION: and what about C?", outcome="ok"),
         _rec(1020, "nightly", date="2026-07-02", green=False, flakes=2, persistent=1,
              filed=[30], parse_error=False, outcome="ok"),
     ]
@@ -75,6 +79,10 @@ def test_full_report_has_every_section_with_its_entries():
     assert "sl/i7-widget-r2" in out
     # Wanders — the declared-vs-actual touches metric
     assert "#12" in out and "wander" in out.lower()
+    # Owner questions — the #163 question-rate, counted per issue (i13 asked twice)
+    q_section = out.split("## Owner questions")[1].split("\n## ")[0]
+    assert "#13" in q_section and "asked 2 owner question(s)" in q_section
+    assert "2 question(s)" in out                             # the summary tally counts total asks
     # Gate health — nightly result + flake count + quarantine size
     assert "flake" in out.lower() and "quarantine" in out.lower()
 

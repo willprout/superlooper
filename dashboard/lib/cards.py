@@ -64,11 +64,14 @@ OFF_PATH_PLAIN = {
 # =============================== the card kind — the four decisions ===============================
 
 def card_kind(flight):
-    """Which of the four decision kinds a waiting flight is. A flight that went around (``attempt``
-    >= 2 — a conflict regeneration happened) and STILL landed on William's desk is the ``conflict-cap``
-    case, whatever its underlying stage — the go-around cap is the story that needs telling (§3).
-    Otherwise: ``parked`` (the machine gave up), or an amber decision that is a ``bounced`` push-back
-    or a plain ``needs-owner``."""
+    """Which decision kind a waiting flight is. A durable owner-decision QUESTION (#163) is its own
+    kind and takes precedence — it is answered, not approved/dropped-only, and its story is the
+    question itself, not a go-around count. Otherwise: a flight that went around (``attempt`` >= 2 —
+    a conflict regeneration happened) and STILL landed on William's desk is the ``conflict-cap`` case,
+    whatever its underlying stage (§3); then ``parked`` (the machine gave up), or an amber decision
+    that is a ``bounced`` push-back or a plain ``needs-owner``."""
+    if flight.get("awaiting_reason") == "question":
+        return "question"
     if _attempt(flight) >= 2:
         return "conflict-cap"
     if flight.get("stage") == flights.PARKED:
@@ -99,6 +102,12 @@ _CARD_COPY = {
         "headline": "This kept colliding with other work and couldn't land — your call.",
         "plain": "It was rebuilt from scratch after merge conflicts and still couldn't merge cleanly, so it came to you.",
         "term": "conflict cap", "badge": "CONFLICT CAP",
+    },
+    "question": {
+        "headline": "A worker needs your decision before it can continue.",
+        "plain": "The worker exited cleanly and posted its question here — nothing is frozen. Type an "
+                 "answer and a fresh session resumes with it, reusing the work so far if it still fits.",
+        "term": "question", "badge": "QUESTION",
     },
 }
 
@@ -219,10 +228,12 @@ def decision_dossier(flight, journal_slice):
         items.append({"label": "recorded cause", "value": cause})
 
     # What the gate READ at the hand-back, under the four real check names (§3). Only the checks that
-    # were RED are evidence — a green check explains nothing about why this stopped.
+    # were RED are evidence — a green check explains nothing about why this stopped. Skipped for a
+    # #163 question: the worker paused MID-build to ask, so every gate check is naturally not-yet and
+    # says nothing about the decision — the question itself is the whole evidence (shown as the memo).
     gate = flight.get("gate") or {}
     red = [GATE_GLOSS[k][0] for k in _GATE_ORDER if not gate.get(k)]
-    if red:
+    if red and flight.get("awaiting_reason") != "question":
         items.append({"label": "gate at hand-back", "value": "not yet: " + ", ".join(red)})
 
     go_arounds = _attempt(flight) - 1
@@ -293,6 +304,18 @@ def decision_actions(flight, slug=None):
                "consequence": "Assembles a briefing you can read and edit. Changes nothing on "
                               "GitHub and builds nothing.",
                "tone": "primary" if kind == "conflict-cap" else "link", "destructive": False}
+
+    # A durable question (#163) is ANSWERED, not approved: the primary verb takes the owner's typed
+    # text (``input: "answer"`` tells the client to render the answer field). Posting it re-applies
+    # agent-ready in William's name — his word, on the record — and a fresh session resumes with the
+    # Q&A in its brief. Drop (never-mind) and Discuss stay available.
+    if kind == "question":
+        answer = {"act": "answer", "label": "Answer & relaunch", "input": "answer",
+                  "consequence": "Posts your answer on the issue and re-applies agent-ready in your "
+                                 "name — a fresh session resumes with your answer in its brief, "
+                                 "reusing the work so far if it still applies cleanly.",
+                  "tone": "primary", "destructive": False}
+        return [answer, discuss, drop]
 
     # On a collision, Discuss LEADS (§8 — the guard against a blind Approve press there).
     return [discuss, yes, drop] if kind == "conflict-cap" else [yes, drop, discuss]

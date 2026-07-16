@@ -93,8 +93,17 @@
       var armed = a.destructive && confirming;
       var cls = a.tone === "link" ? "btn-note link" : ("btn " + (a.tone || "ghost"));
       if (armed) cls += " danger";
-      return '<div class="act">' +
-        '<button class="' + cls + '" data-act="' + esc(a.act) + '"' + da + '>' +
+      // A verb that takes typed input (the #163 Answer) renders a textarea the operator fills in;
+      // the button's handler reads that field by (repo, num). This is still a mechanical verb — a
+      // comment + a label — never AI; the field is just where the operator's own words go.
+      var field = a.input
+        ? '<textarea class="answer-field" data-input="' + esc(a.input) + '"' + da +
+          ' rows="3" placeholder="Type your answer — it posts to the issue in your name and a fresh ' +
+          'session resumes with it."></textarea>'
+        : "";
+      return '<div class="act">' + field +
+        '<button class="' + cls + '" data-act="' + esc(a.act) + '"' + da +
+          (a.input ? ' data-input="' + esc(a.input) + '"' : "") + '>' +
           esc(armed ? (a.armed_label || a.label) : a.label) + '</button>' +
         '<div class="act-why">' + esc(a.consequence || "") + '</div>' +
       '</div>';
