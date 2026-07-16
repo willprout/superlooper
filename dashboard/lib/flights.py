@@ -959,16 +959,29 @@ def _windowed(journal, now, window_s):
     return out
 
 
+# The acts that hand a flight BACK to the owner, each journaling the memo it handed back with. A
+# card's text must come from the LATEST of these — see _flight_memo.
+HANDBACK_ACTS = ("park", "bounce")
+
+
 def _flight_memo(journal, blocked_txt, bounced):
-    """The plain memo a Needs You card leads with: a ``BOUNCED:`` marker's text for a bounce, else
-    the most recent ``park`` event's memo (which also carries the needs-william case). Radio-call
-    questions are NOT memos — those are tower-log material, handled elsewhere."""
+    """The plain memo a Needs You card leads with: a live ``BOUNCED:`` marker's text while the bounce
+    is still settling, else the most recent HAND-BACK event's memo — a ``park`` (which also carries
+    the needs-william case) or a ``bounce``. Radio-call questions are NOT memos — those are tower-log
+    material, handled elsewhere.
+
+    Bounces must be read from the journal (Codex cross-review, issue #162): ``_exec_bounce`` deletes
+    ``state/blocked/<id>`` and settles the status to ``bounced``, so the moment a bounce SETTLES its
+    marker is gone and the amendment survives only in the ``bounce`` record. Reading ``park`` alone
+    made a settled bounce fall back to an older park's memo — the owner would read the wrong question
+    and accept an amendment he was never shown.
+    """
     if bounced and blocked_txt:
         return blocked_txt
     memo = None
     for r in journal:
-        if isinstance(r, dict) and r.get("act") == "park" and r.get("memo"):
-            memo = r.get("memo")   # last park wins
+        if isinstance(r, dict) and r.get("act") in HANDBACK_ACTS and r.get("memo"):
+            memo = r.get("memo")   # the last hand-back wins — park or bounce, whichever came last
     return memo
 
 

@@ -1166,7 +1166,9 @@ def _needs_you(all_flights, now):
         stage = f["stage"]
         if stage not in (flights.PARKED, flights.AWAITING):
             continue
-        card = cards_mod.needs_you_card(f, slug)
+        # The journal slice rides along so the card can carry its dossier — the evidence behind the
+        # decision (issue #162), so William judges the hand-back without opening a terminal.
+        card = cards_mod.needs_you_card(f, slug, journal_slice=records)
         # The age numeral: time since the machine gave up (a park). An amber decision (needs-william/
         # bounce) has no single "since" event, so it carries the state word alone (never a fake age).
         age = None
