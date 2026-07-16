@@ -64,42 +64,33 @@ def test_the_fallback_banner_is_visually_unmistakable():
         ".fld-src must paint its own ground/border — it cannot read as ordinary field chrome")
 
 
-# --------------------------- the always-on stamp ---------------------------
+# --------------------------- the always-on freshness surface ---------------------------
+#
+# #146 mounted a bare stamp (`fld-age`) that rendered the two ages and nothing else. Issue #166
+# ABSORBED it into the standing truth strip (`fld-truth`): the same corner and the same always-on
+# posture, but it now states the CONCLUSION ("loop may be down") and carries a third fact the two
+# clocks cannot see — the engine's publish drift. Two surfaces both reporting freshness would have
+# been a duplicate readout the owner had to reconcile by eye, so the stamp moved rather than
+# multiplied.
+#
+# These guards follow that seam. #146's intent is unchanged and still pinned HERE: the surface is
+# mounted, and it is never gated on the mode. The words themselves are now composed server-side, so
+# the "both clocks, in plain words, never a fabricated zero" half of the intent is pinned where the
+# words are — tests/test_truth.py (`..._is_stated_plainly_and_calmly`, `..._never_a_confident_zero`).
+# The strip's own rendering guards live in tests/test_static_truth.py.
 
-def test_field_mounts_the_freshness_stamp():
-    assert "fld-age" in _FIELD, "field.js must mount the data-age / tick-timer stamp (fld-age)"
-
-
-def test_the_stamp_binds_both_clocks():
-    # Both, always: how old the DATA is, and how long since the runner's last completed TICK. They
-    # are different facts — a fresh tick can still be republishing a 90s-old GitHub read.
-    assert "data_age" in _FIELD, "field.js must bind repo.source.data_age"
-    assert "tick_age" in _FIELD, "field.js must bind repo.source.tick_age"
-
-
-def test_the_stamp_is_shown_in_both_modes():
-    # The stamp must NOT be gated on the mode — it is the always-on honesty, not a fallback extra.
-    # Assert the age element is never given the banner's fallback gate.
-    stamp = re.search(r"fixedEls\.age\.hidden\s*=\s*([^;\n]+)", _FIELD)
-    if stamp:
-        assert "fallback" not in stamp.group(1), (
-            "the freshness stamp must show in BOTH modes, never only in fallback")
+def test_field_mounts_the_always_on_freshness_surface():
+    assert "fld-truth" in _FIELD, (
+        "field.js must mount the always-on freshness surface — the truth strip (fld-truth)")
 
 
-def test_css_styles_the_freshness_stamp():
-    assert ".fld-age" in _CSS, "shell.css must style .fld-age — the always-on freshness stamp"
+def test_the_freshness_surface_is_shown_in_both_modes():
+    # It must NOT be gated on the mode — it is the always-on honesty, not a fallback extra. A strip
+    # that appears only once you already suspect the dashboard is the bug, not the fix.
+    for gate in re.findall(r"fixedEls\.truth\.hidden\s*=\s*([^;\n]+)", _FIELD):
+        assert "fallback" not in gate, (
+            "the truth strip must show in BOTH modes, never only in fallback")
 
 
-def test_the_stamp_names_its_clocks_in_plain_words():
-    # Costume rule 2 (design §3): the metaphor never hides the words you read. A bare "12s / 4s"
-    # tells the owner nothing about WHICH clock is which.
-    assert re.search(r"data|age", _FIELD, re.IGNORECASE)
-    assert re.search(r"tick", _FIELD, re.IGNORECASE), (
-        "the stamp must name the tick timer in plain words, never a bare number")
-
-
-def test_an_unknown_age_is_never_rendered_as_a_number():
-    # source_mode returns data_age None before the first direct poll lands. Rendering that as "0s"
-    # would claim the freshest possible data at the exact moment we have none.
-    assert re.search(r"==\s*null|!=\s*null|null\s*[=!]==?", _FIELD), (
-        "field.js must handle a null age explicitly rather than formatting it as a number")
+def test_css_styles_the_always_on_freshness_surface():
+    assert ".fld-truth" in _CSS, "shell.css must style .fld-truth — the standing truth strip"

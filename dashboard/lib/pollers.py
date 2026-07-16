@@ -68,9 +68,13 @@ _GIT_TIMEOUT = 30   # seconds per git call — a hung git must never wedge the p
 _EMPTY_DIFF = {"present": False, "files": 0, "added": 0, "removed": 0}
 
 
-def _git(cwd, *args, timeout=_GIT_TIMEOUT):
+def git_run(cwd, *args, timeout=_GIT_TIMEOUT):
     """Run ``git -C <cwd> <args>``. Returns ``(rc, stdout)``. Never raises: a timeout, a missing
-    binary, or any OSError becomes a nonzero rc with empty stdout (fail closed)."""
+    binary, or any OSError becomes a nonzero rc with empty stdout (fail closed).
+
+    Public because ``lib/engine`` (issue #166) counts the engine's publish drift with the same
+    discipline — one read-only git wrapper that can never raise into the 2-second poll, rather than
+    a second copy of it drifting out of step with this one."""
     try:
         r = subprocess.run(["git", "-C", os.fspath(cwd), *args],
                            capture_output=True, text=True, timeout=timeout)
@@ -97,10 +101,10 @@ def diff_stat(worktree, base_branch="main"):
     wt = os.fspath(worktree)
     if not os.path.isdir(wt):
         return dict(_EMPTY_DIFF)
-    rc, mb = _git(wt, "merge-base", base_branch, "HEAD")
+    rc, mb = git_run(wt, "merge-base", base_branch, "HEAD")
     if rc != 0 or not mb.strip():
         return dict(_EMPTY_DIFF)
-    rc, out = _git(wt, "diff", "--numstat", mb.strip())
+    rc, out = git_run(wt, "diff", "--numstat", mb.strip())
     if rc != 0:
         return dict(_EMPTY_DIFF)
     files = added = removed = 0
@@ -130,7 +134,7 @@ def _untracked_stat(wt):
     holding the target path, so it is NOT followed). Read-only; an unreadable file counts as a file
     with no lines. Files are read in bounded chunks so a large untracked artifact can't balloon the
     poller's memory."""
-    rc, out = _git(wt, "ls-files", "--others", "--exclude-standard", "-z")
+    rc, out = git_run(wt, "ls-files", "--others", "--exclude-standard", "-z")
     if rc != 0:
         return 0, 0
     files = added = 0
