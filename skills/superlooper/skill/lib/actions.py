@@ -14,9 +14,13 @@ Design commitments (all bought in prior runs, all tested):
     never a trusting default. The gh view is stale-unless-explicitly-fresh: gate, launch, and
     orphan decisions all require `gh_view["stale"] is False`.
   * No mutation of any input, no module-level mutable state: same inputs -> same output, twice.
-  * NOTIFY IS A STANDING RULE (owner directive): every transition to parked/needs-william,
-    every freeze, and every new ALERT emits {"act": "notify"} in the same action list. The
-    scenario table asserts this per scenario. ONCE per (issue, park-cause) episode (issue #61):
+  * NOTIFY IS A STANDING RULE (owner directive), NIGHT-BATCHED (issue #164): every new systemic
+    ALERT (runner/auth dead, whole queue stalled) and every freeze emits {"act": "notify"} at any
+    hour — that is the safety layer, never quieted. A routine owner-DECISION hand-back (park /
+    bounce / durable question) pages immediately during the DAY, but during quiet hours (config
+    `notify.quiet_hours`, default 21:00–08:00) it is BATCHED to the morning report instead: the
+    ACTION still fires (state settles, the journal + morning report list it), only the page waits.
+    The scenario table asserts both directions. ONCE per (issue, park-cause) episode (issue #61):
     when a park's own label move keeps failing, the park re-emits every tick (the labels must
     converge) but as a marked SILENT retry — the 2026-07-08 storm re-texted one park 41 times.
   * Label mechanics are runner-side only (cross-review C2): bounce/park/reclaim/relabel actions
@@ -268,8 +272,10 @@ def _alert_message(reason):
         iid = reason.split(":", 1)[1]
         return (f"{iid} handed back to the owner but its label move has been failing for "
                 f"{PARK_LABEL_STUCK_ALERT_SECONDS // 60}+ min — GitHub writes are not landing. "
-                "The hand-back (park or bounce) already texted once; retries continue silently. "
-                "Check GitHub availability / rate limits (`gh api rate_limit`).")
+                "This alert IS the escalation (the hand-back's own page went out during the day, or "
+                "was batched to the morning report if it happened in quiet hours — #164); the label "
+                "retries continue silently. Check GitHub availability / rate limits "
+                "(`gh api rate_limit`).")
     return ALERT_MESSAGES.get(reason, reason)
 
 
@@ -354,6 +360,42 @@ def _count(x, default=0):
     """A usable counter: a real int (bool excluded), else the default. Wrong-typed counters are
     the fail-OPEN defect class — callers decide whether default or park is the safe landing."""
     return x if type(x) is int else default
+
+
+# Night-batching (issue #164). Routine owner-DECISION hand-backs (a park, a bounce, a durable
+# question) are held to the morning report during quiet hours instead of paged; the SYSTEMIC-STOP
+# alerts and the merge-freeze notice always push. The fallback for an OLD config.json (pre-#164, no
+# `notify.quiet_hours` key) is config's OWN default — one source of truth, imported so it can't drift.
+_DEFAULT_QUIET_HOURS = _config.DEFAULT_QUIET_HOURS
+_ASCII_DIGITS = frozenset("0123456789")
+
+
+def _valid_hhmm(v):
+    """A zero-padded 24h "HH:MM" in range — what the runner's `time.strftime('%H:%M')` local clock
+    always stamps, so the lexical compare below is a true time-of-day order. ASCII digits only:
+    `str.isdigit()` is True for Unicode numerics (superscripts, other-script digits) that would then
+    RAISE in int() — violating decide's never-raise contract — so membership against 0-9 is used."""
+    return (isinstance(v, str) and len(v) == 5 and v[2] == ":"
+            and set(v[:2]) <= _ASCII_DIGITS and set(v[3:]) <= _ASCII_DIGITS
+            and 0 <= int(v[:2]) <= 23 and 0 <= int(v[3:]) <= 59)
+
+
+def _in_quiet_hours(hhmm, quiet_hours):
+    """True iff local time `hhmm` falls inside the configured quiet-hours window — when a routine
+    owner-decision hand-back is BATCHED to the morning report instead of pushed (issue #164).
+    `quiet_hours` is {"start","end"} in "HH:MM"; None (or malformed) DISABLES quieting. Fails toward
+    PUSHING (returns False) on ANY uncertainty — a missing clock, a garbled window — because a
+    notification is a convenience layer the morning report + journal always backstop, so a spurious
+    page is safer than a wrongly-swallowed one. `start > end` wraps past midnight (the night window);
+    `start == end` is a degenerate empty window (never quiet); `end` is EXCLUSIVE."""
+    if not isinstance(quiet_hours, dict):
+        return False
+    start, end = quiet_hours.get("start"), quiet_hours.get("end")
+    if not (_valid_hhmm(start) and _valid_hhmm(end) and _valid_hhmm(hhmm)) or start == end:
+        return False
+    if start < end:
+        return start <= hhmm < end           # same-day window
+    return hhmm >= start or hhmm < end        # wraps midnight (e.g. 21:00 -> 08:00)
 
 
 def _since_ok(since, now):
@@ -697,6 +739,18 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     raw_locks = dsk.get("live_lock_ids")
     live_locks = set(raw_locks) if isinstance(raw_locks, (set, frozenset, list, tuple)) else set()
 
+    # Night-batching (issue #164): during quiet hours a routine owner-DECISION hand-back (park /
+    # bounce / durable question) is BATCHED to the morning report + dashboard instead of pushed —
+    # only systemic-stop ALERTs (runner/auth dead, whole queue stalled) and the merge-freeze notice
+    # keep paging (the safety layer). Config-absent -> the default night window (batching is ON by
+    # default, the point of this issue); an explicit null -> disabled (every hand-back pages, the
+    # pre-#164 behaviour). The clock is the runner's local HH:MM; _in_quiet_hours fails toward
+    # PUSHING on any uncertainty, and the morning report lists every hand-back regardless, so a
+    # night-suppressed decision is never lost — only unsent until morning.
+    notify_cfg = cfg.get("notify") if isinstance(cfg.get("notify"), dict) else {}
+    quiet_hours = notify_cfg["quiet_hours"] if "quiet_hours" in notify_cfg else _DEFAULT_QUIET_HOURS
+    notify_quiet = _in_quiet_hours(dsk.get("local_hhmm"), quiet_hours)
+
     # ---- usage gating (issue #46): fail CLOSED on a fresh over-ceiling read; fail OPEN on a DARK
     # (unreadable-past-grace) meter. Computed here, after alert_on_disk, because the dark-meter
     # EPISODE is marked by the DURABLE usage_stale ALERT (prev_dark) — the piece that survives a
@@ -784,7 +838,15 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             out.append(act)
             return
         who = "needs-owner" if needs_william else "parked"
-        notify(f"superlooper: {iid} {who}", memo)
+        # Night-batching (#164): a park is a routine owner DECISION and a park is a SAFE state, so
+        # during quiet hours it is held to the morning report instead of paged. The park ACTION
+        # still fires — state settles, the label moves, the journal (and the morning report) list
+        # it — so nothing is lost, only unsent until morning. A genuinely stuck park (its label move
+        # failing past the bound) still escalates via the park_label_stuck ALERT, which pages: a
+        # failing GitHub write IS a systemic problem. The notify-once marker is stamped by the
+        # executor regardless of whether we paged, so this park never re-pages once day breaks.
+        if not notify_quiet:
+            notify(f"superlooper: {iid} {who}", memo)
         out.append(act)
 
     def start_ok(p, resume=True):
@@ -1395,7 +1457,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     act["retry"] = True
                     out.append(act)
                     continue
-                notify(f"superlooper: {iid} bounced (needs-owner)", blocked_text)
+                # Night-batching (#164): a bounce is an owner-decision hand-back — held to the
+                # morning report during quiet hours. The bounce ACTION still fires (the label move,
+                # the journal, the report); only the 3am page waits. A stuck bounce-label still
+                # escalates via park_label_stuck (a failing GitHub write is systemic and pages).
+                if not notify_quiet:
+                    notify(f"superlooper: {iid} bounced (needs-owner)", blocked_text)
                 out.append(act)
                 continue
             # A real owner-decision question (#163). The worker has posted a structured question to
@@ -1415,7 +1482,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                                f"round-trip. latest question: {blocked_text!r}",
                      needs_william=True, cause="question_cap")
             else:
-                if not ist.get("question_posted"):
+                # Night-batching (#164): a durable owner question is an owner DECISION — held to the
+                # morning report during quiet hours. post_question still fires, so the question is
+                # posted DURABLY as a GitHub comment (the owner sees it on the dashboard / in the
+                # report); only the 3am page waits. Gated on the post-once stamp too, so a re-derived
+                # tick never re-pages.
+                if not ist.get("question_posted") and not notify_quiet:
                     notify(f"superlooper: {iid} needs an answer",
                            f"a worker exited on a question and is waiting for {operator}:\n\n"
                            f"{blocked_text}")

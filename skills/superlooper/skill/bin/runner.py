@@ -3224,8 +3224,21 @@ class Runner:
         # First non-title, non-blank line is the summary tally / "nothing happened" — the push body.
         summary = next((ln for ln in text.splitlines()
                         if ln.strip() and not ln.startswith("#")), "morning report ready")
-        outcome = notify.send(self.config, f"superlooper morning report — {date}", summary)
-        self._log(f"morning report {date}: notify [{outcome}]")
+        # The morning push doubles as the notify-channel CANARY (issue #164): send_test sends the
+        # SAME push via the SAME precedence as send(), but returns the full delivery result. Journal
+        # it as `notify_canary` so the NEXT report's "Notify channel" line surfaces a SILENTLY dead
+        # channel (once dead for days, found only by a human reading the journal) on the owner-read
+        # report + dashboard — the one surface a dead channel can't itself reach. This is the morning
+        # heartbeat, at a reasonable hour: it adds NO 3am ping, unlike a synthetic nightly probe.
+        r = notify.send_test(self.config, f"superlooper morning report — {date}", summary)
+        self._log(f"morning report {date}: notify [{r.channel} ok={r.ok} rc={r.rc}]")
+        try:
+            journal.append(self.home, {"act": "notify_canary", "date": date, "ok": bool(r.ok),
+                                       "channel": r.channel, "rc": r.rc,
+                                       "detail": (r.stderr or "")[:200], "outcome": "ok"}, now)
+        except (OSError, ValueError):
+            pass                                # the report already rendered; a canary write hiccup
+                                                # never breaks the morning report (contained failure)
 
     def _exec_notify(self, a, now):
         """Task 11 seam (filled): notify.send() delivers by the configured precedence

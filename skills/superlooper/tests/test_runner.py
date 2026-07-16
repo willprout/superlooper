@@ -50,7 +50,11 @@ def make_config(**over):
         "session": {"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2, "conflict_cap": 2},
         "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
                "quarantine": [], "nightly_time": "02:00"},
-        "notify": {"imessage_to": None, "cmd": None},
+        # quiet_hours=None DISABLES night-batching (#164) so these runner tests exercise the notify
+        # MECHANICS unconditionally, independent of the machine timezone that disk_view's local clock
+        # would otherwise inject into decide(). The night-batching POLICY is tested with a pinned
+        # local_hhmm in test_actions.py (test_*_at_night / _at_day), where it belongs.
+        "notify": {"imessage_to": None, "cmd": None, "quiet_hours": None},
         "codex": {"dangerous_bypass": False, "bypass_hook_trust": True, "no_alt_screen": True},
     }
     c.update(over)
@@ -1959,6 +1963,26 @@ def test_crash_before_the_park_executor_never_loses_the_text(rig):
     out2 = actions.decide(NOW + 15, rig.r.config, {"auth_status": "ok", "last_ok_at": NOW + 15,
                           "first_attempt_at": NOW - 60}, [], [], [], rig.r.disk_view(NOW + 15), g)
     assert [a for a in out2 if a["act"] == "notify"]       # the text re-fires, never lost
+
+
+def test_disk_view_local_hhmm_drives_decide_night_batching(rig):
+    """Wiring test (#164): disk_view stamps `local_hhmm` in HH:MM, and decide's night-batching reads
+    exactly that key — so a rename/format drift on either side is caught here. Pins the clock hour
+    (not the machine timezone) by overriding the stamped value, so this asserts the WIRING, never a
+    tz-dependent hour. (The rig disables quiet_hours by default; this test opts it back in.)"""
+    import time as _t, actions
+    seed_issue(rig, "i5", status="running", recheck_failed=True)
+    (rig.home / "state" / "last_morning_report").write_text("2000-01-01")   # keep morning_report quiet
+    rig.r.config["notify"]["quiet_hours"] = {"start": "21:00", "end": "08:00"}
+    d = rig.r.disk_view(NOW)
+    assert d["local_hhmm"] == _t.strftime("%H:%M", _t.localtime(NOW))   # the exact key + format decide reads
+    g = {"stale": False, "consecutive_failures": 0, "closed_nums": set(),
+         "prs": {}, "issue_comments": {}}
+    usage = {"auth_status": "ok", "last_ok_at": NOW, "first_attempt_at": NOW - 60}
+    out_night = actions.decide(NOW, rig.r.config, usage, [], [], [], dict(d, local_hhmm="23:30"), g)
+    assert [a for a in out_night if a["act"] == "park"] and not [a for a in out_night if a["act"] == "notify"]
+    out_day = actions.decide(NOW, rig.r.config, usage, [], [], [], dict(d, local_hhmm="12:00"), g)
+    assert [a for a in out_day if a["act"] == "park"] and [a for a in out_day if a["act"] == "notify"]
 
 
 def test_comment_only_failure_still_settles_the_park(rig):

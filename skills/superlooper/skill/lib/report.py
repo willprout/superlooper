@@ -281,6 +281,35 @@ def _questions(records, window_start):
     return lines, total
 
 
+def _notify_channel(records):
+    """The notify-channel canary line (issue #164). The daily morning push doubles as the channel
+    heartbeat: the runner journals its delivery result as `notify_canary`, and this surfaces the
+    LATEST one — so a SILENTLY dead channel (once dead for days, found only by a human reading the
+    journal) shows up HERE, on the owner-read report + dashboard: the out-of-band surface a dead
+    channel could never itself reach. Fail closed: a wrong-typed/absent record reads as 'not
+    verified', never a false green; a `log-only` result is named as UNCONFIGURED, never 'healthy'."""
+    canaries = [r for r in records if r.get("act") == "notify_canary"]
+    if not canaries:
+        return "- Notify channel: not verified this cycle (no canary recorded)."
+    latest = max(canaries, key=lambda r: _ts(r) if _ts(r) is not None else float("-inf"))
+    channel = latest.get("channel")
+    channel = channel if isinstance(channel, str) and channel else "?"
+    if channel == "log-only":
+        return ("- Notify channel: **no channel configured** — pushes go to the journal only; set "
+                "`notify.imessage_to` or `notify.cmd` so alerts can reach your phone.")
+    if latest.get("ok") is True:               # `is True`: a truthy string must never read as green
+        return f"- Notify channel: healthy (last push delivered via {channel})."
+    # ok is not True -> the last push did NOT deliver. Say so loudly, naming the channel + reason:
+    # this line is the whole point — the owner reads it here even when the channel can't reach them.
+    rc = latest.get("rc")
+    rc_s = f", rc={rc}" if isinstance(rc, int) and not isinstance(rc, bool) else ""
+    detail = latest.get("detail")
+    detail = detail.strip() if isinstance(detail, str) and detail.strip() else "(no error captured)"
+    return (f"- Notify channel: **DEAD** — the last push did not deliver via {channel}{rc_s}: "
+            f"{detail}. Pushes are **not reaching you**; fix the channel and re-run "
+            "`superlooper doctor --stack`.")
+
+
 def _gate_health(records, window_start, ledger, config):
     nightlies = [r for r in records if r.get("act") == "nightly"
                  and (_ts(r) is None or _ts(r) >= window_start)]
@@ -320,6 +349,7 @@ def _gate_health(records, window_start, ledger, config):
     else:
         lines.append("- Nightly: no runs recorded in the last 7 days.")
     lines.append(f"- Quarantine: {q_size} test(s). Accepted known failures: {accepted}.")
+    lines.append(_notify_channel(records))     # issue #164: the channel canary rides the health block
     return lines
 
 

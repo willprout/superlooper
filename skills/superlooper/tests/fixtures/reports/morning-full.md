@@ -30,6 +30,7 @@ None — the watchdog launched nothing.
 - Nightly (2026-07-02): 1 persistent failure(s), filed 1 fix issue(s).
 - 0/1 green over the last 7 nights; flakes last run: 2.
 - Quarantine: 1 test(s). Accepted known failures: 2.
+- Notify channel: not verified this cycle (no canary recorded).
 
 ## Freeze state
 Merges flowing.
