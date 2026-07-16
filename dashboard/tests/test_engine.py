@@ -57,6 +57,33 @@ def src(tmp_path):
     return path
 
 
+def _with_origin(src, tmp_path):
+    """Give ``src`` a REAL origin whose ``main`` can move without the checkout knowing — the shape of
+    this project's actual deployment: the loop merges to origin, and the local checkout lags until
+    someone pulls. Returns a working clone through which "merges" are pushed into that origin.
+
+    A real remote (never a fabricated ref) so ``origin/main`` resolves exactly as it does on the
+    deployment machine, and a ``fetch`` moves it exactly as a real merge would.
+    """
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(src), str(bare)], check=True,
+                   capture_output=True, text=True)
+    _git(src, "remote", "add", "origin", str(bare))
+    _git(src, "fetch", "-q", "origin")
+    work = tmp_path / "origin-work"
+    subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True,
+                   capture_output=True, text=True)
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "T")
+    return work
+
+
+def _merge_to_origin(work, rel, text, msg):
+    """Land a commit on the origin's ``main`` — a merged loop PR, from the checkout's point of view."""
+    _commit(work, rel, text, msg)
+    _git(work, "push", "-q", "origin", "HEAD:main")
+
+
 @pytest.fixture
 def dest(tmp_path):
     """An installed-engine dir, as ``bin/install.sh`` leaves it."""
@@ -90,15 +117,52 @@ def test_the_named_remedy_is_the_gated_installer_that_actually_exists():
 
 # --------------------------- the install dir, derived from existing config ---------------------------
 
-def test_install_dir_derives_the_installers_dest_from_the_configured_cli():
+@pytest.fixture
+def bare_home(tmp_path, monkeypatch):
+    """A HOME with no engine installed.
+
+    `install_dir` consults the DEFAULT install (~/.claude/skills/superlooper) as a backstop, so
+    without this the machine's own real install leaks into the assertions — and the suite would pass
+    or fail depending on whose laptop it ran on. Returns the fake home for tests that want to
+    populate it.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+def test_install_dir_derives_the_installers_dest_from_the_configured_cli(tmp_path, bare_home):
     # install.sh publishes the payload to $DEST and the CLI to $DEST/bin/superlooper, so the parent
     # of the CLI's bin/ IS $DEST. Deriving it from config's existing `superlooper_cli` means a
     # non-standard install is honored for free and no new config key exists to get out of sync.
-    assert engine.install_dir("~/.claude/skills/superlooper/bin/superlooper".replace("~", "/home/x")) \
-        == "/home/x/.claude/skills/superlooper"
+    custom = tmp_path / "custom-install"
+    assert engine.install_dir(str(custom / "bin" / "superlooper")) == str(custom)
 
 
-def test_install_dir_of_a_nonsense_cli_is_none():
+def test_a_cli_pointed_at_the_path_shim_still_finds_the_install(bare_home):
+    # Raised in review. install.sh ALSO drops a `superlooper` shim in ~/.local/bin — which is how
+    # every doc invokes it. Deriving $DEST from that gives ~/.local, which holds no VERSION, and the
+    # engine line would go SILENT forever: a config choice quietly disabling the honesty surface.
+    real = bare_home / ".claude" / "skills" / "superlooper"
+    real.mkdir(parents=True)
+    (real / "VERSION").write_text("abc1234 2026-07-16\n")
+    assert engine.install_dir(str(bare_home / ".local" / "bin" / "superlooper")) == str(real)
+
+
+def test_a_real_custom_install_still_wins_over_the_default(tmp_path, bare_home):
+    # The backstop must never override an install the operator actually has: a configured dir that
+    # HOLDS a stamp is the answer, even when the default install also exists.
+    default = bare_home / ".claude" / "skills" / "superlooper"
+    default.mkdir(parents=True)
+    (default / "VERSION").write_text("aaa 2026-07-16\n")
+    custom = tmp_path / "custom-install"
+    (custom / "bin").mkdir(parents=True)
+    (custom / "VERSION").write_text("bbb 2026-07-16\n")
+    assert engine.install_dir(str(custom / "bin" / "superlooper")) == str(custom)
+
+
+def test_install_dir_of_a_nonsense_cli_is_none(bare_home):
     assert engine.install_dir("") is None
     assert engine.install_dir(None) is None
 
@@ -111,12 +175,29 @@ def test_installed_stamp_reads_the_sha_and_date_install_sh_wrote(dest):
 
 
 def test_absent_version_reads_as_no_stamp(dest):
+    # Absent is an ANSWER: nothing was ever published here, so there is nothing to say.
     assert engine.installed_stamp(dest) is None
 
 
-def test_unreadable_or_empty_version_reads_as_no_stamp(dest):
+def test_a_present_but_empty_version_is_a_failure_not_an_absence(dest):
+    # Raised in review. install.sh always writes content, so an empty stamp means something broke.
+    # Mapping it to None would make a half-written stamp render as a silent all-clear.
     (dest / "VERSION").write_text("\n")
-    assert engine.installed_stamp(dest) is None
+    assert engine.installed_stamp(dest) is engine.UNREADABLE
+
+
+def test_an_unreadable_version_is_a_failure_not_an_absence(dest):
+    # A directory where the stamp should be: present, unopenable. That is a failure, not "never
+    # published" — the two must not collapse into the same silent answer.
+    (dest / "VERSION").mkdir()
+    assert engine.installed_stamp(dest) is engine.UNREADABLE
+
+
+def test_an_unreadable_stamp_speaks_rather_than_going_quiet(src, dest):
+    (dest / "VERSION").write_text("")
+    st = engine.drift(str(src), str(dest))
+    assert st["known"] is False and st["behind"] is None
+    assert st["message"] and "can't tell" in st["message"]
 
 
 # --------------------------- finding the engine source ---------------------------
@@ -179,6 +260,159 @@ def test_the_installed_build_rides_along_for_inspection(src, dest):
     _stamp(dest, sha, "2026-07-11")
     st = engine.drift(str(src), str(dest))
     assert st["installed_sha"] == sha and st["installed_at"] == "2026-07-11"
+
+
+# --------------------------- a dirty payload cannot be compared ---------------------------
+#
+# Raised in review, and verified against the installer: bin/install.sh does NOT publish HEAD — it
+# rsyncs the WORKING TREE (§2) and then stamps HEAD's sha (§3). So the stamp only identifies the
+# published CONTENT while the payload is clean. Dirty, it breaks BOTH ways, which is why neither
+# number may be stated.
+
+def test_uncommitted_engine_changes_are_unknown_not_a_confident_zero(src, dest):
+    # The false all-clear: publish a dirty tree and the stamp says HEAD, so VERSION..HEAD counts 0
+    # and the strip goes silent — "engine is live" — while live code sits in no commit at all.
+    _stamp(dest, _head(src))
+    (src / engine.PAYLOAD_REL / "runner.py").write_text("edited, not committed\n")
+    st = engine.drift(str(src), str(dest))
+    assert st["known"] is False and st["behind"] is None
+    assert "uncommitted engine changes" in st["message"]
+
+
+def test_an_untracked_payload_file_is_also_dirty(src, dest):
+    # rsync copies untracked files too, so a brand-new engine file is live-on-publish while being
+    # invisible to any commit-based count.
+    _stamp(dest, _head(src))
+    (src / engine.PAYLOAD_REL / "brand_new.py").write_text("new\n")
+    assert engine.drift(str(src), str(dest))["known"] is False
+
+
+def test_dirt_outside_the_payload_does_not_muddy_the_engine_verdict(src, dest):
+    # A dashboard edit or a scratch file is not an engine change. If any dirt anywhere blanked the
+    # count, the line would be permanently unknown on a working machine — the nag §0.2 forbids.
+    _stamp(dest, _head(src))
+    (src / "README.md").write_text("editing the readme\n")
+    (src / "scratch.txt").write_text("junk\n")
+    st = engine.drift(str(src), str(dest))
+    assert st["known"] is True and st["behind"] == 0
+
+
+def test_a_dirty_payload_is_unknown_even_when_commits_are_also_waiting(src, dest):
+    # Don't state "1 fix waiting" when the installer would in fact publish that PLUS uncommitted
+    # work: an understated count is still a wrong one.
+    _stamp(dest, _head(src))
+    _commit(src, engine.PAYLOAD_REL + "/runner.py", "v2\n", "a real fix")
+    (src / engine.PAYLOAD_REL / "runner.py").write_text("and more, uncommitted\n")
+    st = engine.drift(str(src), str(dest))
+    assert st["known"] is False and st["behind"] is None
+
+
+# --------------------------- "merged" means origin/main, not this checkout ---------------------------
+#
+# THE finding of this module's review, verified against the real checkout on the deployment machine.
+# `~/Projects/superlooper` lags its own `origin/main` BY DESIGN — the loop merges its PRs to origin,
+# so a freshly merged engine fix is on origin/main and NOT in the checkout until someone pulls.
+# Counting against HEAD made that fix read `behind: 0` -> no message -> an empty engine line, which
+# is pixel-identical to a live engine. The banner built to end confident-while-blind went silent
+# about exactly the fix it exists to name.
+
+def test_a_fix_merged_on_origin_main_but_not_pulled_is_still_named(src, dest, tmp_path):
+    origin = _with_origin(src, tmp_path)
+    _stamp(dest, _head(src))
+    # A fix merges to origin/main. The local checkout has NOT pulled — the everyday state here.
+    _merge_to_origin(origin, engine.PAYLOAD_REL + "/runner.py", "v2\n", "a merged engine fix")
+    _git(src, "fetch", "-q", "origin")
+    st = engine.drift(str(src), str(dest))
+    assert st["known"] is True
+    assert st["behind"] == 1, "a fix merged on origin/main is merged, pulled or not"
+    assert "merged but not yet live" in st["message"]
+
+
+def test_the_remedy_names_the_pull_when_the_checkout_is_the_thing_in_the_way(src, dest, tmp_path):
+    # install.sh publishes the CHECKOUT. Telling the owner to "re-run the installer" over work he
+    # has not pulled would publish the old code and leave the banner refusing to clear — a remedy
+    # that cannot work is worse than none.
+    origin = _with_origin(src, tmp_path)
+    _stamp(dest, _head(src))
+    _merge_to_origin(origin, engine.PAYLOAD_REL + "/runner.py", "v2\n", "merged, unpulled")
+    _git(src, "fetch", "-q", "origin")
+    assert engine.drift(str(src), str(dest))["message"] == (
+        "1 engine fix merged but not yet live; pull, then re-run the installer to switch it on")
+
+
+def test_once_pulled_the_remedy_is_just_the_installer(src, dest, tmp_path):
+    origin = _with_origin(src, tmp_path)
+    _stamp(dest, _head(src))
+    _merge_to_origin(origin, engine.PAYLOAD_REL + "/runner.py", "v2\n", "merged")
+    _git(src, "fetch", "-q", "origin")
+    _git(src, "merge", "-q", "origin/main")          # the owner pulls
+    msg = engine.drift(str(src), str(dest))["message"]
+    assert "pull" not in msg and "re-run the installer" in msg
+
+
+def test_unmerged_local_work_is_not_counted_as_merged(src, dest, tmp_path):
+    # The mirror of the headline case: a commit sitting in the checkout that origin/main has never
+    # seen is not "merged", and must not be counted as one.
+    origin = _with_origin(src, tmp_path)
+    _stamp(dest, _head(src))
+    _commit(src, engine.PAYLOAD_REL + "/runner.py", "v2\n", "local, unmerged")
+    st = engine.drift(str(src), str(dest))
+    assert st["known"] is True and st["behind"] == 0
+    assert st["message"] is None
+
+
+def test_a_checkout_with_no_main_at_all_narrows_the_claim(src, dest):
+    # An exotic repo with neither origin/main nor main: the commits are real and not live, but they
+    # cannot be PROVEN merged, so the sentence may not use the word.
+    _stamp(dest, _head(src))
+    _git(src, "checkout", "-q", "-b", "only-branch")
+    _git(src, "branch", "-q", "-D", "main")
+    _commit(src, engine.PAYLOAD_REL + "/runner.py", "v2\n", "work")
+    st = engine.drift(str(src), str(dest))
+    assert st["known"] is True and st["behind"] == 1
+    assert "merged" not in st["message"], "unprovable work must not be called merged"
+    assert "not yet live" in st["message"] and "re-run the installer" in st["message"]
+
+
+def test_on_main_the_dod_sentence_is_used_verbatim(src, dest):
+    _stamp(dest, _head(src))
+    _commit(src, engine.PAYLOAD_REL + "/runner.py", "v2\n", "a merged fix")
+    assert engine.drift(str(src), str(dest))["message"] == (
+        "1 engine fix merged but not yet live; re-run the installer to switch it on")
+
+
+# --------------------------- ask the installer's question, not a lookalike ---------------------------
+#
+# Raised in review: install.sh's gate diffs CONTENT (`git diff --name-status`), while a bare commit
+# count is a different question that disagrees with it in both directions.
+
+def test_a_commit_and_its_revert_leave_nothing_to_publish(src, dest):
+    # The trust-corroding case: two payload commits, identical content. A commit count would nag
+    # "2 engine fixes merged but not yet live"; the owner runs the named remedy and install.sh
+    # answers "no engine changes since last publish — payload is unchanged". A banner that sends him
+    # to a remedy that does nothing is a §0.2 nag AND a small lie.
+    _stamp(dest, _head(src))
+    _commit(src, engine.PAYLOAD_REL + "/runner.py", "v2\n", "a change")
+    _commit(src, engine.PAYLOAD_REL + "/runner.py", "v1\n", "revert it")
+    st = engine.drift(str(src), str(dest))
+    assert st["known"] is True and st["behind"] == 0
+    assert st["message"] is None, "identical payloads have nothing to switch on"
+
+
+def test_an_installed_engine_ahead_of_the_checkout_is_unknown_not_zero(src, dest):
+    # The live engine was published from a build that `main` never got (a branch publish, a
+    # rolled-back checkout). Its payload DIFFERS from main's, yet no merged commit explains the
+    # difference — `main..` from that sha counts nothing, because main is behind it. install.sh's
+    # gate would report real changes here. A bare commit count reads 0, and 0 renders as silence:
+    # a confident all-clear over an engine nobody can account for.
+    _git(src, "checkout", "-q", "-b", "published-from-here")
+    _commit(src, engine.PAYLOAD_REL + "/runner.py", "v2-only-here\n", "published, never merged")
+    _stamp(dest, _head(src))               # the LIVE engine is THIS build...
+    _git(src, "checkout", "-q", "main")    # ...and the checkout sits on main, which lacks it
+    st = engine.drift(str(src), str(dest))
+    assert st["known"] is False, "an engine nobody can account for must not read as up to date"
+    assert st["behind"] is None
+    assert "differs" in st["message"] and "divergent" in st["message"]
 
 
 # --------------------------- unknown is never zero ---------------------------
@@ -250,3 +484,48 @@ def test_state_is_measured_on_a_slow_clock_not_every_two_second_poll(src, dest):
 def test_state_never_raises_into_the_poll_loop(dest):
     d = engine.EngineDrift("/nonexistent/checkout", str(dest))
     assert d.state()["known"] is False
+
+
+def test_a_measurement_that_blows_up_speaks_rather_than_going_quiet(src, dest):
+    # Raised in review. A raising measurement used to return the SILENT unknown, which renders as no
+    # engine line — indistinguishable from a live engine. "I broke" and "nothing to report" must
+    # never look alike, or the error path quietly issues an all-clear.
+    def boom(*a, **k):
+        raise RuntimeError("git fell over")
+
+    d = engine.EngineDrift(str(src), str(dest), measure=boom)
+    st = d.state()
+    assert st["known"] is False and st["behind"] is None
+    assert st["message"] and "can't tell" in st["message"], (
+        "a failed measurement must carry a message, or it renders as silence")
+
+
+def test_unmeasurable_always_carries_a_message():
+    st = engine.unmeasurable()
+    assert st["known"] is False and st["behind"] is None and st["message"]
+
+
+def test_concurrent_polls_measure_once(src, dest):
+    # The server is a ThreadingHTTPServer, so overlapping polls land in state() together. Without a
+    # lock each thread shells out to git for the same answer.
+    import threading as _t
+    _stamp(dest, _head(src))
+    calls = []
+    barrier = _t.Barrier(4)
+
+    def slow(*a, **k):
+        calls.append(1)
+        return engine.drift(*a, **k)
+
+    d = engine.EngineDrift(str(src), str(dest), interval=30, measure=slow)
+
+    def poll():
+        barrier.wait()
+        d.state()
+
+    threads = [_t.Thread(target=poll) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(calls) == 1, "four concurrent polls must cost exactly one git measurement"

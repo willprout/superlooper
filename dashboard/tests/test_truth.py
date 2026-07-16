@@ -132,6 +132,18 @@ def test_a_dark_tower_never_dates_the_screen_by_a_failed_read():
     assert "data ?" in t["data"]["text"]
 
 
+def test_a_live_dark_tower_keeps_the_runners_own_last_successful_read():
+    # Raised in review, and the mirror of the case above. In LIVE, `unreachable` is the RUNNER's own
+    # stale flag and the age is when the RUNNER last got through to GitHub — a true, useful number,
+    # and exactly what the owner wants while the link is down. Blanking it fails safe but throws away
+    # honest information at the moment it matters most.
+    t = truth.banner(_live(data="20m ago"), github={"unreachable": True})
+    assert t["data"]["state"] == "dark"
+    assert "data 20m ago" in t["data"]["text"], (
+        "the runner's own last successful read is real — don't discard it")
+    assert "can't reach GitHub" in t["data"]["text"]
+
+
 def test_an_unknown_age_is_a_question_mark_never_a_confident_zero():
     # "0s ago" would claim the freshest possible data at the exact moment we have none.
     t = truth.banner(_never_ticked())

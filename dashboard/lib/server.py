@@ -34,6 +34,7 @@ import actions as actions_mod
 import cards as cards_mod
 import config as config_mod
 import digest as digest_mod
+import engine as engine_mod
 import flights
 import launch_rules
 import notify as notify_mod
@@ -1691,8 +1692,12 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
     if engine is not None:
         try:
             engine_state = engine.state()
-        except Exception:   # an unmeasurable engine is an UNKNOWN engine, never a reason to 500
-            engine_state = None
+        except Exception:
+            # Never a reason to 500 — but never silence either. `None` here would render as NO engine
+            # line, which reads exactly like a live, up-to-date engine: the false all-clear this strip
+            # exists to delete, coming back through the error path (caught in review). A wired engine
+            # that cannot answer says so out loud; only an UNWIRED one (engine is None) stays quiet.
+            engine_state = engine_mod.unmeasurable("the dashboard could not read the engine's state")
     snap["engine"] = engine_state
 
     # The standing truth strip (issue #166), per repo. Built HERE rather than inside _assemble_repo

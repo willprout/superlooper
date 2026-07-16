@@ -505,13 +505,18 @@ html, body {
   background: rgba(16, 21, 27, 0.78); border: 1px solid #33404E; border-radius: 4px;
   padding: 2px 7px;
 }
+/* Rows WRAP rather than run off. The chip is capped at 72% and .fld-overlays clips at the field
+   edge, so a nowrap row ("data ? · GitHub direct — not the runner's view" is ~44ch) would spill past
+   its own painted background and get sheared on a narrow tile — the strip's most important sentences
+   silently truncated, which is a new way to lose the truth (raised in review). Wrapping costs a
+   second line in the rare narrow case and never loses a word. */
 .fld-truth .r {
-  font: 600 9px var(--mono); letter-spacing: 0.3px; color: #8DA0B0; white-space: nowrap;
+  font: 600 9px var(--mono); letter-spacing: 0.3px; color: #8DA0B0; white-space: normal;
 }
 /* The engine line is the one row that names a REMEDY rather than a reading, so it gets its own
-   quiet accent and is allowed to wrap — "re-run the installer to switch them on" is an instruction,
-   and an instruction truncated at the field's edge is not one. */
-.fld-truth .r.eng { color: #E0B860; white-space: normal; }
+   quiet accent — "re-run the installer to switch them on" is an instruction, and an instruction
+   the eye slides past is not one. */
+.fld-truth .r.eng { color: #E0B860; }
 
 /* NOTICE — something is drifting; nothing is broken. Amber, the field's existing caution colour
    (.fld-fmt owns it for the same register: a data-integrity caution, not an outage). */

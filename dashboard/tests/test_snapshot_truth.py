@@ -180,9 +180,24 @@ def test_an_engine_that_explodes_never_takes_down_the_poll(home):
     _publish(home)
     _heartbeat(home, 10)
     snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh(), engine=_Exploding())
-    assert snap["engine"] is None
-    assert _strip(snap)["engine"] is None
     assert snap["repos"], "the field still renders"
+
+
+def test_an_engine_that_explodes_says_so_rather_than_going_quiet(home):
+    # Raised in review, and it is the sharpest version of this PR's own thesis: an exception used to
+    # become `engine: None`, which renders as NO engine line — pixel-for-pixel identical to a live,
+    # up-to-date engine. The error path was quietly issuing an all-clear. A wired engine that cannot
+    # answer must SAY it cannot answer.
+    _publish(home)
+    _heartbeat(home, 10)
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh(), engine=_Exploding())
+    assert snap["engine"] is not None, "a broken engine must not be indistinguishable from a live one"
+    assert snap["engine"]["known"] is False
+    assert snap["engine"]["behind"] is None
+    t = _strip(snap)["engine"]
+    assert t is not None and t["state"] == "unknown"
+    assert "can't tell" in t["text"]
+    assert _strip(snap)["level"] == "notice", "an unknown engine is worth a notice, not silence"
 
 
 def test_a_down_loop_outranks_engine_drift_end_to_end(home):

@@ -87,9 +87,17 @@ def test_field_mounts_the_always_on_freshness_surface():
 def test_the_freshness_surface_is_shown_in_both_modes():
     # It must NOT be gated on the mode — it is the always-on honesty, not a fallback extra. A strip
     # that appears only once you already suspect the dashboard is the bug, not the fix.
-    for gate in re.findall(r"fixedEls\.truth\.hidden\s*=\s*([^;\n]+)", _FIELD):
-        assert "fallback" not in gate, (
-            "the truth strip must show in BOTH modes, never only in fallback")
+    #
+    # Asserted POSITIVELY (raised in review): the first cut looped over `findall(...hidden = ...)`
+    # and, finding zero matches, ran an empty loop body and passed vacuously — it would have passed
+    # against a strip hidden by any means at all. So: the binder must be called unconditionally, and
+    # nothing may hide the strip.
+    assert re.search(r"^\s*bindTruth\(c\.repo\.truth\);", _FIELD, re.MULTILINE), (
+        "bindTruth must be called unconditionally on every render, not behind a mode gate")
+    assert not re.search(r"fixedEls\.truth\.hidden\s*=\s*(?!false\b)", _FIELD), (
+        "nothing may hide the truth strip — it is the always-on honesty")
+    assert not re.search(r"fixedEls\.truth\.style\.display", _FIELD), (
+        "the strip must not be hidden via style.display either")
 
 
 def test_css_styles_the_always_on_freshness_surface():

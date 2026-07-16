@@ -92,18 +92,24 @@ def _data_line(src, github):
     """
     age = _age(src, "data")
 
-    # Dark tower first: it outranks "second opinion", because a fallback that can't reach GitHub
-    # either isn't showing a second opinion — it is showing nothing at all, and a calm "data 30s
-    # ago" over a picture that is going nowhere is the confident blank this issue exists to kill.
+    # Dark tower first: it outranks "second opinion", because a source that can't reach GitHub isn't
+    # showing a second opinion — it is showing nothing at all, and a calm "data 30s ago" over a
+    # picture that is going nowhere is the confident blank this issue exists to kill.
     #
-    # The age is deliberately DROPPED here rather than passed through. source_mode dates fallback by
-    # when the dashboard's own fetch last RAN — which, with the link down, is a read that came back
-    # empty. Rendering that as "data 12s ago" beside "the tower is blind" would date the screen by a
-    # failure and hand the owner a freshness number for a layer holding nothing at all. Caught by
-    # driving it in a browser, not by a test: the two clauses only contradict each other out loud.
+    # Whether the age survives depends on WHOSE read went dark, and the two are genuinely different:
+    #
+    #   * FALLBACK — the age is when the DASHBOARD's own fetch last RAN, and with the link down that
+    #     read came back empty. "data 12s ago" beside "the tower is blind" would date the screen by a
+    #     failure and hand the owner a freshness number for a layer holding nothing. Dropped.
+    #     (Caught by driving a browser, not by a test — the two clauses only contradict out loud.)
+    #   * LIVE — `unreachable` is the RUNNER's own stale flag, and the age is when the RUNNER last
+    #     reached GitHub. That is a true and useful number ("the runner last got through 20m ago") —
+    #     exactly what the owner needs while the link is down. Kept. (Raised in review: failing safe
+    #     by blanking it would throw away honest information at the moment it matters most.)
     if isinstance(github, dict) and github.get("unreachable"):
+        shown = age if src.get("mode") == flights.SOURCE_LIVE else _UNKNOWN_AGE
         return {"state": "dark",
-                "text": "data %s · can't reach GitHub — the tower is blind" % _UNKNOWN_AGE}
+                "text": "data %s · can't reach GitHub — the tower is blind" % shown}
 
     if src.get("mode") == flights.SOURCE_LIVE:
         return {"state": "ok", "text": "data %s" % age}

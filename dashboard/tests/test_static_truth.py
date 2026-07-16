@@ -36,11 +36,16 @@ def test_the_strip_binds_the_servers_verdict_and_derives_nothing():
 def test_the_strip_renders_all_three_facts():
     # The three questions the strip exists to answer: is the loop alive, whose truth is this, and is
     # the merged engine fix actually running?
+    #
+    # Matched against the RENDER, not the declarations (raised in review): the first cut asserted
+    # `"tick" in body`, which the binder's own `var tick = t.tick || {}` line satisfies — it would
+    # have passed against a binder that declared all three and rendered none.
     binder = re.search(r"function bindTruth\(t\)\s*\{(.*?)\n  \}", _FIELD, re.S)
     assert binder, "bindTruth must exist"
     body = binder.group(1)
-    for fact in ("tick", "data", "eng"):
-        assert fact in body, "the strip must render its %s line" % fact
+    for fact, expr in (("tick", r"esc\(tick\.text"), ("data", r"esc\(data\.text"),
+                       ("engine", r"esc\(eng\.text\)")):
+        assert re.search(expr, body), "the strip must actually RENDER its %s line" % fact
 
 
 def test_the_level_class_reaches_the_strip():

@@ -283,10 +283,12 @@
     bindTruth(c.repo.truth);
   }
 
-  /* Bind the source-mode surfaces (issue #146): the always-on freshness stamp, and the fallback
-     banner. Both read the server's verdict (repo.source) and derive nothing — which mode we're in,
-     and the words for it, are decided once in lib/flights.source_mode so the banner and the board
-     can never tell two different stories. */
+  /* Bind the fallback banner (issue #146). It reads the server's verdict (repo.source) and derives
+     nothing — which mode we're in, and the words for it, are decided once in lib/flights.source_mode
+     so the banner and the board can never tell two different stories.
+
+     The always-on freshness stamp this used to bind moved into bindTruth (issue #166), which states
+     the same two clocks plus the conclusion; what stays here is the loud fallback band alone. */
   function bindSource(src) {
     src = src || {};
     var fallback = src.mode === 'fallback';
@@ -299,7 +301,6 @@
       fixedEls.src.innerHTML = '<span class="t">◆ FALLBACK — GITHUB DIRECT</span>' +
         lines.map(function (l) { return '<span class="m">' + esc(l) + '</span>'; }).join('');
     }
-
   }
 
   /* Bind the standing truth strip (issue #166): how long since the runner ticked, whose truth is on
