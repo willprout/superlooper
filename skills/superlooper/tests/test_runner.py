@@ -782,16 +782,51 @@ def test_fresh_parsed_view_wins_over_a_stale_stamped_value(rig):
     assert env["SL_EFFORT"] == ""
 
 
-def test_failed_launch_bumps_the_counter_and_moves_no_labels(rig):
+def _per_issue_rc(text="could not create the worktree for i101"):
+    # A launch failure whose captured stderr names THIS issue's own state (its worktree here),
+    # so evidence classifies it PER-ISSUE (worktree_create_failed) rather than a channel fault.
+    return runner_mod.ScriptRC(1, text)
+
+
+def test_per_issue_launch_fault_bumps_the_counter_and_moves_no_labels(rig):
+    # A fault the ISSUE owns (a git-level worktree failure) charges the per-issue launch cap and
+    # moves no labels — the delivery-channel exemption (#153) does not apply to it.
     rig.r.tick(now=NOW)
     rig.calls.clear()
     before = len(mutations(rig))
-    rig.rc_queue.append(2)                             # delivery never verified
+    rig.rc_queue.append(_per_issue_rc())               # per-issue: worktree_create_failed
     out = rig.r._execute(_launch_action(), NOW)
     assert out != "ok"
     ist = issue_state(rig, "i101")
     assert ist["status"] == "ready" and ist["launch_failures"] == 1
     assert len(mutations(rig)) == before               # no label move without a live worker
+
+
+def test_per_issue_launch_fault_skips_the_systemic_streak(rig):
+    # A per-issue fault must NOT enter the runner's channel-failure streak: one issue's own broken
+    # state must never masquerade as a dead delivery channel and freeze the whole queue (issue #153).
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(_per_issue_rc())
+    rig.r._execute(_launch_action(), NOW)
+    assert "i101" not in rig.r._launch_fail_ids
+
+
+def test_channel_fault_launch_charges_no_per_issue_cap(rig):
+    # DoD #1: a launch failure attributable to the DELIVERY CHANNEL (here rc=2 — the shim never
+    # fired) must NOT increment the per-issue launch-failure counter and must move no labels. It
+    # feeds the systemic streak instead, so the queue holds without any issue absorbing the blame.
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="ready", launch_failures=0)
+    rig.calls.clear()
+    before = len(mutations(rig))
+    rig.rc_queue.append(2)                             # channel: shim_not_fired (delivery never verified)
+    out = rig.r._execute(_launch_action(), NOW)
+    assert out != "ok"
+    ist = issue_state(rig, "i101")
+    assert ist["status"] == "ready" and ist["launch_failures"] == 0   # UNCHARGED
+    assert "i101" in rig.r._launch_fail_ids            # but the channel streak records it
+    assert len(mutations(rig)) == before               # agent-ready never moved
 
 
 # --------------------------- launch anchor liveness (#24) ---------------------------
@@ -832,12 +867,13 @@ def test_generic_delivery_failure_does_not_stamp_base_missing(rig):
     assert issue_state(rig, "i101").get("launch_error") is None
 
 
-def test_failed_launch_delivery_records_the_issue_in_the_systemic_streak(rig):
-    # A launch whose delivery is not verified feeds the runner-level systemic-failure streak — the
-    # signal decide uses to tell a dead anchor (many issues) from a bad issue (one).
+def test_channel_launch_failure_records_the_issue_in_the_systemic_streak(rig):
+    # A launch that fails delivery for a CHANNEL reason (rc=2: the shim never fired) feeds the
+    # runner-level channel-failure streak — the signal decide reads to hold the queue systemically
+    # (issue #153: any streak entry now means the channel is down).
     rig.r.tick(now=NOW)
     rig.calls.clear()
-    rig.rc_queue.append(2)                             # delivery never verified
+    rig.rc_queue.append(2)                             # channel: delivery never verified
     rig.r._execute(_launch_action(), NOW)
     assert "i101" in rig.r._launch_fail_ids
 
@@ -862,13 +898,59 @@ def test_verified_recover_delivery_clears_the_systemic_streak(rig):
 
 
 def test_failed_recover_delivery_does_not_clear_the_streak(rig):
-    # A recover that does NOT verify delivery is not proof of anything — the streak must persist.
+    # A recover that does NOT verify delivery is not proof of anything — the streak must persist (and,
+    # for a channel fault, this recover's own id joins it — see the next tests).
     rig.r.tick(now=NOW)
     rig.r._launch_fail_ids = {"i9", "i101"}
     rig.calls.clear()
     rig.rc_queue.append(2)                             # delivery not verified
     rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
     assert rig.r._launch_fail_ids == {"i9", "i101"}
+
+
+def test_channel_fault_recover_relaunch_charges_no_cap_and_feeds_streak(rig):
+    # Issue #153 applies to EVERY launch-delivery path, not just fresh launches: a recover relaunch
+    # that fails for a CHANNEL reason is charged to the CHANNEL, not the issue. No per-issue launch-cap
+    # bump, and it feeds the systemic streak — so a dead channel is detected and held even when only
+    # in-flight work is being relaunched (there may be no fresh agent-ready issue to trip it otherwise).
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="exited", launch_failures=0)
+    rig.r._launch_fail_ids = set()
+    rig.calls.clear()
+    rig.rc_queue.append(2)                             # channel: the shim never fired
+    out = rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
+    assert out != "ok"
+    assert issue_state(rig, "i101").get("launch_failures", 0) == 0   # UNCHARGED
+    assert "i101" in rig.r._launch_fail_ids                          # feeds the systemic streak
+    assert rig.r._launch_fail_at == NOW                              # and the canary retry clock
+
+
+def test_per_issue_recover_relaunch_charges_the_cap_and_skips_streak(rig):
+    # The boundary holds on the relaunch path too: a recover that fails for a PER-ISSUE reason (its
+    # own worktree) still charges the per-issue cap and stays OUT of the channel streak.
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="exited", launch_failures=0)
+    rig.r._launch_fail_ids = set()
+    rig.calls.clear()
+    rig.rc_queue.append(_per_issue_rc())              # per-issue: worktree_create_failed
+    rig.r._execute({"act": "recover", "id": "i101", "tier": "exited"}, NOW)
+    assert issue_state(rig, "i101")["launch_failures"] == 1
+    assert "i101" not in rig.r._launch_fail_ids
+
+
+def test_channel_fault_conflict_relaunch_charges_no_cap_and_feeds_streak(rig):
+    # The conflict-resolution relaunch runs the SAME launch machinery, so a channel fault there is
+    # also charged to the channel, never the issue (issue #153).
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i101", status="gating", branch="sl/i101-render-the-widget", pr=7,
+               launch_failures=0)
+    rig.r._launch_fail_ids = set()
+    rig.calls.clear()
+    rig.rc_queue.append(2)                             # channel: delivery not verified
+    out = rig.r._execute({"act": "resolve_conflict", "id": "i101", "num": 101, "pr": 7}, NOW)
+    assert out != "ok"
+    assert issue_state(rig, "i101").get("launch_failures", 0) == 0
+    assert "i101" in rig.r._launch_fail_ids
 
 
 def test_brief_failure_does_not_touch_the_streak(rig):
@@ -909,6 +991,25 @@ def test_tick_launches_normally_when_the_anchor_is_healthy(rig):
     rig.r.tick(now=NOW)
     assert issue_state(rig, "i101")["status"] == "running"
     assert "ALERT" not in os.listdir(rig.home / "state")
+
+
+def test_a_dead_channel_charges_no_issue_and_raises_one_systemic_hold(rig):
+    # DoD #4, end to end: a dead delivery channel (every launch fails rc=2 — the shim never fires)
+    # across N ready issues must charge NOTHING per-issue and raise exactly ONE systemic hold. This
+    # is the 2026-07-09 storm rewritten: back then each failed delivery bumped a per-issue counter
+    # and the queue walked into parks. Now every failure is charged to the CHANNEL: zero counter
+    # bumps, zero parks, one alert, the queue left intact.
+    rig.rc_queue.extend([2] * 6)                        # every launch delivery fails (channel fault)
+    rig.r.tick(now=NOW)                                 # tick 1: launches attempted, all fail
+    rig.r.tick(now=NOW + 15)                            # tick 2: streak is systemic -> queue held
+    states = _all_issue_states(rig)
+    assert states, "expected the ready issues to have been touched by a launch attempt"
+    for iid, ist in states.items():
+        assert ist.get("launch_failures", 0) == 0, f"{iid} was charged a per-issue launch cap"
+        assert ist.get("status") != "parked", f"{iid} was parked for a channel fault"
+    assert rig.r._launch_fail_ids, "the channel-failure streak must record the dead channel"
+    alert = json.loads((rig.home / "state" / "ALERT").read_text())
+    assert alert["reasons"] == ["launch_systemic_failure"]   # ONE systemic hold, not N per-issue parks
 
 
 def test_a_restart_clears_the_systemic_launch_streak(rig):
@@ -1024,10 +1125,11 @@ def test_launch_recovered_executor_is_wired_and_returns_its_reason(rig):
 
 
 def test_systemic_hold_re_arms_via_canary_end_to_end(rig):
-    # DoD #1 (#115): trip (2 distinct-issue delivery failures) -> hold; a canary after the retry
-    # interval with delivery STILL failing -> still held, zero parks, zero new notifies, per-issue
-    # caps untouched; delivery recovers -> the canary verifies -> streak clears, the ALERT clears
-    # with a journaled recovery record, and the held queue resumes launching in priority order.
+    # DoD #1 (#115): trip (channel delivery failures) -> hold; a canary after the retry interval
+    # with delivery STILL failing -> still held, zero parks, zero new notifies, per-issue caps
+    # NEVER charged (channel faults charge nobody — #153); delivery recovers -> the canary verifies
+    # -> streak clears, the ALERT clears with a journaled recovery record, and the held queue resumes
+    # launching in priority order.
     # Soft affinity so the resume is a clean parallel launch, not an affinity-serialized dribble.
     rig.r.config["affinity"] = "soft"
     launches = lambda: [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
@@ -1057,7 +1159,7 @@ def test_systemic_hold_re_arms_via_canary_end_to_end(rig):
     probes = launches()
     assert len(probes) == 1 and probes[0]["args"][1] == "i102"   # front-of-queue (priority:high)
     assert rig.r._launch_fail_ids == {"i101", "i102"}           # still held
-    assert issue_state(rig, "i102")["launch_failures"] == 1      # probe charged NO per-issue cap
+    assert issue_state(rig, "i102").get("launch_failures", 0) == 0   # channel faults charge NO cap
     assert [i for i in _all_issue_states(rig).values() if i.get("status") == "parked"] == []
     assert alert == json.loads((rig.home / "state" / "ALERT").read_text())   # no new/changed alert
 
@@ -2046,7 +2148,7 @@ def test_executor_counter_bumps_survive_corrupt_values(rig):
     # wedge the bad state in place — the bump resets it to a real count.
     seed_issue(rig, "i5", status="ready", launch_failures="corrupt")
     rig.r.tick(now=NOW)                                # parsed view for i5? not needed:
-    rig.rc_queue.append(2)
+    rig.rc_queue.append(_per_issue_rc("could not create the worktree for i5"))   # per-issue -> bumps
     rig.r._parsed_by_id["i5"] = {"num": 5, "id": "i5", "title": "x", "type": "build",
                                  "labels": ["agent-ready"], "touches": [], "blocked_by": [],
                                  "parent": None, "created_at": "", "priority": 2,

@@ -150,6 +150,46 @@ _LAUNCH_TEXT = (
 )
 
 
+# ---- who is at fault: the DELIVERY CHANNEL, or the ISSUE (issue #153) --------------------------
+# A launch failure is one of two kinds, and the loop charges them in opposite ways. A DELIVERY-
+# CHANNEL fault — the cmux launch anchor, the launch shim, or the launch machinery itself — is a
+# fault NONE of the queued issues caused: the launch never reached a worker because the channel was
+# down. Charging an issue a launch-cap increment or a park for it blames an issue for something it
+# did not do (the 2026-07-09 storm: one dead anchor walked ten issues into ten parks in ~8 min).
+# The runner holds the queue systemically and probes with a canary (#24/#115) for these instead.
+# Every OTHER launch failure names THIS issue's own state — its base branch, its worktree, its
+# identity, its brief — and still parks that one issue. These are the reasons _classify() emits for
+# the machinery-level faults; a reason absent here (base_missing, worktree_create_failed,
+# identity_invalid, brief_missing, or any unmapped rc) is treated as per-issue.
+CHANNEL_FAULT_REASONS = frozenset({
+    "anchor_workspace_missing",       # the 07-09 storm: anchor targets a deleted cmux workspace
+    "anchor_socket_lost",             # the runner lost its cmux socket — it reaches no pane at all
+    "shim_not_fired",                 # rc=2: a tab was created but the shim never ran the command
+    "launch_failed_before_delivery",  # rc=1 generic: "nothing about the session itself is at fault"
+    "launch_timeout",                 # rc=124: the launcher hung — no session ever started
+    "launch_script_unrunnable",       # rc=127: the launch script itself could not execute (install)
+    "agent_unsupported",              # rc=64: the configured agent is repo-wide wrong, not one issue's
+})
+
+
+def is_channel_fault(rec):
+    """True when this launch-failure evidence record names a DELIVERY-CHANNEL fault (issue #153):
+    the anchor, the shim, or the launch machinery — a fault no single issue caused.
+
+    An UNMAPPED rc (reason `<kind>_rc_<n>`) and a corrupt/non-record fail SAFE: they return False (a
+    per-issue fault), so a genuinely novel exit code can never silently freeze the whole loop. This is
+    NOT a blanket 'only these reasons ever hold' guarantee, though: `launch_failed_before_delivery` is
+    the reason `_classify` returns for ANY rc=1 whose stderr matches no per-issue pattern, and it IS a
+    channel reason — because launch-session.sh defines rc=1 as 'aborted before any tab could host a
+    worker; nothing about the session itself is at fault', and its per-issue rc=1 causes
+    (worktree_create_failed, identity_invalid, brief_missing) each echo a distinguishing stderr line.
+    So the contract the classifier relies on is the launcher's: a per-issue fault must carry either its
+    own rc (base_missing=3) or a matching stderr line — a future per-issue rc=1 added WITHOUT one would
+    be read as channel. A wrongly-held queue is a bigger, quieter outage than one wrongly-parked issue
+    the owner can see and re-approve, so the default leans to holding on the machinery-level reasons."""
+    return isinstance(rec, dict) and rec.get("reason") in CHANNEL_FAULT_REASONS
+
+
 def _classify(kind, rc, captured):
     """(reason, detail) for a non-success outcome. Text first, then the rc table, then an honest
     fallback that names the rc rather than inventing a cause."""

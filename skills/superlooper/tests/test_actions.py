@@ -356,12 +356,13 @@ def test_stale_over_ceiling_reading_fails_open_past_grace_by_design():
 
 
 def test_failing_open_never_cascades_parks_under_a_systemic_launch_failure():
-    # DoD: while failing open, a SYSTEMIC launch failure (#24) holds the queue with ONE runner-level
-    # alert — it never parks issues or strips agent-ready across the queue.
+    # DoD: while failing open, a SYSTEMIC launch failure (#24/#153) holds the queue with ONE
+    # runner-level alert — it never parks issues or strips agent-ready across the queue. The streak
+    # is channel-only, so the issues in it carry NO per-issue charge; the hold is what keeps them
+    # queued and intact for recovery.
     d = disk(launch_fail_ids=["i5", "i6"],
              issues_state={"version": 1, "issues": {
-                 "i5": ist("ready", launch_failures=2),
-                 "i6": ist("ready", launch_failures=2)}})
+                 "i5": ist("ready"), "i6": ist("ready")}})
     out = decide(usage=dark_usage(), parsed_issues=[parsed(5), parsed(6)], dsk=d)
     assert only(out, "park") == []                    # no park cascade
     assert only(out, "launch") == []                  # launches HELD (queue intact for recovery)
@@ -582,7 +583,7 @@ def test_dead_anchor_with_a_sole_at_cap_issue_still_alerts_not_silent():
     # An approved issue held under a dead anchor must surface the fault even if it is already at its
     # own launch cap: while degraded its park is SUPPRESSED, so it is part of the held queue — the
     # runner must not sit on it silently (no launch, no park, no alert).
-    dsk = disk(launch_anchor=_anchor_down(), launch_fail_ids=["i5"],
+    dsk = disk(launch_anchor=_anchor_down(), launch_fail_ids=[],
                issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures=2)}})
     out = decide(parsed_issues=[parsed(5)], dsk=dsk)
     assert only(out, "launch") == [] and only(out, "park") == []   # held, not parked
@@ -621,20 +622,26 @@ def test_systemic_launch_failures_across_distinct_issues_alert_and_hold():
     assert has_notify(out)
 
 
-def test_one_distinct_failing_issue_is_not_systemic():
-    # A single issue failing delivery (below the distinct-issue cap) is NOT a systemic fault: the
-    # queue launches normally (that one issue parks per-issue once it hits its own launch cap — see
-    # the next test). Distinct areas so hard affinity lets both go in one tick.
+def test_one_channel_failure_is_systemic_and_holds_the_queue():
+    # Issue #153: the streak is CHANNEL-only (the runner records a launch failure here only when
+    # evidence classifies it as a dead anchor / shim / launch machinery, never a per-issue fault),
+    # so a SINGLE entry already means the channel is down. The FIRST such failure is systemic: every
+    # launch held, one alert, nothing parked — no issue absorbs the blame, not even the first. (This
+    # is the invariant the old distinct-issue-count heuristic could not express: it charged the first
+    # one or two issues before inferring "channel" from the count.)
     dsk = disk(launch_fail_ids=["i5"])
     out = decide(parsed_issues=[parsed(5, touches=("frontend",)), parsed(6, touches=("api",))],
                  dsk=dsk)
-    assert len(only(out, "launch")) == 2 and only(out, "alert") == []
+    assert only(out, "launch") == [] and only(out, "park") == []
+    a = only(out, "alert")
+    assert len(a) == 1 and a[0]["reasons"] == ["launch_systemic_failure"] and has_notify(out)
 
 
 def test_single_issue_launch_cap_still_parks_when_anchor_healthy():
-    # DoD #4: a genuinely issue-SPECIFIC launch failure (one issue at its cap, anchor fine, no
-    # other issue failing) still parks that one issue — unchanged.
-    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=["i5"],
+    # DoD #4 / boundary: a genuinely issue-SPECIFIC launch fault still parks that one issue. Its
+    # counter is at the per-issue cap and the CHANNEL streak is empty (a per-issue fault never enters
+    # it — issue #153), so nothing is systemic and the normal per-issue park fires.
+    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=[],
                issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures=2)}})
     out = decide(parsed_issues=[parsed(5)], dsk=dsk)
     parks = only(out, "park")

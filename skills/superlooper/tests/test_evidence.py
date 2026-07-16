@@ -219,3 +219,64 @@ def test_the_park_memo_never_raises_on_a_missing_or_corrupt_record(bad):
 def test_the_park_memo_is_bounded():
     rec = evidence.build("launch", rc=1, captured="x" * 100_000)
     assert len(evidence.park_memo(rec, attempts=3)) < 4000
+
+
+# ---------------------------------------------------------------- channel vs per-issue (#153)
+# A launch failure is one of two kinds, and they are charged in opposite ways: a DELIVERY-CHANNEL
+# fault (the cmux anchor, the launch shim, the launch machinery) is a fault NO queued issue caused —
+# it must hold the queue systemically and charge nobody — while a PER-ISSUE fault (a bad base branch,
+# a git-level worktree failure, unusable issue state) parks the one issue that owns it. is_channel_fault
+# reads the classified reason, so the runner can tell them apart on the FIRST failure instead of
+# inferring "channel" only after a second distinct issue also fails (issue #153).
+
+@pytest.mark.parametrize("rc", [1, 2, 124, 127, 64])
+def test_bare_launch_rc_faults_are_channel_faults(rc):
+    # With no captured text the reason comes straight from the rc table, and every rc-only launch
+    # failure names the launch MACHINERY, never the session: rc=1 "nothing about the session itself
+    # is at fault", rc=2 the shim, rc=124 a hung launcher, rc=127 an unrunnable script, rc=64 a
+    # repo-wide wrong agent. All are channel-attributable.
+    assert evidence.is_channel_fault(evidence.build("launch", rc=rc, captured=None)) is True
+
+
+@pytest.mark.parametrize("needle,reason", [
+    ("Error: not_found: Pane or workspace not found", "anchor_workspace_missing"),  # 07-09 storm
+    ("cmux: broken pipe", "anchor_socket_lost"),                                     # lost socket
+    # An rc=1 with text that matches no per-issue pattern falls to the generic rc=1 reason, which is
+    # itself a channel reason (the launcher aborted before delivery — not the session's fault):
+    ("the launcher gave up before any tab appeared", "launch_failed_before_delivery"),
+])
+def test_anchor_and_generic_rc1_text_faults_are_channel_faults(needle, reason):
+    # The storm's own cause (anchor targeting a deleted workspace) and a lost cmux socket are the
+    # canonical channel faults; a generic pre-delivery abort is too. All arrive as rc=1 and classify
+    # as channel — the classifier reads the reason, and confirms which reason it resolved to here.
+    rec = evidence.build("launch", rc=1, captured=needle)
+    assert rec["reason"] == reason
+    assert evidence.is_channel_fault(rec) is True
+
+
+@pytest.mark.parametrize("captured,reason", [
+    ("could not create the worktree for i5", "worktree_create_failed"),
+    ("[i5] sanitize validation failed", "identity_invalid"),
+    ("launch aborted: missing brief file", "brief_missing"),
+])
+def test_per_issue_text_faults_are_not_channel_faults(captured, reason):
+    # These name THIS issue's own state (its worktree, its identity, its brief) — a fault the issue
+    # owns and must park for. They arrive as rc=1 but the captured text refines them past the generic
+    # channel reading, so they are NOT channel-attributable.
+    rec = evidence.build("launch", rc=1, captured=captured)
+    assert rec["reason"] == reason
+    assert evidence.is_channel_fault(rec) is False
+
+
+def test_base_missing_is_a_per_issue_fault():
+    # A missing base branch (rc=3) is a per-repo CONFIG fault the issue parks for — never the channel.
+    assert evidence.is_channel_fault(evidence.build("launch", rc=3, captured=None)) is False
+
+
+@pytest.mark.parametrize("bad", [None, "", 17, [], {}, {"reason": None}, {"reason": 5},
+                                 {"reason": "launch_rc_99"}])
+def test_unrecognized_or_corrupt_records_fail_safe_to_per_issue(bad):
+    # Fail SAFE for the queue: an unmapped rc (launch_rc_99) or a corrupt record is NOT treated as a
+    # channel fault. A novel per-issue fault must never silently freeze the whole loop; only the KNOWN
+    # channel reasons hold it. (The worse failure is a wrongly-held queue, not one wrongly-parked issue.)
+    assert evidence.is_channel_fault(bad) is False

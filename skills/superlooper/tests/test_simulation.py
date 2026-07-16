@@ -1998,25 +1998,36 @@ def test_wrong_typed_usage_stops_launches_but_gates_proceed(sim_factory):
 
 
 # =====================================================================================
-# launch delivery failure (drop mode = shim not installed / keystrokes lost): two
-# verified non-deliveries -> park with the shim memo; orphan tabs closed; no liveness
+# launch delivery failure (drop mode = the launch shim isn't firing): a SHIM fault is a
+# DELIVERY-CHANNEL fault, not the issue's — so the queue is HELD systemically, the issue is
+# NEVER parked and NEVER charged, one systemic alert fires, and orphan tabs are still closed
+# (issue #153, superseding the old per-issue "is the shim installed?" park — #152/#24).
 # =====================================================================================
 
-def test_launch_never_delivered_parks_after_cap_with_shim_memo(sim_factory, monkeypatch):
+def test_shim_not_firing_holds_the_queue_and_never_parks_the_issue(sim_factory, monkeypatch):
     sim = sim_factory()
-    monkeypatch.setenv("CMUX_MODE", "drop")
+    monkeypatch.setenv("CMUX_MODE", "drop")            # the shim drops the launch command
     monkeypatch.setenv("SL_LAUNCH_VERIFY_SECONDS", "2")
     num = sim.add_issue(title="Keystrokes lost", scenario={"scenario": "happy"})
     sid = "i%d" % num
 
-    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked", ticks=5), \
-        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
-    memos = [m for m in sim.mutations("comment") if "launch shim" in m["body"]]
-    assert memos, "the park memo must point at the shim installer"
-    assert sim.loop_issue(sid).get("launch_failures") == 2
-    # both orphan tabs were CLOSED (no buffered-keystroke time bomb), and no liveness was
-    # ever fabricated for a worker that never started
+    # The shim fault is channel-attributable: the runner records it in the channel streak (never a
+    # per-issue counter) and decide raises ONE systemic hold. Wait for that hold to engage.
+    alert_path = os.path.join(sim.home, "state", "ALERT")
+    assert sim.tick_until(lambda: os.path.exists(alert_path) and sim.runner._launch_fail_ids,
+                          ticks=6), [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    # NEVER parked, NEVER charged a per-issue cap — no issue absorbs a fault none of them caused.
+    assert sim.loop_issue(sid).get("status") != "parked"
+    assert sim.loop_issue(sid).get("launch_failures", 0) == 0
+    # The systemic alert names the channel fault; it is NOT a per-issue park memo on the issue.
+    alert = json.load(open(alert_path))
+    assert alert["reasons"] == ["launch_systemic_failure"]
+    assert [m for m in sim.mutations("comment") if "launch shim" in m["body"]] == [], \
+        "a shim fault must not post a per-issue park memo — the systemic alert carries the guidance"
+    # Orphan tabs are still CLOSED (no buffered-keystroke time bomb), no liveness was ever fabricated
+    # for a worker that never started, and agent-ready was never moved (the queue is intact).
     closed = (sim.cmux_dir / "closed.jsonl")
-    assert closed.exists() and len(closed.read_text().splitlines()) == 2
+    assert closed.exists() and len(closed.read_text().splitlines()) >= 1
     assert not os.path.exists(os.path.join(sim.home, "state", "activity", sid))
     assert "in-progress" not in sim.issue(num)["labels"]
