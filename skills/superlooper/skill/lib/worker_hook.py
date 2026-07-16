@@ -87,16 +87,20 @@ def _tracked_state(cwd, rel):
         return UNKNOWN
     if r.returncode == 0:
         return TRACKED
-    # Non-zero is ambiguous — "untracked", "not a repo", and "broken index" all land here. Ask a
-    # second, narrower question to tell them apart rather than guessing in the destructive direction.
+    # Non-zero is ambiguous, and the difference is destructive. git distinguishes them by CODE:
+    # rc=1 is the real answer "no such tracked path"; rc=128 is git failing to answer at all
+    # (not a repo, or an unreadable/corrupt index). Treating 128 as "untracked" is exactly the
+    # fail-open this fence exists to prevent — and `rev-parse --is-inside-work-tree` cannot save
+    # us there, because it never reads the index and still cheerfully answers "true".
     try:
         w = subprocess.run(["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
                            capture_output=True, text=True, timeout=GIT_TIMEOUT)
     except Exception:
         return UNKNOWN
-    if w.returncode != 0:
-        return NO_REPO
-    return UNTRACKED if w.stdout.strip() == "true" else UNKNOWN
+    inside = w.returncode == 0 and w.stdout.strip() == "true"
+    if not inside:
+        return NO_REPO if w.returncode != 0 else UNKNOWN
+    return UNTRACKED if r.returncode == 1 else UNKNOWN
 
 
 def harvest_report(state_home, issue_id, cwd):

@@ -178,19 +178,22 @@ def test_an_empty_report_is_not_harvested(tmp_path):
 def test_a_symlinked_report_is_never_harvested(tmp_path):
     # Harvesting MOVES the link itself, so the canonical report would BECOME a symlink to whatever
     # it points at — and the runner reads the canonical report and posts it.
+    # The target sits INSIDE the worktree deliberately: a target outside would be refused by the
+    # containment check, and this test would pass while proving nothing about the islink fence.
     run_root = _state_home(tmp_path)
     wt = tmp_path / "worktrees" / ISSUE
     _worktree(wt)
-    secret = tmp_path / "id_rsa"
-    secret.write_text("PRIVATE KEY")
+    inside = wt / "notes.md"
+    inside.write_text("private working notes, not a report")
     (wt / "reports").mkdir()
-    (wt / "reports" / f"{ISSUE}.md").symlink_to(secret)
+    (wt / "reports" / f"{ISSUE}.md").symlink_to(inside)
 
     r = _stop(run_root, wt)
 
     assert r.returncode == 0, r.stderr
-    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
-    assert secret.read_text() == "PRIVATE KEY"
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists(), \
+        "the canonical report must never become a symlink to some other file"
+    assert inside.read_text() == "private working notes, not a report"
 
 
 def test_a_symlinked_reports_dir_cannot_drag_a_file_out_of_another_directory(tmp_path):
@@ -244,6 +247,29 @@ def test_harvest_refuses_when_git_cannot_say_whether_the_file_is_tracked(tmp_pat
     # the hook no-opped.
     assert _status(run_root)["head"] is None, "the harness must have run, with git unavailable"
     assert stray.exists(), "unknown tracked-state must refuse the move"
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+
+
+def test_harvest_refuses_when_the_git_index_is_corrupt(tmp_path):
+    # The subtle half of the fence. `git ls-files --error-unmatch` says "untracked" with rc=1, but
+    # FAILS with rc=128 — and an unreadable index is rc=128. `rev-parse --is-inside-work-tree`
+    # cannot rescue that: it never reads the index, so it still answers "true". Read the rc, not
+    # just "non-zero", or a committed report gets ripped out of the branch under review.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(REPORT_TEXT)
+    _git(wt, "add", "reports")
+    _git(wt, "commit", "-qm", "tracked report")
+    (wt / ".git" / "index").write_bytes(b"GARBAGE")   # git can no longer answer "is it tracked?"
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert _status(run_root)["ts"], "the harness must really have run"
+    assert stray.exists(), "git could not answer — the move must be refused, not guessed"
     assert not (run_root / "reports" / f"{ISSUE}.md").exists()
 
 
