@@ -2280,9 +2280,16 @@ class Runner:
             rc = self._run_script([self._script("nudge-pane.sh"), surface, iid,
                                    f"[superlooper gate] {a.get('message', '')}"],
                                   env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
-        if rc in (0, 4):
-            # sent, or unsendable-forever (dead pane): either way the one nudge is spent —
-            # gate.nudge_or_park parks on the next pass (never an unbounded nudge loop)
+        if rc in (0, 4, 5):
+            # sent, or unsendable-FOREVER (4 = dead pane; 5 = logged out in-window, issue #151):
+            # either way the one nudge is spent — gate.nudge_or_park parks on the next pass (never
+            # an unbounded nudge loop). rc=5 belongs here and not with the defers: a session whose
+            # auth is dead can never answer, and before #151 taught the classifier to see it, this
+            # screen read as 'idle' and was typed into for rc=0 — which spent the key and reached
+            # the owner. Leaving 5 out would have made a logged-out lane re-nudge every tick and
+            # never park: strictly worse than the bug being fixed.
+            # rc=6 (at_dialog) is NOT here on purpose: a dialog is transient — the session answers
+            # and a later pass delivers. That is a defer, like rc=3.
             def m(st):
                 i = st["issues"].setdefault(iid, loopstate.new_issue())
                 nudged = i.get("nudged")
@@ -2293,7 +2300,10 @@ class Runner:
                 i["nudged"] = nudged
                 i["status"] = "gating"
             loopstate.update(self.issues_path, m)
-            return "ok" if rc == 0 else "dead pane — nudge spent, gate parks next pass"
+            if rc == 0:
+                return "ok"
+            why = "logged out in-window" if rc == 5 else "dead pane"
+            return f"{why} — nudge spent, gate parks next pass"
         return f"nudge rc={rc} (retrying next tick)"
 
     def _exec_merge(self, a, now):

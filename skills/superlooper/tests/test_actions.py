@@ -2627,28 +2627,72 @@ def test_a_session_at_its_own_dialog_does_not_alert():
     assert only(out, "alert") == []
 
 
-def test_a_logged_out_session_is_never_nudged_by_the_liveness_ladder():
-    """The DoD's hard 'NEVER nudges it'. pane_state refuses to type (that is the real enforcement),
-    but the ladder must not even spend the attempt: a logged-out session cannot answer a nudge, and
-    re-firing one every 10 minutes is exactly the 94-minute i336 loop."""
+def test_a_logged_out_session_is_never_actually_typed_into():
+    """The DoD's hard 'NEVER nudges it', located honestly.
+
+    An earlier draft of this test asserted decide emits no `recover` for a logged-out lane. That
+    read well and was wrong: `recover` is the only thing that re-reads the screen, so suppressing
+    it stranded sensed_state forever (fresh-review P0, see the livelock test above). The recover is
+    emitted — and delivers NOTHING, because nudge-pane classifies before it types and refuses with
+    rc=5. That refusal is where 'never nudges' is truly enforced, at the only layer that can see
+    the screen; asserting it here would only be asserting decide's good intentions.
+
+    What decide owes this lane is the other half: alert the owner, and never park it."""
     d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="logged_out")}})
     out = decide(events=[{"type": "frozen", "id": "i5"}], dsk=d)
-    assert [a for a in only(out, "recover") if a["id"] == "i5"] == []
-    # fence: the same lane WITHOUT the sensed state is recovered, so the assert above is really
-    # measuring sensed_state and not a silently-inert input.
-    healthy = disk(issues_state={"version": 1, "issues": {"i5": ist("running")}})
-    assert len(only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=healthy), "recover")) == 1
+    assert any("session_logged_out:i5" in a["reasons"] for a in only(out, "alert"))
+    assert [a for a in only(out, "park") if a["id"] == "i5"] == []
 
 
 def test_a_session_at_a_dialog_is_not_walked_toward_a_park():
     """i280: the nudge ladder exhausted into a false park of a live, working lane. A lane sensed at
-    its own dialog must neither be nudged again nor parked."""
+    its own dialog must not be PARKED — while still being re-sensed each cycle, which is what lets
+    the reading expire once the dialog is answered (see the livelock test below)."""
     d = disk(issues_state={"version": 1,
                            "issues": {"i5": ist("running", sensed_state="at_dialog", retries=99)}})
     out = decide(events=[{"type": "frozen", "id": "i5"}], dsk=d)
-    assert [a for a in only(out, "recover") if a["id"] == "i5"] == []
     assert [a for a in only(out, "park") if a["id"] == "i5"] == []
     # fence: retries=99 is far past the cap, so this exact lane WITHOUT the sensed state parks.
     # That is the false park i280 actually suffered — the assert above must be what prevents it.
     doomed = disk(issues_state={"version": 1, "issues": {"i5": ist("running", retries=99)}})
     assert len(only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=doomed), "park")) == 1
+
+
+def test_a_sensed_lane_is_still_re_sensed_so_the_state_cannot_livelock():
+    """FRESH-REVIEW P0. sensed_state's ONLY writer is _record_sensed, which runs only from
+    _exec_recover, which runs only when decide emits `recover`. So suppressing the recover emit
+    made the field impossible to clear: the lane went silent FOREVER — no recover, no park, no
+    alert — and `status` stays 'frozen' durably, which keeps the branch live to re-suppress every
+    tick. A stale at_dialog would outlive the dialog, survive a relaunch, and mute a genuinely
+    stuck lane for good.
+
+    So the recover MUST keep firing: it is what re-reads the screen. It delivers nothing — nudge-
+    pane refuses to type at logged_out/at_dialog (rc 5/6) — so this is a re-SENSE, not a nudge.
+    What gets suppressed is the ESCALATION (see the park tests below)."""
+    for sensed in ("at_dialog", "logged_out"):
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": ist("frozen", sensed_state=sensed)}})
+        out = decide(events=[{"type": "frozen", "id": "i5"}], dsk=d)
+        r = [a for a in only(out, "recover") if a["id"] == "i5"]
+        assert len(r) == 1 and r[0]["tier"] == "frozen", f"{sensed} must still be re-sensed"
+
+
+def test_a_sensed_lane_past_the_retry_cap_is_not_parked():
+    """The i280 false park, precisely: retries far past the cap is what parks a frozen lane, and a
+    lane at its own dialog is ALIVE. Suppress the park — not the sensing."""
+    for sensed in ("at_dialog", "logged_out"):
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": ist("frozen", sensed_state=sensed, retries=99)}})
+        out = decide(events=[{"type": "frozen", "id": "i5"}], dsk=d)
+        assert [a for a in only(out, "park") if a["id"] == "i5"] == [], f"{sensed} must not park"
+
+
+def test_a_logged_out_alert_stops_once_the_lane_is_terminal():
+    """FRESH-REVIEW P1. `session_logged_out` sat without the TERMINAL_STATUSES guard its immediate
+    neighbour park_label_stuck carries, so a merged/parked lane wearing a stale sensed_state would
+    alert forever and poison the alert dedup for every other reason."""
+    for status in ("merged", "parked", "needs_william", "bounced"):
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": ist(status, sensed_state="logged_out")}})
+        out = decide(dsk=d)
+        assert only(out, "alert") == [], f"a {status} lane must not alert"

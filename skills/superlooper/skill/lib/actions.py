@@ -798,7 +798,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # pane and records it; only the owner can fix it, so it is alert-worthy the moment it is
         # seen. It rides the same durable-marker discipline as every reason here: it stands while
         # the state is on disk and auto-clears when the lane reads healthy again.
-        if ist_of(iid).get("sensed_state") == "logged_out":
+        #
+        # TERMINAL statuses are excluded for the same reason park_label_stuck excludes them
+        # (fresh-review P1): a merged/parked lane's last reading is history, not a live problem —
+        # nothing will ever re-sense it to clear the field — and an un-clearable reason would pin
+        # the ALERT open forever AND poison the dedup for every other reason (the `existing !=
+        # reasons` compare below is what decides whether anything at all gets said).
+        if (ist_of(iid).get("sensed_state") == "logged_out"
+                and _status_of(ist_of(iid)) not in TERMINAL_STATUSES):
             reasons.append(f"session_logged_out:{iid}")
         stamped = ist_of(iid).get("park_notify_at")
         being_absorbed = not gh_stale and _iid_num(iid) in closed_nums
@@ -1255,24 +1262,32 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             if in_wake_grace:
                 continue                               # wake grace: hold the recovery ladder (issue #42)
             # The lane looks frozen by the clock, but the runner has SENSED why (issue #151), and
-            # in both of these cases the ladder is the wrong tool:
-            #   logged_out (i336) — a nudge cannot be answered by a session whose auth is dead, and
-            #     a relaunch just re-enters dead auth. Alerted above; held for the owner.
+            # in both cases PARKING is the wrong answer:
+            #   logged_out (i336) — auth died in-process. Alerted above and held for the owner; a
+            #     park would just bury it behind a memo that names the wrong cause.
             #   at_dialog (i280) — the session is ALIVE and asking something in-window. It went
-            #     quiet because it is waiting on a human, which is not a fault. Nudging it cannot
-            #     help (a stray Enter would only pick an option), and marching the ladder on is
-            #     what false-parked a working lane.
-            # Neither is silent: both are journaled by the executor's outcome, and logged_out
-            # carries an ALERT. This suppresses the LADDER, not the sensing.
-            if ist.get("sensed_state") in ("logged_out", "at_dialog"):
-                continue
-            if type(retries) is not int:
+            #     quiet waiting on a human, which is not a fault. Parking a working lane on that
+            #     evidence is the exact bug this issue exists to end.
+            # The recover still fires (below). That is deliberate and load-bearing: `recover` is
+            # what RE-READS the screen, and _record_sensed — the only writer of sensed_state — runs
+            # nowhere else. Suppressing it too would make the field impossible to clear, and the
+            # lane would go silent forever on a reading that had long since stopped being true
+            # (fresh-review P0). It delivers nothing — nudge-pane refuses to type at both states
+            # (rc 5/6) — so this is a re-sense, not a nudge, and the state self-clears the moment
+            # the screen says something else.
+            sensed = ist.get("sensed_state")
+            parking = False
+            if sensed in ("logged_out", "at_dialog"):
+                parking = False                        # sensed alive/held: re-sense, never park
+            elif type(retries) is not int:
                 park(iid, num, "frozen, and the retry counter is unreadable — parking",
                      cause="frozen_cap")
+                parking = True
             elif retries >= retry_cap:
                 park(iid, num, f"frozen and already relaunched {retries} times (cap "
                                f"{retry_cap}) — parking", cause="frozen_cap")
-            else:
+                parking = True
+            if not parking:
                 last_rec = ist.get("last_recover_at")
                 last_rec = last_rec if _real(last_rec) else 0
                 if now - last_rec >= RECOVER_RETRY_SECONDS:

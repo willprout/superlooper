@@ -74,6 +74,24 @@ _MENU_PATTERNS_STRICT = _MENU_PATTERNS + [
     re.compile(r"▶\s|»\s"),
 ]
 
+# These two states are matched PER LINE and must be the WHOLE line, not a substring of the screen
+# (fresh-review P1). A worker session renders its own conversation — the files it reads, the diff it
+# writes, the issue it was briefed on — so a bare substring search means the worker assigned this
+# very issue reads its own screen as a broken session and disables its own lane. Verified before the
+# fix: a 40-line window of THIS file, of actions.py, and of test_pane_state.py each classified as
+# 'logged_out'. A banner is a line the TUI draws; a sentence containing the words is someone talking
+# ABOUT it. The decoration set below is only what a box can put AROUND a banner — deliberately not
+# "❯" or "⎿", which mark a line as something typed or emitted by the agent rather than UI chrome.
+_BANNER_DECOR = " \t│┃|╭╮╰╯┌┐└┘─━═"
+
+
+def _banner_lines(raw):
+    for ln in raw.splitlines():
+        s = ln.strip().strip(_BANNER_DECOR).strip()
+        if s:
+            yield s
+
+
 # AUTH DEATH (issue #151 / incident i336). Claude Code renders these INSIDE a live TUI frame, so
 # the pane looks like a perfectly normal idle composer and classified as 'idle' = safe-to-send —
 # the runner then typed into a pane that could not act for 94 minutes.
@@ -85,12 +103,13 @@ _MENU_PATTERNS_STRICT = _MENU_PATTERNS + [
 # "Not logged in. Run claude auth login to authenticate.". An exact-only match would leave the
 # other three reading as 'idle', which is precisely the bug. So the exact string is the anchor and
 # its siblings are covered too; the separator is matched loosely (\W) because only the WORDS are
-# stable — a render that swaps "·" for "-" must not silently reopen the hole.
+# stable — a render that swaps "·" for "-" must not silently reopen the hole. That looseness is
+# safe ONLY because these are fullmatched against a single line.
 _LOGGED_OUT_PATTERNS = [
     re.compile(r"not logged in\s*\W\s*please run /login", re.I),   # the DoD's exact string
     re.compile(r"not logged in\s*\W\s*run /login", re.I),
-    re.compile(r"not logged in\W+run claude auth login", re.I),
-    re.compile(r"session expired\W+please run /login", re.I),
+    re.compile(r"not logged in\W+run claude auth login to authenticate\W*", re.I),
+    re.compile(r"session expired\W+please run /login to sign in again\W*", re.I),
 ]
 
 # THE SESSION'S OWN QUESTION DIALOG (issue #151 / incident i280). A worker blocked on its own
@@ -105,11 +124,14 @@ _LOGGED_OUT_PATTERNS = [
 # quietly stopped escalating it. What the question dialog has and no permission menu ever does is
 # its two tail rows: the free-text "Other" row (rendered with the placeholder "Type something." —
 # in the bundle, `multiSelect ? "Type something" : "Type something."`) and the "Chat about this"
-# escape row. Both are stable literals in the bundle; both are required to sit in a NUMBERED option
-# row here, so prose that merely says "type something" can never trip this.
-_AT_DIALOG_PATTERNS = [
-    re.compile(r"\d\s*[.)]\s*type something", re.I),
-    re.compile(r"\d\s*[.)]\s*chat about this", re.I),
+# escape row. Both are stable literals in the bundle.
+#
+# Fullmatched against a WHOLE line (with the option cursor allowed to lead it), so a row is a row:
+# the sentence "ask me to type something", a doc table naming the row, and this file's own source
+# all fail to match where a bare substring search would have fired (fresh-review P1).
+_AT_DIALOG_ROWS = [
+    re.compile(r"[❯>\s]*\d+\s*[.)]\s*type something\.?\s*", re.I),
+    re.compile(r"[❯>\s]*\d+\s*[.)]\s*chat about this\s*", re.I),
 ]
 
 # Codex-specific screen clues. Keep these out of the Claude path: a bare "›" is Codex's idle
@@ -188,8 +210,9 @@ def classify_screen(text, exited_marker=False, orchestrator=False, agent="claude
     # a stale generation footer lingering under an auth-death banner would otherwise hand back a
     # green light on a pane that cannot act. Refusing a genuinely-busy pane costs one retry; typing
     # into dead auth is the 94-minute failure this state exists to end.
+    lines = list(_banner_lines(raw))
     for pat in _LOGGED_OUT_PATTERNS:
-        if pat.search(flat):
+        if any(pat.fullmatch(ln) for ln in lines):
             return "logged_out"
     if _BUSY.search(flat):
         return "busy"
@@ -203,8 +226,8 @@ def classify_screen(text, exited_marker=False, orchestrator=False, agent="claude
     # The ORCHESTRATOR surface is excluded and keeps failing closed to 'menu' (review A5): a stray
     # Enter there corrupts the brain of the whole run, and no caller acts on at_dialog for it.
     if not orchestrator:
-        for pat in _AT_DIALOG_PATTERNS:
-            if pat.search(flat):
+        for pat in _AT_DIALOG_ROWS:
+            if any(pat.fullmatch(ln) for ln in lines):
                 return "at_dialog"
 
     patterns = _MENU_PATTERNS_STRICT if orchestrator else _MENU_PATTERNS

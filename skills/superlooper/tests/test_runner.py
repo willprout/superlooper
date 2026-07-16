@@ -3637,7 +3637,13 @@ def test_pid_alive_bool_contract_is_unchanged_by_the_tri_state(rig):
     p = subprocess.Popen([sys.executable, "-c", "pass"])
     p.wait()
     assert runner_mod._pid_alive(p.pid) is False
-    for junk in (2 ** 31, 2 ** 64, "nonsense", None):
+    # 0 and -1 included deliberately (fresh-review P2): they are the ONLY inputs whose verdict this
+    # refactor changes (True -> False), so a junk tuple that omitted them would be pinning the
+    # contract everywhere except where it moved. The change is correct — os.kill(0, 0) "succeeds"
+    # by signalling the CALLER's own process group and os.kill(-1, 0) every process the user owns,
+    # so the old True was never evidence a worker lived — and it only reaches here from a corrupt
+    # lock, since _lock_pid already maps pid <= 0 to None.
+    for junk in (2 ** 31, 2 ** 64, "nonsense", None, 0, -1):
         assert runner_mod._pid_alive(junk) is False
 
 
@@ -3744,3 +3750,30 @@ def test_sensed_state_clears_once_the_session_answers(rig):
     rig.rc_queue.append(0)                               # nudge delivered -> the dialog is gone
     rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
     assert issue_state(rig, "i5")["sensed_state"] is None
+
+
+def test_the_gate_nudge_spends_its_key_on_a_logged_out_pane(rig):
+    """FRESH-REVIEW P1 — a regression this issue introduced. rc=5 is unsendable-FOREVER, which is
+    the exact property rc=4 is spent for: a logged-out session cannot answer, so the gate's one
+    nudge is gone and gate.nudge_or_park must park on the next pass.
+
+    Before #151 this screen classified as 'idle' -> nudge-pane typed -> rc=0 -> key spent -> park
+    -> the owner heard about it. Teaching the classifier to recognise it, without teaching this
+    executor the new code, would have made a logged-out lane re-nudge every tick forever and never
+    park — a lane that used to reach the owner going permanently silent. `gating` is a settled
+    status, so nothing else would have sensed it either.
+
+    rc=6 (at_dialog) is deliberately NOT spent: a dialog is transient — the session answers it and
+    the nudge lands on a later pass. That is a defer, exactly like rc=3."""
+    seed_issue(rig, "i5", status="gating", nudged=[])
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    a = {"act": "nudge", "id": "i5", "nudge_key": "sections", "message": "fix the report"}
+    rig.rc_queue.append(5)                               # logged out: unsendable forever
+    rig.r._execute(a, NOW)
+    assert issue_state(rig, "i5")["nudged"] == ["sections"], "a logged-out pane must spend the key"
+
+    seed_issue(rig, "i6", status="gating", nudged=[])
+    (rig.home / "state" / "panes" / "i6").write_text("surf-uuid")
+    rig.rc_queue.append(6)                               # at a dialog: transient -> retry later
+    rig.r._execute({"act": "nudge", "id": "i6", "nudge_key": "sections", "message": "m"}, NOW)
+    assert issue_state(rig, "i6")["nudged"] == [], "a dialog is transient — do not spend the key"

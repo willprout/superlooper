@@ -326,3 +326,50 @@ def test_new_states_require_the_claude_agent_path():
     for screen in ("Not logged in · Please run /login",
                    _screen("claude-askuserquestion-dialog.txt")):
         assert ps.classify_screen(screen, agent="codex") not in ("logged_out", "at_dialog")
+
+
+# --- fresh-review P1: the classifier must not fire on text that merely TALKS about these states ---
+
+def test_the_classifier_does_not_fire_on_this_repo_s_own_source():
+    """A worker session renders its own conversation: the files it reads, the diff it writes, the
+    issue it was briefed on. This very file, pane_state.py and actions.py all contain the literal
+    trigger strings — so a naive substring match means the worker assigned THIS issue reads its own
+    screen as a broken session and disables its own lane. Every 40-line window of the files that
+    carry the literals must classify as something harmless."""
+    import os
+    here = os.path.dirname(__file__)
+    targets = [os.path.join(here, "..", "skill", "lib", "pane_state.py"),
+               os.path.join(here, "..", "skill", "lib", "actions.py"),
+               os.path.join(here, "test_pane_state.py")]
+    for path in targets:
+        with open(path) as f:
+            lines = f.read().splitlines()
+        for i in range(0, max(1, len(lines) - 40)):
+            window = "\n".join(lines[i:i + 40])
+            state = ps.classify_screen(window)
+            assert state not in ("logged_out", "at_dialog"), (
+                f"{os.path.basename(path)} line {i+1} reads as {state}")
+
+
+def test_prose_and_code_mentioning_the_states_are_not_the_states():
+    # The banner is a LINE the TUI renders, not a phrase inside a sentence. Anything with other
+    # content on the line is someone talking ABOUT the state.
+    for screen in (
+        'I added a logged_out state that fires on "Not logged in · Please run /login".',
+        '    re.compile(r"not logged in\\s*\\W\\s*please run /login", re.I),  # the exact string',
+        "the alert body says (Not logged in · Please run /login) so the owner knows",
+        "| footer | `N. Chat about this` escape row | the free-text row |",
+        '    re.compile(r"\\d\\s*[.)]\\s*chat about this", re.I),',
+        "Ask me to type something. 3. or so.",
+    ):
+        assert ps.classify_screen(screen) not in ("logged_out", "at_dialog"), screen
+
+
+def test_a_real_banner_is_still_caught_inside_its_box():
+    # The flip side: a genuine banner is its own line, and the TUI may draw a box around it. The
+    # box must not hide it.
+    for screen in ("Not logged in · Please run /login",
+                   "│ Not logged in · Please run /login │",
+                   "╭────────────────────────────────╮\n│ Not logged in · Please run /login │\n"
+                   "╰────────────────────────────────╯\n❯ "):
+        assert ps.classify_screen(screen) == "logged_out", screen
