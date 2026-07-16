@@ -3121,9 +3121,8 @@ def test_a_held_restart_relaunches_the_moment_its_blockers_close(rig):
     assert _launches_of(rig, "i103") == []
     (rig.fixdir / "issue_list_closed.json").write_text(
         json.dumps([{"number": 41}, {"number": 52}, {"number": 101}, {"number": 102}]))
-    rig.r._poll_at = 0                                 # force a fresh poll: the closed set changed
     rig.calls.clear()
-    rig.r.tick(now=NOW + 200)
+    rig.r.tick(now=NOW + 200)                          # >GH_POLL_SECONDS: the new closed set lands
     assert len(_launches_of(rig, "i103")) == 1         # recovered, unblocked, no owner touch
     assert issue_state(rig, "i103")["launch_hold_reason"] is None    # the hold episode is over
 
@@ -3136,3 +3135,19 @@ def test_a_standing_hold_does_not_re_journal_every_tick(rig):
     held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
     assert len(held) == 1
     assert _launches_of(rig, "i103") == []
+
+
+def test_a_github_outage_does_not_strand_a_crash_recovery(rig, monkeypatch):
+    # The gate reads eligibility from the POLLED view, so the obvious way to break the loop with it
+    # is a GitHub blip that reads as "the issue is gone" and strands every recovery behind it. It
+    # can't: a failed poll returns before touching the parsed view, so the last good parse AND
+    # closed set survive, and an unblocked issue still recovers mid-outage — off exactly the data a
+    # fresh launch would have used.
+    rig.r.tick(now=NOW)                                # one good poll: i101 lands in the view
+    (rig.home / "state" / "exited" / "i101").write_text("1751000000 rc=1\n")
+    seed_issue(rig, "i101", status="running", branch="sl/i101-render-the-widget")
+    monkeypatch.setenv("GH_FAIL", "1")                 # GitHub goes dark
+    rig.calls.clear()
+    rig.r.tick(now=NOW + 200)
+    assert len(_launches_of(rig, "i101")) == 1         # recovered anyway
+    assert issue_state(rig, "i101").get("launch_hold_reason") is None
