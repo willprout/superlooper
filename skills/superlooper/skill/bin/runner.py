@@ -1010,11 +1010,19 @@ class Runner:
             exists" answer that false-parks live work. Answered-empty still enters the view through
             the poll's from-scratch snapshot, exactly as before.
           - FINISHING lanes are SKIPPED — they are _refresh_finishing_prs's, and it also buys the
-            comments the gate needs. The two sets are disjoint, so no lane is looked up twice in one
-            tick and a comments-bearing entry is never overwritten by a comment-less one here.
-        No comments sub-read: an in-flight lane is not being gated, so the only fact worth buying is
-        the PR's state — ONE lookup per building lane per tick, the issue's cost bound. Called only
-        on a FRESH view (tick() gates on not-stale), so an outage degrades to the existing wait."""
+            comments the gate needs. Disjoint from that sibling, so those two never double-fetch.
+        NOT disjoint from the 90s poll, though: the poll's want-set reaches an in-flight lane whose
+        issue is still OPEN and `in-progress`-labelled (its `orphanish` tier), and it attaches
+        COMMENTS on a clean read. So on a poll tick such a lane is looked up twice — an accepted
+        cost, since the poll's tier cannot cover the case this exists for (an out-of-band merge
+        CLOSES the issue and drops it from the lists that tier is built from). What is NOT accepted
+        is dropping the poll's paid-for comments: an absent `comments` key reads as REFUSED to the
+        gate and makes it WAIT (#78), so a same-numbered cached read is carried forward rather than
+        clobbered (fresh-agent cross-review).
+        No comments sub-read of its own: an in-flight lane is not being gated, so the only fact
+        worth buying is the PR's state — ONE lookup per building lane per tick, the issue's cost
+        bound. Called only on a FRESH view (tick() gates on not-stale): an outage degrades to the
+        existing wait."""
         if not isinstance(ist_map, dict):
             return
         prs = dict(self.gh_view.get("prs") or {})
@@ -1038,7 +1046,14 @@ class Runner:
                 continue                       # no branch stamp yet — nothing to reconcile against
             pv = gh.pr_for_branch(branch).pr   # a refused read has no pr by construction
             if pv.get("number"):               # POSITIVE find only: refused/empty never erase a
-                prs[iid] = pv                  # cache entry, and never fabricate a PR-less answer
+                cached = prs.get(iid)          # cache entry, and never fabricate a PR-less answer
+                if (isinstance(cached, dict) and cached.get("number") == pv["number"]
+                        and "comments" in cached and "comments" not in pv):
+                    # Same PR => the poll's clean comments read still belongs to it. Carry it rather
+                    # than strip it (#78: an absent key means REFUSED, and the gate WAITs). Number-
+                    # matched, so another PR's review evidence can never be grafted onto this one.
+                    pv = {**pv, "comments": cached["comments"]}
+                prs[iid] = pv
                 changed = True
         if changed:
             self.gh_view = {**self.gh_view, "prs": prs}
@@ -2536,6 +2551,14 @@ class Runner:
         if isinstance(marker, dict) and marker.get("source") == "nightly":
             return "held: nightly-owned freeze (only a green nightly clears it)"
         _rm(path)
+        return "ok"
+
+    def _exec_record_pr(self, a, now):
+        """Stamp the PR number the reconcile found for an in-flight lane (issue #155). Durable, so
+        it outlives the restart that re-derives the rest of the view — and it is what scopes the
+        out-of-band-close hand-back to the PR THIS episode opened (reapprove/regenerate clear it,
+        so a relaunched lane never inherits the previous episode's closed PR)."""
+        self._update_issue(a["id"], {"pr": a.get("pr")})
         return "ok"
 
     def _exec_absorb_merged(self, a, now):

@@ -2368,6 +2368,42 @@ def test_refresh_inflight_prs_never_downgrades_a_known_pr(rig, monkeypatch):
         assert rig.r.gh_view["prs"]["i7"]["number"] == 9
 
 
+def test_refresh_inflight_prs_preserves_a_cached_clean_comments_read(rig, monkeypatch):
+    """Cross-review (Codex) P1. The POLL also writes an in-flight lane's PR — its want-set reaches
+    one whose issue is still OPEN and `in-progress`-labeled (the `orphanish` tier) — and it ATTACHES
+    COMMENTS on a clean read. This refresh must not throw that paid-for read away: an absent
+    `comments` key means REFUSED to the gate, which then WAITs (#78). Same PR number == the same
+    PR, so its comments still belong to it; carry them forward rather than dropping them."""
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7)
+    rig.r.gh_view = {"stale": False, "prs": {"i7": {
+        "number": 5, "state": "OPEN", "headRefName": "sl/i7-x",
+        "comments": [{"body": "<!-- superlooper-review -->\nAPPROVE"}]}}}
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead(
+                            {"number": 5, "state": "MERGED", "headRefName": b}, True))
+    rig.r._refresh_inflight_prs(loopstate.load(str(rig.home / "state" / "issues.json"))["issues"])
+
+    fresh = rig.r.gh_view["prs"]["i7"]
+    assert fresh["state"] == "MERGED"                            # the fresh fact still wins...
+    assert fresh["comments"][0]["body"].startswith("<!-- superlooper-review -->")   # ...read kept
+
+
+def test_refresh_inflight_prs_never_carries_comments_across_a_different_pr(rig, monkeypatch):
+    """The carry-forward is number-matched: a DIFFERENT PR's comments must never be grafted onto
+    this one — that would hand the gate another PR's review evidence."""
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7)
+    rig.r.gh_view = {"stale": False, "prs": {"i7": {
+        "number": 5, "state": "CLOSED", "headRefName": "sl/i7-x",
+        "comments": [{"body": "<!-- superlooper-review -->\nAPPROVE"}]}}}
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead(
+                            {"number": 6, "state": "OPEN", "headRefName": b}, True))
+    rig.r._refresh_inflight_prs(loopstate.load(str(rig.home / "state" / "issues.json"))["issues"])
+
+    fresh = rig.r.gh_view["prs"]["i7"]
+    assert fresh["number"] == 6 and "comments" not in fresh      # absent -> the gate WAITs (#78)
+
+
 def test_refresh_inflight_prs_skips_terminal_and_investigate_lanes(rig, monkeypatch):
     """Boundedness: the reconcile set is exactly the concurrently-building lanes. A terminal issue
     is done being gated, and an investigate issue never opens a PR at all (#21)."""
@@ -3888,3 +3924,44 @@ def test_the_sensed_stamp_measures_the_episode_not_the_last_look(rig):
     rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 3000)
     ist = issue_state(rig, "i5")
     assert ist["sensed_state"] is None and ist["sensed_since"] is None
+
+
+def test_record_pr_stamps_the_pr_number_durably(rig):
+    """#155: the reconcile's durable half. i328's symptom was reported as the runner "carrying
+    pr: null" — this is that loopstate field, and until now nothing ever wrote it. It is what
+    scopes the out-of-band-close hand-back to the PR this episode actually opened."""
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7)
+    assert rig.r._execute({"act": "record_pr", "id": "i7", "pr": 42}, NOW) == "ok"
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))
+    assert st["issues"]["i7"]["pr"] == 42
+
+
+def test_a_reapproved_lane_is_not_re_parked_by_its_previous_episodes_closed_pr(rig, monkeypatch):
+    """The trap the fresh-agent review found, driven through the REAL executors: park -> reapprove
+    -> relaunch -> reconcile. `reapprove` clears `pr` but KEEPS the branch stamp, and the old CLOSED
+    PR still answers a lookup on that head — so an unscoped close-absorb fires a tick after launch
+    (before the worker can push) and re-parks forever, the owner's only remedy being the very
+    re-approval that re-triggers it. Scoped to the episode's own `pr`, the ghost is ignored and the
+    worker goes on to open its own PR — which GitHub permits, refusing only a second OPEN PR."""
+    monkeypatch.setattr(rig.r, "_teardown_session", lambda *a, **k: True)
+    seed_issue(rig, "i7", status="needs_william", branch="sl/i7-x", num=7, pr=42,
+               park_notify_cause="pr_closed")
+    rig.r._execute({"act": "reapprove", "id": "i7", "num": 7}, NOW)
+
+    ist = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]["i7"]
+    assert ist["branch"] == "sl/i7-x"      # the stamp survives reapprove — the trap's whole setup
+    assert ist["pr"] is None               # ...but the episode's PR does not: the ghost is disowned
+
+    seed_issue(rig, "i7", status="running")          # the relaunch puts it back in flight
+    rig.r.gh_view = {"stale": False, "consecutive_failures": 0, "closed_nums": set(),
+                     "prs": {}, "issue_comments": {}, "dev_checks": []}
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead(
+                            {"number": 42, "state": "CLOSED", "headRefName": b, "labels": []}, True))
+    rig.r._refresh_inflight_prs(loopstate.load(str(rig.home / "state" / "issues.json"))["issues"])
+
+    dsk = rig.r.disk_view(NOW)
+    acts = runner_mod.actions.decide(
+        NOW, rig.r.config, rig.r.usage_view(), [],
+        runner_mod.actions.lane_state_from(dsk["issues_state"]), [], dsk, rig.r.gh_view)
+    assert [a for a in acts if a["act"] == "park"] == []       # no trap: the lane keeps building

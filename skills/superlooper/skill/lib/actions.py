@@ -1216,32 +1216,57 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         #     the poll and the refresh OMIT a refused lookup, so presence == "GitHub answered".
         #   * a real PR number. Answered-empty ({}) is the NORMAL mid-build state — the worker has
         #     not pushed yet — so it means KEEP BUILDING. It is never "no PR exists", never a park.
-        #   * not `superseded` — that PR is dead history the runner itself retired (the orphan sweep
-        #     applies the same rule). Only a half-executed regenerate could leave one on the active
-        #     branch, and acting on it would park the very lane the runner just rebuilt.
+        #   * not `superseded` — a belt-and-braces guard mirroring the orphan sweep's own rule. In
+        #     practice a superseded PR cannot BE the active branch's answer (regenerate stamps the
+        #     new branch before it ever labels the old PR), so this should never fire; it costs one
+        #     condition to stay correct if that ordering is ever relaxed.
         if status in INFLIGHT_STATUSES and not gh_stale and iid in prs:
             pv = prs.get(iid) if isinstance(prs.get(iid), dict) else {}
-            if pv.get("number") and "superseded" not in gate._pr_labels(pv):
-                if pv.get("state") == "MERGED":
+            pr_num = pv.get("number")
+            if pr_num and "superseded" not in gate._pr_labels(pv):
+                state = pv.get("state")
+                if state == "MERGED":
                     # The work LANDED, whatever this lane still thinks it is doing. absorb_merged is
                     # idempotent and tears the session down in order (#149), which frees the slot.
+                    # Deliberately NOT episode-scoped the way CLOSED is below: a merge is a landed
+                    # fact about the BRANCH, true whoever opened the PR, and the runner may have
+                    # slept through the whole open->merge (a wake gap) and so never recorded it.
+                    # Refusing to settle without a recorded number would re-open the i328 stall.
                     out.append({"act": "absorb_merged", "id": iid, "num": num})
                     continue
-                if pv.get("state") == "CLOSED":
-                    # Out-of-band BY CONSTRUCTION: the runner never closes its own PR — a regenerate
-                    # supersedes it, leaving it OPEN on a preserved branch, and stamps the new branch
-                    # first — so a CLOSED PR on the ACTIVE branch is somebody's deliberate call. Why
-                    # is unknowable here, and both guesses are wrong: rebuilding loops against that
-                    # call, and merging is not ours to make. Hand it back ONCE (notify-once per cause)
-                    # and stand the lane down. No LLM asked, no retry ladder, no coaching around it.
+                if state == "CLOSED" and pr_num == ist.get("pr"):
+                    # THIS episode's PR was closed under it. Out-of-band by construction: the runner
+                    # never closes its own PR (regenerate supersedes it and leaves it OPEN on a
+                    # preserved branch; the janitor's close path vetoes every claimed lane), so this
+                    # was a deliberate human call. Why is unknowable here, and both guesses are
+                    # wrong — rebuilding loops against the call, merging is not ours to make — so
+                    # hand it back ONCE and stand the lane down. No LLM, no retry ladder. This is
+                    # the gate's own long-standing verdict for a closed PR, moved earlier so the
+                    # lane stops now instead of after a build nobody will merge.
+                    #
+                    # The `pr_num == ist["pr"]` scope is load-bearing, not caution (fresh-agent
+                    # review P0): re-approving clears `pr` but KEEPS the branch stamp, so a
+                    # relaunched lane rebuilds on the same branch — where the old CLOSED PR still
+                    # answers the lookup. A closed PR does not stop a NEW PR on that head (GitHub
+                    # refuses only a second OPEN one), which is exactly how this recovered before
+                    # #155: the worker opened a fresh PR and the newest-first lookup returned it.
+                    # Unscoped, this park would fire a tick after launch — before the worker can
+                    # push — and re-park forever, with the owner's only remedy being the very
+                    # re-approval that re-triggers it. `pr: None` == this episode owns no PR yet.
                     park(iid, num,
-                         f"PR #{pv.get('number')} for branch '{ist.get('branch') or '?'}' was CLOSED "
-                         "outside the loop while this issue was still building. The runner never "
-                         "closes its own PR, so that was a deliberate call by someone — the lane is "
-                         "stood down rather than rebuilt over it. Re-approve to rebuild the issue "
-                         "from scratch on a fresh branch.",
+                         f"PR #{pr_num} for branch '{ist.get('branch') or '?'}' was CLOSED without "
+                         "merging while this issue was still building — external intervention, so "
+                         f"{operator} decides. The lane is stood down rather than rebuilt over that "
+                         "call; the branch and its commits are untouched on the remote.",
                          needs_william=True, cause="pr_closed")
                     continue
+                if state == "OPEN" and pr_num != ist.get("pr"):
+                    # Record the number the moment a PR exists (the issue's first DoD line). Durable,
+                    # so it survives the restart that re-derives everything else — and it is what
+                    # tells a later tick whether a CLOSED PR is this episode's or a previous one's
+                    # ghost. OPEN only: a MERGED/CLOSED PR is handled above or ignored as history,
+                    # and recording one would let a ghost masquerade as this episode's own.
+                    out.append({"act": "record_pr", "id": iid, "pr": pr_num})
 
         # ---- blocked marker present (and no report): bounce or the answerer lifecycle ----
         if blocked_text is not None and not has_exited:
