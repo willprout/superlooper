@@ -106,8 +106,75 @@ def worktree_remove(repo, path):
     starts fresh from current dev. Plain `git worktree remove` refuses dirty trees and the
     override flag is constitutionally unavailable here, so removal is rmtree + prune, which
     needs no flag at all. The branch itself is untouched (branches are preserved; only the
-    checkout dies). True when the directory is gone and the registration pruned."""
+    checkout dies). True when the directory is gone and the registration pruned.
+
+    This is the UNCONDITIONAL primitive — it destroys whatever is in the tree. Reclaim paths that
+    must never destroy the only copy of a worker's output consult worktree_reclaim_block FIRST
+    (issue #190); the deliberate throwaway/rebuild paths (regenerate, reapprove) and the merge
+    paths (work already on the mainline) call this directly, as before."""
     p = os.fspath(path)
     shutil.rmtree(p, ignore_errors=True)
     rc, _ = _git(repo, "worktree", "prune")
     return not os.path.exists(p) and rc == 0
+
+
+def worktree_reclaim_block(worktree):
+    """Would pruning this worktree destroy the only copy of its work? Returns a short reason string
+    when it WOULD (so the reclaim must refuse), or None when the checkout is safe to drop (issue
+    #190). Reasons:
+      "dirty"          — uncommitted changes live only here: tracked edits, staged, OR untracked
+                         files (the i153 shape — the worker's output never `git add`ed).
+      "unpushed"       — commits on the branch that no remote-tracking ref contains: the branch ref
+                         alone would carry them, but the worker never pushed, so they exist nowhere
+                         but this checkout.
+      "dirty+unpushed" — both.
+      "unreadable"     — this IS a git worktree but its state could not be read (a transient git
+                         error, corruption). Fail CLOSED: never destroy what we could not verify is
+                         saved. Leaks a checkout (disk) rather than risk the work.
+
+    None (SAFE to prune) is returned for a missing directory (nothing to protect — the caller's
+    prune just clears a stale registration) and for a directory that is not a git worktree at all
+    (outside this git-state guard's mandate; the runner's reclaim targets are always real linked
+    worktrees, so this only spares a bare dir from wedging the sweep — it never overrides the
+    dirty/unpushed refusal on a genuine worktree).
+
+    Read-only and network-free by construction (status + a local rev-list against the
+    remote-tracking refs already on disk): the reclaim sweep runs it every tick, so it must never
+    fetch or mutate."""
+    p = os.fspath(worktree)
+    if not os.path.isdir(p):
+        return None                                    # already gone: nothing to protect
+    # Is this a git worktree at all? Decide by a FILESYSTEM fact, never a git command's rc: a linked
+    # worktree always carries a .git entry, a stray dir never does. Leaning on `git rev-parse` here
+    # would be the bug — a transient git failure (timeout rc=124, missing binary rc=127, unreadable
+    # index rc=128) and a genuine non-git dir both give rc!=0, and reading that as "not a worktree,
+    # safe to prune" would let worktree_remove destroy a REAL checkout's unsaved work. So: no .git
+    # entry -> outside the guard's mandate, return None (a stray dir never wedges the sweep); a .git
+    # entry present -> it IS ours, and anything we then cannot read fails CLOSED (never destroy what
+    # we could not verify is saved — issue #190).
+    if not os.path.exists(os.path.join(p, ".git")):
+        return None
+    reasons = []
+    rc, out = _git(p, "status", "--porcelain")         # includes untracked by default (the ?? lines)
+    if rc != 0:
+        return "unreadable"                            # a real worktree we can't read -> never prune
+    if out.strip():
+        reasons.append("dirty")
+    # Commits reachable from HEAD but from no remote-tracking ref: `--not --remotes` subtracts every
+    # refs/remotes/* (origin/main, origin/<branch> once pushed). 0 => every commit is already on a
+    # remote; >0 => this checkout holds the only copy. A successful push updates the tracking ref, so
+    # this clears without a fetch. `--count` prints a lone integer to stdout; take the first token so
+    # a stray stderr warning folded in by _git can never turn a real count into a false "unreadable".
+    rc, out = _git(p, "rev-list", "--count", "HEAD", "--not", "--remotes")
+    if rc != 0:
+        return "unreadable"
+    tokens = out.split()
+    if not tokens:
+        return "unreadable"
+    try:
+        unpushed = int(tokens[0])
+    except ValueError:
+        return "unreadable"
+    if unpushed > 0:
+        reasons.append("unpushed")
+    return "+".join(reasons) if reasons else None

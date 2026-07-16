@@ -3884,6 +3884,92 @@ def test_reclaim_early_out_survives_an_unhashable_status(rig, monkeypatch):
     assert removed == [str(rig.r._worktree("i9"))]     # corrupt skipped, valid parked still reclaimed
 
 
+# --------- reclaim never destroys the only copy of unpushed work (issue #190) ---------
+# These build REAL git worktrees at the runner's canonical lane path — the exact shape the reaper
+# prunes — because the guard's whole job is to read git state, so a bare tmp dir would prove nothing.
+
+def _git_sh(cwd, *args):
+    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    assert r.returncode == 0, f"git {' '.join(args)} failed: {r.stderr}"
+    return r.stdout.strip()
+
+
+def _real_git_lane(rig, iid, branch, *, dirty=False):
+    """Give rig a real git repo + bare origin (once), then a REAL linked worktree at
+    rig.r._worktree(iid) on `branch`. `dirty=True` drops an untracked file — the i153 shape: the
+    worker's output, present nowhere but this checkout."""
+    origin = rig.repo.parent / "origin.git"
+    if not origin.exists():
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "init", "-b", "main", str(rig.repo)], check=True, capture_output=True)
+        for k, v in (("user.email", "rt@test.invalid"), ("user.name", "runner-test")):
+            _git_sh(rig.repo, "config", k, v)
+        (rig.repo / "seed.txt").write_text("seed\n")
+        _git_sh(rig.repo, "add", "seed.txt")
+        _git_sh(rig.repo, "commit", "-m", "seed")
+        _git_sh(rig.repo, "remote", "add", "origin", str(origin))
+        _git_sh(rig.repo, "push", "origin", "HEAD:main")
+    wt = Path(rig.r._worktree(iid))
+    assert runner_mod.gitops.worktree_add(str(rig.repo), str(wt), branch, "origin/main")
+    if dirty:
+        (wt / "worker_output.py").write_text("the report says this exists; it lives only here\n")
+    return wt
+
+
+def test_reclaim_preserves_a_dirty_parked_worktree_then_reclaims_after_commit_push(rig):
+    """THE #190 regression: the park-family reaper pruned i153/i163 while their branches sat at
+    origin/main with the worker's output uncommitted — the only copy, gone with the checkout. The
+    reaper must now REFUSE the prune while the work is unsaved, journal why, and reclaim only once
+    the work is committed AND pushed."""
+    wt = _real_git_lane(rig, "i5", "sl/i5-x", dirty=True)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", num=5)
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))
+
+    rig.r._reclaim_terminal_worktrees(st)
+    assert wt.exists(), "reclaim destroyed a parked worktree holding the only copy of the work"
+    assert (wt / "worker_output.py").exists()
+    held = [j for j in _journal(rig) if j.get("act") == "reclaim_held" and j.get("id") == "i5"]
+    assert held and "dirty" in held[-1]["reason"], "the refusal must be journaled with the reason"
+
+    # the work is saved: commit AND push. Now the checkout is redundant and reclaims as today.
+    _git_sh(wt, "add", "-A")
+    _git_sh(wt, "commit", "-m", "save the invariant harness")
+    assert runner_mod.gitops.plain_push(str(wt), "sl/i5-x") is True
+    rig.r._reclaim_terminal_worktrees(st)
+    assert not wt.exists(), "a committed+pushed worktree must reclaim exactly as before"
+
+
+def test_reclaim_hold_is_journaled_once_not_every_tick(rig):
+    """'Surfaced (a bounded, non-storming record)': the reaper runs every ~15s, so a lane stuck
+    with unsaved work must journal its refusal ONCE per state — not a line every tick."""
+    _real_git_lane(rig, "i5", "sl/i5-x", dirty=True)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", num=5)
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))
+    for _ in range(5):
+        rig.r._reclaim_terminal_worktrees(st)
+    held = [j for j in _journal(rig) if j.get("act") == "reclaim_held" and j.get("id") == "i5"]
+    assert len(held) == 1, f"the refusal must be bounded, got one per tick: {held}"
+
+
+def test_drain_guards_a_parked_lane_but_still_reclaims_a_merged_one(rig):
+    """The declined-prune retry (#149) must inherit the guard for park-family lanes, but NEVER for a
+    merged lane — a merged lane's work is on the mainline by definition (a boundary of #190). Both
+    lanes are dirty here so the ONLY thing separating them is status."""
+    wt_parked = _real_git_lane(rig, "i5", "sl/i5-x", dirty=True)
+    wt_merged = _real_git_lane(rig, "i6", "sl/i6-y", dirty=True)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", num=5)
+    seed_issue(rig, "i6", status="merged", branch="sl/i6-y", num=6)
+    (rig.home / "state" / "pending_teardown").mkdir(parents=True, exist_ok=True)
+    for iid in ("i5", "i6"):
+        (rig.home / "state" / "pending_teardown" / iid).write_text("pid=1 still alive at teardown")
+
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))
+    rig.r._drain_pending_teardowns(st)
+    assert wt_parked.exists(), "the drain destroyed a parked lane's unpushed work"
+    assert not wt_merged.exists(), "a merged lane must still reclaim (its work is on the mainline)"
+
+
 # ============ the one launch-eligibility gate, end to end (issue #150 / D8) ============
 # Fixture i103 declares `blocked-by: #101, #102` in its Loop metadata and neither is closed, so no
 # session may start for it BY ANY PATH. These drive the real Runner (real decide, real executors,
