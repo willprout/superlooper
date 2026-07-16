@@ -21,9 +21,13 @@ Two earlier figures in this ledger did not survive the audit: "33 in ~28h zero i
 not in any journal, and "88 lifetime merges" was a *gate* count — real lifetime merges are **91
 across all homes** (eApp 62, command-center 22, sandboxes 7). Across every incident below:
 **no bad merge, ever, and no owner code lost** — the failure mode is always *stall + owner
-interrupt*, never corruption. (One nuance, 07-15: a recovery step destroyed gate *evidence* — a
-review attestation living only in a deleted worktree — forcing a full re-review; work product
-survived.) Roughly half of covered nights broke the promise somewhere. The owner's felt estimate
+interrupt*, never corruption. (One nuance, 07-15: a recovery step destroyed gate *evidence*,
+forcing a full re-review; work product survived. *Corrected 2026-07-15 by the i154 worker's
+reconciliation:* the destroyed evidence was the **report** — a per-run artifact the reapprove
+verb deliberately wipes (D11) — NOT the review attestation, which is a GitHub PR comment and
+survives teardown. The same reconciliation exposed the inverse latent defect: a surviving
+gen-1 attestation mechanically vouches for rebuilt gen-2 code the reviewer never saw — caught
+before it ever fired a bad merge; fix rescoped into #154 as diff-pinned review evidence.) Roughly half of covered nights broke the promise somewhere. The owner's felt estimate
 — "works three out of four times" — is about right, and the misses cluster in the classes below
 rather than being random.
 
@@ -166,8 +170,13 @@ from scratch; **D12** doc drift as a root cause (ops docs name dead verbs, a syn
 installed docs, the debugger playbook wasn't installed on the machine having the incident);
 **D13** the debugger rails and the verified recovery procedure contradict each other on
 hand-merging; **D14** stop hooks failed `posix_spawn '/bin/sh'` ENOENT (root-caused same day —
-see the forensics entry). A reapprove cycle also deleted a worktree holding the only copy of the
-gate's review attestation, forcing a full re-review.
+see the forensics entry). A reapprove cycle also forced a full re-review by wiping finish
+evidence. *Correction (2026-07-15, i154 reconciliation):* this entry originally said the deleted
+worktree held "the only copy of the gate's review attestation" — wrong: the attestation is a PR
+comment and survived; what the reapprove wiped was the report (deliberate D11 behavior). The
+imprecision propagated into issue #154 as filed (a class-3 doc-drift instance inside this ledger
+itself); the worker's launch-time reconciliation caught it and surfaced the real, inverse defect
+(stale attestation vouching for rebuilt code — #154 rescoped to diff-pinning).
 
 **2026-07-15 — the two-round forensics audit: four mysteries solved, two beliefs refuted** ·
 *Meta-entry; verdicts recorded here because the bundles live off-repo (owner's machines).*
