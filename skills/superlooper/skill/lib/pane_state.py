@@ -80,9 +80,23 @@ _MENU_PATTERNS_STRICT = _MENU_PATTERNS + [
 # very issue reads its own screen as a broken session and disables its own lane. Verified before the
 # fix: a 40-line window of THIS file, of actions.py, and of test_pane_state.py each classified as
 # 'logged_out'. A banner is a line the TUI draws; a sentence containing the words is someone talking
-# ABOUT it. The decoration set below is only what a box can put AROUND a banner — deliberately not
-# "❯" or "⎿", which mark a line as something typed or emitted by the agent rather than UI chrome.
-_BANNER_DECOR = " \t│┃|╭╮╰╯┌┐└┘─━═"
+# ABOUT it.
+#
+# What may sit AROUND a banner: box rules, and the leading status glyph Claude renders these behind.
+# The glyphs are here on evidence, not superstition — our own captured dialog carries
+# "⚠ 3 MCP servers need authentication · run /mcp", i.e. an auth-adjacent warning behind a ⚠ with a
+# '·'-separated tail, and the bundle builds a ⏺/● status dot on the default render path (our exact
+# string escapes it only via an early return). Missing a glyph-prefixed banner would be SILENT and
+# would simply restore i336, so the leading glyph is allowed.
+#
+# "❯"/"⎿" are in the set for the same reason, and they are only safe because the match is a WHOLE-
+# LINE fullmatch: an agent line whose entire content is exactly and only this banner is vanishingly
+# rare, and since the recover keeps re-sensing, a false positive costs one self-clearing 10-minute
+# cycle while a miss costs 94 minutes of typing into a dead pane.
+#
+# "|" is deliberately NOT here: it is a markdown table delimiter far more often than TUI chrome
+# (Claude draws boxes with "│"), and a worker's screen is full of markdown.
+_BANNER_DECOR = " \t│┃╭╮╰╯┌┐└┘─━═⏺●○◆◈⚠✗✘✳✻✽⎿❯▪•"
 
 
 def _banner_lines(raw):
@@ -130,8 +144,8 @@ _LOGGED_OUT_PATTERNS = [
 # the sentence "ask me to type something", a doc table naming the row, and this file's own source
 # all fail to match where a bare substring search would have fired (fresh-review P1).
 _AT_DIALOG_ROWS = [
-    re.compile(r"[❯>\s]*\d+\s*[.)]\s*type something\.?\s*", re.I),
-    re.compile(r"[❯>\s]*\d+\s*[.)]\s*chat about this\s*", re.I),
+    re.compile(r"[❯\s]*\d+\s*[.)]\s*type something\.?\s*", re.I),
+    re.compile(r"[❯\s]*\d+\s*[.)]\s*chat about this\s*", re.I),
 ]
 
 # Codex-specific screen clues. Keep these out of the Claude path: a bare "›" is Codex's idle

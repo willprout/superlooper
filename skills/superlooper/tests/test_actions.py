@@ -2696,3 +2696,55 @@ def test_a_logged_out_alert_stops_once_the_lane_is_terminal():
                                "issues": {"i5": ist(status, sensed_state="logged_out")}})
         out = decide(dsk=d)
         assert only(out, "alert") == [], f"a {status} lane must not alert"
+
+
+def test_a_lane_stuck_at_its_own_dialog_eventually_reaches_the_owner():
+    """FRESH-REVIEW P1 — the hole the first fix opened. 'It is waiting on a human' was wrong: there
+    is NO human at that pane. The loop's channel for 'worker needs input' is state/blocked/<id> ->
+    hire_answerer -> deliver_answer; an in-window AskUserQuestion is OFF that channel, so by
+    construction nobody will ever answer it.
+
+    So at_dialog-forever is not a live lane, it is a stalled one the loop cannot serve — and
+    because 'frozen' is an INFLIGHT status, refusing to park it leaks the lane's slot silently and
+    forever. Pre-#151 it parked: the memo named the wrong cause, but the owner learned and the slot
+    came back. Trading a false park for a silent leak is not a fix.
+
+    It gets logged_out's shape instead: an ALERT, bounded by persistence so a normal short dialog
+    stays quiet. Parking is still refused — the lane IS alive — but it can no longer be silent."""
+    ist_new = ist("frozen", sensed_state="at_dialog", sensed_since=NOW - 60)
+    out = decide(events=[{"type": "frozen", "id": "i5"}],
+                 dsk=disk(issues_state={"version": 1, "issues": {"i5": ist_new}}))
+    assert only(out, "alert") == [], "a dialog that just opened must stay quiet"
+
+    stuck = ist("frozen", sensed_state="at_dialog",
+                sensed_since=NOW - actions.AT_DIALOG_ALERT_SECONDS - 1)
+    out = decide(events=[{"type": "frozen", "id": "i5"}],
+                 dsk=disk(issues_state={"version": 1, "issues": {"i5": stuck}}))
+    a = only(out, "alert")
+    assert len(a) == 1 and "session_at_dialog:i5" in a[0]["reasons"]
+    assert has_notify(out)
+    assert [x for x in only(out, "park") if x["id"] == "i5"] == [], "alert, but still never park"
+
+
+def test_the_stuck_dialog_alert_tells_the_owner_where_to_look():
+    stuck = ist("frozen", sensed_state="at_dialog",
+                sensed_since=NOW - actions.AT_DIALOG_ALERT_SECONDS - 1)
+    out = decide(events=[{"type": "frozen", "id": "i5"}],
+                 dsk=disk(issues_state={"version": 1, "issues": {"i5": stuck}}))
+    body = [x for x in out if x["act"] == "notify"][0]["body"]
+    assert "i5" in body and "session_at_dialog:i5" != body
+
+
+def test_a_dialog_alert_needs_a_real_stamp_and_a_live_lane():
+    """A missing/corrupt stamp must not alert (it would fire on every dialog instantly), and a
+    terminal lane's last reading is history — same guard as session_logged_out."""
+    for since in (None, "garbage", NOW + 99999):
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": ist("frozen", sensed_state="at_dialog",
+                                                    sensed_since=since)}})
+        assert only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=d), "alert") == [], since
+    for status in ("merged", "parked"):
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": ist(status, sensed_state="at_dialog",
+                                                    sensed_since=NOW - 99999)}})
+        assert only(decide(dsk=d), "alert") == [], status

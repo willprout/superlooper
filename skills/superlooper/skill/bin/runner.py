@@ -2130,7 +2130,7 @@ class Runner:
             if rc == 4:
                 self._mark_exited(iid, "dead pane found by frozen recovery", now)
                 return "dead pane — marked exited for relaunch"
-            return self._record_sensed(iid, rc)
+            return self._record_sensed(iid, rc, now)
         # idle: the safe peek — a gentle status ask, never a blind action
         surface = self._surface(iid)
         if not surface:
@@ -2139,22 +2139,32 @@ class Runner:
                "background work, touch your awaiting marker (see your brief).")
         rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
                               env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
-        return self._record_sensed(iid, rc)
+        return self._record_sensed(iid, rc, now)
 
-    def _record_sensed(self, iid, rc):
+    def _record_sensed(self, iid, rc, now):
         """Turn a nudge-pane rc into the lane's honest sensed state (issue #151). Shared by BOTH
         liveness tiers so their reading of the same rc can never drift apart.
 
         nudge-pane refuses to TYPE into these panes — that enforcement lives in pane_state, at the
         only place that can actually see the screen. What lands here is the caller's half: naming
-        what was seen so decide can act on it (alert the owner for logged_out; leave a lane that is
-        asking something in-window alone) instead of re-firing a nudge every 10 minutes at a pane
-        that either cannot answer (i336) or is already waiting on a human (i280).
+        what was seen so decide can act on it (alert the owner; never park a lane that is alive)
+        instead of re-firing a nudge every 10 minutes at a pane that cannot answer (i336) or
+        marching a live one to a park (i280).
 
-        sensed_state is a LIVE READING, not a label: any other rc clears it. A sticky one would
-        outlive the dialog it describes and mute the next genuine freeze."""
+        sensed_state is a LIVE READING, not a label: any other rc clears it, and the recover that
+        produced this rc keeps firing (decide suppresses the park, not the re-sense), so the reading
+        cannot outlive what it describes. A sticky one would mute the next genuine freeze.
+
+        `sensed_since` stamps when the CURRENT reading began and is preserved while it holds, so the
+        alert bound measures the episode rather than resetting every re-sense. It is what stops a
+        lane sitting silently at an unanswerable in-window question forever."""
         sensed = {5: "logged_out", 6: "at_dialog"}.get(rc)
-        self._update_issue(iid, {"sensed_state": sensed})
+
+        def m(st, i):
+            if i.get("sensed_state") != sensed:
+                i["sensed_state"] = sensed
+                i["sensed_since"] = now if sensed else None
+        self._update_issue(iid, fn=m)
         if sensed == "logged_out":
             return "logged out in-window — alerting the owner, not nudging"
         if sensed == "at_dialog":
@@ -2288,8 +2298,12 @@ class Runner:
             # screen read as 'idle' and was typed into for rc=0 — which spent the key and reached
             # the owner. Leaving 5 out would have made a logged-out lane re-nudge every tick and
             # never park: strictly worse than the bug being fixed.
-            # rc=6 (at_dialog) is NOT here on purpose: a dialog is transient — the session answers
-            # and a later pass delivers. That is a defer, like rc=3.
+            # rc=6 (at_dialog) is NOT here on purpose: the pane is LIVE, and a dialog that gets
+            # answered leaves the next pass free to deliver, so spending the lane's one nudge on a
+            # refusal would burn it for nothing. It defers exactly like rc=3 — and inherits rc=3's
+            # unbounded-retry shape, which is pre-existing and should be bounded for both together
+            # if the gate's defer is ever capped. (Not "the session answers it" — nobody may:
+            # the liveness tier's session_at_dialog alert is what catches a dialog nobody answers.)
             def m(st):
                 i = st["issues"].setdefault(iid, loopstate.new_issue())
                 nudged = i.get("nudged")

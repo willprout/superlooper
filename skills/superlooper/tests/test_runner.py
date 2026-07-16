@@ -3777,3 +3777,31 @@ def test_the_gate_nudge_spends_its_key_on_a_logged_out_pane(rig):
     rig.rc_queue.append(6)                               # at a dialog: transient -> retry later
     rig.r._execute({"act": "nudge", "id": "i6", "nudge_key": "sections", "message": "m"}, NOW)
     assert issue_state(rig, "i6")["nudged"] == [], "a dialog is transient — do not spend the key"
+
+
+def test_the_sensed_stamp_measures_the_episode_not_the_last_look(rig):
+    """`sensed_since` must survive re-senses of the SAME state. The recover re-fires every 10 min,
+    so a stamp that reset on each look would keep the at_dialog alert bound perpetually 10 minutes
+    from elapsing — the alert would never fire and the lane would be silent forever, which is the
+    hole the bound exists to close. A CHANGED reading starts a fresh episode."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+
+    rig.rc_queue.append(6)
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert issue_state(rig, "i5")["sensed_since"] == NOW
+
+    rig.rc_queue.append(6)                               # still at the dialog, 20 min later
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 1200)
+    assert issue_state(rig, "i5")["sensed_since"] == NOW, "the episode clock must not restart"
+
+    rig.rc_queue.append(5)                               # a DIFFERENT reading -> new episode
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 2400)
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_state"] == "logged_out" and ist["sensed_since"] == NOW + 2400
+
+    rig.rc_queue.append(0)                               # healthy again -> both cleared
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 3000)
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_state"] is None and ist["sensed_since"] is None

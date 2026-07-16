@@ -109,6 +109,13 @@ USAGE_FAIL_OPEN_GRACE_SECONDS = 1800
 GH_ALERT_FAILURES = 10             # consecutive failed poll cycles (~15 min at 90 s) -> ALERT
 ANSWERER_TIMEOUT_SECONDS = 900     # the answerer's 15-min freeze tier = its timeout
 RECOVER_RETRY_SECONDS = 600        # frozen-session recovery ladder re-fires at most every 10 min
+# How long a session may sit at its OWN in-window question before the owner is told (issue #151).
+# A lane at a dialog is never parked — it is alive — but it must not be SILENT either: the loop's
+# channel for "worker needs input" is state/blocked/<id> -> hire_answerer, and an in-window
+# AskUserQuestion is off that channel, so nobody will ever answer it and the lane's slot (frozen is
+# an INFLIGHT status) would leak forever. 30 min is far past any dialog a watching owner answers,
+# and far inside the 94-minute class of silence this issue exists to end.
+AT_DIALOG_ALERT_SECONDS = 1800
 LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LAUNCHVERIFY x2)
 # A dead LAUNCH ANCHOR (the cmux pane every worker tab is born in) is a RUNNER-level fault, never
 # N per-issue parks (incident 2026-07-09: a dead anchor walked 10 approved issues into 10 parks in
@@ -216,6 +223,15 @@ ALERT_MESSAGES = {
 
 
 def _alert_message(reason):
+    if isinstance(reason, str) and reason.startswith("session_at_dialog:"):
+        iid = reason.split(":", 1)[1]
+        return (f"{iid}'s session has been sitting at its OWN question dialog in-window for "
+                f"{AT_DIALOG_ALERT_SECONDS // 60}+ min — it asked something and is waiting for an "
+                "answer nobody is going to give: an in-window question bypasses the loop's "
+                "blocked-file/answerer channel entirely. The lane is ALIVE and is not parked, but "
+                "it is holding its slot and cannot progress. Open its tab and answer the dialog "
+                "(or press Esc so it writes a blocked file instead). Clears by itself once the "
+                "dialog is gone.")
     if isinstance(reason, str) and reason.startswith("session_logged_out:"):
         iid = reason.split(":", 1)[1]
         return (f"{iid}'s session is logged OUT in-window ('Not logged in · Please run /login') — "
@@ -807,6 +823,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         if (ist_of(iid).get("sensed_state") == "logged_out"
                 and _status_of(ist_of(iid)) not in TERMINAL_STATUSES):
             reasons.append(f"session_logged_out:{iid}")
+        # A session sitting at its OWN in-window question, past the bound. It is never parked (it
+        # is alive), but refusing to park it is exactly why it must speak: nothing else in the loop
+        # will ever notice it, and its lane slot is held the whole time. Needs a REAL stamp — an
+        # absent/corrupt/future one must not fire on a dialog that just opened (_since_ok is the
+        # same usable-clock rule the checks-pending bound uses).
+        if (ist_of(iid).get("sensed_state") == "at_dialog"
+                and _status_of(ist_of(iid)) not in TERMINAL_STATUSES
+                and _since_ok(ist_of(iid).get("sensed_since"), now)
+                and now - ist_of(iid)["sensed_since"] >= AT_DIALOG_ALERT_SECONDS):
+            reasons.append(f"session_at_dialog:{iid}")
         stamped = ist_of(iid).get("park_notify_at")
         being_absorbed = not gh_stale and _iid_num(iid) in closed_nums
         if (not being_absorbed
@@ -1265,9 +1291,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # in both cases PARKING is the wrong answer:
             #   logged_out (i336) — auth died in-process. Alerted above and held for the owner; a
             #     park would just bury it behind a memo that names the wrong cause.
-            #   at_dialog (i280) — the session is ALIVE and asking something in-window. It went
-            #     quiet waiting on a human, which is not a fault. Parking a working lane on that
-            #     evidence is the exact bug this issue exists to end.
+            #   at_dialog (i280) — the session is ALIVE and asking something in-window; going quiet
+            #     to wait on an answer is not a fault, and parking a working lane on that evidence
+            #     is the exact bug this issue exists to end. But "waiting on a human" would be too
+            #     generous a reading: nobody is watching that pane, and an in-window question
+            #     bypasses the blocked-file/answerer channel, so the wait can be endless — which is
+            #     why refusing to park it obliges the bounded session_at_dialog ALERT above. Alive
+            #     is not the same as fine.
             # The recover still fires (below). That is deliberate and load-bearing: `recover` is
             # what RE-READS the screen, and _record_sensed — the only writer of sensed_state — runs
             # nowhere else. Suppressing it too would make the field impossible to clear, and the

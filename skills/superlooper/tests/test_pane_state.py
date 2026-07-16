@@ -373,3 +373,37 @@ def test_a_real_banner_is_still_caught_inside_its_box():
                    "╭────────────────────────────────╮\n│ Not logged in · Please run /login │\n"
                    "╰────────────────────────────────╯\n❯ "):
         assert ps.classify_screen(screen) == "logged_out", screen
+
+
+def test_a_banner_behind_a_ui_glyph_is_still_caught():
+    """FRESH-REVIEW P1 — a MISS here is silent, and silence means i336 all over again.
+
+    Evidence this shape is real, from our own capture: claude-askuserquestion-dialog.txt line 11 is
+    "⚠ 3 MCP servers need authentication · run /mcp" — Claude Code demonstrably renders auth-adjacent
+    warnings behind a leading glyph with a '·'-separated tail. The bundle agrees: the status dot
+    (⏺/●) is built on the default render path, and our exact string escapes it only by an early
+    return, while the "Session expired" message is thrown from a 401 handler and would take the
+    dotted path.
+
+    Whole-line fullmatching is what makes the leading glyph safe to allow: an agent message whose
+    ENTIRE content is exactly and only this banner is vanishingly rare, and — since the recover now
+    keeps re-sensing — a false positive costs one self-clearing 10-minute cycle, while a miss costs
+    94 minutes of typing into a pane that cannot answer. The asymmetry favours catching it."""
+    for glyph in ("⏺", "●", "⚠", "✗", "⎿", "✻", "○"):
+        screen = f"{glyph} Not logged in · Please run /login"
+        assert ps.classify_screen(screen) == "logged_out", screen
+    assert ps.classify_screen("  ⚠  Session expired. Please run /login to sign in again.") == "logged_out"
+
+
+def test_a_markdown_table_row_is_not_a_banner():
+    # '|' is a markdown table delimiter far more often than it is TUI chrome (Claude draws boxes
+    # with '│'), and a worker's screen is full of markdown — including this PR's own body.
+    assert ps.classify_screen("| Not logged in · Please run /login |") != "logged_out"
+    assert ps.classify_screen("| state | Not logged in · Please run /login | the banner |") != "logged_out"
+
+
+def test_a_markdown_blockquote_of_a_dialog_row_is_not_a_dialog():
+    # '>' was admitted as a possible option cursor; Claude uses '❯'. Dropping it costs nothing and
+    # stops a quoted row in a review comment or chat log from reading as a live dialog.
+    assert ps.classify_screen("> 3. Type something.") != "at_dialog"
+    assert ps.classify_screen("> 4. Chat about this") != "at_dialog"
