@@ -159,9 +159,17 @@ def test_drop_confirm_keeps_the_two_tap_gesture_and_survives_the_poll():
     # still carries the "tap again" gesture, still keys off `confirming`, still fires data-act=drop;
     # and `confirming` is still derived from the caller-threaded confirmingDrop (so the 2s re-render
     # can't silently disarm a mid-confirm Drop — design record §4).
-    assert re.search(r"confirming\s*\?[^;]*tap again", _NEEDS_CODE), (
-        "the armed drop button must still name the two-tap gesture ('tap again') (issue #44)")
-    assert 'data-act="drop"' in _NEEDS_CODE, "the drop button must still fire data-act=drop"
+    # Issue #162 moved the armed STRING server-side (`armed_label`, design record B.1) — so the
+    # "tap again" wording is now pinned in tests/test_cards, and what this guard binds is the
+    # armed-state WIRING: the armed branch keys off `confirming` (via the server's `destructive`
+    # flag) and renders the server's armed_label rather than the resting one.
+    assert re.search(r"armed\s*=\s*a\.destructive\s*&&\s*confirming", _NEEDS_CODE), (
+        "the armed state must still key off `confirming` — now via the server's destructive flag "
+        "(issues #44/#162)")
+    assert re.search(r"armed\s*\?[^;]*armed_label", _NEEDS_CODE), (
+        "the armed drop button must render the server's armed_label, which names the two-tap "
+        "gesture ('tap again' — pinned in tests/test_cards) (issues #44/#162)")
+    assert 'data-act="' in _NEEDS_CODE, "the buttons must still fire their server-named data-act verb"
     assert re.search(r"confirming\s*=\s*confirmingDrop\s*===\s*\(\s*c\.repo", _NEEDS_CODE), (
         "the confirming flag must still derive from the caller-threaded confirmingDrop === repo#num, "
         "so the poll re-render preserves a mid-confirm Drop (design record §4)")

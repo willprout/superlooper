@@ -153,8 +153,13 @@ def test_needs_card_actions_wrap_in_the_narrow_sidebar():
     # one line. The action row must wrap instead of overflowing across the card or memo.
     actions = _rule_body(_CSS, ".card .actions")
     assert actions, "Needs You cards must keep an action row"
-    assert re.search(r"flex-wrap\s*:\s*wrap\b", actions), (
-        "Needs You action buttons must wrap at narrow sidebar widths (issue #3)")
+    # The property is "the verbs never overflow the narrow column", not one specific layout. A
+    # wrapping row satisfies it; so does a full-width COLUMN, which is what issue #162 moved to once
+    # every label had to carry its consequence and needed the whole width. Either is acceptable —
+    # a row that neither wraps nor stacks is not.
+    assert (re.search(r"flex-wrap\s*:\s*wrap\b", actions)
+            or re.search(r"flex-direction\s*:\s*column\b", actions)), (
+        "Needs You action buttons must wrap or stack at narrow sidebar widths (issues #3/#162)")
     button = _rule_body(_CSS, ".card .actions .btn")
     assert re.search(r"max-width\s*:\s*100%", button), (
         "decision buttons must be bounded by the card content width (issue #3)")

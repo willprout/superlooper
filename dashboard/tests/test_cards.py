@@ -212,7 +212,10 @@ def test_drawer_decision_metadata_is_server_computed():
 
     parked = cards.flight_drawer(_flight(stage=flights.PARKED), [], "r", "Air")
     assert parked["decision"]["approve_act"] == "approve"
-    assert "relaunch" in parked["decision"]["approve_label"].lower()
+    # The label names the effect. Issue #162 made that name HONEST: a re-approval rebuilds from
+    # scratch (the engine's `_exec_reapprove` prunes the worktree and deletes the report), so the
+    # word is "rebuild" — "relaunch" undersold what the button throws away.
+    assert "rebuild" in parked["decision"]["approve_label"].lower()
 
 
 def test_drawer_conflict_cap_defaults_to_discuss_in_the_drawer_too():
@@ -234,3 +237,199 @@ def test_drawer_journal_slice_is_glossed_and_expandable_to_raw():
     assert "depart" in entry["text"].lower()      # glossed via the tower vocabulary
     assert entry["hhmm"] == "09:41"               # server-formatted time (injected)
     assert '"act": "launch"' in entry["raw"] or '"act":"launch"' in entry["raw"]  # raw ground truth
+
+
+# =============================== issue #162 — the full-text decision card ===============================
+# Every owner hand-back is a decision card carrying the WHOLE question, the dossier of evidence
+# behind it, a link to the issue, and verbs whose labels state their effect. William must be able to
+# read the entire question he is being asked to answer and judge it without opening a terminal.
+
+_LONG_QUESTION = "\n".join(
+    ["The runner cannot decide which base the rebuild should target, and the answer changes what "
+     "merges. Please pick one:"] +
+    ["  option %d — rebuild onto dev at the commit the PR branched from, keeping line %d intact"
+     % (i, i) for i in range(1, 41)] +
+    ["Recommendation: option 7, because it is the only one that preserves the gate's evidence."])
+
+
+def test_needs_you_card_carries_the_whole_question_never_truncated():
+    # THE issue #162 promise: the card shows the complete question — no ellipsis, no first-N-lines.
+    card = cards.needs_you_card(_flight(stage=flights.AWAITING, memo=_LONG_QUESTION), "r/s")
+    assert card["memo"] == _LONG_QUESTION                    # byte-for-byte, whole
+    assert len(card["memo"].splitlines()) == 42              # every line survives
+    assert "Recommendation: option 7" in card["memo"]        # the LAST line, not just the first few
+    assert "…" not in card["memo"] and "..." not in card["memo"]
+
+
+def test_needs_you_card_links_to_the_issue():
+    # The owner reads the card and needs the issue itself one click away (never a terminal).
+    card = cards.needs_you_card(_flight(num=7), "will-titan/sandbox")
+    assert card["issue_url"] == "https://github.com/will-titan/sandbox/issues/7"
+
+
+# --------------------------------- the dossier (evidence behind the decision) ---------------------------------
+
+def test_dossier_surfaces_the_structured_evidence_the_runner_captured():
+    # Forward-compatible with issue #152: when the park record carries structured evidence, the card
+    # shows it — the owner judges from what the machine actually saw.
+    jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "delivery not verified",
+               "evidence": {"reason": "Workspace not found", "rc": 1,
+                            "stderr_tail": "launch-session.sh: workspace 'will-titan' is gone"}}]
+    d = cards.decision_dossier(_flight(), jslice)
+    assert d["captured"] is True
+    pairs = {i["label"]: i["value"] for i in d["items"]}
+    assert pairs["reason"] == "Workspace not found"
+    assert pairs["rc"] == "1"
+    assert "workspace 'will-titan' is gone" in pairs["stderr_tail"]
+
+
+def test_dossier_accepts_evidence_captured_as_a_bare_string():
+    # #152 fail-closes to a plain "captured: none, reason unknown" string; render it as-is, never crash.
+    jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m",
+               "evidence": "captured: none, reason unknown"}]
+    d = cards.decision_dossier(_flight(), jslice)
+    assert d["captured"] is True
+    assert d["items"][0]["value"] == "captured: none, reason unknown"
+
+
+def test_dossier_is_honest_when_the_runner_captured_no_evidence():
+    # #152 has not landed for every path. The card must SAY so rather than imply the reason is
+    # everything the machine saw — an honest empty, never a fabricated dossier.
+    d = cards.decision_dossier(_flight(), [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m"}])
+    assert d["captured"] is False
+    assert d["note"]                                  # a plain sentence naming the absence
+    assert "no structured evidence" in d["note"].lower()
+
+
+def test_dossier_names_the_recorded_cause_when_it_differs_from_the_memo():
+    # The park record's `cause` is the runner's own episode key — real evidence when it says more
+    # than the memo. Identical text is not repeated back at the owner.
+    jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "the gate stopped this",
+               "cause": "retry cap reached after 3 launches"}]
+    d = cards.decision_dossier(_flight(memo="the gate stopped this"), jslice)
+    pairs = {i["label"]: i["value"] for i in d["items"]}
+    assert pairs["recorded cause"] == "retry cap reached after 3 launches"
+
+    same = cards.decision_dossier(_flight(memo="same text"),
+                                  [{"ts": 1, "act": "park", "id": "i7", "num": 7,
+                                    "memo": "same text", "cause": "same text"}])
+    assert "recorded cause" not in {i["label"] for i in same["items"]}
+
+
+def test_dossier_names_the_gate_checks_the_machine_saw():
+    # What the gate actually read at the hand-back — the four real check names (§3), never a guess.
+    f = _flight(gate={"report": True, "review": True, "ci": False, "mergeable": False})
+    d = cards.decision_dossier(f, [])
+    pairs = {i["label"]: i["value"] for i in d["items"]}
+    assert "checks green" in pairs["gate at hand-back"]        # the failing checks, by real name
+    assert "fits cleanly" in pairs["gate at hand-back"]
+    assert "report filed" not in pairs["gate at hand-back"]    # the green ones are not "evidence"
+
+
+def test_dossier_counts_the_go_arounds_on_a_conflict_cap():
+    d = cards.decision_dossier(_flight(attempt=3), [])
+    pairs = {i["label"]: i["value"] for i in d["items"]}
+    assert "2" in pairs["rebuilt after conflicts"]
+
+
+def test_needs_you_card_carries_its_dossier():
+    jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m",
+               "evidence": {"reason": "Workspace not found"}}]
+    card = cards.needs_you_card(_flight(), "r/s", journal_slice=jslice)
+    assert card["dossier"]["captured"] is True
+    assert card["dossier"]["items"][0]["value"] == "Workspace not found"
+
+
+def test_a_card_built_without_a_journal_slice_still_has_an_honest_dossier():
+    # The server always passes the slice; a caller that does not must get an honest empty, never a crash.
+    card = cards.needs_you_card(_flight(), "r/s")
+    assert card["dossier"]["captured"] is False
+    assert card["dossier"]["note"]
+
+
+# --------------------------------- consequence-named verbs ---------------------------------
+
+def test_every_action_names_its_consequence():
+    # No button whose name hides what it does. Each carries a label that states its effect and a
+    # plain consequence sentence beneath it.
+    for f in (_flight(stage=flights.PARKED),
+              _flight(stage=flights.AWAITING, awaiting_reason="bounced"),
+              _flight(stage=flights.AWAITING),
+              _flight(stage=flights.PARKED, attempt=2)):
+        acts = cards.decision_actions(f)
+        assert acts, "a waiting flight always offers the owner a way out"
+        for a in acts:
+            assert a["act"] in ("approve", "bounce-yes", "drop", "discuss")   # no invented verbs
+            assert a["consequence"] and a["consequence"][-1] == "."           # a plain sentence
+            assert len(a["label"]) > len(a["act"])                            # never a bare verb
+
+
+def test_the_destructive_action_names_the_close_in_its_own_label():
+    # "Drop" hid a close-for-good behind a friendly word. The label itself must say what it does —
+    # the owner must not have to arm the button to discover the consequence.
+    drop = [a for a in cards.decision_actions(_flight()) if a["act"] == "drop"][0]
+    assert drop["destructive"] is True
+    assert "close" in drop["label"].lower()          # the effect is IN the name
+    assert "for good" in drop["label"].lower()
+    assert "close" in drop["armed_label"].lower()    # and the armed second tap repeats it
+    # Issue #44's two-tap gesture, preserved now that the armed string is the SERVER's: the armed
+    # button still names the gesture, and still names the number it would close.
+    assert "tap again" in drop["armed_label"].lower()
+    assert "#7" in drop["armed_label"]
+
+
+def test_the_safe_actions_are_not_marked_destructive():
+    for a in cards.decision_actions(_flight()):
+        if a["act"] != "drop":
+            assert a["destructive"] is False
+    discuss = [a for a in cards.decision_actions(_flight()) if a["act"] == "discuss"][0]
+    assert "nothing" in discuss["consequence"].lower()   # Discuss changes no state; say so
+
+
+def test_every_yes_verb_says_it_rebuilds_from_scratch():
+    # The honest consequence of a re-approval TODAY (engine `_exec_reapprove`): a fresh `agent-ready`
+    # on any park-family status (`REAPPROVAL_STATUSES` = parked/needs_william/bounced) prunes the
+    # worktree, DELETES the filed report, zeroes the counters and relaunches. "Re-approve" hid that
+    # entirely — the owner could not tell the button threw his finished work away. Issue #161 splits
+    # the verb (resume-at-gate vs rebuild); until it lands, the label names what really happens.
+    for f in (_flight(stage=flights.PARKED), _flight(stage=flights.AWAITING),
+              _flight(stage=flights.AWAITING, awaiting_reason="bounced")):
+        yes = [a for a in cards.decision_actions(f) if a["act"] in ("approve", "bounce-yes")][0]
+        assert "rebuild" in yes["label"].lower(), "the yes verb must not hide the rebuild"
+        low = yes["consequence"].lower()
+        assert "worktree" in low and "report" in low, "say what is discarded, in the sentence"
+
+
+def test_a_bounce_accepts_the_amendment_and_says_so():
+    acts = {a["act"]: a for a in cards.decision_actions(_flight(stage=flights.AWAITING,
+                                                               awaiting_reason="bounced"))}
+    assert "bounce-yes" in acts
+    assert "approve" not in acts                       # a bounce's yes IS bounce-yes, not approve
+    assert "amendment" in acts["bounce-yes"]["label"].lower()
+
+
+def test_conflict_cap_actions_lead_with_discuss():
+    # The §8 guard against a blind Approve on a collision: Discuss is the primary tone there.
+    acts = cards.decision_actions(_flight(stage=flights.PARKED, attempt=2))
+    assert acts[0]["act"] == "discuss" and acts[0]["tone"] == "primary"
+    assert [a for a in acts if a["act"] == "approve"][0]["tone"] != "primary"
+
+
+def test_needs_you_card_carries_its_actions():
+    card = cards.needs_you_card(_flight(stage=flights.PARKED), "r/s")
+    assert [a["act"] for a in card["actions"]] == ["approve", "drop", "discuss"]
+
+
+def test_drawer_decision_carries_the_same_consequence_named_actions():
+    # One source for the verbs (design record B.1) — the drawer cannot drift from the card.
+    f = _flight(stage=flights.PARKED)
+    d = cards.flight_drawer(f, [], "r", "Air")
+    assert d["decision"]["actions"] == cards.decision_actions(f)
+    assert "rebuild" in d["decision"]["approve_label"].lower()    # the shared label names its effect
+
+
+def test_drawer_carries_the_dossier_too():
+    jslice = [{"ts": 300, "act": "park", "id": "i7", "num": 7, "memo": "m",
+               "evidence": {"reason": "Workspace not found"}}]
+    d = cards.flight_drawer(_flight(), jslice, "r", "Air")
+    assert d["dossier"]["captured"] is True
