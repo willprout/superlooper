@@ -41,7 +41,7 @@ The view contract (assembled by runner.py each tick):
                  issues_state; they do not consume lane capacity.
   events         this tick's events.detect_events() output.
   disk           {"issues_state": loopstate dict, "blocked": {id: text}, "reports": {id: text},
-                  "answers": {id: text}, "exited": {id: marker-text}, "frozen": dict|None,
+                  "exited": {id: marker-text}, "frozen": dict|None,
                   "alert": dict|None, "live_lock_ids": iterable of ids with a LIVE worker lock,
                   "filed_fingerprints": {fingerprint: issue_num},
                   "local_date": "YYYY-MM-DD", "local_hhmm": "HH:MM",

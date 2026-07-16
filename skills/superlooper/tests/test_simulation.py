@@ -839,13 +839,15 @@ def test_external_close_of_a_parked_issue_absorbs_and_concludes(sim_factory):
 def _owner_answers(sim, num, answer_text):
     """Simulate the owner answering a durable question: a marked answer comment + the approval verb
     (re-add agent-ready, drop awaiting-answer). This is exactly what the dashboard's Answer button
-    does mechanically (a comment + a label move), and what a GitHub-client reply + re-approve does."""
+    does mechanically (a comment + a label move), and what a GitHub-client reply + re-approve does.
+    The comment is authored by the repo OWNER (sim/repo -> 'sim') and post-dates the question, so it
+    passes the runner's answer-ingestion trust scopes (owner-only, after-the-question)."""
     def fn(st):
         issue = st["issues"][str(num)]
         issue.setdefault("comments", []).append(
             {"body": "<!-- superlooper-answer -->\n%s" % answer_text,
-             "author": {"login": "o"}, "authorAssociation": "OWNER",
-             "createdAt": "2026-07-02T15:00:00Z"})
+             "author": {"login": "sim"}, "authorAssociation": "OWNER",
+             "createdAt": "2099-01-01T00:00:00Z"})   # after any real-clock question_posted_at
         labs = issue.setdefault("labels", [])
         if "agent-ready" not in labs:
             labs.append("agent-ready")
@@ -884,6 +886,10 @@ def test_blocked_question_durable_roundtrip_resumes_and_merges(sim_factory):
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
     assert [r for r in sim.journal("answer_relaunch") if r.get("id") == sid], \
         "the owner's answer must have triggered an answer_relaunch"
+    # the owner's actual answer was ingested into the durable Q&A (owner-authored, post-dating the
+    # question) — not lost, not a stranger's, not a stale one
+    qa = sim.loop_issue(sid).get("qa_log") or []
+    assert qa and "approach A" in (qa[-1].get("answer") or ""), qa
     assert len(sim.mutations("merge_pr")) == 1
     # the relaunch reused the SAME issue worktree (never an answerer's --cwd session)
     assert not os.path.isdir(os.path.join(sim.home, "worktrees", "a1"))

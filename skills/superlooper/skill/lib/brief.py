@@ -193,6 +193,14 @@ def _owner_login(config):
     return None
 
 
+def owner_login(config):
+    """Public face of the owner-trust rule (#163): the trusted repo-owner login — the part before
+    the "/" in config's `repo`, or None when it cannot be derived. The brief's amendments and the
+    runner's answer ingestion share ONE owner definition so a comment counts as the owner's word by
+    the same fail-closed rule in both places (never guess an owner, never promote on a hunch)."""
+    return _owner_login(config)
+
+
 def _one_comment(login, created, body):
     """One rendered comment: an attribution line + its body VERBATIM (the body is embedded exactly
     like the William-approved issue body — placed after all substitution, never format()'d)."""

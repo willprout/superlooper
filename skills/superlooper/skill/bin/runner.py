@@ -145,7 +145,6 @@ CLOSE_TIMEOUT = 15             # bound the best-effort close of a stale session'
 # cwd and kills the next hook spawn, which costs the lane its liveness/exit stamp — the D14 family).
 WORKER_EXIT_TIMEOUT = 10
 WORKER_EXIT_POLL = 0.25
-DELIVERY_RETRY_SECONDS = 120   # min spacing between answer-delivery attempts to one pane
 _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"   # SL_CMUX overrides (tests)
 
 # The Restart request marker (issue #116). A Restart request asks the LIVE runner to restart ITSELF
@@ -165,17 +164,39 @@ QUESTION_MARKER = "<!-- superlooper-question -->"
 ANSWER_MARKER = "<!-- superlooper-answer -->"
 
 
-def _latest_answer(comments):
-    """The owner's typed answer: the body of the LAST ANSWER_MARKER comment, marker line stripped.
-    Returns "" when there is none — a plain GitHub-client reply carries no marker, so its text rides
-    the brief's amendments block instead, and the fresh session still gets the question from qa_log.
-    Fail-closed on any wrong-typed comment/body (a garbage thread yields no answer, never a raise)."""
-    if not isinstance(comments, list):
+def _latest_answer(comments, owner, after_iso):
+    """The owner's typed answer to the CURRENT question: the body (marker line stripped) of the
+    LATEST ANSWER_MARKER comment that is BOTH (1) authored by the repo `owner` and (2) posted AFTER
+    the question was (`after_iso`, the question's post time). Returns "" when there is none — a plain
+    owner reply carries no marker and rides the brief's amendments block instead, and the fresh
+    session still gets the question from qa_log.
+
+    The two scopes close the trust holes a bare "last marker comment" left (fresh-agent review):
+      - OWNER-only, so a stranger on this PUBLIC repo cannot post `<!-- superlooper-answer -->` and
+        have it embedded as the binding answer — the same owner-only rule brief._amendments enforces.
+      - AFTER the question, so a PRIOR question's still-present answer marker is never mistaken for
+        the answer to THIS question (the owner may answer a second question via a plain reply).
+
+    Fail-closed throughout: a wrong-typed comment/author/body/timestamp is skipped, and an unknown
+    owner (owner=None) or absent scope trusts NO marker comment — never a raise. ISO-8601 UTC (Z)
+    timestamps sort lexically == chronologically, so the `> after_iso` compare needs no parsing."""
+    if not isinstance(comments, list) or not (isinstance(owner, str) and owner):
         return ""
+    after = after_iso if isinstance(after_iso, str) else ""
     for c in reversed(comments):
-        body = c.get("body") if isinstance(c, dict) else None
-        if isinstance(body, str) and body.lstrip().startswith(ANSWER_MARKER):
-            return body.split(ANSWER_MARKER, 1)[1].strip()
+        if not isinstance(c, dict):
+            continue
+        body = c.get("body")
+        if not (isinstance(body, str) and body.lstrip().startswith(ANSWER_MARKER)):
+            continue
+        author = c.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        if login != owner:                     # a non-owner marker is never the answer
+            continue
+        created = c.get("createdAt")
+        if not (isinstance(created, str) and created > after):   # must post-date THIS question
+            continue
+        return body.split(ANSWER_MARKER, 1)[1].strip()
     return ""
 
 
@@ -1210,7 +1231,6 @@ class Runner:
             "issues_state": st,
             "blocked": self._scan_dir("state", "blocked"),
             "reports": reports,
-            "answers": self._scan_dir("answers"),
             "exited": self._scan_dir("state", "exited"),
             "launch_stderr": self._scan_dir("state", "launch_stderr"),   # {id: tail} for #40 memos
             "frozen": frozen,
@@ -2032,6 +2052,9 @@ class Runner:
         def settle(st, i):
             i["status"] = "awaiting_answer"
             i["pending_question"] = question
+            # The question's post time (ISO-8601 UTC), so answer ingestion only trusts an answer
+            # marker that post-DATES it — a prior question's answer is never reused (#163 review).
+            i["question_posted_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
             prev = i.get("questions_asked")
             i["questions_asked"] = (prev if type(prev) is int else 0) + 1
             i["question_posted"] = False
@@ -2048,7 +2071,16 @@ class Runner:
         carried forward. questions_asked is deliberately NOT reset: the 2-cap spans the issue's life,
         so a re-approval-to-answer must never silently reopen an unbounded round-trip."""
         iid, num = a["id"], a.get("num")
-        answer = _latest_answer(gh.issue_comments(num).comments)
+        # A REFUSED/starved comments read fails closed to (comments=[], ok=False) — it must NEVER be
+        # read as "no answer" (fresh-agent review P1): that would embed an empty answer as binding and
+        # fire ONCE (status leaves awaiting_answer), silently losing the owner's decision. HOLD
+        # instead — leave the issue awaiting_answer with agent-ready set, so decide re-emits this next
+        # tick until a trustworthy read lands (the refused!=empty discipline await_comments_read uses).
+        cr = gh.issue_comments(num)
+        if not cr.ok:
+            return "comments read refused — holding for a trustworthy read (retries next tick)"
+        after = self._issue_field(iid, "question_posted_at")
+        answer = _latest_answer(cr.comments, brief.owner_login(self.config), after)
         q = self._issue_field(iid, "pending_question") or ""
         def settle(st, i):
             log = i.get("qa_log")
@@ -2059,7 +2091,11 @@ class Runner:
             i["status"] = "ready"
             i["requeue_front"] = True
         self._update_issue(iid, fn=settle)
-        _rm(os.path.join(self.state, "exited", iid))   # a stray turn-end stamp must not recover-launch
+        # Clear BOTH transient markers, mirroring reapprove: a `blocked` marker that survived a failed
+        # _rm (or a worker that wrote one without exiting) would otherwise re-fire post_question on the
+        # stale question after the relaunch; the `exited` stamp must not recover-launch (review P2).
+        _rm(os.path.join(self.state, "blocked", iid))
+        _rm(os.path.join(self.state, "exited", iid))
         ok = gh.set_labels(num, add=["agent-ready"], remove=["awaiting-answer"])
         self._forget_cached_label(iid, "awaiting-answer")
         return "ok" if ok else "answer recorded; label move will retry (orphan sweep reconciles)"
@@ -2263,7 +2299,8 @@ class Runner:
                       "park_notify_cause": None, "park_notify_at": None,
                       "park_comment_posted": False,    # ...and its own park (if any) texts again (#61)
                       "pending_question": None, "qa_log": [],   # a clean-slate rebuild drops the
-                      "question_posted": False})       # prior Q&A trail and the post-once stamp (#163)
+                      "question_posted": False,        # prior Q&A trail, its post time, and the
+                      "question_posted_at": None})     # post-once stamp (#163)
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()
