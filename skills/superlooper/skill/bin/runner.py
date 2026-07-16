@@ -1161,6 +1161,25 @@ class Runner:
                 out[n.split(".")[0] if "." in n else n] = txt
         return out
 
+    def _status_clocks(self):
+        """{id: parsed state/status/<id>.json} — the #157 progress clock worker_hook.stamp_status
+        writes on every rest. A present-but-unreadable file (empty dict from _read_json) or a
+        non-.json name is skipped: an absent/garbage clock reads as "no signal", and the probe
+        ladder falls back to the activity tiers there rather than inventing a signature."""
+        out = {}
+        d = os.path.join(self.state, "status")
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return out
+        for n in names:
+            if n.startswith(".") or not n.endswith(".json"):
+                continue
+            v = _read_json(os.path.join(d, n))
+            if isinstance(v, dict) and v:
+                out[n[:-len(".json")]] = v
+        return out
+
     def _live_lock_ids(self):
         out = set()
         try:
@@ -1190,6 +1209,9 @@ class Runner:
             "answers": self._scan_dir("answers"),
             "exited": self._scan_dir("state", "exited"),
             "launch_stderr": self._scan_dir("state", "launch_stderr"),   # {id: tail} for #40 memos
+            "status_clocks": self._status_clocks(),      # {id: parsed status.json} — the #157 progress clock
+            "acks": self._scan_dir("state", "ack"),      # {id: raw ack text} — the worker's probe reply
+            "awaiting": self._scan_dir("state", "awaiting"),   # {id: marker} — long background work flagged
             "frozen": frozen,
             "alert": alert,
             "live_lock_ids": self._live_lock_ids(),
@@ -1915,7 +1937,8 @@ class Runner:
             # (review P1-1): a fixed anchor must not leave last week's cause behind to name the wrong
             # component in a later, unrelated park.
             self._update_issue(iid, {"status": "running", "launch_error": None,
-                                     "launch_evidence": None})
+                                     "launch_evidence": None},
+                               fn=lambda st, i: self._reset_progress_clock(i))   # fresh #157 episode
             self._delivery_cleared()                   # a verified delivery proves the anchor is live
             return "ok"                                # (a verified canary IS a real launch: the issue
                                                        #  runs and the systemic hold lifts — issue #115)
@@ -2265,7 +2288,8 @@ class Runner:
                 # and name the same event, so a verified delivery must not leave one behind to
                 # disagree with the other in a later, unrelated park memo.
                 self._update_issue(iid, {"status": "running", "launch_error": None,
-                                         "launch_evidence": None})
+                                         "launch_evidence": None},
+                                   fn=lambda st, i: self._reset_progress_clock(i))  # fresh #157 episode
                 self._delivery_cleared()               # a verified delivery proves the anchor is live (#24)
                 return "ok"
             ev = self._evidence("launch", rc, tier=tier)
@@ -2342,6 +2366,80 @@ class Runner:
             return self._failed("nudge", rc, "session is asking something in-window — leaving it alone",
                                 tier=tier)
         return self._failed("nudge", rc, f"nudge rc={rc}", tier=tier)
+
+    # --- the progress-stall probe ladder's executors (issue #157) ---
+
+    @staticmethod
+    def _reset_progress_clock(i):
+        """Clear the #157 progress bookkeeping for a fresh episode. Called on every (re)launch: the
+        old session's frozen signature and probe counters must not carry over, or the first tick
+        after relaunch would immediately look stalled and re-probe a healthy new lane."""
+        i["progress_sig"] = None
+        i["progress_since"] = None
+        i["probe_attempts"] = 0                 # a counter resets to 0, not to an unset None
+        i["probe_nonce"] = None
+        i["probe_sent_at"] = None
+
+    def _exec_progress_advance(self, a, now):
+        """Anchor the progress clock. Re-stamps progress_since to now; when the signature ACTUALLY
+        changed (real progress / first sight), it also resets the probe episode and clears any stale
+        ack — a lane that made progress starts its stall clock and its probe cap over. A mere
+        since-repair (same signature, a corrupt clock) re-stamps the clock only, so an in-flight
+        escalation is never silently dropped."""
+        iid, sig = a["id"], a.get("sig")
+        changed = {"v": False}
+
+        def m(st, i):
+            if i.get("progress_sig") != sig:
+                self._reset_progress_clock(i)              # new episode: zero the probe counters
+                changed["v"] = True
+            i["progress_sig"] = sig
+            i["progress_since"] = now
+        self._update_issue(iid, fn=m)
+        if changed["v"]:
+            _rm(os.path.join(self.state, "ack", iid))      # a new episode: last episode's ack is moot
+        return "ok"
+
+    def _exec_probe(self, a, now):
+        """One bounded progress-stall probe (issue #157). Delivers a MACHINE-READABLE ask through the
+        safe-send primitive — its refusals (dead/logged-out/at-dialog) are kept intact via
+        _record_sensed, exactly like the frozen recover — demanding the worker WRITE an ack file
+        (DONE/WORKING/WAITING/STUCK + the nonce), never a prose-only question the runner can't hear.
+        The attempt is counted BEFORE the send, so a probe that fails to deliver still walks the cap
+        toward escalation rather than looping."""
+        iid, num = a["id"], a.get("num")
+        surface = self._surface(iid)
+        if not surface:
+            return "no pane recorded"
+        # Ground truth first (issue #151): a gone worker process can't answer a probe — mark it
+        # exited for relaunch instead of typing at a dead pane. Only a DEFINITE 'dead' short-circuits.
+        if self._worker_liveness(iid) == "dead":
+            self._mark_exited(iid, "progress-stall probe found a dead worker pid", now)
+            return "dead worker pid — marked exited for relaunch"
+        nonce = "%d-%d" % (int(now), int(a.get("attempt") or 0))
+        ack_path = os.path.join(self.state, "ack", iid)
+        os.makedirs(os.path.join(self.state, "ack"), exist_ok=True)
+        msg = (f"[superlooper] PROGRESS PROBE (nonce {nonce}). Your lane has taken turns but made no "
+               f"commit / marker / HEAD change for a while, so the runner cannot tell whether you are "
+               f"still making progress. THIS MESSAGE IS READ BY A MACHINE — a prose reply typed here "
+               f"is NOT read. Reply by WRITING the file {ack_path} with a single line: "
+               f"`<STATE> {nonce}` where <STATE> is exactly one of DONE, WORKING, WAITING, STUCK "
+               f"(DONE = finished; WORKING = actively progressing; WAITING = on long background work "
+               f"— also touch your awaiting marker; STUCK = need help). Write nothing else in that file. "
+               f"Writing this ack does not reset the progress clock, so keep making real progress.")
+        # Count the attempt + rotate the nonce BEFORE the send (fail toward the cap, never a loop).
+        self._update_issue(iid, fn=lambda st, i: self._probe_bump(i, nonce, now))
+        rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
+                              env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
+        if rc == 4:
+            self._mark_exited(iid, "dead pane found by progress-stall probe", now)
+            return self._failed("nudge", rc, "dead pane — marked exited for relaunch", tier="progress")
+        return self._record_sensed(iid, rc, now, tier="progress")
+
+    def _probe_bump(self, i, nonce, now):
+        self._bump(i, "probe_attempts")
+        i["probe_nonce"] = nonce
+        i["probe_sent_at"] = now
 
     # --- the gate's executors ---
 
