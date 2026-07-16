@@ -201,13 +201,24 @@ def _rm(path):
 
 
 def _pid_alive(pid):
+    """True when `pid` names a live process. Signal 0 is the same probe start-session.sh's own
+    acquire_worker uses (`kill -0`), so the runner and the shell agree on liveness.
+
+    PermissionError means the process EXISTS and is someone else's — that is ALIVE, not dead
+    (#149: reading it dead is what would prune a worktree under a running CLI). Anything that
+    cannot name a process — a huge int (OverflowError: os.kill's C int conversion, NOT an OSError,
+    so it must be caught explicitly or it escapes into the tick), a non-int, a bad value — names
+    nobody: False, never a raise. This probe gates every worktree prune and runs inside the tick,
+    which must never raise (it would wedge the loop before the heartbeat stamp)."""
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, ValueError, TypeError):
+    except (ProcessLookupError, ValueError, TypeError, OverflowError):
         return False
     except PermissionError:
         return True
+    except OSError:
+        return False
 
 
 # ------------------------- restart request marker (issue #116) -------------------------
@@ -417,6 +428,7 @@ class Runner:
         self.issues_path = os.path.join(self.state, "issues.json")
         for sub in ("state/activity", "state/blocked", "state/exited", "state/awaiting",
                     "state/panes", "state/started", "state/launch_stderr", "state/events/processed",
+                    "state/pending_teardown",           # (#149) prunes declined under a live CLI
                     "briefs", "reports", "answers", "worktrees", "logs"):
             os.makedirs(os.path.join(self.home, sub), exist_ok=True)
         if not os.path.exists(self.issues_path):
@@ -1195,10 +1207,11 @@ class Runner:
             # idling in its worktree, and this reaper runs every tick — unlinking that cwd is the
             # D14 prune-under-a-live-CLI shape. It also clears the lane's stale pane markers, which
             # a bare worktree_remove left behind to outlive their session (D9).
-            # exit_timeout=0: this loop is unbounded in N and runs every tick, so it must never pay
-            # a per-lane stall waiting for a pid. Disk hygiene has no deadline — a lane whose CLI is
-            # still unwinding is simply reclaimed on the next sweep, by which time the pane close
-            # issued here has landed.
+            # exit_timeout=0: this loop is unbounded in N and runs every tick, so it does not add a
+            # per-lane WAIT on top of the close it already pays (that close is bounded by
+            # CLOSE_TIMEOUT and is a fast no-op on an already-dead surface). Disk hygiene has no
+            # deadline — a lane whose CLI is still unwinding is reclaimed on the next sweep, by
+            # which time the pane close issued here has landed.
             self._teardown_session(iid, remove_worktree=True, exit_timeout=0)
 
     # ------------------------- the tick -------------------------
@@ -1283,6 +1296,7 @@ class Runner:
         if written:                                    # processed/ only grew if events were archived
             self._prune_processed_events()             # keep next_seq + rebuild scan history-independent
         self._reclaim_terminal_worktrees(st)           # git-remove park-family worktrees (safe: rebuilt on reapprove)
+        self._drain_pending_teardowns(st)              # (#149) retry prunes declined under a live CLI
         if now - self._last_journal_rotate >= JOURNAL_ROTATE_SECONDS:
             try:
                 journal.rotate(self.home, now)         # archive the journal's stale tail -> read() stays bounded
@@ -1464,23 +1478,6 @@ class Runner:
             return None
         return pid if pid > 0 else None
 
-    def _pid_alive(self, pid):
-        """True when `pid` names a live process. Signal 0 is the probe start-session.sh's own
-        acquire_worker uses (`kill -0`), so the runner and the shell agree on liveness. A pid we
-        may not signal (EPERM) EXISTS — that is alive, not dead: guessing dead there is what would
-        prune under a live CLI."""
-        if not pid:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
-
     def _await_worker_exit(self, iid, pid, timeout=None):
         """Observe the worker CLI go, bounded. Returns True when it is gone (or was never there),
         False when it outlived the wait.
@@ -1488,12 +1485,19 @@ class Runner:
         The lock pid is authoritative, not state/exited/<id>: that marker can be STALE (a previous
         generation of the same id wrote one) and a stale marker read as proof is exactly how a live
         CLI gets pruned out from under. The lock, by contrast, is held for the whole process life
-        and freed by start-session.sh's EXIT trap, so a dead pid means the CLI has truly unwound."""
+        and freed by start-session.sh's EXIT trap, so a dead pid means the CLI has truly unwound.
+
+        The converse is weaker, and deliberately so: a LIVE pid does not prove OUR worker lives. A
+        SIGKILLed start-session.sh never runs its trap, so its lock outlives it, and pids recycle
+        (~99999 on macOS) — an unrelated process can inherit that number and hold this lane's prune
+        off for its lifetime. That costs disk and nothing else, and start-session.sh's own
+        acquire_worker carries the identical exposure by design, so both ends agree. The asymmetry
+        is the point: we err toward not pruning, because the other error kills a lane's stamp."""
         if not pid:
             return True                                    # no lock -> no live worker to wait for
         deadline = time.monotonic() + (WORKER_EXIT_TIMEOUT if timeout is None else timeout)
         while True:
-            if not self._pid_alive(pid):
+            if not _pid_alive(pid):
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -1543,18 +1547,79 @@ class Runner:
         reaper, which sweeps EVERY parked lane on EVERY tick and so must not pay a per-lane stall;
         a live pid there simply defers its prune to the next sweep).
 
-        Returns True when everything asked for was done."""
+        A declined prune is RECORDED (state/pending_teardown/<id>) and retried by
+        _drain_pending_teardowns on later ticks. That marker is load-bearing, not bookkeeping: most
+        callers here settle their issue to a terminal status in the same breath, so decide never
+        looks at the lane again and there is no other retry — without the marker a declined prune
+        would leak its worktree, pane markers and lock FOREVER, and the D9 stale-marker bug this
+        function exists to close would reopen on the timeout path.
+
+        RETURNS False for EXACTLY ONE reason: a live worker still holds the worktree, so the lane
+        is not clear. Callers read that as "not mine yet — try again later"; a rebuild that acted
+        on it anyway would inherit a live session's checkout. A removal that merely FAILED (git
+        prune rc, a stubborn dir) is NOT that: nothing is in the way, the lane is clear, and the
+        deferral marker carries the retry — worktree_remove is best-effort by contract, and
+        conflating its rc with "a worker is alive" would abort rebuilds over a git hiccup."""
         pid = self._lock_pid(iid)                          # BEFORE step 3 clears the lock
         self._close_pane(iid)
         if remove_worktree and not self._await_worker_exit(iid, pid, timeout=exit_timeout):
-            return False
+            self._defer_teardown(iid, pid)
+            return False                                   # the ONE meaning: still held
         for p in (os.path.join(self.state, "panes", iid),
                   os.path.join(self.state, "panes", f"{iid}.ws"),
                   os.path.join(self.state, f"worker.{iid}.lock")):
             _rm(p)
         if remove_worktree:
-            return gitops.worktree_remove(self.repo, self._worktree(iid))
+            # Clear the deferral only once the worktree is truly gone; a failed remove keeps the
+            # marker so the drain retries the removal on a later tick.
+            if gitops.worktree_remove(self.repo, self._worktree(iid)):
+                _rm(os.path.join(self.state, "pending_teardown", iid))
+            else:
+                self._defer_teardown(iid, pid)
         return True
+
+    def _defer_teardown(self, iid, pid):
+        """Record a declined prune so a later tick retries it. Fail-silent: a marker we cannot
+        write costs a leaked worktree (disk), never a raise into the tick."""
+        try:
+            os.makedirs(os.path.join(self.state, "pending_teardown"), exist_ok=True)
+            with open(os.path.join(self.state, "pending_teardown", iid), "w") as f:
+                f.write(f"pid={pid} still alive at teardown\n")
+        except OSError:
+            pass
+
+    def _drain_pending_teardowns(self, st):
+        """Retry the teardowns that declined because their CLI was still alive (#149). THIS is the
+        retry the ordering's safety argument rests on: teardown may refuse to prune under a live
+        CLI precisely because something else will try again, and for a lane that has already
+        settled to 'merged' nothing else would.
+
+        Only TERMINAL lanes are drained, and that veto is the whole safety of this sweep: an id can
+        be re-approved or regenerated between the decline and the retry, and by then the worktree
+        at that path belongs to a NEW, live worker. Tearing that down would be the very bug this
+        code exists to prevent, self-inflicted. Terminal here means settled and not coming back
+        without a fresh launch — which itself rebuilds the worktree.
+
+        exit_timeout=0: a sweep over every deferred lane on every tick must not pay a per-lane
+        stall. Self-guarded — hygiene must never crash the tick or block the heartbeat."""
+        d = os.path.join(self.state, "pending_teardown")
+        try:
+            pending = os.listdir(d)
+        except OSError:
+            return                                         # no deferrals -> nothing to do
+        issues = st.get("issues") if isinstance(st, dict) and isinstance(st.get("issues"), dict) else {}
+        for iid in pending:
+            rec = issues.get(iid)
+            status = rec.get("status") if isinstance(rec, dict) else None
+            if not isinstance(status, str):
+                continue                                   # unknown lane: fail closed, keep waiting
+            if status in actions.TERMINAL_STATUSES:
+                self._teardown_session(iid, remove_worktree=True, exit_timeout=0)
+            else:
+                # Back in flight (relaunched/regenerated since the decline): the worktree at this
+                # path is a LIVE lane's now, rebuilt by its own launch. Drop the stale marker —
+                # draining here would tear down a running worker, the exact bug we prevent.
+                _rm(os.path.join(d, iid))
 
     def _close_stale_session(self, iid):
         """D4: a relaunch (conflict-regenerate, or a retry) targets an id whose PRIOR session may
@@ -1921,9 +1986,13 @@ class Runner:
         #    (#149) This USED to prune the worktree outright and leave the pane/lock for the launch
         #    to clean up later — i.e. it unlinked the cwd of a session that was, by this function's
         #    own D4 reasoning, quite possibly still alive: the D14 sequence verbatim. The ordered
-        #    teardown closes that session and sees it go first, and declines to prune while its pid
-        #    lives (the rebuild simply waits a tick — the launch below re-adds the worktree).
-        self._teardown_session(iid, remove_worktree=True)
+        #    teardown closes that session and sees it go first.
+        #    A declined prune ABORTS the re-approval, touching no state (same reason as
+        #    _exec_regenerate): launch-session.sh reuses a surviving worktree rather than failing,
+        #    so a fresh start would silently inherit the parked run's stale checkout — the opposite
+        #    of the clean slate this executor promises. decide re-emits while `agent-ready` stands.
+        if not self._teardown_session(iid, remove_worktree=True):
+            return "worker still live in the worktree — deferring the fresh start (retries next tick)"
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
         for sub in ("blocked", "exited", "awaiting", "started"):
             _rm(os.path.join(self.state, sub, iid))
@@ -2184,8 +2253,15 @@ class Runner:
         #    false-gate the rebuild even if the gh steps below fail and retry later.
         #    (#149) Ordered: the superseded session is closed and observed gone before its worktree
         #    is pruned — this path used to unlink the cwd of a session it knew might still be live
-        #    (D4), which is the D14 stamp-killer. A live pid defers the prune to a later tick.
-        self._teardown_session(iid, remove_worktree=True)
+        #    (D4), which is the D14 stamp-killer.
+        #    A declined prune must ABORT the regenerate, touching no state: launch-session.sh only
+        #    creates the worktree `if [ ! -d "$WT" ]`, so relaunching over a surviving stale
+        #    worktree does not fail — it SILENTLY reuses it, and the rebuild would run on the OLD
+        #    conflicted branch while its brief names the new one, pushing commits onto a superseded
+        #    PR. Fail closed instead: leave every field untouched so decide re-emits this same
+        #    regenerate next tick, by which time the old CLI has almost certainly gone.
+        if not self._teardown_session(iid, remove_worktree=True):
+            return "worker still live in the worktree — deferring the rebuild (retries next tick)"
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
         for sub in ("blocked", "exited", "awaiting"):
             _rm(os.path.join(self.state, sub, iid))

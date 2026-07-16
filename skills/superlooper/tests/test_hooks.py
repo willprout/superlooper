@@ -118,14 +118,16 @@ def test_hooks_stamp_liveness_from_a_safe_cwd_even_with_the_worktree_gone(tmp_pa
     """The other half of the spike: the same prune, but the hook spawned from a safe,
     always-present cwd runs fine and still stamps. Nothing in a hook may depend on the worker's
     worktree being on disk — every path it touches is absolute."""
-    worktree = tmp_path / "worktrees" / "i7"
-    worktree.mkdir(parents=True)
-    run_root = tmp_path / "run"
-    shutil.rmtree(worktree)
     for script in (ACTIVITY_HOOK, STOP_HOOK):
+        # a run_root PER script: sharing one would let the first hook's stamp satisfy the second's
+        # assertion, and the second hook could stamp nothing at all without failing
+        run_root = tmp_path / f"run-{os.path.basename(script)}"
+        worktree = tmp_path / f"wt-{os.path.basename(script)}"
+        worktree.mkdir(parents=True)
+        shutil.rmtree(worktree)
         r = _run_hook_from(tmp_path, script, run_root, "")
         assert r.returncode == 0, r.stderr
-        assert (run_root / "state" / "activity" / "i7").exists()
+        assert (run_root / "state" / "activity" / "i7").exists(), f"{script} did not stamp"
 
 
 def test_hooks_survive_a_cwd_that_was_unlinked_under_them(tmp_path):
@@ -136,9 +138,9 @@ def test_hooks_survive_a_cwd_that_was_unlinked_under_them(tmp_path):
     Note what is deliberately NOT asserted: bash prints `shell-init: ... getcwd` when it STARTS in
     an unlinked directory, before the script's first line runs, so no in-script `cd` can suppress
     it. That noise is harmless; the stamp landing is the promise."""
-    run_root = tmp_path / "run"
     for script in (ACTIVITY_HOOK, STOP_HOOK):
-        doomed = tmp_path / "doomed"
+        run_root = tmp_path / f"unlinked-run-{os.path.basename(script)}"   # per script; see above
+        doomed = tmp_path / f"doomed-{os.path.basename(script)}"
         doomed.mkdir()
         env = {**os.environ, "SL_AGENT": "claude", "SL_ISSUE_ID": "i7",
                "SL_RUN_ROOT": str(run_root)}
