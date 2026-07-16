@@ -63,6 +63,10 @@ PAYLOAD_REL="skills/superlooper/skill"                   # repo-relative, for th
 # unless SL_ISSUE_ID + SL_RUN_ROOT are exported), so registering them globally is safe.
 ACT_CMD='$HOME/.claude/skills/superlooper/bin/activity-hook.sh'
 STOP_CMD='$HOME/.claude/skills/superlooper/bin/stop-hook.sh'
+# PreToolUse deny hook (issue #156). CLAUDE ONLY — registered in settings.json below but NOT in the
+# Codex hooks.json (Codex has no PreToolUse event — spike verdict), so it lives on the Claude side of
+# merge_hooks alone. A strict no-op outside a worker session, like the other two.
+DENY_CMD='$HOME/.claude/skills/superlooper/bin/pretooluse-hook.sh'
 
 [ -d "$SRC" ] || { echo "install: payload not found at $SRC" >&2; exit 1; }
 
@@ -141,11 +145,13 @@ engine_gate() {  # engine_gate <report|gate>
 #     defect class this project has hit twice). ---
 merge_hooks() {  # merge_hooks <mode:apply|report>
   local mode="$1"
-  python3 - "$SETTINGS" "$mode" "$ACT_CMD" "$STOP_CMD" <<'PY'
+  python3 - "$SETTINGS" "$mode" "$ACT_CMD" "$STOP_CMD" "$DENY_CMD" <<'PY'
 import json, os, sys, tempfile
 
-path, mode, act_cmd, stop_cmd = sys.argv[1:5]
-targets = [("PostToolUse", act_cmd), ("Stop", stop_cmd)]  # (event, command)
+path, mode, act_cmd, stop_cmd, deny_cmd = sys.argv[1:6]
+# (event, command). PreToolUse is Claude-only (Codex has no such event — spike verdict); it appears
+# here but NOT in merge_codex_hooks' targets.
+targets = [("PostToolUse", act_cmd), ("Stop", stop_cmd), ("PreToolUse", deny_cmd)]
 
 def fail(msg):
     sys.stderr.write("install: " + msg + " — refusing to overwrite %s.\n" % path)
