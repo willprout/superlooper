@@ -71,3 +71,19 @@ def _never_reach_real_cmux(monkeypatch):
     # subprocess-driven tests pass explicit env dicts, untouched by this.
     if not os.environ.get("SL_CMUX"):
         monkeypatch.setenv("SL_CMUX", "/nonexistent/superlooper-test-cmux")
+
+
+@pytest.fixture(autouse=True)
+def _never_probe_real_auth(monkeypatch):
+    # Same ratchet as _never_reach_real_cmux, for the account-auth probe (issue #159). The runner's
+    # default Runner._probe_auth shells out to the REAL `claude auth status` + `security` keychain on
+    # every tick with a spend pending — external binaries the "no test reaches a real binary" rule
+    # forbids (and on a dev machine that HAS claude, a live auth read). Neutralize the DEFAULT to a
+    # fail-open "unknown" snapshot so any ticking runner test is safe without opting in. Tests that
+    # exercise the probe set their own instance _probe_auth in-body (that instance attr wins); the
+    # probe FUNCTION itself (usage.probe_auth) is untouched, so test_usage still tests the real thing.
+    import runner as runner_mod
+    monkeypatch.setattr(runner_mod.Runner, "_probe_auth",
+                        lambda self: {"cli": "unknown", "keychain_present": None,
+                                      "keychain_mtime": None, "valid": None, "status_raw": ""},
+                        raising=False)
