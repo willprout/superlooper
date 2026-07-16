@@ -103,6 +103,14 @@ LAUNCH_BASE_MISSING_RC = 3
 NUDGE_TIMEOUT = 60
 RECHECK_TIMEOUT = 600
 CLOSE_TIMEOUT = 15             # bound the best-effort close of a stale session's pane (D4)
+# (#149) After the pane close, how long teardown waits to OBSERVE the worker CLI actually go before
+# it will prune the worktree. A closed surface does not mean a dead process: the CLI unwinds on its
+# own clock, and its start-session.sh holds worker.<id>.lock until it truly exits. Bounded because a
+# tick must never wedge — on timeout the prune is simply skipped and retried on a later tick, which
+# is always safe (an unreclaimed worktree costs disk; a worktree pruned under a live CLI unlinks its
+# cwd and kills the next hook spawn, which costs the lane its liveness/exit stamp — the D14 family).
+WORKER_EXIT_TIMEOUT = 10
+WORKER_EXIT_POLL = 0.25
 DELIVERY_RETRY_SECONDS = 120   # min spacing between answer-delivery attempts to one pane
 _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"   # SL_CMUX overrides (tests)
 
@@ -1183,7 +1191,15 @@ class Runner:
         except OSError:
             return
         for iid in tidy.reclaimable_worktrees(issues, on_disk):
-            gitops.worktree_remove(self.repo, self._worktree(iid))
+            # (#149) through the ONE ordered teardown: a park-family lane can still have a live CLI
+            # idling in its worktree, and this reaper runs every tick — unlinking that cwd is the
+            # D14 prune-under-a-live-CLI shape. It also clears the lane's stale pane markers, which
+            # a bare worktree_remove left behind to outlive their session (D9).
+            # exit_timeout=0: this loop is unbounded in N and runs every tick, so it must never pay
+            # a per-lane stall waiting for a pid. Disk hygiene has no deadline — a lane whose CLI is
+            # still unwinding is simply reclaimed on the next sweep, by which time the pane close
+            # issued here has landed.
+            self._teardown_session(iid, remove_worktree=True, exit_timeout=0)
 
     # ------------------------- the tick -------------------------
 
@@ -1436,6 +1452,110 @@ class Runner:
     def _worktree(self, iid):
         return os.path.join(self.home, "worktrees", iid)
 
+    def _lock_pid(self, iid):
+        """The pid recorded in worker.<id>.lock, or None when there is no lock / it names no
+        process. start-session.sh writes the lock atomically WITH its pid (`ln` of a fully-written
+        temp) and its EXIT trap frees it, so a readable pid here means a worker process that was
+        alive when it took the lock. An empty/garbage lock names nobody: None, never a veto."""
+        txt = (_read(os.path.join(self.state, f"worker.{iid}.lock")) or "").strip()
+        try:
+            pid = int(txt)
+        except (TypeError, ValueError):
+            return None
+        return pid if pid > 0 else None
+
+    def _pid_alive(self, pid):
+        """True when `pid` names a live process. Signal 0 is the probe start-session.sh's own
+        acquire_worker uses (`kill -0`), so the runner and the shell agree on liveness. A pid we
+        may not signal (EPERM) EXISTS — that is alive, not dead: guessing dead there is what would
+        prune under a live CLI."""
+        if not pid:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _await_worker_exit(self, iid, pid, timeout=None):
+        """Observe the worker CLI go, bounded. Returns True when it is gone (or was never there),
+        False when it outlived the wait.
+
+        The lock pid is authoritative, not state/exited/<id>: that marker can be STALE (a previous
+        generation of the same id wrote one) and a stale marker read as proof is exactly how a live
+        CLI gets pruned out from under. The lock, by contrast, is held for the whole process life
+        and freed by start-session.sh's EXIT trap, so a dead pid means the CLI has truly unwound."""
+        if not pid:
+            return True                                    # no lock -> no live worker to wait for
+        deadline = time.monotonic() + (WORKER_EXIT_TIMEOUT if timeout is None else timeout)
+        while True:
+            if not self._pid_alive(pid):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(WORKER_EXIT_POLL)
+
+    def _close_pane(self, iid):
+        """Close the id's recorded surface. Best-effort; rc ignored (a dead surface = a no-op)."""
+        surface = self._surface(iid)
+        if not surface:
+            return
+        ws = (_read(os.path.join(self.state, "panes", f"{iid}.ws")) or "").strip()
+        args = [os.environ.get("SL_CMUX", _CMUX_DEFAULT), "close-surface", "--surface", surface]
+        if ws:
+            args += ["--workspace", ws]
+        self._run_script(args, timeout=CLOSE_TIMEOUT)
+
+    def _teardown_session(self, iid, remove_worktree=False, exit_timeout=None):
+        """THE one ordered teardown for every session end (issue #149). Every path that ends a
+        lane's session comes through here, so the ordering below is stated once and cannot drift.
+
+            1. close the pane          — ask the CLI to go; its EXIT trap frees worker.<id>.lock
+            2. observe it actually go  — bounded (only when we intend to prune; see below)
+            3. clear pane markers + the lock, together (D9: no marker outlives its session)
+            4. only THEN prune the worktree
+
+        WHY THE ORDER IS THE WHOLE POINT (the D14 family, 07-15 forensics r2/U4). The agent CLI
+        spawns its hooks with an EXPLICIT cwd — the worker's worktree. Prune that worktree while
+        the CLI still stands in it and the next hook spawn dies in posix_spawn with ENOENT before
+        the hook can run a single line: the liveness/exit stamp never lands, at the exact moment
+        the lane finishes. That silence is what opened the zombie windows and the blind recovery
+        cascades (four on 07-15 alone). No in-hook `cd` can defend against this — the hook is
+        never spawned at all — so refusing to prune under a live CLI is the only real fix.
+
+        The pid, not the pane, is the gate: `close-surface` returning says the surface is gone, not
+        that the process is. A worktree is NEVER removed while worker.<id>.lock names a live pid.
+
+        On timeout we return False having cleared NOTHING — deliberately. The lock is the only
+        record of that live pid, so clearing it would let the very next tick read "no lock, no
+        worker" and prune under the CLI anyway, reintroducing the bug one tick later. Leaving the
+        lane fully intact costs a retry on a later tick and nothing else.
+
+        `remove_worktree=False` is the D4 relaunch close: it prunes nothing, so it has nothing to
+        protect and does not wait (a relaunch must not pay a stall for a pid it is about to
+        supersede). That path's behavior is byte-for-byte what it was before this function existed.
+
+        `exit_timeout=0` probes once and never sleeps — for callers with no deadline (the parked
+        reaper, which sweeps EVERY parked lane on EVERY tick and so must not pay a per-lane stall;
+        a live pid there simply defers its prune to the next sweep).
+
+        Returns True when everything asked for was done."""
+        pid = self._lock_pid(iid)                          # BEFORE step 3 clears the lock
+        self._close_pane(iid)
+        if remove_worktree and not self._await_worker_exit(iid, pid, timeout=exit_timeout):
+            return False
+        for p in (os.path.join(self.state, "panes", iid),
+                  os.path.join(self.state, "panes", f"{iid}.ws"),
+                  os.path.join(self.state, f"worker.{iid}.lock")):
+            _rm(p)
+        if remove_worktree:
+            return gitops.worktree_remove(self.repo, self._worktree(iid))
+        return True
+
     def _close_stale_session(self, iid):
         """D4: a relaunch (conflict-regenerate, or a retry) targets an id whose PRIOR session may
         still be ALIVE at the interactive prompt — a real claude worker does NOT exit after writing
@@ -1449,18 +1569,10 @@ class Runner:
         running/blocked, and reclaim after a runner restart never launches a live worker — the held
         lock is what keeps that reclaim from double-driving) — so the recorded pane here belongs to a
         finished/superseded/dead session, never an actively-building one. No-op when there is no
-        recorded pane (a first launch) or the surface is already gone (a crashed session)."""
-        surface = self._surface(iid)
-        if surface:
-            ws = (_read(os.path.join(self.state, "panes", f"{iid}.ws")) or "").strip()
-            args = [os.environ.get("SL_CMUX", _CMUX_DEFAULT), "close-surface", "--surface", surface]
-            if ws:
-                args += ["--workspace", ws]
-            self._run_script(args, timeout=CLOSE_TIMEOUT)      # best-effort; rc ignored (dead surface = no-op)
-        for p in (os.path.join(self.state, "panes", iid),
-                  os.path.join(self.state, "panes", f"{iid}.ws"),
-                  os.path.join(self.state, f"worker.{iid}.lock")):
-            _rm(p)
+        recorded pane (a first launch) or the surface is already gone (a crashed session).
+
+        The relaunch face of _teardown_session (#149): same close + same marker hygiene, no prune."""
+        self._teardown_session(iid, remove_worktree=False)
 
     def _mark_exited(self, iid, why, now):
         try:
@@ -1719,7 +1831,7 @@ class Runner:
         # Reclaim the worktree, exactly as _exec_absorb_merged does for its 'merged' settle — a
         # bounce/park absorbed this way would otherwise leave its worktree behind to accumulate.
         if self.config.get("cleanup_merged_worktrees", True):
-            gitops.worktree_remove(self.repo, self._worktree(iid))
+            self._teardown_session(iid, remove_worktree=True)      # ordered (#149)
         return "ok"
 
     def _forget_cached_label(self, iid, label):
@@ -1805,8 +1917,13 @@ class Runner:
         old = {}
         # 1. local hygiene FIRST (mirrors _exec_regenerate): stale artifacts must be unable to
         #    drive decide() before the fresh launch. Best-effort — no-ops when nothing is there;
-        #    launch-session.sh recreates the worktree, _close_stale_session frees the pane/lock.
-        gitops.worktree_remove(self.repo, self._worktree(iid))
+        #    launch-session.sh recreates the worktree.
+        #    (#149) This USED to prune the worktree outright and leave the pane/lock for the launch
+        #    to clean up later — i.e. it unlinked the cwd of a session that was, by this function's
+        #    own D4 reasoning, quite possibly still alive: the D14 sequence verbatim. The ordered
+        #    teardown closes that session and sees it go first, and declines to prune while its pid
+        #    lives (the rebuild simply waits a tick — the launch below re-adds the worktree).
+        self._teardown_session(iid, remove_worktree=True)
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
         for sub in ("blocked", "exited", "awaiting", "started"):
             _rm(os.path.join(self.state, sub, iid))
@@ -2033,7 +2150,10 @@ class Runner:
         gh.set_labels(num, remove=["in-progress"])
         self._update_issue(iid, {"status": "merged"})
         if self.config.get("cleanup_merged_worktrees", True):
-            gitops.worktree_remove(self.repo, self._worktree(iid))
+            # (#149) The D14 hot path: the lane that just merged still has its worker idling at the
+            # prompt in this very worktree, so the old bare prune unlinked a live CLI's cwd at the
+            # exact moment the lane finished. Ordered teardown: close, see it go, then reclaim.
+            self._teardown_session(iid, remove_worktree=True)
         return "ok"
 
     def _exec_update(self, a, now):
@@ -2062,7 +2182,10 @@ class Runner:
         iid, num, pr = a["id"], a.get("num"), a.get("pr")
         # 1. local hygiene FIRST (M1): the stale worktree and markers must be unable to
         #    false-gate the rebuild even if the gh steps below fail and retry later.
-        gitops.worktree_remove(self.repo, self._worktree(iid))
+        #    (#149) Ordered: the superseded session is closed and observed gone before its worktree
+        #    is pruned — this path used to unlink the cwd of a session it knew might still be live
+        #    (D4), which is the D14 stamp-killer. A live pid defers the prune to a later tick.
+        self._teardown_session(iid, remove_worktree=True)
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
         for sub in ("blocked", "exited", "awaiting"):
             _rm(os.path.join(self.state, sub, iid))
@@ -2167,7 +2290,7 @@ class Runner:
             return "label cleanup failed (will retry next tick)"
         self._update_issue(iid, {"status": "merged"})
         if self.config.get("cleanup_merged_worktrees", True):
-            gitops.worktree_remove(self.repo, self._worktree(iid))
+            self._teardown_session(iid, remove_worktree=True)      # ordered (#149)
         return "ok"
 
     def _exec_file_fix_issue(self, a, now):

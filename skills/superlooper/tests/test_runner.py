@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -2448,6 +2449,286 @@ def test_close_stale_session_is_a_noop_without_a_recorded_pane(rig):
     """A first launch (no prior pane) must neither attempt a close nor error."""
     rig.r._close_stale_session("i9")
     assert not [c for c in rig.calls if "close-surface" in c["args"]]
+
+
+# ------------------- issue #149: ONE ORDERED TEARDOWN (the D14 family) -------------------
+# The 07-15 forensics root-caused `posix_spawn '/bin/sh' ENOENT` as a worktree pruned while the
+# worker CLI still stood in it: the CLI spawns its hooks with an EXPLICIT cwd, so once that cwd is
+# unlinked the spawn itself dies and the liveness/exit stamp never lands — exactly when the lane
+# finishes. No amount of in-hook `cd` can save a hook that was never spawned (test_hooks.py pins
+# that mechanism directly), so the ONLY real fix is ordering: the pane closes and the CLI is
+# observed gone BEFORE the worktree is pruned.
+
+def test_the_runner_removes_a_worktree_in_exactly_one_place(rig):
+    """Structural, in this repo's 'enforced by absence' idiom (see gitops.py's own source screen).
+    Teardown ordering is only a guarantee if it CANNOT be bypassed: the moment a second call site
+    prunes directly, the D14 hole reopens somewhere new and no behavioral test would catch it. So
+    runner.py may name gitops.worktree_remove exactly once, inside _teardown_session.
+
+    If you are here because this failed: do not add a call — route your path through
+    _teardown_session(iid, remove_worktree=True)."""
+    src = (Path(runner_mod.__file__)).read_text()
+    calls = [ln.strip() for ln in src.splitlines() if "gitops.worktree_remove" in ln]
+    assert len(calls) == 1, f"worktree removal must live in ONE place; found {len(calls)}: {calls}"
+    # ...and that one place is inside _teardown_session, not some other helper
+    body = src.split("def _teardown_session(")[1].split("\n    def ")[0]
+    assert "gitops.worktree_remove" in body
+
+
+def _teardown_rig(rig, iid, pid="4242", surface="SURF", ws="WS"):
+    """A finished-but-alive lane: a recorded pane + a worker lock naming a live pid."""
+    (rig.home / "state" / "panes" / iid).write_text(surface)
+    (rig.home / "state" / "panes" / f"{iid}.ws").write_text(ws)
+    (rig.home / "state" / f"worker.{iid}.lock").write_text(pid)
+
+
+def test_pid_alive_tracks_a_real_process(rig):
+    """The liveness probe is the gate on every prune, so pin it against real pids rather than a
+    stub: signal 0 is what start-session.sh's own acquire_worker uses (`kill -0`)."""
+    assert rig.r._pid_alive(os.getpid()) is True
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()                                             # exited AND reaped -> the pid is gone
+    assert rig.r._pid_alive(p.pid) is False
+    assert rig.r._pid_alive(None) is False
+    assert rig.r._pid_alive(0) is False                  # 0 means "my process group" to kill(2)
+
+
+def test_pid_alive_calls_a_pid_we_may_not_signal_alive(rig, monkeypatch):
+    """EPERM means the process EXISTS and belongs to someone else — that is ALIVE. Reading it as
+    dead is precisely what would prune a worktree under a running CLI."""
+    def eperm(pid, sig):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(runner_mod.os, "kill", eperm)
+    assert rig.r._pid_alive(4242) is True
+
+
+def test_lock_pid_reads_the_lock_and_ignores_garbage(rig):
+    """start-session.sh writes the lock atomically WITH its pid. Anything unparseable names
+    nobody: None, so teardown fails FORWARD to the prune rather than wedging the reclaim on a
+    corrupt file (the lock is a pid record, not a veto token)."""
+    lock = rig.home / "state" / "worker.i3.lock"
+    lock.write_text("4242\n")
+    assert rig.r._lock_pid("i3") == 4242
+    assert rig.r._lock_pid("i-nonexistent") is None
+    for junk in ("", "   ", "not-a-pid", "-1", "0"):
+        lock.write_text(junk)
+        assert rig.r._lock_pid("i3") is None, f"{junk!r} must name no process"
+
+
+def test_teardown_never_prunes_a_worktree_under_a_live_worker(rig, monkeypatch):
+    """THE D14 regression. The worker CLI outlives its pane close (it idles at the prompt and its
+    start-session.sh holds worker.<id>.lock for the whole process life). The worktree MUST survive:
+    pruning it here is what unlinks the live CLI's cwd and kills its next hook spawn."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0.05)     # bound the test, not the rule
+    _teardown_rig(rig, "i3")
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: True)       # the CLI never dies
+
+    assert rig.r._teardown_session("i3", remove_worktree=True) is False
+    assert removed == [], "a worktree was pruned while its worker.<id>.lock pid was still alive"
+    # the lock MUST survive too: it is the only record of the live pid, and clearing it would let
+    # the next tick mistake a live worker for a dead one and prune under it anyway.
+    assert (rig.home / "state" / "worker.i3.lock").exists()
+
+
+def test_teardown_prunes_once_the_worker_is_observed_gone(rig, monkeypatch):
+    """The happy path: the pane close lands, the CLI exits, its lock pid goes dead — now the
+    worktree is safe to reclaim."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    _teardown_rig(rig, "i3")
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: False)
+
+    assert rig.r._teardown_session("i3", remove_worktree=True) is True
+    assert removed == [str(rig.home / "worktrees" / "i3")]
+
+
+def test_teardown_closes_the_pane_before_it_prunes(rig, monkeypatch):
+    """The ORDER is the fix, not the individual steps: close-surface must precede the prune."""
+    order = []
+    def run_script(args, env=None, timeout=None):
+        if "close-surface" in [str(a) for a in args]:
+            order.append("close")
+        return 0
+    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: order.append("prune") or True)
+    _teardown_rig(rig, "i3")
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: False)
+
+    rig.r._teardown_session("i3", remove_worktree=True)
+    assert order == ["close", "prune"]
+
+
+def test_teardown_clears_pane_markers_lock_and_worktree_together(rig, monkeypatch):
+    """D9: stale pane markers surviving a bounce are the same class of bug — teardown that isn't
+    centralized. One teardown clears the pane record, its workspace, and the lock together."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _teardown_rig(rig, "i3")
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: False)
+
+    assert rig.r._teardown_session("i3", remove_worktree=True) is True
+    assert not (rig.home / "state" / "panes" / "i3").exists()
+    assert not (rig.home / "state" / "panes" / "i3.ws").exists()
+    assert not (rig.home / "state" / "worker.i3.lock").exists()
+
+
+def test_teardown_prunes_when_no_worker_lock_is_held(rig, monkeypatch):
+    """The common reclaim case: a long-parked lane whose session died ages ago. No lock = no live
+    CLI = nothing to wait for."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(rig.r, "_pid_alive",
+                        lambda pid: pytest.fail("no lock -> must not probe a pid"))
+    assert rig.r._teardown_session("i8", remove_worktree=True) is True
+    assert removed == [str(rig.home / "worktrees" / "i8")]
+
+
+def test_teardown_ignores_an_unreadable_lock_pid(rig, monkeypatch):
+    """A garbage/empty lock names no process: fail forward to the prune rather than wedge the
+    reclaim forever (the lock is a pid record, not a veto token)."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    _teardown_rig(rig, "i3", pid="not-a-pid")
+    assert rig.r._teardown_session("i3", remove_worktree=True) is True
+    assert removed == [str(rig.home / "worktrees" / "i3")]
+
+
+def test_teardown_waits_for_a_worker_that_dies_after_the_close(rig, monkeypatch):
+    """The realistic shape: close-surface returns, and the CLI takes a moment to actually go. The
+    bounded wait must OBSERVE that exit rather than race it."""
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 5)
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_POLL", 0.01)
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    _teardown_rig(rig, "i3")
+    probes = []
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: len(probes) < 3 and not probes.append(1))
+
+    assert rig.r._teardown_session("i3", remove_worktree=True) is True
+    assert removed == [str(rig.home / "worktrees" / "i3")]
+    assert len(probes) >= 3, "expected the wait to keep probing until the pid went dead"
+
+
+def test_close_stale_session_does_not_wait_on_the_launch_path(rig, monkeypatch):
+    """A relaunch's D4 close must stay fast and unchanged: it prunes nothing, so it has no reason
+    to wait for the old pid — the bounded wait exists only to protect a prune."""
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 999)      # would hang if consulted
+    _teardown_rig(rig, "i3")
+    monkeypatch.setattr(rig.r, "_pid_alive",
+                        lambda pid: pytest.fail("the no-prune path must not probe the pid"))
+    rig.r._close_stale_session("i3")
+    assert not (rig.home / "state" / "worker.i3.lock").exists()
+
+
+# --- every removal call site routes through the one teardown ---
+
+def test_merge_closes_the_pane_before_reclaiming_the_worktree(rig, monkeypatch):
+    """The lane that just merged is the D14 hot path: its worker is finished-but-alive at the
+    prompt when the runner reclaims the worktree."""
+    order = []
+    def run_script(args, env=None, timeout=None):
+        if "close-surface" in [str(a) for a in args]:
+            order.append("close")
+        return 0
+    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: order.append("prune") or True)
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i7", status="gating", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "merge", "id": "i7", "num": 7, "pr": 7, "method": "squash"}, NOW)
+    assert order == ["close", "prune"]
+
+
+def test_regenerate_never_prunes_under_a_live_worker(rig, monkeypatch):
+    """_exec_regenerate pruned the worktree FIRST and only freed the pane/lock later, at launch —
+    the D14 sequence verbatim."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0.05)
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: True)
+    seed_issue(rig, "i7", status="gating", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "regenerate", "id": "i7", "num": 7, "pr": 7,
+                    "new_branch": "sl/i7-x-2", "conflicts": 1}, NOW)
+    assert removed == [], "regenerate pruned a worktree under a live CLI"
+
+
+def test_reapprove_never_prunes_under_a_live_worker(rig, monkeypatch):
+    """Same shape as regenerate: re-approval's local hygiene must not unlink a live worker's cwd."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0.05)
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: True)
+    seed_issue(rig, "i5", status="parked", num=5)
+    _teardown_rig(rig, "i5")
+
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert removed == [], "reapprove pruned a worktree under a live CLI"
+
+
+def test_absorb_merged_closes_the_pane_before_reclaiming(rig, monkeypatch):
+    order = []
+    def run_script(args, env=None, timeout=None):
+        if "close-surface" in [str(a) for a in args]:
+            order.append("close")
+        return 0
+    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: order.append("prune") or True)
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i7", status="gating", num=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+    assert order == ["close", "prune"]
+
+
+def test_reclaim_terminal_worktrees_routes_through_the_one_teardown(rig, monkeypatch):
+    """The parked-worktree reaper must clear the lane's stale pane markers too (D9), not just
+    unlink its directory behind their back."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i7", status="parked", num=7)
+    (rig.home / "worktrees" / "i7").mkdir(parents=True, exist_ok=True)
+    _teardown_rig(rig, "i7")
+
+    rig.r._reclaim_terminal_worktrees(loopstate.load(str(rig.home / "state" / "issues.json")))
+    assert [c for c in rig.calls if "close-surface" in c["args"]], "expected the pane to be closed"
+    assert not (rig.home / "state" / "panes" / "i7").exists()
+    assert not (rig.home / "state" / "worker.i7.lock").exists()
+
+
+def test_reclaim_never_stalls_the_tick_waiting_on_a_live_worker(rig, monkeypatch):
+    """The reaper sweeps EVERY parked lane on EVERY ~15s tick, so it must never pay the bounded
+    exit wait per lane: it probes once and defers. It still refuses to prune under a live CLI —
+    only the WAIT is skipped, never the rule."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 999)      # would hang if consulted
+    monkeypatch.setattr(runner_mod.time, "sleep",
+                        lambda s: pytest.fail("the reaper must not sleep on a live pid"))
+    monkeypatch.setattr(rig.r, "_pid_alive", lambda pid: True)
+    for iid in ("i7", "i5"):
+        seed_issue(rig, iid, status="parked", num=int(iid[1:]))
+        (rig.home / "worktrees" / iid).mkdir(parents=True, exist_ok=True)
+        _teardown_rig(rig, iid)
+
+    rig.r._reclaim_terminal_worktrees(loopstate.load(str(rig.home / "state" / "issues.json")))
+    assert removed == [], "the reaper pruned a worktree under a live CLI"
+    assert (rig.home / "state" / "worker.i7.lock").exists()          # the live pid is still on record
 
 
 def test_launch_closes_a_stale_session_before_relaunching(rig):
