@@ -2583,3 +2583,72 @@ def test_pooled_lanes_reserved_investigation_lane_not_taken_by_build():
                  parsed_issues=[parsed(2, touches=("api",))],
                  lane_state=lane)
     assert only(out, "launch") == []
+
+
+# =========================== issue #151: honest session-state sensing ===========================
+
+def test_decide_alerts_on_a_logged_out_session():
+    """i336: a session whose auth died in-process typed into for 94 minutes. Once the runner SENSES
+    logged_out, decide must route it to the owner — this is the DoD's 'alerts / routes to an owner
+    decision'. It lives here, not in the executor, because decide owns the ALERT file and rebuilds
+    it from disk every tick: an executor-written alert would be cleared one tick later."""
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="logged_out")}})
+    out = decide(dsk=d)
+    a = only(out, "alert")
+    assert len(a) == 1 and "session_logged_out:i5" in a[0]["reasons"]
+    assert has_notify(out)
+
+
+def test_logged_out_alert_says_what_the_owner_must_actually_do():
+    """An alert whose body is a bare reason code costs the owner a diagnosis. The known cause here
+    is specific and the fix is manual (the forensic note: /login inside the wedged window never
+    stuck — only closing it worked), so the text must say so."""
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="logged_out")}})
+    out = decide(dsk=d)
+    body = [a for a in out if a["act"] == "notify"][0]["body"]
+    assert "i5" in body and "login" in body.lower()
+    assert "session_logged_out:i5" != body            # not just the raw code echoed back
+
+
+def test_logged_out_alert_clears_once_the_session_is_sensed_healthy_again():
+    """Same durable-marker discipline as every other reason: the alert stands while the condition
+    is on disk and auto-clears when it is gone — never a sticky alarm needing a human to dismiss."""
+    d = disk(alert={"reasons": ["session_logged_out:i5"]},
+             issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state=None)}})
+    out = decide(dsk=d)
+    assert len(only(out, "clear_alert")) == 1
+
+
+def test_a_session_at_its_own_dialog_does_not_alert():
+    """at_dialog is NOT an alarm: a session asking something in-window is live and working. Alerting
+    on it would just re-teach the loop to cry wolf about healthy lanes (the i280 shape, one level up)."""
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="at_dialog")}})
+    out = decide(dsk=d)
+    assert only(out, "alert") == []
+
+
+def test_a_logged_out_session_is_never_nudged_by_the_liveness_ladder():
+    """The DoD's hard 'NEVER nudges it'. pane_state refuses to type (that is the real enforcement),
+    but the ladder must not even spend the attempt: a logged-out session cannot answer a nudge, and
+    re-firing one every 10 minutes is exactly the 94-minute i336 loop."""
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="logged_out")}})
+    out = decide(events=[{"type": "frozen", "id": "i5"}], dsk=d)
+    assert [a for a in only(out, "recover") if a["id"] == "i5"] == []
+    # fence: the same lane WITHOUT the sensed state is recovered, so the assert above is really
+    # measuring sensed_state and not a silently-inert input.
+    healthy = disk(issues_state={"version": 1, "issues": {"i5": ist("running")}})
+    assert len(only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=healthy), "recover")) == 1
+
+
+def test_a_session_at_a_dialog_is_not_walked_toward_a_park():
+    """i280: the nudge ladder exhausted into a false park of a live, working lane. A lane sensed at
+    its own dialog must neither be nudged again nor parked."""
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist("running", sensed_state="at_dialog", retries=99)}})
+    out = decide(events=[{"type": "frozen", "id": "i5"}], dsk=d)
+    assert [a for a in only(out, "recover") if a["id"] == "i5"] == []
+    assert [a for a in only(out, "park") if a["id"] == "i5"] == []
+    # fence: retries=99 is far past the cap, so this exact lane WITHOUT the sensed state parks.
+    # That is the false park i280 actually suffered — the assert above must be what prevents it.
+    doomed = disk(issues_state={"version": 1, "issues": {"i5": ist("running", retries=99)}})
+    assert len(only(decide(events=[{"type": "frozen", "id": "i5"}], dsk=doomed), "park")) == 1

@@ -1,0 +1,21 @@
+Last login: Wed Jul 15 20:45:27 on ttys029
+dev@host /tmp/probe% claude --permission-mode bypassPermissions
+
+───────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /tmp/probe
+ worktrees-i151/21365f08-0b20-4e96-85a8-5df83bdd8e31/scratchpad/probe
+
+ Quick safety check: Is this a project you created or one you trust? (Like
+ your own code, a well-known open source project, or work from your team). If
+ not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel

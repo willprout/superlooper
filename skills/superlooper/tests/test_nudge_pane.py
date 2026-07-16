@@ -169,3 +169,40 @@ def test_codex_attention_prompts_defer_when_agent_selected(tmp_path):
                  screen=screen, agent="codex")
         assert r.returncode == 3, f"Codex attention/unknown screen must defer: {screen!r}"
         assert not any(ln.startswith("send ") for ln in log.read_text().splitlines())
+
+
+# --- issue #151: the two states that used to hide inside a generic "deferred" ---
+
+def _screen_fixture(name):
+    with open(os.path.join(HERE, "fixtures", "screens", name)) as f:
+        return f.read()
+
+
+def test_logged_out_pane_refuses_to_type_and_says_so(tmp_path):
+    # i336: this screen classified as 'idle' — safe to send — so the runner typed into a session
+    # whose auth was dead for 94 minutes. It must now refuse with its own code, so the caller can
+    # tell "cannot answer" apart from "busy right now".
+    run_root, cmux, log = _setup(tmp_path)
+    r = _run(run_root, cmux, log, "SURF-UUID-9", "i1", "hello",
+             screen="Not logged in · Please run /login\n❯ ")
+    assert r.returncode == 5, f"a logged-out pane must return 5, got {r.returncode}"
+    assert "send" not in log.read_text(), "must never type into a logged-out pane"
+
+
+def test_at_dialog_pane_refuses_to_type_and_says_so(tmp_path):
+    # i280, driven through the REAL captured AskUserQuestion screen.
+    run_root, cmux, log = _setup(tmp_path)
+    r = _run(run_root, cmux, log, "SURF-UUID-9", "i1", "hello",
+             screen=_screen_fixture("claude-askuserquestion-dialog.txt"))
+    assert r.returncode == 6, f"a pane at its own question dialog must return 6, got {r.returncode}"
+    assert "send" not in log.read_text(), "must never type into an open dialog"
+
+
+def test_a_genuine_menu_still_defers_with_the_original_code(tmp_path):
+    # The boundary: the safe-send primitive's refusal for genuine menus is untouched — same code 3,
+    # same silence. Driven through the REAL captured folder-trust screen.
+    run_root, cmux, log = _setup(tmp_path)
+    r = _run(run_root, cmux, log, "SURF-UUID-9", "i1", "hello",
+             screen=_screen_fixture("claude-trust-folder.txt"))
+    assert r.returncode == 3, f"a genuine menu must still return 3, got {r.returncode}"
+    assert "send" not in log.read_text()

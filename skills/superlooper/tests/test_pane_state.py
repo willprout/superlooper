@@ -213,3 +213,116 @@ def test_codex_only_states_require_codex_agent_selection():
     codex_only = {"trust_blocked", "permission_blocked", "quota_blocked", "unknown"}
     for screen in codex_screens:
         assert ps.classify_screen(screen) not in codex_only
+
+
+# ---------------------------------------------------------------------------
+# Issue #151: honest session-state sensing — logged_out + at_dialog.
+# The screens below are REAL captures from Claude Code 2.1.211 driven in a cmux
+# pane (tests/fixtures/screens/), not hand-written guesses: the trust dialog and
+# the AskUserQuestion dialog render nearly identical selection chrome, and only a
+# real capture settles which markers actually separate them.
+# ---------------------------------------------------------------------------
+
+import pathlib
+
+_SCREENS = pathlib.Path(__file__).parent / "fixtures" / "screens"
+
+
+def _screen(name):
+    return (_SCREENS / name).read_text()
+
+
+# --- logged_out (i336: a dead-auth pane classified 'idle', so the runner typed into it 94 min) ---
+
+def test_logged_out_exact_string_from_the_dod():
+    # The exact stable string named in issue #151, byte-for-byte (U+00B7 MIDDLE DOT separator).
+    assert ps.classify_screen("Not logged in · Please run /login") == "logged_out"
+
+
+def test_logged_out_sibling_variants_are_not_idle():
+    # Claude Code 2.1.211 ships FOUR auth-death messages, not one (verified by grepping the
+    # installed binary). Matching only the DoD's exact string would leave these three classifying
+    # as 'idle' — i.e. safe-to-send — which IS the i336 bug. None of them may read as idle.
+    for screen in ("Not logged in · Run /login",
+                   "Session expired. Please run /login to sign in again.",
+                   "Not logged in. Run claude auth login to authenticate."):
+        assert ps.classify_screen(screen) == "logged_out", screen
+
+
+def test_logged_out_inside_a_live_tui_frame_is_still_logged_out():
+    # The real failure was a logged-out message rendered INSIDE a live composer frame — which is
+    # exactly why it read as a normal idle prompt and got typed into.
+    screen = ("╭───────────────────────────────╮\n"
+              "│ Not logged in · Please run /login │\n"
+              "╰───────────────────────────────╯\n"
+              "❯ \n")
+    assert ps.classify_screen(screen) == "logged_out"
+
+
+def test_logged_out_beats_busy_and_is_never_typed_into():
+    # If a stale generation footer is still on screen under a logged-out banner, refuse. 'busy' is
+    # a SAFE-TO-SEND state (Claude queues input); sending into dead auth is the thing to prevent.
+    screen = "Not logged in · Please run /login\n✻ Thinking… (esc to interrupt)"
+    assert ps.classify_screen(screen) == "logged_out"
+
+
+def test_dead_still_beats_logged_out():
+    # A logged-out line scrolled into a dead bash pane must stay DEAD: typing there would run the
+    # nudge as a permission-bypassed shell command (RC-DEADPANE), the worst outcome on the table.
+    assert ps.classify_screen("Not logged in · Please run /login\nwilliam@mac probe % ") == "dead"
+    assert ps.classify_screen("Not logged in · Please run /login", exited_marker=True) == "dead"
+
+
+# --- at_dialog (i280: a worker at its own AskUserQuestion dialog read as 'frozen' -> false park) ---
+
+def test_real_askuserquestion_dialog_is_at_dialog():
+    # REAL capture: Claude Code driven to call AskUserQuestion in a live cmux pane.
+    assert ps.classify_screen(_screen("claude-askuserquestion-dialog.txt")) == "at_dialog"
+
+
+def test_real_trust_dialog_stays_menu_not_at_dialog():
+    # REAL capture of the folder-trust prompt. This is the boundary the issue draws: a genuine
+    # menu keeps its exact current classification. Note it carries NO 'do you want to' and NO
+    # 'do you trust' — it is caught only by the numbered-cursor pattern, and its footer
+    # ('Enter to confirm · Esc to cancel') is near-identical to the question dialog's. Any
+    # at_dialog rule defined by EXCLUDING known permission wording would mis-read this as a
+    # question. That is why at_dialog is anchored on positive, AskUserQuestion-only markers.
+    assert ps.classify_screen(_screen("claude-trust-folder.txt")) == "menu"
+
+
+def test_at_dialog_markers_are_the_askuserquestion_only_rows():
+    # The two rows the real dialog always renders and no permission menu ever does: the free-text
+    # 'Other' row (placeholder "Type something.") and the 'Chat about this' escape row. Both are
+    # stable literals in the 2.1.211 bundle.
+    assert ps.classify_screen("Which colour?\n❯ 1. Red\n  2. Blue\n  3. Type something.\n"
+                              "Enter to select · ↑/↓ to navigate · Esc to cancel") == "at_dialog"
+    assert ps.classify_screen("Pick one\n❯ 1. A\n  2. B\n  4. Chat about this\n"
+                              "Enter to select · Esc to cancel") == "at_dialog"
+
+
+def test_at_dialog_is_distinct_from_frozen_and_from_menu():
+    # The DoD's core ask: at_dialog is its own state. A live session waiting on an in-window
+    # question is neither dead, nor frozen, nor a permission menu.
+    state = ps.classify_screen(_screen("claude-askuserquestion-dialog.txt"))
+    assert state not in ("frozen", "menu", "dead", "idle", "busy")
+
+
+def test_ordinary_menus_and_prompts_are_unchanged():
+    # Regression fence around the boundary "do not change refusal behavior for genuine menus".
+    assert ps.classify_screen("❯ 1. Yes  2. No   (Enter to confirm · Esc to cancel)") == "menu"
+    assert ps.classify_screen("Do you want to proceed?\n❯ 1. Yes\n  2. No") == "menu"
+    assert ps.classify_screen("Continue? (y/n)") == "menu"
+
+
+def test_orchestrator_surface_stays_fail_closed_on_a_dialog():
+    # The orchestrator surface fails CLOSED by design (review A5): every ambiguous selection screen
+    # defers as 'menu'. at_dialog is a worker-surface signal and must not weaken that.
+    assert ps.classify_screen(_screen("claude-askuserquestion-dialog.txt"),
+                              orchestrator=True) == "menu"
+
+
+def test_new_states_require_the_claude_agent_path():
+    # Mirrors the existing Codex-leak fence: Claude-specific labels must not appear for agent=codex.
+    for screen in ("Not logged in · Please run /login",
+                   _screen("claude-askuserquestion-dialog.txt")):
+        assert ps.classify_screen(screen, agent="codex") not in ("logged_out", "at_dialog")

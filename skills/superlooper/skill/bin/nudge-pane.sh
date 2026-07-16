@@ -18,6 +18,17 @@
 #   3 = DEFERRED (pane at a menu / ambiguous / unreadable / Codex attention prompt). Caller retries later.
 #   4 = DEAD (the Claude process is gone; the pane is a bash shell). Caller RESTARTS — it must
 #       NEVER type, or the message would run as a permission-bypassed shell command (RC-DEADPANE).
+#   5 = LOGGED OUT (issue #151). Auth died in-process: the TUI is alive but every turn is refused.
+#       Nothing was typed. Caller ALERTS THE OWNER — it must not retry (a nudge cannot be answered)
+#       and must not restart (the relaunch re-enters dead auth). Was 94 min of typing into a dead
+#       pane when this looked like plain 'idle'.
+#   6 = AT DIALOG (issue #151). The session raised its OWN question (AskUserQuestion) and is waiting
+#       on an answer. Nothing was typed. This is a LIVE, working session — the caller must surface
+#       it, not escalate it; treating it as frozen false-parked a working lane.
+#
+# 5 and 6 are both REFUSALS, exactly like 3 — they differ only in telling the caller WHY, which is
+# the whole point: the old single "deferred" code made a dead-auth pane, a session asking a
+# question, and a genuine menu indistinguishable, so the runner treated all three as "stuck".
 set -uo pipefail
 SURF="${1:?usage: nudge-pane.sh <surface> <id> <message>}"
 ID="${2:?usage: nudge-pane.sh <surface> <id> <message>}"
@@ -71,6 +82,8 @@ PY
 
 case "$STATE" in
   dead) echo "[nudge] $ID pane is DEAD — not typing; caller must restart" >&2; exit 4 ;;
+  logged_out) echo "[nudge] $ID session is LOGGED OUT in-window — not typing; caller must alert the owner" >&2; exit 5 ;;
+  at_dialog) echo "[nudge] $ID session is asking a question in-window — not typing; live, not stuck" >&2; exit 6 ;;
   menu) echo "[nudge] $ID pane at a menu/ambiguous — deferring" >&2; exit 3 ;;
   trust_blocked) echo "[nudge] $ID Codex pane is waiting for directory trust — deferring" >&2; exit 3 ;;
   permission_blocked) echo "[nudge] $ID Codex pane is waiting for permission approval — deferring" >&2; exit 3 ;;

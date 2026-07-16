@@ -216,6 +216,15 @@ ALERT_MESSAGES = {
 
 
 def _alert_message(reason):
+    if isinstance(reason, str) and reason.startswith("session_logged_out:"):
+        iid = reason.split(":", 1)[1]
+        return (f"{iid}'s session is logged OUT in-window ('Not logged in · Please run /login') — "
+                "its auth died mid-run, so the CLI is still up but every turn is refused. The loop "
+                "will NOT nudge it (a nudge cannot be answered) and will NOT relaunch it (the "
+                "relaunch would re-enter dead auth); the lane is held as-is for you. Known from the "
+                "2026-07-14 night: running /login INSIDE the wedged window did not stick — closing "
+                "the window and starting a fresh session did. The alert clears by itself once the "
+                "lane reads healthy again.")
     if isinstance(reason, str) and reason.startswith("park_label_stuck:"):
         iid = reason.split(":", 1)[1]
         return (f"{iid} handed back to the owner but its label move has been failing for "
@@ -785,6 +794,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # issue the owner has CLOSED on GitHub (fresh proof): its stuck label is moot — absorb_close
         # settles it this same tick — so a "label stuck" text as the owner drops it is pure noise (#108
         # review P2). gh_stale keeps this fail-SAFE: an unproven close never suppresses a real alert.
+        # A session whose auth died IN-PROCESS (issue #151 / i336). The runner senses this from the
+        # pane and records it; only the owner can fix it, so it is alert-worthy the moment it is
+        # seen. It rides the same durable-marker discipline as every reason here: it stands while
+        # the state is on disk and auto-clears when the lane reads healthy again.
+        if ist_of(iid).get("sensed_state") == "logged_out":
+            reasons.append(f"session_logged_out:{iid}")
         stamped = ist_of(iid).get("park_notify_at")
         being_absorbed = not gh_stale and _iid_num(iid) in closed_nums
         if (not being_absorbed
@@ -1239,6 +1254,18 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         if iid in frozen_ids or status == "frozen":
             if in_wake_grace:
                 continue                               # wake grace: hold the recovery ladder (issue #42)
+            # The lane looks frozen by the clock, but the runner has SENSED why (issue #151), and
+            # in both of these cases the ladder is the wrong tool:
+            #   logged_out (i336) — a nudge cannot be answered by a session whose auth is dead, and
+            #     a relaunch just re-enters dead auth. Alerted above; held for the owner.
+            #   at_dialog (i280) — the session is ALIVE and asking something in-window. It went
+            #     quiet because it is waiting on a human, which is not a fault. Nudging it cannot
+            #     help (a stray Enter would only pick an option), and marching the ladder on is
+            #     what false-parked a working lane.
+            # Neither is silent: both are journaled by the executor's outcome, and logged_out
+            # carries an ALERT. This suppresses the LADDER, not the sensing.
+            if ist.get("sensed_state") in ("logged_out", "at_dialog"):
+                continue
             if type(retries) is not int:
                 park(iid, num, "frozen, and the retry counter is unreadable — parking",
                      cause="frozen_cap")
