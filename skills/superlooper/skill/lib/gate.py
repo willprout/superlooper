@@ -40,7 +40,11 @@ INVESTIGATION_MARKER = "<!-- superlooper-investigation -->"
 # worker just posted, so it reposts it and parks: a false-park loop with no way out. Recognising
 # the marker and rejecting only the PIN lets the gate say "repin this", which is the truth and is
 # actionable. (Fresh-review finding, P1-3.)
-_REVIEW_MARKER_RE = re.compile(r"<!--\s*superlooper-review\b([^\n]*?)-->", re.IGNORECASE)
+# The payload must be separated by WHITESPACE (or absent entirely). `\b` would match before a
+# hyphen too, so `<!-- superlooper-review-notes sha=<head> -->` — a sibling in the `<!-- superlooper-`
+# marker family — parsed as a full verdict: fail-OPEN on the one property this module exists to
+# protect. (Second fresh review, P2-a.)
+_REVIEW_MARKER_RE = re.compile(r"<!--\s*superlooper-review(\s[^\n]*?)?-->", re.IGNORECASE)
 _REVIEW_PIN_RE = re.compile(r"\bsha\s*=\s*(\S+)", re.IGNORECASE)
 # A readable git oid. Abbreviations are honored (a worker reaches for `git rev-parse --short
 # HEAD`); 7 hex is git's own default abbreviation and identifies a commit unambiguously on a
@@ -130,7 +134,9 @@ def _review_pins(comments):
         if isinstance(body, str):
             m = _REVIEW_MARKER_RE.match(body.lstrip())
             if m:
-                pin = _REVIEW_PIN_RE.search(m.group(1))
+                # group(1) is None for the payload-less `<!-- superlooper-review-->`; `or ""` keeps
+                # that from raising into the tick (a corrupt input must never except — module rule)
+                pin = _REVIEW_PIN_RE.search(m.group(1) or "")
                 out.append(pin.group(1) if pin else None)
     return out
 

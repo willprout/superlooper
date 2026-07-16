@@ -138,16 +138,21 @@ unless you specifically want this build-vs-investigation split.)
 **Review is always mechanically gated, and pinned to the diff it reviewed.** On a repo with its own
 pipeline (`ship_cmd` set), that pipeline owns review. On a repo without one, the gate refuses to
 merge until a fresh agent that wrote none of the code posts a review verdict as a PR comment
-beginning `<!-- superlooper-review sha=<reviewed head oid> -->` — in practice
-`<!-- superlooper-review sha=$(git rev-parse HEAD) -->`, posted after the last push. The `sha=`
-names the commit the reviewer actually saw, and the gate honors the verdict only while the PR's
-head still matches it (a 7+ hex abbreviation is fine). A verdict for a superseded diff stops
-counting: when a PR is rebuilt or pushed to again, the old verdict no longer merges the new code,
-and the worker is nudged to re-review what is on the PR now. The runner's own mechanical
-merge-update is the one head move that carries a verdict forward — it merges the dev branch in
-without touching the authored diff (and `ship_recheck_cmd` plus CI still re-run on the result).
-An unpinned legacy marker (`<!-- superlooper-review -->`, no `sha=`) cannot prove which diff it
-reviewed and so never satisfies the gate — it fails closed to the same nudge-then-park.
+beginning `<!-- superlooper-review sha=REVIEWED_HEAD_OID -->`, posted after the last push, with
+`REVIEWED_HEAD_OID` replaced by the oid `git rev-parse HEAD` then prints — **pasted in literally**.
+Do not write `sha=$(git rev-parse HEAD)`: a body containing `<!--` and `-->` wants single quotes,
+and single quotes do not expand `$(...)`, so the marker would carry unexpanded text and pin
+nothing. The `sha=` names the commit the reviewer actually saw, and the gate honors the verdict
+only while the PR's head still matches it (a 7+ hex abbreviation is fine). A verdict for a
+superseded diff stops counting: when a PR is rebuilt or pushed to again, the old verdict no longer
+merges the new code, and the worker is nudged to re-review what is on the PR now. The merge itself
+is pinned to the same oid (`--match-head-commit`), so a push that races the gate is refused rather
+than merged unreviewed. The runner's own mechanical merge-update is the one head move that carries
+a verdict forward — it merges the dev branch in without touching the authored diff, and only when
+the worktree really was at the reviewed head.
+A marker with no readable pin — the legacy `<!-- superlooper-review -->` form, a placeholder left
+unsubstituted, an unexpanded `$(...)` — cannot prove which diff it reviewed and so never satisfies
+the gate; it fails closed to a nudge asking for a repin, then park.
 Either way, no code merges unreviewed — and the reviewer is never the author.
 
 **Adding browser evidence (web/UI repos) — opt-in.** The default `report_required_sections` asks only

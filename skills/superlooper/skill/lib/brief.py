@@ -84,8 +84,9 @@ _SHIP_NO_CMD = ("Get a fresh-agent review of your diff (an agent that wrote none
                 f"`{gate.pinned_review_marker()}`, naming what was reviewed and the P0/P1 outcome "
                 "— the runner mechanically refuses to merge without that comment. Replace "
                 f"{gate.REVIEW_PIN_PLACEHOLDER} with the oid `git rev-parse HEAD` prints after "
-                "your LAST push, pasted in literally (a `$(...)` inside `gh pr comment --body "
-                "'...'` is not expanded, and the gate reads the unexpanded text as no verdict). "
+                "your LAST push, pasted in literally — run it and paste the oid, because a shell "
+                "substitution is NOT expanded inside a single-quoted `gh pr comment --body` and "
+                "the gate reads the unexpanded text as no verdict. "
                 "The pin names the commit that was reviewed, so a verdict for a superseded diff "
                 "does not count: if you push again, get the new diff reviewed and post a verdict "
                 "pinned to the new head.")

@@ -139,8 +139,9 @@ its conflict IN PLACE, in this worktree on branch `{branch}`.
 2. Run the tests; fix what the merge broke.
 3. Get a fresh-agent review of the RESOLVED diff (an agent that wrote none of it) and post its
    verdict as a PR comment BEGINNING `{review_marker}` — post it AFTER your final push, and
-   replace {pin_placeholder} with the oid `git rev-parse HEAD` then prints (paste the literal
-   oid; `gh pr comment --body '...'` will not expand a `$(...)`). The gate ignores the
+   replace {pin_placeholder} with the oid `git rev-parse HEAD` then prints — run it and paste the
+   oid in, because a shell substitution is NOT expanded inside a single-quoted
+   `gh pr comment --body` and the unexpanded text pins nothing. The gate ignores the
    pre-conflict verdict already on this PR: it reviewed a different diff.
 4. Rewrite your report at {report_path} with the required sections ({report_sections}) — the
    full ship gate re-runs on this PR from scratch.
@@ -2320,7 +2321,17 @@ class Runner:
             # reports nonzero (a network drop after the ref update): the head moves on GitHub, no
             # carry exists, and step 2b sits ABOVE the update retry — so the gate parks on
             # `review_stale` before the retry could heal it. (Fresh-review finding, P0-1 related.)
-            self._update_issue(iid, {"review_carry": self._review_carry(iid, head, pre, wt)})
+            #
+            # ...and only ever WRITE a carry we actually computed. An unconditional write lets a
+            # `None` overwrite a CORRECT carry on the retry after a failed push: the worktree is
+            # already merged by then, so `pre` is the merged oid rather than the head the gate
+            # judged, `_review_carry` declines, and the wipe re-opens the same false-park through
+            # a different door. Never wiping is safe — a stale {from: A, to: C} can only fire if
+            # the head becomes exactly C, and only that merge can produce C, so the claim holds.
+            # (Second fresh review, P1.)
+            carry = self._review_carry(iid, head, pre, wt)
+            if carry:
+                self._update_issue(iid, {"review_carry": carry})
             if gitops.plain_push(wt):
                 self._update_issue(iid, {"update_result": "clean", "update_head_oid": head,
                                          "update_errors": 0})

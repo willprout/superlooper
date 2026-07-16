@@ -1630,7 +1630,7 @@ def test_update_carry_refuses_when_the_worktree_is_not_at_the_reviewed_head(rig,
     seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
     _clean_update(monkeypatch, OID_C, pre_head=OID_B)      # worktree sits on B, gate judged A
     rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}, NOW)
-    assert issue_state(rig, "i5")["review_carry"] is None, \
+    assert issue_state(rig, "i5").get("review_carry") is None, \
         "carried a verdict across a worktree that was never at the reviewed head"
 
 
@@ -1649,13 +1649,40 @@ def test_update_carry_is_recorded_even_when_the_push_reports_failure(rig, monkey
     assert ist["update_result"] == "error"                 # still an infra error -> retried
 
 
+def test_update_retry_after_a_failed_push_never_wipes_a_good_carry(rig, monkeypatch):
+    """Second fresh review, P1 — a false-park the FIRST fix let in through a different door.
+
+    Recording the carry unconditionally means a `None` result OVERWRITES a correct carry:
+      tick 1  worktree at A (reviewed), gate says update(A) -> merge -> carry {A->C} -> push FAILS
+      tick 2  PR head is still A, so the gate judges A again -> update(A). But the worktree is
+              ALREADY merged, so pre = C != A -> _review_carry returns None -> {A->C} is WIPED.
+              This push succeeds; the head becomes C.
+      tick 3  head C, pin A, no carry -> stale -> nudge -> park of correctly-reviewed work.
+
+    Only ever WRITE a carry you actually computed. Never wiping is safe: a stale {A->C} can only
+    fire if the head becomes exactly C, and only that merge can produce C — so the claim is true.
+    """
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    a = {"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}
+
+    _clean_update(monkeypatch, OID_C, pre_head=OID_A, pushed=False)      # tick 1: push fails
+    rig.r._execute(a, NOW)
+    assert issue_state(rig, "i5")["review_carry"] == {"from": OID_A, "to": OID_C}
+
+    # tick 2: the retry re-merges an ALREADY-merged worktree, so pre is C, not the judged head A
+    _clean_update(monkeypatch, OID_C, pre_head=OID_C, pushed=True)
+    rig.r._execute(a, NOW + 1)
+    assert issue_state(rig, "i5")["review_carry"] == {"from": OID_A, "to": OID_C}, \
+        "the retry wiped the carry that vouches for the head it is about to push"
+
+
 def test_update_carry_fails_closed_when_the_new_head_is_unreadable(rig, monkeypatch):
     """No carry beats a guessed one: the gate then asks for a re-review rather than vouching for
     a head the runner could not name."""
     seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
     _clean_update(monkeypatch, None)                    # git could not answer
     rig.r._execute({"act": "update", "id": "i5", "num": 5, "pr": 555, "head_oid": OID_A}, NOW)
-    assert issue_state(rig, "i5")["review_carry"] is None
+    assert issue_state(rig, "i5").get("review_carry") is None
 
 
 def test_update_carry_is_not_recorded_on_a_conflict_or_error(rig, monkeypatch):
@@ -1876,6 +1903,10 @@ def test_resolve_conflict_launches_in_the_prs_own_branch(rig):
     assert out == "ok"
     b = (rig.home / "briefs" / "i123.md").read_text()
     assert "conflict" in b.lower() and "sl/i123-render-the-widget" in b
+    # #154: the resolver re-reviews a RESOLVED diff, so the brief must teach the pinned marker —
+    # rendered from gate, never retyped — and must not teach a `$(...)` gh will not expand.
+    assert runner_mod.gate.pinned_review_marker() in b
+    assert "$(" not in b, "the conflict brief tells the worker to post a substitution"
     assert "force" not in [w for w in b.lower().split() if w == "force"] or "never force" in b.lower()
     close_idx = next((i for i, c in enumerate(rig.calls) if "close-surface" in c["args"]), None)
     launch_idx = next((i for i, c in enumerate(rig.calls)

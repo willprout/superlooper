@@ -203,6 +203,19 @@ def test_review_evidence_malformed_pin_is_unpinned_never_absent():
         assert gate.review_evidence_ok(_cfg(), c, HEAD) is False, bad
 
 
+def test_review_evidence_a_sibling_marker_is_not_a_verdict():
+    """Second fresh review, P2-a. Loosening the marker match to diagnose bad pins must not loosen
+    WHICH marker counts: `<!-- superlooper-` is a family prefix, and a sibling must never vouch for
+    a diff. The payload has to be whitespace-separated, or `superlooper-review-notes` reads as a
+    full verdict — fail-OPEN on the one property this module protects."""
+    for name in ("superlooper-review-notes", "superlooper-reviewer", "superlooper-review2"):
+        c = [{"body": f"<!-- {name} sha={HEAD} --> not a verdict"}]
+        assert gate.review_evidence_state(_cfg(), c, HEAD) == "absent", name
+    # ...while the payload-less real marker still parses (and never raises on a None payload)
+    assert gate.review_evidence_state(_cfg(), [{"body": "<!-- superlooper-review-->"}],
+                                      HEAD) == "unpinned"
+
+
 def test_review_evidence_a_marker_among_junk_pins_still_reads_stale_not_unpinned():
     """A readable pin that simply doesn't match is STALE (re-review the current diff); only the
     total absence of a readable pin is UNPINNED. Mixing the two must not mask a real stale pin."""
@@ -229,6 +242,23 @@ def test_no_engine_source_retypes_the_review_marker_by_hand():
     assert not offenders, (
         "these render the review marker by hand instead of gate.pinned_review_marker():\n  "
         + "\n  ".join(offenders))
+
+
+def test_no_worker_facing_text_tells_a_worker_to_post_a_substitution():
+    """Second fresh review, P2-b: ADOPTING.md went on teaching `sha=$(git rev-parse HEAD)` after
+    the fix round declared that form broken, because the *.py guard above could not see it.
+
+    A file-wide grep is the wrong instrument — it cannot tell teaching the form from WARNING
+    against it, and prose must stay free to say "do not write `sha=$(...)`". So guard the
+    ARTIFACTS a worker actually receives instead: a worker who obeys a `$(...)` posts it
+    unexpanded, pins nothing, and earns a nudge it cannot satisfy by obeying (the P1-3 loop).
+    The brief's own half of this lives in test_brief.py, over brief.build()'s real output."""
+    import actions
+    for key, text in actions.NUDGE_MESSAGES.items():
+        assert "$(" not in text, f"nudge {key!r} tells the worker to post a substitution"
+    # ...and the two review nudges still teach the real marker, from the one source of truth
+    for key in ("review", "review_stale"):
+        assert gate.pinned_review_marker() in actions.NUDGE_MESSAGES[key]
 
 
 def test_review_marker_taught_everywhere_is_the_marker_the_gate_parses():

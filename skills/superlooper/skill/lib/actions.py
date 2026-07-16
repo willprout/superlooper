@@ -188,9 +188,10 @@ NUDGE_MESSAGES = {
                     "fresh agent and post a verdict pinned to the current head: a PR comment "
                     f"BEGINNING `{gate.pinned_review_marker()}`, where "
                     f"{gate.REVIEW_PIN_PLACEHOLDER} is the literal oid `git rev-parse HEAD` "
-                    "prints after your last push — paste the oid itself, since `gh pr comment "
-                    "--body '...'` will not expand a `$(...)`. The runner will not merge code "
-                    "that nothing vouches for.",
+                    "prints after your last push — run it, then paste the oid in. A shell "
+                    "substitution is NOT expanded inside a single-quoted `gh pr comment --body`, "
+                    "and the unexpanded text pins nothing. The runner will not merge code that "
+                    "nothing vouches for.",
     "checks": "A required check failed on your PR. Investigate the failure, fix it, and push — "
               "the gate re-runs automatically.",
     "investigation": "Post your root-cause report as an issue comment BEGINNING "
