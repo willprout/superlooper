@@ -176,6 +176,33 @@ def test_delivered_launch_succeeds_and_records_liveness(tmp_path):
     assert (run_root / "worktrees" / "i1").is_dir(), "the issue worktree must exist"
 
 
+def test_relaunch_clears_the_dead_sessions_mailbox_and_clock_but_keeps_receipts(tmp_path):
+    # Issue #148. The Stop hook gave each worker two new per-id markers, so they join the same
+    # restart hygiene as report/blocked/exited/awaiting:
+    #   * mail was addressed to the session that just DIED. A fresh session would consume a
+    #     stranger's instruction as its own — and the hook's delivery is unconditional.
+    #   * the progress clock is what a probe ladder reads to tell "made progress" from "took a
+    #     turn"; a stale one lets a relaunched session that has never rested look like it stamped.
+    # Delivery RECEIPTS are history, not run-state, and must survive the restart.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    mail_dir = run_root / "state" / "mail"
+    mail_dir.mkdir(parents=True)
+    (mail_dir / "i1").write_text("a dead session's instruction")
+    receipt = mail_dir / "i1.consumed.1700000000"
+    receipt.write_text("what was really delivered last run")
+    status_dir = run_root / "state" / "status"
+    status_dir.mkdir(parents=True)
+    (status_dir / "i1.json").write_text('{"head": "deadbeef", "ts": 1}')
+
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver")
+
+    assert r.returncode == 0, f"expected success, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert not (mail_dir / "i1").exists(), "a dead session's mail must not be inherited"
+    assert not (status_dir / "i1.json").exists(), "a stale progress clock must not survive relaunch"
+    assert receipt.read_text() == "what was really delivered last run", \
+        "delivery receipts are the record of what happened — a restart must not erase them"
+
+
 def test_dropped_keystrokes_fail_loudly_without_fabricating_liveness(tmp_path):
     # THE overnight killer: tab created, keystrokes never delivered (locked Mac).
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)

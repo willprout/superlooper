@@ -1,0 +1,603 @@
+"""Issue #148 — the Claude worker Stop hook is the runner's in-process embassy, not just a clock.
+
+Three duties, each proven here by driving the REAL bash hook against a REAL git worktree and a
+real temp state home (the rig test_hooks.py established):
+
+  1. REPORT HARVEST  — i280 and i328 both wrote their report to a worktree-relative path on the
+     same day and the queue stalled two hours on i328. If the canonical reports/<id>.md is absent
+     and a report sits under the worker's cwd, the hook moves it.
+  2. PROGRESS CLOCK  — state/status/<id>.json each turn end (HEAD, dirty, report/blocked markers),
+     so the runner can tell "made progress" from "took a turn" (what lets a probe ladder escape
+     i328's infinite loop).
+  3. MAILBOX         — state/mail/<id> is consumed, blocks the stop, comes back as the
+     continuation reason, and leaves a .consumed.<ts> receipt as delivery proof. Zero keystrokes.
+
+Codex is NOT in scope (its Stop is notify-only, spike verdict) — test_hooks.py pins that its
+behavior is unchanged. The Claude-only fence is asserted here too.
+"""
+import json
+import os
+import shutil
+import subprocess
+
+import pytest
+
+HERE = os.path.dirname(__file__)
+REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
+STOP_HOOK = os.path.join(REPO_ROOT, "skill", "bin", "stop-hook.sh")
+
+ISSUE = "i7"
+REPORT_TEXT = "## Tests\nthe suite is green\n\n## Screenshot evidence\nn/a\n\n## Review\nclean\n"
+
+
+# --------------------------- the rig ---------------------------
+
+def _git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
+                          timeout=30, check=True).stdout.strip()
+
+
+def _worktree(path):
+    """A real git repo standing in for the worker's worktree. Returns its HEAD sha."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True, timeout=30,
+                   capture_output=True)
+    _git(path, "config", "user.email", "worker@example.invalid")
+    _git(path, "config", "user.name", "Worker")
+    (path / "seed.txt").write_text("seed\n")
+    _git(path, "add", "seed.txt")
+    _git(path, "commit", "-qm", "seed")
+    return _git(path, "rev-parse", "HEAD")
+
+
+def _state_home(tmp_path):
+    root = tmp_path / "run"
+    (root / "state").mkdir(parents=True)
+    return root
+
+
+def _payload(cwd, *, stop_hook_active=False):
+    # The documented Claude Stop payload (code.claude.com/docs/en/hooks).
+    return {
+        "session_id": "sess-1",
+        "transcript_path": "/tmp/transcript.jsonl",
+        "cwd": str(cwd),
+        "permission_mode": "bypassPermissions",
+        "hook_event_name": "Stop",
+        "stop_hook_active": stop_hook_active,
+        "last_assistant_message": "Done.",
+    }
+
+
+def _stop(run_root, cwd, *, stop_hook_active=False, agent="claude", spawn_cwd=None,
+          payload=None):
+    blob = json.dumps(_payload(cwd, stop_hook_active=stop_hook_active)
+                      if payload is None else payload)
+    env = {**os.environ, "SL_ISSUE_ID": ISSUE, "SL_RUN_ROOT": str(run_root), "SL_AGENT": agent}
+    return subprocess.run(["bash", STOP_HOOK], input=blob, env=env, capture_output=True,
+                          text=True, timeout=60, cwd=spawn_cwd)
+
+
+def _status(run_root):
+    return json.loads((run_root / "state" / "status" / f"{ISSUE}.json").read_text())
+
+
+def _decision(result):
+    """The hook speaks to Claude ONLY through JSON on stdout. No JSON == let the stop proceed."""
+    out = result.stdout.strip()
+    return json.loads(out) if out else None
+
+
+def _mailbox(run_root):
+    d = run_root / "state" / "mail"
+    return sorted(p.name for p in d.iterdir()) if d.exists() else []
+
+
+def _receipts(run_root, kind="consumed"):
+    d = run_root / "state" / "mail"
+    if not d.exists():
+        return []
+    return sorted(p for p in d.iterdir() if (".%s." % kind) in p.name)
+
+
+def _put_mail(run_root, text):
+    box = run_root / "state" / "mail"
+    box.mkdir(parents=True, exist_ok=True)
+    (box / ISSUE).write_text(text)
+    return box / ISSUE
+
+
+# --------------------------- duty 1: report harvest ---------------------------
+
+def test_worktree_relative_report_is_harvested_to_the_canonical_path(tmp_path):
+    # The i280/i328 mistake exactly: the report written relative to the worktree, so the runner
+    # (which reads state_home/reports/<id>.md) never sees it and the queue stalls.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(REPORT_TEXT)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    canonical = run_root / "reports" / f"{ISSUE}.md"
+    assert canonical.exists(), "an absent canonical report must be rescued from the worker cwd"
+    assert canonical.read_text() == REPORT_TEXT
+    assert not stray.exists(), "the harvest MOVES — a leftover would re-harvest forever"
+
+
+def test_bare_report_at_the_cwd_root_is_harvested(tmp_path):
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    (wt / f"{ISSUE}.md").write_text(REPORT_TEXT)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert (run_root / "reports" / f"{ISSUE}.md").read_text() == REPORT_TEXT
+
+
+def test_an_existing_canonical_report_is_never_clobbered(tmp_path):
+    # The canonical report is the worker's real deliverable; a stale worktree copy must not win.
+    run_root = _state_home(tmp_path)
+    (run_root / "reports").mkdir()
+    canonical = run_root / "reports" / f"{ISSUE}.md"
+    canonical.write_text("## Tests\nthe real report\n")
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("## Tests\na stale draft\n")
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert canonical.read_text() == "## Tests\nthe real report\n"
+    assert stray.exists(), "with the canonical report present the hook must not touch the worktree"
+
+
+def test_an_empty_report_is_not_harvested(tmp_path):
+    # A touched/half-written file is not a report; harvesting it would fire session_finished on
+    # nothing and the gate would read an empty deliverable.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("   \n")
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+
+
+def test_a_symlinked_report_is_never_harvested(tmp_path):
+    # Harvesting MOVES the link itself, so the canonical report would BECOME a symlink to whatever
+    # it points at — and the runner reads the canonical report and posts it.
+    # The target sits INSIDE the worktree deliberately: a target outside would be refused by the
+    # containment check, and this test would pass while proving nothing about the islink fence.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    inside = wt / "notes.md"
+    inside.write_text("private working notes, not a report")
+    (wt / "reports").mkdir()
+    (wt / "reports" / f"{ISSUE}.md").symlink_to(inside)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists(), \
+        "the canonical report must never become a symlink to some other file"
+    assert inside.read_text() == "private working notes, not a report"
+
+
+def test_a_symlinked_reports_dir_cannot_drag_a_file_out_of_another_directory(tmp_path):
+    # The subtler one: the FILE is real, its PARENT is the link. Following it would move a file out
+    # of a directory that has nothing to do with this worker.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    elsewhere = tmp_path / "someone-elses-dir"
+    elsewhere.mkdir()
+    victim = elsewhere / f"{ISSUE}.md"
+    victim.write_text("## Tests\nnot this worker's file\n")
+    (wt / "reports").symlink_to(elsewhere)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert victim.exists(), "the hook must never move a file that resolves outside the worker cwd"
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+
+
+def test_harvest_refuses_when_git_cannot_say_whether_the_file_is_tracked(tmp_path):
+    # Fail CLOSED in the destructive direction. With git unavailable the hook cannot tell a stray
+    # report from one the worker COMMITTED — and moving a committed file leaves a deletion in the
+    # branch under review. A missed rescue stalls a queue; a wrong move destroys work.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(REPORT_TEXT)
+    # A PATH carrying everything the hook needs EXCEPT git — the honest shape of "git is missing",
+    # rather than an empty PATH (which would just fail to find bash and prove nothing).
+    nogit = tmp_path / "nogit-bin"
+    nogit.mkdir()
+    # `dirname` matters: the hook resolves its own lib through it. Omit it and the hook silently
+    # degrades to the activity-only fallback — the harvest would never even be attempted and this
+    # test would pass while proving nothing.
+    for tool in ("bash", "python3", "date", "mkdir", "cat", "dirname"):
+        real = shutil.which(tool)
+        if real:
+            (nogit / tool).symlink_to(real)
+    assert shutil.which("git", path=str(nogit)) is None, "the rig must really hide git"
+    env = {**os.environ, "SL_ISSUE_ID": ISSUE, "SL_RUN_ROOT": str(run_root), "SL_AGENT": "claude",
+           "PATH": str(nogit)}
+    r = subprocess.run([str(nogit / "bash"), STOP_HOOK], input=json.dumps(_payload(wt)), env=env,
+                       capture_output=True, text=True, timeout=60)
+
+    assert r.returncode == 0, r.stderr
+    # The clock proves worker_hook.py really RAN — without it, "the stray survived" would just mean
+    # the hook no-opped.
+    assert _status(run_root)["head"] is None, "the harness must have run, with git unavailable"
+    assert stray.exists(), "unknown tracked-state must refuse the move"
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+
+
+def test_harvest_refuses_when_the_git_index_is_corrupt(tmp_path):
+    # The subtle half of the fence. `git ls-files --error-unmatch` says "untracked" with rc=1, but
+    # FAILS with rc=128 — and an unreadable index is rc=128. `rev-parse --is-inside-work-tree`
+    # cannot rescue that: it never reads the index, so it still answers "true". Read the rc, not
+    # just "non-zero", or a committed report gets ripped out of the branch under review.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(REPORT_TEXT)
+    _git(wt, "add", "reports")
+    _git(wt, "commit", "-qm", "tracked report")
+    (wt / ".git" / "index").write_bytes(b"GARBAGE")   # git can no longer answer "is it tracked?"
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert _status(run_root)["ts"], "the harness must really have run"
+    assert stray.exists(), "git could not answer — the move must be refused, not guessed"
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+
+
+def test_a_report_in_a_plain_non_git_cwd_is_still_harvested(tmp_path):
+    # The other side of that fence: git ran and said "not a work tree". There is no branch to
+    # damage, so the rescue must still happen — refusing everything would be over-correcting.
+    run_root = _state_home(tmp_path)
+    plain = tmp_path / "plain"
+    (plain / "reports").mkdir(parents=True)
+    (plain / "reports" / f"{ISSUE}.md").write_text(REPORT_TEXT)
+
+    r = _stop(run_root, plain)
+
+    assert r.returncode == 0, r.stderr
+    assert (run_root / "reports" / f"{ISSUE}.md").read_text() == REPORT_TEXT
+
+
+def test_a_git_tracked_file_is_never_harvested(tmp_path):
+    # Safety fence: harvesting MOVES the file. A report the worker committed is repo content —
+    # ripping it out of the worktree would leave a deletion in the branch under review.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(REPORT_TEXT)
+    _git(wt, "add", "reports")
+    _git(wt, "commit", "-qm", "tracked report")
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert stray.exists(), "a tracked file must stay in the worktree"
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+
+
+# --------------------------- duty 2: the progress clock ---------------------------
+
+def test_status_clock_stamps_head_and_a_clean_tree(tmp_path):
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    head = _worktree(wt)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    st = _status(run_root)
+    assert st["id"] == ISSUE
+    assert st["head"] == head, "HEAD is the progress signal a ladder reads"
+    assert st["dirty"] is False
+    assert st["report"] is False
+    assert st["blocked"] is False
+    assert isinstance(st["ts"], int)
+
+
+def test_status_clock_sees_a_dirty_tree_and_the_markers(tmp_path):
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    (wt / "seed.txt").write_text("edited\n")
+    (run_root / "reports").mkdir()
+    (run_root / "reports" / f"{ISSUE}.md").write_text(REPORT_TEXT)
+    (run_root / "state" / "blocked").mkdir()
+    (run_root / "state" / "blocked" / ISSUE).write_text("a question")
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    st = _status(run_root)
+    assert st["dirty"] is True
+    assert st["report"] is True
+    assert st["blocked"] is True
+
+
+def test_status_clock_reflects_the_harvest_it_just_did(tmp_path):
+    # Ordering pin: harvest runs BEFORE the stamp, so the clock never says report=false about a
+    # report the same turn just rescued.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(REPORT_TEXT)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert _status(run_root)["report"] is True
+
+
+def test_status_clock_still_stamps_when_the_cwd_is_not_a_git_repo(tmp_path):
+    # Fail-open: no git facts is not a reason to withhold the clock.
+    run_root = _state_home(tmp_path)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    r = _stop(run_root, plain)
+
+    assert r.returncode == 0, r.stderr
+    st = _status(run_root)
+    assert st["head"] is None
+    assert st["dirty"] is None
+
+
+# --------------------------- duty 3: the mailbox ---------------------------
+
+def test_mail_blocks_the_stop_and_comes_back_as_the_continuation_reason(tmp_path):
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    mail = _put_mail(run_root, "CI went red on your PR — look at the failing job.")
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    d = _decision(r)
+    assert d is not None, "mail must block the stop"
+    assert d["decision"] == "block"
+    assert d["reason"] == "CI went red on your PR — look at the failing job."
+    assert not mail.exists(), "delivered mail must leave the inbox"
+
+
+def test_delivery_leaves_a_consumption_receipt_carrying_what_was_delivered(tmp_path):
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    _put_mail(run_root, "look at the failing job")
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    got = _receipts(run_root)
+    assert len(got) == 1, "the runner reads the receipt as delivery proof"
+    assert got[0].name.startswith(f"{ISSUE}.consumed.")
+    assert got[0].read_text() == "look at the failing job"
+
+
+def test_a_delivered_mailbox_does_not_redeliver_on_the_next_rest(tmp_path):
+    # The i328 shape: an unread mailbox that re-injects forever. Consumption is the first guard.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    _put_mail(run_root, "ping")
+
+    first = _stop(run_root, wt)
+    second = _stop(run_root, wt)
+
+    assert _decision(first)["decision"] == "block"
+    assert _decision(second) is None, "a consumed mailbox must not block a second time"
+
+
+def test_stop_hook_active_refuses_to_deliver_so_a_block_cannot_spin(tmp_path):
+    # The bounded re-injection guard the DoD names. stop_hook_active means we are ALREADY inside a
+    # continuation this hook forced; blocking again is how a Stop hook spins forever.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    mail = _put_mail(run_root, "ping")
+
+    r = _stop(run_root, wt, stop_hook_active=True)
+
+    assert r.returncode == 0, r.stderr
+    assert _decision(r) is None, "must not block while a stop-hook continuation is already active"
+    assert mail.exists(), "undelivered mail stays queued — a receipt here would be a false proof"
+    assert _receipts(run_root) == []
+
+
+def test_stop_hook_active_still_stamps_the_clock_and_harvests(tmp_path):
+    # The guard is about BLOCKING only; the file-side duties are idempotent and must still run.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    stray = wt / "reports" / f"{ISSUE}.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(REPORT_TEXT)
+
+    r = _stop(run_root, wt, stop_hook_active=True)
+
+    assert r.returncode == 0, r.stderr
+    assert (run_root / "reports" / f"{ISSUE}.md").exists()
+    assert _status(run_root)["report"] is True
+
+
+def test_an_empty_mailbox_is_silent(tmp_path):
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "", "no mail == no stdout at all; the stop proceeds untouched"
+
+
+def test_a_blank_mail_is_discarded_never_recorded_as_delivered(tmp_path):
+    # A blank mail carries no instruction. Blocking on it would burn a turn saying nothing — but it
+    # must still leave the inbox or it would be retried on every rest. The receipt has to say what
+    # actually happened: a ".consumed" here would be a delivery proof for a delivery that never
+    # occurred, and the runner is told to trust that word.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    mail = _put_mail(run_root, "   \n")
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert _decision(r) is None
+    assert not mail.exists(), "it must leave the inbox or it retries forever"
+    assert _receipts(run_root, "consumed") == [], "nothing was delivered — nothing may say it was"
+    assert len(_receipts(run_root, "discarded")) == 1
+
+
+def test_a_consumed_receipt_is_only_written_after_the_block_reaches_claude(tmp_path):
+    # THE contract of the receipt: .consumed means "Claude was handed this". If the block JSON
+    # cannot be written, the mail must NOT be recorded as delivered — the leftover .claimed is the
+    # honest "in flight, never proven" state a runner may retry.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    _put_mail(run_root, "ping")
+    env = {**os.environ, "SL_ISSUE_ID": ISSUE, "SL_RUN_ROOT": str(run_root), "SL_AGENT": "claude"}
+    # stdout closed: the hook physically cannot deliver.
+    r = subprocess.run(["bash", "-c", 'exec bash "$1" >&-', "_", STOP_HOOK],
+                       input=json.dumps(_payload(wt)), env=env, capture_output=True,
+                       text=True, timeout=60)
+
+    assert r.returncode == 0, "an undeliverable block must still not break the session"
+    assert _receipts(run_root, "consumed") == [], "no delivery happened — no delivery proof"
+    assert len(_receipts(run_root, "claimed")) == 1, "the claim stands as in-flight and unproven"
+
+
+def test_mail_is_bounded_so_a_huge_file_cannot_be_stuffed_into_the_turn(tmp_path):
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    _put_mail(run_root, "x" * 200_000)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    d = _decision(r)
+    assert d["decision"] == "block"
+    assert d["reason"].startswith("x" * 1000)
+    assert "truncated" in d["reason"], "a truncated instruction must SAY it was truncated"
+    # Pinned to the actual bound, not a loose ceiling: 16 KiB of mail + the truncation notice.
+    assert len(d["reason"]) < 16384 + 200, "an unbounded reason would blow the turn's context"
+
+
+# --------------------------- fences, liveness, and cwd safety ---------------------------
+
+def test_the_claude_stop_still_stamps_liveness(tmp_path):
+    # The hook's original duty. A harness that forgets it would make every healthy worker look frozen.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+
+    r = _stop(run_root, wt)
+
+    assert r.returncode == 0, r.stderr
+    assert (run_root / "state" / "activity" / ISSUE).exists()
+
+
+def test_codex_gets_no_mailbox(tmp_path):
+    # Boundary: Codex's Stop is notify-only (it cannot block), so a "delivery" there would be a lie.
+    run_root = _state_home(tmp_path)
+    wt = tmp_path / "worktrees" / ISSUE
+    _worktree(wt)
+    mail = _put_mail(run_root, "ping")
+
+    r = _stop(run_root, wt, agent="codex")
+
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == ""
+    assert mail.exists(), "Codex mail must stay queued for the typed-probe path"
+    assert _receipts(run_root) == []
+
+
+def test_non_worker_sessions_are_untouched(tmp_path):
+    # The hook is registered globally; the answerer and every ad-hoc session must be a strict no-op.
+    wt = tmp_path / "wt"
+    _worktree(wt)
+    env = {k: v for k, v in os.environ.items() if k not in ("SL_ISSUE_ID", "SL_RUN_ROOT")}
+    r = subprocess.run(["bash", STOP_HOOK], input=json.dumps(_payload(wt)), env=env,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("blob", ["", "{", "not json at all", json.dumps([1, 2])])
+def test_malformed_hook_input_never_breaks_the_session(tmp_path, blob):
+    # Fail closed and SILENT: a non-zero exit or stray stdout here would surface as a hook error in
+    # a live worker's TUI on every rest.
+    run_root = _state_home(tmp_path)
+    env = {**os.environ, "SL_ISSUE_ID": ISSUE, "SL_RUN_ROOT": str(run_root), "SL_AGENT": "claude"}
+    r = subprocess.run(["bash", STOP_HOOK], input=blob, env=env, capture_output=True,
+                       text=True, timeout=30)
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
+
+
+def test_the_hook_survives_a_worker_cwd_deleted_underneath_it(tmp_path):
+    # Teardown removes worktrees. A live process whose cwd is unlinked is the pruned-cwd shape from
+    # the 07-15 forensics — the hook must spawn from a safe cwd and still do its file-side duties.
+    run_root = _state_home(tmp_path)
+    doomed = tmp_path / "doomed"
+    doomed.mkdir()
+    env = {**os.environ, "SL_ISSUE_ID": ISSUE, "SL_RUN_ROOT": str(run_root), "SL_AGENT": "claude"}
+    script = f'cd "{doomed}" && rmdir "{doomed}" && exec bash "{STOP_HOOK}"'
+    r = subprocess.run(["bash", "-c", script], input=json.dumps(_payload(doomed)), env=env,
+                       capture_output=True, text=True, timeout=60)
+
+    assert r.returncode == 0, r.stderr
+    st = _status(run_root)
+    assert st["head"] is None, "a vanished worktree has no HEAD — say so rather than crash"
+    assert isinstance(st["ts"], int)
+
+
+def test_mail_still_delivers_when_the_worker_cwd_is_gone(tmp_path):
+    # The mailbox lives in the state home, so it must not depend on the worktree existing at all.
+    run_root = _state_home(tmp_path)
+    doomed = tmp_path / "doomed2"
+    doomed.mkdir()
+    _put_mail(run_root, "your worktree is gone — stop and report")
+    env = {**os.environ, "SL_ISSUE_ID": ISSUE, "SL_RUN_ROOT": str(run_root), "SL_AGENT": "claude"}
+    script = f'cd "{doomed}" && rmdir "{doomed}" && exec bash "{STOP_HOOK}"'
+    r = subprocess.run(["bash", "-c", script], input=json.dumps(_payload(doomed)), env=env,
+                       capture_output=True, text=True, timeout=60)
+
+    assert r.returncode == 0, r.stderr
+    assert _decision(r)["reason"] == "your worktree is gone — stop and report"
