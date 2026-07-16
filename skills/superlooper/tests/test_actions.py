@@ -1278,6 +1278,20 @@ def test_stuck_ack_escalates_immediately_before_the_cap():
     assert only(out, "probe") == []            # escalated, not re-probed
 
 
+def test_corrupt_probe_attempts_fails_closed_to_a_park():
+    # The fail-OPEN-on-wrong-typed defect class: a corrupt probe-attempt counter must NOT read as 0
+    # and re-probe (an unbounded loop). It fails CLOSED to a classified park, like every other cap
+    # counter in the module.
+    for bad in ("3", None, True, [], 3.0):
+        st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(),
+                                              progress_since=NOW - 100000, probe_attempts=bad)}}
+        out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()}),
+                     parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+        parks = only(out, "park")
+        assert len(parks) == 1 and parks[0]["cause"] == "progress_stall", bad
+        assert only(out, "probe") == [], bad
+
+
 def test_awaiting_suppresses_the_probe_ladder():
     # A worker that flagged long background work (awaiting marker) is quiet by contract — never
     # probe it, never park it, exactly as the activity idle-peek already respects awaiting.

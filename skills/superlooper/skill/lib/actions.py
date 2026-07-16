@@ -1465,7 +1465,15 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # STALLED: turns taken, no commit/marker/HEAD change for the whole window.
                 nonce = ist.get("probe_nonce")
                 ack_state = events_mod.parse_ack(acks.get(iid), nonce) if isinstance(nonce, str) else None
-                attempts, _corrupt = _counter(ist, "probe_attempts")
+                attempts, attempts_corrupt = _counter(ist, "probe_attempts")
+                if attempts_corrupt:
+                    # A wrong-typed probe counter means the cap can't be trusted — fail CLOSED to a
+                    # park (the same discipline retries/merge_refusals/answerer_failures hold), never
+                    # re-read it as 0 and re-probe (that is the fail-OPEN-on-wrong-typed defect class).
+                    park(iid, num, f"{iid}: progress-stall park (issue #157) — the probe-attempt "
+                                   f"counter is unreadable (corrupt state), so the bounded ladder "
+                                   f"cannot be trusted; parking for review.", cause="progress_stall")
+                    continue
                 if ack_state == "STUCK" or (type(probe_cap) is int and attempts >= probe_cap):
                     # cap exhausted, OR the worker explicitly asked for help: escalate to a
                     # classified park with a dossier — never an infinite loop, never a false park of

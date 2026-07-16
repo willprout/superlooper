@@ -2410,7 +2410,13 @@ class Runner:
         iid, num = a["id"], a.get("num")
         surface = self._surface(iid)
         if not surface:
-            return "no pane recorded"
+            # No pane to probe. The idle peek could return inertly here (a peek that no-ops costs
+            # nothing), but the PROBE tier is a bounded escalation ladder: returning without
+            # advancing probe_attempts / probe_sent_at would leave decide re-emitting a probe every
+            # tick forever (never escalating — the exact i328 pathology this issue kills). Mirror the
+            # frozen tier: a running lane with no pane is a relaunch case, not a nudge case.
+            self._mark_exited(iid, "progress-stall probe found no pane recorded", now)
+            return "no pane — marked exited for relaunch"
         # Ground truth first (issue #151): a gone worker process can't answer a probe — mark it
         # exited for relaunch instead of typing at a dead pane. Only a DEFINITE 'dead' short-circuits.
         if self._worker_liveness(iid) == "dead":

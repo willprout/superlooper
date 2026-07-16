@@ -1278,6 +1278,16 @@ def test_exec_probe_counts_the_attempt_even_when_delivery_defers(rig):
     assert issue_state(rig, "i5")["probe_attempts"] == 1
 
 
+def test_exec_probe_marks_a_no_pane_lane_exited(rig):
+    # A running lane whose progress clock is live but whose pane marker is gone must NOT no-op: that
+    # would leave decide re-emitting a probe every tick forever (never advancing the cap). Mirror
+    # the frozen tier — mark it exited for relaunch — so the ladder stays bounded.
+    seed_issue(rig, "i5", status="running")
+    out = rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 1}, NOW)
+    assert (rig.home / "state" / "exited" / "i5").exists()
+    assert _probe_calls(rig) == []                              # nothing typed at a paneless lane
+
+
 def test_exec_probe_marks_a_dead_pane_exited(rig):
     # rc 4 = the Claude process is gone; the safe-send primitive refuses to type. The probe must
     # mark the lane exited for relaunch, exactly as the frozen recover does — never type into it.
