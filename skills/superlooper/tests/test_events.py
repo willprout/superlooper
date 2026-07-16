@@ -446,3 +446,61 @@ def test_snapshot_tolerates_wrong_typed_issues_state(tmp_path):
     for bad in (None, [], "junk", {"issues": []}, {"issues": {"i1": "junk"}}):
         snaps = events.snapshot(home, ["i1"], bad, now=1)
         assert snaps[0]["status"] is None and snaps[0]["launched"] is True
+
+
+# --------------------------- the progress clock (issue #157) ---------------------------
+# The probe ladder keys on state/status/<id>.json (worker_hook.stamp_status), NOT on activity
+# staleness — the i328 trap was that each nudge refreshed the very activity stamp the ladder
+# watched, so it could never escalate. progress_signature distills a status snapshot down to the
+# fields that move ONLY on real progress; parse_ack reads the worker's machine-readable reply.
+
+def test_progress_signature_keys_on_head_and_markers_not_dirty():
+    # HEAD, report, blocked are the progress-bearing fields. `dirty` is DELIBERATELY excluded: the
+    # DoD keys on "commit/marker/HEAD change", and a flapping git-lock read (dirty None<->bool)
+    # would otherwise register as false progress and defeat escalation.
+    base = {"id": "i1", "ts": 100, "cwd": "/w", "head": "abc123",
+            "dirty": False, "report": False, "blocked": False}
+    sig = events.progress_signature(base)
+    assert sig is not None
+    assert events.progress_signature({**base, "dirty": True}) == sig      # dirty flip: NOT progress
+    assert events.progress_signature({**base, "head": "def456"}) != sig   # new commit: progress
+    assert events.progress_signature({**base, "report": True}) != sig     # report marker: progress
+    assert events.progress_signature({**base, "blocked": True}) != sig    # blocked marker: progress
+
+
+def test_progress_signature_is_none_without_a_usable_clock():
+    # A missing/empty/wrong-typed clock means the Stop hook never stamped this rest — there is no
+    # progress signal, so the ladder must fall back to the activity tiers rather than invent one.
+    for bad in (None, {}, [], "junk", 5):
+        assert events.progress_signature(bad) is None
+
+
+def test_progress_signature_stable_across_equal_snapshots():
+    a = {"head": "h", "dirty": None, "report": True, "blocked": False, "ts": 1}
+    b = {"head": "h", "dirty": None, "report": True, "blocked": False, "ts": 999}   # only ts moved
+    assert events.progress_signature(a) == events.progress_signature(b)             # ts is not progress
+
+
+def test_parse_ack_reads_a_valid_reply_only_when_the_nonce_matches():
+    assert events.parse_ack("WORKING nonce-42", "nonce-42") == "WORKING"
+    assert events.parse_ack("DONE nonce-42", "nonce-42") == "DONE"
+    assert events.parse_ack("WAITING nonce-42", "nonce-42") == "WAITING"
+    assert events.parse_ack("STUCK nonce-42", "nonce-42") == "STUCK"
+    # a stale nonce (answering an OLD probe) must NOT be read as answering the current one
+    assert events.parse_ack("WORKING nonce-41", "nonce-42") is None
+    assert events.parse_ack("WORKING", "nonce-42") is None                # no nonce at all
+
+
+def test_parse_ack_tolerates_prose_but_rejects_ambiguity():
+    assert events.parse_ack("state: working  nonce=n7  (still on the tests)", "n7") == "WORKING"
+    # the probe message lists all four states; a worker that echoes the menu is ambiguous, not an
+    # ack — return None (keep probing) rather than guessing the first keyword.
+    assert events.parse_ack("one of DONE, WORKING, WAITING, STUCK -> n7", "n7") is None
+    assert events.parse_ack("i was WORKING but now DONE n7", "n7") is None
+
+
+def test_parse_ack_wrong_typed_inputs_never_raise():
+    for text in (None, 5, [], {"x": 1}):
+        assert events.parse_ack(text, "n") is None
+    for nonce in (None, "", 5, []):
+        assert events.parse_ack("WORKING n", nonce) is None

@@ -651,6 +651,145 @@ def test_launch_anchor_and_fail_ids_wrong_typed_never_raise_or_falsely_degrade()
             assert only(out, "alert") == []
 
 
+# =========================== account auth probe before a spend (#159) ===========================
+# The i336 class (forensics U3): a session's auth died in-process and the runner burned 94 minutes
+# nudging a dead-auth pane. The pane 'logged_out' state (#151) catches that AFTER a session is up;
+# THIS gate catches it BEFORE — a fresh launch or a recovery relaunch into DEAD ACCOUNT AUTH would
+# start logged out and waste the spend. The runner hands decide a `claude auth status` + keychain
+# snapshot in disk["auth_probe"] only when a spend is pending; decide HOLDS the spend and ALERTS
+# once on a DEFINITIVE dead reading, and FAILS OPEN on anything unreadable (never freeze the loop
+# on a probe we merely could not run — the #46/#76 dark-meter asymmetry applied to auth).
+
+def _auth_dead():
+    return {"valid": False, "cli": "logged_out", "keychain_present": True,
+            "keychain_mtime": NOW - 3600}
+
+
+def _auth_unknown():
+    return {"valid": None, "cli": "unknown", "keychain_present": True, "keychain_mtime": None}
+
+
+def _auth_ok():
+    return {"valid": True, "cli": "logged_in", "keychain_present": True, "keychain_mtime": NOW - 60}
+
+
+def test_dead_auth_holds_fresh_launch_and_alerts_once():
+    dsk = disk(auth_probe=_auth_dead())
+    out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
+    assert only(out, "launch") == []                       # every fresh launch held
+    assert only(out, "park") == []                         # nothing parked: the queue is intact
+    assert only(out, "relabel") == []                      # agent-ready never stripped
+    a = only(out, "alert")
+    assert len(a) == 1 and a[0]["reasons"] == ["auth_dead"]
+    assert len(only(out, "notify")) == 1                   # exactly one notify (the alert)
+
+
+def test_dead_auth_alert_dedupes_across_ticks():
+    dsk = disk(auth_probe=_auth_dead(), alert={"reasons": ["auth_dead"]})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert only(out, "alert") == [] and not has_notify(out)   # already alerted: no repeat
+    assert only(out, "launch") == []
+
+
+def test_unknown_auth_probe_fails_open_and_launches():
+    dsk = disk(auth_probe=_auth_unknown())
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "launch")) == 1                   # dark probe -> fail open, launch normally
+    assert only(out, "alert") == []
+
+
+def test_valid_auth_probe_launches_normally():
+    dsk = disk(auth_probe=_auth_ok())
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "launch")) == 1 and only(out, "alert") == []
+
+
+def test_absent_auth_probe_launches_normally():
+    # No auth_probe in the view (the runner saw no launch demand, or agent!=claude): fail open.
+    out = decide(parsed_issues=[parsed(5)])
+    assert len(only(out, "launch")) == 1 and only(out, "alert") == []
+
+
+def test_wrong_typed_auth_probe_never_raises_or_falsely_degrades():
+    for bad in (None, "dead", 0, [], {"valid": "no"}, {"valid": 0}, {"valid": None}, {}):
+        dsk = disk(auth_probe=bad)
+        out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+        assert len(only(out, "launch")) == 1, bad          # only a literal False blocks
+        assert only(out, "alert") == [], bad
+
+
+def test_dead_auth_with_nothing_to_spend_does_not_alert():
+    # Idle: dead auth with NO approved queue, NO in-flight lane, and NO exited marker is not yet
+    # harmful — no alert, no noise (mirrors the idle dead-anchor rule). The issue here is neither
+    # agent-ready (no fresh launch) nor in-progress (no relaunch), so there is nothing to spend.
+    dsk = disk(auth_probe=_auth_dead())
+    out = decide(parsed_issues=[parsed(5, labels=("type:build",))], dsk=dsk)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_dead_auth_alerts_when_only_an_in_flight_lane_is_present():
+    # A recovery relaunch is spend demand too (fresh-review P1 sub-note): a dead-auth reading with an
+    # in-flight lane and no fresh queue must SURFACE, never hold silently.
+    dsk = disk(auth_probe=_auth_dead())
+    out = decide(parsed_issues=[parsed(8, labels=("in-progress", "type:build"))],
+                 dsk=dsk, gh_view=ghv(prs={"i8": {}}))
+    assert only(out, "alert")[0]["reasons"] == ["auth_dead"] and has_notify(out)
+
+
+def test_dead_auth_holds_exited_relaunch_and_never_parks():
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    # Even at the retry cap, dead auth HOLDS rather than parks: auth is the owner's to fix and the
+    # lane resumes the tick it reads healthy again (a park would need a re-approval).
+    dsk = disk(auth_probe=_auth_dead(), exited={"i5": "x rc=1"},
+               issues_state={"version": 1, "issues": {"i5": ist("running", retries=2)}})
+    out = decide(parsed_issues=[p5], dsk=dsk)
+    assert only(out, "recover") == []                      # no relaunch into dead auth
+    assert only(out, "park") == []                         # held, not parked
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i5" and "auth" in h[0]["reason"].lower()
+    a = only(out, "alert")
+    assert len(a) == 1 and a[0]["reasons"] == ["auth_dead"]
+
+
+def test_valid_auth_still_relaunches_an_exited_lane():
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    dsk = disk(auth_probe=_auth_ok(), exited={"i5": "x rc=1"},
+               issues_state={"version": 1, "issues": {"i5": ist("running", retries=1)}})
+    out = decide(parsed_issues=[p5], dsk=dsk)
+    r = only(out, "recover")
+    assert len(r) == 1 and r[0]["tier"] == "exited" and only(out, "alert") == []
+
+
+def test_dead_auth_holds_orphan_resume():
+    p8 = parsed(8, labels=("in-progress", "type:build"))
+    g = ghv(prs={"i8": pr_view(num=88, branch="sl/i8-issue-8")})
+    dsk = disk(auth_probe=_auth_dead())
+    out = decide(parsed_issues=[p8], dsk=dsk, gh_view=g)
+    assert only(out, "launch") == []                       # the orphan resume is held, not spent
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i8" and "auth" in h[0]["reason"].lower()
+    assert only(out, "alert")[0]["reasons"] == ["auth_dead"]   # and it is NOT a silent hold
+
+
+def test_dead_auth_does_not_block_gating_or_merging():
+    # Auth gates SPENDS (launch/relaunch), never merge mechanics: a finished, clean PR still merges
+    # while auth is dead — merging spends no session (mirrors the dead-anchor rule).
+    d, g = _gating()                                       # i5 finished, clean PR
+    d["auth_probe"] = _auth_dead()
+    out = decide(parsed_issues=[parsed(9)], dsk=d, gh_view=g)   # i9 queued behind dead auth
+    assert len(only(out, "merge")) == 1                    # the gate still merges the finished PR
+    assert only(out, "launch") == []                       # but the queued launch is held
+    assert only(out, "alert")[0]["reasons"] == ["auth_dead"]
+
+
+def test_dead_auth_and_dead_anchor_both_named_sorted():
+    dsk = disk(auth_probe=_auth_dead(), launch_anchor=_anchor_down())
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    a = only(out, "alert")
+    assert len(a) == 1 and a[0]["reasons"] == ["auth_dead", "launch_anchor_down"]   # sorted
+    assert only(out, "launch") == [] and only(out, "park") == []
+
+
 # =========================== canary re-arm of the systemic hold (#115) ===========================
 # The 2026-07-13 incident: three launch deliveries failed back-to-back, #24's breaker tripped
 # correctly (one park raced the streak, one alert, launches HELD) — but the hold never released on
@@ -1171,6 +1310,177 @@ def test_exited_with_report_goes_to_gate_not_recovery():
     assert len(only(out, "gate")) == 1
 
 
+# =========================== the progress-stall probe ladder (#157) ===========================
+# The i328 infinite nudge loop: a lane TAKING TURNS (activity fresh) but making NO progress
+# (HEAD/marker frozen) looped forever on the idle nudge, because each nudge refreshed the very
+# activity stamp the ladder watched. The ladder now keys on the PROGRESS clock
+# (state/status/<id>.json), demands a machine-readable ack, caps probes per episode, and escalates
+# to a real park with a dossier — never an infinite loop, never a false park of a progressing lane.
+
+def clock(head="H", report=False, blocked=False, dirty=False, iid="i5", ts=NOW):
+    return {"id": iid, "ts": ts, "cwd": "/w", "head": head,
+            "dirty": dirty, "report": report, "blocked": blocked}
+
+
+def _sig(**kw):
+    return actions.events_mod.progress_signature(clock(**kw))
+
+
+def _apply_probe(ist_dict, act, now):
+    """Mimic runner._exec_probe's durable bookkeeping so a decide loop can advance an episode:
+    the attempt counter climbs, the nonce rotates, the send is stamped."""
+    v = ist_dict.get("probe_attempts")
+    ist_dict["probe_attempts"] = (v if type(v) is int else 0) + 1
+    ist_dict["probe_nonce"] = "%d-%d" % (int(now), int(act.get("attempt") or 0))
+    ist_dict["probe_sent_at"] = now
+
+
+def test_progress_first_sight_anchors_the_clock_without_probing():
+    # A running lane whose progress clock we have never recorded: anchor it (progress_advance), do
+    # NOT probe — the stall clock only starts once we have a baseline to measure against.
+    st = {"version": 1, "issues": {"i5": ist("running")}}          # no stored progress_sig
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()}))
+    adv = only(out, "progress_advance")
+    assert len(adv) == 1 and adv[0]["id"] == "i5" and adv[0]["sig"] == _sig()
+    assert only(out, "probe") == [] and only(out, "park") == []
+
+
+def test_progress_fresh_lane_is_never_probed_and_idle_does_not_nudge():
+    # sig matches, progress_since recent -> not stalled. Even a session_idle event (activity quiet)
+    # must NOT nudge a lane the progress clock says is fine: the whole point of #157 is to stop
+    # poking on activity staleness.
+    st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(), progress_since=NOW - 60)}}
+    out = decide(events=[{"type": "session_idle", "id": "i5"}],
+                 dsk=disk(issues_state=st, status_clocks={"i5": clock()}))
+    assert only(out, "probe") == [] and only(out, "park") == []
+    assert only(out, "recover") == []          # the idle peek is gated off when a clock is present
+
+
+def test_real_progress_resets_a_long_stalled_lane_and_never_parks():
+    # The lane was stalled for ages, but the clock now shows a NEW HEAD: that is real progress.
+    # progress_advance re-anchors and the episode resets — a progressing lane is NEVER parked.
+    st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(head="OLD"),
+                                          progress_since=NOW - 100000, probe_attempts=2)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="NEW")}))
+    adv = only(out, "progress_advance")
+    assert len(adv) == 1 and adv[0]["sig"] == _sig(head="NEW")
+    assert only(out, "probe") == [] and only(out, "park") == []
+
+
+def test_i328_probe_ladder_escalates_within_the_cap_instead_of_looping():
+    # THE reproduction. Clock frozen every tick, activity fresh (frozen tier never fires). The old
+    # idle nudge looped forever; the new ladder MUST reach a real park within a bounded probe count.
+    ist5 = ist("running", progress_sig=_sig(), progress_since=NOW - 100000)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    probes, parked, now = 0, None, NOW
+    for _ in range(50):                        # bounded: this MUST terminate in a park
+        out = decide(now=now, dsk=disk(issues_state=st, status_clocks={"i5": clock()}),
+                     parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+        if only(out, "park"):
+            parked = only(out, "park")[0]
+            break
+        pr = only(out, "probe")
+        if pr:
+            probes += 1
+            _apply_probe(ist5, pr[0], now)
+        now += 300
+    assert parked is not None, "the ladder never escalated — it looped (the i328 bug)"
+    assert parked["cause"] == "progress_stall" and has_notify(out)
+    assert probes <= 3                         # PROBE_CAP: bounded, never an infinite nudge loop
+
+
+def test_working_ack_does_not_stop_escalation():
+    # The i328 lie: the worker keeps answering (here, WORKING with the live nonce) but never
+    # progresses. A probe answer does NOT reset the progress clock, so the cap still escalates.
+    ist5 = ist("running", progress_sig=_sig(), progress_since=NOW - 100000)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    parked, now = None, NOW
+    for _ in range(50):
+        nonce = ist5.get("probe_nonce")
+        acks = {"i5": "WORKING %s" % nonce} if nonce else {}
+        out = decide(now=now, dsk=disk(issues_state=st, status_clocks={"i5": clock()}, acks=acks),
+                     parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+        if only(out, "park"):
+            parked = only(out, "park")[0]
+            break
+        pr = only(out, "probe")
+        if pr:
+            _apply_probe(ist5, pr[0], now)
+        now += 300
+    assert parked is not None and parked["cause"] == "progress_stall"
+    assert "WORKING" in parked["memo"]         # the dossier names the worker's own self-report
+
+
+def test_stuck_ack_escalates_immediately_before_the_cap():
+    # A STUCK ack (with the live nonce) is a definitive "I need help" — escalate now, don't keep
+    # probing to the cap. It reaches the owner (needs-owner), not the plain parked queue.
+    ist5 = ist("running", progress_sig=_sig(), progress_since=NOW - 100000,
+               probe_attempts=1, probe_nonce="n1", probe_sent_at=NOW - 1000)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()},
+                          acks={"i5": "STUCK n1"}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    parks = only(out, "park")
+    assert len(parks) == 1 and parks[0]["cause"] == "progress_stall"
+    assert parks[0]["needs_william"] is True and "STUCK" in parks[0]["memo"]
+    assert only(out, "probe") == []            # escalated, not re-probed
+
+
+def test_corrupt_probe_attempts_fails_closed_to_a_park():
+    # The fail-OPEN-on-wrong-typed defect class: a corrupt probe-attempt counter must NOT read as 0
+    # and re-probe (an unbounded loop). It fails CLOSED to a classified park, like every other cap
+    # counter in the module.
+    for bad in ("3", None, True, [], 3.0):
+        st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(),
+                                              progress_since=NOW - 100000, probe_attempts=bad)}}
+        out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()}),
+                     parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+        parks = only(out, "park")
+        assert len(parks) == 1 and parks[0]["cause"] == "progress_stall", bad
+        assert only(out, "probe") == [], bad
+
+
+def test_awaiting_suppresses_the_probe_ladder():
+    # A worker that flagged long background work (awaiting marker) is quiet by contract — never
+    # probe it, never park it, exactly as the activity idle-peek already respects awaiting.
+    st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(),
+                                          progress_since=NOW - 100000)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()}, awaiting={"i5": ""}))
+    assert only(out, "probe") == [] and only(out, "park") == []
+
+
+def test_probe_respects_the_retry_interval():
+    # Within PROBE_RETRY_SECONDS of the last probe, no new probe fires (bounded cadence).
+    st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(),
+                                          progress_since=NOW - 100000,
+                                          probe_attempts=1, probe_nonce="n1", probe_sent_at=NOW - 60)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert only(out, "probe") == [] and only(out, "park") == []
+
+
+def test_no_progress_clock_falls_back_to_the_idle_peek():
+    # Graceful degradation: an install/session with no status clock (the hook never stamped) keeps
+    # the old activity idle-peek behavior rather than being silently un-probeable.
+    st = {"version": 1, "issues": {"i5": ist("running")}}
+    out = decide(events=[{"type": "session_idle", "id": "i5"}], dsk=disk(issues_state=st))
+    r = only(out, "recover")
+    assert len(r) == 1 and r[0] == {"act": "recover", "id": "i5", "tier": "idle"}
+
+
+def test_progress_stall_park_dossier_names_the_evidence():
+    # The park at the cap carries a real dossier: the stall duration, the frozen HEAD, the probe
+    # count. This is what William reads instead of an unbounded nudge loop.
+    st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(head="abc123def456"),
+                                          progress_since=NOW - 1800, probe_attempts=3,
+                                          probe_nonce="n3", probe_sent_at=NOW - 400)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="abc123def456")}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    memo = only(out, "park")[0]["memo"]
+    assert "abc123def456"[:12] in memo and "3 probe" in memo
+    assert "min" in memo and ("i328" in memo or "progress" in memo)
+
+
 # =========================== the gate, translated ===========================
 
 def _gating(status="gating", report=GOOD_REPORT, pv=None, issues_extra=None, **dover):
@@ -1434,6 +1744,20 @@ def test_preserve_label_hires_a_conflict_resolution_session():
     rc = only(out, "resolve_conflict")
     assert len(rc) == 1 and rc[0]["pr"] == 555
     assert only(out, "regenerate") == []
+
+
+def test_dead_auth_holds_the_conflict_resolver_and_alerts():
+    # A conflict resolver is a session START (#159): dead account auth would spawn it logged-out and
+    # burn the spend, so it holds (never a resolve_conflict, never a park) and the auth_dead alert
+    # surfaces (an in-flight lane is relaunch demand).
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING", labels=[{"name": "preserve"}]))
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid="head1")
+    d["auth_probe"] = _auth_dead()
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    assert only(out, "resolve_conflict") == []             # not spent into dead auth
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i5" and "auth" in h[0]["reason"].lower()
+    assert only(out, "alert")[0]["reasons"] == ["auth_dead"]
 
 
 def test_update_error_retries_and_persistent_errors_alert():

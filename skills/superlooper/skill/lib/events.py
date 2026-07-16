@@ -20,6 +20,7 @@ inside its own tick, so GitHub state never needs a file relay between two proces
 """
 import hashlib
 import os
+import re
 
 # Staleness tiers (seconds). These module defaults mirror the §C.1 config defaults
 # (session.idle_seconds / session.freeze_seconds); the runner passes the adopted repo's
@@ -34,6 +35,55 @@ def _hash_file(path):
             return hashlib.sha1(f.read()).hexdigest()
     except OSError:
         return None
+
+
+# --------------------------- the progress clock (issue #157) ---------------------------
+# The bounded probe ladder keys on state/status/<id>.json (worker_hook.stamp_status), NOT on
+# activity staleness. i328 exposed the structural trap: each idle "are you progressing?" nudge is a
+# tool-call turn that refreshes the very activity stamp the ladder watched, so it could never
+# escalate (8 nudges ~497s apart, forever). The progress clock records HEAD/dirty/report/blocked
+# every rest; these two pure helpers let the runner tell "took a turn" from "made progress" and read
+# the worker's machine-readable reply — neither of which a probe can reset.
+
+# The four machine-readable states a probe demands. STUCK is listed first only for readers; the
+# parser is order-independent (it rejects an ambiguous multi-state reply rather than guessing).
+ACK_STATES = ("DONE", "WORKING", "WAITING", "STUCK")
+
+
+def progress_signature(status):
+    """A status.json snapshot -> the signature of its PROGRESS-bearing fields, or None if there is
+    no usable clock. Keys on HEAD (a new commit moves it) and the report/blocked markers (they
+    appear on real milestones) — exactly the "commit/marker/HEAD change" the DoD names.
+
+    `dirty` is DELIBERATELY excluded. The DoD keys on commit/marker/HEAD, and `dirty` is the one
+    field that can flap without progress: git reads it as None (unknown) whenever an index lock is
+    contended, so a flapping None<->bool would register as false progress every tick and defeat the
+    escalation this exists to enable. A worker that edits without committing for a long time is
+    exactly the i328 shape we DO want to probe.
+
+    None means "no signal this rest" (a missing/empty/wrong-typed clock = the Stop hook never
+    stamped). The ladder falls back to the activity tiers there rather than inventing a signature."""
+    if not isinstance(status, dict) or not status:
+        return None
+    return "%s|%s|%s" % (status.get("head"), bool(status.get("report")), bool(status.get("blocked")))
+
+
+def parse_ack(text, expected_nonce):
+    """A worker's probe-reply file -> one of ACK_STATES, but ONLY when it carries `expected_nonce`.
+
+    The nonce gate is load-bearing: a stale ack answering a PREVIOUS probe (or a previous episode)
+    must never be read as answering the current one, or a single old "WORKING" could mute the
+    escalation forever — the i328 trap in a new costume. Forgiving of prose (the worker may add a
+    sentence) but STRICT on ambiguity: if more than one distinct state word appears (a worker that
+    echoed the probe's own DONE/WORKING/WAITING/STUCK menu), return None and keep probing rather than
+    guess. Wrong-typed inputs never raise (the module's fail-closed contract)."""
+    if not isinstance(text, str) or not isinstance(expected_nonce, str) or not expected_nonce:
+        return None
+    if expected_nonce not in text:
+        return None
+    up = text.upper()
+    found = [s for s in ACK_STATES if re.search(r"\b" + s + r"\b", up)]
+    return found[0] if len(found) == 1 else None
 
 
 # Statuses for which the runner has already taken ownership — never fire idle/frozen for them

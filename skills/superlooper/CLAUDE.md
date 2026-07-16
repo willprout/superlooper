@@ -75,10 +75,13 @@ directives are fixed points — never relitigate them, never safety-creep around
 
 The loop must stay swappable to a different coding agent (Codex etc.) without untangling.
 Everything agent-specific — the launch command line, liveness/hook stamping, the screen
-classifier's TUI patterns, trust pre-acceptance, usage/quota reading — lives ONLY in:
-`start-session.sh`, the hook scripts + install.sh's hook registration, `pane_state.py`,
-`pretrust.sh`, `usage.py`. No other file may reference Claude Code specifics; the runner,
-gate, contracts, and GitHub protocol stay agent-agnostic.
+classifier's TUI patterns, trust pre-acceptance, usage/quota reading, the cross-reviewer command
+line — lives ONLY in: `start-session.sh`, `cross-review.sh` (the pinned codex review command line —
+issue #158), the hook scripts + install.sh's hook registration, `pane_state.py`, `pretrust.sh`,
+`usage.py`. No other file may reference Claude Code specifics; the runner, gate, contracts, and
+GitHub protocol stay agent-agnostic. The cross-reviewer's model/effort is per-repo CONFIG
+(`models.reviewer` / `models.reviewer_effort`), so `cross-review.sh` realizes it in codex flags
+without hardcoding a Codex fact into the core.
 
 ## Publishing
 

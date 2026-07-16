@@ -109,6 +109,15 @@ USAGE_STALE_SECONDS = 300          # no fresh usage for 5 min -> cached reading 
 USAGE_FAIL_OPEN_GRACE_SECONDS = 1800
 GH_ALERT_FAILURES = 10             # consecutive failed poll cycles (~15 min at 90 s) -> ALERT
 RECOVER_RETRY_SECONDS = 600        # frozen-session recovery ladder re-fires at most every 10 min
+# The bounded probe ladder (issue #157), keyed on the PROGRESS clock, not activity staleness. A lane
+# that takes turns but makes no commit/marker/HEAD change for PROGRESS_STALL_SECONDS is probed for a
+# machine-readable ack, at most PROBE_CAP times spaced PROBE_RETRY_SECONDS apart, then escalated to a
+# classified park. Total stall->park is bounded (~STALL + (CAP-1)*RETRY), never the i328 infinite
+# nudge loop; a lane that makes ANY real progress resets the episode and is never parked. Config
+# overrides live under session.* (progress_stall_seconds / probe_retry_seconds / probe_cap).
+PROGRESS_STALL_SECONDS = 900       # no commit/marker/HEAD change (turns still taken) this long -> probe
+PROBE_RETRY_SECONDS = 300          # min spacing between probes within one progress-stall episode
+PROBE_CAP = 3                      # probes per episode before a classified progress-stall park
 # How long a session may sit at its OWN in-window question before the owner is told (issue #151).
 # A lane at a dialog is never parked — it is alive — but it must not be SILENT either: the loop's
 # channel for "worker needs input" is state/blocked/<id> -> hire_answerer, and an in-window
@@ -221,6 +230,14 @@ ALERT_MESSAGES = {
                                "(or re-run bin/install-launch-shim.sh), then FULLY QUIT and "
                                "relaunch cmux in a visible tab and restart the runner — the flag is "
                                "read only at app launch. If it persists, check the cmux anchor.",
+    "auth_dead": "the account AUTH probe reads DEAD — `claude auth status` reports not-logged-in "
+                 "(or the Claude Code credential keychain item is gone), so a fresh launch or a "
+                 "recovery relaunch would start LOGGED OUT and burn the spend (the i336 class). "
+                 "Launches and relaunches are HELD (the queue is intact, nothing parked) and "
+                 "resume automatically once auth reads healthy again. Re-login: run `claude` (or "
+                 "`claude auth login`) in a terminal signed into the loop's subscription account. "
+                 "This is the PRE-LAUNCH sibling of the in-window 'Not logged in' state "
+                 "(session_logged_out): it catches dead auth BEFORE a session is spent, not after.",
 }
 
 
@@ -272,6 +289,26 @@ def _launch_stderr_memo(tail):
     if len(t) > LAUNCH_STDERR_MEMO_MAX:
         t = "…" + t[-LAUNCH_STDERR_MEMO_MAX:]
     return "\n\nlaunch stderr (tail — the agent's own error just before it exited):\n" + t
+
+
+def _progress_stall_memo(iid, clock, stall_secs, attempts, ack_state):
+    """The dossier for a progress-stall park (issue #157). Names the evidence William reads instead
+    of an unbounded nudge loop: how long the progress clock has been frozen, the frozen HEAD, how
+    many probes went unanswered-or-lied-to, and the worker's OWN last self-report. Fail-open on
+    wrong-typed inputs (never raise into a park)."""
+    head = clock.get("head") if isinstance(clock, dict) else None
+    head_s = head[:12] if isinstance(head, str) and head else "unknown"
+    mins = int(stall_secs // 60) if isinstance(stall_secs, (int, float)) else 0
+    n = attempts if type(attempts) is int and attempts >= 0 else 0
+    said = {
+        "DONE": "the worker acked DONE, but produced no report/PR the loop can see",
+        "WORKING": "the worker acked WORKING, but the progress clock disagrees (the i328 shape)",
+        "WAITING": "the worker acked WAITING on background work — verify it is real, not a stall",
+        "STUCK": "the worker acked STUCK and asked for help",
+    }.get(ack_state, "the worker never answered a probe with a valid ack")
+    return (f"{iid}: progress-stall park (issue #157). No new commit/marker/HEAD change for "
+            f"~{mins} min (HEAD {head_s}) across {n} probe(s) — {said}. The lane took turns without "
+            f"progressing, so it was escalated instead of nudged forever (the i328 infinite loop).")
 
 
 def _captured_addendum(ev):
@@ -622,6 +659,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     operator = _config.operator(cfg)          # the owner name every hand-back memo/notify uses (#58)
     session = _dget(cfg, "session", dict)
     retry_cap = _count(session.get("retry_cap"), 2)
+    progress_stall_secs = _count(session.get("progress_stall_seconds"), PROGRESS_STALL_SECONDS)
+    probe_retry_secs = _count(session.get("probe_retry_seconds"), PROBE_RETRY_SECONDS)
+    probe_cap = _count(session.get("probe_cap"), PROBE_CAP)
     dev_branch = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
 
     plist = parsed_issues if isinstance(parsed_issues, list) else []
@@ -645,6 +685,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     reports = _dget(dsk, "reports", dict)
     exited = _dget(dsk, "exited", dict)
     launch_stderr = _dget(dsk, "launch_stderr", dict)   # {id: bounded stderr tail} (issue #40)
+    status_clocks = _dget(dsk, "status_clocks", dict)   # {id: parsed status.json} — the #157 progress clock
+    acks = _dget(dsk, "acks", dict)                      # {id: raw ack text} — the worker's probe reply
+    awaiting = _dget(dsk, "awaiting", dict)              # {id: marker} — worker flagged long background work
     frozen = dsk.get("frozen") if isinstance(dsk.get("frozen"), dict) else None
     alert_on_disk = dsk.get("alert") if isinstance(dsk.get("alert"), dict) else None
     raw_locks = dsk.get("live_lock_ids")
@@ -746,14 +789,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         filters candidates on launch_ok."""
         return scheduler.launch_ok(p, closed_nums, bool(frozen), usage_sched, resume=resume)
 
-    def launch_hold(iid, num, p):
-        """start_ok said no: HOLD, legibly — never a silent launch (D8), and never a park. This is a
-        WAIT, not a verdict: the retry cap and park semantics are untouched (a boundary of #150), the
-        marker/labels stay exactly as they are, and the restart fires on the tick the gate passes.
-        Journal ONCE per CAUSE — dedup on the reason the executor stamps durably, so a standing hold
-        can't spam a 15s tick, while a CHANGED cause (the blocker closed but the labels went
-        ambiguous) still speaks rather than leaving stale prose on the board."""
-        reason = _launch_gate_reason(p, closed_nums, usage_sched)
+    def launch_hold(iid, num, p, reason=None):
+        """start_ok (or the #159 auth gate) said no: HOLD, legibly — never a silent launch (D8), and
+        never a park. This is a WAIT, not a verdict: the retry cap and park semantics are untouched (a
+        boundary of #150), the marker/labels stay exactly as they are, and the restart fires on the
+        tick the gate passes. Journal ONCE per CAUSE — dedup on the reason the executor stamps
+        durably, so a standing hold can't spam a 15s tick, while a CHANGED cause (the blocker closed
+        but the labels went ambiguous) still speaks rather than leaving stale prose on the board. An
+        explicit `reason` overrides the usage/eligibility reason (the auth gate names auth)."""
+        reason = reason if isinstance(reason, str) and reason \
+            else _launch_gate_reason(p, closed_nums, usage_sched)
         if ist_of(iid).get("launch_hold_reason") == reason:
             return
         out.append({"act": "launch_hold", "id": iid, "num": num, "reason": reason})
@@ -790,6 +835,31 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # One degraded mode for both detectors: hold every fresh launch and suppress the per-issue
     # launch-cap park (phases D+E), so the queue is left intact for when the anchor resolves.
     launch_degraded = anchor_down or systemic_launch
+    # Account-level AUTH gate (issue #159 / forensics U3). The runner hands us a `claude auth status`
+    # + credential-keychain snapshot when a spend is pending; a DEFINITIVE dead reading (valid is
+    # literally False — the CLI is not-logged-in, or the keychain item is gone) means a fresh launch
+    # or a recovery relaunch would start LOGGED OUT and burn the spend (the i336 class the in-window
+    # 'logged_out' state catches only AFTER a session is up). Fail OPEN on anything unreadable (valid
+    # None/absent/wrong-typed): a probe we merely could not run must never freeze the whole loop — the
+    # #46/#76 dark-meter asymmetry, applied to auth. auth_invalid holds fresh launches AND recovery
+    # relaunches (below) and, when there is real spend demand, raises the auth_dead ALERT.
+    auth_probe = dsk.get("auth_probe")
+    auth_invalid = isinstance(auth_probe, dict) and auth_probe.get("valid") is False
+    # A recovery relaunch is spend demand too — a dead-auth reading with no fresh queue but an
+    # in-flight lane (an ORPHAN RESUME after a restart, a crash relaunch, a conflict resolve) must
+    # still surface and never hold SILENTLY (fresh-review P1 sub-note; i336 was a recovery scenario).
+    # `in-progress`-labelled == an in-flight lane that may relaunch this tick; the exited marker is a
+    # backstop for a lane whose label move hasn't landed. Loose by design: over-surfacing dead auth is
+    # fail-safe, it auto-clears on the next healthy probe, and a terminal lane's marker is cleaned.
+    has_relaunch_demand = (
+        any(isinstance(p, dict) and isinstance(p.get("labels"), list)
+            and "in-progress" in p["labels"]
+            for p in parsed_by_id.values())
+        or any(_iid_num(k) is not None for k in exited))
+    # launches_held folds auth into the same fresh-launch suppression the anchor/systemic detectors
+    # use, so the queue is held intact (never parked) while auth is dead, exactly as under a dead
+    # anchor. The recovery-relaunch and orphan-resume holds are applied per-issue below.
+    launches_held = launch_degraded or auth_invalid
     # prev_systemic: was a systemic-launch hold ALREADY established? The launch_systemic_failure
     # ALERT is DURABLE (survives a runner restart), so its presence on disk is the episode marker —
     # the same durable-marker discipline usage's prev_dark uses. Its falling edge (prev_systemic and
@@ -852,6 +922,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         reasons.append("launch_anchor_down")
     if systemic_launch:
         reasons.append("launch_systemic_failure")
+    if auth_invalid and (has_pending_launch or has_relaunch_demand):   # dead auth only matters with a
+        reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
     reasons.sort()
     if reasons:
         existing = alert_on_disk.get("reasons") if alert_on_disk else None
@@ -1207,8 +1279,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # (#150 / D8) The gate's verdict is "hire a session to resolve this conflict" — a
                 # session START, so it owes the same eligibility every other start owes. It asked
                 # nothing before. Held (never parked) so the issue keeps its preserve-labeled PR and
-                # the resolver hires the tick the gate passes.
-                if start_ok(p):
+                # the resolver hires the tick the gate passes. Dead account auth (#159) holds it too:
+                # a conflict resolver spawned into logged-out auth would burn the spend like any start.
+                if auth_invalid:
+                    launch_hold(iid, num, p,
+                                reason="account auth is not valid — conflict resolve held (see the auth_dead alert)")
+                elif start_ok(p):
                     out.append({"act": "resolve_conflict", "id": iid, "num": num,
                                 "pr": pv.get("number"), "wander": wander})
                 else:
@@ -1346,7 +1422,15 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # name it in whichever exited-park memo fires, so the operator sees the actual error and
             # not just the relaunch count.
             stderr_memo = _launch_stderr_memo(launch_stderr.get(iid))
-            if type(retries) is not int:               # corrupt counter -> to William, not a loop
+            if auth_invalid:
+                # Account auth is dead (issue #159): a relaunch would start LOGGED OUT and burn the
+                # spend. HOLD (the auth_dead ALERT above names it) — never park (auth is the owner's
+                # to fix, and the lane resumes the tick it reads healthy). Checked FIRST so a lane
+                # already at its retry cap holds too, rather than parking under a fault that is not
+                # its own; the relaunch charges no attempt because it never fires.
+                launch_hold(iid, num, p,
+                            reason="account auth is not valid — relaunch held (see the auth_dead alert)")
+            elif type(retries) is not int:             # corrupt counter -> to William, not a loop
                 park(iid, num, "exited, and the retry counter is unreadable — parking" + stderr_memo,
                      cause="exited_cap")
             elif retries >= retry_cap:
@@ -1402,7 +1486,60 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 if now - last_rec >= RECOVER_RETRY_SECONDS:
                     out.append({"act": "recover", "id": iid, "tier": "frozen"})
             continue
-        if iid in idle_ids:
+
+        # ---- progress-stall probe ladder (issue #157): keyed on the PROGRESS clock, not activity ----
+        # THE i328 fix. The idle peek below keys on activity_mtime, which the nudge itself refreshes —
+        # so it could never escalate (8 nudges ~497s apart, forever). This tier keys on
+        # state/status/<id>.json (HEAD + the report/blocked markers), which move ONLY on real
+        # progress and are immune to a probe or its ack. A lane making progress re-anchors and is
+        # NEVER parked; a lane taking turns without progressing is probed a BOUNDED number of times
+        # (each demanding a machine-readable ack file), then escalated with a dossier. The frozen
+        # tier above already claimed dead/frozen lanes, so a lane reaching here is ALIVE (taking
+        # turns) — "turns taken but no progress" is exactly what this measures.
+        clock = status_clocks.get(iid)
+        cur_sig = events_mod.progress_signature(clock)
+        have_clock = cur_sig is not None
+        if have_clock and status in INFLIGHT_STATUSES and not in_wake_grace and iid not in awaiting:
+            since = ist.get("progress_since")
+            if ist.get("progress_sig") != cur_sig or not _since_ok(since, now):
+                # first sight / real progress / a corrupt clock: re-anchor and (on a genuine change)
+                # reset the episode. The executor clears the probe counters ONLY when the signature
+                # actually changed, so a mere since-repair never drops an in-flight escalation.
+                out.append({"act": "progress_advance", "id": iid, "sig": cur_sig})
+                continue
+            if now - since >= progress_stall_secs:
+                # STALLED: turns taken, no commit/marker/HEAD change for the whole window.
+                nonce = ist.get("probe_nonce")
+                ack_state = events_mod.parse_ack(acks.get(iid), nonce) if isinstance(nonce, str) else None
+                attempts, attempts_corrupt = _counter(ist, "probe_attempts")
+                if attempts_corrupt:
+                    # A wrong-typed probe counter means the cap can't be trusted — fail CLOSED to a
+                    # park (the same discipline retries/merge_refusals/answerer_failures hold), never
+                    # re-read it as 0 and re-probe (that is the fail-OPEN-on-wrong-typed defect class).
+                    park(iid, num, f"{iid}: progress-stall park (issue #157) — the probe-attempt "
+                                   f"counter is unreadable (corrupt state), so the bounded ladder "
+                                   f"cannot be trusted; parking for review.", cause="progress_stall")
+                    continue
+                if ack_state == "STUCK" or (type(probe_cap) is int and attempts >= probe_cap):
+                    # cap exhausted, OR the worker explicitly asked for help: escalate to a
+                    # classified park with a dossier — never an infinite loop, never a false park of
+                    # a lane still making progress (a progressing lane re-anchored above). STUCK /
+                    # WAITING reach the OWNER (a live worker needing a human); a silent or
+                    # WORKING-lying lane goes to the parked queue for review.
+                    memo = _progress_stall_memo(iid, clock, now - since, attempts, ack_state)
+                    park(iid, num, memo, needs_william=ack_state in ("STUCK", "WAITING"),
+                         cause="progress_stall")
+                else:
+                    last_probe = ist.get("probe_sent_at")
+                    if not _real(last_probe) or now - last_probe >= probe_retry_secs:
+                        out.append({"act": "probe", "id": iid, "num": num, "attempt": attempts + 1})
+                continue                                    # a stalled lane is fully handled here
+            # progress fresh: fall through to label reconciliation; the idle fallback below is gated
+            # on `not have_clock`, so a clock-bearing lane is never nudged on activity staleness.
+        if iid in idle_ids and not have_clock:
+            # fallback ONLY when there is no progress clock (an install/session that never stamped
+            # state/status/<id>.json — the pre-#148 shape, or a hook that failed): the old activity
+            # peek, degraded-but-safe. A clock-bearing lane is handled by the tier above instead.
             out.append({"act": "recover", "id": iid, "tier": "idle"})
             continue
 
@@ -1417,10 +1554,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # status is None/"ready" from here on
         launch_fails, corrupt = _counter(ist, "launch_failures")
         if "agent-ready" in labels and (corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
-            if launch_degraded:
-                continue                               # SYSTEMIC launch fault (#24): hold, never
-                                                       # park per-issue — the queue stays intact for
-                                                       # when the anchor resolves (the alert stands)
+            if launches_held:
+                continue                               # SYSTEMIC launch fault (#24) or dead auth
+                                                       # (#159): hold, never park per-issue — the
+                                                       # queue stays intact for when it resolves
+                                                       # (the alert stands)
             # The evidence the runner captured at the MOMENT the launch failed (issue #152) — the
             # launcher's own stderr, stamped into loopstate by _exec_launch. This is what lets the
             # memo below name the component actually at fault instead of guessing one.
@@ -1462,7 +1600,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                          and "superseded" not in gate._pr_labels(pv)
                          and (not isinstance(stamped, str) or not stamped.strip()
                               or stamped == branch))
-            if resumable and not start_ok(p):
+            if resumable and auth_invalid:
+                # Account auth is dead (issue #159): resuming the orphan on its PR branch would start
+                # LOGGED OUT and burn the spend. HOLD in place (never reclaim — reclaim would orphan
+                # the pushed work, same reasoning as the gate-hold below); the auth_dead ALERT names
+                # it and the resume fires the tick auth reads healthy again.
+                launch_hold(iid, num, p,
+                            reason="account auth is not valid — resume held (see the auth_dead alert)")
+            elif resumable and not start_ok(p):
                 # (#150 / D8) The restart rebuild resumes an in-progress issue's session on its open
                 # PR's branch — and asked NO gate at all: not eligibility, not even usage. HOLD in
                 # place rather than reclaim: this orphan resume is the ONLY path that re-attaches the
@@ -1521,7 +1666,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         branch = ist_of(iid).get("branch")
         return branch if isinstance(branch, str) and branch.strip() else brief.branch_for(parsed_by_id[iid])
 
-    if not gh_stale and not issue_state_corrupt_for_launches and not launch_degraded:
+    if not gh_stale and not issue_state_corrupt_for_launches and not launches_held:
         candidates = []
         for iid, p, ist in _eligible_launch_ids():
             if _needs_touches(p):
@@ -1550,11 +1695,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 continue
             out.append({"act": "wildcard_hold", "id": hid, "num": h.get("num"),
                         "blocker": h.get("blocker_id"), "reason": _wildcard_hold_reason(h)})
-    elif (systemic_launch and not anchor_down
+    elif (systemic_launch and not anchor_down and not auth_invalid
             and not gh_stale and not issue_state_corrupt_for_launches):
         # Canary re-arm of the SYSTEMIC hold (issue #115). The streak-based hold cannot clear itself,
         # so once per CANARY_RETRY_SECONDS since the last delivery failure, probe with ONE canary
-        # launch of the front-of-queue issue. A verified delivery clears the streak (runner) and normal
+        # launch of the front-of-queue issue. Suppressed while auth reads DEAD (#159): a canary into
+        # dead account auth would just start logged-out and re-fail — hold until auth recovers.
+        # A verified delivery clears the streak (runner) and normal
         # launching resumes next tick; a failed canary re-enters the hold — the runner charges NO
         # per-issue cap and this decide emits no park. Skipped while the pane probe itself reports the
         # anchor DEAD (anchor_down): that detector self-re-arms via its per-tick probe, and a canary
