@@ -128,8 +128,18 @@ class Sim:
             # in test_actions and exercised end-to-end by the touches_required=True sim below).
             "touches_required": touches_required,
             "session": sess, "cleanup_merged_worktrees": cleanup_merged_worktrees,
+            # `quiet_hours: null` DISABLES night-batching for this harness (issue #164's own escape
+            # hatch). Issue #164 made routine owner-decision pages (park / bounce / durable question)
+            # quiet-hours-batched by default (21:00–08:00): the ACTION still fires but the page waits
+            # for morning. This sim runs the REAL runner, which stamps `local_hhmm` from the wall
+            # clock, so under the DEFAULT window every end-to-end `notify_lines()` assertion below
+            # silently depends on the hour CI runs — green by day, red 21:00–08:00 UTC (a nightly
+            # false-red on `main`, unrelated to any diff). These scenarios assert the notify-DELIVERY
+            # path, not the quiet WINDOW (that gate is unit-tested with a pinned clock in
+            # test_actions `_at_night`/`_at_day` and test_runner's wiring test), so batching is turned
+            # off here to keep every notify assertion deterministic at any hour.
             "notify": {"cmd": "printf '%s|%s\\n' \"$SL_TITLE\" \"$SL_BODY\" >> "
-                              + str(self.notify_log)},
+                              + str(self.notify_log), "quiet_hours": None},
         }
         if qa:
             cfg["qa"] = qa
