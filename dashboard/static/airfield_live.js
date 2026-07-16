@@ -35,6 +35,23 @@
   var STAND_Y = 182;
   var TRANSIT_MS = 1400;                     // one stage-change flight
   var WIND = 9;                              // px/s exhaust drift behind an anchored plane
+  var HOLD_RATE = 1.15;                      // holding-pattern angular speed (rad/s), shared by all holders
+
+  // The idle wander (issue #203). A live plane on the downwind leg drifts slowly inside a small box
+  // around its anchor so the leg reads as "in the air, working," not "stalled" — pixels only (design
+  // B.1), the pure geometry lives in airfield_motion.js. Ground/off-path planes never wander (owner
+  // ruling #3 / §5), and only the HULL moves (the overlay tag stays pinned to the stable anchor).
+  //
+  // ONLY the downwind leg wanders. It is the long straight leg over Build Island — exactly where a
+  // motionless plane read as stalled — and its four anchors are 54px apart, so a bounded ±4 wander +
+  // separation provably never overlaps two hulls. The other airborne stages (takeoff/base-turn/final)
+  // fan their slots out only 12–16px apart, closer than a hull, so wandering them could not honour
+  // "no plane overlaps another" when two share a stage; extending the wander there needs those
+  // anchors re-spaced first (out of this issue's "don't re-place" scope — filed as a follow-up).
+  // SEP_MIN is the separation nudge's min centre distance.
+  var WANDER = { x: 4, y: 3 };
+  var WANDER_STAGES = { downwind: 1 };
+  var SEP_MIN = 38;
 
   // Discrete anchors: placement stage -> slot list (per runway where the stage is runway-owned).
   // Each entry: [x, y, dir, air, small]. Slots beyond the first fan out deterministically.
@@ -98,6 +115,7 @@
 
   function mount(canvas) {
     var A = window.Airfield3;
+    var M = window.AirfieldMotion;                                   // pure geometry (issue #203, design B.1)
     var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     canvas.width = W * S; canvas.height = H * S;
@@ -109,6 +127,7 @@
     var model = { time: 'day', status: 'ok', dim: false, link: 'ok', flights: [], banner: null, resetKey: '' };
     var sprites = {};          // num -> persistent sprite state (cur pos, trail, transit)
     var raf = 0, last = 0, frame = 0;
+    var holdBase = 0;          // shared holding-pattern angle: every holder renders at holdBase + its phase
 
     function rebuildBase() {
       var key = model.time + '|' + model.status;
@@ -130,13 +149,19 @@
       var layoutTags = [];
       var seen = {};
       var standXs = [];          // x of each plane at the stand — one marquee is placed over them
+      // How many flights are in the holding pattern right now — the holders share one loop and are
+      // distributed evenly around it by phase (two opposite, three at thirds, …), so no two coincide
+      // (issue #203, owner ruling #1). The slot is just an index; landing order lives in the tags.
+      var holdCount = ordered.filter(function (f) { return placementOf(f) === 'holding'; }).length;
       ordered.forEach(function (f) {
         var place = placementOf(f);
         var groupKey = place + (place === 'taxi-out' || place === 'takeoff' ||
                                 place === 'final' || place === 'touchdown' ? ':' + f.runway : '');
         byPlace[groupKey] = (byPlace[groupKey] || 0);
-        var anchor = anchorFor(place, f.runway, byPlace[groupKey]);
+        var slot = byPlace[groupKey];
+        var anchor = anchorFor(place, f.runway, slot);
         byPlace[groupKey]++;
+        if (anchor.orbit) anchor.orbit.phase = M.holdPhase(slot, holdCount);   // even holding spacing
         seen[f.num] = true;
 
         var s = sprites[f.num];
@@ -144,8 +169,15 @@
           s = sprites[f.num] = { cur: { x: anchor.x, y: anchor.y }, dir: anchor.dir,
                                  trail: [], th: -1.2, dustUntil: 0, path: null };
         }
-        var moved = !s.target || s.target.x !== anchor.x || s.target.y !== anchor.y ||
-                    (!!s.target.orbit) !== (!!anchor.orbit);
+        // A holder that STAYS a holder must never transit: when the holder count changes its slot
+        // (and so its ring radius / east-point x) is reassigned, but routing that through the
+        // stage-transit path would fly every remaining holder to the east point at once and
+        // momentarily re-stack them — the exact bug this issue fixes. Orbit→orbit re-spaces purely
+        // through the phase ease in step(); only entering or leaving the hold is a real transit.
+        var wasOrbit = !!(s.target && s.target.orbit), isOrbit = !!anchor.orbit;
+        var moved = (wasOrbit && isOrbit) ? false
+                  : (!s.target || s.target.x !== anchor.x || s.target.y !== anchor.y ||
+                     wasOrbit !== isOrbit);
         var wasAir = s.target ? s.target.air : anchor.air;
         s.flight = f;
         if (moved && s.target && !reduced) {
@@ -164,6 +196,13 @@
           s.path = null;
         }
         s.target = anchor;
+        // A live downwind-leg plane drifts within its box (issue #203); the ground and the off-path
+        // states (awaiting/frozen/stranded — their stage is not in WANDER_STAGES) stay still. The
+        // flight TOWING the banner is held still too, so its drawn cloth stays aligned with the
+        // banner's HTML text (which is pinned to the stable anchor) — a wandering cloth under a
+        // pinned label would read as the text sliding off the banner.
+        s.wanders = anchor.air && !anchor.orbit && !!WANDER_STAGES[f.stage] &&
+                    !(m.banner && m.banner.num === f.num);
 
         // Overlay tags at the STABLE target anchor (never chasing the animation).
         var box = spriteBox(anchor.dir, anchor.small);
@@ -261,20 +300,77 @@
         if (t >= 1) {
           s.path = null;
           s.dir = s.target.dir;
-          s.th = 0;   // a holding entry lands exactly on the ellipse's east point — no pop
+          s.th = 0;   // a holding entry lands on the ellipse's east point, then eases to its phase slot
         }
         return;
       }
-      if (s.target.orbit && !reduced) {                        // holding: the one true loop
-        s.th += dt * 1.15;
+      if (s.target.orbit) {                                    // holding: distributed around the loop
         var o = s.target.orbit;
+        var desired = holdBase + (o.phase || 0);               // this holder's evenly-spaced slot
+        if (reduced) {
+          s.th = desired;                                      // honest still, but still phase-separated
+        } else {
+          // holdBase advances for everyone; each holder eases the SHORT way to base+phase, so a
+          // holder joining or leaving re-spaces the pattern smoothly instead of teleporting (#203).
+          s.th += dt * HOLD_RATE + M.angleDelta(s.th, desired) * Math.min(1, dt * 4);
+        }
         s.cur.x = o.cx + Math.cos(s.th) * o.rx;
         s.cur.y = o.cy + Math.sin(s.th) * o.ry;
         var vx = -Math.sin(s.th) * o.rx, vy = Math.cos(s.th) * o.ry;
         s.dir = Math.abs(vx) > Math.abs(vy) ? (vx > 0 ? 'E' : 'W') : (vy > 0 ? 'S' : 'N');
         return;
       }
-      s.cur.x = s.target.x; s.cur.y = s.target.y; s.dir = s.target.dir;
+      if (s.wanders && !reduced) {                             // the bounded idle wander (issue #203)
+        var off = M.wanderOffset(s.flight.num, now / 1000, WANDER.x, WANDER.y);
+        var wb = spriteBox(s.target.dir, s.target.small);
+        var sx = M.axisSpan(s.target.x, WANDER.x, wb.w / 2, W);
+        var sy = M.axisSpan(s.target.y, WANDER.y, wb.h / 2, H);
+        s.cur.x = M.clamp(s.target.x + off.dx, sx[0], sx[1]);
+        s.cur.y = M.clamp(s.target.y + off.dy, sy[0], sy[1]);
+      } else {
+        s.cur.x = s.target.x; s.cur.y = s.target.y;
+      }
+      s.dir = s.target.dir;
+    }
+
+    // The banner cloth the featured downwind flight tows, as a rect in logical coords — mirrors the
+    // draw() geometry exactly (84px behind the hull, 74×14). Wandering planes are kept off it.
+    function bannerRect() {
+      if (!model.banner || !sprites[model.banner.num]) return null;
+      var bs = sprites[model.banner.num];
+      if (bs.path || placementOf(bs.flight) !== 'downwind') return null;
+      var bw = spriteBox(bs.target.dir, bs.target.small).w;
+      return { x: bs.cur.x - bw / 2 - 84, y: bs.cur.y - 4, w: 74, h: 14 };
+    }
+
+    // Separation (issue #203, owner ruling #2): after everyone has wandered, nudge any two whose
+    // hulls got too close, and keep wanderers off the towed banner. Holders join the pass as
+    // IMMOVABLE repulsors (lo==hi==their orbit position) so a leg plane never drifts into the hold
+    // but the hold itself never budges. Only wanderers are written back; the geometry is the pure
+    // module's (airfield_motion.separate). No-op when there is nothing that could collide.
+    function separateWanderers(nums) {
+      var movers = [], wanderCount = 0;
+      nums.forEach(function (n) {
+        var s = sprites[n];
+        if (s.wanders && !s.path) {
+          var b = spriteBox(s.target.dir, s.target.small);
+          var sx = M.axisSpan(s.target.x, WANDER.x, b.w / 2, W);
+          var sy = M.axisSpan(s.target.y, WANDER.y, b.h / 2, H);
+          movers.push({ n: n, x: s.cur.x, y: s.cur.y, xlo: sx[0], xhi: sx[1], ylo: sy[0], yhi: sy[1] });
+          wanderCount++;
+        } else if (s.target.orbit && !s.path) {
+          movers.push({ n: -1, x: s.cur.x, y: s.cur.y, xlo: s.cur.x, xhi: s.cur.x,
+                        ylo: s.cur.y, yhi: s.cur.y });   // immovable repulsor
+        }
+      });
+      if (!wanderCount) return;
+      var bnr = bannerRect();
+      if (movers.length < 2 && !bnr) return;             // a lone wanderer with no banner can't collide
+      M.separate(movers, SEP_MIN, bnr);
+      movers.forEach(function (m) {
+        if (m.n < 0) return;                             // repulsor: never written back
+        sprites[m.n].cur.x = m.x; sprites[m.n].cur.y = m.y;
+      });
     }
 
     // Exhaust: spawn puffs at the tail on a per-kind cadence; puffs drift downwind and fade.
@@ -421,6 +517,7 @@
         return;
       }
       var dt = Math.min(0.1, (now - last) / 1000); last = now; frame++;
+      if (!reduced) holdBase = (holdBase + dt * HOLD_RATE) % (Math.PI * 2);   // one clock for the whole hold
 
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.drawImage(base, 0, 0);
@@ -435,6 +532,7 @@
         step(s, now, dt);
         if (!reduced) spawnTrail(s, now);
       });
+      if (!reduced) separateWanderers(nums);   // nudge so no wanderer overlaps a plane or a banner
 
       // the holding pattern racetrack, under its plane
       var holdDrawn = false;
