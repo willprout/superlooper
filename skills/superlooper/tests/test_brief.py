@@ -354,6 +354,59 @@ def _comment(login="acme", body="Cap the deck at 40 pages.",
             "body": body, "createdAt": created}
 
 
+_QA_HEADER = "## Owner's answers to your predecessor's questions (BINDING"
+
+
+def test_qa_log_renders_the_full_question_and_answer(_sl_home):
+    # #163: a relaunch after an owner's answer embeds the full Q&A so the fresh session inherits the
+    # decision. Both the question AND the answer appear, in order, above the loop contract.
+    qa = [{"question": "QUESTION: use approach A or B?", "answer": "Use A; B breaks migrations."}]
+    out = brief.build(_issue(), _cfg(_sl_home), qa=qa)
+    assert _QA_HEADER in out
+    assert "QUESTION: use approach A or B?" in out
+    assert "Use A; B breaks migrations." in out
+    assert out.index("QUESTION: use approach A or B?") < out.index("Use A; B breaks migrations.")
+    assert out.index(_QA_HEADER) < out.index("# Loop contract"), "Q&A is part of 'the issue above'"
+
+
+def test_qa_log_multiple_pairs_are_numbered_in_order(_sl_home):
+    qa = [{"question": "first?", "answer": "do X"}, {"question": "second?", "answer": "do Y"}]
+    out = brief.build(_issue(), _cfg(_sl_home), qa=qa)
+    assert out.index("first?") < out.index("do X") < out.index("second?") < out.index("do Y")
+
+
+def test_qa_log_empty_answer_points_at_the_amendments(_sl_home):
+    # A plain GitHub-client reply carried no marker, so the runner captured no answer text — the
+    # worker is pointed at the amendments block (where the owner's reply is embedded as binding).
+    out = brief.build(_issue(), _cfg(_sl_home), qa=[{"question": "q?", "answer": ""}])
+    assert "q?" in out and _QA_HEADER in out
+    assert "Amendments" in out.split(_QA_HEADER)[1].split("# Loop contract")[0]
+
+
+def test_no_qa_log_leaves_the_brief_unchanged(_sl_home):
+    base = brief.build(_issue(), _cfg(_sl_home))
+    assert brief.build(_issue(), _cfg(_sl_home), qa=None) == base
+    assert brief.build(_issue(), _cfg(_sl_home), qa=[]) == base
+    assert _QA_HEADER not in base
+
+
+def test_qa_log_fails_closed_on_garbage(_sl_home):
+    # wrong-typed qa (not a list) and garbage entries are skipped, never raised, never rendered.
+    base = brief.build(_issue(), _cfg(_sl_home))
+    assert brief.build(_issue(), _cfg(_sl_home), qa="nonsense") == base
+    out = brief.build(_issue(), _cfg(_sl_home),
+                      qa=[{"question": "real?", "answer": "yes"}, "junk", {"no": "keys"}])
+    assert "real?" in out and "yes" in out          # the good entry renders
+    assert _QA_HEADER in out
+
+
+def test_qa_braces_pass_through_literally(_sl_home):
+    # like the body/comments, a {branch}/{issue_num} token inside a Q&A stays LITERAL.
+    out = brief.build(_issue(), _cfg(_sl_home),
+                      qa=[{"question": "touch {branch}?", "answer": "yes, {issue_num} only"}])
+    assert "touch {branch}?" in out and "yes, {issue_num} only" in out
+
+
 def test_owner_comments_embedded_as_binding_in_order(_sl_home):
     comments = [_comment(body="First amendment: cap the deck at 40 pages."),
                 _comment(body="Second amendment: put the page number in the corner.")]

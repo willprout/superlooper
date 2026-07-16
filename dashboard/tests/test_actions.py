@@ -250,6 +250,43 @@ def test_bounce_yes_audit_comment_names_the_accepted_bounce(tmp_path, monkeypatc
 
 # =============================== flag (raw text → issue labeled flag, no AI) ===============================
 
+# =============================== answer (#163 — the durable-question verb) ===============================
+
+def test_answer_posts_the_marked_comment_and_re_approves(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    res = a.answer(REPO, "Use approach A — it matches the pattern.", 4)
+    assert res["ok"] is True
+    muts = _mutations(tmp_path)
+    comment = [m for m in muts if m["kind"] == "comment"][-1]
+    assert comment["num"] == "4"
+    # the answer carries the machine marker (the engine reads the latest of these as the answer)
+    assert comment["body"].startswith("<!-- superlooper-answer -->")
+    assert "Use approach A — it matches the pattern." in comment["body"]
+    # agent-ready re-applied (the trigger); awaiting-answer cleared (+ the legacy owner labels)
+    assert "agent-ready" in _added_labels(muts)
+    assert "awaiting-answer" in _removed_labels(muts)
+
+
+def test_answer_rejects_empty_text_without_touching_gh(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    res = a.answer(REPO, "   ", 4)
+    assert res["ok"] is False and res["error"] == "empty answer"
+    assert _calls(tmp_path) == []
+
+
+def test_answer_refuses_an_unwatched_repo_with_no_gh_call(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path, allowed=(REPO,))
+    res = a.answer("evil/elsewhere", "hi", 4)
+    assert res["ok"] is False and res["error"] == "unknown repo"
+    assert _calls(tmp_path) == []
+
+
+def test_answer_fails_closed_when_gh_write_fails(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert a.answer(REPO, "an answer", 4)["ok"] is False
+
+
 def test_flag_creates_the_flag_label_first_then_the_issue(tmp_path, monkeypatch):
     a = _acts(monkeypatch, tmp_path)
     monkeypatch.setenv("GH_NEW_ISSUE_NUM", "321")

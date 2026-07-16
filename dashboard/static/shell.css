@@ -281,6 +281,15 @@ html, body {
   display: flex; flex-direction: column; gap: 8px; padding-top: 2px;
 }
 .card .actions .act { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+/* #163: the Answer field — where the operator types the answer to a durable question. Sits above
+   its Answer button in the same .act column; monospace so a code-y answer reads true. */
+.card .actions .answer-field {
+  width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; resize: vertical;
+  border: 1px solid #C9D2DC; border-radius: 6px; padding: 7px 9px; margin-bottom: 3px;
+  font: 500 12px/1.45 var(--mono); color: var(--ink); background: #FBFDFF;
+}
+.card .actions .answer-field:focus { outline: none; border-color: var(--blue); }
+.card.kind-question .memo { border-left: 3px solid var(--blue); }
 .card .actions .btn {
   width: 100%; max-width: 100%; min-width: 0;
   white-space: normal; line-height: 1.25; text-align: center;

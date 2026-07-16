@@ -19,6 +19,7 @@ from pathlib import Path
 _STATIC = Path(__file__).resolve().parent.parent / "static"
 _CSS = (_STATIC / "shell.css").read_text(encoding="utf-8")
 _NEEDS_JS = (_STATIC / "needsyou.js").read_text(encoding="utf-8")
+_SHELL_JS = (_STATIC / "shell.js").read_text(encoding="utf-8")
 
 
 def _rule_body(css, selector):
@@ -122,3 +123,29 @@ def test_the_card_still_names_the_drop_target_uniquely_when_armed():
     # repos can each carry a #7 and the number alone would not say which one closes.
     assert "drop-consequence" in _CODE
     assert "c.repo" in _CODE
+
+
+# =============================== the durable-question Answer field (#163) ===============================
+
+def test_the_answer_field_renders_for_a_typed_verb():
+    # #163: a verb the server marks with `input` (the Answer) renders a textarea the operator fills
+    # in — the answer field must be present in the shipped bundle, keyed off the server's flag.
+    assert "a.input" in _CODE, "the Answer field renders only when the server marks the verb"
+    assert "answer-field" in _CODE, "the textarea class the shell handler reads must be present"
+
+
+def test_the_answer_field_is_styled_and_not_clamped():
+    # The answer field must be a real, resizable input (never a fixed one-liner that hides a long
+    # answer) — a string guard so a future edit that drops the style fails CI.
+    body = _rule_body(_CSS, ".card .actions .answer-field")
+    assert body, "the answer field must carry its own style"
+    assert "resize" in body
+
+
+def test_the_shell_posts_the_answer_to_the_answer_endpoint():
+    # The Answer button's handler reads the field beside it and posts the ONE mechanical verb — a
+    # string guard so a future edit that drops the wiring (or the empty-answer guard) fails CI.
+    shell = _strip_js_comments(_SHELL_JS)
+    assert '"/api/answer"' in shell, "the Answer verb must post to /api/answer"
+    assert 'act === "answer"' in shell, "the shell must route the answer act"
+    assert "answer-field" in shell, "the handler reads the operator's typed answer from the field"

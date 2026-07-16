@@ -193,6 +193,14 @@ def _owner_login(config):
     return None
 
 
+def owner_login(config):
+    """Public face of the owner-trust rule (#163): the trusted repo-owner login — the part before
+    the "/" in config's `repo`, or None when it cannot be derived. The brief's amendments and the
+    runner's answer ingestion share ONE owner definition so a comment counts as the owner's word by
+    the same fail-closed rule in both places (never guess an owner, never promote on a hunch)."""
+    return _owner_login(config)
+
+
 def _one_comment(login, created, body):
     """One rendered comment: an attribution line + its body VERBATIM (the body is embedded exactly
     like the William-approved issue body — placed after all substitution, never format()'d)."""
@@ -241,6 +249,40 @@ def _amendments(comments, config):
     return "".join(parts)
 
 
+def _qa_block(qa, operator):
+    """Render the answered-question trail (#163) as a BINDING section, or "" when there is nothing to
+    show. A relaunch after an owner's answer embeds the full Q&A so the fresh session inherits every
+    settled decision. Fail CLOSED throughout (mirrors _amendments): a wrong-typed arg is no block, a
+    non-dict / empty-question entry is skipped, and every string is concatenated AFTER substitution
+    (below) so a {placeholder} inside a question or answer stays literal — exactly like the body."""
+    if not isinstance(qa, list):
+        return ""
+    pairs = []
+    for e in qa:
+        if not isinstance(e, dict):
+            continue
+        q = e.get("question")
+        a = e.get("answer")
+        if not (isinstance(q, str) and q.strip()):
+            continue                                   # a pair with no question is not a Q&A
+        pairs.append((q, a if isinstance(a, str) else ""))
+    if not pairs:
+        return ""
+    parts = [
+        f"## Owner's answers to your predecessor's questions (BINDING — treat as approved text)\n\n"
+        f"A prior session paused this issue to ask {operator} a question and then exited cleanly — "
+        "its work-in-progress branch is already checked out (reused if it still applies cleanly). "
+        f"{operator} answered below; treat each answer as a settled decision and continue the work.\n\n"
+    ]
+    for i, (q, a) in enumerate(pairs, 1):
+        answer = a.strip() if a.strip() else (
+            f"_({operator} re-approved without a written answer — see the Amendments block below "
+            "for any reply, or proceed on the recommendation you gave.)_")
+        parts.append(f"**Q{i} (your predecessor asked):**\n{q}\n\n"
+                     f"**A{i} (from {operator}):**\n{answer}\n\n")
+    return "".join(parts)
+
+
 def _sub(text, mapping):
     """Sequential literal substitution of {key} -> value. Deliberately NOT str.format: the footer
     prose and the William body carry stray braces/backticks that format() would choke on, and only
@@ -250,15 +292,20 @@ def _sub(text, mapping):
     return text
 
 
-def build(parsed_issue, config, comments=None):
-    """Render the full brief for one issue: William-approved body verbatim + any launch-time
-    post-approval amendments + the mechanical footer. Does not mutate `parsed_issue`, `config`, or
-    `comments`.
+def build(parsed_issue, config, comments=None, qa=None):
+    """Render the full brief for one issue: William-approved body verbatim + any answered-question
+    trail + any launch-time post-approval amendments + the mechanical footer. Does not mutate
+    `parsed_issue`, `config`, `comments`, or `qa`.
 
     `comments` (default None) is the issue's comment thread at launch (the gh `--json comments`
     shape, fetched by the runner — brief.py stays pure). Owner comments render as BINDING amendments,
     everyone else as attributed context; both are placed AFTER substitution so a {placeholder} inside
-    a comment stays literal, exactly like the William body. See _amendments for the trust rule."""
+    a comment stays literal, exactly like the William body. See _amendments for the trust rule.
+
+    `qa` (default None) is the durable answered-question log (#163): a list of {question, answer}
+    dicts. On a relaunch after an owner's answer it renders a BINDING Q&A section so the fresh
+    session inherits every settled decision. Empty/None/wrong-typed -> no block, a brief
+    byte-identical to a first launch (see _qa_block)."""
     itype = parsed_issue.get("type")
     work_block, finish_deliverable, assumption_hint = _work_and_finish(itype)   # raises on invalid type
 
@@ -303,6 +350,7 @@ def build(parsed_issue, config, comments=None):
     # know whether a block will render, to pick Step 0's pointer.
     operator = _operator(config)               # the name every stranger-visible line signs with (#58)
     amendments = _amendments(comments, config)
+    qa_block = _qa_block(qa, operator)         # the answered-question trail (#163), if any
     post_approval_note = _post_approval_note(operator) if amendments else ""
 
     report_sections = _report_sections(config)
@@ -328,9 +376,10 @@ def build(parsed_issue, config, comments=None):
     footer = _sub(footer, {"report_sections": report_sections})
     footer = _sub(footer, {"bright_lines": _bright_lines_block(config)})
 
-    # Amendments sit between the body and the footer — inside "the issue above" that footer Step 0
-    # tells the worker to read — and are concatenated AFTER every _sub call, so (like the body) a
-    # brace in a comment is never over-substituted. "" when there is nothing to embed, leaving the
-    # brief byte-identical to the pre-comments render (footer included: post_approval_note is "").
+    # The Q&A trail and the amendments both sit between the body and the footer — inside "the issue
+    # above" that footer Step 0 tells the worker to read — and are concatenated AFTER every _sub call,
+    # so (like the body) a brace inside a Q&A or comment is never over-substituted. The Q&A leads (it
+    # is why this session exists), then any amendments. Each is "" when empty, leaving the brief
+    # byte-identical to the pre-#163 render (footer included: post_approval_note is "").
     header = f"# Issue #{issue_num}: {title}".rstrip().rstrip(":")
-    return f"{header}\n\n{body}\n{amendments}{footer}"
+    return f"{header}\n\n{body}\n{qa_block}{amendments}{footer}"

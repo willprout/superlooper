@@ -272,7 +272,10 @@ def flight_stage(status, liveness=None, bounced=False, long_wait=False,
     caller adds elsewhere."""
     if status == "parked":
         return PARKED
-    if status in ("needs_william", "bounced") or bounced:
+    # awaiting_answer (#163): the worker exited cleanly on an owner-decision question and posted it
+    # durably to the issue. A person is needed before it moves — the same amber "your call" state as
+    # a needs-owner park or a bounce, and the Questions list is where William answers it.
+    if status in ("needs_william", "bounced", "awaiting_answer") or bounced:
         return AWAITING
     if status == "holding":
         return HOLDING
@@ -1039,9 +1042,16 @@ def build_flight(issue, repo):
     celebrate = landed_clean(journal)      # a flourish is EARNED by a proven clean landing (§7),
                                            # never granted by the mere absence of a wander flag
 
+    pending_question = issue.get("pending_question")
+    pending_question = pending_question if isinstance(pending_question, str) and pending_question.strip() else None
     awaiting_reason = None
     if stage == AWAITING:
-        awaiting_reason = "bounced" if (status == "bounced" or bounced) else "needs-owner"
+        if status == "awaiting_answer":
+            awaiting_reason = "question"       # #163: a durable owner-decision question awaits an answer
+        elif status == "bounced" or bounced:
+            awaiting_reason = "bounced"
+        else:
+            awaiting_reason = "needs-owner"
 
     return {
         "id": issue.get("id"),
@@ -1066,6 +1076,9 @@ def build_flight(issue, repo):
         "pr": issue.get("pr"),
         "awaiting_reason": awaiting_reason,
         "long_wait": long_wait,
-        "memo": _flight_memo(journal, blocked_txt, bounced),
+        # For a #163 question, the whole question IS the memo the card shows verbatim (exactly as a
+        # bounce shows its BOUNCED memo); otherwise the latest journalled hand-back memo.
+        "memo": pending_question if awaiting_reason == "question" else _flight_memo(journal, blocked_txt, bounced),
+        "question": pending_question,
         "landings_paused": repo.get("merges_frozen") is not None,
     }

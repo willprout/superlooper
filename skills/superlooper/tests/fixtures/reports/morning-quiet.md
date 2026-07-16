@@ -11,6 +11,9 @@ None.
 ## Bounces
 None.
 
+## Owner questions
+None — no worker needed an owner decision.
+
 ## Conflict regenerations (last 7 days)
 None.
 

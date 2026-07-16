@@ -51,6 +51,10 @@ class _RecordingActions:
         self.calls.append(("flag", repo, text))
         return {"ok": True, "verb": "flag", "num": 9001}
 
+    def answer(self, repo, text, num):
+        self.calls.append(("answer", repo, text, num))
+        return {"ok": True, "verb": "answer"}
+
 
 def _post(path, payload, acts, origin=None, snap=None, host=None):
     body = json.dumps(payload).encode("utf-8")
@@ -99,6 +103,32 @@ def test_flag_dispatches_the_raw_text():
 def test_flag_missing_text_is_400():
     resp = _post("/api/flag", {"repo": REPO}, _RecordingActions())
     assert resp.status == 400
+
+
+# =============================== answer (#163 — text + num) ===============================
+
+def test_answer_dispatches_repo_text_and_num():
+    acts = _RecordingActions()
+    resp = _post("/api/answer", {"repo": REPO, "num": "12", "text": "use A"}, acts)
+    assert resp.status == 200
+    assert json.loads(resp.body)["verb"] == "answer"
+    assert acts.calls[-1] == ("answer", REPO, "use A", 12)      # num coerced to int
+
+
+def test_answer_missing_text_is_400():
+    resp = _post("/api/answer", {"repo": REPO, "num": 12}, _RecordingActions())
+    assert resp.status == 400
+
+
+def test_answer_missing_num_is_400():
+    resp = _post("/api/answer", {"repo": REPO, "text": "use A"}, _RecordingActions())
+    assert resp.status == 400
+
+
+def test_answer_cross_origin_is_refused_403():
+    resp = _post("/api/answer", {"repo": REPO, "num": 1, "text": "x"}, _RecordingActions(),
+                 origin="https://evil.example.com")
+    assert resp.status == 403
 
 
 # =============================== discuss (composes from the snapshot) ===============================
