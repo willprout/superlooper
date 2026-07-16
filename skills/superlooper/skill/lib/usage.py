@@ -62,8 +62,9 @@ def _keychain_ts_to_epoch(s):
 
 def _credential_keychain_state(timeout=5):
     """(present, mtime_epoch) for the Claude Code credential keychain item, reading its ATTRIBUTES
-    only — never `-w`, so the OAuth secret is never dumped. present is False on a definitive absence
-    (nonzero rc), None when `security` could not be run at all (fail-open ambiguity), True otherwise.
+    only — never `-w`, so the OAuth secret is never dumped. present is False ONLY on a DEFINITIVE
+    absence (rc == errSecItemNotFound); None (fail-open ambiguity) when `security` could not be run
+    at all OR returned some other error we cannot trust as proof of absence; True otherwise.
     mtime_epoch is the item's `mdat` in epoch seconds, or None."""
     try:
         r = subprocess.run(

@@ -862,7 +862,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # backstop for a lane whose label move hasn't landed. Loose by design: over-surfacing dead auth is
     # fail-safe, it auto-clears on the next healthy probe, and a terminal lane's marker is cleaned.
     has_relaunch_demand = (
-        any(isinstance(p, dict) and "in-progress" in (p.get("labels") or [])
+        any(isinstance(p, dict) and isinstance(p.get("labels"), list)
+            and "in-progress" in p["labels"]
             for p in parsed_by_id.values())
         or any(_iid_num(k) is not None for k in exited))
     # launches_held folds auth into the same fresh-launch suppression the anchor/systemic detectors
