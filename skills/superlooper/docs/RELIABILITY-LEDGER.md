@@ -220,6 +220,29 @@ report-path compliance must be mechanically rescued, not instructed; in-flight l
 per-tick branch→PR reconciliation; probes must demand machine-readable replies and must not
 reset the clock they feed.
 
+**2026-07-16 (overnight) — the first Wave-1 regression: the report harvest promotes drafts** ·
+*Classes 1, 4* · Two lanes in one night (i153 03:29, i163 04:33): workers drafted their reports
+in-worktree mid-session (against the "report is your LAST action" order — class-6 drift the new
+machinery was meant to absorb, not amplify); the brand-new #148 Stop-hook harvest moved the
+drafts to the canonical path at a turn boundary (report mtimes match the harvest moments to the
+second; i153's Review section is a literal placeholder that also cleared the 40-char section
+check); the runner read "finished", the gate — correctly fail-closed — parked both on "finished
+but no PR exists", and the park-family reclaim then pruned worktrees whose branches carried ZERO
+commits and no push: the only copies of both sessions' work were destroyed. No bad merge (the
+gate held); cost = ~2 worker-sessions of output lost + 2 owner-decision parks. Fixes filed as
+#189 (harvest fires only for a genuinely-ended run; placeholder sections never satisfy the
+section check) and #190 (reclaim refuses to prune a dirty/unpushed worktree).
+
+**2026-07-16 (overnight) — the diff-pinned review contract parks its own PR** · *Class 3* ·
+i154 built the new pinned review marker (`<!-- superlooper-review sha=… -->`) and its reviewer
+posted the verdict in that new format on PR #181 — which the *running* engine's gate (installed
+before the change; the change itself was still unmerged) reads as "no review evidence"
+(`_any_comment_begins` requires the legacy `<!-- superlooper-review -->` prefix): nudged once,
+parked. The self-referee bootstrap case: a worker applying its own new contract to itself is
+judged by the old referee until the change merges AND republishes. Work product fully intact
+(PR #181 open, reviewed APPROVED-after-fixes, pinned to the unchanged head). Dashboard-side
+sibling already filed as #176.
+
 ---
 
 ## The owner's documented frustrations (recorded 2026-07-15, in his words where quoted)
