@@ -1619,10 +1619,18 @@ class Runner:
         MERGED worktrees are auto-removed today). tidy.reclaimable_worktrees is the pure, fail-closed
         selector — it never returns an in-flight/gating/holding/ready lane, so a LIVE build is never
         touched. Safe because re-approval rebuilds from the issue on a fresh branch (the committed
-        work survives on the branch ref; worktree_remove drops only the checkout). Config-gated so an
-        operator can keep parked worktrees for inspection. Best-effort: a worktree that can't be fully
-        removed (worktree_remove -> False) is simply retried on a later tick — never raised."""
-        if not self.config.get("cleanup_parked_worktrees", True):
+        work survives on the branch ref; worktree_remove drops only the checkout).
+
+        OFF BY DEFAULT since owner ruling 2026-07-16 (#168): `cleanup_parked_worktrees` now defaults
+        FALSE, so this sweep is a no-op unless a repo explicitly opts in. The owner must be able to
+        open the window of stalled work and look at the session — and this reaper closes that window
+        (the #149 ordered teardown must close the pane before it can prune under the live CLI), which
+        was the behavior annoying him on the work machine. So a park-family lane's window AND worktree
+        now simply persist until an owner verb resolves the lane. An opt-in operator on a disk-
+        constrained machine accepts the window close; the #190 dirty/unpushed guard still protects
+        every prune. Best-effort: a worktree that can't be fully removed (worktree_remove -> False) is
+        simply retried on a later tick — never raised."""
+        if not self.config.get("cleanup_parked_worktrees", False):
             return
         issues = st.get("issues") if isinstance(st, dict) and isinstance(st.get("issues"), dict) else {}
         # `isinstance(status, str)` BEFORE the set membership: an unhashable wrong-typed status
@@ -1749,7 +1757,7 @@ class Runner:
         # safety — each is self-guarded so it can never crash the tick or block the heartbeat.
         if written:                                    # processed/ only grew if events were archived
             self._prune_processed_events()             # keep next_seq + rebuild scan history-independent
-        self._reclaim_terminal_worktrees(st)           # git-remove park-family worktrees (safe: rebuilt on reapprove)
+        self._reclaim_terminal_worktrees(st)           # opt-in only (#168): OFF by default, park-family persists
         self._drain_pending_teardowns(st)              # (#149) retry prunes declined under a live CLI
         if now - self._last_journal_rotate >= JOURNAL_ROTATE_SECONDS:
             try:
@@ -1986,6 +1994,17 @@ class Runner:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(WORKER_EXIT_POLL)
+
+    def _auto_close_merged(self):
+        """May a lane that just MERGED and landed have its cmux window auto-closed and its worktree
+        reclaimed? Owner ruling 2026-07-16 (#168): auto-closing a window is allowed ONLY for a
+        merged-and-landed lane, and even that is gated by `auto_close_merged_windows` (default True).
+        Composed (AND) with the pre-existing `cleanup_merged_worktrees` so a repo that set EITHER knob
+        to keep its finished checkouts is honored; #178 tracks unifying the overlapping pair. Off, the
+        merged window — and, since a prune can never run under the live CLI it would leave open (#149),
+        its worktree — persists until `superlooper tidy` (the owner's explicit word)."""
+        return (self.config.get("auto_close_merged_windows", True)
+                and self.config.get("cleanup_merged_worktrees", True))
 
     def _close_pane(self, iid):
         """Close the id's recorded surface. Best-effort; rc ignored (a dead surface = a no-op)."""
@@ -2521,8 +2540,11 @@ class Runner:
                       "park_comment_posted": False})
         self._update_issue(iid, fn=settle)
         # Reclaim the worktree, exactly as _exec_absorb_merged does for its 'merged' settle — a
-        # bounce/park absorbed this way would otherwise leave its worktree behind to accumulate.
-        if self.config.get("cleanup_merged_worktrees", True):
+        # bounce/park absorbed this way would otherwise leave its worktree behind to accumulate. The
+        # owner's close IS the owner verb that resolved this lane (#168), so auto-closing its window
+        # here is not the "auto-close stalled work" the ruling forbids; it is gated by the same
+        # merged knob for an operator who keeps finished windows for inspection.
+        if self._auto_close_merged():
             self._teardown_session(iid, remove_worktree=True)      # ordered (#149)
         return "ok"
 
@@ -3019,10 +3041,11 @@ class Runner:
                         "evidence + required checks + mergeable).")
         gh.set_labels(num, remove=["in-progress"])
         self._update_issue(iid, {"status": "merged"})
-        if self.config.get("cleanup_merged_worktrees", True):
+        if self._auto_close_merged():
             # (#149) The D14 hot path: the lane that just merged still has its worker idling at the
             # prompt in this very worktree, so the old bare prune unlinked a live CLI's cwd at the
             # exact moment the lane finished. Ordered teardown: close, see it go, then reclaim.
+            # (#168) A merged-and-landed lane is the ONE case the owner allows to auto-close.
             self._teardown_session(iid, remove_worktree=True)
         return "ok"
 
@@ -3247,8 +3270,8 @@ class Runner:
         if not gh.set_labels(num, remove=["in-progress"]):
             return "label cleanup failed (will retry next tick)"
         self._update_issue(iid, {"status": "merged"})
-        if self.config.get("cleanup_merged_worktrees", True):
-            self._teardown_session(iid, remove_worktree=True)      # ordered (#149)
+        if self._auto_close_merged():
+            self._teardown_session(iid, remove_worktree=True)      # ordered (#149); merged-only (#168)
         return "ok"
 
     def _exec_file_fix_issue(self, a, now):

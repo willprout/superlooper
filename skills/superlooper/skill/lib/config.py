@@ -47,10 +47,20 @@ _TOP_DEFAULTS = {
     "report_required_sections": ["Tests", "Review"],
     "bright_lines": [],
     "cleanup_merged_worktrees": True,
-    # Reclaim the worktrees of park-family terminal issues (parked/needs-william/bounced), which
-    # otherwise linger forever (issue #41). Safe: re-approval rebuilds from the issue on a fresh
-    # branch. Set false to keep parked worktrees on disk for manual inspection.
-    "cleanup_parked_worktrees": True,
+    # Auto-close a lane's cmux window (and, ordered by #149, reclaim its worktree) once it has
+    # SUCCESSFULLY MERGED and landed — owner ruling 2026-07-16 (#168). Default True: a merged lane is
+    # truly done and never resurrected, so its finished session need not linger. Set false to keep
+    # merged windows/worktrees for inspection — the pre-#149 "nothing auto-closed" posture as an
+    # explicit opt-out; `superlooper tidy` then remains the owner's explicit word to close them.
+    # This is the ONLY automatic window close: park-family lanes are NEVER auto-closed (see below).
+    "auto_close_merged_windows": True,
+    # Reclaim the worktrees of park-family terminal issues (parked/needs-william/bounced) on every
+    # tick. Owner ruling 2026-07-16 (#168): DEFAULT FALSE — the owner must be able to open the window
+    # of stalled work and look at the session, so a park-family lane's window AND worktree simply
+    # persist until an owner verb (re-approve / drop / tidy) resolves the lane. Set true to opt back
+    # into the disk-bounding reaper (#41) on a disk-constrained machine, accepting that it closes
+    # park-family windows to do so; the #190 dirty/unpushed refusal still guards every prune.
+    "cleanup_parked_worktrees": False,
     "report_time": "08:45",
 }
 
@@ -277,7 +287,8 @@ def _validate_and_fill(raw):
         _err(f"'affinity' must be one of {sorted(_AFFINITIES)}, got {out['affinity']!r}")
     if not isinstance(out["merge_method"], str) or out["merge_method"] not in _MERGE_METHODS:
         _err(f"'merge_method' must be one of {sorted(_MERGE_METHODS)}, got {out['merge_method']!r}")
-    for flag in ("touches_required", "cleanup_merged_worktrees", "cleanup_parked_worktrees"):
+    for flag in ("touches_required", "cleanup_merged_worktrees", "cleanup_parked_worktrees",
+                 "auto_close_merged_windows"):
         if not isinstance(out[flag], bool):
             _err(f"'{flag}' must be true or false, got {out[flag]!r}")
     for listkey in ("bright_lines", "report_required_sections"):

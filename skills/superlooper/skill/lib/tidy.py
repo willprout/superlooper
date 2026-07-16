@@ -2,10 +2,17 @@
 no cmux, no gh, no subprocess, no clock — so the safety contract is a unit-test table
 (tests/test_tidy.py). The CLI (skill/bin/superlooper `tidy`) does the best-effort close.
 
-`tidy` is William's explicit word, never an automatic path: the V1 'nothing auto-closed'
-posture stands (DRYRUN 2026-07-03). A real claude worker idles at its prompt forever after
-finishing (D4) and never self-exits, so its cmux window lingers; this decides which lingering
-windows are safe to close.
+`tidy` is William's explicit word for closing FINISHED windows on demand. The runner also
+auto-closes on its own, but ONLY the two cases the owner ruled for (2026-07-16, #168): a lane
+that SUCCESSFULLY MERGED and landed (gated by `auto_close_merged_windows`, default on), and —
+strictly opt-in via `cleanup_parked_worktrees` — the park-family reaper. By default the runner
+NEVER auto-closes a parked / needs-william / bounced / stalled window: the owner must be able to
+open stalled work and look at the session, so it persists until an owner verb resolves the lane.
+This supersedes the V1 'nothing auto-closed' posture (DRYRUN 2026-07-03), written before the D14
+forensics forced the ordered teardown (#149). A real claude worker idles at its prompt forever
+after finishing (D4) and never self-exits, so its cmux window lingers; this decides which
+lingering windows `tidy` is safe to close on the owner's word (merged by default; --all extends
+to the park family, which the runner never touches automatically).
 
 Safety, stated as code below and pinned by tests:
   * Only a status this module can positively NAME as terminal is ever selected (a positive
