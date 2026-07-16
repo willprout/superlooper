@@ -34,6 +34,7 @@ import actions as actions_mod
 import cards as cards_mod
 import config as config_mod
 import digest as digest_mod
+import engine as engine_mod
 import flights
 import launch_rules
 import notify as notify_mod
@@ -42,6 +43,7 @@ import readers
 import runner_source
 import replay as replay_mod
 import tower as tower_mod
+import truth
 import version as version_mod
 
 # The one address this server may ever bind. It writes labels; off-machine reachability is a
@@ -1584,7 +1586,7 @@ def _live_cargo(all_flights):
 
 
 def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=None, desk=None,
-                      concluded=None, version=None):
+                      concluded=None, version=None, engine=None):
     """Compose the whole snapshot the front-end binds. Reads FRESH local state every call; ``gh_mod``
     and ``usage`` are inputs so GitHub + usage egress ride the slow clock (decision B.2). With
     ``gh_mod=None`` the snapshot is honest but title-less — exactly what a poll produces when GitHub
@@ -1594,8 +1596,11 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
     facts a once-per-run fetch instead of a forever poll (issue #48); ``None`` keeps the old
     per-poll behavior (embedders/tests that don't wire it). ``version`` (a ``lib.version.Version``,
     created once at boot) carries this server's own code identity so the UI can see it has gone stale
-    under a moving checkout (issue #136); ``None`` omits the block entirely. Semantics all route
-    through the tested ``lib/`` functions (design record B.1)."""
+    under a moving checkout (issue #136); ``None`` omits the block entirely. ``engine`` (a
+    ``lib.engine.EngineDrift``, created once at boot) carries whether the INSTALLED engine is behind
+    the checkout, which every repo's truth strip folds in (issue #166); ``None`` simply leaves the
+    strip's engine line silent. Semantics all route through the tested ``lib/`` functions (design
+    record B.1)."""
     now = time.time() if now is None else now
     diff_reader = pollers.diff_stat if diff_reader is None else diff_reader
     last_seen = desk.tower_last_seen() if desk is not None else None
@@ -1679,6 +1684,29 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
             snap["version"] = version.state()
         except Exception:   # the field is the truth the owner came for; never 500 the poll over a stamp
             pass
+
+    # The engine's publish drift (issue #166) — like `version`, a fact about the TOOLING rather than
+    # the field, and global: there is one installed engine behind every watched repo. Measured on its
+    # own 30s clock inside EngineDrift, so this costs a dict copy on the 2-second poll.
+    engine_state = None
+    if engine is not None:
+        try:
+            engine_state = engine.state()
+        except Exception:
+            # Never a reason to 500 — but never silence either. `None` here would render as NO engine
+            # line, which reads exactly like a live, up-to-date engine: the false all-clear this strip
+            # exists to delete, coming back through the error path (caught in review). A wired engine
+            # that cannot answer says so out loud; only an UNWIRED one (engine is None) stays quiet.
+            engine_state = engine_mod.unmeasurable("the dashboard could not read the engine's state")
+    snap["engine"] = engine_state
+
+    # The standing truth strip (issue #166), per repo. Built HERE rather than inside _assemble_repo
+    # because it is the one line that folds a GLOBAL fact (engine drift) into a PER-REPO one (that
+    # repo's runner tick + data source) — this is the first point where both are known. Each repo
+    # gets its own strip: the runner, the heartbeat and the published view are all per-repo, so a
+    # single field-wide freshness line would be a lie the moment two repos disagreed.
+    for rs in repo_snaps:
+        rs["truth"] = truth.banner(rs.get("source"), engine=engine_state, github=rs.get("github"))
     return snap
 
 

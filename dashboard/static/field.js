@@ -108,14 +108,23 @@
     overlays.appendChild(srcBanner);
     fixedEls.src = srcBanner;
 
-    // The always-on freshness stamp: how old the DATA on screen is, and how long since the runner's
-    // last completed tick. Shown in BOTH modes and never gated on trouble — it is the honesty that
-    // makes the whole surface readable, not a warning. The two clocks are genuinely different (a
-    // fresh tick can still be republishing a 90s-old GitHub read), so both are named in plain words.
-    var age = document.createElement('span');
-    age.className = 'fld-age';
-    overlays.appendChild(age);
-    fixedEls.age = age;
+    // THE STANDING TRUTH STRIP (issue #166). It absorbs #146's always-on freshness stamp — same
+    // corner, same quiet register when all is well — but it now states the CONCLUSION rather than
+    // only the numbers ("loop may be down", not merely "last tick 15m ago", which makes the owner
+    // know the threshold to read it), and it carries a third fact those clocks can't see: the
+    // engine's publish drift, the merged fixes the runner is not running yet.
+    //
+    // Always mounted, never gated on trouble. It is the honesty that makes the whole surface
+    // readable, not a warning — the owner read this field for weeks as a live mirror of the runner
+    // while it quietly wasn't one, and a strip that only appears when someone already knows to look
+    // for it would rebuild that exact bug.
+    //
+    // Design B.1: every word here is the server's (lib/truth.py, unit-tested). This file picks no
+    // threshold, formats no age, and decides no state — it binds three strings and a level class.
+    var strip = document.createElement('div');
+    strip.className = 'fld-truth';
+    overlays.appendChild(strip);
+    fixedEls.truth = strip;
 
     engine = window.AirfieldLive.mount(canvas);
     canvas.addEventListener('click', function (e) {
@@ -271,12 +280,15 @@
     if (mismatch) fixedEls.fmt.querySelector('.m').textContent = sf.message || '';
 
     bindSource(c.repo.source);
+    bindTruth(c.repo.truth);
   }
 
-  /* Bind the source-mode surfaces (issue #146): the always-on freshness stamp, and the fallback
-     banner. Both read the server's verdict (repo.source) and derive nothing — which mode we're in,
-     and the words for it, are decided once in lib/flights.source_mode so the banner and the board
-     can never tell two different stories. */
+  /* Bind the fallback banner (issue #146). It reads the server's verdict (repo.source) and derives
+     nothing — which mode we're in, and the words for it, are decided once in lib/flights.source_mode
+     so the banner and the board can never tell two different stories.
+
+     The always-on freshness stamp this used to bind moved into bindTruth (issue #166), which states
+     the same two clocks plus the conclusion; what stays here is the loud fallback band alone. */
   function bindSource(src) {
     src = src || {};
     var fallback = src.mode === 'fallback';
@@ -289,14 +301,34 @@
       fixedEls.src.innerHTML = '<span class="t">◆ FALLBACK — GITHUB DIRECT</span>' +
         lines.map(function (l) { return '<span class="m">' + esc(l) + '</span>'; }).join('');
     }
+  }
 
-    // The stamp: ALWAYS, both modes. Deliberately not gated on `fallback`. Both phrases are the
-    // SERVER's words (design B.1) — including its "?" for an age we don't honestly have, which is
-    // never rendered as a number: a "0s ago" would claim the freshest possible data at the exact
-    // moment we have none. The data_age/tick_age numbers ride the snapshot too, for inspection.
-    fixedEls.age.textContent = 'data ' + (src.data_age_text || '?') +
-      ' · last tick ' + (src.tick_age_text || '?');
-    fixedEls.age.classList.toggle('fld-age-warn', fallback);
+  /* Bind the standing truth strip (issue #166): how long since the runner ticked, whose truth is on
+     screen, and whether the engine running the loop is the one that was merged.
+
+     ALWAYS rendered — in every mode, healthy or not. That is deliberate and is the whole point: a
+     surface that only tells you it might be lying once you suspect it isn't a surface you can trust
+     the rest of the time.
+
+     This derives NOTHING. `level`, each `state`, and every `text` are composed server-side in
+     lib/truth.py (which in turn reads flights.source_mode's and engine.drift's verdicts, never a
+     second opinion of its own). A missing strip falls back to the DOWN state rather than a blank:
+     an absent verdict is not an all-clear, and rendering nothing is how this surface lied before. */
+  function bindTruth(t) {
+    t = t || {};
+    var tick = t.tick || {}, data = t.data || {}, eng = t.engine;
+    // The level class colours the whole strip, so one glance at it summarises everything under it.
+    fixedEls.truth.className = 'fld-truth lvl-' + esc(t.level || 'down');
+    var rows = '<span class="r ' + esc(tick.state || 'down') + '">' +
+      esc(tick.text || 'no tick seen — loop may be down') + '</span>' +
+      '<span class="r ' + esc(data.state || 'blind') + '">' + esc(data.text || 'data ?') + '</span>';
+    // The engine line appears ONLY when there is something to say — a live engine is silent (§0.2:
+    // a strip that congratulates itself every two seconds is one the owner stops reading, and then
+    // the one time it matters he won't see it).
+    if (eng && eng.text) {
+      rows += '<span class="r eng ' + esc(eng.state || '') + '">' + esc(eng.text) + '</span>';
+    }
+    fixedEls.truth.innerHTML = rows;
   }
 
   window.CCField = { attach: attach };

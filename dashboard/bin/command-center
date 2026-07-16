@@ -34,6 +34,7 @@ sys.path.insert(0, str(_ROOT / "lib"))
 import actions as actions_mod  # noqa: E402
 import config as config_mod   # noqa: E402
 import desk as desk_mod       # noqa: E402
+import engine as engine_mod   # noqa: E402
 import fixer as fixer_mod     # noqa: E402
 import gh                     # noqa: E402
 import pollers                # noqa: E402
@@ -68,13 +69,15 @@ def _bind_error_line(port, err):
             'then start again.\n' % (port, reason, port))
 
 
-def build_provider(cfg, dashboard_desk, monitor, version=None):
+def build_provider(cfg, dashboard_desk, monitor, version=None, engine=None):
     """Wire the snapshot provider: fresh local state every call, GitHub + usage on the slow clock,
     the dashboard's own desk supplying the since-you-last-looked watermark (Task 9), and the
     dead-man's switch (Task 10) — every poll re-evaluates the runner heartbeat and ``monitor`` (a
     lib.watchdog.Watchdog) fires exactly one RUNNER DOWN push per down episode, off the poll thread.
     ``version`` (a lib.version.Version, stamped once at boot) rides along so every poll re-checks
-    whether this process's code still matches disk (issue #136)."""
+    whether this process's code still matches disk (issue #136). ``engine`` (a lib.engine.EngineDrift)
+    does the same for the INSTALLED engine the runner actually executes (issue #166) — a merged
+    engine fix is inert until republished, and the truth strip is what makes that gap visible."""
     interval = cfg.get("gh_poll_seconds", 30)
     # The dashboard's own GitHub reads are the FALLBACK path only (issue #146): when the runner is
     # ticking, the snapshot is built from its published view and this adapter is never consulted. So
@@ -92,7 +95,8 @@ def build_provider(cfg, dashboard_desk, monitor, version=None):
     def provider():
         snap = server.assemble_snapshot(cfg, now=time.time(), gh_mod=cached_gh,
                                         usage=usage_cache.get(), diff_reader=pollers.diff_stat,
-                                        desk=dashboard_desk, concluded=concluded, version=version)
+                                        desk=dashboard_desk, concluded=concluded, version=version,
+                                        engine=engine)
         # The one push the dashboard owns (§6): the runner can't announce its own death. Bounded and
         # never-raising, dispatched on a daemon thread so a slow notifier never stalls the snapshot.
         server.dispatch_runner_pushes(snap, monitor, cfg)
@@ -141,7 +145,15 @@ def main(argv):
     # the owner a RAMP SWEEP button his day-old server had no route for. From here on the server can
     # see that gap itself and say so.
     code_version = version_mod.Version(_ROOT)
-    provider = build_provider(cfg, dashboard_desk, monitor, code_version)
+    # The engine's publish drift (issue #166). BOTH inputs are derived from config the operator
+    # already wrote, so there is no new key to get out of sync: the source checkout is whichever
+    # watched repo carries the engine payload (a dashboard watching none simply has nothing to say),
+    # and the installed copy is the parent of the configured `superlooper_cli`'s bin/ — which is
+    # exactly install.sh's $DEST. Read-only and gated to a 30s clock; it never publishes anything.
+    engine_drift = engine_mod.EngineDrift(
+        engine_mod.source_repo([r["path"] for r in cfg["repos"]]),
+        engine_mod.install_dir(cfg["superlooper_cli"]))
+    provider = build_provider(cfg, dashboard_desk, monitor, code_version, engine_drift)
     # The verbs (Task 6) — the only GitHub writes in the product. They take the RAW gh adapter, never
     # the slow read-cache (a label change must land now, not on the next 30s tick — CachedGh caches
     # only reads). The allow-list is exactly the configured slugs, so a tap can only ever steer a repo

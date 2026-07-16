@@ -343,7 +343,11 @@ html, body {
    they are. Both stay TRUE when the runner is gone, and are precisely what the owner needs then
    (runner-down is a superset of runner-silent, so this is when fallback is certain to be running).
    Same principle as the stale-tower NOTAM (#136): a surface reporting the tower, not the field. */
-.fld-root.down .fld-overlays > :not(.fld-rd):not(.fld-src):not(.fld-age) { display: none !important; }
+/* RUNNER DOWN grays the field and hides the overlays — except the ones whose whole job is to tell
+   the truth about WHY it is gray. .fld-truth is in that set for the obvious reason: it is the strip
+   that says "loop may be down", so hiding it in the down state would silence the exact sentence the
+   owner needs most (issue #166). */
+.fld-root.down .fld-overlays > :not(.fld-rd):not(.fld-src):not(.fld-truth) { display: none !important; }
 .fld-overlays { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
 /* author display values (grid etc.) must never defeat the hidden attribute */
 .fld-overlays [hidden] { display: none !important; }
@@ -482,12 +486,54 @@ html, body {
 /* Bottom-LEFT, not right: the painted incident sign ("N landings since the last incident") lives
    bottom-right, and it is a §7 joy element — covering it to make room for a freshness stamp would
    trade delight for plumbing, which §0.1 forbids outright. Verified by screenshot, not by eye. */
-.fld-age {
-  position: absolute; left: 6px; bottom: 5px; z-index: 3; white-space: nowrap;
+/* THE STANDING TRUTH STRIP (issue #166) — always on the wall, in every mode.
+
+   It absorbs #146's freshness stamp and keeps its posture exactly: bottom-LEFT (the painted incident
+   sign — "N landings since the last incident" — owns bottom-right, and it is a §7 joy element;
+   covering it for plumbing would trade delight for telemetry, which §0.1 forbids outright), small,
+   and at rest almost invisible.
+
+   THE GRADIENT IS THE DESIGN. §0.1 says joy is terminal, and a permanent alarm taxes every glance at
+   a healthy field — so `lvl-ok` is the same quiet grey chip the stamp always was and asks for
+   nothing. The strip earns attention only as the truth gets worse: amber when something is drifting
+   but nothing is broken (`lvl-notice`), red-hot with a slow pulse when the loop itself may be dead
+   (`lvl-down`). That escalation is what keeps the shout credible; a strip that is loud all the time
+   is wallpaper within a week, and then the one time it matters the owner doesn't see it. */
+.fld-truth {
+  position: absolute; left: 6px; bottom: 5px; z-index: 3; max-width: 72%;
+  display: flex; flex-direction: column; gap: 1px; align-items: flex-start;
   background: rgba(16, 21, 27, 0.78); border: 1px solid #33404E; border-radius: 4px;
-  font: 600 9px var(--mono); letter-spacing: 0.3px; color: #8DA0B0; padding: 2px 7px;
+  padding: 2px 7px;
 }
-.fld-age-warn { color: #E4C4FF; border-color: #7E4FB0; background: rgba(34, 14, 52, 0.88); }
+/* Rows WRAP rather than run off. The chip is capped at 72% and .fld-overlays clips at the field
+   edge, so a nowrap row ("data ? · GitHub direct — not the runner's view" is ~44ch) would spill past
+   its own painted background and get sheared on a narrow tile — the strip's most important sentences
+   silently truncated, which is a new way to lose the truth (raised in review). Wrapping costs a
+   second line in the rare narrow case and never loses a word. */
+.fld-truth .r {
+  font: 600 9px var(--mono); letter-spacing: 0.3px; color: #8DA0B0; white-space: normal;
+}
+/* The engine line is the one row that names a REMEDY rather than a reading, so it gets its own
+   quiet accent — "re-run the installer to switch them on" is an instruction, and an instruction
+   the eye slides past is not one. */
+.fld-truth .r.eng { color: #E0B860; }
+
+/* NOTICE — something is drifting; nothing is broken. Amber, the field's existing caution colour
+   (.fld-fmt owns it for the same register: a data-integrity caution, not an outage). */
+.fld-truth.lvl-notice { border-color: #8A6A2A; background: rgba(30, 22, 8, 0.86); }
+.fld-truth.lvl-notice .r { color: #ECD9B4; }
+
+/* DOWN — the loop itself may be dead, and everything on this field may be a picture of the past.
+   Red, bordered, and slowly pulsing: the one state where the strip is allowed to demand the eye. */
+.fld-truth.lvl-down {
+  border-color: #C0392B; background: rgba(40, 12, 8, 0.92);
+  box-shadow: 0 0 0 1px rgba(192, 57, 43, 0.35), 0 4px 14px rgba(0, 0, 0, 0.5);
+  animation: cc-truth-pulse 2s ease-in-out infinite;
+}
+.fld-truth.lvl-down .r { color: #FFD9CF; }
+.fld-truth.lvl-down .r.eng { color: #E0B860; }
+@keyframes cc-truth-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.62; } }
+@media (prefers-reduced-motion: reduce) { .fld-truth.lvl-down { animation: none; } }
 .repo-sel { display: inline-flex; align-items: center; gap: 5px; margin-left: 6px; }
 .repo-tab {
   position: relative;
