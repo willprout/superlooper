@@ -110,11 +110,23 @@ Keep total response under 1200 words.
 ### 3. Run the review
 
 **Default path — Codex (a different model family).** Write the assembled prompt to a tempfile,
-then:
+then run it through the loop's **pinned** review helper — never `codex exec` bare:
 
 ```bash
-codex exec - < /tmp/codex-review-prompt.txt 2>&1
+"$HOME/.claude/skills/superlooper/bin/cross-review.sh" < /tmp/codex-review-prompt.txt 2>&1
 ```
+
+The helper reads `models.reviewer` / `models.reviewer_effort` from the repo's
+`.superlooper/config.json` and passes them to codex as **explicit** `-m` / `-c
+model_reasoning_effort=` flags, so the review runs at the tier the *loop* pins — never whatever the
+owner's machine-global `~/.codex/config.toml` happens to say (issue #158: the 2026-07-14→15 incident
+began when a global config change silently ran every in-flight review at ultra effort until they
+timed out). It also echoes the pinned model+effort so a wrong-tier review is diagnosable.
+
+If the helper isn't installed on this machine (cross-review used standalone, no superlooper engine),
+pass the equivalent explicit flags yourself — `codex exec -m <models.reviewer> -c
+model_reasoning_effort="<models.reviewer_effort>" - < /tmp/codex-review-prompt.txt` — and **never**
+run `codex exec` bare, so the review can never inherit the ambient `~/.codex/config.toml`.
 
 Use the Bash tool with timeout >= 300000ms (5 minutes). Capture full output.
 
@@ -160,8 +172,12 @@ nothing useful for an artifact type, the user should know so they don't burn cyc
   (if relevant) the spec.
 - For artifacts >2000 lines, warn the user that the reviewer's context may truncate. Offer to
   split the review into sections.
-- Codex's default model comes from `~/.codex/config.toml`. Suggest `-m <model>` if the user
-  wants to override for a specific review; don't override unprompted.
+- The reviewer's model + reasoning-effort are **pinned per repo** by `models.reviewer` /
+  `models.reviewer_effort` in `.superlooper/config.json`, applied by `bin/cross-review.sh` as
+  explicit `-m` / `-c model_reasoning_effort=` flags (issue #158). The review deliberately does
+  **not** read the machine-global `~/.codex/config.toml` for these, so a global config change can't
+  poison an in-flight loop review. To review at a different tier, edit the repo config (or set
+  `SL_REVIEW_REPO_ROOT` to point the helper at another repo's config) — don't hand-edit the global.
 - This skill is pure content: it carries no hook. The machine-local `suggest-cross-review` hook
   (a PostToolUse nudge on the owner's personal paths) is deliberately **not** shipped here — a
   plugin hook would execute ungated, and its triggers are personal setup, not loop machinery.

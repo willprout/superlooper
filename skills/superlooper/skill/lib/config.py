@@ -62,7 +62,19 @@ _NESTED_DEFAULTS = {
     # MUST stay a genuine null: unlike worker/answerer, a filled-in truthy default would WIN over
     # the runner's no-flag fallback and force an effort on every repo that omits the field (the
     # stale-fable trap). A per-issue effort:* label overrides it; the answerer never reads it.
-    "models": {"worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": None},
+    # reviewer/reviewer_effort (issue #158): the per-repo pin for the CROSS-REVIEWER's model +
+    # reasoning-effort. The 2026-07-14→15 incident began when the owner changed his machine-global
+    # Codex config for unrelated work and every in-flight cross-review silently ran at ultra effort,
+    # timed out, and aged workers past the freeze threshold — because the plugin's cross-review ran
+    # `codex exec` BARE (no -m, no -c model_reasoning_effort), inheriting ~/.codex/config.toml. So
+    # both fields carry CONCRETE non-null defaults (unlike worker_effort, whose null means "no flag"):
+    # a null here would re-open the bare-invocation hole — the review must ALWAYS pass an explicit
+    # flag. `reviewer` is a codex model (the default cross-review path; a Claude-only machine falls
+    # back to a fresh subagent that needs no model flag); `reviewer_effort` is a bounded, reliably-
+    # under-timeout tier. A repo overrides either; the codex flag syntax lives in bin/cross-review.sh
+    # (agent boundary), so the pin stays per-repo config, never a hardcoded Codex fact in the core.
+    "models": {"worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": None,
+               "reviewer": "gpt-5.5", "reviewer_effort": "medium"},
     # checks_pending_cap (issue #26): seconds a FINISHED PR may sit with its required checks
     # PENDING before the runner escalates ONCE to needs-william (naming the unreported checks).
     # The merge decision stays fail-closed — pending never merges — this only bounds the wait so a
@@ -270,6 +282,15 @@ def _validate_and_fill(raw):
     we = out["models"]["worker_effort"]
     if we is not None and (not isinstance(we, str) or not we.strip()):
         _err(f"'models.worker_effort' must be null or a non-empty string, got {we!r}")
+    # reviewer / reviewer_effort (issue #158): NO valid null. A null model would omit `-m` and a null
+    # effort would omit `-c model_reasoning_effort=`, and either omission lets codex read the
+    # machine-global config — the exact ambient-poison the pin exists to end. So both are required
+    # non-empty strings, validated like worker/answerer (a blank or wrong type fails the adopt loudly).
+    for rk in ("reviewer", "reviewer_effort"):
+        v = out["models"][rk]
+        if not isinstance(v, str) or not v.strip():
+            _err(f"'models.{rk}' must be a non-empty string (the cross-reviewer pin has no valid "
+                 f"null — a review must never inherit the machine-global Codex config), got {v!r}")
     for sk in ("idle_seconds", "freeze_seconds", "retry_cap", "conflict_cap", "checks_pending_cap"):
         v = out["session"][sk]
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:
