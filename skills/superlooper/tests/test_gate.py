@@ -1218,9 +1218,11 @@ def test_gate_preauthorization_does_not_bypass_other_gates():
              statusCheckRollup=[{"context": "quality-gate", "state": "FAILURE"}])
     d = _decide(issue=_issue(pre_authorized_referee=True), pr=pr)
     assert d["action"] == "nudge" and d["nudge_key"] == "checks"
-    # and a frozen mainline still holds it
+    # and a frozen mainline still holds it. Pinned to "hold", not a ("hold", "nudge") disjunction:
+    # freeze (step 4) deterministically precedes the checks ladder (step 5), so a disjunction would
+    # still pass if that ordering ever regressed — which is exactly what this asserts.
     d2 = _decide(issue=_issue(pre_authorized_referee=True), pr=pr, frozen=True)
-    assert d2["action"] in ("hold", "nudge")   # never merge under a foreseeable non-referee stop
+    assert d2["action"] == "hold"   # never merge under a foreseeable non-referee stop
 
 
 def test_gate_preauthorization_ignored_when_diff_touches_no_referee_path():

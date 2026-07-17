@@ -440,7 +440,15 @@ def foreseeable_referee_stop(declared_touches, config):
     the stop pre-authorizable up front (and what lets the launch gate refuse to burn a lane
     reaching a certain, un-authorized park). Fail closed to False on any wrong-typed input: an
     unreadable declaration/config is simply 'not foreseeable' — the gate's referee park over the
-    ACTUAL diff remains the bright line for everything this cannot see in advance."""
+    ACTUAL diff remains the bright line for everything this cannot see in advance.
+
+    Certainty is per-GLOB, not per-AREA: an area is flagged when ANY of its globs targets referee,
+    so a MIXED area (`{"ci": [".github/workflows/**", "scripts/**"]}`) marks every `touches: ci`
+    issue foreseeable — including one that would only ever edit `scripts/`. That over-claims, and
+    deliberately in the safe direction: the cost is an approved non-referee issue WAITING for a
+    pre-authorization it doesn't need (visible — it is journaled as a launch_hold naming the label,
+    and clears the moment the owner grants or re-scopes), never a referee diff merging unattended.
+    A repo that trips this should split the referee glob into its own area."""
     areas = config.get("areas") if isinstance(config, dict) else None
     if not isinstance(areas, dict):
         return False

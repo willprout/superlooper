@@ -1726,6 +1726,35 @@ def test_preauthorized_referee_issue_merges_through_decide():
     assert not any("needs-owner" in n.get("title", "") for n in only(out, "notify"))
 
 
+def test_preauthorized_merge_act_carries_the_referee_audit_trail():
+    # issue #165: a pre-authorized referee merge must never be a SILENT auto-merge. The gate names
+    # the paths; the ACT is what survives into the journal (_journal_outcome writes the act dict
+    # verbatim) and into the merge comment. If the act drops them, the one unattended merge that
+    # crosses a bright line becomes the least legible record in the loop — and the merge journal
+    # naming every referee touch is the compensating control approval-protocol.md offers for the
+    # coarse per-issue grant. So assert the keys ride onto the act itself.
+    d, g = _gating(pv=pr_view(files=["src/f/Widget.tsx", ".superlooper/config.json"]))
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build",
+                                                  gate.PREAUTHORIZED_REFEREE_LABEL),
+                                       touches=("frontend",))],
+                 dsk=d, gh_view=g)
+    m = only(out, "merge")
+    assert len(m) == 1
+    assert m[0].get("referee_preauthorized") is True
+    assert m[0].get("referee_paths") == [".superlooper/config.json"]
+
+
+def test_ordinary_merge_act_carries_no_referee_noise():
+    # the flag is inert on an ordinary merge — no referee keys on an act that crossed no bright line
+    d, g = _gating(pv=pr_view(files=["src/f/Widget.tsx"]))
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build",
+                                                  gate.PREAUTHORIZED_REFEREE_LABEL),
+                                       touches=("frontend",))],
+                 dsk=d, gh_view=g)
+    m = only(out, "merge")
+    assert len(m) == 1 and "referee_preauthorized" not in m[0] and "referee_paths" not in m[0]
+
+
 def test_foreseeable_referee_issue_not_launched_without_preauth():
     # issue #165: an approved issue whose declared touches resolve to a referee path is NOT launched
     # unattended without the owner's pre-authorization — it waits, rather than burning a lane to a

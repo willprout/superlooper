@@ -1427,8 +1427,18 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # head_oid pins the merge to the commit this decision actually judged (#154): the
                 # review verdict was matched against THIS head, so the merge must land on it or be
                 # refused — never on whatever the branch grew since the last poll.
-                out.append({"act": "merge", "id": iid, "num": num, "pr": pv.get("number"),
-                            "method": method, "head_oid": head, "wander": wander})
+                merge_act = {"act": "merge", "id": iid, "num": num, "pr": pv.get("number"),
+                             "method": method, "head_oid": head, "wander": wander}
+                if g.get("referee_preauthorized") is True:
+                    # (#165) Carry the owner's pre-authorization onto the ACT. The gate already
+                    # decided it; the executor must never re-derive it. Without this the journal
+                    # record (_journal_outcome writes the act verbatim) and the merge comment would
+                    # both recite the ORDINARY green rationale for a diff that crossed a bright line
+                    # on his word — and the journal naming the referee paths is the one compensating
+                    # control approval-protocol.md offers for the coarse per-issue grant.
+                    merge_act["referee_preauthorized"] = True
+                    merge_act["referee_paths"] = g.get("referee_paths")
+                out.append(merge_act)
             elif act == "update":
                 out.append({"act": "update", "id": iid, "num": num, "pr": pv.get("number"),
                             "head_oid": head, "wander": wander})
