@@ -128,8 +128,15 @@ class Sim:
             # in test_actions and exercised end-to-end by the touches_required=True sim below).
             "touches_required": touches_required,
             "session": sess, "cleanup_merged_worktrees": cleanup_merged_worktrees,
+            # quiet_hours=None DISABLES night-batching (#164), same as test_runner's make_config
+            # and for the same reason: the sim asserts notify MECHANICS ("every park notifies"),
+            # and the sim's runner reads the REAL machine clock — on CI (UTC) every run between
+            # 21:00 and 08:00 UTC fell inside the default quiet window, so park/bounce notifies
+            # batched to the morning report and nine sim tests went red nightly (the #217
+            # false-red, live since #164 merged). The batching POLICY is tested where it belongs:
+            # test_actions.py with a PINNED local_hhmm, immune to the wall clock.
             "notify": {"cmd": "printf '%s|%s\\n' \"$SL_TITLE\" \"$SL_BODY\" >> "
-                              + str(self.notify_log)},
+                              + str(self.notify_log), "quiet_hours": None},
         }
         if qa:
             cfg["qa"] = qa
