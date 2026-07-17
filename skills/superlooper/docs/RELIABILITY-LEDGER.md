@@ -243,6 +243,16 @@ judged by the old referee until the change merges AND republishes. Work product 
 (PR #181 open, reviewed APPROVED-after-fixes, pinned to the unchanged head). Dashboard-side
 sibling already filed as #176.
 
+**2026-07-16 (evening) — a docs commit's message closes the approved regression fix** · *Classes
+1, 3* · The ledger commit 8b79d7a — whose message says "…fixes #189/#190…" — auto-closed #189 via
+GitHub's close-keyword: an approved, priority:high, never-built fix for the previous night's
+draft-promotion regression. No code commit or `sl/i189` branch ever existed; the harvest still
+fired unguarded on every Stop and the 40-char report-section floor still stood, so the regression
+vector stayed open for a day while the tracker said COMPLETED. Caught by the 2026-07-16
+first-prompt audit (see `AUDIT-2026-07-16-worker-first-prompt.md`); #189 reopened by hand the
+same evening with its approval labels intact; a mechanical detector for the class (closed-as-
+completed with no merged PR behind it) filed as #229.
+
 ---
 
 ## The owner's documented frustrations (recorded 2026-07-15, in his words where quoted)
