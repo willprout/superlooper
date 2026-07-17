@@ -119,14 +119,23 @@ def test_investigation_marked_merged_is_never_asked_for_pr_facts(tmp_path):
     assert gh.pr_calls == {}
 
 
-def test_skipping_the_lookup_changes_nothing_the_investigation_renders(tmp_path):
-    # The skip must be pure budget, never a fact the board loses. GitHub's honest answer for an
-    # investigation branch is {} — exactly what the skip substitutes — so every downstream consumer
-    # of pr_facts (cargo, the gate checklist, the review state, the drawer) must read identically
-    # whether the lookup happened or not. Pinned by rendering the flight BOTH ways and comparing the
-    # WHOLE flight dict, so a future consumer that starts reading pr_facts cannot regress this
-    # silently. The control arm is the same flight with its type stamp removed — the un-skipped
-    # code path, which really does ask GitHub (asserted, so this can never go vacuous).
+def test_skipping_the_lookup_renders_the_same_flight_as_performing_it(tmp_path):
+    # The skip must be pure budget, never a fact the board loses. Renders the flight BOTH ways —
+    # skipped, and with the type stamp removed to force the un-skipped path that really asks gh
+    # (asserted, so this can never go vacuous) — and compares the derived flight dict.
+    #
+    # Be precise about what this does and does not prove. It does NOT prove the skip is neutral for
+    # a branch that HAS a PR: the stub answers {} in both arms (GitHub's real answer for an
+    # investigation branch, per the module docstring), so both arms feed pr_facts={} into
+    # build_flight and the equality holds by that construction. A hand-opened PR on an
+    # investigation branch IS a real behaviour change, named at the skip site rather than pretended
+    # away here. Nor does it pin the substituted value's exact shape: build_flight normalises via
+    # `pr_facts or {}`, so a None would render the same too (verified by mutation, not assumed).
+    #
+    # What it DOES pin is narrow but real, and nothing else in this file covers it: the loopstate
+    # `type` stamp has no rendering effect ANYWHERE beyond this skip. That is the assumption the
+    # whole change rests on — `type` is read at exactly one site — and it is what would break
+    # silently if a future consumer started branching on `type` to render a flight.
     issues = {"i9": {"status": "running", "branch": "sl/i9-x", "pr": None,
                      "lane": "i9", "type": "investigate"}}
     home = _make_home(tmp_path, issues)
