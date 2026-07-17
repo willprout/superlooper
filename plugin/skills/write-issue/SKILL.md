@@ -119,6 +119,22 @@ enforce it at write time by scoping the issue away from bright lines in the firs
 **Why:** bright lines are William-only decisions; an issue that quietly crosses one converts an
 owner decision into an autonomous one — exactly what the whole design forbids.
 
+### Foreseeable referee-path stops get pre-authorized at approval, not re-parked at 3am
+
+Some issues *must* touch a **referee path** — `.superlooper/**` (the loop's live config) or
+`.github/workflows/**` (the CI gate itself) — and there is no scoping that away: the change is the
+point. The merge gate can only ever park such a diff for William. That park is **computable when he
+approves** (the issue's `touches:` resolve to a referee path). Rather than launch it into an
+unattended window only to park at the finish line, **surface the foreseeable owner-gate stop at
+approval and let William pre-authorize it** — his word, granted early, recorded as the distinct
+`pre-authorized:referee` label. The launch gate then won't burn a lane on an un-pre-authorized
+referee issue (it waits for him), and the merge gate consumes the label to merge instead of
+re-park. See the superlooper skill's `references/approval-protocol.md`.
+
+**Why:** a foreseeable park that arrives at 3am can never clear itself — it just strands finished
+work until morning. Moving the decision to the moment he is already engaged (approval) keeps it
+*his* word while removing the dead unattended round-trip.
+
 ### Never edit an approved Goal or DoD
 
 Once an issue is approved (`agent-ready`), its Goal and Definition of done are frozen William-text.
