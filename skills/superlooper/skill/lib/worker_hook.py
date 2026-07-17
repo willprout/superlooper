@@ -1,19 +1,14 @@
 """The Claude worker Stop hook's core — the runner's in-process embassy (issue #148).
 
-stop-hook.sh stamps liveness and then hands the hook payload here. TWO duties (the harvest was the
-third until issue #189 — see below), each one a promise the runner can no longer get from "what a
-model remembered to do":
+stop-hook.sh stamps liveness and then hands the hook payload here. TWO duties, each one a promise
+the runner can no longer get from "what a model remembered to do":
 
-  1. REPORT HARVEST — MOVED OUT (issue #189). Twice in one day (i280, i328) a worker wrote its
-     report to a worktree-relative path; the runner reads state_home/reports/<id>.md, saw nothing,
-     and the queue stalled two hours on i328. This hook used to rescue that on every rest — and on
-     2026-07-16 that rescue promoted two LIVE drafts (i153, i163) to "finished". harvest_report()
-     still lives here, fences and all, but the runner decides WHEN to call it. See its docstring.
-  2. PROGRESS CLOCK. state/status/<id>.json each turn end: HEAD, dirty tree, report/blocked
+  1. PROGRESS CLOCK. state/status/<id>.json each turn end: HEAD, dirty tree, report/blocked
      markers. "Took a turn" is not "made progress" — a session can rest forever changing nothing
      (i328). This is the signal a probe ladder reads to tell those apart; it is written on EVERY
-     rest, so a missing stamp means the hook itself didn't run.
-  3. MAILBOX. The runner drops state/mail/<id>; this consumes it, blocks the stop, and hands the
+     rest, so a missing stamp means the hook itself didn't run. It also carries the worker's `cwd`,
+     which is where the runner's report harvest looks (below).
+  2. MAILBOX. The runner drops state/mail/<id>; this consumes it, blocks the stop, and hands the
      text back as the continuation reason — verified delivery with zero keystrokes. Delivery is
      TWO-PHASE, because the receipt is the runner's proof and a proof that can be true when the
      delivery wasn't is worse than no proof at all:
@@ -23,6 +18,13 @@ model remembered to do":
      So .consumed means "Claude was handed this", full stop. If we die between the two, the
      leftover .claimed.<ts> is the honest "in flight, never proven" state — a runner may retry it;
      it must never read it as delivered.
+
+THE REPORT HARVEST WAS THE FIRST DUTY, AND IS GONE FROM THIS HOOK (issue #189). Twice in one day
+(i280, i328) a worker wrote its report to a worktree-relative path; the runner reads
+state_home/reports/<id>.md, saw nothing, and the queue stalled two hours on i328. This hook rescued
+that on every rest — and on 2026-07-16 that rescue promoted two LIVE drafts (i153, i163) to
+"finished". harvest_report() still lives in this module, fences and all; the RUNNER now decides when
+to call it. See its docstring for why the decision cannot be made here.
 
 CLAUDE ONLY. Codex's Stop is notify-only (it cannot block a stop), so Codex workers keep the
 typed-probe + file-ack path; stop-hook.sh never routes them here.
@@ -164,7 +166,7 @@ def harvest_report(state_home, issue_id, cwd):
     return None
 
 
-# --------------------------- duty 2: the progress clock ---------------------------
+# --------------------------- duty 1: the progress clock ---------------------------
 
 def status_snapshot(state_home, issue_id, cwd, now):
     # --no-optional-locks: plain `git status` takes index.lock to refresh the index, and this fires
@@ -203,7 +205,7 @@ def stamp_status(state_home, issue_id, cwd, now):
     return path
 
 
-# --------------------------- duty 3: the mailbox ---------------------------
+# --------------------------- duty 2: the mailbox ---------------------------
 
 def _free_name(base):
     """`base`, or base.1/base.2/… — two mails inside one second must not overwrite each other's

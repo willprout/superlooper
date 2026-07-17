@@ -1744,9 +1744,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # on every rest and promoted two live drafts on 07-16 (i153/i163).
                     # ONCE per episode (`harvest_tried`, cleared by progress_advance): a report
                     # that genuinely does not exist must not re-harvest every tick — that is the
-                    # i328 loop in a new costume. A harvest that LANDS moves the report marker, so
-                    # the signature changes and next tick re-anchors the episode anyway; a
-                    # fruitless one falls through to the cap below and parks as it always did.
+                    # i328 loop in a new costume. A fruitless attempt falls through to the cap
+                    # below and parks exactly as it always did.
+                    # What stops a LANDED harvest from re-firing is the has_report branch far
+                    # above, which owns a lane the moment a report is visible and never reaches
+                    # here. Note it is NOT the progress signature: the clock's `report` field is
+                    # stamped by the worker's own Stop hook, and a finished worker takes no
+                    # further turn, so a harvest the RUNNER performs never moves that signature
+                    # (fresh review P2 — this comment used to claim it did).
                     out.append({"act": "harvest_report", "id": iid, "num": num})
                     continue
                 if ack_state == "STUCK" or (type(probe_cap) is int and attempts >= probe_cap):
