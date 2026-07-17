@@ -1376,6 +1376,85 @@ def test_exec_probe_marks_a_dead_pane_exited(rig):
     assert (rig.home / "state" / "exited" / "i5").exists()
 
 
+# ---- the report harvest's executor (#189) ----
+
+def _clock(rig, iid, cwd, **over):
+    """Write the worker hook's progress clock — the executor reads the worker's OWN cwd from it."""
+    d = rig.home / "state" / "status"
+    d.mkdir(parents=True, exist_ok=True)
+    blob = {"id": iid, "ts": NOW, "cwd": str(cwd), "head": "H", "dirty": False,
+            "report": False, "blocked": False}
+    blob.update(over)
+    (d / f"{iid}.json").write_text(json.dumps(blob))
+
+
+def test_exec_harvest_report_rescues_a_stray_report_from_the_workers_own_cwd(rig):
+    # THE i280/i328 RESCUE end to end: the worker acked DONE, its report is one directory off, and
+    # the runner moves it to where it looks — so the lane finishes instead of stalling for hours.
+    seed_issue(rig, "i5", status="running")
+    wt = rig.home.parent / "wt-i5"
+    (wt / "reports").mkdir(parents=True)
+    (wt / "reports" / "i5.md").write_text("## Tests\ngreen\n")
+    _clock(rig, "i5", wt)
+
+    out = rig.r._execute({"act": "harvest_report", "id": "i5", "num": 5}, NOW)
+
+    assert (rig.home / "reports" / "i5.md").read_text() == "## Tests\ngreen\n"
+    assert not (wt / "reports" / "i5.md").exists(), "the harvest MOVES"
+    assert "harvested" in out
+    assert issue_state(rig, "i5")["harvest_tried"] is True
+
+
+def test_exec_harvest_report_spends_its_attempt_even_when_there_is_nothing_to_find(rig):
+    # THE BOUND. A DONE ack whose report exists nowhere must not re-harvest every tick forever.
+    # The stamp lands whatever happens, so the ladder escalates to its park exactly as before.
+    seed_issue(rig, "i5", status="running")
+    wt = rig.home.parent / "wt-i5"
+    wt.mkdir(parents=True)
+    _clock(rig, "i5", wt)
+
+    out = rig.r._execute({"act": "harvest_report", "id": "i5", "num": 5}, NOW)
+
+    assert not (rig.home / "reports" / "i5.md").exists()
+    assert "no stray report" in out
+    assert issue_state(rig, "i5")["harvest_tried"] is True, "a fruitless attempt is still spent"
+
+
+def test_exec_harvest_report_never_guesses_a_directory_without_a_progress_clock(rig):
+    # No clock -> no cwd the worker vouched for. This gates a DESTRUCTIVE move: refuse, never guess.
+    seed_issue(rig, "i5", status="running")
+
+    out = rig.r._execute({"act": "harvest_report", "id": "i5", "num": 5}, NOW)
+
+    assert "no progress clock cwd" in out
+    assert issue_state(rig, "i5")["harvest_tried"] is True, "still bounded — never a per-tick retry"
+
+
+def test_exec_harvest_report_survives_a_raising_harvest(rig):
+    # A duty that raises must never wedge the tick (the hook's fail-silent contract, kept here).
+    seed_issue(rig, "i5", status="running")
+    _clock(rig, "i5", rig.home.parent / "wt-i5")
+
+    def boom(*a, **k):
+        raise OSError("disk gone")
+    import worker_hook as wh
+    real, wh.harvest_report = wh.harvest_report, boom
+    try:
+        out = rig.r._execute({"act": "harvest_report", "id": "i5", "num": 5}, NOW)
+    finally:
+        wh.harvest_report = real
+    assert "harvest failed" in out and "OSError" in out
+    assert issue_state(rig, "i5")["harvest_tried"] is True
+
+
+def test_progress_advance_re_arms_the_harvest_on_a_new_episode(rig):
+    # A worker that drafted, kept building, and only LATER genuinely finished still gets its rescue.
+    seed_issue(rig, "i5", status="running", progress_sig="OLD", progress_since=NOW - 100000,
+               harvest_tried=True)
+    rig.r._execute({"act": "progress_advance", "id": "i5", "sig": "NEW"}, NOW)
+    assert issue_state(rig, "i5")["harvest_tried"] is False
+
+
 def test_exec_progress_advance_anchors_and_resets_the_episode_on_change(rig):
     seed_issue(rig, "i5", status="running", progress_sig="OLD", progress_since=NOW - 100000,
                probe_attempts=2, probe_nonce="n2", probe_sent_at=NOW - 500)

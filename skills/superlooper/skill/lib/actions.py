@@ -1732,6 +1732,28 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                                    f"counter is unreadable (corrupt state), so the bounded ladder "
                                    f"cannot be trusted; parking for review.", cause="progress_stall")
                     continue
+                if (ack_state == "DONE" and iid not in reports
+                        and not ist.get("harvest_tried")):
+                    # THE REPORT HARVEST'S TRIGGER (issue #189). Look for the report before
+                    # concluding there is none: "acked DONE, but produced no report" is the exact
+                    # i280/i328 stall (a finished worker that wrote its report one directory off),
+                    # and it used to end in a park. A DONE ack is the ONLY mechanical "I am
+                    # finished" the loop ever gets — nonce-fenced, and only ever asked of a lane
+                    # this ladder found progress-stalled and nudge-pane found IDLE. That is the
+                    # discriminator the Stop hook could never have, which is why the harvest fired
+                    # on every rest and promoted two live drafts on 07-16 (i153/i163).
+                    # ONCE per episode (`harvest_tried`, cleared by progress_advance): a report
+                    # that genuinely does not exist must not re-harvest every tick — that is the
+                    # i328 loop in a new costume. A fruitless attempt falls through to the cap
+                    # below and parks exactly as it always did.
+                    # What stops a LANDED harvest from re-firing is the has_report branch far
+                    # above, which owns a lane the moment a report is visible and never reaches
+                    # here. Note it is NOT the progress signature: the clock's `report` field is
+                    # stamped by the worker's own Stop hook, and a finished worker takes no
+                    # further turn, so a harvest the RUNNER performs never moves that signature
+                    # (fresh review P2 — this comment used to claim it did).
+                    out.append({"act": "harvest_report", "id": iid, "num": num})
+                    continue
                 if ack_state == "STUCK" or (type(probe_cap) is int and attempts >= probe_cap):
                     # cap exhausted, OR the worker explicitly asked for help: escalate to a
                     # classified park with a dossier — never an infinite loop, never a false park of

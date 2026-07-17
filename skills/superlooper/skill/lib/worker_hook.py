@@ -1,17 +1,14 @@
 """The Claude worker Stop hook's core — the runner's in-process embassy (issue #148).
 
-stop-hook.sh stamps liveness and then hands the hook payload here. Three duties, each one a
-promise the runner can no longer get from "what a model remembered to do":
+stop-hook.sh stamps liveness and then hands the hook payload here. TWO duties, each one a promise
+the runner can no longer get from "what a model remembered to do":
 
-  1. REPORT HARVEST. Twice in one day (i280, i328) a worker wrote its report to a
-     worktree-relative path; the runner reads state_home/reports/<id>.md, saw nothing, and the
-     queue stalled two hours on i328. If the canonical report is absent and one is sitting at a
-     conventional spot under the worker's cwd, move it where the runner looks.
-  2. PROGRESS CLOCK. state/status/<id>.json each turn end: HEAD, dirty tree, report/blocked
+  1. PROGRESS CLOCK. state/status/<id>.json each turn end: HEAD, dirty tree, report/blocked
      markers. "Took a turn" is not "made progress" — a session can rest forever changing nothing
      (i328). This is the signal a probe ladder reads to tell those apart; it is written on EVERY
-     rest, so a missing stamp means the hook itself didn't run.
-  3. MAILBOX. The runner drops state/mail/<id>; this consumes it, blocks the stop, and hands the
+     rest, so a missing stamp means the hook itself didn't run. It also carries the worker's `cwd`,
+     which is where the runner's report harvest looks (below).
+  2. MAILBOX. The runner drops state/mail/<id>; this consumes it, blocks the stop, and hands the
      text back as the continuation reason — verified delivery with zero keystrokes. Delivery is
      TWO-PHASE, because the receipt is the runner's proof and a proof that can be true when the
      delivery wasn't is worse than no proof at all:
@@ -21,6 +18,13 @@ promise the runner can no longer get from "what a model remembered to do":
      So .consumed means "Claude was handed this", full stop. If we die between the two, the
      leftover .claimed.<ts> is the honest "in flight, never proven" state — a runner may retry it;
      it must never read it as delivered.
+
+THE REPORT HARVEST WAS THE FIRST DUTY, AND IS GONE FROM THIS HOOK (issue #189). Twice in one day
+(i280, i328) a worker wrote its report to a worktree-relative path; the runner reads
+state_home/reports/<id>.md, saw nothing, and the queue stalled two hours on i328. This hook rescued
+that on every rest — and on 2026-07-16 that rescue promoted two LIVE drafts (i153, i163) to
+"finished". harvest_report() still lives in this module, fences and all; the RUNNER now decides when
+to call it. See its docstring for why the decision cannot be made here.
 
 CLAUDE ONLY. Codex's Stop is notify-only (it cannot block a stop), so Codex workers keep the
 typed-probe + file-ack path; stop-hook.sh never routes them here.
@@ -56,7 +60,21 @@ def _git(cwd, *args):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-# --------------------------- duty 1: report harvest ---------------------------
+# --------------------- the report harvest (CALLED BY THE RUNNER, not this hook) ---------------------
+#
+# WHY THIS IS NOT A STOP-HOOK DUTY ANY MORE (issue #189). The harvest fired on every rest, and a
+# rest is not an ending: a Claude worker never exits — it writes its report and sits at the prompt
+# forever, which is exactly why the report FILE is the loop's finish signal. So at any given Stop,
+# "a finished session's misplaced report" and "a live session's draft" are the same file: same
+# shape, same age, same everything (on 07-16 the promoted drafts' mtimes matched the harvest
+# moments exactly). The fact that separates them — that no further turn ever comes — arrives only
+# AFTER the turn a hook is called on, and a hook cannot observe an absence in its own future.
+#
+# So the trigger moved to the one place that can hold a real discriminator: the runner's #157 probe
+# ladder, which asks a progress-stalled lane for a machine-readable ack and harvests only on DONE —
+# the worker's own "I am finished". That ladder already refuses to type into a busy/dialog/dead
+# pane and nonce-fences the reply, so a worker mid-build is never even asked. The i280/i328 rescue
+# still lands; it just costs one probe round-trip instead of promoting whatever it finds.
 
 # Where a worker that fumbled the absolute path actually puts it. Ordered by how it went wrong:
 # a relative "reports/<id>.md" (the i280/i328 shape — the brief's path minus its root), then the
@@ -148,7 +166,7 @@ def harvest_report(state_home, issue_id, cwd):
     return None
 
 
-# --------------------------- duty 2: the progress clock ---------------------------
+# --------------------------- duty 1: the progress clock ---------------------------
 
 def status_snapshot(state_home, issue_id, cwd, now):
     # --no-optional-locks: plain `git status` takes index.lock to refresh the index, and this fires
@@ -187,7 +205,7 @@ def stamp_status(state_home, issue_id, cwd, now):
     return path
 
 
-# --------------------------- duty 3: the mailbox ---------------------------
+# --------------------------- duty 2: the mailbox ---------------------------
 
 def _free_name(base):
     """`base`, or base.1/base.2/… — two mails inside one second must not overwrite each other's
@@ -258,13 +276,12 @@ def run(payload, env, now=None):
         return None, None                # not a worker session — stop-hook.sh already fenced this
     cwd = payload.get("cwd")
     if not isinstance(cwd, str) or not os.path.isdir(cwd):
-        cwd = None                       # a pruned/vanished worktree: no git facts, no harvest
-    # Harvest BEFORE the stamp so the clock never reports report=false about a report this very
-    # turn just rescued. Each duty is independently wrapped — one failing must not sink the others.
-    try:
-        harvest_report(state_home, issue_id, cwd)
-    except Exception:
-        pass
+        cwd = None                       # a pruned/vanished worktree: no git facts
+    # NO HARVEST HERE (issue #189). This used to move a stray report on every rest; the stamp below
+    # is now the hook's whole contribution to the rescue — it carries the `cwd` the RUNNER harvests
+    # from once the worker has acked DONE. See harvest_report()'s docstring for why the trigger
+    # cannot live at a turn end. Each duty is independently wrapped — one failing must not sink the
+    # others.
     try:
         stamp_status(state_home, issue_id, cwd, now)
     except Exception:

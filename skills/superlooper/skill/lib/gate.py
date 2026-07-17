@@ -93,12 +93,34 @@ SECTION_MIN_CHARS = 40
 _CHECK_FAIL = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}
 _CHECK_SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
+# An HTML comment is not prose (issue #189). i153's harvested report carried a literal
+# "<!-- filled in after the fresh-agent review verdict lands -->" as its whole Review section and
+# cleared the 40-char floor on the comment's own text — a section that renders BLANK counted as
+# evidence. A comment is the absence of the thing the section exists to carry, so it is stripped
+# before the count rather than merely discounted. `.*?` + DOTALL: a multi-line placeholder is one
+# comment, and the strip is not line-oriented.
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+# An UNCLOSED "<!--" swallows the rest of the section when rendered, so it must swallow the rest
+# here too — anything after it is invisible prose, and reading it as evidence is the same fail-open
+# in a subtler costume. Applied after the closed-comment strip, so it only ever sees a real dangle.
+# ANCHORED TO LINE START (fresh review P1), which is both what CommonMark actually does — an HTML
+# block only OPENS at the start of a line — and what keeps a report that merely TALKS about "<!--"
+# mid-sentence (in inline code, say) from having its real prose swallowed and its finished build
+# false-parked. This very issue's report is that shape, which is how the case was found.
+_OPEN_COMMENT = re.compile(r"(?m)^[ \t]*<!--.*\Z", re.S)
+
+
+def _prose_chars(body):
+    """A section body -> its non-whitespace PROSE characters: HTML comments removed, then all
+    whitespace. This is what SECTION_MIN_CHARS measures — what a READER would actually see."""
+    return re.sub(r"\s", "", _OPEN_COMMENT.sub("", _HTML_COMMENT.sub("", body)))
+
 
 def report_sections_ok(report_text, required):
     """Every required H2 heading present AND carrying >= SECTION_MIN_CHARS non-whitespace chars
-    of prose (cross-review C3). Wrong-typed report or required list -> False (fail closed);
-    an EMPTY required list is vacuously ok (config defaults are non-empty; doctor owns refusing
-    degenerate repo setups, cross-review C3)."""
+    of RENDERED prose — HTML comments do not count (issue #189). Wrong-typed report or required
+    list -> False (fail closed); an EMPTY required list is vacuously ok (config defaults are
+    non-empty; doctor owns refusing degenerate repo setups, cross-review C3)."""
     if not isinstance(required, list) or any(not isinstance(r, str) for r in required):
         return False
     if not required:
@@ -115,7 +137,7 @@ def report_sections_ok(report_text, required):
         elif current is not None:
             sections[current] += line + "\n"
     return all(
-        req in sections and len(re.sub(r"\s", "", sections[req])) >= SECTION_MIN_CHARS
+        req in sections and len(_prose_chars(sections[req])) >= SECTION_MIN_CHARS
         for req in required)
 
 
