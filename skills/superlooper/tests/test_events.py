@@ -481,6 +481,56 @@ def test_progress_signature_stable_across_equal_snapshots():
     assert events.progress_signature(a) == events.progress_signature(b)             # ts is not progress
 
 
+def test_progress_advanced_only_on_a_proven_advance():
+    # A real HEAD movement between two readable commits, or a report/blocked marker change.
+    assert events.progress_advanced("A|False|False", "B|False|False") is True    # HEAD moved
+    assert events.progress_advanced("A|False|False", "A|True|False") is True     # report appeared
+    assert events.progress_advanced("A|False|False", "A|False|True") is True     # blocked appeared
+    assert events.progress_advanced("A|False|False", "A|False|False") is False   # nothing changed
+
+
+def test_progress_advanced_treats_an_unreadable_head_as_non_progress():
+    # The i328 fail-closed guard: a head that became git-UNREADABLE ('None') is a flap, not movement —
+    # exactly why progress_signature excludes `dirty`. Neither direction counts as an advance.
+    assert events.progress_advanced("A|False|False", "None|False|False") is False   # readable -> None
+    assert events.progress_advanced("None|False|False", "A|False|False") is False   # None -> readable
+    assert events.progress_advanced("|False|False", "A|False|False") is False       # empty head
+    # ...but a report marker change is a real milestone regardless of head readability
+    assert events.progress_advanced("None|False|False", "None|True|False") is True
+
+
+def test_progress_advanced_fails_closed_on_corrupt_input():
+    # A non-str / malformed baseline is not a usable measurement -> never a (false) advance.
+    for bad in (None, 42, ["A"], {}, True, "A|False", "a|b|c|d"):
+        assert events.progress_advanced(bad, "A|False|False") is False
+        assert events.progress_advanced("A|False|False", bad) is False
+
+
+def test_usable_baseline_requires_a_wellformed_readable_head_signature():
+    assert events.usable_baseline("A|False|False") is True
+    assert events.usable_baseline("None|False|False") is False     # unreadable head -> poison
+    assert events.usable_baseline("|False|False") is False         # empty head
+    for bad in (None, 42, ["A"], {}, True, "A|False", "a|b|c|d"):
+        assert events.usable_baseline(bad) is False
+
+
+def test_progress_evidence_names_the_changed_signature_field():
+    # The #231 un-latch journal names WHICH progress-bearing field advanced. Signature is
+    # 'head|report|blocked'; compare the parts and label the differences.
+    assert events.progress_evidence("A|False|False", "B|False|False") == "HEAD"
+    assert events.progress_evidence("A|False|False", "A|True|False") == "report marker"
+    assert events.progress_evidence("A|False|False", "A|False|True") == "blocked marker"
+    assert events.progress_evidence("A|False|False", "B|True|False") == "HEAD, report marker"
+
+
+def test_progress_evidence_is_fail_closed_on_unparseable_input():
+    # Never raise into the tick: a non-str, or an identical signature, yields the generic phrase.
+    for bad in (None, 123, ["A"], {}):
+        assert events.progress_evidence(bad, "A|False|False") == "progress clock advanced"
+        assert events.progress_evidence("A|False|False", bad) == "progress clock advanced"
+    assert events.progress_evidence("A|False|False", "A|False|False") == "progress clock advanced"
+
+
 def test_parse_ack_reads_a_valid_reply_only_when_the_nonce_matches():
     assert events.parse_ack("WORKING nonce-42", "nonce-42") == "WORKING"
     assert events.parse_ack("DONE nonce-42", "nonce-42") == "DONE"

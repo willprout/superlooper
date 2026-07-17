@@ -68,6 +68,62 @@ def progress_signature(status):
     return "%s|%s|%s" % (status.get("head"), bool(status.get("report")), bool(status.get("blocked")))
 
 
+def _readable_head(h):
+    """A signature's head component that names a REAL commit — not the literal 'None' that
+    progress_signature() formats when `git rev-parse HEAD` returned None (a timeout under load, a
+    wedged/pruned worktree), and not the empty string. Used to keep an UNREADABLE head from counting
+    as HEAD movement, the same reason progress_signature() excludes `dirty`: a field that flaps to
+    None on a read failure is noise, not progress."""
+    return isinstance(h, str) and h not in ("", "None")
+
+
+def usable_baseline(sig):
+    """A signature fit to serve as the #231 un-latch BASELINE: a well-formed 'head|report|blocked'
+    string whose HEAD is readable, so a later HEAD movement can actually be proven against it. A
+    None / non-str / malformed / unreadable-head signature is NOT usable — anchoring one as the
+    baseline would poison it (no future movement could ever be proven against an unreadable head), so
+    the caller waits for a readable signature instead. Fail-closed: never raises."""
+    if not isinstance(sig, str):
+        return False
+    parts = sig.split("|")
+    return len(parts) == 3 and _readable_head(parts[0])
+
+
+def progress_advanced(baseline, current):
+    """Did `current` PROVE a progress advance over `baseline` — the only thing that un-latches a
+    frozen lane (issue #231)? True for a report/blocked marker change, or a HEAD movement between two
+    REAL commits. Conservative BY DESIGN, so the recovery ladder can never answer itself (i328): a
+    nudge wakes the worker, whose next re-stamp can flap the head to git-UNREADABLE ('None'), and that
+    is NOT movement (same exclusion as `dirty`); a non-str / malformed / corrupt baseline is not a
+    usable measurement at all. Every one of those returns False -> the lane stays frozen (fail-closed),
+    and the caller re-anchors an unusable baseline rather than reading it as progress."""
+    if not isinstance(baseline, str) or not isinstance(current, str):
+        return False
+    o, n = baseline.split("|"), current.split("|")
+    if len(o) != 3 or len(n) != 3:
+        return False
+    if o[1] != n[1] or o[2] != n[2]:               # a report/blocked marker flipped: a real milestone
+        return True
+    return o[0] != n[0] and _readable_head(o[0]) and _readable_head(n[0])   # movement, real->real head
+
+
+def progress_evidence(old_sig, new_sig):
+    """Name which PROGRESS-bearing field(s) advanced between two signatures (issue #231), for the
+    un-latch journal line ("the evidence class that un-latched it"). The signature is the
+    'head|report|blocked' string progress_signature() builds, so this splits and compares the three
+    parts and returns the human labels of whichever differ. Only ever called on a proven advance
+    (progress_advanced True), so the named parts are real. Fail-closed like the rest of the module:
+    anything unparseable (a non-str, or a shape from a future signature format) yields the generic
+    phrase rather than raising into the tick."""
+    labels = ("HEAD", "report marker", "blocked marker")
+    if not isinstance(old_sig, str) or not isinstance(new_sig, str):
+        return "progress clock advanced"
+    o, n = old_sig.split("|"), new_sig.split("|")
+    changed = [labels[i] for i in range(min(len(labels), len(n)))
+               if i >= len(o) or o[i] != n[i]]
+    return ", ".join(changed) if changed else "progress clock advanced"
+
+
 def parse_ack(text, expected_nonce):
     """A worker's probe-reply file -> one of ACK_STATES, but ONLY when it carries `expected_nonce`.
 

@@ -1334,6 +1334,157 @@ def test_still_frozen_status_re_recovers_only_after_the_interval():
     assert len(only(out, "recover")) == 1
 
 
+# =============== the frozen un-latch: resumed progress flips status back (issue #231) ===============
+# A lane latched to `frozen` keeps drawing the 10-minute recovery nudge until its report lands — even
+# after the session demonstrably resumed (took turns, committed, opened its PR). The un-latch keys on
+# the #157 PROGRESS clock (HEAD / report / blocked marker), NEVER on activity: a nudge refreshes the
+# pane's activity but can never move the signature, so the recovery ladder cannot answer itself (the
+# i328 lesson #157 exists to encode). `clock`/`_sig` live in the probe-ladder section below.
+
+def test_frozen_lane_unlatches_when_the_progress_clock_advances():
+    # The core fix: a `frozen` lane whose baseline signature is OLD, whose clock now shows a NEW HEAD,
+    # is written back to `running` (unfreeze) and the frozen recovery nudge STOPS for it.
+    st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(head="OLD"),
+                                          last_recover_at=NOW - 601)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="NEW")}))
+    uf = only(out, "unlatch_frozen")
+    assert len(uf) == 1 and uf[0]["id"] == "i5" and uf[0]["sig"] == _sig(head="NEW")
+    assert uf[0]["evidence_class"] == "HEAD"           # the journal names WHAT un-latched it
+    assert only(out, "recover") == []                  # ...and the frozen ladder is done for it
+
+
+def test_frozen_lane_unlatch_names_the_report_marker_as_evidence():
+    # A resumed session that lands its report marker (HEAD unchanged) un-latches on the REPORT signal —
+    # the journal must name the actual evidence class, not just "advanced".
+    st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(report=False),
+                                          last_recover_at=NOW - 601)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(report=True)}))
+    uf = only(out, "unlatch_frozen")
+    assert len(uf) == 1 and "report" in uf[0]["evidence_class"]
+
+
+def test_i328_echo_alone_never_unlatches_a_frozen_lane():
+    # THE regression guard (DoD): the clock is UNCHANGED from the baseline — a probe/nudge refreshed
+    # the pane's activity but moved no HEAD/report/blocked. Activity-without-a-progress-change must NOT
+    # un-latch; the lane stays frozen and the ladder keeps nudging on its cadence.
+    st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(),
+                                          last_recover_at=NOW - 601)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()}))   # sig == baseline
+    assert only(out, "unlatch_frozen") == []
+    assert len(only(out, "recover")) == 1              # still nudged as frozen (genuinely stuck)
+
+
+def test_frozen_lane_with_no_clock_keeps_nudging_and_never_unlatches():
+    # A genuinely-stuck lane with no progress clock at all: no signature to measure, so the existing
+    # frozen ladder is untouched (nudge on cadence). Never a false un-latch off a missing clock.
+    st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(),
+                                          last_recover_at=NOW - 601)}}
+    out = decide(dsk=disk(issues_state=st))            # no status_clocks in the view
+    assert only(out, "unlatch_frozen") == []
+    assert len(only(out, "recover")) == 1
+
+
+def test_frozen_lane_without_a_baseline_anchors_first_then_unlatches_on_a_real_change():
+    # The awaiting/degraded edge: a lane that froze without a progress baseline (progress_sig None —
+    # e.g. it was `awaiting` long-running work before the probe ladder ever anchored it). The FIRST
+    # clock sighting is ANCHORED (so a later real advance can be measured), NOT mistaken for progress:
+    # no unfreeze on first sight (mirrors #157's first-sight-anchors-without-acting).
+    st = {"version": 1, "issues": {"i5": ist("frozen", last_recover_at=NOW - 601)}}  # no progress_sig
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="A")}))
+    assert only(out, "unlatch_frozen") == []
+    adv = only(out, "progress_advance")
+    assert len(adv) == 1 and adv[0]["sig"] == _sig(head="A")
+    assert only(out, "recover") == []                  # anchoring supersedes the nudge this one tick
+    # Now the baseline is A; a genuine advance to B un-latches.
+    st2 = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(head="A"),
+                                           last_recover_at=NOW - 601)}}
+    out2 = decide(dsk=disk(issues_state=st2, status_clocks={"i5": clock(head="B")}))
+    assert len(only(out2, "unlatch_frozen")) == 1
+
+
+def test_a_freshly_frozen_event_still_recovers_even_with_a_clock():
+    # A lane crossing INTO frozen this tick (a `frozen` event, status still 'running') takes the normal
+    # recover path — the un-latch is only for an already-LATCHED `frozen` status. Guards the un-latch
+    # from swallowing the very first freeze recover (which is what stamps the baseline).
+    st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(head="OLD"))}}
+    out = decide(events=[{"type": "frozen", "id": "i5"}],
+                 dsk=disk(issues_state=st, status_clocks={"i5": clock(head="NEW")}))
+    assert only(out, "unlatch_frozen") == []
+    r = only(out, "recover")
+    assert len(r) == 1 and r[0]["tier"] == "frozen"
+
+
+def test_a_head_that_became_git_unreadable_never_unlatches_a_frozen_lane():
+    # Fail-closed (fresh-review P1): a nudge wakes the worker, whose re-stamp can flap HEAD to
+    # git-UNREADABLE when `git rev-parse` fails (a timeout / wedged worktree) — progress_signature
+    # formats that as 'None|...'. That is NOT movement (the i328 self-answer shape); it must NOT
+    # un-latch. The last-known-good baseline is preserved and the lane keeps being nudged.
+    st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(head="REALHEAD"),
+                                          last_recover_at=NOW - 601)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head=None)}))  # head unreadable
+    assert only(out, "unlatch_frozen") == []
+    assert only(out, "progress_advance") == []         # never re-anchor a good baseline to a None head
+    assert len(only(out, "recover")) == 1              # still nudged as frozen
+
+
+def test_a_corrupt_non_str_baseline_fails_closed_and_re_anchors_instead_of_unlatching():
+    # Fail-closed (fresh-review P1): a wrong-typed baseline (legacy/hand-corrupt state) is not None,
+    # so a naive `cur_sig != baseline` would read ANY real signature as progress and falsely un-latch.
+    # It must instead RE-ANCHOR (repair the baseline) and never un-latch — mirroring this codebase's
+    # corrupt-input-fails-closed discipline.
+    for bad in (42, ["x"], {"a": 1}, True):
+        st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=bad,
+                                              last_recover_at=NOW - 601)}}
+        out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="H")}))
+        assert only(out, "unlatch_frozen") == [], bad
+        adv = only(out, "progress_advance")
+        assert len(adv) == 1 and adv[0]["sig"] == _sig(head="H"), bad   # baseline repaired
+
+
+def test_first_sight_with_an_unreadable_head_does_not_poison_the_baseline():
+    # A lane with no baseline whose first clock sighting has an unreadable head must NOT anchor a
+    # 'None' head (that baseline could never prove a future movement). Leave it unanchored and nudge;
+    # anchor only once a readable head appears.
+    st = {"version": 1, "issues": {"i5": ist("frozen", last_recover_at=NOW - 601)}}  # no progress_sig
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head=None)}))
+    assert only(out, "unlatch_frozen") == [] and only(out, "progress_advance") == []
+    assert len(only(out, "recover")) == 1
+
+
+def test_a_report_marker_unlatches_even_when_the_head_is_unreadable():
+    # A report/blocked marker change is a real milestone regardless of head readability: it un-latches
+    # even if `git rev-parse` happens to be failing that rest.
+    st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(head="H", report=False),
+                                          last_recover_at=NOW - 601)}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head=None, report=True)}))
+    uf = only(out, "unlatch_frozen")
+    assert len(uf) == 1 and "report" in uf[0]["evidence_class"]
+
+
+def test_frozen_lane_with_a_report_goes_to_the_gate_not_the_unlatch():
+    # Boundary: once the report lands the ship gate owns the lane (it is checked above the frozen
+    # tier). A frozen+report lane whose clock also advanced must go to `gate`, never `unlatch_frozen`
+    # — the un-latch fills only the resumed-but-not-yet-reported window.
+    st = {"version": 1, "issues": {"i5": ist("frozen", progress_sig=_sig(head="OLD"),
+                                          last_recover_at=NOW - 601)}}
+    out = decide(dsk=disk(issues_state=st, reports={"i5": GOOD_REPORT},
+                          status_clocks={"i5": clock(head="NEW")}))
+    assert only(out, "unlatch_frozen") == []
+    assert len(only(out, "gate")) == 1
+
+
+def test_unlatched_lane_that_freezes_again_re_enters_the_ladder_fresh():
+    # DoD: the same lane freezing again later re-enters the ladder fresh. After an un-latch the lane is
+    # `running` with a fresh baseline (progress_sig=NEW); a later `frozen` event recovers it normally
+    # (no lingering un-latch state suppresses the ladder).
+    st = {"version": 1, "issues": {"i5": ist("running", progress_sig=_sig(head="NEW"),
+                                          progress_since=NOW - 60)}}
+    out = decide(events=[{"type": "frozen", "id": "i5"}],
+                 dsk=disk(issues_state=st, status_clocks={"i5": clock(head="NEW")}))
+    r = only(out, "recover")
+    assert len(r) == 1 and r[0]["tier"] == "frozen"    # re-freeze -> the ladder fires again
+
+
 def test_exited_marker_relaunches_under_cap_and_parks_at_cap():
     p5 = parsed(5, labels=("in-progress", "type:build"))   # in the view, as an in-flight issue is
     under = disk(exited={"i5": "x rc=1"},

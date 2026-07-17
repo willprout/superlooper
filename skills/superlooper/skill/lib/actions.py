@@ -1717,6 +1717,45 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         if iid in frozen_ids or status == "frozen":
             if in_wake_grace:
                 continue                               # wake grace: hold the recovery ladder (issue #42)
+            # ---- un-latch a LATCHED `frozen` status when the progress clock advances (issue #231) ----
+            # The stored status latched to `frozen`, but the frozen tier `continue`s before the #157
+            # probe ladder below, so nothing ever notices when the session resumes real work: it keeps
+            # the stale paint and draws the 10-minute nudge until its report lands (observed live, 360
+            # eApp 2026-07-16 — a session that had already opened its PR). Key the un-latch on the
+            # PROGRESS clock (HEAD / report / blocked marker), NEVER on activity: a nudge refreshes the
+            # pane's activity — an activity-keyed un-latch would let the ladder answer itself (i328) —
+            # but it can never move HEAD/report/blocked. Only an already-LATCHED status is un-latched;
+            # a lane crossing INTO frozen this tick (`frozen_ids`, status still 'running') takes the
+            # normal recover below, which is what stamps the baseline the comparison reads.
+            if status == "frozen":
+                cur_sig = events_mod.progress_signature(status_clocks.get(iid))
+                if cur_sig is not None:
+                    baseline = ist.get("progress_sig")
+                    if events_mod.progress_advanced(baseline, cur_sig):
+                        # The session demonstrably resumed: a report/blocked marker, or a HEAD movement
+                        # between two real commits, since the freeze baseline. Flip back to `running`,
+                        # end the frozen ladder, journal the transition (evidence class named), and
+                        # start a fresh #157 episode. `progress_advanced` is the fail-CLOSED gate: a
+                        # corrupt baseline or a head that merely became git-UNREADABLE ('None') is NOT
+                        # an advance, so a nudge waking the worker can never un-latch its own ladder
+                        # (i328). The action is `unlatch_frozen`, deliberately NOT `unfreeze` — that
+                        # verb is the unrelated MERGES-frozen mechanism (state/merges_frozen.json), a
+                        # different machine that happens to share the word (this issue's boundary).
+                        out.append({"act": "unlatch_frozen", "id": iid, "num": num, "sig": cur_sig,
+                                    "evidence_class": events_mod.progress_evidence(baseline, cur_sig)})
+                        continue
+                    if not events_mod.usable_baseline(baseline) and events_mod.usable_baseline(cur_sig):
+                        # No baseline fit to measure a future advance against — it froze before the
+                        # probe ladder ever anchored it (an `awaiting` lane, whose ladder is suppressed),
+                        # the freeze stamp found no readable clock, or a stored baseline is
+                        # corrupt/unreadable-head. ANCHOR the current (readable) signature so a later
+                        # PROVEN advance is measurable, and never read a first/repaired baseline as
+                        # progress itself (mirrors the ladder's own first-sight-anchors-without-acting,
+                        # #157). Anchor only to a readable signature — never poison the baseline with an
+                        # unreadable 'None' head. A good baseline that simply did not advance falls
+                        # through to the nudge ladder, its last-known-good head preserved.
+                        out.append({"act": "progress_advance", "id": iid, "sig": cur_sig})
+                        continue
             # The lane looks frozen by the clock, but the runner has SENSED why (issue #151), and
             # in both cases PARKING is the wrong answer:
             #   logged_out (i336) — auth died in-process. Alerted above and held for the owner; a
