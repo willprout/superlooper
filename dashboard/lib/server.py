@@ -140,12 +140,13 @@ def _serve_static(rel_path, static_root):
 _MAX_BODY = 64 * 1024                    # a flag body is short; cap the read so a POST can't balloon RAM
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-# The four verbs that are a label/close write keyed on (repo, num) → the Actions method name.
+# The label/close write verbs keyed on (repo, num) → the Actions method name.
 _LABEL_VERBS = {
     "/api/approve": "approve",           # also serves re-approve (same mechanical effect + comment)
     "/api/drop": "drop",
     "/api/expedite": "expedite",
     "/api/bounce-yes": "bounce_yes",
+    "/api/rebuild": "rebuild",           # issue #161: the explicit rebuild-from-scratch verb
 }
 _ACTION_PATHS = set(_LABEL_VERBS) | {"/api/flag", "/api/discuss", "/api/answer"}
 
@@ -1414,6 +1415,9 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         cargo = diff_reader(worktree)
         issue = {
             "id": iid, "num": num, "status": st.get("status"), "branch": branch, "pr": pr,
+            # Investigations file a report but open no PR and are REBUILT (not resumed) on re-approval;
+            # the decision card reads this to keep its resume/rebuild verb honest (issue #161).
+            "is_investigation": is_investigation,
             "activity_mtime": facts["activity"].get(iid), "blocked": facts["blocked"].get(iid),
             "awaiting_marker": iid in facts["awaiting"], "report_present": iid in facts["reports"],
             # The three-way review state (issue #176), judged against the PR's CURRENT head so a

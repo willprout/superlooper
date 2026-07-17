@@ -131,8 +131,8 @@
     var da = ' data-repo="' + esc(d.repo) + '" data-num="' + esc(d.num) + '"';
     // The verb + label + whether Discuss is the default are the SERVER's (d.decision) — so a bounced
     // flight fires bounce-yes (its audit trail), and the conflict-cap Discuss-default (§8) holds here
-    // exactly as on the card. Drop — the one destructive verb — stays on the card (its confirm lives
-    // there). Discuss is always available.
+    // exactly as on the card. The destructive verbs — Drop, and Rebuild on a finished lane (issue
+    // #161) — stay on the card, where their two-tap confirm lives. Discuss is always available.
     var dec = d.decision;
     var discuss = '<button class="btn-note link" data-act="discuss"' + da + '>Discuss →</button>';
     if (!dec) return '<div class="drawer-actions">' + discuss + '</div>';

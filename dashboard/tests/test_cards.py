@@ -458,11 +458,15 @@ def test_every_action_names_its_consequence():
     for f in (_flight(stage=flights.PARKED),
               _flight(stage=flights.AWAITING, awaiting_reason="bounced"),
               _flight(stage=flights.AWAITING),
-              _flight(stage=flights.PARKED, attempt=2)):
+              _flight(stage=flights.PARKED, attempt=2),
+              _flight(stage=flights.PARKED, pr=555,        # a FINISHED lane (resume + rebuild, #161)
+                      gate={"report": True, "review": True, "ci": False,
+                            "mergeable": False, "cleared": False})):
         acts = cards.decision_actions(f)
         assert acts, "a waiting flight always offers the owner a way out"
         for a in acts:
-            assert a["act"] in ("approve", "bounce-yes", "drop", "discuss")   # no invented verbs
+            # the mechanical verbs only — approve/bounce-yes/drop/discuss plus the #161 rebuild split
+            assert a["act"] in ("approve", "bounce-yes", "drop", "discuss", "rebuild")
             assert a["consequence"] and a["consequence"][-1] == "."           # a plain sentence
             assert len(a["label"]) > len(a["act"])                            # never a bare verb
 
@@ -501,6 +505,82 @@ def test_every_yes_verb_says_it_rebuilds_from_scratch():
         assert "rebuild" in yes["label"].lower(), "the yes verb must not hide the rebuild"
         low = yes["consequence"].lower()
         assert "worktree" in low and "report" in low, "say what is discarded, in the sentence"
+
+
+# ------------- D11: a finished lane resumes at the gate; rebuild is a separate action (issue #161) -------------
+
+def _finished_flight(**over):
+    # a FINISHED build handed back for a decision: report filed (⇒ a PR was opened), so re-approval
+    # resumes at the gate rather than rebuilding.
+    f = _flight(stage=flights.PARKED, pr=555,
+                gate={"report": True, "review": True, "ci": False, "mergeable": False, "cleared": False})
+    f.update(over)
+    return f
+
+
+def test_a_finished_lane_reapproves_to_resume_at_the_gate_not_rebuild():
+    # THE D11 button fix: on a finished lane the primary yes verb RESUMES AT THE GATE — its label and
+    # consequence say the PR/report/review are KEPT and the gate re-runs, never that work is discarded.
+    yes = [a for a in cards.decision_actions(_finished_flight()) if a["act"] == "approve"][0]
+    assert yes["destructive"] is False
+    low = yes["label"].lower() + " " + yes["consequence"].lower()
+    assert "resume" in low and "gate" in low
+    assert "kept" in low or "keep" in low                       # says the work is preserved
+    assert "discard" not in yes["consequence"].lower()          # the yes verb never threatens the work
+
+
+def test_a_finished_lane_offers_rebuild_as_a_separate_destructive_action():
+    # Rebuild-from-scratch exists as a distinct, armed, destructive verb whose LABEL names the
+    # consequence (discards the PR + review). Only it throws the finished work away.
+    acts = cards.decision_actions(_finished_flight())
+    rb = [a for a in acts if a["act"] == "rebuild"]
+    assert len(rb) == 1, "a finished lane must offer an explicit rebuild"
+    rb = rb[0]
+    assert rb["destructive"] is True
+    assert "rebuild" in rb["label"].lower()
+    assert "discard" in rb["label"].lower() and ("pr" in rb["label"].lower() or "review" in rb["label"].lower())
+    assert "tap again" in rb["armed_label"].lower()             # the two-tap arm, like Drop
+    low = rb["consequence"].lower()
+    assert "worktree" in low and "report" in low               # the discard is named in the sentence
+
+
+def test_the_rebuild_armed_caption_names_the_unique_target_with_the_slug():
+    # Like Drop, the armed caption names repo AND number (Needs You is whole-field, #44) — omitted
+    # without a slug rather than naming an ambiguous target.
+    rb = [a for a in cards.decision_actions(_finished_flight(), slug="w/cc") if a["act"] == "rebuild"][0]
+    assert "w/cc" in rb["armed_caption"] and "#7" in rb["armed_caption"]
+    rb_noslug = [a for a in cards.decision_actions(_finished_flight()) if a["act"] == "rebuild"][0]
+    assert rb_noslug["armed_caption"] is None
+
+
+def test_an_unfinished_lane_has_no_rebuild_button_and_still_rebuilds_on_approve():
+    # Nothing to discard: a lane parked before it ever finished keeps the single honest "re-approve &
+    # rebuild" yes verb (no separate rebuild button — approve already rebuilds it).
+    acts = cards.decision_actions(_flight(stage=flights.PARKED))   # report:False by default
+    assert [a for a in acts if a["act"] == "rebuild"] == []
+    yes = [a for a in acts if a["act"] == "approve"][0]
+    assert "rebuild" in yes["label"].lower()
+
+
+def test_a_finished_investigation_shows_rebuild_never_a_lying_resume_button():
+    # Fresh-review P1: an investigation files a report but opens NO PR, and the engine REBUILDS it on
+    # re-approval (its resume path is `has_report AND type != investigate`). So the card must NOT show
+    # "resume at the gate — the report is kept" on a finished investigation — that would promise to
+    # keep the investigation's whole deliverable and then delete it. It mirrors the engine EXACTLY via
+    # `is_investigation`, so a finished investigation reads as a plain rebuild, no separate resume.
+    f = _finished_flight(is_investigation=True, pr=None)
+    acts = cards.decision_actions(f)
+    assert [a for a in acts if a["act"] == "rebuild"] == []        # no separate resume/rebuild split
+    yes = [a for a in acts if a["act"] == "approve"][0]
+    assert "rebuild" in yes["label"].lower()                      # the honest single yes verb
+    assert "resume" not in yes["label"].lower()
+    assert "kept" not in yes["consequence"].lower()               # never promises to keep the report
+
+
+def test_a_finished_needs_you_card_carries_the_rebuild_action():
+    card = cards.needs_you_card(_finished_flight(stage=flights.AWAITING, awaiting_reason="needs-owner"), "r/s")
+    assert "rebuild" in [a["act"] for a in card["actions"]]
+    assert "approve" in [a["act"] for a in card["actions"]]     # both: resume (approve) AND rebuild
 
 
 def test_a_bounce_accepts_the_amendment_and_says_so():

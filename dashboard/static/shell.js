@@ -34,7 +34,9 @@
     repoIndex: 0,
     towerRepin: false,       // set on a repo switch so the NEW repo's tower pins to its newest line
                              // (never inherits the old repo's scroll offset — different feed) (issue #27)
-    confirmingDrop: null,    // "repo#num" mid-confirm — kept in state so a 2s re-render can't reset it
+    confirming: null,        // "repo#num#act" mid-confirm for a destructive verb (Drop or Rebuild,
+                             // issue #161) — kept in state so a 2s re-render can't reset it, and keyed
+                             // by ACT so arming one destructive button never arms the other
     depPage: 0,              // departures board page — kept in state so the 2s re-render preserves it,
                              // reset to page 1 on a repo switch (the new repo has its own queue) (issue #30)
   };
@@ -321,9 +323,9 @@
 
   function needsYouHTML(s) {
     // Every semantic (headline, gloss, kind, conflict-cap collision, Discuss-default) is the
-    // server's; needsyou.js binds it. The drop-confirm state rides along so the 2s re-render can't
-    // silently disarm a mid-confirm Drop (design record §4 — the panel never moves).
-    return window.NeedsYou.panelHTML(s.needs_you, state.confirmingDrop);
+    // server's; needsyou.js binds it. The confirm state rides along so the 2s re-render can't
+    // silently disarm a mid-confirm destructive verb (design record §4 — the panel never moves).
+    return window.NeedsYou.panelHTML(s.needs_you, state.confirming);
   }
 
   function fieldHTML(s, r) {
@@ -516,26 +518,29 @@
     }
     if (act === "bounce-yes") { postVerb("/api/bounce-yes", repo, num, "Bounce accepted — SL-" + num + " relaunching"); return; }
     if (act === "expedite") { postVerb("/api/expedite", repo, num, "⚡ Expedited SL-" + num); return; }
-    if (act === "drop") { onDrop(repo, num); return; }
+    if (act === "drop") { armThenFire("drop", "/api/drop", repo, num, "Dropped SL-" + num + " — issue closed"); return; }
+    if (act === "rebuild") { armThenFire("rebuild", "/api/rebuild", repo, num, "Rebuilding SL-" + num + " from scratch"); return; }
   }
 
-  // Drop is the ONE destructive tap, so it takes a single inline confirm: first tap arms it (the
-  // button flips to "Drop — tap again"), second tap within the window closes the issue. The armed
-  // state lives in `state` so the 2s poll re-render can't silently disarm it; a timeout clears it.
-  function onDrop(repo, num) {
-    var keyd = repo + "#" + num;
-    if (state.confirmingDrop !== keyd) {
-      state.confirmingDrop = keyd;
+  // A destructive verb takes a single inline confirm: first tap arms it (the button flips to its
+  // server-supplied armed_label), second tap within the window fires. The armed state lives in
+  // `state.confirming` so the 2s poll re-render can't silently disarm it; a timeout clears it. The
+  // key is per (repo, num, ACT) so a card carrying BOTH destructive verbs (Rebuild and Drop, issue
+  // #161) arms each independently — arming Rebuild never arms Drop, and vice versa.
+  function armThenFire(act, path, repo, num, okMsg) {
+    var keyd = repo + "#" + num + "#" + act;
+    if (state.confirming !== keyd) {
+      state.confirming = keyd;
       render();
-      window.clearTimeout(onDrop._t);
-      onDrop._t = window.setTimeout(function () {
-        if (state.confirmingDrop === keyd) { state.confirmingDrop = null; render(); }
+      window.clearTimeout(armThenFire._t);
+      armThenFire._t = window.setTimeout(function () {
+        if (state.confirming === keyd) { state.confirming = null; render(); }
       }, 5000);
       return;
     }
-    window.clearTimeout(onDrop._t);
-    state.confirmingDrop = null;
-    postVerb("/api/drop", repo, num, "Dropped SL-" + num + " — issue closed");
+    window.clearTimeout(armThenFire._t);
+    state.confirming = null;
+    postVerb(path, repo, num, okMsg);
   }
 
   function postVerb(path, repo, num, okMsg) {

@@ -46,6 +46,7 @@ class _RecordingActions:
     def drop(self, repo, num): return self._rec("drop", repo, num)
     def expedite(self, repo, num): return self._rec("expedite", repo, num)
     def bounce_yes(self, repo, num): return self._rec("bounce-yes", repo, num)
+    def rebuild(self, repo, num): return self._rec("rebuild", repo, num)
 
     def flag(self, repo, text):
         self.calls.append(("flag", repo, text))
@@ -69,6 +70,7 @@ def _post(path, payload, acts, origin=None, snap=None, host=None):
     ("/api/drop", "drop"),
     ("/api/expedite", "expedite"),
     ("/api/bounce-yes", "bounce-yes"),
+    ("/api/rebuild", "rebuild"),          # issue #161: the explicit rebuild-from-scratch verb
 ])
 def test_label_verb_dispatches_with_repo_and_num(path, verb):
     acts = _RecordingActions()

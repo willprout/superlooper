@@ -34,6 +34,23 @@ def test_referee_preauthorization_label_exists_but_is_never_runner_managed():
                for step in labels.label_migration_plan(set()))
 
 
+def test_rebuild_label_exists_but_is_never_runner_managed():
+    """Issue #161: the explicit rebuild-from-scratch verb is signalled by the `rebuild` label — the
+    owner's choice to DISCARD a finished PR/report instead of the default resume-at-the-gate. gh
+    refuses to apply a label a repo doesn't have, so it must be in the §C.2 set (adopt creates it;
+    the dashboard's rebuild verb also create-or-forces it on tap). It is NOT runner-managed: like
+    every owner-applied control label it is the OWNER's word, never a label the runner creates or
+    heals as its own machinery."""
+    spec = labels.label_spec("rebuild")
+    assert spec is not None, "the rebuild label must be in the §C.2 set, or adopt never creates it"
+    color, desc = spec
+    assert color and desc
+    assert "(runner-managed)" not in desc
+    assert "rebuild" not in labels.runner_managed_labels()
+    assert "rebuild" not in labels.missing_runner_labels(set())
+    assert all(step.get("name") != "rebuild" for step in labels.label_migration_plan(set()))
+
+
 def test_runner_managed_subset_is_the_tagged_set():
     # exactly the labels the RUNNER writes as machinery — derived from the description tag, so the
     # LABELS list is the one place the vocabulary is defined.

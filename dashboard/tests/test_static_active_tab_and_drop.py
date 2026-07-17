@@ -166,8 +166,8 @@ def test_drop_confirm_names_the_consequence_in_plain_language():
 def test_drop_confirm_keeps_the_two_tap_gesture_and_survives_the_poll():
     # DoD: the existing two-tap, state-survives-re-render behaviour stays intact. The armed button
     # still carries the "tap again" gesture, still keys off `confirming`, still fires data-act=drop;
-    # and `confirming` is still derived from the caller-threaded confirmingDrop (so the 2s re-render
-    # can't silently disarm a mid-confirm Drop — design record §4).
+    # and `confirming` is still the caller-threaded state (so the 2s re-render can't silently disarm
+    # a mid-confirm destructive verb — design record §4).
     # Issue #162 moved the armed STRING server-side (`armed_label`, design record B.1) — so the
     # "tap again" wording is now pinned in tests/test_cards, and what this guard binds is the
     # armed-state WIRING: the armed branch keys off `confirming` (via the server's `destructive`
@@ -182,12 +182,33 @@ def test_drop_confirm_keeps_the_two_tap_gesture_and_survives_the_poll():
     # if every button were hard-coded to one verb — the drop would silently become an approve.
     assert re.search(r'data-act="\'\s*\+\s*esc\(a\.act\)', _NEEDS_CODE), (
         "each button's verb must be the server's a.act, never a hard-coded literal (issues #44/#162)")
-    assert re.search(r"confirming\s*=\s*confirmingDrop\s*===\s*\(\s*c\.repo", _NEEDS_CODE), (
-        "the confirming flag must still derive from the caller-threaded confirmingDrop === repo#num, "
-        "so the poll re-render preserves a mid-confirm Drop (design record §4)")
-    # panelHTML still threads confirmingDrop through to every card.
-    assert re.search(r"panelHTML\(\s*needs\s*,\s*confirmingDrop\s*\)", _NEEDS_CODE), (
-        "panelHTML must still accept and thread confirmingDrop (state survives the poll)")
+    # panelHTML still threads the caller's confirm state through to every card (survives the poll).
+    assert re.search(r"panelHTML\(\s*needs\s*,\s*confirming\s*\)", _NEEDS_CODE), (
+        "panelHTML must still accept and thread the confirm state (state survives the poll)")
+
+
+def test_the_arm_key_is_per_action_so_two_destructive_verbs_never_co_arm():
+    # Issue #161: a finished decision card carries BOTH Rebuild and Drop (two destructive verbs).
+    # Arming one must NEVER arm the other, so the confirm key includes the ACT — repo#num#act — not
+    # merely repo#num. Without this, tapping Rebuild would flip Drop to its armed "close for good"
+    # state too, and a second tap meant for Rebuild could close the issue.
+    assert re.search(r'c\.repo\s*\+\s*"#"\s*\+\s*c\.num\s*\+\s*"#"\s*\+\s*a\.act', _NEEDS_CODE), (
+        "the armed key must be per (repo, num, ACT), so Rebuild and Drop arm independently (#161)")
+    # shell.js keys `state.confirming` the same way, per (repo, num, act).
+    assert re.search(r'repo\s*\+\s*"#"\s*\+\s*num\s*\+\s*"#"\s*\+\s*act', _SHELL_CODE), (
+        "the shell's confirm state must be keyed per (repo, num, act) too (#161)")
+
+
+def test_rebuild_is_wired_to_the_two_tap_arm_like_drop():
+    # The explicit rebuild verb (issue #161) is destructive — it discards a finished PR/report — so it
+    # takes the SAME two-tap arm as Drop, routed through the shared arm helper, and fires the
+    # /api/rebuild endpoint (never approve, which would resume-at-gate instead of rebuilding).
+    assert re.search(r'act\s*===\s*"rebuild"', _SHELL_CODE), (
+        "the shell must handle the rebuild verb (#161)")
+    assert re.search(r'armThenFire\(\s*"rebuild"\s*,\s*"/api/rebuild"', _SHELL_CODE), (
+        "rebuild must go through the two-tap arm helper to /api/rebuild (#161)")
+    assert re.search(r'armThenFire\(\s*"drop"\s*,\s*"/api/drop"', _SHELL_CODE), (
+        "drop must still go through the same shared two-tap arm helper (#161)")
 
 
 def test_drop_consequence_reads_as_destructive_not_neutral():

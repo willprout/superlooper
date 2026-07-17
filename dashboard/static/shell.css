@@ -843,7 +843,8 @@ html, body {
 .btn.primary:hover { filter: brightness(1.08); }
 .btn.ghost:hover { background: #EEF2F6; }
 .btn:active { transform: translateY(0.5px); }
-/* Drop is the one destructive verb — armed (mid-confirm) it goes red so the second tap is deliberate. */
+/* A destructive verb (Drop, or Rebuild on a finished lane — issue #161) goes red while armed
+   (mid-confirm) so the second tap is deliberate. */
 .btn.ghost.danger {
   background: #FBEAE7; border-color: var(--red); color: var(--red); font-weight: 700;
 }

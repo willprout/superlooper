@@ -62,8 +62,9 @@ def test_approve_adds_agent_ready_removes_parked_and_needs_william(tmp_path, mon
     muts = _mutations(tmp_path)
     assert all(m["num"] == "4" for m in muts if m["kind"] == "set_labels")
     assert "agent-ready" in _added_labels(muts)                              # agent-ready applied
-    # all three blockers cleared (each in its own edit — issue #114 split; order-independent)
-    assert _removed_labels(muts) == {"parked", "needs-owner", "needs-william"}
+    # the blockers cleared (each in its own edit — issue #114 split; order-independent), PLUS the
+    # `rebuild` override (issue #161): a plain re-approval is a RESUME, so it clears any stale rebuild.
+    assert _removed_labels(muts) == {"parked", "needs-owner", "needs-william", "rebuild"}
 
 
 def test_approve_posts_the_exact_audit_comment(tmp_path, monkeypatch):
@@ -133,6 +134,101 @@ def test_approve_still_clears_the_legacy_label_mid_migration(tmp_path, monkeypat
     res = a.approve(REPO, 4)
     assert res["ok"] is True
     assert "needs-william" in _removed_labels(_mutations(tmp_path))
+
+
+# =============================== rebuild — the explicit destructive re-approval (issue #161) ===============================
+# Re-approving a finished lane now RESUMES AT THE GATE by default (the engine keeps the PR/report and
+# re-runs the merge gate). Rebuild is the separately-named destructive verb: it re-applies agent-ready
+# AND the `rebuild` label, which the engine reads as the owner's explicit choice to DISCARD the
+# finished PR/report and build from scratch. Same audit-trail + fail-closed disciplines as approve.
+
+def test_rebuild_applies_agent_ready_and_the_rebuild_label(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    res = a.rebuild(REPO, 4)
+    assert res["ok"] is True and res["verb"] == "rebuild"
+    muts = _mutations(tmp_path)
+    added = _added_labels(muts)
+    assert "agent-ready" in added and "rebuild" in added     # BOTH — the rebuild flag rides along
+    assert {"parked", "needs-owner", "needs-william"} <= _removed_labels(muts)
+
+
+def test_rebuild_creates_the_rebuild_label_first_so_it_works_pre_adopt(tmp_path, monkeypatch):
+    # gh refuses to apply a label a repo doesn't have; a repo not yet re-adopted after #161 shipped
+    # would have no `rebuild` label. Create-or-force it first (idempotent, --force) — mirrors flag —
+    # so the button just works, then apply it.
+    a = _acts(monkeypatch, tmp_path)
+    a.rebuild(REPO, 4)
+    muts = _mutations(tmp_path)
+    lab = next(m for m in muts if m["kind"] == "create_label")
+    assert lab["name"] == "rebuild" and lab["force"] is True
+    setl = next(m for m in muts if m["kind"] == "set_labels" and "rebuild" in (m.get("add") or ""))
+    assert muts.index(lab) < muts.index(setl)                # created BEFORE it is applied
+
+
+def test_rebuild_posts_the_exact_audit_comment(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    a.rebuild(REPO, 4)
+    comment = [m for m in _mutations(tmp_path) if m["kind"] == "comment"][-1]
+    assert comment["num"] == "4"
+    assert comment["body"] == "Rebuilt from scratch by Ada via command-center, 2026-07-07."
+
+
+def test_rebuild_refuses_an_unwatched_repo_with_no_gh_call(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path, allowed=(REPO,))
+    res = a.rebuild("evil/elsewhere", 4)
+    assert res["ok"] is False and res["error"] == "unknown repo"
+    assert _calls(tmp_path) == []
+
+
+def test_rebuild_fails_closed_when_gh_write_fails(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert a.rebuild(REPO, 4)["ok"] is False
+
+
+def test_the_non_rebuild_reapproval_verbs_clear_a_stale_rebuild_label(tmp_path, monkeypatch):
+    # Issue #161, the one-shot guarantee (fresh-review P1): `rebuild` is applied ONLY by the rebuild
+    # verb. Every OTHER re-approval — approve (resume-at-the-gate), bounce-yes, answer — must REMOVE a
+    # stale rebuild left behind by an earlier tap whose engine-side cleanup blipped, so a later plain
+    # re-approval can never inherit a destructive override and wipe finished work (the D11 defect).
+    for verb, call in (("approve", lambda a: a.approve(REPO, 4)),
+                       ("bounce-yes", lambda a: a.bounce_yes(REPO, 4)),
+                       ("answer", lambda a: a.answer(REPO, "go ahead", 4))):
+        a = _acts(monkeypatch, tmp_path)
+        call(a)
+        removed = _removed_labels(_mutations(tmp_path))
+        assert "rebuild" in removed, "%s must clear a stale rebuild label (#161)" % verb
+        # clean the mutations log between verbs so each assertion reads only its own writes
+        (tmp_path / "mutations.jsonl").unlink(missing_ok=True)
+
+
+def test_a_resume_verb_is_fail_closed_when_the_rebuild_clear_genuinely_fails(tmp_path, monkeypatch):
+    # Issue #161, fresh-review (Codex P1): the rebuild-clear is a PRECONDITION. If clearing a stale
+    # `rebuild` fails for a GENUINE reason (auth/network/5xx — not the benign repo-absent no-op), the
+    # resume must ABORT before agent-ready lands, so the engine never sees `agent-ready + rebuild` and
+    # rebuilds. Simulated with GH_FAIL_REMOVE (a generic --remove-label failure).
+    for verb, call in (("approve", lambda a: a.approve(REPO, 4)),
+                       ("bounce-yes", lambda a: a.bounce_yes(REPO, 4)),
+                       ("answer", lambda a: a.answer(REPO, "go ahead", 4))):
+        monkeypatch.setenv("GH_FAIL_REMOVE", "1")
+        a = _acts(monkeypatch, tmp_path)
+        res = call(a)
+        assert res["ok"] is False, "%s must fail closed when the rebuild clear genuinely fails" % verb
+        assert "agent-ready" not in _added_labels(_mutations(tmp_path)), \
+            "%s must NOT land agent-ready over a surviving rebuild override" % verb
+        (tmp_path / "mutations.jsonl").unlink(missing_ok=True)
+        monkeypatch.delenv("GH_FAIL_REMOVE", raising=False)
+
+
+def test_a_repo_absent_rebuild_never_blocks_a_normal_reapproval(tmp_path, monkeypatch):
+    # The benign no-op path: on a repo that hasn't re-adopted (no `rebuild` label defined), clearing
+    # it is a vacuous "not found" that set_labels swallows — so a normal re-approval, which is the
+    # overwhelming majority, is NEVER spuriously blocked by the new precondition.
+    monkeypatch.setenv("GH_LABEL_NOT_IN_REPO", "rebuild")
+    a = _acts(monkeypatch, tmp_path)
+    res = a.approve(REPO, 4)
+    assert res["ok"] is True and res["labeled"] is True          # the tap still lands, agent-ready on
+    assert "agent-ready" in _added_labels(_mutations(tmp_path))
 
 
 def test_bounce_yes_succeeds_on_a_repo_that_finished_the_migration(tmp_path, monkeypatch):

@@ -27,6 +27,10 @@ _FAKE_GH = Path(__file__).resolve().parent / "fakes" / "fake-gh"
 
 ALL_LABELS = ["agent-ready", "in-progress", "needs-owner", "parked", "expedite",
               "preserve", "auto-approved:nightly-red", "superseded",
+              # the owner's explicit rebuild-from-scratch verb (#161). adopt must CREATE it — gh
+              # refuses to apply a label that does not exist — but the runner never APPLIES it (that
+              # owner-applied split is pinned in test_labels.py).
+              "rebuild",
               # the owner's referee pre-authorization (#165). adopt must CREATE it — gh refuses to
               # apply a label that does not exist, so an unseeded label is a grant he cannot make —
               # but the runner never APPLIES it (that split is pinned in test_labels.py).

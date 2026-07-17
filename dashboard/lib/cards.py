@@ -275,9 +275,10 @@ def decision_dossier(flight, journal_slice):
 
 
 # =============================== the verbs, named by consequence (issue #162) ===============================
-# No button may hide what it does. These are exactly the mechanical verbs ``lib/actions`` already
-# exposes — approve / bounce-yes / drop / discuss — with NO new verb invented here (issue #162
-# boundary); only their NAMES change, and the name now states the effect.
+# No button may hide what it does. These are the mechanical verbs ``lib/actions`` exposes — approve /
+# bounce-yes / drop / discuss, plus the explicit ``rebuild`` that issue #161 splits out of re-approval
+# — and the name always states the effect. #162 kept the set fixed and only renamed; #161's split is
+# the one owner-approved addition (a finished lane resumes by default, so rebuild needs its own verb).
 #
 # The load-bearing honesty: a re-approval is NOT "carry on from here". A fresh `agent-ready` on any
 # park-family status routes through the engine's `_exec_reapprove`, which prunes the worktree,
@@ -294,6 +295,16 @@ def decision_dossier(flight, journal_slice):
 _DISCARDS = ("Any worktree and filed report this issue already has are discarded — nothing is "
              "resumed — its attempt counters are zeroed, and a fresh session starts from the issue.")
 
+# The consequence of the DEFAULT re-approval on a FINISHED lane (issue #161 — the D11 fix). The
+# engine now RESUMES AT THE GATE instead of rebuilding: it re-enters the merge gate on the PR this
+# issue already opened, re-reads the durable review evidence (issue #154), and re-runs the mechanical
+# checks — building nothing new. The worktree, the filed report and the review are all kept. This is
+# the load-bearing opposite of _DISCARDS: the owner's loudest frustration was that re-approval threw
+# finished work away by default; now it doesn't, and the label says so.
+_RESUMES = ("Nothing is rebuilt: the runner re-enters the merge gate on the PR this issue already "
+            "opened, re-reads the durable review, and re-runs the mechanical checks. The worktree, "
+            "the filed report and the review are kept.")
+
 
 def decision_actions(flight, slug=None):
     """The ordered buttons for a waiting flight, each naming its consequence (issue #162).
@@ -308,10 +319,40 @@ def decision_actions(flight, slug=None):
     kind = card_kind(flight)
     bounced = flight.get("awaiting_reason") == "bounced" or kind == "bounced"
     num = flight.get("num")
+    # A filed report on a MERGE-producing lane means the worker FINISHED and opened its PR (its last
+    # act is the report, written only after `gh pr create`). Issue #161 splits the yes verb by that
+    # signal: a finished lane RESUMES AT THE GATE by default (the engine keeps the PR/report/review and
+    # re-runs the merge gate), and rebuild-from-scratch becomes a separate, armed, destructive verb.
+    # The condition MIRRORS the engine's resume path EXACTLY — `has_report AND type != investigate AND
+    # status != bounced` — so the button text can never contradict what the runner will do (design
+    # record B.1). The `is_investigation` clause is load-bearing, not caution: an investigation ALSO
+    # files a report but opens no PR, and the engine rebuilds it — keying on report alone would show
+    # "resume ... the report is kept" on a lane the runner rebuilds, deleting the investigation's whole
+    # deliverable behind a preservation promise. A bounce rejects the premise — always a rebuild.
+    finished = (bool((flight.get("gate") or {}).get("report"))
+                and not flight.get("is_investigation") and not bounced)
 
+    rebuild = None
     if bounced:
         yes = {"act": "bounce-yes", "label": "Accept the amendment & rebuild",
                "consequence": "Records that you accepted the worker's proposed amendment. " + _DISCARDS}
+    elif finished:
+        # The D11 default: re-approval resumes at the gate, keeping the finished work.
+        yes = {"act": "approve", "label": "Re-approve — resume at the gate",
+               "consequence": "Re-applies agent-ready in your name — your word, on the record. "
+                              + _RESUMES}
+        # Rebuild-from-scratch: offered ONLY when there is finished work to discard. Its own label
+        # names the consequence, and — being destructive — its second tap is armed client-side like
+        # Drop. The armed caption is a SEMANTIC (a destructive consequence) so it lives here beside
+        # the label it warns about, naming the UNIQUE target (repo AND number, since Needs You is
+        # whole-field — issue #44); without a slug the caption is omitted rather than half-named.
+        rebuild = {"act": "rebuild",
+                   "label": "Rebuild from scratch — discards the current PR & review",
+                   "armed_label": "Tap again to discard #%s's PR & review and rebuild" % num,
+                   "armed_caption": ("↻ Discards %s #%s's PR and its review — rebuilds from the issue."
+                                     % (slug, num) if slug else None),
+                   "consequence": "Throws the finished work away and starts over. " + _DISCARDS,
+                   "tone": "ghost", "destructive": True}
     else:
         yes = {"act": "approve", "label": "Re-approve & rebuild from scratch",
                "consequence": "Re-applies agent-ready in your name — your word, on the record. "
@@ -347,8 +388,10 @@ def decision_actions(flight, slug=None):
                   "tone": "primary", "destructive": False}
         return [answer, discuss, drop]
 
+    # The destructive rebuild (issue #161), when present, groups with the safe primary ahead of Drop.
     # On a collision, Discuss LEADS (§8 — the guard against a blind Approve press there).
-    return [discuss, yes, drop] if kind == "conflict-cap" else [yes, drop, discuss]
+    mid = [yes] + ([rebuild] if rebuild else [])
+    return [discuss] + mid + [drop] if kind == "conflict-cap" else mid + [drop, discuss]
 
 
 def needs_you_card(flight, slug, journal_slice=None):

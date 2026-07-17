@@ -1,4 +1,8 @@
-"""The six mechanical verbs — the ONLY writes in the whole product (design record §2, Task 6).
+"""The mechanical verbs — the ONLY writes in the whole product (design record §2, Task 6).
+
+The set was six through issue #162; issue #161 splits re-approval into resume-at-the-gate (the
+existing ``approve``) and an explicit ``rebuild``, so ``rebuild`` is the seventh — still a plain
+label+comment write in William's name, no new KIND of write, no AI.
 
 Every button the dashboard shows is one of exactly SIX existing mechanical verbs — approve/
 re-approve, drop, expedite, bounce-yes, flag, discuss — each a label/comment/issue write made in
@@ -40,6 +44,12 @@ FLAG = "flag"
 # the LATEST comment carrying it as the owner's answer and embeds the Q&A in the relaunched brief.
 AWAITING_ANSWER = "awaiting-answer"
 ANSWER_MARKER = "<!-- superlooper-answer -->"
+# The explicit rebuild-from-scratch flag (issue #161). Re-approving a finished lane RESUMES AT THE
+# GATE by default (the engine keeps the PR/report); this label is the owner's separately-named choice
+# to instead DISCARD that work and build anew. The engine reads it, then clears it once consumed. It
+# is created-or-forced on first use (like FLAG) so the button works on a repo not yet re-adopted.
+REBUILD = "rebuild"
+_REBUILD_LABEL_COLOR = "d73a4a"              # the destructive red — this verb throws finished work away
 
 # The flag label, created-or-updated on first use so a fresh repo's first flag just works (the gh
 # adapter's create_label uses --force, so this is idempotent — never an error on a repo that already
@@ -74,6 +84,10 @@ def expedite_comment(operator, date):
 def bounce_comment(operator, date):
     return ("Bounce accepted by %s via command-center, %s. "
             "Proceeding with the amended goal." % (operator, date))
+
+
+def rebuild_comment(operator, date):
+    return "Rebuilt from scratch by %s via command-center, %s." % (operator, date)
 
 
 def flag_title(text):
@@ -120,12 +134,33 @@ class Actions:
         # repos the operator configured (bright line: never steerable off-machine or off-repo).
         return {"ok": False, "verb": verb, "error": "unknown repo"}
 
+    def _clear_rebuild_override(self, repo, num):
+        """Clear a stale ``rebuild`` override, FAIL-CLOSED (issue #161). A resume/continue verb —
+        approve (resume-at-the-gate), bounce-yes, answer — must never land ``agent-ready`` beside a
+        surviving ``rebuild``: the engine reads ``agent-ready + rebuild`` as the owner's choice to
+        DISCARD finished work (the D11 defect), so a half-applied resume that left the override
+        standing would silently rebuild. Running this BEFORE the ``agent-ready`` add makes the clear a
+        precondition — its failure aborts the verb, so agent-ready never lands over a live override.
+
+        A repo-absent OR issue-absent ``rebuild`` is a benign no-op that ``set_labels`` reports as
+        success (it swallows gh's ``'rebuild' not found``), so a normal re-approval — the vast
+        majority, with no rebuild anywhere — is never spuriously blocked. Only a GENUINE gh failure
+        (auth / network / 5xx) returns False, and that same failure would sink the ``agent-ready`` add
+        one line later regardless — so this adds no new failure mode, only the guarantee."""
+        return self._gh.set_labels(repo, num, remove=[REBUILD])
+
     def approve(self, repo, num):
         """Approve / re-approve: apply ``agent-ready`` (William's word — this tap IS his word),
         clear ``parked`` and ``needs-william``, and leave the standard audit comment. One endpoint
         serves both the fresh approval and the re-approval of a parked flight."""
         if repo not in self._allowed:
             return self._refuse("approve")
+        # Resume-at-the-gate is the OPPOSITE of a rebuild, so clear any stale `rebuild` override FIRST
+        # and fail-closed (issue #161) — never land agent-ready beside a live override, or the engine
+        # rebuilds. Only the `rebuild` verb ever applies that label; every other re-approval clears it.
+        if not self._clear_rebuild_override(repo, num):
+            return {"ok": False, "verb": "approve", "labeled": False, "commented": False,
+                    "error": "could not clear a stale rebuild override — not re-approving"}
         labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
                                       remove=[PARKED, NEEDS_OWNER, NEEDS_OWNER_LEGACY])
         commented = self._gh.comment(repo, num, approve_comment(self._operator, self._date()))
@@ -153,6 +188,26 @@ class Actions:
         return {"ok": bool(labeled and commented), "verb": "expedite",
                 "labeled": bool(labeled), "commented": bool(commented)}
 
+    def rebuild(self, repo, num):
+        """Rebuild from scratch (issue #161): the destructive sibling of approve. Re-applies
+        ``agent-ready`` AND the ``rebuild`` label — the engine reads that label as the owner's
+        explicit choice to DISCARD the finished PR/report and build anew, overriding the default
+        resume-at-the-gate. Clears the park labels and leaves the standard audit comment. The
+        ``rebuild`` label is create-or-forced first (idempotent ``--force``, mirroring ``flag``) so
+        the verb works even on a repo not yet re-adopted after #161 shipped — gh refuses to apply a
+        label that does not exist. ``agent-ready`` is William's word: ``ok`` requires BOTH the label
+        move and its audit comment, so a label applied without the trail is not a success."""
+        if repo not in self._allowed:
+            return self._refuse("rebuild")
+        self._gh.create_label(repo, REBUILD, _REBUILD_LABEL_COLOR,
+                              "%s's explicit rebuild: discard this issue's PR and review and build "
+                              "from scratch" % self._operator)
+        labeled = self._gh.set_labels(repo, num, add=[AGENT_READY, REBUILD],
+                                      remove=[PARKED, NEEDS_OWNER, NEEDS_OWNER_LEGACY])
+        commented = self._gh.comment(repo, num, rebuild_comment(self._operator, self._date()))
+        return {"ok": bool(labeled and commented), "verb": "rebuild",
+                "labeled": bool(labeled), "commented": bool(commented)}
+
     def bounce_yes(self, repo, num):
         """Bounce-yes: accept a bounced flight's proposed amendment — re-apply ``agent-ready`` and
         clear ``needs-william`` (and ``parked`` if it lingers) so the runner relaunches it, with an
@@ -160,6 +215,11 @@ class Actions:
         approve."""
         if repo not in self._allowed:
             return self._refuse("bounce-yes")
+        # Clear a stale `rebuild` override first, fail-closed (issue #161): a bounce-accept rebuilds
+        # from the AMENDED premise, so it must never inherit a prior tap's rebuild override.
+        if not self._clear_rebuild_override(repo, num):
+            return {"ok": False, "verb": "bounce-yes", "labeled": False, "commented": False,
+                    "error": "could not clear a stale rebuild override — not re-approving"}
         labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
                                       remove=[NEEDS_OWNER, NEEDS_OWNER_LEGACY, PARKED])
         commented = self._gh.comment(repo, num, bounce_comment(self._operator, self._date()))
@@ -181,6 +241,11 @@ class Actions:
         text = (text or "").strip()
         if not text:
             return {"ok": False, "verb": "answer", "error": "empty answer"}
+        # Clear a stale `rebuild` override first, fail-closed (issue #161): answering a durable
+        # question resumes with the WIP reused, so it must never inherit a rebuild override.
+        if not self._clear_rebuild_override(repo, num):
+            return {"ok": False, "verb": "answer", "commented": False, "labeled": False,
+                    "error": "could not clear a stale rebuild override — not re-approving"}
         commented = self._gh.comment(repo, num, "%s\n%s" % (ANSWER_MARKER, text))
         labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
                                       remove=[AWAITING_ANSWER, NEEDS_OWNER, NEEDS_OWNER_LEGACY])

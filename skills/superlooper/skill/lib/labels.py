@@ -35,6 +35,14 @@ LABELS = [
     ("pre-authorized:referee", "f9d0c4",
      "{operator}'s pre-authorization: the gate may merge this issue's referee-path touches"),
     ("superseded", "cccccc", "on a PR: replaced by a rebuild; branch preserved, nothing auto-closed"),
+    # {operator}'s explicit rebuild-from-scratch verb (issue #161). Re-approving a FINISHED lane now
+    # RESUMES AT THE GATE by default (keeps the PR/report/worktree, re-runs the merge gate); this
+    # label is the owner's separately-named choice to instead DISCARD that work and build anew. Like
+    # every owner-applied control label (expedite, pre-authorized:referee) it is NEVER
+    # '(runner-managed)': the owner applies it, the runner only reads it and clears it once consumed.
+    ("rebuild", "d73a4a",
+     "{operator}'s explicit rebuild: discard this issue's PR and review and build from scratch "
+     "(instead of the default resume-at-the-gate)"),
     ("priority:high", "ff9500", "front of the normal queue"),
     ("priority:low", "0075ca", "back of the queue"),
     ("type:build", "1d76db", "build issue"),

@@ -539,6 +539,86 @@ def test_after_the_reapprove_reset_the_issue_launches_next_tick():
     assert len(only(out, "launch")) == 1                 # and now it launches
 
 
+# --------------------- D11: re-approval resumes at the gate, does not rebuild (issue #161) ---------------------
+# The owner's loudest frustration: re-approving a FINISHED lane that already has an open PR wiped the
+# worktree + report and rebuilt from scratch (the D11 defect). The split: a finished build resumes at
+# the merge gate on its existing PR (building nothing new) by DEFAULT; the destructive rebuild is a
+# separately-named action reached only via the explicit `rebuild` label.
+
+def _finished(status="parked", **over):
+    # a finished BUILD lane: report on disk, a recorded PR, a branch stamp — the shape a lane that
+    # opened its PR and filed its report carries when it then parks for an owner decision.
+    return disk(reports={"i5": GOOD_REPORT},
+                issues_state={"version": 1, "issues": {
+                    "i5": ist(status, pr=555, branch="sl/i5-issue-5", **over)}})
+
+
+def test_reapproving_a_finished_build_resumes_at_the_gate_never_rebuilds():
+    # THE D11 fix: a finished build (report on disk ⇒ a PR was opened) that parked and is re-approved
+    # RE-ENTERS THE GATE on the existing PR — it emits `resume_at_gate`, never the destructive
+    # `reapprove`, and never a fresh launch that would rebuild over the finished work.
+    out = decide(parsed_issues=[parsed(5)], dsk=_finished("parked", merge_refusals=3))
+    ra = only(out, "resume_at_gate")
+    assert len(ra) == 1 and ra[0]["id"] == "i5" and ra[0]["num"] == 5
+    assert only(out, "reapprove") == []                  # the work is NOT thrown away
+    assert only(out, "launch") == []                     # and nothing is rebuilt from scratch
+    assert only(out, "park") == []
+
+
+def test_a_finished_needs_owner_build_also_resumes_at_the_gate():
+    # needs_william is a park-family status too — a finished build handed back for an owner decision
+    # (e.g. a merge GitHub refused) resumes at the gate on re-approval, keeping its PR.
+    out = decide(parsed_issues=[parsed(5)], dsk=_finished("needs_william"))
+    assert len(only(out, "resume_at_gate")) == 1 and only(out, "reapprove") == []
+
+
+def test_the_explicit_rebuild_label_forces_a_finished_lane_to_rebuild():
+    # The separately-named destructive action: the `rebuild` label is the owner's explicit choice to
+    # DISCARD the finished PR/report and build anew. It routes a finished lane to `reapprove`, and
+    # carries `had_rebuild` so the executor clears the one-shot label from its own isolated call.
+    out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "rebuild", "type:build"))],
+                 dsk=_finished("parked"))
+    ra = only(out, "reapprove")
+    assert len(ra) == 1 and ra[0]["had_rebuild"] is True
+    assert only(out, "resume_at_gate") == []             # the label overrides the resume default
+
+
+def test_a_non_rebuild_reapprove_marks_had_rebuild_false():
+    # An unfinished parked lane rebuilds with NO rebuild label present — the action says so, so the
+    # executor never names a repo-absent `rebuild` in a remove (which would hard-fail the batch).
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("parked", launch_failures=2)}})
+    ra = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "reapprove")
+    assert len(ra) == 1 and ra[0]["had_rebuild"] is False
+
+
+def test_a_parked_lane_with_no_finished_work_still_rebuilds():
+    # Nothing to resume: a lane parked BEFORE it ever finished (no report) has no PR to re-enter the
+    # gate on, so re-approval rebuilds from scratch exactly as before — resume is finished-only.
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("parked", launches=3, launch_failures=2)}})   # no report
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "reapprove")) == 1 and only(out, "resume_at_gate") == []
+
+
+def test_a_finished_investigation_rebuilds_never_resumes_at_a_merge_gate():
+    # An investigation opens no PR — its completion is a marker comment, not a merge — so there is no
+    # merge gate to resume at. Re-approving a finished investigation rebuilds it, never resumes.
+    dsk = disk(reports={"i5": GOOD_REPORT},
+               issues_state={"version": 1, "issues": {"i5": ist("parked", type="investigate")}})
+    out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "type:investigate"))], dsk=dsk)
+    assert only(out, "resume_at_gate") == []
+    assert len(only(out, "reapprove")) == 1
+
+
+def test_a_resumed_lane_holds_the_launch_back_this_tick():
+    # Like reapprove, resume must not also fire a same-tick launch off the pre-resume view: the lane
+    # is being re-claimed for the gate, not relaunched. (Next tick the executor's in-progress label +
+    # gating status keep it out of the launch phase entirely.)
+    out = decide(parsed_issues=[parsed(5)], dsk=_finished("parked"))
+    assert len(only(out, "resume_at_gate")) == 1
+    assert only(out, "launch") == []
+
+
 def test_regenerated_issue_relaunches_on_its_stamped_branch():
     dsk = disk(issues_state={"version": 1, "issues": {
         "i5": ist("ready", branch="sl/i5-issue-5-r1", conflicts=1, requeue_front=True)}})
