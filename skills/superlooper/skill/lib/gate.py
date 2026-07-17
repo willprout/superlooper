@@ -696,7 +696,10 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     The view contract (assembled by the runner):
       issue_state — the loopstate entry merged with parsed-issue facts:
         type ('build'|'investigate'|'diagnose-and-fix'), conflicts (int), nudged (list of
-        nudge_keys already delivered), declared_touches (list), update_result
+        nudge_keys already delivered), nudge_expired (issue #222: the subset of `nudged` keys
+        whose compliance window has elapsed — decide computes it from the `nudged_at` stamps and
+        the clock; a nudged-but-not-expired key WAITs, an expired one parks), declared_touches
+        (list), update_result
         (None|'clean'|'conflict' — the outcome of gitops.merge_update for the CURRENT head;
         the runner clears it whenever the PR head changes), investigation_done (bool,
         precomputed via investigation_done() on the issue comments).
@@ -712,15 +715,30 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     cfg = config if isinstance(config, dict) else {}
     op = _config.operator(cfg)                # the owner name a hand-back memo addresses (issue #58)
     nudged = ist.get("nudged")
+    # issue #222: a nudge opens a COMPLIANCE WINDOW, it does not park on the next tick. decide stamps
+    # `nudged_at` on delivery and passes `nudge_expired` — the keys whose window has run out (the gate
+    # stays clockless, exactly like the exit interview's `exit_ask_expired`). A key already nudged but
+    # whose window is still OPEN WAITs; only an EXPIRED key parks. Fail closed on an unreadable window:
+    # decide always passes a real list, so an absent/wrong-typed value is corruption — read every
+    # already-nudged key as expired (park; handing to William is safe, an unbounded WAIT is not).
+    nudge_expired = ist.get("nudge_expired")
+    _window_readable = isinstance(nudge_expired, (list, set, tuple))
 
     def nudge_or_park(key, defect):
-        # one nudge per cause, then park. A wrong-typed nudge ledger parks immediately:
-        # handing to William is safe; an unbounded nudge loop is not (fail closed).
+        # one nudge per cause; then WAIT out the compliance window; then park. The nudge stays a
+        # single nudge (i280) — #222 bounds only the WAIT between the nudge and the park. A wrong-typed
+        # nudge ledger parks immediately: handing to William is safe; an unbounded nudge loop is not.
         if not isinstance(nudged, list):
             return {"action": "park",
                     "reason": f"{defect} — and the nudge ledger is unreadable, parking"}
         if key in nudged:
-            return {"action": "park", "reason": f"{defect} — already nudged once, parking"}
+            if (not _window_readable) or key in nudge_expired:
+                return {"action": "park",
+                        "reason": f"{defect} — nudged once and the compliance window has elapsed, "
+                                  "parking"}
+            return {"action": "wait",
+                    "reason": f"{defect} — nudged once; waiting out the compliance window before "
+                              "parking (the worker still has time to comply)"}
         return {"action": "nudge", "nudge_key": key, "reason": f"{defect} — nudging once"}
 
     # ---- investigate-type: the marker-comment contract, no PR, no merge (C1). Checked before

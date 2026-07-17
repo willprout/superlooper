@@ -1798,6 +1798,91 @@ def test_gate_park_when_no_pr_exists():
     assert len(p) == 1 and p[0]["needs_william"] is False and has_notify(out)
 
 
+# ---------------- the nudge->park compliance window (issue #222) ----------------
+# The pre-#222 grace was ONE tick: decide stamped the nudge and the very next tick (~18-25s) found the
+# key present and parked, so no worker could post a review comment or fix report sections in time. The
+# fix: decide stamps `nudged_at` on delivery and, until the configurable window elapses, the gate
+# WAITS on that cause instead of parking. One nudge per cause is unchanged; only the WAIT is bounded.
+
+def _nudged(iid="i5", key="review", at=NOW, **over):
+    """A gating build lane that has already had `key` nudged, stamped at `at`."""
+    base = {"nudged": [key], "nudged_at": {key: at}}
+    base.update(over)
+    return {iid: ist("gating", branch="sl/i5-issue-5", pr=555, **base)}
+
+
+def test_a_freshly_nudged_review_waits_out_its_window_never_parks():
+    # DoD: a lane whose review evidence is still missing 2 minutes after its nudge does NOT park —
+    # the compliance window (default 480s) is still open, so decide neither parks nor re-nudges.
+    d, g = _gating(pv=pr_view(comments=[]),                 # clean empty read: review genuinely absent
+                   issues_extra=_nudged(key="review", at=NOW))
+    out = decide(now=NOW + 120, dsk=d, gh_view=g)           # +2 min, well inside the 480s window
+    assert only(out, "park") == [] and not has_notify(out)  # NOT the one-tick park
+    assert only(out, "nudge") == []                         # and NOT a second nudge (one per cause)
+    assert only(out, "merge") == []                         # nothing to merge yet — just waiting
+
+
+def test_the_landing_review_gates_through_with_no_park_and_no_second_nudge():
+    # the other half of the DoD: once the review comment LANDS (inside the window), the lane MERGES —
+    # one nudge total, zero parks. The verdict is pinned to the PR head (the default pr_view shape).
+    d, g = _gating(pv=pr_view(),                            # default comments carry the pinned marker
+                   issues_extra=_nudged(key="review", at=NOW))
+    out = decide(now=NOW + 120, dsk=d, gh_view=g)           # review arrived 2 min after the nudge
+    assert len(only(out, "merge")) == 1
+    assert only(out, "park") == [] and only(out, "nudge") == []
+
+
+def test_the_window_parks_once_it_actually_elapses():
+    # the ladder still terminates: past the window with the cause still unmet, decide parks — once.
+    d, g = _gating(pv=pr_view(comments=[]), issues_extra=_nudged(key="review", at=NOW))
+    out = decide(now=NOW + actions.NUDGE_GRACE_WINDOW_SECONDS + 1, dsk=d, gh_view=g)
+    assert len(only(out, "park")) == 1 and has_notify(out)
+
+
+def test_a_missing_or_corrupt_nudge_stamp_reads_as_expired_and_parks():
+    # fail-closed: a nudged key with NO stamp (e.g. a lane nudged under pre-#222 state) — or a
+    # future/negative one — reads as EXPIRED, so the ladder stays bounded (park, never a stuck wait).
+    for bad in ({}, {"review": NOW + 10_000}, {"review": -5}, "not-a-dict"):
+        d, g = _gating(pv=pr_view(comments=[]),
+                       issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                                nudged=["review"], nudged_at=bad)})
+        out = decide(now=NOW + 60, dsk=d, gh_view=g)        # only 60s in, yet the bad stamp expires it
+        assert len(only(out, "park")) == 1, f"nudged_at={bad!r} must fail closed to park"
+
+
+def test_the_window_is_config_overridable():
+    # session.nudge_grace_window_seconds widens/narrows the grace. A 30s window parks at +60s where
+    # the 480s default would still be waiting — proving the value flows from config, not a constant.
+    short = cfg(session={"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2,
+                         "conflict_cap": 2, "nudge_grace_window_seconds": 30})
+    d, g = _gating(pv=pr_view(comments=[]), issues_extra=_nudged(key="review", at=NOW))
+    out = decide(now=NOW + 60, config=short, dsk=d, gh_view=g)
+    assert len(only(out, "park")) == 1                      # 60s > the 30s override -> parked
+
+
+def test_a_reapproved_lane_gets_a_fresh_nudge_before_any_park():
+    # DoD defect (b): a re-approval (resume_at_gate/reapprove) clears nudged+nudged_at, so the very
+    # next gate look on a still-unmet cause NUDGES fresh — it does NOT park instantly on a stale key.
+    d, g = _gating(pv=pr_view(comments=[]),
+                   issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                           nudged=[], nudged_at={})})
+    out = decide(now=NOW + 5, dsk=d, gh_view=g)
+    assert len(only(out, "nudge")) == 1 and only(out, "nudge")[0]["nudge_key"] == "review"
+    assert only(out, "park") == []                          # a fresh nudge FIRST, never an instant park
+
+
+def test_a_corrupt_nudged_element_never_raises_into_the_tick():
+    # decide-never-raises contract: a hand-corrupt non-str (here non-hashable) element in `nudged`
+    # must not blow up the compliance-window computation; it reads as expired -> park, fail closed.
+    d, g = _gating(pv=pr_view(comments=[]),
+                   issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                           nudged=["review", ["oops"]], nudged_at={"review": NOW})})
+    out = decide(now=NOW + 5, dsk=d, gh_view=g)             # must not raise
+    # 'review' is fresh (window open) -> the corrupt element does not force a park by itself, and the
+    # tick completes; the point is simply that decide returned SOMETHING without crashing.
+    assert isinstance(out, list)
+
+
 # ---------------- bounded pending-checks escalation (issue #26) ----------------
 # A required check that never reports reads as "pending" forever, and the pending wait had no
 # timer: a finished issue sat in `gating` with no park, no memo, no notify. These pin the bound.
