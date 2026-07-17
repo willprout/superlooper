@@ -186,8 +186,12 @@ def _level(lvl):
     why it is worth pinning: the next level someone adds server-side must not render as "all fine"
     on the way to getting its colour. (Pinned by ``test_an_unknown_level_can_never_paint_the_calm_strip``
     and, at the seam, by ``test_every_level_the_server_can_emit_has_a_boring_mode_colour``.)
+
+    The ``isinstance`` is not redundant: ``in`` on a dict HASHES, so an unhashable level (``[]``,
+    ``{}``) would raise ``TypeError`` out of the one function whose entire job is junk defense —
+    on the 2-second poll (raised in review).
     """
-    return lvl if lvl in _LEVEL_RANK else LEVEL_DOWN
+    return lvl if isinstance(lvl, str) and lvl in _LEVEL_RANK else LEVEL_DOWN
 
 
 def _spoken(line):
@@ -269,6 +273,11 @@ def whole_field(repos):
     level = LEVEL_DOWN
     if rows:
         level = max((r["level"] for r in rows), key=lambda l: _LEVEL_RANK[l])
+        # Boundary defense, and dead against the server's own input: `banner` already promotes any
+        # repo carrying an engine line to `notice`, so every row is ≥ notice by the time we get here
+        # (proved by mutation in review — replacing this with `if False` broke no test). It stays for
+        # a hand-built block that states drift under an `ok` level: a stated drift must colour the
+        # strip, or the line and the ground contradict each other.
         if _LEVEL_RANK[level] < _LEVEL_RANK[LEVEL_NOTICE] and eng is not None:
             level = LEVEL_NOTICE          # drift alone is a notice, exactly as it is per-repo
     return {"level": level, "repos": rows, "engine": eng}

@@ -179,6 +179,12 @@ def test_boring_modes_absent_verdict_falls_back_to_down_never_to_blank():
     body = _boring_binder()
     assert re.search(r'lvl-"\s*\+\s*esc\(t\.level\s*\|\|\s*"down"\)', body), (
         "the strip's level must default to down, not to ok")
+    # Asserted on the EMPTY-REPOS fallback's own words, not on a bare "loop may be down" — which the
+    # tick fallback below already satisfies, so the check passed even with this branch deleted and a
+    # blank strip rendering over a confident table: the exact failure it is named for (raised in
+    # review, by deleting the branch and watching the suite stay green).
+    assert "no repo verdict" in body, (
+        "a snapshot with no repo verdicts must SAY so, never render an empty strip")
     assert "loop may be down" in body, (
         "the no-verdict fallback must name the down state rather than render nothing")
 

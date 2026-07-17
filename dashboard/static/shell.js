@@ -798,9 +798,12 @@
       '</span>';
     }).join("");
     // Stated ONCE: there is one installed engine behind every repo. A live engine says nothing (§0.2).
+    // Carries only `.r.eng` — the one class the CSS actually styles. Its drift/unknown state needs no
+    // colour of its own (both read the same amber), and emitting it would be the same unstyled hook
+    // the repo rows deliberately drop above.
     if (t.engine && t.engine.text) {
-      rows += '<span class="brow-t eng"><span class="n">ENGINE</span>' +
-        '<span class="r eng ' + esc(t.engine.state || "") + '">' + esc(t.engine.text) + '</span></span>';
+      rows += '<span class="brow-t"><span class="n">ENGINE</span>' +
+        '<span class="r eng">' + esc(t.engine.text) + '</span></span>';
     }
     box.innerHTML = rows;
   }

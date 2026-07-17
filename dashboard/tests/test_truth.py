@@ -269,6 +269,21 @@ def test_drift_alone_is_a_notice_not_an_alarm():
     assert t["level"] == "notice"
 
 
+def test_a_stated_drift_always_colours_the_strip_even_under_a_calm_level():
+    # Pins the promotion clause DIRECTLY. Review's mutation testing showed the test above passes via
+    # row-level propagation (banner already promotes the repo to notice), so it would stay green with
+    # the clause gone — it was pinning the composition, not the boundary. This states drift under an
+    # `ok` level, which only a hand-built block can do: the line and the ground must not contradict.
+    hand_built = {"level": "ok",
+                  "tick": {"state": "ok", "text": "last tick 4s ago"},
+                  "data": {"state": "ok", "text": "data 12s ago"},
+                  "engine": {"state": "drift", "text": "3 engine fixes merged but not yet live",
+                             "behind": 3, "remedy": "bin/install.sh"}}
+    t = truth.whole_field([_repo("titan", hand_built)])
+    assert t["engine"]["text"] == "3 engine fixes merged but not yet live"
+    assert t["level"] == "notice", "a strip that STATES drift may not paint the calm ground"
+
+
 def test_the_engine_line_reaches_boring_mode_stated_once_not_once_per_repo():
     # DoD item 3. There is ONE installed engine behind every watched repo, so repeating its drift on
     # each row would be noise AND a lie of shape — it would imply the drift were per-repo.
@@ -310,6 +325,25 @@ def test_junk_repos_never_raise_into_the_two_second_poll():
         t = truth.whole_field(junk)
         assert t["level"] == "down", "nothing to report is not an all-clear"
         assert t["repos"] == []
+
+
+def test_the_clamps_vocabulary_is_the_modules_vocabulary():
+    # Raised in review, and it is this issue's own bug class aimed at the future. The clamp ranks
+    # against _LEVEL_RANK; the CSS ratchet reflects over LEVEL_*. Add a LEVEL_WARN with colours for
+    # both strips but forget _LEVEL_RANK, and every check stays green while a `warn` repo renders
+    # `warn` on the field and `down` in boring mode — the two views telling two different stories
+    # about one runner, silently. The two lists must BE one list.
+    assert set(truth._LEVEL_RANK) == {v for k, v in vars(truth).items() if k.startswith("LEVEL_")}, (
+        "every LEVEL_* must be rankable, or boring mode clamps a level the field strip renders")
+
+
+def test_an_unhashable_level_never_raises_into_the_poll():
+    # `in` on a dict hashes, so `[]` or `{}` would TypeError out of the one function whose whole job
+    # is junk defense — on the 2-second poll (raised in review).
+    for junk in ([], {}, set()):
+        b = truth.banner(_live())
+        b["level"] = junk
+        assert truth.whole_field([_repo("titan", b)])["level"] == "down"
 
 
 def test_an_unknown_level_can_never_paint_the_calm_strip():
