@@ -671,6 +671,38 @@ html, body {
 
 .boring-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 14px; }
 
+/* The whole field's truth strip (issue #180) — boring mode's standing "how much of this table do I
+   believe?". Always present, never gated on trouble.
+
+   It cannot borrow .fld-truth: that strip is a dark chip floating on the painted field, this one sits
+   on boring mode's light panel. More importantly it may NOT pulse — "boring mode is fully static, no
+   exceptions" is an owner ruling, and `.boring *` kills every animation above. So the down state
+   earns the eye with a painted ground and a hard left rule instead of motion. That is the same
+   contract said in the local dialect: each level must be impossible to mistake for the healthy one. */
+.btruth { display: flex; flex-direction: column; gap: 2px; border-radius: 6px; padding: 7px 10px;
+  background: #F2F5F8; border: 1px solid var(--panel-border); border-left: 3px solid #C3CCD6; }
+.btruth .brow-t { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.btruth .brow-t .n {
+  font: 700 10px var(--mono); letter-spacing: 1px; text-transform: uppercase; color: #6C7684;
+  min-width: 96px;
+}
+.btruth .r { font: 500 11.5px var(--mono); color: var(--ink-2); }
+/* A rule between the facts. Found by driving a browser, not by a test: the two sentences sat on one
+   dense row separated only by a gap and read as one run-on ("…loop may be down data ? · can't reach
+   GitHub…"), with the strip's own "·" inside the data clause making it worse. Two facts, two fields. */
+.btruth .r + .r { border-left: 1px solid #D4DCE4; padding-left: 10px; }
+.btruth.lvl-down .r + .r { border-left-color: #EBC3B8; }
+.btruth.lvl-notice .r + .r { border-left-color: #E6D4A8; }
+/* A repo's own state, said in its own row: worst-of colours the strip, but a healthy repo beside a
+   dead one must still read as healthy — that is why the words are per-repo in the first place. */
+.btruth .r.down { color: #A3301C; font-weight: 700; }
+.btruth .r.blind, .btruth .r.dark { color: #8A5A12; font-weight: 700; }
+.btruth .r.eng { color: #8A5A12; }
+/* Level = the worst repo's. One glance at the strip's ground summarises everything under it. */
+.btruth.lvl-notice { background: #FDF6E6; border-color: #D9BE7E; border-left-color: #C08A22; }
+.btruth.lvl-down { background: #FDECE8; border-color: #E2A899; border-left-color: #C0341C; }
+.btruth.lvl-down .brow-t .n { color: #8A4436; }
+
 .btable { width: 100%; }
 .btable .thead, .btable .brow {
   display: grid;

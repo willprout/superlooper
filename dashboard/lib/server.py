@@ -1767,6 +1767,12 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
     # single field-wide freshness line would be a lie the moment two repos disagreed.
     for rs in repo_snaps:
         rs["truth"] = truth.banner(rs.get("source"), engine=engine_state, github=rs.get("github"))
+
+    # The same truth, for the view that has no field to hang a strip on (issue #180). Boring mode
+    # shows every repo in ONE table, so it needs the whole field's verdict rather than one repo's:
+    # worst-of on the level, each repo's own words on its own row. Built from the per-repo strips
+    # just composed above — by reference, never re-derived — so the two views cannot disagree.
+    snap["truth"] = truth.whole_field(repo_snaps)
     return snap
 
 

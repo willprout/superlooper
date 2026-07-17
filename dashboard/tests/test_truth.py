@@ -209,3 +209,168 @@ def test_a_missing_or_junk_source_degrades_to_unknown_never_an_all_clear():
         t = truth.banner(junk)
         assert t["tick"]["state"] == "down", "no source verdict is not an all-clear"
         assert t["level"] == "down"
+
+
+# ===================== the WHOLE field's truth (issue #180) — boring mode =====================
+# Boring mode shows every repo in ONE table and has no per-repo field to hang a strip on, so
+# between 90s (the strip's threshold) and 300s (the RUNNER DOWN banner's) it rendered a confident
+# table of flights with nothing saying the data may be a picture of the past. Same class of silent
+# lie #166 exists to close, on the other view.
+#
+# The aggregation is DECIDED (DoD): worst-of on the LEVEL, exact per-repo on the WORDS. A single
+# worst-of sentence would say "loop may be down" without saying whose loop; boring mode's whole rule
+# is every visual channel paired with an exact numeral.
+
+def _repo(name, banner):
+    return {"name": name, "slug": "acme/" + name, "truth": banner}
+
+
+def test_boring_modes_strip_reuses_each_repos_own_verdict_never_a_second_opinion():
+    # THE structural guard (DoD). The rows must BE the repo.truth blocks the field strip binds —
+    # not a re-derivation. If this composed its own tick line against its own threshold, boring mode
+    # and the shell could tell two different stories about the same runner: the original bug with a
+    # third hat on. Identity, not equality: nothing was recomputed.
+    a = truth.banner(_live())
+    t = truth.whole_field([_repo("titan", a)])
+    assert t["repos"][0]["tick"] is a["tick"], "the row must carry the repo's OWN verdict object"
+    assert t["repos"][0]["data"] is a["data"]
+
+
+def test_a_healthy_field_states_every_repos_tick_and_stays_calm():
+    t = truth.whole_field([_repo("titan", truth.banner(_live())),
+                           _repo("acme", truth.banner(_live()))])
+    assert t["level"] == "ok"
+    assert [r["name"] for r in t["repos"]] == ["titan", "acme"]
+    assert t["repos"][0]["tick"]["text"] == "last tick 4s ago"
+
+
+def test_one_silent_repo_takes_the_whole_strip_down():
+    # Worst-of on the level: one glance at the strip's colour is a true summary of everything under
+    # it. A field where any loop may be dead is not a green field.
+    t = truth.whole_field([_repo("titan", truth.banner(_live())),
+                           _repo("acme", truth.banner(_silent()))])
+    assert t["level"] == "down"
+
+
+def test_the_worst_repo_never_erases_the_healthy_ones_names():
+    # Why the words are NOT aggregated. "loop may be down" over a two-repo table, with no name on
+    # it, sends the owner to check the wrong runner — and hides that the other one is fine.
+    t = truth.whole_field([_repo("titan", truth.banner(_live())),
+                           _repo("acme", truth.banner(_silent()))])
+    rows = {r["name"]: r for r in t["repos"]}
+    assert rows["titan"]["level"] == "ok"
+    assert rows["titan"]["tick"]["text"] == "last tick 4s ago"
+    assert rows["acme"]["level"] == "down"
+    assert rows["acme"]["tick"]["text"] == "last tick 15m ago — loop may be down"
+
+
+def test_drift_alone_is_a_notice_not_an_alarm():
+    t = truth.whole_field([_repo("titan", truth.banner(_live(), engine=_drift(3)))])
+    assert t["level"] == "notice"
+
+
+def test_a_stated_drift_always_colours_the_strip_even_under_a_calm_level():
+    # Pins the promotion clause DIRECTLY. Review's mutation testing showed the test above passes via
+    # row-level propagation (banner already promotes the repo to notice), so it would stay green with
+    # the clause gone — it was pinning the composition, not the boundary. This states drift under an
+    # `ok` level, which only a hand-built block can do: the line and the ground must not contradict.
+    hand_built = {"level": "ok",
+                  "tick": {"state": "ok", "text": "last tick 4s ago"},
+                  "data": {"state": "ok", "text": "data 12s ago"},
+                  "engine": {"state": "drift", "text": "3 engine fixes merged but not yet live",
+                             "behind": 3, "remedy": "bin/install.sh"}}
+    t = truth.whole_field([_repo("titan", hand_built)])
+    assert t["engine"]["text"] == "3 engine fixes merged but not yet live"
+    assert t["level"] == "notice", "a strip that STATES drift may not paint the calm ground"
+
+
+def test_the_engine_line_reaches_boring_mode_stated_once_not_once_per_repo():
+    # DoD item 3. There is ONE installed engine behind every watched repo, so repeating its drift on
+    # each row would be noise AND a lie of shape — it would imply the drift were per-repo.
+    eng = _drift(3)
+    t = truth.whole_field([_repo("titan", truth.banner(_live(), engine=eng)),
+                           _repo("acme", truth.banner(_live(), engine=eng))])
+    assert t["engine"]["text"] == ("3 engine fixes merged but not yet live; re-run the installer "
+                                   "to switch them on")
+    for row in t["repos"]:
+        assert "engine" not in row, "the engine line is global — it must not ride each row"
+
+
+def test_a_live_engine_says_nothing_here_either():
+    assert truth.whole_field([_repo("titan", truth.banner(_live(), engine=_engine_ok()))])["engine"] is None
+
+
+def test_a_stale_runner_view_never_renders_as_a_confident_boring_table():
+    # THE DoD guard, said in one assertion. This is the 90s–300s window the issue is about: the
+    # RUNNER DOWN banner has not fired yet, and without this strip the table below looks authoritative.
+    t = truth.whole_field([_repo("titan", truth.banner(_silent()))])
+    assert t["level"] == "down"
+    row = t["repos"][0]
+    assert "loop may be down" in row["tick"]["text"]
+    assert "not the runner's view" in row["data"]["text"]
+
+
+def test_a_repo_with_no_truth_block_is_called_down_never_skipped():
+    # Unknown is never an all-clear — the asymmetry the whole module is built on. A repo silently
+    # dropped from the strip reads exactly like a repo that is fine.
+    for junk in (None, {}, "nonsense", {"level": "ok"}):
+        t = truth.whole_field([_repo("titan", junk)])
+        assert t["level"] == "down"
+        assert len(t["repos"]) == 1, "a repo with no verdict must still get a row"
+        assert "loop may be down" in t["repos"][0]["tick"]["text"]
+
+
+def test_junk_repos_never_raise_into_the_two_second_poll():
+    for junk in (None, {}, [], "nonsense", 7):
+        t = truth.whole_field(junk)
+        assert t["level"] == "down", "nothing to report is not an all-clear"
+        assert t["repos"] == []
+
+
+def test_the_clamps_vocabulary_is_the_modules_vocabulary():
+    # Raised in review, and it is this issue's own bug class aimed at the future. The clamp ranks
+    # against _LEVEL_RANK; the CSS ratchet reflects over LEVEL_*. Add a LEVEL_WARN with colours for
+    # both strips but forget _LEVEL_RANK, and every check stays green while a `warn` repo renders
+    # `warn` on the field and `down` in boring mode — the two views telling two different stories
+    # about one runner, silently. The two lists must BE one list.
+    assert set(truth._LEVEL_RANK) == {v for k, v in vars(truth).items() if k.startswith("LEVEL_")}, (
+        "every LEVEL_* must be rankable, or boring mode clamps a level the field strip renders")
+
+
+def test_an_unhashable_level_never_raises_into_the_poll():
+    # `in` on a dict hashes, so `[]` or `{}` would TypeError out of the one function whose whole job
+    # is junk defense — on the 2-second poll (raised in review).
+    for junk in ([], {}, set()):
+        b = truth.banner(_live())
+        b["level"] = junk
+        assert truth.whole_field([_repo("titan", b)])["level"] == "down"
+
+
+def test_an_unknown_level_can_never_paint_the_calm_strip():
+    # Raised in review, and the sharpest version of this issue's own thesis. The CSS styles one class
+    # per KNOWN level and the base .btruth IS the healthy ground — so a level this module doesn't
+    # recognise reaches the browser as lvl-<junk>, matches no rule, and renders CALM. Ranking it as
+    # down is not enough: `max` returns the element it ranked, so the junk string would survive to
+    # the class attribute. It must be REPLACED at the boundary.
+    b = truth.banner(_live())
+    b["level"] = "totally-bogus"
+    t = truth.whole_field([_repo("titan", b)])
+    assert t["repos"][0]["level"] == "down", "an unplaceable level is not an all-clear"
+    assert t["level"] == "down"
+    assert t["level"] in ("ok", "notice", "down"), "the strip may only emit levels the CSS colours"
+
+
+def test_a_level_that_contradicts_its_own_words_is_not_believed():
+    # Also from review: `{"tick": {}}` satisfies a bare isinstance check, then renders the binder's
+    # fallback text ("no tick seen — loop may be down") under a level claiming all is well — the
+    # level and the words contradicting each other on screen. A line with no words is no line.
+    t = truth.whole_field([_repo("titan", {"level": "ok", "tick": {}, "data": {}, "engine": None})])
+    assert t["level"] == "down"
+    assert "loop may be down" in t["repos"][0]["tick"]["text"]
+
+
+def test_a_nameless_repo_still_gets_a_named_row():
+    # The slug is the fallback the rest of boring mode already uses (§7 — the literal slug stays
+    # visible everywhere in boring mode). An unnamed row is an unattributable alarm.
+    t = truth.whole_field([{"slug": "acme/titan", "truth": truth.banner(_silent())}])
+    assert t["repos"][0]["name"] == "acme/titan"
