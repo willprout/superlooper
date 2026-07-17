@@ -155,3 +155,120 @@ def banner(source, engine=None, github=None):
     elif data["state"] in ("blind", "dark") or eng is not None:
         level = LEVEL_NOTICE
     return {"level": level, "tick": tick, "data": data, "engine": eng}
+
+
+# =============================== the whole field's truth (issue #180) ===============================
+# Everything above answers "how much of THIS repo's field do I believe?" — and it only ever reached
+# the shell view, because the strip lives in the field overlays and boring mode has no field.
+#
+# Boring mode carried the RUNNER DOWN banner, but that fires at `heartbeat_down_seconds` (300s) while
+# the strip fires at `runner_silent_seconds` (90s). So for three and a half minutes boring mode
+# rendered a confident table of flights with nothing on screen saying the data may be a picture of
+# the past — the same silent lie #166 exists to close, just on the other view. (Pre-existing, not a
+# regression: #146's freshness stamp was field-scoped in exactly the same way and #166 inherited the
+# scope.) Engine drift never reached boring mode at all, so a merged-but-not-live engine fix was
+# invisible there entirely.
+
+_LEVEL_RANK = {LEVEL_OK: 0, LEVEL_NOTICE: 1, LEVEL_DOWN: 2}
+
+
+def _level(lvl):
+    """A level from this module's own vocabulary, or ``down``.
+
+    Load-bearing, and subtler than it looks (raised in review). The CSS styles ONE class per known
+    level and the base ``.btruth`` IS the healthy ground, so an unrecognised level reaches the
+    browser as ``lvl-<junk>``, matches no rule, and paints the CALM strip — a false all-clear
+    arriving through the one door this module swears is bolted. Ranking junk as down is not enough:
+    ``max`` returns the ELEMENT it ranked, so the junk string itself would survive to the class
+    attribute. It has to be replaced here, at the boundary, not merely sorted correctly.
+
+    Unreachable while ``banner`` is the only source (it emits exactly the three), which is precisely
+    why it is worth pinning: the next level someone adds server-side must not render as "all fine"
+    on the way to getting its colour. (Pinned by ``test_an_unknown_level_can_never_paint_the_calm_strip``
+    and, at the seam, by ``test_every_level_the_server_can_emit_has_a_boring_mode_colour``.)
+    """
+    return lvl if lvl in _LEVEL_RANK else LEVEL_DOWN
+
+
+def _spoken(line):
+    """Is this a line that actually SAYS something — a dict carrying non-empty ``text``?"""
+    return isinstance(line, dict) and isinstance(line.get("text"), str) and bool(line["text"])
+
+
+def _row(repo):
+    """One repo's line in the whole-field strip, carrying that repo's OWN ``banner`` verdict.
+
+    Nothing here is re-derived. The tick/data objects are passed through BY REFERENCE from the
+    strip the shell already binds, so boring mode and the field cannot tell two different stories
+    about the same runner — which would be the original bug wearing a third hat. (Pinned by
+    ``test_boring_modes_strip_reuses_each_repos_own_verdict_never_a_second_opinion``.)
+
+    A repo whose verdict is missing or junk gets a DOWN row, never a dropped one: a repo silently
+    absent from the strip reads exactly like a repo that is fine.
+    """
+    repo = repo if isinstance(repo, dict) else {}
+    # §7: the literal slug stays visible everywhere in boring mode, so it is the honest fallback for
+    # an unnamed repo. An unattributable alarm is barely better than no alarm.
+    name = repo.get("name") or repo.get("slug") or "?"
+    t = repo.get("truth")
+    # A line without WORDS is as useless as no line: `{"tick": {}}` would satisfy a bare isinstance
+    # check and then render the binder's own fallback text under a level claiming all is well — the
+    # level and the words contradicting each other on screen (raised in review).
+    if not isinstance(t, dict) or not _spoken(t.get("tick")) or not _spoken(t.get("data")):
+        t = banner(None)                  # no verdict is not an all-clear — degrade to the alarm
+    return {"name": name, "level": _level(t.get("level")),
+            "tick": t["tick"], "data": t["data"]}
+
+
+def whole_field(repos):
+    """The standing truth strip for boring mode (screen 8c) — every repo at once.
+
+    ``repos``  the snapshot's repo slices, each read only for ``name``/``slug`` and its ``truth``
+               block (this repo's ``banner`` above, already composed by the server).
+
+    Returns ``{level, repos: [{name, level, tick, data}, ...], engine}``.
+
+    **How the multi-repo case aggregates** (decided, not implied — DoD): *worst-of on the LEVEL,
+    exact per-repo on the WORDS.*
+
+      * The **level** is the worst repo's, exactly as ``banner`` takes the worst of its own lines —
+        so one glance at the strip's colour is a true summary of everything under it, and a field
+        where any loop may be dead is never a green field.
+      * The **words** are NOT aggregated. A single worst-of sentence would say "loop may be down"
+        without saying WHOSE loop — sending the owner to check the wrong runner while hiding that
+        the other is fine. Boring mode's whole rule is every visual channel paired with an exact
+        numeral (§4), so each repo keeps its own named row with its own number.
+      * A per-row column on the flights table was rejected: truth is per-REPO, not per-FLIGHT. A
+        column would repeat one sentence down every row of a repo and imply a per-flight freshness
+        that does not exist.
+
+    The **engine line is stated ONCE**, not once per repo: there is one installed engine behind
+    every watched repo (the server hands the same drift to every ``banner``), so repeating it would
+    be noise — and worse, a lie of shape, implying the drift were per-repo. Taken from the first
+    repo that has one so a junk leading entry cannot silence a real drift.
+
+    Never raises: it rides the 2-second poll, and a strip that could 500 the snapshot would take
+    down the very table the owner came for. Nothing to report is not an all-clear — junk in, alarm
+    out, like everything else here.
+    """
+    entries = list(repos) if isinstance(repos, (list, tuple)) else []
+    rows = [_row(r) for r in entries]
+
+    eng = None
+    for r in entries:
+        t = r.get("truth") if isinstance(r, dict) else None
+        if isinstance(t, dict) and isinstance(t.get("engine"), dict):
+            eng = t["engine"]
+            break
+
+    # No repos at all means no verdict, and an absent verdict has never been an all-clear here.
+    # (Unreachable through real config — `repos` is required non-empty — but the asymmetry is the
+    # one direction this module may never fail in, so it holds at the boundary too.)
+    # Every row's level is already this module's own vocabulary (``_row`` → ``_level``), so ranking
+    # here can never be handed a string it cannot place.
+    level = LEVEL_DOWN
+    if rows:
+        level = max((r["level"] for r in rows), key=lambda l: _LEVEL_RANK[l])
+        if _LEVEL_RANK[level] < _LEVEL_RANK[LEVEL_NOTICE] and eng is not None:
+            level = LEVEL_NOTICE          # drift alone is a notice, exactly as it is per-repo
+    return {"level": level, "repos": rows, "engine": eng}

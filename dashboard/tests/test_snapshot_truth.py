@@ -207,3 +207,90 @@ def test_a_down_loop_outranks_engine_drift_end_to_end(home):
                                     engine=_Engine(_drifted(2)))
     assert _strip(snap)["level"] == "down", "a dead loop is the headline"
     assert _strip(snap)["engine"]["state"] == "drift", "the drift is still stated underneath"
+
+
+# =============================== boring mode's strip (issue #180) ===============================
+# Everything above lands on `repo.truth`, which only the FIELD binds — and boring mode has no field.
+# `snapshot.truth` is the same verdict for the view that shows every repo in one table.
+
+def test_the_whole_field_strip_reaches_the_snapshot(home):
+    _publish(home)
+    _heartbeat(home, 10)
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh())
+    assert "truth" in snap, "boring mode has no field — it needs the whole-field strip on the snapshot"
+    assert [r["name"] for r in snap["truth"]["repos"]] == ["superlooper-sandbox"]
+    assert snap["truth"]["level"] == "ok"
+
+
+def test_a_stale_runner_view_never_renders_as_a_confident_boring_table(home):
+    # THE DoD case for this issue, end to end on a real state home. This is the 90s–300s window: the
+    # runner has been quiet long enough for the strip to fire but NOT long enough for the RUNNER DOWN
+    # banner (heartbeat_down_seconds=300), so boring mode's only other honesty signal is still silent.
+    # Without this block the table below renders authoritative while the loop may already be dead.
+    _publish(home)
+    _heartbeat(home, 120)                       # > 90s silent, < 300s down: the gap this issue is about
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh())
+    assert snap["runner"]["down"] is False, "the RUNNER DOWN banner has NOT fired — that is the point"
+    t = snap["truth"]
+    assert t["level"] == "down"
+    row = t["repos"][0]
+    assert "loop may be down" in row["tick"]["text"]
+    assert "not the runner's view" in row["data"]["text"]
+
+
+def test_boring_modes_strip_cannot_disagree_with_the_fields(home):
+    # The two views bind different blocks; they must be the same verdict. whole_field passes each
+    # repo's own banner through by reference, so this is identity — nothing was recomputed.
+    _publish(home)
+    _heartbeat(home, SILENT_AFTER + 500)
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh())
+    assert snap["truth"]["repos"][0]["tick"] is _strip(snap)["tick"]
+    assert snap["truth"]["repos"][0]["data"] is _strip(snap)["data"]
+    assert snap["truth"]["level"] == _strip(snap)["level"]
+
+
+def test_engine_drift_reaches_boring_mode_stated_once(home):
+    # DoD item 3: a merged-but-not-live engine fix used to be invisible in boring mode entirely.
+    _publish(home)
+    _heartbeat(home, 10)
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_Gh(),
+                                    engine=_Engine(_drifted(3)))
+    assert snap["truth"]["engine"]["state"] == "drift"
+    assert snap["truth"]["engine"]["text"].startswith("3 engine fixes merged but not yet live")
+    assert snap["truth"]["level"] == "notice"
+    assert "engine" not in snap["truth"]["repos"][0], "one installed engine — one line, not one per repo"
+
+
+def test_the_worst_repo_sets_the_level_and_the_healthy_one_keeps_its_own_words(tmp_path):
+    # The multi-repo aggregation, decided: worst-of on the level, exact per-repo on the words. A
+    # single worst-of sentence would say "loop may be down" without saying WHOSE loop.
+    homes = {}
+    for name in ("alpha", "bravo"):
+        dst = tmp_path / name
+        shutil.copytree(FIXTURE, dst)
+        (dst / "state" / "ALERT").unlink()
+        (dst / "state" / "merges_frozen.json").unlink()
+        for iid in ("i16", "i23"):
+            os.utime(dst / "state" / "activity" / iid, (NOW - 100, NOW - 100))
+        _publish(dst)
+        homes[name] = dst
+    _heartbeat(homes["alpha"], 10)                    # healthy
+    _heartbeat(homes["bravo"], SILENT_AFTER + 500)    # silent
+
+    def _entry(name):
+        return {"slug": "will-titan/%s" % name, "owner": "will-titan", "name": name,
+                "state_home": str(homes[name]), "idle_seconds": 480, "freeze_seconds": 2700,
+                "required_checks": ["tests"], "airline": "%s Air" % name.title()}
+
+    cfg = {"poll_seconds": 2, "heartbeat_down_seconds": 300, "runner_silent_seconds": SILENT_AFTER,
+           "repos": [_entry("alpha"), _entry("bravo")]}
+    snap = server.assemble_snapshot(cfg, now=NOW, gh_mod=_Gh())
+    t = snap["truth"]
+    assert t["level"] == "down", "one dead loop is enough — the field is not green"
+    rows = {r["name"]: r for r in t["repos"]}
+    assert rows["alpha"]["level"] == "ok"
+    assert rows["alpha"]["tick"]["text"].startswith("last tick ")
+    assert "loop may be down" not in rows["alpha"]["tick"]["text"], (
+        "the worst repo must not smear its alarm over a healthy one")
+    assert rows["bravo"]["level"] == "down"
+    assert "loop may be down" in rows["bravo"]["tick"]["text"]

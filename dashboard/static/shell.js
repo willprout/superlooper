@@ -101,6 +101,7 @@
         state.builtView = "boring";
         wireBoring();
       }
+      updateBoringTruth();   // before the table: it says how much of the table to believe
       updateBoringTable();
       updateFirehose();
     } else {
@@ -711,6 +712,7 @@
           '<span class="hint" id="boring-slugs"></span>' +
           '<span class="right">EVERY VISUAL CHANNEL PAIRED WITH AN EXACT NUMERAL — SORT BY THE NUMBER, THE ART IS FLAVOR</span></div>' +
         '<div class="boring-body">' +
+          '<div class="btruth" id="btruth"></div>' +
           '<div class="btable"><div class="thead" id="btable-head"></div><div id="btable-body"></div></div>' +
           '<div class="firehose">' +
             '<div class="firehose-head"><span class="tag">JOURNAL.JSONL — FIREHOSE</span>' +
@@ -752,6 +754,55 @@
     el("fire-filter").addEventListener("input", function () {
       state.fireFilter = el("fire-filter").value; updateFirehose();
     });
+  }
+
+  /* Bind the whole field's truth strip (issue #180) — boring mode's answer to "how much of the table
+     below do I believe?".
+
+     The shell's strip lives in the field overlays, and boring mode has no field, so it had none. It
+     carried the RUNNER DOWN banner, but that fires at 300s while the strip fires at 90s: for three
+     and a half minutes boring mode rendered a confident table of flights with nothing saying the data
+     may be a picture of the past. Engine drift never reached it at all.
+
+     ALWAYS rendered, healthy or not — same reason as the field's: a surface that only admits it might
+     be lying once you already suspect it isn't one you can trust the rest of the time.
+
+     Derives NOTHING (design B.1). The level, each repo's level, and every word are composed in
+     lib/truth.whole_field, which passes each repo's OWN lib/truth.banner verdict through by
+     reference — the same object the shell binds — so the two views cannot tell two different stories
+     about one runner. An absent block falls back to DOWN, never a blank: rendering nothing is how
+     this surface lied in the first place. */
+  function updateBoringTruth() {
+    var box = el("btruth"); if (!box) return;
+    var t = state.snapshot.truth || {};
+    var repos = t.repos || [];
+    box.className = "btruth lvl-" + esc(t.level || "down");
+
+    if (!repos.length) {
+      box.innerHTML = '<span class="brow-t"><span class="r down">no repo verdict — loop may be down</span></span>';
+      return;
+    }
+    // One row per repo, each named and carrying its own numbers. The strip's LEVEL is worst-of (one
+    // glance summarises), but the WORDS are never aggregated — "loop may be down" with no name on it
+    // sends the owner to check the wrong runner and hides that the other repo is fine.
+    var rows = repos.map(function (r) {
+      var tick = r.tick || {}, data = r.data || {};
+      // No per-row level class: the row's state is already carried by its tick/data spans (.r.down,
+      // .r.blind, .r.dark), and an emitted-but-unstyled class is a hook that reads as intent it
+      // doesn't have (raised in review). The strip's own lvl- class carries the worst-of colour.
+      return '<span class="brow-t">' +
+        '<span class="n">' + esc(r.name) + '</span>' +
+        '<span class="r ' + esc(tick.state || "down") + '">' +
+          esc(tick.text || "no tick seen — loop may be down") + '</span>' +
+        '<span class="r ' + esc(data.state || "blind") + '">' + esc(data.text || "data ?") + '</span>' +
+      '</span>';
+    }).join("");
+    // Stated ONCE: there is one installed engine behind every repo. A live engine says nothing (§0.2).
+    if (t.engine && t.engine.text) {
+      rows += '<span class="brow-t eng"><span class="n">ENGINE</span>' +
+        '<span class="r eng ' + esc(t.engine.state || "") + '">' + esc(t.engine.text) + '</span></span>';
+    }
+    box.innerHTML = rows;
   }
 
   function updateBoringTable() {
