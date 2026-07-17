@@ -142,7 +142,7 @@
     el("cc-replay-trunc").hidden = true;
     var scrub = el("cc-replay-scrub"); scrub.max = 0; scrub.value = 0;
     if (engine) engine.update({ resetKey: "replay-error", time: "day", status: "ok",
-                                dim: false, banner: null, flights: [] });
+                                dim: false, banners: [], flights: [] });
   }
 
   function setFrames(rp) {
@@ -159,7 +159,7 @@
     idx = 0;
     if (!frames.length) {
       if (engine) engine.update({ resetKey: "replay-empty", time: "day", status: "ok", dim: false,
-                                  banner: null, flights: [] });
+                                  banners: [], flights: [] });
       el("cc-replay-caption").innerHTML = "";
       el("cc-replay-pos").textContent = "0 / 0";
       return;
@@ -178,7 +178,8 @@
       time: clock ? (fr.daypart || "day") : "day",
       status: fr.status || "ok",
       dim: false,
-      banner: null,
+      banners: [],       // replay scrubs recorded field states; it has never towed the name cloths
+
       flights: (fr.flights || []).map(function (f) {
         return { num: f.num, label: f.label, stage: f.stage, circuitStage: f.circuit_stage,
                  runway: f.runway || 0, contrail: f.contrail || "none",

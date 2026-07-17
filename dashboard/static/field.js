@@ -10,7 +10,7 @@
 (function () {
   'use strict';
 
-  var root = null, canvas = null, overlays = null, tagBox = null, engine = null;
+  var root = null, canvas = null, overlays = null, tagBox = null, bannerBox = null, engine = null;
   var lmEls = [], fixedEls = {};
   var lastLayout = null, lastCtx = null;
   var slug = "";
@@ -47,7 +47,14 @@
     tagBox.className = 'fld-tags';
     overlays.appendChild(tagBox);
 
-    ['banner', 'caption', 'sign', 'freeze'].forEach(function (k) {
+    // One name cloth per downwind leg plane (issue #204) — a container of .fld-banner spans the
+    // engine lays out (repo.field_banners), sibling to the tag field. One box (a single overlays
+    // child) so the runner-down CSS takeover hides them all in one rule, like the old lone banner.
+    bannerBox = document.createElement('div');
+    bannerBox.className = 'fld-banners';
+    overlays.appendChild(bannerBox);
+
+    ['caption', 'sign', 'freeze'].forEach(function (k) {
       var el = document.createElement('span');
       el.className = 'fld-' + k;
       el.hidden = true;
@@ -185,9 +192,10 @@
                runway: 0, contrail: 'none', spinning: false, trouble: false, tail: tail };
     });
 
-    // The towed banner's flight and text are CHOSEN server-side (repo.field_banner, squint
-    // test) — this file only carries them to the cloth.
-    var banner = repo.field_banner || null;
+    // Which planes tow a name cloth and what each says are CHOSEN server-side (repo.field_banners,
+    // squint test — issue #204 generalised the single pick to a list) — this file only carries them
+    // to the cloths; the engine staggers the placement occlusion-free.
+    var banners = repo.field_banners || [];
 
     // GitHub-unreachable (issue #38): the server's honest flag → the engine's `link` state. When the
     // link is lost the tower beacon goes dark and sweeps for a signal (a dark tower, never a red
@@ -202,11 +210,11 @@
       status: snapshot.tower_status || 'attention',
       dim: anyLit || (repo.state && repo.state.state === 'alert'),
       link: linkLost ? 'lost' : 'ok',
-      banner: banner,
+      banners: banners,
       flights: flights.concat(standFlights)
     });
 
-    var ctxState = { snapshot: snapshot, repo: repo, banner: banner, fun: fun };
+    var ctxState = { snapshot: snapshot, repo: repo, banners: banners, fun: fun };
     lastLayout = layout; lastCtx = ctxState;
     placeOverlays(layout, ctxState);
   }
@@ -228,14 +236,17 @@
              'px;top:' + (ty * f) + 'px">' + esc(t.text) + '</span>';
     }).join('');
 
-    var b = fixedEls.banner;
-    b.hidden = !(layout.banner && c.banner);
-    if (!b.hidden) {
-      pos(b, layout.banner.x, layout.banner.y);
-      b.style.width = (layout.banner.w * f) + 'px';
-      b.style.height = (layout.banner.h * f) + 'px';
-      b.textContent = c.banner.text;
-    }
+    // One text cloth per downwind leg plane (issue #204). The engine returns a pinned rect per
+    // banner (staggered occlusion-free); we match each to its server text by flight number and lay
+    // out a .fld-banner span. A banner whose plane is mid-transit is absent from layout.banners
+    // (the engine suppresses it), so the clothless label never floats. Rebuilt each poll like tags.
+    var textByNum = {};
+    (c.banners || []).forEach(function (bn) { textByNum[bn.num] = bn.text; });
+    bannerBox.innerHTML = (layout.banners || []).map(function (r) {
+      return '<span class="fld-banner" style="left:' + (r.x * f) + 'px;top:' + (r.y * f) +
+             'px;width:' + (r.w * f) + 'px;height:' + (r.h * f) + 'px">' +
+             esc(textByNum[r.num] || '') + '</span>';
+    }).join('');
 
     var cap = fixedEls.caption;
     cap.hidden = !c.repo.field_caption;

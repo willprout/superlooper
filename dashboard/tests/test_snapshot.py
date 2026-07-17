@@ -798,11 +798,60 @@ def test_caption_suppressed_by_a_fresh_landing_still_taxiing(tmp_path):
     assert snap["repos"][0]["field_caption"] is None
 
 
-def test_field_banner_is_the_longest_flying_downwind_flight(home):
-    # Review fix (cross-review, 2026-07-07): the towed banner's flight is CHOSEN server-side
-    # (squint test) — the longest-elapsed downwind flight tells the field's current story, with
-    # its real elapsed time on the cloth. Rebuild the fixture's i16/i23 as two pure downwind
-    # flights (running, fresh activity, no filed report) with different launch ages.
+def _leg(num, stage, on_field=True, elapsed="1h 0m", label=None):
+    """A minimal projected flight for the pure banner-selection unit tests: only the fields
+    ``_field_banners`` reads (stage, on_field, num, label, elapsed)."""
+    return {"num": num, "label": label if label is not None else ("SL-%d" % num),
+            "stage": stage, "display": {"on_field": on_field, "elapsed": elapsed}}
+
+
+def test_field_banners_lists_every_on_field_downwind_leg_flight():
+    # Issue #204: the former single-featured pick becomes a LIST — EVERY plane on the working
+    # downwind leg tows its own name cloth, so no in-flight plane is left nameless. Ordered by
+    # flight number so the list never flickers between polls; each cloth carries SL-N · BUILDING ·
+    # <ELAPSED>.
+    banners = server._field_banners([
+        _leg(23, flights.DOWNWIND, elapsed="12m"),
+        _leg(16, flights.DOWNWIND, elapsed="2h 30m"),
+    ])
+    assert [b["num"] for b in banners] == [16, 23]         # sorted by num — stable across polls
+    assert banners[0]["text"] == "SL-16 · BUILDING · 2H 30M"
+    assert banners[1]["text"].startswith("SL-23") and "BUILDING" in banners[1]["text"]
+
+
+def test_field_banners_excludes_tagged_and_cramped_legs():
+    # Owner ruling #1 (issue #204): holding keeps its amber tag and final keeps its gold gate tag —
+    # no double labelling, so neither tows a banner. Takeoff/base-turn are airborne circuit legs
+    # too, but their anchors fan out 12–16px apart (sub-hull, proven by #203/#206) — too tight to
+    # tow a 74px cloth occlusion-free without an anchor re-space that is out of this issue's scope,
+    # so they are deferred (needs-owner follow-up) and carry no banner yet.
+    banners = server._field_banners([
+        _leg(16, flights.DOWNWIND),
+        _leg(17, flights.HOLDING),
+        _leg(18, flights.FINAL),
+        _leg(19, flights.TAKEOFF),
+        _leg(20, flights.BASE_TURN),
+    ])
+    assert [b["num"] for b in banners] == [16]            # only the downwind leg tows a cloth
+
+
+def test_field_banners_excludes_downwind_that_has_left_the_field():
+    # A downwind flight whose plane is no longer on the field (merged/rolled out) tows no cloth —
+    # the banner rides with the plane, never a ghost caption over empty sky.
+    assert server._field_banners([_leg(16, flights.DOWNWIND, on_field=False)]) == []
+
+
+def test_field_banners_empty_when_no_downwind_leg_flights():
+    # Zero leg flights → empty list (never None): the client renders no cloth, and the all-clear /
+    # other overlays own the quiet field.
+    assert server._field_banners([]) == []
+    assert server._field_banners([_leg(9, flights.TOUCHDOWN), _leg(10, flights.AT_STAND)]) == []
+
+
+def test_field_banners_wired_into_the_snapshot(home):
+    # The assembler wires the pure selection: rebuild the fixture's i16/i23 as two pure downwind
+    # flights (running, fresh activity, no filed report) with different launch ages — BOTH now tow
+    # their own cloth (issue #204 generalises the 2026-07-07 single pick), ordered by number.
     p = home / "state" / "issues.json"
     body = json.loads(p.read_text())
     body["issues"]["i16"]["status"] = "running"
@@ -821,10 +870,10 @@ def test_field_banner_is_the_longest_flying_downwind_flight(home):
     repo = snap["repos"][0]
     by = {f["num"]: f for f in repo["flights"]}
     assert by[16]["stage"] == flights.DOWNWIND and by[23]["stage"] == flights.DOWNWIND
-    banner = repo["field_banner"]
-    assert banner["num"] == 16                             # launched earliest — longest flying
-    assert banner["text"].startswith("SL-16")
-    assert "BUILDING" in banner["text"]
+    banners = repo["field_banners"]
+    assert [b["num"] for b in banners] == [16, 23]         # both leg planes, ordered by number
+    assert banners[0]["text"].startswith("SL-16") and "BUILDING" in banners[0]["text"]
+    assert banners[1]["text"].startswith("SL-23")
 
 
 # =============================== Task 8 — the departures board is the real launch order ===============================

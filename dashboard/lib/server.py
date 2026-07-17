@@ -897,23 +897,30 @@ def _field_caption(repo_flights, state, arrivals, now, stand=(), gh_unreachable=
     return "no landings yet — all clear"
 
 
-def _field_banner(repo_flights):
-    """The towed banner's flight — chosen HERE, not in the pixels (review fix 2026-07-07, squint
-    test): the longest-elapsed downwind flight tells the field's current story, with its real
-    elapsed time on the cloth. ``None`` when nothing is downwind. Ties (or unknown elapsed) break
-    by flight number, so the choice never flickers between polls."""
-    working = [f for f in repo_flights
-               if f["stage"] == flights.DOWNWIND and f["display"]["on_field"]]
-    if not working:
-        return None
+def _field_banners(repo_flights):
+    """One towed name banner per airborne circuit-leg flight that has a name to tell and no tag of
+    its own — chosen HERE, not in the pixels (review fix 2026-07-07, squint test). Generalises the
+    former single-featured pick to a LIST (issue #204): William watched the one cloth cover a
+    neighbouring in-flight plane that itself showed no name — "which flight is that?" was the exact
+    thing he reached for and it wasn't on the screen. Now EVERY plane on the working DOWNWIND leg
+    (the long building leg over Build Island) tows its own name, so no in-flight plane is nameless.
 
-    def key(f):
-        e = f["display"].get("elapsed_seconds")
-        return (-(e if isinstance(e, (int, float)) else -1), f["num"])
+    Excluded, by owner ruling #1 — no double labelling:
+      * HOLDING keeps its amber holding-pattern tag; FINAL keeps its gold gate tag.
+      * TAKEOFF and BASE_TURN are airborne circuit legs too, but their runway-owned anchors fan out
+        only 12–16px apart (sub-hull — see #203/#206) — too tight to tow a legible 74px cloth
+        occlusion-free without re-spacing those anchors, which is out of this issue's scope. They
+        are deferred to a needs-owner follow-up and carry no banner yet.
 
-    f = sorted(working, key=key)[0]
-    return {"num": f["num"], "label": f["label"],
-            "text": "%s · BUILDING · %s" % (f["label"], f["display"]["elapsed"].upper())}
+    Ordered by flight number so the list never flickers between polls; the client staggers the
+    cloths so no banner ever covers a plane or another banner (issue #204, owner ruling #3). Empty
+    (never ``None``) when nothing is on the leg."""
+    working = sorted((f for f in repo_flights
+                      if f["stage"] == flights.DOWNWIND and f["display"]["on_field"]),
+                     key=lambda f: f["num"])
+    return [{"num": f["num"], "label": f["label"],
+             "text": "%s · BUILDING · %s" % (f["label"], f["display"]["elapsed"].upper())}
+            for f in working]
 
 
 def _fun_map(config):
@@ -1448,7 +1455,7 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         # must render the lost-data-link state, never a false all-clear. `reachable` keeps the raw
         # tri-state inspectable (True answered · False refused · None no gh wired / unknown).
         "github": {"reachable": gh_reachable, "unreachable": gh_unreachable},
-        "field_banner": _field_banner(repo_flights),
+        "field_banners": _field_banners(repo_flights),
         "tower_log": tower_rows,
         "tower_new": tower_new,
         "shipped": flights.corner_stats(journal, now=now),

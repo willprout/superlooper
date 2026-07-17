@@ -171,13 +171,22 @@ def test_live_engine_wanders_only_the_downwind_leg():
             "an off-path state (%r) must render still in place, not hover (design §5)" % offpath)
 
 
-def test_banner_towing_plane_is_held_still():
-    # The flight towing the banner must NOT wander: its drawn cloth follows its hull, while the
-    # banner's HTML text is pinned to the stable anchor — a wandering cloth under a pinned label
-    # would read as the text sliding off the banner (DoD: no jitter from the wander).
-    assert re.search(r"wanders\s*=[^;]*m\.banner", _LIVE_CODE), (
-        "the wanders flag must exclude the banner-towing flight (m.banner.num) so its cloth stays "
-        "aligned with the pinned banner text (issue #203)")
+def test_banner_cloth_is_pinned_to_the_stable_anchor_so_the_towing_plane_may_wander():
+    # Issue #204 supersedes #203's "hold the banner-towing plane still". Now EVERY downwind plane
+    # tows its own name cloth, so holding them all still would cost the leg the very life #203 gave
+    # it. Instead the CLOTH is pinned to the plane's STABLE anchor (bannerLayout reads s.target,
+    # never the wandering s.cur) — so the drawn cloth and its anchor-pinned HTML text stay aligned
+    # while the hull keeps drifting; only a short leader flexes between them. Two guarantees:
+    #   (a) the cloth-placement helper anchors to s.target, not the wandering hull, and
+    #   (b) the wander flag no longer carves the banner plane out (downwind still wanders).
+    body = _fn_body(_LIVE_CODE, "bannerLayout")
+    assert body, "airfield_live.js must define bannerLayout() — the pinned cloth rects (issue #204)"
+    assert "s.target" in body and "s.cur" not in body, (
+        "the towed cloth must be pinned to the STABLE anchor (s.target), never the wandering hull "
+        "(s.cur) — otherwise the cloth slides out from under its pinned text (issue #204)")
+    assert not re.search(r"wanders\s*=[^;]*banner", _LIVE_CODE), (
+        "the wander flag must NOT exclude the banner-towing flight any more — pinning the cloth "
+        "(not the plane) is what keeps the text aligned, so downwind planes keep their wander (#204)")
 
 
 def test_a_holder_that_stays_a_holder_never_transits():
