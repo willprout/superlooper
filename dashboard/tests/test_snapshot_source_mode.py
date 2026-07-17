@@ -375,3 +375,53 @@ def test_a_view_without_the_pr_still_fails_closed_not_open(home):
     _publish(home, prs={})
     snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh())
     assert _flight(snap, 23)["gate"]["cleared"] is False
+
+
+# =============================== rate-limit snapshot rides fallback only (issue #15) ===============================
+# The dashboard records a FREE rate-limit snapshot when — and only when — it is the one talking to
+# GitHub (fallback). In LIVE mode the source is the runner's view (no snapshot method), so the
+# zero-egress-when-live property (issue #146) is preserved.
+
+class _SnapshotGh(_CountingGh):
+    """_CountingGh plus the rate-limit-snapshot surface the real adapter exposes; records each
+    snapshot call separately from the ordinary reads."""
+
+    def __init__(self):
+        super().__init__()
+        self.snaps = []
+
+    def rate_limit_snapshot(self, repo):
+        self.snaps.append(repo)
+        return True
+
+
+def test_fallback_takes_a_rate_limit_snapshot(home):
+    _heartbeat(home, SILENT_AFTER + 60)               # silent runner -> fallback
+    gh = _SnapshotGh()
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=gh)
+    assert _repo(snap)["source"]["mode"] == "fallback"
+    assert gh.snaps == [SLUG], "fallback must snapshot the shared rate-limit budget it is spending"
+
+
+def test_live_takes_no_rate_limit_snapshot(home):
+    # LIVE renders the runner's view; the runner owns the periodic snapshot, so the dashboard adds
+    # none (and stays zero-egress).
+    _heartbeat(home, 10)
+    _publish(home)
+    gh = _SnapshotGh()
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=gh)
+    assert _repo(snap)["source"]["mode"] == "live"
+    assert gh.snaps == [] and gh.reads == []
+
+
+def test_cachedgh_snapshot_rides_the_slow_clock(home):
+    # Wrapped in CachedGh (as production is), the snapshot's SIDE EFFECT fires once per fallback
+    # window, not once per 2s poll — so it never spends more of the budget than a person reads.
+    _heartbeat(home, SILENT_AFTER + 60)
+    inner = _SnapshotGh()
+    clock = [NOW]
+    cached = server.CachedGh(inner, interval=120, clock=lambda: clock[0])
+    for i in range(5):
+        clock[0] = NOW + i          # five polls inside one 120s window
+        server.assemble_snapshot(_config(home), now=clock[0], gh_mod=cached)
+    assert inner.snaps == [SLUG], "the snapshot must ride the slow clock, not fire every poll"

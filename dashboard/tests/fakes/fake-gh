@@ -115,6 +115,14 @@ def route():
     elif sub == ["label", "list"]:
         serve_first(["label_list.json"])
 
+    # ---------- rate-limit snapshot (issue #15): a FREE `gh api rate_limit` read ----------
+    elif ARGS[:1] == ["api"]:
+        # `api` is a one-word subcommand followed by the endpoint path (not two words like the rest).
+        path = ARGS[1] if len(ARGS) > 1 else ""
+        if "rate_limit" in path:
+            serve_first(["api_rate_limit.json", "api.json"])
+        serve_first(["api.json"])
+
     # ---------- writes (recorded to mutations.jsonl) ----------
     elif sub == ["issue", "edit"]:
         remove = opt("--remove-label")
@@ -165,7 +173,9 @@ def main():
     if os.environ.get("GH_SLEEP"):
         time.sleep(float(os.environ["GH_SLEEP"]))
     if os.environ.get("GH_FAIL"):
-        die("forced failure (GH_FAIL)")
+        # GH_FAIL_STDERR sets the failure's stderr verbatim — lets a test drive the adapter's
+        # burn-telemetry status classification (e.g. a rate-limit 403 vs a generic refusal, issue #15).
+        die(os.environ.get("GH_FAIL_STDERR") or "forced failure (GH_FAIL)")
     route()
 
 

@@ -28,6 +28,10 @@ import json
 import os
 import re
 import subprocess
+import sys
+
+import config  # pure sibling module; resolves a repo slug -> its state home for telemetry (issue #15)
+import telemetry  # pure sibling module; bounded local GitHub API-burn telemetry (issue #15)
 
 _ISSUE_FIELDS = "number,title,labels,body,createdAt,state"    # `state` (OPEN/CLOSED) lets the
 # departures board resolve a blocked-by connection fail-closed — a blocker is only "arrived" with
@@ -52,6 +56,59 @@ def _binary():
     return os.environ.get("SL_GH", "gh")
 
 
+# GitHub API-burn telemetry (issue #15). False = OFF: no telemetry is recorded, so ordinary gh tests
+# write nothing. The long-lived command-center server turns it on once at startup
+# (bin/command-center -> set_telemetry_enabled()). The dashboard watches MANY repos, so — unlike the
+# runner's single configured home — each gh call resolves its OWN repo's state home from the slug it
+# is already pinned to, writing under `<state_home>/gh-telemetry-dashboard.jsonl`.
+_telemetry_enabled = False
+
+
+def set_telemetry_enabled(on=True):
+    """Enable per-call GitHub API-burn telemetry for THIS process (issue #15). Off by default so gh
+    unit tests record nothing; the server enables it at startup. Recording is best-effort and never
+    breaks a gh call (see lib/telemetry.py)."""
+    global _telemetry_enabled
+    _telemetry_enabled = bool(on)
+
+
+def _caller_op():
+    """The gh.py public function this subprocess is being run for — the OUTERMOST non-underscore
+    function defined in THIS module on the call stack. Walking to the OUTERMOST (nearest the external
+    caller) rather than the innermost keeps the SEMANTIC entry point (`ready_issues`) even when a
+    public function delegates through others down to `_run`. Best-effort: `"?"` on any failure — the
+    op is a telemetry label, never worth raising into a gh call for."""
+    try:
+        op = "?"
+        f = sys._getframe(1)
+        while f is not None:
+            if f.f_globals.get("__name__") == __name__ and not f.f_code.co_name.startswith("_"):
+                op = f.f_code.co_name        # overwrite as we climb -> the final value is outermost
+            f = f.f_back
+        return op
+    except Exception:
+        return "?"
+
+
+def _telemetry_home(repo):
+    """The state home to record `repo`'s telemetry under, or None when telemetry is off / the repo is
+    unknown (a call with no pin can't be attributed to a home). Best-effort: any config resolution
+    error -> None (never breaks the gh call)."""
+    if not _telemetry_enabled or not repo:
+        return None
+    try:
+        return config.state_home(repo)
+    except Exception:
+        return None
+
+
+def _record_call(args, repo, rc, err):
+    """Record one gh subprocess as a client="dashboard" telemetry row when telemetry is enabled."""
+    home = _telemetry_home(repo)
+    if home is not None:
+        telemetry.record_call(home, "dashboard", repo, _caller_op(), list(args), rc, err)
+
+
 def _run3(args, repo=None, timeout=None):
     """Run ``gh <args>`` pinned to ``repo`` with a HARD timeout. Returns ``(rc, stdout, stderr)``.
     Never raises: a timeout, a missing binary, or any OSError is caught and returned as a nonzero rc
@@ -68,11 +125,13 @@ def _run3(args, repo=None, timeout=None):
     try:
         proc = subprocess.run([_binary(), *args], capture_output=True, text=True,
                               timeout=timeout, env=env)
-        return (proc.returncode, proc.stdout, proc.stderr)
+        rc, out, err = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
-        return (124, "", "")      # conventional timeout rc
+        rc, out, err = 124, "", "gh timed out"      # conventional timeout rc
     except (OSError, ValueError):
-        return (127, "", "")      # command not found / bad invocation
+        rc, out, err = 127, "", "gh not found / bad invocation"   # command not found / bad invocation
+    _record_call(args, repo, rc, err)   # issue #15: one bounded burn-telemetry row per subprocess (no-op when off)
+    return (rc, out, err)
 
 
 def _run(args, repo=None, timeout=None):
@@ -177,6 +236,26 @@ def pr_for_branch(repo, branch):
     lst = _json_list(["pr", "list", "--head", branch, "--state", "all",
                       "--json", _PR_FIELDS, "--limit", "1"], repo=repo)
     return lst[0] if lst and isinstance(lst[0], dict) else {}
+
+
+def rate_limit_snapshot(repo):
+    """Read ``gh api rate_limit`` for ``repo`` and record a FREE rate-limit SNAPSHOT (issue #15).
+    The endpoint is exempt from rate limiting, so this costs no quota — the same property that lets
+    the runner snapshot on every poll. Returns ``True`` iff gh answered (a reachability signal, so a
+    caller can use it as a probe); records a client="dashboard" snapshot row with per-resource
+    used/remaining/reset, or ``ok=False`` with no resources when the read was refused. Records nothing
+    when telemetry is off.
+
+    The dashboard's own GitHub reads are the FALLBACK path only (issue #146) — in LIVE mode it renders
+    the runner's published view and never calls this — so a dashboard snapshot appears exactly when
+    the dashboard is the one talking to GitHub, which is when its own burn matters most. The runner's
+    account-global snapshots remain the primary hourly-burn source (the token is shared)."""
+    rc, out = _run(["api", "rate_limit"], repo=repo)
+    home = _telemetry_home(repo)
+    if home is not None:
+        telemetry.record_rate_limit(home, "dashboard", repo,
+                                    telemetry.parse_rate_limit(out) if rc == 0 else {}, rc == 0)
+    return rc == 0
 
 
 # --------------------------- writes (fail closed to False / None) ---------------------------

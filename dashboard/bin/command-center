@@ -130,6 +130,12 @@ def main(argv):
         sys.stderr.write("command-center: %s\n" % e)
         return EXIT_CONFIG_ERROR
 
+    # GitHub API-burn telemetry (issue #15): enable it here, at the server's process entrypoint, so
+    # the dashboard's own gh reads (the FALLBACK path — issue #146) each land one bounded row under
+    # their repo's state home (`gh-telemetry-dashboard.jsonl`). Off in gh unit tests, which never boot
+    # the server. Pairs with the runner's own telemetry to attribute the shared token's burn by client.
+    gh.set_telemetry_enabled()
+
     static_dir = str(_ROOT / "static")
     # The dashboard's OWN tiny state (the since-you-last-looked watermark, Task 9) — under $SL_HOME,
     # beside the loop state homes it reads, never inside them.
