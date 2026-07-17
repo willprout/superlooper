@@ -944,6 +944,24 @@ _DEFAULT_PROGRESS_WINDOW = 900   # seconds of journal history the progress heuri
 # is still known to have launched).
 _LAUNCHED_STATUSES = {"running", "blocked", "frozen", "exited", "gating", "holding", "merged"}
 
+# A wrong-typed status folds to a sentinel that belongs to no status set — the engine's own guard,
+# mirrored (``actions._status_of`` / ``_CORRUPT_STATUS``, engine issue #95). ``build_flight`` runs a
+# ``status in _LAUNCHED_STATUSES`` membership test (a SET), and a well-formed ``issues.json`` entry
+# whose status VALUE is unhashable (a list, a dict) would make that test raise ``TypeError`` — inside
+# the snapshot poll, so ONE corrupt entry takes down the whole board, every repo and every flight,
+# not merely its own row (issue #139). Folding at the read boundary keeps every downstream status
+# test hash-safe and fails CLOSED: a corrupt flight occupies no launched state. ``launch_rules``'
+# ``is_launch_candidate`` is the sibling worked example (#138); this closes the same trap in the
+# capstone composer. ``None`` is preserved — it is a legitimate never-launched status, never corrupt.
+_CORRUPT_STATUS = object()
+
+
+def _status_of(status):
+    """A loopstate status value folded hash-safe: itself when ``None`` or a ``str``, else
+    :data:`_CORRUPT_STATUS` — a sentinel that is a member of no status set, so a ``status in <SET>``
+    test on it never raises. Mirror of the engine's ``_status_of`` (issue #95); see the note above."""
+    return status if (status is None or isinstance(status, str)) else _CORRUPT_STATUS
+
 
 def _windowed(journal, now, window_s):
     """This issue's records within the last ``window_s`` seconds of ``now`` — the rolling window the
@@ -998,7 +1016,12 @@ def build_flight(issue, repo):
     optional ``progress_window_seconds``. Every derived field routes through the tested functions
     above, so the object is exactly the state diagram — nothing computed in the pixels downstream."""
     num = issue.get("num")
-    status = issue.get("status")
+    # Fold the raw loopstate status hash-safe at the read boundary (issue #139): a wrong-typed,
+    # unhashable value (a list/dict) must never reach the `status in _LAUNCHED_STATUSES` SET test
+    # below and raise into the poll. The folded sentinel makes that one set test hash-safe; every
+    # OTHER downstream status comparison is `==` or a tuple `in`, which already accepts the sentinel
+    # harmlessly — so this single fold makes the whole composer fail closed on corruption.
+    status = _status_of(issue.get("status"))
     journal = issue.get("journal") or []
     now = repo.get("now")
     activity_mtime = issue.get("activity_mtime")

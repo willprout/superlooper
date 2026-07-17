@@ -130,6 +130,27 @@ def test_every_issue_in_state_becomes_a_flight(home):
     assert by_num[16]["stage"] == flights.TOUCHDOWN
 
 
+def test_a_wrong_typed_status_does_not_take_down_the_whole_poll(home):
+    # issue #139: a well-formed issues.json entry whose status VALUE is unhashable (a list/dict)
+    # parses fine, then used to raise TypeError at `status in _LAUNCHED_STATUSES` inside build_flight
+    # — INSIDE the poll, so ONE corrupt entry took down the WHOLE board: every repo, every flight,
+    # not merely its own row. i21 has no activity file (session_started False), so it reaches that
+    # set test. The poll must now survive: every OTHER flight still builds, and the corrupt one fails
+    # CLOSED to at-stand (a never-launched flight), never crashing the board.
+    ij = home / "state" / "issues.json"
+    doc = json.loads(ij.read_text())
+    doc["issues"]["i21"]["status"] = []          # unhashable — the value class the engine already folds
+    ij.write_text(json.dumps(doc))
+
+    snap = server.assemble_snapshot(_config(home), now=NOW)   # must not raise
+
+    by_num = {f["num"]: f for f in snap["flights"]}
+    assert set(by_num) == {23, 16, 15, 7, 21}        # every flight survives, the corrupt one included
+    assert by_num[21]["stage"] == flights.AT_STAND   # fails closed: never-launched, not crashed
+    assert by_num[16]["stage"] == flights.TOUCHDOWN  # the healthy field is untouched
+    assert by_num[23]["stage"] == flights.TOUCHDOWN
+
+
 def test_wandered_landing_earns_no_celebration(home):
     snap = server.assemble_snapshot(_config(home), now=NOW)
     f23 = next(f for f in snap["flights"] if f["num"] == 23)
