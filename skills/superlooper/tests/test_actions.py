@@ -1860,6 +1860,29 @@ def test_the_window_is_config_overridable():
     assert len(only(out, "park")) == 1                      # 60s > the 30s override -> parked
 
 
+def test_a_reapproved_lane_gets_a_fresh_nudge_before_any_park():
+    # DoD defect (b): a re-approval (resume_at_gate/reapprove) clears nudged+nudged_at, so the very
+    # next gate look on a still-unmet cause NUDGES fresh — it does NOT park instantly on a stale key.
+    d, g = _gating(pv=pr_view(comments=[]),
+                   issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                           nudged=[], nudged_at={})})
+    out = decide(now=NOW + 5, dsk=d, gh_view=g)
+    assert len(only(out, "nudge")) == 1 and only(out, "nudge")[0]["nudge_key"] == "review"
+    assert only(out, "park") == []                          # a fresh nudge FIRST, never an instant park
+
+
+def test_a_corrupt_nudged_element_never_raises_into_the_tick():
+    # decide-never-raises contract: a hand-corrupt non-str (here non-hashable) element in `nudged`
+    # must not blow up the compliance-window computation; it reads as expired -> park, fail closed.
+    d, g = _gating(pv=pr_view(comments=[]),
+                   issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                           nudged=["review", ["oops"]], nudged_at={"review": NOW})})
+    out = decide(now=NOW + 5, dsk=d, gh_view=g)             # must not raise
+    # 'review' is fresh (window open) -> the corrupt element does not force a park by itself, and the
+    # tick completes; the point is simply that decide returned SOMETHING without crashing.
+    assert isinstance(out, list)
+
+
 # ---------------- bounded pending-checks escalation (issue #26) ----------------
 # A required check that never reports reads as "pending" forever, and the pending wait had no
 # timer: a finished issue sat in `gating` with no park, no memo, no notify. These pin the bound.

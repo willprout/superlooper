@@ -1360,7 +1360,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             nudge_expired = []
             if isinstance(nudged, list):
                 for k in nudged:
-                    stamp = nudged_at.get(k) if isinstance(nudged_at, dict) else None
+                    # `k` is a str in every path the engine writes; guard it anyway so a hand-corrupt
+                    # non-str (worse, non-hashable) element can't raise in dict.get and break decide's
+                    # never-raise contract — a bad key simply reads as expired (park), fail closed.
+                    stamp = nudged_at.get(k) if isinstance(nudged_at, dict) and isinstance(k, str) \
+                        else None
                     if not _since_ok(stamp, now) or now - stamp >= nudge_window:
                         nudge_expired.append(k)
             conflicts = ist.get("conflicts", 0)
