@@ -3082,8 +3082,21 @@ class Runner:
             self._update_issue(iid, {"merge_refusal_reason": reason},
                                fn=lambda st, i: self._bump(i, "merge_refusals"))
             return f"merge refused (will retry to the bound): {reason or '(no gh reason)'}"
-        gh.comment(num, f"Merged as PR #{pr} by superlooper (gate green: report + review "
-                        "evidence + required checks + mergeable).")
+        # (#165) A pre-authorized referee merge NAMES what rode through it and under whose word.
+        # Reciting the ordinary green rationale for a diff that crossed a bright line would make the
+        # one unattended referee merge the loop can perform its least legible one — and a referee
+        # change is LIVE on merge, with no publish backstop to catch it later.
+        if a.get("referee_preauthorized") is True:
+            paths = a.get("referee_paths")
+            named = ", ".join(p for p in paths if isinstance(p, str)) \
+                if isinstance(paths, list) else ""
+            gh.comment(num, f"Merged as PR #{pr} by superlooper (gate green: report + review "
+                            "evidence + required checks + mergeable) — including referee path(s) "
+                            f"{named or '(unnamed)'}, merged under {self._operator()}'s "
+                            "`pre-authorized:referee` pre-authorization rather than parked.")
+        else:
+            gh.comment(num, f"Merged as PR #{pr} by superlooper (gate green: report + review "
+                            "evidence + required checks + mergeable).")
         gh.set_labels(num, remove=["in-progress"])
         self._update_issue(iid, {"status": "merged"})
         if self._auto_close_merged():

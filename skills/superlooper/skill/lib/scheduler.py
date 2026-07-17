@@ -21,6 +21,7 @@ session asks — fresh launch, crash recovery, restart orphan resume, conflict r
 """
 import math
 
+import gate
 import issues
 
 FIVE_HOUR_LAUNCH_CEILING = 90    # spec: >90% five-hour -> no fresh launch
@@ -74,10 +75,11 @@ def usage_ok(usage):
     return _usage_ok(usage)
 
 
-def launch_ok(parsed, closed_nums, frozen, usage, resume=False):
+def launch_ok(parsed, closed_nums, frozen, usage, resume=False, config=None):
     """THE launch-eligibility gate (issue #150 / D8) — the ONE predicate every path that starts or
     restarts a session must pass: usage headroom (fail closed) AND issues.eligible (approved, valid
-    type, no control-label conflict, every `blocked-by` closed).
+    type, no control-label conflict, every `blocked-by` closed) AND, when `config` is supplied, the
+    foreseeable-referee gate (issue #165).
 
     It exists because those two halves used to be asked separately, by different callers, in
     different combinations: fresh phase-E launches asked both, crash recovery asked only usage, and
@@ -85,6 +87,14 @@ def launch_ok(parsed, closed_nums, frozen, usage, resume=False):
     worker straight past an open blocker, contained only by the worker's own step-0 reconcile
     bounce. Every caller now asks THIS, so the paths cannot drift: a condition added here binds
     recovery the same tick it binds a fresh launch.
+
+    Foreseeable-referee gate (issue #165): an issue whose DECLARED touches resolve to a referee path
+    (.superlooper/**, .github/workflows/**) can ONLY ever end in a needs-owner park at the gate, so
+    launching it unattended just burns a lane to reach a certain stop. It is refused UNLESS the owner
+    pre-authorized it up front (the `pre-authorized:referee` label). This is a LANE-economy gate, not
+    the bright line: it only fires when `config` (needed to resolve touch areas -> globs) is passed,
+    and when it is skipped the diff-time referee park in gate_decision still refuses the merge — so a
+    caller without config degrades to the old burn-a-lane-then-park behaviour, never to auto-merge.
 
     Fails CLOSED on a missing or wrong-typed `parsed` (the recovery paths can reach this for an
     issue absent from the GitHub view): with no issue to read, not one of the conditions can be
@@ -98,9 +108,14 @@ def launch_ok(parsed, closed_nums, frozen, usage, resume=False):
     if not isinstance(parsed, dict):
         return False
     try:
-        return issues.eligible(parsed, closed_nums, frozen, resume=resume)
+        if not issues.eligible(parsed, closed_nums, frozen, resume=resume):
+            return False
     except (KeyError, TypeError):        # a malformed parse (missing/wrong-typed labels, type, ...)
         return False                     # -> unreadable eligibility -> fail closed, never launch
+    if config is not None and gate.foreseeable_referee_stop(parsed.get("touches"), config) \
+            and not gate.preauthorized_referee(parsed.get("labels")):
+        return False                     # a certain, un-authorized referee park -> wait for the owner
+    return True
 
 
 def _is_wildcard(touches):
@@ -238,7 +253,7 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
     candidates = [p for p in parsed_issues
                   if p.get("id") not in running_ids
                   and p.get("id") not in claimed_ids
-                  and launch_ok(p, closed_nums, frozen, usage)]
+                  and launch_ok(p, closed_nums, frozen, usage, config=config)]
     candidates.sort(key=lambda p: issues.sort_key(p, p.get("requeue_front", False)))
 
     selected_ids = set(running_ids) | set(claimed_ids)

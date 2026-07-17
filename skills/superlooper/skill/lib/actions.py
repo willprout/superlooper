@@ -539,7 +539,7 @@ def _touches_required_memo(num):
             "`touches:` line to the Loop metadata and re-approve.")
 
 
-def _launch_gate_reason(p, closed_nums, usage):
+def _launch_gate_reason(p, closed_nums, usage, config=None):
     """WHY the one launch gate (scheduler.launch_ok) refused to start or restart this session —
     the SPECIFIC failing condition, named. This is what makes a refusal a legible hold instead of
     the silent launch D8 caught: the board and the journal say which dependency is open, or which
@@ -575,6 +575,16 @@ def _launch_gate_reason(p, closed_nums, usage):
                 + ", ".join("#%s" % d for d in open_deps)
                 + " not confirmed closed. The restart waits for the dependency to close — a recovery "
                   "never carries a session past a blocker a fresh launch would respect.")
+    if config is not None and gate.foreseeable_referee_stop(p.get("touches"), config) \
+            and not gate.preauthorized_referee(p.get("labels")):
+        # issue #165: its declared `touches:` resolve to a referee subtree, so building it can ONLY
+        # end in a needs-owner park — and the owner has not pre-authorized it. Waiting for his word
+        # (a `pre-authorized:referee` label at approval) beats burning a lane to reach a certain stop.
+        return (f"it declares `touches:` that reach a referee path (.superlooper/** or "
+                ".github/workflows/**), so building it can only end in a needs-owner park — and the "
+                f"owner has not pre-authorized it (`{gate.PREAUTHORIZED_REFEREE_LABEL}`). Held for his "
+                "word up front rather than launched unattended to a foreseeable stop; pre-authorize "
+                "at approval or re-scope the issue off the referee paths.")
     return "the launch gate refused this start (no single condition named)"
 
 
@@ -876,8 +886,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     def start_ok(p, resume=True):
         """THE gate, asked identically by every path that starts or restarts a session (issue #150 /
         D8). Fresh phase-E launches reach the same predicate through scheduler.launchable, which
-        filters candidates on launch_ok."""
-        return scheduler.launch_ok(p, closed_nums, bool(frozen), usage_sched, resume=resume)
+        filters candidates on launch_ok. `config=cfg` arms the foreseeable-referee gate (#165) on
+        the recovery paths too, so a certain, un-authorized referee park never burns a lane on a
+        restart any more than on a fresh launch."""
+        return scheduler.launch_ok(p, closed_nums, bool(frozen), usage_sched, resume=resume,
+                                   config=cfg)
 
     def launch_hold(iid, num, p, reason=None):
         """start_ok (or the #159 auth gate) said no: HOLD, legibly — never a silent launch (D8), and
@@ -888,7 +901,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         but the labels went ambiguous) still speaks rather than leaving stale prose on the board. An
         explicit `reason` overrides the usage/eligibility reason (the auth gate names auth)."""
         reason = reason if isinstance(reason, str) and reason \
-            else _launch_gate_reason(p, closed_nums, usage_sched)
+            else _launch_gate_reason(p, closed_nums, usage_sched, config=cfg)
         if ist_of(iid).get("launch_hold_reason") == reason:
             return
         out.append({"act": "launch_hold", "id": iid, "num": num, "reason": reason})
@@ -1309,10 +1322,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     inflight[other] = [t for t in ot if isinstance(t, str)] \
                         if isinstance(ot, list) else []
 
+            # issue #165: the owner's referee pre-authorization is read from the issue's LIVE labels
+            # (his word, applied at approval), precomputed here the same way investigation_done is —
+            # the gate consumes the bool, never the label set. Absent/wrong-typed labels -> False, so
+            # the bright line holds by default.
+            pre_auth_referee = gate.preauthorized_referee(p.get("labels")) if isinstance(p, dict) \
+                else False
             g = gate.gate_decision(
                 {"type": itype, "conflicts": conflicts, "nudged": nudged,
                  "declared_touches": declared, "update_result": update_result,
                  "review_carry": ist.get("review_carry"),
+                 "pre_authorized_referee": pre_auth_referee,
                  "investigation_done": inv_done,
                  "exit_reply": exit_reply, "exit_asks": ist.get("exit_asks"),
                  "exit_asked_key": ist.get("exit_asked_key"),
@@ -1407,8 +1427,18 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # head_oid pins the merge to the commit this decision actually judged (#154): the
                 # review verdict was matched against THIS head, so the merge must land on it or be
                 # refused — never on whatever the branch grew since the last poll.
-                out.append({"act": "merge", "id": iid, "num": num, "pr": pv.get("number"),
-                            "method": method, "head_oid": head, "wander": wander})
+                merge_act = {"act": "merge", "id": iid, "num": num, "pr": pv.get("number"),
+                             "method": method, "head_oid": head, "wander": wander}
+                if g.get("referee_preauthorized") is True:
+                    # (#165) Carry the owner's pre-authorization onto the ACT. The gate already
+                    # decided it; the executor must never re-derive it. Without this the journal
+                    # record (_journal_outcome writes the act verbatim) and the merge comment would
+                    # both recite the ORDINARY green rationale for a diff that crossed a bright line
+                    # on his word — and the journal naming the referee paths is the one compensating
+                    # control approval-protocol.md offers for the coarse per-issue grant.
+                    merge_act["referee_preauthorized"] = True
+                    merge_act["referee_paths"] = g.get("referee_paths")
+                out.append(merge_act)
             elif act == "update":
                 out.append({"act": "update", "id": iid, "num": num, "pr": pv.get("number"),
                             "head_oid": head, "wander": wander})
@@ -1877,6 +1907,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 continue
             out.append({"act": "wildcard_hold", "id": hid, "num": h.get("num"),
                         "blocker": h.get("blocker_id"), "reason": _wildcard_hold_reason(h)})
+        # Foreseeable-referee launch hold (issue #165): an approved issue whose declared touches
+        # resolve to a referee path is withheld by launch_ok unless pre-authorized — so it never
+        # reaches launchable/launch_holds above. Journal WHY here (via the same #150 launch_hold
+        # ledger, deduped once per episode) rather than withholding it silently: "why isn't my
+        # approved issue running?" must be answerable. Journal-only — no park, no notify, no label
+        # move — the queue is untouched and the issue launches the tick a pre-authorization lands.
+        for c in candidates:
+            cid = c.get("id")
+            if cid in selected_ids:
+                continue
+            if gate.foreseeable_referee_stop(c.get("touches"), cfg) \
+                    and not gate.preauthorized_referee(c.get("labels")):
+                launch_hold(cid, c.get("num"), c)
     elif (systemic_launch and not anchor_down and not auth_invalid
             and not gh_stale and not issue_state_corrupt_for_launches):
         # Canary re-arm of the SYSTEMIC hold (issue #115). The streak-based hold cannot clear itself,

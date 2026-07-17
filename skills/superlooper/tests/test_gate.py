@@ -1148,3 +1148,85 @@ def test_fingerprint_distinguishes_checks_and_content():
 def test_fingerprint_tolerates_wrong_typed_input():
     fp = gate.fix_issue_fingerprint(None, None)
     assert isinstance(fp, str) and len(fp) == 16
+
+
+# --------------------------- referee pre-authorization (issue #165) ---------------------------
+# A referee-path touch (.superlooper/**, .github/workflows/**) can only ever END in a needs-owner
+# stop. When it is FORESEEABLE at approval (the issue declares a touch area that resolves to a
+# referee glob), William can pre-authorize it up front — his word, recorded as the
+# `pre-authorized:referee` label. The gate then CONSUMES that authorization and merges instead of
+# re-parking at the finish line. Without the label, the bright line is untouched: an un-authorized
+# referee diff still parks needs-william.
+
+def test_preauthorized_referee_label_detected():
+    assert gate.preauthorized_referee([gate.PREAUTHORIZED_REFEREE_LABEL]) is True
+    assert gate.preauthorized_referee(["type:build", gate.PREAUTHORIZED_REFEREE_LABEL]) is True
+    assert gate.preauthorized_referee(["type:build", "agent-ready"]) is False
+    assert gate.preauthorized_referee([]) is False
+    # fail closed on every wrong-typed label set — an unreadable set is NOT pre-authorized
+    for bad in (None, "pre-authorized:referee", 42, [123, None], [{"name": "x"}]):
+        assert gate.preauthorized_referee(bad) is False, bad
+
+
+def test_foreseeable_referee_stop_from_declared_area():
+    # a repo that schedules referee work declares a referee area; an issue that will touch referee
+    # declares it in touches: — so the stop is computable from the DECLARATION alone, at approval.
+    cfg = _cfg(areas={"frontend": ["src/components/**"], "loop_rules": [".superlooper/**"],
+                      "ci": [".github/workflows/*.yml"]})
+    assert gate.foreseeable_referee_stop(["loop_rules"], cfg) is True
+    assert gate.foreseeable_referee_stop(["ci"], cfg) is True
+    assert gate.foreseeable_referee_stop(["frontend"], cfg) is False
+    assert gate.foreseeable_referee_stop([], cfg) is False
+    # an area that merely COULD reach referee (a broad `.github/**`) is not CERTAIN -> not flagged
+    assert gate.foreseeable_referee_stop(["broad"], _cfg(areas={"broad": [".github/**"]})) is False
+    # fail closed / degrade to not-foreseeable on wrong-typed inputs (the gate's own diff-time
+    # referee park stays the bright line for anything this misses)
+    assert gate.foreseeable_referee_stop(["loop_rules"], {"areas": "junk"}) is False
+    assert gate.foreseeable_referee_stop("junk", cfg) is False
+    assert gate.foreseeable_referee_stop(["loop_rules"], None) is False
+
+
+def test_gate_referee_path_preauthorized_merges():
+    # THE issue #165 acceptance: a protected-path issue with a recorded pre-authorization merges
+    # without a new finish-line park.
+    pr = _pr(files=[{"path": ".superlooper/config.json"}])
+    d = _decide(issue=_issue(pre_authorized_referee=True), pr=pr)
+    assert d["action"] == "merge"
+    assert d.get("referee_preauthorized") is True
+    assert ".superlooper/config.json" in d.get("referee_paths", [])
+
+
+def test_gate_referee_workflow_path_preauthorized_merges():
+    pr = _pr(files=[{"path": ".github/workflows/quality.yml"}])
+    d = _decide(issue=_issue(pre_authorized_referee=True), pr=pr)
+    assert d["action"] == "merge" and d.get("referee_preauthorized") is True
+
+
+def test_gate_referee_path_without_preauthorization_still_parks():
+    # the bright line is untouched for un-authorized diffs: no label -> park needs-william, exactly
+    # as before. (Boundaries: never auto-merge referee without his explicit pre-authorization.)
+    pr = _pr(files=[{"path": ".superlooper/config.json"}])
+    d = _decide(issue=_issue(pre_authorized_referee=False), pr=pr)
+    assert d["action"] == "park" and d["needs_william"] is True
+    assert d.get("referee_preauthorized") is not True
+
+
+def test_gate_preauthorization_does_not_bypass_other_gates():
+    # pre-authorization consumes ONLY the referee owner-stop; every other gate still applies, so a
+    # failing check on a pre-authorized referee PR does NOT merge — it takes the checks ladder.
+    pr = _pr(files=[{"path": ".superlooper/config.json"}],
+             statusCheckRollup=[{"context": "quality-gate", "state": "FAILURE"}])
+    d = _decide(issue=_issue(pre_authorized_referee=True), pr=pr)
+    assert d["action"] == "nudge" and d["nudge_key"] == "checks"
+    # and a frozen mainline still holds it. Pinned to "hold", not a ("hold", "nudge") disjunction:
+    # freeze (step 4) deterministically precedes the checks ladder (step 5), so a disjunction would
+    # still pass if that ordering ever regressed — which is exactly what this asserts.
+    d2 = _decide(issue=_issue(pre_authorized_referee=True), pr=pr, frozen=True)
+    assert d2["action"] == "hold"   # never merge under a foreseeable non-referee stop
+
+
+def test_gate_preauthorization_ignored_when_diff_touches_no_referee_path():
+    # a pre-authorized issue whose diff DOESN'T touch referee just merges normally — the flag is
+    # inert (no referee_preauthorized journal noise on an ordinary merge).
+    d = _decide(issue=_issue(pre_authorized_referee=True))
+    assert d["action"] == "merge" and d.get("referee_preauthorized") is not True

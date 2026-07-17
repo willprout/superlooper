@@ -27,6 +27,13 @@ LABELS = [
     ("preserve", "5319e7", "on a PR: resolve conflicts in-branch instead of regenerating"),
     ("auto-approved:nightly-red", "e99695",
      "standing rule: auto-filed fix for a red nightly/dev (scoped to restoring green)"),
+    # {operator}'s word, granted at approval, for a foreseeable referee-path owner-stop (issue
+    # #165). A DISTINCT label, never folded into `agent-ready` — the same discipline as
+    # `auto-approved:nightly-red` above (and coloured as its sibling): the audit trail must always
+    # show HOW a referee touch was cleared. Deliberately NOT '(runner-managed)': the runner must
+    # never create, apply, or heal this one — it is only ever applied by hand, by {operator}.
+    ("pre-authorized:referee", "f9d0c4",
+     "{operator}'s pre-authorization: the gate may merge this issue's referee-path touches"),
     ("superseded", "cccccc", "on a PR: replaced by a rebuild; branch preserved, nothing auto-closed"),
     ("priority:high", "ff9500", "front of the normal queue"),
     ("priority:low", "0075ca", "back of the queue"),

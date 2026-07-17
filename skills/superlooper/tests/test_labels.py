@@ -6,7 +6,32 @@ single source of truth), and label_migration_plan turns "what labels does the re
 the ordered, idempotent steps that close the merged+installed -> applied gap. Impure application
 (gh writes, the systemic hold) is tested in test_runner.py; here nothing touches GitHub.
 """
+import gate
 import labels
+
+
+def test_referee_preauthorization_label_exists_but_is_never_runner_managed():
+    """Issue #165: the owner's pre-authorization is only reachable if the label EXISTS — gh refuses
+    to apply a label a repo doesn't have, so a label absent from LABELS is a feature the owner
+    cannot use at all (adopt creates the set; doctor reports what's missing). It must be here, and
+    its name must be the ONE the gate keys on.
+
+    But it must NEVER be runner-managed: '(runner-managed)' is what boot-migration self-healing keys
+    off, and this label is the owner's WORD — the runner creating or healing it is exactly the
+    machine granting itself a bright-line pass. adopt (the whole set) creates it; the runner (the
+    tagged subset) never touches it.
+    """
+    spec = labels.label_spec(gate.PREAUTHORIZED_REFEREE_LABEL)
+    assert spec is not None, "the label the gate keys on must be in the §C.2 set, or adopt/doctor " \
+                             "never create it and the owner cannot apply it"
+    color, desc = spec
+    assert color and desc
+    assert "(runner-managed)" not in desc
+    assert gate.PREAUTHORIZED_REFEREE_LABEL not in labels.runner_managed_labels()
+    assert gate.PREAUTHORIZED_REFEREE_LABEL not in labels.missing_runner_labels(set())
+    # and it is never planned for creation by the runner's boot migration, on any repo state
+    assert all(step.get("name") != gate.PREAUTHORIZED_REFEREE_LABEL
+               for step in labels.label_migration_plan(set()))
 
 
 def test_runner_managed_subset_is_the_tagged_set():

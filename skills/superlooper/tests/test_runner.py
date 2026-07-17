@@ -1761,6 +1761,35 @@ def test_merge_executor_full_sequence(rig, monkeypatch):
     assert removed and removed[0].endswith("worktrees/i5")
 
 
+def test_preauthorized_referee_merge_comment_names_the_paths_and_the_word(rig, monkeypatch):
+    """Issue #165: the ONE unattended merge that crosses a bright line must be the loop's most
+    legible record, not its least. A referee change is LIVE on merge (no publish backstop), and
+    approval-protocol.md sells this comment + the journal as the compensating control for the
+    coarse per-issue grant — so reciting the ordinary 'gate green' line here would make that
+    promise false. Name the paths, and name whose word let them through."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    out = rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash",
+                          "wander": False, "referee_preauthorized": True,
+                          "referee_paths": [".superlooper/config.json",
+                                            ".github/workflows/ci.yml"]}, NOW)
+    assert out == "ok"
+    body = [m for m in mutations(rig) if m["kind"] == "comment"][0]["body"]
+    assert ".superlooper/config.json" in body and ".github/workflows/ci.yml" in body
+    assert "pre-authorized:referee" in body
+
+
+def test_ordinary_merge_comment_says_nothing_about_referee(rig, monkeypatch):
+    # the un-authorized/ordinary path is untouched — no referee prose on a merge that crossed no
+    # bright line (the pre-authorization line must stay a signal, never boilerplate).
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash",
+                    "wander": False}, NOW)
+    body = [m for m in mutations(rig) if m["kind"] == "comment"][0]["body"]
+    assert "referee" not in body and "pre-authorized" not in body
+
+
 def test_merge_failure_retries_next_tick(rig, monkeypatch):
     seed_issue(rig, "i5", status="gating")
     monkeypatch.setenv("GH_FAIL", "1")

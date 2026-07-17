@@ -271,6 +271,7 @@ The runner drives these; a few ask for a decision from you.
 | `effort:<level>` (on an issue) | run **this issue's** worker sessions at reasoning effort `<level>` (nothing sent when absent) | apply it to a gnarly issue that needs more, or a trivial one that needs less |
 | `superseded` (on a PR) | the loop replaced this PR with a rebuild on current dev; branch kept, PR left open, nothing auto-closed | none — housekeeping only |
 | `auto-approved:nightly-red` | a fix issue the nightly filed to restore a red mainline; entered by your standing rule, not by hand | none — it builds automatically; the distinct label is just the audit trail |
+| `pre-authorized:referee` (on an issue) | **your word, granted early**: the gate may *merge* this issue's touches to `.superlooper/**` / `.github/workflows/**` instead of parking them for you at the finish line; also lets the launch gate start such an issue unattended | apply it **by hand, at approval**, to an issue whose referee reach you have read and accept. Without it, any referee-path diff still parks for you — unchanged |
 
 **`parked` vs `needs-owner`** is the distinction that matters: `parked` is *mechanical
 exhaustion* (retries ran out — no decision pending, look when convenient); `needs-owner` is *a

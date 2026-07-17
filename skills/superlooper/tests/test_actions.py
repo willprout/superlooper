@@ -1711,6 +1711,83 @@ def test_declared_referee_area_still_parks_needs_william():
     assert len(only(out, "notify")) == 1
 
 
+def test_preauthorized_referee_issue_merges_through_decide():
+    # issue #165 end-to-end through the runner: the owner's `pre-authorized:referee` label on the
+    # LIVE issue flows (via gate.preauthorized_referee) into the gate, which merges the referee-
+    # touching PR instead of re-parking. No park, no needs-owner notify.
+    d, g = _gating(pv=pr_view(files=["src/f/Widget.tsx", ".superlooper/config.json"]))
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build",
+                                                  gate.PREAUTHORIZED_REFEREE_LABEL),
+                                       touches=("frontend",))],
+                 dsk=d, gh_view=g)
+    m = only(out, "merge")
+    assert len(m) == 1 and m[0]["num"] == 5
+    assert only(out, "park") == []
+    assert not any("needs-owner" in n.get("title", "") for n in only(out, "notify"))
+
+
+def test_preauthorized_merge_act_carries_the_referee_audit_trail():
+    # issue #165: a pre-authorized referee merge must never be a SILENT auto-merge. The gate names
+    # the paths; the ACT is what survives into the journal (_journal_outcome writes the act dict
+    # verbatim) and into the merge comment. If the act drops them, the one unattended merge that
+    # crosses a bright line becomes the least legible record in the loop — and the merge journal
+    # naming every referee touch is the compensating control approval-protocol.md offers for the
+    # coarse per-issue grant. So assert the keys ride onto the act itself.
+    d, g = _gating(pv=pr_view(files=["src/f/Widget.tsx", ".superlooper/config.json"]))
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build",
+                                                  gate.PREAUTHORIZED_REFEREE_LABEL),
+                                       touches=("frontend",))],
+                 dsk=d, gh_view=g)
+    m = only(out, "merge")
+    assert len(m) == 1
+    assert m[0].get("referee_preauthorized") is True
+    assert m[0].get("referee_paths") == [".superlooper/config.json"]
+
+
+def test_ordinary_merge_act_carries_no_referee_noise():
+    # the flag is inert on an ordinary merge — no referee keys on an act that crossed no bright line
+    d, g = _gating(pv=pr_view(files=["src/f/Widget.tsx"]))
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build",
+                                                  gate.PREAUTHORIZED_REFEREE_LABEL),
+                                       touches=("frontend",))],
+                 dsk=d, gh_view=g)
+    m = only(out, "merge")
+    assert len(m) == 1 and "referee_preauthorized" not in m[0] and "referee_paths" not in m[0]
+
+
+def test_foreseeable_referee_issue_not_launched_without_preauth():
+    # issue #165: an approved issue whose declared touches resolve to a referee path is NOT launched
+    # unattended without the owner's pre-authorization — it waits, rather than burning a lane to a
+    # certain park. Granting the label lets it launch.
+    config = cfg(areas={"frontend": ["src/f/**"], "loop_rules": [".superlooper/**"]})
+    held = decide(config=config,
+                  parsed_issues=[parsed(9, touches=("loop_rules",))])   # agent-ready, no preauth
+    assert only(held, "launch") == []
+    allowed = decide(config=config,
+                     parsed_issues=[parsed(9, touches=("loop_rules",),
+                                           labels=("agent-ready", "type:build",
+                                                   gate.PREAUTHORIZED_REFEREE_LABEL))])
+    assert len(only(allowed, "launch")) == 1 and only(allowed, "launch")[0]["num"] == 9
+
+
+def test_foreseeable_referee_hold_is_journaled_not_silent():
+    # issue #165 + the #36/#150 "never a silent hold" discipline: a withheld referee issue is not
+    # just skipped — the runner journals WHY (a launch_hold naming the pre-authorization label), so
+    # "why isn't my approved issue running?" is answerable. Journal-only: no park, no notify.
+    config = cfg(areas={"frontend": ["src/f/**"], "loop_rules": [".superlooper/**"]})
+    out = decide(config=config, parsed_issues=[parsed(9, touches=("loop_rules",))])
+    assert only(out, "launch") == [] and only(out, "park") == []
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and holds[0]["id"] == "i9"
+    assert gate.PREAUTHORIZED_REFEREE_LABEL in holds[0]["reason"]
+    # pre-authorized -> it launches, and there is NO hold journal line
+    out2 = decide(config=config,
+                  parsed_issues=[parsed(9, touches=("loop_rules",),
+                                        labels=("agent-ready", "type:build",
+                                                gate.PREAUTHORIZED_REFEREE_LABEL))])
+    assert len(only(out2, "launch")) == 1 and only(out2, "launch_hold") == []
+
+
 def test_conflicting_pr_gets_a_mechanical_update():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING"))
     out = decide(dsk=d, gh_view=g)
