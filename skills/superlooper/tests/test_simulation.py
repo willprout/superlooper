@@ -128,8 +128,15 @@ class Sim:
             # in test_actions and exercised end-to-end by the touches_required=True sim below).
             "touches_required": touches_required,
             "session": sess, "cleanup_merged_worktrees": cleanup_merged_worktrees,
+            # quiet_hours=None DISABLES night-batching (#164), same as test_runner's make_config
+            # and for the same reason: the sim asserts notify MECHANICS ("every park notifies"),
+            # and the sim's runner reads the REAL machine clock — on CI (UTC) every run between
+            # 21:00 and 08:00 UTC fell inside the default quiet window, so park/bounce notifies
+            # batched to the morning report and nine sim tests went red nightly (the #217
+            # false-red, live since #164 merged). The batching POLICY is tested where it belongs:
+            # test_actions.py with a PINNED local_hhmm, immune to the wall clock.
             "notify": {"cmd": "printf '%s|%s\\n' \"$SL_TITLE\" \"$SL_BODY\" >> "
-                              + str(self.notify_log)},
+                              + str(self.notify_log), "quiet_hours": None},
         }
         if qa:
             cfg["qa"] = qa
@@ -929,6 +936,27 @@ def test_investigate_marker_and_child_parent_closed_child_waits(sim_factory):
     sim.tick()
     assert len(sim.surfaces()) == 1, "the child must WAIT for William, never auto-launch"
     assert not sim.mutations("merge_pr"), "an investigation opens zero PRs"
+
+
+def test_investigate_ghosted_exit_interview_reasks_then_parks_never_closes(sim_factory):
+    # #215: the worker finishes (marker + child) but never answers the exit interview — the mail
+    # sits unconsumed. The ladder re-asks once (window), then parks. The parent must stay OPEN:
+    # closing unaccounted is the motivating incident.
+    sim = sim_factory()
+    num = sim.add_issue(title="Investigation that ghosts the interview",
+                        labels=("type:investigate", "agent-ready"),
+                        scenario={"scenario": "investigate", "skip_exit_reply": True,
+                                  "linger": True})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert sim.issue(num)["state"] == "open", "never close unaccounted"
+    asks = [r for r in sim.journal("exit_interview") if r.get("id") == sid]
+    assert len(asks) == 2, asks                      # the interview + exactly one re-ask
+    assert os.path.exists(os.path.join(sim.home, "state", "mail", sid)), \
+        "the unconsumed mail is the honest evidence delivery never happened"
 
 
 def test_investigate_missing_marker_nudges_then_parks(sim_factory):

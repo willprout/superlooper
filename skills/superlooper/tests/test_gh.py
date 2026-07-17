@@ -321,6 +321,40 @@ def test_child_issues_precise_filter(ghenv):
     assert sorted(k["number"] for k in kids) == [41, 42]
 
 
+def test_child_issues_health_reads_ok_with_precise_filter(ghenv):
+    # the #215 exit-interview verification read: ONE typed search proving each FINDINGS-FILED
+    # ref is a genuine `parent: #N` child (owner API-burn ruling: never per-ref reads).
+    rh = gh.child_issues_health(40)
+    assert rh.ok is True
+    assert sorted(k["number"] for k in rh.value) == [41, 42]
+
+
+def test_child_issues_health_refused_is_not_empty(ghenv, monkeypatch):
+    # refused != empty (the #21/#61 discipline): the gate WAITS on ok=False rather than reading
+    # the fail-closed [] as "no children exist" and blocking a truthful reply.
+    monkeypatch.setenv("GH_FAIL", "1")
+    rh = gh.child_issues_health(40)
+    assert rh.ok is False and rh.value == []
+
+
+def test_child_issues_health_wrong_typed_body_reads_refused(ghenv):
+    (ghenv / "issue_search.json").write_text('"a bare string, wrong type"')
+    rh = gh.child_issues_health(40)
+    assert rh.ok is False and rh.value == []
+
+
+def test_child_issues_health_argv_requests_state_and_labels(ghenv):
+    # the verdict needs each child's labels (needs-owner / released) AND its open/closed state —
+    # pin that the one read actually asks for them.
+    gh.child_issues_health(40)
+    argv = _calls(ghenv)[-1]
+    assert argv[:2] == ["issue", "list"]
+    assert _after(argv, "--state") == "all"
+    assert "parent: #40" in _after(argv, "--search")
+    fields = (_after(argv, "--json") or "").split(",")
+    assert {"number", "labels", "body", "state"} <= set(fields)
+
+
 # --------------------------- writes: mutation recording ---------------------------
 
 def test_set_labels_records_mutation(ghenv):

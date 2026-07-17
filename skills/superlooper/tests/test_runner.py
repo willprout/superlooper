@@ -2216,6 +2216,193 @@ def test_close_investigate_executor(rig):
     assert issue_state(rig, "i7")["status"] == "merged"
 
 
+def test_close_investigate_comment_carries_the_accounted_claim(rig):
+    # #215: the close comment names the exit-interview outcome — the owner-auditable claim.
+    seed_issue(rig, "i7", status="gating", type="investigate")
+    rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7,
+                    "exit": "FINDINGS-FILED: #41 #42"}, NOW)
+    close = [m for m in mutations(rig) if m["kind"] == "close_issue"][-1]
+    assert "FINDINGS-FILED: #41 #42" in close["comment"]
+
+
+# --------------------------- the exit interview's executors (issue #215) ---------------------------
+
+def _pane_calls(rig):
+    return [c for c in rig.calls if c["args"] and c["args"][0].endswith("nudge-pane.sh")]
+
+
+def test_exec_exit_interview_claude_arms_the_mailbox_and_wake_pings(rig):
+    # Claude path: the interview rides the MAILBOX (verified, zero-keystroke — #148); the pane
+    # gets only a minimal wake ping so the resting session takes a turn and its Stop hook
+    # consumes the mail. The payload must NOT be typed into the pane.
+    seed_issue(rig, "i7", status="gating", type="investigate")
+    (rig.home / "state" / "panes" / "i7").write_text("surf-7")
+    out = rig.r._execute({"act": "exit_interview", "id": "i7", "num": 7,
+                          "reply_key": None, "defect": None}, NOW)
+    mail = (rig.home / "state" / "mail" / "i7").read_text()
+    assert "FINDINGS-FILED:" in mail and "NO-FINDINGS" in mail
+    assert "#7" in mail and "needs-owner" in mail and "parent: #7" in mail
+    pings = _pane_calls(rig)
+    assert len(pings) == 1 and pings[0]["args"][1] == "surf-7"
+    assert "FINDINGS-FILED" not in pings[0]["args"][3]      # payload rides the mailbox only
+    st = issue_state(rig, "i7")
+    assert st["exit_asks"] == 1 and st["exit_asked_at"] == NOW and st["exit_nonce"]
+    # the outcome never claims delivery off a send rc — the receipt is the only proof
+    assert "deliver" not in out.lower() or "receipt" in out.lower()
+
+
+def test_exec_exit_interview_reask_names_the_defect_and_the_reply_it_answers(rig):
+    seed_issue(rig, "i7", status="gating", type="investigate", exit_asks=1)
+    (rig.home / "state" / "panes" / "i7").write_text("surf-7")
+    rig.r._execute({"act": "exit_interview", "id": "i7", "num": 7, "reply_key": "c9",
+                    "defect": "the reply lists #99 which the parent's child set does not "
+                              "account for"}, NOW)
+    mail = (rig.home / "state" / "mail" / "i7").read_text()
+    assert "#99" in mail                                    # the re-ask says WHY
+    st = issue_state(rig, "i7")
+    assert st["exit_asks"] == 2 and st["exit_asked_key"] == "c9"
+
+
+def test_exec_exit_interview_counts_the_ask_even_when_the_ping_defers(rig):
+    # stamped BEFORE the send (the probe ladder's rule): a failed/deferred ping still walks the
+    # cap toward the park — never an unbounded ask loop.
+    seed_issue(rig, "i7", status="gating", type="investigate")
+    (rig.home / "state" / "panes" / "i7").write_text("surf-7")
+    rig.rc_queue.append(4)                                  # dead pane
+    rig.r._execute({"act": "exit_interview", "id": "i7", "num": 7}, NOW)
+    assert issue_state(rig, "i7")["exit_asks"] == 1
+    assert (rig.home / "state" / "mail" / "i7").exists()    # the mail stays armed regardless
+
+
+def test_exec_exit_interview_no_pane_still_arms_the_mail(rig):
+    # a finished lane may have no recorded pane (closed tab). The mail is still armed — a live
+    # session consumes it at its next rest — and the ask is spent, so a truly dead session walks
+    # the bounded ladder to a park instead of looping.
+    seed_issue(rig, "i7", status="gating", type="investigate")
+    out = rig.r._execute({"act": "exit_interview", "id": "i7", "num": 7}, NOW)
+    assert (rig.home / "state" / "mail" / "i7").exists()
+    assert _pane_calls(rig) == []
+    assert issue_state(rig, "i7")["exit_asks"] == 1
+    assert "no pane" in out
+
+
+def test_exec_exit_interview_codex_types_the_ask_demanding_the_ack_file(rig):
+    # degraded path (Codex Stop cannot block a stop): the ask is TYPED, and the reply comes back
+    # through the nonce-fenced ack file — same grammar, no mailbox.
+    calls = []
+    r2 = runner_mod.Runner(repo=str(rig.repo), config=make_config(), state_home=str(rig.home),
+                           pane="p", agent="codex",
+                           run_script=lambda a, env=None, timeout=None:
+                               calls.append({"args": [str(x) for x in a]}) or 0,
+                           fetch_usage=lambda: {})
+    seed_issue(rig, "i7", status="gating", type="investigate")
+    (rig.home / "state" / "panes" / "i7").write_text("surf-7")
+    r2._execute({"act": "exit_interview", "id": "i7", "num": 7}, NOW)
+    typed = [c for c in calls if c["args"][0].endswith("nudge-pane.sh")]
+    assert len(typed) == 1
+    msg = typed[0]["args"][3]
+    st = issue_state(rig, "i7")
+    assert "FINDINGS-FILED:" in msg and "NO-FINDINGS" in msg
+    assert str(rig.home / "state" / "ack" / "i7") in msg    # names the ack FILE
+    assert st["exit_nonce"] in msg                          # the SAME nonce is demanded
+    assert not (rig.home / "state" / "mail" / "i7").exists()   # no mailbox on the degraded path
+
+
+def test_exec_verify_exit_refs_stamps_the_verdict_from_one_typed_read(rig):
+    # fixture children of #40: #41 and #42 (needs-owner, parent: #40); #43 belongs to #400.
+    seed_issue(rig, "i40", status="gating", type="investigate")
+    out = rig.r._execute({"act": "verify_exit_refs", "id": "i40", "num": 40,
+                          "refs": [41, 42], "reply_key": "k1"}, NOW)
+    assert out == "ok"
+    assert issue_state(rig, "i40")["exit_verify"] == {"key": "k1", "missing": []}
+    # a ref outside the child set (or another parent's child) is MISSING — it blocks the close.
+    rig.r._execute({"act": "verify_exit_refs", "id": "i40", "num": 40,
+                    "refs": [41, 43, 99], "reply_key": "k2"}, NOW)
+    assert issue_state(rig, "i40")["exit_verify"] == {"key": "k2", "missing": [43, 99]}
+
+
+def test_exec_verify_exit_refs_refused_read_stamps_nothing_and_waits(rig, monkeypatch):
+    # refused != empty: a refused child-set read must stamp NO verdict (the gate re-emits next
+    # tick — that is the wait), never read the fail-closed [] as "nothing is filed".
+    seed_issue(rig, "i40", status="gating", type="investigate")
+    monkeypatch.setenv("GH_FAIL", "1")
+    out = rig.r._execute({"act": "verify_exit_refs", "id": "i40", "num": 40,
+                          "refs": [41], "reply_key": "k1"}, NOW)
+    assert "refused" in out
+    assert issue_state(rig, "i40").get("exit_verify") is None
+
+
+def test_exec_relay_exit_reply_posts_the_durable_comment_once(rig):
+    seed_issue(rig, "i7", status="gating", type="investigate", exit_nonce="exit-9")
+    out = rig.r._execute({"act": "relay_exit_reply", "id": "i7", "num": 7,
+                          "line": "FINDINGS-FILED: #41", "nonce": "exit-9"}, NOW)
+    assert out == "ok"
+    m = [x for x in mutations(rig) if x["kind"] == "comment"][-1]
+    assert m["num"] == "7" and m["body"] == "FINDINGS-FILED: #41"
+    assert issue_state(rig, "i7")["exit_ack_relayed"] == "exit-9"
+
+
+def test_exec_relay_exit_reply_failure_stamps_nothing(rig, monkeypatch):
+    seed_issue(rig, "i7", status="gating", type="investigate", exit_nonce="exit-9")
+    monkeypatch.setenv("GH_FAIL", "1")
+    out = rig.r._execute({"act": "relay_exit_reply", "id": "i7", "num": 7,
+                          "line": "NO-FINDINGS", "nonce": "exit-9"}, NOW)
+    assert "retry" in out
+    assert issue_state(rig, "i7").get("exit_ack_relayed") is None
+
+
+def test_disk_view_scans_the_newest_consumption_receipt(rig):
+    # the mailbox's two-phase receipt (#148) is the exit interview's delivery proof: the view
+    # carries {id: newest .consumed ts}; pending mail, claimed markers, and dotfiles are not
+    # receipts.
+    mail_dir = rig.home / "state" / "mail"
+    mail_dir.mkdir(parents=True, exist_ok=True)
+    (mail_dir / "i7").write_text("pending mail")
+    (mail_dir / "i7.claimed.1750000100").write_text("in flight")
+    (mail_dir / "i7.consumed.1750000050").write_text("older receipt")
+    (mail_dir / "i7.consumed.1750000123").write_text("newest receipt")
+    (mail_dir / "i9.discarded.1750000060").write_text("blank mail")
+    (mail_dir / ".DS_Store").write_text("junk")
+    view = rig.r.disk_view(NOW)
+    assert view["exit_receipts"] == {"i7": 1750000123}
+
+
+def test_reapprove_resets_the_exit_interview_episode(rig):
+    seed_issue(rig, "i7", status="parked", type="investigate", branch="sl/i7-x",
+               exit_asks=2, exit_asked_at=NOW - 50, exit_asked_key="c1",
+               exit_nonce="exit-9", exit_verify={"key": "c1", "missing": [99]},
+               exit_ack_relayed="exit-9")
+    rig.r._execute({"act": "reapprove", "id": "i7", "num": 7}, NOW)
+    st = issue_state(rig, "i7")
+    assert st["exit_asks"] == 0
+    for f in ("exit_asked_at", "exit_asked_key", "exit_nonce", "exit_verify",
+              "exit_ack_relayed"):
+        assert st[f] is None, f
+
+
+def test_reapprove_clears_stale_interview_mail_and_ack_but_keeps_receipts(rig):
+    # P1 (fresh review, 2026-07-16): the ghosted-interview park leaves state/mail/<iid> ARMED —
+    # the honest evidence for episode 1. But mail carries no episode fence (unlike the ack's
+    # nonce), so a reapproved episode's fresh session would consume the STALE interview at its
+    # very first rest and could post NO-FINDINGS before re-investigating anything — and with the
+    # episode-1 marker still on the thread, the re-run would close without EVER getting its own
+    # interview: the exact #215 incident, one episode removed. Reapprove must clear pending mail
+    # (and the stale ack, cheap symmetry) while receipts — the history of what WAS delivered —
+    # stay, mirroring launch-session.sh's own rule.
+    seed_issue(rig, "i7", status="parked", type="investigate", branch="sl/i7-x",
+               exit_asks=2, exit_nonce="exit-9")
+    mail_dir = rig.home / "state" / "mail"
+    mail_dir.mkdir(parents=True, exist_ok=True)
+    (mail_dir / "i7").write_text("[superlooper exit interview] Issue #7 …")
+    (mail_dir / "i7.consumed.1749000000").write_text("an old receipt")
+    (rig.home / "state" / "ack").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "ack" / "i7").write_text("NO-FINDINGS exit-9")
+    rig.r._execute({"act": "reapprove", "id": "i7", "num": 7}, NOW)
+    assert not (mail_dir / "i7").exists(), "stale pending mail must not poison the next episode"
+    assert (mail_dir / "i7.consumed.1749000000").exists(), "receipts are history — kept"
+    assert not (rig.home / "state" / "ack" / "i7").exists()
+
+
 def test_freeze_unfreeze_alert_and_fix_issue_files(rig):
     rig.r._execute({"act": "freeze", "reason": "dev red", "fingerprint": "fp1"}, NOW)
     frozen = json.loads((rig.home / "state" / "merges_frozen.json").read_text())
@@ -3708,8 +3895,10 @@ def _inv_issue(num, comments):
 
 def test_investigation_refused_reads_hold_then_recover_and_close(rig):
     # DoD: comment reads refused across N ticks -> gate HOLDS (zero parks, zero notifies), ONE
-    # bounded refusal record in the journal; reads recover -> the parent closes cleanly.
-    marker = [{"body": "<!-- superlooper-investigation -->\nRoot cause: tenant id omitted."}]
+    # bounded refusal record in the journal; reads recover -> the parent closes cleanly (the
+    # thread already carries the marker AND an accounted NO-FINDINGS exit reply — #215).
+    marker = [{"body": "<!-- superlooper-investigation -->\nRoot cause: tenant id omitted."},
+              {"body": "NO-FINDINGS"}]
     _stateful(rig, {"7": _inv_issue(7, marker)})
     seed_issue(rig, "i7", status="gating", type="investigate", branch="sl/i7-cache", num=7)
     (rig.home / "reports" / "i7.md").write_text("## Tests\n" + "x" * 60)
@@ -3733,6 +3922,58 @@ def test_investigation_refused_reads_hold_then_recover_and_close(rig):
     rig.r.tick(now=NOW + (N + 2) * 100)
     assert [m for m in mutations(rig) if m["kind"] == "close_issue" and m["num"] == "7"]
     assert issue_state(rig, "i7")["status"] == "merged"
+
+
+def test_full_exit_interview_roundtrip_no_findings(rig):
+    # The whole #215 flow through REAL ticks: finish with the marker -> the interview is
+    # delivered (mail armed, ask stamped, wake ping typed), NOT a close; the worker consumes the
+    # mail (receipt) and replies NO-FINDINGS; the next poll sees the reply and closes, restating
+    # the accounted claim in the close comment.
+    marker = [{"body": "<!-- superlooper-investigation -->\nRoot cause: X."}]
+    _stateful(rig, {"7": _inv_issue(7, marker)})
+    seed_issue(rig, "i7", status="gating", type="investigate", branch="sl/i7-x", num=7)
+    (rig.home / "reports" / "i7.md").write_text("## Tests\n" + "x" * 60)
+    (rig.home / "state" / "panes" / "i7").write_text("surf-7")
+
+    rig.r.tick(now=NOW)
+    assert (rig.home / "state" / "mail" / "i7").exists()               # the ask rode the mailbox
+    assert issue_state(rig, "i7")["exit_asks"] == 1
+    assert [m for m in mutations(rig) if m["kind"] == "close_issue"] == []   # never marker-only
+
+    mail_dir = rig.home / "state" / "mail"                             # the worker's hook consumes
+    (mail_dir / "i7").rename(mail_dir / ("i7.consumed.%d" % (int(NOW) + 30)))
+    state = json.loads((rig.fixdir / "state.json").read_text())        # ...and the worker replies
+    state["issues"]["7"]["comments"].append({"body": "NO-FINDINGS"})
+    (rig.fixdir / "state.json").write_text(json.dumps(state))
+
+    rig.r.tick(now=NOW + 100)                                          # re-poll sees the reply
+    assert issue_state(rig, "i7")["status"] == "merged"
+    close = [m for m in mutations(rig) if m["kind"] == "close_issue"][-1]
+    assert "NO-FINDINGS" in close["comment"]
+
+
+def test_full_exit_interview_roundtrip_findings_verified(rig):
+    # The FINDINGS flow through real ticks: the reply's refs are verified against the parent's
+    # REAL child set (one typed read), then the close carries the verified claim. A genuine
+    # needs-owner child accounts; the close never fires before the verdict is stamped.
+    marker = [{"body": "<!-- superlooper-investigation -->\nRoot cause: X."},
+              {"body": "FINDINGS-FILED: #41"}]
+    child_body = "## Goal\nFollow-up.\n\n## Loop metadata\nparent: #40\n"
+    _stateful(rig, {
+        "40": _inv_issue(40, marker),
+        "41": {"number": 41, "title": "follow-up", "state": "open",
+               "labels": ["needs-owner"], "body": child_body, "comments": []}})
+    seed_issue(rig, "i40", status="gating", type="investigate", branch="sl/i40-x", num=40)
+    (rig.home / "reports" / "i40.md").write_text("## Tests\n" + "x" * 60)
+
+    rig.r.tick(now=NOW)                                                # reply present -> verify
+    assert issue_state(rig, "i40")["exit_verify"]["missing"] == []
+    assert [m for m in mutations(rig) if m["kind"] == "close_issue"] == []
+
+    rig.r.tick(now=NOW + 100)                                          # verdict stamped -> close
+    assert issue_state(rig, "i40")["status"] == "merged"
+    close = [m for m in mutations(rig) if m["kind"] == "close_issue"][-1]
+    assert "FINDINGS-FILED: #41" in close["comment"]
 
 
 def test_answered_empty_investigation_still_nudges_then_parks(rig):
@@ -3766,7 +4007,8 @@ def test_want_set_independent_of_merged_history_no_starvation(rig):
                           "body": _INV_BODY, "comments": []}
     seed_issue(rig, "i99", status="gating", type="investigate", branch="sl/i99-x", num=99)
     (rig.home / "reports" / "i99.md").write_text("## Tests\n" + "x" * 60)
-    issues["99"] = _inv_issue(99, [{"body": "<!-- superlooper-investigation -->\ndone."}])
+    issues["99"] = _inv_issue(99, [{"body": "<!-- superlooper-investigation -->\ndone."},
+                                   {"body": "NO-FINDINGS"}])           # accounted exit reply (#215)
     _stateful(rig, issues, next_num=200)
     rig.calls.clear()
 
@@ -3797,7 +4039,8 @@ def test_starved_investigation_read_is_rescued_budget_exempt(rig):
         issues[str(n)] = _inv_issue(n, [])                 # no marker yet -> holds, never parks
     seed_issue(rig, "i99", status="gating", type="investigate", branch="sl/i99-x", num=99)
     (rig.home / "reports" / "i99.md").write_text("## Tests\n" + "x" * 60)
-    issues["99"] = _inv_issue(99, [{"body": "<!-- superlooper-investigation -->\ndone."}])
+    issues["99"] = _inv_issue(99, [{"body": "<!-- superlooper-investigation -->\ndone."},
+                                   {"body": "NO-FINDINGS"}])           # accounted exit reply (#215)
     _stateful(rig, issues, next_num=200)
 
     import runner as _r

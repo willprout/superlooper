@@ -783,16 +783,20 @@ def test_gate_preserve_label_resolves_in_branch():               # step 6c
     assert d2["action"] == "resolve_conflict"
 
 
-def test_gate_investigate_marker_closes_parent():                # investigate branch (C1)
+def test_gate_investigate_marker_alone_no_longer_closes():       # issue #215
+    # The motivating incident: ~45 actionable items died inside report bodies while the gate
+    # closed green on the marker alone. The marker now opens the EXIT INTERVIEW, never the close.
     d = _decide(issue=_issue(type="investigate", investigation_done=True), pr={})
-    assert d["action"] == "close_investigate"
+    assert d["action"] == "exit_interview"
 
 
 def test_gate_investigate_close_ignores_freeze_and_pr():
     # freeze only stops MERGES; closing an investigation parent is not a merge. Zero children
-    # and zero PRs are legal ("nothing to do" is a valid root cause).
-    d = _decide(issue=_issue(type="investigate", investigation_done=True), pr=None, frozen=True)
-    assert d["action"] == "close_investigate"
+    # and zero PRs are legal — but only through an explicit NO-FINDINGS reply (#215).
+    d = _decide(issue=_issue(type="investigate", investigation_done=True,
+                             exit_reply={"kind": "no_findings", "key": "c1"}),
+                pr=None, frozen=True)
+    assert d["action"] == "close_investigate" and d["exit"] == "NO-FINDINGS"
 
 
 def test_gate_investigate_missing_marker_nudge_once_then_park():
@@ -800,6 +804,263 @@ def test_gate_investigate_missing_marker_nudge_once_then_park():
     assert d["action"] == "nudge" and d["nudge_key"] == "investigation"
     d2 = _decide(issue=_issue(type="investigate", nudged=["investigation"]), pr={})
     assert d2["action"] == "park"
+
+
+# --------------------------- the exit interview (issue #215) ---------------------------
+# An investigation closes only through an end-of-run exit interview: findings filed as
+# needs-owner children and verified, or an explicit NO-FINDINGS. The gate parses ONE strict
+# line; the judgment lives in the worker at its freshest turn.
+
+def test_exit_reply_no_findings_exact_line():
+    r = gate.exit_interview_reply([{"body": "  NO-FINDINGS  \n"}])
+    assert r["kind"] == "no_findings"
+
+
+def test_exit_reply_findings_refs_parse():
+    r = gate.exit_interview_reply([{"body": "FINDINGS-FILED: #12 #34"}])
+    assert r["kind"] == "findings" and r["refs"] == [12, 34]
+
+
+def test_exit_reply_single_ref():
+    r = gate.exit_interview_reply([{"body": "FINDINGS-FILED: #7"}])
+    assert r["kind"] == "findings" and r["refs"] == [7]
+
+
+def test_exit_reply_newest_wins():
+    # newest reply wins if several exist — comments arrive in thread (chronological) order.
+    r = gate.exit_interview_reply([
+        {"body": "FINDINGS-FILED: garbage"},          # malformed, superseded
+        {"body": "chatter in between"},
+        {"body": "NO-FINDINGS"}])
+    assert r["kind"] == "no_findings"
+    r2 = gate.exit_interview_reply([
+        {"body": "NO-FINDINGS"},
+        {"body": "FINDINGS-FILED: #3"}])              # the later correction wins
+    assert r2["kind"] == "findings" and r2["refs"] == [3]
+
+
+def test_exit_reply_keys_are_distinct_per_comment():
+    # the reply's key identifies WHICH comment answered, so a verification verdict pinned to an
+    # old reply can never vouch for a newer one.
+    a = gate.exit_interview_reply([{"body": "FINDINGS-FILED: #3"}])
+    b = gate.exit_interview_reply([{"body": "chatter"}, {"body": "FINDINGS-FILED: #3"}])
+    c = gate.exit_interview_reply([{"body": "FINDINGS-FILED: #3",
+                                    "createdAt": "2026-07-16T10:00:00Z"}])
+    assert a["key"] != b["key"]                       # positional keys differ
+    assert c["key"] == "2026-07-16T10:00:00Z"         # createdAt when no id rides along
+    # the comment id outranks createdAt (fresh review P2-1): two replies inside one second share
+    # a createdAt, and a verdict for the first must never vouch for the second.
+    d = gate.exit_interview_reply([{"body": "FINDINGS-FILED: #3", "id": "IC_abc",
+                                    "createdAt": "2026-07-16T10:00:00Z"}])
+    assert d["key"] == "IC_abc"
+
+
+def test_exit_reply_non_reply_comments_are_not_replies():
+    assert gate.exit_interview_reply([
+        {"body": "<!-- superlooper-investigation -->\nRoot cause: X"},
+        {"body": "No findings here, really"},          # prose, not the exact token
+        {"body": "the FINDINGS-FILED: #3 form is documented above"}]) is None  # mid-text quote
+
+
+def test_exit_reply_malformed_shapes():
+    for body in ("FINDINGS-FILED:",                    # zero refs: must be the explicit sentinel
+                 "FINDINGS-FILED: 12",                 # bare number, not a #ref
+                 "FINDINGS-FILED: #12 and #13",        # prose inside the ref list
+                 "FINDINGS-FILED: #12\nsee above",     # not one line
+                 "NO-FINDINGS but see the report"):    # trailing prose
+        r = gate.exit_interview_reply([{"body": body}])
+        assert r is not None and r["kind"] == "malformed", body
+
+
+def test_exit_reply_wrong_typed_inputs_fail_closed():
+    for junk in (None, "x", 7, [3], [{}], [{"body": 3}], [{"nobody": "here"}]):
+        assert gate.exit_interview_reply(junk) is None
+
+
+def test_exit_ack_line_extracts_reply_and_strips_nonce():
+    assert gate.exit_ack_line("NO-FINDINGS exit-99", "exit-99") == "NO-FINDINGS"
+    assert gate.exit_ack_line("ok here goes\nFINDINGS-FILED: #12 #13 exit-99\nthanks",
+                              "exit-99") == "FINDINGS-FILED: #12 #13"
+    # the LAST matching line wins — a worker appending a correction to its own ack is believed,
+    # mirroring the reply comments' newest-wins rule (fresh review P2-5).
+    assert gate.exit_ack_line("NO-FINDINGS exit-99\nFINDINGS-FILED: #3 exit-99",
+                              "exit-99") == "FINDINGS-FILED: #3"
+
+
+def test_exit_ack_line_requires_the_nonce_and_a_reply_prefix():
+    # a stale ack answering a PREVIOUS ask (or the #157 progress-probe ladder) must never be
+    # read as answering this one — same nonce fence as events.parse_ack.
+    assert gate.exit_ack_line("NO-FINDINGS exit-1", "exit-2") is None
+    assert gate.exit_ack_line("WORKING exit-2", "exit-2") is None       # a probe ack, not a reply
+    assert gate.exit_ack_line("exit-2 all done!", "exit-2") is None     # no reply prefix
+    for junk in (None, 7, [], {}):
+        assert gate.exit_ack_line(junk, "exit-2") is None
+        assert gate.exit_ack_line("NO-FINDINGS exit-2", junk) is None
+
+
+def test_accounted_child_nums():
+    kids = [
+        {"number": 11, "state": "OPEN", "labels": [{"name": "needs-owner"}]},   # awaiting owner
+        {"number": 12, "state": "OPEN", "labels": ["agent-ready"]},             # released
+        {"number": 13, "state": "OPEN", "labels": [{"name": "in-progress"}]},   # claimed
+        {"number": 14, "state": "CLOSED", "labels": []},                        # already handled
+        {"number": 15, "state": "OPEN", "labels": []},                          # invisible: NOT ok
+        {"number": "x", "state": "OPEN", "labels": [{"name": "needs-owner"}]},  # wrong-typed num
+        "junk", None,
+    ]
+    assert gate.accounted_child_nums(kids) == {11, 12, 13, 14}
+    assert gate.accounted_child_nums("junk") == set()
+
+
+def _inv(**over):
+    base = {"type": "investigate", "investigation_done": True, "nudged": [],
+            "exit_reply": None, "exit_asks": 0, "exit_asked_key": None, "exit_verify": None,
+            "exit_ask_expired": False, "exit_delivered": False, "exit_relay_pending": False}
+    base.update(over)
+    return _issue(**base)
+
+
+def test_exit_no_reply_first_pass_asks_the_interview():
+    d = _decide(issue=_inv(), pr={})
+    assert d["action"] == "exit_interview"
+
+
+def test_exit_no_reply_within_window_waits():
+    d = _decide(issue=_inv(exit_asks=1), pr={})
+    assert d["action"] == "wait"
+
+
+def test_exit_no_reply_past_window_reasks_once_then_parks():
+    d = _decide(issue=_inv(exit_asks=1, exit_ask_expired=True), pr={})
+    assert d["action"] == "exit_interview"
+    d2 = _decide(issue=_inv(exit_asks=2, exit_ask_expired=True), pr={})
+    assert d2["action"] == "park"
+
+
+def test_exit_no_reply_park_memo_names_delivery_state_honestly():
+    # delivery is judged by the consumption receipt / ack, never a send exit code — and the park
+    # memo must say which failure this was.
+    dead = _decide(issue=_inv(exit_asks=2, exit_ask_expired=True, exit_delivered=False), pr={})
+    assert dead["action"] == "park" and "never verifiably delivered" in dead["reason"]
+    ghosted = _decide(issue=_inv(exit_asks=2, exit_ask_expired=True, exit_delivered=True), pr={})
+    assert ghosted["action"] == "park" and "delivered" in ghosted["reason"] \
+        and "no usable reply" in ghosted["reason"]
+
+
+def test_exit_no_findings_closes():
+    d = _decide(issue=_inv(exit_reply={"kind": "no_findings", "key": "c9"}), pr={})
+    assert d["action"] == "close_investigate" and d["exit"] == "NO-FINDINGS"
+
+
+def test_exit_findings_without_verification_emits_the_one_typed_read():
+    d = _decide(issue=_inv(exit_reply={"kind": "findings", "refs": [12, 13], "key": "c2"}), pr={})
+    assert d["action"] == "verify_exit_refs"
+    assert d["refs"] == [12, 13] and d["reply_key"] == "c2"
+
+
+def test_exit_findings_with_verified_refs_closes():
+    d = _decide(issue=_inv(exit_reply={"kind": "findings", "refs": [12, 13], "key": "c2"},
+                           exit_verify={"key": "c2", "missing": []}), pr={})
+    assert d["action"] == "close_investigate" and d["exit"] == "FINDINGS-FILED: #12 #13"
+
+
+def test_exit_findings_with_a_missing_ref_blocks_never_closes():
+    # a ref pointing outside the parent's real needs-owner child set blocks: re-ask once
+    # (naming the refs), then park. NEVER close.
+    issue = _inv(exit_reply={"kind": "findings", "refs": [12, 99], "key": "c2"},
+                 exit_verify={"key": "c2", "missing": [99]}, exit_asks=1)
+    d = _decide(issue=issue, pr={})
+    assert d["action"] == "exit_interview" and "#99" in d["defect"]
+    issue2 = _inv(exit_reply={"kind": "findings", "refs": [12, 99], "key": "c3"},
+                  exit_verify={"key": "c3", "missing": [99]}, exit_asks=2, exit_asked_key="c2")
+    d2 = _decide(issue=issue2, pr={})
+    assert d2["action"] == "park" and "#99" in d2["reason"]
+
+
+def test_exit_stale_verification_never_vouches_for_a_newer_reply():
+    # newest reply wins — and the verify verdict is pinned to the reply it judged, so a NEW
+    # findings reply re-verifies instead of riding an old verdict (in either direction).
+    d = _decide(issue=_inv(exit_reply={"kind": "findings", "refs": [12], "key": "c5"},
+                           exit_verify={"key": "c4", "missing": []}), pr={})
+    assert d["action"] == "verify_exit_refs" and d["reply_key"] == "c5"
+
+
+def test_exit_malformed_reply_reasks_once_then_parks():
+    # the ask ladder is charged per reply: a malformed reply gets ONE re-ask naming the grammar,
+    # and a second malformed reply (a new key, the re-ask spent) parks.
+    d = _decide(issue=_inv(exit_reply={"kind": "malformed", "key": "c1"}, exit_asks=1,
+                           exit_asked_key=None), pr={})
+    assert d["action"] == "exit_interview" and d["defect"]
+    d2 = _decide(issue=_inv(exit_reply={"kind": "malformed", "key": "c2"}, exit_asks=2,
+                            exit_asked_key="c1"), pr={})
+    assert d2["action"] == "park"
+
+
+def test_exit_malformed_already_reasked_waits_for_the_window():
+    # the re-ask already addressed THIS malformed reply: give the worker the window before
+    # parking, exactly like the no-reply wait.
+    d = _decide(issue=_inv(exit_reply={"kind": "malformed", "key": "c1"}, exit_asks=2,
+                           exit_asked_key="c1"), pr={})
+    assert d["action"] == "wait"
+    d2 = _decide(issue=_inv(exit_reply={"kind": "malformed", "key": "c1"}, exit_asks=2,
+                            exit_asked_key="c1", exit_ask_expired=True), pr={})
+    assert d2["action"] == "park"
+    # ...and the memo says a reply EXISTS but is unusable — never "nobody answered" when
+    # somebody did (fresh review P2-3: honesty of the hand-back).
+    assert "unusable" in d2["reason"] and "never verifiably delivered" not in d2["reason"]
+
+
+def test_exit_findings_refs_are_deduped_and_sorted():
+    # `FINDINGS-FILED: #13 #12 #12` is one two-ref claim; the verify read and the close comment
+    # both see the canonical form.
+    d = _decide(issue=_inv(exit_reply={"kind": "findings", "refs": [13, 12, 12], "key": "c2"}),
+                pr={})
+    assert d["action"] == "verify_exit_refs" and d["refs"] == [12, 13]
+    d2 = _decide(issue=_inv(exit_reply={"kind": "findings", "refs": [13, 12, 12], "key": "c2"},
+                            exit_verify={"key": "c2", "missing": []}), pr={})
+    assert d2["exit"] == "FINDINGS-FILED: #12 #13"
+
+
+def test_exit_relay_pending_waits():
+    # the worker's ack is in hand but its durable reply comment has not landed yet: WAIT — the
+    # ladder must not re-ask or park while the runner itself holds the answer.
+    d = _decide(issue=_inv(exit_asks=1, exit_ask_expired=True, exit_relay_pending=True), pr={})
+    assert d["action"] == "wait"
+
+
+def test_exit_corrupt_inputs_fail_closed():
+    # wrong-typed ask counter: park (an unbounded ask loop is never safe), like every capped
+    # counter. Wrong-typed verify record: park, never close. Wrong-typed reply object: the
+    # bounded ask ladder, never close.
+    d = _decide(issue=_inv(exit_asks="lots"), pr={})
+    assert d["action"] == "park" and "unreadable" in d["reason"]
+    d2 = _decide(issue=_inv(exit_reply={"kind": "findings", "refs": [12], "key": "c2"},
+                            exit_verify={"key": "c2", "missing": "junk"}), pr={})
+    assert d2["action"] == "park"
+    d3 = _decide(issue=_inv(exit_reply="junk"), pr={})
+    assert d3["action"] == "exit_interview"
+    d4 = _decide(issue=_inv(exit_reply={"kind": "findings", "refs": "junk", "key": "c2"}),
+                 pr={})
+    assert d4["action"] == "exit_interview" and d4["defect"]   # unreadable refs: a re-ask, never a read
+
+
+def test_exit_interview_verdict_shared_helper():
+    # the reconcile path (a PARKED investigation) reuses the same verdict: close / verify /
+    # blocked — never a close without an accounted reply.
+    assert gate.exit_interview_verdict({"kind": "no_findings", "key": "k"}, None) \
+        == ("close", "NO-FINDINGS")
+    assert gate.exit_interview_verdict({"kind": "findings", "refs": [3], "key": "k"}, None) \
+        == ("verify", [3])
+    st, detail = gate.exit_interview_verdict(
+        {"kind": "findings", "refs": [3], "key": "k"}, {"key": "k", "missing": []})
+    assert (st, detail) == ("close", "FINDINGS-FILED: #3")
+    st2, _ = gate.exit_interview_verdict(
+        {"kind": "findings", "refs": [3], "key": "k"}, {"key": "k", "missing": [3]})
+    assert st2 == "ask"
+    assert gate.exit_interview_verdict(None, None)[0] == "ask"
+    assert gate.exit_interview_verdict({"kind": "malformed", "key": "k"}, None)[0] == "ask"
+    assert gate.exit_interview_verdict(
+        {"kind": "findings", "refs": [3], "key": "k"}, {"key": "k", "missing": 7})[0] == "park"
 
 
 def test_gate_already_merged_pr_is_a_noop_wait():

@@ -208,8 +208,175 @@ def review_evidence_ok(config, pr_comments, head_oid=None, review_carry=None):
 def investigation_done(issue_comments):
     """Cross-review C1: an investigation is complete iff its root-cause report exists as an
     issue comment beginning INVESTIGATION_MARKER. Zero child issues is legal — 'nothing to do'
-    is a valid root cause — so the marker, not the children, is the completion signal."""
+    is a valid root cause — so the marker, not the children, is the completion signal. Since
+    issue #215 the marker opens the EXIT INTERVIEW rather than the close: completion and
+    findings-accounting are separate facts."""
     return _any_comment_begins(issue_comments, INVESTIGATION_MARKER)
+
+
+# --------------------------- the exit interview (issue #215) ---------------------------
+# ~45 actionable items once died inside investigation report bodies while the gate closed green:
+# investigation_done checks only that a marker comment EXISTS, never that its findings went
+# anywhere. The fix is an end-of-run exit interview, not a report format — a format taught at
+# brief time asks a model to remember protocol across a long, context-heavy run (the
+# instruction-drift failure mode this system keeps re-learning), so the runner ASKS at the moment
+# of finish, the freshest turn, and the gate parses ONE strict line. The reply is a durable issue
+# comment, so the claim is timestamped and owner-auditable; the honest limit stands — this
+# guarantees findings are ACCOUNTED FOR, not correctly triaged.
+EXIT_NO_FINDINGS = "NO-FINDINGS"
+EXIT_FINDINGS_PREFIX = "FINDINGS-FILED:"
+# The interview plus ONE re-ask, then park — the same one-remedy-then-hand-back discipline as the
+# nudge ledger. Re-approval resets it (the reapprove executor zeroes exit_asks).
+EXIT_ASK_CAP = 2
+
+_EXIT_REF_RE = re.compile(r"#(\d+)$")
+
+
+def _exit_parse_line(line):
+    """One stripped reply line -> a (kind, refs) pair, or None when it is not reply-shaped at
+    all. Prefix-shaped but unparseable text is 'malformed' — a named, re-askable defect — never
+    silently ignored (that would route a worker's honest-but-typo'd answer to the no-reply park,
+    whose memo would then lie about what happened)."""
+    if line == EXIT_NO_FINDINGS:
+        return ("no_findings", [])
+    if line.startswith(EXIT_FINDINGS_PREFIX):
+        refs = []
+        for tok in line[len(EXIT_FINDINGS_PREFIX):].split():
+            m = _EXIT_REF_RE.fullmatch(tok)
+            if not m:
+                return ("malformed", [])
+            refs.append(int(m.group(1)))
+        return ("findings", refs) if refs else ("malformed", [])
+    if line.startswith(EXIT_NO_FINDINGS):
+        return ("malformed", [])            # "NO-FINDINGS but…": reply intent, broken grammar
+    return None
+
+
+def exit_interview_reply(comments):
+    """The NEWEST exit-interview reply in an issue's comment thread, parsed — or None when no
+    comment is a reply at all. A reply is a comment whose body, stripped, is exactly one line
+    beginning `FINDINGS-FILED:` or `NO-FINDINGS` (mid-text quotes are not replies, same contract
+    as every marker). Returns {"kind": "no_findings"|"findings"|"malformed", "refs": [ints],
+    "key": str} — `key` identifies WHICH comment answered, so a verification verdict is pinned
+    to the reply it judged and can never vouch for a newer one. The comment's `id` is preferred
+    (globally unique — two replies posted within one second share a createdAt, and a verdict for
+    the first must never vouch for the second; fresh review P2-1), then createdAt, then the
+    thread position. Newest wins: comments arrive in thread (chronological) order, so the LAST
+    reply-shaped comment is the answer — a worker that corrects itself is believed.
+    Wrong-typed comment lists/entries contribute nothing (fail closed, never a raise)."""
+    out = None
+    for i, c in enumerate(comments if isinstance(comments, list) else []):
+        body = c.get("body") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+        if not isinstance(body, str):
+            continue
+        stripped = body.strip()
+        line = stripped if "\n" not in stripped else None
+        parsed = _exit_parse_line(line) if line is not None else None
+        if parsed is None and line is None:
+            # a multi-line body that BEGINS with a reply prefix is a malformed reply ("exactly
+            # one line" is the grammar), not chatter — same intent rule as _exit_parse_line.
+            first = stripped.splitlines()[0].strip() if stripped else ""
+            if first.startswith(EXIT_FINDINGS_PREFIX) or first.startswith(EXIT_NO_FINDINGS):
+                parsed = ("malformed", [])
+        if parsed is None:
+            continue
+        key = None
+        if isinstance(c, dict):
+            for field in ("id", "createdAt"):
+                v = c.get(field)
+                if isinstance(v, str) and v:
+                    key = v
+                    break
+        out = {"kind": parsed[0], "refs": parsed[1], "key": key or "idx-%d" % i}
+    return out
+
+
+def exit_ack_line(text, nonce):
+    """The degraded (Codex) path's reply: extract the one-line reply from an ack FILE that
+    carries `nonce`, nonce stripped, ready to post verbatim as the durable reply comment. The
+    nonce fence is load-bearing (same rule as events.parse_ack): a stale ack answering a
+    previous ask — or the #157 progress-probe ladder, which shares the ack file — must never be
+    read as answering this one. The LAST matching line wins, mirroring the reply comments'
+    newest-wins rule — a worker that appends a correction to its own ack is believed. Returns
+    None when the nonce is absent, no line both carries the nonce and begins with a reply
+    prefix, or any input is wrong-typed (fail closed: no relay, and the bounded ask ladder owns
+    what happens next)."""
+    if not isinstance(text, str) or not isinstance(nonce, str) or not nonce or nonce not in text:
+        return None
+    out = None
+    for raw in text.splitlines():
+        line = " ".join(t for t in raw.split() if t != nonce)
+        if nonce in raw and (line.startswith(EXIT_FINDINGS_PREFIX)
+                             or line.startswith(EXIT_NO_FINDINGS)):
+            out = line
+    return out
+
+
+def accounted_child_nums(children):
+    """The child-issue numbers that ACCOUNT for a finding (issue #215), from a
+    gh.child_issues_health read (already filtered to genuine `parent: #N` children). A finding is
+    accounted when the owner can see it — `needs-owner` — or has already acted on it under an
+    existing convention: released to the queue (`agent-ready`, the approval word), claimed
+    (`in-progress`), or CLOSED. An open child with none of those is invisible to the owner: it
+    does NOT account, so a ref to it blocks the close. Wrong-typed entries contribute nothing."""
+    out = set()
+    for c in children if isinstance(children, list) else []:
+        if not isinstance(c, dict) or type(c.get("number")) is not int:
+            continue
+        labels = _pr_labels(c)      # same dict-or-string labels fold gh uses everywhere
+        state = c.get("state")
+        if (labels & {"needs-owner", "agent-ready", "in-progress"}) \
+                or (isinstance(state, str) and state.upper() == "CLOSED"):
+            out.add(c["number"])
+    return out
+
+
+def exit_interview_verdict(reply, verify):
+    """The close verdict over a parsed reply + the runner's verification record, shared by the
+    live gate and the parked-investigation reconcile (#21) so neither can drift into closing
+    unaccounted. Returns (state, detail):
+
+      ("close",  claim)   — an accounted reply: the one-line claim for the close comment.
+      ("verify", refs)    — a findings reply not yet verified: the refs for the ONE typed
+                            child_issues_health read (verify is absent or pinned to an OLDER
+                            reply — a verdict never vouches for a reply it did not judge).
+      ("park",   reason)  — the verification record itself is unreadable: fail closed to the
+                            owner, never close on a corrupt verdict.
+      ("ask",    defect)  — the interview (or a re-ask) is owed: no reply yet (defect None), a
+                            malformed reply, or refs the child set does not account for (defect
+                            names them). The caller owns the bounded ask ladder.
+    """
+    r = reply if isinstance(reply, dict) else None
+    kind = r.get("kind") if r else None
+    if kind == "no_findings":
+        return ("close", EXIT_NO_FINDINGS)
+    if kind == "findings":
+        refs = r.get("refs")
+        # dedup + sort: `FINDINGS-FILED: #12 #12` is one claim, and the close comment should
+        # read canonically whatever order the worker typed
+        refs = sorted({x for x in refs if type(x) is int}) if isinstance(refs, list) else []
+        if not refs:
+            return ("ask", "the FINDINGS-FILED reply carries no readable `#N` refs — reply "
+                           "with exactly one line: `FINDINGS-FILED: #N [#N …]` or "
+                           "`NO-FINDINGS`")
+        v = verify if isinstance(verify, dict) else None
+        if v is None or v.get("key") != r.get("key"):
+            return ("verify", refs)
+        missing = v.get("missing")
+        if not isinstance(missing, list) or any(type(m) is not int for m in missing):
+            return ("park", "the exit-interview verification record is unreadable — parking, "
+                            "never closing unaccounted")
+        if not missing:
+            return ("close", EXIT_FINDINGS_PREFIX + " "
+                    + " ".join("#%d" % x for x in refs))
+        return ("ask", "the reply lists " + ", ".join("#%d" % m for m in missing)
+                + " which the parent's child set does not account for (a genuine child must "
+                  "carry `parent: #N` in its Loop metadata and the `needs-owner` label, unless "
+                  "already released) — file them properly, then reply again")
+    if kind == "malformed":
+        return ("ask", "the reply does not parse — it must be exactly one line: "
+                       "`FINDINGS-FILED: #N [#N …]` or `NO-FINDINGS`")
+    return ("ask", None)
 
 
 def _clean_areas(v):
@@ -474,14 +641,81 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
         return {"action": "nudge", "nudge_key": key, "reason": f"{defect} — nudging once"}
 
     # ---- investigate-type: the marker-comment contract, no PR, no merge (C1). Checked before
-    # every merge-mechanics step — freeze never blocks closing a finished investigation. ----
+    # every merge-mechanics step — freeze never blocks closing a finished investigation. Since
+    # issue #215 the marker alone no longer closes: the close runs through the EXIT INTERVIEW —
+    # findings filed as needs-owner children and verified, or an explicit NO-FINDINGS. The extra
+    # view fields (exit_reply parsed from the same comments read, exit_verify the runner's one
+    # child-set verdict, the clock-derived exit_ask_expired / exit_delivered booleans) are
+    # assembled by decide; this stays a clockless pure function. ----
     if ist.get("type") == "investigate":
-        if ist.get("investigation_done") is True:
-            return {"action": "close_investigate",
-                    "reason": "investigation marker comment present — close the parent"}
-        return nudge_or_park(
-            "investigation",
-            "report exists but no issue comment begins the investigation marker")
+        if ist.get("investigation_done") is not True:
+            return nudge_or_park(
+                "investigation",
+                "report exists but no issue comment begins the investigation marker")
+        reply = ist.get("exit_reply") if isinstance(ist.get("exit_reply"), dict) else None
+        state, detail = exit_interview_verdict(reply, ist.get("exit_verify"))
+        if state == "close":
+            return {"action": "close_investigate", "exit": detail,
+                    "reason": "investigation marker present and the exit interview is "
+                              f"accounted ({detail}) — close the parent"}
+        if state == "verify":
+            return {"action": "verify_exit_refs", "refs": detail,
+                    "reply_key": reply.get("key"),
+                    "reason": "exit reply claims filed findings — verifying each ref against "
+                              "the parent's real child set (one typed read; refused waits)"}
+        if state == "park":
+            return {"action": "park", "reason": detail}
+        # state == "ask": the interview (or a re-ask) is owed. Bounded exactly like every other
+        # remedy ladder: the interview plus ONE re-ask, then park — never close unaccounted.
+        if ist.get("exit_relay_pending") is True:
+            # the runner itself holds the worker's ack and is still posting the durable reply
+            # comment — re-asking or parking now would contradict an answer already in hand.
+            return {"action": "wait",
+                    "reason": "worker's exit ack is being posted as the durable reply "
+                              "comment — waiting for it to land"}
+        asks = ist.get("exit_asks")
+        asks = 0 if asks is None else asks
+        if type(asks) is not int or asks < 0:
+            return {"action": "park",
+                    "reason": "exit-interview ask counter unreadable — parking, never "
+                              "closing unaccounted"}
+        key = reply.get("key") if reply else None
+        if asks == 0:
+            return {"action": "exit_interview", "reply_key": key, "defect": detail,
+                    "reason": "investigation finished — delivering the exit interview "
+                              "(findings must be accounted before the close)"}
+        if detail is not None and key != ist.get("exit_asked_key"):
+            # a defective reply the last ask has not yet addressed: re-ask about IT (charged
+            # per reply — "malformed after one re-ask parks"), don't wait out the window.
+            if asks < EXIT_ASK_CAP:
+                return {"action": "exit_interview", "reply_key": key, "defect": detail,
+                        "reason": f"{detail} — re-asking once"}
+            return {"action": "park",
+                    "reason": f"{detail} — and the exit-interview re-ask is spent; parking, "
+                              "never closing unaccounted"}
+        if ist.get("exit_ask_expired") is True:
+            if asks < EXIT_ASK_CAP:
+                return {"action": "exit_interview", "reply_key": key, "defect": detail,
+                        "reason": "no usable exit-interview reply within the window — "
+                                  "re-asking once"}
+            if detail is not None:
+                # a reply EXISTS but never became usable — the memo must say that, not claim
+                # nobody answered (fresh review P2-3: honesty of the hand-back)
+                return {"action": "park",
+                        "reason": f"exit interview unresolved after {EXIT_ASK_CAP} asks — the "
+                                  f"newest reply is unusable ({detail}) and no correction "
+                                  "arrived within the window; parking, never closing "
+                                  "unaccounted"}
+            how = ("the interview was delivered (consumption receipt/ack recorded) but no "
+                   "usable reply was posted"
+                   if ist.get("exit_delivered") is True else
+                   "the interview was never verifiably delivered (no consumption receipt/"
+                   "ack) — the session is likely dead")
+            return {"action": "park",
+                    "reason": f"exit interview unanswered after {EXIT_ASK_CAP} asks — {how}; "
+                              "parking, never closing unaccounted"}
+        return {"action": "wait",
+                "reason": "exit interview delivered — awaiting the one-line reply comment"}
 
     # ---- build / diagnose-and-fix ----
     # step 1: a PR must exist for the issue branch (identity = the branch lookup itself).

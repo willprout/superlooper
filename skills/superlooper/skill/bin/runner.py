@@ -111,6 +111,15 @@ LAUNCH_TIMEOUT = 120           # launch-session.sh verifies delivery within ~30s
 # memo can name the branch instead of the launch shim. Must match launch-session.sh's `exit 3`.
 LAUNCH_BASE_MISSING_RC = 3
 NUDGE_TIMEOUT = 60
+# The exit interview's wake ping (issue #215). On Claude the interview PAYLOAD rides the mailbox
+# (verified, zero-keystroke — #148), but a finished worker is RESTING and the Stop hook fires only
+# at a turn end, so armed mail would sit unread forever. This ping is the sanctioned idle-wake
+# keystroke (mailbox spike, 2026-07-15): one short line that starts a turn, at whose end the hook
+# consumes the mail and blocks the stop with the interview as the continuation reason. It carries
+# NO payload on purpose — rc=0 on a send was never proof of arrival (i280); the mail and its
+# consumption receipt are the real channel.
+EXIT_WAKE_PING = ("[superlooper] end-of-run message waiting — this line only wakes your session; "
+                  "the runner's instruction arrives when this turn ends.")
 
 
 class ScriptRC(int):
@@ -1502,6 +1511,7 @@ class Runner:
             "status_clocks": self._status_clocks(),      # {id: parsed status.json} — the #157 progress clock
             "acks": self._scan_dir("state", "ack"),      # {id: raw ack text} — the worker's probe reply
             "awaiting": self._scan_dir("state", "awaiting"),   # {id: marker} — long background work flagged
+            "exit_receipts": self._exit_receipts(),      # {id: newest mail-consumption ts} (#148/#215)
             "frozen": frozen,
             "alert": alert,
             "live_lock_ids": self._live_lock_ids(),
@@ -1510,6 +1520,30 @@ class Runner:
             "local_hhmm": time.strftime("%H:%M", lt),
             "last_report_date": (_read(os.path.join(self.state, "last_morning_report")) or "").strip() or None,
         }
+
+    def _exit_receipts(self):
+        """{issue id: newest mail-consumption ts} from state/mail/<id>.consumed.<ts>[.n] — the
+        worker hook's two-phase delivery receipt (#148), and THE proof the exit interview (#215)
+        reads as 'the worker was handed this'. Pending mail, .claimed markers (in flight, never
+        proven) and .discarded ones (blank mail) are not receipts; an unparseable name simply
+        contributes nothing. INVARIANT (fresh review P2-2): the exit interview is TODAY the only
+        mailbox writer, so 'newest receipt' == 'the interview was delivered'. A second mail type
+        must fence receipts per-purpose (e.g. a purpose tag in the mail name) before reusing
+        this scan, or its consumption would silently extend the interview's reply window."""
+        d = os.path.join(self.state, "mail")
+        out = {}
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return out
+        for n in names:
+            if n.startswith("."):
+                continue                       # macOS metadata, same rule as _scan_dir
+            iid, sep, tail = n.partition(".consumed.")
+            ts = tail.split(".")[0] if sep else ""   # tolerate _free_name's .1/.2 suffixes
+            if iid and ts.isdigit():
+                out[iid] = max(out.get(iid, 0), int(ts))
+        return out
 
     def _wants_launch(self):
         """True if the last poll left any APPROVED, not-yet-in-flight issue in the queue — the only
@@ -2616,7 +2650,8 @@ class Runner:
     # here — this tuple is int counters only, zeroed with `i[k] = 0`.)
     _REAPPROVE_COUNTERS = ("launches", "retries", "conflicts", "launch_failures",
                            "answerer_failures", "answer_delivery_failures", "merge_refusals",
-                           "questions_asked")   # a fresh approval resets the 2-question cap too (#163)
+                           "questions_asked",   # a fresh approval resets the 2-question cap too (#163)
+                           "exit_asks")         # ...and the exit-interview ask ladder (#215)
 
     def _exec_reapprove(self, a, now):
         """D7-sibling operator fix: William re-approving a parked/needs-william/bounced issue (a
@@ -2645,7 +2680,13 @@ class Runner:
         if not self._teardown_session(iid, remove_worktree=True):
             return "worker still live in the worktree — deferring the fresh start (retries next tick)"
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
-        for sub in ("blocked", "exited", "awaiting", "started"):
+        # `mail` and `ack` join this list for the #215 exit interview (fresh review P1): a park
+        # can leave the interview MAIL armed, and mail carries no episode fence — a reapproved
+        # episode's fresh session would consume the stale ask at its first rest and could post
+        # NO-FINDINGS before re-investigating anything, closing the re-run without its own
+        # interview. Pending mail only: the .consumed/.claimed/.discarded receipts are the
+        # history of what was actually delivered and stay (launch-session.sh's own rule).
+        for sub in ("blocked", "exited", "awaiting", "started", "mail", "ack"):
             _rm(os.path.join(self.state, sub, iid))
         # 2. durable state: zero the attempt counters and clear the stale run/gate fields that
         #    would otherwise re-park, plus any active answerer record (a fresh approval is a fresh
@@ -2668,7 +2709,10 @@ class Runner:
                       "park_comment_posted": False,    # ...and its own park (if any) texts again (#61)
                       "pending_question": None, "qa_log": [],   # a clean-slate rebuild drops the
                       "question_posted": False,        # prior Q&A trail, its post time, and the
-                      "question_posted_at": None})     # post-once stamp (#163)
+                      "question_posted_at": None,      # post-once stamp (#163)
+                      "exit_asked_at": None, "exit_asked_key": None,   # a fresh episode gets a
+                      "exit_nonce": None, "exit_verify": None,         # fresh exit interview,
+                      "exit_ack_relayed": None})       # paired with exit_asks=0 above (#215)
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()
@@ -3224,13 +3268,138 @@ class Runner:
 
     def _exec_close_investigate(self, a, now):
         iid, num = a["id"], a.get("num")
-        if not gh.close_issue(num, comment="Investigation complete — the root-cause report is "
-                                           "the marker comment above; child issues (if any) "
-                                           f"carry `parent: #{num}` and await {self._operator()}'s "
-                                           "approval."):
+        claim = a.get("exit")
+        claim = claim.strip() if isinstance(claim, str) and claim.strip() else None
+        text = ("Investigation complete — the root-cause report is the marker comment above; "
+                f"child issues (if any) carry `parent: #{num}` and await {self._operator()}'s "
+                "approval.")
+        if claim:
+            # the exit interview's accounted claim (#215), restated at the close so the audit
+            # trail is one comment, not a thread-dig
+            text += f" Exit interview: `{claim}`."
+        if not gh.close_issue(num, comment=text):
             return "close failed (will retry next tick)"
         gh.set_labels(num, remove=["in-progress"])
         self._update_issue(iid, {"status": "merged"})  # terminal-good (loopstate has no 'closed')
+        return "ok"
+
+    # --------------- the exit interview (issue #215) ---------------
+
+    def _exit_interview_text(self, num, defect=None, ack_path=None, nonce=None):
+        """The exit-interview ask, rendered for either channel. The grammar strings are gate.py's
+        own constants — the form the worker is taught cannot drift from the form the gate parses
+        (the #154 rule). ack_path+nonce -> the degraded (Codex) rendering, where the reply comes
+        back through the nonce-fenced ack file; otherwise the Claude mailbox rendering, where the
+        worker posts the reply comment itself."""
+        why = f"Your previous answer did not settle it: {defect}.\n\n" if defect else ""
+        file_kids = ("file EACH ONE as its own child issue NOW — labeled `needs-owner`, "
+                     f"carrying `parent: #{num}` in its `## Loop metadata` section")
+        if ack_path:
+            return (f"[superlooper] EXIT INTERVIEW (nonce {nonce}). Issue #{num} (an "
+                    f"investigation) closes only after its findings are accounted for. {why}"
+                    f"If your report surfaced findings that need follow-up work, {file_kids}. "
+                    f"Then reply by WRITING the file {ack_path} containing a single line: "
+                    f"`{gate.EXIT_FINDINGS_PREFIX} #a #b {nonce}` (the child issue numbers you "
+                    f"filed) or `{gate.EXIT_NO_FINDINGS} {nonce}` (nothing needs follow-up). "
+                    "THIS MESSAGE IS READ BY A MACHINE — a prose reply typed here is NOT read.")
+        return (f"[superlooper exit interview] Issue #{num} (an investigation) is about to "
+                f"close.\n\n{why}"
+                "Before it closes: if your report surfaced findings that need follow-up work, "
+                f"{file_kids}. Then reply by posting ONE comment on issue #{num} whose body is "
+                "exactly one line —\n\n"
+                f"    {gate.EXIT_FINDINGS_PREFIX} #a #b\n"
+                "        (the child issue numbers you filed), or\n"
+                f"    {gate.EXIT_NO_FINDINGS}\n"
+                "        (nothing needs follow-up — an explicit, auditable claim)\n\n"
+                f"e.g. `gh issue comment {num} --body '{gate.EXIT_NO_FINDINGS}'`. The runner "
+                f"verifies each ref against #{num}'s real child set and closes only after the "
+                "reply verifies. The reply is read by a MACHINE: the comment body must be that "
+                "one line and nothing else.")
+
+    def _exec_exit_interview(self, a, now):
+        """Deliver (or re-deliver) the #215 exit interview through the worker channel. The ask is
+        stamped BEFORE the send — the probe ladder's rule: a send that never lands still walks the
+        bounded ladder toward the park, never a loop. The outcome text never claims delivery: on
+        Claude the mailbox consumption receipt is the only proof (#148), on Codex the nonce-fenced
+        ack is — an rc=0 'sent' was never 'arrived' (i280)."""
+        iid, num = a["id"], a.get("num")
+        nonce = "exit-%d" % int(now)
+        defect = a.get("defect") if isinstance(a.get("defect"), str) else None
+
+        def stamp(st, i):
+            self._bump(i, "exit_asks")
+            i.update({"exit_asked_at": now, "exit_asked_key": a.get("reply_key"),
+                      "exit_nonce": nonce})
+        self._update_issue(iid, fn=stamp)
+        surface = self._surface(iid)
+        if self.agent == "codex":
+            # degraded path: Codex's Stop hook cannot block a stop, so no mailbox — the ask is
+            # TYPED and the reply comes back through the ack file (stop-hook.sh's agent split).
+            ack_path = os.path.join(self.state, "ack", iid)
+            os.makedirs(os.path.join(self.state, "ack"), exist_ok=True)
+            msg = self._exit_interview_text(num, defect=defect, ack_path=ack_path, nonce=nonce)
+            if not surface:
+                return ("no pane recorded — ask spent; the bounded ladder parks if no reply "
+                        "ever lands")
+            rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
+                                  env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
+            return (f"exit interview typed (rc={rc}) — the reply is judged by the ack file, "
+                    "never this rc")
+        # Claude: arm the mailbox (atomically — the Stop hook may claim it at any rest), then
+        # wake the resting session with the payload-free ping. A finished worker is RESTING and
+        # the hook fires only at a turn end, so without the ping the mail would sit unread; the
+        # ping is the sanctioned idle-wake keystroke (mailbox spike 2026-07-15) and carries no
+        # payload on purpose — the mail + receipt are the real channel.
+        mail_dir = os.path.join(self.state, "mail")
+        mail = os.path.join(mail_dir, iid)
+        try:
+            os.makedirs(mail_dir, exist_ok=True)
+            tmp = mail + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(self._exit_interview_text(num, defect=defect))
+            os.replace(tmp, mail)
+        except OSError as e:
+            return (f"mail write failed ({e.__class__.__name__}) — ask spent; the bounded "
+                    "ladder re-asks once, then parks")
+        if not surface:
+            return ("interview mailed; no pane recorded for a wake ping — a live session "
+                    "consumes it at its next rest; delivery pends the consumption receipt")
+        rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, EXIT_WAKE_PING],
+                              env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
+        return (f"interview mailed + wake ping (rc={rc}) — delivery is judged by the "
+                "consumption receipt, never this rc")
+
+    def _exec_verify_exit_refs(self, a, now):
+        """The ONE added GitHub read per finishing investigation (#215, owner API-burn ruling
+        2026-07-16): a typed child-set search proving each FINDINGS-FILED ref is a genuine
+        `parent: #N` child that accounts for its finding (needs-owner, or already released/
+        closed). The verdict is stamped against the reply's key so it never re-fires for the same
+        reply — and a REFUSED read stamps nothing: decide re-emits next tick, which IS the wait
+        (refused != empty, the #21/#61 discipline)."""
+        iid, num = a["id"], a.get("num")
+        refs = [r for r in a.get("refs") or [] if type(r) is int]
+        rh = gh.child_issues_health(num)
+        if not rh.ok:
+            return ("child-set read refused — no verdict stamped; waiting for a trustworthy "
+                    "read (retries next tick)")
+        accounted = gate.accounted_child_nums(rh.value)
+        missing = sorted(r for r in refs if r not in accounted)
+        self._update_issue(iid, {"exit_verify": {"key": a.get("reply_key"), "missing": missing}})
+        if missing:
+            return "refs not accounted by the child set: " + ", ".join("#%d" % m for m in missing)
+        return "ok"
+
+    def _exec_relay_exit_reply(self, a, now):
+        """Post the degraded path's ack as the durable one-line reply comment (#215): the claim
+        must be timestamped and owner-auditable on the issue whichever channel carried it. The
+        relayed-nonce stamp lands only AFTER gh confirms the write, so a failed post retries
+        next tick. Delivery is therefore AT-LEAST-ONCE: a crash between the confirmed post and
+        the stamp re-posts the identical line next tick — harmless, because the gate's
+        newest-wins parse reads duplicates as one answer."""
+        iid, num = a["id"], a.get("num")
+        if not gh.comment(num, a.get("line") or ""):
+            return "reply comment failed (will retry next tick)"
+        self._update_issue(iid, {"exit_ack_relayed": a.get("nonce")})
         return "ok"
 
     # --- system state ---

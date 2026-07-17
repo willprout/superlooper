@@ -435,6 +435,29 @@ def child_issues(parent_num):
             and _issues.parse_loop_metadata(c.get("body", "")).get("parent") == parent_num]
 
 
+# The exit-interview verification read (#215) needs each child's open/closed state on top of the
+# standard issue fields: a CLOSED child still accounts for a finding (the owner already acted).
+_CHILD_FIELDS = _ISSUE_FIELDS + ",state"
+
+
+def child_issues_health(parent_num):
+    """child_issues() as a ReadHealth(children, ok) — the issue #215 exit-interview verification
+    read, and the ONE GitHub read a finishing investigation adds (owner API-burn ruling,
+    2026-07-16: one search proving every FINDINGS-FILED ref at once — parent linkage included —
+    never per-ref issue reads). Each child rides with `labels` and `state` so
+    gate.accounted_child_nums can judge needs-owner / released / closed without further reads.
+    refused != empty (the #21/#61 discipline): ok=False on any refusal, and the gate WAITS on it
+    rather than reading the fail-closed [] as 'no children exist' — which would block a truthful
+    reply forever."""
+    rh = _json_list_health(["issue", "list", "--state", "all",
+                            "--search", '"parent: #%d" in:body' % parent_num,
+                            "--json", _CHILD_FIELDS, "--limit", "200"])
+    kids = [c for c in rh.value
+            if isinstance(c, dict)
+            and _issues.parse_loop_metadata(c.get("body", "")).get("parent") == parent_num]
+    return ReadHealth(kids, rh.ok)
+
+
 # --------------------------- writes (fail closed to False/None) ---------------------------
 
 def set_labels(num, add=None, remove=None):

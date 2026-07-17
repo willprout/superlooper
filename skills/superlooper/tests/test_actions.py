@@ -1807,10 +1807,13 @@ def test_frozen_mainline_holds_merges_but_not_investigation_closes():
     out = decide(dsk=d, gh_view=g)
     assert only(out, "merge") == []
     assert len(only(out, "hold")) == 1
-    # an investigation close is not a merge: freeze never blocks it
+    # an investigation close is not a merge: freeze never blocks it (the close still runs
+    # through the exit interview — an accounted NO-FINDINGS reply, #215)
     d2 = disk(reports={"i7": GOOD_REPORT}, frozen={"reason": "dev red", "fingerprint": "f", "since": 1},
               issues_state={"version": 1, "issues": {"i7": ist("gating", type="investigate")}})
-    g2 = ghv(prs={}, issue_comments={"i7": [{"body": "<!-- superlooper-investigation --> root cause: X"}]})
+    g2 = ghv(prs={}, issue_comments={"i7": [
+        {"body": "<!-- superlooper-investigation --> root cause: X"},
+        {"body": "NO-FINDINGS"}]})
     out2 = decide(parsed_issues=[parsed(7, labels=("in-progress", "type:investigate"))],
                   dsk=d2, gh_view=g2)
     assert [a["act"] for a in out2 if a["act"] in ("close_investigate", "hold")] == ["close_investigate"]
@@ -1854,11 +1857,14 @@ def test_finished_investigation_refused_read_holds_never_parks():
 
 
 def test_refused_read_recovers_and_the_investigation_closes():
-    # After holding on refused reads, a clean read carrying the marker closes the parent cleanly.
+    # After holding on refused reads, a clean read carrying the marker AND an accounted exit
+    # reply (#215) closes the parent cleanly.
     d = disk(reports={"i7": GOOD_REPORT},
              issues_state={"version": 1, "issues": {
                  "i7": ist("gating", type="investigate", read_waited=True)}})
-    g = ghv(issue_comments={"i7": [{"body": "<!-- superlooper-investigation --> root cause: X"}]})
+    g = ghv(issue_comments={"i7": [
+        {"body": "<!-- superlooper-investigation --> root cause: X"},
+        {"body": "NO-FINDINGS"}]})
     p7 = parsed(7, labels=("in-progress", "type:investigate"))
     out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
     assert [a["act"] for a in out if a["act"] in ("close_investigate", "park", "nudge")] \
@@ -1878,13 +1884,53 @@ def test_stale_view_never_emits_await_read_for_an_investigation():
 def test_parked_investigation_reconciles_when_marker_appears_on_a_clean_read():
     # RECONCILIATION (issue #21): a PARKED investigation whose marker comment shows up on a later
     # SUCCESSFUL read is closed — never left parked forever. The issue is terminal (parked), so it
-    # is NOT in the open-issue queue; the type comes from loopstate.
+    # is NOT in the open-issue queue; the type comes from loopstate. Since #215 the reconciled
+    # close ALSO runs through the exit interview: the reply must exist and be accounted.
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {"i7": ist("parked", type="investigate")}})
+    g = ghv(issue_comments={"i7": [
+        {"body": "<!-- superlooper-investigation --> root cause: X"},
+        {"body": "NO-FINDINGS"}]})
+    out = decide(parsed_issues=[], dsk=d, gh_view=g)
+    assert [a["act"] for a in out] == [a["act"] for a in out if a["act"] == "close_investigate"]
+    assert len(only(out, "close_investigate")) == 1 and only(out, "close_investigate")[0]["num"] == 7
+
+
+def test_parked_investigation_with_marker_but_no_exit_reply_stays_parked():
+    # #215: the marker alone no longer reconciles a parked investigation — closing unaccounted is
+    # the exact defect this gate exists to end. A parked lane has no session to interview, so it
+    # simply stays parked (the owner's call), with no ask, no park-churn, no notify.
     d = disk(reports={"i7": GOOD_REPORT},
              issues_state={"version": 1, "issues": {"i7": ist("parked", type="investigate")}})
     g = ghv(issue_comments={"i7": [{"body": "<!-- superlooper-investigation --> root cause: X"}]})
     out = decide(parsed_issues=[], dsk=d, gh_view=g)
-    assert [a["act"] for a in out] == [a["act"] for a in out if a["act"] == "close_investigate"]
-    assert len(only(out, "close_investigate")) == 1 and only(out, "close_investigate")[0]["num"] == 7
+    assert only(out, "close_investigate") == [] and only(out, "exit_interview") == []
+    assert not has_notify(out)
+
+
+def test_parked_investigation_with_findings_reply_verifies_then_closes():
+    # a truthful FINDINGS-FILED reply still reconciles a parked investigation: first the ONE
+    # typed child-set read, then (verdict stamped, nothing missing) the close.
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {"i7": ist("parked", type="investigate")}})
+    g = ghv(issue_comments={"i7": [
+        {"body": "<!-- superlooper-investigation --> root cause: X"},
+        {"body": "FINDINGS-FILED: #41 #42", "createdAt": "2026-07-16T10:00:00Z"}]})
+    out = decide(parsed_issues=[], dsk=d, gh_view=g)
+    v = only(out, "verify_exit_refs")
+    assert len(v) == 1 and v[0]["num"] == 7 and v[0]["refs"] == [41, 42]
+    assert only(out, "close_investigate") == []
+    d["issues_state"]["issues"]["i7"]["exit_verify"] = {
+        "key": "2026-07-16T10:00:00Z", "missing": []}
+    out2 = decide(parsed_issues=[], dsk=d, gh_view=g)
+    assert len(only(out2, "close_investigate")) == 1
+    c = only(out2, "close_investigate")[0]
+    assert c["exit"] == "FINDINGS-FILED: #41 #42"
+    # ...but a verdict naming an unaccounted ref leaves it parked — never a close.
+    d["issues_state"]["issues"]["i7"]["exit_verify"] = {
+        "key": "2026-07-16T10:00:00Z", "missing": [42]}
+    out3 = decide(parsed_issues=[], dsk=d, gh_view=g)
+    assert only(out3, "close_investigate") == [] and only(out3, "verify_exit_refs") == []
 
 
 def test_parked_investigation_does_not_reconcile_on_a_refused_read():
@@ -1899,6 +1945,157 @@ def test_parked_investigation_does_not_reconcile_on_a_refused_read():
     g2 = ghv(issue_comments={"i7": [{"body": "still just chatter"}]})
     out2 = decide(parsed_issues=[], dsk=d, gh_view=g2)
     assert only(out2, "close_investigate") == []
+
+
+# =========================== issue #215: the exit interview ===========================
+# An investigation closes only through an end-of-run exit interview — findings filed as
+# needs-owner children and verified against the parent's real child set, or an explicit
+# NO-FINDINGS. Asked at the freshest turn (the finish), parsed as ONE strict line, bounded by
+# the ask ladder: the interview + one re-ask, then park. Never close unaccounted.
+
+_MARKER_COMMENT = {"body": "<!-- superlooper-investigation --> root cause: X"}
+
+
+def _inv_finishing(comments=(_MARKER_COMMENT,), dsk_extra=None, **ist_over):
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {
+                 "i7": ist("gating", type="investigate", **ist_over)}},
+             **(dsk_extra or {}))
+    g = ghv(issue_comments={"i7": list(comments)})
+    p7 = parsed(7, labels=("in-progress", "type:investigate"))
+    return d, g, p7
+
+
+def test_finished_investigation_with_marker_gets_the_interview_not_a_close():
+    d, g, p7 = _inv_finishing()
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert only(out, "close_investigate") == []          # the motivating incident, closed
+    a = only(out, "exit_interview")
+    assert len(a) == 1 and a[0]["id"] == "i7" and a[0]["num"] == 7
+
+
+def test_interview_asked_within_window_waits_quietly():
+    d, g, p7 = _inv_finishing(exit_asks=1, exit_asked_at=NOW - 10)
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    for act in ("exit_interview", "close_investigate", "park", "nudge"):
+        assert only(out, act) == [], act
+
+
+def test_interview_no_reply_past_window_reasks_then_parks_with_notify():
+    late = NOW - actions.EXIT_REPLY_WINDOW_SECONDS - 1
+    d, g, p7 = _inv_finishing(exit_asks=1, exit_asked_at=late)
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert len(only(out, "exit_interview")) == 1         # the one re-ask
+    d2, g2, _ = _inv_finishing(exit_asks=2, exit_asked_at=late)
+    out2 = decide(parsed_issues=[p7], dsk=d2, gh_view=g2)
+    p = only(out2, "park")
+    assert len(p) == 1 and has_notify(out2)
+    assert "never verifiably delivered" in p[0]["memo"]  # no receipt: honest delivery state
+
+
+def test_consumption_receipt_restarts_the_reply_window():
+    # delivery is judged by the receipt, never the send rc — a mail consumed late (the worker
+    # was mid-turn) gets its window from CONSUMPTION, so a slow-but-alive lane is not re-asked.
+    late = NOW - actions.EXIT_REPLY_WINDOW_SECONDS - 100
+    d, g, p7 = _inv_finishing(exit_asks=1, exit_asked_at=late,
+                              dsk_extra={"exit_receipts": {"i7": NOW - 30}})
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert only(out, "exit_interview") == [] and only(out, "park") == []
+    # ...and once even the receipt-based window expires, the park memo says DELIVERED.
+    d2, g2, _ = _inv_finishing(
+        exit_asks=2, exit_asked_at=late,
+        dsk_extra={"exit_receipts": {"i7": late + 50}})
+    out2 = decide(parsed_issues=[p7], dsk=d2, gh_view=g2)
+    p = only(out2, "park")
+    assert len(p) == 1 and "delivered" in p[0]["memo"] \
+        and "never verifiably delivered" not in p[0]["memo"]
+
+
+def test_no_findings_reply_closes_with_the_accounted_claim():
+    d, g, p7 = _inv_finishing(comments=[_MARKER_COMMENT, {"body": "NO-FINDINGS"}])
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    c = only(out, "close_investigate")
+    assert len(c) == 1 and c[0]["num"] == 7 and c[0]["exit"] == "NO-FINDINGS"
+
+
+def test_findings_reply_emits_exactly_one_typed_verification_read():
+    d, g, p7 = _inv_finishing(comments=[
+        _MARKER_COMMENT,
+        {"body": "FINDINGS-FILED: #41 #42", "createdAt": "2026-07-16T09:00:00Z"}])
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    v = only(out, "verify_exit_refs")
+    assert len(v) == 1 and v[0]["id"] == "i7" and v[0]["num"] == 7
+    assert v[0]["refs"] == [41, 42] and v[0]["reply_key"] == "2026-07-16T09:00:00Z"
+    assert only(out, "close_investigate") == []
+    # with the verdict stamped clean, the SAME view closes — no second read is ever emitted.
+    d["issues_state"]["issues"]["i7"]["exit_verify"] = {
+        "key": "2026-07-16T09:00:00Z", "missing": []}
+    out2 = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert only(out2, "verify_exit_refs") == []
+    assert len(only(out2, "close_investigate")) == 1
+
+
+def test_newest_reply_wins_through_decide():
+    d, g, p7 = _inv_finishing(comments=[
+        _MARKER_COMMENT,
+        {"body": "FINDINGS-FILED: garbage"},             # malformed, then corrected:
+        {"body": "NO-FINDINGS"}])
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert len(only(out, "close_investigate")) == 1
+
+
+def test_codex_ack_is_relayed_to_the_durable_comment_and_holds_the_ladder():
+    # the degraded path: the ack file carries the one-line reply + nonce; the runner posts it
+    # durably. While the relay is pending, the ladder must neither re-ask nor park — the runner
+    # itself holds the answer.
+    late = NOW - actions.EXIT_REPLY_WINDOW_SECONDS - 1
+    d, g, p7 = _inv_finishing(exit_asks=2, exit_asked_at=late, exit_nonce="exit-77",
+                              dsk_extra={"acks": {"i7": "NO-FINDINGS exit-77"}})
+    out = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    r = only(out, "relay_exit_reply")
+    assert len(r) == 1 and r[0]["num"] == 7 and r[0]["line"] == "NO-FINDINGS" \
+        and r[0]["nonce"] == "exit-77"
+    assert only(out, "park") == [] and only(out, "exit_interview") == []
+    # relayed already: never posted twice, and the ladder resumes normally.
+    d["issues_state"]["issues"]["i7"]["exit_ack_relayed"] = "exit-77"
+    out2 = decide(parsed_issues=[p7], dsk=d, gh_view=g)
+    assert only(out2, "relay_exit_reply") == []
+    assert len(only(out2, "park")) == 1                  # cap spent, window expired, no reply yet
+    # a stale ack (wrong nonce — e.g. the #157 progress ladder's) is never relayed.
+    d2, g2, _ = _inv_finishing(exit_asks=1, exit_asked_at=NOW - 10, exit_nonce="exit-78",
+                               dsk_extra={"acks": {"i7": "WORKING exit-12"}})
+    out3 = decide(parsed_issues=[p7], dsk=d2, gh_view=g2)
+    assert only(out3, "relay_exit_reply") == []
+
+
+def test_parked_lane_with_a_stranded_ack_relays_it_then_reconciles():
+    # fresh review P2-4: a lane parked OUT-OF-BAND (not by the gate's own relay-suppressed
+    # paths) can still hold a valid nonce-fenced ack — the worker DID answer. The reconcile
+    # relays it to the durable thread first (verdict deferred a tick), then closes off the
+    # posted comment like any reconcile.
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {
+                 "i7": ist("parked", type="investigate", exit_nonce="exit-9")}},
+             acks={"i7": "NO-FINDINGS exit-9"})
+    g = ghv(issue_comments={"i7": [_MARKER_COMMENT]})
+    out = decide(parsed_issues=[], dsk=d, gh_view=g)
+    r = only(out, "relay_exit_reply")
+    assert len(r) == 1 and r[0]["line"] == "NO-FINDINGS" and r[0]["num"] == 7
+    assert only(out, "close_investigate") == []          # verdict deferred while the relay posts
+    # relayed + the comment visible: the ordinary reconcile close fires.
+    d["issues_state"]["issues"]["i7"]["exit_ack_relayed"] = "exit-9"
+    g2 = ghv(issue_comments={"i7": [_MARKER_COMMENT, {"body": "NO-FINDINGS"}]})
+    out2 = decide(parsed_issues=[], dsk=d, gh_view=g2)
+    assert only(out2, "relay_exit_reply") == []
+    assert len(only(out2, "close_investigate")) == 1
+
+
+def test_exit_window_is_config_tunable():
+    d, g, p7 = _inv_finishing(exit_asks=1, exit_asked_at=NOW - 100)
+    c = cfg(session={"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2,
+                     "conflict_cap": 2, "exit_reply_window_seconds": 60})
+    out = decide(config=c, dsk=d, gh_view=g, parsed_issues=[p7])
+    assert len(only(out, "exit_interview")) == 1         # 100s > the 60s override: re-ask
 
 
 # =========================== issue #61: refused PR lookup holds; notify-once per park cause ====

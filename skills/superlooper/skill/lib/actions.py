@@ -122,6 +122,13 @@ RECOVER_RETRY_SECONDS = 600        # frozen-session recovery ladder re-fires at 
 PROGRESS_STALL_SECONDS = 900       # no commit/marker/HEAD change (turns still taken) this long -> probe
 PROBE_RETRY_SECONDS = 300          # min spacing between probes within one progress-stall episode
 PROBE_CAP = 3                      # probes per episode before a classified progress-stall park
+# The exit interview's reply window (issue #215): how long a finishing investigation gets to file
+# its findings as child issues and post the one-line reply before the ladder re-asks (once) and
+# then parks. Generous next to the probe window — answering means CREATING issues, not writing
+# one ack line. The window runs from the LATER of the ask and its consumption receipt (a mail
+# consumed late, e.g. a worker mid-long-turn, gets its full window from delivery). Config
+# override: session.exit_reply_window_seconds.
+EXIT_REPLY_WINDOW_SECONDS = 600
 # How long a session may sit at its OWN in-window question before the owner is told (issue #151).
 # A lane at a dialog is never parked — it is alive — but it must not be SILENT either: the loop's
 # channel for "worker needs input" is state/blocked/<id> -> hire_answerer, and an in-window
@@ -220,8 +227,9 @@ NUDGE_MESSAGES = {
     "checks": "A required check failed on your PR. Investigate the failure, fix it, and push — "
               "the gate re-runs automatically.",
     "investigation": "Post your root-cause report as an issue comment BEGINNING "
-                     "`<!-- superlooper-investigation -->` — the runner closes the parent only "
-                     "when that marker comment exists.",
+                     "`<!-- superlooper-investigation -->` — without that marker comment the "
+                     "runner cannot even begin closing the parent (the close itself runs "
+                     "through an exit interview that arrives once the marker exists).",
 }
 
 # Human-readable ALERT notify bodies. The reason CODES (stable, sorted) are what the ALERT file
@@ -722,6 +730,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     progress_stall_secs = _count(session.get("progress_stall_seconds"), PROGRESS_STALL_SECONDS)
     probe_retry_secs = _count(session.get("probe_retry_seconds"), PROBE_RETRY_SECONDS)
     probe_cap = _count(session.get("probe_cap"), PROBE_CAP)
+    exit_window = _count(session.get("exit_reply_window_seconds"), EXIT_REPLY_WINDOW_SECONDS)
     dev_branch = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
 
     plist = parsed_issues if isinstance(parsed_issues, list) else []
@@ -748,6 +757,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     status_clocks = _dget(dsk, "status_clocks", dict)   # {id: parsed status.json} — the #157 progress clock
     acks = _dget(dsk, "acks", dict)                      # {id: raw ack text} — the worker's probe reply
     awaiting = _dget(dsk, "awaiting", dict)              # {id: marker} — worker flagged long background work
+    exit_receipts = _dget(dsk, "exit_receipts", dict)    # {id: newest mail-consumption ts} (#148/#215)
     frozen = dsk.get("frozen") if isinstance(dsk.get("frozen"), dict) else None
     alert_on_disk = dsk.get("alert") if isinstance(dsk.get("alert"), dict) else None
     raw_locks = dsk.get("live_lock_ids")
@@ -1135,7 +1145,31 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     and ist.get("type") == "investigate"
                     and iid in issue_comments
                     and gate.investigation_done(issue_comments.get(iid))):
-                out.append({"act": "close_investigate", "id": iid, "num": _iid_num(iid)})
+                # #215: even the reconciled close runs through the exit interview — the marker
+                # alone closing green is the motivating incident. A parked lane has no session
+                # to interview, so an absent/malformed/unaccounted reply simply leaves it parked
+                # (the owner's call); a truthful reply still reconciles: verify (the one typed
+                # read), then close on a clean verdict. A STRANDED ack relays first (fresh
+                # review P2-4): a lane parked out-of-band (usage/systemic, not the gate's own
+                # suppressed paths) can hold a valid nonce-fenced ack the live branch never got
+                # to post — the worker DID answer, so the answer must reach the durable thread
+                # rather than die with the park. Relay-pending defers the verdict a tick, same
+                # as the live branch.
+                nonce = ist.get("exit_nonce")
+                if isinstance(nonce, str) and nonce and ist.get("exit_ack_relayed") != nonce \
+                        and gate.exit_ack_line(acks.get(iid), nonce):
+                    out.append({"act": "relay_exit_reply", "id": iid, "num": _iid_num(iid),
+                                "line": gate.exit_ack_line(acks.get(iid), nonce),
+                                "nonce": nonce})
+                    continue
+                reply = gate.exit_interview_reply(issue_comments.get(iid))
+                state, detail = gate.exit_interview_verdict(reply, ist.get("exit_verify"))
+                if state == "close":
+                    out.append({"act": "close_investigate", "id": iid, "num": _iid_num(iid),
+                                "exit": detail})
+                elif state == "verify":
+                    out.append({"act": "verify_exit_refs", "id": iid, "num": _iid_num(iid),
+                                "refs": detail, "reply_key": reply.get("key")})
             continue                                   # else re-release happens via labels (phase E)
         num = _iid_num(iid)
         p = parsed_by_id.get(iid)
@@ -1187,6 +1221,38 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 view_comments = issue_comments.get(iid)
                 inv_done = gate.investigation_done(view_comments)
                 pv = {}
+                # ---- the exit interview (issue #215): the marker opens an interview, never the
+                # close. All facts the gate's ladder needs are assembled HERE (the gate stays a
+                # clockless pure function): the newest reply parsed from the SAME comments read
+                # (zero added per-tick reads), the degraded-path ack relay, and the clock-derived
+                # window/delivery booleans. ----
+                exit_reply = gate.exit_interview_reply(view_comments)
+                exit_relay_pending = False
+                nonce = ist.get("exit_nonce")
+                if isinstance(nonce, str) and nonce and ist.get("exit_ack_relayed") != nonce:
+                    # Codex Stop can't block a stop, so its reply arrives as an ack FILE (the
+                    # #157 channel, nonce-fenced); the runner posts it as the durable comment.
+                    # While that relay is in flight the gate WAITS — the answer is already in
+                    # the runner's hands, so re-asking or parking would contradict it.
+                    line = gate.exit_ack_line(acks.get(iid), nonce)
+                    if line:
+                        out.append({"act": "relay_exit_reply", "id": iid, "num": num,
+                                    "line": line, "nonce": nonce})
+                        exit_relay_pending = True
+                # The reply window runs from the LATER of the ask and its consumption receipt:
+                # delivery is judged by the receipt (never a send rc), and a mail consumed late —
+                # a worker mid-long-turn — gets its full window from actual delivery. An
+                # unreadable ask clock reads as expired: the ladder is bounded (asks cap), so
+                # corruption walks to the park, never to an unbounded wait.
+                asked_at = ist.get("exit_asked_at")
+                receipt = exit_receipts.get(iid)
+                exit_delivered = (_since_ok(asked_at, now) and _since_ok(receipt, now)
+                                  and receipt >= asked_at)
+                if _since_ok(asked_at, now):
+                    base = receipt if (exit_delivered and receipt > asked_at) else asked_at
+                    exit_expired = now - base >= exit_window
+                else:
+                    exit_expired = True
             else:
                 if iid not in prs:
                     # No trustworthy PR read this tick: the lookup was REFUSED (the poll OMITS a
@@ -1217,6 +1283,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 if _real(ist.get("pr_read_pending_since")):
                     out.append({"act": "clear_pr_read", "id": iid})   # a trustworthy read landed
                 inv_done = False
+                exit_reply = None                      # the interview is investigate-only (#215)
+                exit_relay_pending = exit_delivered = exit_expired = False
                 if pv.get("state") == "MERGED":
                     # crash window (Codex round-1 C2): the merge landed but the runner died
                     # before settling local state/labels — ABSORB the merged fact
@@ -1245,7 +1313,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 {"type": itype, "conflicts": conflicts, "nudged": nudged,
                  "declared_touches": declared, "update_result": update_result,
                  "review_carry": ist.get("review_carry"),
-                 "investigation_done": inv_done},
+                 "investigation_done": inv_done,
+                 "exit_reply": exit_reply, "exit_asks": ist.get("exit_asks"),
+                 "exit_asked_key": ist.get("exit_asked_key"),
+                 "exit_verify": ist.get("exit_verify"),
+                 "exit_ask_expired": exit_expired, "exit_delivered": exit_delivered,
+                 "exit_relay_pending": exit_relay_pending},
                 pv, reports.get(iid), cfg, bool(frozen), inflight)
 
             act, wander = g.get("action"), g.get("wander", False)
@@ -1376,7 +1449,20 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 else:
                     launch_hold(iid, num, p)
             elif act == "close_investigate":
-                out.append({"act": "close_investigate", "id": iid, "num": num})
+                out.append({"act": "close_investigate", "id": iid, "num": num,
+                            "exit": g.get("exit")})
+            elif act == "exit_interview":
+                # deliver (or re-deliver) the interview through the worker channel — the
+                # executor stamps the ask BEFORE the send, so failure walks toward the cap.
+                out.append({"act": "exit_interview", "id": iid, "num": num,
+                            "reply_key": g.get("reply_key"), "defect": g.get("defect")})
+            elif act == "verify_exit_refs":
+                # the ONE added GitHub read per finishing investigation (#215): a typed
+                # child-set search whose verdict is stamped against this reply's key, so it
+                # never re-fires for the same reply (and a refused read stamps nothing — the
+                # gate re-emits next tick, which IS the wait).
+                out.append({"act": "verify_exit_refs", "id": iid, "num": num,
+                            "refs": g.get("refs"), "reply_key": g.get("reply_key")})
             # "wait" -> no action this tick
 
             # The issue LEFT the failing state without the park label ever landing (issue #61):
