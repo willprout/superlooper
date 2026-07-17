@@ -2851,7 +2851,22 @@ class Runner:
             return "dead worker pid — marked exited for relaunch"
 
         if tier == "frozen":
-            self._update_issue(iid, {"status": "frozen", "last_recover_at": now})
+            # Latch `frozen` AND anchor the progress-clock baseline the #231 un-latch reads against.
+            # Capture the signature as of THIS moment ONLY when there is no baseline yet: an `awaiting`
+            # lane's probe ladder never ran, so it reaches the freeze with progress_sig=None, and
+            # without a baseline the un-latch could not tell a resumed HEAD from the pre-freeze one.
+            # Only-if-None is deliberate — never clobber an existing baseline (that would re-anchor to a
+            # post-progress signature every 10 minutes and mask the very advance we watch for). A clock
+            # that is absent this tick leaves the baseline None; the decide-side first-sight anchor
+            # picks it up when a clock finally appears.
+            def _anchor_frozen_baseline(st, i):
+                i["status"] = "frozen"
+                i["last_recover_at"] = now
+                if i.get("progress_sig") is None:
+                    sig = events_mod.progress_signature(self._status_clocks().get(iid))
+                    if events_mod.usable_baseline(sig):   # only a readable-head sig; never poison None
+                        i["progress_sig"] = sig
+            self._update_issue(iid, fn=_anchor_frozen_baseline)
             surface = self._surface(iid)
             if not surface:
                 self._mark_exited(iid, "frozen with no pane recorded", now)
@@ -2945,6 +2960,37 @@ class Runner:
         if changed["v"]:
             _rm(os.path.join(self.state, "ack", iid))      # a new episode: last episode's ack is moot
         return "ok"
+
+    def _exec_unlatch_frozen(self, a, now):
+        """Un-latch a lane whose stored status latched to `frozen` but whose #157 progress clock has
+        since advanced (issue #231): the session demonstrably resumed real work — a new HEAD, or a
+        report/blocked marker, past the freeze baseline — so write the status back to `running`, end
+        the frozen recovery ladder, and open a FRESH progress episode anchored at the signature we
+        just measured. Keys on the progress clock, never activity: a nudge refreshes activity but
+        never moves the signature, so this transition can never answer its own ladder (the i328 trap).
+
+        NB the verb: `unlatch_frozen`, NOT `_exec_unfreeze` (which already exists, below, for the
+        unrelated MERGES-frozen mechanism — same word, different machine; this issue's boundary).
+
+        The frozen-era transients are cleared so nothing outlives the freeze: `last_recover_at` (a
+        later re-freeze must nudge promptly, not sit out a stale 10-minute window) and any
+        `sensed_state` reading (a lane making real progress is neither logged-out nor stuck at a
+        dialog — a stale reading would keep firing the #151 alerts at a working lane). The journal
+        record — action + id + the evidence class decide named — is written by the tick's
+        _journal_outcome, so the un-latch is auditable as one bounded line."""
+        iid, sig = a["id"], a.get("sig")
+
+        def m(st, i):
+            self._reset_progress_clock(i)          # a fresh #157 episode (zero probe counters)...
+            i["progress_sig"] = sig                # ...anchored at the advance we just measured
+            i["progress_since"] = now
+            i["status"] = "running"
+            i["last_recover_at"] = None            # a later re-freeze nudges fresh, not on a stale clock
+            i["sensed_state"] = None               # a working lane: drop any frozen-era screen reading
+            i["sensed_since"] = None
+        self._update_issue(iid, fn=m)
+        _rm(os.path.join(self.state, "ack", iid))  # the fresh episode: any old probe ack is moot
+        return f"un-latched frozen -> running ({a.get('evidence_class') or 'progress clock advanced'})"
 
     def _exec_harvest_report(self, a, now):
         """Rescue a report a DONE-acked worker wrote one directory off (issues #148/#189).

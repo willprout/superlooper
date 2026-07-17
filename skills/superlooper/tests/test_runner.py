@@ -1799,6 +1799,90 @@ def test_recover_frozen_dead_pane_writes_the_exited_marker(rig):
     assert ist["status"] == "frozen" and ist["last_recover_at"] == NOW
 
 
+# =============== the frozen un-latch executors (issue #231) ===============
+
+def _seed_clock(rig, iid, **over):
+    c = {"id": iid, "ts": NOW, "cwd": "/w", "head": "H", "dirty": False,
+         "report": False, "blocked": False}
+    c.update(over)
+    (rig.home / "state" / "status").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "status" / f"{iid}.json").write_text(json.dumps(c))
+    return c
+
+
+def test_recover_frozen_anchors_the_progress_baseline_from_the_clock(rig):
+    # An `awaiting` lane reaches the freeze with no progress_sig (its probe ladder never ran). The
+    # frozen recover must stamp the baseline from the CURRENT clock so a later resume is measurable.
+    c = _seed_clock(rig, "i5", head="FROZEN_HEAD")
+    seed_issue(rig, "i5", status="running")            # no progress_sig yet
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    st = issue_state(rig, "i5")
+    assert st["status"] == "frozen"
+    assert st["progress_sig"] == events.progress_signature(c)   # baseline captured at freeze
+
+
+def test_recover_frozen_never_clobbers_an_existing_baseline(rig):
+    # Only-if-None: a lane that DID have a pre-freeze baseline keeps it — re-stamping to the current
+    # clock every 10 minutes would mask the very advance the un-latch watches for.
+    _seed_clock(rig, "i5", head="CURRENT")
+    seed_issue(rig, "i5", status="frozen", progress_sig="PRE_FREEZE_BASELINE",
+               last_recover_at=NOW - 100000)
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert issue_state(rig, "i5")["progress_sig"] == "PRE_FREEZE_BASELINE"
+
+
+def test_exec_unlatch_frozen_writes_running_and_a_fresh_progress_episode(rig):
+    seed_issue(rig, "i5", status="frozen", progress_sig="OLD", progress_since=NOW - 100000,
+               last_recover_at=NOW - 100, sensed_state="at_dialog", sensed_since=NOW - 50,
+               probe_attempts=3, probe_nonce="n3", probe_sent_at=NOW - 400, harvest_tried=True)
+    (rig.home / "state" / "ack").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "ack" / "i5").write_text("STUCK n3")   # a stale ack from the frozen episode
+    out = rig.r._execute({"act": "unlatch_frozen", "id": "i5", "num": 5, "sig": "NEW",
+                          "evidence_class": "HEAD"}, NOW)
+    assert "running" in out and "HEAD" in out
+    st = issue_state(rig, "i5")
+    assert st["status"] == "running"
+    assert st["progress_sig"] == "NEW" and st["progress_since"] == NOW    # fresh episode, anchored
+    assert (st.get("probe_attempts") or 0) == 0 and st["probe_nonce"] is None
+    assert st["last_recover_at"] is None                                  # a re-freeze nudges fresh
+    assert st["sensed_state"] is None and st["sensed_since"] is None      # frozen-era reading dropped
+    assert st["harvest_tried"] is False
+    assert not (rig.home / "state" / "ack" / "i5").exists()               # stale ack cleared
+
+
+def test_frozen_lane_unlatches_end_to_end_when_progress_resumes(rig):
+    # The live 360 eApp incident (2026-07-16): a lane latched `frozen` while quiet, then resumed — took
+    # turns, committed, opened its PR — but kept the stale `frozen` paint and the 10-minute nudge. Drive
+    # a REAL tick: with the progress clock now showing a NEW HEAD past the frozen baseline, the runner
+    # writes the status back to `running`, sends NO frozen nudge, and journals the un-latch. Activity is
+    # deliberately left absent (a `frozen` event would still fire) — proving the un-latch keys on the
+    # progress clock, not activity.
+    old = {"id": "i5", "ts": NOW - 5000, "cwd": "/w", "head": "OLDHEAD", "dirty": False,
+           "report": False, "blocked": False}
+    seed_issue(rig, "i5", status="frozen", progress_sig=events.progress_signature(old),
+               progress_since=NOW - 100000, last_recover_at=NOW - 100000)
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    _seed_clock(rig, "i5", head="NEWHEAD", ts=NOW)     # the session committed: HEAD moved
+
+    rig.r.tick(now=NOW)
+
+    assert issue_state(rig, "i5")["status"] == "running"   # un-latched: the dashboard stops the lie
+    assert _frozen_nudges(rig) == []                       # NO 10-minute frozen nudge this tick
+    recs = [json.loads(x) for x in (rig.home / "journal.jsonl").read_text().splitlines()]
+    uf = [r for r in recs if r.get("act") == "unlatch_frozen" and r.get("id") == "i5"]
+    assert len(uf) == 1 and uf[-1]["evidence_class"] == "HEAD"    # auditable, names the evidence
+
+    # DoD: the same lane freezing AGAIN later re-enters the ladder fresh. It is now `running` with a
+    # fresh baseline; a stale activity marker + a frozen event drives the normal recover nudge.
+    _activity(rig, "i5", NOW - 100000)                    # very old activity -> a fresh frozen event
+    later = NOW + 700                                     # past the 10-minute recover interval
+    rig.r.tick(now=later)
+    assert issue_state(rig, "i5")["status"] == "frozen"   # re-latched
+    assert _frozen_nudges(rig), "a re-frozen lane must re-enter the recovery ladder"
+
+
 def test_nudge_spends_the_key_on_sent_and_dead_but_not_on_defer(rig):
     seed_issue(rig, "i5", status="gating", nudged=[])
     (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
