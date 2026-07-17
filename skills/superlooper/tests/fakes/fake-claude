@@ -327,6 +327,7 @@ def scenario_review_late(spec, contract):
 def scenario_investigate(spec, contract):
     activity()
     num = contract["issue_num"]
+    child_num = None
     if not spec.get("skip_marker"):
         sh(GH, "issue", "comment", num, "--body",
            "<!-- superlooper-investigation --> Root cause (simulated): the flake traces to a "
@@ -336,9 +337,29 @@ def scenario_investigate(spec, contract):
                       "## Definition of done\n- [ ] fixture isolated\n\n"
                       "## Boundaries\nOnly the fixture.\n\n"
                       "## Loop metadata\ntouches: tests\nparent: #%s\n") % (num, num)
-        sh(GH, "issue", "create", "--title", "Child of #%s: isolate the fixture" % num,
-           "--body", child_body, "--label", "type:build,needs-owner")
+        r = sh(GH, "issue", "create", "--title", "Child of #%s: isolate the fixture" % num,
+               "--body", child_body, "--label", "type:build,needs-owner")
+        m = re.search(r"/issues/(\d+)", r.stdout) or re.search(r"(\d+)\s*$", r.stdout.strip())
+        child_num = m.group(1) if m else None
     finish(spec, contract)
+    # --- the exit interview (#215). A real finished worker RESTS; the runner arms
+    # state/mail/<id> and wake-pings the pane; the Stop hook consumes the mail at the next turn
+    # end (renaming it to the .consumed receipt) and hands the text back as the continuation,
+    # and the model replies with the one-line comment. Model exactly that: consume-with-receipt,
+    # then reply — FINDINGS-FILED naming the child actually filed (driving the verification
+    # read), or NO-FINDINGS when no child exists. skip_marker skips it (the gate parks on the
+    # missing marker and never interviews); "skip_exit_reply" lets a test model a worker that
+    # ghosts the interview.
+    if spec.get("skip_marker") or spec.get("skip_exit_reply"):
+        return
+    mail = os.path.join(RUN_ROOT, "state", "mail", ID)
+    if not wait_until(lambda: os.path.exists(mail), "the exit-interview mail"):
+        return
+    os.replace(mail, "%s.consumed.%d" % (mail, int(time.time())))    # the hook's receipt
+    reply = "FINDINGS-FILED: #%s" % child_num if child_num else "NO-FINDINGS"
+    sh(GH, "issue", "comment", num, "--body", reply)
+    activity()
+    log("exit interview answered: %s" % reply)
 
 
 def scenario_blocked(spec, contract, brief):

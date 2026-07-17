@@ -61,11 +61,14 @@ touches any bright-line area below — do NOT fix it here: SPLIT. File scoped ch
 _INVESTIGATE_WORK_BLOCK = """\
 **Investigate (no code changes, no PR):**
 1. Produce a root-cause report as an issue comment on #{issue_num} that BEGINS with the exact marker
-   `<!-- superlooper-investigation -->`. The runner closes the parent ONLY when that marker comment
-   exists. Zero children is a valid finding — "nothing to do" is a legitimate root cause.
+   `<!-- superlooper-investigation -->`. Zero children is a valid finding — "nothing to do" is a
+   legitimate root cause.
 2. File scoped child issues for the work the root cause implies, each carrying `parent: #{issue_num}`
    in its `## Loop metadata` and labeled `needs-owner` ({operator} approves every child before it runs).
-3. Open ZERO pull requests and change no files outside your own scratch notes."""
+3. Open ZERO pull requests and change no files outside your own scratch notes.
+4. After you finish, the runner delivers an EXIT INTERVIEW asking you to account for your findings.
+   Answer it when it arrives (it carries its own instructions) — the parent closes only after that
+   one-line reply verifies, never on the marker alone."""
 
 # The PR-opening line of Finish — present for code types, empty for an investigation.
 _FINISH_PR = ("Open the PR with `Closes #{issue_num}` (unless you shipped via the configured ship "

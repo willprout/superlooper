@@ -931,6 +931,27 @@ def test_investigate_marker_and_child_parent_closed_child_waits(sim_factory):
     assert not sim.mutations("merge_pr"), "an investigation opens zero PRs"
 
 
+def test_investigate_ghosted_exit_interview_reasks_then_parks_never_closes(sim_factory):
+    # #215: the worker finishes (marker + child) but never answers the exit interview — the mail
+    # sits unconsumed. The ladder re-asks once (window), then parks. The parent must stay OPEN:
+    # closing unaccounted is the motivating incident.
+    sim = sim_factory()
+    num = sim.add_issue(title="Investigation that ghosts the interview",
+                        labels=("type:investigate", "agent-ready"),
+                        scenario={"scenario": "investigate", "skip_exit_reply": True,
+                                  "linger": True})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert sim.issue(num)["state"] == "open", "never close unaccounted"
+    asks = [r for r in sim.journal("exit_interview") if r.get("id") == sid]
+    assert len(asks) == 2, asks                      # the interview + exactly one re-ask
+    assert os.path.exists(os.path.join(sim.home, "state", "mail", sid)), \
+        "the unconsumed mail is the honest evidence delivery never happened"
+
+
 def test_investigate_missing_marker_nudges_then_parks(sim_factory):
     # report exists but the marker comment is missing -> one nudge, then park (§C.4).
     sim = sim_factory()
