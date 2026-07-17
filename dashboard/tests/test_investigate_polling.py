@@ -133,9 +133,10 @@ def test_skipping_the_lookup_renders_the_same_flight_as_performing_it(tmp_path):
     # `pr_facts or {}`, so a None would render the same too (verified by mutation, not assumed).
     #
     # What it DOES pin is narrow but real, and nothing else in this file covers it: the loopstate
-    # `type` stamp has no rendering effect ANYWHERE beyond this skip. That is the assumption the
-    # whole change rests on — `type` is read at exactly one site — and it is what would break
-    # silently if a future consumer started branching on `type` to render a flight.
+    # `type` stamp has no rendering effect anywhere in the flight dict this compares, beyond the
+    # skip. (Only THIS flight — a consumer branching on `type` to set a repo-level field would slip
+    # past.) That is the assumption the whole change rests on, `type` being read at exactly one
+    # site, and it is what would break silently if a future consumer rendered a flight from it.
     issues = {"i9": {"status": "running", "branch": "sl/i9-x", "pr": None,
                      "lane": "i9", "type": "investigate"}}
     home = _make_home(tmp_path, issues)
