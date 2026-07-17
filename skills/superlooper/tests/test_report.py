@@ -485,6 +485,12 @@ def test_runner_resurrection_renders_and_breaks_quiet():
     assert "## Runner resurrection" in out
     assert "RESTARTED" in out and "r1" in out and "heartbeat_stale" in out
     assert "nothing happened" not in out.lower()      # the runner going down is never a quiet night
+    # Pin the honest phrasing (second fresh review): rc==0 proves the PIDFILE went live, nothing
+    # more. The reconcile is an inference from what `superlooper run` does, not something this path
+    # witnessed — so the line must name the verified fact and infer the rest, never assert
+    # "It reconciled from GitHub + disk" as past-tense history. Unpinned, that regresses silently.
+    assert "verified live via its pidfile" in out
+    assert "It reconciled from GitHub" not in out
 
 
 def test_runner_resurrection_failure_and_cap_are_honest():
