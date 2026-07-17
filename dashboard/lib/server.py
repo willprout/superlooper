@@ -1387,7 +1387,18 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         if not is_concluded and concluded is not None and is_closed:
             is_concluded = concluded.confirm_closed(slug, num, lambda n=num: source.issue(slug, n))
         mem = concluded if is_concluded else None
-        if source is None or not branch:
+        # An INVESTIGATE flight never opens a PR and never merges — its completion signal is a
+        # marker COMMENT on the issue, so a PR lookup on one can only ever answer "no PR" (issue
+        # #16). The runner already skips it on all three of its PR paths for this reason (#21);
+        # this is the board's half of that parity. Concluded investigations are the ones that
+        # bite: ConcludedFlights.pr_facts remembers only a SETTLED read, and {} is not settled, so
+        # the #48 memo can never latch one — the read repeats every gh_poll_seconds window
+        # forever, once per completed investigation, growing with every investigation the loop
+        # lands. Skipping is behaviour-neutral: {} is exactly what the lookup returned anyway.
+        # Keyed on a POSITIVE type stamp — an untyped flight is not provably an investigation and
+        # keeps the build path, so a real PR's facts are never blanked on a missing stamp.
+        is_investigation = st.get("type") == "investigate"
+        if source is None or not branch or is_investigation:
             pr_facts = {}
         elif mem is not None:
             pr_facts = mem.pr_facts(slug, branch, lambda b=branch: source.pr_for_branch(slug, b))
