@@ -1831,6 +1831,12 @@ def cmd_watchdog(args):
         # is hired for a wedge — a corpse needs restarting, not diagnosing. The attempt was already
         # recorded in evaluate() (so it counts toward the crash-loop cap even if delivery fails).
         if res.get("resurrect") is not None:
+            # Persist the recorded attempt BEFORE the launcher runs. That subprocess can take up to
+            # WATCHDOG_LAUNCH_TIMEOUT, and a watchdog killed inside that window would otherwise lose
+            # the attempt entirely — leaving the cap slot un-burned and the next check free to
+            # restart again. The cap is the ONLY anti-storm guard, so bias it to OVER-count: a lost
+            # restart that still burned a slot is recoverable, a storm is not.
+            loopstate.save(state_path, final)
             resurrect_rc = _watchdog_resurrect(args.repo, cfg, home, state_dir, res["resurrect"])
             done = watchdog_lib.after_resurrect(now, cfg, final, res["resurrect"], resurrect_rc)
             for rec in done["journal"]:
@@ -1838,9 +1844,11 @@ def cmd_watchdog(args):
             for title, body in done["notify"]:
                 print(f"notify: {notify.send(cfg, title, body)}")
             final = done["state"]
-        # A provably-gone runner past the rolling-hour cap: no resurrect emitted, an escalation
-        # journaled instead (so the hand-run summary below is honest that the runner is DOWN).
-        capped = any(rec.get("outcome") == "resurrect_capped" for rec in res["journal"])
+        # A provably-gone runner past the rolling-hour cap: no resurrect emitted. Read the RAW
+        # provably-gone fact from evaluate(), NOT the journal: the escalation record is deduped to
+        # once per capped streak, so every later capped check journals nothing and the summary read
+        # "healthy — no signal" while the loop was down (fresh-review P1-1).
+        capped = bool(res.get("runner_down")) and res.get("resurrect") is None
         if res["launch"] is not None:
             rc = _watchdog_launch(args.repo, cfg, home, state_dir, res["launch"], final)
             done = watchdog_lib.after_launch(now, cfg, final, res["launch"], rc)
@@ -1861,7 +1869,12 @@ def cmd_watchdog(args):
                               if view["kill_switch"] else
                               "resurrected the runner" if resurrect_rc == 0 else
                               "runner is DOWN — restart FAILED" if resurrect_rc is not None else
-                              "runner is DOWN — auto-restart PAUSED (crash-loop cap hit)" if capped else
+                              # cap==0 was never a crash loop — nothing was ever attempted; saying
+                              # "cap hit" there would misname a deliberate config choice.
+                              ("runner is DOWN — auto-restart DISABLED "
+                               "(watchdog.resurrection_max_per_hour = 0)"
+                               if cfg["watchdog"]["resurrection_max_per_hour"] == 0 else
+                               "runner is DOWN — auto-restart PAUSED (crash-loop cap hit)") if capped else
                               f"episode open ({', '.join(ep['signals'])})" if ep else
                               "healthy — no signal"))
         return 0

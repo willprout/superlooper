@@ -397,9 +397,13 @@ def _resurrection(records, window_start):
                              "(watchdog.resurrection_max_per_hour = 0) — it will stay down until you "
                              "restart it.")
             else:
-                lines.append(f"- Runner auto-restart PAUSED — it was restarted {r.get('attempts')} "
-                             "time(s) in an hour and kept going down. A repeatedly-dying runner is a "
-                             "real incident, not a flap; the loop needs you.")
+                # "attempted", never "was restarted": an undeliverable attempt (no_pane) counts
+                # toward the cap without ever restarting anything, so asserting a restart here would
+                # fabricate history the journal does not support (fresh-review P1-2).
+                lines.append(f"- Runner auto-restart PAUSED — restart was attempted "
+                             f"{r.get('attempts')} time(s) in an hour and the runner is still going "
+                             "down. A repeatedly-dying runner is a real incident, not a flap; the "
+                             "loop needs you.")
     return lines
 
 

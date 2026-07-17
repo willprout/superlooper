@@ -334,7 +334,11 @@ def _without(sigs, details, drop):
 def _resurrection(now, view, w, sigs, details, new_state):
     """The provably-gone-runner restart decision (issue #208), folded into the mechanical check.
 
-    Returns (sigs, details, resurrect, journal, notify, new_state). `runner_dead` in the view is
+    Returns (sigs, details, resurrect, journal, notify, new_state, runner_down). `runner_down` is
+    the RAW fact — provably gone THIS check — reported on every check regardless of the cap or the
+    journal's escalation dedup, so a caller's summary can stay honest while the escalation stays
+    quiet (fresh-review P1-1: a deduped journal made the 3rd capped check read "healthy").
+    `runner_dead` in the view is
     the CLI's "state/runner.lock names a DEAD pid" read — a CRASH leaves the pidfile behind, a
     clean stop removes it, so it distinguishes 'provably gone' from 'deliberately stopped'.
 
@@ -385,11 +389,15 @@ def _resurrection(now, view, w, sigs, details, new_state):
                         "restart is disabled (watchdog.resurrection_max_per_hour = 0). The loop is "
                         "down and will stay down until you restart it."))
                 else:                                      # genuine crash-loop cap hit
+                    # ATTEMPTED, never "was restarted": an attempt is recorded before delivery, so an
+                    # undeliverable one (no_pane — no tab made, nothing launched) burns a slot too.
+                    # Counting it is deliberate; asserting a restart that never happened is not
+                    # (fresh-review P1-2 — fabricated history is this codebase's cardinal sin).
                     notify.append((
                         "superlooper runner keeps dying — auto-restart PAUSED",
-                        f"the runner has been auto-restarted {len(recent)} time(s) in the last hour "
-                        "and is still going down. That is a real incident, not a flap, so automatic "
-                        "resurrection is paused — the loop needs you."))
+                        f"automatic restart has been attempted {len(recent)} time(s) in the last "
+                        "hour and the runner is still down. That is a real incident, not a flap, so "
+                        "automatic resurrection is paused — the loop needs you."))
         else:
             n = new_state.get("next_resurrection", 1)
             resurrect = {"id": f"r{n}", "signals": present}
@@ -405,7 +413,7 @@ def _resurrection(now, view, w, sigs, details, new_state):
         r["attempts"] = attempts
 
     new_state = dict(new_state, resurrection=r)
-    return sigs, details, resurrect, journal, notify, new_state
+    return sigs, details, resurrect, journal, notify, new_state, (hb_stale and runner_dead)
 
 
 def evaluate(now, config, view, state):
@@ -416,6 +424,10 @@ def evaluate(now, config, view, state):
       notify   [(title, body)] — at most one entry (the episode-opening text);
       launch   None, or the launch request {"id","signals","authority","allowlist"} the
                caller executes through the launch shim, then feeds to after_launch.
+      runner_down  the runner is PROVABLY GONE this check (heartbeat stale AND its recorded pid
+               dead). Reported EVERY check, unlike the escalation journal/notify, which dedup to
+               once per capped streak — so a caller can stay honest ("the runner is DOWN") on
+               checks that deliberately say nothing. False under the kill switch (path suppressed).
     The caller supplies `view` (every I/O fact, already read) so this stays a pure function.
     """
     w = _wcfg(config)
@@ -427,10 +439,13 @@ def evaluate(now, config, view, state):
         # launch, NO resurrection (WATCHDOG_OFF is the whole-path kill switch). The journal record
         # dedups on the OBSERVED signal set (review P1-2): a standing switch writes one line per
         # distinct observation, never one per check.
+        # runner_down stays False here: the kill switch suppresses the whole resurrection path, so
+        # the caller's summary reports DISABLED (what it observed), never a cap it never evaluated.
         if sigs == state.get("disabled_observed"):
-            return {"state": state, "notify": [], "launch": None, "journal": [], "resurrect": None}
+            return {"state": state, "notify": [], "launch": None, "journal": [], "resurrect": None,
+                    "runner_down": False}
         return {"state": dict(state, disabled_observed=sigs), "notify": [], "launch": None,
-                "journal": [_rec("disabled", sigs)], "resurrect": None}
+                "journal": [_rec("disabled", sigs)], "resurrect": None, "runner_down": False}
 
     new_state = dict(state, no_progress_since=since, disabled_observed=None)
     journal, notify, launch = [], [], None
@@ -438,7 +453,7 @@ def evaluate(now, config, view, state):
     # Runner resurrection (issue #208) runs BEFORE the debugger-episode logic: it may reroute a
     # provably-gone runner's heartbeat_stale away from the episode (a corpse needs restarting, not
     # diagnosing) and emit a resurrect request or a loud escalation.
-    sigs, details, resurrect, res_journal, res_notify, new_state = _resurrection(
+    sigs, details, resurrect, res_journal, res_notify, new_state, runner_down = _resurrection(
         now, view, w, sigs, details, new_state)
     journal.extend(res_journal)
     notify.extend(res_notify)
@@ -457,13 +472,13 @@ def evaluate(now, config, view, state):
                 # (a long outage at a 5-min interval must not write a record per check).
                 new_state["episode"] = ep
                 return {"state": new_state, "journal": journal, "notify": notify,
-                        "launch": None, "resurrect": resurrect}
+                        "launch": None, "resurrect": resurrect, "runner_down": runner_down}
             # Self-recovery or owner intervention during (or after) the grace: stand down
             # SILENTLY — the journal keeps the record, the phone stays quiet.
             journal.append(_rec("stand_down", ep_signals))
         new_state["episode"] = None
         return {"state": new_state, "journal": journal, "notify": notify, "launch": launch,
-                "resurrect": resurrect}
+                "resurrect": resurrect, "runner_down": runner_down}
 
     if ep is None:
         ep = {"signals": sigs, "opened_at": now, "detail": "; ".join(details),
@@ -496,7 +511,7 @@ def evaluate(now, config, view, state):
             new_state["next_debugger"] = n + 1
 
     return {"state": new_state, "journal": journal, "notify": notify, "launch": launch,
-            "resurrect": resurrect}
+            "resurrect": resurrect, "runner_down": runner_down}
 
 
 def after_launch(now, config, state, launch, rc):

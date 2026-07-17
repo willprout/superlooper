@@ -644,6 +644,25 @@ def test_cap_of_zero_disables_resurrection_and_escalates_immediately():
     assert "0 time" not in body
 
 
+def test_cap_escalation_claims_attempts_never_asserted_restarts():
+    # Fresh-review P1-2: an attempt is recorded BEFORE delivery, so a "no_pane" attempt (no tab
+    # created, nothing launched) burns a cap slot identically to a real restart. Counting it is
+    # deliberate (an undeliverable restart is still a failure to recover), but the escalation must
+    # not FABRICATE history by asserting the runner "was restarted N times" when it never came up.
+    cfg = _cfg(resurrection_max_per_hour=1)
+    st = wd.new_state()
+    r1 = _run(T0, _dead(T0), st, cfg=cfg)
+    # the attempt was undeliverable: the recorded pane is gone, so nothing was ever restarted
+    st = wd.after_resurrect(T0, cfg, r1["state"], r1["resurrect"], rc="no_pane")["state"]
+    later = T0 + 6 * MIN
+    capped = _run(later, _dead(later), st, cfg=cfg)
+    assert [j.get("outcome") for j in capped["journal"]] == ["resurrect_capped"]
+    body = capped["notify"][0][1].lower()
+    assert "attempt" in body                          # honest: restart was TRIED
+    assert "been auto-restarted" not in body          # never assert a restart that did not happen
+    assert "restarted 1 time" not in body
+
+
 def test_attempts_age_out_of_the_rolling_window():
     cfg = _cfg(resurrection_max_per_hour=2)
     st = wd.new_state()

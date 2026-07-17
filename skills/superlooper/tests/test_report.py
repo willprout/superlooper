@@ -498,6 +498,18 @@ def test_runner_resurrection_failure_and_cap_are_honest():
     assert "nothing happened" not in out.lower()
 
 
+def test_runner_resurrection_cap_line_claims_attempts_not_asserted_restarts():
+    # Fresh-review P1-2 (report face): attempts are recorded before delivery, so an undeliverable
+    # (no_pane) attempt counts toward the cap without ever restarting anything. The morning line
+    # must describe ATTEMPTS, never assert "it was restarted N time(s)" — fabricated history.
+    j = [_rec(1040, "runner_resurrect", outcome="resurrect_capped", attempts=5, max_per_hour=5,
+              signals=["heartbeat_stale"])]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "PAUSED" in out and "5 time" in out         # the count still reaches the owner
+    assert "attempt" in out.lower()
+    assert "it was restarted 5 time" not in out
+
+
 def test_runner_resurrection_disabled_report_line_is_honest():
     # max_per_hour=0 (auto-restart disabled): the report must say DISABLED, not "restarted 0 time(s)".
     j = [_rec(1040, "runner_resurrect", outcome="resurrect_capped", attempts=0, max_per_hour=0,

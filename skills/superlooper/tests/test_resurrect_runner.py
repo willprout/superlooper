@@ -50,6 +50,15 @@ STUB_CMUX = textwrap.dedent("""\
             # the dropped command. Run the REAL shim so this is a true integration test.
             ( CMUX_SURFACE_ID="$SURF" zsh -c "source '$SHIM_PATH'" ) >/dev/null 2>&1 &
             ;;
+          late)
+            # A runner that acquires the lock 1.5s in — INSIDE the gap between the poll's last read
+            # (t=1s) and the window closing (t=2s), with SL_LAUNCH_VERIFY_SECONDS=2. Anchored to the
+            # new-surface call (milliseconds before the poll starts) rather than to a shim/zsh boot,
+            # whose startup jitter under load is a large fraction of the 1s gap being targeted — the
+            # timing must be pinned to the same clock as the loop it is probing.
+            ( sleep 1.5; bash -c 'echo $$ > "$SL_RUN_ROOT/state/runner.lock"; sleep 5' ) \\
+              >/dev/null 2>&1 &
+            ;;
           drop) : ;;   # nothing runs the dropped command -> runner never comes up -> verify times out
         esac
         ;;
@@ -156,6 +165,33 @@ def test_rejects_a_non_runner_id(tmp_path):
     r = rig.run("deliver", rid="i7")                       # an issue id must never route here
     assert r.returncode == 64
     assert "runner id" in r.stderr
+
+
+@pytest.mark.parametrize("rid", ["r1; touch /tmp/sl-pwned", "r1abc", "r1 r2", "r", "r1/../x"])
+def test_the_runner_id_contract_is_anchored_not_a_prefix_glob(tmp_path, rid):
+    # Fresh-review P2-3: the id guard was `case $ID_IN in r[0-9]*)`, an UNANCHORED glob that accepts
+    # anything trailing the first digit ("r1; touch ..." ACCEPTED). Not exploitable today ($ID only
+    # reaches quoted argv, never eval/a filename), but the script's own comment claims the symmetric
+    # contract to launch-session.sh's anchored ^[ad][0-9]+$ — so make the code match the claim
+    # rather than rest on a downstream accident. Refuse at the door: r<N> and nothing else.
+    rig = _Rig(tmp_path)
+    r = rig.run("deliver", rid=rid)
+    assert r.returncode == 64, (rid, r.stdout, r.stderr)
+    assert "runner id" in r.stderr
+    assert not os.path.exists("/tmp/sl-pwned")
+
+
+def test_a_runner_that_lands_in_the_last_second_is_verified_not_killed(tmp_path):
+    # Fresh-review P2-5: the poll's last READ is a full second before the window closes, so a runner
+    # that acquired the lock inside that gap was declared NOT VERIFIED — and the cleanup then
+    # close-surface'd the tab of a runner that was actually UP (SIGHUP to a live loop), journaled a
+    # failure, and paged the owner falsely. Re-check once after the loop, before concluding.
+    rig = _Rig(tmp_path)
+    r = rig.run("late", verify_seconds="2")
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "verified live" in r.stdout
+    assert (rig.state / "runner.lock").read_text().strip() != "999999"   # the NEW runner's pid
+    assert not (rig.stub_dir / "closed").exists(), "must never close a LIVE runner's tab"
 
 
 # A noop `superlooper`: does NOT write runner.lock — so the pidfile keeps whatever pid was there.

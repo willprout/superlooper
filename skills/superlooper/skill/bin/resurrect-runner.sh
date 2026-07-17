@@ -29,10 +29,14 @@ CWD="${2:?usage: resurrect-runner.sh --cwd <repo> <r-id>}"
 ID_IN="${3:?usage: resurrect-runner.sh --cwd <repo> <r-id>}"
 # Runner-resurrection ids are r<N> ONLY — the symmetric contract to launch-session.sh's a<N>/d<N>
 # --cwd ids, so a stray issue/answerer id can never route a session launch through the runner path.
-case "$ID_IN" in
-  r[0-9]*) ID="$ID_IN" ;;
-  *) echo "[$ID_IN] resurrect-runner.sh takes a runner id (r<N>) only — refusing" >&2; exit 64 ;;
-esac
+# ANCHORED (^r[0-9]+$), matching launch-session.sh: a `case` glob of `r[0-9]*` accepts everything
+# trailing the first digit ("r1; touch ..."), which today is harmless only because $ID reaches
+# nothing but quoted argv. Refuse at the door rather than rest on that downstream accident.
+if [[ "$ID_IN" =~ ^r[0-9]+$ ]]; then
+  ID="$ID_IN"
+else
+  echo "[$ID_IN] resurrect-runner.sh takes a runner id (r<N>) only — refusing" >&2; exit 64
+fi
 
 SL_RUN_ROOT="${SL_RUN_ROOT:?SL_RUN_ROOT required}"
 # The cmux PANE the dead runner recorded as its anchor — the new runner tab is born here so it is
@@ -98,14 +102,20 @@ LOCK="$SL_RUN_ROOT/state/runner.lock"
 VERIFY_WINDOW="${SL_LAUNCH_VERIFY_SECONDS:-30}"
 up=0
 waited=0
-while [ "$waited" -lt "$VERIFY_WINDOW" ]; do
+runner_up() {
   pid="$(cat "$LOCK" 2>/dev/null | tr -d '[:space:]' || true)"
-  if [ -n "$pid" ] && [ "$pid" != "$OLD_PID" ] \
-       && printf '%s' "$pid" | grep -qE '^[0-9]+$' && kill -0 "$pid" 2>/dev/null; then
-    up=1; break
-  fi
+  [ -n "$pid" ] && [ "$pid" != "$OLD_PID" ] \
+    && printf '%s' "$pid" | grep -qE '^[0-9]+$' && kill -0 "$pid" 2>/dev/null
+}
+while [ "$waited" -lt "$VERIFY_WINDOW" ]; do
+  if runner_up; then up=1; break; fi
   sleep 1; waited=$((waited + 1))
 done
+# One FINAL read before concluding: the loop's last read happens a full second before the window
+# actually closes, and a runner that acquires the lock inside that gap is UP. Concluding "not
+# verified" there would close-surface a LIVE runner's tab (SIGHUP to a running loop) and page the
+# owner about a restart that in fact succeeded — a self-inflicted outage. Costs one file read.
+if [ "$up" -ne 1 ] && runner_up; then up=1; fi
 
 if [ "$up" -ne 1 ]; then
   # Leave no time-bomb: remove the dropped command so no straggler shell starts a second runner, and

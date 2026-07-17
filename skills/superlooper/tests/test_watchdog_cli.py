@@ -57,6 +57,9 @@ _FAKE_RESURRECT = """#!/bin/bash
   printf 'ROOT %s\\n' "${SL_RUN_ROOT:-}"
   printf 'BIN %s\\n' "${SL_SUPERLOOPER_BIN:-}"
   printf 'VERIFY %s\\n' "${SL_LAUNCH_VERIFY_SECONDS:-unset}"
+  # Snapshot the watchdog state AS THE LAUNCHER SEES IT — proof of what was already durable on
+  # disk at launch time, not merely what got written once the launcher returned.
+  printf 'STATE_AT_LAUNCH %s\\n' "$(cat "${SL_RUN_ROOT:-}/state/watchdog.json" 2>/dev/null | tr -d '\\n ')"
 } >> "$RESURRECT_LOG"
 exit "${STUB_RESURRECT_RC:-0}"
 """
@@ -603,6 +606,45 @@ def test_cap_of_zero_escalates_without_resurrecting_and_summary_is_honest(tmp_pa
     assert [x["outcome"] for x in rig.rjournal()] == ["resurrect_capped"]
     assert "DISABLED" in r.stdout or "PAUSED" in r.stdout
     assert "healthy" not in r.stdout
+
+
+def test_the_attempt_is_durable_before_the_launcher_runs(tmp_path):
+    # Fresh-review P2-6: the attempt was persisted only AFTER the resurrect subprocess, which can run
+    # up to WATCHDOG_LAUNCH_TIMEOUT (180s). A watchdog killed inside that window lost the attempt, so
+    # the next check restarted again with the slot un-burned — and the rolling-hour cap is the ONLY
+    # anti-storm guard the DoD has ("no relaunch storms"). The attempt must be on disk BEFORE the
+    # launcher is invoked, so a crash mid-restart can only ever OVER-count, never under-count.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)
+    rig.anchor()
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    snap = [l.split(" ", 1)[1] for l in rig.resurrect_log.read_text().splitlines()
+            if l.startswith("STATE_AT_LAUNCH ")]
+    assert len(snap) == 1, rig.resurrect_log.read_text()
+    at_launch = json.loads(snap[0])
+    assert len(at_launch["resurrection"]["attempts"]) == 1, at_launch
+
+
+def test_every_capped_check_stays_honest_not_just_the_first(tmp_path):
+    # Fresh-review P1-1: the escalation JOURNAL/notify is deduped to once per capped streak (no
+    # storm), but the hand-run summary must be honest on EVERY check. Deriving "capped" from the
+    # (deduped) journal made the 3rd check print "healthy — no signal" while the runner was still
+    # provably gone — the machine telling the owner the loop is fine during an outage.
+    rig = _Rig(tmp_path, watchdog_cfg={"resurrection_max_per_hour": 1})
+    rig.anchor()
+    rig.runner_lock(999999)                          # dead pid: the runner stays provably gone
+    rig.heartbeat(3600)
+    first = rig.run()                                # burns the single cap slot
+    assert "resurrected the runner" in first.stdout, first.stdout
+    second = rig.run()                               # cap hit: escalates loudly, once
+    assert "PAUSED" in second.stdout and "healthy" not in second.stdout
+    third = rig.run()                                # still capped: silent, but MUST stay honest
+    assert "healthy" not in third.stdout, third.stdout
+    assert "DOWN" in third.stdout, third.stdout
+    # the escalation itself stays deduped — one notify across the capped streak, never per check
+    assert [x["outcome"] for x in rig.rjournal()] == ["resurrected", "resurrect_capped"]
 
 
 def test_no_resolvable_pane_is_a_loud_resurrect_failure_not_a_crash(tmp_path):
