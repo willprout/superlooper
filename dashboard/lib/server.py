@@ -140,12 +140,13 @@ def _serve_static(rel_path, static_root):
 _MAX_BODY = 64 * 1024                    # a flag body is short; cap the read so a POST can't balloon RAM
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-# The four verbs that are a label/close write keyed on (repo, num) → the Actions method name.
+# The label/close write verbs keyed on (repo, num) → the Actions method name.
 _LABEL_VERBS = {
     "/api/approve": "approve",           # also serves re-approve (same mechanical effect + comment)
     "/api/drop": "drop",
     "/api/expedite": "expedite",
     "/api/bounce-yes": "bounce_yes",
+    "/api/rebuild": "rebuild",           # issue #161: the explicit rebuild-from-scratch verb
 }
 _ACTION_PATHS = set(_LABEL_VERBS) | {"/api/flag", "/api/discuss", "/api/answer"}
 

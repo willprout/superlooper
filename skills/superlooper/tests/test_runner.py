@@ -2696,6 +2696,76 @@ def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(ri
     assert st["answerers"] == {}                                    # active answerer dropped
 
 
+# ---------------- resume at the gate: D11 non-destructive re-approval (issue #161) ----------------
+
+def test_resume_at_gate_preserves_the_worktree_report_pr_and_review_carry(rig, monkeypatch):
+    """THE D11 fix: re-approving a FINISHED build resumes at the merge gate on the EXISTING PR — it
+    must NOT prune the worktree, NOT delete the filed report, and NOT drop the recorded PR or the
+    #154 durable review carry (the whole point is to re-run the mechanical gate against the work that
+    already exists, building nothing new)."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    seed_issue(rig, "i5", status="needs_william", pr=555, branch="sl/i5-x",
+               review_carry={"from": "a" * 40, "to": "b" * 40}, launches=2, retries=1)
+    (rig.home / "reports" / "i5.md").write_text("## Tests\nthe finished report")
+
+    out = rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
+
+    assert "resume" in out.lower()
+    assert removed == []                                       # worktree NEVER torn down
+    assert (rig.home / "reports" / "i5.md").exists()           # report NEVER wiped
+    ist = issue_state(rig, "i5")
+    assert ist["pr"] == 555                                    # PR kept — the gate re-enters on it
+    assert ist["review_carry"] == {"from": "a" * 40, "to": "b" * 40}   # #154 evidence kept
+    assert ist["branch"] == "sl/i5-x"
+    # a continuation, not a fresh cap: the honest attempt counters are NOT zeroed (unlike reapprove)
+    assert ist["launches"] == 2 and ist["retries"] == 1
+
+
+def test_resume_at_gate_reclaims_the_lane_for_gating(rig):
+    # status -> gating and the labels swap agent-ready -> in-progress (removing the park labels), so
+    # the finished/gate path re-runs next tick and the launch phase never rebuilds it.
+    seed_issue(rig, "i5", status="parked", pr=555, branch="sl/i5-x")
+    (rig.home / "reports" / "i5.md").write_text("## Tests\nreport")
+    rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
+    assert issue_state(rig, "i5")["status"] == "gating"
+    lab = [m for m in mutations(rig) if m["kind"] == "set_labels"][-1]
+    assert "in-progress" in lab["add"]
+    assert "agent-ready" in lab["remove"] and "parked" in lab["remove"] and "needs-owner" in lab["remove"]
+
+
+def test_resume_at_gate_clears_the_repark_triggers_so_the_gate_does_not_immediately_repark(rig):
+    """Resume must clear exactly the transient fields that would re-park the gate the instant it
+    re-runs: the merge-refusal guard (episode-scoped, #27), the recheck-failed hand-back (#…), the
+    pending-checks / PR-read / comments-read hold clocks (#26/#61/#78), and the park-notify episode
+    markers (#61). Everything that is real WORK — the PR, report, worktree, carry — stays."""
+    seed_issue(rig, "i5", status="needs_william", pr=555, branch="sl/i5-x",
+               merge_refusals=3, merge_refusal_reason="branch protection",
+               recheck_failed=True, checks_pending_since=NOW - 9999,
+               comments_read_pending_since=NOW - 9999, pr_read_pending_since=NOW - 9999,
+               read_waited=True, park_notify_cause="merge_refused", park_notify_at=NOW - 9999,
+               park_comment_posted=True)
+    (rig.home / "reports" / "i5.md").write_text("## Tests\nreport")
+    rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
+    st = issue_state(rig, "i5")
+    assert st["merge_refusals"] == 0 and st["merge_refusal_reason"] is None
+    assert st["recheck_failed"] is False
+    assert st["checks_pending_since"] is None
+    assert st["comments_read_pending_since"] is None and st["pr_read_pending_since"] is None
+    assert st["read_waited"] is False
+    assert st["park_notify_cause"] is None and st["park_notify_at"] is None
+    assert st["park_comment_posted"] is False
+
+
+def test_resume_at_gate_journals_the_resume(rig):
+    seed_issue(rig, "i5", status="parked", pr=555, branch="sl/i5-x")
+    (rig.home / "reports" / "i5.md").write_text("## Tests\nreport")
+    rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
+    recs = [r for r in journal.read(rig.home) if r.get("act") == "resume_at_gate"]
+    assert recs and recs[-1]["id"] == "i5"
+
+
 # ---------------- bounded pending-checks clock executors (issue #26) ----------------
 
 def test_note_checks_pending_stamps_once_and_is_idempotent(rig):

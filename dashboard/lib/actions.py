@@ -40,6 +40,12 @@ FLAG = "flag"
 # the LATEST comment carrying it as the owner's answer and embeds the Q&A in the relaunched brief.
 AWAITING_ANSWER = "awaiting-answer"
 ANSWER_MARKER = "<!-- superlooper-answer -->"
+# The explicit rebuild-from-scratch flag (issue #161). Re-approving a finished lane RESUMES AT THE
+# GATE by default (the engine keeps the PR/report); this label is the owner's separately-named choice
+# to instead DISCARD that work and build anew. The engine reads it, then clears it once consumed. It
+# is created-or-forced on first use (like FLAG) so the button works on a repo not yet re-adopted.
+REBUILD = "rebuild"
+_REBUILD_LABEL_COLOR = "d73a4a"              # the destructive red — this verb throws finished work away
 
 # The flag label, created-or-updated on first use so a fresh repo's first flag just works (the gh
 # adapter's create_label uses --force, so this is idempotent — never an error on a repo that already
@@ -74,6 +80,10 @@ def expedite_comment(operator, date):
 def bounce_comment(operator, date):
     return ("Bounce accepted by %s via command-center, %s. "
             "Proceeding with the amended goal." % (operator, date))
+
+
+def rebuild_comment(operator, date):
+    return "Rebuilt from scratch by %s via command-center, %s." % (operator, date)
 
 
 def flag_title(text):
@@ -151,6 +161,26 @@ class Actions:
         labeled = self._gh.set_labels(repo, num, add=[EXPEDITE])
         commented = self._gh.comment(repo, num, expedite_comment(self._operator, self._date()))
         return {"ok": bool(labeled and commented), "verb": "expedite",
+                "labeled": bool(labeled), "commented": bool(commented)}
+
+    def rebuild(self, repo, num):
+        """Rebuild from scratch (issue #161): the destructive sibling of approve. Re-applies
+        ``agent-ready`` AND the ``rebuild`` label — the engine reads that label as the owner's
+        explicit choice to DISCARD the finished PR/report and build anew, overriding the default
+        resume-at-the-gate. Clears the park labels and leaves the standard audit comment. The
+        ``rebuild`` label is create-or-forced first (idempotent ``--force``, mirroring ``flag``) so
+        the verb works even on a repo not yet re-adopted after #161 shipped — gh refuses to apply a
+        label that does not exist. ``agent-ready`` is William's word: ``ok`` requires BOTH the label
+        move and its audit comment, so a label applied without the trail is not a success."""
+        if repo not in self._allowed:
+            return self._refuse("rebuild")
+        self._gh.create_label(repo, REBUILD, _REBUILD_LABEL_COLOR,
+                              "%s's explicit rebuild: discard this issue's PR and review and build "
+                              "from scratch" % self._operator)
+        labeled = self._gh.set_labels(repo, num, add=[AGENT_READY, REBUILD],
+                                      remove=[PARKED, NEEDS_OWNER, NEEDS_OWNER_LEGACY])
+        commented = self._gh.comment(repo, num, rebuild_comment(self._operator, self._date()))
+        return {"ok": bool(labeled and commented), "verb": "rebuild",
                 "labeled": bool(labeled), "commented": bool(commented)}
 
     def bounce_yes(self, repo, num):

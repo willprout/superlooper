@@ -135,6 +135,56 @@ def test_approve_still_clears_the_legacy_label_mid_migration(tmp_path, monkeypat
     assert "needs-william" in _removed_labels(_mutations(tmp_path))
 
 
+# =============================== rebuild — the explicit destructive re-approval (issue #161) ===============================
+# Re-approving a finished lane now RESUMES AT THE GATE by default (the engine keeps the PR/report and
+# re-runs the merge gate). Rebuild is the separately-named destructive verb: it re-applies agent-ready
+# AND the `rebuild` label, which the engine reads as the owner's explicit choice to DISCARD the
+# finished PR/report and build from scratch. Same audit-trail + fail-closed disciplines as approve.
+
+def test_rebuild_applies_agent_ready_and_the_rebuild_label(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    res = a.rebuild(REPO, 4)
+    assert res["ok"] is True and res["verb"] == "rebuild"
+    muts = _mutations(tmp_path)
+    added = _added_labels(muts)
+    assert "agent-ready" in added and "rebuild" in added     # BOTH — the rebuild flag rides along
+    assert {"parked", "needs-owner", "needs-william"} <= _removed_labels(muts)
+
+
+def test_rebuild_creates_the_rebuild_label_first_so_it_works_pre_adopt(tmp_path, monkeypatch):
+    # gh refuses to apply a label a repo doesn't have; a repo not yet re-adopted after #161 shipped
+    # would have no `rebuild` label. Create-or-force it first (idempotent, --force) — mirrors flag —
+    # so the button just works, then apply it.
+    a = _acts(monkeypatch, tmp_path)
+    a.rebuild(REPO, 4)
+    muts = _mutations(tmp_path)
+    lab = next(m for m in muts if m["kind"] == "create_label")
+    assert lab["name"] == "rebuild" and lab["force"] is True
+    setl = next(m for m in muts if m["kind"] == "set_labels" and "rebuild" in (m.get("add") or ""))
+    assert muts.index(lab) < muts.index(setl)                # created BEFORE it is applied
+
+
+def test_rebuild_posts_the_exact_audit_comment(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    a.rebuild(REPO, 4)
+    comment = [m for m in _mutations(tmp_path) if m["kind"] == "comment"][-1]
+    assert comment["num"] == "4"
+    assert comment["body"] == "Rebuilt from scratch by Ada via command-center, 2026-07-07."
+
+
+def test_rebuild_refuses_an_unwatched_repo_with_no_gh_call(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path, allowed=(REPO,))
+    res = a.rebuild("evil/elsewhere", 4)
+    assert res["ok"] is False and res["error"] == "unknown repo"
+    assert _calls(tmp_path) == []
+
+
+def test_rebuild_fails_closed_when_gh_write_fails(tmp_path, monkeypatch):
+    a = _acts(monkeypatch, tmp_path)
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert a.rebuild(REPO, 4)["ok"] is False
+
+
 def test_bounce_yes_succeeds_on_a_repo_that_finished_the_migration(tmp_path, monkeypatch):
     a = _acts(monkeypatch, tmp_path)
     monkeypatch.setenv("GH_LABEL_NOT_IN_REPO", "needs-william")

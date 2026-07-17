@@ -842,6 +842,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     out = []
     parked_now = set()
     reapproved_now = set()
+    resumed_now = set()          # re-approved FINISHED builds resuming at the gate (issue #161):
+                                 # held out of THIS tick's launch phase, like reapproved_now, so the
+                                 # gate re-claims the lane rather than a fresh session rebuilding it
 
     def notify(title, body):
         out.append({"act": "notify", "title": title, "body": body})
@@ -1145,8 +1148,24 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 p = parsed_by_id.get(iid)
                 labels = p.get("labels") if isinstance(p, dict) and isinstance(p.get("labels"), list) else []
                 if "agent-ready" in labels:
-                    out.append({"act": "reapprove", "id": iid, "num": _iid_num(iid)})
-                    reapproved_now.add(iid)
+                    # D11 (issue #161): re-approving a FINISHED build must stop destroying finished
+                    # work by default. A report on disk means the worker finished and opened its PR
+                    # (its last act is the report, filed only after `gh pr create`), so the default is
+                    # RESUME AT THE GATE — re-enter the merge gate on the existing PR and its #154
+                    # durable review evidence, building nothing new (`resume_at_gate`). Only the
+                    # explicit `rebuild` label — the dashboard's separately-named destructive verb —
+                    # or a lane with no finished work to keep takes the rebuild-from-scratch path
+                    # (`reapprove`, which prunes the worktree and wipes the report). An investigation
+                    # opens no PR (its completion is a marker comment, not a merge) and a bounce
+                    # rejects the issue's premise, so both always rebuild.
+                    itype = (p.get("type") if isinstance(p, dict) else None) or ist.get("type")
+                    if (iid in reports and itype != "investigate" and status != "bounced"
+                            and "rebuild" not in labels):
+                        out.append({"act": "resume_at_gate", "id": iid, "num": _iid_num(iid)})
+                        resumed_now.add(iid)
+                    else:
+                        out.append({"act": "reapprove", "id": iid, "num": _iid_num(iid)})
+                        reapproved_now.add(iid)
                     reapproved = True
             # Reconciliation (issue #21): a PARKED investigation whose marker comment appears on a
             # later SUCCESSFUL read must never be left parked forever — close it. Only a fresh,
@@ -1880,6 +1899,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             if ("agent-ready" not in labels or "in-progress" in labels
                     or iid in parked_now
                     or iid in reapproved_now   # just re-released: launch next tick, reset counters
+                    or iid in resumed_now      # just re-claimed for the gate (#161): never rebuild it
                     or _status_of(ist) not in RELAUNCHABLE_STATUSES   # wrong-typed status: never launch (#95)
                     or corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
                 continue

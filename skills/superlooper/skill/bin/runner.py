@@ -2739,8 +2739,43 @@ class Runner:
         # agent-ready -> in-progress. Best-effort: a gh blip only leaves a cosmetic stale label,
         # never blocks the relaunch (phase E keys off agent-ready, not the parked label). Remove BOTH
         # the current `needs-owner` and the legacy `needs-william` so a repo mid-migration clears too.
-        gh.set_labels(num, remove=["parked", "needs-owner", "needs-william"])
+        gh.set_labels(num, remove=["parked", "needs-owner", "needs-william", "rebuild"])
         return f"reapproved (reset {old or 'nothing'})"
+
+    def _exec_resume_at_gate(self, a, now):
+        """D11 fix (issue #161): re-approving a FINISHED build RESUMES AT THE GATE — it re-enters the
+        mechanical merge gate on the PR the issue already opened, building NOTHING new. Unlike
+        _exec_reapprove (the explicit `rebuild` path), this KEEPS the worktree, the filed report, the
+        recorded PR, and the #154 durable review carry. It clears ONLY the transient fields that would
+        make the gate re-park the instant it re-runs — the episode-scoped merge-refusal guard (#27),
+        the recheck-failed hand-back (checked before the gate), the pending-checks / PR-read /
+        comments-read hold clocks (#26/#61/#78), and the park-notify episode markers (#61) — and
+        re-claims the lane for gating: status -> gating, and the labels swap agent-ready -> in-progress
+        (the finished/gate path keys off the report on disk, and the launch phase skips an in-progress
+        lane, so no fresh session ever rebuilds over the preserved work). The attempt counters are
+        DELIBERATELY not zeroed: a resume is a continuation of the same episode, not a fresh cap, so
+        the honest prior cost stays. No _teardown_session: a park-family lane has no live session (the
+        park stood it down), and tearing one down is exactly what this fix exists to avoid."""
+        iid, num = a["id"], a.get("num")
+        def resume(st, i):
+            i.update({"status": "gating", "requeue_front": False, "recheck_failed": False,
+                      "merge_refusals": 0, "merge_refusal_reason": None,
+                      "checks_pending_since": None, "comments_read_pending_since": None,
+                      "pr_read_pending_since": None, "read_waited": False,
+                      "park_notify_cause": None, "park_notify_at": None,
+                      "park_comment_posted": False})
+        self._update_issue(iid, fn=resume)
+        journal.append(self.home, {"act": "resume_at_gate", "id": iid}, now)
+        # Re-claim the lane: in-progress (the loop is driving it to merge) replaces the owner's
+        # agent-ready, and the park-family labels the re-approval passed are cleared. Best-effort like
+        # _exec_reapprove's own tail: the durable status=gating is the real guard (it keeps the lane
+        # out of both the reapprove branch and the launch phase), so a gh blip only leaves a cosmetic
+        # stale label, never a rebuild. Remove BOTH needs-owner and the legacy needs-william so a repo
+        # mid-migration clears too.
+        gh.set_labels(num, add=["in-progress"],
+                      remove=["agent-ready", "parked", "needs-owner", "needs-william"])
+        self._forget_cached_label(iid, "agent-ready")
+        return "resumed at the gate (PR, report and worktree preserved)"
 
     def _exec_reclaim(self, a, now):
         if not gh.set_labels(a.get("num"), add=["agent-ready"], remove=["in-progress"]):

@@ -16,9 +16,13 @@
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
-  function cardHTML(c, confirmingDrop) {
+  function cardHTML(c, confirming) {
     var da = ' data-repo="' + esc(c.repo) + '" data-num="' + esc(c.num) + '"';
-    var confirming = confirmingDrop === (c.repo + "#" + c.num);
+    // The armed (second-tap) key is per (repo, num, ACT): a decision card can now carry TWO
+    // destructive verbs — Rebuild and Drop (issue #161) — and arming one must never arm the other.
+    // `confirming` is the caller-threaded "repo#num#act" mid-confirm, kept in state so the 2s poll
+    // re-render can't silently disarm it (design record §4). `armKey` is that string for one action.
+    var armKey = function (a) { return c.repo + "#" + c.num + "#" + a.act; };
 
     // The flight chip opens the drawer (tap-where-you-read); it carries data-repo because Needs You
     // is WHOLE-FIELD — a card may name any watched repo, not the one currently on camera, so the
@@ -78,9 +82,9 @@
     // Plain visible text, no aria-live role: #root is rebuilt whole every 2s poll while the confirm
     // stays armed, so a live region would re-announce every tick (Codex review). It is never a browser
     // confirm() — the state survives that re-render (§4).
-    var armedAct = confirming
-      ? (c.actions || []).filter(function (a) { return a.destructive && a.armed_caption; })[0]
-      : null;
+    var armedAct = confirming && (c.actions || []).filter(function (a) {
+      return a.destructive && a.armed_caption && confirming === armKey(a);
+    })[0];
     var dropConsequence = armedAct
       ? '<div class="drop-consequence">' + esc(armedAct.armed_caption) + '</div>'
       : "";
@@ -90,7 +94,7 @@
     // real behaviour cannot drift apart. `destructive` (not a hard-coded "drop") drives the two-tap
     // arm, so any future destructive verb inherits the confirm rather than being forgotten.
     var actions = '<div class="actions">' + (c.actions || []).map(function (a) {
-      var armed = a.destructive && confirming;
+      var armed = a.destructive && confirming === armKey(a);
       var cls = a.tone === "link" ? "btn-note link" : ("btn " + (a.tone || "ghost"));
       if (armed) cls += " danger";
       // A verb that takes typed input (the #163 Answer) renders a textarea the operator fills in;
@@ -117,7 +121,7 @@
   // EMPTY collapses to a slim all-clear rail (§4) instead of a full empty column; shell.js narrows
   // the grid track to match, so the airfield gains the reclaimed width. The rail carries an explicit
   // "all clear" caption so the quiet state is never ambiguous (§5 — calm carries a caption).
-  function panelHTML(needs, confirmingDrop) {
+  function panelHTML(needs, confirming) {
     needs = needs || [];
     if (!needs.length) {
       return '<div class="needs collapsed">' +
@@ -127,7 +131,7 @@
           '<span class="cap">ALL CLEAR</span></div></div>';
     }
     var body = '<div class="needs-list">' +
-      needs.map(function (c) { return cardHTML(c, confirmingDrop); }).join("") + '</div>';
+      needs.map(function (c) { return cardHTML(c, confirming); }).join("") + '</div>';
     return '<div class="panel needs">' +
       '<div class="panel-head"><span class="panel-title">NEEDS YOU</span>' +
         '<span class="badge">' + needs.length + '</span></div>' +
