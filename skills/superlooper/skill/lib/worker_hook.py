@@ -1,7 +1,8 @@
 """The Claude worker Stop hook's core — the runner's in-process embassy (issue #148).
 
-stop-hook.sh stamps liveness and then hands the hook payload here. Three duties, each one a
-promise the runner can no longer get from "what a model remembered to do":
+stop-hook.sh stamps liveness and then hands the hook payload here. TWO duties (the harvest was the
+third until issue #189 — see below), each one a promise the runner can no longer get from "what a
+model remembered to do":
 
   1. REPORT HARVEST — MOVED OUT (issue #189). Twice in one day (i280, i328) a worker wrote its
      report to a worktree-relative path; the runner reads state_home/reports/<id>.md, saw nothing,

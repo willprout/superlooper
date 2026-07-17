@@ -1484,7 +1484,12 @@ def test_a_stale_done_ack_from_a_previous_probe_never_harvests():
 
 
 def test_a_done_ack_never_harvests_when_the_report_is_already_visible():
-    # Nothing to rescue: the runner can already see the report, so session_finished is the path.
+    # Nothing to rescue: the runner can already SEE the report, so the finish path owns this lane.
+    # HONEST SCOPE (fresh review P2): a visible report is caught by the has_report branch far
+    # earlier in decide(), which never reaches the stall ladder — so this pins the LAYERED outcome
+    # ("a visible report is never harvested, whichever layer stops it"), not the ladder's own
+    # `iid not in reports` clause. That clause is deliberate defence-in-depth for a DESTRUCTIVE
+    # move: it must not depend on a distant `continue` staying where it is.
     ist5 = ist("running", progress_sig=_sig(report=True), progress_since=NOW - 100000,
                probe_attempts=1, probe_nonce="n1", probe_sent_at=NOW - 1000)
     st = {"version": 1, "issues": {"i5": ist5}}

@@ -103,7 +103,11 @@ _HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 # An UNCLOSED "<!--" swallows the rest of the section when rendered, so it must swallow the rest
 # here too — anything after it is invisible prose, and reading it as evidence is the same fail-open
 # in a subtler costume. Applied after the closed-comment strip, so it only ever sees a real dangle.
-_OPEN_COMMENT = re.compile(r"<!--.*\Z", re.S)
+# ANCHORED TO LINE START (fresh review P1), which is both what CommonMark actually does — an HTML
+# block only OPENS at the start of a line — and what keeps a report that merely TALKS about "<!--"
+# mid-sentence (in inline code, say) from having its real prose swallowed and its finished build
+# false-parked. This very issue's report is that shape, which is how the case was found.
+_OPEN_COMMENT = re.compile(r"(?m)^[ \t]*<!--.*\Z", re.S)
 
 
 def _prose_chars(body):

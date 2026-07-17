@@ -138,6 +138,22 @@ def test_report_sections_multiline_comment_placeholder_never_merges():
     assert gate.report_sections_ok(txt, ["Tests", "Review"]) is False
 
 
+def test_report_sections_an_unclosed_comment_swallows_the_rest_of_its_section():
+    # A dangling "<!--" at line start renders as a comment to the end of the document, so every
+    # "word" after it is invisible — counting it would be the same fail-open in a subtler costume.
+    txt = "## Tests\n" + "x" * 40 + "\n## Review\n<!-- filled in later\n" + "y" * 80 + "\n"
+    assert gate.report_sections_ok(txt, ["Tests", "Review"]) is False
+
+
+def test_report_sections_a_report_that_merely_mentions_a_comment_opener_still_merges():
+    # THE FALSE-PARK GUARD (fresh review P1). An unclosed "<!--" is only an HTML block when it
+    # OPENS a line (CommonMark). A section that TALKS about the marker mid-sentence — inline code
+    # in a report about this very issue — is real, rendered prose and must not be swallowed.
+    review = "`<!--` handling was verified by a fresh agent; no P0/P1 findings survived."
+    txt = "## Tests\n" + "x" * 40 + f"\n## Review\n{review}\n"
+    assert gate.report_sections_ok(txt, ["Tests", "Review"]) is True
+
+
 def test_report_sections_h3_is_not_h2():
     # the contract is H2 headings, parsed mechanically — an H3 "### Tests" is not the section.
     txt = "### Tests\n" + "x" * 50 + "\n## Review\n" + "y" * 50

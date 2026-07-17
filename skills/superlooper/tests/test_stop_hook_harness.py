@@ -1,7 +1,8 @@
 """Issue #148 — the Claude worker Stop hook is the runner's in-process embassy, not just a clock.
 
-Three duties, each proven here by driving the REAL bash hook against a REAL git worktree and a
-real temp state home (the rig test_hooks.py established):
+TWO duties (the harvest was the third until issue #189 retired it from the hook), each proven here
+by driving the REAL bash hook against a REAL git worktree and a real temp state home (the rig
+test_hooks.py established):
 
   1. REPORT HARVEST  — RETIRED from the hook by issue #189; the trigger now lives in the runner
      (lib/actions.py + the runner's executor, proven in test_report_harvest.py). What is pinned

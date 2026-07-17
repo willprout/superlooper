@@ -2888,6 +2888,14 @@ class Runner:
         cwd Claude was actually in), so the harvest looks exactly where the hook used to look. No
         clock, no cwd, no harvest — never a guessed directory for a destructive move.
 
+        DELIBERATELY NOT pinned to self._worktree(iid) (fresh review P2, declined with reasons):
+        that path is CONSTRUCTED, not resolved, and an equality check against a resolved cwd
+        silently never matches wherever the state home sits behind a symlink (/tmp -> /private/tmp
+        on this very platform) — turning the rescue off for good, which is the exact failure this
+        duty exists to prevent. The containment fence inside harvest_report already requires the
+        resolved source to sit under the resolved cwd, and no reachable exploit was found: the cwd
+        is one the worker's own hook stamped, i.e. a directory Claude really ran in.
+
         `harvest_tried` is stamped WHATEVER happens, including on a refusal: it is the bound that
         keeps a report which simply does not exist from re-harvesting every tick (the i328 loop in
         a new costume). progress_advance clears it, so a genuinely-later finish is still rescued.
