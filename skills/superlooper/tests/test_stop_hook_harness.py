@@ -3,9 +3,9 @@
 Three duties, each proven here by driving the REAL bash hook against a REAL git worktree and a
 real temp state home (the rig test_hooks.py established):
 
-  1. REPORT HARVEST  — i280 and i328 both wrote their report to a worktree-relative path on the
-     same day and the queue stalled two hours on i328. If the canonical reports/<id>.md is absent
-     and a report sits under the worker's cwd, the hook moves it.
+  1. REPORT HARVEST  — RETIRED from the hook by issue #189; the trigger now lives in the runner
+     (lib/actions.py + the runner's executor, proven in test_report_harvest.py). What is pinned
+     here is the negative: a Stop must never move a report. See the duty-1 block below.
   2. PROGRESS CLOCK  — state/status/<id>.json each turn end (HEAD, dirty, report/blocked markers),
      so the runner can tell "made progress" from "took a turn" (what lets a probe ladder escape
      i328's infinite loop).
@@ -17,7 +17,6 @@ behavior is unchanged. The Claude-only fence is asserted here too.
 """
 import json
 import os
-import shutil
 import subprocess
 
 import pytest
@@ -107,11 +106,20 @@ def _put_mail(run_root, text):
     return box / ISSUE
 
 
-# --------------------------- duty 1: report harvest ---------------------------
+# ------------- duty 1 RETIRED: the Stop hook never harvests (issue #189) -------------
+# The harvest's fences and its rescue live in test_report_harvest.py now; what belongs HERE is the
+# proof the hook no longer moves anything. On 2026-07-16 it did, twice: i153 and i163 drafted a
+# report at the conventional in-worktree spot MID-session, the very next Stop harvested the draft
+# to the canonical path, the runner read that as session_finished, and the gate parked both lanes
+# on "finished but no PR exists". A Stop fires at EVERY turn end, and at that instant a draft and a
+# finished session's misplaced report are indistinguishable — same shape, same age (the 07-16
+# report mtimes matched the harvest moments exactly). The discriminator only arrives LATER, as the
+# absence of further turns, which a turn-end hook cannot observe. So the hook stopped guessing.
 
-def test_worktree_relative_report_is_harvested_to_the_canonical_path(tmp_path):
-    # The i280/i328 mistake exactly: the report written relative to the worktree, so the runner
-    # (which reads state_home/reports/<id>.md) never sees it and the queue stalls.
+def test_the_stop_hook_never_promotes_an_in_progress_draft(tmp_path):
+    # THE 07-16 REPRO (i153/i163). A worker drafts its report mid-session and keeps building. The
+    # turn ends. Nothing may move: the draft stays put and, crucially, the clock still says
+    # report=false — that field is what the runner turns into session_finished.
     run_root = _state_home(tmp_path)
     wt = tmp_path / "worktrees" / ISSUE
     _worktree(wt)
@@ -122,13 +130,15 @@ def test_worktree_relative_report_is_harvested_to_the_canonical_path(tmp_path):
     r = _stop(run_root, wt)
 
     assert r.returncode == 0, r.stderr
-    canonical = run_root / "reports" / f"{ISSUE}.md"
-    assert canonical.exists(), "an absent canonical report must be rescued from the worker cwd"
-    assert canonical.read_text() == REPORT_TEXT
-    assert not stray.exists(), "the harvest MOVES — a leftover would re-harvest forever"
+    assert stray.read_text() == REPORT_TEXT, "the worker's draft is still its own to edit"
+    assert not (run_root / "reports" / f"{ISSUE}.md").exists(), \
+        "a turn end is not proof of a finished run — the hook must not promote a draft"
+    assert _status(run_root)["report"] is False, \
+        "report=false is what keeps the runner from firing session_finished on a live lane"
 
 
-def test_bare_report_at_the_cwd_root_is_harvested(tmp_path):
+def test_a_bare_draft_at_the_cwd_root_is_left_alone_too(tmp_path):
+    # The hook's other old candidate spot. Same rule: a turn end proves nothing about either.
     run_root = _state_home(tmp_path)
     wt = tmp_path / "worktrees" / ISSUE
     _worktree(wt)
@@ -137,173 +147,26 @@ def test_bare_report_at_the_cwd_root_is_harvested(tmp_path):
     r = _stop(run_root, wt)
 
     assert r.returncode == 0, r.stderr
-    assert (run_root / "reports" / f"{ISSUE}.md").read_text() == REPORT_TEXT
-
-
-def test_an_existing_canonical_report_is_never_clobbered(tmp_path):
-    # The canonical report is the worker's real deliverable; a stale worktree copy must not win.
-    run_root = _state_home(tmp_path)
-    (run_root / "reports").mkdir()
-    canonical = run_root / "reports" / f"{ISSUE}.md"
-    canonical.write_text("## Tests\nthe real report\n")
-    wt = tmp_path / "worktrees" / ISSUE
-    _worktree(wt)
-    stray = wt / "reports" / f"{ISSUE}.md"
-    stray.parent.mkdir(parents=True)
-    stray.write_text("## Tests\na stale draft\n")
-
-    r = _stop(run_root, wt)
-
-    assert r.returncode == 0, r.stderr
-    assert canonical.read_text() == "## Tests\nthe real report\n"
-    assert stray.exists(), "with the canonical report present the hook must not touch the worktree"
-
-
-def test_an_empty_report_is_not_harvested(tmp_path):
-    # A touched/half-written file is not a report; harvesting it would fire session_finished on
-    # nothing and the gate would read an empty deliverable.
-    run_root = _state_home(tmp_path)
-    wt = tmp_path / "worktrees" / ISSUE
-    _worktree(wt)
-    stray = wt / "reports" / f"{ISSUE}.md"
-    stray.parent.mkdir(parents=True)
-    stray.write_text("   \n")
-
-    r = _stop(run_root, wt)
-
-    assert r.returncode == 0, r.stderr
+    assert (wt / f"{ISSUE}.md").exists()
     assert not (run_root / "reports" / f"{ISSUE}.md").exists()
 
 
-def test_a_symlinked_report_is_never_harvested(tmp_path):
-    # Harvesting MOVES the link itself, so the canonical report would BECOME a symlink to whatever
-    # it points at — and the runner reads the canonical report and posts it.
-    # The target sits INSIDE the worktree deliberately: a target outside would be refused by the
-    # containment check, and this test would pass while proving nothing about the islink fence.
+def test_the_hook_still_stamps_the_clock_beside_an_untouched_draft(tmp_path):
+    # Not-harvesting must not become not-running: duties 2 and 3 are unchanged, and the clock is
+    # the very signal the runner's harvest trigger reads. A silent hook would be a worse bug.
     run_root = _state_home(tmp_path)
     wt = tmp_path / "worktrees" / ISSUE
-    _worktree(wt)
-    inside = wt / "notes.md"
-    inside.write_text("private working notes, not a report")
-    (wt / "reports").mkdir()
-    (wt / "reports" / f"{ISSUE}.md").symlink_to(inside)
-
-    r = _stop(run_root, wt)
-
-    assert r.returncode == 0, r.stderr
-    assert not (run_root / "reports" / f"{ISSUE}.md").exists(), \
-        "the canonical report must never become a symlink to some other file"
-    assert inside.read_text() == "private working notes, not a report"
-
-
-def test_a_symlinked_reports_dir_cannot_drag_a_file_out_of_another_directory(tmp_path):
-    # The subtler one: the FILE is real, its PARENT is the link. Following it would move a file out
-    # of a directory that has nothing to do with this worker.
-    run_root = _state_home(tmp_path)
-    wt = tmp_path / "worktrees" / ISSUE
-    _worktree(wt)
-    elsewhere = tmp_path / "someone-elses-dir"
-    elsewhere.mkdir()
-    victim = elsewhere / f"{ISSUE}.md"
-    victim.write_text("## Tests\nnot this worker's file\n")
-    (wt / "reports").symlink_to(elsewhere)
-
-    r = _stop(run_root, wt)
-
-    assert r.returncode == 0, r.stderr
-    assert victim.exists(), "the hook must never move a file that resolves outside the worker cwd"
-    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
-
-
-def test_harvest_refuses_when_git_cannot_say_whether_the_file_is_tracked(tmp_path):
-    # Fail CLOSED in the destructive direction. With git unavailable the hook cannot tell a stray
-    # report from one the worker COMMITTED — and moving a committed file leaves a deletion in the
-    # branch under review. A missed rescue stalls a queue; a wrong move destroys work.
-    run_root = _state_home(tmp_path)
-    wt = tmp_path / "worktrees" / ISSUE
-    _worktree(wt)
+    head = _worktree(wt)
     stray = wt / "reports" / f"{ISSUE}.md"
     stray.parent.mkdir(parents=True)
     stray.write_text(REPORT_TEXT)
-    # A PATH carrying everything the hook needs EXCEPT git — the honest shape of "git is missing",
-    # rather than an empty PATH (which would just fail to find bash and prove nothing).
-    nogit = tmp_path / "nogit-bin"
-    nogit.mkdir()
-    # `dirname` matters: the hook resolves its own lib through it. Omit it and the hook silently
-    # degrades to the activity-only fallback — the harvest would never even be attempted and this
-    # test would pass while proving nothing.
-    for tool in ("bash", "python3", "date", "mkdir", "cat", "dirname"):
-        real = shutil.which(tool)
-        if real:
-            (nogit / tool).symlink_to(real)
-    assert shutil.which("git", path=str(nogit)) is None, "the rig must really hide git"
-    env = {**os.environ, "SL_ISSUE_ID": ISSUE, "SL_RUN_ROOT": str(run_root), "SL_AGENT": "claude",
-           "PATH": str(nogit)}
-    r = subprocess.run([str(nogit / "bash"), STOP_HOOK], input=json.dumps(_payload(wt)), env=env,
-                       capture_output=True, text=True, timeout=60)
-
-    assert r.returncode == 0, r.stderr
-    # The clock proves worker_hook.py really RAN — without it, "the stray survived" would just mean
-    # the hook no-opped.
-    assert _status(run_root)["head"] is None, "the harness must have run, with git unavailable"
-    assert stray.exists(), "unknown tracked-state must refuse the move"
-    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
-
-
-def test_harvest_refuses_when_the_git_index_is_corrupt(tmp_path):
-    # The subtle half of the fence. `git ls-files --error-unmatch` says "untracked" with rc=1, but
-    # FAILS with rc=128 — and an unreadable index is rc=128. `rev-parse --is-inside-work-tree`
-    # cannot rescue that: it never reads the index, so it still answers "true". Read the rc, not
-    # just "non-zero", or a committed report gets ripped out of the branch under review.
-    run_root = _state_home(tmp_path)
-    wt = tmp_path / "worktrees" / ISSUE
-    _worktree(wt)
-    stray = wt / "reports" / f"{ISSUE}.md"
-    stray.parent.mkdir(parents=True)
-    stray.write_text(REPORT_TEXT)
-    _git(wt, "add", "reports")
-    _git(wt, "commit", "-qm", "tracked report")
-    (wt / ".git" / "index").write_bytes(b"GARBAGE")   # git can no longer answer "is it tracked?"
 
     r = _stop(run_root, wt)
 
     assert r.returncode == 0, r.stderr
-    assert _status(run_root)["ts"], "the harness must really have run"
-    assert stray.exists(), "git could not answer — the move must be refused, not guessed"
-    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
-
-
-def test_a_report_in_a_plain_non_git_cwd_is_still_harvested(tmp_path):
-    # The other side of that fence: git ran and said "not a work tree". There is no branch to
-    # damage, so the rescue must still happen — refusing everything would be over-correcting.
-    run_root = _state_home(tmp_path)
-    plain = tmp_path / "plain"
-    (plain / "reports").mkdir(parents=True)
-    (plain / "reports" / f"{ISSUE}.md").write_text(REPORT_TEXT)
-
-    r = _stop(run_root, plain)
-
-    assert r.returncode == 0, r.stderr
-    assert (run_root / "reports" / f"{ISSUE}.md").read_text() == REPORT_TEXT
-
-
-def test_a_git_tracked_file_is_never_harvested(tmp_path):
-    # Safety fence: harvesting MOVES the file. A report the worker committed is repo content —
-    # ripping it out of the worktree would leave a deletion in the branch under review.
-    run_root = _state_home(tmp_path)
-    wt = tmp_path / "worktrees" / ISSUE
-    _worktree(wt)
-    stray = wt / "reports" / f"{ISSUE}.md"
-    stray.parent.mkdir(parents=True)
-    stray.write_text(REPORT_TEXT)
-    _git(wt, "add", "reports")
-    _git(wt, "commit", "-qm", "tracked report")
-
-    r = _stop(run_root, wt)
-
-    assert r.returncode == 0, r.stderr
-    assert stray.exists(), "a tracked file must stay in the worktree"
-    assert not (run_root / "reports" / f"{ISSUE}.md").exists()
+    st = _status(run_root)
+    assert st["head"] == head, "the clock still runs — the hook only stopped MOVING things"
+    assert st["cwd"] == str(wt), "cwd is how the runner finds the stray report to harvest later"
 
 
 # --------------------------- duty 2: the progress clock ---------------------------
@@ -344,15 +207,16 @@ def test_status_clock_sees_a_dirty_tree_and_the_markers(tmp_path):
     assert st["blocked"] is True
 
 
-def test_status_clock_reflects_the_harvest_it_just_did(tmp_path):
-    # Ordering pin: harvest runs BEFORE the stamp, so the clock never says report=false about a
-    # report the same turn just rescued.
+def test_status_clock_reports_the_canonical_report_only(tmp_path):
+    # The clock's `report` field means "the runner can SEE a report", so it keys on the canonical
+    # path alone. Issue #189 retired the ordering pin that used to live here (harvest-then-stamp):
+    # with the hook no longer harvesting, a stray draft must leave this field false — that is what
+    # stops session_finished from firing on a live lane.
     run_root = _state_home(tmp_path)
     wt = tmp_path / "worktrees" / ISSUE
     _worktree(wt)
-    stray = wt / "reports" / f"{ISSUE}.md"
-    stray.parent.mkdir(parents=True)
-    stray.write_text(REPORT_TEXT)
+    (run_root / "reports").mkdir()
+    (run_root / "reports" / f"{ISSUE}.md").write_text(REPORT_TEXT)
 
     r = _stop(run_root, wt)
 
@@ -437,11 +301,12 @@ def test_stop_hook_active_refuses_to_deliver_so_a_block_cannot_spin(tmp_path):
     assert _receipts(run_root) == []
 
 
-def test_stop_hook_active_still_stamps_the_clock_and_harvests(tmp_path):
+def test_stop_hook_active_still_stamps_the_clock(tmp_path):
     # The guard is about BLOCKING only; the file-side duties are idempotent and must still run.
+    # A continuation is even LESS of an ending than a normal rest, so the draft stays put too.
     run_root = _state_home(tmp_path)
     wt = tmp_path / "worktrees" / ISSUE
-    _worktree(wt)
+    head = _worktree(wt)
     stray = wt / "reports" / f"{ISSUE}.md"
     stray.parent.mkdir(parents=True)
     stray.write_text(REPORT_TEXT)
@@ -449,8 +314,8 @@ def test_stop_hook_active_still_stamps_the_clock_and_harvests(tmp_path):
     r = _stop(run_root, wt, stop_hook_active=True)
 
     assert r.returncode == 0, r.stderr
-    assert (run_root / "reports" / f"{ISSUE}.md").exists()
-    assert _status(run_root)["report"] is True
+    assert _status(run_root)["head"] == head
+    assert stray.exists() and not (run_root / "reports" / f"{ISSUE}.md").exists()
 
 
 def test_an_empty_mailbox_is_silent(tmp_path):

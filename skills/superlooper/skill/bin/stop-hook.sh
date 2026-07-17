@@ -9,8 +9,10 @@
 # state/blocked/<id>, neither from rest. See docs/founding/EVENT-MODEL.md.
 #
 # Beyond the activity stamp, a CLAUDE worker's rest is the runner's one reliable in-process moment
-# (issue #148), so lib/worker_hook.py then: harvests a report written to the wrong path, stamps the
-# state/status/<id>.json progress clock, and delivers state/mail/<id> by blocking the stop. CODEX
+# (issue #148), so lib/worker_hook.py then: stamps the state/status/<id>.json progress clock and
+# delivers state/mail/<id> by blocking the stop. It does NOT harvest a misplaced report any more
+# (issue #189): a rest is not an ending, so on 07-16 that promoted two live drafts to "finished".
+# The runner owns that trigger now — it harvests only once a worker acks DONE. CODEX
 # STAYS NOTIFY-ONLY — its Stop cannot block a stop, so a "delivery" there would be a lie; Codex
 # workers keep the typed-probe + file-ack path (spike verdict). This split is the agent boundary:
 # both branches' agent-specific knowledge lives here, in a hook script, and nowhere else.

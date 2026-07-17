@@ -42,6 +42,7 @@ import loopstate
 import published_view
 import tidy
 import usage as usage_mod
+import worker_hook
 
 TICK_SECONDS = 15
 TICK_ERROR_ALERT = 4           # consecutive tick crashes (~1 min at 15 s) -> ALERT + notify. A
@@ -2852,6 +2853,7 @@ class Runner:
         i["probe_attempts"] = 0                 # a counter resets to 0, not to an unset None
         i["probe_nonce"] = None
         i["probe_sent_at"] = None
+        i["harvest_tried"] = False              # (#189) a new episode re-arms the one report rescue
 
     def _exec_progress_advance(self, a, now):
         """Anchor the progress clock. Re-stamps progress_since to now; when the signature ACTUALLY
@@ -2872,6 +2874,41 @@ class Runner:
         if changed["v"]:
             _rm(os.path.join(self.state, "ack", iid))      # a new episode: last episode's ack is moot
         return "ok"
+
+    def _exec_harvest_report(self, a, now):
+        """Rescue a report a DONE-acked worker wrote one directory off (issues #148/#189).
+
+        The mover — fences and all — is still worker_hook.harvest_report; only its TRIGGER lives
+        here. It ran on every Stop until 07-16, when it promoted two live drafts (i153/i163) to
+        "finished" and the gate parked both. A rest is not an ending, so the hook could never tell
+        a draft from a finished session's misplaced report; decide only emits this action once the
+        worker itself has acked DONE.
+
+        The cwd comes from the worker's OWN progress clock (worker_hook.stamp_status records the
+        cwd Claude was actually in), so the harvest looks exactly where the hook used to look. No
+        clock, no cwd, no harvest — never a guessed directory for a destructive move.
+
+        `harvest_tried` is stamped WHATEVER happens, including on a refusal: it is the bound that
+        keeps a report which simply does not exist from re-harvesting every tick (the i328 loop in
+        a new costume). progress_advance clears it, so a genuinely-later finish is still rescued.
+        """
+        iid = a["id"]
+        self._update_issue(iid, fn=lambda st, i: i.update({"harvest_tried": True}))
+        clock = self._status_clocks().get(iid)
+        cwd = clock.get("cwd") if isinstance(clock, dict) else None
+        if not isinstance(cwd, str) or not cwd:
+            return "no progress clock cwd — nothing to harvest from (attempt spent)"
+        try:
+            moved = worker_hook.harvest_report(self.home, iid, cwd)
+        except Exception as e:
+            # A duty that raises must never wedge the tick. The ladder still escalates.
+            journal.append(self.home, {"act": "harvest_error", "id": iid,
+                                       "error": _short_repr(e)}, now)
+            return f"harvest failed ({e.__class__.__name__}) — the ladder still escalates"
+        if not moved:
+            return ("no stray report found under the worker cwd — the ladder escalates as before "
+                    "(attempt spent)")
+        return f"harvested {moved} -> reports/{iid}.md (the worker acked DONE)"
 
     def _exec_probe(self, a, now):
         """One bounded progress-stall probe (issue #157). Delivers a MACHINE-READABLE ask through the

@@ -107,6 +107,37 @@ def test_report_sections_whitespace_padding_does_not_count():
     assert gate.report_sections_ok(txt, ["Tests", "Review"]) is False
 
 
+def test_report_sections_html_comment_placeholder_never_merges():
+    # THE i153 negative (issue #189): the harvested report's Review section was a literal
+    # placeholder — "<!-- filled in after the fresh-agent review verdict lands -->" — which cleared
+    # the 40-char floor purely on comment text. A comment is invisible in the rendered report: it
+    # is the ABSENCE of the evidence the section exists to carry, so it must never satisfy it.
+    placeholder = "<!-- filled in after the fresh-agent review verdict lands -->"
+    txt = f"## Tests\n{'x' * 40}\n## Review\n{placeholder}\n"
+    assert gate.report_sections_ok(txt, ["Tests", "Review"]) is False
+
+
+def test_report_sections_comment_padding_cannot_top_up_a_short_body():
+    # A comment must not COUNT toward the floor either: 10 chars of prose + a long comment is a
+    # 10-char section, not a 40-char one.
+    txt = "## Tests\n" + "x" * 40 + "\n## Review\nten chars." + "<!-- " + "z" * 80 + " -->\n"
+    assert gate.report_sections_ok(txt, ["Tests", "Review"]) is False
+
+
+def test_report_sections_prose_beside_a_comment_still_passes():
+    # The rescue direction: a REAL section that merely also carries a comment is still evidence.
+    # Stripping comments must not punish a genuine report.
+    txt = ("## Tests\n" + "x" * 40 + "\n"
+           "## Review\n<!-- reviewer: codex -->\n" + "y" * 40 + "\n")
+    assert gate.report_sections_ok(txt, ["Tests", "Review"]) is True
+
+
+def test_report_sections_multiline_comment_placeholder_never_merges():
+    # The same placeholder spread across lines — the strip must not be line-oriented.
+    txt = "## Tests\n" + "x" * 40 + "\n## Review\n<!--\nfilled in after the review verdict\nlands\n-->\n"
+    assert gate.report_sections_ok(txt, ["Tests", "Review"]) is False
+
+
 def test_report_sections_h3_is_not_h2():
     # the contract is H2 headings, parsed mechanically — an H3 "### Tests" is not the section.
     txt = "### Tests\n" + "x" * 50 + "\n## Review\n" + "y" * 50

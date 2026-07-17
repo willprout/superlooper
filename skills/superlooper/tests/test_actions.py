@@ -1428,6 +1428,110 @@ def test_working_ack_does_not_stop_escalation():
     assert "WORKING" in parked["memo"]         # the dossier names the worker's own self-report
 
 
+# ---- the DONE ack is the harvest's trigger (issue #189) ----
+# A DONE ack is the only mechanical "I am finished" the loop ever gets from a worker: nonce-fenced,
+# machine-readable, and only ever asked of a lane the progress clock says is stalled and whose pane
+# nudge-pane found idle. That is precisely the discriminator the Stop hook could not have — a rest
+# is not an ending, and a live draft looks exactly like a finished session's misplaced report.
+# Before #189, a DONE ack with no visible report walked the cap and parked on
+# "acked DONE, but produced no report/PR the loop can see" — which IS the i280/i328 stall.
+
+def test_done_ack_with_no_report_harvests_instead_of_walking_to_a_park():
+    # THE i280/i328 RESCUE, relocated: the worker says it finished, the runner sees no report, so
+    # LOOK for it before concluding there is none.
+    ist5 = ist("running", progress_sig=_sig(), progress_since=NOW - 100000,
+               probe_attempts=1, probe_nonce="n1", probe_sent_at=NOW - 1000)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()}, acks={"i5": "DONE n1"}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    h = only(out, "harvest_report")
+    assert len(h) == 1 and h[0]["id"] == "i5"
+    assert only(out, "park") == [], "look for the report before parking on 'there is no report'"
+
+
+def test_a_working_ack_never_harvests():
+    # The i153/i163 shape at the decision layer: a worker still building must never have its draft
+    # promoted, no matter how long its clock has been frozen.
+    ist5 = ist("running", progress_sig=_sig(), progress_since=NOW - 100000,
+               probe_attempts=1, probe_nonce="n1", probe_sent_at=NOW - 1000)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()},
+                          acks={"i5": "WORKING n1"}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert only(out, "harvest_report") == []
+
+
+def test_silence_is_not_a_done_ack_and_never_harvests():
+    # No ack at all — the lane may be wedged mid-turn. Silence is not a declaration of finishedness.
+    ist5 = ist("running", progress_sig=_sig(), progress_since=NOW - 100000,
+               probe_attempts=1, probe_nonce="n1", probe_sent_at=NOW - 1000)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert only(out, "harvest_report") == []
+
+
+def test_a_stale_done_ack_from_a_previous_probe_never_harvests():
+    # The nonce fence carries straight through to the harvest: an old episode's DONE must not move
+    # a live session's files.
+    ist5 = ist("running", progress_sig=_sig(), progress_since=NOW - 100000,
+               probe_attempts=1, probe_nonce="n2", probe_sent_at=NOW - 1000)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock()},
+                          acks={"i5": "DONE n1"}),          # answers the PREVIOUS probe
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert only(out, "harvest_report") == []
+
+
+def test_a_done_ack_never_harvests_when_the_report_is_already_visible():
+    # Nothing to rescue: the runner can already see the report, so session_finished is the path.
+    ist5 = ist("running", progress_sig=_sig(report=True), progress_since=NOW - 100000,
+               probe_attempts=1, probe_nonce="n1", probe_sent_at=NOW - 1000)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(report=True)},
+                          reports={"i5": "## Tests\nreal"}, acks={"i5": "DONE n1"}),
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+    assert only(out, "harvest_report") == []
+
+
+def test_a_fruitless_harvest_is_tried_once_then_the_ladder_still_parks():
+    # THE BOUNDING RULE. A DONE ack whose report simply does not exist anywhere must not re-harvest
+    # every tick forever — that is the i328 pathology in a new costume. The attempt is spent once
+    # per episode; the ladder then resumes and still reaches its classified park.
+    ist5 = ist("running", progress_sig=_sig(), progress_since=NOW - 100000,
+               probe_attempts=1, probe_nonce="n1", probe_sent_at=NOW - 1000)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    harvests, parked, now = 0, None, NOW
+    for _ in range(50):                        # bounded: this MUST terminate in a park
+        out = decide(now=now, dsk=disk(issues_state=st, status_clocks={"i5": clock()},
+                                       acks={"i5": "DONE %s" % ist5.get("probe_nonce")}),
+                     parsed_issues=[parsed(5, labels=("in-progress", "type:build"))])
+        if only(out, "park"):
+            parked = only(out, "park")[0]
+            break
+        if only(out, "harvest_report"):
+            harvests += 1
+            ist5["harvest_tried"] = True       # mimic the executor's durable stamp
+        pr = only(out, "probe")
+        if pr:
+            _apply_probe(ist5, pr[0], now)
+        now += 300
+    assert harvests == 1, "the harvest is spent once per episode, never a per-tick loop"
+    assert parked is not None, "a fruitless harvest must still let the ladder escalate"
+    assert parked["cause"] == "progress_stall" and "DONE" in parked["memo"]
+
+
+def test_a_new_episode_re_arms_the_harvest():
+    # Real progress resets the episode (the executor clears the stamp), so a worker that drafts,
+    # keeps building, and only later genuinely finishes still gets its one rescue.
+    ist5 = ist("running", progress_sig=_sig(head="OLD"), progress_since=NOW - 100000,
+               probe_attempts=2, harvest_tried=True)
+    st = {"version": 1, "issues": {"i5": ist5}}
+    out = decide(dsk=disk(issues_state=st, status_clocks={"i5": clock(head="NEW")}))
+    adv = only(out, "progress_advance")
+    assert len(adv) == 1, "a lane that moved HEAD re-anchors — and re-arms its rescue"
+
+
 def test_stuck_ack_escalates_immediately_before_the_cap():
     # A STUCK ack (with the live nonce) is a definitive "I need help" — escalate now, don't keep
     # probing to the cap. It reaches the owner (needs-owner), not the plain parked queue.
