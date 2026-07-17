@@ -574,11 +574,21 @@ def test_a_finished_needs_owner_build_also_resumes_at_the_gate():
 
 def test_the_explicit_rebuild_label_forces_a_finished_lane_to_rebuild():
     # The separately-named destructive action: the `rebuild` label is the owner's explicit choice to
-    # DISCARD the finished PR/report and build anew. It routes a finished lane to `reapprove`.
+    # DISCARD the finished PR/report and build anew. It routes a finished lane to `reapprove`, and
+    # carries `had_rebuild` so the executor clears the one-shot label from its own isolated call.
     out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "rebuild", "type:build"))],
                  dsk=_finished("parked"))
-    assert len(only(out, "reapprove")) == 1
+    ra = only(out, "reapprove")
+    assert len(ra) == 1 and ra[0]["had_rebuild"] is True
     assert only(out, "resume_at_gate") == []             # the label overrides the resume default
+
+
+def test_a_non_rebuild_reapprove_marks_had_rebuild_false():
+    # An unfinished parked lane rebuilds with NO rebuild label present — the action says so, so the
+    # executor never names a repo-absent `rebuild` in a remove (which would hard-fail the batch).
+    dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("parked", launch_failures=2)}})
+    ra = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "reapprove")
+    assert len(ra) == 1 and ra[0]["had_rebuild"] is False
 
 
 def test_a_parked_lane_with_no_finished_work_still_rebuilds():

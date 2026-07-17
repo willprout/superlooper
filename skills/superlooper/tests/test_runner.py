@@ -540,9 +540,7 @@ def test_launch_env_contract_and_registration(rig):
     brief_text = (rig.home / "briefs" / "i101.md").read_text()
     assert "#101" in brief_text
     m = mutations(rig)[-1]
-    assert m["kind"] == "set_labels" and m["add"] == "in-progress"
-    # a verified launch clears agent-ready AND consumes any one-shot `rebuild` label (issue #161)
-    assert set(m["remove"].split(",")) == {"agent-ready", "rebuild"}
+    assert m["kind"] == "set_labels" and m["add"] == "in-progress" and m["remove"] == "agent-ready"
 
 
 def test_launch_env_uses_per_issue_model_override(rig):
@@ -1087,8 +1085,7 @@ def test_a_verified_canary_clears_the_streak_and_launches_the_issue(rig):
     assert rig.r._launch_fail_ids == set() and rig.r._launch_fail_at == 0
     assert issue_state(rig, "i101")["status"] == "running"
     m = mutations(rig)[-1]
-    assert m["kind"] == "set_labels" and m["add"] == "in-progress"
-    assert set(m["remove"].split(",")) == {"agent-ready", "rebuild"}   # one-shot rebuild consumed (#161)
+    assert m["kind"] == "set_labels" and m["add"] == "in-progress" and m["remove"] == "agent-ready"
 
 
 def test_a_failed_canary_via_base_missing_charges_no_cap_and_re_spaces_the_clock(rig):
@@ -2769,18 +2766,32 @@ def test_resume_at_gate_journals_the_resume(rig):
     assert recs and recs[-1]["id"] == "i5"
 
 
-def test_launch_consumes_a_stale_rebuild_label(rig):
-    """Issue #161, the one-shot belt (fresh-review P1): `rebuild` is consumed the moment its rebuild
-    session actually launches, so a stale label whose _exec_reapprove cleanup blipped cannot ride the
-    whole episode and make a LATER plain re-approval destructive. A verified launch delivery
-    (agent-ready -> in-progress) removes it too — harmless on a fresh launch that carries no rebuild."""
-    rig.r.tick(now=NOW)                                          # poll: i101 lands in the parsed view
-    rig.calls.clear()
-    out = rig.r._execute(_launch_action(), NOW)                  # i101 delivers cleanly (rc 0)
-    assert out == "ok"
-    m = mutations(rig)[-1]
-    assert m["kind"] == "set_labels" and "in-progress" in m["add"]
-    assert set(m["remove"].split(",")) == {"agent-ready", "rebuild"}
+def test_reapprove_clears_the_rebuild_label_only_when_it_triggered_the_rebuild(rig):
+    """Issue #161, the one-shot clear (fresh-review P1): the explicit `rebuild` label is removed in
+    its OWN set_labels call and ONLY when `had_rebuild` says it was actually on the issue. Two hazards
+    it dodges: the engine's `set_labels` is one batched, all-or-nothing `gh issue edit`, so folding
+    `rebuild` into the park-label remove would let a repo-absent `rebuild` hard-fail the whole batch;
+    and removing `rebuild` on EVERY reapprove (an unfinished lane, an investigation — no rebuild label)
+    would hit that same repo-absent hard-fail on a not-yet-re-adopted repo."""
+    # a rebuild-triggered reapprove clears rebuild in a dedicated call
+    seed_issue(rig, "i5", status="parked", launches=1)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5, "had_rebuild": True}, NOW)
+    removes = [set(m["remove"].split(",")) for m in mutations(rig)
+               if m["kind"] == "set_labels" and m.get("remove")]
+    assert {"rebuild"} in removes, "rebuild must be cleared in its own isolated call"
+    assert not any("rebuild" in r and len(r) > 1 for r in removes), \
+        "rebuild must NOT ride the park-label batch (a repo-absent rebuild would hard-fail it)"
+
+
+def test_reapprove_never_touches_the_rebuild_label_when_it_was_absent(rig):
+    # A non-rebuild reapprove (unfinished lane / investigation) must NEVER name `rebuild` in a remove:
+    # on a repo that has not re-adopted, `rebuild` does not exist, and the engine's batched edit would
+    # hard-fail on it — stranding the park labels this reapprove is trying to clear.
+    seed_issue(rig, "i5", status="parked", launches=2)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)   # no had_rebuild
+    for m in mutations(rig):
+        if m["kind"] == "set_labels" and m.get("remove"):
+            assert "rebuild" not in m["remove"].split(","), "a non-rebuild reapprove must not touch rebuild"
 
 
 # ---------------- bounded pending-checks clock executors (issue #26) ----------------

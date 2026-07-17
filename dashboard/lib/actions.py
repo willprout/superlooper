@@ -134,19 +134,35 @@ class Actions:
         # repos the operator configured (bright line: never steerable off-machine or off-repo).
         return {"ok": False, "verb": verb, "error": "unknown repo"}
 
+    def _clear_rebuild_override(self, repo, num):
+        """Clear a stale ``rebuild`` override, FAIL-CLOSED (issue #161). A resume/continue verb —
+        approve (resume-at-the-gate), bounce-yes, answer — must never land ``agent-ready`` beside a
+        surviving ``rebuild``: the engine reads ``agent-ready + rebuild`` as the owner's choice to
+        DISCARD finished work (the D11 defect), so a half-applied resume that left the override
+        standing would silently rebuild. Running this BEFORE the ``agent-ready`` add makes the clear a
+        precondition — its failure aborts the verb, so agent-ready never lands over a live override.
+
+        A repo-absent OR issue-absent ``rebuild`` is a benign no-op that ``set_labels`` reports as
+        success (it swallows gh's ``'rebuild' not found``), so a normal re-approval — the vast
+        majority, with no rebuild anywhere — is never spuriously blocked. Only a GENUINE gh failure
+        (auth / network / 5xx) returns False, and that same failure would sink the ``agent-ready`` add
+        one line later regardless — so this adds no new failure mode, only the guarantee."""
+        return self._gh.set_labels(repo, num, remove=[REBUILD])
+
     def approve(self, repo, num):
         """Approve / re-approve: apply ``agent-ready`` (William's word — this tap IS his word),
         clear ``parked`` and ``needs-william``, and leave the standard audit comment. One endpoint
         serves both the fresh approval and the re-approval of a parked flight."""
         if repo not in self._allowed:
             return self._refuse("approve")
-        # REBUILD is removed too (issue #161): this is the RESUME-at-the-gate tap, the opposite of a
-        # rebuild, so it must also clear any STALE `rebuild` label a prior tap left behind (e.g. a
-        # rebuild whose engine-side cleanup blipped). Only the `rebuild` verb ever applies that label;
-        # every other re-approval clears it, so a plain re-approval can never inherit a destructive
-        # override and wipe finished work.
+        # Resume-at-the-gate is the OPPOSITE of a rebuild, so clear any stale `rebuild` override FIRST
+        # and fail-closed (issue #161) — never land agent-ready beside a live override, or the engine
+        # rebuilds. Only the `rebuild` verb ever applies that label; every other re-approval clears it.
+        if not self._clear_rebuild_override(repo, num):
+            return {"ok": False, "verb": "approve", "labeled": False, "commented": False,
+                    "error": "could not clear a stale rebuild override — not re-approving"}
         labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
-                                      remove=[PARKED, NEEDS_OWNER, NEEDS_OWNER_LEGACY, REBUILD])
+                                      remove=[PARKED, NEEDS_OWNER, NEEDS_OWNER_LEGACY])
         commented = self._gh.comment(repo, num, approve_comment(self._operator, self._date()))
         # ok requires BOTH: agent-ready is William's word ONLY when its audit comment records the
         # tap — a label applied without the trail is not a success (the "journal-greppable via audit
@@ -199,10 +215,13 @@ class Actions:
         approve."""
         if repo not in self._allowed:
             return self._refuse("bounce-yes")
-        # REBUILD removed too (issue #161): a bounce-accept rebuilds from the amended premise, never
-        # inheriting a stale rebuild override from a prior tap. Only the `rebuild` verb applies it.
+        # Clear a stale `rebuild` override first, fail-closed (issue #161): a bounce-accept rebuilds
+        # from the AMENDED premise, so it must never inherit a prior tap's rebuild override.
+        if not self._clear_rebuild_override(repo, num):
+            return {"ok": False, "verb": "bounce-yes", "labeled": False, "commented": False,
+                    "error": "could not clear a stale rebuild override — not re-approving"}
         labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
-                                      remove=[NEEDS_OWNER, NEEDS_OWNER_LEGACY, PARKED, REBUILD])
+                                      remove=[NEEDS_OWNER, NEEDS_OWNER_LEGACY, PARKED])
         commented = self._gh.comment(repo, num, bounce_comment(self._operator, self._date()))
         return {"ok": bool(labeled and commented), "verb": "bounce-yes",
                 "labeled": bool(labeled), "commented": bool(commented)}
@@ -222,11 +241,14 @@ class Actions:
         text = (text or "").strip()
         if not text:
             return {"ok": False, "verb": "answer", "error": "empty answer"}
+        # Clear a stale `rebuild` override first, fail-closed (issue #161): answering a durable
+        # question resumes with the WIP reused, so it must never inherit a rebuild override.
+        if not self._clear_rebuild_override(repo, num):
+            return {"ok": False, "verb": "answer", "commented": False, "labeled": False,
+                    "error": "could not clear a stale rebuild override — not re-approving"}
         commented = self._gh.comment(repo, num, "%s\n%s" % (ANSWER_MARKER, text))
-        # REBUILD removed too (issue #161): answering a durable question resumes with the WIP reused,
-        # never inheriting a stale rebuild override. Only the `rebuild` verb applies that label.
         labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
-                                      remove=[AWAITING_ANSWER, NEEDS_OWNER, NEEDS_OWNER_LEGACY, REBUILD])
+                                      remove=[AWAITING_ANSWER, NEEDS_OWNER, NEEDS_OWNER_LEGACY])
         return {"ok": bool(commented and labeled), "verb": "answer",
                 "commented": bool(commented), "labeled": bool(labeled)}
 

@@ -1164,7 +1164,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                         out.append({"act": "resume_at_gate", "id": iid, "num": _iid_num(iid)})
                         resumed_now.add(iid)
                     else:
-                        out.append({"act": "reapprove", "id": iid, "num": _iid_num(iid)})
+                        # `had_rebuild` tells the executor whether the one-shot `rebuild` label is
+                        # actually on the issue, so it clears ONLY a label it knows exists — a
+                        # repo-absent `rebuild` (a not-yet-re-adopted repo) is never fed to the
+                        # engine's all-or-nothing batched remove (issue #161).
+                        out.append({"act": "reapprove", "id": iid, "num": _iid_num(iid),
+                                    "had_rebuild": "rebuild" in labels})
                         reapproved_now.add(iid)
                     reapproved = True
             # Reconciliation (issue #21): a PARKED investigation whose marker comment appears on a

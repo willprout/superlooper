@@ -2375,12 +2375,7 @@ class Runner:
         rc = self._run_script([self._script("launch-session.sh"), iid],
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
-            # `rebuild` is one-shot (issue #161): once its rebuild session actually launches, the
-            # signal is fully consumed, so clear it here too. This is the engine-side belt behind
-            # _exec_reapprove's own best-effort removal — if that gh write blipped, a stale `rebuild`
-            # would otherwise ride the whole episode and make a LATER plain re-approval destructive
-            # (the D11 defect, resurrected). Harmless on a fresh launch (no label to remove).
-            gh.set_labels(num, add=["in-progress"], remove=["agent-ready", "rebuild"])
+            gh.set_labels(num, add=["in-progress"], remove=["agent-ready"])
             # clear any stale base-missing cause: a verified delivery proves the base now exists.
             # launch_evidence clears with it (#152) for the same reason and the #40 staleness lesson
             # (review P1-1): a fixed anchor must not leave last week's cause behind to name the wrong
@@ -2744,7 +2739,19 @@ class Runner:
         # agent-ready -> in-progress. Best-effort: a gh blip only leaves a cosmetic stale label,
         # never blocks the relaunch (phase E keys off agent-ready, not the parked label). Remove BOTH
         # the current `needs-owner` and the legacy `needs-william` so a repo mid-migration clears too.
-        gh.set_labels(num, remove=["parked", "needs-owner", "needs-william", "rebuild"])
+        gh.set_labels(num, remove=["parked", "needs-owner", "needs-william"])
+        # The one-shot `rebuild` label (issue #161) is cleared in its OWN call, and ONLY when it
+        # actually triggered this rebuild (`had_rebuild`, set by decide). Both are load-bearing:
+        # engine `set_labels` is one batched, all-or-nothing `gh issue edit`, so folding `rebuild`
+        # into the batch above would let a repo-absent `rebuild` (a repo that republished the engine
+        # but has not re-run `adopt`) HARD-FAIL the whole remove, stranding the park labels — and
+        # unconditionally removing `rebuild` on the non-rebuild reapproves (an unfinished lane, an
+        # investigation) would hit that same repo-absent hard-fail. When `had_rebuild` holds the label
+        # WAS on the issue, so it exists in the repo and this isolated remove is safe. Best-effort:
+        # the dashboard's resume verbs also clear a stale `rebuild`, so a blip here is not the only
+        # backstop.
+        if a.get("had_rebuild"):
+            gh.set_labels(num, remove=["rebuild"])
         return f"reapproved (reset {old or 'nothing'})"
 
     def _exec_resume_at_gate(self, a, now):

@@ -202,6 +202,35 @@ def test_the_non_rebuild_reapproval_verbs_clear_a_stale_rebuild_label(tmp_path, 
         (tmp_path / "mutations.jsonl").unlink(missing_ok=True)
 
 
+def test_a_resume_verb_is_fail_closed_when_the_rebuild_clear_genuinely_fails(tmp_path, monkeypatch):
+    # Issue #161, fresh-review (Codex P1): the rebuild-clear is a PRECONDITION. If clearing a stale
+    # `rebuild` fails for a GENUINE reason (auth/network/5xx — not the benign repo-absent no-op), the
+    # resume must ABORT before agent-ready lands, so the engine never sees `agent-ready + rebuild` and
+    # rebuilds. Simulated with GH_FAIL_REMOVE (a generic --remove-label failure).
+    for verb, call in (("approve", lambda a: a.approve(REPO, 4)),
+                       ("bounce-yes", lambda a: a.bounce_yes(REPO, 4)),
+                       ("answer", lambda a: a.answer(REPO, "go ahead", 4))):
+        monkeypatch.setenv("GH_FAIL_REMOVE", "1")
+        a = _acts(monkeypatch, tmp_path)
+        res = call(a)
+        assert res["ok"] is False, "%s must fail closed when the rebuild clear genuinely fails" % verb
+        assert "agent-ready" not in _added_labels(_mutations(tmp_path)), \
+            "%s must NOT land agent-ready over a surviving rebuild override" % verb
+        (tmp_path / "mutations.jsonl").unlink(missing_ok=True)
+        monkeypatch.delenv("GH_FAIL_REMOVE", raising=False)
+
+
+def test_a_repo_absent_rebuild_never_blocks_a_normal_reapproval(tmp_path, monkeypatch):
+    # The benign no-op path: on a repo that hasn't re-adopted (no `rebuild` label defined), clearing
+    # it is a vacuous "not found" that set_labels swallows — so a normal re-approval, which is the
+    # overwhelming majority, is NEVER spuriously blocked by the new precondition.
+    monkeypatch.setenv("GH_LABEL_NOT_IN_REPO", "rebuild")
+    a = _acts(monkeypatch, tmp_path)
+    res = a.approve(REPO, 4)
+    assert res["ok"] is True and res["labeled"] is True          # the tap still lands, agent-ready on
+    assert "agent-ready" in _added_labels(_mutations(tmp_path))
+
+
 def test_bounce_yes_succeeds_on_a_repo_that_finished_the_migration(tmp_path, monkeypatch):
     a = _acts(monkeypatch, tmp_path)
     monkeypatch.setenv("GH_LABEL_NOT_IN_REPO", "needs-william")
