@@ -1387,7 +1387,24 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         if not is_concluded and concluded is not None and is_closed:
             is_concluded = concluded.confirm_closed(slug, num, lambda n=num: source.issue(slug, n))
         mem = concluded if is_concluded else None
-        if source is None or not branch:
+        # An INVESTIGATE flight never opens a PR and never merges — its completion signal is a
+        # marker COMMENT on the issue, so the lookup answers "no PR" for the loop's whole lifetime
+        # of one (issue #16). The behaviour change this DOES make: a PR opened on an investigation
+        # branch BY HAND would no longer show its cargo/gate here. Accepted — the runner would not
+        # gate or merge it either (its three PR paths skip investigations, #21), so surfacing it
+        # would draw a plane the loop will never land. The runner's skip is the precedent;
+        # this is the board's half of that parity — in LIVE the runner's view already carries no PR
+        # for one, so this makes the FALLBACK mode agree with the mode that is already primary.
+        # Concluded investigations are what bite, in that fallback mode: ConcludedFlights.pr_facts
+        # remembers only a SETTLED read, and {} is not settled, so the #48 memo can never latch one
+        # — the read then repeats every gh_poll_seconds window for as long as the runner stays
+        # silent, once per completed investigation, growing with every investigation the loop lands.
+        # (The PR read is the one this removes; an investigation's title/closed reads still ride the
+        # #48 memo at once-per-run, so this makes it cheap, not free.)
+        # Keyed on a POSITIVE type stamp — an untyped flight is not provably an investigation and
+        # keeps the build path, so a real PR's facts are never blanked on a missing stamp.
+        is_investigation = st.get("type") == "investigate"
+        if source is None or not branch or is_investigation:
             pr_facts = {}
         elif mem is not None:
             pr_facts = mem.pr_facts(slug, branch, lambda b=branch: source.pr_for_branch(slug, b))
