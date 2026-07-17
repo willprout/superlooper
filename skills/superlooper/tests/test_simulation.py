@@ -2153,8 +2153,12 @@ def test_night_batching_withholds_the_park_page_but_lands_it_in_the_morning_repo
     assert sim.tick_until(lambda: os.path.exists(report_path)), \
         "the morning report never fired: %s" % [(r.get("act"), r.get("outcome")) for r in sim.journal()]
     report_text = open(report_path).read()
-    assert ("#%d" % num) in report_text and "parked" in report_text, \
-        "the batched park must appear in the morning report:\n%s" % report_text
+    # Bind #num AND "parked" on the SAME line — the issue's own Parked entry — so this can't pass on
+    # a summary tally that merely says "N parked" while this issue is absent (fresh-review P3).
+    park_line = next((ln for ln in report_text.splitlines()
+                      if ("#%d" % num) in ln and "parked" in ln), None)
+    assert park_line, \
+        "the batched park must appear as its own line in the morning report:\n%s" % report_text
 
 
 def test_daytime_park_pages_immediately(sim_factory):
