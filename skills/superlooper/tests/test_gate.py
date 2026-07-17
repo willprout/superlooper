@@ -847,7 +847,12 @@ def test_exit_reply_keys_are_distinct_per_comment():
     c = gate.exit_interview_reply([{"body": "FINDINGS-FILED: #3",
                                     "createdAt": "2026-07-16T10:00:00Z"}])
     assert a["key"] != b["key"]                       # positional keys differ
-    assert c["key"] == "2026-07-16T10:00:00Z"         # createdAt preferred when present
+    assert c["key"] == "2026-07-16T10:00:00Z"         # createdAt when no id rides along
+    # the comment id outranks createdAt (fresh review P2-1): two replies inside one second share
+    # a createdAt, and a verdict for the first must never vouch for the second.
+    d = gate.exit_interview_reply([{"body": "FINDINGS-FILED: #3", "id": "IC_abc",
+                                    "createdAt": "2026-07-16T10:00:00Z"}])
+    assert d["key"] == "IC_abc"
 
 
 def test_exit_reply_non_reply_comments_are_not_replies():
@@ -876,6 +881,10 @@ def test_exit_ack_line_extracts_reply_and_strips_nonce():
     assert gate.exit_ack_line("NO-FINDINGS exit-99", "exit-99") == "NO-FINDINGS"
     assert gate.exit_ack_line("ok here goes\nFINDINGS-FILED: #12 #13 exit-99\nthanks",
                               "exit-99") == "FINDINGS-FILED: #12 #13"
+    # the LAST matching line wins — a worker appending a correction to its own ack is believed,
+    # mirroring the reply comments' newest-wins rule (fresh review P2-5).
+    assert gate.exit_ack_line("NO-FINDINGS exit-99\nFINDINGS-FILED: #3 exit-99",
+                              "exit-99") == "FINDINGS-FILED: #3"
 
 
 def test_exit_ack_line_requires_the_nonce_and_a_reply_prefix():
@@ -996,6 +1005,20 @@ def test_exit_malformed_already_reasked_waits_for_the_window():
     d2 = _decide(issue=_inv(exit_reply={"kind": "malformed", "key": "c1"}, exit_asks=2,
                             exit_asked_key="c1", exit_ask_expired=True), pr={})
     assert d2["action"] == "park"
+    # ...and the memo says a reply EXISTS but is unusable — never "nobody answered" when
+    # somebody did (fresh review P2-3: honesty of the hand-back).
+    assert "unusable" in d2["reason"] and "never verifiably delivered" not in d2["reason"]
+
+
+def test_exit_findings_refs_are_deduped_and_sorted():
+    # `FINDINGS-FILED: #13 #12 #12` is one two-ref claim; the verify read and the close comment
+    # both see the canonical form.
+    d = _decide(issue=_inv(exit_reply={"kind": "findings", "refs": [13, 12, 12], "key": "c2"}),
+                pr={})
+    assert d["action"] == "verify_exit_refs" and d["refs"] == [12, 13]
+    d2 = _decide(issue=_inv(exit_reply={"kind": "findings", "refs": [13, 12, 12], "key": "c2"},
+                            exit_verify={"key": "c2", "missing": []}), pr={})
+    assert d2["exit"] == "FINDINGS-FILED: #12 #13"
 
 
 def test_exit_relay_pending_waits():

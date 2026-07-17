@@ -2380,6 +2380,29 @@ def test_reapprove_resets_the_exit_interview_episode(rig):
         assert st[f] is None, f
 
 
+def test_reapprove_clears_stale_interview_mail_and_ack_but_keeps_receipts(rig):
+    # P1 (fresh review, 2026-07-16): the ghosted-interview park leaves state/mail/<iid> ARMED —
+    # the honest evidence for episode 1. But mail carries no episode fence (unlike the ack's
+    # nonce), so a reapproved episode's fresh session would consume the STALE interview at its
+    # very first rest and could post NO-FINDINGS before re-investigating anything — and with the
+    # episode-1 marker still on the thread, the re-run would close without EVER getting its own
+    # interview: the exact #215 incident, one episode removed. Reapprove must clear pending mail
+    # (and the stale ack, cheap symmetry) while receipts — the history of what WAS delivered —
+    # stay, mirroring launch-session.sh's own rule.
+    seed_issue(rig, "i7", status="parked", type="investigate", branch="sl/i7-x",
+               exit_asks=2, exit_nonce="exit-9")
+    mail_dir = rig.home / "state" / "mail"
+    mail_dir.mkdir(parents=True, exist_ok=True)
+    (mail_dir / "i7").write_text("[superlooper exit interview] Issue #7 …")
+    (mail_dir / "i7.consumed.1749000000").write_text("an old receipt")
+    (rig.home / "state" / "ack").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "ack" / "i7").write_text("NO-FINDINGS exit-9")
+    rig.r._execute({"act": "reapprove", "id": "i7", "num": 7}, NOW)
+    assert not (mail_dir / "i7").exists(), "stale pending mail must not poison the next episode"
+    assert (mail_dir / "i7.consumed.1749000000").exists(), "receipts are history — kept"
+    assert not (rig.home / "state" / "ack" / "i7").exists()
+
+
 def test_freeze_unfreeze_alert_and_fix_issue_files(rig):
     rig.r._execute({"act": "freeze", "reason": "dev red", "fingerprint": "fp1"}, NOW)
     frozen = json.loads((rig.home / "state" / "merges_frozen.json").read_text())

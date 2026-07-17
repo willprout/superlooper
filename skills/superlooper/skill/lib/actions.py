@@ -1149,7 +1149,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # alone closing green is the motivating incident. A parked lane has no session
                 # to interview, so an absent/malformed/unaccounted reply simply leaves it parked
                 # (the owner's call); a truthful reply still reconciles: verify (the one typed
-                # read), then close on a clean verdict.
+                # read), then close on a clean verdict. A STRANDED ack relays first (fresh
+                # review P2-4): a lane parked out-of-band (usage/systemic, not the gate's own
+                # suppressed paths) can hold a valid nonce-fenced ack the live branch never got
+                # to post — the worker DID answer, so the answer must reach the durable thread
+                # rather than die with the park. Relay-pending defers the verdict a tick, same
+                # as the live branch.
+                nonce = ist.get("exit_nonce")
+                if isinstance(nonce, str) and nonce and ist.get("exit_ack_relayed") != nonce \
+                        and gate.exit_ack_line(acks.get(iid), nonce):
+                    out.append({"act": "relay_exit_reply", "id": iid, "num": _iid_num(iid),
+                                "line": gate.exit_ack_line(acks.get(iid), nonce),
+                                "nonce": nonce})
+                    continue
                 reply = gate.exit_interview_reply(issue_comments.get(iid))
                 state, detail = gate.exit_interview_verdict(reply, ist.get("exit_verify"))
                 if state == "close":

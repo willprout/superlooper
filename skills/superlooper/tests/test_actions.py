@@ -2068,6 +2068,28 @@ def test_codex_ack_is_relayed_to_the_durable_comment_and_holds_the_ladder():
     assert only(out3, "relay_exit_reply") == []
 
 
+def test_parked_lane_with_a_stranded_ack_relays_it_then_reconciles():
+    # fresh review P2-4: a lane parked OUT-OF-BAND (not by the gate's own relay-suppressed
+    # paths) can still hold a valid nonce-fenced ack — the worker DID answer. The reconcile
+    # relays it to the durable thread first (verdict deferred a tick), then closes off the
+    # posted comment like any reconcile.
+    d = disk(reports={"i7": GOOD_REPORT},
+             issues_state={"version": 1, "issues": {
+                 "i7": ist("parked", type="investigate", exit_nonce="exit-9")}},
+             acks={"i7": "NO-FINDINGS exit-9"})
+    g = ghv(issue_comments={"i7": [_MARKER_COMMENT]})
+    out = decide(parsed_issues=[], dsk=d, gh_view=g)
+    r = only(out, "relay_exit_reply")
+    assert len(r) == 1 and r[0]["line"] == "NO-FINDINGS" and r[0]["num"] == 7
+    assert only(out, "close_investigate") == []          # verdict deferred while the relay posts
+    # relayed + the comment visible: the ordinary reconcile close fires.
+    d["issues_state"]["issues"]["i7"]["exit_ack_relayed"] = "exit-9"
+    g2 = ghv(issue_comments={"i7": [_MARKER_COMMENT, {"body": "NO-FINDINGS"}]})
+    out2 = decide(parsed_issues=[], dsk=d, gh_view=g2)
+    assert only(out2, "relay_exit_reply") == []
+    assert len(only(out2, "close_investigate")) == 1
+
+
 def test_exit_window_is_config_tunable():
     d, g, p7 = _inv_finishing(exit_asks=1, exit_asked_at=NOW - 100)
     c = cfg(session={"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2,

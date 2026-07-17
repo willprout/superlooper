@@ -257,10 +257,12 @@ def exit_interview_reply(comments):
     comment is a reply at all. A reply is a comment whose body, stripped, is exactly one line
     beginning `FINDINGS-FILED:` or `NO-FINDINGS` (mid-text quotes are not replies, same contract
     as every marker). Returns {"kind": "no_findings"|"findings"|"malformed", "refs": [ints],
-    "key": str} — `key` identifies WHICH comment answered (createdAt when present, else the
-    thread position), so a verification verdict is pinned to the reply it judged and can never
-    vouch for a newer one. Newest wins: comments arrive in thread (chronological) order, so the
-    LAST reply-shaped comment is the answer — a worker that corrects itself is believed.
+    "key": str} — `key` identifies WHICH comment answered, so a verification verdict is pinned
+    to the reply it judged and can never vouch for a newer one. The comment's `id` is preferred
+    (globally unique — two replies posted within one second share a createdAt, and a verdict for
+    the first must never vouch for the second; fresh review P2-1), then createdAt, then the
+    thread position. Newest wins: comments arrive in thread (chronological) order, so the LAST
+    reply-shaped comment is the answer — a worker that corrects itself is believed.
     Wrong-typed comment lists/entries contribute nothing (fail closed, never a raise)."""
     out = None
     for i, c in enumerate(comments if isinstance(comments, list) else []):
@@ -278,9 +280,14 @@ def exit_interview_reply(comments):
                 parsed = ("malformed", [])
         if parsed is None:
             continue
-        key = c.get("createdAt") if isinstance(c, dict) else None
-        key = key if isinstance(key, str) and key else "idx-%d" % i
-        out = {"kind": parsed[0], "refs": parsed[1], "key": key}
+        key = None
+        if isinstance(c, dict):
+            for field in ("id", "createdAt"):
+                v = c.get(field)
+                if isinstance(v, str) and v:
+                    key = v
+                    break
+        out = {"kind": parsed[0], "refs": parsed[1], "key": key or "idx-%d" % i}
     return out
 
 
@@ -289,17 +296,20 @@ def exit_ack_line(text, nonce):
     carries `nonce`, nonce stripped, ready to post verbatim as the durable reply comment. The
     nonce fence is load-bearing (same rule as events.parse_ack): a stale ack answering a
     previous ask — or the #157 progress-probe ladder, which shares the ack file — must never be
-    read as answering this one. Returns None when the nonce is absent, no line both carries the
-    nonce and begins with a reply prefix, or any input is wrong-typed (fail closed: no relay,
-    and the bounded ask ladder owns what happens next)."""
+    read as answering this one. The LAST matching line wins, mirroring the reply comments'
+    newest-wins rule — a worker that appends a correction to its own ack is believed. Returns
+    None when the nonce is absent, no line both carries the nonce and begins with a reply
+    prefix, or any input is wrong-typed (fail closed: no relay, and the bounded ask ladder owns
+    what happens next)."""
     if not isinstance(text, str) or not isinstance(nonce, str) or not nonce or nonce not in text:
         return None
+    out = None
     for raw in text.splitlines():
         line = " ".join(t for t in raw.split() if t != nonce)
         if nonce in raw and (line.startswith(EXIT_FINDINGS_PREFIX)
                              or line.startswith(EXIT_NO_FINDINGS)):
-            return line
-    return None
+            out = line
+    return out
 
 
 def accounted_child_nums(children):
@@ -342,7 +352,9 @@ def exit_interview_verdict(reply, verify):
         return ("close", EXIT_NO_FINDINGS)
     if kind == "findings":
         refs = r.get("refs")
-        refs = [x for x in refs if type(x) is int] if isinstance(refs, list) else []
+        # dedup + sort: `FINDINGS-FILED: #12 #12` is one claim, and the close comment should
+        # read canonically whatever order the worker typed
+        refs = sorted({x for x in refs if type(x) is int}) if isinstance(refs, list) else []
         if not refs:
             return ("ask", "the FINDINGS-FILED reply carries no readable `#N` refs — reply "
                            "with exactly one line: `FINDINGS-FILED: #N [#N …]` or "
@@ -686,6 +698,14 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
                 return {"action": "exit_interview", "reply_key": key, "defect": detail,
                         "reason": "no usable exit-interview reply within the window — "
                                   "re-asking once"}
+            if detail is not None:
+                # a reply EXISTS but never became usable — the memo must say that, not claim
+                # nobody answered (fresh review P2-3: honesty of the hand-back)
+                return {"action": "park",
+                        "reason": f"exit interview unresolved after {EXIT_ASK_CAP} asks — the "
+                                  f"newest reply is unusable ({detail}) and no correction "
+                                  "arrived within the window; parking, never closing "
+                                  "unaccounted"}
             how = ("the interview was delivered (consumption receipt/ack recorded) but no "
                    "usable reply was posted"
                    if ist.get("exit_delivered") is True else

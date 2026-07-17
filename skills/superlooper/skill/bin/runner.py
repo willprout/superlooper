@@ -1526,7 +1526,10 @@ class Runner:
         worker hook's two-phase delivery receipt (#148), and THE proof the exit interview (#215)
         reads as 'the worker was handed this'. Pending mail, .claimed markers (in flight, never
         proven) and .discarded ones (blank mail) are not receipts; an unparseable name simply
-        contributes nothing."""
+        contributes nothing. INVARIANT (fresh review P2-2): the exit interview is TODAY the only
+        mailbox writer, so 'newest receipt' == 'the interview was delivered'. A second mail type
+        must fence receipts per-purpose (e.g. a purpose tag in the mail name) before reusing
+        this scan, or its consumption would silently extend the interview's reply window."""
         d = os.path.join(self.state, "mail")
         out = {}
         try:
@@ -2654,7 +2657,13 @@ class Runner:
         if not self._teardown_session(iid, remove_worktree=True):
             return "worker still live in the worktree — deferring the fresh start (retries next tick)"
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
-        for sub in ("blocked", "exited", "awaiting", "started"):
+        # `mail` and `ack` join this list for the #215 exit interview (fresh review P1): a park
+        # can leave the interview MAIL armed, and mail carries no episode fence — a reapproved
+        # episode's fresh session would consume the stale ask at its first rest and could post
+        # NO-FINDINGS before re-investigating anything, closing the re-run without its own
+        # interview. Pending mail only: the .consumed/.claimed/.discarded receipts are the
+        # history of what was actually delivered and stay (launch-session.sh's own rule).
+        for sub in ("blocked", "exited", "awaiting", "started", "mail", "ack"):
             _rm(os.path.join(self.state, sub, iid))
         # 2. durable state: zero the attempt counters and clear the stale run/gate fields that
         #    would otherwise re-park, plus any active answerer record (a fresh approval is a fresh
@@ -3359,8 +3368,10 @@ class Runner:
     def _exec_relay_exit_reply(self, a, now):
         """Post the degraded path's ack as the durable one-line reply comment (#215): the claim
         must be timestamped and owner-auditable on the issue whichever channel carried it. The
-        relayed-nonce stamp lands only AFTER gh confirms the write, so a failed post retries next
-        tick and a posted reply is never duplicated."""
+        relayed-nonce stamp lands only AFTER gh confirms the write, so a failed post retries
+        next tick. Delivery is therefore AT-LEAST-ONCE: a crash between the confirmed post and
+        the stamp re-posts the identical line next tick — harmless, because the gate's
+        newest-wins parse reads duplicates as one answer."""
         iid, num = a["id"], a.get("num")
         if not gh.comment(num, a.get("line") or ""):
             return "reply comment failed (will retry next tick)"
