@@ -129,6 +129,18 @@ PROBE_CAP = 3                      # probes per episode before a classified prog
 # consumed late, e.g. a worker mid-long-turn, gets its full window from delivery). Config
 # override: session.exit_reply_window_seconds.
 EXIT_REPLY_WINDOW_SECONDS = 600
+# The gate nudge's COMPLIANCE WINDOW (issue #222): once the gate nudges a cause (missing report
+# sections, absent/stale review evidence, a missing investigation marker), the worker gets this long
+# to comply before the gate parks the lane. The pre-#222 grace was ONE tick (~18-25s): decide stamped
+# the nudge and the very next tick found the key present and parked, so no worker could post a review
+# comment or fix report sections in time — the "nudge once" design was structurally a park with extra
+# steps. The window runs from the nudge's actual delivery (the `nudged_at` stamp _exec_nudge writes
+# when the key is spent). One nudge per cause is UNCHANGED — this bounds the WAIT between the nudge and
+# the park, it does not unbound the nudge (the i280 lesson). Default 480s ("on the order of the session
+# idle threshold", session.idle_seconds) — generous enough for a real paperwork fix, far past a tick.
+# Config override: session.nudge_grace_window_seconds. An unreadable/absent stamp reads as EXPIRED
+# (fail closed to the park; the ladder stays bounded, never an unbounded wait).
+NUDGE_GRACE_WINDOW_SECONDS = 480
 # How long a session may sit at its OWN in-window question before the owner is told (issue #151).
 # A lane at a dialog is never parked — it is alive — but it must not be SILENT either: the loop's
 # channel for "worker needs input" is state/blocked/<id> -> hire_answerer, and an in-window
@@ -741,6 +753,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     probe_retry_secs = _count(session.get("probe_retry_seconds"), PROBE_RETRY_SECONDS)
     probe_cap = _count(session.get("probe_cap"), PROBE_CAP)
     exit_window = _count(session.get("exit_reply_window_seconds"), EXIT_REPLY_WINDOW_SECONDS)
+    nudge_window = _count(session.get("nudge_grace_window_seconds"), NUDGE_GRACE_WINDOW_SECONDS)
     dev_branch = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
 
     plist = parsed_issues if isinstance(parsed_issues, list) else []
@@ -1337,6 +1350,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             declared = (p.get("touches") if isinstance(p, dict) else None) \
                 or ist.get("declared_touches") or []
             nudged = ist.get("nudged", [])
+            # issue #222: the compliance window. The gate is clockless, so decide computes which
+            # already-nudged keys have EXPIRED (their window ran out) and passes the subset in — the
+            # same split as the exit interview's `exit_ask_expired`. The window runs from `nudged_at`
+            # (the delivery stamp _exec_nudge writes). An unreadable/absent/future stamp reads as
+            # EXPIRED via the _since_ok discipline (fail closed to the park; the ladder stays bounded,
+            # never an unbounded wait). Only keys actually in `nudged` are considered.
+            nudged_at = ist.get("nudged_at")
+            nudge_expired = []
+            if isinstance(nudged, list):
+                for k in nudged:
+                    stamp = nudged_at.get(k) if isinstance(nudged_at, dict) else None
+                    if not _since_ok(stamp, now) or now - stamp >= nudge_window:
+                        nudge_expired.append(k)
             conflicts = ist.get("conflicts", 0)
             inflight = {}
             for other in ist_map:
@@ -1354,6 +1380,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 else False
             g = gate.gate_decision(
                 {"type": itype, "conflicts": conflicts, "nudged": nudged,
+                 "nudge_expired": nudge_expired,
                  "declared_touches": declared, "update_result": update_result,
                  "review_carry": ist.get("review_carry"),
                  "pre_authorized_referee": pre_auth_referee,

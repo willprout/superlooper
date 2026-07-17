@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+import actions
 import evidence
 import events
 import issues
@@ -1815,6 +1816,30 @@ def test_nudge_spends_the_key_on_sent_and_dead_but_not_on_defer(rig):
     assert issue_state(rig, "i6")["nudged"] == ["sections"]
 
 
+def test_nudge_stamps_the_compliance_window_start(rig):
+    # issue #222: spending a nudge stamps `nudged_at[key] = now` — the start of the worker's
+    # compliance window that decide times before parking. The stamp lands on a delivered send AND on
+    # an unspendable one (dead/logged-out pane), because the window runs from the moment the key is
+    # spent, never from a DEFER (a defer must not start the clock — it never nudged anyone).
+    seed_issue(rig, "i5", status="gating", nudged=[])
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    a = {"act": "nudge", "id": "i5", "nudge_key": "review", "message": "post the review"}
+    rig.rc_queue.append(3)                             # deferred: no stamp yet (nobody was nudged)
+    rig.r._execute(a, NOW)
+    assert issue_state(rig, "i5").get("nudged_at") in (None, {})
+    rig.rc_queue.append(0)                             # delivered: window opens at NOW
+    rig.r._execute(a, NOW)
+    assert issue_state(rig, "i5")["nudged_at"] == {"review": NOW}
+
+    # a dead pane (rc=4) still spends the key, so it too opens the window — the gate must WAIT out a
+    # real grace even here, never re-nudge a pane that can't receive it.
+    seed_issue(rig, "i6", status="gating", nudged=[])
+    (rig.home / "state" / "panes" / "i6").write_text("surf-uuid")
+    rig.rc_queue.append(4)
+    rig.r._execute({"act": "nudge", "id": "i6", "nudge_key": "sections", "message": "m"}, NOW + 7)
+    assert issue_state(rig, "i6")["nudged_at"] == {"sections": NOW + 7}
+
+
 def test_codex_nudge_passes_agent_to_pane_classifier(rig):
     rig.r.agent = "codex"
     seed_issue(rig, "i5", status="gating", nudged=[])
@@ -2764,6 +2789,30 @@ def test_resume_at_gate_journals_the_resume(rig):
     rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
     recs = [r for r in journal.read(rig.home) if r.get("act") == "resume_at_gate"]
     assert recs and recs[-1]["id"] == "i5"
+
+
+def test_resume_at_gate_clears_the_nudge_ledger_for_a_fresh_grace(rig):
+    """Issue #222 defect (b): a park-family lane carries its predecessor's spent nudge keys AND their
+    now-long-expired `nudged_at` stamps. Resuming at the gate must clear BOTH — otherwise the gate
+    re-parks INSTANTLY at the first gate hiccup (the stale stamp reads as an elapsed window), with
+    zero grace: exactly the i165 morning re-approval that re-parked within a minute of relaunch. The
+    stale ledger is the archetypal transient re-park trigger this executor exists to clear."""
+    seed_issue(rig, "i5", status="needs_william", pr=555, branch="sl/i5-x",
+               nudged=["review"], nudged_at={"review": NOW - 99999})
+    (rig.home / "reports" / "i5.md").write_text("## Tests\nthe finished report")
+    rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
+    st = issue_state(rig, "i5")
+    assert st["nudged"] == [] and st["nudged_at"] == {}     # fresh grace on the re-approval
+
+
+def test_reapprove_clears_the_nudge_window_stamps(rig):
+    # #222: the destructive rebuild path clears `nudged_at` with `nudged` and the other counters, so a
+    # rebuilt run never inherits a spent, already-expired window.
+    seed_issue(rig, "i5", status="parked", num=5, branch="sl/i5-x",
+               nudged=["review", "sections"], nudged_at={"review": NOW - 1, "sections": NOW - 2})
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    st = issue_state(rig, "i5")
+    assert st["nudged"] == [] and st["nudged_at"] == {}
 
 
 def test_reapprove_clears_the_rebuild_label_only_when_it_triggered_the_rebuild(rig):
@@ -4183,8 +4232,10 @@ def test_full_exit_interview_roundtrip_findings_verified(rig):
 
 
 def test_answered_empty_investigation_still_nudges_then_parks(rig):
-    # DoD: answered-empty (marker genuinely absent) still nudges once then parks — UNCHANGED. A
-    # clean read that simply carries no marker is authoritative; only a REFUSED read holds.
+    # DoD: answered-empty (marker genuinely absent) still nudges once then parks. A clean read that
+    # simply carries no marker is authoritative; only a REFUSED read holds. Issue #222 adds a real
+    # compliance WINDOW between the nudge and the park (no longer one tick), so the park lands only
+    # AFTER the window elapses — verified below by ticking within, then past, the window.
     _stateful(rig, {"7": _inv_issue(7, [{"body": "just chatter, no marker"}])})
     seed_issue(rig, "i7", status="gating", type="investigate", branch="sl/i7-x", num=7)
     (rig.home / "reports" / "i7.md").write_text("## Tests\n" + "x" * 60)
@@ -4192,10 +4243,18 @@ def test_answered_empty_investigation_still_nudges_then_parks(rig):
 
     rig.r.tick(now=NOW)                                    # clean read, no marker -> nudge once
     assert issue_state(rig, "i7")["nudged"] == ["investigation"]
+    assert issue_state(rig, "i7")["nudged_at"]["investigation"] == NOW   # window stamp (#222)
     assert issue_state(rig, "i7")["status"] == "gating"
     assert issue_state(rig, "i7").get("read_waited") in (None, False)   # a clean read never "waited"
 
-    rig.r.tick(now=NOW + 100)                              # still no marker, already nudged -> park
+    # #222: within the compliance window the lane WAITS — the one-tick park is gone.
+    rig.r.tick(now=NOW + 100)                              # still no marker, but window still open
+    assert issue_state(rig, "i7")["status"] == "gating", "must not park inside the compliance window"
+    assert not [m for m in mutations(rig) if m["kind"] == "set_labels"
+                and "parked" in (m.get("add") or "")]
+
+    # ...and past the window (default 480s) it parks, once, exactly as before.
+    rig.r.tick(now=NOW + actions.NUDGE_GRACE_WINDOW_SECONDS + 1)
     assert issue_state(rig, "i7")["status"] == "parked"
     assert [m for m in mutations(rig) if m["kind"] == "set_labels"
             and "parked" in (m.get("add") or "")]

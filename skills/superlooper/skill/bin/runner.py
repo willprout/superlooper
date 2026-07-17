@@ -2712,7 +2712,10 @@ class Runner:
                     old[k] = i.get(k)
                 i[k] = 0
             i.update({"status": "ready", "requeue_front": False, "recheck_failed": False,
-                      "update_result": None, "update_head_oid": None, "nudged": [], "pr": None,
+                      "update_result": None, "update_head_oid": None, "nudged": [],
+                      "nudged_at": {},                 # ...and its per-cause window stamps (#222):
+                      "pr": None,                      # a fresh run earns a fresh nudge+grace, never
+                                                       # its predecessor's spent, already-expired keys
                       "review_carry": None,            # a rebuild is reviewed on its own diff (#154)
                       "read_waited": False, "checks_pending_since": None,
                       "wildcard_hold_journaled": False,   # a fresh approval re-journals its own hold (#36)
@@ -2761,13 +2764,14 @@ class Runner:
         recorded PR, and the #154 durable review carry. It clears ONLY the transient fields that would
         make the gate re-park the instant it re-runs — the episode-scoped merge-refusal guard (#27),
         the recheck-failed hand-back (checked before the gate), the pending-checks / PR-read /
-        comments-read hold clocks (#26/#61/#78), and the park-notify episode markers (#61) — and
-        re-claims the lane for gating: status -> gating, and the labels swap agent-ready -> in-progress
-        (the finished/gate path keys off the report on disk, and the launch phase skips an in-progress
-        lane, so no fresh session ever rebuilds over the preserved work). The attempt counters are
-        DELIBERATELY not zeroed: a resume is a continuation of the same episode, not a fresh cap, so
-        the honest prior cost stays. No _teardown_session: a park-family lane has no live session (the
-        park stood it down), and tearing one down is exactly what this fix exists to avoid."""
+        comments-read hold clocks (#26/#61/#78), the park-notify episode markers (#61), and the
+        nudge ledger (#222) — and re-claims the lane for gating: status -> gating, and the labels swap
+        agent-ready -> in-progress (the finished/gate path keys off the report on disk, and the launch
+        phase skips an in-progress lane, so no fresh session ever rebuilds over the preserved work).
+        The attempt counters are DELIBERATELY not zeroed: a resume is a continuation of the same
+        episode, not a fresh cap, so the honest prior cost stays. No _teardown_session: a park-family
+        lane has no live session (the park stood it down), and tearing one down is exactly what this
+        fix exists to avoid."""
         iid, num = a["id"], a.get("num")
         def resume(st, i):
             i.update({"status": "gating", "requeue_front": False, "recheck_failed": False,
@@ -2775,7 +2779,13 @@ class Runner:
                       "checks_pending_since": None, "comments_read_pending_since": None,
                       "pr_read_pending_since": None, "read_waited": False,
                       "park_notify_cause": None, "park_notify_at": None,
-                      "park_comment_posted": False})
+                      "park_comment_posted": False,
+                      # issue #222: the nudge ledger is the archetypal "transient field that re-parks
+                      # the gate the instant it re-runs" — a leftover key + its stale (long-expired)
+                      # `nudged_at` stamp would make the gate park INSTANTLY at the first gate hiccup,
+                      # zero grace (defect b). An owner re-approval is a fresh chance, so clear both;
+                      # the gate nudges anew and the worker gets its full compliance window.
+                      "nudged": [], "nudged_at": {}})
         self._update_issue(iid, fn=resume)
         journal.append(self.home, {"act": "resume_at_gate", "id": iid}, now)
         # Re-claim the lane: in-progress (the loop is driving it to merge) replaces the owner's
@@ -3167,6 +3177,16 @@ class Runner:
                 if key not in nudged:
                     nudged = nudged + [key]
                 i["nudged"] = nudged
+                # issue #222: stamp WHEN this cause was nudged (the moment the key is spent — this
+                # branch is reached only on a delivered/dead/logged-out send, never a defer). decide
+                # times the compliance window from this stamp before parking, so the worker gets a
+                # real grace to comply instead of the pre-#222 one-tick death. A wrong-typed ledger
+                # is rebuilt fresh here, matching the `nudged` guard just above.
+                nudged_at = i.get("nudged_at")
+                if not isinstance(nudged_at, dict):
+                    nudged_at = {}
+                nudged_at[key] = now
+                i["nudged_at"] = nudged_at
                 i["status"] = "gating"
             loopstate.update(self.issues_path, m)
             if rc == 0:
@@ -3322,7 +3342,8 @@ class Runner:
                                  "conflicts": a.get("conflicts"), "requeue_front": True,
                                  "update_result": None, "update_head_oid": None,
                                  "review_carry": None,   # fresh branch, fresh review (#154)
-                                 "nudged": [], "pr": None, "recheck_failed": False,
+                                 "nudged": [], "nudged_at": {},   # fresh nudge+grace window (#222)
+                                 "pr": None, "recheck_failed": False,
                                  "checks_pending_since": None, "merge_refusals": 0,
                                  "merge_refusal_reason": None,
                                  "pr_read_pending_since": None,   # fresh branch, fresh episodes (#61)
@@ -3373,7 +3394,7 @@ class Runner:
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,
                                      "update_head_oid": None, "review_carry": None,
-                                     "nudged": [],
+                                     "nudged": [], "nudged_at": {},   # fresh nudge+grace (#222)
                                      "launch_error": None, "launch_evidence": None})
             self._delivery_cleared()                   # a verified delivery proves the anchor is live (#24)
             return "ok"

@@ -560,11 +560,16 @@ def test_gate_no_pr_parks():                                     # step 1
         assert d["action"] == "park"
 
 
-def test_gate_bad_sections_nudge_once_then_park():               # step 2
+def test_gate_bad_sections_nudge_once_then_park():               # step 2 (+ #222 window)
     d = _decide(report="## Tests\nshort\n")
     assert d["action"] == "nudge" and d["nudge_key"] == "sections"
-    d2 = _decide(issue=_issue(nudged=["sections"]), report="## Tests\nshort\n")
-    assert d2["action"] == "park"
+    # #222: a nudged cause WAITS out its compliance window (key not yet expired) before any park...
+    d2 = _decide(issue=_issue(nudged=["sections"], nudge_expired=[]), report="## Tests\nshort\n")
+    assert d2["action"] == "wait"
+    # ...and parks only once decide reports the window elapsed (key in nudge_expired).
+    d3 = _decide(issue=_issue(nudged=["sections"], nudge_expired=["sections"]),
+                 report="## Tests\nshort\n")
+    assert d3["action"] == "park"
 
 
 def test_gate_wrong_typed_report_is_the_sections_path():
@@ -580,8 +585,56 @@ def test_gate_review_evidence_nudge_once_then_park():            # step 2b
     d = _decide(pr=pr)
     assert d["action"] == "nudge" and d["nudge_key"] == "review"
     assert d.get("comments_unread") is None
-    d2 = _decide(issue=_issue(nudged=["review"]), pr=pr)
-    assert d2["action"] == "park"
+    # #222: WAIT out the window before parking; park only once the window has elapsed.
+    d2 = _decide(issue=_issue(nudged=["review"], nudge_expired=[]), pr=pr)
+    assert d2["action"] == "wait"
+    d3 = _decide(issue=_issue(nudged=["review"], nudge_expired=["review"]), pr=pr)
+    assert d3["action"] == "park"
+
+
+# ------------------- the nudge->park compliance window (issue #222) -------------------
+# A nudge is no longer a one-tick death sentence. After the gate nudges a cause, it WAITS on that
+# cause until the worker's compliance window has elapsed, then parks. The gate stays clockless: decide
+# stamps `nudged_at` on delivery and passes in `nudge_expired` — the keys whose window has run out.
+# One nudge per cause is unchanged (the fix bounds the WAIT, it does not unbound the nudge — i280).
+
+def test_gate_a_nudged_cause_waits_out_its_window_before_parking():
+    # the SAME cause, the SAME single nudge already spent: window open -> wait, window elapsed -> park.
+    open_win = _decide(issue=_issue(nudged=["sections"], nudge_expired=[]),
+                       report="## Tests\nshort\n")
+    assert open_win["action"] == "wait"
+    elapsed = _decide(issue=_issue(nudged=["sections"], nudge_expired=["sections"]),
+                      report="## Tests\nshort\n")
+    assert elapsed["action"] == "park"
+
+
+def test_gate_window_is_per_cause_not_global():
+    # two causes can't share one window: 'review' still open must WAIT even if some OTHER key expired.
+    pr = _pr(comments=[])
+    d = _decide(issue=_issue(nudged=["review"], nudge_expired=["sections"]), pr=pr)
+    assert d["action"] == "wait"
+
+
+def test_gate_unreadable_nudge_window_fails_closed_to_park():
+    # decide always passes a real list; an absent/wrong-typed window is corruption. Fail closed to
+    # park (handing to William is safe) — never an unbounded WAIT, the mirror of the wrong-typed
+    # nudge-ledger park.
+    for bad in (None, {"sections": 1}, 7, "expired", 1.5):
+        d = _decide(issue=_issue(nudged=["sections"], nudge_expired=bad),
+                    report="## Tests\nshort\n")
+        assert d["action"] == "park", f"nudge_expired={bad!r} must fail closed to park"
+
+
+def test_gate_wrong_typed_nudge_ledger_still_parks_immediately():
+    # unchanged boundary (#222): the LEDGER itself being unreadable still parks at once, window or no.
+    d = _decide(issue=_issue(nudged="not-a-list", nudge_expired=[]), report="## Tests\nshort\n")
+    assert d["action"] == "park"
+
+
+def test_gate_a_never_nudged_cause_still_nudges_first():
+    # the window only gates the SECOND look at a cause; the first unmet look still nudges once.
+    d = _decide(issue=_issue(nudged=[], nudge_expired=[]), report="## Tests\nshort\n")
+    assert d["action"] == "nudge" and d["nudge_key"] == "sections"
 
 
 def test_gate_stale_verdict_never_merges_rebuilt_code():         # step 2b (issue #154)
