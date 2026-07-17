@@ -1,4 +1,8 @@
-"""The six mechanical verbs — the ONLY writes in the whole product (design record §2, Task 6).
+"""The mechanical verbs — the ONLY writes in the whole product (design record §2, Task 6).
+
+The set was six through issue #162; issue #161 splits re-approval into resume-at-the-gate (the
+existing ``approve``) and an explicit ``rebuild``, so ``rebuild`` is the seventh — still a plain
+label+comment write in William's name, no new KIND of write, no AI.
 
 Every button the dashboard shows is one of exactly SIX existing mechanical verbs — approve/
 re-approve, drop, expedite, bounce-yes, flag, discuss — each a label/comment/issue write made in
@@ -136,8 +140,13 @@ class Actions:
         serves both the fresh approval and the re-approval of a parked flight."""
         if repo not in self._allowed:
             return self._refuse("approve")
+        # REBUILD is removed too (issue #161): this is the RESUME-at-the-gate tap, the opposite of a
+        # rebuild, so it must also clear any STALE `rebuild` label a prior tap left behind (e.g. a
+        # rebuild whose engine-side cleanup blipped). Only the `rebuild` verb ever applies that label;
+        # every other re-approval clears it, so a plain re-approval can never inherit a destructive
+        # override and wipe finished work.
         labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
-                                      remove=[PARKED, NEEDS_OWNER, NEEDS_OWNER_LEGACY])
+                                      remove=[PARKED, NEEDS_OWNER, NEEDS_OWNER_LEGACY, REBUILD])
         commented = self._gh.comment(repo, num, approve_comment(self._operator, self._date()))
         # ok requires BOTH: agent-ready is William's word ONLY when its audit comment records the
         # tap — a label applied without the trail is not a success (the "journal-greppable via audit
@@ -190,8 +199,10 @@ class Actions:
         approve."""
         if repo not in self._allowed:
             return self._refuse("bounce-yes")
+        # REBUILD removed too (issue #161): a bounce-accept rebuilds from the amended premise, never
+        # inheriting a stale rebuild override from a prior tap. Only the `rebuild` verb applies it.
         labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
-                                      remove=[NEEDS_OWNER, NEEDS_OWNER_LEGACY, PARKED])
+                                      remove=[NEEDS_OWNER, NEEDS_OWNER_LEGACY, PARKED, REBUILD])
         commented = self._gh.comment(repo, num, bounce_comment(self._operator, self._date()))
         return {"ok": bool(labeled and commented), "verb": "bounce-yes",
                 "labeled": bool(labeled), "commented": bool(commented)}
@@ -212,8 +223,10 @@ class Actions:
         if not text:
             return {"ok": False, "verb": "answer", "error": "empty answer"}
         commented = self._gh.comment(repo, num, "%s\n%s" % (ANSWER_MARKER, text))
+        # REBUILD removed too (issue #161): answering a durable question resumes with the WIP reused,
+        # never inheriting a stale rebuild override. Only the `rebuild` verb applies that label.
         labeled = self._gh.set_labels(repo, num, add=[AGENT_READY],
-                                      remove=[AWAITING_ANSWER, NEEDS_OWNER, NEEDS_OWNER_LEGACY])
+                                      remove=[AWAITING_ANSWER, NEEDS_OWNER, NEEDS_OWNER_LEGACY, REBUILD])
         return {"ok": bool(commented and labeled), "verb": "answer",
                 "commented": bool(commented), "labeled": bool(labeled)}
 

@@ -2375,7 +2375,12 @@ class Runner:
         rc = self._run_script([self._script("launch-session.sh"), iid],
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
-            gh.set_labels(num, add=["in-progress"], remove=["agent-ready"])
+            # `rebuild` is one-shot (issue #161): once its rebuild session actually launches, the
+            # signal is fully consumed, so clear it here too. This is the engine-side belt behind
+            # _exec_reapprove's own best-effort removal — if that gh write blipped, a stale `rebuild`
+            # would otherwise ride the whole episode and make a LATER plain re-approval destructive
+            # (the D11 defect, resurrected). Harmless on a fresh launch (no label to remove).
+            gh.set_labels(num, add=["in-progress"], remove=["agent-ready", "rebuild"])
             # clear any stale base-missing cause: a verified delivery proves the base now exists.
             # launch_evidence clears with it (#152) for the same reason and the #40 staleness lesson
             # (review P1-1): a fixed anchor must not leave last week's cause behind to name the wrong

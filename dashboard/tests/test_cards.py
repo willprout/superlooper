@@ -562,6 +562,21 @@ def test_an_unfinished_lane_has_no_rebuild_button_and_still_rebuilds_on_approve(
     assert "rebuild" in yes["label"].lower()
 
 
+def test_a_finished_investigation_shows_rebuild_never_a_lying_resume_button():
+    # Fresh-review P1: an investigation files a report but opens NO PR, and the engine REBUILDS it on
+    # re-approval (its resume path is `has_report AND type != investigate`). So the card must NOT show
+    # "resume at the gate — the report is kept" on a finished investigation — that would promise to
+    # keep the investigation's whole deliverable and then delete it. It mirrors the engine EXACTLY via
+    # `is_investigation`, so a finished investigation reads as a plain rebuild, no separate resume.
+    f = _finished_flight(is_investigation=True, pr=None)
+    acts = cards.decision_actions(f)
+    assert [a for a in acts if a["act"] == "rebuild"] == []        # no separate resume/rebuild split
+    yes = [a for a in acts if a["act"] == "approve"][0]
+    assert "rebuild" in yes["label"].lower()                      # the honest single yes verb
+    assert "resume" not in yes["label"].lower()
+    assert "kept" not in yes["consequence"].lower()               # never promises to keep the report
+
+
 def test_a_finished_needs_you_card_carries_the_rebuild_action():
     card = cards.needs_you_card(_finished_flight(stage=flights.AWAITING, awaiting_reason="needs-owner"), "r/s")
     assert "rebuild" in [a["act"] for a in card["actions"]]

@@ -133,10 +133,11 @@ def test_skipping_the_lookup_renders_the_same_flight_as_performing_it(tmp_path):
     # `pr_facts or {}`, so a None would render the same too (verified by mutation, not assumed).
     #
     # What it DOES pin is narrow but real, and nothing else in this file covers it: the loopstate
-    # `type` stamp has no rendering effect anywhere in the flight dict this compares, beyond the
-    # skip. (Only THIS flight — a consumer branching on `type` to set a repo-level field would slip
-    # past.) That is the assumption the whole change rests on, `type` being read at exactly one
-    # site, and it is what would break silently if a future consumer rendered a flight from it.
+    # `type` stamp has no rendering effect on the flight dict this compares BEYOND the skip and the
+    # `is_investigation` flag issue #161 derives from it (the two deliberate read sites). The control
+    # arm removes `type` to force the un-skipped path, so it legitimately reads `is_investigation`
+    # False there — excluded from the comparison below. Any OTHER type-derived field appearing would
+    # be an unaccounted read site and would fail this equality (the guard the test exists to be).
     issues = {"i9": {"status": "running", "branch": "sl/i9-x", "pr": None,
                      "lane": "i9", "type": "investigate"}}
     home = _make_home(tmp_path, issues)
@@ -148,7 +149,11 @@ def test_skipping_the_lookup_renders_the_same_flight_as_performing_it(tmp_path):
     looked_up = _flight(_assemble_n(_config(_make_home(tmp_path / "control", typeless)), gh2,
                                     server.ConcludedFlights(), 1), 9)
     assert gh2.pr_calls == {"sl/i9-x": 1}    # the control arm really did ask GitHub...
-    assert skipped == looked_up              # ...and the board is identical either way
+    # ...and the board is identical either way, save the type-derived `is_investigation` flag the
+    # control arm zeroes by construction (it removed the `type` stamp to force the lookup).
+    drop_inv = lambda f: {k: v for k, v in f.items() if k != "is_investigation"}
+    assert skipped["is_investigation"] is True and looked_up["is_investigation"] is False
+    assert drop_inv(skipped) == drop_inv(looked_up)
 
 
 # =============================== the build path is untouched ===============================

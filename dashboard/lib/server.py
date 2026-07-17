@@ -1415,6 +1415,9 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         cargo = diff_reader(worktree)
         issue = {
             "id": iid, "num": num, "status": st.get("status"), "branch": branch, "pr": pr,
+            # Investigations file a report but open no PR and are REBUILT (not resumed) on re-approval;
+            # the decision card reads this to keep its resume/rebuild verb honest (issue #161).
+            "is_investigation": is_investigation,
             "activity_mtime": facts["activity"].get(iid), "blocked": facts["blocked"].get(iid),
             "awaiting_marker": iid in facts["awaiting"], "report_present": iid in facts["reports"],
             # The three-way review state (issue #176), judged against the PR's CURRENT head so a

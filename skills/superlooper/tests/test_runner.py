@@ -540,7 +540,9 @@ def test_launch_env_contract_and_registration(rig):
     brief_text = (rig.home / "briefs" / "i101.md").read_text()
     assert "#101" in brief_text
     m = mutations(rig)[-1]
-    assert m["kind"] == "set_labels" and m["add"] == "in-progress" and m["remove"] == "agent-ready"
+    assert m["kind"] == "set_labels" and m["add"] == "in-progress"
+    # a verified launch clears agent-ready AND consumes any one-shot `rebuild` label (issue #161)
+    assert set(m["remove"].split(",")) == {"agent-ready", "rebuild"}
 
 
 def test_launch_env_uses_per_issue_model_override(rig):
@@ -1085,7 +1087,8 @@ def test_a_verified_canary_clears_the_streak_and_launches_the_issue(rig):
     assert rig.r._launch_fail_ids == set() and rig.r._launch_fail_at == 0
     assert issue_state(rig, "i101")["status"] == "running"
     m = mutations(rig)[-1]
-    assert m["kind"] == "set_labels" and m["add"] == "in-progress" and m["remove"] == "agent-ready"
+    assert m["kind"] == "set_labels" and m["add"] == "in-progress"
+    assert set(m["remove"].split(",")) == {"agent-ready", "rebuild"}   # one-shot rebuild consumed (#161)
 
 
 def test_a_failed_canary_via_base_missing_charges_no_cap_and_re_spaces_the_clock(rig):
@@ -2764,6 +2767,20 @@ def test_resume_at_gate_journals_the_resume(rig):
     rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
     recs = [r for r in journal.read(rig.home) if r.get("act") == "resume_at_gate"]
     assert recs and recs[-1]["id"] == "i5"
+
+
+def test_launch_consumes_a_stale_rebuild_label(rig):
+    """Issue #161, the one-shot belt (fresh-review P1): `rebuild` is consumed the moment its rebuild
+    session actually launches, so a stale label whose _exec_reapprove cleanup blipped cannot ride the
+    whole episode and make a LATER plain re-approval destructive. A verified launch delivery
+    (agent-ready -> in-progress) removes it too — harmless on a fresh launch that carries no rebuild."""
+    rig.r.tick(now=NOW)                                          # poll: i101 lands in the parsed view
+    rig.calls.clear()
+    out = rig.r._execute(_launch_action(), NOW)                  # i101 delivers cleanly (rc 0)
+    assert out == "ok"
+    m = mutations(rig)[-1]
+    assert m["kind"] == "set_labels" and "in-progress" in m["add"]
+    assert set(m["remove"].split(",")) == {"agent-ready", "rebuild"}
 
 
 # ---------------- bounded pending-checks clock executors (issue #26) ----------------

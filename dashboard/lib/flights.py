@@ -1126,6 +1126,9 @@ def build_flight(issue, repo):
         "branch": issue.get("branch"),
         "pr": issue.get("pr"),
         "awaiting_reason": awaiting_reason,
+        # An investigation files a report but opens no PR, so re-approval REBUILDS it, never resumes at
+        # a merge gate; the decision card's resume/rebuild verb reads this to stay honest (issue #161).
+        "is_investigation": bool(issue.get("is_investigation")),
         "long_wait": long_wait,
         # For a #163 question, the whole question IS the memo the card shows verbatim (exactly as a
         # bounce shows its BOUNCED memo); otherwise the latest journalled hand-back memo.

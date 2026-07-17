@@ -275,9 +275,10 @@ def decision_dossier(flight, journal_slice):
 
 
 # =============================== the verbs, named by consequence (issue #162) ===============================
-# No button may hide what it does. These are exactly the mechanical verbs ``lib/actions`` already
-# exposes — approve / bounce-yes / drop / discuss — with NO new verb invented here (issue #162
-# boundary); only their NAMES change, and the name now states the effect.
+# No button may hide what it does. These are the mechanical verbs ``lib/actions`` exposes — approve /
+# bounce-yes / drop / discuss, plus the explicit ``rebuild`` that issue #161 splits out of re-approval
+# — and the name always states the effect. #162 kept the set fixed and only renamed; #161's split is
+# the one owner-approved addition (a finished lane resumes by default, so rebuild needs its own verb).
 #
 # The load-bearing honesty: a re-approval is NOT "carry on from here". A fresh `agent-ready` on any
 # park-family status routes through the engine's `_exec_reapprove`, which prunes the worktree,
@@ -318,14 +319,18 @@ def decision_actions(flight, slug=None):
     kind = card_kind(flight)
     bounced = flight.get("awaiting_reason") == "bounced" or kind == "bounced"
     num = flight.get("num")
-    # A filed report means the worker FINISHED and opened its PR (its last act is the report, written
-    # only after `gh pr create`). Issue #161 splits the yes verb by this exact signal: a finished lane
-    # RESUMES AT THE GATE by default (the engine keeps the PR/report/review and re-runs the merge
-    # gate), and rebuild-from-scratch becomes a separate, armed, destructive verb. The card reads the
-    # SAME `report` signal the engine's `has_report` does, so the button text can never contradict
-    # what the runner will actually do (design record B.1). A bounce rejects the premise — it always
-    # rebuilds — so it is never a resume, whatever artifacts happen to linger.
-    finished = bool((flight.get("gate") or {}).get("report")) and not bounced
+    # A filed report on a MERGE-producing lane means the worker FINISHED and opened its PR (its last
+    # act is the report, written only after `gh pr create`). Issue #161 splits the yes verb by that
+    # signal: a finished lane RESUMES AT THE GATE by default (the engine keeps the PR/report/review and
+    # re-runs the merge gate), and rebuild-from-scratch becomes a separate, armed, destructive verb.
+    # The condition MIRRORS the engine's resume path EXACTLY — `has_report AND type != investigate AND
+    # status != bounced` — so the button text can never contradict what the runner will do (design
+    # record B.1). The `is_investigation` clause is load-bearing, not caution: an investigation ALSO
+    # files a report but opens no PR, and the engine rebuilds it — keying on report alone would show
+    # "resume ... the report is kept" on a lane the runner rebuilds, deleting the investigation's whole
+    # deliverable behind a preservation promise. A bounce rejects the premise — always a rebuild.
+    finished = (bool((flight.get("gate") or {}).get("report"))
+                and not flight.get("is_investigation") and not bounced)
 
     rebuild = None
     if bounced:

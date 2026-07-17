@@ -208,6 +208,18 @@ def test_build_flight_awaiting_answer_is_a_question_with_the_question_as_memo():
     assert f["question"] == "QUESTION: approach A or B?\nRECOMMENDATION: A"
 
 
+def test_build_flight_carries_the_investigation_flag(_pri=None):
+    # Issue #161: the flight carries whether its issue is an investigation, so the decision card's
+    # resume/rebuild verb can mirror the engine EXACTLY (the engine rebuilds a finished investigation,
+    # never resumes it). Present and true for an investigation; falsy/absent otherwise.
+    inv = flights.build_flight({"id": "i9", "num": 9, "status": "parked", "branch": "sl/i9-x",
+                                "is_investigation": True, "report_present": True, "journal": []}, _REPO)
+    assert inv["is_investigation"] is True
+    build = flights.build_flight({"id": "i8", "num": 8, "status": "parked", "branch": "sl/i8-x",
+                                  "report_present": True, "journal": []}, _REPO)
+    assert build["is_investigation"] is False
+
+
 def test_plain_blocked_keeps_flying_not_amber():
     # A worker blocked on a question the answerer is handling is still in the air (a radio call),
     # NOT an amber owner-decision — those demand opposite responses and must never share a look.

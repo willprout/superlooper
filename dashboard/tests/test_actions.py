@@ -62,8 +62,9 @@ def test_approve_adds_agent_ready_removes_parked_and_needs_william(tmp_path, mon
     muts = _mutations(tmp_path)
     assert all(m["num"] == "4" for m in muts if m["kind"] == "set_labels")
     assert "agent-ready" in _added_labels(muts)                              # agent-ready applied
-    # all three blockers cleared (each in its own edit — issue #114 split; order-independent)
-    assert _removed_labels(muts) == {"parked", "needs-owner", "needs-william"}
+    # the blockers cleared (each in its own edit — issue #114 split; order-independent), PLUS the
+    # `rebuild` override (issue #161): a plain re-approval is a RESUME, so it clears any stale rebuild.
+    assert _removed_labels(muts) == {"parked", "needs-owner", "needs-william", "rebuild"}
 
 
 def test_approve_posts_the_exact_audit_comment(tmp_path, monkeypatch):
@@ -183,6 +184,22 @@ def test_rebuild_fails_closed_when_gh_write_fails(tmp_path, monkeypatch):
     a = _acts(monkeypatch, tmp_path)
     monkeypatch.setenv("GH_FAIL", "1")
     assert a.rebuild(REPO, 4)["ok"] is False
+
+
+def test_the_non_rebuild_reapproval_verbs_clear_a_stale_rebuild_label(tmp_path, monkeypatch):
+    # Issue #161, the one-shot guarantee (fresh-review P1): `rebuild` is applied ONLY by the rebuild
+    # verb. Every OTHER re-approval — approve (resume-at-the-gate), bounce-yes, answer — must REMOVE a
+    # stale rebuild left behind by an earlier tap whose engine-side cleanup blipped, so a later plain
+    # re-approval can never inherit a destructive override and wipe finished work (the D11 defect).
+    for verb, call in (("approve", lambda a: a.approve(REPO, 4)),
+                       ("bounce-yes", lambda a: a.bounce_yes(REPO, 4)),
+                       ("answer", lambda a: a.answer(REPO, "go ahead", 4))):
+        a = _acts(monkeypatch, tmp_path)
+        call(a)
+        removed = _removed_labels(_mutations(tmp_path))
+        assert "rebuild" in removed, "%s must clear a stale rebuild label (#161)" % verb
+        # clean the mutations log between verbs so each assertion reads only its own writes
+        (tmp_path / "mutations.jsonl").unlink(missing_ok=True)
 
 
 def test_bounce_yes_succeeds_on_a_repo_that_finished_the_migration(tmp_path, monkeypatch):
