@@ -386,8 +386,12 @@ def _resurrection(records, window_start):
             or "(signal unrecorded)"
         outcome = r.get("outcome")
         if outcome == "resurrected":
+            # What was actually VERIFIED is the pidfile flipping to a live pid; the reconcile is a
+            # property of `superlooper run` itself, not something this path observed. State the
+            # mechanism, don't assert the outcome as witnessed history (fresh-review P2-4).
             lines.append(f"- Runner was down and AUTOMATICALLY RESTARTED ({r.get('id')}) — signals: "
-                         f"{sigs}. It reconciled from GitHub + disk like a manual restart.")
+                         f"{sigs}. It came up as a normal `superlooper run` (verified live via its "
+                         "pidfile), so it rebuilds from GitHub + disk like a manual restart.")
         elif outcome == "resurrect_failed":
             lines.append(f"- Automatic runner restart {r.get('id')} FAILED (rc={r.get('rc')}) — the "
                          "loop was down and could not restart itself (its cmux tab is likely gone).")

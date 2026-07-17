@@ -417,13 +417,16 @@ def _resurrection(now, view, w, sigs, details, new_state):
 
 
 def evaluate(now, config, view, state):
-    """One mechanical check. Returns {"state", "journal", "notify", "launch"}:
+    """One mechanical check. Returns {"state", "journal", "notify", "launch", "resurrect",
+    "runner_down"}:
       state    the new state to persist (episode + no-progress clocks + id counter);
       journal  act:"watchdog" records for TRANSITIONS only (open/stand-down/launch outcomes
                live in after_launch; quiet waiting checks journal nothing);
       notify   [(title, body)] — at most one entry (the episode-opening text);
       launch   None, or the launch request {"id","signals","authority","allowlist"} the
                caller executes through the launch shim, then feeds to after_launch.
+      resurrect  None, or the restart request {"id","signals"} the caller executes through
+               resurrect-runner.sh, then feeds to after_resurrect (issue #208).
       runner_down  the runner is PROVABLY GONE this check (heartbeat stale AND its recorded pid
                dead). Reported EVERY check, unlike the escalation journal/notify, which dedup to
                once per capped streak — so a caller can stay honest ("the runner is DOWN") on

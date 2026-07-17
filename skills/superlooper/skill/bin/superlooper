@@ -1745,7 +1745,9 @@ def _watchdog_resurrect(repo, cfg, home, state_dir, resurrect):
     pid). A gone/unresolvable pane returns "no_pane" (a new tab cannot be placed without the owner).
 
     The launcher is fully overridable via SL_RESURRECT_RUNNER (tests inject a fake, like the debugger
-    path's SL_LAUNCH_SESSION)."""
+    path's SL_LAUNCH_SESSION). `cfg` is accepted for call-site symmetry with _watchdog_launch and is
+    deliberately unread: the runner re-reads the repo's config itself on boot, so nothing from this
+    process's view of it should ride into the restart."""
     pane = _watchdog_pane(state_dir)
     if not pane:
         print("watchdog: no cmux pane resolves for the dead runner (no recorded anchor / not inside "
@@ -1863,7 +1865,13 @@ def cmd_watchdog(args):
         # An honest one-line summary for a hand-run check. The notify/journal already carry the
         # authoritative record; this must not contradict them (a capped/failed restart is NOT
         # "healthy", and a FAILED restart is not "resurrected").
-        disabled_sigs = res["journal"][0]["signals"] if view["kill_switch"] and res["journal"] else []
+        # Read the STATE, not the journal: the `disabled` record is deduped on the observed signal
+        # set (one line per distinct observation, not one per check), so every later check journals
+        # nothing while still observing the SAME signals — and reading the empty journal printed
+        # "observed: no signal" over a corpse. evaluate() writes the current sigs to
+        # disabled_observed on both kill-switch returns, so state is the honest source. Same defect
+        # as the capped summary above (fresh-review P1-1); it lived two lines apart and was missed.
+        disabled_sigs = (final.get("disabled_observed") or []) if view["kill_switch"] else []
         print("watchdog: " + ("DISABLED (state/WATCHDOG_OFF) — observed: "
                               + (", ".join(disabled_sigs) or "no signal")
                               if view["kill_switch"] else

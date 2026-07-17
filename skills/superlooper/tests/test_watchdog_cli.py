@@ -670,3 +670,25 @@ def test_kill_switch_suppresses_resurrection(tmp_path):
     assert rig.resurrect_calls() == []               # WATCHDOG_OFF disables the whole path
     assert rig.rjournal() == []
     assert [x["outcome"] for x in rig.wjournal()] == ["disabled"]
+
+
+def test_every_disabled_check_names_what_it_observed_not_just_the_first(tmp_path):
+    # Second fresh review, P1: the SAME deduped-journal falsehood this commit fixes for the capped
+    # summary, two lines away in the kill-switch summary. evaluate() dedups the `disabled` record on
+    # the OBSERVED signal set, so every later check journals nothing and the summary printed
+    # "observed: no signal" while the runner was a corpse — the machine contradicting what it knows
+    # (the signals are sitting in state's disabled_observed). Honest source = the STATE, not the
+    # journal. Keep the empty-journal guard: a bare res["journal"][0] IndexErrors on these checks.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)                          # provably gone, but the kill switch is on
+    rig.anchor()
+    (rig.home / "state" / "WATCHDOG_OFF").write_text("")
+    for check in range(1, 4):
+        r = rig.run()
+        assert r.returncode == 0, r.stderr
+        assert "DISABLED" in r.stdout, (check, r.stdout)
+        assert "heartbeat_stale" in r.stdout, (check, r.stdout)
+        assert "no signal" not in r.stdout, (check, r.stdout)
+    assert [x["outcome"] for x in rig.wjournal()] == ["disabled"]   # record stays deduped: 1, not 3
+    assert rig.resurrect_calls() == []
