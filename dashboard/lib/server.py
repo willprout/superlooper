@@ -718,12 +718,16 @@ class ConcludedFlights:
 
     def review_state(self, repo, pr, fetch):
         """The concluded flight's review STATE (issue #176 — ``reviewed`` / ``stale`` / ``absent`` /
-        ``unread``, see lib/review_marker) — fetched once and remembered. Only a settled ``reviewed``
-        is remembered: the adapter cannot tell an empty-but-successful comment list from a
-        fail-closed ``[]`` (a gh error), nor a stale-then-repinned verdict from a still-arriving one,
-        so anything short of ``reviewed`` is re-read until it positively settles. A merged flight
-        always carries a verdict pinned to its head (the runner refuses to merge without one), so
-        this settles on the first reachable read."""
+        ``unread``, see lib/review_marker) — fetched once and remembered. Only the POSITIVE settled
+        reading, ``reviewed``, is locked in: the dashboard's ``gh.pr_comments`` fail-closes a refused
+        read to ``[]`` (it never raises), which parses as ``absent`` — indistinguishable from a clean
+        empty read — so an ``absent`` is never frozen (a gh blip would otherwise brand a reviewed PR
+        'no review' for the whole run). The common merged flight carries a verdict pinned to its head
+        and settles here on the first reachable read. The exceptions re-read every poll, fail-closed:
+        a merge-updated merged flight reads ``stale`` (its merged head differs from the reviewed pin;
+        the engine carries the verdict across via ``review_carry``, which the board does not have —
+        see lib/review_marker), and an unreachable read reads ``absent``/``unread``. Re-reading that
+        minority is the safe cost of never locking in a false 'no review'."""
         keep = lambda v: v == review_marker.REVIEWED
         return self._remember(("review", repo, pr), fetch, keep)
 

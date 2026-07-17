@@ -11,15 +11,25 @@
 """
 from pathlib import Path
 
+import pytest
+
 import review_marker as rm
 
 # The monorepo root: this dashboard is a subdirectory of it, and the engine it mirrors lives at
 # skills/superlooper/skill/lib/gate.py. Reached by PATH (read as text, never imported) so the pin
 # cannot pull the engine's module graph onto the dashboard's sys.path — the same discipline
-# test_engine.py uses to pin lib/engine.PAYLOAD_REL to bin/install.sh.
-_MONOREPO = Path(__file__).resolve().parent.parent.parent
-_GATE_SRC = (_MONOREPO / "skills" / "superlooper" / "skill" / "lib" / "gate.py").read_text(
-    encoding="utf-8")
+# test_engine.py uses to pin lib/engine.PAYLOAD_REL to bin/install.sh. The dashboard bills itself as
+# separable (its own repo), so if the engine source is absent — an adopter who took command-center
+# alone — the pin SKIPS rather than erroring at collection; the runtime review_marker.py never reads
+# gate.py, so its behaviour is unaffected. In THIS monorepo the file is present and the pin runs.
+_GATE_PATH = Path(__file__).resolve().parent.parent.parent / "skills" / "superlooper" / "skill" \
+    / "lib" / "gate.py"
+
+
+def _gate_source():
+    if not _GATE_PATH.is_file():
+        pytest.skip("engine gate.py not present (dashboard checked out without the monorepo)")
+    return _GATE_PATH.read_text(encoding="utf-8")
 
 # Three distinct, well-formed head oids, mirroring test_gate.py's own constants. HEAD is "the PR's
 # current head"; OTHER stands for a superseded (gen-1) head.
@@ -41,11 +51,12 @@ def test_regexes_are_pinned_byte_for_byte_to_the_engine_gate():
     that can drift out of step with the engine that parses it. These three regexes are copies of
     gate.py's; assert each source pattern still appears VERBATIM in gate.py, so a change there fails
     this test until the mirror is updated to match."""
+    gate_src = _gate_source()
     for label, pat in (("_REVIEW_MARKER_RE", rm._REVIEW_MARKER_RE),
                         ("_REVIEW_PIN_RE", rm._REVIEW_PIN_RE),
                         ("_OID_RE", rm._OID_RE)):
         literal = 'r"%s"' % pat.pattern
-        assert literal in _GATE_SRC, (
+        assert literal in gate_src, (
             "%s drifted from skills/superlooper/skill/lib/gate.py: this dashboard mirror renders\n"
             "  %s\n"
             "which no longer appears in gate.py. Re-copy the engine's regex (see review_marker.py "
