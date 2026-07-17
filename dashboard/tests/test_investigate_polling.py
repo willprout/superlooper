@@ -5,14 +5,16 @@ COMMENT on the issue, not a branch->PR association. The runner already knows thi
 ``pr_for_branch`` on every one of its three PR paths (issue #21). The dashboard did not — snapshot
 assembly asked GitHub for PR facts on every investigation branch, running and concluded alike.
 
-Concluded investigations are the ones that bite. ``ConcludedFlights.pr_facts`` only remembers a
-SETTLED read (state MERGED/CLOSED), and an investigation's honest answer is ``{}`` — so the #48
-"fetch once, remember" memo can never latch it, and the read repeats every ``gh_poll_seconds``
-window FOREVER. That is the same shape as the concluded-flight polling bug #48 bought off, and it
-grows linearly with every investigation the loop completes.
+Concluded investigations are the ones that bite, in the gh-FALLBACK mode a silent runner puts the
+board in (in LIVE the runner's published view answers, and carries no PR for an investigation
+either). ``ConcludedFlights.pr_facts`` only remembers a SETTLED read (state MERGED/CLOSED), and an
+investigation's honest answer is ``{}`` — so the #48 "fetch once, remember" memo can never latch it,
+and the read repeats every ``gh_poll_seconds`` window for as long as the runner stays silent. Same
+shape as the concluded-flight polling bug #48 bought off, growing with every investigation landed.
 
 These tests pin the call-count contract with a counting gh stub across repeated assemblies — the
-only honest proof that the asking actually stopped — and pin that the BUILD path is untouched.
+only honest proof that the asking actually stopped — plus the two things that make the skip safe
+rather than merely cheap: the BUILD path is untouched, and the investigation renders identically.
 """
 import json
 
@@ -115,6 +117,28 @@ def test_investigation_marked_merged_is_never_asked_for_pr_facts(tmp_path):
     gh = _CountingGh(open_nums=set(), no_pr_for={"sl/i9-x"})
     _assemble_n(_config(home), gh, server.ConcludedFlights(), 6)
     assert gh.pr_calls == {}
+
+
+def test_skipping_the_lookup_changes_nothing_the_investigation_renders(tmp_path):
+    # The skip must be pure budget, never a fact the board loses. GitHub's honest answer for an
+    # investigation branch is {} — exactly what the skip substitutes — so every downstream consumer
+    # of pr_facts (cargo, the gate checklist, the review state, the drawer) must read identically
+    # whether the lookup happened or not. Pinned by rendering the flight BOTH ways and comparing the
+    # WHOLE flight dict, so a future consumer that starts reading pr_facts cannot regress this
+    # silently. The control arm is the same flight with its type stamp removed — the un-skipped
+    # code path, which really does ask GitHub (asserted, so this can never go vacuous).
+    issues = {"i9": {"status": "running", "branch": "sl/i9-x", "pr": None,
+                     "lane": "i9", "type": "investigate"}}
+    home = _make_home(tmp_path, issues)
+    skipped = _flight(_assemble_n(_config(home), _CountingGh(open_nums={9}, no_pr_for={"sl/i9-x"}),
+                                  server.ConcludedFlights(), 1), 9)
+
+    typeless = {"i9": {k: v for k, v in issues["i9"].items() if k != "type"}}
+    gh2 = _CountingGh(open_nums={9}, no_pr_for={"sl/i9-x"})
+    looked_up = _flight(_assemble_n(_config(_make_home(tmp_path / "control", typeless)), gh2,
+                                    server.ConcludedFlights(), 1), 9)
+    assert gh2.pr_calls == {"sl/i9-x": 1}    # the control arm really did ask GitHub...
+    assert skipped == looked_up              # ...and the board is identical either way
 
 
 # =============================== the build path is untouched ===============================
