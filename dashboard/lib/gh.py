@@ -33,11 +33,15 @@ _ISSUE_FIELDS = "number,title,labels,body,createdAt,state"    # `state` (OPEN/CL
 # departures board resolve a blocked-by connection fail-closed — a blocker is only "arrived" with
 # positive proof it is CLOSED (Task 8; open/unknown ⇒ still awaiting).
 # state/mergeable/statusCheckRollup are what the gate checklist (Task 3) reads; headRefName rides
-# along so the caller can confirm the PR really is this branch's. additions/deletions/changedFiles
-# are the PR's own diff size — the cargo that must survive after a landed flight's worktree is
-# cleaned up (issue #48, absorbing #47), carried on the SAME single read, never a second call. Raw
-# dicts out — the SEMANTICS (is the gate green? which stage? how big?) live in lib/flights.py.
-_PR_FIELDS = "number,state,mergeable,statusCheckRollup,headRefName,additions,deletions,changedFiles"
+# along so the caller can confirm the PR really is this branch's. headRefOid is the PR's CURRENT
+# head — the review line needs it to tell a verdict pinned to THIS diff from one pinned to a
+# superseded head (issue #176: #154 pins the review marker to the oid it reviewed, and the board
+# must judge the pin, not just its shape). additions/deletions/changedFiles are the PR's own diff
+# size — the cargo that must survive after a landed flight's worktree is cleaned up (issue #48,
+# absorbing #47), carried on the SAME single read, never a second call. Raw dicts out — the
+# SEMANTICS (is the gate green? which stage? how big?) live in lib/flights.py.
+_PR_FIELDS = ("number,state,mergeable,statusCheckRollup,headRefName,headRefOid,"
+              "additions,deletions,changedFiles")
 
 # Per-call hard timeout (seconds). A module constant, not a literal, so a test can shrink it and
 # trip the timeout path in a fraction of a second instead of waiting the real 30.

@@ -40,6 +40,7 @@ import launch_rules
 import notify as notify_mod
 import pollers
 import readers
+import review_marker
 import runner_source
 import replay as replay_mod
 import tower as tower_mod
@@ -715,13 +716,20 @@ class ConcludedFlights:
         """The closed issue's title, fetched once and remembered (a closed issue's title is fixed)."""
         return self._remember(("title", repo, num), fetch, bool)
 
-    def review_present(self, repo, pr, fetch):
-        """Whether the concluded flight's PR carries its review verdict — fetched once and
-        remembered. Only ``True`` is remembered: the adapter cannot tell an empty-but-successful
-        comment list from a fail-closed ``[]`` (a gh error), so a ``False`` is never locked in — it
-        is re-read until the marker positively shows. A merged flight always carries the marker (the
-        runner refuses to merge without it), so this settles on the first reachable read."""
-        return bool(self._remember(("review", repo, pr), fetch, bool))
+    def review_state(self, repo, pr, fetch):
+        """The concluded flight's review STATE (issue #176 — ``reviewed`` / ``stale`` / ``absent`` /
+        ``unread``, see lib/review_marker) — fetched once and remembered. Only the POSITIVE settled
+        reading, ``reviewed``, is locked in: the dashboard's ``gh.pr_comments`` fail-closes a refused
+        read to ``[]`` (it never raises), which parses as ``absent`` — indistinguishable from a clean
+        empty read — so an ``absent`` is never frozen (a gh blip would otherwise brand a reviewed PR
+        'no review' for the whole run). The common merged flight carries a verdict pinned to its head
+        and settles here on the first reachable read. The exceptions re-read every poll, fail-closed:
+        a merge-updated merged flight reads ``stale`` (its merged head differs from the reviewed pin;
+        the engine carries the verdict across via ``review_carry``, which the board does not have —
+        see lib/review_marker), and an unreachable read reads ``absent``/``unread``. Re-reading that
+        minority is the safe cost of never locking in a false 'no review'."""
+        keep = lambda v: v == review_marker.REVIEWED
+        return self._remember(("review", repo, pr), fetch, keep)
 
 
 # =============================== the snapshot — folding the truth layer together ===============================
@@ -738,7 +746,10 @@ _LANDED = (flights.TOUCHDOWN, flights.TAXI_IN)
 # them, "idle" means "time since anything happened to this flight" (its last journal event).
 _LIVE_AIR = (flights.TAXI_OUT, flights.TAKEOFF, flights.DOWNWIND, flights.BASE_TURN, flights.FINAL)
 
-_REVIEW_MARKER = "<!-- superlooper-review -->"
+# The review-marker parse lives in lib/review_marker — a documented mirror of the engine's gate,
+# pinned to it by tests/test_review_marker (issue #176). The dashboard once kept its own literal
+# here and substring-matched it, which silently broke the moment #154 pinned the verdict to its
+# diff; the mirror + its pin test are what stop that drift from recurring.
 
 # The sort rank for the boring table's STAGE column — the traffic-pattern order (on-circuit first,
 # by circuit position; off-path states grouped after). Server-side so the JS sorts by a supplied
@@ -1047,22 +1058,29 @@ def _titles(slug, open_issue_list, gh_mod, merged_nums, concluded=None):
     return titles
 
 
-def _review_present(gh_mod, slug, pr, concluded=None):
-    """Whether PR ``pr`` carries the fresh-agent review verdict marker. For a CONCLUDED flight a
-    ``concluded`` memory is supplied so the settled answer is fetched once and remembered (issue
-    #48); an in-flight flight passes ``concluded=None`` and re-reads every poll (its review is still
-    arriving)."""
+def _review_state(gh_mod, slug, pr, head_oid, concluded=None):
+    """PR ``pr``'s review evidence, as the three-way state the board draws (issue #176):
+    ``reviewed`` (a verdict pinned to the PR's current head — provably this diff), ``stale`` (a
+    review exists but not for this head: superseded pin, or the legacy unpinned form), ``absent``
+    (no marker), or ``unread`` (the comments/head couldn't be read — fail closed, NOT "no review").
+    ``head_oid`` is the PR's current head, needed to judge the pin (the whole point of #154's pin,
+    which the old substring check ignored). The parse itself is lib/review_marker, a documented
+    mirror of the engine's gate.
+
+    For a CONCLUDED flight a ``concluded`` memory is supplied so the settled answer is fetched once
+    and remembered (issue #48); an in-flight flight passes ``concluded=None`` and re-reads every poll
+    (its review is still arriving)."""
     if gh_mod is None or not pr:
-        return False
+        return review_marker.ABSENT      # no PR yet ⇒ no review posted — fail closed to not-reviewed
 
     def fetch():
         try:
             comments = gh_mod.pr_comments(slug, pr)
         except Exception:
-            return False
-        return any(isinstance(c, dict) and _REVIEW_MARKER in (c.get("body") or "") for c in comments)
+            comments = None              # unreadable ⇒ UNREAD, never a confident "no review"
+        return review_marker.review_state(comments, head_oid)
 
-    return concluded.review_present(slug, pr, fetch) if concluded is not None else fetch()
+    return concluded.review_state(slug, pr, fetch) if concluded is not None else fetch()
 
 
 def _connection_resolver(gh_mod, slug):
@@ -1381,7 +1399,13 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
             "id": iid, "num": num, "status": st.get("status"), "branch": branch, "pr": pr,
             "activity_mtime": facts["activity"].get(iid), "blocked": facts["blocked"].get(iid),
             "awaiting_marker": iid in facts["awaiting"], "report_present": iid in facts["reports"],
-            "review_present": _review_present(source, slug, pr, mem), "journal": jslice,
+            # The three-way review state (issue #176), judged against the PR's CURRENT head so a
+            # verdict pinned to a superseded diff reads 'stale', not a false green. ``review_present``
+            # is the field's historical name; it now carries that state string (gate_checklist and
+            # build_flight both accept it — a legacy bool still works too).
+            "review_present": _review_state(source, slug, pr,
+                                            (pr_facts or {}).get("headRefOid"), mem),
+            "journal": jslice,
             "pr_facts": pr_facts, "cargo": cargo, "diff_delta": None,
             "closed": is_closed,
             # #163: the durable owner-decision question this flight is waiting on (loopstate), so the

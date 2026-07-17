@@ -275,9 +275,13 @@ def test_a_partial_view_never_concludes_a_live_flight(home):
 # unticked — while FALLBACK, which remembers concluded facts (issue #48), still showed them. A
 # landing losing its cargo is a §0.1 joy regression traded for plumbing; these pin it shut.
 
+# A merged PR carries a review verdict PINNED to the head it reviewed (#154/#176), and the runner
+# publishes that head oid on the PR view — so the board can prove the verdict covers this diff.
+_MERGED_HEAD = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 _MERGED_PR = {"number": 25, "state": "MERGED", "mergeable": "MERGEABLE",
+              "headRefOid": _MERGED_HEAD,
               "statusCheckRollup": [{"name": "tests", "conclusion": "SUCCESS"}],
-              "comments": [{"body": "<!-- superlooper-review --> verdict: ok"}],
+              "comments": [{"body": "<!-- superlooper-review sha=%s --> verdict: ok" % _MERGED_HEAD}],
               "files": [{"path": "a.py", "additions": 100, "deletions": 5},
                         {"path": "b.py", "additions": 20, "deletions": 3}]}
 
@@ -304,6 +308,55 @@ def test_a_landed_flights_gate_checklist_is_complete_in_live(home):
     snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh())
     gate = _flight(snap, 23)["gate"]
     assert gate["review"] is True and gate["ci"] is True and gate["mergeable"] is True
+
+
+# --------------------------- issue #176: the review line reads the pin, not a literal ---------------------------
+# The regression the issue asks for: pinned / legacy-unpinned / stale / absent bodies driven all the
+# way through assemble_snapshot's _review_state into the flight's gate. Before #176 the board kept a
+# private literal and substring-matched it, so a #154 pinned verdict read as "no review" on every
+# reviewed PR. These pin the three-way state the board now draws.
+_I23_HEAD = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+_I23_OLD_HEAD = "b9c8d7e6f5a41302f1e0d9c8b7a6958473625140"
+
+
+def _pr_with_review(body, head=_I23_HEAD):
+    return {"number": 25, "state": "OPEN", "mergeable": "MERGEABLE", "headRefOid": head,
+            "statusCheckRollup": [{"name": "tests", "conclusion": "SUCCESS"}],
+            "comments": [{"body": body}] if body is not None else [],
+            "files": [{"path": "a.py", "additions": 3, "deletions": 1}]}
+
+
+def _gate_for(home, pr):
+    _heartbeat(home, 10)
+    _publish(home, prs={"i23": pr})
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh())
+    return _flight(snap, 23)["gate"]
+
+
+def test_pinned_verdict_for_the_head_reads_reviewed(home):
+    """The headline #176 fix: a #154 pinned verdict must tick the review line — the exact case the
+    old substring check broke."""
+    gate = _gate_for(home, _pr_with_review("<!-- superlooper-review sha=%s --> ok" % _I23_HEAD))
+    assert gate["review"] is True and gate["review_state"] == "reviewed"
+
+
+def test_legacy_unpinned_verdict_reads_stale_not_absent(home):
+    """A pre-#154 unpinned marker cannot prove which diff it reviewed. The board shows it as
+    'reviewed, then rebuilt' (stale), never a confident tick and never a bare 'never reviewed'."""
+    gate = _gate_for(home, _pr_with_review("<!-- superlooper-review --> looked fine"))
+    assert gate["review"] is False and gate["review_state"] == "stale"
+
+
+def test_verdict_pinned_to_a_superseded_head_reads_stale(home):
+    """The distinction #176 exists to draw: a verdict pinned to an OLD head is stale, not reviewed —
+    the head moved since (a worker rebuilt). The gate would nudge; the board must say so, not tick."""
+    gate = _gate_for(home, _pr_with_review("<!-- superlooper-review sha=%s --> gen-1" % _I23_OLD_HEAD))
+    assert gate["review"] is False and gate["review_state"] == "stale"
+
+
+def test_no_review_marker_reads_absent(home):
+    gate = _gate_for(home, _pr_with_review("looks good, shipping"))
+    assert gate["review"] is False and gate["review_state"] == "absent"
 
 
 def test_the_settled_carry_still_costs_no_github_reads(home):

@@ -361,20 +361,48 @@ def _ci_passed(rollup, required_checks):
     return True
 
 
+# The board-facing review states, mirrored from lib/review_marker (which mirrors the engine's
+# gate). Only REVIEWED clears the review line — matching the gate, which merges only on a verdict
+# pinned to the diff. STALE ("reviewed, then rebuilt") is kept DISTINCT from ABSENT ("never
+# reviewed") so the checklist can draw the difference (issue #176) instead of one bare cross.
+_REVIEW_REVIEWED = "reviewed"
+_REVIEW_ABSENT = "absent"
+
+
+def _review_state_of(review_present):
+    """Normalise the review input, which arrives as EITHER the three-way state string the server now
+    derives (issue #176) OR a bare bool from the many legacy callers/fixtures. A bool maps True ->
+    'reviewed', False -> 'absent'; a recognised state string passes through; anything else fails
+    closed to 'absent' (never a hopeful 'reviewed' off a corrupt input)."""
+    if isinstance(review_present, str):
+        return review_present if review_present in (
+            _REVIEW_REVIEWED, _REVIEW_ABSENT, "stale", "unread") else _REVIEW_ABSENT
+    return _REVIEW_REVIEWED if review_present else _REVIEW_ABSENT
+
+
 def gate_checklist(pr_facts, report_present, review_present, required_checks):
     """The clearance checklist rendered at ``FINAL`` — the four REAL, fixed check names (design
     record §3): ``report`` (a per-issue report exists), ``review`` (a fresh-agent review verdict is
     posted), ``ci`` (all required checks green), ``mergeable`` (the PR fits cleanly onto today's
     code). ``cleared`` is all four — "cleared to land". Every line fails closed: an unreadable PR
     (``{}``) or a missing signal reads as not-passed, never as a hopeful yes the runner would then
-    refuse to act on."""
+    refuse to act on.
+
+    ``review_present`` is EITHER the three-way review state the server derives (issue #176 —
+    'reviewed' / 'stale' / 'absent' / 'unread', mirroring the engine's pinned-verdict contract) OR a
+    bare bool (legacy callers). Only 'reviewed' passes the ``review`` line, so a STALE verdict
+    (reviewed, then rebuilt) fails the gate closed exactly as the engine does — but the raw state is
+    carried out on ``review_state`` so the drawer can tell "reviewed, then rebuilt" from "never
+    reviewed" rather than collapsing both to a bare cross."""
     pr = pr_facts if isinstance(pr_facts, dict) else {}
     rollup = pr.get("statusCheckRollup")
     report = bool(report_present)
-    review = bool(review_present)
+    review_state = _review_state_of(review_present)
+    review = review_state == _REVIEW_REVIEWED
     ci = _ci_passed(rollup if isinstance(rollup, list) else [], required_checks)
     mergeable = pr.get("mergeable") == "MERGEABLE"
     return {"report": report, "review": review, "ci": ci, "mergeable": mergeable,
+            "review_state": review_state,
             "cleared": report and review and ci and mergeable}
 
 

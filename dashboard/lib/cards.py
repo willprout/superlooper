@@ -33,6 +33,26 @@ GATE_GLOSS = {
 }
 _GATE_ORDER = ("report", "review", "ci", "mergeable")
 
+# The review line has THREE readings, not two (issue #176). A verdict pinned to a superseded diff is
+# "stale" — a review DID happen, just not for the current code — and must not read like "never
+# reviewed" (a bare cross), because the two demand different owner responses: re-review the new diff
+# vs get a first review. The gate carries the state on ``review_state`` (see lib/review_marker); when
+# it is "stale" the review row swaps to this distinct label + gloss and keeps its own state so the
+# pixel layer can paint it amber (reviewed, then rebuilt), never the same as absent.
+_REVIEW_STALE_GLOSS = ("reviewed, then rebuilt",
+                       "a review was posted, but for an earlier version of this diff — the current "
+                       "code needs a fresh review before it can land")
+
+
+def _review_state_of(gate):
+    """The review line's state for display: the gate's own ``review_state`` when present (issue
+    #176), else derived from the ``review`` bool for a legacy gate dict (True -> reviewed, False ->
+    absent). Anything unrecognised fails closed to 'absent' — never a hopeful 'reviewed'."""
+    state = gate.get("review_state")
+    if state in ("reviewed", "stale", "absent", "unread"):
+        return state
+    return "reviewed" if gate.get("review") else "absent"
+
 # The circuit stages, developer-term FIRST (costume rule 2 / joy-pass owner ruling 2026-07-07): the
 # ground-truth drawer's rail leads with the real state name (``dev``); the airport metaphor
 # (``flavor``) is the secondary skin; ``desc`` is the fuller plain-language detail for the hover. The
@@ -232,7 +252,17 @@ def decision_dossier(flight, journal_slice):
     # #163 question: the worker paused MID-build to ask, so every gate check is naturally not-yet and
     # says nothing about the decision — the question itself is the whole evidence (shown as the memo).
     gate = flight.get("gate") or {}
-    red = [GATE_GLOSS[k][0] for k in _GATE_ORDER if not gate.get(k)]
+    # A stale review is named distinctly here too (issue #176): "reviewed, then rebuilt" is a
+    # different hand-back reason than "never independently reviewed", and the dossier is where the
+    # owner reads why it stopped.
+    red = []
+    for k in _GATE_ORDER:
+        if gate.get(k):
+            continue
+        if k == "review" and _review_state_of(gate) == "stale":
+            red.append(_REVIEW_STALE_GLOSS[0])
+        else:
+            red.append(GATE_GLOSS[k][0])
     if red and flight.get("awaiting_reason") != "question":
         items.append({"label": "gate at hand-back", "value": "not yet: " + ", ".join(red)})
 
@@ -377,12 +407,25 @@ def _circuit_rail(flight):
 
 def _clearance(flight):
     """The clearance checklist under the four REAL check names (§3), each leading with its plain
-    gloss. ``ok`` is the honest gate reading (fail-closed upstream in ``flights.gate_checklist``)."""
+    gloss. ``ok`` is the honest gate reading (fail-closed upstream in ``flights.gate_checklist``).
+    Every row also carries a ``state`` so the pixel layer maps glyphs uniformly: the binary checks
+    are ``ok``/``no``; the review line is the three-way #176 state (reviewed / stale / absent /
+    unread), and a STALE review swaps to a distinct label + gloss so 'reviewed, then rebuilt' never
+    renders identical to 'never reviewed'."""
     gate = flight.get("gate") or {}
     out = []
     for key in _GATE_ORDER:
         label, gloss = GATE_GLOSS[key]
-        out.append({"key": key, "label": label, "gloss": gloss, "ok": bool(gate.get(key))})
+        if key == "review":
+            state = _review_state_of(gate)
+            if state == "stale":
+                label, gloss = _REVIEW_STALE_GLOSS
+            out.append({"key": key, "label": label, "gloss": gloss,
+                        "ok": state == "reviewed", "state": state})
+        else:
+            ok = bool(gate.get(key))
+            out.append({"key": key, "label": label, "gloss": gloss, "ok": ok,
+                        "state": "ok" if ok else "no"})
     return out
 
 

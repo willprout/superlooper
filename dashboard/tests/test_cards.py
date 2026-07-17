@@ -210,6 +210,76 @@ def test_drawer_clearance_checklist_has_real_names_and_plain_glosses():
     assert "cleanly" in by_key["mergeable"]["gloss"].lower()
 
 
+# --------------------------- issue #176: a stale review is not a bare cross ---------------------------
+
+def _review_row(flight):
+    d = cards.flight_drawer(flight, [], "r", "Air")
+    return next(c for c in d["clearance"] if c["key"] == "review")
+
+
+def test_clearance_review_stale_reads_reviewed_then_rebuilt_not_a_bare_cross():
+    """Issue #176: a verdict pinned to a superseded diff (stale) must NOT look identical to 'never
+    reviewed'. The review row carries state='stale', stays not-ok, and leads with a DISTINCT label so
+    the owner reads 'reviewed, then rebuilt' rather than the same line an unreviewed flight shows."""
+    f = _flight(stage=flights.FINAL, circuit_stage=flights.FINAL,
+                gate={"report": True, "review": False, "ci": True, "mergeable": True,
+                      "review_state": "stale", "cleared": False})
+    row = _review_row(f)
+    assert row["ok"] is False and row["state"] == "stale"
+    assert "rebuilt" in row["label"].lower()             # 'reviewed, then rebuilt'
+    assert row["label"] != "independently reviewed"      # not the same line as a fresh review
+    assert "earlier" in row["gloss"].lower() or "fresh" in row["gloss"].lower()
+
+
+def test_clearance_review_reviewed_and_absent_carry_their_state():
+    reviewed = _review_row(_flight(gate={"report": True, "review": True, "ci": True,
+                                         "mergeable": True, "review_state": "reviewed",
+                                         "cleared": True}))
+    assert reviewed["ok"] is True and reviewed["state"] == "reviewed"
+    assert reviewed["label"] == "independently reviewed"
+    absent = _review_row(_flight(gate={"report": True, "review": False, "ci": True,
+                                       "mergeable": True, "review_state": "absent",
+                                       "cleared": False}))
+    assert absent["ok"] is False and absent["state"] == "absent"
+    assert absent["label"] == "independently reviewed"   # 'never reviewed' keeps the plain name
+
+
+def test_clearance_review_state_defaults_from_bool_when_absent():
+    """Back-compat: a gate dict with no review_state (older callers/fixtures) derives the row state
+    from the review bool — True->reviewed, False->absent — so the drawer never crashes on it."""
+    on = _review_row(_flight(gate={"report": True, "review": True, "ci": True, "mergeable": True,
+                                   "cleared": True}))
+    assert on["ok"] is True and on["state"] == "reviewed"
+    off = _review_row(_flight(gate={"report": True, "review": False, "ci": True, "mergeable": True,
+                                    "cleared": False}))
+    assert off["ok"] is False and off["state"] == "absent"
+
+
+def test_non_review_rows_carry_a_plain_ok_state():
+    """Every clearance row carries a `state` so the pixel layer maps glyphs uniformly; the binary
+    checks are just ok/no."""
+    d = cards.flight_drawer(_flight(gate={"report": True, "review": True, "ci": False,
+                                          "mergeable": True, "review_state": "reviewed"}), [], "r", "Air")
+    by_key = {c["key"]: c for c in d["clearance"]}
+    assert by_key["report"]["state"] == "ok" and by_key["ci"]["state"] == "no"
+
+
+def test_dossier_names_a_stale_review_distinctly_from_never_reviewed():
+    """The parked dossier's 'gate at hand-back: not yet …' list must name a stale review as
+    'reviewed, then rebuilt', not the 'independently reviewed' phrase a never-reviewed flight shows —
+    the two demand different owner responses (re-review the new diff vs get a first review)."""
+    stale = cards.decision_dossier(
+        _flight(gate={"report": True, "review": False, "ci": True, "mergeable": True,
+                      "review_state": "stale", "cleared": False}), [])
+    val = {i["label"]: i["value"] for i in stale["items"]}["gate at hand-back"]
+    assert "rebuilt" in val.lower() and "independently reviewed" not in val
+    never = cards.decision_dossier(
+        _flight(gate={"report": True, "review": False, "ci": True, "mergeable": True,
+                      "review_state": "absent", "cleared": False}), [])
+    val2 = {i["label"]: i["value"] for i in never["items"]}["gate at hand-back"]
+    assert "independently reviewed" in val2 and "rebuilt" not in val2.lower()
+
+
 def test_drawer_cargo_chip_is_size_never_risk():
     f = _flight(cargo={"present": True, "added": 340, "removed": 12, "files": 3})
     d = cards.flight_drawer(f, [], "r", "Air")
