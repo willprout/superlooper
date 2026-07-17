@@ -79,7 +79,13 @@ class Sim:
 
     def __init__(self, tmp_path, monkeypatch, lanes=2, affinity="hard", areas=None,
                  required_checks=("ci",), session=None, retry_cap=None, conflict_cap=None,
-                 cleanup_merged_worktrees=True, qa=None, touches_required=False):
+                 cleanup_merged_worktrees=True, qa=None, touches_required=False,
+                 night_batching=False):
+        # night_batching=False (the default) keeps notify.quiet_hours=None, so notify MECHANICS are
+        # asserted at any wall-clock hour (see the config note below). A test opts night_batching ON
+        # ONLY together with pin_clock(), so the batch path is driven deterministically (#217).
+        self.night_batching = night_batching
+        self.pinned_local = None                     # None => the injected clock uses the real wall clock
         self.tmp = tmp_path
         self.origin = tmp_path / "origin"
         self.repo = tmp_path / "repo"
@@ -134,9 +140,13 @@ class Sim:
             # 21:00 and 08:00 UTC fell inside the default quiet window, so park/bounce notifies
             # batched to the morning report and nine sim tests went red nightly (the #217
             # false-red, live since #164 merged). The batching POLICY is tested where it belongs:
-            # test_actions.py with a PINNED local_hhmm, immune to the wall clock.
+            # test_actions.py with a PINNED local_hhmm, immune to the wall clock. A night_batching=True
+            # test turns the DEFAULT window back on and drives it deterministically by PINNING the
+            # runner's local clock (pin_clock) — the #217 seam that ends the wall-clock coupling.
             "notify": {"cmd": "printf '%s|%s\\n' \"$SL_TITLE\" \"$SL_BODY\" >> "
-                              + str(self.notify_log), "quiet_hours": None},
+                              + str(self.notify_log),
+                       "quiet_hours": ({"start": "21:00", "end": "08:00"}
+                                       if night_batching else None)},
         }
         if qa:
             cfg["qa"] = qa
@@ -191,7 +201,41 @@ class Sim:
         return Runner(repo=str(self.repo), config=self.config, state_home=self.home,
                       pane="11111111-aaaa-aaaa-aaaa-111111111111",
                       fetch_usage=fetch_usage or (lambda: {
-                          "auth_status": "ok", "five_hour_pct": 5, "seven_day_pct": 5}))
+                          "auth_status": "ok", "five_hour_pct": 5, "seven_day_pct": 5}),
+                      local_clock=self._local_clock)
+
+    def _local_clock(self, now):
+        """The clock injected into the runner (#217). Default: the real wall clock (unchanged sim
+        behavior — every quiet_hours=None test is unaffected). pin_clock() pins a deterministic
+        (date, HH:MM) so a night-batching scenario is immune to the machine timezone. A sim that
+        turned batching ON but never pinned would silently re-inherit the wall clock — the exact
+        #217 coupling — so that combination RAISES here instead of returning a live-clock value."""
+        if self.pinned_local is None:
+            if self.night_batching:
+                raise AssertionError(
+                    "a night_batching sim must pin_clock() — an unpinned clock re-inherits the "
+                    "machine wall clock (the #217 false-red). Pin a deterministic time-of-day.")
+            return time.localtime(now)
+        date, hhmm = self.pinned_local
+        y, mo, d = (int(x) for x in date.split("-"))
+        hh, mm = (int(x) for x in hhmm.split(":"))
+        # A struct_time carrying exactly the fields disk_view formats (%Y-%m-%d, %H:%M); tm_wday/
+        # tm_yday/tm_isdst are placeholders those two directives never read.
+        return time.struct_time((y, mo, d, hh, mm, 0, 0, 1, -1))
+
+    def pin_clock(self, date, hhmm):
+        """Pin the runner's LOCAL time-of-day for every subsequent tick — `date` as YYYY-MM-DD,
+        `hhmm` as HH:MM — so a time-of-day policy (night-batching, the morning-report trigger) is
+        driven deterministically regardless of the machine timezone (#217). Callable between ticks
+        to move the clock (e.g. dead-of-night -> morning)."""
+        self.pinned_local = (date, hhmm)
+
+    def set_last_morning_report(self, date):
+        """Stamp the once-a-day morning-report ledger (state/last_morning_report). decide fires the
+        report when the pinned local_date differs from this; pin it to today to suppress the report,
+        to a prior day to make it due."""
+        with open(os.path.join(self.home, "state", "last_morning_report"), "w") as f:
+            f.write(date)
 
     # ------------------------- GitHub-side helpers -------------------------
 
@@ -2065,3 +2109,79 @@ def test_shim_not_firing_holds_the_queue_and_never_parks_the_issue(sim_factory, 
     assert closed.exists() and len(closed.read_text().splitlines()) >= 1
     assert not os.path.exists(os.path.join(sim.home, "state", "activity", sid))
     assert "in-progress" not in sim.issue(num)["labels"]
+
+
+# =====================================================================================
+# Night-batching end to end (issue #164, hardened by #217). The rest of this suite runs
+# with quiet_hours DISABLED (notify.quiet_hours=None) so notify MECHANICS are asserted at
+# any wall-clock hour. These three tests are the ONLY ones that turn batching ON — and they
+# do it deterministically by PINNING the runner's local clock (sim.pin_clock), the seam #217
+# adds so a time-of-day policy can be driven through the real runner->notify wiring without
+# inheriting the machine's timezone. Before #217 the sim's runner read the real wall clock,
+# so every notify assertion silently went red 21:00-08:00 UTC (the #217 false-red).
+# =====================================================================================
+
+def test_night_batching_withholds_the_park_page_but_lands_it_in_the_morning_report(sim_factory):
+    # Quiet-hours clock (03:00, inside the default 21:00-08:00 window): a routine owner-decision
+    # park is a SAFE, batchable hand-back, so its PAGE is withheld — but the park ACTION still
+    # fires (label moves, journal records it) and the decision surfaces in the morning report.
+    sim = sim_factory(night_batching=True)
+    sim.pin_clock("2026-07-05", "03:00")          # dead of night: batching ON, before report_time
+    num = sim.add_issue(title="Widget without review, at night",
+                        scenario={"scenario": "no-review", "linger": True})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    # The ACTION fired: the label really moved and the park is journaled (never lost) ...
+    assert "parked" in sim.issue(num)["labels"]
+    assert "in-progress" not in sim.issue(num)["labels"]
+    assert any(r.get("num") == num for r in sim.journal("park")), \
+        "the park must be journaled even when its page is batched: %s" % sim.journal()
+    # ... but the PAGE was WITHHELD — no park notify pushed during quiet hours. (At 03:00 the
+    # morning report cannot fire either — 03:00 < report_time 08:45 — so notify stays silent.)
+    assert not any("parked" in ln for ln in sim.notify_lines()), \
+        "the park page must be batched (withheld) during quiet hours: %s" % sim.notify_lines()
+
+    # Morning breaks: same day, now past report_time and OUT of the quiet window. The morning
+    # report fires and LISTS the batched decision — the owner learns of it, just not at 3am.
+    sim.set_last_morning_report("2026-07-04")     # a prior day, so today's report is due
+    sim.pin_clock("2026-07-05", "08:45")
+    report_path = os.path.join(sim.home, "reports", "morning-2026-07-05.md")
+    assert sim.tick_until(lambda: os.path.exists(report_path)), \
+        "the morning report never fired: %s" % [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    report_text = open(report_path).read()
+    assert ("#%d" % num) in report_text and "parked" in report_text, \
+        "the batched park must appear in the morning report:\n%s" % report_text
+
+
+def test_daytime_park_pages_immediately(sim_factory):
+    # The day branch: OUTSIDE quiet hours (12:00) the exact same park pages at once — batching is
+    # the night behavior only. last_morning_report is pinned to today so no morning report fires,
+    # leaving the park page the ONLY notify line (an unambiguous read of "the page went out now").
+    sim = sim_factory(night_batching=True)
+    sim.pin_clock("2026-07-05", "12:00")          # midday: batching window OFF
+    sim.set_last_morning_report("2026-07-05")     # today already reported -> no report this tick
+    num = sim.add_issue(title="Widget without review, by day",
+                        scenario={"scenario": "no-review", "linger": True})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    assert "parked" in sim.issue(num)["labels"]
+    assert any(("%s parked" % sid) in ln for ln in sim.notify_lines()), \
+        "outside quiet hours a park must page immediately: %s" % sim.notify_lines()
+
+
+def test_a_night_batching_sim_that_forgets_to_pin_the_clock_fails_loudly(sim_factory):
+    # The guard (issue #217, proposal 3): a sim that turns batching ON but never pins the clock
+    # would silently re-inherit the machine wall clock — the exact coupling that caused the
+    # false-red. Make that impossible: the injected harness clock RAISES on the first read rather
+    # than let the coupling return unnoticed. (disk_view is called every tick; assert directly.)
+    sim = sim_factory(night_batching=True)        # ... but no pin_clock()
+    with pytest.raises(AssertionError, match="pin_clock"):
+        sim.runner.disk_view(sim.now)

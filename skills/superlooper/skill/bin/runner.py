@@ -504,7 +504,7 @@ def detect_self_pane(cmux=None, run=None):
 
 class Runner:
     def __init__(self, repo, config, state_home=None, pane=None, agent="claude",
-                 run_script=None, fetch_usage=None, workspace="", window=""):
+                 run_script=None, fetch_usage=None, workspace="", window="", local_clock=None):
         import config as config_lib          # sibling module; only for the state-home default
         self.repo = os.fspath(repo)
         self.config = config
@@ -526,6 +526,13 @@ class Runner:
             self._run_script = run_script
         if fetch_usage is not None:
             self._fetch_usage = fetch_usage
+        # Injectable local clock (issue #217): disk_view stamps local_date/local_hhmm — the time-of-
+        # day signals decide's night-batching (#164) reads — from this. The default is the machine's
+        # real wall clock; a test injects a pinned clock so a time-of-day scenario is deterministic
+        # instead of inheriting the CI timezone. The production entrypoint never passes it (default
+        # path is byte-identical to `time.localtime(now)`), so this seam is inert off the test bench.
+        if local_clock is not None:
+            self._local_clock = local_clock
         self.stop = False
         self._owns_lock = False
         # True once this process ADOPTED the singleton across a Restart re-exec (issue #116) — the
@@ -1023,6 +1030,13 @@ class Runner:
     def _fetch_usage(self):                            # default; injectable for tests
         return usage_mod.fetch_claude_usage()
 
+    def _local_clock(self, now):                       # default; injectable for tests (issue #217)
+        """The runner's local wall clock as a struct_time, the single source disk_view stamps
+        local_date/local_hhmm from. A test injects a pinned clock here so a time-of-day policy
+        (decide's #164 night-batching) can be driven deterministically instead of depending on the
+        machine timezone the sim happens to run under."""
+        return time.localtime(now)
+
     def _refresh_usage(self, now):
         if self.agent == "codex":
             # Codex quota accounting is intentionally deferred in the v1 adapter. Do not let
@@ -1502,7 +1516,7 @@ class Runner:
         if frozen == {}:
             frozen = {"reason": "merges_frozen.json unreadable"}   # existence = frozen (fail closed)
         alert = _read_json(os.path.join(self.state, "ALERT"))
-        lt = time.localtime(now)
+        lt = self._local_clock(now)         # injectable (#217): default is time.localtime(now)
         return {
             "issues_state": st,
             "blocked": self._scan_dir("state", "blocked"),
