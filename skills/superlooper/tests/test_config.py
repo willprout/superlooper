@@ -65,6 +65,11 @@ def test_minimal_config_fills_defaults(tmp_path):
     assert cfg["qa"] == {"nightly_cmd": None, "results_glob": None, "retry_once": True,
                          "quarantine": [], "nightly_time": "02:00"}
     assert cfg["cleanup_merged_worktrees"] is True
+    # issue #168 owner ruling 2026-07-16: a merged-and-landed lane auto-closes its window by default;
+    # the park-family reaper is now OFF by default so stalled work's window/worktree persist until an
+    # owner verb resolves the lane.
+    assert cfg["auto_close_merged_windows"] is True
+    assert cfg["cleanup_parked_worktrees"] is False
     # notify.quiet_hours (issue #164) defaults ON (21:00–08:00): routine owner-decision pages are
     # batched to the morning report during these hours; an explicit null disables the batching.
     assert cfg["notify"] == {"imessage_to": None, "cmd": None,

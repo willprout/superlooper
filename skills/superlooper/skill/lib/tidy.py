@@ -2,10 +2,21 @@
 no cmux, no gh, no subprocess, no clock — so the safety contract is a unit-test table
 (tests/test_tidy.py). The CLI (skill/bin/superlooper `tidy`) does the best-effort close.
 
-`tidy` is William's explicit word, never an automatic path: the V1 'nothing auto-closed'
-posture stands (DRYRUN 2026-07-03). A real claude worker idles at its prompt forever after
-finishing (D4) and never self-exits, so its cmux window lingers; this decides which lingering
-windows are safe to close.
+`tidy` is William's explicit word for closing FINISHED windows on demand (it closes the window
+only — it never prunes a worktree). The runner also auto-closes some windows on its own. Owner
+ruling 2026-07-16 (#168) governs the #149-family teardowns: a lane that SUCCESSFULLY MERGED and
+landed auto-closes (gated by `auto_close_merged_windows`, default on), and the park-family reaper
+is now strictly OPT-IN (`cleanup_parked_worktrees`, default off). By default the runner NEVER
+auto-closes a parked / needs-william / bounced window while its session is live — the owner must
+be able to open that stalled work and look at the session, so its window AND worktree persist
+until an owner verb resolves the lane. (Separately, the #163 exit-clean question hand-back closes
+an awaiting-answer window, but only AFTER the worker has already EXITED and pushed its WIP, and it
+PRESERVES the worktree — there is no live session left to inspect.) This supersedes the V1
+'nothing auto-closed' posture (DRYRUN 2026-07-03), written before the D14 forensics forced the
+ordered teardown (#149). A real claude worker idles at its prompt forever after finishing (D4)
+and never self-exits, so its cmux window lingers; this decides which lingering windows `tidy` is
+safe to close on the owner's word (merged by default; --all extends to the park family, which the
+runner never touches automatically by default).
 
 Safety, stated as code below and pinned by tests:
   * Only a status this module can positively NAME as terminal is ever selected (a positive

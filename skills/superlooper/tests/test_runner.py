@@ -3042,6 +3042,7 @@ def test_a_corrupt_worker_lock_cannot_wedge_the_reclaim_sweep(rig, monkeypatch):
     """End-to-end of the above: the reaper is documented 'never raised' and runs before the
     heartbeat, so a lock holding an absurd pid must sweep normally, not crash the tick."""
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    rig.r.config = make_config(cleanup_parked_worktrees=True)   # reaper is opt-in now (#168)
     seed_issue(rig, "i7", status="parked", num=7)
     (rig.home / "worktrees" / "i7").mkdir(parents=True, exist_ok=True)
     (rig.home / "state" / "worker.i7.lock").write_text(str(2 ** 31))
@@ -3265,11 +3266,87 @@ def test_absorb_merged_closes_the_pane_before_reclaiming(rig, monkeypatch):
     assert order == ["close", "prune"]
 
 
+# --------- auto_close_merged_windows: the merged auto-close is opt-outable (issue #168) ---------
+# Owner ruling 2026-07-16: auto-closing a cmux window is allowed ONLY for a lane that successfully
+# merged and landed, and even that is gated by `auto_close_merged_windows` (default True). Off, the
+# merged lane keeps its window — and, because a prune can never happen under the live CLI it would
+# leave open (#149), its worktree too — the pre-#149 "nothing auto-closed" posture, now an explicit
+# opt-out. The merge/absorb itself still lands regardless.
+
+def _no_close_no_prune(rig, monkeypatch):
+    closed, pruned = [], []
+    def run_script(args, env=None, timeout=None):
+        if "close-surface" in [str(a) for a in args]:
+            closed.append(1)
+        return 0
+    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: pruned.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    rig.r.config = make_config(auto_close_merged_windows=False)
+    return closed, pruned
+
+
+def test_merge_does_not_auto_close_when_gated_off(rig, monkeypatch):
+    closed, pruned = _no_close_no_prune(rig, monkeypatch)
+    seed_issue(rig, "i7", status="gating", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    out = rig.r._execute({"act": "merge", "id": "i7", "num": 7, "pr": 7, "method": "squash"}, NOW)
+    assert out == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"       # the merge itself lands regardless
+    assert closed == [] and pruned == []                      # ...but nothing was auto-closed/pruned
+    assert (rig.home / "state" / "panes" / "i7").exists()     # window kept for inspection
+    assert (rig.home / "state" / "worker.i7.lock").exists()
+
+
+def test_absorb_merged_does_not_auto_close_when_gated_off(rig, monkeypatch):
+    closed, pruned = _no_close_no_prune(rig, monkeypatch)
+    seed_issue(rig, "i7", status="gating", num=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+    assert issue_state(rig, "i7")["status"] == "merged"
+    assert closed == [] and pruned == []
+    assert (rig.home / "state" / "panes" / "i7").exists()
+
+
+def test_absorb_close_does_not_auto_close_when_gated_off(rig, monkeypatch):
+    closed, pruned = _no_close_no_prune(rig, monkeypatch)
+    seed_issue(rig, "i7", status="bounced", num=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "absorb_close", "id": "i7", "num": 7}, NOW)
+    assert issue_state(rig, "i7")["status"] == "merged"       # settled terminal (loopstate has no 'closed')
+    assert closed == [] and pruned == []
+    assert (rig.home / "state" / "panes" / "i7").exists()
+
+
+def test_merge_auto_closes_by_default(rig, monkeypatch):
+    """The shipped default (auto_close_merged_windows absent -> True) still closes then prunes a
+    landed lane — point 1 of the ruling ALLOWS auto-close for merged-and-landed."""
+    order = []
+    def run_script(args, env=None, timeout=None):
+        if "close-surface" in [str(a) for a in args]:
+            order.append("close")
+        return 0
+    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: order.append("prune") or True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i7", status="gating", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "merge", "id": "i7", "num": 7, "pr": 7, "method": "squash"}, NOW)
+    assert order == ["close", "prune"]
+
+
 def test_reclaim_terminal_worktrees_routes_through_the_one_teardown(rig, monkeypatch):
     """The parked-worktree reaper must clear the lane's stale pane markers too (D9), not just
     unlink its directory behind their back."""
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    rig.r.config = make_config(cleanup_parked_worktrees=True)   # reaper is opt-in now (#168)
     seed_issue(rig, "i7", status="parked", num=7)
     (rig.home / "worktrees" / "i7").mkdir(parents=True, exist_ok=True)
     _teardown_rig(rig, "i7")
@@ -3391,6 +3468,7 @@ def test_reclaim_never_stalls_the_tick_waiting_on_a_live_worker(rig, monkeypatch
     monkeypatch.setattr(runner_mod.time, "sleep",
                         lambda s: pytest.fail("the reaper must not sleep on a live pid"))
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: True)
+    rig.r.config = make_config(cleanup_parked_worktrees=True)   # reaper is opt-in now (#168)
     for iid in ("i7", "i5"):
         seed_issue(rig, iid, status="parked", num=int(iid[1:]))
         (rig.home / "worktrees" / iid).mkdir(parents=True, exist_ok=True)
@@ -3994,6 +4072,7 @@ def test_reclaim_removes_parked_worktree_not_the_running_lane(rig, monkeypatch):
     removed = []
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: removed.append(str(path)) or True)
+    rig.r.config = make_config(cleanup_parked_worktrees=True)   # reaper is opt-in now (#168)
     _mk_worktree(rig, "i5")
     _mk_worktree(rig, "i6")
     seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
@@ -4015,10 +4094,28 @@ def test_reclaim_respects_the_config_gate(rig, monkeypatch):
     assert removed == []                                          # gate off -> kept for inspection
 
 
-def test_tick_reclaims_a_parked_worktree(rig, monkeypatch):
+def test_tick_does_not_reclaim_park_family_by_default(rig, monkeypatch):
+    """Owner ruling 2026-07-16 (#168): the park-family reaper is OFF by default now
+    (cleanup_parked_worktrees defaults False). A parked lane's window AND worktree simply persist
+    until an owner verb resolves the lane, so the owner can open the stalled session and look at
+    it — the #149 reaper closing those windows was the behavior annoying him on the work machine."""
     removed = []
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: removed.append(str(path)) or True)
+    _mk_worktree(rig, "i5")
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
+    rig.r.tick(now=NOW)
+    assert removed == []                                # default: nothing reclaimed
+    assert (rig.home / "worktrees" / "i5").exists()     # the parked worktree persists
+
+
+def test_tick_reclaims_a_parked_worktree_when_opted_in(rig, monkeypatch):
+    """The reaper survives as an explicit opt-in (cleanup_parked_worktrees=True) for a disk-
+    constrained adopter that accepts closing park-family windows to bound long-run disk (#41)."""
+    removed = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: removed.append(str(path)) or True)
+    rig.r.config = make_config(cleanup_parked_worktrees=True)
     _mk_worktree(rig, "i5")
     seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
     rig.r.tick(now=NOW)
@@ -4033,6 +4130,7 @@ def test_reclaim_early_out_survives_an_unhashable_status(rig, monkeypatch):
     removed = []
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: removed.append(str(path)) or True)
+    rig.r.config = make_config(cleanup_parked_worktrees=True)   # reaper is opt-in now (#168)
     _mk_worktree(rig, "i9")
     st = {"issues": {"i1": {"status": []}, "i2": {"status": {}}, "i9": {"status": "parked"}}}
     rig.r._reclaim_terminal_worktrees(st)              # must not raise on the [] / {} statuses
@@ -4076,8 +4174,10 @@ def test_reclaim_preserves_a_dirty_parked_worktree_then_reclaims_after_commit_pu
     """THE #190 regression: the park-family reaper pruned i153/i163 while their branches sat at
     origin/main with the worker's output uncommitted — the only copy, gone with the checkout. The
     reaper must now REFUSE the prune while the work is unsaved, journal why, and reclaim only once
-    the work is committed AND pushed."""
+    the work is committed AND pushed. (The reaper is opt-in since #168; the #190 guard it inherits
+    is what these tests pin.)"""
     wt = _real_git_lane(rig, "i5", "sl/i5-x", dirty=True)
+    rig.r.config = make_config(cleanup_parked_worktrees=True)
     seed_issue(rig, "i5", status="parked", branch="sl/i5-x", num=5)
     st = loopstate.load(str(rig.home / "state" / "issues.json"))
 
@@ -4099,6 +4199,7 @@ def test_reclaim_hold_is_journaled_once_not_every_tick(rig):
     """'Surfaced (a bounded, non-storming record)': the reaper runs every ~15s, so a lane stuck
     with unsaved work must journal its refusal ONCE per state — not a line every tick."""
     _real_git_lane(rig, "i5", "sl/i5-x", dirty=True)
+    rig.r.config = make_config(cleanup_parked_worktrees=True)   # reaper is opt-in now (#168)
     seed_issue(rig, "i5", status="parked", branch="sl/i5-x", num=5)
     st = loopstate.load(str(rig.home / "state" / "issues.json"))
     for _ in range(5):
