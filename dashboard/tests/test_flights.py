@@ -377,13 +377,40 @@ _GREEN_PR = {
 def test_gate_all_four_green_is_cleared():
     gate = flights.gate_checklist(_GREEN_PR, report_present=True, review_present=True,
                                   required_checks=["tests"])
-    assert gate == {"report": True, "review": True, "ci": True, "mergeable": True, "cleared": True}
+    assert gate == {"report": True, "review": True, "ci": True, "mergeable": True,
+                    "review_state": "reviewed", "cleared": True}
 
 
 def test_gate_uses_the_four_real_check_names():
     gate = flights.gate_checklist(_GREEN_PR, report_present=True, review_present=True,
                                   required_checks=["tests"])
-    assert set(gate) == {"report", "review", "ci", "mergeable", "cleared"}
+    assert set(gate) == {"report", "review", "ci", "mergeable", "review_state", "cleared"}
+
+
+def test_gate_accepts_a_review_state_string_and_only_reviewed_clears():
+    """Issue #176: the review input may arrive as the three-way STATE the board now derives, not a
+    bare bool. Only 'reviewed' (a verdict pinned to this diff) passes the review line; 'stale'
+    (reviewed, then rebuilt) and 'absent' (never reviewed) both fail it closed — but the state is
+    carried through so the checklist can tell them apart downstream."""
+    reviewed = flights.gate_checklist(_GREEN_PR, True, "reviewed", ["tests"])
+    assert reviewed["review"] is True and reviewed["review_state"] == "reviewed"
+    assert reviewed["cleared"] is True
+    stale = flights.gate_checklist(_GREEN_PR, True, "stale", ["tests"])
+    assert stale["review"] is False and stale["review_state"] == "stale"
+    assert stale["cleared"] is False
+    absent = flights.gate_checklist(_GREEN_PR, True, "absent", ["tests"])
+    assert absent["review"] is False and absent["review_state"] == "absent"
+    unread = flights.gate_checklist(_GREEN_PR, True, "unread", ["tests"])
+    assert unread["review"] is False and unread["review_state"] == "unread"
+
+
+def test_gate_bool_review_input_still_maps_to_reviewed_or_absent():
+    """Back-compat: the many callers/fixtures that pass a bare bool keep working — True is a
+    verdict for this diff (reviewed), False is none (absent)."""
+    t = flights.gate_checklist(_GREEN_PR, True, True, ["tests"])
+    assert t["review"] is True and t["review_state"] == "reviewed"
+    f = flights.gate_checklist(_GREEN_PR, True, False, ["tests"])
+    assert f["review"] is False and f["review_state"] == "absent"
 
 
 def test_gate_missing_report_is_not_cleared():

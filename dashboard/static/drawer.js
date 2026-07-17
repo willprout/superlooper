@@ -66,8 +66,14 @@
 
   function clearanceHTML(d) {
     var rows = (d.clearance || []).map(function (c) {
-      var mark = c.ok ? '<span class="ck ok">✓</span>' : '<span class="ck no">•</span>';
-      return '<div class="clr-row' + (c.ok ? " ok" : "") + '" title="check name: ' + esc(c.key) + '">' +
+      // Three readings, not two (issue #176): a green ✓, an amber ↻ for a stale review (reviewed,
+      // then rebuilt — a review exists but not for this diff), and a grey • for not-yet. Logic-free:
+      // the server decided c.state; this only picks the glyph and row class.
+      var mark, cls;
+      if (c.ok) { mark = '<span class="ck ok">✓</span>'; cls = " ok"; }
+      else if (c.state === "stale") { mark = '<span class="ck stale">↻</span>'; cls = " stale"; }
+      else { mark = '<span class="ck no">•</span>'; cls = ""; }
+      return '<div class="clr-row' + cls + '" title="check name: ' + esc(c.key) + '">' +
         mark + '<span class="clr-label">' + esc(c.label) + '</span>' +
         '<span class="clr-gloss">' + esc(c.gloss) + '</span></div>';
     }).join("");

@@ -1029,6 +1029,10 @@ html, body {
 .clr-row .ck { font-weight: 700; text-align: center; }
 .clr-row .ck.ok { color: var(--green); }
 .clr-row .ck.no { color: var(--faint); }
+/* A stale review (issue #176): reviewed, then rebuilt — amber, so it reads as its own thing, never
+   the green tick of a fresh review nor the faint dot of never-reviewed. */
+.clr-row .ck.stale { color: var(--amber); }
+.clr-row.stale .clr-label { color: var(--amber-ink); }
 .clr-row .clr-label { color: var(--ink); font-weight: 600; }
 .clr-row.ok .clr-label { color: var(--green); }
 .clr-row .clr-gloss { font: 400 10.5px var(--mono); color: var(--muted); }

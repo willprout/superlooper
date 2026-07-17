@@ -16,6 +16,10 @@ import server
 
 SLUG = "will-titan/cc"
 NOW = 1783364300
+# A PR's current head oid, and the pinned review verdict a worker posts for it (#154/#176). The
+# verdict names the head it reviewed, so the board can prove it covers THIS diff.
+HEAD_OID = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+_PINNED_REVIEW = "<!-- superlooper-review sha=%s --> ok" % HEAD_OID
 
 
 def _make_home(tmp_path, issues, journal=()):
@@ -72,11 +76,12 @@ class _CountingGh:
         if branch in self._empty:
             return {}
         return {"number": 19, "state": "MERGED", "mergeable": "MERGEABLE", "statusCheckRollup": [],
-                "headRefName": branch, "additions": 100, "deletions": 20, "changedFiles": 4}
+                "headRefName": branch, "headRefOid": HEAD_OID,
+                "additions": 100, "deletions": 20, "changedFiles": 4}
 
     def pr_comments(self, repo, num):
         self.review_calls[num] = self.review_calls.get(num, 0) + 1
-        return [{"body": "<!-- superlooper-review --> ok"}]
+        return [{"body": _PINNED_REVIEW}]
 
 
 def _assemble_n(cfg, gh, mem, n):
