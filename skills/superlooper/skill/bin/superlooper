@@ -1563,6 +1563,20 @@ def _watchdog_heartbeat(state_dir):
         return None
 
 
+def _watchdog_runner_dead(state_dir):
+    """True only when state/runner.lock names a DEAD pid — the runner CRASHED (a crash leaves the
+    pidfile behind; a clean stop REMOVES it; a live pid means the loop is up). This is the "recorded
+    pid dead" half of the DoD's provably-gone test (issue #208): a crash we may restart, never a
+    deliberate stop we must respect. A garbage (non-numeric) pidfile reads False — it is not a clean
+    recorded-dead-pid signal, so we fall through to the debugger/notify path rather than auto-restart
+    on a weird state."""
+    txt = _read(os.path.join(state_dir, "runner.lock"))
+    if txt is None:
+        return False
+    pid = txt.strip()
+    return pid.isdigit() and not _pid_alive(int(pid))
+
+
 def _watchdog_alert(state_dir):
     """The ALERT dict, {} when present-but-unreadable (existence IS the signal — fail
     closed, runner._read_json's posture), None when absent."""
@@ -1723,6 +1737,47 @@ def _watchdog_launch(repo, cfg, home, state_dir, launch, state):
     return r.returncode
 
 
+def _watchdog_resurrect(repo, cfg, home, state_dir, resurrect):
+    """Execute one resurrect request (issue #208): RESTART the provably-gone runner in its recorded
+    anchor pane via resurrect-runner.sh (the keystroke-free shim, running `superlooper run` — a
+    deterministic zero-token process, never an LLM, never a worker tab). Returns the rc fed to
+    watchdog.after_resurrect: 0 only when the runner VERIFIABLY came up (its pidfile names a live
+    pid). A gone/unresolvable pane returns "no_pane" (a new tab cannot be placed without the owner).
+
+    The launcher is fully overridable via SL_RESURRECT_RUNNER (tests inject a fake, like the debugger
+    path's SL_LAUNCH_SESSION). `cfg` is accepted for call-site symmetry with _watchdog_launch and is
+    deliberately unread: the runner re-reads the repo's config itself on boot, so nothing from this
+    process's view of it should ride into the restart."""
+    pane = _watchdog_pane(state_dir)
+    if not pane:
+        print("watchdog: no cmux pane resolves for the dead runner (no recorded anchor / not inside "
+              "cmux) — cannot resurrect; notifying instead.", file=sys.stderr)
+        return "no_pane"
+    script = os.environ.get("SL_RESURRECT_RUNNER") or os.path.join(_HERE, "resurrect-runner.sh")
+    # The reborn runner's fresh tab shell inherits NONE of this process's env, so NAME the CLI to
+    # (re)start explicitly — our own resolved bin path, so it reloads the exact installed engine.
+    bin_path = os.environ.get("SL_SUPERLOOPER_BIN") or os.path.abspath(sys.argv[0])
+    env = {**os.environ, "SL_RUN_ROOT": home, "SL_PANE": pane, "SL_SUPERLOOPER_BIN": bin_path,
+           # PIN the verify window (HARDCODE, exactly like _watchdog_launch's P1-1 — do NOT pass the
+           # ambient value through): an ambient SL_LAUNCH_VERIFY_SECONDS > WATCHDOG_LAUNCH_TIMEOUT (a
+           # debugging export, a LaunchAgent env) would let resurrect-runner.sh's poll outlive the
+           # subprocess timeout below, so subprocess.run kills the child MID-POLL — its failure
+           # cleanup (close the orphan tab, remove the dropped .cmd time-bomb) never runs, and a
+           # slow-but-successful restart records a false resurrect_failed. 30s sits far under 180s.
+           "SL_LAUNCH_VERIFY_SECONDS": "30"}
+    try:
+        r = subprocess.run([script, "--cwd", os.path.abspath(repo), resurrect["id"]],
+                           env=env, capture_output=True, text=True, timeout=WATCHDOG_LAUNCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 124
+    except OSError:
+        return 127
+    out = (r.stdout or "") + (r.stderr or "")
+    if out.strip():
+        print(out.strip())
+    return r.returncode
+
+
 def cmd_watchdog(args):
     import watchdog as watchdog_lib
     cfg = _load_config(args.repo)
@@ -1761,7 +1816,8 @@ def cmd_watchdog(args):
                 "usage_exhausted": usage_exhausted,
                 "kill_switch": os.path.exists(
                     os.path.join(state_dir, watchdog_lib.KILL_SWITCH_FILENAME)),
-                "debugger_live": _watchdog_debugger_live(state_dir)}
+                "debugger_live": _watchdog_debugger_live(state_dir),
+                "runner_dead": _watchdog_runner_dead(state_dir)}
         state_path = os.path.join(state_dir, watchdog_lib.STATE_FILENAME)
         prior = watchdog_lib.coerce_state(_read_json_file(state_path, None))
 
@@ -1772,6 +1828,29 @@ def cmd_watchdog(args):
             print(f"notify: {notify.send(cfg, title, body)}")
 
         final = res["state"]
+        resurrect_rc = None
+        # Runner resurrection (issue #208): a provably-gone runner is RESTARTED before any debugger
+        # is hired for a wedge — a corpse needs restarting, not diagnosing. The attempt was already
+        # recorded in evaluate() (so it counts toward the crash-loop cap even if delivery fails).
+        if res.get("resurrect") is not None:
+            # Persist the recorded attempt BEFORE the launcher runs. That subprocess can take up to
+            # WATCHDOG_LAUNCH_TIMEOUT, and a watchdog killed inside that window would otherwise lose
+            # the attempt entirely — leaving the cap slot un-burned and the next check free to
+            # restart again. The cap is the ONLY anti-storm guard, so bias it to OVER-count: a lost
+            # restart that still burned a slot is recoverable, a storm is not.
+            loopstate.save(state_path, final)
+            resurrect_rc = _watchdog_resurrect(args.repo, cfg, home, state_dir, res["resurrect"])
+            done = watchdog_lib.after_resurrect(now, cfg, final, res["resurrect"], resurrect_rc)
+            for rec in done["journal"]:
+                journal.append(home, rec, now)
+            for title, body in done["notify"]:
+                print(f"notify: {notify.send(cfg, title, body)}")
+            final = done["state"]
+        # A provably-gone runner past the rolling-hour cap: no resurrect emitted. Read the RAW
+        # provably-gone fact from evaluate(), NOT the journal: the escalation record is deduped to
+        # once per capped streak, so every later capped check journals nothing and the summary read
+        # "healthy — no signal" while the loop was down (fresh-review P1-1).
+        capped = bool(res.get("runner_down")) and res.get("resurrect") is None
         if res["launch"] is not None:
             rc = _watchdog_launch(args.repo, cfg, home, state_dir, res["launch"], final)
             done = watchdog_lib.after_launch(now, cfg, final, res["launch"], rc)
@@ -1783,9 +1862,27 @@ def cmd_watchdog(args):
 
         loopstate.save(state_path, final)
         ep = final.get("episode")
+        # An honest one-line summary for a hand-run check. The notify/journal already carry the
+        # authoritative record; this must not contradict them (a capped/failed restart is NOT
+        # "healthy", and a FAILED restart is not "resurrected").
+        # Read the STATE, not the journal: the `disabled` record is deduped on the observed signal
+        # set (one line per distinct observation, not one per check), so every later check journals
+        # nothing while still observing the SAME signals — and reading the empty journal printed
+        # "observed: no signal" over a corpse. evaluate() writes the current sigs to
+        # disabled_observed on both kill-switch returns, so state is the honest source. Same defect
+        # as the capped summary above (fresh-review P1-1); it lived two lines apart and was missed.
+        disabled_sigs = (final.get("disabled_observed") or []) if view["kill_switch"] else []
         print("watchdog: " + ("DISABLED (state/WATCHDOG_OFF) — observed: "
-                              + (", ".join(res["journal"][0]["signals"]) or "no signal")
+                              + (", ".join(disabled_sigs) or "no signal")
                               if view["kill_switch"] else
+                              "resurrected the runner" if resurrect_rc == 0 else
+                              "runner is DOWN — restart FAILED" if resurrect_rc is not None else
+                              # cap==0 was never a crash loop — nothing was ever attempted; saying
+                              # "cap hit" there would misname a deliberate config choice.
+                              ("runner is DOWN — auto-restart DISABLED "
+                               "(watchdog.resurrection_max_per_hour = 0)"
+                               if cfg["watchdog"]["resurrection_max_per_hour"] == 0 else
+                               "runner is DOWN — auto-restart PAUSED (crash-loop cap hit)") if capped else
                               f"episode open ({', '.join(ep['signals'])})" if ep else
                               "healthy — no signal"))
         return 0

@@ -80,7 +80,8 @@ def test_minimal_config_fills_defaults(tmp_path):
     # watchdog (issue #66): authority DEFAULTS to full (owner standing rule 2026-07-10) —
     # the constitution's absolute exclusions are enforced by the sl-debugger contract, not here.
     assert cfg["watchdog"] == {"authority": "full", "allowlist": [], "grace_minutes": 30,
-                               "heartbeat_stale_minutes": 20, "no_progress_minutes": 30}
+                               "heartbeat_stale_minutes": 20, "no_progress_minutes": 30,
+                               "resurrection_max_per_hour": 5}
 
 
 # --------------------------- report sections default (issue #57) ---------------------------
@@ -146,9 +147,14 @@ def test_watchdog_minutes_validation(tmp_path):
     # (a zero bound would trip on any instantaneous glimpse).
     _write_cfg(tmp_path, {"repo": "o/r", "watchdog": {"grace_minutes": 0}})
     assert config.load(tmp_path)["watchdog"]["grace_minutes"] == 0
+    # resurrection_max_per_hour may be 0 (disables auto-restart -> escalate immediately); issue #208.
+    _write_cfg(tmp_path, {"repo": "o/r", "watchdog": {"resurrection_max_per_hour": 0}})
+    assert config.load(tmp_path)["watchdog"]["resurrection_max_per_hour"] == 0
     for key, bad in (("grace_minutes", -1), ("grace_minutes", True), ("grace_minutes", "30"),
                      ("heartbeat_stale_minutes", 0), ("heartbeat_stale_minutes", 1.5),
-                     ("no_progress_minutes", 0), ("no_progress_minutes", False)):
+                     ("no_progress_minutes", 0), ("no_progress_minutes", False),
+                     ("resurrection_max_per_hour", -1), ("resurrection_max_per_hour", True),
+                     ("resurrection_max_per_hour", 1.5)):
         _write_cfg(tmp_path, {"repo": "o/r", "watchdog": {key: bad}})
         with pytest.raises(ValueError, match=f"watchdog.{key}"):
             config.load(tmp_path)

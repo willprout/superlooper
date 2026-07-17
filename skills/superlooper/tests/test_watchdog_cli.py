@@ -51,6 +51,19 @@ _FAKE_LAUNCH = """#!/bin/bash
 exit "${STUB_RC:-0}"
 """
 
+_FAKE_RESURRECT = """#!/bin/bash
+{ printf 'ARGS %s\\n' "$*"
+  printf 'PANE %s\\n' "${SL_PANE:-}"
+  printf 'ROOT %s\\n' "${SL_RUN_ROOT:-}"
+  printf 'BIN %s\\n' "${SL_SUPERLOOPER_BIN:-}"
+  printf 'VERIFY %s\\n' "${SL_LAUNCH_VERIFY_SECONDS:-unset}"
+  # Snapshot the watchdog state AS THE LAUNCHER SEES IT — proof of what was already durable on
+  # disk at launch time, not merely what got written once the launcher returned.
+  printf 'STATE_AT_LAUNCH %s\\n' "$(cat "${SL_RUN_ROOT:-}/state/watchdog.json" 2>/dev/null | tr -d '\\n ')"
+} >> "$RESURRECT_LOG"
+exit "${STUB_RESURRECT_RC:-0}"
+"""
+
 
 class _Rig:
     def __init__(self, tmp_path, watchdog_cfg=None):
@@ -71,13 +84,21 @@ class _Rig:
         launch = tmp_path / "fake-launch-session.sh"
         launch.write_text(_FAKE_LAUNCH)
         launch.chmod(launch.stat().st_mode | stat.S_IXUSR)
+        # A fake runner-resurrection launcher (issue #208): logs its call + honors STUB_RESURRECT_RC,
+        # exactly like the fake launch-session above — no test reaches real cmux / a real runner.
+        self.resurrect_log = tmp_path / "resurrect-calls.log"
+        resurrect = tmp_path / "fake-resurrect-runner.sh"
+        resurrect.write_text(_FAKE_RESURRECT)
+        resurrect.chmod(resurrect.stat().st_mode | stat.S_IXUSR)
         self.env = {**os.environ,
                     "HOME": str(tmp_path / "userhome"),
                     "SL_HOME": str(tmp_path / "slhome"),
                     "SL_GH": str(_FAKE_GH), "GH_FIXTURES": str(fixdir),
                     "SL_CMUX": "/nonexistent/superlooper-test-cmux",
                     "SL_LAUNCH_SESSION": str(launch),
+                    "SL_RESURRECT_RUNNER": str(resurrect),
                     "STUB_LOG": str(self.stub_log),
+                    "RESURRECT_LOG": str(self.resurrect_log),
                     "SL_FAKE_USAGE": _LOW_USAGE}
         # this test process may itself run inside a superlooper worker: its ambient pane must
         # never leak into the subject's pane resolution.
@@ -104,13 +125,26 @@ class _Rig:
     def wstate(self):
         return json.loads((self.home / "state" / "watchdog.json").read_text())
 
+    def runner_lock(self, pid):
+        # A pidfile the dead runner left behind (a crash leaves it; a clean stop removes it).
+        (self.home / "state" / "runner.lock").write_text(str(pid))
+
     def wjournal(self):
         return [r for r in journal.read(str(self.home)) if r.get("act") == "watchdog"]
+
+    def rjournal(self):
+        return [r for r in journal.read(str(self.home)) if r.get("act") == "runner_resurrect"]
 
     def launch_calls(self):
         if not self.stub_log.exists():
             return []
         return [l.split(" ", 1)[1] for l in self.stub_log.read_text().splitlines()
+                if l.startswith("ARGS ")]
+
+    def resurrect_calls(self):
+        if not self.resurrect_log.exists():
+            return []
+        return [l.split(" ", 1)[1] for l in self.resurrect_log.read_text().splitlines()
                 if l.startswith("ARGS ")]
 
     def run(self, **extra_env):
@@ -466,3 +500,195 @@ def test_recovery_stands_down_silently(tmp_path):
     assert [x["outcome"] for x in rig.wjournal()] == ["stand_down"]
     assert rig.wstate()["episode"] is None
     assert rig.launch_calls() == []
+
+
+# ============================ runner resurrection (issue #208) ============================
+# The watchdog RESTARTS a provably-gone runner (heartbeat stale AND its recorded pid dead) instead
+# of only hiring a debugger. `runner.lock` naming a DEAD pid is the crash signal; a clean stop
+# removes the pidfile, so it is not resurrected. The launcher (resurrect-runner.sh) is faked via
+# SL_RESURRECT_RUNNER, exactly like the debugger launcher.
+
+def test_provably_gone_runner_is_resurrected_not_debugged(tmp_path):
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)                              # heartbeat stale...
+    rig.runner_lock(999999)                          # ...AND the recorded pid is dead (a crash)
+    rig.anchor(pane="ANCHOR-PANE-1")
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    # the runner was RESTARTED (r1), NOT debugged
+    calls = rig.resurrect_calls()
+    assert len(calls) == 1
+    assert calls[0] == f"--cwd {rig.repo} r1"
+    assert rig.launch_calls() == []                  # no debugger for a dead runner
+    log = rig.resurrect_log.read_text()
+    assert "PANE ANCHOR-PANE-1" in log               # into the recorded anchor pane
+    assert f"ROOT {rig.home}" in log
+    assert "VERIFY 30" in log                         # verify window pinned under the timeout
+    # a distinct journal act + a loud restart notification
+    recs = rig.rjournal()
+    assert [x["outcome"] for x in recs] == ["resurrected"]
+    assert recs[0]["id"] == "r1"
+    st = rig.wstate()
+    assert st["episode"] is None                     # no debugger episode opened
+    assert len(st["resurrection"]["attempts"]) == 1
+    assert st["next_resurrection"] == 2
+    assert "resurrected the runner" in r.stdout
+
+
+def test_clean_stop_no_pidfile_is_not_resurrected(tmp_path):
+    # A deliberately-stopped runner removes its pidfile. Heartbeat stale + NO runner.lock is NOT
+    # 'provably gone' — it must not be auto-restarted (that would fight the owner). It falls to the
+    # existing debugger episode instead.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)                              # no runner.lock written
+    rig.anchor()
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert rig.resurrect_calls() == []               # never resurrected
+    assert [x["outcome"] for x in rig.wjournal()] == ["notified"]   # the debugger episode opens
+    assert rig.rjournal() == []
+
+
+def test_live_runner_pidfile_is_wedged_not_dead(tmp_path):
+    # heartbeat stale but the recorded pid is ALIVE = a wedged loop (up, not ticking). That is the
+    # debugger's job, not a restart.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(os.getpid())                     # a real, alive pid
+    rig.anchor()
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert rig.resurrect_calls() == []
+    assert [x["outcome"] for x in rig.wjournal()] == ["notified"]   # debugger episode
+
+
+def test_failed_resurrection_journals_and_notifies_the_failure(tmp_path):
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)
+    rig.anchor()
+    r = rig.run(STUB_RESURRECT_RC=2)                 # the launcher could not bring the runner up
+    assert r.returncode == 0, r.stderr
+    assert len(rig.resurrect_calls()) == 1
+    recs = rig.rjournal()
+    assert [x["outcome"] for x in recs] == ["resurrect_failed"]
+    assert recs[0]["rc"] == 2
+    # the attempt still counts toward the crash-loop cap even though delivery failed
+    assert len(rig.wstate()["resurrection"]["attempts"]) == 1
+    # the hand-run summary must NOT claim "resurrected" when the restart FAILED
+    assert "restart FAILED" in r.stdout
+    assert "resurrected the runner" not in r.stdout
+
+
+def test_resurrect_pins_the_verify_window(tmp_path):
+    # Mirror of test_launch_env_pins_the_verify_window for the resurrect path: an ambient
+    # SL_LAUNCH_VERIFY_SECONDS must NOT leak through, or resurrect-runner.sh's poll could outlive the
+    # subprocess timeout and get killed mid-cleanup. The watchdog HARDCODES 30.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)
+    rig.anchor()
+    r = rig.run(SL_LAUNCH_VERIFY_SECONDS="600")
+    assert r.returncode == 0, r.stderr
+    assert "VERIFY 30" in rig.resurrect_log.read_text()
+
+
+def test_cap_of_zero_escalates_without_resurrecting_and_summary_is_honest(tmp_path):
+    # resurrection_max_per_hour=0 disables auto-restart: a provably-gone runner escalates LOUDLY
+    # (once) and is NOT restarted; the hand-run summary must say the runner is DOWN, never "healthy".
+    rig = _Rig(tmp_path, watchdog_cfg={"resurrection_max_per_hour": 0})
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)
+    rig.anchor()
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert rig.resurrect_calls() == []               # disabled: nothing restarted
+    assert [x["outcome"] for x in rig.rjournal()] == ["resurrect_capped"]
+    assert "DISABLED" in r.stdout or "PAUSED" in r.stdout
+    assert "healthy" not in r.stdout
+
+
+def test_the_attempt_is_durable_before_the_launcher_runs(tmp_path):
+    # Fresh-review P2-6: the attempt was persisted only AFTER the resurrect subprocess, which can run
+    # up to WATCHDOG_LAUNCH_TIMEOUT (180s). A watchdog killed inside that window lost the attempt, so
+    # the next check restarted again with the slot un-burned — and the rolling-hour cap is the ONLY
+    # anti-storm guard the DoD has ("no relaunch storms"). The attempt must be on disk BEFORE the
+    # launcher is invoked, so a crash mid-restart can only ever OVER-count, never under-count.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)
+    rig.anchor()
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    snap = [l.split(" ", 1)[1] for l in rig.resurrect_log.read_text().splitlines()
+            if l.startswith("STATE_AT_LAUNCH ")]
+    assert len(snap) == 1, rig.resurrect_log.read_text()
+    at_launch = json.loads(snap[0])
+    assert len(at_launch["resurrection"]["attempts"]) == 1, at_launch
+
+
+def test_every_capped_check_stays_honest_not_just_the_first(tmp_path):
+    # Fresh-review P1-1: the escalation JOURNAL/notify is deduped to once per capped streak (no
+    # storm), but the hand-run summary must be honest on EVERY check. Deriving "capped" from the
+    # (deduped) journal made the 3rd check print "healthy — no signal" while the runner was still
+    # provably gone — the machine telling the owner the loop is fine during an outage.
+    rig = _Rig(tmp_path, watchdog_cfg={"resurrection_max_per_hour": 1})
+    rig.anchor()
+    rig.runner_lock(999999)                          # dead pid: the runner stays provably gone
+    rig.heartbeat(3600)
+    first = rig.run()                                # burns the single cap slot
+    assert "resurrected the runner" in first.stdout, first.stdout
+    second = rig.run()                               # cap hit: escalates loudly, once
+    assert "PAUSED" in second.stdout and "healthy" not in second.stdout
+    third = rig.run()                                # still capped: silent, but MUST stay honest
+    assert "healthy" not in third.stdout, third.stdout
+    assert "DOWN" in third.stdout, third.stdout
+    # the escalation itself stays deduped — one notify across the capped streak, never per check
+    assert [x["outcome"] for x in rig.rjournal()] == ["resurrected", "resurrect_capped"]
+
+
+def test_no_resolvable_pane_is_a_loud_resurrect_failure_not_a_crash(tmp_path):
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)                          # dead runner, but no anchor + no SL_PANE
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert rig.resurrect_calls() == []               # nothing to launch INTO — script never ran
+    recs = rig.rjournal()
+    assert [x["outcome"] for x in recs] == ["resurrect_failed"]
+    assert recs[0]["rc"] == "no_pane"
+
+
+def test_kill_switch_suppresses_resurrection(tmp_path):
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)
+    rig.anchor()
+    (rig.home / "state" / "WATCHDOG_OFF").write_text("")
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert rig.resurrect_calls() == []               # WATCHDOG_OFF disables the whole path
+    assert rig.rjournal() == []
+    assert [x["outcome"] for x in rig.wjournal()] == ["disabled"]
+
+
+def test_every_disabled_check_names_what_it_observed_not_just_the_first(tmp_path):
+    # Second fresh review, P1: the SAME deduped-journal falsehood this commit fixes for the capped
+    # summary, two lines away in the kill-switch summary. evaluate() dedups the `disabled` record on
+    # the OBSERVED signal set, so every later check journals nothing and the summary printed
+    # "observed: no signal" while the runner was a corpse — the machine contradicting what it knows
+    # (the signals are sitting in state's disabled_observed). Honest source = the STATE, not the
+    # journal. Keep the empty-journal guard: a bare res["journal"][0] IndexErrors on these checks.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(999999)                          # provably gone, but the kill switch is on
+    rig.anchor()
+    (rig.home / "state" / "WATCHDOG_OFF").write_text("")
+    for check in range(1, 4):
+        r = rig.run()
+        assert r.returncode == 0, r.stderr
+        assert "DISABLED" in r.stdout, (check, r.stdout)
+        assert "heartbeat_stale" in r.stdout, (check, r.stdout)
+        assert "no signal" not in r.stdout, (check, r.stdout)
+    assert [x["outcome"] for x in rig.wjournal()] == ["disabled"]   # record stays deduped: 1, not 3
+    assert rig.resurrect_calls() == []

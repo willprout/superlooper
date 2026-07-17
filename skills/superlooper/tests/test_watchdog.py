@@ -534,3 +534,199 @@ def test_wrong_typed_persisted_state_degrades_to_a_fresh_one():
         r = wd.evaluate(T0, _cfg(), _view(), wd.coerce_state(garbage))
         assert r["state"]["episode"] is None
         assert r["launch"] is None
+
+
+# ============================ runner resurrection (issue #208) ============================
+# A runner that is PROVABLY GONE — heartbeat stale AND its recorded pid dead (a crash leaves the
+# pidfile behind; a clean stop removes it) — is relaunched automatically, not merely debugged. The
+# runner is a deterministic zero-token process, so it should restart as often as it needs to. A
+# rolling-hour attempt cap turns a repeatedly-dying runner into a loud incident rather than a flap.
+# `runner_dead` in the view is the CLI's "runner.lock names a dead pid" read; it defaults False, so
+# the wedged-runner (alive, not ticking) debugger path above is untouched.
+
+def _dead(now=T0, stale_min=21, **over):
+    """A view where the runner is PROVABLY GONE: heartbeat stale AND the recorded pid dead."""
+    return _view(now, heartbeat=now - stale_min * MIN, runner_dead=True, **over)
+
+
+def test_provably_gone_runner_resurrects_instead_of_debugging():
+    # heartbeat stale AND the recorded pid dead -> restart the runner, do NOT open a debugger
+    # episode (there is nothing to diagnose in a dead process; it just needs restarting).
+    r = _run(T0, _dead(T0))
+    assert r["resurrect"] is not None
+    assert r["resurrect"]["id"] == "r1"
+    assert r["resurrect"]["signals"] == ["heartbeat_stale"]
+    assert r["launch"] is None                             # no debugger for a dead runner
+    assert r["state"]["episode"] is None                   # no heartbeat_stale debugger episode
+    assert r["notify"] == []                               # the decision is quiet; after_resurrect texts
+    assert r["state"]["resurrection"]["attempts"] == [T0]  # the attempt is recorded for the cap
+    assert r["state"]["next_resurrection"] == 2            # the id counter advanced past r1
+
+
+def test_after_resurrect_success_journals_a_distinct_act_and_texts_loudly():
+    r = _run(T0, _dead(T0))
+    done = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=0)
+    assert [j.get("act") for j in done["journal"]] == ["runner_resurrect"]
+    assert done["journal"][0]["outcome"] == "resurrected"
+    assert done["journal"][0]["id"] == "r1"
+    assert len(done["notify"]) == 1                        # loud, not silent (the DoD)
+    assert "r1" in done["notify"][0][1] or "runner" in done["notify"][0][1].lower()
+
+
+def test_dead_runner_with_a_fresh_heartbeat_is_not_resurrected():
+    # The DoD requires BOTH signals. A runner that crashed seconds ago still has a fresh heartbeat;
+    # we wait for it to go stale (giving a human the chance to restart by hand first). The bounded
+    # window is exactly the heartbeat-stale bound.
+    r = _run(T0, _view(T0, heartbeat=T0 - 5 * MIN, runner_dead=True))
+    assert r["resurrect"] is None
+    assert r["state"]["episode"] is None
+    assert r["notify"] == []
+
+
+def test_wedged_runner_that_is_still_alive_gets_the_debugger_not_a_restart():
+    # heartbeat stale but the pid is ALIVE = the loop is up but not completing ticks (wedged). That
+    # is the debugger's job, exactly as before — resurrection must not fire.
+    r = _run(T0, _view(T0, heartbeat=T0 - 21 * MIN, runner_dead=False))
+    assert r["resurrect"] is None
+    assert r["state"]["episode"] is not None               # the existing debugger episode opens
+    assert r["state"]["episode"]["signals"] == ["heartbeat_stale"]
+
+
+def test_resurrection_records_every_attempt_and_advances_the_id():
+    st = wd.new_state()
+    now = T0
+    for i in range(3):
+        r = _run(now, _dead(now), st)
+        assert r["resurrect"]["id"] == f"r{i + 1}"
+        # the runner restarts but re-dies before the next check (a crash loop)
+        st = wd.after_resurrect(now, _cfg(), r["state"], r["resurrect"], rc=0)["state"]
+        now += 6 * MIN
+    assert len(st["resurrection"]["attempts"]) == 3
+
+
+def test_rolling_hour_cap_stops_resurrecting_and_escalates_once():
+    cfg = _cfg(resurrection_max_per_hour=3)
+    st = wd.new_state()
+    now = T0
+    escalations = 0
+    for _ in range(3):                                     # burn the cap
+        r = _run(now, _dead(now), st, cfg=cfg)
+        assert r["resurrect"] is not None
+        st = wd.after_resurrect(now, cfg, r["state"], r["resurrect"], rc=0)["state"]
+        now += 6 * MIN
+    # cap reached: the next provably-gone check must NOT resurrect; it escalates loudly, once.
+    capped = _run(now, _dead(now), st, cfg=cfg)
+    assert capped["resurrect"] is None
+    assert capped["state"]["episode"] is None              # no debugger flapping alongside the cap
+    assert [j.get("outcome") for j in capped["journal"]] == ["resurrect_capped"]
+    assert len(capped["notify"]) == 1
+    escalations += len(capped["notify"])
+    st = capped["state"]
+    # a further check still capped: silent (the escalation already fired — no storm)
+    now += 6 * MIN
+    again = _run(now, _dead(now), st, cfg=cfg)
+    assert again["resurrect"] is None
+    assert again["notify"] == []
+    assert again["journal"] == []
+    assert escalations == 1
+
+
+def test_cap_of_zero_disables_resurrection_and_escalates_immediately():
+    cfg = _cfg(resurrection_max_per_hour=0)
+    r = _run(T0, _dead(T0), cfg=cfg)
+    assert r["resurrect"] is None
+    assert [j.get("outcome") for j in r["journal"]] == ["resurrect_capped"]
+    assert r["journal"][0]["max_per_hour"] == 0
+    assert len(r["notify"]) == 1
+    # the message must reflect DISABLED, never "restarted 0 time(s)" (misleading when never enabled)
+    body = r["notify"][0][1]
+    assert "disabled" in body.lower()
+    assert "0 time" not in body
+
+
+def test_cap_escalation_claims_attempts_never_asserted_restarts():
+    # Fresh-review P1-2: an attempt is recorded BEFORE delivery, so a "no_pane" attempt (no tab
+    # created, nothing launched) burns a cap slot identically to a real restart. Counting it is
+    # deliberate (an undeliverable restart is still a failure to recover), but the escalation must
+    # not FABRICATE history by asserting the runner "was restarted N times" when it never came up.
+    cfg = _cfg(resurrection_max_per_hour=1)
+    st = wd.new_state()
+    r1 = _run(T0, _dead(T0), st, cfg=cfg)
+    # the attempt was undeliverable: the recorded pane is gone, so nothing was ever restarted
+    st = wd.after_resurrect(T0, cfg, r1["state"], r1["resurrect"], rc="no_pane")["state"]
+    later = T0 + 6 * MIN
+    capped = _run(later, _dead(later), st, cfg=cfg)
+    assert [j.get("outcome") for j in capped["journal"]] == ["resurrect_capped"]
+    body = capped["notify"][0][1].lower()
+    assert "attempt" in body                          # honest: restart was TRIED
+    assert "been auto-restarted" not in body          # never assert a restart that did not happen
+    assert "restarted 1 time" not in body
+
+
+def test_attempts_age_out_of_the_rolling_window():
+    cfg = _cfg(resurrection_max_per_hour=2)
+    st = wd.new_state()
+    # two attempts an hour+ apart never trip the cap (each ages out before the next)
+    r1 = _run(T0, _dead(T0), st, cfg=cfg)
+    st = wd.after_resurrect(T0, cfg, r1["state"], r1["resurrect"], rc=0)["state"]
+    later = T0 + 61 * MIN
+    r2 = _run(later, _dead(later), st, cfg=cfg)
+    assert r2["resurrect"] is not None                     # the first attempt aged out of the window
+    assert r2["state"]["resurrection"]["attempts"] == [later]
+
+
+def test_settle_window_suppresses_the_wedged_debugger_right_after_a_resurrection():
+    # Just after a resurrection the NEW runner is booting and has not stamped a fresh heartbeat yet,
+    # so the OLD heartbeat still reads stale WHILE the pid is now alive. That must NOT be mistaken
+    # for a wedged runner and open a debugger episode — the runner is simply catching up.
+    r = _run(T0, _dead(T0))
+    st = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=0)["state"]
+    booting = _run(T0 + 2 * MIN, _view(T0 + 2 * MIN, heartbeat=T0 - 21 * MIN, runner_dead=False), st)
+    assert booting["state"]["episode"] is None             # settle window: no debugger, no notify
+    assert booting["notify"] == []
+    assert booting["launch"] is None
+    # ...but if it is STILL stale after the settle window, it is genuinely wedged -> debugger opens
+    wedged = _run(T0 + 10 * MIN, _view(T0 + 10 * MIN, heartbeat=T0 - 21 * MIN, runner_dead=False), st)
+    assert wedged["state"]["episode"] is not None
+
+
+def test_after_resurrect_failure_texts_once_per_down_streak():
+    r = _run(T0, _dead(T0))
+    d1 = wd.after_resurrect(T0, _cfg(), r["state"], r["resurrect"], rc=2)
+    assert [j.get("outcome") for j in d1["journal"]] == ["resurrect_failed"]
+    assert len(d1["notify"]) == 1                           # the failure texts once...
+    # a second failed attempt in the SAME down-streak does not re-text
+    r2 = _run(T0 + 6 * MIN, _dead(T0 + 6 * MIN), d1["state"])
+    d2 = wd.after_resurrect(T0 + 6 * MIN, _cfg(), r2["state"], r2["resurrect"], rc=2)
+    assert d2["notify"] == []
+    # recovery (runner healthy again) re-arms the failure text for a future streak
+    healthy = _run(T0 + 12 * MIN, _view(T0 + 12 * MIN), d2["state"])
+    assert healthy["state"]["resurrection"]["failure_notified"] is False
+
+
+def test_kill_switch_suppresses_resurrection_entirely():
+    r = _run(T0, _dead(T0, kill_switch=True))
+    assert r["resurrect"] is None
+    assert _outcomes(r) == ["disabled"]
+    assert r["notify"] == []
+    assert r["state"]["episode"] is None
+
+
+def test_resurrection_coexists_with_a_separate_alert_debugger_episode():
+    # A dead runner that ALSO left an ALERT on disk: resurrection restarts the runner AND the alert
+    # (a separate concern) still drives the debugger episode. Only heartbeat_stale is rerouted.
+    r = _run(T0, _dead(T0, alert={"reasons": ["issues_json_corrupt"]}))
+    assert r["resurrect"] is not None
+    ep = r["state"]["episode"]
+    assert ep is not None and ep["signals"] == ["alert"]   # heartbeat_stale rerouted; alert remains
+
+
+def test_coerce_state_handles_a_wrong_typed_resurrection_slice():
+    for garbage in (None, [], "x", {"resurrection": "weird", "next_resurrection": "9"},
+                    {"resurrection": {"attempts": "nope"}}):
+        st = wd.coerce_state(garbage)
+        assert isinstance(st["resurrection"], dict)
+        assert isinstance(st["resurrection"]["attempts"], list)
+        assert st["next_resurrection"] >= 1
+        r = wd.evaluate(T0, _cfg(), _view(), st)           # never crashes
+        assert r["resurrect"] is None
