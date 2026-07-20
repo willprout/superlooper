@@ -98,6 +98,25 @@ def test_execute_threads_an_explicit_retry_flag():
     assert j.calls[-1] == ("execute", REPO, ["branch:sl/i7-x"], True)
 
 
+def test_a_retry_of_more_than_one_action_is_400_and_never_dispatched():
+    # Cross-review round 1 (medium): the retry is ONE held row's own tap. A body asking to retry a
+    # batch — or nothing at all — is not a request this route understands, and is refused at the
+    # boundary before the verb (which enforces the same rule again on the filtered subset).
+    for keys in (["branch:sl/i7-x", "pr:41"], []):
+        j = _RecordingJanitor()
+        resp = _post("/api/janitor", {"repo": REPO, "keys": keys, "retry": True}, j)
+        assert resp.status == 400, keys
+        assert j.calls == [], keys
+
+
+def test_a_sweep_of_many_keys_is_still_fine_without_retry():
+    # …and the ordinary multi-key sweep is untouched by that rule.
+    j = _RecordingJanitor()
+    resp = _post("/api/janitor", {"repo": REPO, "keys": ["pr:14", "issue:9"], "retry": False}, j)
+    assert resp.status == 200
+    assert j.calls[-1] == ("execute", REPO, ["pr:14", "issue:9"], False)
+
+
 def test_execute_with_a_non_boolean_retry_is_400_and_never_dispatched():
     # `retry` re-runs a KNOWN-FAILING GitHub write, so its input is strict: only a real boolean is a
     # request this route understands. A truthy string is refused before any command runs — never

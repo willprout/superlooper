@@ -208,6 +208,29 @@ def test_execute_with_retry_passes_retry_refused(jan_fix):
     assert argv[argv.index("--execute-keys") + 1] == "branch:sl/i7-x"
 
 
+def test_retry_is_refused_for_anything_but_a_single_action(jan_fix):
+    # Cross-review round 1 (medium): strict-boolean is not enough — the retry path is documented as
+    # ONE held row's own deliberate tap, so the verb must enforce that shape too. A caller (or a
+    # forged body) asking to retry a BATCH would widen the narrowest consent path in the dialog into
+    # a bulk re-run of known-failing writes, so it is refused before any subprocess.
+    verb, fixtures = jan_fix
+    res = verb.execute(SLUG, ["branch:sl/i7-x", "pr:41"], retry=True)
+    assert res["ok"] is False and res["executed"] == 0
+    assert "one" in res["error"]                   # names the actual rule, not a generic refusal
+    assert _calls(fixtures) == []                  # nothing ran
+
+
+def test_retry_counts_the_keys_that_survive_filtering(jan_fix):
+    # The rule is measured on the FILTERED subset (the keys that would really be sent): garbage
+    # alongside one real key still leaves exactly one action, so the retry proceeds.
+    verb, fixtures = jan_fix
+    res = verb.execute(SLUG, ["", None, "branch:sl/i7-x"], retry=True)
+    assert res["ok"] is True
+    argv = _calls(fixtures)[-1]["argv"]
+    assert "--retry-refused" in argv
+    assert argv[argv.index("--execute-keys") + 1] == "branch:sl/i7-x"
+
+
 def test_execute_retry_must_be_a_real_boolean_true(jan_fix):
     # Fail closed: a merely-truthy value (a forged/garbage body that survived the route) must not
     # arm a retry of a known-failing GitHub write. Only literal True does.

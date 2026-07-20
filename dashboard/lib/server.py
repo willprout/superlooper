@@ -317,6 +317,12 @@ def _route_janitor(clean, body_bytes, janitor):
     retry = payload.get("retry", False)
     if not isinstance(retry, bool):
         return _json_resp(400, {"ok": False, "error": "bad 'retry' — must be a boolean"})
+    # …and it is ONE row's tap: the dialog arms exactly one held key, so a retry of a batch (or of
+    # nothing) is not a request this route understands. Refused here at the boundary; the verb
+    # enforces the same rule again on the keys that survive its own filtering.
+    if retry and len(keys) != 1:
+        return _json_resp(400, {"ok": False,
+                                "error": "a retry runs one held-back action at a time"})
     return _json_resp(200, janitor.execute(repo, keys, retry=retry))
 
 

@@ -243,7 +243,9 @@
   function heldHTML(held, items) {
     var keys = (held && held.length) ? held : [];
     if (!keys.length) return "";
-    var canRetry = !!(items && items.length);
+    // Array.isArray, not truthiness: a skewed/garbled body must fail closed to the terminal note
+    // rather than into a half-built retry control.
+    var canRetry = Array.isArray(items) && items.length > 0;
     var rows = canRetry
       ? items.map(function (it) {
           return '<div class="cc-jan-held-row" data-jan-held-row="' + esc(it.key) + '">' +

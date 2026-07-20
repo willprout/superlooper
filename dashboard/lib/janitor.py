@@ -249,6 +249,14 @@ class Janitor:
         if not keys:
             return {"ok": False, "verb": "janitor", "repo": repo, "results": [], "executed": 0,
                     "failed": 0, "skipped": 0, "held": 0, "error": "no proposals selected"}
+        # A retry is ONE held row's own deliberate tap, so it is refused for any other shape —
+        # strict-boolean alone would still let a caller batch a bulk re-run of known-failing writes
+        # through the dialog's narrowest consent path (cross-review round 1). Counted on the FILTERED
+        # subset: the keys that would really be sent.
+        if retry is True and len(keys) != 1:
+            return {"ok": False, "verb": "janitor", "repo": repo, "results": [], "executed": 0,
+                    "failed": 0, "skipped": 0, "held": 0,
+                    "error": "a retry runs one held-back action at a time"}
         binary = _binary(self._binary)
         extra = ["--execute-keys", ",".join(keys)]
         if retry is True:

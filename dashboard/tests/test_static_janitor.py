@@ -132,10 +132,24 @@ def test_the_retry_control_only_appears_when_the_server_speaks_the_retry_contrac
     # silently does nothing, so the panel falls back to the terminal instruction instead.
     assert re.search(r"retry-refused", _JAN_JS), (
         "the fallback note must still name the terminal command for a server that can't retry")
-    assert re.search(r"heldHTML\s*\(\s*held\s*,\s*items", _JAN_JS) or \
-        re.search(r"function heldHTML\([^)]*items", _JAN_JS), (
+    assert re.search(r"function heldHTML\([^)]*items", _JAN_JS), (
         "heldHTML must take the server's held_items so it can tell a retry-capable server from an "
         "older one")
+    # The repo runs no JS engine, so pin the SHAPE that makes the fallback true rather than the mere
+    # presence of the words: the fallback branch (`: keys.map(...)`) must build rows carrying NO
+    # retry markers at all. A regression that moved the Retry button out of the canRetry branch and
+    # into the shared row template would fail here (cross-review round 1, medium).
+    fallback = re.search(r':\s*keys\.map\(function \(k\) \{[\s\S]*?\}\)\.join\(""\);', _JAN_JS)
+    assert fallback, "heldHTML must keep a key-only fallback branch built from the raw held keys"
+    for marker in ("data-jan-held-retry", "data-jan-held-go", "data-jan-held-act"):
+        assert marker not in fallback.group(0), (
+            "the no-held_items fallback row must offer %s to nobody — that server cannot honour a "
+            "retry, and a button that silently does nothing is worse than the terminal note" % marker)
+    # …and the retry-capable branch is the one gated on canRetry, which is what `held_items` sets.
+    assert re.search(r"canRetry\s*=\s*Array\.isArray\(\s*items\s*\)", _JAN_JS), (
+        "canRetry must prove held_items is really a list before offering any retry control")
+    assert re.search(r"var rows = canRetry", _JAN_JS), (
+        "which row template renders must be decided by canRetry, nothing else")
 
 
 def test_proposal_rows_are_keyboard_operable():
