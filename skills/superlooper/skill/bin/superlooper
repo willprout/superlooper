@@ -209,6 +209,11 @@ def cmd_run(args):
     agent = args.agent or cfg.get("agent", "claude")
     r = Runner(repo=args.repo, config=cfg, pane=pane, agent=agent,
                workspace=anchor["workspace"], window=anchor["window"], fetch_usage=fetch_usage)
+    # GitHub API-burn telemetry (issue #15): enable it here, at the LIVE runner's process entrypoint —
+    # not in Runner.__init__ — so the sole long-lived per-repo gh writer records its burn while
+    # one-shot CLI commands (doctor/status/adopt) and Runner unit tests stay silent. Every gh
+    # subprocess the tick loop runs then lands one bounded row under `<state_home>/gh-telemetry-runner.jsonl`.
+    gh.set_telemetry(r.home)
     # Anchor identity in the boot line (issue #33): the pane is WHAT worker tabs are born in;
     # workspace/window name WHERE — so a runner started in the wrong cmux window (the 2026-07-09
     # focused-window misplacement) is visible at a glance, not an opaque pane UUID that fits any

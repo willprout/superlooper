@@ -18,9 +18,11 @@ import json
 import os
 import re
 import subprocess
+import sys
 from urllib.parse import quote
 
 import issues as _issues  # pure sibling module; used only to filter child_issues by parent
+import telemetry  # pure sibling module; bounded local GitHub API-burn telemetry (issue #15)
 
 _ISSUE_FIELDS = "number,title,labels,body,createdAt"
 # labels rides along for the gate's §C.4 step-6c `preserve` check (gate._pr_labels) — the one
@@ -52,6 +54,48 @@ def set_repo(slug):
     _repo = slug.strip() if isinstance(slug, str) and slug.strip() else None
 
 
+# GitHub API-burn telemetry sink (issue #15). None = OFF: no telemetry is recorded, so ordinary
+# tests and one-shot CLI commands (doctor/status/adopt) write nothing. The LONG-LIVED runner turns
+# it on once at startup (superlooper `cmd_run` -> set_telemetry(state_home)); being the sole writer
+# of its file makes the ring's rewrite race-free. Every gh subprocess this process then runs lands
+# one bounded row under `<state_home>/gh-telemetry-runner.jsonl`, alongside the runner's other state.
+_telemetry_home = None
+
+
+def set_telemetry(home):
+    """Enable per-call GitHub API-burn telemetry for THIS process, writing under `home` (issue #15) —
+    the runner's state home. Off by default; a falsy `home` disables it again. Recording is
+    best-effort and never breaks a gh call (see lib/telemetry.py)."""
+    global _telemetry_home
+    _telemetry_home = os.fspath(home) if home else None
+
+
+def _caller_op():
+    """The gh.py public function this subprocess is being run for — the OUTERMOST non-underscore
+    function defined in THIS module on the call stack. Walking to the OUTERMOST (nearest the external
+    caller) rather than the innermost keeps the SEMANTIC entry point (`ready_issues`) even when a
+    public function delegates through others down to `_run`. Best-effort: `"?"` on any failure — the
+    op is a telemetry label, never worth raising into a gh call for."""
+    try:
+        op = "?"
+        f = sys._getframe(1)
+        while f is not None:
+            if f.f_globals.get("__name__") == __name__ and not f.f_code.co_name.startswith("_"):
+                op = f.f_code.co_name        # overwrite as we climb -> the final value is outermost
+            f = f.f_back
+        return op
+    except Exception:
+        return "?"
+
+
+def _record_call(args, rc, err):
+    """Record one gh subprocess as a telemetry row when telemetry is enabled. Never raises (the
+    telemetry module swallows its own errors; the None-guard and list() copy are the only work here)."""
+    if _telemetry_home is None:
+        return
+    telemetry.record_call(_telemetry_home, "runner", _repo, _caller_op(), list(args), rc, err)
+
+
 def _run_full(args, timeout=30):
     """Run `gh <args>` with a HARD timeout. Returns (rc, stdout, stderr). Never raises: a timeout,
     a missing binary, or any OSError is caught and returned as a nonzero rc with empty streams so
@@ -61,11 +105,13 @@ def _run_full(args, timeout=30):
     try:
         proc = subprocess.run([_binary(), *args], capture_output=True, text=True,
                               timeout=timeout, env=env)
-        return (proc.returncode, proc.stdout, proc.stderr)
+        rc, out, err = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
-        return (124, "", "gh timed out")                    # conventional timeout rc
+        rc, out, err = 124, "", "gh timed out"              # conventional timeout rc
     except (OSError, ValueError):
-        return (127, "", "gh not found / bad invocation")   # command not found / bad invocation
+        rc, out, err = 127, "", "gh not found / bad invocation"   # command not found / bad invocation
+    _record_call(args, rc, err)     # issue #15: one bounded burn-telemetry row per subprocess (no-op when off)
+    return (rc, out, err)
 
 
 def _run(args, timeout=30):
@@ -213,8 +259,17 @@ def probe():
     """Is gh reachable + authenticated RIGHT NOW? (`gh api rate_limit` — free, does not count
     against limits.) The runner probes once per poll cycle: a False keeps the previous GitHub
     view (marked stale, so gate/launch decisions wait) and feeds the persistent-failure ALERT
-    counter, instead of letting every fail-closed empty read masquerade as 'no work exists'."""
-    rc, _ = _run(["api", "rate_limit"])
+    counter, instead of letting every fail-closed empty read masquerade as 'no work exists'.
+
+    Rides a FREE rate-limit SNAPSHOT (issue #15) when telemetry is enabled: `gh api rate_limit` is
+    exempt from rate limiting, and the runner already makes exactly this call here once per poll — so
+    the snapshot costs no extra quota. The per-resource used/remaining/reset it records is what lets a
+    later incident estimate hourly GraphQL/core burn without a live sampler. A refused probe records
+    `ok=False` with no resources (distinguishing 'GitHub refused' from a real answer)."""
+    rc, out = _run(["api", "rate_limit"])
+    if _telemetry_home is not None:
+        telemetry.record_rate_limit(_telemetry_home, "runner", _repo,
+                                    telemetry.parse_rate_limit(out) if rc == 0 else {}, rc == 0)
     return rc == 0
 
 

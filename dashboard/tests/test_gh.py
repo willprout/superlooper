@@ -466,3 +466,112 @@ def test_create_issue_returns_none_when_number_unparseable(tmp_path, monkeypatch
     _use_fake(monkeypatch, tmp_path)
     monkeypatch.setenv("GH_NEW_ISSUE_NUM", "")   # fake prints ".../issues/\n" -> no digits
     assert gh.create_issue(REPO, "t", "b") is None
+
+
+# --------------------------- per-client GitHub API-burn telemetry (issue #15) ---------------------------
+# The dashboard adapter records one bounded local telemetry row per gh subprocess (client="dashboard")
+# — the same shape the runner records — plus a FREE rate-limit snapshot via rate_limit_snapshot().
+# Enabled explicitly via gh.set_telemetry_enabled() — OFF by default, so ordinary gh tests record
+# nothing. Rows land in each repo's own state home (the dashboard watches many repos), never the repo.
+
+import config
+import telemetry
+
+
+def _tele(home):
+    return telemetry.read(home, "dashboard")
+
+
+def test_telemetry_off_by_default_writes_nothing(tmp_path, monkeypatch):
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "sl"))
+    _write(tmp_path, "issue_list.json", [])
+    gh.open_issues(REPO)
+    assert list((tmp_path / "sl").glob("**/gh-telemetry-*.jsonl")) == []
+
+
+def test_telemetry_records_one_dashboard_row_per_gh_call(tmp_path, monkeypatch):
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "sl"))
+    monkeypatch.setattr(gh, "_telemetry_enabled", False, raising=False)   # isolate + auto-restore
+    _write(tmp_path, "issue_list_agent-ready.json", [{"number": 4}])
+    gh.set_telemetry_enabled()
+    gh.ready_issues(REPO)
+    home = config.state_home(REPO)
+    rows = [r for r in _tele(home) if r["kind"] == "call"]
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["client"] == "dashboard"
+    assert r["repo"] == REPO                          # the pinned repo rode into the row
+    assert r["op"] == "ready_issues"
+    assert r["family"] == "issue list"
+    assert r["api"] == "graphql"
+    assert r["status"] == "success"
+
+
+def test_telemetry_writes_under_each_repos_own_state_home(tmp_path, monkeypatch):
+    # The dashboard watches many repos; each call's row lands under ITS repo's state home, not a
+    # single dashboard-wide file.
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "sl"))
+    monkeypatch.setattr(gh, "_telemetry_enabled", False, raising=False)
+    other = "will-titan/superlooper"
+    _write(tmp_path, "issue_list.json", [])
+    gh.set_telemetry_enabled()
+    gh.open_issues(REPO)
+    gh.open_issues(other)
+    assert [r["repo"] for r in _tele(config.state_home(REPO))] == [REPO]
+    assert [r["repo"] for r in _tele(config.state_home(other))] == [other]
+
+
+def test_telemetry_distinguishes_rate_limited_from_refused_and_success(tmp_path, monkeypatch):
+    # The #8 distinction the burn record must keep: a rate-limit refusal is a DIFFERENT status than a
+    # generic refusal, and both are visibly NOT the "success" a genuine empty answer carries.
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "sl"))
+    monkeypatch.setattr(gh, "_telemetry_enabled", False, raising=False)
+    _write(tmp_path, "issue_list.json", [])
+    gh.set_telemetry_enabled()
+    # a rate-limit 403 (fake-gh sets the exact stderr)
+    monkeypatch.setenv("GH_FAIL", "1")
+    monkeypatch.setenv("GH_FAIL_STDERR", "HTTP 403: API rate limit exceeded for user")
+    gh.open_issues(REPO)
+    monkeypatch.delenv("GH_FAIL", raising=False)
+    monkeypatch.delenv("GH_FAIL_STDERR", raising=False)
+    gh.open_issues(REPO)                              # a clean, empty answer
+    statuses = [r["status"] for r in _tele(config.state_home(REPO)) if r["kind"] == "call"]
+    assert statuses == ["rate_limited", "success"]
+
+
+def test_rate_limit_snapshot_records_a_free_snapshot(tmp_path, monkeypatch):
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "sl"))
+    monkeypatch.setattr(gh, "_telemetry_enabled", False, raising=False)
+    _write(tmp_path, "api_rate_limit.json", {"resources": {
+        "core": {"limit": 5000, "used": 10, "remaining": 4990, "reset": 1700000000},
+        "graphql": {"limit": 5000, "used": 3000, "remaining": 2000, "reset": 1700000123}}})
+    gh.set_telemetry_enabled()
+    assert gh.rate_limit_snapshot(REPO) is True
+    snaps = [r for r in _tele(config.state_home(REPO)) if r["kind"] == "rate_limit"]
+    assert len(snaps) == 1
+    assert snaps[0]["client"] == "dashboard" and snaps[0]["ok"] is True
+    assert snaps[0]["resources"]["graphql"]["remaining"] == 2000
+    # the snapshot read hit the FREE rate_limit endpoint, not a quota-bearing surface
+    assert _calls(tmp_path)[-1]["argv"][:2] == ["api", "rate_limit"]
+
+
+def test_rate_limit_snapshot_marks_unreachable(tmp_path, monkeypatch):
+    _use_fake(monkeypatch, tmp_path)
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "sl"))
+    monkeypatch.setattr(gh, "_telemetry_enabled", False, raising=False)
+    gh.set_telemetry_enabled()
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.rate_limit_snapshot(REPO) is False
+    snap = [r for r in _tele(config.state_home(REPO)) if r["kind"] == "rate_limit"][0]
+    assert snap["ok"] is False and snap["resources"] == {}
+
+
+def test_config_import_is_available_for_home_resolution(tmp_path, monkeypatch):
+    # gh resolves each row's home via config.state_home — pin that the module is wired.
+    import config as _config
+    assert gh.config is _config

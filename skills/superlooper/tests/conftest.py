@@ -60,6 +60,18 @@ def _clear_worker_launch_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _telemetry_off_by_default():
+    # GitHub API-burn telemetry (issue #15) is a process-global sink the LIVE runner turns ON at its
+    # entrypoint (superlooper `cmd_run` -> gh.set_telemetry(state_home)). A CLI test that goes through
+    # cmd_run would otherwise leak that sink into every later test, which would then write burn rows
+    # under the leaked home. Force it OFF before every test so the default is fail-closed; a telemetry
+    # test re-enables it in-body.
+    import gh
+    gh.set_telemetry(None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _never_reach_real_cmux(monkeypatch):
     # Ratchet rule (2026-07-03 toast-spam incident, CLAUDE.md): no test may resolve cmux to
     # the real /Applications binary and fire a live desktop notification. notify._cmux_binary

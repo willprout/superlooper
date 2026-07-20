@@ -754,3 +754,117 @@ def test_close_pr_without_comment_and_fail_closed(ghenv, monkeypatch):
     assert _mutations(ghenv)[-1]["comment"] is None
     monkeypatch.setenv("GH_FAIL", "1")
     assert gh.close_pr(14) is False
+
+
+# --------------------------- per-client GitHub API-burn telemetry (issue #15) ---------------------------
+# The runner adapter records one bounded local telemetry row per gh subprocess (client="runner"),
+# plus a free rate-limit snapshot on probe(). Enabled explicitly via gh.set_telemetry(home) — OFF by
+# default, so ordinary tests and one-shot CLI commands record nothing. Rows land in the state home,
+# never in the repo. See lib/telemetry.py for the row shapes.
+
+import telemetry
+
+
+def _tele(home, client="runner"):
+    return telemetry.read(home, client)
+
+
+def test_telemetry_off_by_default_writes_nothing(ghenv, tmp_path):
+    # No set_telemetry -> not a single telemetry file, however many gh calls run.
+    gh.ready_issues()
+    gh.open_issues("in-progress")
+    assert list(tmp_path.glob("gh-telemetry-*.jsonl")) == []
+
+
+def test_set_telemetry_records_one_row_per_gh_call(ghenv, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(gh, "_telemetry_home", None, raising=False)   # isolate + auto-restore
+    monkeypatch.setattr(gh, "_repo", "will-titan/superlooper", raising=False)
+    gh.set_telemetry(home)
+    gh.ready_issues()
+    rows = [r for r in _tele(home) if r["kind"] == "call"]
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["client"] == "runner"
+    assert r["repo"] == "will-titan/superlooper"      # the pinned repo rode into the row
+    assert r["op"] == "ready_issues"                  # the gh.py function it ran for
+    assert r["family"] == "issue list"                # the gh subcommand
+    assert r["api"] == "graphql"                      # an issue read is expected GraphQL burn
+    assert r["status"] == "success"
+
+
+def test_telemetry_op_is_the_outermost_public_gh_function(ghenv, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(gh, "_telemetry_home", None, raising=False)
+    gh.set_telemetry(home)
+    gh.pr_for_branch("sl/i123-render-the-widget")
+    gh.labels()
+    ops = [(r["op"], r["family"], r["api"]) for r in _tele(home) if r["kind"] == "call"]
+    assert ("pr_for_branch", "pr list", "graphql") in ops
+    assert ("labels", "label list", "rest") in ops    # labels is expected REST, not GraphQL
+
+
+def test_telemetry_records_refused_vs_rate_limited(ghenv, tmp_path, monkeypatch):
+    # The #8 distinction the burn record must keep: a rate-limit refusal is a DIFFERENT status than a
+    # generic refusal, and both are visibly NOT the "success" a genuine empty answer carries.
+    home = tmp_path / "home"
+    monkeypatch.setattr(gh, "_telemetry_home", None, raising=False)
+    gh.set_telemetry(home)
+    # a gh 403 rate-limit on the issue-list read (fake-gh fail rule sets the exact stderr)
+    (ghenv / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue list", "times": 1, "stderr": "HTTP 403: API rate limit exceeded for user"}]))
+    gh.ready_issues()                                 # refused for rate limit
+    gh.open_issues("in-progress")                     # the next issue-list read succeeds
+    calls = [r for r in _tele(home) if r["kind"] == "call"]
+    by_op = {r["op"]: r["status"] for r in calls}
+    assert by_op["ready_issues"] == "rate_limited"
+    assert by_op["open_issues"] == "success"          # answered (even if empty) — never "refused"
+
+
+def test_telemetry_records_failure_when_binary_is_missing(tmp_path, monkeypatch):
+    # SL_GH points at an absent path (the conftest default) -> rc 127 -> "failure" (no GitHub
+    # round-trip, so burn accounting must not count it as an attempt).
+    home = tmp_path / "home"
+    monkeypatch.setattr(gh, "_telemetry_home", None, raising=False)
+    monkeypatch.setenv("SL_GH", "/nonexistent/superlooper-test-gh")
+    gh.set_telemetry(home)
+    gh.ready_issues()
+    r = [r for r in _tele(home) if r["kind"] == "call"][0]
+    assert r["status"] == "failure"
+
+
+def test_probe_records_a_free_rate_limit_snapshot(ghenv, tmp_path, monkeypatch):
+    # probe() already reads `gh api rate_limit` (exempt from limits) once per poll; the snapshot rides
+    # that same read, adding no burn. The per-resource used/remaining is what estimates hourly burn.
+    home = tmp_path / "home"
+    monkeypatch.setattr(gh, "_telemetry_home", None, raising=False)
+    gh.set_telemetry(home)
+    (ghenv / "rate_limit.json").write_text(json.dumps({"resources": {
+        "core": {"limit": 5000, "used": 40, "remaining": 4960, "reset": 1700000000},
+        "graphql": {"limit": 5000, "used": 4200, "remaining": 800, "reset": 1700000123}}}))
+    assert gh.probe() is True
+    snaps = [r for r in _tele(home) if r["kind"] == "rate_limit"]
+    assert len(snaps) == 1
+    assert snaps[0]["ok"] is True
+    assert snaps[0]["resources"]["graphql"]["remaining"] == 800
+    assert snaps[0]["resources"]["core"]["used"] == 40
+
+
+def test_probe_snapshot_marks_unreachable_read(ghenv, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(gh, "_telemetry_home", None, raising=False)
+    gh.set_telemetry(home)
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.probe() is False
+    snap = [r for r in _tele(home) if r["kind"] == "rate_limit"][0]
+    assert snap["ok"] is False and snap["resources"] == {}
+
+
+def test_set_telemetry_none_disables_recording(ghenv, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(gh, "_telemetry_home", None, raising=False)
+    gh.set_telemetry(home)
+    gh.ready_issues()
+    gh.set_telemetry(None)                            # disable
+    gh.ready_issues()
+    assert len([r for r in _tele(home) if r["kind"] == "call"]) == 1   # only the first was recorded

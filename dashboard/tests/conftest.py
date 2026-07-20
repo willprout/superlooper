@@ -105,3 +105,15 @@ def _never_reach_real_externals(monkeypatch):
     # it never unblocks this.
     monkeypatch.setattr(urllib.request, "urlopen", _blocked_urlopen)
     monkeypatch.setenv(NEUTRALIZATION_SENTINEL, "1")
+
+
+@pytest.fixture(autouse=True)
+def _telemetry_off_by_default():
+    # GitHub API-burn telemetry (issue #15) is a process-global toggle the server turns ON at boot
+    # (bin/command-center). A test that boots the server in-process (test_command_center) would
+    # otherwise leak that ON state into every later test — and with telemetry on, a gh call writes
+    # burn rows into the REAL state home. Force it OFF before every test so the default is fail-closed
+    # exactly like the external-binary neutralization above; a telemetry test re-enables it in-body.
+    import gh
+    gh.set_telemetry_enabled(False)
+    yield

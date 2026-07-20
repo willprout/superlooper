@@ -646,6 +646,17 @@ class CachedGh:
     def pr_comments(self, repo, num):
         return self._cached(("pr_comments", repo, num), lambda: self._gh.pr_comments(repo, num))
 
+    def rate_limit_snapshot(self, repo):
+        # The FREE rate-limit snapshot (issue #15) rides the SAME slow fallback clock as every other
+        # read — one snapshot per fallback window, never per 2s poll. The endpoint is exempt from rate
+        # limiting, so this adds no quota burn even at the fallback cadence; its VALUE (reachability)
+        # is cached, and its SIDE EFFECT (the recorded snapshot row) fires only on a real fetch, i.e.
+        # once per window. Present only when the wrapped adapter exposes it (the real gh does).
+        snap = getattr(self._gh, "rate_limit_snapshot", None)
+        if not callable(snap):
+            return None
+        return self._cached(("rate_limit_snapshot", repo), lambda: snap(repo))
+
     def newest_fetch_at(self):
         """When the most recent real ``gh`` fetch landed, across every memoized query (``None``
         before the first). This is the age of what FALLBACK mode is showing (issue #146): with the
@@ -1357,6 +1368,18 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     # for titles below. gh_reachable: True answered · False unreachable · None unknown (no gh wired).
     open_issue_list, gh_reachable = _probe_open_issues(source, slug)
     gh_unreachable = gh_reachable is False
+
+    # Fallback-only rate-limit snapshot (issue #15): when the dashboard is polling GitHub directly
+    # (the runner is silent, so `source` is the gh adapter, not the runner's view), record a FREE
+    # `gh api rate_limit` snapshot so the dashboard's own burn is estimable too. LIVE mode's
+    # RunnerSource has no such method, so this never fires there — #146's zero-egress-when-live
+    # property is preserved. Best-effort and never-raising: a snapshot must never break assembly.
+    _snap = getattr(source, "rate_limit_snapshot", None)
+    if callable(_snap):
+        try:
+            _snap(slug)
+        except Exception:
+            pass
     open_nums = {iss["number"] for iss in open_issue_list
                  if isinstance(iss, dict) and isinstance(iss.get("number"), int)}
 
