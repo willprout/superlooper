@@ -291,8 +291,9 @@ def _route_janitor(clean, body_bytes, janitor):
     able to sweep GitHub any more than it could drive the label writer). ``janitor=None`` (a
     read-only embedder, or writes disabled) → 405. Dispatches to the tested ``lib.janitor.Janitor``:
     ``propose`` returns the proposals grouped by kind (the dialog shows exactly this), ``execute``
-    runs EXACTLY the ``keys`` the owner tapped. A command failure is the action's own honest ``ok:
-    false`` body at 200 — never an HTTP error, never a silent success."""
+    runs EXACTLY the ``keys`` the owner tapped — optionally with ``retry`` (issue #131), the held-back
+    row's own deliberate second tap. A command failure is the action's own honest ``ok: false`` body
+    at 200 — never an HTTP error, never a silent success."""
     if janitor is None:
         return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
     payload, err = _parse_json_body(body_bytes)
@@ -309,7 +310,20 @@ def _route_janitor(clean, body_bytes, janitor):
     keys = payload.get("keys")
     if not isinstance(keys, list):
         return _json_resp(400, {"ok": False, "error": "missing or bad 'keys'"})
-    return _json_resp(200, janitor.execute(repo, keys))
+    # `retry` (issue #131) is the owner's explicit per-held-row tap: it re-runs an action a PREVIOUS
+    # sweep failed, which the CLI otherwise holds back. Absent = an ordinary sweep (the holdback
+    # contract, unchanged). Strictly boolean: a truthy string must never be read as "yes" — nor
+    # silently as "no", which would hide the owner's intent — so anything else is a bad request.
+    retry = payload.get("retry", False)
+    if not isinstance(retry, bool):
+        return _json_resp(400, {"ok": False, "error": "bad 'retry' — must be a boolean"})
+    # …and it is ONE row's tap: the dialog arms exactly one held key, so a retry of a batch (or of
+    # nothing) is not a request this route understands. Refused here at the boundary; the verb
+    # enforces the same rule again on the keys that survive its own filtering.
+    if retry and len(keys) != 1:
+        return _json_resp(400, {"ok": False,
+                                "error": "a retry runs one held-back action at a time"})
+    return _json_resp(200, janitor.execute(repo, keys, retry=retry))
 
 
 def _unroutable(clean, version):

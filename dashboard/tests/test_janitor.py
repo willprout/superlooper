@@ -87,6 +87,45 @@ def test_group_proposals_omits_empty_kinds_and_drops_wrong_typed_items():
     assert [i["key"] for i in groups[0]["items"]] == ["pr:5"]
 
 
+def test_held_rows_name_what_each_held_action_would_do():
+    # Issue #131: a held-back key is now a RETRY target, so the panel must state the consequence of
+    # tapping it — the same plain-language verb the proposal rows carry. The CLI reports `held` as
+    # bare keys, so the verb is derived from the key's own kind prefix (server-side and pure; the JS
+    # stays logic-free, design B.1). No safety rule is re-derived: the CLI still decides at act time.
+    rows = janitor_mod.held_rows(["branch:sl/i7-x", "pr:41", "issue:9"])
+    assert [r["key"] for r in rows] == ["branch:sl/i7-x", "pr:41", "issue:9"]
+    assert [r["what"] for r in rows] == ["delete branch sl/i7-x", "close PR #41", "close issue #9"]
+
+
+def test_held_rows_fall_back_to_the_raw_key_for_an_unrecognized_kind():
+    # An unknown prefix must still be SHOWN (never silently dropped — a held action the owner
+    # cannot see is a held action he cannot clear); it just names itself rather than inventing a verb.
+    rows = janitor_mod.held_rows(["gremlin:7", "nocolon"])
+    assert [r["what"] for r in rows] == ["gremlin:7", "nocolon"]
+
+
+def test_held_rows_drop_wrong_typed_entries():
+    assert janitor_mod.held_rows([None, 5, "", {"key": "pr:1"}, "pr:2"]) == \
+        [{"key": "pr:2", "what": "close PR #2"}]
+    assert janitor_mod.held_rows("branch:x") == []      # not a list → nothing
+    assert janitor_mod.held_rows(None) == []
+
+
+def test_propose_carries_held_rows_beside_the_raw_held_keys(jan_fix):
+    # `held` (raw keys) stays exactly as it was — the old contract is not broken — and `held_items`
+    # is added beside it. The front-end treats the presence of `held_items` as the server's proof
+    # that it speaks the retry contract at all (an older server returns only `held`).
+    verb, fixtures = jan_fix
+    (fixtures / "propose.json").write_text(json.dumps(
+        {"ok": True, "proposals": [], "held": ["branch:sl/i7-x", "pr:41"], "aged_park_days": 14}))
+    res = verb.propose(SLUG)
+    assert res["ok"] is True
+    assert res["held"] == ["branch:sl/i7-x", "pr:41"]
+    assert res["held_items"] == [
+        {"key": "branch:sl/i7-x", "what": "delete branch sl/i7-x"},
+        {"key": "pr:41", "what": "close PR #41"}]
+
+
 def test_parse_execute_reads_results_and_counts():
     doc = janitor_mod.parse_execute(json.dumps({
         "ok": True, "results": [{"key": "pr:41", "outcome": "ok"}],
@@ -147,6 +186,58 @@ def test_execute_passes_exactly_the_tapped_subset(jan_fix):
     # the fake records the keys it was asked to execute — nothing beyond the taps
     mut = [m for m in _mutations(fixtures) if m["kind"] == "janitor_execute"][-1]
     assert mut["keys"] == ["pr:41", "issue:9"]
+
+
+def test_execute_never_retries_a_held_action_unless_asked(jan_fix):
+    # The holdback contract, unchanged (issue #121): an ordinary sweep must NOT carry
+    # --retry-refused, so a key the CLI is holding back stays held. This is the guard that keeps
+    # #131's retry from leaking into the normal path.
+    verb, fixtures = jan_fix
+    verb.execute(SLUG, ["pr:41"])
+    assert "--retry-refused" not in _calls(fixtures)[-1]["argv"]
+
+
+def test_execute_with_retry_passes_retry_refused(jan_fix):
+    # Issue #131: the owner's explicit per-held-row Retry tap → the CLI's --retry-refused, alongside
+    # the single tapped key. Nothing else changes: same --execute-keys subset, same fresh re-derive.
+    verb, fixtures = jan_fix
+    res = verb.execute(SLUG, ["branch:sl/i7-x"], retry=True)
+    assert res["ok"] is True
+    argv = _calls(fixtures)[-1]["argv"]
+    assert "--retry-refused" in argv
+    assert argv[argv.index("--execute-keys") + 1] == "branch:sl/i7-x"
+
+
+def test_retry_is_refused_for_anything_but_a_single_action(jan_fix):
+    # Cross-review round 1 (medium): strict-boolean is not enough — the retry path is documented as
+    # ONE held row's own deliberate tap, so the verb must enforce that shape too. A caller (or a
+    # forged body) asking to retry a BATCH would widen the narrowest consent path in the dialog into
+    # a bulk re-run of known-failing writes, so it is refused before any subprocess.
+    verb, fixtures = jan_fix
+    res = verb.execute(SLUG, ["branch:sl/i7-x", "pr:41"], retry=True)
+    assert res["ok"] is False and res["executed"] == 0
+    assert "one" in res["error"]                   # names the actual rule, not a generic refusal
+    assert _calls(fixtures) == []                  # nothing ran
+
+
+def test_retry_counts_the_keys_that_survive_filtering(jan_fix):
+    # The rule is measured on the FILTERED subset (the keys that would really be sent): garbage
+    # alongside one real key still leaves exactly one action, so the retry proceeds.
+    verb, fixtures = jan_fix
+    res = verb.execute(SLUG, ["", None, "branch:sl/i7-x"], retry=True)
+    assert res["ok"] is True
+    argv = _calls(fixtures)[-1]["argv"]
+    assert "--retry-refused" in argv
+    assert argv[argv.index("--execute-keys") + 1] == "branch:sl/i7-x"
+
+
+def test_execute_retry_must_be_a_real_boolean_true(jan_fix):
+    # Fail closed: a merely-truthy value (a forged/garbage body that survived the route) must not
+    # arm a retry of a known-failing GitHub write. Only literal True does.
+    verb, fixtures = jan_fix
+    for truthy in ("yes", 1, ["x"]):
+        verb.execute(SLUG, ["pr:41"], retry=truthy)
+        assert "--retry-refused" not in _calls(fixtures)[-1]["argv"], truthy
 
 
 def test_execute_with_no_selection_is_refused_before_any_subprocess(jan_fix):

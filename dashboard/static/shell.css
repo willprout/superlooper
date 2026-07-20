@@ -1417,10 +1417,36 @@ html, body {
 }
 .cc-jan-row.is-selected .cc-jan-check { background: var(--board-gold); border-color: var(--amber-ink); }
 .cc-jan-row:focus-visible { outline: 2px solid var(--amber-ink); outline-offset: 1px; }
-/* Held-back debris — a prior sweep's failure the CLI holds back. Shown once, muted, NOT tappable. */
+/* Held-back debris — a prior sweep's failure the CLI holds back. Shown once, muted, and never part
+   of the sweep selection; its only action is the row's own two-tap Retry (issue #131). */
 .cc-jan-held { border: 2px dashed #D8B36A; border-radius: 6px; background: #FCF6E7; padding: 8px 10px; }
 .cc-jan-held-head { font: 700 10px var(--mono); letter-spacing: 0.6px; text-transform: uppercase; color: var(--amber-ink); }
-.cc-jan-held-row { font: 500 11px var(--mono); color: var(--ink-3); padding: 2px 0; }
+.cc-jan-held-row {
+  font: 500 11px var(--mono); color: var(--ink-3); padding: 3px 0;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-height: 22px;
+}
+.cc-jan-held-what { flex: 1 1 auto; word-break: break-word; }
+.cc-jan-held-act { flex: 0 0 auto; margin-left: auto; display: flex; align-items: center; gap: 6px; }
+/* Armed, the question gets its own line: a confirm crammed beside a long branch name is a confirm
+   the owner skims past, and this is the one control here that re-runs a write that already failed. */
+.cc-jan-held-row.is-armed { border-top: 1px dashed #E0C892; padding-top: 5px; margin-top: 2px; }
+.cc-jan-held-row.is-armed .cc-jan-held-what { flex: 1 1 100%; color: var(--ink); }
+/* Resting: a quiet ghost button — deliberately NOT a sweep checkbox, so it never reads as "armed
+   for the sweep". Armed: the confirm names the write it would re-run, in the amber warning voice. */
+.cc-jan-held-retry, .cc-jan-held-go, .cc-jan-held-cancel {
+  font: 700 9.5px var(--mono); letter-spacing: 0.5px; text-transform: uppercase; padding: 3px 8px;
+  border-radius: 4px;
+}
+.cc-jan-held-retry { border: 1px solid #C9A75B; background: none; color: var(--amber-ink); }
+.cc-jan-held-retry:hover { background: var(--amber-bg); border-color: var(--amber-ink); }
+.cc-jan-held-ask { font: 400 10.5px var(--sans); color: var(--amber-ink); }
+.cc-jan-held-go {
+  background: var(--board-gold); border: 1px solid var(--amber-ink); color: #1B1206;
+  box-shadow: 2px 2px 0 var(--amber-border);
+}
+.cc-jan-held-go:hover { filter: brightness(1.06); }
+.cc-jan-held-cancel { border: 1px solid #C9D2DC; background: none; color: #3A4552; }
+.cc-jan-held-cancel:hover { background: #EEF2F6; }
 .cc-jan-held-note { font: 400 10.5px/1.5 var(--sans); color: var(--muted); margin-top: 3px; }
 .cc-jan-held-note code { font: 500 10px var(--mono); color: var(--ink-3); background: #F1F4F8; padding: 1px 4px; border-radius: 3px; }
 .cc-jan-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }

@@ -126,6 +126,33 @@ def _what(p):
     return str(p.get("action") or "")
 
 
+def _held_what(key):
+    """The plain-language verb a held-back key would run if retried. The CLI reports ``held`` as
+    bare keys (``branch:<name>`` / ``pr:<n>`` / ``issue:<n>`` — the identities it minted), so unlike
+    :func:`_what` there is no proposal dict to read; the verb comes from the key's own kind prefix.
+    This names a CONSEQUENCE, it does not decide one: the CLI still re-derives freshly at act time
+    and can skip the key. An unrecognized shape names itself rather than inventing a verb."""
+    kind, sep, rest = key.partition(":")
+    if sep and rest:
+        if kind == "branch":
+            return "delete branch %s" % rest
+        if kind == "pr":
+            return "close PR #%s" % rest
+        if kind == "issue":
+            return "close issue #%s" % rest
+    return key
+
+
+def held_rows(held):
+    """The held-back keys as rows the front-end binds: ``[{"key", "what"}, ...]``, in the CLI's own
+    order. Issue #131 made each held row a RETRY target, so it must state what tapping it would do —
+    derived here (pure, tested) so the JS stays logic-free (design B.1). Wrong-typed/empty entries
+    are dropped; an unknown kind is still SHOWN under its raw key (a held action the owner cannot
+    see is one he can never clear)."""
+    items = held if isinstance(held, list) else []
+    return [{"key": k, "what": _held_what(k)} for k in items if isinstance(k, str) and k]
+
+
 def group_proposals(proposals):
     """Group the CLI's flat, already-sorted proposal list into per-kind tiles the front-end binds:
     ``[{"kind", "label", "items": [{"key", "what", "why", "target"}, ...]}, ...]`` in
@@ -185,21 +212,32 @@ class Janitor:
             # the CLI speaks for itself when it can (its fail-closed envelope carries an error);
             # otherwise a missing binary / crash gets the rc-derived message.
             return {"ok": False, "verb": "janitor-propose", "repo": repo, "groups": [],
-                    "count": 0, "held": [], "error": doc.get("error") or _error(rc, err, binary),
-                    "raw": out}
+                    "count": 0, "held": [], "held_items": [],
+                    "error": doc.get("error") or _error(rc, err, binary), "raw": out}
         proposals = doc.get("proposals") or []
+        held = doc.get("held") or []
+        # `held` (the raw keys) is the ORIGINAL contract and stays byte-for-byte; `held_items` is
+        # added beside it (issue #131) so the dialog can name what a retry would do — and so the
+        # front-end can tell a retry-capable server from an older one still serving only `held`.
         return {"ok": True, "verb": "janitor-propose", "repo": repo,
                 "groups": group_proposals(proposals), "count": len(proposals),
-                "held": doc.get("held") or [], "raw": out}
+                "held": held, "held_items": held_rows(held), "raw": out}
 
-    def execute(self, repo, keys):
+    def execute(self, repo, keys, retry=False):
         """Execute EXACTLY the proposal keys the owner tapped — runs ``janitor --json
         --execute-keys k1,k2`` (the CLI re-derives fresh and executes only what is still eligible,
         journaling and holding back failures itself). Returns the per-key outcomes. ``ok`` is the
         honest outcome: ``False`` on a nonzero-envelope / missing binary; a partial failure is
         ``ok: True`` with ``failed > 0`` and the failing keys marked, surfaced so nothing is
         mistaken for a clean sweep. An empty/garbage selection is refused before any subprocess —
-        the dashboard never sweeps what the owner did not tap."""
+        the dashboard never sweeps what the owner did not tap.
+
+        ``retry=True`` (issue #131) adds ``--retry-refused``, the ONE thing that lets a key the CLI
+        is holding back from a previous failure run again. It is the owner's separate, explicit
+        per-row tap — never part of an ordinary sweep — so it fails closed on anything but a real
+        boolean ``True``: a merely-truthy value must not re-run a known-failing GitHub write. The
+        holdback itself is unchanged and still the CLI's: without this flag a held key comes back
+        ``outcome: held``, exactly as it did before."""
         path = self._paths.get(repo)
         if path is None:
             return self._refuse("janitor")
@@ -211,9 +249,19 @@ class Janitor:
         if not keys:
             return {"ok": False, "verb": "janitor", "repo": repo, "results": [], "executed": 0,
                     "failed": 0, "skipped": 0, "held": 0, "error": "no proposals selected"}
+        # A retry is ONE held row's own deliberate tap, so it is refused for any other shape —
+        # strict-boolean alone would still let a caller batch a bulk re-run of known-failing writes
+        # through the dialog's narrowest consent path (cross-review round 1). Counted on the FILTERED
+        # subset: the keys that would really be sent.
+        if retry is True and len(keys) != 1:
+            return {"ok": False, "verb": "janitor", "repo": repo, "results": [], "executed": 0,
+                    "failed": 0, "skipped": 0, "held": 0,
+                    "error": "a retry runs one held-back action at a time"}
         binary = _binary(self._binary)
-        rc, out, err = _run(binary, self._args(path, "--execute-keys", ",".join(keys)),
-                            timeout=self._timeout)
+        extra = ["--execute-keys", ",".join(keys)]
+        if retry is True:
+            extra.append("--retry-refused")
+        rc, out, err = _run(binary, self._args(path, *extra), timeout=self._timeout)
         doc = parse_execute(out)
         if not doc.get("ok"):
             return {"ok": False, "verb": "janitor", "repo": repo, "results": [], "executed": 0,
