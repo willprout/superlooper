@@ -978,6 +978,9 @@ def test_stack_md_names_no_block_the_doctor_no_longer_emits():
     emitted = _emitted_block_names()
     documented = _documented_block_names()
 
+    # Same guard as its sibling, so this test can't go green on an EMPTY parse (a renamed heading or
+    # a reformatted bullet): with no names parsed there is trivially no phantom.
+    assert documented, "STACK.md's %r section must bullet the block names" % _CHECK_NAMES_HEADING
     phantom = [n for n in documented if n not in emitted]
     assert not phantom, (
         "STACK.md documents block names doctor --stack no longer emits (renamed or removed): %s"

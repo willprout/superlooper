@@ -46,6 +46,10 @@ A loop user needs enough local stack for a worker session to launch, work, repor
   operation, so a configured-cmux-only setup still FAILs.
 - `launch shim sourced` - `~/.superlooper/launch-shim.zsh` must be installed and sourced from
   `.zshrc`, so new cmux tabs self-run the dropped worker command without keystrokes.
+- `cmux App Nap disabled` - cmux must carry the persistent `NSAppSleepDisabled` default, or macOS
+  App Nap suspends an idle, occluded cmux and worker launches stop being delivered about 40 minutes
+  after the operator walks away — the one mechanism that does this even on a machine whose display
+  and system sleep are both off.
 - `superlooper plugin` - the `superlooper@superlooper` plugin should be installed and enabled, so
   planning and worker sessions on this machine load the superlooper ops, write-issue and debugger
   skills. This is a **WARN**, never a FAIL: the runner does not depend on the skills being
@@ -134,8 +138,9 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   republish through `bin/install.sh` when you want those changes live. Nothing to compare (no stamp,
   a `nogit` stamp, or no source checkout on this machine — the normal case on a machine that only
   *runs* the loop) is also a plain ok. A WARN also covers the anomalies: a stamped commit that is
-  not in this checkout's history (rebased or unrelated — republish to re-stamp), or git failing to
-  compute the distance. Point it at a checkout elsewhere with `SL_SOURCE_REPO`.
+  not in this checkout's history (rebased or unrelated — republish to re-stamp), none of the three
+  refs resolving at all, or git failing to compute the distance. Point it at a checkout elsewhere
+  with `SL_SOURCE_REPO`.
 - `superlooper plugin`: install it with `claude plugin marketplace add willprout/superlooper` then
   `claude plugin install superlooper@superlooper --scope user`; if it is installed but disabled, run
   `claude plugin enable superlooper@superlooper`. Always a WARN — the loop runs correctly without
