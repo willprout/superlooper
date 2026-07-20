@@ -252,3 +252,40 @@ def test_routine_rows_are_never_marked_fresh():
     tower.apply_divider(rows, last_seen=100)
     assert rows[0]["fresh"] is False
     assert rows[1]["fresh"] is True
+
+
+# =============================== the owner-tap fixer (issue #144) ===============================
+
+def test_a_deployed_fixer_reads_as_a_fixer_not_as_a_flight():
+    # The engine journals every owner-tap debugger launch (`superlooper debug`) so it "appears in
+    # the tower log like every other act" — issue #144's own DoD. Its id is d<N>, NOT an issue
+    # number, so the generic fallback rendered it as the nonsense "the flight debug_launch." A
+    # repo-wide act must read as a repo-wide sentence.
+    row = tower.comms_row({"act": "debug_launch", "outcome": "launched", "id": "d9",
+                           "operator": "William", "source": "command-center",
+                           "note": "the departures board is lying about SL-12"})
+    assert "the flight" not in row["text"], "a fixer is not a flight — it has no issue number"
+    assert "debug_launch" not in row["text"], "the raw act name must never reach the radio"
+    assert "d9" in row["text"]
+    assert "William" in row["text"]
+    assert row["num"] is None
+    assert row["tier"] == "comms", "a session launched on the owner's machine is real traffic"
+
+
+def test_a_fixer_that_failed_to_launch_is_never_read_as_deployed():
+    # The honesty law (§7): no flourish for a dishonest state. A launch the shim did not verify
+    # must not read as a session that exists.
+    row = tower.comms_row({"act": "debug_launch", "outcome": "launch_failed", "id": "d9",
+                           "operator": "William",
+                           "error": "the launch timed out — no session was confirmed"})
+    low = row["text"].lower()
+    assert "fail" in low or "did not" in low or "no session" in low
+    assert "deployed" not in low
+
+
+def test_a_fixer_launch_names_the_operator_it_was_signed_with_not_the_configured_one():
+    # The journal record carries WHO tapped. A row that fell back to the dashboard's own configured
+    # operator would misattribute a launch made from a terminal by someone else.
+    row = tower.comms_row({"act": "debug_launch", "outcome": "launched", "id": "d3",
+                           "operator": "Pat"}, operator="William")
+    assert "Pat" in row["text"] and "William" not in row["text"]

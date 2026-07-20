@@ -167,9 +167,10 @@ _RESTART_PATHS = {"/api/restart/check": "preflight", "/api/restart": "execute"}
 # safety contract stays the single source of truth (the dashboard re-derives none of it).
 _JANITOR_PATHS = {"/api/janitor/propose": "propose", "/api/janitor": "execute"}
 # ``/api/fixer/check`` is the note box's preflight (is a fixer already live? what trouble will ride
-# into the prompt?); ``/api/fixer`` composes the prompt and launches ONE interactive sl-debugger
-# session through the engine's shim (issue #141). Both are POST-only and same-origin gated: this is
-# the most consequential endpoint in the product — it starts an agent on the owner's machine.
+# into the prompt?); ``/api/fixer`` hands the note plus that trouble to ``superlooper debug``, the
+# engine's owner-tap launch verb, which opens ONE interactive sl-debugger session (issues #141,
+# #144). Both are POST-only and same-origin gated: this is the most consequential endpoint in the
+# product — it starts an agent on the owner's machine.
 _FIXER_PATHS = {"/api/fixer/check": "preflight", "/api/fixer": "execute"}
 
 
@@ -368,10 +369,11 @@ def _route_fixer(clean, body_bytes, fixer, snapshot_provider):
     that raises fails closed to a refusal (no context ⇒ no launch), never a 500 and never a launch
     with a blank picture.
 
-    Dispatches to the tested pure ``lib.fixer.Fixer``: ``preflight`` reports whether a fixer is
-    already live (writes nothing), ``execute`` composes the brief and launches on the owner's tap. A
-    live-fixer refusal or a failed launch is the verb's own honest ``ok: false`` body at 200 — the
-    request itself was fine — never an HTTP error, never a silent success."""
+    Dispatches to the tested pure ``lib.fixer.Fixer``: ``preflight`` asks the engine whether a
+    debugger is already live (writes nothing), ``execute`` hands the note and the composed board
+    readout to ``superlooper debug`` on the owner's tap. A live-fixer refusal or a failed launch is
+    the engine's own honest ``ok: false`` body, relayed at 200 — the request itself was fine — never
+    an HTTP error, never a silent success."""
     if fixer is None:
         return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
     payload, err = _parse_json_body(body_bytes)
@@ -503,7 +505,8 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
     turns a bare ``no such action`` into an honest "this server is older than that button" when the
     checkout has moved on under a running process (issue #136); ``None`` keeps the plain old 404.
     ``fixer`` (a ``lib.fixer.Fixer``) backs the Deploy Fixer endpoints (issue #141), which compose a
-    prompt from the CURRENT snapshot and launch one interactive sl-debugger session."""
+    readout from the CURRENT snapshot and shell ``superlooper debug`` to launch one interactive
+    sl-debugger session (issue #144)."""
     clean = path.split("?", 1)[0]
     if method == "POST":
         return _route_post(clean, body, origin, host, actions, snapshot_provider, desk, tidy,

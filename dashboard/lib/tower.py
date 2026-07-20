@@ -171,6 +171,20 @@ def comms_row(rec, operator="the owner"):
     elif act == "update":
         row = {"radio": "", "kind": "update",
                "text": "%s update — %s." % (who, _first_line(rec.get("outcome")) or "in progress")}
+    elif act == "debug_launch":
+        # An owner-tap debugger launch (`superlooper debug`, issue #144). Repo-wide, not a flight:
+        # its id is d<N>, so the generic fallback rendered the nonsense "the flight debug_launch."
+        # The operator comes from the RECORD (who actually tapped), never the dashboard's configured
+        # name — a launch made from a terminal by someone else must not be signed with the owner's.
+        sid = rec.get("id") or "a fixer"
+        by = rec.get("operator") or operator
+        if rec.get("outcome") == "launched":
+            row = {"radio": "Engineering to the field.", "kind": "launch",
+                   "text": "Fixer %s deployed by %s — a debug session is on the field." % (sid, by)}
+        else:                              # no flourish for a dishonest state (§7): it did NOT start
+            why = _first_line(rec.get("error")) or "no session was confirmed"
+            row = {"radio": "", "kind": "alert",
+                   "text": "Fixer %s did not launch — %s." % (sid, why)}
     elif act == "alert":
         row = {"radio": "Mayday, mayday.", "kind": "alert", "text": "ALERT raised — a factory-stop."}
     elif act == "freeze":

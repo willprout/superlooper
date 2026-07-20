@@ -185,21 +185,16 @@ def main(argv):
     # Owner ruling 2026-07-13: full CLI parity without leaving the dashboard.
     janitor = janitor_mod.Janitor(cfg["superlooper_cli"],
                                   {r["slug"]: r["path"] for r in cfg["repos"]})
-    # The Deploy Fixer button (issue #141) — a local SESSION LAUNCH: it composes a prompt from what
-    # the board is currently showing as unhealthy plus whatever William types, and hands it to the
-    # engine's own launch shim (launch-session.sh, a sibling of the configured CLI), which opens ONE
+    # The Deploy Fixer button (issue #141) — a local SESSION LAUNCH: it composes a readout of what
+    # the board is currently showing as unhealthy, adds whatever William types, and hands both to
+    # `superlooper debug`, the ENGINE's owner-tap launch verb (issue #144), which opens ONE
     # interactive sl-debugger session. No model call and no standing seat live here (owner ruling
     # 2026-07-15): the AI runs in the launched session, outside this process, because he tapped.
-    # Bound to the same watched-repo allow-list as every other verb — plus each repo's state home,
-    # which is the patient the launched session is pointed at.
-    # The seat is FORCED to claude / opus[1m] (lib/fixer's defaults, which are the engine's own for a
-    # debugger seat) — a deliberate choice, not an omission: `agent` and `models.answerer` are the
-    # ENGINE's config knobs and this dashboard's schema has neither, so rather than half-read a
-    # config it doesn't own, the button pins the same seat the watchdog's launch uses. sl-debugger is
-    # a Claude skill, so a codex-agent repo still gets a claude fixer. Pinned by test_fixer.
+    # Bound to the same watched-repo allow-list — and, since #144, to the same slug→checkout map as
+    # every other local-command verb: the state home, the seat and the launch handshake are the
+    # engine's own business now, resolved from the repo's config where they are actually defined.
     fixer = fixer_mod.Fixer(cfg["superlooper_cli"],
-                            {r["slug"]: {"path": r["path"], "state_home": str(r["state_home"])}
-                             for r in cfg["repos"]},
+                            {r["slug"]: r["path"] for r in cfg["repos"]},
                             operator=config_mod.operator(cfg))
     replay_provider, digest_provider = build_data_providers(cfg)
     # The bind (in build_server) is the first thing that can fail on an otherwise-valid config: the
