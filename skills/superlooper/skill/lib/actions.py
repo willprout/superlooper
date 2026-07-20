@@ -966,6 +966,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # relaunches (below) and, when there is real spend demand, raises the auth_dead ALERT.
     auth_probe = dsk.get("auth_probe")
     auth_invalid = isinstance(auth_probe, dict) and auth_probe.get("valid") is False
+    # Display-sleep launch hold (issue #124). macOS will not boot a fresh cmux tab's shell while the
+    # DISPLAY sleeps, so a launch attempted then is created and closed as an orphan (exit 2) — a burned
+    # attempt that feeds #24's systemic streak and churns an alert every sleeping episode. The runner
+    # hands us a per-tick display-power read (only when there is launch demand); we HOLD every fresh
+    # launch — and the #115 canary — QUIETLY while it reads CONFIRMED asleep, and resume automatically
+    # on wake (the next tick reads awake). FAIL OPEN on anything but an explicit True (unreadable /
+    # absent / awake all launch normally, EXACTLY today's behavior): a false hold would wedge the whole
+    # queue, whereas a missed hold merely costs one already-self-recovering canary cycle. Unlike the
+    # anchor / auth detectors this raises NO alert and enters NO streak — a sleeping display is normal,
+    # expected behavior (the owner's Mac overnight), not a fault to page on.
+    display_asleep = dsk.get("display_asleep") is True
     # A recovery relaunch is spend demand too — a dead-auth reading with no fresh queue but an
     # in-flight lane (an ORPHAN RESUME after a restart, a crash relaunch, a conflict resolve) must
     # still surface and never hold SILENTLY (fresh-review P1 sub-note; i336 was a recovery scenario).
@@ -977,10 +988,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             and "in-progress" in p["labels"]
             for p in parsed_by_id.values())
         or any(_iid_num(k) is not None for k in exited))
-    # launches_held folds auth into the same fresh-launch suppression the anchor/systemic detectors
-    # use, so the queue is held intact (never parked) while auth is dead, exactly as under a dead
-    # anchor. The recovery-relaunch and orphan-resume holds are applied per-issue below.
-    launches_held = launch_degraded or auth_invalid
+    # launches_held folds auth AND a sleeping display (#124) into the same fresh-launch suppression the
+    # anchor/systemic detectors use, so the queue is held intact (never parked) while either stands,
+    # exactly as under a dead anchor. The recovery-relaunch and orphan-resume holds are applied
+    # per-issue below. NB: display_asleep is deliberately NOT part of launch_degraded — it must NOT
+    # feed the alert/streak surface the way anchor_down/systemic_launch do (a sleeping display is not a
+    # fault) — only this fresh-launch/cap-park suppression.
+    launches_held = launch_degraded or auth_invalid or display_asleep
     # prev_systemic: was a systemic-launch hold ALREADY established? The launch_systemic_failure
     # ALERT is DURABLE (survives a runner restart), so its presence on disk is the episode marker —
     # the same durable-marker discipline usage's prev_dark uses. Its falling edge (prev_systemic and
@@ -1528,6 +1542,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 if auth_invalid:
                     launch_hold(iid, num, p,
                                 reason="account auth is not valid — conflict resolve held (see the auth_dead alert)")
+                elif display_asleep:
+                    # Display is asleep (issue #124): the conflict resolver is a session START — a fresh
+                    # tab macOS will not boot while the display sleeps. HOLD like the auth sibling (keeps
+                    # its preserve-labeled PR); it hires the tick the display wakes.
+                    launch_hold(iid, num, p,
+                                reason="the display is asleep — conflict resolve held; macOS will not "
+                                       "boot the new tab's shell until wake, when it resumes automatically")
                 elif start_ok(p):
                     out.append({"act": "resolve_conflict", "id": iid, "num": num,
                                 "pr": pv.get("number"), "wander": wander})
@@ -1697,6 +1718,15 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # its own; the relaunch charges no attempt because it never fires.
                 launch_hold(iid, num, p,
                             reason="account auth is not valid — relaunch held (see the auth_dead alert)")
+            elif display_asleep:
+                # Display is asleep (issue #124): the recovery relaunch boots a FRESH tab, whose shell
+                # macOS will not schedule while the display sleeps — the exact orphan-and-burn #124
+                # prevents. HOLD like the auth sibling (no attempt, no streak entry, no alert, no park
+                # even at cap); it resumes the tick the display wakes. Quiet — a sleeping display is
+                # normal overnight behavior, not a fault.
+                launch_hold(iid, num, p,
+                            reason="the display is asleep — relaunch held; macOS will not boot the "
+                                   "new tab's shell until wake, when it resumes automatically")
             elif type(retries) is not int:             # corrupt counter -> to William, not a loop
                 park(iid, num, "exited, and the retry counter is unreadable — parking" + stderr_memo,
                      cause="exited_cap")
@@ -1883,10 +1913,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         launch_fails, corrupt = _counter(ist, "launch_failures")
         if "agent-ready" in labels and (corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
             if launches_held:
-                continue                               # SYSTEMIC launch fault (#24) or dead auth
-                                                       # (#159): hold, never park per-issue — the
-                                                       # queue stays intact for when it resolves
-                                                       # (the alert stands)
+                continue                               # SYSTEMIC launch fault (#24) / dead auth (#159)
+                                                       # / a sleeping display (#124): hold, never park
+                                                       # per-issue — the queue stays intact for when it
+                                                       # resolves (the anchor/auth alert stands; a
+                                                       # sleeping display carries none — the park just
+                                                       # defers to wake)
             # The evidence the runner captured at the MOMENT the launch failed (issue #152) — the
             # launcher's own stderr, stamped into loopstate by _exec_launch. This is what lets the
             # memo below name the component actually at fault instead of guessing one.
@@ -1935,6 +1967,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # it and the resume fires the tick auth reads healthy again.
                 launch_hold(iid, num, p,
                             reason="account auth is not valid — resume held (see the auth_dead alert)")
+            elif resumable and display_asleep:
+                # Display is asleep (issue #124): the orphan resume boots a FRESH tab (orphan: True),
+                # whose shell macOS will not schedule while the display sleeps. HOLD in place like the
+                # auth sibling (never reclaim — reclaim would orphan the pushed work); it resumes the
+                # tick the display wakes.
+                launch_hold(iid, num, p,
+                            reason="the display is asleep — resume held; macOS will not boot the new "
+                                   "tab's shell until wake, when it resumes automatically")
             elif resumable and not start_ok(p):
                 # (#150 / D8) The restart rebuild resumes an in-progress issue's session on its open
                 # PR's branch — and asked NO gate at all: not eligibility, not even usage. HOLD in
@@ -2037,8 +2077,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             if gate.foreseeable_referee_stop(c.get("touches"), cfg) \
                     and not gate.preauthorized_referee(c.get("labels")):
                 launch_hold(cid, c.get("num"), c)
-    elif (systemic_launch and not anchor_down and not auth_invalid
+    elif (systemic_launch and not anchor_down and not auth_invalid and not display_asleep
             and not gh_stale and not issue_state_corrupt_for_launches):
+        # ...and NOT while the display sleeps (#124): a canary into a sleeping display would just
+        # create+close an orphan, the very burned attempt this hold exists to prevent. The systemic
+        # streak stays intact (the alert still stands), and the canary fires the tick the display wakes.
         # Canary re-arm of the SYSTEMIC hold (issue #115). The streak-based hold cannot clear itself,
         # so once per CANARY_RETRY_SECONDS since the last delivery failure, probe with ONE canary
         # launch of the front-of-queue issue. Suppressed while auth reads DEAD (#159): a canary into

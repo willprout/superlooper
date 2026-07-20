@@ -451,6 +451,49 @@ def preflight_pane(pane, cmux=None, run=None):
     return True, ""
 
 
+def display_asleep(run=None):
+    """Is the machine's DISPLAY confirmed asleep? True = confirmed asleep, False = confirmed awake,
+    None = unreadable (issue #124). Read-only, bounded, injectable for tests. Fail-open lives in the
+    CALLER: decide holds launches only on an explicit True, so None/False both launch normally.
+
+    WHY this exists: macOS does NOT schedule a fresh cmux tab's shell to boot while the display
+    sleeps (the live 2026-07-13 launch killer). launch-session.sh drops the worker command in a file
+    the tab's ~/.zshrc shim runs (keystroke-free, RC6), but that shim never runs because the shell
+    itself is not scheduled — so the 30s delivery sentinel expires and the tab is closed as an orphan
+    (exit 2): a burned launch attempt, a systemic-streak entry (#24), and an alert, every sleeping
+    episode. #115's canary makes THAT self-recover, but the cleaner fix is to not ATTEMPT delivery
+    into a sleeping display at all. The runner calls this once per tick (only when there is launch
+    demand) and holds every fresh launch while it reads asleep, resuming automatically on wake.
+
+    WHERE it lives: display power is an OS fact, not an agent one, so this belongs on the launcher
+    side next to the cmux ANCHOR probe (preflight_pane), NOT in any agent-specific file — the agent
+    boundary (CLAUDE.md) stays intact and the loop stays swappable to another coding agent.
+
+    SIGNAL: `pmset -g systemstate` prints the IOPMSystemCapabilities bitfield as
+        Current System Capabilities are: CPU Graphics Audio Network
+    The `Graphics` capability is set while the display framebuffer is powered and CLEARS on display
+    sleep — portable across Intel/Apple-Silicon and internal/external displays (IODisplayWrangler is
+    absent on Apple Silicon, so the classic `ioreg`/`pmset -g powerstate IODisplayWrangler` probe
+    returns 'Internal failure' there and cannot be used). We conclude ASLEEP only on a POSITIVE,
+    unambiguous read: the capabilities line resolved AND lacks Graphics. EVERYTHING else — pmset
+    missing (non-macOS), timeout, non-zero exit, no capabilities line, empty output — returns None
+    (unknown). Fail-open is the safety property that matters: a false ASLEEP would wedge the WHOLE
+    queue, whereas a false AWAKE merely costs one already-self-recovering #115 canary cycle."""
+    run = run or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=5))
+    try:
+        r = run(["pmset", "-g", "systemstate"])
+    except (OSError, subprocess.TimeoutExpired):
+        return None                                    # pmset absent (non-macOS) / hung -> unknown
+    if getattr(r, "returncode", 1) != 0:
+        return None                                    # pmset errored -> do not trust its output
+    out = (getattr(r, "stdout", "") or "") + (getattr(r, "stderr", "") or "")
+    for line in out.splitlines():
+        low = line.lower()
+        if "system capabilities" in low:              # the positive read: caps line resolved
+            return "graphics" not in low               # Graphics present -> awake; absent -> asleep
+    return None                                        # no capabilities line -> unknown -> fail open
+
+
 def _caller_field(caller, key):
     """One field of cmux `identify`'s caller object, fail-CLOSED to "" — a null/int/blank field
     reads as absent, never leaking a non-string anchor into a boot line or a `new-surface` target
@@ -1583,6 +1626,13 @@ class Runner:
         ok, why = preflight_pane(self.pane)
         return {"ok": ok, "reason": why}
 
+    def _display_asleep(self):
+        """Display-sleep tri-state for decide (issue #124): True = confirmed asleep, False = confirmed
+        awake, None = unreadable. A thin wrapper over the module-level probe so tests can override the
+        method (and conftest can neutralize the real `pmset` shell-out), exactly like _anchor_status /
+        _probe_auth. Called per tick only when there is launch demand; fail-open lives in decide."""
+        return display_asleep()
+
     # ------------------------- events -------------------------
 
     def _events_dir(self):
@@ -1783,6 +1833,13 @@ class Runner:
             auth_snap = self.auth_view()
             if isinstance(auth_snap, dict):
                 disk["auth_probe"] = auth_snap
+            # Display-sleep launch hold (issue #124): macOS will not boot a fresh tab's shell while the
+            # display sleeps, so decide holds every fresh launch AND every recovery relaunch (exited /
+            # orphan-resume / conflict-resolve — all boot a fresh tab) while this reads asleep, resuming
+            # on wake. Gated on _wants_session_start (launch OR relaunch), the SAME breadth as the auth
+            # probe — a recovery-only tick must still see the signal. Tri-state; fail-open (only an
+            # explicit True holds) lives in decide.
+            disk["display_asleep"] = self._display_asleep()
 
         lane_state = actions.lane_state_from(st)
         acts = actions.decide(now, self.config, self.usage_view(),
