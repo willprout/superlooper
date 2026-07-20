@@ -1,5 +1,7 @@
 import json
 import os
+import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import config as config_lib
@@ -926,3 +928,60 @@ def test_superlooper_plugin_missing_never_fails_the_whole_stack():
 
     assert plugin.warn is True and plugin.ok is True
     assert [r.name for r in results if not r.ok] == []          # overall stack still PASSES
+
+
+# --- STACK.md coverage of the emitted block names (issue #142) ----------------------------------
+# STACK.md's "Check Names And Fixes" section opens with a completeness claim — "`doctor --stack`
+# emits these exact block names" — and it had silently fallen three blocks behind the doctor
+# (`cmux App Nap disabled` #120, `runner anchor (live)` #33, `installed engine current` #39), each
+# added by a separate issue that never revisited the list. An operator who hits one of those lines
+# and reaches for the doc finds nothing, at exactly the moment the doc should earn its keep. This
+# test makes the list mechanically un-driftable in BOTH directions: a new block must be documented,
+# and a documented name must still be emitted.
+_STACK_MD = Path(__file__).resolve().parent.parent / "docs" / "STACK.md"
+_CHECK_NAMES_HEADING = "## Check Names And Fixes"
+
+
+def _documented_block_names():
+    """The block names bulleted under STACK.md's 'Check Names And Fixes' heading, in doc order.
+
+    Each entry opens a top-level bullet as ``- `name`: …``; continuation lines are indented, so
+    anchoring on that un-indented backticked-name prefix ignores wrapped prose and nested bullets."""
+    text = _STACK_MD.read_text(encoding="utf-8")
+    section = text.split(_CHECK_NAMES_HEADING, 1)[1]
+    section = re.split(r"^## ", section, flags=re.M)[0]
+    return re.findall(r"^- `([^`]+)`:", section, flags=re.M)
+
+
+def _emitted_block_names():
+    """Every CheckResult.name `check_stack` actually emits, in emit order — read from the real call
+    rather than a hand-kept literal, so the doc is pinned to the doctor's behavior."""
+    config = {"notify": {"cmd": "true", "imessage_to": None}}
+    results = stack_doctor.check_stack(
+        config, probe=_healthy_probe(), sender=_ok_sender(), announce=lambda *a: None,
+    )
+    return [r.name for r in results]
+
+
+def test_stack_md_documents_every_block_name_the_doctor_emits():
+    emitted = _emitted_block_names()
+    documented = _documented_block_names()
+
+    assert documented, "STACK.md's %r section must bullet the block names" % _CHECK_NAMES_HEADING
+    missing = [n for n in emitted if n not in documented]
+    assert not missing, (
+        "doctor --stack emits block names STACK.md's 'Check Names And Fixes' list omits, so its "
+        "completeness claim is false: %s" % missing)
+
+
+def test_stack_md_names_no_block_the_doctor_no_longer_emits():
+    emitted = _emitted_block_names()
+    documented = _documented_block_names()
+
+    # Same guard as its sibling, so this test can't go green on an EMPTY parse (a renamed heading or
+    # a reformatted bullet): with no names parsed there is trivially no phantom.
+    assert documented, "STACK.md's %r section must bullet the block names" % _CHECK_NAMES_HEADING
+    phantom = [n for n in documented if n not in emitted]
+    assert not phantom, (
+        "STACK.md documents block names doctor --stack no longer emits (renamed or removed): %s"
+        % phantom)

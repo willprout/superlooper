@@ -17,8 +17,10 @@ create tabs, or spend model calls. It prints one status line per machine block a
 only when a block **FAILs**. A block may also be a **WARN** — an advisory that does not fail the
 stack. A WARN is used for something that is only conditionally needed on this machine (a missing
 Codex CLI on a Claude-only machine; see `codex CLI` below), for something that costs session
-*quality* rather than correctness (a missing `superlooper plugin`), and for a state the doctor
-could not actually read (it never fails the stack on a fact it could not determine). A WARN carries
+*quality* rather than correctness (a missing `superlooper plugin`), for a state the doctor
+could not actually read (it never fails the stack on a fact it could not determine), and for a
+by-design state worth seeing but never worth failing on (an `installed engine current` that is
+behind, since publishing is deliberately manual). A WARN carries
 its whole story on its own line — only a FAIL prints a separate `Fix:` line.
 
 ## Tier 1: Loop User
@@ -44,6 +46,10 @@ A loop user needs enough local stack for a worker session to launch, work, repor
   operation, so a configured-cmux-only setup still FAILs.
 - `launch shim sourced` - `~/.superlooper/launch-shim.zsh` must be installed and sourced from
   `.zshrc`, so new cmux tabs self-run the dropped worker command without keystrokes.
+- `cmux App Nap disabled` - cmux must carry the persistent `NSAppSleepDisabled` default, or macOS
+  App Nap suspends an idle, occluded cmux and worker launches stop being delivered about 40 minutes
+  after the operator walks away — the one mechanism that does this even on a machine whose display
+  and system sleep are both off.
 - `superlooper plugin` - the `superlooper@superlooper` plugin should be installed and enabled, so
   planning and worker sessions on this machine load the superlooper ops, write-issue and debugger
   skills. This is a **WARN**, never a FAIL: the runner does not depend on the skills being
@@ -103,6 +109,38 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   is signed in, the recipient is valid, and the one-time macOS permission click is granted.
 - `launch shim sourced`: run `skills/superlooper/skill/bin/install-launch-shim.sh`, then open a new
   cmux tab or source `.zshrc`.
+- `cmux App Nap disabled`: run `defaults write com.cmuxterm.app NSAppSleepDisabled -bool true` (or
+  re-run `install-launch-shim.sh`, which sets it), then FULLY QUIT and relaunch cmux — AppKit reads
+  the flag only at app launch, so a cmux that is already running stays App-Nap-eligible until you
+  restart it. FAILs when the default is absent or explicitly false: that is a machine where an idle,
+  occluded cmux gets napped and defers spawning worker-tab shells past the 30s launch verify window
+  — the systemic "LAUNCH NOT DELIVERED" failure that starts ~40 minutes after you walk away
+  (issue #120). A state the doctor could not pin down is a WARN, never a FAIL: no `defaults` binary,
+  a read that errored, or a read that came back with a value that is neither true nor false (verify
+  that one by hand). Override the checked bundle id with `SL_CMUX_BUNDLE_ID`.
+- `runner anchor (live)`: mostly a state line, not a chore — it fires only when a runner for this
+  repo is actually live, and re-runs the read-only pane probe the startup preflight uses against the
+  anchor that runner recorded (issue #33). No live runner, a stale pidfile, or an unreadable config
+  print as a clean skip; a live runner that recorded no matching anchor is a WARN (an older runner,
+  or one started before anchors shipped) — restart it from a visible cmux tab to record one. It
+  FAILs, with a `Fix:` line, only when a live runner's recorded pane no longer resolves in the
+  workspace it launched in — its cmux tab was closed or dragged to another window, so every worker
+  launch would be born in a dead pane and the queue parks. The fix there is to stop the runner, open
+  a tab in the INTENDED cmux window, and re-run `superlooper run` (see
+  `plugin/skills/superlooper/references/runner-ops.md` → Restarting the runner).
+- `installed engine current`: a visibility line that never fails the stack — being behind is by
+  design, since a merged engine change is inert until someone republishes through the gated
+  `bin/install.sh` (issue #39). It compares the installed copy's VERSION stamp
+  (`~/.claude/skills/superlooper/VERSION`) against the engine payload in a superlooper source
+  checkout, at the first ref that resolves there: `origin/<dev_branch>`, else the local
+  `<dev_branch>`, else `HEAD` — the line names which one it measured, so a checkout with a stale
+  `origin` says so. In sync prints a plain ok; N commits behind is a WARN saying so —
+  republish through `bin/install.sh` when you want those changes live. Nothing to compare (no stamp,
+  a `nogit` stamp, or no source checkout on this machine — the normal case on a machine that only
+  *runs* the loop) is also a plain ok. A WARN also covers the anomalies: a stamped commit that is
+  not in this checkout's history (rebased or unrelated — republish to re-stamp), none of the three
+  refs resolving at all, or git failing to compute the distance. Point it at a checkout elsewhere
+  with `SL_SOURCE_REPO`.
 - `superlooper plugin`: install it with `claude plugin marketplace add willprout/superlooper` then
   `claude plugin install superlooper@superlooper --scope user`; if it is installed but disabled, run
   `claude plugin enable superlooper@superlooper`. Always a WARN — the loop runs correctly without
