@@ -389,3 +389,72 @@ def test_the_human_line_is_readable_without_json(rig):
     r = run(rig, "debug", "--repo", str(rig.repo), "--note", "x")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "d1" in r.stdout
+
+
+# --------------------------- fresh-agent review round 1 ---------------------------
+
+def test_a_note_that_looks_like_a_placeholder_is_never_expanded(rig):
+    # The ONE promise this brief makes about the note is that it is VERBATIM. A sequential
+    # str.replace renderer breaks that: it substitutes {note} first, then goes looking for
+    # {context} — and finds the one the note itself contained, rewriting the owner's words into
+    # the board readout. One pass over the ORIGINAL template can never do that.
+    rig.anchor()
+    rig.wstate(next_debugger=1)
+    note = "the {context} and {repo_path} placeholders render wrong somewhere"
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", note,
+            "--context-file", "-", inp="BOARD-READOUT-SENTINEL")
+    assert r.returncode == 0, r.stdout + r.stderr
+    text = rig.brief("d1")
+    assert note in text, "the note must survive rendering byte-for-byte"
+    assert text.count("BOARD-READOUT-SENTINEL") == 1, "the context must land ONCE, in its own slot"
+
+
+def test_a_context_that_looks_like_a_placeholder_is_never_expanded(rig):
+    rig.anchor()
+    rig.wstate(next_debugger=1)
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "NOTE-SENTINEL",
+            "--context-file", "-", inp="the board mentions {note} and {operator}")
+    assert r.returncode == 0, r.stdout + r.stderr
+    text = rig.brief("d1")
+    assert "the board mentions {note} and {operator}" in text
+    assert text.count("NOTE-SENTINEL") == 1
+
+
+def test_a_journal_failure_never_turns_a_real_launch_into_a_reported_failure(rig):
+    # The session EXISTS — the shim verified delivery. A bookkeeping write that fails afterwards
+    # must not make the caller believe nothing launched: that belief is exactly what invites a
+    # second tap, and a second debugger on one patient is the thing this whole verb prevents.
+    rig.anchor()
+    rig.wstate(next_debugger=4)
+    (rig.home / "journal.jsonl").mkdir(parents=True)      # an unwritable journal path
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x")
+    assert r.returncode == 0, r.stdout + r.stderr
+    b = body(r)
+    assert b["ok"] is True and b["id"] == "d4"
+    assert "Traceback" not in r.stderr
+    assert len(rig.launch_calls()) == 1
+
+
+def test_an_unwritable_brief_dir_is_a_json_refusal_not_a_traceback(rig):
+    # Every failure this verb can hit must arrive at the caller as its --json contract. A UI that
+    # gets a traceback on stderr and nothing on stdout cannot tell a refusal from a crash.
+    rig.anchor()
+    rig.wstate(next_debugger=4)
+    (rig.home / "briefs").write_text("not a directory")   # mkdir will fail here
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x")
+    assert r.returncode != 0
+    b = body(r)                                            # parses ⇒ the contract held
+    assert b["ok"] is False and b["error"]
+    assert "Traceback" not in r.stderr
+    assert rig.launch_calls() == []
+
+
+def test_a_giant_piped_context_is_bounded_rather_than_drowning_the_brief(rig):
+    rig.anchor()
+    rig.wstate(next_debugger=1)
+    r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x",
+            "--context-file", "-", inp="c" * 200_000)
+    assert r.returncode == 0, r.stdout + r.stderr
+    text = rig.brief("d1")
+    assert "truncated" in text
+    assert len(text) < 12000

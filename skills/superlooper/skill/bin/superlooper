@@ -1949,6 +1949,36 @@ _DEBUG_CONTEXT_MAX = 8000
 
 _DEBUG_ID_RE = re.compile(r"^d([0-9]+)$")
 
+_DEBUG_PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
+
+
+def _debug_render(template, mapping):
+    """SINGLE-PASS ``{name}`` substitution over the ORIGINAL template (fresh-agent review).
+
+    Deliberately NOT watchdog.render_brief's sequential ``str.replace`` chain. That chain
+    substitutes each key in turn over the OUTPUT of the last, so a placeholder appearing inside an
+    earlier value gets expanded: an owner note containing the literal text ``{context}`` would be
+    rewritten into the board readout. The one promise this brief makes about the note is that it is
+    VERBATIM — and only one pass over the original template can keep it. (The watchdog's own brief
+    is rendered from engine-generated values, so its chain is safe; this one takes caller text.)
+
+    An unknown ``{name}`` is left exactly as written — prose braces are ordinary text here."""
+    return _DEBUG_PLACEHOLDER_RE.sub(
+        lambda m: str(mapping[m.group(1)]) if m.group(1) in mapping else m.group(0), template)
+
+
+def _debug_journal(home, record):
+    """Journal one debug record, swallowing any write failure. journal.append normally fails LOUD
+    (a record we cannot write is a bug) — but this call sits AFTER a launch that already happened.
+    A bookkeeping failure that turned a real, delivered session into a traceback with no ``--json``
+    body would tell the caller nothing launched; that belief is exactly what invites a second tap,
+    and a second debugger on one patient is the thing this verb exists to prevent."""
+    try:
+        journal.append(home, record)
+    except (OSError, ValueError):
+        print("debug: could not write the journal record (the session still launched)",
+              file=sys.stderr)
+
 
 def _emit_debug(args, result):
     """Print a debug result: one JSON object when ``--json`` (for a local ops UI to parse), else a
@@ -2039,28 +2069,34 @@ def _debug_context(args):
     src = getattr(args, "context_file", None)
     if not src:
         return "", None
+    # Read at most ONE character past the bound (fresh-agent review): the value is truncated to
+    # _DEBUG_CONTEXT_MAX anyway, and reading a whole file first only means a stray `--context-file
+    # /var/log/something-huge` is pulled into memory before being thrown away. The extra character
+    # is what lets _debug_bounded still SEE that it overflowed and say so.
+    cap = _DEBUG_CONTEXT_MAX + 1
     if src == "-":
-        return sys.stdin.read(), None
+        return sys.stdin.read(cap), None
     try:
         with open(src) as f:
-            return f.read(), None
+            return f.read(cap), None
     except OSError as e:
         return None, "could not read the context file %s: %s" % (src, e)
 
 
 def _debug_brief(cfg, home, repo, operator, source, note, context):
-    """The launched session's ENTIRE opening message. Literal ``{name}`` substitution (brief.py's
-    _sub convention — never str.format, which chokes on the prose braces a note may carry).
+    """The launched session's ENTIRE opening message. Rendered by :func:`_debug_render` — literal,
+    SINGLE-PASS ``{name}`` substitution (never str.format, which chokes on the prose braces a note
+    may carry; and never a sequential replace chain, which would expand a placeholder the caller's
+    own text contained).
 
     Deliberately does NOT tell the debugger how to work: its authority, its ladder and its
     exclusions are the sl-debugger skill's own contract. The one thing this brief must assert is the
     MODE — a person is at the keyboard, so the skill's human-present contract applies and the
     watchdog's unattended one does not."""
-    import watchdog as watchdog_lib
     template = _read(os.path.join(_TEMPLATES, "debugger-brief-owner.md")) or ""
     note = _debug_bounded(note, _DEBUG_NOTE_MAX, "note")
     context = _debug_bounded(context, _DEBUG_CONTEXT_MAX, "context")
-    return watchdog_lib.render_brief(template, {
+    return _debug_render(template, {
         "operator": operator,
         "source": source,
         "note": note or ("*(no note — they launched the fixer without typing one, so whatever "
@@ -2110,14 +2146,20 @@ def cmd_debug(args):
                            "live_id": None, "error": ctx_err})
         return 1
 
-    os.makedirs(state_dir, exist_ok=True)
-
     def refuse(error, **extra):
         out = {"ok": False, "verb": "debug", "id": None, "live": False, "live_id": None,
                "error": error}
         out.update(extra)
         _emit_debug(args, out)
         return 1
+
+    # Every failure below must reach the caller as the --json CONTRACT, never as a traceback: a UI
+    # that gets an empty stdout and a stack trace on stderr cannot tell a refusal from a crash, and
+    # this is the one endpoint where guessing wrong means a second agent on the owner's machine.
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+    except OSError as e:
+        return refuse("could not open this loop's state home (%s): %s" % (state_dir, e))
 
     # The watchdog's OWN lock, held across the whole check-allocate-launch. A live watchdog check
     # owns it for its entire run (its launch subprocess included), so we do not queue behind it —
@@ -2141,14 +2183,22 @@ def cmd_debug(args):
                           "anchor, not inside cmux) — start the loop once so the session's tab has "
                           "somewhere to be born")
 
-        sid = _debug_allocate(os.path.join(state_dir, watchdog_lib.STATE_FILENAME),
-                              home, state_dir)
-        os.makedirs(os.path.join(home, "briefs"), exist_ok=True)
+        try:
+            sid = _debug_allocate(os.path.join(state_dir, watchdog_lib.STATE_FILENAME),
+                                  home, state_dir)
+        except (OSError, ValueError) as e:
+            # The counter could not be advanced, so we do NOT hold an id we can prove is ours —
+            # launching on one anyway is exactly the reuse this verb exists to prevent.
+            return refuse("could not allocate a debugger id (%s is unwritable): %s"
+                          % (watchdog_lib.STATE_FILENAME, e))
+
         brief_path = os.path.join(home, "briefs", "%s.md" % sid)
         try:
+            os.makedirs(os.path.join(home, "briefs"), exist_ok=True)
             with open(brief_path, "w") as f:
                 f.write(_debug_brief(cfg, home, args.repo, operator, source, args.note, context))
         except OSError as e:
+            brief_path = None            # nothing on disk to clean up below
             return refuse("could not write the session brief: %s" % e, id=sid)
 
         rc, out, err, spawned = _debugger_shim_run(cfg, args.repo, home, pane, sid)
@@ -2160,7 +2210,7 @@ def cmd_debug(args):
         _watchdog_release_lock(lock)
 
     if rc == 0:
-        journal.append(home, {"act": "debug_launch", "outcome": "launched", "id": sid,
+        _debug_journal(home, {"act": "debug_launch", "outcome": "launched", "id": sid,
                               "operator": operator, "source": source,
                               "note": _debug_bounded(args.note, _DEBUG_NOTE_MAX, "note")})
         _emit_debug(args, {"ok": True, "verb": "debug", "id": sid, "live": True,
@@ -2168,7 +2218,7 @@ def cmd_debug(args):
         return 0
 
     error = _debug_error(rc, err, out)
-    journal.append(home, {"act": "debug_launch", "outcome": "launch_failed", "id": sid,
+    _debug_journal(home, {"act": "debug_launch", "outcome": "launch_failed", "id": sid,
                           "operator": operator, "source": source, "error": error})
     _emit_debug(args, {"ok": False, "verb": "debug", "id": sid, "live": False, "live_id": None,
                        "error": error})
