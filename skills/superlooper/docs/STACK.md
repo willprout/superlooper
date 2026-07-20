@@ -17,8 +17,10 @@ create tabs, or spend model calls. It prints one status line per machine block a
 only when a block **FAILs**. A block may also be a **WARN** — an advisory that does not fail the
 stack. A WARN is used for something that is only conditionally needed on this machine (a missing
 Codex CLI on a Claude-only machine; see `codex CLI` below), for something that costs session
-*quality* rather than correctness (a missing `superlooper plugin`), and for a state the doctor
-could not actually read (it never fails the stack on a fact it could not determine). A WARN carries
+*quality* rather than correctness (a missing `superlooper plugin`), for a state the doctor
+could not actually read (it never fails the stack on a fact it could not determine), and for a
+by-design state worth seeing but never worth failing on (an `installed engine current` that is
+behind, since publishing is deliberately manual). A WARN carries
 its whole story on its own line — only a FAIL prints a separate `Fix:` line.
 
 ## Tier 1: Loop User
@@ -109,8 +111,9 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   restart it. FAILs when the default is absent or explicitly false: that is a machine where an idle,
   occluded cmux gets napped and defers spawning worker-tab shells past the 30s launch verify window
   — the systemic "LAUNCH NOT DELIVERED" failure that starts ~40 minutes after you walk away
-  (issue #120). A state the doctor could not read (no `defaults` binary, or the read errored) is a
-  WARN, never a FAIL. Override the checked bundle id with `SL_CMUX_BUNDLE_ID`.
+  (issue #120). A state the doctor could not pin down is a WARN, never a FAIL: no `defaults` binary,
+  a read that errored, or a read that came back with a value that is neither true nor false (verify
+  that one by hand). Override the checked bundle id with `SL_CMUX_BUNDLE_ID`.
 - `runner anchor (live)`: mostly a state line, not a chore — it fires only when a runner for this
   repo is actually live, and re-runs the read-only pane probe the startup preflight uses against the
   anchor that runner recorded (issue #33). No live runner, a stale pidfile, or an unreadable config
@@ -124,8 +127,10 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
 - `installed engine current`: a visibility line that never fails the stack — being behind is by
   design, since a merged engine change is inert until someone republishes through the gated
   `bin/install.sh` (issue #39). It compares the installed copy's VERSION stamp
-  (`~/.claude/skills/superlooper/VERSION`) against the engine payload on `origin/<dev_branch>` in a
-  superlooper source checkout. In sync prints a plain ok; N commits behind is a WARN saying so —
+  (`~/.claude/skills/superlooper/VERSION`) against the engine payload in a superlooper source
+  checkout, at the first ref that resolves there: `origin/<dev_branch>`, else the local
+  `<dev_branch>`, else `HEAD` — the line names which one it measured, so a checkout with a stale
+  `origin` says so. In sync prints a plain ok; N commits behind is a WARN saying so —
   republish through `bin/install.sh` when you want those changes live. Nothing to compare (no stamp,
   a `nogit` stamp, or no source checkout on this machine — the normal case on a machine that only
   *runs* the loop) is also a plain ok. A WARN also covers the anomalies: a stamped commit that is
