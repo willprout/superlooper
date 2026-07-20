@@ -458,3 +458,25 @@ def test_a_giant_piped_context_is_bounded_rather_than_drowning_the_brief(rig):
     text = rig.brief("d1")
     assert "truncated" in text
     assert len(text) < 12000
+
+
+# --------------------------- fresh-agent review round 2 ---------------------------
+
+def test_an_unwritable_state_dir_is_a_json_refusal_not_a_traceback(rig):
+    # The lock is acquired by hardlinking a temp file INTO state/ — so a state dir that exists but
+    # cannot be written raises out of tempfile.mkstemp, before a single byte of the --json contract
+    # has been printed. Every failure this verb can hit must arrive as its contract.
+    rig.anchor()
+    rig.wstate(next_debugger=4)
+    state = rig.home / "state"
+    mode = state.stat().st_mode
+    state.chmod(0o555)                                    # r-x: readable, not writable
+    try:
+        r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x")
+    finally:
+        state.chmod(mode)                                 # restore so tmp_path cleanup works
+    assert r.returncode != 0
+    b = body(r)                                           # parses ⇒ the contract held
+    assert b["ok"] is False and b["error"]
+    assert "Traceback" not in r.stderr
+    assert rig.launch_calls() == []

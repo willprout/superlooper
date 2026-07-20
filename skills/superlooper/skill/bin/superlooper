@@ -2165,7 +2165,16 @@ def cmd_debug(args):
     # owns it for its entire run (its launch subprocess included), so we do not queue behind it —
     # we say so plainly and change nothing. A tap is cheap to repeat; a second debugger is not.
     lock = os.path.join(state_dir, "watchdog.lock")
-    if not _watchdog_acquire_lock(lock):
+    try:
+        acquired = _watchdog_acquire_lock(lock)
+    except OSError as e:
+        # The lock is taken by hardlinking a temp file INTO state/, so an existing-but-unwritable
+        # state dir raises here — before a single byte of the --json contract has been printed
+        # (fresh-agent review round 2). Wrapped at THIS call site, not inside the helper: the
+        # watchdog's own acquire is a background job whose loud failure is the right behavior.
+        return refuse("could not take this loop's watchdog lock (%s is unwritable): %s"
+                      % (state_dir, e))
+    if not acquired:
         return refuse("a watchdog check is running for this state home right now — nothing was "
                       "launched; try again in a moment", live=None)
     brief_path = None
@@ -2198,7 +2207,11 @@ def cmd_debug(args):
             with open(brief_path, "w") as f:
                 f.write(_debug_brief(cfg, home, args.repo, operator, source, args.note, context))
         except OSError as e:
-            brief_path = None            # nothing on disk to clean up below
+            # open(,"w") CREATES/TRUNCATES before write() runs, so a failure mid-write leaves a
+            # partial brief for a session that never launched — which a later reader would read as
+            # one that existed (fresh-agent review round 2). Remove it; a no-such-file is fine.
+            _rm_quiet(brief_path)
+            brief_path = None
             return refuse("could not write the session brief: %s" % e, id=sid)
 
         rc, out, err, spawned = _debugger_shim_run(cfg, args.repo, home, pane, sid)
