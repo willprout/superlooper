@@ -93,6 +93,51 @@ def test_held_back_actions_are_surfaced():
     assert re.search(r"\.held", _JAN_JS), "janitor.js must surface the server's held-back keys"
 
 
+# =============================== the held-back retry (issue #131) ===============================
+
+def test_a_held_back_row_offers_its_own_retry_control():
+    # Issue #131 closes the terminal-only gap: a held-back (previously failed) action can be retried
+    # from the dashboard. The control is per-row, so the owner retries exactly one known-failing
+    # write at a time — never a batch, never folded into the sweep selection.
+    assert "data-jan-held-retry" in _JAN_JS, (
+        "each held-back row must carry its own retry control (data-jan-held-retry)")
+    assert re.search(r"held_items", _JAN_JS), (
+        "the held rows must be bound from the server's held_items (key + what) — design B.1")
+
+
+def test_retry_is_a_separate_deliberate_confirm_not_the_sweep_confirm():
+    # A held action is a KNOWN-FAILING write, so re-running it is more deliberate than a normal tap:
+    # arm, then confirm, on its own control — and never via the sweep's data-jan-confirm button.
+    assert "data-jan-held-go" in _JAN_JS, (
+        "the retry must have its own confirm step (data-jan-held-go), armed from the Retry tap")
+    assert re.search(r"data-jan-held-go[\s\S]{0,200}runRetry", _JAN_JS), (
+        "the held confirm control must trigger runRetry")
+    assert re.search(r"function runRetry[\s\S]{0,900}?/api/janitor", _JAN_JS), (
+        "the retry execute POST must live inside runRetry, reached only from its own confirm")
+
+
+def test_retry_sends_exactly_one_key_with_an_explicit_retry_flag():
+    assert re.search(r"function runRetry[\s\S]{0,900}?retry:\s*true", _JAN_JS), (
+        "the retry POST must carry retry: true — the explicit flag the server threads to "
+        "--retry-refused")
+    assert re.search(r"function runRetry[\s\S]{0,900}?keys:\s*\[\s*key\s*\]", _JAN_JS), (
+        "the retry POST must send exactly the one held key being retried")
+    assert not re.search(r"function runExecute[\s\S]{0,800}?retry", _JAN_JS), (
+        "the ordinary sweep must never carry a retry flag — the holdback contract is unchanged")
+
+
+def test_the_retry_control_only_appears_when_the_server_speaks_the_retry_contract():
+    # A running server older than the static bundle (the issue #136 skew shape) answers propose
+    # WITHOUT held_items — it cannot honour a retry. Offering a Retry there would be a button that
+    # silently does nothing, so the panel falls back to the terminal instruction instead.
+    assert re.search(r"retry-refused", _JAN_JS), (
+        "the fallback note must still name the terminal command for a server that can't retry")
+    assert re.search(r"heldHTML\s*\(\s*held\s*,\s*items", _JAN_JS) or \
+        re.search(r"function heldHTML\([^)]*items", _JAN_JS), (
+        "heldHTML must take the server's held_items so it can tell a retry-capable server from an "
+        "older one")
+
+
 def test_proposal_rows_are_keyboard_operable():
     # A proposal row is role="checkbox" tabindex="0"; a <div> does not fire click on Space/Enter, so
     # janitor.js must wire a keydown handler that toggles selection AND keep aria-checked honest — a
@@ -117,3 +162,6 @@ def test_shell_dispatches_janitor_open_to_the_overlay():
 def test_janitor_surfaces_are_styled():
     assert ".cc-janitor" in _CSS, "shell.css must style the .cc-janitor dialog"
     assert ".janitor-btn" in _CSS, "shell.css must style the .janitor-btn top-bar button"
+    assert ".cc-jan-held-retry" in _CSS, (
+        "shell.css must style the held-back Retry control (issue #131) — it must read as a "
+        "deliberate, consequence-stating act, not another sweep checkbox")

@@ -48,8 +48,8 @@ class _RecordingJanitor:
                                        "target": 14}]}],
                 "count": 1, "held": []}
 
-    def execute(self, repo, keys):
-        self.calls.append(("execute", repo, keys))
+    def execute(self, repo, keys, retry=False):
+        self.calls.append(("execute", repo, keys, retry))
         return {"ok": True, "verb": "janitor", "repo": repo,
                 "results": [{"key": k, "outcome": "ok"} for k in keys],
                 "executed": len(keys), "failed": 0, "skipped": 0, "held": 0}
@@ -78,7 +78,35 @@ def test_execute_dispatches_with_the_tapped_subset():
     assert resp.status == 200
     out = json.loads(resp.body)
     assert out["verb"] == "janitor" and out["executed"] == 2
-    assert j.calls[-1] == ("execute", REPO, ["pr:14", "issue:9"])
+    assert j.calls[-1] == ("execute", REPO, ["pr:14", "issue:9"], False)
+
+
+def test_execute_defaults_to_no_retry():
+    # The holdback contract (issue #121) is the default: a body with no `retry` sweeps normally, so
+    # a held-back key stays held. Retry is opt-in, never a side effect of an ordinary sweep.
+    j = _RecordingJanitor()
+    _post("/api/janitor", {"repo": REPO, "keys": ["pr:14"]}, j)
+    assert j.calls[-1] == ("execute", REPO, ["pr:14"], False)
+
+
+def test_execute_threads_an_explicit_retry_flag():
+    # Issue #131: the per-held-row Retry tap sends `retry: true`, which the route hands to the verb
+    # (→ the CLI's --retry-refused). The key set is still exactly what was tapped.
+    j = _RecordingJanitor()
+    resp = _post("/api/janitor", {"repo": REPO, "keys": ["branch:sl/i7-x"], "retry": True}, j)
+    assert resp.status == 200
+    assert j.calls[-1] == ("execute", REPO, ["branch:sl/i7-x"], True)
+
+
+def test_execute_with_a_non_boolean_retry_is_400_and_never_dispatched():
+    # `retry` re-runs a KNOWN-FAILING GitHub write, so its input is strict: only a real boolean is a
+    # request this route understands. A truthy string is refused before any command runs — never
+    # silently read as "yes" (and never silently read as "no", which would hide the owner's intent).
+    for bad in ("true", 1, [], {"x": 1}):
+        j = _RecordingJanitor()
+        resp = _post("/api/janitor", {"repo": REPO, "keys": ["pr:14"], "retry": bad}, j)
+        assert resp.status == 400, bad
+        assert j.calls == [], bad
 
 
 def test_janitor_results_are_never_cached():
@@ -158,7 +186,7 @@ def test_command_failure_is_ok_false_at_200_not_an_http_error():
         def propose(self, repo):
             return {"ok": False, "verb": "janitor-propose", "repo": repo, "groups": [],
                     "count": 0, "held": [], "error": "could not run the superlooper CLI"}
-        def execute(self, repo, keys):
+        def execute(self, repo, keys, retry=False):
             return {"ok": False, "verb": "janitor", "repo": repo, "results": [], "executed": 0,
                     "failed": 0, "skipped": 0, "held": 0, "error": "boom"}
 
@@ -196,6 +224,17 @@ def test_propose_then_execute_over_the_socket_to_fake_cli(tmp_path, monkeypatch)
         assert r.status == 200
         assert json.loads(r.read())["executed"] == 1
         conn.close()
+
+        # …and the held-back retry (issue #131): the same route, one key, `retry: true` → the CLI
+        # gains --retry-refused. Socket → route → real Janitor → CLI, with no real superlooper.
+        conn = http_client.HTTPConnection(host, port, timeout=5)
+        conn.request("POST", "/api/janitor",
+                     body=json.dumps({"repo": REPO, "keys": ["branch:sl/i7-x"], "retry": True}),
+                     headers={"Content-Type": "application/json"})
+        r = conn.getresponse()
+        assert r.status == 200
+        assert json.loads(r.read())["executed"] == 1
+        conn.close()
     finally:
         srv.shutdown()
         srv.server_close()
@@ -205,3 +244,5 @@ def test_propose_then_execute_over_the_socket_to_fake_cli(tmp_path, monkeypatch)
     argvs = [c["argv"] for c in calls]
     assert ["janitor", "--repo", CHECKOUT, "--json"] in argvs
     assert ["janitor", "--repo", CHECKOUT, "--json", "--execute-keys", "pr:41"] in argvs
+    assert ["janitor", "--repo", CHECKOUT, "--json", "--execute-keys", "branch:sl/i7-x",
+            "--retry-refused"] in argvs

@@ -13,6 +13,15 @@
    sweep-all — every item is an individual tap (per-kind consent). A command failure (nonzero exit,
    missing binary) comes back as ok:false with an error string and is shown plainly.
 
+   Held-back debris — an action a PREVIOUS sweep failed, which the CLI holds back — gets a second,
+   deliberately narrower path (issue #131), because retrying is re-running a KNOWN-FAILING write:
+
+     held row → "Retry" ARMS that one row → "Yes — <what it does>" → POST /api/janitor with that
+     ONE key and retry:true → the server adds the CLI's --retry-refused → the honest result.
+
+   It is never folded into the sweep confirm, never batched, and never automatic; the holdback itself
+   is unchanged and still the CLI's (without that flag a held key comes back `held`, as before).
+
    window.CCJanitor is a persistent overlay OUTSIDE #root (like Tidy/the drawer) so the 2s poll never
    touches it. Design B.1: this file computes NO janitor semantics — the server (driving the CLI's
    pure lib/janitor) already selected and grouped the proposals; this only binds them to pixels and
@@ -32,6 +41,9 @@
   // newer open/retry starts. `selected` is the set of proposal keys the owner has tapped.
   var node = null, slug = "", listedRepo = "", busy = false, gen = 0;
   var selected = null;
+  // `heldArmed` is the ONE held-back key currently showing its confirm strip (issue #131). A retry
+  // executes only the armed key, so a stale/forged confirm for another row can't run.
+  var heldArmed = "";
 
   function postJSON(path, payload) {
     return fetch(path, {
@@ -71,6 +83,13 @@
         return;
       }
       if (t.closest("[data-jan-confirm]")) { runExecute(); return; }
+      // the held-back row's own two-tap path — checked BEFORE the proposal rows, and entirely
+      // separate from the sweep's confirm above.
+      var heldGo = t.closest("[data-jan-held-go]");
+      if (heldGo) { runRetry(heldGo.getAttribute("data-jan-held-go")); return; }
+      var heldArm = t.closest("[data-jan-held-retry]");
+      if (heldArm) { armRetry(heldArm.getAttribute("data-jan-held-retry")); return; }
+      if (t.closest("[data-jan-held-cancel]")) { disarmRetry(); return; }
       var retryEl = t.closest("[data-jan-retry]");
       if (retryEl) { loadPropose(++gen, retryEl.getAttribute("data-jan-retry")); return; }
       var row = t.closest("[data-jan-key]");
@@ -98,12 +117,13 @@
     listedRepo = "";                 // nothing is listed yet for this open
     busy = false;
     selected = {};                   // a fresh open starts with NOTHING selected — no sweep-all
+    heldArmed = "";                  // …and with no held-back retry armed
     el("cc-jan-target").textContent = "→ " + slug;
     node.classList.add("open");
     loadPropose(++gen, repoSlug);    // ++gen supersedes any propose still in flight from a prior open
   }
 
-  function close() { if (node) node.classList.remove("open"); }
+  function close() { heldArmed = ""; if (node) node.classList.remove("open"); }
 
   // Step 1 — propose: list what the sweep WOULD do (changes NOTHING). Each propose carries the
   // generation of the open (or retry) that started it and the repo it is listing; a response from a
@@ -118,7 +138,8 @@
         if (res.status !== 200 || !b.ok) { renderError(b.error, false, repo, b.skew); return; }
         listedRepo = repo;                         // THIS repo's proposals are the ones now on screen
         selected = {};                             // a fresh listing selects nothing
-        renderProposals(b.groups || [], b.held || []);
+        heldArmed = "";                            // …and arms no held-back retry
+        renderProposals(b.groups || [], b.held || [], b.held_items);
       })
       .catch(function () {
         if (myGen === gen && isOpen()) renderError("couldn’t reach the command center", false, repo);
@@ -173,11 +194,11 @@
 
   // The proposal list, grouped by kind, each item a tap target. Nothing is pre-selected. When there
   // is no debris, an honest all-clear — and no confirm button, because there is nothing to sweep.
-  function renderProposals(groups, held) {
+  function renderProposals(groups, held, heldItems) {
     if (!groups.length) {
       setBody(
         '<div class="cc-jan-empty">Apron’s clear — no GitHub debris to sweep ✓</div>' +
-        heldHTML(held) +
+        heldHTML(held, heldItems) +
         '<div class="cc-jan-actions"><button class="btn ghost" data-jan-close>Done</button></div>');
       return;
     }
@@ -201,7 +222,7 @@
         'a PR/issue here does the same GitHub write the terminal would — it can’t be undone from the ' +
         'dashboard.</div>' +
       '<div class="cc-jan-list">' + body + '</div>' +
-      heldHTML(held) +
+      heldHTML(held, heldItems) +
       '<div class="cc-jan-actions">' +
         '<button class="btn ghost" data-jan-cancel>Cancel</button>' +
         '<button class="btn primary" id="cc-jan-confirm" data-jan-confirm disabled>' +
@@ -211,19 +232,116 @@
   }
 
   // Held-back actions: a prior sweep's failure the CLI is holding back (janitor_refused.json) — the
-  // server reports them in `held`. Surface them once, plainly, and DON'T offer them as tap targets:
-  // they are not silently retried (the terminal's --retry-refused re-proposes them deliberately).
-  function heldHTML(held) {
-    if (!held || !held.length) return "";
-    var rows = held.map(function (k) {
-      return '<div class="cc-jan-held-row">' + esc(k) + '</div>';
-    }).join("");
+  // server reports the raw keys in `held` and, when it speaks the retry contract (issue #131), the
+  // same keys WITH their consequence in `held_items`. They are never part of the sweep selection and
+  // are never retried on their own: each row carries its own Retry, and that Retry only arms a
+  // second, consequence-stating confirm (see armRetry/runRetry).
+  //
+  // No `held_items` means the RUNNING server is older than this bundle (the issue #136 skew shape)
+  // and has no retry to give — so the rows fall back to key-only, with the terminal instruction, and
+  // no button that would silently do nothing.
+  function heldHTML(held, items) {
+    var keys = (held && held.length) ? held : [];
+    if (!keys.length) return "";
+    var canRetry = !!(items && items.length);
+    var rows = canRetry
+      ? items.map(function (it) {
+          return '<div class="cc-jan-held-row" data-jan-held-row="' + esc(it.key) + '">' +
+            '<span class="cc-jan-held-what">' + esc(it.what) + '</span>' +
+            '<span class="cc-jan-held-act" data-jan-held-act="' + esc(it.key) + '">' +
+              retryArmHTML(it.key) + '</span>' +
+          '</div>';
+        }).join("")
+      : keys.map(function (k) {
+          return '<div class="cc-jan-held-row">' + esc(k) + '</div>';
+        }).join("");
+    var note = canRetry
+      ? 'Never retried on its own. <b>Retry</b> re-runs the one GitHub write that already failed — ' +
+        'its own tap, its own confirm.'
+      : 'Not retried automatically. Re-propose from the terminal with ' +
+        '<code>superlooper janitor --retry-refused</code>.';
     return '<div class="cc-jan-held">' +
-      '<div class="cc-jan-held-head">Held back — failed a previous sweep (' + held.length + ')</div>' +
+      '<div class="cc-jan-held-head">Held back — failed a previous sweep (' +
+        (canRetry ? items.length : keys.length) + ')</div>' +
       rows +
-      '<div class="cc-jan-held-note">Not retried automatically. Re-propose from the terminal with ' +
-        '<code>superlooper janitor --retry-refused</code>.</div>' +
+      '<div class="cc-jan-held-note">' + note + '</div>' +
     '</div>';
+  }
+
+  // The two faces of one held row's action cell: the resting Retry, and — once armed — the explicit
+  // confirm that states what re-running the failed write would do.
+  function retryArmHTML(key) {
+    return '<button class="btn ghost cc-jan-held-retry" data-jan-held-retry="' + esc(key) + '">' +
+      'Retry</button>';
+  }
+
+  function retryConfirmHTML(key, what) {
+    return '<span class="cc-jan-held-ask">re-run this failed write?</span>' +
+      '<button class="btn cc-jan-held-go" data-jan-held-go="' + esc(key) + '" ' +
+        'title="' + esc(what) + '">Yes — ' + esc(what) + '</button>' +
+      '<button class="btn ghost cc-jan-held-cancel" data-jan-held-cancel>Cancel</button>';
+  }
+
+  // Tap 1 of the retry: arm THIS row (any other armed row goes back to rest — one at a time, so the
+  // owner is always confirming exactly the write in front of him).
+  function armRetry(key) {
+    if (!key || busy) return;
+    if (heldArmed && heldArmed !== key) disarmRetry();
+    heldArmed = key;
+    var cell = heldCell(key);
+    if (cell) cell.innerHTML = retryConfirmHTML(key, heldWhat(key));
+    // the armed row gives the question its own line — a confirm crammed beside a long branch name
+    // is a confirm the owner skims past.
+    var row = heldRow(key);
+    if (row) row.classList.add("is-armed");
+  }
+
+  function disarmRetry() {
+    var key = heldArmed;
+    heldArmed = "";
+    var cell = key ? heldCell(key) : null;
+    if (cell) cell.innerHTML = retryArmHTML(key);
+    var row = key ? heldRow(key) : null;
+    if (row) row.classList.remove("is-armed");
+  }
+
+  function heldRow(key) {
+    return node ? node.querySelector('[data-jan-held-row="' + cssEsc(key) + '"]') : null;
+  }
+
+  function heldCell(key) {
+    return node ? node.querySelector('[data-jan-held-act="' + cssEsc(key) + '"]') : null;
+  }
+
+  // The server's own words for what this key does — read back off the row it rendered, never
+  // re-derived here (design B.1: the JS computes no janitor semantics).
+  function heldWhat(key) {
+    var row = heldRow(key);
+    var what = row ? row.querySelector(".cc-jan-held-what") : null;
+    return (what && what.textContent) || key;
+  }
+
+  // Tap 2 of the retry — the ONLY place a held-back action is re-run (issue #131). It runs ALONE:
+  // exactly the one armed key, with the explicit flag the server threads to the CLI's
+  // --retry-refused. The sweep's confirm never reaches here, and this never sweeps anything else.
+  function runRetry(key) {
+    if (busy || !listedRepo || !key || key !== heldArmed) return;
+    var repo = listedRepo, myGen = gen;
+    busy = true;
+    heldArmed = "";
+    setBody('<div class="cc-jan-loading">retrying ' + esc(key) + '…</div>');
+    postJSON("/api/janitor", { repo: repo, keys: [key], retry: true })
+      .then(function (res) {
+        busy = false;
+        if (myGen !== gen || !isOpen()) return;   // a re-open superseded this / dialog closed
+        var b = res.body || {};
+        if (res.status !== 200 || !b.ok) { renderError(b.error, true, repo, b.skew); return; }
+        renderResults(b);
+      })
+      .catch(function () {
+        busy = false;
+        if (myGen === gen && isOpen()) renderError("couldn’t reach the command center", true, repo);
+      });
   }
 
   // Update the confirm button's enabled state and its consequence-stating label from the current
