@@ -50,7 +50,8 @@ import time
 ARGS = sys.argv[1:]
 # One fixtures dir, whichever local-command button set it (Tidy or Janitor). calls.jsonl and
 # mutations.jsonl land here for either verb.
-FIX = os.environ.get("SL_TIDY_FIXTURES") or os.environ.get("SL_JANITOR_FIXTURES") or ""
+FIX = (os.environ.get("SL_TIDY_FIXTURES") or os.environ.get("SL_JANITOR_FIXTURES")
+       or os.environ.get("SL_FIXER_FIXTURES") or "")
 
 _DEFAULT_DRY_RUN = (
     "tidy will close 2 finished (merged) session window(s):\n"
@@ -141,6 +142,9 @@ def route():
     if ARGS[:1] == ["request-restart"]:
         route_request_restart()
         return
+    if ARGS[:1] == ["debug"]:
+        route_debug()
+        return
     if ARGS[:1] != ["tidy"]:
         die("unhandled command: %s" % " ".join(ARGS))
     if "--dry-run" in ARGS:
@@ -179,6 +183,48 @@ def route_request_restart():
     record("restart_request", repo=repo, operator=opt("--operator"), source=opt("--source"))
     out = {"ok": True, "verb": "request-restart", "running": True, "pid": pid,
            "requested": True, "manual": manual}
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.exit(0)
+
+
+def route_debug():
+    """Model the real `superlooper debug --json` contract ``lib/fixer`` parses (issue #144) — the
+    ENGINE's owner-tap debugger launch, which owns the id allocation, the single-flight lock, the
+    brief and the launch handshake. The dashboard only shells it, so this fake is the whole of what
+    a fixer test may see of a launch.
+
+    ``SL_DEBUG_LIVE=d3`` simulates a debugger already on this patient (the engine's refusal);
+    ``SL_DEBUG_FAIL=1`` simulates a launch that did not land; ``SL_DEBUG_GARBAGE=1`` prints non-JSON
+    so a test can exercise the adapter's unparseable path. ``--check`` reports liveness and writes
+    nothing; the plain form records a mutation carrying the note, the audit fields and the CONTEXT
+    the dashboard piped in, so a test can prove the owner's words reached the engine verbatim."""
+    if os.environ.get("SL_DEBUG_GARBAGE"):
+        sys.stdout.write("not json — the CLI misbehaved\n")
+        sys.exit(0)
+    live = os.environ.get("SL_DEBUG_LIVE") or ""
+    if "--check" in ARGS:
+        out = {"ok": True, "verb": "debug-check", "id": None,
+               "live": bool(live), "live_id": live or None}
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.exit(0)
+    # Drain stdin exactly as the real verb does for `--context-file -`, so a test can assert what
+    # the dashboard piped over (and so a large context can never deadlock the adapter).
+    context = sys.stdin.read() if opt("--context-file") == "-" else ""
+    if live:
+        out = {"ok": False, "verb": "debug", "id": None, "live": True, "live_id": live,
+               "error": "a debugger session (%s) is already running for this repo — never two "
+                        "debuggers on one patient" % live}
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.exit(1)
+    record("debug_launch", repo=opt("--repo"), note=opt("--note"), context=context,
+           operator=opt("--operator"), source=opt("--source"))
+    if os.environ.get("SL_DEBUG_FAIL"):
+        out = {"ok": False, "verb": "debug", "id": "d4", "live": False, "live_id": None,
+               "error": "the launch timed out — no session was confirmed"}
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.exit(1)
+    out = {"ok": True, "verb": "debug", "id": "d4", "live": True, "live_id": "d4",
+           "brief": "/nonexistent/home/briefs/d4.md"}
     sys.stdout.write(json.dumps(out) + "\n")
     sys.exit(0)
 

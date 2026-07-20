@@ -1,36 +1,42 @@
-"""Issue #141 — the Deploy Fixer button: launch ONE interactive sl-debugger session at whatever the
-dashboard is showing stuck.
+"""Issue #141 / #144 — the Deploy Fixer button: launch ONE interactive sl-debugger session at
+whatever the dashboard is showing stuck.
 
 Deploy Fixer is a LOCAL COMMAND execution — the same button class as Tidy (#41), Restart (#116) and
-Janitor (#121), and the owner's 2026-07-07 verb amendment that created it. Its adapter
-(``lib/fixer.py``) mirrors ``lib/restart.py``'s discipline: a subprocess wrapper that NEVER raises
-into the caller, a hard timeout, an allow-list of watched repos, and fail-closed on every unknown.
+Janitor (#121), and the owner's 2026-07-07 verb amendment that created it. Since #144 its adapter
+(``lib/fixer.py``) is a THIN CLI SHELL, exactly like ``lib/restart.py``: it shells
+``superlooper debug``, the engine's owner-tap launch verb.
+
+That collapse is the whole point of #144, so these tests pin BOTH halves of the split:
+
+* **What stays the dashboard's.** Reading the snapshot for what the board is currently rendering as
+  unhealthy, and composing that into the context it hands over. Nobody else knows what the owner is
+  looking at. Pure functions, unit-tested here.
+* **What is now the ENGINE's.** The ``d<N>`` id allocation, the single-flight lock, the brief, the
+  ``--cwd`` invocation, the ``SL_RUN_ROOT``/``SL_PANE`` handshake, the ``runner.anchor.json`` pane
+  resolution, the ``worker.d<N>.lock`` liveness rule. Before #144 this file hand-copied all five,
+  with no stability contract toward the engine — so a silent production break could not fail a
+  green suite. ``test_no_engine_internals_remain_in_the_adapter`` is the ratchet that keeps them
+  gone.
 
 The owner ruling that makes this legal (2026-07-15) is worth restating, because these tests are its
 enforcement: **the no-AI-in-the-dashboard bright line is NOT crossed here.** The dashboard makes no
-model call and holds no standing seat. It composes a prompt by string assembly (exactly as
-``actions.compose_briefing`` already does for Discuss) and hands it to the engine's existing launch
-shim — the same mechanism the runner and the watchdog already use. The AI runs in the launched
-session, outside this process, because a human tapped a button. `test_no_model_call_or_network_in_
-the_adapter` pins that.
+model call and holds no standing seat. It composes a string (exactly as ``actions.compose_briefing``
+already does for Discuss) and executes a local CLI. The AI runs in the launched session, outside
+this process, because a human tapped a button. ``test_no_model_call_or_network_in_the_adapter``
+pins that.
 
-Four properties are load-bearing bright lines:
+Two properties are load-bearing bright lines:
 
-* **No real shim in tests.** The real ``launch-session.sh`` OPENS A CMUX TAB and starts a live
-  interactive Claude session — the most expensive stray call in this repo. The conftest points
-  ``SL_LAUNCH_SESSION`` at an absent path by default; these tests override it in-body to
-  ``tests/fakes/fake-launch-session``.
-* **Fail closed when the launch can't be resolved.** No shim / no cmux pane / an unwatched repo ⇒ a
-  plain honest error and NOTHING launches — never a half-launch, never a pretend success.
-* **Single-flight.** A live debugger session (any ``worker.d*.lock`` naming a live pid — the
-  engine's OWN convention, which its watchdog checks the same way) blocks a second launch. Never two
-  debuggers on one patient.
-* **The owner's note rides VERBATIM into the session's prompt.** Not summarized, not reworded — the
-  brief is what ``start-session.sh`` cats into the agent as its opening message, so these tests read
-  the brief back off disk through the fake and assert the exact text survives.
+* **No real binary in tests.** ``superlooper debug`` OPENS A CMUX TAB and starts a live interactive
+  Claude session — the most expensive stray call in this repo. The conftest points
+  ``SL_SUPERLOOPER`` at an absent path by default; these tests override it in-body to
+  ``tests/fakes/fake-superlooper``.
+* **Fail closed, honestly.** An unwatched repo, an unreachable CLI, a live debugger, a launch that
+  did not land — each is a plain ``ok: false`` with the reason in words. Never a half-launch, never
+  a pretend success, never an exception into the caller.
 """
 import json
-import os
+import re
 from pathlib import Path
 
 import pytest
@@ -38,7 +44,7 @@ import pytest
 import fixer as fixer_mod
 import flights
 
-FAKE = str(Path(__file__).resolve().parent / "fakes" / "fake-launch-session")
+FAKE = str(Path(__file__).resolve().parent / "fakes" / "fake-superlooper")
 SLUG = "will-titan/command-center"
 PATH = "/home/pat/code/command-center"          # a synthetic (non-William) checkout path
 
@@ -135,7 +141,7 @@ def test_context_items_are_ranked_worst_first():
     assert kinds.index(flights.PARKED) < kinds.index(flights.SESSION_FROZEN)
 
 
-# =============================== prompt composition (DoD: unit-tested) ===============================
+# =============================== context composition (DoD: unit-tested) ===============================
 
 def _ctx_with_trouble():
     snap = _snapshot([_flight(12, flights.PARKED, memo="gate refused: no review comment")],
@@ -144,422 +150,230 @@ def _ctx_with_trouble():
     return fixer_mod.trouble_context(snap, SLUG)
 
 
-def test_prompt_invokes_the_sl_debugger_skill_and_says_a_human_is_present():
-    p = fixer_mod.compose_prompt(_ctx_with_trouble(), "", PATH, "/home/pat/.superlooper/x",
-                                 operator="William")
-    assert "sl-debugger" in p, "the prompt must invoke the skill by name — it IS the invocation"
-    low = p.lower()
-    assert "human-present" in low and "at the keyboard" in low, (
-        "the launched session must know a person is present — the skill's authority contract "
-        "branches on it (human-present vs the watchdog's unattended contract)")
-    # It must never CLAIM to be the watchdog's unattended session — a different, stricter authority
-    # tier. These are the unattended brief template's own load-bearing phrases; saying any of them
-    # here would put the session in the wrong mode. (Naming `unattended` to DISCLAIM it is correct
-    # and expected — so this pins the claims, not the word.)
-    for claim in ("you are **unattended**", "nobody is watching", "nobody can answer",
-                  "not a person"):
-        assert claim not in low, "the prompt must not put the session in unattended mode: %r" % claim
+def test_the_composed_context_is_the_board_in_words():
+    c = fixer_mod.compose_context(_ctx_with_trouble())
+    assert "RUNNER DOWN" in c.upper()
+    assert "SL-12" in c, "the parked flight must be named by its number"
+    assert "gate refused: no review comment" in c, "the flight's own memo is context, not noise"
+    assert "last heartbeat 612s ago" in c, "the debugger gets the fact, not just the word"
 
 
-def test_prompt_carries_the_owners_note_verbatim():
-    note = "the queue looks frozen — i think the runner is wedged again.\n\nsecond paragraph."
-    p = fixer_mod.compose_prompt(_ctx_with_trouble(), note, PATH, "/home/pat/.superlooper/x",
-                                operator="William")
-    assert note in p, "the note must ride VERBATIM — never summarized, never reworded (no AI)"
+def test_the_composed_context_is_ordered_worst_first():
+    c = fixer_mod.compose_context(_ctx_with_trouble())
+    assert c.index("RUNNER DOWN") < c.index("SL-12")
 
 
-def test_prompt_works_with_an_empty_note_and_says_so_plainly():
-    # DoD: launching with an empty note works. The prompt must be honest that none was typed,
-    # rather than leaving a blank section the session reads as a lost instruction.
-    p = fixer_mod.compose_prompt(_ctx_with_trouble(), "", PATH, "/home/pat/.superlooper/x",
-                                 operator="William")
-    assert "no note" in p.lower()
+def test_a_healthy_field_composes_an_honest_nothing_not_a_fabricated_symptom():
+    # The owner may tap Deploy Fixer on a field that reads clean (they saw something the UI didn't).
+    # The context must say that honestly rather than invent trouble.
+    c = fixer_mod.compose_context(fixer_mod.trouble_context(_snapshot(), SLUG))
+    low = c.lower()
+    assert "nothing" in low or "healthy" in low
 
 
-@pytest.mark.parametrize("note", [None, "", "   \n  "])
-def test_prompt_treats_blank_notes_as_no_note(note):
-    p = fixer_mod.compose_prompt(_ctx_with_trouble(), note, PATH, "/home/pat/.superlooper/x")
-    assert "no note" in p.lower()
-
-
-def test_prompt_carries_the_machine_context_repo_state_home_and_the_trouble():
-    p = fixer_mod.compose_prompt(_ctx_with_trouble(), "", PATH, "/home/pat/.superlooper/x",
-                                 operator="William")
-    assert PATH in p, "the checkout path is machine context the debugger needs"
-    assert "/home/pat/.superlooper/x" in p, "the state home is where the patient's truth lives"
-    assert SLUG in p
-    # The specific items the UI is rendering as unhealthy, in words:
-    assert "RUNNER DOWN" in p.upper()
-    assert "SL-12" in p, "the parked flight must be named by its number"
-    assert "gate refused: no review comment" in p, "the flight's own memo is context, not noise"
-
-
-def test_prompt_on_a_healthy_field_says_the_dashboard_shows_nothing_wrong():
-    # The owner may tap Deploy Fixer on a field that reads clean (he saw something the UI didn't).
-    # The prompt must say that honestly rather than fabricate a symptom.
-    ctx = fixer_mod.trouble_context(_snapshot(), SLUG)
-    p = fixer_mod.compose_prompt(ctx, "everything looks fine but the board feels wrong", PATH,
-                                 "/home/x", operator="William")
-    assert "everything looks fine but the board feels wrong" in p
-    low = p.lower()
-    assert "nothing" in low or "no trouble" in low or "healthy" in low
-
-
-def test_prompt_does_not_instruct_the_debugger_how_to_repair():
-    # Boundary: this issue defines the LAUNCH, never the debugger's behavior — its authority and
-    # its ladder are the skill's own contract. A prompt that started dictating repairs would be
-    # this issue quietly rewriting the skill.
-    p = fixer_mod.compose_prompt(_ctx_with_trouble(), "fix it", PATH, "/home/x")
-    low = p.lower()
+def test_the_composed_context_does_not_instruct_the_debugger_how_to_repair():
+    # Boundary: this is a READOUT of the board, never a work order — the debugger's authority and
+    # its ladder are the sl-debugger skill's own contract. A context that started dictating repairs
+    # would be this button quietly rewriting the skill.
+    c = fixer_mod.compose_context(_ctx_with_trouble()).lower()
     for forbidden in ("force-push", "agent-ready", "pkill", "rung"):
-        assert forbidden not in low, (
-            "the prompt must not define debugger behavior (%r) — the skill owns that" % forbidden)
+        assert forbidden not in c, (
+            "the context must not define debugger behavior (%r) — the skill owns that" % forbidden)
 
 
-def test_note_is_bounded_so_a_pasted_novel_cannot_become_the_prompt():
-    huge = "x" * 50_000
-    p = fixer_mod.compose_prompt(_ctx_with_trouble(), huge, PATH, "/home/x")
-    assert len(p) < 20_000, "an unbounded note would drown the machine context it rides with"
-    assert "truncated" in p.lower()
+def test_the_composed_context_is_bounded_so_a_huge_board_cannot_drown_the_brief():
+    # A repo with a hundred parked flights is a real state. The context rides into the session's
+    # opening message, so it is bounded here as well as in the engine.
+    snap = _snapshot([_flight(n, flights.PARKED, memo="m" * 400) for n in range(300)])
+    c = fixer_mod.compose_context(fixer_mod.trouble_context(snap, SLUG))
+    # The bound is on the CONTENT; the truncation marker is a fixed, visible addition on top.
+    assert len(c) <= fixer_mod.CONTEXT_MAX + 200
+    assert "truncated" in c.lower()
 
 
-# =============================== launch-command construction (DoD: unit-tested) ===============================
-
-def test_launch_script_is_the_shim_beside_the_configured_cli():
-    # The engine ships `superlooper` and `launch-session.sh` as siblings in its bin/, so the ONE
-    # configured path (config's superlooper_cli) locates both — no second config knob.
-    got = fixer_mod.launch_script_for("~/.claude/skills/superlooper/bin/superlooper")
-    assert got.endswith("/bin/launch-session.sh")
-    assert "~" not in got, "the path must be expanded — a literal ~ never resolves in a subprocess"
+def test_compose_context_on_a_missing_context_is_a_string_not_a_crash():
+    assert isinstance(fixer_mod.compose_context(None), str)
 
 
-def test_env_override_wins_over_the_configured_script(monkeypatch):
-    monkeypatch.setenv("SL_LAUNCH_SESSION", "/tmp/injected-shim")
-    assert fixer_mod.resolve_script("/configured/launch-session.sh") == "/tmp/injected-shim"
-
-
-def test_resolve_script_falls_back_to_the_configured_path(monkeypatch):
-    monkeypatch.delenv("SL_LAUNCH_SESSION", raising=False)
-    assert fixer_mod.resolve_script("/configured/launch-session.sh") == "/configured/launch-session.sh"
-
-
-def test_launch_argv_is_exactly_the_engines_cwd_form():
-    # The `--cwd <dir> <d-id>` form is the engine's own contract for a debugger session: no
-    # worktree, no branch, launched in an existing dir. `launch-session.sh` REFUSES an id that
-    # isn't ^[ad][0-9]+$ through this path, so the id shape is load-bearing.
-    argv = fixer_mod.launch_argv("/bin/shim", PATH, "d3")
-    assert argv == ["/bin/shim", "--cwd", PATH, "d3"]
-
-
-def test_launch_env_carries_the_shims_required_handshake():
-    env = fixer_mod.launch_env({"PATH": "/usr/bin"}, "/home/state", "cmux:pane-1",
-                               model="opus[1m]", agent="claude")
-    assert env["SL_RUN_ROOT"] == "/home/state", "the shim aborts without it"
-    assert env["SL_PANE"] == "cmux:pane-1", "the shim aborts without it"
-    assert env["SL_AGENT"] == "claude"
-    assert env["SL_MODEL"] == "opus[1m]"
-    assert env["PATH"] == "/usr/bin", "the ambient env must survive — the shim needs git/cmux on PATH"
-
-
-def test_the_seat_is_deliberately_forced_to_claude_opus():
-    # An INTENTIONAL decision, pinned so it reads as a choice rather than an oversight: the agent
-    # and model are the ENGINE's config knobs (`agent`, `models.answerer`), and this dashboard's
-    # config schema has neither — so rather than half-read a config it doesn't own, the button
-    # forces the same defaults the engine's own watchdog launch uses for a debugger seat.
-    # sl-debugger is a Claude skill; a codex-agent repo still gets a claude fixer, on purpose.
-    env = fixer_mod.launch_env({}, "/h", "p")
-    assert env["SL_AGENT"] == "claude"
-    assert env["SL_MODEL"] == "opus[1m]"
-    # A caller CAN override (the parameter exists for the day the engine's config is threaded
-    # through), and a garbage agent still falls back to claude rather than reaching the shim —
-    # launch-session.sh exits 64 on an unsupported agent.
-    assert fixer_mod.launch_env({}, "/h", "p", agent="codex")["SL_AGENT"] == "codex"
-    assert fixer_mod.launch_env({}, "/h", "p", agent="hal9000")["SL_AGENT"] == "claude"
-
-
-def test_launch_env_pins_the_verify_window():
-    # The engine pins this for its own watchdog launch (review P1-1 there): an ambient large
-    # SL_LAUNCH_VERIFY_SECONDS would let the launch outlive our timeout, so a late-delivering tab
-    # could start a REAL session while we counted the attempt failed — the exact double-launch the
-    # single-flight check exists to prevent.
-    env = fixer_mod.launch_env({"SL_LAUNCH_VERIFY_SECONDS": "9999"}, "/h", "p")
-    assert env["SL_LAUNCH_VERIFY_SECONDS"] == "30"
-
-
-def test_next_fixer_id_shape_and_succession():
-    assert fixer_mod.next_fixer_id([]) == "d1"
-    assert fixer_mod.next_fixer_id(["d1", "d2"]) == "d3"
-    # Non-debugger ids and garbage are ignored, never crash the allocator.
-    assert fixer_mod.next_fixer_id(["i44", "a2", "junk", "d7"]) == "d8"
-    # Gaps never re-use a number: a brief for d3 exists ⇒ the next is d4, so THIS side can never
-    # clobber a prior session's brief.
-    assert fixer_mod.next_fixer_id(["d3"]) == "d4"
-
-
-def test_next_fixer_id_respects_the_watchdogs_counter():
-    # The engine's watchdog allocates from its OWN counter (state/watchdog.json next_debugger) and
-    # never consults briefs/ — so "one past the highest brief" can land exactly on the id the
-    # watchdog has already earmarked, and the two would write the same brief path. Taking the floor
-    # from its counter keeps the dashboard off the watchdog's next id. (This is the read-only half
-    # of the fix; see test_a_watchdog_clobber_cannot_erase_the_record for the other half.)
-    assert fixer_mod.next_fixer_id(["d1"], floor=5) == "d5"
-    assert fixer_mod.next_fixer_id(["d9"], floor=3) == "d10", "the floor never LOWERS the id"
-    assert fixer_mod.next_fixer_id([], floor=None) == "d1"
-    for junk in ("x", -3, 0, 2.5, True):
-        assert fixer_mod.next_fixer_id(["d1"], floor=junk) == "d2", (
-            "a garbage floor (%r) must never crash or lower the id" % junk)
-
-
-def test_the_watchdog_counter_is_read_not_written(tmp_path):
-    # Reading the watchdog's counter is fine; WRITING it would make the dashboard a co-author of the
-    # engine's episode state machine (its anti-storm rails live in that same file) — machinery the
-    # center must not add to the runner (design §6). Read-only, fails closed on anything unreadable.
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "watchdog.json").write_text(json.dumps({"next_debugger": 7, "episode": {"x": 1}}))
-    before = (state / "watchdog.json").read_text()
-    assert fixer_mod.watchdog_next_debugger(str(tmp_path)) == 7
-    assert (state / "watchdog.json").read_text() == before, "the dashboard must not write this file"
-
-
-@pytest.mark.parametrize("body", ["{not json", json.dumps({"next_debugger": "x"}),
-                                  json.dumps({}), json.dumps([1, 2])])
-def test_an_unreadable_watchdog_counter_fails_closed_to_none(tmp_path, body):
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "watchdog.json").write_text(body)
-    assert fixer_mod.watchdog_next_debugger(str(tmp_path)) is None
-
-
-def test_a_missing_watchdog_file_is_none_not_a_crash(tmp_path):
-    assert fixer_mod.watchdog_next_debugger(str(tmp_path)) is None
-
-
-# =============================== the adapter (subprocess, against the fake) ===============================
+# =============================== the adapter (subprocess, against the fake CLI) ===============================
 
 @pytest.fixture
 def fx(tmp_path, monkeypatch):
-    """A Fixer bound to the fake shim, a synthetic state home, and a fixtures dir the fake logs
-    launches into."""
-    monkeypatch.setenv("SL_LAUNCH_SESSION", FAKE)
-    monkeypatch.setenv("SL_FIXER_FIXTURES", str(tmp_path / "fix"))
-    (tmp_path / "fix").mkdir()
-    home = tmp_path / "home"
-    (home / "state").mkdir(parents=True)
-    # A live runner anchor — the cmux pane the debugger tab is born in (the engine's own
-    # resolution: state/runner.anchor.json, present while a runner is live OR crashed).
-    (home / "state" / "runner.anchor.json").write_text(json.dumps({"pane": "cmux:pane-7"}))
+    """A Fixer bound to the fake ``superlooper`` CLI, with a fixtures dir the fake logs its
+    calls/mutations into."""
+    monkeypatch.setenv("SL_SUPERLOOPER", FAKE)
+    monkeypatch.setenv("SL_FIXER_FIXTURES", str(tmp_path))
     log = tmp_path / "cc" / "fixer-log.jsonl"
-    # The configured script is deliberately bogus so a passing test PROVES the SL_LAUNCH_SESSION
+    # The configured binary is deliberately bogus so a passing test PROVES the SL_SUPERLOOPER env
     # override (the fail-closed fixture's only lever) actually wins over the configured path.
-    verb = fixer_mod.Fixer("/nonexistent/configured-shim",
-                           {SLUG: {"path": PATH, "state_home": str(home)}},
+    verb = fixer_mod.Fixer("/nonexistent/configured-superlooper", {SLUG: PATH},
                            operator="William", log_path=str(log), now=lambda: 1_700_000_000.0)
-    return verb, tmp_path, home, log
+    return verb, tmp_path, log
 
 
-def _launches(tmp_path):
-    p = tmp_path / "fix" / "launches.jsonl"
+def _calls(fixtures):
+    p = fixtures / "calls.jsonl"
     return [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()] if p.exists() else []
 
 
-def _live_lock(home, sid, pid=None):
-    """Plant a worker.d<N>.lock naming a LIVE pid — the engine's own singleton marker, which its
-    watchdog reads the same way to refuse a second debugger."""
-    (home / "state" / ("worker.%s.lock" % sid)).write_text(str(pid or os.getpid()))
+def _launches(fixtures):
+    p = fixtures / "mutations.jsonl"
+    rows = [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()] if p.exists() else []
+    return [r for r in rows if r["kind"] == "debug_launch"]
 
 
 # ---- the happy path ----
 
-def test_execute_launches_one_session_through_the_shim(fx):
-    verb, tmp_path, home, _log = fx
+def test_execute_shells_the_engines_debug_verb(fx):
+    verb, fixtures, _log = fx
     res = verb.execute(SLUG, "the queue is frozen", _snapshot(runner_down=True))
     assert res["ok"] is True, res
-    assert res["id"] == "d1"
-    launches = _launches(tmp_path)
-    assert len(launches) == 1, "exactly ONE session — never two"
-    L = launches[0]
-    assert L["argv"] == ["--cwd", PATH, "d1"], "the engine's own --cwd debugger form"
-    assert L["env"]["SL_RUN_ROOT"] == str(home)
-    assert L["env"]["SL_PANE"] == "cmux:pane-7", "resolved from the runner's recorded anchor"
-    assert L["env"]["SL_AGENT"] == "claude"
+    assert res["id"] == "d4", "the id is the ENGINE's — the dashboard no longer allocates one"
+    assert res["verb"] == "fixer", "the UI's verb name, normalized from the CLI's own"
+
+    argv = _calls(fixtures)[-1]["argv"]
+    assert argv[0] == "debug"
+    assert argv[argv.index("--repo") + 1] == PATH
+    assert "--json" in argv
+    assert argv[argv.index("--source") + 1] == "command-center"
+    assert argv[argv.index("--operator") + 1] == "William"
+    assert len(_launches(fixtures)) == 1, "exactly ONE session — never two"
 
 
-def test_the_owners_note_reaches_the_sessions_actual_prompt(fx):
-    # The end-to-end proof of the whole feature: the brief the shim reads (which start-session.sh
-    # cats into the interactive agent as its opening message) contains the owner's words verbatim.
-    verb, tmp_path, _home, _log = fx
+def test_the_owners_note_reaches_the_engine_verbatim(fx):
+    # The end-to-end proof of the whole feature: the words the owner typed arrive at the verb that
+    # writes the brief, unsummarized and unreworded (there is no model in this path to reword them).
+    verb, fixtures, _log = fx
     note = "the departures board is lying about SL-12"
     verb.execute(SLUG, note, _snapshot([_flight(12, flights.PARKED)]))
-    brief = _launches(tmp_path)[0]["brief"]
-    assert brief is not None, "the brief must exist BEFORE the shim runs — it aborts without one"
-    assert note in brief
-    assert "sl-debugger" in brief
-    assert "SL-12" in brief, "the trouble the UI was showing rides along with the note"
+    assert _launches(fixtures)[0]["note"] == note
+
+
+def test_the_board_context_is_piped_to_the_engine_on_stdin(fx):
+    # Piped, not argv: a board with a hundred stuck flights must never hit an argv limit.
+    verb, fixtures, _log = fx
+    verb.execute(SLUG, "look", _snapshot([_flight(12, flights.PARKED)], runner_down=True))
+    argv = _calls(fixtures)[-1]["argv"]
+    assert argv[argv.index("--context-file") + 1] == "-"
+    context = _launches(fixtures)[0]["context"]
+    assert "SL-12" in context and "RUNNER DOWN" in context.upper()
 
 
 def test_execute_with_an_empty_note_still_launches(fx):
-    verb, tmp_path, _home, _log = fx
+    verb, fixtures, _log = fx
     res = verb.execute(SLUG, "", _snapshot(alert={}))
     assert res["ok"] is True, res
-    assert "no note" in _launches(tmp_path)[0]["brief"].lower()
+    assert len(_launches(fixtures)) == 1
 
 
-def test_the_brief_lands_where_the_engine_looks_for_it(fx):
-    verb, tmp_path, home, _log = fx
-    verb.execute(SLUG, "x", _snapshot())
-    assert _launches(tmp_path)[0]["brief_path"] == str(home / "briefs" / "d1.md")
-    assert (home / "briefs" / "d1.md").exists(), "the brief persists — it is the session's record"
+@pytest.mark.parametrize("note", [None, "", "   \n  "])
+def test_a_blank_note_is_sent_as_no_note_at_all(fx, note):
+    # An engine that receives `--note "   "` would write whitespace where the owner's words go.
+    # Send nothing and let the engine say "no note" in its own words.
+    verb, fixtures, _log = fx
+    verb.execute(SLUG, note, _snapshot())
+    argv = _calls(fixtures)[-1]["argv"]
+    assert "--note" not in argv
 
 
-# ---- single-flight (DoD) ----
+def test_a_giant_note_is_bounded_before_it_is_handed_over(fx):
+    verb, fixtures, _log = fx
+    verb.execute(SLUG, "x" * 50_000, _snapshot())
+    sent = _launches(fixtures)[0]["note"]
+    assert len(sent) <= fixer_mod.NOTE_MAX + 200
+    assert "truncated" in sent.lower()
 
-def test_preflight_reports_a_live_fixer_and_the_button_refuses(fx):
-    verb, tmp_path, home, _log = fx
-    _live_lock(home, "d1")
+
+# ---- the preflight ----
+
+def test_preflight_asks_the_engine_and_writes_nothing(fx):
+    verb, fixtures, log = fx
     pre = verb.preflight(SLUG, _snapshot(alert={}))
-    assert pre["live"] is True, "a live worker.d*.lock IS a live debugger — the engine's convention"
-    res = verb.execute(SLUG, "again", _snapshot(alert={}))
-    assert res["ok"] is False
-    assert res["live"] is True
-    assert "already" in (res.get("error") or "").lower()
-    assert _launches(tmp_path) == [], "NOTHING may launch while a fixer is live"
-
-
-def test_a_dead_lock_does_not_block_a_launch(fx):
-    # A crashed session leaves its lock behind. A stale lock must not wedge the button forever —
-    # liveness is the PID's, not the file's.
-    verb, tmp_path, home, _log = fx
-    _live_lock(home, "d1", pid=999_999)          # a pid that cannot be alive
-    pre = verb.preflight(SLUG, _snapshot())
-    assert pre["live"] is False
-    res = verb.execute(SLUG, "", _snapshot())
-    assert res["ok"] is True, res
-    assert res["id"] == "d2", "the dead d1 is never re-used — its brief stays its own record"
-
-
-def test_preflight_is_read_only(fx):
-    verb, tmp_path, home, log = fx
-    verb.preflight(SLUG, _snapshot(alert={}))
-    assert _launches(tmp_path) == [], "the preflight launches nothing"
-    assert not (home / "briefs").exists(), "the preflight composes no brief"
+    assert pre["ok"] is True and pre["verb"] == "fixer-check"
+    assert pre["live"] is False and pre["live_id"] is None
+    argv = _calls(fixtures)[-1]["argv"]
+    assert argv[0] == "debug" and "--check" in argv
+    assert _launches(fixtures) == [], "the preflight launches nothing"
     assert not log.exists(), "the preflight records no launch"
 
 
 def test_preflight_shows_the_trouble_the_dialog_will_send(fx):
-    verb, _tmp, _home, _log = fx
+    verb, _fixtures, _log = fx
     pre = verb.preflight(SLUG, _snapshot([_flight(12, flights.PARKED)], alert={}))
     kinds = [i["kind"] for i in pre["trouble"]["items"]]
     assert "alert" in kinds and flights.PARKED in kinds
 
 
-# ---- fail closed (DoD) ----
+def test_preflight_surfaces_a_live_debugger_the_engine_reports(fx, monkeypatch):
+    verb, _fixtures, _log = fx
+    monkeypatch.setenv("SL_DEBUG_LIVE", "d3")
+    pre = verb.preflight(SLUG, _snapshot(alert={}))
+    assert pre["live"] is True and pre["live_id"] == "d3"
+
+
+# ---- single-flight: now the ENGINE's refusal, surfaced as-is ----
+
+def test_a_live_debugger_refusal_is_surfaced_not_reinvented(fx, monkeypatch):
+    # The engine holds the watchdog's own lock across its whole check-allocate-launch, so IT is the
+    # authority on "a debugger is already on this patient". The dashboard shows its words.
+    verb, fixtures, _log = fx
+    monkeypatch.setenv("SL_DEBUG_LIVE", "d3")
+    res = verb.execute(SLUG, "again", _snapshot(alert={}))
+    assert res["ok"] is False
+    assert res["live"] is True and res["live_id"] == "d3"
+    assert "already" in (res.get("error") or "").lower()
+    assert _launches(fixtures) == [], "NOTHING may launch while a fixer is live"
+
+
+# ---- fail closed ----
 
 def test_unwatched_repo_is_refused_before_any_subprocess(fx):
-    verb, tmp_path, _home, _log = fx
+    verb, fixtures, _log = fx
     res = verb.execute("someone/else", "hi", _snapshot())
     assert res["ok"] is False
     assert res["error"] == "unknown repo"
-    assert _launches(tmp_path) == []
+    assert _calls(fixtures) == []
 
 
-def test_execute_allocates_clear_of_the_watchdogs_next_id(fx):
-    verb, tmp_path, home, _log = fx
-    (home / "state" / "watchdog.json").write_text(json.dumps({"next_debugger": 4}))
-    res = verb.execute(SLUG, "x", _snapshot())
-    assert res["id"] == "d4", "the dashboard must not step onto an id the watchdog has earmarked"
-
-
-def test_a_watchdog_clobber_cannot_erase_the_record(fx):
-    # The residual of the shared-namespace gap: the engine's watchdog can later reuse an id and
-    # overwrite <state_home>/briefs/d1.md (it allocates from its own counter and never reads
-    # briefs/). The dashboard cannot stop that from inside its own boundary — so the DURABLE record
-    # of what the owner asked lives in the dashboard's OWN log, which the engine never touches. This
-    # is what keeps that gap from costing history.
-    verb, _tmp, home, log = fx
-    verb.execute(SLUG, "the queue is frozen", _snapshot(runner_down=True))
-    (home / "briefs" / "d1.md").write_text("the watchdog overwrote this with its own brief")
-    rows = [json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
-    assert rows[0]["note"] == "the queue is frozen", "the owner's words survive a clobbered brief"
-    assert "runner-down" in rows[0]["trouble"]
-
-
-def test_a_non_executable_shim_refuses_before_writing_a_brief(fx, monkeypatch):
-    # The refusal contract is "resolve everything the shim REQUIRES before writing a single byte".
-    # A file that exists but cannot be executed must be caught by that pre-flight, not by the
-    # subprocess blowing up after the brief is already on disk.
-    verb, tmp_path, home, _log = fx
-    dud = tmp_path / "not-executable-shim"
-    dud.write_text("#!/bin/sh\necho hi\n")
-    dud.chmod(0o644)
-    monkeypatch.setenv("SL_LAUNCH_SESSION", str(dud))
-    res = verb.execute(SLUG, "x", _snapshot())
+def test_a_repo_not_on_the_field_is_refused_before_any_subprocess(fx):
+    # Configured but absent from the snapshot: the dashboard cannot describe what it cannot see, so
+    # it refuses rather than sending a context-free launch.
+    verb, fixtures, _log = fx
+    res = verb.execute(SLUG, "hi", {"repos": []})
     assert res["ok"] is False
-    assert "launch-session.sh" in res["error"] or "execute" in res["error"].lower()
-    assert _launches(tmp_path) == []
-    assert not (home / "briefs" / "d1.md").exists(), (
-        "a shim that can't run must leave no brief — the refusal is indistinguishable from "
-        "never having tapped")
-
-
-def test_a_launch_that_never_spawned_leaves_no_brief_behind(fx, monkeypatch):
-    # The belt-and-braces half: if the process could not be spawned at all (an OSError the
-    # pre-flight didn't predict — a bad shebang, a broken interpreter), the brief we just wrote
-    # reached nothing, so it must not linger and burn an id.
-    verb, tmp_path, home, _log = fx
-    bad = tmp_path / "bad-shebang"
-    bad.write_text("#!/nonexistent/interpreter\n")
-    bad.chmod(0o755)
-    monkeypatch.setenv("SL_LAUNCH_SESSION", str(bad))
-    res = verb.execute(SLUG, "x", _snapshot())
-    assert res["ok"] is False
-    assert not (home / "briefs" / "d1.md").exists(), "nothing spawned ⇒ no brief left behind"
-
-
-def test_unresolvable_shim_says_so_plainly_and_launches_nothing(fx, monkeypatch):
-    # The conftest's DEFAULT posture: SL_LAUNCH_SESSION points at an absent path. The UI must say
-    # so in words the owner can act on, and nothing may launch.
-    verb, tmp_path, home, _log = fx
-    monkeypatch.setenv("SL_LAUNCH_SESSION", "/nonexistent/not-a-shim")
-    res = verb.execute(SLUG, "x", _snapshot())
-    assert res["ok"] is False
-    assert "launch-session.sh" in res["error"] or "could not" in res["error"].lower()
-    assert _launches(tmp_path) == []
-    assert not (home / "briefs" / "d1.md").exists(), (
-        "an unresolvable shim must not leave a brief behind — nothing launched, no trace")
-
-
-def test_no_cmux_pane_fails_closed(fx):
-    # No recorded runner anchor (a cleanly-stopped loop) ⇒ no pane ⇒ the shim would abort. Refuse
-    # BEFORE launching, with the reason in plain words.
-    verb, tmp_path, home, _log = fx
-    (home / "state" / "runner.anchor.json").unlink()
-    res = verb.execute(SLUG, "x", _snapshot())
-    assert res["ok"] is False
-    assert "pane" in res["error"].lower() or "cmux" in res["error"].lower()
-    assert _launches(tmp_path) == []
-
-
-def test_a_corrupt_anchor_fails_closed_not_crash(fx):
-    verb, _tmp, home, _log = fx
-    (home / "state" / "runner.anchor.json").write_text("{not json")
-    res = verb.execute(SLUG, "x", _snapshot())
-    assert res["ok"] is False
-    assert "pane" in res["error"].lower() or "cmux" in res["error"].lower()
+    assert _calls(fixtures) == []
 
 
 def test_a_failed_launch_is_never_a_silent_success(fx, monkeypatch):
-    verb, _tmp, _home, _log = fx
-    monkeypatch.setenv("SL_FIXER_RC", "1")
+    verb, _fixtures, _log = fx
+    monkeypatch.setenv("SL_DEBUG_FAIL", "1")
     res = verb.execute(SLUG, "x", _snapshot())
-    assert res["ok"] is False, "rc != 0 means the shim did NOT verify delivery"
-    assert res["error"]
+    assert res["ok"] is False, "the CLI's ok:false is the honest verdict on delivery"
+    assert "timed out" in res["error"]
+    assert res["verb"] == "fixer"
+
+
+def test_an_unreachable_cli_says_so_plainly(fx, monkeypatch):
+    # The conftest's DEFAULT posture: SL_SUPERLOOPER points at an absent path. The UI must say so
+    # in words the owner can act on, never a bare exit code.
+    verb, _fixtures, _log = fx
+    monkeypatch.setenv("SL_SUPERLOOPER", "/nonexistent/not-a-cli")
+    res = verb.execute(SLUG, "x", _snapshot())
+    assert res["ok"] is False
+    assert "superlooper" in res["error"].lower()
+
+
+def test_unparseable_cli_output_is_an_honest_failure_not_a_pretend_success(fx, monkeypatch):
+    verb, _fixtures, _log = fx
+    monkeypatch.setenv("SL_DEBUG_GARBAGE", "1")
+    res = verb.execute(SLUG, "x", _snapshot())
+    assert res["ok"] is False and res["error"]
 
 
 def test_a_hung_launch_trips_the_timeout_and_reports_it(fx, monkeypatch):
-    verb, _tmp, _home, _log = fx
-    monkeypatch.setenv("SL_FIXER_SLEEP", "3")
-    verb._timeout = 0.4                       # a module-constant-free shrink, mirroring tidy/restart
+    verb, _fixtures, _log = fx
+    monkeypatch.setenv("SL_TIDY_SLEEP", "3")           # the fake's shared sleep injector
+    verb._timeout = 0.4                                # mirrors tidy/restart's shrinkable timeout
     res = verb.execute(SLUG, "x", _snapshot())
     assert res["ok"] is False
     assert "timed out" in res["error"].lower()
@@ -567,23 +381,23 @@ def test_a_hung_launch_trips_the_timeout_and_reports_it(fx, monkeypatch):
 
 def test_the_adapter_never_raises_into_the_caller(fx, monkeypatch):
     # A button that 500s is worse than one that says "no". Every failure mode is a dict.
-    verb, _tmp, _home, _log = fx
-    monkeypatch.setenv("SL_LAUNCH_SESSION", str(Path(__file__)))   # not executable → OSError
+    verb, _fixtures, _log = fx
+    monkeypatch.setenv("SL_SUPERLOOPER", str(Path(__file__)))   # not executable → OSError
     res = verb.execute(SLUG, "x", _snapshot())
     assert res["ok"] is False and res["error"]
 
 
-# ---- the launch is recorded (DoD) ----
+# ---- the launch is recorded ----
 
 def test_every_launch_is_recorded_with_a_timestamp_and_the_note(fx):
-    verb, _tmp, _home, log = fx
+    verb, _fixtures, log = fx
     verb.execute(SLUG, "the queue is frozen", _snapshot(runner_down=True))
     rows = [json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
     assert len(rows) == 1
     r = rows[0]
     assert r["ts"] == 1_700_000_000.0
     assert r["note"] == "the queue is frozen", "a later reader must see WHY the fixer ran"
-    assert r["id"] == "d1"
+    assert r["id"] == "d4"
     assert r["repo"] == SLUG
     assert r["ok"] is True
     assert r["operator"] == "William"
@@ -593,8 +407,8 @@ def test_every_launch_is_recorded_with_a_timestamp_and_the_note(fx):
 def test_a_failed_launch_is_recorded_too(fx, monkeypatch):
     # The record is the honest history: an attempt that failed is exactly what a later reader
     # needs to see, so it can never be quietly absent.
-    verb, _tmp, _home, log = fx
-    monkeypatch.setenv("SL_FIXER_RC", "1")
+    verb, _fixtures, log = fx
+    monkeypatch.setenv("SL_DEBUG_FAIL", "1")
     verb.execute(SLUG, "nope", _snapshot())
     rows = [json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
     assert len(rows) == 1 and rows[0]["ok"] is False
@@ -608,19 +422,19 @@ def test_the_log_lives_in_the_dashboards_own_dir_not_a_repos_loop_state():
 
 
 def test_a_log_write_failure_never_breaks_the_launch(fx):
-    verb, tmp_path, _home, _log = fx
+    verb, fixtures, _log = fx
     verb._log_path = "/nonexistent/dir/deep/fixer-log.jsonl"
     res = verb.execute(SLUG, "x", _snapshot())
     assert res["ok"] is True, "the record is bookkeeping — it must never fail the owner's tap"
-    assert len(_launches(tmp_path)) == 1
+    assert len(_launches(fixtures)) == 1
 
 
-# ---- the bright line ----
+# ---- the bright lines ----
 
 def test_no_model_call_or_network_in_the_adapter():
-    # The owner's 2026-07-15 ruling in code: the dashboard composes a prompt by string assembly and
-    # hands it to the engine's shim. No model call, no standing seat, no network — the AI runs in
-    # the launched session, outside this process, because a human tapped a button.
+    # The owner's 2026-07-15 ruling in code: the dashboard composes a string and hands it to a local
+    # CLI. No model call, no standing seat, no network — the AI runs in the launched session,
+    # outside this process, because a human tapped a button.
     low = (Path(__file__).resolve().parent.parent / "lib" / "fixer.py").read_text().lower()
     # No model vendor or inference surface anywhere in the adapter.
     for forbidden in ("anthropic", "openai", "api_key", "claude -p", "messages.create",
@@ -633,3 +447,39 @@ def test_no_model_call_or_network_in_the_adapter():
                       "urlopen(", "http.client", "socket."):
         assert forbidden not in low, (
             "lib/fixer.py must make no network call (%r) — the bright line" % forbidden)
+
+
+def test_no_engine_internals_remain_in_the_adapter():
+    """Issue #144's DoD as a RATCHET. Each pattern below is an engine internal this adapter used to
+    hard-code with no stability contract toward the engine — and because no test may reach a real
+    shim, the suite would have stayed green while production silently broke. They now live behind
+    ``superlooper debug``; a future edit that reaches back for one fails here.
+
+    Matched as CODE, not prose: the module header legitimately explains what moved and why, so the
+    scan reads the file with its docstrings and comments stripped."""
+    src = (Path(__file__).resolve().parent.parent / "lib" / "fixer.py").read_text()
+    code = _strip_comments_and_docstrings(src).lower()
+    forbidden = {
+        "launch-session": "the launch shim path — the engine resolves its own",
+        "sl_run_root": "the shim's env handshake — the engine owns it",
+        "sl_pane": "the shim's env handshake — the engine owns it",
+        "sl_launch_verify_seconds": "the shim's pinned verify window — the engine owns it",
+        "sl_launch_session": "the shim override — the engine resolves it",
+        "runner.anchor.json": "the pane anchor's on-disk shape — the engine reads it",
+        "watchdog.json": "the watchdog's own document — only the engine may read or write it",
+        "next_debugger": "the id allocator — the engine allocates under its own lock",
+        "worker.d": "the worker-lock naming convention — the engine's single-flight rule",
+        "briefs": "the brief path convention — the engine composes and places the brief",
+        "os.kill": "pid liveness probing — the engine decides what 'already running' means",
+    }
+    for needle, why in forbidden.items():
+        assert needle not in code, (
+            "lib/fixer.py must not hard-code the engine internal %r (%s) — issue #144" % (needle, why))
+
+
+def _strip_comments_and_docstrings(src):
+    """The source with ``#`` comments and triple-quoted strings removed — crude but sufficient for
+    a needle scan over a stdlib-only module whose only triple-quoted strings ARE docstrings."""
+    src = re.sub(r'"""(?:.|\n)*?"""', "", src)
+    src = re.sub(r"'''(?:.|\n)*?'''", "", src)
+    return "\n".join(line.split("#", 1)[0] for line in src.splitlines())

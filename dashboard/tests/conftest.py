@@ -25,18 +25,20 @@ William's live cmux). Each MUST resolve through an env-var override:
                    Neutralizing it fail-closes the usage path's Keychain access AND, transitively,
                    its network call (no token ⇒ no request to api.anthropic.com), so the whole usage
                    egress is off by default; a test that wants a real token injects a fake instead.
-    SL_SUPERLOOPER the superlooper CLI     (lib/tidy.py — the Tidy button's `superlooper tidy`).
-                   The runtime default is the CONFIGURED path (config's ``superlooper_cli``), but
-                   ``lib/tidy`` lets THIS var override it exactly so the fixture can point every
-                   test at an absent binary — `tidy` closes cmux windows, so a test must never
-                   reach the real one; a tidy test injects tests/fakes/fake-superlooper in-body.
-    SL_LAUNCH_SESSION the engine's launch shim (lib/fixer.py — the Deploy Fixer button, issue #141).
-                   The shim OPENS A REAL CMUX TAB and starts an interactive Claude session, so a
-                   stray real call in a test would spawn a live agent on William's machine — the
-                   most expensive stray call in this repo. Same name the ENGINE's own watchdog
-                   resolves it by, so the dashboard and the engine agree on the override; the
-                   runtime default is derived from config's ``superlooper_cli`` (a sibling in the
-                   engine's bin/). A fixer test injects tests/fakes/fake-launch-session in-body.
+    SL_SUPERLOOPER the superlooper CLI     (lib/tidy.py, lib/restart.py, lib/janitor.py — and,
+                   since issue #144, lib/fixer.py: Deploy Fixer shells `superlooper debug`, the
+                   engine's owner-tap debugger launch). The runtime default is the CONFIGURED path
+                   (config's ``superlooper_cli``), but each adapter lets THIS var override it
+                   exactly so the fixture can point every test at an absent binary. `tidy` closes
+                   cmux windows and `debug` OPENS A REAL CMUX TAB and starts an interactive Claude
+                   session — a stray real call would spawn a live agent on William's machine, the
+                   most expensive stray call in this repo. Those tests inject
+                   tests/fakes/fake-superlooper in-body.
+    SL_LAUNCH_SESSION the engine's launch shim. Nothing in the dashboard resolves this any more
+                   (before #144, lib/fixer drove the shim directly — that whole handshake now lives
+                   behind `superlooper debug`). Kept neutralized anyway: it is the variable the
+                   ENGINE's own launcher reads, and the tests run the real engine CLI nowhere but
+                   still share this process's environment. Belt and braces on the priciest call.
 
 The autouse fixture points every one at a guaranteed-absent path **unconditionally** — even a
 real value exported into the caller's shell is overridden — so the suite is fail-closed by

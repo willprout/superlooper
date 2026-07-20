@@ -1,101 +1,85 @@
-"""The Deploy Fixer button (issue #141) — a LOCAL SESSION LAUNCH, a sibling of Tidy (``lib/tidy``),
-Restart (``lib/restart``) and Janitor (``lib/janitor``) in the dashboard's SECOND button class
-(design record §2's verb amendment: local command execution, not a GitHub write).
+"""The Deploy Fixer button (issue #141) — a LOCAL COMMAND execution, a sibling of Tidy
+(``lib/tidy``), Restart (``lib/restart``) and Janitor (``lib/janitor``) in the dashboard's SECOND
+button class (design record §2's verb amendment: local command execution, not a GitHub write).
 
 When the board shows something wrong — a frozen repo, a wedged session, a park pile-up, an ALERT —
 the owner's recourse used to be: open a terminal, find the repo, start a debug session by hand.
-This is that, as one tap: compose a prompt from what the UI is *currently showing* as unhealthy plus
-whatever the owner types in his own words, and hand it to the engine's existing launch shim, which
-opens ONE fresh interactive Claude session running the ``sl-debugger`` skill.
+This is that, as one tap: compose a readout from what the UI is *currently showing* as unhealthy,
+add whatever the owner types in his own words, and hand both to ``superlooper debug``, the engine's
+owner-tap launch verb, which opens ONE fresh interactive Claude session running the ``sl-debugger``
+skill.
 
 **The no-AI-in-the-dashboard bright line is NOT crossed here** (owner ruling, 2026-07-15). This
 module makes no model call and holds no standing seat. It assembles a string — exactly as
-``actions.compose_briefing`` already does for Discuss — and executes a local script. The AI runs in
-the launched session, in its own process, because a human tapped a button; the tap plus his note are
-his word, the same way the Approve button records it. ``tests/test_fixer.py`` pins the absence of any
+``actions.compose_briefing`` already does for Discuss — and executes a local CLI. The AI runs in the
+launched session, in its own process, because a human tapped a button; the tap plus his note are his
+word, the same way the Approve button records it. ``tests/test_fixer.py`` pins the absence of any
 model/network call in this file, so a future edit that reaches for one fails CI.
 
-What this module knows about the engine (and why each piece is here rather than behind a CLI verb):
-the engine exposes no owner-tap "launch a debugger" subcommand — its only debugger launch is
-``superlooper watchdog``, the UNATTENDED, episode-gated fallback, whose whole contract (grace
-windows, authority tiers, once-per-incident) is wrong for a human standing at the keyboard. So this
-adapter drives the shim the way the engine's own watchdog drives it (``superlooper`` ▸
-``_watchdog_launch``), reusing its conventions rather than inventing parallel ones:
+**Why this is a THIN SHELL (issue #144).** It did not start that way. #141 shipped this module
+driving the engine's launch shim DIRECTLY, hard-coding five engine internals that had no stability
+contract toward the dashboard: the ``--cwd <dir> d<N>`` invocation form, the
+``<state_home>/briefs/<id>.md`` path convention, the ``SL_RUN_ROOT``/``SL_PANE``/``SL_MODEL``
+handshake, ``state/runner.anchor.json``'s shape, and ``worker.d<N>.lock`` + pid liveness as "a
+debugger is already running". The engine was free to change any of them, and because no test may
+reach a real shim, this suite would have stayed green while production silently broke.
 
-* the ``--cwd <dir> d<N>`` invocation — a session with no worktree and no branch, launched in an
-  existing dir; the shim REFUSES an id that isn't ``^[ad][0-9]+$`` through this path;
-* the brief at ``<state_home>/briefs/<id>.md`` — the shim aborts without it, and
-  ``start-session.sh`` cats it into the interactive agent as its opening message, which is why the
-  owner's note lands there VERBATIM;
-* the ``SL_RUN_ROOT``/``SL_PANE``/``SL_AGENT`` handshake, and the pinned ``SL_LAUNCH_VERIFY_SECONDS``;
-* ``worker.d<N>.lock`` naming a live pid as "a debugger is already on this patient" — the SAME file
-  the watchdog checks before its own launch, so in the ordinary case whichever starts first is seen
-  by the other.
+Two of those five could not merely be COPIED correctly — they were unreachable from outside the
+engine at all:
 
-KNOWN GAP, recorded rather than papered over (cross-review, issue #141). The ``d<N>`` namespace is
-SHARED with the engine's watchdog, but its allocator is not: the watchdog counts from
-``state/watchdog.json`` ▸ ``next_debugger`` and never reads ``briefs/``. Two consequences the
-dashboard cannot fully close from inside its own boundary:
+1. *A reused id.* The ``d<N>`` namespace is the watchdog's, allocated from ``state/watchdog.json`` ▸
+   ``next_debugger``. A dashboard launch could read that counter but must never write it (the
+   watchdog's anti-storm rails live in the same document, behind the engine's atomic lock — §6
+   machinery the center must not add to the runner), so it could only step AROUND the watchdog's
+   next id, never claim it. A later watchdog launch would then reuse the id and overwrite the brief.
+2. *A simultaneous launch.* Both sides checked ``worker.d*.lock``, but ``start-session.sh`` creates
+   that lock a beat AFTER the launch begins — so two checks landing in the same few seconds both saw
+   "nobody home" and both launched. Its correlation is worst exactly when it matters: a wedged
+   runner is both what trips the watchdog and what makes the owner tap this button.
 
-1. *A reused id.* The watchdog's counter does not advance when the dashboard launches, so a later
-   watchdog launch can pick an id this button already used and overwrite its brief. Mitigated by
-   reading its counter as an allocation floor (:func:`watchdog_next_debugger` — a READ; writing that
-   file would make this a co-author of the watchdog's episode state machine, which §6 forbids), and
-   defused by keeping the durable record of every launch in the dashboard's OWN log, which the
-   engine never touches: a clobbered brief costs no history.
-2. *A simultaneous launch.* Both sides check ``worker.d*.lock`` before launching, but the lock is
-   created by ``start-session.sh`` a beat later — so a watchdog check firing inside that window
-   could allocate a DIFFERENT id and launch a second debugger. Narrow (it needs an open post-grace
-   episode landing in a few-second window), but its correlation is worst exactly when it matters:
-   a wedged runner is both what trips the watchdog and what makes the owner tap this button.
+``superlooper debug`` closes both by allocating and launching while holding the watchdog's OWN lock
+— which the watchdog holds across its entire check, launch subprocess included. So this module now
+keeps only what is genuinely the dashboard's (it is the thing that knows what the board is showing)
+and shells the CLI for everything else, exactly as ``lib/restart`` shells ``request-restart``.
 
-Both dissolve the moment the ENGINE owns an owner-tap launch verb (a ``superlooper debug`` that
-allocates under the watchdog's own lock, exactly as ``request-restart`` owns the restart marker) —
-at which point this adapter becomes a thin CLI shell like ``lib/restart``. That is engine work; this
-issue's boundary is ``dashboard/**``, so it is filed for the owner rather than smuggled in here.
+What remains here:
+
+* **The trouble readout.** :func:`trouble_context` derives what the UI is currently rendering as
+  unhealthy from the same snapshot the pixels came from (design record B.1: semantics server-side),
+  and :func:`compose_context` turns it into the markdown the engine frames into the brief.
+* **The dashboard's OWN launch log.** Beside ``desk.json``, never inside a loop state home
+  (decision B.4). The engine journals the tap in the tower log; this is the center's own record of
+  what its own button did, including the failures.
 
 Bright lines this module encodes (not conveniences):
 
-* **Fail closed, always.** An unwatched repo, an unresolvable shim, no cmux pane, a corrupt anchor —
-  each refuses BEFORE anything launches, with the reason in plain words. Nothing half-launches.
-* **Single-flight.** Never two debuggers on one patient. A live ``worker.d*.lock`` blocks the tap.
-* **This adapter never raises into a caller.** A missing script, a timeout, a killed process — all
+* **Fail closed, always.** An unwatched repo, a repo not on the field — refused BEFORE any
+  subprocess. Everything downstream is the engine's own honest refusal, surfaced in its words.
+* **This adapter never raises into a caller.** A missing binary, a timeout, a killed process — all
   become an honest ``{"ok": false, "error": …}`` (mirrors ``restart._run`` / ``tidy._run``).
 * **The launch never touches labels.** It starts a session; that is the whole verb.
 * **The launched session's authority is the sl-debugger skill's own** (its human-present contract).
-  This module composes context and gets out of the way — it never dictates a repair.
+  This module reports what the board shows and gets out of the way — it never dictates a repair.
 """
 import json
 import math
 import os
-import re
 import subprocess
-import threading
 import time
 from pathlib import Path
 
 import flights
 
-# Per-call hard timeout (seconds) for the shim, which opens a cmux tab and VERIFIES delivery. A
+# Per-call hard timeout (seconds) for the CLI, which opens a cmux tab and VERIFIES delivery. A
 # module constant, not a literal, so a test can shrink it and trip the timeout path (mirrors
-# restart._DEFAULT_TIMEOUT). Matches the engine's own WATCHDOG_LAUNCH_TIMEOUT.
+# restart._DEFAULT_TIMEOUT). Matches the engine's own launch timeout.
 _DEFAULT_TIMEOUT = 180
 
-# The shim's delivery-verification window, PINNED rather than inherited. The engine pins it for the
-# same reason (its review's P1-1): an ambient large SL_LAUNCH_VERIFY_SECONDS — a debugging export, a
-# LaunchAgent env — would let a launch outlive our timeout, so we would report a failed attempt
-# while the tab delivers late and a REAL session starts. That is precisely the double-launch the
-# single-flight check exists to prevent. 30s is the script's own default, far under the timeout.
-_VERIFY_SECONDS = "30"
-
-# The debugger seat is hired judgment, like the answerer — the engine gives it the same default.
-_DEFAULT_MODEL = "opus[1m]"
-
-_ID_RE = re.compile(r"^d([0-9]+)$")
-
-# A note is the owner's words, not a manuscript. Bounded so a stray paste can never drown the
-# machine context it rides with (the shim cats the whole brief into the agent's opening message).
-_NOTE_MAX = 4000
+# A note is the owner's words, not a manuscript; the board readout is a readout, not a corpus. Both
+# are bounded HERE as well as in the engine — the engine bounds what it will frame into a brief, and
+# this bounds what a browser POST can push through a subprocess argument in the first place.
+NOTE_MAX = 4000
+CONTEXT_MAX = 8000
 
 _LOG_FILENAME = "fixer-log.jsonl"
 
@@ -177,17 +161,15 @@ def trouble_kinds(ctx):
     return [i["kind"] for i in (ctx or {}).get("items", [])]
 
 
-# =============================== the prompt (pure string assembly — no AI) ===============================
+# =============================== the context (pure string assembly — no AI) ===============================
 
-def _note_text(note):
-    """The owner's note, trimmed and BOUNDED. Blank/absent reads as "no note" — stated plainly in
-    the prompt rather than left as an empty section the session would read as a lost instruction."""
-    note = (note or "").strip()
-    if not note:
-        return None
-    if len(note) > _NOTE_MAX:
-        note = note[:_NOTE_MAX].rstrip() + "\n\n[note truncated at %d characters]" % _NOTE_MAX
-    return note
+def _bounded(text, limit, what):
+    """A string, trimmed and BOUNDED. Truncation is STATED in the text so the session reads a
+    visible cut rather than silently losing the end of an instruction."""
+    text = (text or "").strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + ("\n\n[%s truncated at %d characters]" % (what, limit))
+    return text
 
 
 def _item_line(item):
@@ -209,45 +191,20 @@ def _item_line(item):
     return line
 
 
-def compose_prompt(ctx, note, repo_path, state_home, operator=None):
-    """The launched session's ENTIRE opening message, assembled by string concatenation from facts
-    the dashboard already has: the sl-debugger invocation, who launched it and how, the owner's note
-    VERBATIM, and the machine context (repo, checkout, state home, and the specific items the UI is
-    rendering as unhealthy right now).
+def compose_context(ctx):
+    """The dashboard's half of the launched session's opening message: the specific things the UI is
+    rendering as unhealthy RIGHT NOW, worst first, in the same words the owner just read.
 
-    Deliberately does NOT tell the debugger how to work. Its authority, its ladder and its
-    exclusions are the skill's own contract (this issue defines the LAUNCH, never the debugger's
-    behavior) — a prompt that started dictating repairs would be this button quietly rewriting the
-    skill. The one thing it must assert is the MODE: a person is at the keyboard, so the skill's
-    human-present contract applies, not the watchdog's unattended one."""
-    who = operator if (isinstance(operator, str) and operator.strip()) else "the owner"
+    This is the piece that is genuinely the dashboard's — nobody else knows what board the owner was
+    looking at when he tapped. The engine (``superlooper debug``) frames it, together with the note,
+    into the brief, and owns everything about the session itself: the invocation, the mode, the
+    patient's paths, the skill's contract.
+
+    Deliberately a READOUT, never a work order. It does not tell the debugger how to work — its
+    authority, its ladder and its exclusions are the sl-debugger skill's own contract, and a context
+    that started dictating repairs would be this button quietly rewriting the skill."""
     ctx = ctx or {}
-    lines = [
-        "# sl-debugger session — launched from the command-center dashboard",
-        "",
-        "Use the **sl-debugger** skill.",
-        "",
-        "%s tapped **Deploy Fixer** on the command center just now, because the dashboard was "
-        "showing trouble on this loop instance. This is a **human-present** session: %s is at the "
-        "keyboard right now and can answer you. The skill's human-present contract applies — its "
-        "unattended-invocation contract (the mechanical watchdog's) does NOT: nobody launched this "
-        "on a timer, a person did." % (who, who),
-        "",
-        "## What %s typed" % who,
-        "",
-    ]
-    typed = _note_text(note)
-    lines.append(typed if typed else
-                 "*(no note — he tapped Deploy Fixer without typing one, so the board below is the "
-                 "whole of what he saw.)*")
-
-    lines += ["", "## The patient", "",
-              "- Repo under loop management: **%s**" % ctx.get("slug", "?"),
-              "- Working copy (your cwd): `%s`" % repo_path,
-              "- State home: `%s` (journal, per-issue state, liveness markers, heartbeat, ALERT)"
-              % state_home,
-              "", "## What the dashboard is showing as unhealthy, right now", ""]
-
+    lines = ["## What the dashboard is showing as unhealthy, right now", ""]
     items = ctx.get("items") or []
     if items:
         lines.append("This is the board he was looking at when he tapped — worst first:")
@@ -257,247 +214,94 @@ def compose_prompt(ctx, note, repo_path, state_home, operator=None):
         lines.append("**Nothing** — the board reads healthy: no stale heartbeat, no ALERT, no "
                      "freeze, no parked or frozen flights. He tapped anyway, so trust his note "
                      "over the board and start by finding what the board is failing to show.")
-
-    lines += ["", "---", "",
-              "Start with the skill's read-only health readout before changing anything, and ask "
-              "%s whatever you need — he is right here." % who]
-    return "\n".join(lines)
+    return _bounded("\n".join(lines), CONTEXT_MAX, "board readout")
 
 
-# =============================== the launch command (pure construction) ===============================
-
-def launch_script_for(superlooper_cli):
-    """The engine's launch shim: ``launch-session.sh``, a SIBLING of the ``superlooper`` CLI in the
-    engine's ``bin/``. Derived from the ONE configured path (config's ``superlooper_cli``) so the
-    dashboard needs no second knob for a second engine entry point. Expanded to an absolute path — a
-    literal ``~`` never resolves inside a subprocess."""
-    cli = os.path.abspath(os.path.expanduser(str(superlooper_cli)))
-    return os.path.join(os.path.dirname(cli), "launch-session.sh")
-
-
-def resolve_script(configured):
-    """The shim to run: the ``SL_LAUNCH_SESSION`` env override wins over the configured path. This is
-    the SAME variable the engine's own watchdog resolves the shim by, so the dashboard and the
-    engine agree on the override — and ``tests/conftest.py`` can point the whole suite at an absent
-    path fail-closed (mirrors ``lib/tidy``/``lib/restart``'s ``SL_SUPERLOOPER`` precedence)."""
-    return os.environ.get("SL_LAUNCH_SESSION") or configured
-
-
-def launch_argv(script, repo_path, fixer_id):
-    """The shim's ``--cwd`` form — the engine's own contract for a debugger session: launch in an
-    existing dir, no worktree, no branch. The shim refuses an id that isn't ``^[ad][0-9]+$`` here,
-    so the ``d<N>`` shape is load-bearing, not cosmetic."""
-    return [script, "--cwd", repo_path, fixer_id]
-
-
-def launch_env(base_env, state_home, pane, model=None, agent=None):
-    """The environment the shim reads. ``SL_RUN_ROOT`` and ``SL_PANE`` are REQUIRED (it aborts
-    without either). The ambient env is carried through — the shim needs git/cmux on PATH — with our
-    keys layered on top, and the verify window PINNED (never inherited; see ``_VERIFY_SECONDS``)."""
-    env = dict(base_env)
-    env.update({
-        "SL_RUN_ROOT": str(state_home),
-        "SL_PANE": str(pane),
-        "SL_MODEL": model or _DEFAULT_MODEL,
-        "SL_EFFORT": "",
-        "SL_AGENT": agent if agent in ("claude", "codex") else "claude",
-        "SL_LAUNCH_VERIFY_SECONDS": _VERIFY_SECONDS,
-    })
-    return env
-
-
-def next_fixer_id(seen_ids, floor=None):
-    """The next debugger id: one past the highest ``d<N>`` ever seen in this state home, never below
-    ``floor``. Never re-uses a number even across a gap, so THIS side can't clobber a prior
-    session's brief. Garbage and non-debugger ids (``i44``, ``a2``) are ignored, never a crash.
-
-    ``floor`` is the engine watchdog's own counter (see :func:`watchdog_next_debugger`). The
-    watchdog allocates from that counter and never reads ``briefs/``, so "one past the highest
-    brief" can land exactly on the id it has already earmarked — and both would write the same brief
-    path. Honouring its floor keeps the dashboard off its next id. A non-int/absent floor is ignored,
-    and a floor can only ever RAISE the id, never lower it into a used number."""
-    highest = 0
-    for name in seen_ids or []:
-        m = _ID_RE.match(str(name))
-        if m:
-            highest = max(highest, int(m.group(1)))
-    n = highest + 1
-    # `is True/False` guard: bool is an int subclass, and `floor=True` must not become id d1.
-    if isinstance(floor, int) and not isinstance(floor, bool) and floor > n:
-        n = floor
-    return "d%d" % n
-
-
-# =============================== filesystem reads (fail closed, never raise) ===============================
-
-def _pid_alive(pid):
-    """Mirrors the engine's own ``_pid_alive``: a permission error means it exists but isn't ours."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, ValueError, TypeError, OverflowError):
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
-def _live_lock(path):
-    """A lock file naming a LIVE pid. Unreadable/garbage content reads as dead (reclaimable) — the
-    engine's exact rule, so both sides agree on what "a debugger is running" means."""
-    try:
-        pid = Path(path).read_text().strip()
-    except OSError:
-        return False
-    return pid.isdigit() and _pid_alive(int(pid))
-
-
-def _state_dir(state_home):
-    return Path(state_home) / "state"
-
-
-def live_fixer_id(state_home):
-    """The id of a live debugger session, or ``None``. Any ``worker.d<N>.lock`` naming a live pid —
-    ``start-session.sh``'s per-id singleton, and the SAME signal the engine's watchdog reads before
-    its own launch. So a watchdog session blocks a tap and a tapped session blocks the watchdog:
-    never two debuggers on one patient."""
-    try:
-        names = os.listdir(str(_state_dir(state_home)))
-    except OSError:
-        return None
-    for name in sorted(names):
-        if name.startswith("worker.d") and name.endswith(".lock"):
-            if _live_lock(_state_dir(state_home) / name):
-                return name[len("worker."):-len(".lock")]
-    return None
-
-
-def _seen_ids(state_home):
-    """Every debugger id this state home has ever handed out, from the two places the engine leaves
-    them: composed briefs and session locks (live or stale)."""
-    seen = []
-    try:
-        seen += [n[:-3] for n in os.listdir(str(Path(state_home) / "briefs")) if n.endswith(".md")]
-    except OSError:
-        pass
-    try:
-        seen += [n[len("worker."):-len(".lock")]
-                 for n in os.listdir(str(_state_dir(state_home)))
-                 if n.startswith("worker.") and n.endswith(".lock")]
-    except OSError:
-        pass
-    return seen
-
-
-def watchdog_next_debugger(state_home):
-    """The id number the ENGINE's watchdog will hand its next unattended debugger session
-    (``state/watchdog.json`` ▸ ``next_debugger``), or ``None`` when absent/unreadable/garbage.
-
-    READ-ONLY, deliberately. Writing this file would make the dashboard a co-author of the
-    watchdog's episode state machine — its anti-storm rails (one notify per episode, at most one
-    launch per incident, the attempt cap) live in the same document, behind the engine's own atomic
-    lock protocol. That is machinery the center must not add to the runner (design §6), and getting
-    it subtly wrong would be worse than the narrow race it would close. So we read its intent and
-    step around it; the remaining gap is recorded honestly in this module's header."""
-    try:
-        doc = json.loads((_state_dir(state_home) / "watchdog.json").read_text())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(doc, dict):
-        return None
-    n = doc.get("next_debugger")
-    if isinstance(n, int) and not isinstance(n, bool) and n > 0:
-        return n
-    return None
-
-
-def resolve_pane(state_home):
-    """The cmux pane the fixer's tab is born in, resolved the way the ENGINE resolves it: an explicit
-    ``$SL_PANE``, else the RUNNER's recorded anchor (``state/runner.anchor.json`` — present while a
-    runner is live OR crashed; a clean stop clears it). ``None`` when nothing resolves, which is a
-    refusal, never a guess: the shim would abort anyway, and a launch that half-happens is worse
-    than one that plainly didn't.
-
-    Note the crashed-runner case is exactly the one this button is for — a dead runner still leaves
-    its anchor, so the fixer can still be born in the loop's own pane."""
-    pane = (os.environ.get("SL_PANE") or "").strip()
-    if pane:
-        return pane
-    try:
-        anchor = json.loads((_state_dir(state_home) / "runner.anchor.json").read_text())
-    except (OSError, ValueError):
-        return None
-    if isinstance(anchor, dict):
-        pane = anchor.get("pane")
-        if isinstance(pane, str) and pane.strip():
-            return pane.strip()
-    return None
-
+# =============================== the launch record ===============================
 
 def default_log_path():
     """The dashboard's OWN launch log: ``<base>/command-center/fixer-log.jsonl``, beside
     ``desk.json`` — where ``base`` is ``$SL_HOME`` or ``~/.superlooper``. Decision B.4 (see
     ``lib/desk``): the center's own facts live BESIDE the loop state homes it reads, never inside
-    one. The brief in the state home is the session's own record; this is the dashboard's."""
+    one. The engine journals the tap in the tower log; this is the center's record of its own
+    button, failures included."""
     base = os.environ.get("SL_HOME") or os.path.expanduser("~/.superlooper")
     return Path(base) / "command-center" / _LOG_FILENAME
 
 
 # =============================== the verb ===============================
 
-def _run(argv, env, timeout):
-    """Run the shim; returns ``(rc, stdout, stderr, spawned)``. NEVER raises: a timeout, a missing
-    script, a bad shebang — each is caught and returned as a nonzero rc, so the caller fails closed
-    (mirrors ``restart._run``).
+def _binary(configured):
+    """The superlooper CLI to run: the ``SL_SUPERLOOPER`` env override wins over the configured path
+    (config's ``superlooper_cli``), mirroring ``lib/restart``/``lib/tidy``'s precedence so every
+    local-command button and the tests agree on binary resolution."""
+    return os.environ.get("SL_SUPERLOOPER") or configured
 
-    ``spawned`` is False ONLY when the process never started at all (an ``OSError`` from the exec
-    itself). The caller uses it to clean up the brief it just wrote: a launch that never spawned
-    reached nothing, so leaving its brief behind would burn an id and litter the state home with a
-    session that never existed. A TIMEOUT is spawned=True — the tab may yet deliver late, so its
-    brief must stay."""
+
+def _run(binary, args, stdin_text=None, timeout=None):
+    """Run ``<binary> <args>``; returns ``(rc, stdout, stderr)``. NEVER raises: a timeout, a missing
+    binary, or any OSError is caught and returned as a nonzero rc with empty stdout so the caller
+    fails closed (mirrors ``restart._run``)."""
     try:
-        proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
-        return proc.returncode, proc.stdout, proc.stderr, True
+        proc = subprocess.run([binary, *args], input=stdin_text, capture_output=True, text=True,
+                              timeout=timeout if timeout is not None else _DEFAULT_TIMEOUT)
+        return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
-        return 124, "", "timed out", True
+        return 124, "", "timed out"            # conventional timeout rc
     except (OSError, ValueError):
-        return 127, "", "command not found", False
+        return 127, "", "command not found"    # missing binary / bad invocation
+
+
+def parse_result(stdout):
+    """The single JSON object ``superlooper debug --json`` prints, or ``None`` when stdout carries no
+    parseable object (a missing/crashed CLI). Pure and unit-tested, so the coupling to the CLI's
+    ``--json`` contract is pinned by a test rather than discovered in production."""
+    txt = (stdout or "").strip()
+    if not txt:
+        return None
+    try:
+        val = json.loads(txt)
+    except (ValueError, TypeError):
+        return None
+    return val if isinstance(val, dict) else None
+
+
+def _error(rc, stderr, binary):
+    """A plain, honest failure message for a CLI that didn't answer — what the UI shows instead of a
+    fake success. Names the CLI on a missing binary so the operator knows exactly what to fix."""
+    stderr = (stderr or "").strip()
+    if rc == 127:
+        return ("could not run the superlooper CLI at %s — is it installed? "
+                "(set 'superlooper_cli' in config.json)" % binary)
+    if rc == 124:
+        return "the launch timed out — no session was confirmed"
+    return stderr or ("superlooper debug failed (exit %d) — no session was confirmed" % rc)
 
 
 class Fixer:
-    """The Deploy Fixer verb, bound to the configured superlooper CLI path (from which the shim is
-    derived), an allow-list mapping each WATCHED repo slug to its checkout + state home, and the
-    operator name the launch is recorded under.
+    """The Deploy Fixer verb, bound to the configured superlooper CLI path, an allow-list mapping
+    each WATCHED repo slug to its checkout path, and the operator name the launch is recorded under.
 
-    Two methods back the button's two-step flow: :meth:`preflight` reports whether a fixer is
+    Two methods back the button's two-step flow: :meth:`preflight` reports whether a debugger is
     already live and what trouble would ride into the prompt, and writes NOTHING; :meth:`execute`
-    composes the brief and launches (only after the owner's in-box confirm). Every result is honest —
-    ``ok`` is the shim's real verdict on delivery, never a pretend one."""
+    hands the note and the board readout to the engine (only after the owner's in-box confirm).
+    Every result is honest — ``ok`` is the engine's real verdict on delivery, never a pretend one."""
 
-    def __init__(self, superlooper_cli, repos, operator=None, timeout=None, log_path=None,
-                 now=None, agent=None):
-        self._script = launch_script_for(superlooper_cli)
-        # slug -> {"path": <checkout>, "state_home": <home>}
-        self._repos = dict(repos or {})
+    def __init__(self, superlooper_cli, repo_paths, operator=None, timeout=None, log_path=None,
+                 now=None):
+        self._binary = superlooper_cli
+        self._paths = dict(repo_paths or {})
         self._operator = operator if (isinstance(operator, str) and operator.strip()) else None
         self._timeout = timeout if timeout is not None else _DEFAULT_TIMEOUT
         self._log_path = str(log_path) if log_path else str(default_log_path())
         self._now = now if now is not None else time.time
-        self._agent = agent
-        # ThreadingHTTPServer serves POSTs concurrently: two taps racing would both pass the
-        # single-flight check and both allocate d<N>. Serialize the whole check-allocate-launch.
-        self._lock = threading.Lock()
 
     # ---- helpers ----
 
     def _refuse(self, verb, error, **extra):
-        out = {"ok": False, "verb": verb, "error": error}
+        out = {"ok": False, "verb": verb, "error": error, "live": None, "live_id": None}
         out.update(extra)
         return out
-
-    def _entry(self, repo):
-        return self._repos.get(repo)
 
     def _stamp(self):
         ts = self._now() if callable(self._now) else self._now
@@ -520,110 +324,73 @@ class Fixer:
         except (OSError, ValueError, TypeError):
             pass
 
+    def _invoke(self, path, extra, stdin_text=None):
+        """Shell ``superlooper debug`` and return its parsed body, or an honest failure dict when the
+        CLI could not answer at all. The CLI's own refusals (a live debugger, no pane, a launch that
+        did not land) are WELL-FORMED bodies at rc 1 — surfaced as-is, in the engine's words, never
+        flattened into a generic error (``lib/restart``'s dead-runner discipline)."""
+        binary = _binary(self._binary)
+        rc, out, err = _run(binary, ["debug", "--repo", path, "--json", *extra],
+                            stdin_text=stdin_text, timeout=self._timeout)
+        parsed = parse_result(out)
+        if parsed is not None:
+            return parsed
+        return {"ok": False, "live": None, "live_id": None, "error": _error(rc, err, binary)}
+
     # ---- step 1: the preflight (writes nothing) ----
 
     def preflight(self, repo, snapshot):
-        """Is a fixer already on this patient, and what would ride into its prompt? Read-only: no
-        brief, no launch, no record. The dialog decides what to show from this."""
-        entry = self._entry(repo)
-        if entry is None:
-            return self._refuse("fixer-check", "unknown repo", live=None)
+        """Is a debugger already on this patient, and what would ride into its prompt? Read-only: no
+        brief, no launch, no record. The dialog decides what to show from this.
+
+        Liveness is the ENGINE's answer (``superlooper debug --check``), not a lock file this module
+        interprets — that convention is the engine's to change."""
+        path = self._paths.get(repo)
+        if path is None:
+            return self._refuse("fixer-check", "unknown repo")
         ctx = trouble_context(snapshot, repo)
         if ctx is None:
-            return self._refuse("fixer-check", "that repo is not on the field", live=None)
-        live = live_fixer_id(entry["state_home"])
-        return {"ok": True, "verb": "fixer-check", "live": live is not None,
-                "live_id": live, "trouble": ctx}
+            return self._refuse("fixer-check", "that repo is not on the field")
+
+        res = self._invoke(path, ["--check"])
+        res["verb"] = "fixer-check"
+        res["trouble"] = ctx
+        if not res.get("ok"):
+            return res
+        res["live"] = bool(res.get("live"))
+        return res
 
     # ---- step 2: the launch ----
 
     def execute(self, repo, note, snapshot):
-        """Compose the prompt and launch ONE interactive sl-debugger session through the engine's
-        shim. Refuses — changing nothing, launching nothing — on an unwatched repo, a live fixer, an
-        unresolvable shim, or an unresolvable cmux pane. ``ok`` is the shim's verdict: rc 0 means it
+        """Hand the owner's note and the board readout to ``superlooper debug``, which launches ONE
+        interactive sl-debugger session. Refuses locally — changing nothing, running nothing — on an
+        unwatched repo or a repo that isn't on the field; every other refusal is the engine's own,
+        surfaced in its words. ``ok`` is the engine's verdict: true only when the launch shim
         VERIFIED the tab took the prompt."""
-        entry = self._entry(repo)
-        if entry is None:
-            return self._refuse("fixer", "unknown repo", live=None)
+        path = self._paths.get(repo)
+        if path is None:
+            return self._refuse("fixer", "unknown repo")
 
         ctx = trouble_context(snapshot, repo)
         if ctx is None:
-            return self._refuse("fixer", "that repo is not on the field", live=None)
+            return self._refuse("fixer", "that repo is not on the field")
 
-        home = entry["state_home"]
-        script = resolve_script(self._script)
+        extra = ["--context-file", "-", "--source", "command-center"]
+        # A blank note is sent as NO note, never as whitespace: the engine says "no note" in its own
+        # words, and an argument of spaces would land where the owner's words go.
+        sent_note = _bounded(note, NOTE_MAX, "note")
+        if sent_note:
+            extra += ["--note", sent_note]
+        if self._operator:
+            extra += ["--operator", self._operator]
 
-        with self._lock:
-            live = live_fixer_id(home)
-            if live is not None:
-                return self._refuse(
-                    "fixer",
-                    "a fixer session (%s) is already running for this repo — never two debuggers "
-                    "on one patient" % live,
-                    live=True, live_id=live)
-
-            # Resolve everything the shim REQUIRES before writing a single byte: an unresolvable
-            # launch must leave no brief behind, so a refusal is indistinguishable from never having
-            # tapped. Executability is part of "resolvable" — a present-but-unrunnable shim (a
-            # checkout that lost its +x, a half-finished install) must be caught HERE, not by the
-            # subprocess failing after the brief is already on disk.
-            if not os.path.isfile(script):
-                return self._refuse(
-                    "fixer",
-                    "could not find the engine's launch-session.sh at %s — is superlooper "
-                    "installed? (set 'superlooper_cli' in config.json)" % script,
-                    live=False)
-            if not os.access(script, os.X_OK):
-                return self._refuse(
-                    "fixer",
-                    "the engine's launch-session.sh at %s is not executable — nothing launched"
-                    % script,
-                    live=False)
-            pane = resolve_pane(home)
-            if not pane:
-                return self._refuse(
-                    "fixer",
-                    "no cmux pane resolves for this loop (no recorded runner anchor) — start the "
-                    "loop once so the fixer's tab has somewhere to be born",
-                    live=False)
-
-            fixer_id = next_fixer_id(_seen_ids(home), floor=watchdog_next_debugger(home))
-            prompt = compose_prompt(ctx, note, entry["path"], home, operator=self._operator)
-            brief = Path(home) / "briefs" / ("%s.md" % fixer_id)
-            try:
-                brief.parent.mkdir(parents=True, exist_ok=True)
-                brief.write_text(prompt)
-            except OSError as e:
-                return self._refuse("fixer", "could not write the session brief: %s" % e, live=False)
-
-            rc, out, err, spawned = _run(launch_argv(script, entry["path"], fixer_id),
-                                         launch_env(os.environ, home, pane, agent=self._agent),
-                                         self._timeout)
-            if not spawned:
-                # Nothing ever ran: the brief reached no one, so it must not linger (it would burn
-                # an id and read to a later reader as a session that existed).
-                try:
-                    brief.unlink()
-                except OSError:
-                    pass
-
+        res = self._invoke(path, extra, stdin_text=compose_context(ctx))
+        res["verb"] = "fixer"
         ts = self._stamp()
-        if rc == 0:
-            self._record(ts, repo, fixer_id, note, ctx, True)
-            return {"ok": True, "verb": "fixer", "id": fixer_id, "live": True,
-                    "trouble": trouble_kinds(ctx)}
-
-        error = _launch_error(rc, err, out)
-        self._record(ts, repo, fixer_id, note, ctx, False, error=error)
-        return self._refuse("fixer", error, live=False, id=fixer_id)
-
-
-def _launch_error(rc, stderr, stdout):
-    """A plain, honest failure message for a launch that didn't land — what the UI shows instead of
-    a fake success. Never a bare exit code: the owner can act on words."""
-    msg = (stderr or "").strip() or (stdout or "").strip()
-    if rc == 124:
-        return "the launch timed out — no session was confirmed"
-    if rc == 127:
-        return "could not run the engine's launch-session.sh — is superlooper installed?"
-    return msg or "the launch failed (exit %d) — no session was confirmed" % rc
+        if res.get("ok"):
+            self._record(ts, repo, res.get("id"), sent_note, ctx, True)
+            res["trouble"] = trouble_kinds(ctx)
+            return res
+        self._record(ts, repo, res.get("id"), sent_note, ctx, False, error=res.get("error"))
+        return res

@@ -9,14 +9,15 @@
 
      open → POST /api/fixer/check → the box shows what the board is reporting and offers an
      OPTIONAL note (skippable — an empty note deploys just fine) → the owner taps "Deploy fixer" →
-     POST /api/fixer → the server composes the prompt and launches → the honest result is shown.
+     POST /api/fixer → the server composes the board readout and hands it, with the note, to
+     `superlooper debug` → the honest result is shown.
 
    The bright line, and the owner's 2026-07-15 ruling in the UI: **no AI runs here.** This file makes
    no model call and the dashboard holds no seat. It collects a tap and (optionally) the owner's own
-   words, and the server hands them to the engine's existing launch shim — the same mechanism the
-   runner and the watchdog already use. The AI runs in the LAUNCHED session, in its own process,
-   because a human tapped a button. His tap plus his note are his word, exactly as the Approve
-   button records it.
+   words, and the server shells `superlooper debug` — the ENGINE's owner-tap launch verb (issue
+   #144), which owns the id allocation, the single-flight lock, the brief and the launch handshake.
+   The AI runs in the LAUNCHED session, in its own process, because a human tapped a button. His tap
+   plus his note are his word, exactly as the Approve button records it.
 
    Two things this file deliberately does NOT do:
      * it never decides what is "unhealthy" — the server read the board and sent it (design B.1: the

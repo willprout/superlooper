@@ -102,3 +102,45 @@ def test_a_config_error_keeps_its_own_distinct_exit_code(tmp_path):
     code = cc.main(["command-center", str(tmp_path / "does-not-exist.json")])
     assert code == cc.EXIT_CONFIG_ERROR
     assert cc.EXIT_CONFIG_ERROR != cc.EXIT_BIND_FAILED
+
+
+# =============================== the verb wiring (issue #144) ===============================
+
+def test_the_fixer_is_bound_to_the_same_slug_to_checkout_map_as_every_other_verb(
+        tmp_path, monkeypatch, capsys):
+    """Issue #144: ``lib/fixer`` is a thin CLI shell now — it passes each repo's CHECKOUT to
+    ``superlooper debug --repo``, exactly as Restart/Janitor/Tidy do. Before #144 it was handed a
+    ``{"path", "state_home"}`` dict, because it read the state home itself to resolve the pane, the
+    brief dir and the worker locks.
+
+    Pin the shape AT THE SEAM: a stale wiring type-checks fine (a dict is a valid mapping value) and
+    would only blow up where the checkout reaches the subprocess — and no test may reach the real
+    CLI, so nothing else in this suite would notice."""
+    captured = {}
+
+    class _CaptureFixer:
+        def __init__(self, cli, repo_paths, **kwargs):
+            captured["cli"] = cli
+            captured["repo_paths"] = repo_paths
+
+    monkeypatch.setattr(cc.fixer_mod, "Fixer", _CaptureFixer)
+    monkeypatch.setenv("SL_HOME", str(tmp_path / "sl-home"))
+    # Occupy the port so main() returns right after building the verbs — construction is what we
+    # are inspecting, and this keeps the test off a real serve loop.
+    occupier = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occupier.bind(("127.0.0.1", 0))
+    occupier.listen(1)
+    port = occupier.getsockname()[1]
+    try:
+        cc.main(["command-center", str(_write_installed_config(tmp_path, port))])
+    finally:
+        occupier.close()
+    capsys.readouterr()
+
+    paths = captured["repo_paths"]
+    assert list(paths) == ["will-titan/superlooper-sandbox"]
+    for slug, value in paths.items():
+        assert isinstance(value, str), (
+            "the fixer takes slug → checkout PATH (issue #144), not the pre-#144 "
+            "{path, state_home} dict — %r got %r" % (slug, value))
+        assert value == str(tmp_path / "code" / "superlooper-sandbox")

@@ -26,6 +26,11 @@
                   `superseded` PRs, aged parked/needs-william issues) and execute ONLY what
                   William approves (y/N or --yes) — list/--dry-run changes nothing anywhere;
                   nothing is ever auto-closed or auto-deleted (issue #62, spec §8 V2)
+  debug           launch ONE interactive sl-debugger session on this repo because a PERSON asked
+                  (issue #144) — the attended sibling of `watchdog`'s unattended fallback. Owns the
+                  d<N> id allocation and single-flight under the watchdog's own lock, composes the
+                  brief from --note + --context-file, and journals the tap. A local ops UI over the
+                  loop shells this instead of re-implementing the launch handshake
   watchdog        one MECHANICAL health check (issue #66): stale heartbeat / present ALERT /
                   the no-progress shape -> notify the owner -> grace window -> launch ONE
                   unattended sl-debugger session through the launch shim. Run it on an
@@ -1689,6 +1694,44 @@ def _watchdog_pane(state_dir):
     return detect_self_anchor()["pane"]
 
 
+def _debugger_shim_run(cfg, repo, home, pane, sid):
+    """Run ONE debugger session (``d<N>``) through the launch shim — the single handshake shared by
+    the watchdog's UNATTENDED launch and ``superlooper debug``'s owner tap (issue #144). Returns
+    ``(rc, stdout, stderr, spawned)``; NEVER raises.
+
+    Sharing it is the point: the ``--cwd`` invocation form, the ``SL_RUN_ROOT``/``SL_PANE`` contract,
+    the seat defaults and the pinned verify window are ONE fact with one place to change, so a second
+    caller can never drift from the first (before #144 the command center held a hand-copied
+    duplicate of all of it, outside the engine, with no stability contract).
+
+    ``spawned`` is False ONLY when the process never started at all (an ``OSError`` from the exec):
+    the caller uses it to clean up a brief that reached nobody. A TIMEOUT is spawned=True — the tab
+    may yet deliver late, so its brief must stay."""
+    models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    script = os.environ.get("SL_LAUNCH_SESSION") or os.path.join(_HERE, "launch-session.sh")
+    env = {**os.environ,
+           "SL_RUN_ROOT": home, "SL_PANE": pane,
+           # the debugger is a hired-judgment seat like the answerer — same model default
+           "SL_MODEL": models.get("answerer") or "opus[1m]", "SL_EFFORT": "",
+           # PIN the shim verify window (review P1-1): launch-session.sh inherits
+           # SL_LAUNCH_VERIFY_SECONDS, and an ambient large value (a debugging export, a
+           # LaunchAgent env) would let the launch outlive WATCHDOG_LAUNCH_TIMEOUT — rc=124
+           # counts a FAILED attempt while the tab delivers late and a real session starts,
+           # so a later check could launch a SECOND session for one episode. 30s is the
+           # script's own default and sits far under the 180s timeout.
+           "SL_LAUNCH_VERIFY_SECONDS": "30",
+           "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
+    try:
+        r = subprocess.run([script, "--cwd", os.path.abspath(repo), sid],
+                           env=env, capture_output=True, text=True,
+                           timeout=WATCHDOG_LAUNCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out", True
+    except (OSError, ValueError):
+        return 127, "", "could not run the launch shim", False
+    return r.returncode, r.stdout, r.stderr, True
+
+
 def _watchdog_launch(repo, cfg, home, state_dir, launch, state):
     """Execute one launch request through the SAME shim stack workers use. Returns the rc
     fed to watchdog.after_launch: 0 only when launch-session.sh VERIFIED delivery."""
@@ -1714,32 +1757,11 @@ def _watchdog_launch(repo, cfg, home, state_dir, launch, state):
         print("watchdog: no cmux pane resolves (no $SL_PANE, no recorded runner anchor, not "
               "inside cmux) — cannot launch; notifying instead.", file=sys.stderr)
         return "no_pane"
-    models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
-    script = os.environ.get("SL_LAUNCH_SESSION") or os.path.join(_HERE, "launch-session.sh")
-    env = {**os.environ,
-           "SL_RUN_ROOT": home, "SL_PANE": pane,
-           # the debugger is a hired-judgment seat like the answerer — same model default
-           "SL_MODEL": models.get("answerer") or "opus[1m]", "SL_EFFORT": "",
-           # PIN the shim verify window (review P1-1): launch-session.sh inherits
-           # SL_LAUNCH_VERIFY_SECONDS, and an ambient large value (a debugging export, a
-           # LaunchAgent env) would let the launch outlive WATCHDOG_LAUNCH_TIMEOUT — rc=124
-           # counts a FAILED attempt while the tab delivers late and a real session starts,
-           # so a later check could launch a SECOND session for one episode. 30s is the
-           # script's own default and sits far under the 180s timeout.
-           "SL_LAUNCH_VERIFY_SECONDS": "30",
-           "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
-    try:
-        r = subprocess.run([script, "--cwd", os.path.abspath(repo), launch["id"]],
-                           env=env, capture_output=True, text=True,
-                           timeout=WATCHDOG_LAUNCH_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return 124
-    except OSError:
-        return 127
-    out = (r.stdout or "") + (r.stderr or "")
-    if out.strip():
-        print(out.strip())
-    return r.returncode
+    rc, out, err, _spawned = _debugger_shim_run(cfg, repo, home, pane, launch["id"])
+    combined = (out or "") + (err or "")
+    if combined.strip():
+        print(combined.strip())
+    return rc
 
 
 def _watchdog_resurrect(repo, cfg, home, state_dir, resurrect):
@@ -1895,6 +1917,327 @@ def cmd_watchdog(args):
         _watchdog_release_lock(lock)
 
 
+# ------------------------------- debug (issue #144) -------------------------------
+#
+# The OWNER-TAP debugger launch — the attended sibling of `watchdog`'s unattended, episode-gated
+# fallback. `watchdog` is a timer's verb: grace windows, authority tiers, once-per-incident. None of
+# that fits a human standing at the keyboard who can see the trouble and answer questions, so the
+# engine grew a second door rather than bending the first.
+#
+# It exists as an ENGINE verb (not as five conventions re-implemented by whoever wants a debugger)
+# because two of the things a launch must get right are only reachable from in here:
+#
+#   * the d<N> allocator. It lives in state/watchdog.json ▸ next_debugger. A caller outside the
+#     engine can READ that counter but must not write it — the watchdog's anti-storm rails live in
+#     the same document behind this lock — so it could only ever step AROUND the watchdog's next id,
+#     never claim it. A later watchdog launch would then reuse the id and overwrite the brief.
+#   * single flight. Both sides can look for a live worker.d<N>.lock, but start-session.sh creates
+#     that lock a beat AFTER the launch begins, so two checks landing in the same few seconds both
+#     see "nobody home" and both launch. Holding state/watchdog.lock across the whole
+#     check-allocate-launch — exactly as cmd_watchdog holds it across its entire check, launch
+#     subprocess included — is what makes the two mutually exclusive rather than merely polite.
+#
+# Everything the CALLER knows stays the caller's: it passes the owner's note verbatim and whatever
+# context it alone can assemble (the command center knows what the board is showing). The engine
+# frames that into the brief, allocates, launches, and journals one line.
+
+# The owner's note is his words, not a manuscript; the caller's context is a board readout, not a
+# corpus. Both are BOUNDED so a stray paste can never drown the machine context it rides with —
+# start-session.sh cats the whole brief in as the session's opening message.
+_DEBUG_NOTE_MAX = 4000
+_DEBUG_CONTEXT_MAX = 8000
+
+_DEBUG_ID_RE = re.compile(r"^d([0-9]+)$")
+
+_DEBUG_PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
+
+
+def _debug_render(template, mapping):
+    """SINGLE-PASS ``{name}`` substitution over the ORIGINAL template (fresh-agent review).
+
+    Deliberately NOT watchdog.render_brief's sequential ``str.replace`` chain. That chain
+    substitutes each key in turn over the OUTPUT of the last, so a placeholder appearing inside an
+    earlier value gets expanded: an owner note containing the literal text ``{context}`` would be
+    rewritten into the board readout. The one promise this brief makes about the note is that it is
+    VERBATIM — and only one pass over the original template can keep it. (The watchdog's own brief
+    is rendered from engine-generated values, so its chain is safe; this one takes caller text.)
+
+    An unknown ``{name}`` is left exactly as written — prose braces are ordinary text here."""
+    return _DEBUG_PLACEHOLDER_RE.sub(
+        lambda m: str(mapping[m.group(1)]) if m.group(1) in mapping else m.group(0), template)
+
+
+def _debug_journal(home, record):
+    """Journal one debug record, swallowing any write failure. journal.append normally fails LOUD
+    (a record we cannot write is a bug) — but this call sits AFTER a launch that already happened.
+    A bookkeeping failure that turned a real, delivered session into a traceback with no ``--json``
+    body would tell the caller nothing launched; that belief is exactly what invites a second tap,
+    and a second debugger on one patient is the thing this verb exists to prevent."""
+    try:
+        journal.append(home, record)
+    except (OSError, ValueError):
+        print("debug: could not write the journal record (the session still launched)",
+              file=sys.stderr)
+
+
+def _emit_debug(args, result):
+    """Print a debug result: one JSON object when ``--json`` (for a local ops UI to parse), else a
+    plain human line for a terminal operator."""
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(result) + "\n")
+        return
+    if result.get("ok") and result.get("verb") == "debug":
+        sys.stdout.write("launched sl-debugger session %s — brief: %s\n"
+                         % (result.get("id"), result.get("brief")))
+    elif result.get("verb") == "debug-check":
+        sys.stdout.write(("a debugger session (%s) is already live for this repo.\n"
+                          % result.get("live_id")) if result.get("live")
+                         else "no debugger session is live for this repo.\n")
+    else:
+        sys.stdout.write("no debugger launched: %s\n" % result.get("error"))
+
+
+def _debug_live_id(state_dir):
+    """The id of a LIVE debugger session, or None — any ``worker.d<N>.lock`` naming a live pid
+    (start-session.sh's per-id singleton, the SAME file _watchdog_debugger_live reads, so a tapped
+    session blocks the watchdog and a watchdog session blocks a tap)."""
+    try:
+        names = sorted(os.listdir(state_dir))
+    except OSError:
+        return None
+    for n in names:
+        if n.startswith("worker.d") and n.endswith(".lock") \
+                and _live_lock(os.path.join(state_dir, n)):
+            return n[len("worker."):-len(".lock")]
+    return None
+
+
+def _debug_seen_ids(home, state_dir):
+    """Every ``d<N>`` this state home has already handed out, from the two places a launch leaves
+    one behind: a composed brief and a session lock (live or stale)."""
+    out = []
+    for directory, prefix, suffix in ((os.path.join(home, "briefs"), "", ".md"),
+                                      (state_dir, "worker.", ".lock")):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        out += [n[len(prefix):len(n) - len(suffix)] for n in names
+                if n.startswith(prefix) and n.endswith(suffix)]
+    return out
+
+
+def _debug_allocate(state_path, home, state_dir):
+    """Take the next debugger id and write the counter FORWARD — the co-authorship a caller outside
+    the engine could not have. Must be called while HOLDING state/watchdog.lock: that is what keeps
+    this read-modify-write and the watchdog's own from interleaving.
+
+    The counter is authoritative, but a brief or lock sitting ABOVE it also bars its number: ids
+    allocated out of band before this verb existed (the command center's own allocator, issue #141)
+    can sit higher than next_debugger, and handing one out again would overwrite that session's
+    brief. So allocate past whichever is greater, and leave the counter above BOTH.
+
+    The whole watchdog document is round-tripped through coerce_state, never rewritten from scratch:
+    the episode state machine and its anti-storm rails live in the same file, and this verb is a
+    co-author of exactly one field."""
+    import watchdog as watchdog_lib
+    st = watchdog_lib.coerce_state(_read_json_file(state_path, None))
+    n = st.get("next_debugger", 1)
+    for name in _debug_seen_ids(home, state_dir):
+        m = _DEBUG_ID_RE.match(name)
+        if m:
+            n = max(n, int(m.group(1)) + 1)
+    st["next_debugger"] = n + 1
+    loopstate.save(state_path, st)          # DURABLE before anything launches — see cmd_debug
+    return "d%d" % n
+
+
+def _debug_bounded(text, limit, what):
+    """A caller-supplied string, trimmed and BOUNDED — truncation is STATED in the text so the
+    session reads a visible cut rather than silently losing the end of an instruction."""
+    text = (text or "").strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + ("\n\n[%s truncated at %d characters]" % (what, limit))
+    return text
+
+
+def _debug_context(args):
+    """``(context, error)`` — the caller's composed context, read from ``--context-file`` (``-`` is
+    stdin, so a large board readout can never hit an argv limit). Absent ⇒ empty, which is a normal
+    hand-run invocation, not an error. An unreadable file IS an error: a launch that silently
+    dropped the context it was handed would send the session in half-informed."""
+    src = getattr(args, "context_file", None)
+    if not src:
+        return "", None
+    # Read at most ONE character past the bound (fresh-agent review): the value is truncated to
+    # _DEBUG_CONTEXT_MAX anyway, and reading a whole file first only means a stray `--context-file
+    # /var/log/something-huge` is pulled into memory before being thrown away. The extra character
+    # is what lets _debug_bounded still SEE that it overflowed and say so.
+    cap = _DEBUG_CONTEXT_MAX + 1
+    if src == "-":
+        return sys.stdin.read(cap), None
+    try:
+        with open(src) as f:
+            return f.read(cap), None
+    except OSError as e:
+        return None, "could not read the context file %s: %s" % (src, e)
+
+
+def _debug_brief(cfg, home, repo, operator, source, note, context):
+    """The launched session's ENTIRE opening message. Rendered by :func:`_debug_render` — literal,
+    SINGLE-PASS ``{name}`` substitution (never str.format, which chokes on the prose braces a note
+    may carry; and never a sequential replace chain, which would expand a placeholder the caller's
+    own text contained).
+
+    Deliberately does NOT tell the debugger how to work: its authority, its ladder and its
+    exclusions are the sl-debugger skill's own contract. The one thing this brief must assert is the
+    MODE — a person is at the keyboard, so the skill's human-present contract applies and the
+    watchdog's unattended one does not."""
+    template = _read(os.path.join(_TEMPLATES, "debugger-brief-owner.md")) or ""
+    note = _debug_bounded(note, _DEBUG_NOTE_MAX, "note")
+    context = _debug_bounded(context, _DEBUG_CONTEXT_MAX, "context")
+    return _debug_render(template, {
+        "operator": operator,
+        "source": source,
+        "note": note or ("*(no note — they launched the fixer without typing one, so whatever "
+                         "follows is the whole of what they handed you.)*"),
+        "context": context or ("## Context from the caller\n\n*(none — nothing rode in beyond the "
+                               "note above. Start from the state home's own truth.)*"),
+        "repo_slug": cfg.get("repo") or "?",
+        "repo_path": os.path.abspath(repo),
+        "state_home": home,
+    })
+
+
+def _debug_error(rc, stderr, stdout):
+    """A plain, honest failure message for a launch that did not land — what a caller shows instead
+    of a fake success. Never a bare exit code: the operator can act on words."""
+    msg = (stderr or "").strip() or (stdout or "").strip()
+    if rc == 124:
+        return "the launch timed out — no session was confirmed"
+    if rc == 127:
+        return "could not run the engine's launch-session.sh — is superlooper installed?"
+    return msg or ("the launch failed (exit %d) — no session was confirmed" % rc)
+
+
+def cmd_debug(args):
+    """Launch ONE interactive sl-debugger session on this repo, because a person asked for it.
+
+    Refuses — changing nothing, launching nothing — when a debugger is already live, when a watchdog
+    check holds the lock, or when no cmux pane resolves. ``ok`` is the shim's real verdict on
+    delivery, never a pretend one. ``--check`` is the read-only preflight (writes NOTHING), so a
+    confirm dialog can decide what to show before the owner commits."""
+    import watchdog as watchdog_lib
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    state_dir = os.path.join(home, "state")
+    operator = (args.operator or "").strip() or "the owner"
+    source = (args.source or "").strip() or "cli"
+
+    if getattr(args, "check", False):
+        live = _debug_live_id(state_dir)
+        _emit_debug(args, {"ok": True, "verb": "debug-check", "id": None,
+                           "live": live is not None, "live_id": live})
+        return 0
+
+    context, ctx_err = _debug_context(args)
+    if ctx_err is not None:
+        _emit_debug(args, {"ok": False, "verb": "debug", "id": None, "live": None,
+                           "live_id": None, "error": ctx_err})
+        return 1
+
+    def refuse(error, **extra):
+        out = {"ok": False, "verb": "debug", "id": None, "live": False, "live_id": None,
+               "error": error}
+        out.update(extra)
+        _emit_debug(args, out)
+        return 1
+
+    # Every failure below must reach the caller as the --json CONTRACT, never as a traceback: a UI
+    # that gets an empty stdout and a stack trace on stderr cannot tell a refusal from a crash, and
+    # this is the one endpoint where guessing wrong means a second agent on the owner's machine.
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+    except OSError as e:
+        return refuse("could not open this loop's state home (%s): %s" % (state_dir, e))
+
+    # The watchdog's OWN lock, held across the whole check-allocate-launch. A live watchdog check
+    # owns it for its entire run (its launch subprocess included), so we do not queue behind it —
+    # we say so plainly and change nothing. A tap is cheap to repeat; a second debugger is not.
+    lock = os.path.join(state_dir, "watchdog.lock")
+    try:
+        acquired = _watchdog_acquire_lock(lock)
+    except OSError as e:
+        # The lock is taken by hardlinking a temp file INTO state/, so an existing-but-unwritable
+        # state dir raises here — before a single byte of the --json contract has been printed
+        # (fresh-agent review round 2). Wrapped at THIS call site, not inside the helper: the
+        # watchdog's own acquire is a background job whose loud failure is the right behavior.
+        return refuse("could not take this loop's watchdog lock (%s is unwritable): %s"
+                      % (state_dir, e))
+    if not acquired:
+        return refuse("a watchdog check is running for this state home right now — nothing was "
+                      "launched; try again in a moment", live=None)
+    brief_path = None
+    try:
+        live = _debug_live_id(state_dir)
+        if live is not None:
+            return refuse("a debugger session (%s) is already running for this repo — never two "
+                          "debuggers on one patient" % live, live=True, live_id=live)
+
+        # Resolve everything the shim REQUIRES before burning an id or writing a byte, so a refusal
+        # is indistinguishable from never having asked.
+        pane = _watchdog_pane(state_dir)
+        if not pane:
+            return refuse("no cmux pane resolves for this loop (no $SL_PANE, no recorded runner "
+                          "anchor, not inside cmux) — start the loop once so the session's tab has "
+                          "somewhere to be born")
+
+        try:
+            sid = _debug_allocate(os.path.join(state_dir, watchdog_lib.STATE_FILENAME),
+                                  home, state_dir)
+        except (OSError, ValueError) as e:
+            # The counter could not be advanced, so we do NOT hold an id we can prove is ours —
+            # launching on one anyway is exactly the reuse this verb exists to prevent.
+            return refuse("could not allocate a debugger id (%s is unwritable): %s"
+                          % (watchdog_lib.STATE_FILENAME, e))
+
+        brief_path = os.path.join(home, "briefs", "%s.md" % sid)
+        try:
+            os.makedirs(os.path.join(home, "briefs"), exist_ok=True)
+            with open(brief_path, "w") as f:
+                f.write(_debug_brief(cfg, home, args.repo, operator, source, args.note, context))
+        except OSError as e:
+            # open(,"w") CREATES/TRUNCATES before write() runs, so a failure mid-write leaves a
+            # partial brief for a session that never launched — which a later reader would read as
+            # one that existed (fresh-agent review round 2). Remove it; a no-such-file is fine.
+            _rm_quiet(brief_path)
+            brief_path = None
+            return refuse("could not write the session brief: %s" % e, id=sid)
+
+        rc, out, err, spawned = _debugger_shim_run(cfg, args.repo, home, pane, sid)
+        if not spawned:
+            # Nothing ever ran: the brief reached no one, so it must not linger (it would read to a
+            # later reader as a session that existed). The BURNED id stands — never re-handed out.
+            _rm_quiet(brief_path)
+    finally:
+        _watchdog_release_lock(lock)
+
+    if rc == 0:
+        _debug_journal(home, {"act": "debug_launch", "outcome": "launched", "id": sid,
+                              "operator": operator, "source": source,
+                              "note": _debug_bounded(args.note, _DEBUG_NOTE_MAX, "note")})
+        _emit_debug(args, {"ok": True, "verb": "debug", "id": sid, "live": True,
+                           "live_id": sid, "brief": brief_path})
+        return 0
+
+    error = _debug_error(rc, err, out)
+    _debug_journal(home, {"act": "debug_launch", "outcome": "launch_failed", "id": sid,
+                          "operator": operator, "source": source, "error": error})
+    _emit_debug(args, {"ok": False, "verb": "debug", "id": sid, "live": False, "live_id": None,
+                       "error": error})
+    return 1
+
+
 # ------------------------------- stubs -------------------------------
 
 def _stub(which, wave):
@@ -1959,6 +2302,21 @@ def main(argv=None):
            "--source": dict(default=None,
                             help="who asked (audit only)")})
     add("watchdog", cmd_watchdog)
+    add("debug", cmd_debug,
+        **{"--note": dict(default=None,
+                          help="the owner's own words, carried into the session's brief VERBATIM"),
+           "--context-file": dict(default=None, metavar="PATH",
+                                  help="a file of caller-composed context to frame into the brief "
+                                       "('-' reads stdin — a local ops UI pipes what it is showing)"),
+           "--check": dict(action="store_true",
+                           help="report whether a debugger session is already live and write "
+                                "nothing (a read-only preflight)"),
+           "--json": dict(action="store_true",
+                          help="emit a single JSON object (for a UI over the loop to parse)"),
+           "--operator": dict(default=None,
+                              help="who tapped — named in the brief and the journal line (audit)"),
+           "--source": dict(default=None,
+                            help="what asked (audit only; default 'cli')")})
     add("janitor", cmd_janitor,
         **{"--dry-run": dict(action="store_true",
                              help="list the proposals and change NOTHING anywhere"),
