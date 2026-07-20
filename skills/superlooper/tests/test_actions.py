@@ -1009,6 +1009,151 @@ def test_wrong_typed_canary_clock_never_raises_or_probes_immediately():
         assert only(out, "park") == []
 
 
+# =========================== display-sleep launch hold (#124) ===========================
+# The live 2026-07-13 launch killer: macOS will not boot a fresh cmux tab's shell while the DISPLAY
+# sleeps, so a launch attempted then is created and closed as an orphan — a burned attempt that feeds
+# #24's systemic streak and churns an alert every sleeping episode (#115's canary makes THAT self-
+# recover, but a cleaner fix is to not ATTEMPT delivery into a sleeping display at all). The runner
+# hands decide a per-tick display-power read in disk["display_asleep"] (True=asleep, False=awake,
+# None/absent=unreadable); decide HOLDS every fresh launch (and the #115 canary) QUIETLY while it
+# reads confirmed asleep — no streak, no per-issue cap, no alert, since a sleeping display is normal,
+# not a fault — and resumes automatically on wake. FAIL OPEN on anything but an explicit True.
+
+def test_display_asleep_holds_every_fresh_launch_quietly():
+    dsk = disk(display_asleep=True)
+    out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
+    assert only(out, "launch") == []                       # every launch held: no tab attempted
+    assert only(out, "park") == []                         # queue intact — nothing parked
+    assert only(out, "relabel") == []                      # agent-ready never stripped
+    assert only(out, "alert") == [] and not has_notify(out)   # a sleeping display is NOT a fault
+
+
+def test_display_awake_launches_normally():
+    dsk = disk(display_asleep=False)
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "launch")) == 1 and only(out, "alert") == []
+
+
+def test_display_probe_unreadable_fails_open_and_launches():
+    # None (the runner could not read the display state — a non-macOS host, a pmset error/timeout)
+    # must launch normally, EXACTLY today's behavior — never wedge the queue on a probe we could not
+    # run (the #46/#76 dark-meter asymmetry, applied to display sleep).
+    dsk = disk(display_asleep=None)
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "launch")) == 1 and only(out, "alert") == []
+
+
+def test_display_probe_absent_launches_normally():
+    # No display_asleep key at all (the runner saw no launch demand and never probed): fail open.
+    out = decide(parsed_issues=[parsed(5)])
+    assert len(only(out, "launch")) == 1 and only(out, "alert") == []
+
+
+def test_display_asleep_does_not_feed_the_streak_or_cap_or_park():
+    # The whole point: while asleep NOTHING is attempted, so no issue's launch_failures grows and no
+    # streak entry is made. An at-cap issue is held (its park defers to wake, like every other hold),
+    # so a sleeping night never walks the queue into parks or alerts.
+    dsk = disk(display_asleep=True, launch_fail_ids=[],
+               issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures=2)}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert only(out, "launch") == [] and only(out, "park") == []
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_display_asleep_wrong_typed_never_raises_or_falsely_degrades():
+    # Fail-open-on-wrong-TYPED (the project's named defect class): ONLY an explicit True holds; any
+    # other value launches normally and never raises.
+    for bad in ("yes", 1, [], {"asleep": True}, "true", 0):
+        dsk = disk(display_asleep=bad)
+        out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+        assert len(only(out, "launch")) == 1, bad
+        assert only(out, "alert") == [], bad
+
+
+def test_display_asleep_does_not_block_gating_or_merging():
+    # A sleeping display holds SPENDS (fresh launches), never merge mechanics: a finished, clean PR
+    # still merges while asleep — merging spends no session (mirrors the dead-anchor / dead-auth rule).
+    d, g = _gating()                                       # i5 finished, clean PR
+    d["display_asleep"] = True
+    out = decide(parsed_issues=[parsed(9)], dsk=d, gh_view=g)   # i9 queued behind the sleeping display
+    assert len(only(out, "merge")) == 1                    # the gate still merges the finished PR
+    assert only(out, "launch") == []                       # but the queued launch is held
+
+
+def test_no_canary_while_the_display_is_asleep():
+    # A systemic hold stands AND the display sleeps: the #115 canary must NOT fire into a sleeping
+    # display (it would just create+close an orphan). The systemic streak is intact so the durable
+    # alert still stands, but no probe is attempted until the display wakes.
+    out = decide(now=NOW, dsk=_held(display_asleep=True),
+                 parsed_issues=[parsed(5), parsed(6)])
+    assert only(out, "launch") == []                       # no canary into the sleeping display
+    assert only(out, "park") == []
+
+
+def test_canary_fires_once_the_display_wakes():
+    # The mirror: with the display awake (False) the held systemic streak still gets its one canary
+    # probe after the interval — display sleep gates the canary, it does not disable it.
+    out = decide(now=NOW, dsk=_held(display_asleep=False),
+                 parsed_issues=[parsed(5), parsed(6)])
+    launches = only(out, "launch")
+    assert len(launches) == 1 and launches[0].get("canary") is True
+
+
+# ---- recovery relaunches also boot a fresh tab, so a sleeping display holds them too (#124) ----
+# A fresh-queue launch is not the only path that boots a tab macOS will not schedule while asleep:
+# an exited-lane relaunch, an orphan resume, and a conflict resolver all do. The auth sibling (#159)
+# holds all three; #124 must too, or the systemic streak still churns overnight via the relaunch
+# path. Each holds QUIETLY (unlike dead auth, a sleeping display raises no alert) and resumes on wake.
+
+def test_display_asleep_holds_the_exited_relaunch_and_never_parks():
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    # Even at the retry cap, a sleeping display HOLDS the recovery relaunch rather than parking or
+    # burning a fresh tab: it resumes the tick the display wakes.
+    dsk = disk(display_asleep=True, exited={"i5": "x rc=1"},
+               issues_state={"version": 1, "issues": {"i5": ist("running", retries=2)}})
+    out = decide(parsed_issues=[p5], dsk=dsk)
+    assert only(out, "recover") == []                      # no relaunch into the sleeping display
+    assert only(out, "park") == []                         # held, not parked (even at cap)
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i5" and "display" in h[0]["reason"].lower()
+    assert only(out, "alert") == [] and not has_notify(out)   # quiet: a sleeping display is no fault
+
+
+def test_display_asleep_holds_the_orphan_resume():
+    p8 = parsed(8, labels=("in-progress", "type:build"))
+    g = ghv(prs={"i8": pr_view(num=88, branch="sl/i8-issue-8")})
+    dsk = disk(display_asleep=True)
+    out = decide(parsed_issues=[p8], dsk=dsk, gh_view=g)
+    assert only(out, "launch") == []                       # the orphan resume is held, not spent
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i8" and "display" in h[0]["reason"].lower()
+    assert only(out, "alert") == [] and not has_notify(out)   # quiet: no alert
+
+
+def test_display_asleep_holds_the_conflict_resolver_quietly():
+    # A conflict resolver is a session START: a fresh tab macOS will not boot while asleep, so it
+    # holds (never a resolve_conflict, never a park) — and QUIETLY, unlike dead auth (#159).
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING", labels=[{"name": "preserve"}]))
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid=HEAD1)
+    d["display_asleep"] = True
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    assert only(out, "resolve_conflict") == []             # not spent into the sleeping display
+    h = only(out, "launch_hold")
+    assert len(h) == 1 and h[0]["id"] == "i5" and "display" in h[0]["reason"].lower()
+    assert only(out, "alert") == [] and not has_notify(out)   # quiet: no alert
+
+
+def test_display_awake_still_relaunches_an_exited_lane():
+    # The mirror: an awake display (or an absent read) never blocks a recovery relaunch — the exited
+    # lane relaunches exactly as today.
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    dsk = disk(display_asleep=False, exited={"i5": "x rc=1"},
+               issues_state={"version": 1, "issues": {"i5": ist("running", retries=1)}})
+    out = decide(parsed_issues=[p5], dsk=dsk)
+    r = only(out, "recover")
+    assert len(r) == 1 and r[0]["tier"] == "exited" and only(out, "alert") == []
+
+
 def test_running_issue_still_labeled_agent_ready_gets_relabel_reconciliation():
     dsk = disk(issues_state={"version": 1, "issues": {"i5": ist("running")}})
     out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "in-progress", "type:build"))],

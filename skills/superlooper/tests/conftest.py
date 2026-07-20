@@ -99,3 +99,17 @@ def _never_probe_real_auth(monkeypatch):
                         lambda self: {"cli": "unknown", "keychain_present": None,
                                       "keychain_mtime": None, "valid": None, "status_raw": ""},
                         raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _never_probe_real_display(monkeypatch):
+    # Same ratchet as _never_probe_real_auth, for the display-sleep probe (issue #124). The runner's
+    # default Runner._display_asleep shells out to the REAL `pmset -g systemstate` on every tick with
+    # launch demand — an external binary the "no test reaches a real binary" rule forbids, AND a read
+    # whose result (display asleep vs awake) would make ticking runner tests non-deterministic on the
+    # dev machine. Neutralize the DEFAULT to a fail-open "unknown" (None) so any ticking runner test
+    # is safe without opting in and launches proceed. Tests that exercise the hold set their own
+    # instance _display_asleep in-body (the instance attr wins over this class patch); the probe
+    # FUNCTION itself (runner.display_asleep) is untouched, so test_runner still tests the real parse.
+    import runner as runner_mod
+    monkeypatch.setattr(runner_mod.Runner, "_display_asleep", lambda self: None, raising=False)

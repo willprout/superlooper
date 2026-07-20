@@ -3052,6 +3052,81 @@ def test_preflight_fails_when_cmux_binary_is_missing():
     assert ok is False and "could not run cmux" in why.lower()
 
 
+# --------------------------- display-sleep probe (issue #124) -------------------------------------
+# macOS clears the `Graphics` capability from IOPMSystemCapabilities on display sleep (portable
+# across Intel/Apple-Silicon and internal/external displays; IODisplayWrangler is absent on Apple
+# Silicon, so the classic ioreg probe is not). `pmset -g systemstate` prints that bitfield. The
+# probe concludes ASLEEP only on a POSITIVE read (caps line present, Graphics absent) and returns
+# None (fail-open "unknown") on EVERYTHING else — so decide, which holds only on an explicit True,
+# launches normally on any read we could not trust. A false ASLEEP would wedge the whole queue.
+_SYSTEMSTATE_AWAKE = ("Current System Capabilities are: CPU Graphics Audio Network \n"
+                      "Current Power State: 4\n")
+_SYSTEMSTATE_ASLEEP = ("Current System Capabilities are: CPU \n"
+                       "Current Power State: 4\n")
+
+
+def test_display_probe_reads_awake_when_graphics_capability_is_present():
+    assert runner_mod.display_asleep(run=_fake_run(0, _SYSTEMSTATE_AWAKE)) is False
+
+
+def test_display_probe_reads_asleep_when_graphics_capability_is_absent():
+    assert runner_mod.display_asleep(run=_fake_run(0, _SYSTEMSTATE_ASLEEP)) is True
+
+
+def test_display_probe_is_unknown_on_a_nonzero_exit():
+    # pmset failed — do not trust its output either way; fail open.
+    assert runner_mod.display_asleep(run=_fake_run(1, _SYSTEMSTATE_ASLEEP)) is None
+
+
+def test_display_probe_is_unknown_when_the_capabilities_line_is_missing():
+    # An unexpected output shape (a future macOS, a truncated read) is UNKNOWN, never "asleep":
+    # concluding asleep on an unparseable read would wedge launches.
+    assert runner_mod.display_asleep(run=_fake_run(0, "Current Power State: 4\n")) is None
+    assert runner_mod.display_asleep(run=_fake_run(0, "")) is None
+
+
+def test_display_probe_is_unknown_when_pmset_is_missing():
+    # Non-macOS host / no pmset on PATH: OSError -> unknown -> fail open (launch normally).
+    def boom(argv):
+        raise OSError("No such file or directory: 'pmset'")
+    assert runner_mod.display_asleep(run=boom) is None
+
+
+def test_display_probe_is_unknown_on_timeout():
+    import subprocess as _sp
+
+    def slow(argv):
+        raise _sp.TimeoutExpired(cmd=argv, timeout=5)
+    assert runner_mod.display_asleep(run=slow) is None
+
+
+def test_display_probe_is_read_only_pmset_systemstate():
+    # Belt-and-suspenders: the probe must READ state, never change it. Assert the exact argv.
+    seen = {}
+
+    def spy(argv):
+        seen["argv"] = list(argv)
+        return type("R", (), {"returncode": 0, "stdout": _SYSTEMSTATE_AWAKE, "stderr": ""})
+    runner_mod.display_asleep(run=spy)
+    assert seen["argv"][0].endswith("pmset")
+    assert "-g" in seen["argv"] and "systemstate" in seen["argv"]
+
+
+def test_tick_holds_launches_while_the_display_sleeps(rig):
+    # End to end at the shell (mirror of the dead-anchor tick test): a tick with launch demand whose
+    # per-tick display probe reads ASLEEP holds every launch — launch-session.sh is never even
+    # invoked, no tab is created, agent-ready is never moved, and NO alert is raised (a sleeping
+    # display is normal, not a fault). The held queue resumes automatically when the probe reads awake.
+    rig.r._display_asleep = lambda: True
+    before = len(mutations(rig))
+    rig.r.tick(now=NOW)
+    assert not (rig.home / "state" / "ALERT").exists()     # a sleeping display raises no alert
+    assert issue_state(rig, "i101") is None                # never launched -> no loopstate stamp
+    assert len(mutations(rig)) == before                   # agent-ready never moved to in-progress
+    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
+    assert launches == []                                  # launch-session.sh never even invoked
+
+
 # --------------------------- self-pane auto-detection (owner request 2026-07-06) -----------------
 
 _IDENTIFY_JSON = (
