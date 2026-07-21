@@ -619,7 +619,7 @@ class Runner:
 
         # last-known GitHub view: stale until the first successful poll proves otherwise.
         self.gh_view = {"stale": True, "consecutive_failures": 0, "closed_nums": set(),
-                        "prs": {}, "issue_comments": {}}
+                        "closed_read_ok": False, "prs": {}, "issue_comments": {}}
         self._parsed_by_id = {}
         self._raw_by_id = {}
         self._last_poll = 0
@@ -1233,7 +1233,14 @@ class Runner:
             if type(num) is int and num > 0 and p["id"] not in parsed_by_id:
                 parsed_by_id[p["id"]] = p
                 raw_by_id[p["id"]] = r if isinstance(r, dict) else {}
-        closed = gh.closed_issue_nums()
+        # The closed-list read carries its HEALTH into the view (issue #172). It fails closed to an
+        # empty set, and `probe` (`gh api rate_limit`) is EXEMPT from rate limiting — so a poll made
+        # DURING a GraphQL/REST throttle still completes and stamps the view `stale: False` while the
+        # closed set is empty for a reason nobody observed. Read as data, that empty set makes every
+        # `blocked-by` issue read as blocked and silently un-launchable, fresh and recovery alike.
+        # `closed_read_ok` is the vouch decide needs to hold with an honest reason instead.
+        closed_read = gh.closed_issue_nums_health()
+        closed = closed_read.value
         dev_checks = gh.branch_checks(self.config.get("dev_branch", "main"))
 
         st = self._load_state()
@@ -1301,6 +1308,7 @@ class Runner:
         self._raw_by_id = raw_by_id
         self._last_poll_ok = now              # this read LANDED — the age the published view reports
         self.gh_view = {"stale": False, "consecutive_failures": 0, "closed_nums": closed,
+                        "closed_read_ok": closed_read.ok,
                         "prs": prs, "issue_comments": issue_comments, "dev_checks": dev_checks}
 
     def _refresh_finishing_prs(self, ist_map):
@@ -2779,6 +2787,13 @@ class Runner:
                     recs.pop(aid, None)
             i = st["issues"].setdefault(iid, loopstate.new_issue())
             i["status"] = "needs_william" if a.get("needs_william") else "parked"
+            # A park ENDS the eligibility-hold episode, exactly as a launch and a re-approve do
+            # (#150's stamp is cleared in both of those). Without this the issue sits parked wearing
+            # whatever the last hold said — e.g. "the closed-issue list read did not land this poll"
+            # on an issue actually handed back for a missing `touches:` declaration (issue #172,
+            # third review round). That is a durable narration of a cause that is no longer the
+            # reason anything is stopped, on the one artifact the owner reads to decide what to do.
+            i["launch_hold_reason"] = None
             # (#169) The one durable record that a park's LABELS actually moved — written here and
             # nowhere else, because this block runs only past the set_labels above. `status` cannot
             # carry that fact: a lane that was ALREADY needs_william (parked before, for some other

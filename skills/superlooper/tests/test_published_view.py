@@ -66,6 +66,27 @@ def test_closed_nums_are_published_as_a_sorted_list():
     assert doc["closed_nums"] == [2, 5, 9]
 
 
+def test_the_closed_reads_health_rides_out_with_the_closed_set():
+    # Issue #172. `closed_nums` alone cannot say whether GitHub ANSWERED "nothing is closed" or
+    # REFUSED the read — both arrive as an empty set, and the probe (`gh api rate_limit`) is exempt
+    # from throttling, so the document is stamped fresh either way. `closed_read_ok` is the vouch:
+    # True ONLY when the closed list was genuinely read this poll.
+    assert published_view.build(_view(closed_nums={2}, closed_read_ok=True), {},
+                                tracked_ids=set(), now=1, polled_at=1)["closed_read_ok"] is True
+    assert published_view.build(_view(closed_nums=set(), closed_read_ok=False), {},
+                                tracked_ids=set(), now=1, polled_at=1)["closed_read_ok"] is False
+
+
+def test_an_unvouched_closed_set_is_published_as_unvouched():
+    # The flag is trusted ONLY in the direction it explicitly asserts: a view that never claimed the
+    # read landed (an older runner, or the empty-but-typed document below) publishes False. Failing
+    # closed here matches `stale` — a document we cannot vouch for is never a confident all-clear.
+    assert published_view.build(_view(), {}, tracked_ids=set(), now=1,
+                                polled_at=1)["closed_read_ok"] is False
+    assert published_view.build(None, None, tracked_ids=None, now=5,
+                                polled_at=None)["closed_read_ok"] is False
+
+
 def test_prs_and_dev_checks_ride_through_untouched():
     pr = {"number": 12, "state": "OPEN", "mergeable": "MERGEABLE", "comments": [{"body": "hi"}]}
     doc = published_view.build(_view(prs={"i7": pr}, dev_checks={"ok": True}),

@@ -1436,6 +1436,329 @@ def test_touches_required_does_not_park_a_blocked_issue_early():
     assert len(only(out2, "park")) == 1 and only(out2, "park")[0]["needs_william"] is True
 
 
+# ---- issue #172: a REFUSED closed-list read is not an answered-empty closed set ----
+# gh's closed-list read fails CLOSED to an empty set while `probe` (`gh api rate_limit`) is EXEMPT
+# from rate limiting — so a THROTTLED poll still stamps the view FRESH and every `blocked-by` issue
+# reads as unmet. Holding is the right call (it is what a clean read of an open blocker would do,
+# and it self-heals on the next poll), but the loop must not act on, or narrate, a closure state it
+# never observed. `closed_read_ok` is the view's vouch for that read.
+
+UNLANDED = actions.UNLANDED_CLOSED_READ_PREFIX
+
+
+def test_an_unlanded_closed_read_holds_a_fresh_launch_out_loud():
+    # THE defect: the fresh launch path drops such a candidate SILENTLY — the queue simply stops
+    # moving, with nothing anywhere saying why. It must hold with an honest, named reason.
+    out = decide(parsed_issues=[parsed(5, blocked_by=[3])],
+                 gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert only(out, "launch") == []
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and holds[0]["id"] == "i5"
+    reason = holds[0]["reason"]
+    assert reason.startswith(UNLANDED) and "#3" in reason
+    assert "still open" not in reason        # never asserts a closure state it did not observe
+
+
+def test_a_clean_closed_read_leaves_a_genuinely_blocked_issue_waiting_quietly():
+    # The honest case is untouched: GitHub ANSWERED, #3 really is open, the issue waits — and no
+    # hold episode is opened, so a long-open dependency never walks the journal.
+    out = decide(parsed_issues=[parsed(5, blocked_by=[3])],
+                 gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+    assert only(out, "launch") == [] and only(out, "launch_hold") == []
+
+
+def test_an_unlanded_closed_read_does_not_hold_an_issue_with_no_blocked_by():
+    # Scope: an unlanded read only touches dependency eligibility. An unblocked issue never consults
+    # the closed set, so it launches through a throttle exactly as it does today.
+    out = decide(parsed_issues=[parsed(5)], gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert len(only(out, "launch")) == 1 and only(out, "launch_hold") == []
+
+
+def test_a_view_that_never_vouched_for_its_closed_read_keeps_todays_prose():
+    # The flag is trusted ONLY in the direction it explicitly asserts. A view with no `closed_read_ok`
+    # key at all (an older document) must not have a refusal manufactured for it.
+    g = ghv(closed_nums=set())
+    assert "closed_read_ok" not in g          # the pre-#172 view shape, explicitly
+    out = decide(parsed_issues=[parsed(5, blocked_by=[3])], gh_view=g)
+    assert only(out, "launch") == [] and only(out, "launch_hold") == []
+
+
+# The reason must name the condition that ACTUALLY decided, never the read (fresh-agent review P1-1).
+# `candidates` is not launch_ok-filtered, so a blocked-by issue can also be held by usage, an
+# ambiguous type, or a control-label conflict — every one of which outranks the dependency check.
+# Stamping "the closed read did not land" over those would narrate a cause the loop never
+# established, in the durable record the morning report reads, and would end with "held until a
+# clean closed-list read lands" — a promise the next clean read cannot keep.
+
+def _stale_unlanded_stamp():
+    """A durable stamp exactly as this path's own executor would have written it last episode."""
+    return only(decide(parsed_issues=[parsed(5, blocked_by=[3])],
+                       gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                "launch_hold")[0]["reason"]
+
+
+def _outranked(p, names, **over):
+    """Force an emission (a stale stamp needs correcting) while an unlanded read ALSO holds `p`, and
+    assert the reason names the condition that really decided — not the read. Forcing the emission is
+    what makes this a real ordering test: asserting only the ABSENCE of the unlanded prose would pass
+    against any code that emits nothing at all (second review round, P2-5)."""
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None,
+                                                launch_hold_reason=_stale_unlanded_stamp())}})
+    out = decide(parsed_issues=[p], dsk=d,
+                 gh_view=ghv(closed_nums=set(), closed_read_ok=False), **over)
+    holds = only(out, "launch_hold")
+    assert only(out, "launch") == []
+    assert len(holds) == 1, holds
+    assert names in holds[0]["reason"], holds[0]["reason"]
+    assert not holds[0]["reason"].startswith(UNLANDED)
+
+
+def test_a_dead_usage_meter_outranks_the_unlanded_read_in_the_reason():
+    _outranked(parsed(5, blocked_by=[3]), "usage headroom",
+               usage=dict(usage_ok(), auth_status="expired"))
+
+
+def test_a_control_label_conflict_outranks_the_unlanded_read_in_the_reason():
+    _outranked(parsed(5, blocked_by=[3], label_conflict=True), "control labels conflict")
+
+
+def test_an_ambiguous_type_outranks_the_unlanded_read_in_the_reason():
+    _outranked(parsed(5, labels=("agent-ready", "type:build", "type:investigate"), blocked_by=[3]),
+               "`type:` labels are missing")
+
+
+def test_none_of_those_outranked_conditions_opens_a_hold_episode_on_its_own():
+    # The other half: with no stamp to correct, a candidate held by usage/labels/type stays silent on
+    # the fresh path — this change adds a hold episode for the unlanded read ONLY.
+    for p, over in ((parsed(5, blocked_by=[3]), {"usage": dict(usage_ok(), auth_status="expired")}),
+                    (parsed(5, blocked_by=[3], label_conflict=True), {}),
+                    (parsed(5, labels=("agent-ready", "type:build", "type:investigate"),
+                            blocked_by=[3]), {})):
+        out = decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False), **over)
+        assert only(out, "launch_hold") == [] and only(out, "launch") == []
+
+
+def test_a_stale_view_falls_back_to_the_non_committal_wording():
+    # Second review round P2-2. The probe-failure path carries the previous poll's closed_read_ok
+    # forward under `stale: True`. Prose claiming "the view still reads fresh" about a view decide
+    # has been told is STALE would narrate a state it did not observe — the whole bright line here.
+    p = parsed(5, blocked_by=[3])
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status="exited", branch="sl/i5-x",
+                                                launch_hold_reason=None)}},
+             exited={"i5": "1751000000 rc=1\n"})
+    out = decide(parsed_issues=[p], dsk=d,
+                 gh_view=ghv(stale=True, closed_nums=set(), closed_read_ok=False))
+    for h in only(out, "launch_hold"):
+        assert not h["reason"].startswith(UNLANDED), h["reason"]
+
+
+def test_a_standing_unlanded_read_hold_does_not_re_journal():
+    # The ledger dedups on the durably stamped reason, so a throttle lasting many 15s ticks says it
+    # ONCE. Simulated by handing decide the stamp its own executor would have written.
+    p = parsed(5, blocked_by=[3])
+    first = only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                 "launch_hold")
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None, launch_hold_reason=first[0]["reason"])}})
+    out = decide(parsed_issues=[p], dsk=d, gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert only(out, "launch_hold") == []
+
+
+def test_a_stale_unlanded_read_stamp_is_corrected_once_the_read_lands():
+    # Fresh-agent review P1-2. The read lands and #3 is GENUINELY open: the issue is still held, but
+    # for a different cause. Left standing, the old stamp would (a) misdescribe the board and (b)
+    # silence the next throttle episode outright, since the ledger dedups on exactly that string.
+    p = parsed(5, blocked_by=[3])
+    stale = only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                 "launch_hold")[0]["reason"]
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None, launch_hold_reason=stale)}})
+    out = decide(parsed_issues=[p], dsk=d, gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1
+    assert not holds[0]["reason"].startswith(UNLANDED)      # corrected to the landed-read wording
+    assert "not confirmed closed" in holds[0]["reason"] and "#3" in holds[0]["reason"]
+
+
+def _lane_bound(p, stamp, closed_read_ok=True, closed_nums=frozenset({3}), lanes=1, claims=None):
+    """The gate PASSES (#3 closed in a landed read) but SCHEDULING withholds the launch. `lanes=1`
+    with one lane occupied exercises the cap; `lanes=4` makes capacity a non-issue so the wildcard
+    lane blocks on ANTI-AFFINITY instead — a distinct branch of `_plan` the cap short-circuits past
+    (third review round, P2-4). Both must reach the same retirement, since the stamp names both."""
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None, launch_hold_reason=stamp)}})
+    return decide(parsed_issues=[p], lane_state=[{"id": "i9", "touches": ["*"], "type": "build"}],
+                  config=cfg(lanes=lanes), dsk=d,
+                  gh_view=ghv(closed_nums=set(closed_nums), closed_read_ok=closed_read_ok))
+
+
+def test_a_stale_stamp_is_retired_even_when_only_a_lane_stands_in_the_way():
+    # SECOND review round: this is the COMMON route in a busy loop, and skipping it was the residual
+    # left by the first fix. The read has landed and #3 is provably closed — the gate holds nothing —
+    # but every lane is full. Left alone, the board would keep asserting a GitHub outage that ended.
+    p = parsed(5, blocked_by=[3])
+    stale = only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                 "launch_hold")[0]["reason"]
+    out = _lane_bound(p, stale)
+    holds = only(out, "launch_hold")
+    assert only(out, "launch") == []
+    assert len(holds) == 1
+    assert not holds[0]["reason"].startswith(UNLANDED)
+    assert "lane capacity" in holds[0]["reason"] and "nothing here needs an owner" in holds[0]["reason"]
+
+
+def test_retiring_that_stamp_re_arms_the_ledger_for_the_NEXT_episode():
+    # ...and the POINT of retiring it: the ledger dedups on the stamp, so a stale unlanded stamp
+    # would have swallowed the next throttle episode outright — the very silence #172 exists to end.
+    p = parsed(5, blocked_by=[3])
+    stale = only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                 "launch_hold")[0]["reason"]
+    retired = only(_lane_bound(p, stale), "launch_hold")[0]["reason"]
+    # the throttle returns while the issue is still queued: it speaks again
+    out = decide(parsed_issues=[p],
+                 dsk=disk(issues_state={"version": 1,
+                                        "issues": {"i5": ist(status=None,
+                                                             launch_hold_reason=retired)}}),
+                 gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and holds[0]["reason"].startswith(UNLANDED)
+
+
+def test_the_stale_stamp_is_retired_when_ANTI_AFFINITY_is_what_holds_it_too():
+    # The other scheduling branch: lanes are free, so `_plan` does not short-circuit on capacity and
+    # the wildcard lane blocks on overlap instead. The stamp names both; both must retire it.
+    p = parsed(5, blocked_by=[3])
+    out = _lane_bound(p, _stale_unlanded_stamp(), lanes=4)
+    holds = only(out, "launch_hold")
+    assert only(out, "launch") == []                      # genuinely still not launched
+    assert len(holds) == 1 and not holds[0]["reason"].startswith(UNLANDED)
+    assert "anti-affinity overlap" in holds[0]["reason"]
+
+
+def test_a_lane_bound_issue_with_no_stale_stamp_stays_silent():
+    # No new noise: lane contention on its own is not a hold and must not journal (#150's own line —
+    # a lane-bound candidate "carries no 'why is only one lane busy' mystery").
+    out = _lane_bound(parsed(5, blocked_by=[3]), None)
+    assert only(out, "launch") == [] and only(out, "launch_hold") == []
+
+
+def test_the_retirement_stamp_is_said_once_not_every_tick():
+    p = parsed(5, blocked_by=[3])
+    first = only(_lane_bound(p, "the closed-issue list read did not land this poll — stale"),
+                 "launch_hold")[0]["reason"]
+    assert only(_lane_bound(p, first), "launch_hold") == []
+
+
+# THIRD review round, P1-1: the retirement stamp must itself be retirable. It asserts "nothing here
+# needs an owner" — true only while the gate really passes. Because it deliberately does NOT carry
+# the unlanded prefix, the first version of it was unrecognizable the moment it was written, so every
+# LATER cause went silent behind a standing false all-clear. Whatever writes a durable claim must
+# leave the next tick able to tell that it wrote it.
+
+def _retirement_stamp():
+    return only(_lane_bound(parsed(5, blocked_by=[3]), _stale_unlanded_stamp()),
+                "launch_hold")[0]["reason"]
+
+
+def _wearing_retirement(p, **over):
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None,
+                                                launch_hold_reason=_retirement_stamp())}})
+    return decide(parsed_issues=[p], dsk=d, **over)
+
+
+def test_the_retirement_stamp_is_corrected_when_the_dependency_RE_OPENS():
+    out = _wearing_retirement(parsed(5, blocked_by=[3]),
+                              gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1
+    assert "not confirmed closed" in holds[0]["reason"] and "#3" in holds[0]["reason"]
+    assert "nothing here needs an owner" not in holds[0]["reason"]
+
+
+def test_the_retirement_stamp_is_corrected_when_the_usage_meter_DIES():
+    out = _wearing_retirement(parsed(5, blocked_by=[3]),
+                              usage=dict(usage_ok(), auth_status="expired"),
+                              gh_view=ghv(closed_nums={3}, closed_read_ok=True))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and "usage headroom" in holds[0]["reason"]
+
+
+def test_the_retirement_stamp_is_corrected_when_the_control_labels_GO_AMBIGUOUS():
+    out = _wearing_retirement(parsed(5, blocked_by=[3], label_conflict=True),
+                              gh_view=ghv(closed_nums={3}, closed_read_ok=True))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and "control labels conflict" in holds[0]["reason"]
+
+
+def test_both_i172_stamps_are_recognized_by_PREFIX_so_an_older_release_stamp_still_corrects():
+    # FOURTH review round. `launch_hold_reason` is durable loopstate that outlives a republish, so a
+    # stamp written by the PREVIOUS release is on disk when the next one boots. Matching either stamp
+    # on its whole string would make one prose tweak reproduce the exact defect the retirement stamp
+    # was introduced to fix: unrecognizable, therefore uncorrectable, therefore standing forever.
+    for prefix in (actions.UNLANDED_CLOSED_READ_PREFIX, actions._LANE_BOUND_PREFIX):
+        older = prefix + " — wording from some earlier release entirely"
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": ist(status=None, launch_hold_reason=older)}})
+        out = decide(parsed_issues=[parsed(5, blocked_by=[3])], dsk=d,
+                     gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+        holds = only(out, "launch_hold")
+        assert len(holds) == 1, (prefix, holds)
+        assert "not confirmed closed" in holds[0]["reason"]
+
+
+def test_the_retirement_stamp_still_re_arms_the_ledger_for_a_new_throttle():
+    out = _wearing_retirement(parsed(5, blocked_by=[3]),
+                              gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and holds[0]["reason"].startswith(UNLANDED)
+
+
+def test_the_hold_reason_survives_a_tuple_dependency():
+    # THIRD review round, P2-1: `"#%s" % (1, 2)` raises "not all arguments converted", and `% ()`
+    # raises "not enough arguments" — a tuple is HASHABLE, so _dep_unmet passes it straight into the
+    # prose. The totality claim has to hold at the formatting step too, not just the membership one.
+    for dep in ((1, 2), (), (3,)):
+        p = parsed(5, blocked_by=[dep])
+        for ok in (False, True):
+            assert only(decide(parsed_issues=[p],
+                               gh_view=ghv(closed_nums=set(), closed_read_ok=ok)), "launch") == []
+
+
+def test_the_hold_reason_path_is_total_on_a_wrong_typed_blocked_by():
+    # The reason path must never raise, on any input, on any read health: an unhashable dep would go
+    # straight into a set membership test. NB this covers _launch_gate_reason's own walk, NOT every
+    # route into issues.eligible — `_needs_touches` reaches eligible unguarded, which raises on the
+    # same input. That is pre-existing (it predates #172 and is unreachable from parse_issue, which
+    # always yields ints); filed as its own issue rather than widened into this diff.
+    p = parsed(5, blocked_by=[{"nope": 1}, ["x"], "7", 3, True])
+    for ok in (False, True):
+        assert only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=ok)),
+                    "launch") == []
+    # ...and through the stale-stamp correction branch, which walks it a second time.
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None,
+                                                launch_hold_reason=_stale_unlanded_stamp())}})
+    assert only(decide(parsed_issues=[p], dsk=d,
+                       gh_view=ghv(closed_nums=set(), closed_read_ok=True)), "launch") == []
+
+
+def test_a_wrong_typed_dependency_is_still_NAMED_in_the_reason():
+    # Totality must not cost legibility: a non-int `blocked-by` entry reads as unmet (matching
+    # issues.eligible exactly) and is NAMED, rather than filtered out into the unnamed fallback —
+    # which is what a `type(d) is int` filter did in the first review round (second round, P2-3).
+    p = parsed(5, blocked_by=["7"])
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None,
+                                                launch_hold_reason=_stale_unlanded_stamp())}})
+    out = decide(parsed_issues=[p], dsk=d, gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and "#7" in holds[0]["reason"]
+    assert "no single condition named" not in holds[0]["reason"]
+
+
 def test_touches_required_does_not_mislabel_a_control_label_conflict_issue():
     # P2-1: a no-touches issue that is ALSO ineligible for a control-label conflict must not be
     # parked with a "missing touches" memo (a misdiagnosis). It is left for its own handling.
