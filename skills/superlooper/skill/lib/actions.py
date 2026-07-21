@@ -155,8 +155,7 @@ NUDGE_GRACE_WINDOW_SECONDS = 480
 # channel for "worker needs input" is state/blocked/<id> -> a durable GitHub question (#163), and
 # an in-window AskUserQuestion is off that channel, so nobody will ever answer it and the lane's
 # slot (frozen is an INFLIGHT status) would leak forever. 30 min is far past any dialog a watching
-# owner answers,
-# and far inside the 94-minute class of silence this issue exists to end.
+# owner answers, and far inside the 94-minute class of silence this issue exists to end.
 AT_DIALOG_ALERT_SECONDS = 1800
 LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LAUNCHVERIFY x2)
 # A dead DELIVERY CHANNEL — the cmux launch anchor (the pane every worker tab is born in), the

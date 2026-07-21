@@ -79,7 +79,7 @@ def ist(status="running", **over):
 
 def disk(**over):
     d = {"issues_state": {"version": 1, "issues": {}}, "blocked": {}, "reports": {},
-         "answers": {}, "exited": {}, "launch_stderr": {}, "frozen": None, "alert": None,
+         "exited": {}, "launch_stderr": {}, "frozen": None, "alert": None,
          "live_lock_ids": set(), "filed_fingerprints": {}, "local_date": "2026-07-02",
          "local_hhmm": "12:00", "last_report_date": "2026-07-02"}
     d.update(over)

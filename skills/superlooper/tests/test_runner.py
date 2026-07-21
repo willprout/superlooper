@@ -3150,7 +3150,7 @@ def test_park_purges_cached_agent_ready_to_stop_reapprove_churn(rig):
     assert "agent-ready" in lab["remove"]
     # end-to-end: decide over the post-park cache does NOT reapprove i5 (loop broken)
     disk = {"issues_state": loopstate.load(str(rig.home / "state" / "issues.json")),
-            "blocked": {}, "reports": {}, "answers": {}, "exited": {}, "frozen": None,
+            "blocked": {}, "reports": {}, "exited": {}, "frozen": None,
             "alert": None, "live_lock_ids": set(), "filed_fingerprints": {},
             "local_date": "2026-07-06", "local_hhmm": "12:00", "last_report_date": "2026-07-06"}
     gh_view = {"stale": False, "consecutive_failures": 0, "closed_nums": set(), "prs": {},

@@ -118,8 +118,22 @@ def test_models_answerer_is_no_longer_a_config_field(tmp_path):
     sees exactly what to rename instead of silently losing the pin."""
     with pytest.raises(ValueError) as e:
         config_lib.load(_write_cfg(tmp_path, {"repo": "o/r", "models": {"answerer": "fable"}}))
-    assert "models.answerer" in str(e.value)
-    assert "debugger" in str(e.value), "the error must name the key that replaced it"
+    msg = str(e.value)
+    assert "models.answerer" in msg
+    assert "models.debugger" in msg, "the error must name the key that replaced it"
+
+
+def test_the_retired_key_error_explains_itself_rather_than_reading_as_a_typo(tmp_path):
+    """A bare "unknown key" is the right REFUSAL but the wrong MESSAGE: to a repo that adopted
+    before the change it reads as a typo. The refusal must carry, at the point of the error, what
+    died and what to do — and must NOT silently auto-migrate the value, because `fable` pinned for
+    the answerer's resolve-vs-escalate call is not a considered choice for the debugger's."""
+    with pytest.raises(ValueError) as e:
+        config_lib.load(_write_cfg(tmp_path, {"repo": "o/r", "models": {"answerer": "fable"}}))
+    msg = str(e.value)
+    assert "retired" in msg, "the message must say the seat is gone, not just that the key is unknown"
+    assert "#194" in msg, "...and cite where that happened"
+    assert "rename" in msg and "drop the key" in msg, "...and name both ways out"
 
 
 def test_models_debugger_is_the_replacement_pin(tmp_path):

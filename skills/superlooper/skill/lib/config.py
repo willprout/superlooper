@@ -160,6 +160,24 @@ def _err(msg):
     raise ValueError(f"invalid .superlooper/config.json: {msg}")
 
 
+# Keys this engine used to accept and no longer does. A bare "unknown key" is the right REFUSAL —
+# a retired field must never load silently — but on its own it reads as a typo, so a repo that
+# adopted before the change gets no idea what happened. Each entry adds the one sentence the owner
+# needs AT THE POINT OF THE ERROR: what died, and what to do about it.
+#
+# Deliberately a message, NOT an auto-migration alias. `models.answerer` pinned the model of the
+# ANSWERER — a seat that no longer exists — and silently re-pointing that value at the debugger
+# would hand a different seat a model chosen for a different job (the eApp pinned `fable` there for
+# the answerer's resolve-vs-escalate call, not for diagnosing a wedged loop). The owner should pick
+# the debugger's model deliberately, so the load fails and says so.
+_RETIRED_KEYS = {
+    "models.answerer": "the answerer seat is retired (#194). Its only remaining reader is the "
+                       "sl-debugger session, so rename this to `models.debugger` if you still want "
+                       "a per-repo pin for that seat — or drop the key to take the default "
+                       "(`opus[1m]`). Pick the value deliberately: it now sets the DEBUGGER's model.",
+}
+
+
 _ASCII_DIGITS = frozenset("0123456789")
 
 
@@ -340,7 +358,9 @@ def _validate_and_fill(raw):
             _err(f"'{field}' must be an object, got {type(given).__name__}")
         for sk in given:
             if sk not in sub_defaults:
-                _err(f"unknown key '{field}.{sk}' (allowed: {', '.join(sorted(sub_defaults))})")
+                hint = _RETIRED_KEYS.get(f"{field}.{sk}")
+                _err(f"unknown key '{field}.{sk}' (allowed: {', '.join(sorted(sub_defaults))})"
+                     + (f" — {hint}" if hint else ""))
         merged = copy.deepcopy(sub_defaults)   # deepcopy so qa.quarantine's default list isn't shared
         merged.update(given)                   # given values are fresh from json.loads
         out[field] = merged

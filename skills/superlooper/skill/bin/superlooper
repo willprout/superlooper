@@ -53,6 +53,7 @@ for _p in (os.path.join(_HERE, "..", "lib"), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import actions as actions_lib
 import config as config_lib
 import gate
 import gh
@@ -338,9 +339,11 @@ def cmd_status(args):
     except (OSError, ValueError):
         st = {"issues": {}}
     issues = st.get("issues") if isinstance(st.get("issues"), dict) else {}
-    inflight = {"running", "blocked", "frozen", "exited"}
+    # The runner's OWN notion of an occupied lane, never a hand-copied set: a duplicate here
+    # silently drifts from actions.py the moment the taxonomy changes (it did — the retired
+    # `blocked` status, #194 — and this copy kept counting a status the runner no longer has).
     lanes = [(i, d) for i, d in sorted(issues.items()) if isinstance(d, dict)
-             and d.get("status") in inflight]
+             and d.get("status") in actions_lib.INFLIGHT_STATUSES]
     gate = [(i, d) for i, d in sorted(issues.items()) if isinstance(d, dict)
             and d.get("status") in ("gating", "holding")]
     print(f"\nlanes ({len(lanes)} occupied):")
