@@ -57,10 +57,15 @@ import sys
 # things an operator on an unfamiliar machine wants in the same place.
 MIRROR_REL = ("docs", "ops")
 
-# The mirror's own publish stamp. The installed engine home has a VERSION at its root; this one
-# records which publish wrote the MIRROR, so a doctor can tell "these docs are current" from "these
-# docs are left over from an older installer that did not know about them".
+# The mirror's own publish stamp. It records which publish wrote the MIRROR, so a doctor can tell
+# "these docs are current" from "these docs are left over from an older installer that did not know
+# about them".
 STAMP_NAME = "VERSION"
+
+# The ENGINE's root stamp, written by bin/install.sh at step 3. Same filename today, a DIFFERENT
+# file and a different meaning — named separately so renaming one cannot silently move the other.
+# publish() reads it only as proof that `dest` really is a published install home.
+ENGINE_STAMP_NAME = "VERSION"
 
 # (repo-relative source, mirror-relative destination). Order is the order they are published in and
 # the order the doctor reports them missing in, so both read top-down from "the doc an operator
@@ -141,13 +146,14 @@ def publish(repo_root, dest, version):
     # rsyncs the payload into it before calling here. Checking is what makes the rmtree below safe
     # to describe as guarded: a mistyped or empty `dest` refuses instead of creating a stray tree
     # somewhere and then deleting the `docs/ops` inside it.
-    if not os.path.isdir(str(dest)) or not os.path.isfile(os.path.join(str(dest), STAMP_NAME)):
+    if (not os.path.isdir(str(dest))
+            or not os.path.isfile(os.path.join(str(dest), ENGINE_STAMP_NAME))):
         raise MissingOpsDoc(
             "refusing to mirror ops docs into %r — it is not a published install destination (an "
             "existing directory carrying a %s stamp). The installer creates it, syncs the payload "
             "and stamps it BEFORE the docs are mirrored in, so anything else is a mistyped "
             "destination — and this refusal is what stops the rebuild below from clearing a "
-            "%s directory inside it." % (dest, STAMP_NAME, "/".join(MIRROR_REL)))
+            "%s directory inside it." % (dest, ENGINE_STAMP_NAME, "/".join(MIRROR_REL)))
 
     missing = [src for src, _dst in OPS_DOCS if not os.path.isfile(os.path.join(repo_root, src))]
     if missing:

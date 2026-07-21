@@ -682,9 +682,9 @@ def test_lint_flags_a_retired_label_used_as_current_behaviour():
 def test_lint_flags_a_retired_label_that_ends_a_sentence():
     """The most common shape in prose, and the one the tokeniser swallowed.
 
-    `.` has to be inside the token class (a label value may carry one), so `needs-william.` used to
-    match nothing at all — and the approval-protocol.md sentence this lint was written to catch was
-    one edit away from that exact form.
+    `.` is inside the token class so a dotted string is read as one token rather than split into a
+    label-shaped fragment, which meant `needs-william.` used to match nothing at all — and the
+    approval-protocol.md sentence this lint was written to catch is one edit away from that form.
     """
     m = manifest()
     for doc in ("A sensitive-area diff still parks needs-william.\n",

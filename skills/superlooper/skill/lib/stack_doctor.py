@@ -658,10 +658,13 @@ def check_engine_drift(probe, repo_path=None, dev_branch="main"):
 # D12: "the debugger playbook wasn't installed on the machine having the incident". The gated
 # bin/install.sh now mirrors the ops docs into the installed engine home (see lib/ops_docs.py); this
 # block is the half that notices when it did not, or when the mirror is left over from an older
-# publish. Deliberately a FAIL, not a WARN, unlike the sibling `superlooper plugin` line: that one
-# is about session QUALITY (a self-contained brief still works without the skills), while this one
-# is about whether an unattended 3am repair session can read the contract it is being held to. The
-# cure is one command, and it is the same command the operator was going to run anyway.
+# publish. Deliberately a FAIL where the sibling `superlooper plugin` line is only ever a WARN:
+# that one is about session QUALITY (a self-contained brief still works without the skills), while
+# this one is about whether an unattended 3am repair session can read the contract it is being held
+# to. The cure is one command, and it is the same command the operator was going to run anyway.
+# The one WARN this block does emit is the doctor's standing discipline, not a softening: docs all
+# present but no engine stamp to compare them against is a state it could not READ, and it never
+# asserts a mismatch it could not actually determine. See the docstring for all four states.
 
 _OPS_DOCS_FIX = ("Republish through the gated `bin/install.sh` from a superlooper source checkout "
                  "— it mirrors the ops docs into the installed engine home and stamps them.")

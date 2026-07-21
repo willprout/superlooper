@@ -177,9 +177,13 @@ def test_mirror_targets_are_unique_and_relative():
     assert len(targets) == len(set(targets)), "two sources mirror onto the same target"
     for dst in targets:
         assert not os.path.isabs(dst) and ".." not in Path(dst).parts, dst
-        # Markdown only. test_one_publish_door.py's boundary note leans on this: what keeps
-        # ops_docs from being a second door for the ENGINE is that it can only ever carry prose.
+        # Markdown only, at BOTH ends. test_one_publish_door.py's boundary note leans on this:
+        # what keeps ops_docs from being a second door for the ENGINE is that it can only ever
+        # carry prose. Checking the destination alone would let ("…/lib/actions.py", "actions.md")
+        # through and put engine source on the machine under a .md name.
         assert dst.endswith(".md"), "ops_docs may publish documentation only, never code: %s" % dst
+    for src, _dst in ops_docs.OPS_DOCS:
+        assert src.endswith(".md"), "ops_docs may publish documentation only, never code: %s" % src
 
 
 # --------------------------------------------------------------------------------------------
@@ -328,8 +332,11 @@ def test_the_installer_reads_the_table_without_executing_unreviewed_payload_code
     assert "ast.parse" in snippet, "the installer must PARSE ops_docs.py, not import it"
     # Comments stripped — whole-line AND trailing — because the block above legitimately EXPLAINS
     # why `--list` is not used, and a guard that cannot tell an explanation from the thing it warns
-    # against gets deleted rather than fixed.
-    code = "\n".join(l.split("#", 1)[0] for l in text.splitlines())
+    # against gets deleted rather than fixed. A `#` only opens a comment at the start of a word, so
+    # `$#` and `${VAR#pat}` (this script uses the latter) do not truncate the line and hide code
+    # after them. A `--list` inside a quoted string is still out of reach; the anchor assert and the
+    # snippet-vs-sources() comparison below are what actually stop the reader being replaced.
+    code = "\n".join(re.sub(r"(?:^|(?<=\s))#.*$", "", l) for l in text.splitlines())
     assert "--list" not in code and "import ops_docs" not in code, (
         "the installer must not execute the payload module before the gate")
 
