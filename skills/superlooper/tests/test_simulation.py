@@ -1142,7 +1142,8 @@ def test_reapproved_rebuild_opens_its_own_pr_on_a_fresh_branch(sim_factory):
     # the owner's destructive verb (the dashboard's Rebuild): agent-ready + rebuild
     sim.edit_gh_state(
         lambda st: st["issues"][str(num)]["labels"].extend(["agent-ready", "rebuild"]))
-    assert sim.tick_until(lambda: sim.loop_issue(sid).get("branch", "").endswith("-r1"), ticks=12), \
+    assert sim.tick_until(
+            lambda: (sim.loop_issue(sid).get("branch") or "").endswith("-r1"), ticks=12), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
 
     # the retired branch: work preserved on the remote, PR left OPEN and labeled for the janitor

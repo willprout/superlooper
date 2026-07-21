@@ -1729,9 +1729,9 @@ class Runner:
         touched. Safe because re-approval rebuilds from the issue on a fresh branch — _exec_reapprove
         ROTATES the branch to its next unburned generation (#177), so the rebuild starts from
         origin/<dev> rather than re-attaching the parked episode's checkout — while the committed
-        work survives on the retired branch ref (worktree_remove drops only the checkout). UNCOMMITTED
-        work in the pruned worktree is gone: that is the trade this sweep makes, and why it is
-        opt-in.
+        work survives on the retired branch ref (worktree_remove drops only the checkout). Unsaved
+        work is not this sweep's to lose either: it prunes through guard_worktree=True, so the #190
+        guard refuses a dirty/unpushed checkout outright and only ever drops a saved one.
 
         OFF BY DEFAULT since owner ruling 2026-07-16 (#168): `cleanup_parked_worktrees` now defaults
         FALSE, so this sweep is a no-op unless a repo explicitly opts in. The owner must be able to
@@ -2949,38 +2949,61 @@ class Runner:
         # backstop.
         if a.get("had_rebuild"):
             gh.set_labels(num, remove=["rebuild"])
-        sup = self._supersede_retired_branch_pr(num, rotated) if rotated else None
-        return (f"reapproved (reset {old or 'nothing'}"
-                + (f"; rebuilding on {rotated['new']}" if rotated else "")
-                + (f"; superseded PR #{sup}" if sup else "") + ")")
+        pr, gh_ok = self._retire_old_branch(num, rotated) if rotated else (None, True)
+        parts = [f"reset {old or 'nothing'}"]
+        if rotated:
+            parts.append(f"rebuilding on {rotated['new']}")
+        if pr:
+            parts.append(f"superseded PR #{pr}")
+        if not gh_ok:
+            # NEVER report a supersede that did not land (fresh review P1): nothing retries this —
+            # the state reset has already dropped `pr`, decide will not re-emit a completed
+            # reapprove, and every downstream reconciliation (janitor close-pr, delete-branch)
+            # keys off the `superseded` LABEL. A silent failure would orphan the retired PR
+            # forever behind a journal line that says it was handled.
+            parts.append("gh bookkeeping incomplete — the retired branch's PR may not carry "
+                         "`superseded`; the janitor cannot see it until it does")
+        return "reapproved (" + "; ".join(parts) + ")"
 
-    def _supersede_retired_branch_pr(self, num, rotated):
-        """(#177) A re-approval rotates the branch, so any PR still OPEN on the retired one is now an
-        orphan: no issue points at it, nothing will ever push to it again, and the janitor's sweeps
-        (close-pr, delete-branch) only ever act on a PR carrying the `superseded` label. Label it and
-        say so — the same bookkeeping _exec_regenerate does for the identical situation, so a rebuild
-        reached by re-approval lands in the same lane as one reached by a conflict. Returns the PR
-        number it superseded, else None.
+    def _retire_old_branch(self, num, rotated):
+        """(#177) Record the rotation on GitHub and hand any PR still OPEN on the retired branch to
+        the janitor's `superseded` lane. Returns (pr_number_superseded_or_None, everything_landed).
+
+        Two duties, both owed to the owner:
+          * the ISSUE comment always fires — a re-approval that silently retires a branch leaves the
+            episode's committed-but-unpushed work reachable only from the journal, and the owner is
+            the one who decides whether to go get it.
+          * a PR still OPEN on that branch is now an orphan (no issue points at it, nothing will
+            ever push to it again), and the janitor's sweeps — close-pr, delete-branch — only act on
+            a PR carrying the `superseded` label. Labelling it is the same bookkeeping
+            _exec_regenerate does for the identical situation, so a rebuild reached by re-approval
+            lands in the same lane as one reached by a conflict.
 
         Reads the branch instead of trusting the recorded `pr`: the stamp can be stale or never
         discovered, and pr_for_branch answers with the STATE too — only an OPEN PR is superseded (a
         merged/closed one is history, and labelling it would feed the janitor's branch-delete sweep a
-        branch it must never touch). Best-effort throughout: a refused read (the GraphQL dead zone)
-        supersedes nothing and leaves the old PR visible to the owner rather than silently
-        mis-swept — the fresh branch is the safety property, this is bookkeeping."""
+        branch it must never touch). A refused read (the GraphQL dead zone) supersedes nothing and
+        leaves the old PR visible to the owner rather than silently mis-swept; the fresh branch is
+        the safety property, this is bookkeeping — so nothing here can fail the re-approval, but
+        every write's result travels back so the outcome can say what really landed."""
         read = gh.pr_for_branch(rotated["old"])
         pv = read.pr if read.ok and isinstance(read.pr, dict) else {}
         pr = pv.get("number") if pv.get("state") == "OPEN" else None
-        if not isinstance(pr, int) or isinstance(pr, bool):
-            return None
-        gh.pr_add_labels(pr, ["superseded"])
-        gh.pr_comment(pr, "Superseded by superlooper: this issue was re-approved and is being "
-                          f"rebuilt from scratch on a fresh branch (`{rotated['new']}`). Branch "
-                          "preserved; nothing auto-closed.")
-        gh.comment(num, f"Re-approved — rebuilding from this issue on a fresh branch "
-                        f"(`{rotated['new']}`). PR #{pr} on `{rotated['old']}` is superseded "
-                        "(branch preserved on the remote, nothing auto-closed).")
-        return pr
+        pr = pr if type(pr) is int else None
+        ok = True
+        if pr:
+            ok = gh.pr_add_labels(pr, ["superseded"]) and ok
+            ok = gh.pr_comment(pr, "Superseded by superlooper: this issue was re-approved and is "
+                                   "being rebuilt from scratch on a fresh branch "
+                                   f"(`{rotated['new']}`). Branch preserved; nothing "
+                                   "auto-closed.") and ok
+        tail = (f" PR #{pr} on `{rotated['old']}` is superseded (branch preserved on the remote, "
+                "nothing auto-closed)." if pr
+                else f" Whatever `{rotated['old']}` carries stays on that branch — nothing is "
+                     "auto-closed or deleted.")
+        ok = gh.comment(num, "Re-approved — rebuilding from this issue on a fresh branch "
+                             f"(`{rotated['new']}`), retiring `{rotated['old']}`.{tail}") and ok
+        return pr, ok
 
     def _exec_resume_at_gate(self, a, now):
         """D11 fix (issue #161): re-approving a FINISHED build RESUMES AT THE GATE — it re-enters the

@@ -2875,6 +2875,35 @@ def test_reapprove_supersedes_the_open_pr_left_on_the_retired_branch(rig, monkey
     assert ic and "sl/i5-x-r1" in ic[-1]["body"]
 
 
+def test_reapprove_records_the_retirement_on_the_issue_even_with_no_pr(rig, monkeypatch):
+    """A rotation that said nothing would leave the retired episode's committed-but-unpushed work
+    reachable only from the journal. The owner decides whether to go get it, so he is told which
+    branch was retired whether or not a PR was ever opened on it."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _no_pr(monkeypatch)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    ic = [m for m in mutations(rig) if m["kind"] == "comment"]
+    assert ic and "sl/i5-x-r1" in ic[-1]["body"] and "sl/i5-x" in ic[-1]["body"]
+
+
+def test_reapprove_never_reports_a_supersede_that_did_not_land(rig, monkeypatch):
+    """Nothing retries this bookkeeping — the reset has already dropped `pr`, decide will not
+    re-emit a completed reapprove, and the janitor only ever sees a PR through the `superseded`
+    LABEL. So a failed label write must reach the journal as a failure, never as a silent
+    'superseded PR #N' (the #165 inert-label trap: a repo that never re-ran `adopt` has no such
+    label and `gh pr edit` hard-fails)."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead(
+                            {"number": 555, "state": "OPEN", "headRefName": b}, True))
+    monkeypatch.setattr(runner_mod.gh, "pr_add_labels", lambda n, labels: False)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", pr=555)
+    out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert "incomplete" in out and "superseded" in out
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"       # the rebuild still gets its branch
+
+
 def test_reapprove_never_supersedes_a_pr_that_is_not_open(rig, monkeypatch):
     """A merged/closed PR on the retired branch is history, not a rebuild's leftover — labelling it
     `superseded` would feed the janitor's branch-delete sweep a branch it should never touch."""

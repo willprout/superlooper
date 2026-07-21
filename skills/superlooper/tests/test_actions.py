@@ -2909,7 +2909,7 @@ def test_real_conflict_under_cap_regenerates_on_a_fresh_generation_branch():
     assert r[0]["pr"] == 555
 
 
-def test_regenerate_never_reuses_a_generation_the_branch_already_burned(monkeypatch):
+def test_regenerate_never_reuses_a_generation_the_branch_already_burned():
     """Issue #177: `conflicts` is no longer the sole generation source, because a re-approval zeroes
     it while the branch it already minted survives on the remote. A lane sitting on `-r1` with
     conflicts=0 (the post-reapprove shape) must regenerate onto `-r2` — minting `-r1` again would
