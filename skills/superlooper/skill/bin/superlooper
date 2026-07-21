@@ -31,6 +31,12 @@
                   d<N> id allocation and single-flight under the watchdog's own lock, composes the
                   brief from --note + --context-file, and journals the tap. A local ops UI over the
                   loop shells this instead of re-implementing the launch handshake
+  upkeep          the WEEKLY once-over as one READ-ONLY command (issue #200): the machine stack,
+                  installed-engine publish drift, the janitor's proposals, the ops-doc lint, the
+                  branch/worktree census, the notify channel's last real delivery, and the week's
+                  question/park rates — one short page. It executes nothing and writes nothing;
+                  every finding names the existing owner-approved command that acts on it. There
+                  is no --execute and there never will be (issue #200 Boundaries)
   watchdog        one MECHANICAL health check (issue #66): stale heartbeat / present ALERT /
                   the no-progress shape -> notify the owner -> grace window -> launch ONE
                   unattended sl-debugger session through the launch shim. Run it on an
@@ -55,6 +61,7 @@ for _p in (os.path.join(_HERE, "..", "lib"), _HERE):
 
 import actions as actions_lib
 import config as config_lib
+import doc_lint
 import gate
 import gh
 import gitops
@@ -72,6 +79,7 @@ import notify
 import report
 import stack_doctor
 import tidy as tidy_lib
+import upkeep as upkeep_lib
 
 _TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
 
@@ -1446,6 +1454,114 @@ def cmd_janitor(args):
     return 1 if failed else 0
 
 
+# ------------------------------- upkeep (issue #200) -------------------------------
+# `superlooper upkeep` is the weekly once-over as ONE read-only command: the routine glances that
+# were previously remembered chores (doctor --stack, publish drift, the janitor's sweep, the ops-doc
+# lint, branch/worktree sprawl, is-the-notify-channel-alive, the loop's own question/park rates)
+# batched into one short page. Nothing here executes, and nothing here writes — not a state file,
+# not a GitHub write, not even the notify test message `doctor --stack` sends on purpose. Every
+# finding names the EXISTING approve path that acts on it (janitor's y/N, the gated bin/install.sh,
+# a doc edit); adding an `--execute` is out of scope by the issue's Boundaries and stays out.
+#
+# Read-only is enforced by what this function CALLS, not by care: janitor.propose (the same pure
+# selector `--dry-run` uses, with no execute path reachable from here), check_stack under the
+# SKIP_SEND sentinel, gitops.worktree_reclaim_block (documented read-only and network-free), and
+# journal.read. The layout and all the census arithmetic live in lib/upkeep.py, pure and
+# unit-tested; this half only gathers.
+
+_UPKEEP_WORKTREE_RE = re.compile(r"i\d+")
+
+
+def _upkeep_janitor_view(home, cfg, dev):
+    """(view, branches) — the janitor's PROPOSALS only, plus the remote-branch snapshot the census
+    reuses. The same fail-closed reads the interactive sweep does: a present-but-unreadable
+    issues.json or refused map means nothing is provably idle, so we propose NOTHING and SAY why
+    rather than rendering a reassuring empty sweep."""
+    ls, _refused_map, refused_keys, err = _janitor_read_state(home, retry_refused=False)
+    if err is not None:
+        return {"error": err, "proposals": [], "held": []}, {}
+    fetched = _janitor_fetch(ls)
+    days = cfg["janitor"]["aged_park_days"]
+    result = janitor_lib.propose(**fetched, now=time.time(), aged_park_days=days,
+                                 refused=refused_keys, dev_branch=dev)
+    return ({"error": None, "proposals": result["proposals"], "held": result["refused"]},
+            fetched["branches"])
+
+
+def _upkeep_worktrees(home):
+    """(worktree ids on disk, {iid: reclaim-block reason or None}).
+
+    The block reason comes from gitops.worktree_reclaim_block — read-only and network-free by
+    construction (a `git status` plus a local rev-list against refs already on disk), which is why
+    a weekly report may call it. It is what turns "5 checkouts on disk" into the one fact worth
+    acting on: which of them hold work that exists nowhere else (issue #190)."""
+    wdir = os.path.join(home, "worktrees")
+    try:
+        names = sorted(os.listdir(wdir))
+    except OSError:
+        return [], {}
+    ids = [n for n in names if _UPKEEP_WORKTREE_RE.fullmatch(n)
+           and os.path.isdir(os.path.join(wdir, n))]
+    return ids, {i: gitops.worktree_reclaim_block(os.path.join(wdir, i)) for i in ids}
+
+
+def cmd_upkeep(args):
+    try:
+        cfg = _load_config(args.repo)
+    except (FileNotFoundError, ValueError) as e:
+        # No config means no state home, no repo slug and nothing to census — there is no honest
+        # page to print. Refuse, naming the one command that fixes it (the doctor's own posture).
+        print("upkeep: %s\n  Run `superlooper adopt --repo %s` first, then "
+              "`superlooper doctor --repo %s`." % (e, args.repo, args.repo), file=sys.stderr)
+        return 2
+
+    home = str(config_lib.state_home(cfg))
+    dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
+    records = journal.read(home)
+
+    # SKIP_SEND: doctor --stack proves the notify channel by SENDING one live message; upkeep must
+    # not, so the block reports "configured, not sent" and the notify ROW below leans on the canary
+    # the morning push already journaled. announce is silenced for the same reason — there is no
+    # side effect to announce.
+    stack = stack_doctor.check_stack(cfg, sender=stack_doctor.SKIP_SEND,
+                                     announce=lambda *a, **k: None, repo_path=args.repo)
+
+    janitor_view, branches = _upkeep_janitor_view(home, cfg, dev)
+
+    try:
+        st = loopstate.load(os.path.join(home, "state", "issues.json"))
+    except (OSError, ValueError):
+        st = {}
+    st = st if isinstance(st, dict) else {}
+    issues = st.get("issues") if isinstance(st.get("issues"), dict) else {}
+    wt_ids, wt_blocks = _upkeep_worktrees(home)
+
+    view = {
+        "repo": cfg.get("repo"),
+        "repo_path": os.path.abspath(args.repo),
+        "state_home": home,
+        "date": time.strftime("%Y-%m-%d", time.localtime()),
+        "stack": upkeep_lib.fold_stack(stack),
+        # Same call the morning report makes (issue #39): git is impure, so it lives out here.
+        "engine_drift": stack_doctor.engine_drift(repo_path=args.repo, dev_branch=dev),
+        "janitor": janitor_view,
+        # The ops-doc lint (issue #199) reads THIS repo's docs; for every adopted repo but the
+        # engine's own monorepo there are none, and lint() skips cleanly rather than inventing a
+        # verdict — the same posture engine_drift takes with no source checkout.
+        "doc_lint": doc_lint.lint(args.repo),
+        "branches": upkeep_lib.branch_census(branches, janitor_view["proposals"]),
+        "worktrees": upkeep_lib.worktree_census(wt_ids, issues, wt_blocks),
+        "notify": report.notify_canary(records),
+        "week": upkeep_lib.week_counts(records, time.time()),
+    }
+    for line in upkeep_lib.render(view):
+        print(line)
+    # Always 0 on an adopted repo: this is a REPORT, not a gate. A nonzero exit would make it
+    # unusable in the one place it belongs — a routine weekly glance — by turning "there are two
+    # things to look at" into "something is broken".
+    return 0
+
+
 # ------------------------------- watchdog (issue #66) -------------------------------
 # `superlooper watchdog` is ONE mechanical health check — the unattended-debugger fallback.
 # No LLM call exists anywhere on this path and it makes no repair decisions: it reads the
@@ -2286,6 +2402,9 @@ def main(argv=None):
                               help="operator name recorded in the request marker (audit)"),
            "--source": dict(default=None,
                             help="who asked (audit only)")})
+    # No flags at all, deliberately: `upkeep` is read-only by contract (issue #200 Boundaries), and
+    # the shortest way to keep it that way is to give it nothing to turn on. --repo comes from add().
+    add("upkeep", cmd_upkeep)
     add("watchdog", cmd_watchdog)
     add("debug", cmd_debug,
         **{"--note": dict(default=None,

@@ -34,6 +34,27 @@ NOTIFY_TEST_BODY = (
 )
 
 
+class _SkipSend:
+    """The sentinel a READ-ONLY caller passes as `sender` (issue #200).
+
+    ``check_notify`` proves the channel by SENDING — that is the whole point of the block, and
+    ``doctor --stack`` owns that one deliberate side effect. But ``superlooper upkeep`` runs the
+    same stack checks under a read-only contract, and it must not push a message every time the
+    owner glances at the weekly report. A no-op callable is NOT a safe substitute: it returns
+    something without an `.ok`, which check_notify would render as a FAILED send — a false red on a
+    healthy channel. So the skip is explicit and the block says what it did and did not prove.
+
+    A class with a repr rather than ``object()`` so a stray sentinel in a traceback or a log line
+    reads as itself.
+    """
+
+    def __repr__(self):
+        return "stack_doctor.SKIP_SEND"
+
+
+SKIP_SEND = _SkipSend()
+
+
 @dataclass
 class CheckResult:
     name: str
@@ -284,6 +305,17 @@ def check_notify(config, config_error=None, sender=None, announce=None):
             "Set notify.cmd or notify.imessage_to in .superlooper/config.json; cmux desktop toasts "
             "are not enough for overnight stalls.",
         )
+
+    if sender is SKIP_SEND:
+        # A read-only caller (`superlooper upkeep`). The channel is CONFIGURED — that much is
+        # proven above — but delivery is not, so this is a WARN carrying the command that does
+        # prove it, never a pass dressed up as one. The notify canary the morning push journals is
+        # the evidence a read-only report leans on instead (report.notify_canary).
+        return CheckResult(
+            "notify channel", True,
+            "%s configured; NOT sent — this check is read-only. `superlooper doctor --stack` "
+            "sends the live test message that proves delivery." % channel,
+            warn=True)
 
     announce = announce if announce is not None else print
     sender = sender if sender is not None else notify.send_test
