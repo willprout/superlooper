@@ -1576,9 +1576,12 @@ def test_out_of_band_merge_kills_the_builder_even_when_the_worktree_is_kept(sim_
         "never absorbed the out-of-band merge: %s" % [
             (r.get("act"), r.get("outcome")) for r in sim.journal()]
 
+    # read defensively: when this regresses NOTHING is ever closed, and a bare read_text would die
+    # with FileNotFoundError instead of naming the property that broke
+    log = sim.cmux_dir / "closed.jsonl"
     closed = [json.loads(l)["surface"]
-              for l in (sim.cmux_dir / "closed.jsonl").read_text().splitlines() if l.strip()]
-    assert surf0 in closed, closed
+              for l in (log.read_text() if log.exists() else "").splitlines() if l.strip()]
+    assert surf0 in closed, "the builder's window was never closed: %s" % closed
     assert _wait_dead(pid0), "the builder must be GONE — a merged branch must not keep a live " \
         "worker able to push to it and open a fresh PR"
     assert not os.path.exists(lock)
