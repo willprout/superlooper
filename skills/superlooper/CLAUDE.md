@@ -86,5 +86,7 @@ without hardcoding a Codex fact into the core.
 ## Publishing
 
 Source NEVER lives in `~/.claude`. Installing to `~/.claude/skills/` is an explicit publish
-step via `bin/install.sh` (deliberate copy, version-stamped) — never a symlink, so
-half-finished edits in this repo can't leak into live sessions or a running loop.
+step via the **repo-root** `bin/install.sh` (deliberate copy, version-stamped) — never a symlink,
+so half-finished edits in this repo can't leak into live sessions or a running loop. Run it from
+the monorepo root: this directory's own `bin/install.sh` is a tombstone that refuses, and it is
+the only door — `tests/test_one_publish_door.py` fails if any other script writes there.
