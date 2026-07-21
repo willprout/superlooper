@@ -1582,12 +1582,15 @@ def test_a_stale_unlanded_read_stamp_is_corrected_once_the_read_lands():
     assert "not confirmed closed" in holds[0]["reason"] and "#3" in holds[0]["reason"]
 
 
-def _lane_bound(p, stamp, closed_read_ok=True, closed_nums=frozenset({3})):
-    """The gate PASSES (#3 closed in a landed read) but every lane is occupied by a wildcard lane."""
+def _lane_bound(p, stamp, closed_read_ok=True, closed_nums=frozenset({3}), lanes=1, claims=None):
+    """The gate PASSES (#3 closed in a landed read) but SCHEDULING withholds the launch. `lanes=1`
+    with one lane occupied exercises the cap; `lanes=4` makes capacity a non-issue so the wildcard
+    lane blocks on ANTI-AFFINITY instead — a distinct branch of `_plan` the cap short-circuits past
+    (third review round, P2-4). Both must reach the same retirement, since the stamp names both."""
     d = disk(issues_state={"version": 1,
                            "issues": {"i5": ist(status=None, launch_hold_reason=stamp)}})
     return decide(parsed_issues=[p], lane_state=[{"id": "i9", "touches": ["*"], "type": "build"}],
-                  config=cfg(lanes=1), dsk=d,
+                  config=cfg(lanes=lanes), dsk=d,
                   gh_view=ghv(closed_nums=set(closed_nums), closed_read_ok=closed_read_ok))
 
 
@@ -1623,6 +1626,17 @@ def test_retiring_that_stamp_re_arms_the_ledger_for_the_NEXT_episode():
     assert len(holds) == 1 and holds[0]["reason"].startswith(UNLANDED)
 
 
+def test_the_stale_stamp_is_retired_when_ANTI_AFFINITY_is_what_holds_it_too():
+    # The other scheduling branch: lanes are free, so `_plan` does not short-circuit on capacity and
+    # the wildcard lane blocks on overlap instead. The stamp names both; both must retire it.
+    p = parsed(5, blocked_by=[3])
+    out = _lane_bound(p, _stale_unlanded_stamp(), lanes=4)
+    holds = only(out, "launch_hold")
+    assert only(out, "launch") == []                      # genuinely still not launched
+    assert len(holds) == 1 and not holds[0]["reason"].startswith(UNLANDED)
+    assert "anti-affinity overlap" in holds[0]["reason"]
+
+
 def test_a_lane_bound_issue_with_no_stale_stamp_stays_silent():
     # No new noise: lane contention on its own is not a hold and must not journal (#150's own line —
     # a lane-bound candidate "carries no 'why is only one lane busy' mystery").
@@ -1635,6 +1649,66 @@ def test_the_retirement_stamp_is_said_once_not_every_tick():
     first = only(_lane_bound(p, "the closed-issue list read did not land this poll — stale"),
                  "launch_hold")[0]["reason"]
     assert only(_lane_bound(p, first), "launch_hold") == []
+
+
+# THIRD review round, P1-1: the retirement stamp must itself be retirable. It asserts "nothing here
+# needs an owner" — true only while the gate really passes. Because it deliberately does NOT carry
+# the unlanded prefix, the first version of it was unrecognizable the moment it was written, so every
+# LATER cause went silent behind a standing false all-clear. Whatever writes a durable claim must
+# leave the next tick able to tell that it wrote it.
+
+def _retirement_stamp():
+    return only(_lane_bound(parsed(5, blocked_by=[3]), _stale_unlanded_stamp()),
+                "launch_hold")[0]["reason"]
+
+
+def _wearing_retirement(p, **over):
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None,
+                                                launch_hold_reason=_retirement_stamp())}})
+    return decide(parsed_issues=[p], dsk=d, **over)
+
+
+def test_the_retirement_stamp_is_corrected_when_the_dependency_RE_OPENS():
+    out = _wearing_retirement(parsed(5, blocked_by=[3]),
+                              gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1
+    assert "not confirmed closed" in holds[0]["reason"] and "#3" in holds[0]["reason"]
+    assert "nothing here needs an owner" not in holds[0]["reason"]
+
+
+def test_the_retirement_stamp_is_corrected_when_the_usage_meter_DIES():
+    out = _wearing_retirement(parsed(5, blocked_by=[3]),
+                              usage=dict(usage_ok(), auth_status="expired"),
+                              gh_view=ghv(closed_nums={3}, closed_read_ok=True))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and "usage headroom" in holds[0]["reason"]
+
+
+def test_the_retirement_stamp_is_corrected_when_the_control_labels_GO_AMBIGUOUS():
+    out = _wearing_retirement(parsed(5, blocked_by=[3], label_conflict=True),
+                              gh_view=ghv(closed_nums={3}, closed_read_ok=True))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and "control labels conflict" in holds[0]["reason"]
+
+
+def test_the_retirement_stamp_still_re_arms_the_ledger_for_a_new_throttle():
+    out = _wearing_retirement(parsed(5, blocked_by=[3]),
+                              gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and holds[0]["reason"].startswith(UNLANDED)
+
+
+def test_the_hold_reason_survives_a_tuple_dependency():
+    # THIRD review round, P2-1: `"#%s" % (1, 2)` raises "not all arguments converted", and `% ()`
+    # raises "not enough arguments" — a tuple is HASHABLE, so _dep_unmet passes it straight into the
+    # prose. The totality claim has to hold at the formatting step too, not just the membership one.
+    for dep in ((1, 2), (), (3,)):
+        p = parsed(5, blocked_by=[dep])
+        for ok in (False, True):
+            assert only(decide(parsed_issues=[p],
+                               gh_view=ghv(closed_nums=set(), closed_read_ok=ok)), "launch") == []
 
 
 def test_the_hold_reason_path_is_total_on_a_wrong_typed_blocked_by():

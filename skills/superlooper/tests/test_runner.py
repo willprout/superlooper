@@ -5326,6 +5326,20 @@ def test_a_standing_throttle_says_it_once_then_speaks_again_for_the_NEXT_episode
     assert held[-1]["outcome"].startswith("the closed-issue list read did not land")
 
 
+def test_a_park_ends_the_hold_episode_rather_than_leaving_its_reason_standing(rig):
+    # THIRD review round, P2-2. An issue handed back for a MISSING `touches:` declaration while
+    # wearing an unlanded-read stamp from an earlier throttle must not sit parked telling the owner
+    # GitHub is throttled: the stamp names a cause that is no longer why anything is stopped, on the
+    # one artifact he reads to decide what to do. A park ends the hold episode, as a launch does.
+    rig.r.tick(now=NOW)
+    seed_issue(rig, "i103", launch_hold_reason="the closed-issue list read did not land this poll — x")
+    rig.r._exec_park({"id": "i103", "num": 103, "needs_william": True,
+                      "memo": "no touches declared", "cause": "touches_missing"}, NOW + 10)
+    ist = issue_state(rig, "i103")
+    assert ist["status"] == "needs_william"
+    assert ist["launch_hold_reason"] is None
+
+
 def test_a_genuinely_blocked_issue_still_waits_quietly_under_a_clean_read(rig):
     # No new noise for the honest case: #101/#102 really are open, i103 waits, and nothing is
     # journalled — a long-open dependency must not walk the journal every tick.

@@ -2787,6 +2787,13 @@ class Runner:
                     recs.pop(aid, None)
             i = st["issues"].setdefault(iid, loopstate.new_issue())
             i["status"] = "needs_william" if a.get("needs_william") else "parked"
+            # A park ENDS the eligibility-hold episode, exactly as a launch and a re-approve do
+            # (#150's stamp is cleared in both of those). Without this the issue sits parked wearing
+            # whatever the last hold said — e.g. "the closed-issue list read did not land this poll"
+            # on an issue actually handed back for a missing `touches:` declaration (issue #172,
+            # third review round). That is a durable narration of a cause that is no longer the
+            # reason anything is stopped, on the one artifact the owner reads to decide what to do.
+            i["launch_hold_reason"] = None
             # (#169) The one durable record that a park's LABELS actually moved — written here and
             # nowhere else, because this block runs only past the set_labels above. `status` cannot
             # carry that fact: a lane that was ALREADY needs_william (parked before, for some other

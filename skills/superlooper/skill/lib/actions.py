@@ -693,17 +693,38 @@ UNLANDED_CLOSED_READ_PREFIX = "the closed-issue list read did not land this poll
 # really is closed, and only a lane stands between this issue and a session. Said once (the ledger
 # dedups on it), it replaces a stamp that would otherwise assert a GitHub outage that has ended and
 # keep the dedup key armed against the next real one.
+#
+# It is ITSELF a #172 stamp for the purposes of the staleness check below (third review round): it
+# asserts "nothing here needs an owner", which stops being true the moment the dependency re-opens,
+# the meter dies or a control label goes ambiguous. A stamp that cannot be recognized cannot be
+# corrected, and this one would then stand — silently — through every later cause. Whatever writes
+# a durable claim must leave the next tick able to tell that it wrote it.
 _LANE_BOUND_AFTER_UNLANDED_READ = (
     "the closed-issue list read has since LANDED and its `blocked-by` is satisfied — this issue is "
-    "no longer held by the gate at all, only by lane capacity or an anti-affinity overlap. It "
-    "launches on the first tick a lane frees; nothing here needs an owner.")
+    "no longer held by the eligibility gate at all. What it is waiting on is scheduling: lane "
+    "capacity, an anti-affinity overlap, or a territory claim a finished-but-unmerged lane still "
+    "holds. It launches on the first tick that clears; nothing here needs an owner.")
+
+
+def _is_i172_hold_stamp(reason):
+    """Is this durable `launch_hold_reason` one THIS path wrote (issue #172) — either an
+    unlanded-read hold or its lane-bound retirement? Both must stay correctable: the ledger dedups
+    on the stored string, so a stamp left standing after its cause ended both misdescribes the board
+    and silences the next episode."""
+    return _is_unlanded_closed_read_stamp(reason) or reason == _LANE_BOUND_AFTER_UNLANDED_READ
 
 
 def _dep_unmet(d, closed_nums):
-    """Is this `blocked-by` entry unsatisfied? Mirrors issues.eligible's membership test EXACTLY —
+    """Is this `blocked-by` ENTRY unsatisfied? Mirrors issues.eligible's per-entry membership test —
     a wrong-typed entry is never in the closed set, so it reads as unmet, which is the fail-closed
-    answer — but survives an UNHASHABLE entry, which the bare `in` raises on. decide() must be total
-    on garbage, and the gate and the prose that explains it must never disagree about the same rule."""
+    answer — but survives an UNHASHABLE entry, which the bare `in` raises on.
+
+    Scope, precisely (third review round: the earlier wording over-claimed). This aligns the two on
+    each ENTRY. It does not align them on the CONTAINER: _launch_gate_reason still guards with
+    `isinstance(deps, list)` while issues.eligible iterates whatever it is, so a non-list container
+    (a tuple) is refused by the gate but falls to the unnamed reason. Pre-existing, unreachable from
+    parse_issue (which always builds a list of ints), and tracked with the wider eligibility-totality
+    hole in its own issue rather than widened into this diff."""
     try:
         return d not in closed_nums
     except TypeError:
@@ -717,7 +738,7 @@ def _unlanded_closed_read_reason(open_deps):
     return (UNLANDED_CLOSED_READ_PREFIX + " — a rate-limit throttle is the usual cause, and `gh api "
             "rate_limit` (what the poll probes with) is EXEMPT from throttling, so the view still "
             "reads fresh. Its `blocked-by` ("
-            + ", ".join("#%s" % d for d in open_deps)
+            + ", ".join("#%s" % (d,) for d in open_deps)
             + ") therefore cannot be verified as closed. An unlanded read is never taken as "
               "'nothing is closed': held until a clean closed-list read lands.")
 
@@ -769,7 +790,7 @@ def _launch_gate_reason(p, closed_nums, usage, config=None, closed_read_ok=True)
         # closure state it did not actually observe — the refused≠empty trap of #21/#61/#78/#92/#108.
         # (Kept as the wording for a LANDED read: a view with no vouch is never narrated as refused.)
         return ("its `blocked-by` is not satisfied in the latest GitHub read: "
-                + ", ".join("#%s" % d for d in open_deps)
+                + ", ".join("#%s" % (d,) for d in open_deps)
                 + " not confirmed closed. The restart waits for the dependency to close — a recovery "
                   "never carries a session past a blocker a fresh launch would respect.")
     if config is not None and gate.foreseeable_referee_stop(p.get("touches"), config) \
@@ -2332,7 +2353,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             #     is not launch_ok-filtered, so a candidate can be held by usage, an ambiguous type or
             #     a control-label conflict, all of which OUTRANK the dependency check. Stamping "the
             #     closed read did not land" over one of those would narrate a cause the loop never
-            #     established, in a record the morning report reads. That function tests conditions in
+            #     established, in the journal and in durable loopstate (NOT the morning report, which
+            #     carries no launch_hold — an earlier draft of this comment said otherwise). That
+            #     record is what an incident is reconstructed from. That function tests conditions in
             #     launch_ok's own order, so the prose names the one that actually decided — and it is
             #     the same function the recovery path asks, so the two paths cannot drift;
             #   * emit ONLY when the unlanded read is what decided, or when the board is still wearing
@@ -2350,20 +2373,28 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             #     precisely the silence this issue exists to end. It is retired with the honest
             #     reason (there is no clear-the-stamp verb, and inventing one is a bigger change
             #     than this issue's boundaries hold; the stamp clears for real on launch).
-            stale = _is_unlanded_closed_read_stamp(ist_of(cid).get("launch_hold_reason"))
+            stale = _is_i172_hold_stamp(ist_of(cid).get("launch_hold_reason"))
             if scheduler.launch_ok(c, closed_nums, bool(frozen), usage_sched, config=cfg):
                 if stale:
+                    # Re-asserted, not just written once: launch_hold's equality dedup makes this a
+                    # no-op while the retirement stamp is already standing and still true, so the
+                    # "said once" property holds — but the moment the gate starts refusing again
+                    # (the dependency re-opens, the meter dies, a label goes ambiguous) the branch
+                    # below re-derives and the false all-clear is replaced.
                     launch_hold(cid, c.get("num"), c, reason=_LANE_BOUND_AFTER_UNLANDED_READ)
                 continue
             reason = _launch_gate_reason(c, closed_nums, usage_sched, config=cfg,
                                          closed_read_ok=closed_read_ok)
             if stale or _is_unlanded_closed_read_stamp(reason):
-                # NOTE the churn this accepts: a closed read that FLAPS (lands, refuses, lands) is a
-                # genuinely changing cause, so it journals once per change — at POLL cadence (~90s),
-                # never the 15s tick, and journal-only with no notify. That is the #150 ledger's
-                # designed behaviour for any flapping condition (a usage meter crossing its ceiling
-                # back and forth does the same), not something this path makes worse. Silence would
-                # be the alternative, and silence is the defect.
+                # NOTE the churn this accepts, stated honestly (third review round corrected an
+                # earlier claim of parity here). Correcting the stamp is what costs it: a closed read
+                # that FLAPS journals TWICE per flap cycle per held candidate, where a version that
+                # let the stamp go stale journaled once per outage. It is bounded — POLL cadence
+                # (~90s), never the 15s tick — and journal-only, no notify, no label move, no park.
+                # The trade is deliberate: the un-corrected stamp is what silences the NEXT real
+                # episode, and silence is the defect this issue was filed for. A flapping PROBE
+                # costs the same by a second route (`or gh_stale` above swaps the wording whenever
+                # the whole view is doubted).
                 launch_hold(cid, c.get("num"), c, reason=reason)
     elif (systemic_launch and not anchor_down and not auth_invalid and not display_asleep
             and not gh_stale and not issue_state_corrupt_for_launches):
