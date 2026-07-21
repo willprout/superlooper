@@ -1041,6 +1041,65 @@ def test_silent_exit_relaunch_ladder_parks_at_cap(sim_factory):
 
 
 # =====================================================================================
+# issue #169: a stale worker lock must BOUND the rebuild, not livelock the lane forever
+# =====================================================================================
+
+def test_a_stale_worker_lock_bounds_the_rebuild_instead_of_livelocking_the_lane(
+        sim_factory, monkeypatch):
+    """The #169 livelock, end to end, against the real tick loop.
+
+    A parked lane is re-approved while worker.<id>.lock names a LIVE pid that is NOT its worker —
+    the state a SIGKILLed start-session.sh (no EXIT trap) or a recycled pid leaves behind. #149's
+    rule refuses to prune under that pid, so the rebuild aborts; decide re-emits it every tick, and
+    its own `reapproved_now` holds back the launch whose _close_stale_session would drop the stale
+    lock. Before this issue that ran forever: status `parked`, counters unmoved, no notification, no
+    ALERT, and only `rm state/worker.<id>.lock` freed it. Now it climbs a counted ladder and hands
+    back to the owner with the pid and the lock path — and the memo's instruction is TRUE: removing
+    the lock and re-approving really does rebuild (asserted below, because a park whose advice does
+    not work is a louder livelock, not a fix)."""
+    import runner as runner_mod
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0.05)   # bound the test, not the rule
+    sim = sim_factory()
+    num = sim.add_issue(title="Vanishes silently", scenario={"scenario": "vanish"})
+    sid = "i%d" % num
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked", ticks=20), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    lock = os.path.join(sim.home, "state", "worker.%s.lock" % sid)
+    try:
+        # THE precondition: an unrelated live process (this one) inherits the lane's lock.
+        with open(lock, "w") as f:
+            f.write(str(os.getpid()))
+        os.makedirs(os.path.join(sim.home, "worktrees", sid), exist_ok=True)
+        sim.edit_gh_state(lambda st: st["issues"][str(num)]["labels"].append("agent-ready"))
+        before = len(sim.notify_lines())
+
+        assert sim.tick_until(lambda: "needs-owner" in sim.issue(num)["labels"], ticks=12), \
+            [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+        ist = sim.loop_issue(sid)
+        assert ist["status"] == "needs_william"
+        assert ist["teardown_deferrals"] == actions_lib.TEARDOWN_DEFERRAL_CAP
+        assert ist["teardown_deferral_pid"] == os.getpid()
+        # the hand-back reached the owner on all three durable channels, naming what to remove
+        memo = [m for m in sim.mutations("comment") if str(os.getpid()) in m["body"]]
+        assert memo and lock in memo[0]["body"], sim.mutations("comment")
+        assert len(sim.notify_lines()) > before
+        assert [r for r in sim.journal("park") if r.get("cause") == "teardown_deferral"]
+        assert "agent-ready" not in sim.issue(num)["labels"], "the retry must stop retrying"
+
+        # ...and the escape the memo promises: drop the stale lock, re-approve, the rebuild runs.
+        os.remove(lock)
+        sim.edit_gh_state(lambda st: st["issues"][str(num)]["labels"].append("agent-ready"))
+        assert sim.tick_until(lambda: sim.loop_issue(sid).get("teardown_deferrals") == 0, ticks=5), \
+            sim.loop_issue(sid)
+        assert sim.loop_issue(sid)["status"] in ("ready", "running")
+    finally:
+        if os.path.exists(lock):
+            os.remove(lock)          # never leave this process's pid in a lock at teardown
+
+
+# =====================================================================================
 # launch anchor liveness (#24): a dead launch anchor must never walk the queue
 # =====================================================================================
 

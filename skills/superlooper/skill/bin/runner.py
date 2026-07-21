@@ -2039,12 +2039,18 @@ class Runner:
     def _worktree(self, iid):
         return os.path.join(self.home, "worktrees", iid)
 
+    def _lock_path(self, iid):
+        """The lane's worker singleton, named in ONE place — start-session.sh's `acquire_worker`
+        writes it, teardown clears it, and the #169 hand-back quotes this exact path at the owner
+        because deleting it is the one thing that frees a lane held by a stale lock."""
+        return os.path.join(self.state, f"worker.{iid}.lock")
+
     def _lock_pid(self, iid):
         """The pid recorded in worker.<id>.lock, or None when there is no lock / it names no
         process. start-session.sh writes the lock atomically WITH its pid (`ln` of a fully-written
         temp) and its EXIT trap frees it, so a readable pid here means a worker process that was
         alive when it took the lock. An empty/garbage lock names nobody: None, never a veto."""
-        txt = (_read(os.path.join(self.state, f"worker.{iid}.lock")) or "").strip()
+        txt = (_read(self._lock_path(iid)) or "").strip()
         try:
             pid = int(txt)
         except (TypeError, ValueError):
@@ -2086,11 +2092,16 @@ class Runner:
         makes _exec_reapprove/_exec_regenerate defer forever (they must not rebuild over a worktree
         they cannot clear), and decide re-emits them every tick while `reapproved_now` holds back
         the very launch whose _close_stale_session would drop the stale lock. The lane livelocks —
-        journaled each tick via the executor's outcome, but uncapped and un-alerted, and only
-        removing the lock frees it. Nor is this symmetric with start-session.sh's acquire_worker:
-        that refusal is counted and eventually parks the issue with a memo; this one is not counted
-        at all. Bounding it is issue #169 — do not talk yourself out of that on the strength of
-        'it only costs disk'."""
+        and until #169 that was SILENT: journaled each tick via the executor's outcome, but uncapped
+        and un-alerted, so only removing the lock by hand freed it.
+
+        That asymmetry is now bounded rather than merely accepted (#169). The refusal here is
+        unchanged — we still err toward not pruning — but each refused REBUILD is charged to
+        `teardown_deferrals` (_charge_teardown_deferral), and at TEARDOWN_DEFERRAL_CAP decide hands
+        the lane to the owner naming this pid and this lock path. That makes it symmetric with
+        start-session.sh's acquire_worker, whose identical pid-reuse refusal was already counted
+        (`launch_failures`) and already parked with a memo. Do not remove the cap on the strength of
+        'it only costs disk' — it never only cost disk."""
         if not pid:
             return True                                    # no lock -> no live worker to wait for
         deadline = time.monotonic() + (WORKER_EXIT_TIMEOUT if timeout is None else timeout)
@@ -2192,7 +2203,7 @@ class Runner:
             return False                                   # the ONE meaning: still held
         for p in (os.path.join(self.state, "panes", iid),
                   os.path.join(self.state, "panes", f"{iid}.ws"),
-                  os.path.join(self.state, f"worker.{iid}.lock")):
+                  self._lock_path(iid)):
             _rm(p)
         if remove_worktree:
             # (#190) The unsaved-work guard, for the disk-hygiene reclaim only. The worker is gone
@@ -2232,6 +2243,35 @@ class Runner:
                 f.write(f"pid={pid} still alive at teardown\n")
         except OSError:
             pass
+
+    def _charge_teardown_deferral(self, iid):
+        """Charge ONE refused rebuild to this lane's teardown-deferral ladder (issue #169), the
+        bound decide caps on. The sibling of _charge_launch_failure, and for the same reason: the
+        refusal itself is correct — a rebuild must not run over a worktree it could not clear — but
+        an UNCOUNTED refusal cannot end. start-session.sh's own acquire_worker has the identical
+        pid-reuse exposure and its refusal is counted (`launch_failures`) and eventually parks with
+        a memo; this one was counted nowhere, so a stale lock naming a recycled pid parked a lane
+        silently and forever.
+
+        Only the two REBUILD paths charge it (_exec_reapprove / _exec_regenerate) — the paths whose
+        whole action aborts on the decline. The disk-hygiene deferrals (the merge auto-close, the
+        parked reaper, the drain just below) defer for the same reason every tick BY DESIGN — a
+        merged lane's worker idles at the prompt — and their retry is _drain_pending_teardowns, not
+        a rebuild; charging them would park healthy lanes for finishing normally.
+
+        The pid and the lock path are stamped alongside the count because the park memo is useless
+        without them: removing that lock is the one thing that frees the lane. Re-read here rather
+        than threaded out of _teardown_session — a declined teardown clears NOTHING, so the lock is
+        still on disk saying exactly what refused. Returns (count, pid) for the outcome string, so
+        the journal shows the ladder climbing instead of N identical lines."""
+        pid = self._lock_pid(iid)
+        seen = {}
+        def charge(st, i):
+            self._bump(i, "teardown_deferrals")
+            seen["n"] = i["teardown_deferrals"]
+        self._update_issue(iid, {"teardown_deferral_pid": pid,
+                                 "teardown_deferral_lock": self._lock_path(iid)}, fn=charge)
+        return seen.get("n", 0), pid
 
     def _drain_pending_teardowns(self, st):
         """Retry the teardowns that declined because their CLI was still alive (#149). THIS is the
@@ -2723,7 +2763,12 @@ class Runner:
     _REAPPROVE_COUNTERS = ("launches", "retries", "conflicts", "launch_failures",
                            "answerer_failures", "answer_delivery_failures", "merge_refusals",
                            "questions_asked",   # a fresh approval resets the 2-question cap too (#163)
-                           "exit_asks")         # ...and the exit-interview ask ladder (#215)
+                           "exit_asks",         # ...and the exit-interview ask ladder (#215)
+                           "teardown_deferrals")   # ...and the declined-prune ladder (#169): this
+                                                   # reset only ever runs AFTER the teardown it
+                                                   # counts SUCCEEDED, so the counter means
+                                                   # CONSECUTIVE refusals, and a lane freed by
+                                                   # deleting a stale lock starts from zero
 
     def _exec_reapprove(self, a, now):
         """D7-sibling operator fix: William re-approving a parked/needs-william/bounced issue (a
@@ -2749,8 +2794,14 @@ class Runner:
         #    _exec_regenerate): launch-session.sh reuses a surviving worktree rather than failing,
         #    so a fresh start would silently inherit the parked run's stale checkout — the opposite
         #    of the clean slate this executor promises. decide re-emits while `agent-ready` stands.
+        #    (#169) The deferral is COUNTED. It is right to abort, but a stale lock naming a reused
+        #    pid never goes dead, and decide's re-emission holds back the very launch whose
+        #    _close_stale_session would drop that lock — so an uncounted abort is a lane parked
+        #    silently and forever. At the cap decide parks it needs-owner naming the pid + lock.
         if not self._teardown_session(iid, remove_worktree=True):
-            return "worker still live in the worktree — deferring the fresh start (retries next tick)"
+            n, pid = self._charge_teardown_deferral(iid)
+            return (f"worker still live in the worktree (pid {pid}) — deferring the fresh start "
+                    f"(deferral {n} of {actions.TEARDOWN_DEFERRAL_CAP}; retries next tick)")
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
         # `mail` and `ack` join this list for the #215 exit interview (fresh review P1): a park
         # can leave the interview MAIL armed, and mail carries no episode fence — a reapproved
@@ -2787,7 +2838,9 @@ class Runner:
                       "question_posted_at": None,      # post-once stamp (#163)
                       "exit_asked_at": None, "exit_asked_key": None,   # a fresh episode gets a
                       "exit_nonce": None, "exit_verify": None,         # fresh exit interview,
-                      "exit_ack_relayed": None})       # paired with exit_asks=0 above (#215)
+                      "exit_ack_relayed": None,        # paired with exit_asks=0 above (#215)
+                      "teardown_deferral_pid": None,   # the ladder's evidence, dropped with the
+                      "teardown_deferral_lock": None})  # counter it explains (#169)
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()
@@ -3429,8 +3482,13 @@ class Runner:
         #    conflicted branch while its brief names the new one, pushing commits onto a superseded
         #    PR. Fail closed instead: leave every field untouched so decide re-emits this same
         #    regenerate next tick, by which time the old CLI has almost certainly gone.
+        #    (#169) Counted, for the same reason as _exec_reapprove's: the gate re-derives this same
+        #    regenerate from the same unchanged conflict every tick, so an unclearable worktree
+        #    means a rebuild emitted forever and landed never. At the cap decide parks it.
         if not self._teardown_session(iid, remove_worktree=True):
-            return "worker still live in the worktree — deferring the rebuild (retries next tick)"
+            n, pid = self._charge_teardown_deferral(iid)
+            return (f"worker still live in the worktree (pid {pid}) — deferring the rebuild "
+                    f"(deferral {n} of {actions.TEARDOWN_DEFERRAL_CAP}; retries next tick)")
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
         for sub in ("blocked", "exited", "awaiting"):
             _rm(os.path.join(self.state, sub, iid))
@@ -3447,6 +3505,12 @@ class Runner:
                                  "review_carry": None,   # fresh branch, fresh review (#154)
                                  "nudged": [], "nudged_at": {},   # fresh nudge+grace window (#222)
                                  "pr": None, "recheck_failed": False,
+                                 # (#169) The prune this rebuild needed just SUCCEEDED, so the
+                                 # declined-prune ladder starts over: the counter means CONSECUTIVE
+                                 # refusals, never a lifetime tally that would park a later episode
+                                 # on a worker that merely took a few ticks to unwind.
+                                 "teardown_deferrals": 0, "teardown_deferral_pid": None,
+                                 "teardown_deferral_lock": None,
                                  "checks_pending_since": None, "merge_refusals": 0,
                                  "merge_refusal_reason": None,
                                  "pr_read_pending_since": None,   # fresh branch, fresh episodes (#61)

@@ -175,6 +175,16 @@ CANARY_RETRY_SECONDS = 300
 # the issue back (needs-owner) with the question quoted, rather than posting a third round-trip.
 QUESTION_CAP = 2
 MERGE_REFUSAL_CAP = 2              # gate-green PR's merge refused this many ticks -> park (#27)
+# A rebuild (reapprove / conflict-regenerate) that cannot clear its worktree ABORTS, because
+# launch-session.sh only creates a worktree `if [ ! -d "$WT" ]` and would otherwise silently reuse
+# the stale one on the old branch (#149 P0-3). That refusal is right, and #149 deliberately left it
+# uncounted — so a stale worker.<id>.lock naming a REUSED pid (a SIGKILLed start-session.sh never
+# runs its EXIT trap; pids recycle) made the rebuild abort every tick FOREVER: parked, uncounted,
+# un-alerted, freed only by deleting the lock by hand. This is that bound (#169). Higher than the
+# launch/merge caps on purpose: those count a real failure, this counts a WAIT, and a worker that is
+# genuinely still unwinding must never be parked for taking a few ticks about it (five consecutive
+# refusals is ~75s of a lane that has already been asked to go and been observed not going).
+TEARDOWN_DEFERRAL_CAP = 5
 UPDATE_ERROR_ALERT = 4             # persistent merge-update infra errors -> ALERT (never regenerate)
 RUNAWAY_THRESHOLD = 4              # retries far past the cap -> ALERT (events.retry_runaway)
 # The bound (seconds) on a FINISHED issue's required-checks PENDING wait (issue #26). A required
@@ -549,6 +559,50 @@ def _touches_required_memo(num):
             "launch it until the issue declares which area(s) it touches (e.g. `touches: engine`): "
             "the declaration is what anti-affinity and the wander check verify against. Add a "
             "`touches:` line to the Loop metadata and re-approve.")
+
+
+def _teardown_corrupt(ist):
+    return _counter(ist, "teardown_deferrals")[1]
+
+
+def _teardown_livelocked(ist, iid, live_locks):
+    """Is this lane's rebuild stuck behind a worktree it will never be allowed to clear (#169)?
+
+    BOTH halves are load-bearing. The counter alone says the rebuild has been refused to the cap;
+    `iid in live_locks` says the CAUSE — a worker.<id>.lock naming a live pid — is still there right
+    now. Without the second half the park would be a trap rather than a hand-back: its memo tells
+    the owner to remove the stale lock and re-approve, and an at-cap counter that re-parked on sight
+    would answer that re-approval with the same park, forever, having never retried. With it, a lane
+    whose lock is gone falls straight through to its rebuild, which succeeds and zeroes the ladder.
+
+    A CORRUPT counter fails closed to the park (the wrong-typed-value rule) — but only while the
+    lock is live, for the same reason: a corrupt value must not strand a lane whose cause has
+    cleared, and the rebuild it falls through to rewrites the counter honestly."""
+    n, corrupt = _counter(ist, "teardown_deferrals")
+    return (corrupt or n >= TEARDOWN_DEFERRAL_CAP) and iid in live_locks
+
+
+def _teardown_deferral_memo(ist, iid, corrupt=False):
+    """The hand-back for a rebuild that cannot clear its worktree (#169). It exists to name the two
+    facts the owner cannot get any other way — WHICH pid is holding the lane and WHICH lock file
+    records it — because deleting that lock is the only thing that frees the lane. The runner stamps
+    both when it charges the rung; a state file that predates the stamp still gets an actionable
+    memo, just without the specifics."""
+    pid = ist.get("teardown_deferral_pid") if isinstance(ist, dict) else None
+    pid = str(pid) if type(pid) is int and pid > 0 else "(pid not recorded)"
+    lock = ist.get("teardown_deferral_lock") if isinstance(ist, dict) else None
+    lock = lock if isinstance(lock, str) and lock.strip() else f"the state dir's worker.{iid}.lock"
+    how_many = ("the teardown-deferral counter is unreadable" if corrupt else
+                f"superlooper refused {TEARDOWN_DEFERRAL_CAP} consecutive times")
+    return (f"the rebuild cannot start: `{lock}` names a LIVE pid ({pid}), so {how_many} to prune "
+            f"this lane's worktree rather than unlink a running worker's cwd (a pruned cwd kills "
+            f"the next hook spawn outright — the D14 mechanism #149 exists to stop). Nothing is "
+            f"wrong with the refusal; what is wrong is that it cannot end on its own. Either that "
+            f"worker really is still running (let it finish, or close its window), or the lock is "
+            f"STALE: a SIGKILLed session never runs the EXIT trap that frees it, and pids recycle, "
+            f"so an unrelated process can inherit the number and hold this lane off for its whole "
+            f"lifetime. Check with `ps -p {pid}`; if it is not this lane's worker, remove `{lock}` "
+            f"and re-approve — the rebuild then runs on the next tick.")
 
 
 def _launch_gate_reason(p, closed_nums, usage, config=None):
@@ -1190,6 +1244,18 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                             and "rebuild" not in labels):
                         out.append({"act": "resume_at_gate", "id": iid, "num": _iid_num(iid)})
                         resumed_now.add(iid)
+                    elif _teardown_livelocked(ist, iid, live_locks):
+                        # (#169) The rebuild has been refused its worktree to the cap and the lock
+                        # STILL names a live pid. Left alone this is the silent livelock: the
+                        # executor aborts, we re-emit next tick, and `reapproved_now` (below) holds
+                        # back the one launch whose _close_stale_session would drop a stale lock —
+                        # the retry blocks its own escape hatch, forever, with nothing counting.
+                        # Hand it to the owner with the pid and the lock path, exactly as the
+                        # launch-failure and merge-refusal ladders hand back theirs.
+                        park(iid, _iid_num(iid),
+                             _teardown_deferral_memo(ist, iid, corrupt=_teardown_corrupt(ist)),
+                             needs_william=True, cause="teardown_deferral")
+                        continue
                     else:
                         # `had_rebuild` tells the executor whether the one-shot `rebuild` label is
                         # actually on the issue, so it clears ONLY a label it knows exists — a
@@ -1527,6 +1593,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 park(iid, num, g.get("reason", "gate parked this issue"),
                      needs_william=bool(g.get("needs_william")))   # cause defaults to the memo
             elif act == "regenerate":
+                if _teardown_livelocked(ist, iid, live_locks):
+                    # (#169) The regenerate face of the same livelock. _exec_regenerate aborts on a
+                    # declined prune (relaunching over a surviving worktree would silently rebuild
+                    # on the OLD conflicted branch), and the gate re-derives this verdict every tick
+                    # from the same unchanged conflict — so an unclearable worktree means a rebuild
+                    # that is emitted forever and lands never. Hand it back with the pid and lock.
+                    park(iid, num,
+                         _teardown_deferral_memo(ist, iid, corrupt=_teardown_corrupt(ist)),
+                         needs_william=True, cause="teardown_deferral")
+                    continue
                 new_conflicts = _count(conflicts) + 1
                 src = p if isinstance(p, dict) else {"num": num, "id": iid,
                                                      "title": ist.get("title", "")}

@@ -627,6 +627,98 @@ def test_regenerated_issue_relaunches_on_its_stamped_branch():
     assert a["branch"] == "sl/i5-issue-5-r1"
 
 
+# ============ the teardown deferral is BOUNDED (issue #169) ============
+# #149 made a rebuild refuse to prune a worktree while worker.<id>.lock names a live pid (the D14
+# rule). A live pid does not prove the worker is OURS: a SIGKILLed start-session.sh never runs its
+# EXIT trap, and pids recycle, so an unrelated process can inherit the number and hold the prune off
+# forever. The rebuild then aborts every tick — and decide re-emits it every tick, with
+# `reapproved_now` blocking the one launch whose _close_stale_session would drop the stale lock. The
+# lane livelocks: parked forever, no cap, no notification, no ALERT. This ladder is the bound.
+
+def _deferred(status="parked", deferrals=actions.TEARDOWN_DEFERRAL_CAP, live=True,
+              reports=None, **over):
+    ist_over = {"teardown_deferral_pid": 4242,
+                "teardown_deferral_lock": "/run/state/worker.i5.lock"}
+    ist_over.update(over)
+    return disk(issues_state={"version": 1, "issues": {
+                    "i5": ist(status, teardown_deferrals=deferrals, **ist_over)}},
+                reports=reports or {},
+                live_lock_ids={"i5"} if live else set())
+
+
+def test_a_rebuild_that_cannot_clear_its_worktree_parks_at_the_cap_instead_of_retrying_forever():
+    out = decide(parsed_issues=[parsed(5)], dsk=_deferred())
+    assert only(out, "reapprove") == [], "the livelocked rebuild kept being re-emitted"
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["id"] == "i5" and p[0]["needs_william"] is True
+    assert p[0]["cause"] == "teardown_deferral"
+    assert has_notify(out), "the silent livelock must reach the owner"
+
+
+def test_the_deferral_park_memo_names_the_pid_and_the_lock_path():
+    # The memo is the whole point of counting it: the ONE thing that frees the lane is removing that
+    # lock, and the owner cannot check the pid they are never told.
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=_deferred()), "park")[0]["memo"]
+    assert "4242" in memo and "/run/state/worker.i5.lock" in memo
+
+
+def test_under_the_cap_the_rebuild_still_retries():
+    # The deferral is CORRECT under the cap — a worker really can still be unwinding. Only the
+    # unbounded repetition is the bug.
+    out = decide(parsed_issues=[parsed(5)],
+                 dsk=_deferred(deferrals=actions.TEARDOWN_DEFERRAL_CAP - 1))
+    assert len(only(out, "reapprove")) == 1 and only(out, "park") == []
+
+
+def test_a_capped_lane_whose_lock_is_gone_rebuilds_instead_of_re_parking():
+    # THE escape hatch. The park's memo tells the owner to remove the stale lock and re-approve;
+    # if the at-cap counter alone re-parked, that instruction would be a lie and the lane would be
+    # stuck FOREVER, one park louder. The counter only bites while the cause — a lock naming a live
+    # pid — is still there; the successful rebuild then zeroes it (_exec_reapprove).
+    out = decide(parsed_issues=[parsed(5)], dsk=_deferred(live=False))
+    assert len(only(out, "reapprove")) == 1 and only(out, "park") == []
+
+
+def test_a_corrupt_deferral_counter_fails_closed_to_the_park():
+    # The project's fail-OPEN-on-wrong-TYPE rule: an unreadable counter must land on the safe
+    # action (park), never re-allow the capped retry forever.
+    out = decide(parsed_issues=[parsed(5)], dsk=_deferred(deferrals="lots"))
+    assert only(out, "reapprove") == [] and len(only(out, "park")) == 1
+
+
+def test_a_resume_at_the_gate_is_never_capped_by_the_deferral_ladder():
+    # resume_at_gate (#161) tears NOTHING down — it re-enters the gate on the preserved worktree —
+    # so the deferral ladder must not touch it. Capping it would strand a finished build whose only
+    # sin is a stale lock.
+    dsk = _deferred(reports={"i5": GOOD_REPORT})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "resume_at_gate")) == 1 and only(out, "park") == []
+
+
+def test_a_conflict_regenerate_that_cannot_clear_its_worktree_parks_at_the_cap():
+    # The regenerate face of the same livelock: _exec_regenerate aborts on a declined prune too, and
+    # the gate re-emits it every tick with nothing counting.
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING"), live_lock_ids={"i5"})
+    d["issues_state"]["issues"]["i5"].update(
+        update_result="conflict", update_head_oid=HEAD1, conflicts=0,
+        teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP,
+        teardown_deferral_pid=4242, teardown_deferral_lock="/run/state/worker.i5.lock")
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    assert only(out, "regenerate") == []
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["needs_william"] is True and "4242" in p[0]["memo"]
+    assert has_notify(out)
+
+
+def test_a_conflict_regenerate_under_the_cap_is_untouched():
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING"), live_lock_ids={"i5"})
+    d["issues_state"]["issues"]["i5"].update(
+        update_result="conflict", update_head_oid=HEAD1, conflicts=0,
+        teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP - 1)
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    assert len(only(out, "regenerate")) == 1 and only(out, "park") == []
+
+
 # =========================== launch anchor liveness (#24) ===========================
 # The 2026-07-09 incident: the launch anchor — the cmux pane every worker tab is born in —
 # died mid-run (the runner's tab dragged between cmux windows). Each fresh launch failed
