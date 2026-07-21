@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # Claude "PreToolUse" hook. Fires before EVERY tool call. Denies exactly two named hazards —
-# AskUserQuestion, and pattern-kills (pkill -f / killall) — in a superlooper WORKER session, and
-# lets everything else proceed untouched. This script fences on SL_ISSUE_ID + SL_RUN_ROOT (present
-# for the whole worker family — start-session.sh launches issue workers AND answerers through it) and
-# on Claude; lib/worker_pretooluse.py then makes the fine decision, denying only in a WORKER session
-# (`i<N>`) and no-opping for answerers (`a<N>`), ad-hoc, and everything else. Safe to register
-# globally: outside that family this exits before reading a byte.
+# AskUserQuestion, and pattern-kills (pkill -f / killall) — in the UNATTENDED sessions superlooper
+# launches, and lets everything else proceed untouched. This script fences on SL_ISSUE_ID +
+# SL_RUN_ROOT (present for the whole family — start-session.sh launches issue workers, answerers and
+# the watchdog's sl-debugger through it) and on Claude; lib/worker_pretooluse.py then makes the fine
+# decision, adapting the AskUserQuestion fallback to the session's own role (`i<N>` worker ->
+# blocked file, `a<N>` answerer -> `PARK:` in its answer file, `d<N>` debugger -> memo + notify) and
+# no-opping for ad-hoc and everything else. Safe to register globally: outside that family this
+# exits before reading a byte.
 #
-# The deny makes two of the costliest worker-instruction-drift incidents mechanically impossible
-# rather than instructed-against (issue #156): AskUserQuestion in an unattended lane (i280) and a
-# pattern-kill that matched the owner's own live dashboard. lib/worker_pretooluse.py decides; the
-# spike proved permissionDecision:"deny" blocks the call even under --dangerously-skip-permissions,
-# with the reason delivered to the model verbatim.
+# The deny makes two of the costliest session-instruction-drift incidents mechanically impossible
+# rather than instructed-against (issue #156, widened to every unattended session by the owner
+# ruling on #185): AskUserQuestion in an unattended lane (i280) and a pattern-kill that matched the
+# owner's own live dashboard. lib/worker_pretooluse.py decides; the spike proved
+# permissionDecision:"deny" blocks the call even under --dangerously-skip-permissions, with the
+# reason delivered to the model verbatim.
 #
 # CLAUDE ONLY. Codex has no PreToolUse event (spike verdict), so this hook is registered only in
 # Claude's settings.json — never in Codex's hooks.json. The SL_AGENT=codex guard below is

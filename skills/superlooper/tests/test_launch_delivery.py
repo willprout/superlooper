@@ -330,6 +330,28 @@ def test_worker_command_names_model_and_effort_env(tmp_path):
     assert "SL_AGENT=claude" in cmd                      # default agent reaches the session boundary
 
 
+def test_launched_command_names_the_attended_flag(tmp_path):
+    """#185: SL_ATTENDED is what tells the PreToolUse deny that a PERSON is at this pane (the
+    `superlooper debug` owner tap sets it; every unattended launch leaves it empty). The fresh tab
+    inherits nothing, so it must be NAMED in the dropped command or the carve-out never arrives —
+    and an unattended launch must carry it EMPTY, never absent-and-then-inherited from a stray
+    ambient export in whatever shell the runner was started from."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    capture = tmp_path / "attended.cmd"
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"SL_ATTENDED": "1", "STUB_CMD_CAPTURE": str(capture)})
+    assert r.returncode == 2
+    assert "SL_ATTENDED=1" in capture.read_text()
+
+    capture2 = tmp_path / "unattended.cmd"
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"STUB_CMD_CAPTURE": str(capture2)})
+    assert r.returncode == 2
+    cmd = capture2.read_text()
+    assert "SL_ATTENDED=''" in cmd, \
+        "an unattended launch must name the flag EMPTY (%%q of ''), not omit it: %r" % cmd
+
+
 def test_codex_agent_selection_launches_and_pretrusts_project(tmp_path):
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
     r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",

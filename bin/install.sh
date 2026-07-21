@@ -65,7 +65,7 @@ ACT_CMD='$HOME/.claude/skills/superlooper/bin/activity-hook.sh'
 STOP_CMD='$HOME/.claude/skills/superlooper/bin/stop-hook.sh'
 # PreToolUse deny hook (issue #156). CLAUDE ONLY — registered in settings.json below but NOT in the
 # Codex hooks.json (Codex has no PreToolUse event — spike verdict), so it lives on the Claude side of
-# merge_hooks alone. A strict no-op outside a worker session, like the other two.
+# merge_hooks alone. A strict no-op outside a superlooper loop session, like the other two.
 DENY_CMD='$HOME/.claude/skills/superlooper/bin/pretooluse-hook.sh'
 
 [ -d "$SRC" ] || { echo "install: payload not found at $SRC" >&2; exit 1; }
