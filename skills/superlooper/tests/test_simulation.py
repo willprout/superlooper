@@ -1544,6 +1544,53 @@ def test_out_of_band_merge_of_an_inflight_lane_is_absorbed_never_stalls(sim_fact
     sync.write_text("go\n")                          # release the held worker for teardown
 
 
+def test_out_of_band_merge_kills_the_builder_even_when_the_worktree_is_kept(sim_factory):
+    """Issue #178, against REAL ticks. Same out-of-band merge of a BUILDING lane as above, but the
+    repo set `cleanup_merged_worktrees: false` — a choice about keeping the CHECKOUT to look at.
+
+    That knob used to skip the teardown entirely, so the worker was left ALIVE and still building
+    against a branch that had already merged, on a lane local state had already freed: free to
+    commit and push to the merged branch and open a fresh PR nobody asked for, with nothing
+    watching. The session must end regardless; only the prune is the knob's to withhold.
+    """
+    sim = sim_factory(cleanup_merged_worktrees=False)
+    sync = sim.tmp / "hold-the-worker"
+    num = sim.add_issue(title="Merged out from under a lane whose checkout is kept",
+                        scenario={"scenario": "happy", "wait_for": str(sync)})
+    sid = "i%d" % num
+
+    sim.tick()
+    assert sim.tick_until(lambda: sim.prs_for()), \
+        "worker never opened a PR: %s" % sim.journal()
+    pr = sim.prs_for()[0]
+    assert pr["state"] == "OPEN"
+    assert sim.loop_issue(sid).get("status") == "running"          # still building behind it
+    with open(os.path.join(sim.home, "state", "panes", sid)) as f:
+        surf0 = f.read().strip()
+    lock = os.path.join(sim.home, "state", "worker.%s.lock" % sid)
+    pid0, alive0 = sim._lock_holder(lock)
+    assert pid0 and alive0, "the builder must be a LIVE process — the whole premise"
+
+    _run([os.path.join(FAKES, "fake-gh"), "pr", "merge", str(pr["number"]), "--squash"])
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged", ticks=3), \
+        "never absorbed the out-of-band merge: %s" % [
+            (r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    # read defensively: when this regresses NOTHING is ever closed, and a bare read_text would die
+    # with FileNotFoundError instead of naming the property that broke
+    log = sim.cmux_dir / "closed.jsonl"
+    closed = [json.loads(l)["surface"]
+              for l in (log.read_text() if log.exists() else "").splitlines() if l.strip()]
+    assert surf0 in closed, "the builder's window was never closed: %s" % closed
+    assert _wait_dead(pid0), "the builder must be GONE — a merged branch must not keep a live " \
+        "worker able to push to it and open a fresh PR"
+    assert not os.path.exists(lock)
+    assert os.path.isdir(os.path.join(sim.home, "worktrees", sid)), \
+        "cleanup_merged_worktrees: false keeps the CHECKOUT — that is all it keeps"
+
+    sync.write_text("go\n")                          # belt-and-braces for teardown
+
+
 def test_review_marker_after_pr_cached_still_merges(sim_factory):
     # D6 (live 2026-07-04): a `<!-- superlooper-review -->` marker comment posted AFTER the poll
     # first cached the PR was invisible to the gate until the next 90s poll — and the gate

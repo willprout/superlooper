@@ -4347,6 +4347,284 @@ def test_merge_auto_closes_by_default(rig, monkeypatch):
     assert order == ["close", "prune"]
 
 
+# --- cleanup_merged_worktrees keeps the CHECKOUT, never the running CLI (issue #178) ---
+# The two knobs used to be ANDed, so `cleanup_merged_worktrees: false` — a choice about keeping the
+# checkout for inspection — also skipped the teardown entirely and left the session running. Since
+# #155 absorb_merged fires on an IN-FLIGHT lane, that left a worker actively building against an
+# already-merged PR, on a lane local state had already freed. Now the window knob alone decides
+# whether the session ends; the worktree knob decides only whether the checkout is pruned.
+
+def _close_but_keep_checkout(rig, monkeypatch, close_kills=True):
+    """Prune gated off, window knob at its default. The worker is ALIVE until close-surface kills
+    its tab — the #178 case is a builder still BUILDING, and the teardown must OBSERVE it go rather
+    than assume it. `close_kills=False` models the close that did not: cmux returned but the process
+    lived (a stale surface id, a vanished workspace)."""
+    closed, pruned = [], []
+    def run_script(args, env=None, timeout=None):
+        if "close-surface" in [str(a) for a in args]:
+            closed.append(1)
+        return 0
+    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: pruned.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: not (closed and close_kills))
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0)   # no real stall on the refusal case
+    rig.r.config = make_config(cleanup_merged_worktrees=False)
+    (rig.home / "worktrees" / "i7").mkdir(parents=True, exist_ok=True)
+    return closed, pruned
+
+
+def _assert_session_ended_checkout_kept(rig, closed, pruned, closes=1):
+    assert closed == [1] * closes, "the merged lane's live CLI must be closed"
+    assert pruned == [], "cleanup_merged_worktrees: false keeps the checkout"
+    assert (rig.home / "worktrees" / "i7").exists()          # kept for inspection
+    assert not (rig.home / "state" / "panes" / "i7").exists()
+    assert not (rig.home / "state" / "worker.i7.lock").exists()
+    # nothing was DEFERRED: a lane whose prune is gated off must never enter the drain, which
+    # retries with remove_worktree=True and would prune the checkout the config says to keep.
+    assert not (rig.home / "state" / "pending_teardown" / "i7").exists()
+
+
+def test_absorb_merged_closes_the_live_session_when_only_the_prune_is_gated_off(rig, monkeypatch):
+    """The #178 headline: a PR merged out of band while the worker is still building. Under
+    `cleanup_merged_worktrees: false` the lane settles to merged either way — but the builder must
+    not be left running against a branch that has already landed."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"
+    _assert_session_ended_checkout_kept(rig, closed, pruned)
+
+
+def test_merge_closes_the_live_session_when_only_the_prune_is_gated_off(rig, monkeypatch):
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    seed_issue(rig, "i7", status="gating", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "merge", "id": "i7", "num": 7, "pr": 7,
+                           "method": "squash"}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"
+    _assert_session_ended_checkout_kept(rig, closed, pruned)
+
+
+def test_absorb_close_closes_the_live_session_when_only_the_prune_is_gated_off(rig, monkeypatch):
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    seed_issue(rig, "i7", status="bounced", num=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "absorb_close", "id": "i7", "num": 7}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"
+    _assert_session_ended_checkout_kept(rig, closed, pruned)
+
+
+def test_keeping_the_checkout_drops_a_stale_deferral_so_the_drain_cannot_prune_it(rig, monkeypatch):
+    """The drain retries every pending_teardown marker with remove_worktree=True, unconditionally.
+    So a marker left by an EARLIER decline on this lane (a re-approval that could not clear it, the
+    opt-in parked reaper) would, one tick after this settle cleared the lock, prune the very checkout
+    the operator asked to keep — and prune it with no live pid left to refuse it, which is the #149
+    guarantee itself. The settle must retire the retry vehicle."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    (rig.home / "state" / "pending_teardown").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "pending_teardown" / "i7").write_text("pid=4242 still alive at teardown\n")
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+    _assert_session_ended_checkout_kept(rig, closed, pruned)
+
+    rig.r._drain_pending_teardowns(loopstate.load(str(rig.home / "state" / "issues.json")))
+    assert pruned == [], "the drain must not prune a checkout the config says to keep"
+    assert (rig.home / "worktrees" / "i7").exists()
+
+
+def test_a_close_that_did_not_kill_the_builder_clears_nothing_and_is_retried(rig, monkeypatch):
+    """_close_pane is best-effort by contract (rc ignored, a missing pane record a silent no-op), so
+    the keep-the-checkout path must OBSERVE the pid go before it declares the session ended. A close
+    that failed leaves the survivor's handles intact — the pane markers `superlooper tidy` needs to
+    close the window, the lock the liveness tiers read — instead of deleting them behind its back,
+    and RECORDS the owed close so the drain re-issues it. Without the record this config would be
+    strictly weaker than the default one: a builder left building against a merged branch, with
+    nothing retrying and nothing on disk to say so."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"       # the merge truth still lands
+    assert closed == [1] and pruned == []
+    assert (rig.home / "state" / "panes" / "i7").exists()     # tidy's escape hatch survives
+    assert (rig.home / "state" / "worker.i7.lock").exists()
+    assert (rig.home / "worktrees" / "i7").exists()
+    assert (rig.home / "state" / "pending_teardown" / "i7").exists(), "the owed CLOSE is recorded"
+
+    # the drain re-issues the close — and still never prunes the kept checkout
+    rig.r._drain_pending_teardowns(loopstate.load(str(rig.home / "state" / "issues.json")))
+    assert closed == [1, 1], "the drain must retry the close that did not take"
+    assert pruned == [] and (rig.home / "worktrees" / "i7").exists()
+
+
+def test_the_drain_finishes_a_kept_checkout_lane_once_its_builder_is_gone(rig, monkeypatch):
+    """...and when the retry finally finds the builder gone, the lane settles: markers and lock
+    cleared, marker retired, checkout still on disk. Otherwise the retry above would loop forever."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)      # the builder finally died
+    rig.r._drain_pending_teardowns(loopstate.load(str(rig.home / "state" / "issues.json")))
+    _assert_session_ended_checkout_kept(rig, closed, pruned, closes=2)
+
+
+# The three above hand the drain a FRESHLY loaded state. The real tick did not: it snapshotted
+# issues.json before decide and handed that same snapshot to the drain after the executors ran, so
+# the drain judged every lane by its PRE-execute status. The settle's marker is written during
+# _execute — so on the tick it was created the drain read a lane that still said `running`, took the
+# "back in flight" branch and deleted it; and read one that still said `bounced` as a park-family
+# prune. These two drive the tick's own ordering instead of imitating it.
+
+def _one_action_tick(rig, monkeypatch, act):
+    """The REAL tick around a single action — production's snapshot -> execute -> hygiene-sweep
+    ordering, not a hand-rolled imitation. Only decide is stubbed, to emit exactly this act."""
+    monkeypatch.setattr(runner_mod.actions, "decide", lambda *a, **k: [dict(act)])
+    rig.r.tick(now=NOW)
+
+
+def test_the_owed_close_survives_the_tick_that_created_it(rig, monkeypatch):
+    """The marker is written mid-tick by the settle, and the drain runs later in that SAME tick.
+    Judged against the pre-execute snapshot the lane still says `running`, so the drain called it
+    'back in flight' and dropped the marker — deleting, on the tick it was created, the retry the
+    whole #149 safety argument rests on."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    _one_action_tick(rig, monkeypatch, {"act": "absorb_merged", "id": "i7", "num": 7})
+    assert issue_state(rig, "i7")["status"] == "merged"
+    assert (rig.home / "state" / "pending_teardown" / "i7").exists(), \
+        "the tick that wrote the marker must not also eat it"
+    assert pruned == [] and (rig.home / "worktrees" / "i7").exists()
+
+
+def test_a_builder_that_survived_its_close_is_journaled_once(rig, monkeypatch):
+    """The executors return "ok" whatever the settle returns — correctly, since what they report is
+    that the MERGE landed — and no ladder is charged here. So the journal line is the loop's ONLY
+    signal that a builder outlived its close and is still standing in a merged branch's checkout.
+    Bounded to one line per (iid, pid): the drain re-enters the settle every tick."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+    for _ in range(3):                                    # the every-tick retry must not storm
+        rig.r._drain_pending_teardowns(rig.r._load_state())
+    held = [j for j in _journal(rig) if j.get("act") == "merged_close_declined"]
+    assert len(held) == 1, held
+    assert held[0]["id"] == "i7" and str(held[0]["pid"]) == "4242"
+
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)   # the builder finally dies
+    rig.r._drain_pending_teardowns(rig.r._load_state())
+    assert not (rig.home / "state" / "pending_teardown" / "i7").exists()
+    assert "i7" not in rig.r._close_held, "a settled lane must journal afresh next episode"
+
+
+def test_an_unreadable_lock_still_journals_the_declined_close(rig, monkeypatch):
+    """_lock_pid maps an absent/empty/garbage lock to None — which is also what an unheld id reads
+    as. A dedup keyed on `.get() == pid` would call that 'already journaled' for a lane journaled
+    nowhere, and record nothing either. Reachable when the worker's own EXIT trap frees the lock in
+    the window between the settle's decline and this re-read."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+    # alive at the teardown's entry (so it declines), gone by the time the settle re-reads it —
+    # the worker's own EXIT trap freeing the lock in that window
+    reads = []
+    monkeypatch.setattr(rig.r, "_lock_pid",
+                        lambda iid: (reads.append(1), 4242 if len(reads) == 1 else None)[1])
+
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+    held = [j for j in _journal(rig) if j.get("act") == "merged_close_declined"]
+    assert len(held) == 1 and held[0]["pid"] is None, held
+
+
+def test_the_reclaim_sweep_also_reads_post_execute_truth(rig, monkeypatch):
+    """The other half of the same re-read, and the one with teeth under `cleanup_parked_worktrees`:
+    absorb_close settles a park-family lane to `merged`, so read against the pre-execute snapshot the
+    reaper still sees `bounced` — a lane it is entitled to prune — and deletes with
+    remove_worktree=True the checkout the merged knobs just decided to keep."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    rig.r.config = make_config(cleanup_merged_worktrees=False, cleanup_parked_worktrees=True)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: None)
+    seed_issue(rig, "i7", status="bounced", num=7)
+    _teardown_rig(rig, "i7")
+
+    _one_action_tick(rig, monkeypatch, {"act": "absorb_close", "id": "i7", "num": 7})
+    assert issue_state(rig, "i7")["status"] == "merged"
+    assert pruned == [], "the reaper must not prune a lane the merged knobs just settled"
+    assert (rig.home / "worktrees" / "i7").exists()
+
+
+def test_a_kept_checkout_is_not_pruned_by_the_same_tick_that_deferred_it(rig, monkeypatch):
+    """The same staleness from the other side, and the sharper harm. absorb_close settles a
+    park-family lane to `merged`; judged against the pre-execute snapshot it still says `bounced`,
+    so the drain took the park-family branch and pruned with remove_worktree=True — deleting the
+    very checkout `cleanup_merged_worktrees: false` asked to keep, on the tick the settle deferred
+    it, and #190's guard saves only a DIRTY tree, never a clean pushed one."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="bounced", num=7)
+    _teardown_rig(rig, "i7")
+    # The builder outlives the settle's wait and dies before the retry, so no live pid refuses a
+    # stale prune. Keyed on the close COUNT, not on a call count: tick() probes pids elsewhere too.
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: len(closed) < 2)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: None)  # clean tree
+
+    _one_action_tick(rig, monkeypatch, {"act": "absorb_close", "id": "i7", "num": 7})
+    assert issue_state(rig, "i7")["status"] == "merged"
+    assert closed == [1, 1], "the settle deferred, so the retry must re-issue the close"
+    assert pruned == [], "the checkout the config said to keep must survive the tick"
+    assert (rig.home / "worktrees" / "i7").exists()
+
+
+def test_window_knob_off_keeps_the_checkout_even_with_the_prune_knob_on(rig, monkeypatch):
+    """The #168 property splitting the pair must not lose: an operator who set EITHER knob to keep
+    a finished checkout still gets it kept. With the window open there is nothing to prune under —
+    a prune can never run beneath the live CLI it would leave standing (#149)."""
+    closed, pruned = _no_close_no_prune(rig, monkeypatch)     # auto_close_merged_windows=False
+    assert rig.r.config["cleanup_merged_worktrees"] is True
+    (rig.home / "worktrees" / "i7").mkdir(parents=True, exist_ok=True)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+    assert closed == [] and pruned == []
+    assert (rig.home / "worktrees" / "i7").exists()
+    assert (rig.home / "state" / "worker.i7.lock").exists()   # session left fully intact
+
+
+def test_window_knob_off_survives_a_stale_deferral_marker(rig, monkeypatch):
+    """The same drain hazard from the other side, and the one the split must not leave half-fixed.
+    A #190 reclaim refusal keeps its marker indefinitely (_teardown_session returns True before the
+    _rm), and the drain's stale-marker sweep only fires for NON-terminal lanes — which a park->merged
+    absorb_close never passes through. So without a drop here the drain would close the window AND
+    prune the checkout this knob exists to preserve, unguarded, one tick later."""
+    closed, pruned = _no_close_no_prune(rig, monkeypatch)     # auto_close_merged_windows=False
+    (rig.home / "worktrees" / "i7").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "pending_teardown").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "pending_teardown" / "i7").write_text("pid=4242 still alive at teardown\n")
+    seed_issue(rig, "i7", status="bounced", num=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "absorb_close", "id": "i7", "num": 7}, NOW)
+    assert not (rig.home / "state" / "pending_teardown" / "i7").exists()
+
+    rig.r._drain_pending_teardowns(loopstate.load(str(rig.home / "state" / "issues.json")))
+    assert closed == [] and pruned == []
+    assert (rig.home / "worktrees" / "i7").exists()
+    assert (rig.home / "state" / "panes" / "i7").exists()     # window kept, as the knob asked
+
+
 def test_reclaim_terminal_worktrees_routes_through_the_one_teardown(rig, monkeypatch):
     """The parked-worktree reaper must clear the lane's stale pane markers too (D9), not just
     unlink its directory behind their back."""
