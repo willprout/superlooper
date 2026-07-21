@@ -4508,6 +4508,45 @@ def test_the_owed_close_survives_the_tick_that_created_it(rig, monkeypatch):
     assert pruned == [] and (rig.home / "worktrees" / "i7").exists()
 
 
+def test_a_builder_that_survived_its_close_is_journaled_once(rig, monkeypatch):
+    """The executors return "ok" whatever the settle returns — correctly, since what they report is
+    that the MERGE landed — and no ladder is charged here. So the journal line is the loop's ONLY
+    signal that a builder outlived its close and is still standing in a merged branch's checkout.
+    Bounded to one line per (iid, pid): the drain re-enters the settle every tick."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+    for _ in range(3):                                    # the every-tick retry must not storm
+        rig.r._drain_pending_teardowns(rig.r._load_state())
+    held = [j for j in _journal(rig) if j.get("act") == "merged_close_declined"]
+    assert len(held) == 1, held
+    assert held[0]["id"] == "i7" and str(held[0]["pid"]) == "4242"
+
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)   # the builder finally dies
+    rig.r._drain_pending_teardowns(rig.r._load_state())
+    assert not (rig.home / "state" / "pending_teardown" / "i7").exists()
+    assert rig.r._close_held.get("i7") is None, "a settled lane must journal afresh next episode"
+
+
+def test_the_reclaim_sweep_also_reads_post_execute_truth(rig, monkeypatch):
+    """The other half of the same re-read, and the one with teeth under `cleanup_parked_worktrees`:
+    absorb_close settles a park-family lane to `merged`, so read against the pre-execute snapshot the
+    reaper still sees `bounced` — a lane it is entitled to prune — and deletes with
+    remove_worktree=True the checkout the merged knobs just decided to keep."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    rig.r.config = make_config(cleanup_merged_worktrees=False, cleanup_parked_worktrees=True)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: None)
+    seed_issue(rig, "i7", status="bounced", num=7)
+    _teardown_rig(rig, "i7")
+
+    _one_action_tick(rig, monkeypatch, {"act": "absorb_close", "id": "i7", "num": 7})
+    assert issue_state(rig, "i7")["status"] == "merged"
+    assert pruned == [], "the reaper must not prune a lane the merged knobs just settled"
+    assert (rig.home / "worktrees" / "i7").exists()
+
+
 def test_a_kept_checkout_is_not_pruned_by_the_same_tick_that_deferred_it(rig, monkeypatch):
     """The same staleness from the other side, and the sharper harm. absorb_close settles a
     park-family lane to `merged`; judged against the pre-execute snapshot it still says `bounced`,

@@ -613,6 +613,12 @@ class Runner:
         # lands (a later re-park then re-journals). In-memory like the launch streak: the durable
         # record is the journal line + the preserved worktree itself, not this dedup cache.
         self._reclaim_held = {}
+        # The same shape for the merged-lane close that did not take (#178): a builder that survived
+        # its close is the residual harm this whole path exists to end, and its retry is silent by
+        # construction (the executor returns "ok" either way, because the MERGE landed). Journaled
+        # once per (iid, pid) so the every-tick retry never storms the log; dropped when the lane
+        # finally settles, so a later episode journals afresh.
+        self._close_held = {}
 
         self.state = os.path.join(self.home, "state")
         self.issues_path = os.path.join(self.state, "issues.json")
@@ -1890,6 +1896,16 @@ class Runner:
         # #149 safety argument rests on, gone on the tick it was created — or, worse, read a stale
         # park-family status and pruned with remove_worktree=True a checkout the merged knobs had
         # just decided to keep. One re-read, once per tick, off the hot path.
+        #
+        # It cuts the other way too, and that is deliberate rather than incidental: under the opt-in
+        # `cleanup_parked_worktrees`, a lane parked by THIS tick's own _exec_park is now reaped on
+        # this tick instead of the next. That is what an every-tick reaper says it does, and both of
+        # its refusals still stand in front of it — the live-pid gate and #190's dirty/unpushed
+        # guard. It also costs the two rebuild executors one same-tick retry of a git removal that
+        # merely failed: they reset status to `ready` in the same breath, so the drain now reads a
+        # non-terminal lane and drops the marker instead of retrying it once more. The stale checkout
+        # then survives to the relaunch, which is a smaller wrong than judging any lane by a status
+        # that is one phase out of date.
         fresh = self._load_state()
         self._reclaim_terminal_worktrees(fresh)        # opt-in only (#168): OFF by default, park-family persists
         self._drain_pending_teardowns(fresh)           # (#149) retry prunes declined under a live CLI
@@ -2196,13 +2212,17 @@ class Runner:
                                indefinitely, and the drain's stale-marker sweep only fires for
                                NON-terminal lanes, which a park->merged absorb_close never passes
                                through). Without this drop the drain would honor neither knob.
-          settle succeeded  -> nothing is owed: drop it (the prune path drops its own inside
-                               _teardown_session; the keep-checkout path drops it here).
-          settle declined   -> the CLOSE is still owed, so RECORD it. The drain re-enters here every
-                               tick until the builder is gone. Without the record the keep-checkout
-                               config would be strictly weaker than the default one: a close that did
-                               not kill the builder would leave it building against a merged branch
-                               with nothing retrying and nothing journaled.
+          settle succeeded  -> on the keep-checkout path nothing is owed, so drop it here. (The prune
+                               path's marker is _teardown_session's own: it returns True having
+                               RE-written one when the git removal itself failed, which is not this
+                               method's to touch.)
+          settle declined   -> the CLOSE is still owed, so RECORD it — and JOURNAL it, once. The
+                               drain re-enters here every tick until the builder is gone. Without
+                               the record the keep-checkout config would be strictly weaker than the
+                               default one; without the journal line the retry is invisible, because
+                               the executors return "ok" whatever this returns (the MERGE landed —
+                               that is the truth they report), so a builder that survived its close
+                               and keeps pushing to a merged branch would show up nowhere at all.
 
         `exit_timeout` is threaded for that drain re-entry alone: the drain sweeps every marker on
         every tick and must not pay a per-lane stall, so it probes once (0) instead of waiting.
@@ -2213,6 +2233,7 @@ class Runner:
         if not self.config.get("auto_close_merged_windows", True):
             _rm(marker)
             self._reclaim_held.pop(iid, None)   # marker dropped without a prune: re-journal later
+            self._close_held.pop(iid, None)
             return False
         keep_checkout = not self.config.get("cleanup_merged_worktrees", True)
         ok = self._teardown_session(iid, remove_worktree=not keep_checkout, await_exit=True,
@@ -2221,9 +2242,29 @@ class Runner:
             if ok:
                 _rm(marker)
                 self._reclaim_held.pop(iid, None)
+                self._close_held.pop(iid, None)
             else:
-                self._defer_teardown(iid, self._lock_pid(iid))    # the close is owed, not a prune
+                pid = self._lock_pid(iid)
+                self._defer_teardown(iid, pid)                    # the close is owed, not a prune
+                self._hold_close(iid, pid)                        # ...and say so, once
         return ok
+
+    def _hold_close(self, iid, pid):
+        """Journal a merged lane whose close did NOT take — bounded to ONE line per (iid, pid), the
+        sibling of _hold_reclaim and for the same reason: the drain re-enters _settle_merged_lane
+        every tick, and an unbounded line there would storm the log (issue #178).
+
+        This is the loop's only signal for the residual harm. The lane's executor returns "ok"
+        regardless — correctly, because what it reports is that the MERGE landed — and no ladder is
+        charged here (charging one would park healthy lanes for finishing normally, the same reason
+        the disk-hygiene deferrals do not charge). So without this line a builder that survived its
+        close, still standing in a checkout whose branch is already on the mainline, would be visible
+        nowhere: not in the journal, not in the report, not on the dashboard. The pid is named because
+        it is the one thing that makes the survivor actionable."""
+        if self._close_held.get(iid) == pid:
+            return
+        self._close_held[iid] = pid
+        journal.append(self.home, {"act": "merged_close_declined", "id": iid, "pid": pid})
 
     def _close_pane(self, iid):
         """Close the id's recorded surface. Best-effort; rc ignored (a dead surface = a no-op)."""
