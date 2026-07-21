@@ -65,6 +65,21 @@ def test_the_whole_debugger_playbook_ships_not_just_its_entry_page():
         % sorted(on_disk - mirrored))
 
 
+def test_the_whole_ops_reference_set_ships_not_just_runner_ops():
+    """Same glob-vs-list guard for the superlooper skill's references.
+
+    Without it, an operational reference added beside runner-ops.md would silently never reach a
+    machine — the identical rot the sl-debugger guard above prevents, one directory over.
+    """
+    on_disk = {p.relative_to(_REPO).as_posix()
+               for p in (_REPO / "plugin" / "skills" / "superlooper" / "references").glob("*.md")}
+    mirrored = {src for src, _dst in ops_docs.OPS_DOCS}
+    assert on_disk, "the superlooper skill's references have moved — this guard sees nothing"
+    assert on_disk <= mirrored, (
+        "ops references that would NOT reach an installed machine: %s"
+        % sorted(on_disk - mirrored))
+
+
 def test_the_operator_facing_ops_docs_ship():
     mirrored = {src for src, _dst in ops_docs.OPS_DOCS}
     for rel in ("skills/superlooper/docs/STACK.md",
@@ -72,6 +87,48 @@ def test_the_operator_facing_ops_docs_ship():
                 "plugin/skills/sl-debugger/SKILL.md",
                 "plugin/skills/sl-debugger/references/unattended-contract.md"):
         assert rel in mirrored, "%s must ship with the engine publish" % rel
+
+
+def _relative_links(text):
+    """Relative markdown/backtick references to a sibling .md, as written in the doc."""
+    found = set()
+    for match in re.finditer(r"\]\(([^)\s]+\.md)[^)]*\)", text):     # [text](path.md)
+        found.add(match.group(1))
+    for match in re.finditer(r"`((?:\.\./|\./)[^`\s]+\.md)`", text):  # `../path.md`
+        found.add(match.group(1))
+    return {link for link in found
+            if not link.startswith(("http://", "https://", "/", "~"))}
+
+
+def test_every_relative_link_between_mirrored_docs_resolves_in_the_mirror(tmp_path):
+    """The mirror must not ship a broken cross-reference — that is D12's own defect class.
+
+    The playbook links sideways to `../superlooper/references/runner-ops.md`. Flattening the
+    mirror would leave that pointing at nothing, and an operator following it mid-incident would
+    hit exactly the dead end this whole issue is about. So the mirror keeps the plugin's directory
+    shape, and this walks every relative .md link in the published tree to prove it.
+    """
+    dest = tmp_path / "installed"
+    dest.mkdir()
+    ops_docs.publish(_REPO, dest, "abc1234 2026-07-21")
+    root = Path(ops_docs.mirror_dir(dest))
+
+    broken = []
+    for page in sorted(root.rglob("*.md")):
+        for link in _relative_links(page.read_text(encoding="utf-8")):
+            if not (page.parent / link).resolve().exists():
+                broken.append("%s -> %s" % (page.relative_to(root).as_posix(), link))
+    assert not broken, "the published ops-doc mirror carries dead links: %s" % broken
+
+
+def test_the_playbooks_sibling_link_is_the_one_this_layout_exists_for():
+    """A pin on the specific link that made flattening wrong, so the reason survives a refactor."""
+    text = (_REPO / "plugin" / "skills" / "sl-debugger" / "SKILL.md").read_text(encoding="utf-8")
+    assert "../superlooper/references/runner-ops.md" in text, (
+        "the playbook no longer links sideways to runner-ops — if that is deliberate, the mirror "
+        "may flatten again; if not, the link was lost")
+    assert ("plugin/skills/superlooper/references/runner-ops.md",
+            "superlooper/references/runner-ops.md") in ops_docs.OPS_DOCS
 
 
 def test_no_mirror_target_is_named_skill_md():

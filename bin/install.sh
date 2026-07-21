@@ -75,8 +75,15 @@ PAYLOAD_REL="skills/superlooper/skill"                   # repo-relative, for th
 # the doctor read the same source of truth. $OPS_DOC_PATHS carries the source paths into the
 # engine-diff gate below: a doc that lands on the machine must be shown to the human first, exactly
 # like every other published file.
+# This is a READ of the same checkout the gate is about to diff — no machine state is touched, so
+# it does not break the "nothing is touched before the human OK" promise in the header above.
+#
+# `|| OPS_DOC_PATHS=""` is load-bearing: under `set -e` a bare assignment whose command
+# substitution fails aborts the script on the spot, and the refusal below — written for exactly
+# that case — would never print. stderr is deliberately NOT swallowed, so python's own reason
+# (syntax error, missing file, no python3) reaches the operator before this script gives up.
 OPS_DOCS_PY="$REPO_ROOT/$PAYLOAD_REL/lib/ops_docs.py"
-OPS_DOC_PATHS="$(python3 "$OPS_DOCS_PY" --list 2>/dev/null | tr '\n' ' ')"
+OPS_DOC_PATHS="$(python3 "$OPS_DOCS_PY" --list | tr '\n' ' ')" || OPS_DOC_PATHS=""
 if [ -z "${OPS_DOC_PATHS// }" ]; then
   echo "install: could not read the ops-doc list from $OPS_DOCS_PY — refusing to publish a" >&2
   echo "install: machine whose gate would not show the docs it is about to install." >&2
@@ -342,6 +349,7 @@ if $DRY; then
   echo "[install] would publish : $SRC/ -> $DEST/   (rsync -a --delete)"
   echo "[install] would stamp   : $DEST/VERSION = $VERSION"
   echo "[install] would mirror  : ops docs -> $DEST/docs/ops/ (stamped $VERSION)"
+  # shellcheck disable=SC2086
   printf '%s\n' $OPS_DOC_PATHS | sed 's/^/    /'
   echo "[install] settings hooks ($SETTINGS):"
   merge_hooks report

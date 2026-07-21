@@ -22,19 +22,26 @@ regenerated whole on every publish, never edited in place.
 
 Design notes that are load-bearing rather than incidental:
 
-  * **``SKILL.md`` is mirrored as ``PLAYBOOK.md``.** A file named ``SKILL.md`` under
-    ``~/.claude/skills/`` risks being discovered as a second, stale copy of the sl-debugger skill —
-    the double-load the plugin restructure deliberately closed. The rename makes the reference copy
-    unmistakably a reference copy; the playbook's ``references/…`` links are relative and survive.
-  * **The list is explicit, and its completeness is a test.** ``publish`` runs from the repo and
-    could glob, but ``expected_paths`` runs on a machine with no checkout and cannot. One explicit
-    table read by both sides keeps them symmetrical, and
-    ``tests/test_ops_docs.py::test_the_whole_debugger_playbook_ships_not_just_its_entry_page``
-    fails if a page is added to the playbook and not to this table.
-  * **This module never names ``~/.claude``.** The destination is always a parameter. Locating the
-    installed home is the caller's business (the installer's ``$DEST``, the doctor's probe), which
-    keeps the one-publish-door fence in ``tests/test_one_publish_door.py`` honest: this file writes,
-    but it has no idea where the skill home is and cannot become a second publisher.
+  * **``SKILL.md`` is mirrored as ``PLAYBOOK.md``.** The mirror lands inside the installed skills
+    home, and a file named ``SKILL.md`` there risks being discovered as a second, stale copy of the
+    sl-debugger skill — the double-load the plugin restructure deliberately closed. The rename makes
+    the reference copy unmistakably a reference copy.
+  * **The mirror preserves the plugin's own directory shape**, so the cross-links the docs already
+    carry keep resolving: the playbook's ``references/…`` links and its
+    ``../superlooper/references/runner-ops.md`` sibling link both land where they point.
+    ``tests/test_ops_docs.py`` walks every relative link in the mirrored set and fails on one that
+    does not resolve in the mirror layout — otherwise this module would ship D12's own defect.
+  * **The list is explicit, and a test pins its completeness against the source trees.** ``publish``
+    runs from the repo and could glob, but ``expected_paths`` runs on a machine with no checkout and
+    cannot. One explicit table read by both sides keeps them symmetrical, and the tests fail if a
+    page is added under ``plugin/skills/sl-debugger/`` or ``plugin/skills/superlooper/references/``
+    and not to this table.
+  * **This module cannot spell the installed skills home** — not in code, not in prose. The
+    destination is always a parameter; locating the install root is the caller's business (the
+    installer's ``$DEST``, the doctor's probe). That is what keeps the one-publish-door fence in
+    ``tests/test_one_publish_door.py`` honest: this file writes, but it has no idea where to write
+    and so cannot become a second publisher. Do not paste the literal path into this file, even in a
+    comment — the fence reads prose too, on purpose.
 
 Pure stdlib, importable without side effects, and runnable as a script — ``bin/install.sh`` shells
 to it rather than reimplementing the table in bash, so there is one source of truth for what ships.
@@ -61,9 +68,12 @@ OPS_DOCS = (
     # The machine-stack reference: what every `doctor --stack` block name means and how to fix it.
     ("skills/superlooper/docs/STACK.md", "STACK.md"),
     # Running the loop: heartbeat/ALERT contract, restarting the runner, reading the morning report.
-    ("plugin/skills/superlooper/references/runner-ops.md", "runner-ops.md"),
+    # Mirrored under its plugin-relative path, not flattened: the playbook links to it as
+    # `../superlooper/references/runner-ops.md`, and flattening would break that link in the mirror.
+    ("plugin/skills/superlooper/references/runner-ops.md", "superlooper/references/runner-ops.md"),
     # What approval means and what the gate will and will not merge.
-    ("plugin/skills/superlooper/references/approval-protocol.md", "approval-protocol.md"),
+    ("plugin/skills/superlooper/references/approval-protocol.md",
+     "superlooper/references/approval-protocol.md"),
     # The debugger playbook, whole. The entry page routes to all four references; the unattended
     # contract is the one a watchdog-launched session is held to.
     ("plugin/skills/sl-debugger/SKILL.md", "sl-debugger/PLAYBOOK.md"),
@@ -126,17 +136,27 @@ def publish(repo_root, dest, version):
     repo_root = str(repo_root)
     root = mirror_dir(dest)
 
+    # `dest` must be an installed engine home that already exists — the installer creates it and
+    # rsyncs the payload into it before calling here. Checking is what makes the rmtree below safe
+    # to describe as guarded: a mistyped or empty `dest` refuses instead of creating a stray tree
+    # somewhere and then deleting the `docs/ops` inside it.
+    if not os.path.isdir(str(dest)):
+        raise MissingOpsDoc(
+            "refusing to mirror ops docs into %r — it is not an existing directory. The install "
+            "destination is created and populated before the docs are mirrored into it." % (dest,))
+
     missing = [src for src, _dst in OPS_DOCS if not os.path.isfile(os.path.join(repo_root, src))]
     if missing:
         raise MissingOpsDoc(
             "ops docs missing from %s: %s — publish would put a machine one incident away from "
             "having no playbook, so it refuses instead." % (repo_root, ", ".join(missing)))
 
-    # Guarded rmtree: only ever the mirror directory, never a path a caller mistyped into `dest`.
-    if os.path.basename(root) != MIRROR_REL[-1]:
-        raise MissingOpsDoc("refusing to clear %s — not the ops-docs mirror" % root)
     if os.path.isdir(root):
         shutil.rmtree(root)
+    elif os.path.exists(root):
+        # A plain file where the mirror directory belongs: makedirs would raise a bare OSError deep
+        # in the copy loop. Say what is wrong instead.
+        raise MissingOpsDoc("%s exists and is not a directory — cannot mirror the ops docs" % root)
 
     written = []
     for src, dst in OPS_DOCS:
@@ -174,9 +194,12 @@ def main(argv=None):
     for name in ("repo_root", "dest", "version"):
         if not getattr(args, name):
             ap.error("--publish requires --%s" % name.replace("_", "-"))
+    # OSError as well as MissingOpsDoc: a permissions problem or a full disk mid-copy should print
+    # one clear line the operator can act on, not a traceback out of the middle of the one gated
+    # publish step. Either way the exit is non-zero, so install.sh's pipefail aborts the publish.
     try:
         written = publish(args.repo_root, args.dest, args.version)
-    except MissingOpsDoc as exc:
+    except (MissingOpsDoc, OSError) as exc:
         print("ops-docs: %s" % exc, file=sys.stderr)
         return 1
     for dst in written:

@@ -249,11 +249,16 @@ def documented_verbs(text, doctor_blocks=()):
     return found
 
 
-# A label token is either one of the bare protocol names or a `<family>:<value>` pair. The value
-# must be non-empty and concrete: `model:*` / `effort:` are wildcards a doc uses to talk about the
-# FAMILY, not a claim that a specific label exists, and tokenising stops at the colon for both.
-_BARE_LABELS = ("agent-ready", "in-progress", "needs-owner", "parked", "expedite", "preserve",
-                "superseded", "rebuild")
+# What the lint recognises as a label claim: a RETIRED name (the whole point of the retired check),
+# or a `<family>:<value>` pair whose family is one the live set actually uses. The value must be
+# non-empty and concrete — `model:*` and `effort:` are a doc talking about the FAMILY, not claiming
+# a specific label exists, and the tokeniser stops at the colon for both.
+#
+# Bare live names (`parked`, `preserve`, `agent-ready`…) are deliberately NOT enumerated. A
+# hand-written list of them would be the one un-generated table in a manifest whose whole claim is
+# "generated, never written", and it could not catch anything: a bare name is either live (passes)
+# or an ordinary English word the lint has no business ruling on. An invented bare label
+# (`needs-attention`) is therefore out of this lint's reach — stated here rather than implied.
 _LABEL_TOKEN_RE = re.compile(r"[A-Za-z0-9:\[\]_.-]+")
 _LABEL_PAIR_RE = re.compile(r"^[a-z][a-z-]*:[A-Za-z0-9\[\]-]+$")
 
@@ -269,33 +274,45 @@ def label_families(live):
     return {name.split(":", 1)[0] for name in live if ":" in name}
 
 
-def _label_candidates(span, known_bare, families):
+def _label_candidates(span, retired, families):
     for tok in _LABEL_TOKEN_RE.findall(span):
-        if tok in known_bare:
+        if tok in retired:
             yield tok
         elif _LABEL_PAIR_RE.match(tok) and tok.split(":", 1)[0] in families:
             yield tok
 
 
 def _paragraphs(text):
-    """(paragraph_text, [lines]) for each block of consecutive non-blank lines.
+    """Each block of consecutive non-blank lines, with markdown table ROWS split out singly.
 
-    The unit the retired-label carve-out is judged in. A line is too tight — ADOPTING.md's honest
-    rename note puts `needs-owner` on the bullet and `needs-william` on its continuation — and the
-    whole document is far too loose, since one correct mention anywhere would excuse every stale
-    one. A paragraph is the passage a reader actually takes in at once, which is the thing that
-    either does or does not tell them the current name.
+    This is the unit the retired-label carve-out is judged in. A line is too tight — ADOPTING.md's
+    honest rename note puts `needs-owner` on the bullet and `needs-william` on its continuation —
+    and the whole document is far too loose, since one correct mention anywhere would excuse every
+    stale one.
+
+    A table is the case where "block of non-blank lines" is also too loose: runner-ops.md's label
+    table is fifteen rows in one block, and one correct `needs-owner` row would excuse a stale name
+    in any other row. A table row is a self-contained record and a reader reads it as one, so each
+    `|`-led line stands alone.
     """
     blocks, current = [], []
+
+    def flush():
+        if current:
+            blocks.append("\n".join(current))
+            del current[:]
+
     for line in text.splitlines():
-        if line.strip():
+        stripped = line.strip()
+        if not stripped:
+            flush()
+        elif stripped.startswith("|"):
+            flush()
+            blocks.append(line)
+        else:
             current.append(line)
-        elif current:
-            blocks.append(current)
-            current = []
-    if current:
-        blocks.append(current)
-    return [("\n".join(b), b) for b in blocks]
+    flush()
+    return blocks
 
 
 def documented_labels(text, live, retired):
@@ -307,20 +324,23 @@ def documented_labels(text, live, retired):
     prose, and it is exactly the sentence that would send a helper agent hunting a dead label.
     Nothing live can fail this check, so scanning prose costs nothing and catches more.
 
-    ``unknown`` — a name that is neither live nor a recognised retired name: a typo, or a label
-    that was deleted outright. gh refuses to apply a label that does not exist, so a doc naming
-    one hands the reader an instruction that cannot work.
+    ``unknown`` — a `<family>:<value>` pair whose value is not in LABELS, in a family whose values
+    are CLOSED. gh refuses to apply a label that does not exist, so a doc naming one hands the
+    reader an instruction that cannot work. ``labels.OPEN_LABEL_FAMILIES`` (model, effort) are
+    exempt by owner ruling: the runner has no allowlist there, LABELS carries only a starter set,
+    and `model:haiku` in a doc is a legitimate example rather than a typo. Failing those would
+    redden CI over an instruction that genuinely works — which is how a guard gets deleted instead
+    of fixed.
 
     ``stale_retired`` — a retired name in a paragraph that never names its replacement. The
     carve-out keeps runner-ops.md's honest "(renamed from `needs-william`; `adopt` migrates the old
     label in place)" while failing a bare description of today's behaviour in the dead name.
     """
     live = set(live)
-    bare = set(_BARE_LABELS) | live | set(retired)
-    families = label_families(live)
+    families = label_families(live) - set(labels_mod.OPEN_LABEL_FAMILIES)
     unknown, stale = set(), set()
-    for block, _lines in _paragraphs(text):
-        for tok in _label_candidates(block, bare, families):
+    for block in _paragraphs(text):
+        for tok in _label_candidates(block, retired, families):
             if tok in live:
                 continue
             if tok in retired:
@@ -567,6 +587,34 @@ def test_lint_allows_a_retired_label_in_a_sentence_that_names_its_replacement():
     doc = "`needs-owner` — an owner decision is required (renamed from `needs-william`).\n"
     unknown, stale = documented_labels(doc, m["labels"], m["retired_labels"])
     assert not unknown and not stale
+
+
+def test_lint_accepts_a_concrete_value_in_an_open_label_family():
+    """`model:`/`effort:` values are open by owner ruling — LABELS is a starter set, not a gate.
+
+    A doc writing `model:haiku` is documenting something that genuinely works. A lint that
+    reddened CI over it would be wrong AND would teach the next author to delete the lint.
+    """
+    m = manifest()
+    assert "model:haiku" not in m["labels"] and "effort:ultra" not in m["labels"]
+    doc = "Drop `model:haiku` on a cheap issue, or `effort:ultra` on the hardest one.\n"
+    unknown, stale = documented_labels(doc, m["labels"], m["retired_labels"])
+    assert not unknown and not stale
+
+
+def test_lint_still_flags_a_bad_value_in_a_closed_label_family():
+    m = manifest()
+    unknown, _stale = documented_labels("Use `priority:urgent`.\n", m["labels"], m["retired_labels"])
+    assert unknown == {"priority:urgent"}, "priority: values are closed and must stay checked"
+
+
+def test_lint_does_not_let_one_good_table_row_excuse_a_stale_one():
+    """A table is many records, not one paragraph — runner-ops.md's label table is 15 rows."""
+    m = manifest()
+    doc = ("| `needs-owner` | an owner decision is required (renamed from `needs-william`) |\n"
+           "| something else | a capped conflict parks `needs-william` |\n")
+    _unknown, stale = documented_labels(doc, m["labels"], m["retired_labels"])
+    assert stale == {"needs-william"}
 
 
 def test_lint_ignores_a_label_family_wildcard():

@@ -36,6 +36,13 @@ _ENGINE_SKILL = _REPO / "skills" / "superlooper" / "skill"
 _RUNNER_OPS_NEW = "plugin/skills/superlooper/references/runner-ops.md"
 # The stale skill-relative form no engine file may keep after the move.
 _RUNNER_OPS_OLD = "references/runner-ops.md"
+# Legitimate longer paths that END in the stale form and must be stripped before looking for it.
+# The mirror path (issue #199): the gated installer publishes the ops docs into the installed engine
+# home keeping the plugin's directory shape, so the playbook's `../superlooper/references/…` sibling
+# link still resolves there. That target is a DESTINATION inside the published tree, not a pointer
+# back at a pre-move source, so it is not the drift this guard is about.
+_RUNNER_OPS_MIRROR = "superlooper/references/runner-ops.md"
+_RUNNER_OPS_LEGIT = (_RUNNER_OPS_NEW, _RUNNER_OPS_MIRROR)
 
 
 # ---- manifests ---------------------------------------------------------------------------
@@ -158,8 +165,10 @@ def test_plugin_payload_has_no_executable_file_bits():
 def test_no_engine_file_names_the_moved_doc_by_its_old_relative_path():
     """After the move, ``runner-ops.md`` lives in the plugin. Every engine file that used to
     name it as the skill-relative ``references/runner-ops.md`` must now name the plugin home.
-    The new full path CONTAINS the old string as a tail, so strip the full path first, then
-    any surviving bare ``references/runner-ops.md`` is a stale pointer."""
+    The new full path CONTAINS the old string as a tail, so strip the legitimate full paths first
+    (the plugin home, and the issue-#199 publish mirror that keeps the plugin's shape so the
+    playbook's sibling link resolves on an installed machine), then any surviving bare
+    ``references/runner-ops.md`` is a stale pointer."""
     roots = [_ENGINE_SKILL, _REPO / "skills" / "superlooper" / "tests"]
     offenders = []
     for root in roots:
@@ -175,7 +184,10 @@ def test_no_engine_file_names_the_moved_doc_by_its_old_relative_path():
                     text = p.read_text(encoding="utf-8")
                 except (UnicodeDecodeError, OSError):
                     continue
-                if _RUNNER_OPS_OLD in text.replace(_RUNNER_OPS_NEW, ""):
+                stripped = text
+                for legit in _RUNNER_OPS_LEGIT:
+                    stripped = stripped.replace(legit, "")
+                if _RUNNER_OPS_OLD in stripped:
                     offenders.append(str(p.relative_to(_REPO)))
     assert not offenders, (
         "these engine files still name the moved doc by its old skill-relative path "
