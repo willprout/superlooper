@@ -18,10 +18,13 @@
 #   3 = DEFERRED (pane at a menu / ambiguous / unreadable / Codex attention prompt). Caller retries later.
 #   4 = DEAD (the Claude process is gone; the pane is a bash shell). Caller RESTARTS — it must
 #       NEVER type, or the message would run as a permission-bypassed shell command (RC-DEADPANE).
-#   5 = LOGGED OUT (issue #151). Auth died in-process: the TUI is alive but every turn is refused.
-#       Nothing was typed. Caller ALERTS THE OWNER — it must not retry (a nudge cannot be answered)
-#       and must not restart (the relaunch re-enters dead auth). Was 94 min of typing into a dead
-#       pane when this looked like plain 'idle'.
+#   5 = AUTH DEAD IN-WINDOW (issue #151, widened by #174). The TUI is alive but every turn is
+#       refused. Nothing was typed. Caller ALERTS THE OWNER — it must not retry (a nudge cannot be
+#       answered) and must not restart (the relaunch re-enters dead auth). Was 94 min of typing into
+#       a dead pane when this looked like plain 'idle'. ONE code covers the whole auth-death family
+#       (bad external key, revoked token, org policy, failing apiKeyHelper, gateway) because the
+#       caller's handling is identical for all of them; WHICH one it was rides out on stderr as
+#       `auth=<variant>` so the caller's alert can name the owner's actual remedy.
 #   6 = AT DIALOG (issue #151). The session raised its OWN question (AskUserQuestion) and is waiting
 #       on an answer. Nothing was typed. This is a LIVE, working session — the caller must surface
 #       it, not escalate it; treating it as frozen false-parked a working lane.
@@ -81,16 +84,24 @@ import sys, os, base64
 sys.path.insert(0, sys.argv[1])
 import pane_state, evidence
 raw = base64.b64decode(os.environ.get("SCREEN_B64", "") or "").decode("utf-8", "replace")
-print(pane_state.classify_screen(
+state = pane_state.classify_screen(
     raw,
     exited_marker=(os.environ.get("EXITED") == "1"),
     agent=os.environ.get("SL_AGENT", "claude"),
-))
+)
+print(state)
+# Line 2 is the AUTH-DEATH VARIANT (issue #174), and is emitted ONLY for logged_out — an auth
+# verdict printed beside any other state would be a reader trap. Blank when the state is anything
+# else. It is NEVER blank for a logged_out state: classify_screen and auth_death_variant read the
+# same table, so a logged_out verdict always has a variant. The blank case exists for the READER
+# (a state that is not logged_out), not for a banner we half-recognised (fresh-review P2-6).
+print(pane_state.auth_death_variant(raw) or "" if state == "logged_out" else "")
 print("---8<--- screen ---8<---")
 print(evidence.bound(raw, limit=evidence.SCREEN_SNIPPET_MAX))
 PY
 )"
 STATE="$(printf '%s\n' "$CLASSIFY" | sed -n 1p)"
+AUTH_VARIANT="$(printf '%s\n' "$CLASSIFY" | sed -n 2p)"
 
 # Every refusal below is EVIDENCE the caller records (issue #152), so it must carry both halves of
 # the judgement: the classifier's verdict AND the screen text it was drawn from. A bare "deferring"
@@ -101,13 +112,23 @@ STATE="$(printf '%s\n' "$CLASSIFY" | sed -n 1p)"
 # `state=<verdict>` is machine-readable on purpose (the runner's evidence record reads it back);
 # the sentence after it is for the human reading the park memo.
 #
+# `auth=<variant>` rides on the SAME line for the same reason (issue #174). The exit code is one bit
+# — "this pane cannot answer" — and that is all the runner branches on, deliberately: every member
+# of the auth-death family gets the identical never-type/never-relaunch treatment, so giving each
+# one its own code would have multiplied the sites that can silently forget a member. But the
+# OWNER'S remedy differs per banner ("unset ANTHROPIC_API_KEY" is not "/login"), and only this
+# script can see the screen — so the variant travels out here, on the stderr the runner already
+# collects, pinned to the state token so a tail cut can never keep one without the other.
+#
 # The snippet was already bounded and sanitized by lib/evidence.bound in the classify call above.
 # An EMPTY screen still refuses (pane_state defers an unreadable read) and must say so honestly
 # rather than print nothing — "captured: none, reason unknown" is a finding; silence is not.
 refuse() {                             # refuse <exit-code> <state> <human sentence>
   code="$1"; state="$2"; why="$3"
-  echo "[nudge] $ID state=$state — $why" >&2
-  snip="$(printf '%s\n' "$CLASSIFY" | sed '1,2d')"
+  auth=""
+  if [ "$state" = "logged_out" ] && [ -n "$AUTH_VARIANT" ]; then auth=" auth=$AUTH_VARIANT"; fi
+  echo "[nudge] $ID state=$state$auth — $why" >&2
+  snip="$(printf '%s\n' "$CLASSIFY" | sed '1,3d')"
   if [ -n "$(printf '%s' "$snip" | tr -d '[:space:]')" ]; then
     echo "[nudge] $ID screen (bounded tail — what the verdict was read from):" >&2
     printf '%s\n' "$snip" >&2
@@ -119,7 +140,7 @@ refuse() {                             # refuse <exit-code> <state> <human sente
 
 case "$STATE" in
   dead) refuse 4 dead "pane is DEAD (the agent process is gone; the pane is a bare shell) — not typing; caller must restart" ;;
-  logged_out) refuse 5 logged_out "session is LOGGED OUT in-window — not typing; caller must alert the owner" ;;
+  logged_out) refuse 5 logged_out "session auth is DEAD in-window (${AUTH_VARIANT:-variant unrecognised}) — not typing; caller must alert the owner" ;;
   at_dialog) refuse 6 at_dialog "session is asking a question in-window — not typing; live, not stuck" ;;
   menu) refuse 3 menu "pane at a menu/ambiguous — deferring" ;;
   trust_blocked) refuse 3 trust_blocked "Codex pane is waiting for directory trust — deferring" ;;

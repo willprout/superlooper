@@ -5874,3 +5874,84 @@ def test_a_recovered_migration_lets_a_clean_tick_clear_the_hold(rig):
     rig.r.tick(now=NOW)
     alert = _alert(rig)
     assert alert is None or not any("migration_hold" in r for r in alert.get("reasons", []))
+
+
+# --- issue #174: the auth-death VARIANT survives the trip from the pane to the alert -------------
+
+def _logged_out_rc(variant):
+    """A realistic rc=5 from nudge-pane.sh: the exit code plus the stderr it actually prints."""
+    return runner_mod.ScriptRC(
+        5, f"[nudge] i5 state=logged_out auth={variant} — session auth is DEAD in-window "
+           f"({variant}) — not typing; caller must alert the owner\n"
+           f"[nudge] i5 screen (bounded tail — what the verdict was read from):\n<screen>\n")
+
+
+def test_the_auth_death_variant_is_recorded_beside_the_sensed_state(rig):
+    """#151 recorded THAT auth died; #174 records WHICH way. The state stays one value —
+    'logged_out' — because the send-safety answer is identical for every member and every guard
+    downstream keys off it; the variant rides beside it purely so the alert can name the owner's
+    actual remedy ('unset ANTHROPIC_API_KEY' is not '/login')."""
+    for variant in ("login", "invalid_api_key", "org_api_key_disabled", "oauth_revoked"):
+        seed_issue(rig, "i5", status="running")
+        (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+        (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+        rig.rc_queue.append(_logged_out_rc(variant))
+        rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+        ist = issue_state(rig, "i5")
+        assert ist["sensed_state"] == "logged_out", variant
+        assert ist["sensed_auth"] == variant, variant
+
+
+def test_an_unreadable_rc5_still_records_logged_out_with_no_variant(rig):
+    """Fail OPEN on the variant, never on the state. A stubbed/plain int rc genuinely captured
+    nothing (ScriptRC's own rule), and an unrecognised banner reaches us through the generic nets
+    with no variant at all — in both cases the lane is still auth-dead and must still be held. The
+    alert falls back to generic wording rather than inventing a remedy."""
+    for rc in (5, runner_mod.ScriptRC(5, "[nudge] i5 state=logged_out — no variant token here\n")):
+        seed_issue(rig, "i5", status="running")
+        (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+        (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+        rig.rc_queue.append(rc)
+        rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+        ist = issue_state(rig, "i5")
+        assert ist["sensed_state"] == "logged_out"
+        assert ist.get("sensed_auth") is None
+
+
+def test_the_variant_clears_the_moment_the_lane_reads_healthy(rig):
+    """sensed_auth is a LIVE reading with exactly the lifetime of sensed_state. A sticky one would
+    outlive the screen that produced it and pin a stale remedy in front of the owner."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+    rig.rc_queue.append(_logged_out_rc("invalid_api_key"))
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    assert issue_state(rig, "i5")["sensed_auth"] == "invalid_api_key"
+    rig.rc_queue.append(0)                               # nudge delivered -> auth is back
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 60)
+    ist = issue_state(rig, "i5")
+    assert ist["sensed_state"] is None and ist["sensed_auth"] is None
+
+
+def test_a_changed_banner_replaces_the_recorded_variant(rig):
+    """The owner fixes the API key, the session falls back to a dead subscription login: same
+    state, different remedy. The recorded variant must follow the screen, not the first reading."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+    rig.rc_queue.append(_logged_out_rc("invalid_api_key"))
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    rig.rc_queue.append(_logged_out_rc("login"))
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW + 60)
+    assert issue_state(rig, "i5")["sensed_auth"] == "login"
+
+
+def test_a_non_auth_rc_never_grows_a_variant(rig):
+    """A menu deferral's stderr can carry anything; it must not be mined for an auth verdict."""
+    seed_issue(rig, "i5", status="running")
+    (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
+    (rig.home / "state" / "worker.i5.lock").write_text(f"{os.getpid()}\n")
+    rig.rc_queue.append(runner_mod.ScriptRC(3, "[nudge] i5 state=menu — auth=login is just prose\n"))
+    rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
+    ist = issue_state(rig, "i5")
+    assert ist.get("sensed_state") is None and ist.get("sensed_auth") is None

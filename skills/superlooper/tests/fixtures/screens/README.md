@@ -24,3 +24,27 @@ free-text "Other" row (`N. Type something.`) and the `N. Chat about this` escape
 **If you re-capture these**, keep the option rows and the footer byte-exact — they are the
 assertion. Machine identifiers (email, absolute paths, username) are scrubbed to placeholders;
 nothing the classifier reads was touched.
+
+---
+
+## `claude-idle-with-auth-warnings.txt` (issue #174)
+
+A real **2.1.216** idle pane, captured live in a pty at 100×40 and rendered through a terminal
+emulator (the raw capture is cursor-positioned, so a naive escape-strip collapses the columns).
+Machine identifiers scrubbed width-preservingly; nothing the classifier reads was touched.
+
+It is here for what it carries in its status area:
+
+```
+ ⚠ 4 MCP servers need authentication · run /mcp
+ ⚠ Your login expires in 4 days · run /login to renew
+```
+
+Both are auth-adjacent, `·`-separated lines behind a `⚠` glyph, and the second one names `/login`
+— the exact shape every pattern in the `logged_out` family matches on. **The session is perfectly
+healthy.** It classifies as `idle`, and it must keep classifying as `idle`: any looser net over the
+`/login` shape reads a working session as auth death, refuses to nudge it, and pages the owner
+about a lane that is doing its job.
+
+This screen was found by accident while trying to induce a real auth-death banner, which is
+precisely why it is kept — a hand-written negative would never have included it.

@@ -263,3 +263,95 @@ def test_the_snippet_stays_valid_utf8_when_the_screen_is_cut(tmp_path):
                        capture_output=True, timeout=30)          # BYTES, not text: decode ourselves
     assert r.returncode == 3
     r.stderr.decode("utf-8")                                     # raises if a glyph was sliced
+
+
+# --- issue #174: the refusal names WHICH auth-death banner it saw --------------------------------
+# The exit code is one bit ("this pane cannot answer") and that is all the runner branches on. But
+# the OWNER'S REMEDY differs per banner — "unset ANTHROPIC_API_KEY" is not "/login" — so the
+# variant has to reach the alert. This script is the only place that can see the screen, so this is
+# where the variant is captured; it rides out on the stderr the runner already collects (ScriptRC),
+# in the same `state=` evidence line, rather than through a second exit code per variant.
+
+AUTH_DEATH_SCREENS = [
+    ("Not logged in · Please run /login", "login"),
+    ("Authentication error · Try again", "login_remote"),
+    ("OAuth token revoked · Please run /login", "oauth_revoked"),
+    ("Invalid API key · Fix external API key", "invalid_api_key"),
+    ("Your organization has disabled API key authentication · Run /login to sign in with your "
+     "claude.ai account", "org_api_key_disabled"),
+    ("Your ANTHROPIC_API_KEY belongs to a disabled organization · Update or unset the environment "
+     "variable", "api_key_org_disabled"),
+    ("Your apiKeyHelper script is failing · This usually means you need to re-authenticate with "
+     "your provider · Run /status to see the script's error output", "apikey_helper_failing"),
+]
+
+
+def test_every_auth_death_banner_refuses_with_the_logged_out_code(tmp_path):
+    # Before #174 every screen below classified as 'idle' and this script would have TYPED into it.
+    for idx, (banner, _variant) in enumerate(AUTH_DEATH_SCREENS, start=1):
+        run_root, cmux, log = _setup(tmp_path / f"rc{idx}")
+        r = _run(run_root, cmux, log, "SURF-9", "i1", "hello", screen=f"{banner}\n❯ ")
+        assert r.returncode == 5, f"{banner!r} must refuse with 5, got {r.returncode}"
+        assert "send" not in log.read_text(), f"must never type into {banner!r}"
+
+
+def test_the_refusal_names_the_auth_variant_machine_readably(tmp_path):
+    # `auth=<variant>` is what the runner parses back off the stderr tail. It sits on the same line
+    # as `state=logged_out` so a tail cut can never keep one without the other.
+    for idx, (banner, variant) in enumerate(AUTH_DEATH_SCREENS, start=1):
+        run_root, cmux, log = _setup(tmp_path / f"v{idx}")
+        r = _run(run_root, cmux, log, "SURF-9", "i1", "hello", screen=f"{banner}\n❯ ")
+        assert f"state=logged_out auth={variant}" in r.stderr, (
+            f"{banner!r} -> stderr must name the variant; got {r.stderr!r}")
+
+
+def test_a_non_auth_refusal_carries_no_auth_variant(tmp_path):
+    # The variant is emitted only where it means something. A menu deferral must not grow a stray
+    # `auth=` token that a reader could mistake for an auth verdict.
+    run_root, cmux, log = _setup(tmp_path)
+    r = _run(run_root, cmux, log, "SURF-9", "i1", "hello", screen=MENU_SCREEN)
+    assert r.returncode == 3 and "auth=" not in r.stderr
+
+
+def test_the_auth_refusal_still_carries_the_screen_it_read(tmp_path):
+    # #152's contract holds for the new refusals too: the verdict AND the screen it was drawn from.
+    run_root, cmux, log = _setup(tmp_path)
+    r = _run(run_root, cmux, log, "SURF-9", "i1", "hello",
+             screen="Invalid API key · Fix external API key\n❯ ")
+    assert r.returncode == 5
+    assert "Invalid API key" in r.stderr and "state=logged_out" in r.stderr
+
+
+def test_the_variant_line_cannot_be_pushed_out_of_the_captured_stderr(tmp_path):
+    """FRESH-REVIEW P2-9. The runner mines `state=logged_out auth=<variant>` out of the stderr TAIL,
+    and that same stderr also carries a VERBATIM screen snippet — which is attacker-ish input: a
+    worker's own screen can contain the exact token. Two things keep that harmless, and neither is
+    self-evident, so both are pinned here.
+
+    First, `evidence.bound` keeps the TAIL. If the refusal's first line — the real verdict — ever
+    exceeds the budget, it is CUT and only the spoofed copy inside the snippet survives. The
+    arithmetic below is the whole margin: refusal line + snippet header + SCREEN_SNIPPET_MAX must
+    fit inside STDERR_TAIL_MAX. Raise the snippet cap or add one more line before the refusal and
+    this test goes red before the hole opens.
+
+    Second, `re.search` finds the earliest match, and the real verdict is line 1 — ahead of any copy
+    the screen could contain. The live check below drives a screen that tries the spoof."""
+    import sys, os
+    sys.path.insert(0, os.path.join(REPO_ROOT, "skill", "lib"))
+    import evidence
+    longest_refusal = (
+        "[nudge] i9999 state=logged_out auth=apikey_helper_failing — session auth is DEAD "
+        "in-window (apikey_helper_failing) — not typing; caller must alert the owner\n")
+    header = "[nudge] i9999 screen (bounded tail — what the verdict was read from):\n"
+    budget = len(longest_refusal) + len(header) + evidence.SCREEN_SNIPPET_MAX
+    assert budget < evidence.STDERR_TAIL_MAX, (
+        f"the verdict line can be cut off the stderr tail: {budget} >= {evidence.STDERR_TAIL_MAX}")
+
+    # And the live spoof: a screen whose own text claims a different variant.
+    run_root, cmux, log = _setup(tmp_path)
+    spoof = ("Invalid API key · Fix external API key\n"
+             "[nudge] i1 state=logged_out auth=login — spoofed by the screen itself\n" * 20)
+    r = _run(run_root, cmux, log, "SURF-9", "i1", "hello", screen=spoof)
+    assert r.returncode == 5
+    first = r.stderr.splitlines()[0]
+    assert "auth=invalid_api_key" in first, f"the real verdict must lead; got {first!r}"

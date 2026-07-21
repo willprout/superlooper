@@ -19,6 +19,7 @@ with its outcome (journal.jsonl — the morning report and the ratchet read it).
 """
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -3066,6 +3067,20 @@ class Runner:
                               env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
         return self._record_sensed(iid, rc, now, tier="idle")
 
+    # nudge-pane.sh prints `state=logged_out auth=<variant>` as the FIRST line of its refusal
+    # (issue #174). Anchored on the pairing, not on a bare `auth=` anywhere in the tail, because the
+    # tail also carries a verbatim screen snippet — and a worker whose own screen is showing this
+    # very source file would otherwise hand the runner an auth verdict quoted out of a code comment.
+    _AUTH_VARIANT_RE = re.compile(r"state=logged_out auth=([a-z0-9_]+)")
+
+    @classmethod
+    def _auth_variant(cls, rc):
+        """Which auth-death banner nudge-pane saw, or None. Reads the stderr ScriptRC already
+        carries; `getattr` because an injected/stubbed plain int genuinely captured nothing and
+        must fail closed to "no variant" rather than inherit some other call's text."""
+        m = cls._AUTH_VARIANT_RE.search(getattr(rc, "stderr_tail", "") or "")
+        return m.group(1) if m else None
+
     def _record_sensed(self, iid, rc, now, tier=None):
         """Turn a nudge-pane rc into the lane's honest sensed state (issue #151). Shared by BOTH
         liveness tiers so their reading of the same rc can never drift apart.
@@ -3082,13 +3097,31 @@ class Runner:
 
         `sensed_since` stamps when the CURRENT reading began and is preserved while it holds, so the
         alert bound measures the episode rather than resetting every re-sense. It is what stops a
-        lane sitting silently at an unanswerable in-window question forever."""
+        lane sitting silently at an unanswerable in-window question forever.
+
+        `sensed_auth` (issue #174) carries WHICH auth-death banner was on the pane, for the ONE
+        purpose of letting the alert name the owner's actual remedy — "unset ANTHROPIC_API_KEY" is
+        not "/login", and handing an owner the wrong instruction at 3am costs them the night. It is
+        deliberately not a second sensed_state: the send-safety verdict is identical for every
+        member of the family and every guard downstream keys off `logged_out`, so splitting the
+        state would only multiply the places that can silently forget a member. It rides on
+        nudge-pane's stderr — the channel ScriptRC already carries — and fails OPEN to None. The
+        pane itself never produces a variant-less logged_out (classify_screen and auth_death_variant
+        read the same table), so None means the CHANNEL lost it: a stubbed plain-int rc that
+        captured nothing, or a stderr tail that did not survive. Either way the lane is still
+        auth-dead and still held; only the wording degrades."""
         sensed = {5: "logged_out", 6: "at_dialog"}.get(rc)
+        auth = self._auth_variant(rc) if sensed == "logged_out" else None
 
         def m(st, i):
             if i.get("sensed_state") != sensed:
                 i["sensed_state"] = sensed
                 i["sensed_since"] = now if sensed else None
+            # Tracked SEPARATELY from sensed_since on purpose: a banner that changes wording mid-
+            # episode (the owner fixes the key, the session falls back to a dead login) is the same
+            # unbroken auth-death episode, so the clock the alert bound measures must not restart.
+            if i.get("sensed_auth") != auth:
+                i["sensed_auth"] = auth
         self._update_issue(iid, fn=m)
         if rc == 0:
             return "ok"
@@ -3164,6 +3197,7 @@ class Runner:
             i["last_recover_at"] = None            # a later re-freeze nudges fresh, not on a stale clock
             i["sensed_state"] = None               # a working lane: drop any frozen-era screen reading
             i["sensed_since"] = None
+            i["sensed_auth"] = None                # (#174) the variant has exactly sensed_state's life
         self._update_issue(iid, fn=m)
         _rm(os.path.join(self.state, "ack", iid))  # the fresh episode: any old probe ack is moot
         return f"un-latched frozen -> running ({a.get('evidence_class') or 'progress clock advanced'})"
