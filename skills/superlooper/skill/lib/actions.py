@@ -560,25 +560,39 @@ def _touches_required_memo(num):
             "`touches:` line to the Loop metadata and re-approve.")
 
 
-def _refused_closed_read_deps(p, closed_nums, closed_read_ok):
-    """The `blocked-by` numbers this issue is held on WHILE the closed-list read stands REFUSED
+# The opening of the unlanded-closed-read hold reason, as a constant so the stamp is RECOGNIZABLE
+# later: the ledger dedups on the stored reason, so an episode's stamp must be identifiable once the
+# read lands again or it would silence the NEXT episode (see the phase-E hold below).
+UNLANDED_CLOSED_READ_PREFIX = "the closed-issue list read did not land this poll"
+
+
+def _unlanded_closed_read_deps(p, closed_nums, closed_read_ok):
+    """The `blocked-by` numbers this issue is held on WHILE the closed-list read has NOT landed
     (issue #172) — empty when the read landed, when the issue declares no dependency, or when the
     dependency is satisfied anyway. This is the ONE condition under which "blocked" is a statement
-    about GitHub's refusal rather than about the dependency: the fail-closed empty set cannot tell
-    the two apart, so the caller names the refusal instead of the (unobserved) closure state."""
+    about the READ rather than about the dependency: the fail-closed empty set cannot tell the two
+    apart, so the caller names the read instead of the (unobserved) closure state."""
     if closed_read_ok or not isinstance(p, dict):
         return []
     deps = p.get("blocked_by") if isinstance(p.get("blocked_by"), list) else []
-    return [d for d in deps if d not in closed_nums]
+    return [d for d in deps if type(d) is int and d not in closed_nums]
 
 
-def _refused_closed_read_reason(open_deps):
-    return ("the closed-issue list could not be read this poll — GitHub REFUSED it (a throttle "
-            "refuses the list read while `gh api rate_limit`, which is exempt, still answers), so "
-            "its `blocked-by` ("
+def _unlanded_closed_read_reason(open_deps):
+    # Says only what ReadHealth can actually OBSERVE. `ok=False` covers a nonzero rc, a timeout, a
+    # missing binary and an unparseable/wrong-typed body alike — a throttle is the LIKELY cause (and
+    # the one that motivated #172), not a fact the loop established, so it is named as such.
+    return (UNLANDED_CLOSED_READ_PREFIX + " — a rate-limit throttle is the usual cause, and `gh api "
+            "rate_limit` (what the poll probes with) is EXEMPT from throttling, so the view still "
+            "reads fresh. Its `blocked-by` ("
             + ", ".join("#%s" % d for d in open_deps)
-            + ") cannot be verified as closed. A refused read is never taken as 'nothing is "
-              "closed': held until a clean closed-list read lands, which is the next poll.")
+            + ") therefore cannot be verified as closed. An unlanded read is never taken as "
+              "'nothing is closed': held until a clean closed-list read lands.")
+
+
+def _is_unlanded_closed_read_stamp(reason):
+    """Is this durable `launch_hold_reason` an unlanded-closed-read stamp (issue #172)?"""
+    return isinstance(reason, str) and reason.startswith(UNLANDED_CLOSED_READ_PREFIX)
 
 
 def _launch_gate_reason(p, closed_nums, usage, config=None, closed_read_ok=True):
@@ -605,14 +619,16 @@ def _launch_gate_reason(p, closed_nums, usage, config=None, closed_read_ok=True)
         return ("its control labels conflict (2+ `model:*` or 2+ `effort:*`), so which model/effort "
                 "to restart under is ambiguous — waiting for the labels to be fixed")
     deps = p.get("blocked_by") if isinstance(p.get("blocked_by"), list) else []
-    open_deps = [d for d in deps if d not in closed_nums]
+    open_deps = [d for d in deps if type(d) is int and d not in closed_nums]
     if open_deps:
-        # The view now VOUCHES for its closed read (issue #172), so when the read was REFUSED we say
+        # The view now VOUCHES for its closed read (issue #172), so when the read did NOT land we say
         # THAT — the honest cause — instead of describing the dependency at all. #150 could only be
         # non-committal here ("not confirmed closed") because the poll handed decide a bare set with
-        # no way to tell a refusal from an answer; carrying the read health closes that gap.
+        # no way to tell a refusal from an answer; carrying the read health closes that gap. Note the
+        # position: this sits BELOW usage/approval/type/label-conflict on purpose, so a candidate
+        # that a throttle and a dead usage meter both hold is named for the meter, which decided.
         if not closed_read_ok:
-            return _refused_closed_read_reason(open_deps)
+            return _unlanded_closed_read_reason(open_deps)
         # Says "not confirmed closed", never "still open" (fresh-agent review P2-1). gh's closed-list
         # read fails CLOSED to an empty set, and `probe` (rate_limit) is exempt from throttling — so
         # a THROTTLED poll still stamps the view fresh while every dependency reads as unmet. The
@@ -888,11 +904,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     issue_comments = _dget(gv, "issue_comments", dict)
     raw_closed = gv.get("closed_nums")
     closed_nums = set(raw_closed) if isinstance(raw_closed, (set, frozenset, list, tuple)) else set()
-    # Does the poll VOUCH for that closed set (issue #172)? Only an EXPLICIT False is a refusal — a
-    # view that never carried the key (an older document) keeps today's non-committal prose rather
-    # than having a refusal invented for it. Eligibility is UNCHANGED either way: a refused read
-    # still holds every `blocked-by` issue, which is the safe direction (waiting beats launching
+    # Does the poll VOUCH for that closed set (issue #172)? Only an EXPLICIT False is an unlanded
+    # read — a view that never carried the key (an older document) keeps today's non-committal prose
+    # rather than having a refusal invented for it. Eligibility is UNCHANGED either way: an unlanded
+    # read still holds every `blocked-by` issue, which is the safe direction (waiting beats launching
     # past a blocker). What changes is that the hold is now SAID, and named for its real cause.
+    #
+    # NOTE the DELIBERATE asymmetry with published_view.build, which publishes the flag only on an
+    # explicit True. The two are conservative on DIFFERENT axes and must not be unified: here a wrong
+    # default would invent a refusal in prose the owner reads, there it would publish an all-clear the
+    # runner never earned. Each defaults away from its own worse failure. (Post-#172 the runner always
+    # carries the key on both branches, so the key-absent case is a contract guard, not a live path.)
     closed_read_ok = gv.get("closed_read_ok") is not False
 
     out = []
@@ -2122,16 +2144,32 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     and not gate.preauthorized_referee(c.get("labels")):
                 launch_hold(cid, c.get("num"), c)
                 continue
-            # Refused closed-list read (issue #172). launch_ok withheld this candidate because its
-            # `blocked-by` is unsatisfied in a closed set the poll could not actually READ — so on
-            # the fresh path it was dropped SILENTLY, and a throttle made every blocked-by issue
-            # quietly un-launchable for as long as it lasted. Journal WHY, through the same #150
-            # ledger (deduped once per cause), naming the refusal rather than the dependency.
-            # Deliberately NOT emitted for a LANDED read: a genuinely open dependency is the loop
-            # working as designed and must not walk the journal every tick.
-            refused_deps = _refused_closed_read_deps(c, closed_nums, closed_read_ok)
-            if refused_deps:
-                launch_hold(cid, c.get("num"), c, reason=_refused_closed_read_reason(refused_deps))
+            # Unlanded closed-list read (issue #172). launch_ok withheld this candidate because its
+            # `blocked-by` is unsatisfied in a closed set the poll never actually READ — so on the
+            # fresh path it was dropped SILENTLY, and a throttle made every blocked-by issue quietly
+            # un-launchable for as long as it lasted. Journal WHY, through the same #150 ledger.
+            # Three disciplines, each bought by a fresh-agent review of this change:
+            #   * the reason ALWAYS comes from _launch_gate_reason, never asserted here — `candidates`
+            #     is not launch_ok-filtered, so a candidate can be held by usage, an ambiguous type or
+            #     a control-label conflict, all of which OUTRANK the dependency check. Stamping "the
+            #     closed read did not land" over one of those would narrate a cause the loop never
+            #     established, in a record the morning report reads. That function tests conditions in
+            #     launch_ok's own order, so the prose names the one that actually decided — and it is
+            #     the same function the recovery path asks, so the two paths cannot drift;
+            #   * emit ONLY when the unlanded read is what decided, or when the board is still wearing
+            #     a stamp from an earlier unlanded episode. A genuinely open dependency under a landed
+            #     read is the loop working as designed and stays quiet — but a STALE refusal stamp
+            #     must be corrected to the condition that holds now, because the ledger dedups on that
+            #     stamp: left standing, it would silence the NEXT throttle episode entirely;
+            #   * skip a candidate the gate now PASSES (lane- or affinity-bound). Its reason would be
+            #     the unnamed fallback, and the stamp clears when it launches, as #150 intends.
+            if scheduler.launch_ok(c, closed_nums, bool(frozen), usage_sched, config=cfg):
+                continue
+            stale = _is_unlanded_closed_read_stamp(ist_of(cid).get("launch_hold_reason"))
+            reason = _launch_gate_reason(c, closed_nums, usage_sched, config=cfg,
+                                         closed_read_ok=closed_read_ok)
+            if stale or _is_unlanded_closed_read_stamp(reason):
+                launch_hold(cid, c.get("num"), c, reason=reason)
     elif (systemic_launch and not anchor_down and not auth_invalid and not display_asleep
             and not gh_stale and not issue_state_corrupt_for_launches):
         # ...and NOT while the display sleeps (#124): a canary into a sleeping display would just

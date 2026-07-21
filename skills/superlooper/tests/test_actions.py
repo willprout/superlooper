@@ -1247,7 +1247,10 @@ def test_touches_required_does_not_park_a_blocked_issue_early():
 # and it self-heals on the next poll), but the loop must not act on, or narrate, a closure state it
 # never observed. `closed_read_ok` is the view's vouch for that read.
 
-def test_a_refused_closed_read_holds_a_fresh_launch_out_loud():
+UNLANDED = actions.UNLANDED_CLOSED_READ_PREFIX
+
+
+def test_an_unlanded_closed_read_holds_a_fresh_launch_out_loud():
     # THE defect: the fresh launch path drops such a candidate SILENTLY — the queue simply stops
     # moving, with nothing anywhere saying why. It must hold with an honest, named reason.
     out = decide(parsed_issues=[parsed(5, blocked_by=[3])],
@@ -1256,7 +1259,7 @@ def test_a_refused_closed_read_holds_a_fresh_launch_out_loud():
     holds = only(out, "launch_hold")
     assert len(holds) == 1 and holds[0]["id"] == "i5"
     reason = holds[0]["reason"]
-    assert "closed-issue list" in reason and "#3" in reason
+    assert reason.startswith(UNLANDED) and "#3" in reason
     assert "still open" not in reason        # never asserts a closure state it did not observe
 
 
@@ -1268,20 +1271,114 @@ def test_a_clean_closed_read_leaves_a_genuinely_blocked_issue_waiting_quietly():
     assert only(out, "launch") == [] and only(out, "launch_hold") == []
 
 
-def test_a_refused_closed_read_does_not_hold_an_issue_with_no_blocked_by():
-    # Scope: the refusal only touches dependency eligibility. An unblocked issue never consults the
-    # closed set, so it launches through a throttle exactly as it does today.
+def test_an_unlanded_closed_read_does_not_hold_an_issue_with_no_blocked_by():
+    # Scope: an unlanded read only touches dependency eligibility. An unblocked issue never consults
+    # the closed set, so it launches through a throttle exactly as it does today.
     out = decide(parsed_issues=[parsed(5)], gh_view=ghv(closed_nums=set(), closed_read_ok=False))
     assert len(only(out, "launch")) == 1 and only(out, "launch_hold") == []
 
 
 def test_a_view_that_never_vouched_for_its_closed_read_keeps_todays_prose():
     # The flag is trusted ONLY in the direction it explicitly asserts. A view with no `closed_read_ok`
-    # at all (an older document) must not manufacture a refusal that never happened.
+    # key at all (an older document) must not have a refusal manufactured for it.
     g = ghv(closed_nums=set())
-    g.pop("closed_read_ok", None)
+    assert "closed_read_ok" not in g          # the pre-#172 view shape, explicitly
     out = decide(parsed_issues=[parsed(5, blocked_by=[3])], gh_view=g)
     assert only(out, "launch") == [] and only(out, "launch_hold") == []
+
+
+# The reason must name the condition that ACTUALLY decided, never the read (fresh-agent review P1-1).
+# `candidates` is not launch_ok-filtered, so a blocked-by issue can also be held by usage, an
+# ambiguous type, or a control-label conflict — every one of which outranks the dependency check.
+# Stamping "the closed read did not land" over those would narrate a cause the loop never
+# established, in the durable record the morning report reads, and would end with "held until a
+# clean closed-list read lands" — a promise the next clean read cannot keep.
+
+def test_a_dead_usage_meter_outranks_the_unlanded_read_in_the_reason():
+    out = decide(parsed_issues=[parsed(5, blocked_by=[3])],
+                 usage=dict(usage_ok(), auth_status="expired"),
+                 gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert only(out, "launch") == []
+    assert [h for h in only(out, "launch_hold") if h["reason"].startswith(UNLANDED)] == []
+
+
+def test_a_control_label_conflict_outranks_the_unlanded_read_in_the_reason():
+    out = decide(parsed_issues=[parsed(5, blocked_by=[3], label_conflict=True)],
+                 gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert only(out, "launch") == []
+    assert [h for h in only(out, "launch_hold") if h["reason"].startswith(UNLANDED)] == []
+
+
+def test_an_ambiguous_type_outranks_the_unlanded_read_in_the_reason():
+    p = parsed(5, labels=("agent-ready", "type:build", "type:investigate"), blocked_by=[3])
+    out = decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert only(out, "launch") == []
+    assert [h for h in only(out, "launch_hold") if h["reason"].startswith(UNLANDED)] == []
+
+
+def test_a_correction_under_a_dead_meter_names_the_meter_not_the_read():
+    # The positive half of P1-1: here a hold IS emitted (an earlier episode's stamp needs
+    # correcting) while BOTH a dead meter and an unlanded read hold the issue. The meter decided.
+    p = parsed(5, blocked_by=[3])
+    stale = only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                 "launch_hold")[0]["reason"]
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None, launch_hold_reason=stale)}})
+    out = decide(parsed_issues=[p], usage=dict(usage_ok(), auth_status="expired"), dsk=d,
+                 gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and "usage headroom" in holds[0]["reason"]
+    assert not holds[0]["reason"].startswith(UNLANDED)
+
+
+def test_a_standing_unlanded_read_hold_does_not_re_journal():
+    # The ledger dedups on the durably stamped reason, so a throttle lasting many 15s ticks says it
+    # ONCE. Simulated by handing decide the stamp its own executor would have written.
+    p = parsed(5, blocked_by=[3])
+    first = only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                 "launch_hold")
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None, launch_hold_reason=first[0]["reason"])}})
+    out = decide(parsed_issues=[p], dsk=d, gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert only(out, "launch_hold") == []
+
+
+def test_a_stale_unlanded_read_stamp_is_corrected_once_the_read_lands():
+    # Fresh-agent review P1-2. The read lands and #3 is GENUINELY open: the issue is still held, but
+    # for a different cause. Left standing, the old stamp would (a) misdescribe the board and (b)
+    # silence the next throttle episode outright, since the ledger dedups on exactly that string.
+    p = parsed(5, blocked_by=[3])
+    stale = only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                 "launch_hold")[0]["reason"]
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None, launch_hold_reason=stale)}})
+    out = decide(parsed_issues=[p], dsk=d, gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1
+    assert not holds[0]["reason"].startswith(UNLANDED)      # corrected to the landed-read wording
+    assert "not confirmed closed" in holds[0]["reason"] and "#3" in holds[0]["reason"]
+
+
+def test_a_stale_stamp_on_an_issue_the_gate_now_passes_is_left_for_the_launch_to_clear():
+    # The gate PASSES (#3 closed in a landed read) and the issue is merely lane-bound. Re-deriving a
+    # reason here would stamp the unnamed fallback over it; #150's contract is that the launch itself
+    # clears the stamp, so this path stays out of the way.
+    p = parsed(5, blocked_by=[3])
+    stale = only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                 "launch_hold")[0]["reason"]
+    d = disk(issues_state={"version": 1,
+                           "issues": {"i5": ist(status=None, launch_hold_reason=stale)}})
+    out = decide(parsed_issues=[p], lane_state=[{"id": "i9", "touches": ["*"], "type": "build"}],
+                 config=cfg(lanes=1), dsk=d, gh_view=ghv(closed_nums={3}, closed_read_ok=True))
+    assert only(out, "launch") == [] and only(out, "launch_hold") == []
+
+
+def test_decide_is_total_on_a_wrong_typed_blocked_by_under_an_unlanded_read():
+    # decide must never raise, on any input, on any read health. An unhashable dep in `blocked_by`
+    # would have gone straight into a set membership test.
+    p = parsed(5, blocked_by=[{"nope": 1}, "7", 3])
+    out = decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert only(out, "launch") == []
 
 
 def test_touches_required_does_not_mislabel_a_control_label_conflict_issue():

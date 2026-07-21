@@ -224,6 +224,10 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
         # from throttling, so `stale` stays False through a throttle either way. Trusted ONLY in the
         # direction it explicitly asserts: True demands an explicit True, so a view that never
         # claimed the read landed publishes an honest False rather than a confident all-clear.
+        # (actions.decide reads the SAME flag with the opposite default, on purpose — the worse
+        # failure there is inventing a refusal in prose, here it is publishing an unearned
+        # all-clear. Each side defaults away from its own. See the note beside `closed_read_ok`
+        # in decide before "fixing" the divergence.)
         "closed_read_ok": view.get("closed_read_ok") is True,
         "prs": prs,
         "dev_checks": _dict(view.get("dev_checks")),

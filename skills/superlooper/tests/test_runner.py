@@ -5002,7 +5002,7 @@ def test_a_refused_closed_read_holds_without_claiming_the_blockers_are_open(rig)
     # invariant #150 bought — never narrate a closure state the loop did not observe — is unchanged
     # and still asserted above; the "not confirmed closed" wording now belongs to a LANDED read
     # (test_a_held_restart_relaunches_the_moment_its_blockers_close's world), not to this one.
-    assert "closed-issue list could not be read" in reason and "#101" in reason
+    assert "closed-issue list read did not land" in reason and "#101" in reason
 
 
 # ====== issue #172: the poll's closed-list read carries its HEALTH into the view ======
@@ -5078,6 +5078,31 @@ def test_the_throttled_hold_launches_the_moment_a_clean_closed_read_lands(rig):
     assert rig.r.gh_view["closed_read_ok"] is True
     assert len(_launches_of(rig, "i103")) == 1
     assert issue_state(rig, "i103")["launch_hold_reason"] is None
+
+
+def test_a_standing_throttle_says_it_once_then_speaks_again_for_the_NEXT_episode(rig):
+    # Two disciplines in one drive (fresh-agent review P1-2). A throttle spanning many 15s ticks must
+    # say it ONCE — but when the read lands and the issue is STILL held (now for a genuinely open
+    # dependency), the stale stamp must be corrected, or the ledger's dedup would silence episode #2
+    # outright: exactly the silence #172 exists to end.
+    _unblock_the_fixture_world(rig)
+    _throttle_the_closed_list(rig, times=1)
+    for i in range(4):                                  # one episode, four ticks
+        rig.r.tick(now=NOW + i * 20)
+    held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
+    assert len(held) == 1 and held[0]["outcome"].startswith("the closed-issue list read did not land")
+
+    # #101/#102 re-open (the dependency is real again) and the read lands: the stamp is corrected...
+    (rig.fixdir / "issue_list_closed.json").write_text(json.dumps([{"number": 41}, {"number": 52}]))
+    rig.r.tick(now=NOW + 200)
+    corrected = issue_state(rig, "i103")["launch_hold_reason"]
+    assert "not confirmed closed" in corrected and "did not land" not in corrected
+    # ...so when the throttle returns, episode #2 is NOT swallowed by the dedup.
+    _throttle_the_closed_list(rig)
+    rig.r.tick(now=NOW + 400)
+    held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
+    assert len(held) == 3                               # episode 1, the correction, episode 2
+    assert held[-1]["outcome"].startswith("the closed-issue list read did not land")
 
 
 def test_a_genuinely_blocked_issue_still_waits_quietly_under_a_clean_read(rig):
