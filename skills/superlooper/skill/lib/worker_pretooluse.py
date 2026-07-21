@@ -140,10 +140,10 @@ _KILL_REASON = (
     "Killing processes by name or pattern (pkill / killall) is forbidden in a superlooper loop "
     "session: the pattern can also match the OWNER's own live processes — a worker once killed the "
     "owner's live dashboard this way. Record the PID of anything you background ($!) and kill only "
-    "that exact PID (`kill <pid>` / `kill -9 <pid>`). If you were only SEARCHING for those words — "
-    "a grep over docs or logs — this is the documented false positive: a `|` or `;` inside your "
-    "quoted pattern reads as a command position. Rephrase it (`grep -e pkill -e killall …`) and the "
-    "call goes through."
+    "that exact PID (`kill <pid>` / `kill -9 <pid>`). If this was a SEARCH over text and not a kill "
+    "at all — a grep over docs or logs — you hit the documented false positive: a shell separator "
+    "inside your quoted pattern (`|`, `;`, `&`, `(`, a backtick, a newline) reads as a command "
+    "position. Rephrase the SEARCH (`grep -e pkill -e killall …`) and it goes through."
 )
 
 # `pkill` / `killall` invoked as a COMMAND, not as an incidental substring. It matches only at a
@@ -197,14 +197,19 @@ def _attended(env, role):
 
 # --------------------------- the decision ---------------------------
 
-def decide(tool_name, tool_input, state_home, issue_id, ask_reason=None, attended=False):
+def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=False):
     """Return a deny-reason string, or None to let the call proceed. Deny ONLY the two named
-    hazards — no broad allowlist. `ask_reason` is the caller's role-specific fallback text builder
-    (defaults to the worker's); `attended` stands duty 1 down when a human is genuinely present."""
+    hazards — no broad allowlist. `ask_reason` is the caller's role-specific fallback text builder;
+    `attended` stands duty 1 down when a human is genuinely present.
+
+    `ask_reason` is REQUIRED, deliberately (fresh-agent review): a default would mean a caller that
+    forgets it silently hands some other role the WORKER's protocol — the exact drift this module
+    says is worse than no deny at all. Better a TypeError, which main() turns into a fail-open
+    allow, than a confident wrong instruction."""
     if tool_name == "AskUserQuestion":
         if attended:
             return None                  # a person IS at this pane — the dialog will be answered
-        return (ask_reason or _worker_ask_reason)(state_home, issue_id)
+        return ask_reason(state_home, issue_id)
     if tool_name == "Bash":
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
         if _is_pattern_kill(command):
