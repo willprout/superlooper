@@ -3942,10 +3942,15 @@ def test_a_wrong_typed_ladder_is_repaired_by_the_teardown_that_clears_the_lock(r
     _teardown_rig(rig, "i5")
 
     assert rig.r._teardown_session("i5", remove_worktree=True) is True
-    assert _ist(rig, "i5")["teardown_deferrals"] == 0, "a wrong-typed ladder survived its repair"
+    # `is int` matters as much as `== 0`: a leftover False satisfies `== 0` while still being the
+    # wrong-typed value decide fails closed on, so the bool case — the subtlest one the type guard
+    # exists for — would pass vacuously against the truthiness guard this replaced.
+    v = _ist(rig, "i5")["teardown_deferrals"]
+    assert type(v) is int and v == 0, f"a wrong-typed ladder survived its repair: {v!r}"
 
 
-def test_a_lane_with_no_ladder_pays_no_state_write_for_the_clear(rig, monkeypatch):
+@pytest.mark.parametrize("ladder", [{}, {"teardown_deferrals": 0}])
+def test_a_lane_with_no_ladder_pays_no_state_write_for_the_clear(rig, monkeypatch, ladder):
     """The guard is the entire cost argument for calling this from the every-tick teardown: an
     unconditional locked read-modify-write per deferred lane per tick would be a real cost for
     nothing. A refactor that drops the guard must fail here, not silently."""
@@ -3955,7 +3960,7 @@ def test_a_lane_with_no_ladder_pays_no_state_write_for_the_clear(rig, monkeypatc
                         lambda path, m, **kw: writes.append(1) or real(path, m, **kw))
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
-    seed_issue(rig, "i5", status="parked", num=5)          # no ladder at all
+    seed_issue(rig, "i5", status="parked", num=5, **ladder)   # absent, and an honest zero
     _teardown_rig(rig, "i5")
 
     writes.clear()

@@ -2264,9 +2264,10 @@ class Runner:
         calls any present non-int corrupt — `null` by name — and fails closed to the park, so a
         falsy-corrupt value (None, "", False, []) would park the lane on its first tick with zero
         deferrals actually attempted. Under a `if not ...` guard THIS repair would then skip exactly
-        those values, and no other path rewrites the field: the owner would clear the lock, the
-        rebuild would run, and the next one would park instantly again, forever. Only an honest int
-        0 (or an absent key) may be left alone."""
+        those values, and nothing else on the rebuild route rewrites the field (only
+        _exec_resume_at_gate does, and a lane with no report never reaches it): the owner would
+        clear the lock, the rebuild would run, and the next one would park instantly again,
+        forever. Only an honest int 0 (or an absent key) may be left alone."""
         v = self._issue_field(iid, "teardown_deferrals", 0)
         if type(v) is int and v == 0:
             return

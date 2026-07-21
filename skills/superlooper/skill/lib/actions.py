@@ -631,7 +631,9 @@ def _teardown_deferral_memo(ist, iid, corrupt=False, reapproved=False):
     # fallback above exists to avoid, relocated one field over.
     lock_text = f"`{lock}`" if lock_known else \
         f"the lane's worker.{iid}.lock file in superlooper's state dir"
-    how_many = ("refused to prune this lane's worktree" if corrupt else
+    # No count in the corrupt case, and no past tense either: a corrupt counter parks on sight, so
+    # this episode may have attempted no prune at all. "will not prune" is true either way.
+    how_many = ("will not prune this lane's worktree" if corrupt else
                 f"refused {TEARDOWN_DEFERRAL_CAP} consecutive times to prune this lane's worktree")
     if reapproved:
         lead = (f"re-approved, but NOTHING WAS RETRIED and the lane is handed straight back: "
@@ -645,14 +647,14 @@ def _teardown_deferral_memo(ist, iid, corrupt=False, reapproved=False):
                 f"{how_many} rather than unlink a running worker's cwd (a pruned cwd kills the "
                 f"next hook spawn outright — the D14 mechanism #149 exists to stop). Nothing is "
                 f"wrong with the refusal; what is wrong is that it cannot end on its own.")
-    # The corruption is its own fact and belongs on BOTH leads: it says the count above is the cap
-    # rather than a real tally, and it points at a second thing to look at (a damaged state file).
-    # Spliced into the count clause instead, it read as "so the teardown-deferral counter is
-    # unreadable to prune this lane's worktree" — the one owner-facing artifact this issue exists
-    # to produce, ungrammatical, with its actual signal buried.
+    # The corruption is its own fact and belongs on BOTH leads: it explains why no count is quoted
+    # above, and it points at a second thing to look at (a damaged state file). Spliced into the
+    # count clause instead, it read as "so the teardown-deferral counter is unreadable to prune
+    # this lane's worktree" — the one owner-facing artifact this issue exists to produce,
+    # ungrammatical, with its actual signal buried.
     damaged = (" superlooper's own teardown-deferral counter for this lane is UNREADABLE (a "
-               "wrong-typed value in its state file), which is why it stopped here rather than "
-               "counting further — that state file wants a look too." if corrupt else "")
+               "wrong-typed value in its state file), so it stopped here rather than counting at "
+               "all — that state file wants a look too." if corrupt else "")
     if known:
         check = f"Check with `ps -p {pid}`"
     elif lock_known:

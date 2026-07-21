@@ -16,6 +16,7 @@ Contract highlights under test:
     nothing here ever asks a worker to move a label.
 """
 import copy
+import re
 
 import pytest
 
@@ -708,12 +709,20 @@ def test_a_refused_re_approval_on_a_corrupt_counter_still_reports_the_corruption
     assert "NOTHING WAS RETRIED" in memo and "UNREADABLE" in memo
 
 
-def test_a_memo_with_no_recorded_lock_path_never_quotes_prose_as_a_command():
-    # The pid fallback's own defect class, one field over: backticks belong around a real path only.
-    dsk = _deferred(teardown_deferral_lock=None)
-    memo = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")[0]["memo"]
-    assert "`the lane's" not in memo and "cat the lane's" not in memo
-    assert "worker.i5.lock" in memo          # still names WHAT to look for
+@pytest.mark.parametrize("stamps", [{}, {"teardown_deferral_pid": None},
+                                    {"teardown_deferral_lock": None},
+                                    {"teardown_deferral_pid": None,
+                                     "teardown_deferral_lock": None}])
+def test_every_code_span_in_the_memo_is_something_the_owner_can_actually_run(stamps):
+    # Asserted on SHAPE, not on wording: a test that names only the post-fix prose passes against
+    # the very defect it is meant to pin (the old fallback wrapped `the state dir's worker.i5.lock`
+    # in backticks — un-runnable, and invisible to a "the new words are present" check). Every
+    # backticked span must be a command or a real path, whatever the memo happens to say.
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=_deferred(**stamps)), "park")[0]["memo"]
+    spans = re.findall(r"`([^`]+)`", memo)
+    assert spans, "a hand-back with nothing to run is not actionable"
+    assert all(s.startswith(("ps -p ", "cat /", "/")) for s in spans), spans
+    assert "worker.i5.lock" in memo          # ...and it still names WHAT to look for
 
 
 def test_a_corrupt_deferral_counter_with_no_live_lock_still_rebuilds():
