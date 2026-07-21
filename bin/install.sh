@@ -17,11 +17,16 @@
 # is the fence that makes `skills/**` a bright line trustworthy: the engine is supervised-only, and
 # no engine change reaches a live loop without a human saying so here.
 #
-# CANONICAL PUBLISH PATH: this repo-root bin/install.sh is the ONE installer to run — the gated
-# one. The engine ALSO carries its own older installer at skills/superlooper/bin/install.sh (kept
-# byte-for-byte from when the engine was a standalone repo); that copy publishes the SAME payload
-# to the SAME ~/.claude location but WITHOUT this gate. Always publish through THIS script — the
-# nested one is standalone-era dev tooling, not a second publish door to use.
+# THE ONLY PUBLISH PATH: this repo-root bin/install.sh is the one door into ~/.claude/skills, and
+# nothing else in the repo writes there (issue #197). The engine's standalone-era nested installer
+# at skills/superlooper/bin/install.sh once published the same payload to the same location with no
+# gate; it is now a tombstone that refuses and points here. Two mechanical guards keep it that way:
+# skills/superlooper/tests/test_install.py drives the tombstone, and
+# skills/superlooper/tests/test_one_publish_door.py fails if ANY script but this one names — or
+# writes to — the installed-skill home. That fence also pins the SHAPE of this script's own gate
+# (engine diff, explicit OK, the TTY test, consent defaulting to false) so the pieces cannot be
+# deleted quietly. It reads for those strings; it does not execute the gate, so it is a tripwire
+# against removal, not a proof the gate still behaves.
 #
 # Idempotent: re-running re-syncs the payload, never duplicates a hook or the shim block, and leaves
 # an unchanged settings.json byte-for-byte. --dry-run prints what WOULD change (including the gate

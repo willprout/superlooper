@@ -10,6 +10,8 @@ Codex is available with `superlooper run --agent codex`.
 - **Implementation plan:** `PLAN-2026-07-02-superlooper-v1.md`
 - **Project rules:** `CLAUDE.md`
 
-Source lives here. `~/.claude/skills/superlooper` is a published copy, created only by
-`bin/install.sh` — which also links a stable `superlooper` command onto your PATH (a thin shim
-pointing at the installed copy), so the bare invocations in the docs resolve after a publish.
+Source lives here. `~/.claude/skills/superlooper` is a published copy, created only by the
+**repo-root** `bin/install.sh` — run it from the monorepo root, not from this directory, where
+`bin/install.sh` is the standalone-era tombstone that refuses. The gated installer also links a
+stable `superlooper` command onto your PATH (a thin shim pointing at the installed copy), so the
+bare invocations in the docs resolve after a publish.

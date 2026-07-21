@@ -105,12 +105,16 @@ PR #4).*
 
 ## Migration follow-ups (2026-07-08 monorepo cross-review; each is a deliberate accept or a known follow-up)
 
-- **Second, un-gated publish door (accepted by William).** The engine's own
-  `skills/superlooper/bin/install.sh` publishes the same payload to the same `~/.claude` as
-  the gated root `bin/install.sh`, but with no gate — and running it resets the gated one's
-  VERSION baseline. Left deliberately (engine byte-for-byte untouched at migration); root
-  installer documented as canonical. To harden later: neuter/redirect the nested script +
-  update `skills/superlooper/tests/test_install.py`.
+- **Second, un-gated publish door — CLOSED (issue #197).** The engine's own
+  `skills/superlooper/bin/install.sh` used to publish the same payload to the same `~/.claude`
+  as the gated root `bin/install.sh` but with no gate, and running it reset the gated one's
+  VERSION baseline. It is now a tombstone that refuses and points at the root installer
+  (`skills/superlooper/tests/test_install.py` drives it). The general form shipped with #197:
+  `skills/superlooper/tests/test_one_publish_door.py` fails if ANY script but the gated door
+  names or writes to the installed-skill home, so a *new* second door cannot appear either.
+  Not covered by that fence, and filed as issue #280: `install-launch-shim.sh` and
+  `install-cli-link.sh` carry executable shell into `~/.superlooper` / `PATH` and are runnable
+  standalone, outside the gate.
 - **Fence flags, doesn't hard-stop, for config/CI paths.** The gate only flags an out-of-lane
   wander (journal + morning report); it does not block the merge — and unlike the engine
   (inert until republish), `.superlooper/**` / `.github/workflows/**` changes are live

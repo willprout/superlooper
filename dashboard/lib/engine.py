@@ -59,10 +59,12 @@ import pollers
 # different question than the remedy performs. tests/test_engine.py pins the two together.
 PAYLOAD_REL = "skills/superlooper/skill"
 
-# The one remedy this names: the GATED installer at the repo root. Deliberately NOT the engine's own
-# nested copy (skills/superlooper/bin/install.sh), which publishes the same payload WITHOUT the diff
-# gate — a banner that sent the owner through the ungated door would be helping him skip his own
-# fence, which is the opposite of this module's job.
+# The one remedy this names: the GATED installer at the repo root — which, since issue #197, is the
+# only script in the repo that writes into ~/.claude/skills at all (the engine's standalone-era
+# nested copy at skills/superlooper/bin/install.sh is a refusing tombstone, and
+# skills/superlooper/tests/test_one_publish_door.py fails if a second door ever appears). A banner
+# that sent the owner around his own fence would be the opposite of this module's job, so there is
+# deliberately no other path to name here.
 REMEDY = "bin/install.sh"
 
 VERSION_FILE = "VERSION"

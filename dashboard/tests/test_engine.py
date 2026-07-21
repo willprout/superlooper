@@ -109,8 +109,10 @@ def test_the_banner_scopes_the_same_payload_the_installer_publishes():
 
 
 def test_the_named_remedy_is_the_gated_installer_that_actually_exists():
-    # The remedy is a real, runnable path from the monorepo root — and specifically the GATED one,
-    # not the engine's ungated nested copy (which would walk the owner around his own fence).
+    # The remedy is a real, runnable path from the monorepo root — and specifically the GATED one.
+    # Since issue #197 it is also the ONLY script that writes into ~/.claude/skills; the engine's
+    # standalone-era nested copy is a refusing tombstone, and the one-door fence in the engine suite
+    # (tests/test_one_publish_door.py) fails if another writer appears for this to name by mistake.
     assert (_MONOREPO / engine.REMEDY).is_file()
     assert engine.REMEDY == "bin/install.sh"
 
