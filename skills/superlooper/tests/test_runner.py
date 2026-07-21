@@ -5302,20 +5302,25 @@ def test_a_standing_throttle_says_it_once_then_speaks_again_for_the_NEXT_episode
     # dependency), the stale stamp must be corrected, or the ledger's dedup would silence episode #2
     # outright: exactly the silence #172 exists to end.
     _unblock_the_fixture_world(rig)
-    _throttle_the_closed_list(rig, times=1)
-    for i in range(4):                                  # one episode, four ticks
-        rig.r.tick(now=NOW + i * 20)
+    _throttle_the_closed_list(rig, times=99)            # the throttle STANDS across polls
+    # Ticks spaced past GH_POLL_SECONDS so these are four real POLLS, not one cached view replayed
+    # (second review round P2-6: at 20s apart only the first tick would have polled, which would
+    # have tested decide's per-tick dedup rather than a standing outage). The extra +15 tick covers
+    # the within-one-poll-window case too.
+    for t in (NOW, NOW + 100, NOW + 115, NOW + 220, NOW + 340):
+        rig.r.tick(now=t)
     held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
     assert len(held) == 1 and held[0]["outcome"].startswith("the closed-issue list read did not land")
 
     # #101/#102 re-open (the dependency is real again) and the read lands: the stamp is corrected...
+    (rig.fixdir / "fail_rules.json").write_text("[]")
     (rig.fixdir / "issue_list_closed.json").write_text(json.dumps([{"number": 41}, {"number": 52}]))
-    rig.r.tick(now=NOW + 200)
+    rig.r.tick(now=NOW + 460)
     corrected = issue_state(rig, "i103")["launch_hold_reason"]
     assert "not confirmed closed" in corrected and "did not land" not in corrected
     # ...so when the throttle returns, episode #2 is NOT swallowed by the dedup.
     _throttle_the_closed_list(rig)
-    rig.r.tick(now=NOW + 400)
+    rig.r.tick(now=NOW + 580)
     held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
     assert len(held) == 3                               # episode 1, the correction, episode 2
     assert held[-1]["outcome"].startswith("the closed-issue list read did not land")
