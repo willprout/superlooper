@@ -2131,7 +2131,7 @@ class Runner:
                 return False
             time.sleep(WORKER_EXIT_POLL)
 
-    def _settle_merged_lane(self, iid):
+    def _settle_merged_lane(self, iid, exit_timeout=None):
         """End the session of a lane that has settled TERMINAL-GOOD (merged, or closed by the owner)
         and reclaim its checkout — each under its OWN knob (issue #178).
 
@@ -2160,6 +2160,11 @@ class Runner:
         worktree, so the checkout stays on disk for manual inspection). Prune knob off -> the session
         ends and the checkout stays, which is what that knob's name promised all along.
 
+        Under the prune knob this waits on a worker that is normally already dying, but it is a real
+        bound: N lanes settling in one tick can cost N x WORKER_EXIT_TIMEOUT of tick latency. The
+        default config has always paid exactly that on the same lanes, and the drain re-entry probes
+        once rather than waiting, so no sweep pays it per lane.
+
         The keep-the-checkout path still WAITS on the worker's exit (`await_exit=True`) even though
         it prunes nothing, and that is not belt-and-braces: ending the session is this path's whole
         job, and `_close_pane` is best-effort by contract (rc ignored, a missing pane record is a
@@ -2168,28 +2173,47 @@ class Runner:
         needs to close the window, the lock the liveness tiers read — was deleted in the same breath.
         Observing the pid go is the only thing that makes "the session ended" true.
 
-        And on the keep-the-checkout path the declined-prune marker is DROPPED rather than written:
-        `_drain_pending_teardowns` retries markers with remove_worktree=True unconditionally, so a
-        marker left by an EARLIER decline on this lane (a re-approval that could not clear it, the
-        opt-in parked reaper) would, one tick after this settle cleared the lock, prune the very
-        checkout the operator asked to keep — and prune it with no live pid left to refuse it, which
-        is the #149 guarantee itself. Under this knob no prune is ever wanted, so the retry vehicle
-        must not survive the settle.
+        The declined-teardown marker (state/pending_teardown/<id>) is this method's to keep or drop,
+        because under these knobs it no longer means one fixed thing. _drain_pending_teardowns retries
+        a marker by tearing down, and for a merged lane it retries THROUGH HERE — a bare
+        remove_worktree=True retry would prune a checkout `cleanup_merged_worktrees: false` asked to
+        keep and close a window `auto_close_merged_windows: false` asked to keep, one tick after the
+        settle, behind the operator's back and with no live pid left to refuse it (the #149 guarantee
+        itself). So:
+
+          window knob off   -> nothing is owed on this lane ever again: DROP any marker an earlier
+                               decline left (a re-approval that could not clear the lane, the opt-in
+                               parked reaper, a #190 reclaim refusal — that last one keeps its marker
+                               indefinitely, and the drain's stale-marker sweep only fires for
+                               NON-terminal lanes, which a park->merged absorb_close never passes
+                               through). Without this drop the drain would honor neither knob.
+          settle succeeded  -> nothing is owed: drop it (the prune path drops its own inside
+                               _teardown_session; the keep-checkout path drops it here).
+          settle declined   -> the CLOSE is still owed, so RECORD it. The drain re-enters here every
+                               tick until the builder is gone. Without the record the keep-checkout
+                               config would be strictly weaker than the default one: a close that did
+                               not kill the builder would leave it building against a merged branch
+                               with nothing retrying and nothing journaled.
+
+        `exit_timeout` is threaded for that drain re-entry alone: the drain sweeps every marker on
+        every tick and must not pay a per-lane stall, so it probes once (0) instead of waiting.
 
         Returns _teardown_session's bool (False = a live worker still holds the lane), or False when
-        the window knob is off and nothing was attempted. No caller acts on it today. A declined
-        prune retries via _drain_pending_teardowns as everywhere else; a declined CLOSE on the
-        keep-the-checkout path has no retry by design — it clears nothing, so the window, its markers
-        and the lock all survive and `superlooper tidy` remains the owner's working escape hatch,
-        exactly the posture this config had before the split."""
+        the window knob is off and nothing was attempted. No caller acts on it today."""
+        marker = os.path.join(self.state, "pending_teardown", iid)
         if not self.config.get("auto_close_merged_windows", True):
+            _rm(marker)
+            self._reclaim_held.pop(iid, None)   # marker dropped without a prune: re-journal later
             return False
         keep_checkout = not self.config.get("cleanup_merged_worktrees", True)
-        ok = self._teardown_session(iid, remove_worktree=not keep_checkout, await_exit=True)
+        ok = self._teardown_session(iid, remove_worktree=not keep_checkout, await_exit=True,
+                                    exit_timeout=exit_timeout)
         if keep_checkout:
-            # unconditional, `ok` or not: a decline leaves the lock on disk naming the live pid, so
-            # the drain would merely defer again today — and prune the moment that worker dies.
-            _rm(os.path.join(self.state, "pending_teardown", iid))
+            if ok:
+                _rm(marker)
+                self._reclaim_held.pop(iid, None)
+            else:
+                self._defer_teardown(iid, self._lock_pid(iid))    # the close is owed, not a prune
         return ok
 
     def _close_pane(self, iid):
@@ -2244,18 +2268,19 @@ class Runner:
         worker" and prune under the CLI anyway, reintroducing the bug one tick later. Leaving the
         lane fully intact costs a retry on a later tick and nothing else.
 
-        `remove_worktree=False` is the D4 relaunch close: it prunes nothing, so it has nothing to
-        protect and does not wait (a relaunch must not pay a stall for a pid it is about to
-        supersede). That path's behavior is byte-for-byte what it was before this function existed.
+        `remove_worktree=False` is the D4 relaunch close: it prunes nothing, so (unless the caller
+        asks for a wait — see `await_exit`) it has nothing to protect and does not wait, a relaunch
+        must not pay a stall for a pid it is about to supersede. That path's behavior is byte-for-byte
+        what it was before this function existed.
 
-        `await_exit` defaults to remove_worktree — waiting is the prune's precondition — and exists
-        for the ONE caller that prunes nothing yet still needs the exit observed: the keep-the-
-        checkout settle of a merged lane (_settle_merged_lane, #178). There, ending the session IS
-        the action, and _close_pane is best-effort (rc ignored, a missing pane record a silent
-        no-op), so without the wait a failed close would be recorded as a session ended while the
-        markers and lock that are the only handles on the survivor were deleted. Note what a decline
-        then means for that caller: no worktree is at stake, so NO deferral marker is written — the
-        drain retries markers by PRUNING, which is the one thing that config forbids.
+        `await_exit` can only ADD a wait to the one a prune already implies, and exists for the ONE
+        caller that prunes nothing yet still needs the exit observed: the keep-the-checkout settle of
+        a merged lane (_settle_merged_lane, #178). There, ending the session IS the action, and
+        _close_pane is best-effort (rc ignored, a missing pane record a silent no-op), so without the
+        wait a failed close would be recorded as a session ended while the markers and lock that are
+        the only handles on the survivor were deleted. Note what a decline then means for that
+        caller: no worktree is at stake, so no PRUNE is owed and none is recorded here — the settle
+        records the owed CLOSE itself, because the marker's meaning is that caller's to choose.
 
         `exit_timeout=0` probes once and never sleeps — for callers with no deadline (the parked
         reaper, which sweeps EVERY parked lane on EVERY tick and so must not pay a per-lane stall;
@@ -2276,7 +2301,10 @@ class Runner:
         conflating its rc with "a worker is alive" would abort rebuilds over a git hiccup."""
         pid = self._lock_pid(iid)                          # BEFORE step 3 clears the lock
         self._close_pane(iid)
-        wait = remove_worktree if await_exit is None else bool(await_exit)
+        # OR, never a ternary: await_exit may only ADD a wait. `remove_worktree=True,
+        # await_exit=False` must not be expressible — that is a prune with no liveness check, the
+        # #149 violation itself, and a future caller should not be able to write it by accident.
+        wait = remove_worktree or bool(await_exit)
         if wait and not self._await_worker_exit(iid, pid, timeout=exit_timeout):
             if remove_worktree:                            # only a declined PRUNE has a retry here
                 self._defer_teardown(iid, pid)
@@ -2408,11 +2436,20 @@ class Runner:
             status = rec.get("status") if isinstance(rec, dict) else None
             if not isinstance(status, str):
                 continue                                   # unknown lane: fail closed, keep waiting
-            if status in actions.TERMINAL_STATUSES:
+            if status == "merged":
+                # (#178) A merged lane's teardown is KNOB-GATED, so retry it through the same settle
+                # that decided it. Retrying with a bare remove_worktree=True would prune a checkout
+                # `cleanup_merged_worktrees: false` asked to keep and close a window
+                # `auto_close_merged_windows: false` asked to keep — behind the operator's back, and
+                # with no live pid left to refuse it once the settle cleared the lock. Under the
+                # shipped defaults this is the same call as the branch below (a merged lane never
+                # guards), so the merge-path cleanup this drain exists to retry is untouched.
+                self._settle_merged_lane(iid, exit_timeout=0)
+            elif status in actions.TERMINAL_STATUSES:
                 # (#190) Inherit the reaper's unsaved-work guard for park-family lanes: a declined
                 # prune deferred here can be a parked lane whose worktree still holds the only copy
                 # of its work. A MERGED lane never guards — its work is on the mainline by
-                # definition — so the merge-path cleanup this drain exists to retry is untouched.
+                # definition.
                 guard = status in actions.REAPPROVAL_STATUSES
                 self._teardown_session(iid, remove_worktree=True, exit_timeout=0, guard_worktree=guard)
             else:
