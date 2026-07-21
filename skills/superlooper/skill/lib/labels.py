@@ -72,8 +72,16 @@ _SPEC = {name: (color, desc) for name, color, desc in LABELS}
 # hand-back that writes the NEW label fails and re-notifies forever (the 2026-07-13 bounce storm,
 # ~15 texts). Renaming in place PRESERVES it on every issue that carries it, unlike creating a fresh
 # new-name label and orphaning the old one.
-_RENAME_OLD = "needs-william"
-_RENAME_NEW = "needs-owner"
+# Retired label name -> the name that replaced it. PUBLIC because it is the only record of the
+# loop's dead vocabulary, and the doc-lint (issue #199, defect class D12) needs it: an ops doc that
+# describes today's behaviour in a retired name sends the reader hunting a label the runner never
+# writes. Keeping the map here — beside LABELS — means the lint reads the same source of truth the
+# migration does, and a future rename is one edit, not two.
+RETIRED_LABELS = {
+    "needs-william": "needs-owner",
+}
+
+_RENAME_OLD, _RENAME_NEW = next(iter(RETIRED_LABELS.items()))
 
 
 def runner_managed_labels():

@@ -1,0 +1,338 @@
+"""The ops docs ride the gated publish, and the doctor says so (issue #199, defect class D12).
+
+The third of D12 the doc-lint cannot reach: "the debugger playbook wasn't installed on the machine
+having the incident". A lint keeps the docs TRUE; it cannot put them on the machine. After the
+plugin restructure the playbook and runner-ops travel as plugin CONTENT, which means a machine that
+runs the loop but never installed the plugin — or whose plugin is disabled, which `doctor --stack`
+already only WARNs about — has no playbook at 3am. The unattended debugger brief tells the session
+to follow `references/unattended-contract.md`; on that machine there is nothing to follow.
+
+So the gated `bin/install.sh` now MIRRORS the operational docs into the installed engine home
+alongside the payload it already publishes, and `doctor --stack` verifies they are there and carry
+the current publish stamp.
+
+Two design points worth stating, because both are load-bearing:
+
+  * **One home in the repo, a mirror on the machine.** The plugin restructure moved skill content
+    out of the engine payload deliberately — "moved, never copied — one home, no drift, no
+    double-load". That still holds: ``plugin/`` remains the only place these files are EDITED. The
+    installer copies them out at publish time, the same way it copies the payload, so the mirror is
+    a build product that cannot drift from its source by more than one publish.
+  * **The playbook lands as PLAYBOOK.md, not SKILL.md.** A file named SKILL.md under
+    ``~/.claude/skills/`` risks being discovered as a second, stale copy of the sl-debugger skill —
+    exactly the double-load the restructure closed. Renaming it in the mirror makes the reference
+    copy unmistakably a reference copy. Its ``references/`` links are relative and survive intact.
+"""
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+import ops_docs
+import stack_doctor
+
+_ENGINE = Path(__file__).resolve().parent.parent          # skills/superlooper
+_REPO = Path(__file__).resolve().parents[3]               # the monorepo root
+_INSTALLER = _REPO / "bin" / "install.sh"
+
+
+# --------------------------------------------------------------------------------------------
+# The doc set
+# --------------------------------------------------------------------------------------------
+
+def test_every_mirrored_source_exists_in_the_repo():
+    missing = [src for src, _dst in ops_docs.OPS_DOCS if not (_REPO / src).is_file()]
+    assert not missing, "ops_docs names sources that are not in the repo: %s" % missing
+
+
+def test_the_whole_debugger_playbook_ships_not_just_its_entry_page():
+    """Glob-vs-list: a reference page added to the playbook must be mirrored too.
+
+    The playbook is only useful whole — SKILL.md routes to the four references, and the unattended
+    contract (the one that constrains what a 3am session may touch) is one of them. A hand-written
+    list that silently falls behind the directory is the same rot the doc-lint exists to stop, so
+    it is checked here rather than trusted.
+    """
+    on_disk = {p.relative_to(_REPO).as_posix()
+               for p in (_REPO / "plugin" / "skills" / "sl-debugger").rglob("*.md")}
+    mirrored = {src for src, _dst in ops_docs.OPS_DOCS}
+    assert on_disk, "the sl-debugger playbook has moved — this guard is looking at nothing"
+    assert on_disk <= mirrored, (
+        "playbook pages that would NOT reach an installed machine: %s"
+        % sorted(on_disk - mirrored))
+
+
+def test_the_operator_facing_ops_docs_ship():
+    mirrored = {src for src, _dst in ops_docs.OPS_DOCS}
+    for rel in ("skills/superlooper/docs/STACK.md",
+                "plugin/skills/superlooper/references/runner-ops.md",
+                "plugin/skills/sl-debugger/SKILL.md",
+                "plugin/skills/sl-debugger/references/unattended-contract.md"):
+        assert rel in mirrored, "%s must ship with the engine publish" % rel
+
+
+def test_no_mirror_target_is_named_skill_md():
+    """A SKILL.md under the installed skills home could be discovered as a second sl-debugger."""
+    bad = [dst for _src, dst in ops_docs.OPS_DOCS if Path(dst).name == "SKILL.md"]
+    assert not bad, ("mirror targets named SKILL.md risk a double-loaded skill: %s" % bad)
+    assert ("plugin/skills/sl-debugger/SKILL.md", "sl-debugger/PLAYBOOK.md") in ops_docs.OPS_DOCS
+
+
+def test_mirror_targets_are_unique_and_relative():
+    targets = [dst for _src, dst in ops_docs.OPS_DOCS]
+    assert len(targets) == len(set(targets)), "two sources mirror onto the same target"
+    for dst in targets:
+        assert not os.path.isabs(dst) and ".." not in Path(dst).parts, dst
+
+
+# --------------------------------------------------------------------------------------------
+# publish()
+# --------------------------------------------------------------------------------------------
+
+def test_publish_writes_every_doc_and_the_stamp(tmp_path):
+    dest = tmp_path / "installed"
+    dest.mkdir()
+    written = ops_docs.publish(_REPO, dest, "abc1234 2026-07-21")
+
+    assert sorted(written) == sorted(dst for _src, dst in ops_docs.OPS_DOCS)
+    for src, dst in ops_docs.OPS_DOCS:
+        landed = Path(ops_docs.mirror_dir(dest)) / dst
+        assert landed.is_file(), "%s did not land at %s" % (src, dst)
+        assert landed.read_text(encoding="utf-8") == (_REPO / src).read_text(encoding="utf-8")
+    assert Path(ops_docs.stamp_path(dest)).read_text(encoding="utf-8").strip() == "abc1234 2026-07-21"
+
+
+def test_publish_clears_a_stale_mirror_and_is_idempotent(tmp_path):
+    dest = tmp_path / "installed"
+    dest.mkdir()
+    ops_docs.publish(_REPO, dest, "old 2026-01-01")
+    orphan = Path(ops_docs.mirror_dir(dest)) / "retired-page.md"
+    orphan.write_text("a doc that no longer exists upstream\n", encoding="utf-8")
+
+    first = ops_docs.publish(_REPO, dest, "new 2026-07-21")
+    second = ops_docs.publish(_REPO, dest, "new 2026-07-21")
+
+    assert first == second
+    assert not orphan.exists(), "a stale mirrored page survived a republish"
+    assert Path(ops_docs.stamp_path(dest)).read_text(encoding="utf-8").strip() == "new 2026-07-21"
+
+
+def test_publish_refuses_a_missing_source(tmp_path, monkeypatch):
+    dest = tmp_path / "installed"
+    dest.mkdir()
+    monkeypatch.setattr(ops_docs, "OPS_DOCS",
+                        (("plugin/skills/sl-debugger/NOPE.md", "sl-debugger/NOPE.md"),))
+    with pytest.raises(ops_docs.MissingOpsDoc):
+        ops_docs.publish(_REPO, dest, "abc1234 2026-07-21")
+
+
+def test_publish_never_escapes_the_mirror_directory(tmp_path):
+    """Everything publish() touches lives under <dest>/docs/ops — it is not a general copier."""
+    dest = tmp_path / "installed"
+    dest.mkdir()
+    (dest / "VERSION").write_text("abc1234 2026-07-21\n", encoding="utf-8")
+    (dest / "lib").mkdir()
+    (dest / "lib" / "gate.py").write_text("payload\n", encoding="utf-8")
+
+    ops_docs.publish(_REPO, dest, "abc1234 2026-07-21")
+
+    assert (dest / "lib" / "gate.py").read_text(encoding="utf-8") == "payload\n"
+    assert (dest / "VERSION").read_text(encoding="utf-8") == "abc1234 2026-07-21\n"
+    assert sorted(p.name for p in dest.iterdir()) == ["VERSION", "docs", "lib"]
+
+
+def test_expected_paths_covers_every_doc_plus_the_stamp(tmp_path):
+    dest = tmp_path / "installed"
+    expected = set(ops_docs.expected_paths(dest))
+    assert ops_docs.stamp_path(dest) in expected
+    assert len(expected) == len(ops_docs.OPS_DOCS) + 1
+    for _src, dst in ops_docs.OPS_DOCS:
+        assert os.path.join(ops_docs.mirror_dir(dest), *dst.split("/")) in expected
+
+
+def test_list_cli_prints_the_sources_for_the_installer(tmp_path):
+    proc = subprocess.run([sys.executable, str(_ENGINE / "skill" / "lib" / "ops_docs.py"), "--list"],
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    printed = [l for l in proc.stdout.splitlines() if l.strip()]
+    assert printed == [src for src, _dst in ops_docs.OPS_DOCS]
+
+
+def test_publish_cli_mirrors_the_docs(tmp_path):
+    dest = tmp_path / "installed"
+    dest.mkdir()
+    proc = subprocess.run(
+        [sys.executable, str(_ENGINE / "skill" / "lib" / "ops_docs.py"), "--publish",
+         "--repo-root", str(_REPO), "--dest", str(dest), "--version", "abc1234 2026-07-21"],
+        capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert (Path(ops_docs.mirror_dir(dest)) / "sl-debugger" / "PLAYBOOK.md").is_file()
+    assert Path(ops_docs.stamp_path(dest)).is_file()
+
+
+# --------------------------------------------------------------------------------------------
+# The gated installer actually does it
+# --------------------------------------------------------------------------------------------
+
+def _installer_text():
+    return _INSTALLER.read_text(encoding="utf-8")
+
+
+def test_the_gated_installer_publishes_the_ops_docs():
+    text = _installer_text()
+    assert "ops_docs.py" in text, "bin/install.sh must invoke the ops-docs mirror"
+    assert "--publish" in text and "--repo-root" in text, text[-2000:]
+
+
+def test_the_engine_diff_gate_covers_the_ops_doc_sources():
+    """A doc change must be shown at the publish gate, like every other published file.
+
+    The gate's whole promise is "here is what you are about to make live". Mirroring docs the gate
+    never diffed would put content on the machine that the human OK'd without seeing.
+    """
+    text = _installer_text()
+    assert "OPS_DOC_PATHS" in text, "the gate's diff scope must include the ops-doc sources"
+    # The scope is used by BOTH gate branches: the no-baseline ls-files listing and the diff.
+    for anchor in ("ls-files", "diff --name-status"):
+        line = next((l for l in text.splitlines() if anchor in l and "git -C" in l), None)
+        assert line is not None, "lost the %r line in the gate" % anchor
+        assert "$OPS_DOC_PATHS" in line or "${OPS_DOC_PATHS" in line, (
+            "%r scopes the gate to the payload only, so an ops-doc change would publish "
+            "unreviewed: %s" % (anchor, line))
+
+
+def test_the_installer_dry_run_announces_the_ops_docs():
+    text = _installer_text()
+    assert re.search(r"would mirror.*ops docs|ops docs.*would", text, re.IGNORECASE), \
+        "--dry-run must say the ops docs would be mirrored"
+
+
+# --------------------------------------------------------------------------------------------
+# doctor --stack's block
+# --------------------------------------------------------------------------------------------
+
+class FakeProbe:
+    """A probe whose filesystem is a dict — no real ~/.claude, no real binaries."""
+
+    def __init__(self, home="/fake-home", files=None):
+        self.home = home
+        self.env = {"HOME": home}
+        self.files = dict(files or {})
+
+    def command(self, name, envvar=None, default=None):
+        return None
+
+    def run(self, argv, timeout=10):
+        raise AssertionError("check_ops_docs must not run an external binary: %r" % (argv,))
+
+    def exists(self, path):
+        return path in self.files or any(k.startswith(path.rstrip("/") + "/") for k in self.files)
+
+    def read_text(self, path):
+        return self.files.get(path)
+
+    def expanduser(self, path):
+        return path
+
+    def pid_alive(self, pid):
+        return False
+
+
+def _install_home(home="/fake-home"):
+    return os.path.join(home, ".claude", "skills", "superlooper")
+
+
+def _healthy_files(home="/fake-home", version="abc1234 2026-07-21"):
+    dest = _install_home(home)
+    files = {os.path.join(dest, "VERSION"): version + "\n",
+             ops_docs.stamp_path(dest): version + "\n"}
+    for _src, dst in ops_docs.OPS_DOCS:
+        files[os.path.join(ops_docs.mirror_dir(dest), *dst.split("/"))] = "# doc\n"
+    return files
+
+
+def test_ops_docs_block_passes_on_a_freshly_published_machine():
+    result = stack_doctor.check_ops_docs(FakeProbe(files=_healthy_files()))
+    assert result.name == "installed ops docs"
+    assert result.ok and not result.warn, result.detail
+    assert "abc1234" in result.detail
+
+
+def test_ops_docs_block_fails_when_the_playbook_is_absent():
+    files = _healthy_files()
+    playbook = os.path.join(ops_docs.mirror_dir(_install_home()), "sl-debugger", "PLAYBOOK.md")
+    assert playbook in files
+    del files[playbook]
+
+    result = stack_doctor.check_ops_docs(FakeProbe(files=files))
+
+    assert not result.ok, result.detail
+    assert "PLAYBOOK.md" in result.detail
+    assert "install.sh" in result.fix
+
+
+def test_ops_docs_block_fails_when_the_mirror_is_from_an_older_publish():
+    files = _healthy_files(version="new5678 2026-07-21")
+    files[ops_docs.stamp_path(_install_home())] = "old1234 2026-07-01\n"
+
+    result = stack_doctor.check_ops_docs(FakeProbe(files=files))
+
+    assert not result.ok, result.detail
+    assert "old1234" in result.detail and "new5678" in result.detail
+    assert "install.sh" in result.fix
+
+
+def test_ops_docs_block_fails_when_nothing_was_mirrored_at_all():
+    """The state every machine is in until it republishes past this change."""
+    dest = _install_home()
+    result = stack_doctor.check_ops_docs(
+        FakeProbe(files={os.path.join(dest, "VERSION"): "abc1234 2026-07-21\n"}))
+
+    assert not result.ok, result.detail
+    assert "install.sh" in result.fix
+
+
+def test_ops_docs_block_skips_cleanly_when_no_engine_is_installed():
+    """No installed engine at all is another block's problem — never this one's false alarm."""
+    result = stack_doctor.check_ops_docs(FakeProbe(files={}))
+    assert result.ok and not result.warn, result.detail
+    assert "no installed engine" in result.detail.lower()
+
+
+def test_ops_docs_block_warns_when_the_engine_carries_no_stamp_to_compare():
+    files = _healthy_files()
+    dest = _install_home()
+    del files[os.path.join(dest, "VERSION")]
+
+    result = stack_doctor.check_ops_docs(FakeProbe(files=files))
+
+    assert result.ok and result.warn, result.detail
+    assert "stamp" in result.detail.lower()
+
+
+def test_check_stack_emits_the_ops_docs_block():
+    names = [r.name for r in stack_doctor.check_stack({}, probe=FakeProbe(files=_healthy_files()),
+                                                      sender=lambda *a, **k: None,
+                                                      announce=lambda *a, **k: None)]
+    assert "installed ops docs" in names
+    assert len(names) == len(set(names)), "duplicate block name in check_stack"
+
+
+# --------------------------------------------------------------------------------------------
+# The brief the 3am session actually reads
+# --------------------------------------------------------------------------------------------
+
+def test_the_unattended_brief_names_the_installed_playbook_fallback():
+    """D12's actual failure: the brief said "follow the skill" on a machine with no skill.
+
+    The brief must name a path that exists on a machine the gated installer has published to, so a
+    session whose plugin is missing or disabled can still read the contract it is being held to.
+    """
+    brief = (_ENGINE / "skill" / "templates" / "debugger-brief.md").read_text(encoding="utf-8")
+    assert "unattended-contract.md" in brief
+    assert "docs/ops/sl-debugger" in brief, (
+        "the unattended brief must route to the installed ops-docs mirror when the sl-debugger "
+        "skill is not on the machine")

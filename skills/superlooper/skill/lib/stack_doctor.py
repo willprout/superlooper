@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import config as config_lib
 import notify
+import ops_docs
 
 
 _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
@@ -507,17 +508,28 @@ def check_runner_anchor(probe, config):
 ENGINE_PAYLOAD_REL = "skills/superlooper/skill"       # mirrors bin/install.sh PAYLOAD_REL
 
 
+def _installed_home(probe):
+    """The installed engine home ($HOME/.claude/skills/superlooper) as this probe sees it."""
+    return os.path.join(probe.home, ".claude", "skills", "superlooper")
+
+
+def _first_token(text):
+    """The first whitespace-separated token of a VERSION stamp (`<sha> <date>`), or None.
+
+    Both stamps the doctor compares — the engine's and the ops-doc mirror's — carry the source
+    commit first and the publish date second; only the commit identifies the publish."""
+    if not _nonempty_string(text):
+        return None
+    parts = text.split()
+    return parts[0] if parts else None
+
+
 def _installed_version_sha(probe):
     """First token of the installed VERSION stamp ($HOME/.claude/skills/superlooper/VERSION) — the
     source commit bin/install.sh recorded at the last publish (`<sha> <date>`, or `nogit <date>` for
     a non-git payload). None when the stamp is missing/empty (never published, or a pre-stamp
     install). Read via probe so tests inject the file without a real ~/.claude."""
-    path = os.path.join(probe.home, ".claude", "skills", "superlooper", "VERSION")
-    text = probe.read_text(path)
-    if not _nonempty_string(text):
-        return None
-    parts = text.split()
-    return parts[0] if parts else None
+    return _first_token(probe.read_text(os.path.join(_installed_home(probe), "VERSION")))
 
 
 def _git(probe):
@@ -640,6 +652,76 @@ def check_engine_drift(probe, repo_path=None, dev_branch="main"):
     if d["status"] in ("behind", "unknown"):
         return CheckResult(name, True, d["detail"], warn=True)
     return CheckResult(name, True, d["detail"])           # in_sync / skipped -> a plain ok line
+
+
+# --- installed operational docs (issue #199, defect class D12) ----------------------------------
+# D12: "the debugger playbook wasn't installed on the machine having the incident". The gated
+# bin/install.sh now mirrors the ops docs into the installed engine home (see lib/ops_docs.py); this
+# block is the half that notices when it did not, or when the mirror is left over from an older
+# publish. Deliberately a FAIL, not a WARN, unlike the sibling `superlooper plugin` line: that one
+# is about session QUALITY (a self-contained brief still works without the skills), while this one
+# is about whether an unattended 3am repair session can read the contract it is being held to. The
+# cure is one command, and it is the same command the operator was going to run anyway.
+
+_OPS_DOCS_FIX = ("Republish through the gated `bin/install.sh` from a superlooper source checkout "
+                 "— it mirrors the ops docs into the installed engine home and stamps them.")
+
+
+def check_ops_docs(probe):
+    """doctor --stack's installed-ops-docs line.
+
+    Four states, in the order they are decided:
+
+      1. **No installed engine home at all** — a plain ok. Another block (the launch shim, the
+         activity hooks) already names that machine's real problem, and the doctor never invents a
+         second alarm for one cause.
+      2. **Docs missing** — FAIL, naming the first few absentees. This is the state every machine
+         is in until it republishes past this change, and the fix line says exactly that.
+      3. **Docs present, stamps disagree** — FAIL. The mirror survived from an older publish, so at
+         least one page describes an engine that is no longer the one running.
+      4. **Docs present, engine carries no stamp to compare** — WARN. A hand-copied or pre-stamp
+         install; we never assert a mismatch we could not actually read.
+    """
+    name = "installed ops docs"
+    dest = _installed_home(probe)
+    if not probe.exists(dest):
+        return CheckResult(
+            name, True,
+            "no installed engine at %s — nothing published on this machine yet, so there are no "
+            "ops docs to check (the launch shim / hooks blocks name the real problem)." % dest)
+
+    missing = [p for p in ops_docs.expected_paths(dest) if not probe.exists(p)]
+    if missing:
+        shown = ", ".join(os.path.basename(p) for p in missing[:4])
+        more = "" if len(missing) <= 4 else " (+%d more)" % (len(missing) - 4)
+        return CheckResult(
+            name, False,
+            "%d of %d ops-doc files are missing from %s: %s%s — an unattended sl-debugger session "
+            "on this machine has no playbook to follow."
+            % (len(missing), len(ops_docs.expected_paths(dest)), ops_docs.mirror_dir(dest),
+               shown, more),
+            _OPS_DOCS_FIX)
+
+    mirror_stamp = _first_token(probe.read_text(ops_docs.stamp_path(dest)))
+    engine_stamp = _installed_version_sha(probe)
+    if engine_stamp is None:
+        return CheckResult(
+            name, True,
+            "ops docs present at %s (stamp %s), but the installed engine carries no VERSION stamp "
+            "to compare against — cannot confirm they came from the same publish."
+            % (ops_docs.mirror_dir(dest), mirror_stamp or "none"),
+            warn=True)
+    if mirror_stamp != engine_stamp:
+        return CheckResult(
+            name, False,
+            "ops docs at %s were published at %s but the installed engine is %s — the docs are "
+            "left over from an older publish and may describe an engine that is not running."
+            % (ops_docs.mirror_dir(dest), mirror_stamp or "an unreadable stamp", engine_stamp),
+            _OPS_DOCS_FIX)
+    return CheckResult(
+        name, True,
+        "%d ops docs published at %s (%s), including the sl-debugger playbook"
+        % (len(ops_docs.OPS_DOCS), ops_docs.mirror_dir(dest), engine_stamp))
 
 
 # --- superlooper plugin presence (issue #90) ---------------------------------------------------
@@ -772,6 +854,7 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_cmux_app_nap(probe),
         check_runner_anchor(probe, config),
         check_engine_drift(probe, repo_path=repo_path, dev_branch=dev),
+        check_ops_docs(probe),
         check_superlooper_plugin(probe),
     ]
 

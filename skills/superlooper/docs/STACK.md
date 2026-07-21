@@ -50,6 +50,14 @@ A loop user needs enough local stack for a worker session to launch, work, repor
   App Nap suspends an idle, occluded cmux and worker launches stop being delivered about 40 minutes
   after the operator walks away — the one mechanism that does this even on a machine whose display
   and system sleep are both off.
+- `installed ops docs` - the gated `bin/install.sh` mirrors the operational docs — this file,
+  `runner-ops.md`, the approval protocol and the whole sl-debugger playbook — into
+  `~/.claude/skills/superlooper/docs/ops/`, stamped with the publish they came from. They must be
+  there and the stamp must match the installed engine's. Unlike `superlooper plugin` this is a
+  **FAIL**, because it is not about session quality: the watchdog's unattended 3am session is
+  pointed at the debugger playbook's `unattended-contract.md` for the rules it is held to, and a
+  machine where that file does not exist is the 2026-07-12 incident (defect class D12) waiting to
+  repeat. A machine with no installed engine at all is a clean pass here — another block names that.
 - `superlooper plugin` - the `superlooper@superlooper` plugin should be installed and enabled, so
   planning and worker sessions on this machine load the superlooper ops, write-issue and debugger
   skills. This is a **WARN**, never a FAIL: the runner does not depend on the skills being
@@ -141,6 +149,14 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   not in this checkout's history (rebased or unrelated — republish to re-stamp), none of the three
   refs resolving at all, or git failing to compute the distance. Point it at a checkout elsewhere
   with `SL_SOURCE_REPO`.
+- `installed ops docs`: republish through the gated `bin/install.sh` from a superlooper source
+  checkout — it mirrors the operational docs into `~/.claude/skills/superlooper/docs/ops/` and
+  stamps them with the same publish as the engine. FAILs in two states: the files are missing (the
+  state every machine is in until it republishes past issue #199, and the state D12 recorded — the
+  debugger playbook absent on the machine having the incident), or their stamp does not match the
+  installed engine's, meaning the mirror survived from an older publish and may describe an engine
+  that is not the one running. A machine with no installed engine home at all passes cleanly: there
+  is nothing published to check, and the launch-shim and hook blocks already name that problem.
 - `superlooper plugin`: install it with `claude plugin marketplace add willprout/superlooper` then
   `claude plugin install superlooper@superlooper --scope user`; if it is installed but disabled, run
   `claude plugin enable superlooper@superlooper`. Always a WARN — the loop runs correctly without

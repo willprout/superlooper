@@ -25,7 +25,16 @@ this conversation, nobody is watching, and nobody can answer a question — you 
 
 Invoke the **sl-debugger** skill NOW and follow its `references/unattended-contract.md`
 exactly — the authority tiers, the absolute exclusions (which no tier ever unlocks), the
-once-per-incident discipline, and the memo + notify every unattended run ends with. In
+once-per-incident discipline, and the memo + notify every unattended run ends with.
+
+If that skill is not on this machine (the superlooper plugin is optional and may be missing
+or disabled — nobody is awake to install it), read the copy the gated installer published
+instead: `~/.claude/skills/superlooper/docs/ops/sl-debugger/PLAYBOOK.md` and the
+`references/` beside it. Read the contract before you touch anything; do not improvise the
+rules you are held to. If neither is present, you are DIAGNOSE-ONLY regardless of the tier
+above — write the memo and stop.
+
+In
 short: run the read-only health readout first, diagnose, repair only what your tier
 permits, journal every mutating step, then write the plain-language memo into
 `{state_home}/reports/` and send the notify — and **end the session**.

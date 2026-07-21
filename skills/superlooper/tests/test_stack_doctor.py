@@ -130,6 +130,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("cmux App Nap disabled", True),
         ("runner anchor (live)", True),      # no repo in this config -> cleanly skipped, passes
         ("installed engine current", True),  # no VERSION stamp injected -> cleanly skipped, passes
+        ("installed ops docs", True),        # no installed engine home injected -> clean skip (#199)
         ("superlooper plugin", True),        # installed + enabled in the healthy probe
     ]
 
