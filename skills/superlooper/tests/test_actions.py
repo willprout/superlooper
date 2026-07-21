@@ -16,6 +16,7 @@ Contract highlights under test:
     nothing here ever asks a worker to move a label.
 """
 import copy
+import re
 
 import pytest
 
@@ -625,6 +626,201 @@ def test_regenerated_issue_relaunches_on_its_stamped_branch():
     out = decide(parsed_issues=[parsed(5)], dsk=dsk)
     a = only(out, "launch")[0]
     assert a["branch"] == "sl/i5-issue-5-r1"
+
+
+# ============ the teardown deferral is BOUNDED (issue #169) ============
+# #149 made a rebuild refuse to prune a worktree while worker.<id>.lock names a live pid (the D14
+# rule). A live pid does not prove the worker is OURS: a SIGKILLed start-session.sh never runs its
+# EXIT trap, and pids recycle, so an unrelated process can inherit the number and hold the prune off
+# forever. The rebuild then aborts every tick — and decide re-emits it every tick, with
+# `reapproved_now` blocking the one launch whose _close_stale_session would drop the stale lock. The
+# lane livelocks: parked forever, no cap, no notification, no ALERT. This ladder is the bound.
+
+def _deferred(status="parked", deferrals=actions.TEARDOWN_DEFERRAL_CAP, live=True,
+              reports=None, **over):
+    ist_over = {"teardown_deferral_pid": 4242,
+                "teardown_deferral_lock": "/run/state/worker.i5.lock"}
+    ist_over.update(over)
+    return disk(issues_state={"version": 1, "issues": {
+                    "i5": ist(status, teardown_deferrals=deferrals, **ist_over)}},
+                reports=reports or {},
+                live_lock_ids={"i5"} if live else set())
+
+
+def test_a_rebuild_that_cannot_clear_its_worktree_parks_at_the_cap_instead_of_retrying_forever():
+    out = decide(parsed_issues=[parsed(5)], dsk=_deferred())
+    assert only(out, "reapprove") == [], "the livelocked rebuild kept being re-emitted"
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["id"] == "i5" and p[0]["needs_william"] is True
+    assert p[0]["cause"] == "teardown_deferral"
+    assert has_notify(out), "the silent livelock must reach the owner"
+
+
+def test_the_deferral_park_memo_names_the_pid_and_the_lock_path():
+    # The memo is the whole point of counting it: the ONE thing that frees the lane is removing that
+    # lock, and the owner cannot check the pid they are never told.
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=_deferred()), "park")[0]["memo"]
+    assert "4242" in memo and "/run/state/worker.i5.lock" in memo
+
+
+def test_under_the_cap_the_rebuild_still_retries():
+    # The deferral is CORRECT under the cap — a worker really can still be unwinding. Only the
+    # unbounded repetition is the bug.
+    out = decide(parsed_issues=[parsed(5)],
+                 dsk=_deferred(deferrals=actions.TEARDOWN_DEFERRAL_CAP - 1))
+    assert len(only(out, "reapprove")) == 1 and only(out, "park") == []
+
+
+def test_a_capped_lane_whose_lock_is_gone_rebuilds_instead_of_re_parking():
+    # THE escape hatch. The park's memo tells the owner to remove the stale lock and re-approve;
+    # if the at-cap counter alone re-parked, that instruction would be a lie and the lane would be
+    # stuck FOREVER, one park louder. The counter only bites while the cause — a lock naming a live
+    # pid — is still there; the successful rebuild then zeroes it (_exec_reapprove).
+    out = decide(parsed_issues=[parsed(5)], dsk=_deferred(live=False))
+    assert len(only(out, "reapprove")) == 1 and only(out, "park") == []
+
+
+def test_a_corrupt_deferral_counter_fails_closed_to_the_park():
+    # The fail-OPEN-on-wrong-TYPE defect class (_counter's own docstring): an unreadable counter
+    # must land on the SAFE action (park), never be read as 0 and re-allow the capped retry forever.
+    out = decide(parsed_issues=[parsed(5)], dsk=_deferred(deferrals="lots"))
+    assert only(out, "reapprove") == [] and len(only(out, "park")) == 1
+
+
+@pytest.mark.parametrize("bad", [None, "", False, [], 0.0, "lots", {"n": 1}])
+def test_every_wrong_typed_deferral_counter_parks_with_a_readable_memo(bad):
+    # `_counter` calls ANY present non-int corrupt — `null` by name — so the FALSY wrong types are
+    # as real as the truthy ones and must land identically. The memo must also stay a sentence: the
+    # corruption is its own fact appended to the hand-back, never spliced into the count clause
+    # (which once rendered "so the teardown-deferral counter is unreadable to prune this lane's
+    # worktree" — the one owner-facing artifact this issue produces, ungrammatical).
+    p = only(decide(parsed_issues=[parsed(5)], dsk=_deferred(deferrals=bad)), "park")
+    assert len(p) == 1 and p[0]["cause"] == actions.TEARDOWN_CAUSE
+    assert "UNREADABLE" in p[0]["memo"] and "unreadable to prune" not in p[0]["memo"]
+    assert "4242" in p[0]["memo"], "a corrupt counter must not cost the actionable facts"
+
+
+def test_a_refused_re_approval_on_a_corrupt_counter_still_reports_the_corruption():
+    # The corruption rides BOTH leads: the re-approved hand-back once dropped it silently.
+    dsk = _deferred(deferrals=None, status="needs_william",
+                    park_notify_cause=actions.TEARDOWN_CAUSE,
+                    park_landed_cause=actions.TEARDOWN_CAUSE)
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")[0]["memo"]
+    assert "NOTHING WAS RETRIED" in memo and "UNREADABLE" in memo
+
+
+@pytest.mark.parametrize("stamps", [{}, {"teardown_deferral_pid": None},
+                                    {"teardown_deferral_lock": None},
+                                    {"teardown_deferral_pid": None,
+                                     "teardown_deferral_lock": None}])
+def test_every_code_span_in_the_memo_is_something_the_owner_can_actually_run(stamps):
+    # Asserted on SHAPE, not on wording: a test that names only the post-fix prose passes against
+    # the very defect it is meant to pin (the old fallback wrapped `the state dir's worker.i5.lock`
+    # in backticks — un-runnable, and invisible to a "the new words are present" check). Every
+    # backticked span must be a command or a real path, whatever the memo happens to say.
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=_deferred(**stamps)), "park")[0]["memo"]
+    spans = re.findall(r"`([^`]+)`", memo)
+    assert spans, "a hand-back with nothing to run is not actionable"
+    assert all(s.startswith(("ps -p ", "cat /", "/")) for s in spans), spans
+    assert "worker.i5.lock" in memo          # ...and it still names WHAT to look for
+
+
+def test_a_corrupt_deferral_counter_with_no_live_lock_still_rebuilds():
+    # The other half of that rule, and the reason the corrupt check is ANDed with live_locks: fail
+    # closed must not mean strand-forever. With the cause gone there is nothing to protect the lane
+    # from, and the rebuild it falls through to rewrites the unreadable counter honestly.
+    out = decide(parsed_issues=[parsed(5)], dsk=_deferred(deferrals="lots", live=False))
+    assert len(only(out, "reapprove")) == 1 and only(out, "park") == []
+
+
+def test_the_first_hand_back_never_claims_the_owner_re_approved():
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=_deferred()), "park")[0]["memo"]
+    assert "NOTHING WAS RETRIED" not in memo and "re-approved, but" not in memo
+
+
+def test_re_approving_a_still_locked_lane_answers_the_owner_instead_of_silently_re_parking():
+    # A re-approval this ladder REFUSES (the counter is already at cap, so nothing is retried) must
+    # not just strip `agent-ready` and go quiet — an owner action silently undone is the same
+    # silence #169 exists to end. The prior park LANDED (park_landed_cause is written only past a
+    # successful set_labels, the call that strips agent-ready), so this agent-ready can only be one
+    # the owner put back: distinct cause -> park() texts and memos again.
+    dsk = _deferred(status="needs_william", park_notify_cause=actions.TEARDOWN_CAUSE,
+                    park_landed_cause=actions.TEARDOWN_CAUSE)
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["cause"] == actions.TEARDOWN_CAUSE_REAPPROVED
+    assert "retry" not in p[0], "a new cause is a new episode, never a suppressed retry"
+    assert has_notify(out)
+    assert "NOTHING WAS RETRIED" in p[0]["memo"] and "4242" in p[0]["memo"]
+
+
+@pytest.mark.parametrize("status", ["parked", "needs_william"])
+def test_a_park_whose_label_move_failed_is_still_a_silent_retry_not_an_owner_re_approval(status):
+    # The counter-case, and why the cause reads park_landed_cause rather than the status: when a
+    # park's label move fails (the #61 dead zone) the notify marker IS stamped but the labels never
+    # moved, so the OLD agent-ready is still standing — that is the first park re-deriving, not an
+    # owner act. `needs_william` is the load-bearing half of the parametrize: a lane parked
+    # needs-owner earlier for another cause is already in that status, so status alone cannot tell
+    # the two apart. Reading it as a re-approval would text a falsehood AND burn the re-approved
+    # cause, making the owner's real re-approval the silent one — the very defect this pair fixes.
+    dsk = _deferred(status=status, park_notify_cause=actions.TEARDOWN_CAUSE,
+                    park_landed_cause="launch_delivery")     # the last park that ACTUALLY landed
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["cause"] == actions.TEARDOWN_CAUSE and p[0].get("retry") is True
+    assert not has_notify(out)
+
+
+def test_a_memo_with_no_recorded_pid_still_gives_a_runnable_check():
+    # State that predates the stamp (or a lock removed between the refusal and the charge) must not
+    # produce `ps -p (pid not recorded)`. Point at the lock to read the pid out of instead.
+    dsk = _deferred(teardown_deferral_pid=None)
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")[0]["memo"]
+    assert "not recorded" not in memo and "cat /run/state/worker.i5.lock" in memo
+
+
+def test_a_resume_at_the_gate_is_never_capped_by_the_deferral_ladder():
+    # resume_at_gate (#161) tears NOTHING down — it re-enters the gate on the preserved worktree —
+    # so the deferral ladder must not touch it. Capping it would strand a finished build whose only
+    # sin is a stale lock.
+    dsk = _deferred(reports={"i5": GOOD_REPORT})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "resume_at_gate")) == 1 and only(out, "park") == []
+
+
+def test_a_conflict_regenerate_that_cannot_clear_its_worktree_parks_at_the_cap():
+    # The regenerate face of the same livelock: _exec_regenerate aborts on a declined prune too, and
+    # the gate re-emits it every tick with nothing counting.
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING"), live_lock_ids={"i5"})
+    d["issues_state"]["issues"]["i5"].update(
+        update_result="conflict", update_head_oid=HEAD1, conflicts=0,
+        teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP,
+        teardown_deferral_pid=4242, teardown_deferral_lock="/run/state/worker.i5.lock")
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    assert only(out, "regenerate") == []
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["needs_william"] is True and "4242" in p[0]["memo"]
+    assert has_notify(out)
+
+
+def test_a_capped_conflict_regenerate_whose_lock_is_gone_still_rebuilds():
+    # The regenerate face of the escape hatch: the cap must bite only while the cause stands, here
+    # too. Without this, a lane whose stale lock finally died would never regenerate again.
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING"), live_lock_ids=set())
+    d["issues_state"]["issues"]["i5"].update(
+        update_result="conflict", update_head_oid=HEAD1, conflicts=0,
+        teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP, teardown_deferral_pid=4242)
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    assert len(only(out, "regenerate")) == 1 and only(out, "park") == []
+
+
+def test_a_conflict_regenerate_under_the_cap_is_untouched():
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING"), live_lock_ids={"i5"})
+    d["issues_state"]["issues"]["i5"].update(
+        update_result="conflict", update_head_oid=HEAD1, conflicts=0,
+        teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP - 1)
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    assert len(only(out, "regenerate")) == 1 and only(out, "park") == []
 
 
 # =========================== launch anchor liveness (#24) ===========================
