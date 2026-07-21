@@ -333,9 +333,10 @@ def test_the_installer_reads_the_table_without_executing_unreviewed_payload_code
     # Comments stripped — whole-line AND trailing — because the block above legitimately EXPLAINS
     # why `--list` is not used, and a guard that cannot tell an explanation from the thing it warns
     # against gets deleted rather than fixed. A `#` only opens a comment at the start of a word, so
-    # `$#` and `${VAR#pat}` (this script uses the latter) do not truncate the line and hide code
-    # after them. A `--list` inside a quoted string is still out of reach; the anchor assert and the
-    # snippet-vs-sources() comparison below are what actually stop the reader being replaced.
+    # `$#` and `${VAR#pat}` do not truncate the line and hide code after them. (The installer uses
+    # neither today — this guard just should not depend on that staying true.) A `--list` inside a
+    # quoted string is still out of reach; the anchor assert and the snippet-vs-sources() comparison
+    # below are what actually stop the reader being replaced.
     code = "\n".join(re.sub(r"(?:^|(?<=\s))#.*$", "", l) for l in text.splitlines())
     assert "--list" not in code and "import ops_docs" not in code, (
         "the installer must not execute the payload module before the gate")

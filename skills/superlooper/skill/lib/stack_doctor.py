@@ -664,7 +664,7 @@ def check_engine_drift(probe, repo_path=None, dev_branch="main"):
 # to. The cure is one command, and it is the same command the operator was going to run anyway.
 # The one WARN this block does emit is the doctor's standing discipline, not a softening: docs all
 # present but no engine stamp to compare them against is a state it could not READ, and it never
-# asserts a mismatch it could not actually determine. See the docstring for all four states.
+# asserts a mismatch it could not actually determine. See the docstring for all five states.
 
 _OPS_DOCS_FIX = ("Republish through the gated `bin/install.sh` from a superlooper source checkout "
                  "— it mirrors the ops docs into the installed engine home and stamps them.")
@@ -673,17 +673,20 @@ _OPS_DOCS_FIX = ("Republish through the gated `bin/install.sh` from a superloope
 def check_ops_docs(probe):
     """doctor --stack's installed-ops-docs line.
 
-    Four states, in the order they are decided:
+    Five states, in the order they are decided:
 
       1. **No installed engine home at all** — a plain ok. Another block (the launch shim, the
          activity hooks) already names that machine's real problem, and the doctor never invents a
          second alarm for one cause.
-      2. **Docs missing** — FAIL, naming the first few absentees. This is the state every machine
-         is in until it republishes past this change, and the fix line says exactly that.
-      3. **Docs present, stamps disagree** — FAIL. The mirror survived from an older publish, so at
+      2. **Docs missing** — FAIL, naming the first few absentees. Reached when the mirror step of a
+         publish failed, or when the CLI is run from a source checkout against an engine published
+         before the docs shipped; the fix line says exactly what to do.
+      3. **Docs present, engine carries no stamp to compare** — WARN, and decided BEFORE the
+         mismatch below, because with nothing to compare against there is no mismatch to claim. A
+         hand-copied or pre-stamp install; we never assert a state we could not actually read.
+      4. **Docs present, stamps disagree** — FAIL. The mirror survived from an older publish, so at
          least one page describes an engine that is no longer the one running.
-      4. **Docs present, engine carries no stamp to compare** — WARN. A hand-copied or pre-stamp
-         install; we never assert a mismatch we could not actually read.
+      5. **Docs present, stamps agree** — ok, naming the count and the publish.
     """
     name = "installed ops docs"
     dest = _installed_home(probe)
