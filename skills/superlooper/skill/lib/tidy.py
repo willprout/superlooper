@@ -20,7 +20,7 @@ runner never touches automatically by default).
 
 Safety, stated as code below and pinned by tests:
   * Only a status this module can positively NAME as terminal is ever selected (a positive
-    allowlist). An in-flight lane ({running,blocked,frozen,exited} — a build in progress or an
+    allowlist). An in-flight lane ({running,frozen,exited} — a build in progress or an
     exited session mid-recovery), an in-between gate lane ({gating,holding} — build done, merge
     mechanics still running), a not-yet-started (ready/None) or unknown/typo'd status is NEVER
     selected. This is the fail-OPEN-on-wrong-typed defect class pointing the safe way: when in
@@ -52,17 +52,6 @@ def _iid_num(iid):
     off a private name."""
     if isinstance(iid, str) and iid.startswith("i") and iid[1:].isdigit():
         return int(iid[1:])
-    return None
-
-
-def _aid_num(aid):
-    """a<N> -> N (N >= 1), else None. The runner allocates aids from a1 upward (actions.decide /
-    _exec_hire_answerer; next_answerer starts at 1), so `a0` is not a shape it ever produces — a
-    stray `a0` marker is corruption and is skipped, matching the positive-allowlist doctrine (only
-    act on a provably-real answerer id). Anything else (wrong-typed, `aX`, bare `a`) is skipped too."""
-    if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
-        n = int(aid[1:])
-        return n if n >= 1 else None
     return None
 
 
@@ -101,61 +90,13 @@ def closable(issues, windows, *, scope_all=False):
     return out
 
 
-def closable_answerers(answerers, next_answerer, windows):
-    """[{"id","status":"finished"}] for every answerer window (a<N> pane marker) whose answerer is
-    PROVABLY FINISHED — its hire completed and its lifecycle has since ended. Sorted by answerer
-    number (deterministic). PURE — no input is mutated and a fresh list of fresh dicts is returned
-    every call. (Issue #132: an answerer hired by the Discuss/blocked flow is not a tracked issue,
-    so closable() never sees it and its window lingers after its Q&A concludes.)
-
-    An answerer's record lives in `answerers` for exactly the span it is ACTIVE: the runner writes
-    it at hire (_exec_hire_answerer) and POPS it the instant the lifecycle ends — delivery, park
-    (timeout / escalation / hire-cap), owner-absorb, re-approval (runner.py, four pop sites). So the
-    map holds EXACTLY the currently-active answerers and "finished" is the ABSENCE of the record. The
-    safety is a clock-free high-water mark: next_answerer is bumped to N+1 ATOMICALLY with writing
-    a<N>'s record (one loopstate.update), and launch-session.sh writes a<N>'s pane marker only AFTER
-    delivery verifies — strictly BEFORE that atomic write. So in the ONLY window where a<N> has a
-    marker but no record (mid-hire, or a hire that failed and re-hires the SAME aid), next_answerer
-    has NOT yet passed N and `N < next_answerer` is False: a mid-hire answerer is NEVER selected.
-    Once the hire completes (counter past N) and the answerer later terminates (record popped), both
-    conditions hold and the idle window is closable. aids are allocated monotonically and never
-    reused, so a selected a<N> can never relaunch — closing its window AND clearing its marker are
-    both permanently race-free (unlike a re-approvable issue, whose markers stay the runner's).
-
-    Fail-closed, mirroring closable() — "wrong-typed / unprovable -> do not close":
-      * `next_answerer` not a real positive int (bool excluded, float/str/None/missing) -> nothing is
-        `< next_answerer` -> nothing selected.
-      * `answerers` not a dict -> we CANNOT prove any a<N> is inactive -> nothing selected (a NON-dict
-        fails closed; an empty {} is the normal all-delivered case and is fine). A record with any
-        value type protects its aid (key-presence is the active test, not value shape).
-      * `windows` not a collection, or a wrong-typed / unhashable element -> that element is skipped,
-        never a raise.
-
-    answerers      loopstate['answerers']: {aid: {"for": iid, ...}} — the active set.
-    next_answerer  loopstate['next_answerer']: the monotonic high-water aid counter.
-    windows        the a<N> ids that have a recorded pane marker on disk.
-    """
-    # `bool` is an int subclass but never a real counter — exclude it, or True would read as 1.
-    hw = next_answerer if isinstance(next_answerer, int) and not isinstance(next_answerer, bool) else 0
-    if not isinstance(answerers, dict):
-        return []                                  # cannot read the active set -> close nothing
-    active = {a for a in answerers if isinstance(a, str)}
-    have_window = ({w for w in windows if isinstance(w, str)}
-                   if isinstance(windows, (set, frozenset, list, tuple)) else set())
-    out = []
-    for aid in sorted((w for w in have_window if _aid_num(w) is not None), key=_aid_num):
-        if aid not in active and _aid_num(aid) < hw:
-            out.append({"id": aid, "status": "finished"})
-    return out
-
-
 def reclaimable_worktrees(issues, worktree_ids):
     """[iid] for every PARK-FAMILY terminal issue (parked / needs-william / bounced) that still has a
     worktree dir on disk — the set the runner may safely `git worktree remove` to bound long-run disk
     growth (issue #41). PURE — no input mutated; a fresh sorted list every call.
 
     Same fail-closed safety as closable(): a positive REAPPROVABLE allowlist AND an explicit
-    in-flight veto, so an in-flight lane ({running,blocked,frozen,exited}) or an in-between gate lane
+    in-flight veto, so an in-flight lane ({running,frozen,exited}) or an in-between gate lane
     ({gating,holding}) or a not-yet-started/unknown status is NEVER reclaimed — its worktree is a
     LIVE lane still being written. Reclaiming a park-family worktree is safe: re-approval rebuilds
     from the issue on a fresh branch — _exec_reapprove rotates the stamp to the next unburned

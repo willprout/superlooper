@@ -415,7 +415,7 @@ def test_codex_gets_no_mailbox(tmp_path):
 
 
 def test_non_worker_sessions_are_untouched(tmp_path):
-    # The hook is registered globally; the answerer and every ad-hoc session must be a strict no-op.
+    # The hook is registered globally; the debugger and every ad-hoc session must be a strict no-op.
     wt = tmp_path / "wt"
     _worktree(wt)
     env = {k: v for k, v in os.environ.items() if k not in ("SL_ISSUE_ID", "SL_RUN_ROOT")}

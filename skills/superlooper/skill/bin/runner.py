@@ -625,7 +625,7 @@ class Runner:
         for sub in ("state/activity", "state/blocked", "state/exited", "state/awaiting",
                     "state/panes", "state/started", "state/launch_stderr", "state/events/processed",
                     "state/pending_teardown",           # (#149) prunes declined under a live CLI
-                    "briefs", "reports", "answers", "worktrees", "logs"):
+                    "briefs", "reports", "worktrees", "logs"):
             os.makedirs(os.path.join(self.home, sub), exist_ok=True)
         if not os.path.exists(self.issues_path):
             loopstate.save(self.issues_path, loopstate.new_state())
@@ -2020,8 +2020,9 @@ class Runner:
         recover-exited fires straight off the on-disk marker; resolve-conflict — falls back to that
         stamped value so the override survives instead of silently reverting to the default. It NEVER
         blocks the relaunch — a crashed worker must always be able to restart (bright line); the
-        config default applies only when neither source has a value. The ANSWERER never comes through
-        here (config-only, launched with _script_env(answerer_model))."""
+        config default applies only when neither source has a value. This is the WORKER launch env
+        only; the sl-debugger seat (issue #66) is config-only and builds its own env in the CLI's
+        debugger shim, off models.debugger."""
         p = self._parsed_by_id.get(iid)
         if p is not None:
             model, effort = p.get("model"), p.get("effort")
@@ -2037,23 +2038,23 @@ class Runner:
             return self._script_env(model or os.environ.get("SL_MODEL", ""),
                                     effort or os.environ.get("SL_EFFORT", "")
                                     or models.get("worker_effort") or "")
-        return self._script_env(model or self._models()[0],
+        return self._script_env(model or self._worker_model(),
                                 effort or models.get("worker_effort") or "")
 
     def _script(self, name):
         return os.path.join(_HERE, name)
 
-    def _models(self):
+    def _worker_model(self):
         m = self.config.get("models") if isinstance(self.config.get("models"), dict) else {}
-        # Default worker AND answerer to `opus[1m]` (owner ruling 2026-07-06): the latest Opus
-        # (the `opus` alias auto-tracks it) WITH the 1M-token context window (the `[1m]` suffix
-        # opts in — bare `opus` is the standard ~200K context). The answerer is the loop's
-        # highest-judgment hire (resolve-vs-escalate on a blocked worker), and long worker builds
-        # benefit from the large window, so both run on the strongest configuration by default.
-        # Kept modular: a repo overrides either in config.models. The value flows to
-        # `claude --model "$SL_MODEL"` — always double-quoted through the launch stack (%q +
-        # quoted expansion), so the brackets never hit zsh glob expansion.
-        return m.get("worker") or "opus[1m]", m.get("answerer") or "opus[1m]"
+        # Default the worker to `opus[1m]` (owner ruling 2026-07-06): the latest Opus (the `opus`
+        # alias auto-tracks it) WITH the 1M-token context window (the `[1m]` suffix opts in — bare
+        # `opus` is the standard ~200K context). Long worker builds benefit from the large window,
+        # so a worker runs on the strongest configuration by default. Kept modular: a repo
+        # overrides it in config.models.worker. The value flows to `claude --model "$SL_MODEL"` —
+        # always double-quoted through the launch stack (%q + quoted expansion), so the brackets
+        # never hit zsh glob expansion. (The ruling covered the answerer too; that seat is retired
+        # by #194 and its config pin lives on as models.debugger, read by the CLI's debugger shim.)
+        return m.get("worker") or "opus[1m]"
 
     @staticmethod
     def _bump(issue, key):
@@ -2719,8 +2720,8 @@ class Runner:
 
     def _operator(self):
         """The operator display name (issue #58) — config.operator over this repo's config, so
-        every stranger-visible line the runner emits (answerer brief, close-investigate memo) signs
-        the owner's own name and never a hardcoded person."""
+        every stranger-visible line the runner emits (the durable question comment, the
+        close-investigate memo) signs the owner's own name and never a hardcoded person."""
         import config as config_lib
         return config_lib.operator(self.config)
 
@@ -2852,16 +2853,6 @@ class Runner:
             return "label move failed (will retry silently next tick)"
         _rm(os.path.join(self.state, "blocked", iid))
         def settle(st, i):
-            # Stand down any answerer still filed for this issue (mirrors _exec_park /
-            # _exec_absorb_close): a bounce is terminal, so it must not leave a `for: <iid>` record
-            # behind. This keeps the "answerers holds exactly the ACTIVE answerers" invariant airtight
-            # across EVERY terminal transition — the property tidy.closable_answerers rests on to close
-            # a bounced issue's finished answerer window (issue #132 review).
-            recs = st.get("answerers")
-            if isinstance(recs, dict):
-                for aid in [k for k, v in recs.items()
-                            if isinstance(v, dict) and v.get("for") == iid]:
-                    recs.pop(aid, None)
             i["status"] = "bounced"
         self._update_issue(iid, fn=settle)
         return "ok"
@@ -2881,14 +2872,6 @@ class Runner:
         _rm(os.path.join(self.state, "blocked", iid))
         _rm(os.path.join(self.state, "awaiting", iid))
         def settle(st, i):
-            # drop any lingering answerer record for this issue (mirrors _exec_park): an
-            # answerer-caused park that was still storming when the owner closed it would otherwise
-            # leave its `for: <iid>` record behind.
-            recs = st.get("answerers")
-            if isinstance(recs, dict):
-                for aid in [k for k, v in recs.items()
-                            if isinstance(v, dict) and v.get("for") == iid]:
-                    recs.pop(aid, None)
             i.update({"status": "merged", "park_notify_cause": None, "park_notify_at": None,
                       "park_landed_cause": None,       # the pair (#169)
                       "park_comment_posted": False})
@@ -2947,11 +2930,6 @@ class Runner:
         _rm(os.path.join(self.state, "blocked", iid))
         _rm(os.path.join(self.state, "awaiting", iid))
         def m(st):
-            recs = st.get("answerers")
-            if isinstance(recs, dict):
-                for aid in [k for k, v in recs.items()
-                            if isinstance(v, dict) and v.get("for") == iid]:
-                    recs.pop(aid, None)
             i = st["issues"].setdefault(iid, loopstate.new_issue())
             i["status"] = "needs_william" if a.get("needs_william") else "parked"
             # A park ENDS the eligibility-hold episode, exactly as a launch and a re-approve do
@@ -2976,14 +2954,13 @@ class Runner:
     # Per-issue attempt counters a fresh approval zeroes. `launches` MUST be reset alongside
     # `retries`: launch-session.sh recomputes `retries = launches - 1` on every verified delivery,
     # so leaving `launches` at its old value would silently restore `retries` on the next launch
-    # and re-park the issue at the retry cap. `conflicts` and the answerer counters are reset too
-    # so re-approval is a clean slate on every ladder, not just the launch one. `merge_refusals`
+    # and re-park the issue at the retry cap. `conflicts` is reset too so re-approval is a clean
+    # slate on every ladder, not just the launch one. `merge_refusals`
     # is here too so the merge-refusal guard is EPISODE-scoped (issue #27): a re-approval rebuilds
     # from scratch, so the rebuilt PR's merge must be retried from zero, never a forever-latched
     # park. (The paired `merge_refusal_reason` string is cleared in the reset block below, not
     # here — this tuple is int counters only, zeroed with `i[k] = 0`.)
-    _REAPPROVE_COUNTERS = ("launches", "retries", "conflicts", "launch_failures",
-                           "answerer_failures", "answer_delivery_failures", "merge_refusals",
+    _REAPPROVE_COUNTERS = ("launches", "retries", "conflicts", "launch_failures", "merge_refusals",
                            "questions_asked",   # a fresh approval resets the 2-question cap too (#163)
                            "exit_asks")         # ...and the exit-interview ask ladder (#215)
     # (`teardown_deferrals` is deliberately NOT here: the #169 ladder is retired by the teardown
@@ -3045,8 +3022,7 @@ class Runner:
         for sub in ("blocked", "exited", "awaiting", "started", "mail", "ack"):
             _rm(os.path.join(self.state, sub, iid))
         # 2. durable state: zero the attempt counters and clear the stale run/gate fields that
-        #    would otherwise re-park, plus any active answerer record (a fresh approval is a fresh
-        #    question too — mirrors _exec_park's answerer cleanup).
+        #    would otherwise re-park.
         def reset(st, i):
             # (#177) Rotate BEFORE the counters are zeroed: next_generation reads `conflicts` as one
             # of the two burned-generation sources, and a zeroed count would let this rebuild re-mint
@@ -3091,11 +3067,6 @@ class Runner:
             if new_branch:
                 rotated.update(old=old_branch, new=new_branch)
                 i["branch"] = new_branch
-            recs = st.get("answerers")
-            if isinstance(recs, dict):
-                for aid in [k for k, v in recs.items()
-                            if isinstance(v, dict) and v.get("for") == iid]:
-                    recs.pop(aid, None)
         self._update_issue(iid, fn=reset)
         # The rotation is journaled with the counters — the record of where the retired episode's
         # committed work went is exactly as load-bearing as the record of what it cost.

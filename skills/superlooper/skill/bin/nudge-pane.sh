@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # The SINGLE safe primitive for every write into any cmux session pane — the runner's
-# resume/answer/nudge into a worker or answerer pane. See docs/founding/EVENT-MODEL.md.
+# resume/answer/nudge into a worker pane. See docs/founding/EVENT-MODEL.md.
 #
 # Usage: nudge-pane.sh <surface> <id> <message>
-#   <id> is a loop session id (i<N> worker, a<N> answerer). There is NO orchestrator here — the
+#   <id> is a loop session id (i<N> worker, d<N> debugger). There is NO orchestrator here — the
 #   deterministic runner is a normal terminal/launchd process, never a cmux Claude pane — so this
 #   drops autocode's "orchestrator" special case entirely. (The `orchestrator=` param survives,
 #   unused, in lib/pane_state.py, still unit-tested there.) Every pane this writes to is an exec
 #   session, so classification uses the standard (non-fail-closed) table; an unreadable/empty screen
-#   already DEFERS for all surfaces (pane_state), which is the fail-closed behaviour the answerer
+#   already DEFERS for all surfaces (pane_state), which is the fail-closed behaviour the delivery
 #   delivery relies on.
 #
 # EXIT CODES (load-bearing — the runner branches on these):

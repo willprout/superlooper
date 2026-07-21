@@ -2,8 +2,8 @@
 actions.decide (tested in test_actions.py); these tests pin what the SHELL must guarantee:
 
   * the env contract launch-session.sh depends on (SL_RUN_ROOT/SL_REPO/SL_PANE/SL_DEV_BRANCH/
-    SL_MODEL/SL_EFFORT/SL_AGENT) on every launch, worker AND answerer, plus the per-issue model/effort
-    override (label > config > default; durable across a cold restart; answerer unaffected);
+    SL_MODEL/SL_EFFORT/SL_AGENT) on every worker launch, plus the per-issue model/effort
+    override (label > config > default; durable across a cold restart);
   * executor mechanics: ordered gh mutations, loopstate stamps, marker hygiene, fail-and-retry
     (a failed gh write never advances local state past the truth);
   * the pidfile singleton, the per-tick heartbeat, SIGTERM as a clean fail-stop;
@@ -47,7 +47,7 @@ def make_config(**over):
         "ship_cmd": None, "ship_recheck_cmd": None,
         "report_required_sections": ["Tests"], "bright_lines": [],
         "cleanup_merged_worktrees": True, "report_time": "08:45",
-        "models": {"worker": "opus", "answerer": "fable"},
+        "models": {"worker": "opus", "debugger": "fable"},
         "session": {"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2, "conflict_cap": 2},
         "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
                "quarantine": [], "nightly_time": "02:00"},
@@ -129,7 +129,7 @@ def _seed_gh_comments(rig, num, items):
 def test_init_creates_the_c3_layout(rig):
     for sub in ("state/activity", "state/blocked", "state/exited", "state/awaiting",
                 "state/panes", "state/started", "state/launch_stderr", "state/events/processed",
-                "briefs", "reports", "answers", "worktrees", "logs"):
+                "briefs", "reports", "worktrees", "logs"):
         assert (rig.home / sub).is_dir(), f"missing {sub}"
     assert (rig.home / "state" / "issues.json").is_file()
 
@@ -1526,7 +1526,7 @@ def test_progress_stall_ladder_probes_then_parks_end_to_end(rig):
 def test_post_question_posts_durable_comment_releases_lane(rig):
     # #163: a worker's owner-decision question becomes a DURABLE GitHub comment, the live window is
     # closed, and the lane is released to awaiting_answer — the WIP worktree is preserved for reuse.
-    seed_issue(rig, "i5", status="blocked", questions_asked=0)
+    seed_issue(rig, "i5", status="running", questions_asked=0)
     q = "QUESTION: A or B?\nOPTIONS:\n- A\n- B\nRECOMMENDATION: A"
     (rig.home / "state" / "blocked" / "i5").write_text(q)
     (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
@@ -1553,18 +1553,18 @@ def test_post_question_posts_durable_comment_releases_lane(rig):
 
 
 def test_post_question_comment_failure_keeps_the_marker_for_retry(rig, monkeypatch):
-    seed_issue(rig, "i5", status="blocked", questions_asked=0)
+    seed_issue(rig, "i5", status="running", questions_asked=0)
     (rig.home / "state" / "blocked" / "i5").write_text("q?")
     monkeypatch.setenv("GH_FAIL", "1")
     out = rig.r._execute({"act": "post_question", "id": "i5", "num": 5, "question": "q?"}, NOW)
     assert out != "ok"
-    assert issue_state(rig, "i5")["status"] == "blocked"          # truth not advanced
+    assert issue_state(rig, "i5")["status"] == "running"          # truth not advanced
     assert (rig.home / "state" / "blocked" / "i5").exists()       # marker kept -> decide retries
 
 
 def test_post_question_is_idempotent_never_double_posts(rig):
     # A re-derived tick (the label move retrying) must NOT re-post the durable comment.
-    seed_issue(rig, "i5", status="blocked", questions_asked=0, question_posted=True)
+    seed_issue(rig, "i5", status="running", questions_asked=0, question_posted=True)
     (rig.home / "state" / "blocked" / "i5").write_text("q?")
     rig.r._execute({"act": "post_question", "id": "i5", "num": 5, "question": "q?"}, NOW)
     assert [m for m in mutations(rig) if m["kind"] == "comment"] == []   # comment already posted
@@ -1573,7 +1573,7 @@ def test_post_question_is_idempotent_never_double_posts(rig):
 def test_third_question_is_never_posted_by_the_executor(rig):
     # The cap lives in decide (park), so the executor only ever runs for questions 1 and 2 — but even
     # so, questions_asked increments truthfully per post.
-    seed_issue(rig, "i5", status="blocked", questions_asked=1)
+    seed_issue(rig, "i5", status="running", questions_asked=1)
     (rig.home / "state" / "blocked" / "i5").write_text("second q")
     rig.r._execute({"act": "post_question", "id": "i5", "num": 5, "question": "second q"}, NOW)
     assert issue_state(rig, "i5")["questions_asked"] == 2
@@ -1645,7 +1645,7 @@ def test_answer_relaunch_ignores_a_prior_questions_answer(rig):
 
 
 def test_bounce_posts_memo_then_labels_then_state(rig):
-    seed_issue(rig, "i7", status="blocked")
+    seed_issue(rig, "i7", status="running")
     (rig.home / "state" / "blocked" / "i7").write_text("BOUNCED: premise gone")
     out = rig.r._execute({"act": "bounce", "id": "i7", "num": 7,
                           "memo": "BOUNCED: premise gone"}, NOW)
@@ -1659,12 +1659,12 @@ def test_bounce_posts_memo_then_labels_then_state(rig):
 
 
 def test_bounce_gh_failure_keeps_the_marker_for_retry(rig, monkeypatch):
-    seed_issue(rig, "i7", status="blocked")
+    seed_issue(rig, "i7", status="running")
     (rig.home / "state" / "blocked" / "i7").write_text("BOUNCED: x")
     monkeypatch.setenv("GH_FAIL", "1")
     out = rig.r._execute({"act": "bounce", "id": "i7", "num": 7, "memo": "BOUNCED: x"}, NOW)
     assert out != "ok"
-    assert issue_state(rig, "i7")["status"] == "blocked"       # truth not advanced
+    assert issue_state(rig, "i7")["status"] == "running"       # truth not advanced
     assert (rig.home / "state" / "blocked" / "i7").exists()
 
 
@@ -1731,27 +1731,6 @@ def test_bounce_comment_only_failure_still_settles_the_bounce(rig):
     assert lab["add"] == "needs-owner"                 # the label DID land — the bounce is real
 
 
-def test_bounce_stands_down_a_lingering_answerer_record(rig):
-    """Issue #132 review: a bounce settles the issue terminal ('bounced'), so it must also stand
-    down any answerer record still filed for that issue — mirroring _exec_park / _exec_absorb_close.
-    Without this the "answerers holds exactly the active answerers" invariant that
-    tidy.closable_answerers rests on would have a gap: a bounced issue's finished answerer window
-    would stay protected from tidy until the issue was reapproved or closed by hand. Only THIS
-    issue's record is dropped — an answerer for another issue is untouched."""
-    seed_issue(rig, "i7", status="blocked")
-    (rig.home / "state" / "blocked" / "i7").write_text("BOUNCED: premise gone")
-    def add_answerers(st):
-        st["answerers"] = {"a1": {"for": "i7", "launched_at": NOW},
-                           "a2": {"for": "i9", "launched_at": NOW}}
-    loopstate.update(str(rig.home / "state" / "issues.json"), add_answerers)
-    out = rig.r._execute({"act": "bounce", "id": "i7", "num": 7,
-                          "memo": "BOUNCED: premise gone"}, NOW)
-    assert out == "ok"
-    st = loopstate.load(str(rig.home / "state" / "issues.json"))
-    assert st["issues"]["i7"]["status"] == "bounced"
-    assert st["answerers"] == {"a2": {"for": "i9", "launched_at": NOW}}   # only i7's record dropped
-
-
 def test_absorb_close_settles_terminal_and_stands_down(rig, monkeypatch):
     """Issue #108: the issue was closed on GitHub while the loop was bouncing/parking it. Absorb:
     settle terminal, clear the handback markers + blocked/awaiting files, reclaim the worktree, and
@@ -1763,16 +1742,12 @@ def test_absorb_close_settles_terminal_and_stands_down(rig, monkeypatch):
     seed_issue(rig, "i7", status="running", park_notify_cause="bounce", park_notify_at=NOW - 30)
     (rig.home / "state" / "blocked" / "i7").write_text("BOUNCED: premise gone")
     (rig.home / "state" / "awaiting" / "i7").write_text("waiting")
-    def add_answerer(st):
-        st["answerers"] = {"a1": {"for": "i7", "launched_at": NOW}}
-    loopstate.update(str(rig.home / "state" / "issues.json"), add_answerer)
     out = rig.r._execute({"act": "absorb_close", "id": "i7", "num": 7}, NOW)
     assert out == "ok"
     st = loopstate.load(str(rig.home / "state" / "issues.json"))
     assert st["issues"]["i7"]["status"] == "merged"    # terminal (loopstate has no 'closed')
     assert st["issues"]["i7"]["park_notify_cause"] is None and st["issues"]["i7"]["park_notify_at"] is None
     assert st["issues"]["i7"]["park_comment_posted"] is False
-    assert st["answerers"] == {}                        # lingering answerer record cleaned
     assert not (rig.home / "state" / "blocked" / "i7").exists()
     assert not (rig.home / "state" / "awaiting" / "i7").exists()
     assert removed == [str(rig.r._worktree("i7"))]      # worktree reclaimed (mirrors absorb_merged)
@@ -2197,21 +2172,17 @@ def test_update_recheck_failure_sets_the_flag_and_never_pushes(rig, monkeypatch)
 
 
 def test_park_executor_labels_comment_and_cleanup(rig):
-    seed_issue(rig, "i5", status="blocked")
+    seed_issue(rig, "i5", status="running")
     (rig.home / "state" / "blocked" / "i5").write_text("q?")
-    def m(st):
-        st["answerers"] = {"a1": {"for": "i5", "launched_at": NOW}}
-    loopstate.update(str(rig.home / "state" / "issues.json"), m)
     out = rig.r._execute({"act": "park", "id": "i5", "num": 5,
-                          "needs_william": True, "memo": "answerer escalated"}, NOW)
+                          "needs_william": True, "memo": "progress-stall escalated"}, NOW)
     assert out == "ok"
     ms = mutations(rig)
-    assert any(m["kind"] == "comment" and "answerer escalated" in m["body"] for m in ms)
+    assert any(m["kind"] == "comment" and "progress-stall escalated" in m["body"] for m in ms)
     lab = [m for m in ms if m["kind"] == "set_labels"][-1]
     assert lab["add"] == "needs-owner" and "in-progress" in lab["remove"]
     st = loopstate.load(str(rig.home / "state" / "issues.json"))
     assert st["issues"]["i5"]["status"] == "needs_william"
-    assert st["answerers"] == {}
     assert not (rig.home / "state" / "blocked" / "i5").exists()
 
 
@@ -2752,19 +2723,19 @@ def test_reapprove_executor_zeroes_counters_rereleases_and_journals_the_old_ones
     retry count on the next launch and re-park at cap), status returns to ready, and the OLD
     counters are journaled so the issue's real prior cost is never lost."""
     seed_issue(rig, "i5", status="parked", launches=3, retries=2, conflicts=1,
-               launch_failures=2, answerer_failures=1, requeue_front=True)
+               launch_failures=2, merge_refusals=1, requeue_front=True)
     out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
     assert out.startswith("reapproved")
     ist = issue_state(rig, "i5")
     assert ist["status"] == "ready"
-    for k in ("launches", "retries", "conflicts", "launch_failures", "answerer_failures"):
+    for k in ("launches", "retries", "conflicts", "launch_failures", "merge_refusals"):
         assert ist[k] == 0, f"{k} not reset"
     assert ist["requeue_front"] is False
     # old counters journaled, not lost
     rec = [r for r in journal.read(rig.home) if r.get("act") == "reapprove"][-1]
     assert rec["id"] == "i5"
     assert rec["old_counters"] == {"launches": 3, "retries": 2, "conflicts": 1,
-                                   "launch_failures": 2, "answerer_failures": 1}
+                                   "launch_failures": 2, "merge_refusals": 1}
     # stale park-family label cleared (current needs-owner + legacy needs-william, issue #58)
     lab = [m for m in mutations(rig) if m["kind"] == "set_labels"][-1]
     assert "parked" in lab["remove"] and "needs-owner" in lab["remove"]
@@ -2773,7 +2744,7 @@ def test_reapprove_executor_zeroes_counters_rereleases_and_journals_the_old_ones
 def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(rig, monkeypatch):
     """Codex review R1 (blocking): counters alone are not enough — a parked issue's leftover
     finished/in-flight artifacts still drive decide() BEFORE the fresh launch. A leftover report
-    re-gates, an `exited` marker double-launches, a `blocked` marker re-enters the answerer flow,
+    re-gates, an `exited` marker double-launches, a `blocked` marker re-enters the question flow,
     and a `recheck_failed` field re-parks immediately. Reapprove must present a clean slate."""
     removed = []
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
@@ -2784,9 +2755,6 @@ def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(ri
     (rig.home / "reports" / "i5.md").write_text("## Tests\nstale report")
     for sub in ("blocked", "exited", "awaiting", "started"):
         (rig.home / "state" / sub / "i5").write_text("stale")
-    def m(st):
-        st["answerers"] = {"a1": {"for": "i5", "launched_at": NOW}}
-    loopstate.update(str(rig.home / "state" / "issues.json"), m)
 
     rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
 
@@ -2801,8 +2769,6 @@ def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(ri
     # record. A rebuild's diff is NOT that diff — a surviving carry would let a gen-1 verdict
     # ride onto gen-2 code, the exact hole the diff-pin closes.
     assert ist["review_carry"] is None
-    st = loopstate.load(str(rig.home / "state" / "issues.json"))
-    assert st["answerers"] == {}                                    # active answerer dropped
 
 
 # ---------------- re-approval rebuilds on a genuinely FRESH branch (issue #177) -------------------
@@ -3418,20 +3384,21 @@ def test_detect_self_anchor_empty_when_not_in_cmux():
     assert runner_mod.detect_self_anchor(run=boom) == {"pane": "", "workspace": "", "window": ""}
 
 
-# --------------------------- answerer default model (owner ruling 2026-07-05) --------------------
+# --------------------------- worker default model (owner ruling 2026-07-05) ----------------------
 
-def test_default_models_are_opus_1m_when_config_omits_them(tmp_path):
-    # owner ruling 2026-07-06: latest Opus + 1M context (the [1m] suffix) for both worker+answerer.
+def test_default_worker_model_is_opus_1m_when_config_omits_it(tmp_path):
+    # owner ruling 2026-07-06: latest Opus + 1M context (the [1m] suffix). The ruling covered the
+    # answerer too; that seat is retired (#194) and only the worker default lives here now.
     r = runner_mod.Runner(repo="x", config={"repo": "o/r"}, state_home=str(tmp_path), pane="p",
                           run_script=lambda *a, **k: 0, fetch_usage=lambda: {})
-    assert r._models() == ("opus[1m]", "opus[1m]")
+    assert r._worker_model() == "opus[1m]"
 
 
-def test_config_still_overrides_either_model(tmp_path):
-    r = runner_mod.Runner(repo="x", config={"repo": "o/r", "models": {"answerer": "haiku"}},
+def test_config_still_overrides_the_worker_model(tmp_path):
+    r = runner_mod.Runner(repo="x", config={"repo": "o/r", "models": {"worker": "haiku"}},
                           state_home=str(tmp_path), pane="p",
                           run_script=lambda *a, **k: 0, fetch_usage=lambda: {})
-    assert r._models() == ("opus[1m]", "haiku")
+    assert r._worker_model() == "haiku"
 
 
 # --------------------------- D3: finished-issue PR refresh bypasses the 90s poll throttle -------

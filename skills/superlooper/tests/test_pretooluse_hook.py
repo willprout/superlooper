@@ -5,7 +5,7 @@ rather than merely instructed-against:
 
   * AskUserQuestion in an unattended lane (i280): a human-facing dialog with no human at the pane,
     which stalled the lane all night. The deny points the worker at the DURABLE protocol — write
-    the blocked-question file — that a fresh answerer actually reads.
+    the blocked-question file — that the runner turns into a durable GitHub question (#163).
   * a pattern-kill (`pkill -f`, `killall`) that matched and killed the owner's own live process
     (the dashboard). The deny restates the standing CLAUDE.md rule: kill exact PIDs only.
 
@@ -125,13 +125,13 @@ def test_noop_outside_a_worker_session():
     assert wp.run(_pre("AskUserQuestion", {}), {"SL_RUN_ROOT": "/runs"}) is None
 
 
-def test_noop_in_an_answerer_session():
+def test_noop_in_a_debugger_session():
     # An ANSWERER (id `a<N>`) is launched through the same start-session.sh, so it carries BOTH gate
     # vars — but it is not a worker: its blocked-file protocol doesn't exist (it writes one answer
     # file and escalates via `PARK:`). The deny must NOT fire for it, for either hazard.
-    answerer = {"SL_ISSUE_ID": "a5", "SL_RUN_ROOT": "/runs/willprout"}
-    assert wp.run(_pre("AskUserQuestion", {}), answerer) is None
-    assert wp.run(_pre("Bash", {"command": "pkill -f x"}), answerer) is None
+    debugger = {"SL_ISSUE_ID": "d5", "SL_RUN_ROOT": "/runs/willprout"}
+    assert wp.run(_pre("AskUserQuestion", {}), debugger) is None
+    assert wp.run(_pre("Bash", {"command": "pkill -f x"}), debugger) is None
     # And a malformed / non-`i<N>` id is likewise never treated as a worker.
     for bad_id in ("", "i", "iabc", "7", "worker"):
         env = {"SL_ISSUE_ID": bad_id, "SL_RUN_ROOT": "/runs"}
@@ -224,11 +224,11 @@ def test_hook_is_a_noop_when_not_a_worker_session(tmp_path):
     assert _decision(r.stdout) is None
 
 
-def test_hook_is_a_noop_for_an_answerer_session(tmp_path):
-    # An answerer (id `a<N>`) carries both gate vars but is not a worker — the deny must not fire.
-    r = _run_hook(tmp_path / "run", _pre("AskUserQuestion", {}), issue_id="a5")
+def test_hook_is_a_noop_for_a_debugger_session(tmp_path):
+    # A debugger (id `d<N>`) carries both gate vars but is not a worker — the deny must not fire.
+    r = _run_hook(tmp_path / "run", _pre("AskUserQuestion", {}), issue_id="d5")
     assert r.returncode == 0, r.stderr
-    assert _decision(r.stdout) is None, "the deny is worker-scoped; an answerer must be untouched"
+    assert _decision(r.stdout) is None, "the deny is worker-scoped; a debugger must be untouched"
 
 
 def test_hook_fails_open_when_the_lib_is_missing(tmp_path):

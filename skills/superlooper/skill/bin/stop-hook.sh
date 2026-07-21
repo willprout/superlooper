@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Claude/Codex "Stop" hook. Fires when a session comes to rest. Acts only for worker sessions
-# (start-session.sh exports SL_ISSUE_ID + SL_RUN_ROOT). No-ops for the answerer, ad-hoc, and
+# (start-session.sh exports SL_ISSUE_ID + SL_RUN_ROOT). No-ops for the debugger, ad-hoc, and
 # every other session, so it is safe to register globally.
 #
 # It does NOT write a completion/report marker and does NOT notify — a session yields the turn to

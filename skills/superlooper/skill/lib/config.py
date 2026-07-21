@@ -77,15 +77,19 @@ _TOP_DEFAULTS = {
 # the sibling defaults instead of wiping them. Unknown sub-keys inside these are rejected too.
 _NESTED_DEFAULTS = {
     # opus[1m] for BOTH (owner ruling 2026-07-06): this loader default WINS over
-    # runner._models()'s fallback (a filled-in value is truthy), so it must carry the ruling
-    # itself — a stale "fable" here silently starved answerers on repos that omit `models`
-    # (the eApp session's 2026-07-06 catch). Repos override either key explicitly (the eApp
-    # pins answerer: fable by William's project-specific choice).
+    # runner._worker_model()'s fallback (a filled-in value is truthy), so it must carry the ruling
+    # itself — a stale "fable" here silently starved the hired seat on repos that omit `models`
+    # (the eApp session's 2026-07-06 catch). Repos override either key explicitly.
+    # `debugger` is the watchdog's unattended sl-debugger seat (issue #66) — the field WAS
+    # `models.answerer`, renamed when #194 retired the answerer, because the debugger became its
+    # only reader (a hired-judgment seat, so it keeps the same strongest-configuration default).
+    # An old config still saying `answerer` fails loud as an unknown key, naming `debugger` in the
+    # allowed list — the owner renames the pin instead of silently losing it.
     # worker_effort defaults to None (owner ruling 2026-07-07): a repo-wide reasoning-effort
     # default for WORKER launches. None means exactly today's behaviour — NEVER send --effort. It
-    # MUST stay a genuine null: unlike worker/answerer, a filled-in truthy default would WIN over
+    # MUST stay a genuine null: unlike worker/debugger, a filled-in truthy default would WIN over
     # the runner's no-flag fallback and force an effort on every repo that omits the field (the
-    # stale-fable trap). A per-issue effort:* label overrides it; the answerer never reads it.
+    # stale-fable trap). A per-issue effort:* label overrides it; the debugger never reads it.
     # reviewer/reviewer_effort (issue #158): the per-repo pin for the CROSS-REVIEWER's model +
     # reasoning-effort. The 2026-07-14→15 incident began when the owner changed his machine-global
     # Codex config for unrelated work and every in-flight cross-review silently ran at ultra effort,
@@ -97,7 +101,7 @@ _NESTED_DEFAULTS = {
     # back to a fresh subagent that needs no model flag); `reviewer_effort` is a bounded, reliably-
     # under-timeout tier. A repo overrides either; the codex flag syntax lives in bin/cross-review.sh
     # (agent boundary), so the pin stays per-repo config, never a hardcoded Codex fact in the core.
-    "models": {"worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": None,
+    "models": {"worker": "opus[1m]", "debugger": "opus[1m]", "worker_effort": None,
                "reviewer": "gpt-5.5", "reviewer_effort": "medium"},
     # checks_pending_cap (issue #26): seconds a FINISHED PR may sit with its required checks
     # PENDING before the runner escalates ONCE to needs-william (naming the unreported checks).
@@ -343,7 +347,7 @@ def _validate_and_fill(raw):
 
     # --- typed checks on the nested sub-fields (unknown-key rejection above is not enough: a
     # wrong-TYPED value would load clean and only blow up later in the runner/notify/QA code) ---
-    for mk in ("worker", "answerer"):
+    for mk in ("worker", "debugger"):
         v = out["models"][mk]
         if not isinstance(v, str) or not v.strip():
             _err(f"'models.{mk}' must be a non-empty string, got {v!r}")
@@ -355,7 +359,7 @@ def _validate_and_fill(raw):
     # reviewer / reviewer_effort (issue #158): NO valid null. A null model would omit `-m` and a null
     # effort would omit `-c model_reasoning_effort=`, and either omission lets codex read the
     # machine-global config — the exact ambient-poison the pin exists to end. So both are required
-    # non-empty strings, validated like worker/answerer (a blank or wrong type fails the adopt loudly).
+    # non-empty strings, validated like worker/debugger (a blank or wrong type fails the adopt loudly).
     for rk in ("reviewer", "reviewer_effort"):
         v = out["models"][rk]
         if not isinstance(v, str) or not v.strip():

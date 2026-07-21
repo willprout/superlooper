@@ -2,9 +2,9 @@
 # Claude "PreToolUse" hook. Fires before EVERY tool call. Denies exactly two named hazards —
 # AskUserQuestion, and pattern-kills (pkill -f / killall) — in a superlooper WORKER session, and
 # lets everything else proceed untouched. This script fences on SL_ISSUE_ID + SL_RUN_ROOT (present
-# for the whole worker family — start-session.sh launches issue workers AND answerers through it) and
+# for the whole worker family — start-session.sh launches issue workers AND debuggers through it) and
 # on Claude; lib/worker_pretooluse.py then makes the fine decision, denying only in a WORKER session
-# (`i<N>`) and no-opping for answerers (`a<N>`), ad-hoc, and everything else. Safe to register
+# (`i<N>`) and no-opping for debuggers (`d<N>`), ad-hoc, and everything else. Safe to register
 # globally: outside that family this exits before reading a byte.
 #
 # The deny makes two of the costliest worker-instruction-drift incidents mechanically impossible

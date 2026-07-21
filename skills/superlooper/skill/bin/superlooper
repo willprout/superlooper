@@ -1059,20 +1059,6 @@ def _recorded_windows(home):
     return out
 
 
-def _recorded_answerer_windows(home):
-    """The a<N> ids that have a recorded cmux window: a pane marker file state/panes/a<N> (an exact
-    `a<N>` name — the `.ws` sidecar is skipped). Missing dir / unreadable -> empty set. Mirrors
-    _recorded_windows for the answerer id shape (issue #132)."""
-    out = set()
-    try:
-        for name in os.listdir(_panes_dir(home)):
-            if re.fullmatch(r"a\d+", name):
-                out.add(name)
-    except OSError:
-        pass
-    return out
-
-
 def _snapshot(home, iid):
     """(surface, ws) read from disk NOW. Captured at LIST time — the close then targets exactly
     the window shown to William, never a re-read that a relaunch during the y/N wait could have
@@ -1134,13 +1120,6 @@ def cmd_tidy(args):
     st = st if isinstance(st, dict) else {}
     issues = st.get("issues") if isinstance(st.get("issues"), dict) else {}
     targets = tidy_lib.closable(issues, _recorded_windows(home), scope_all=args.all)
-    # Answerer (a<N>) windows are ALWAYS in scope, both here and under --all: a finished answerer
-    # never relaunches (aids are monotonic, single-use), so there is no merged-vs-terminal distinction
-    # to gate — and the dashboard button (always merged-only) rides on the default scope to close them
-    # too (issue #132). closable_answerers' high-water mark guarantees a mid-hire answerer is never
-    # picked, and its cleanup is race-free, so these are folded straight into the same close path.
-    targets += tidy_lib.closable_answerers(st.get("answerers"), st.get("next_answerer"),
-                                           _recorded_answerer_windows(home))
     scope = "terminal" if args.all else "merged"
     if not targets:
         print(f"tidy: no finished ({scope}) session windows to close.")
@@ -1711,8 +1690,11 @@ def _debugger_shim_run(cfg, repo, home, pane, sid):
     script = os.environ.get("SL_LAUNCH_SESSION") or os.path.join(_HERE, "launch-session.sh")
     env = {**os.environ,
            "SL_RUN_ROOT": home, "SL_PANE": pane,
-           # the debugger is a hired-judgment seat like the answerer — same model default
-           "SL_MODEL": models.get("answerer") or "opus[1m]", "SL_EFFORT": "",
+           # The debugger is the loop's one remaining hired-judgment seat (diagnose-vs-escalate on a
+           # stuck instance), so it runs on the strongest configuration by default. `models.debugger`
+           # is the per-repo pin — the field was called `models.answerer` until #194 retired the
+           # answerer and left the debugger its only reader.
+           "SL_MODEL": models.get("debugger") or "opus[1m]", "SL_EFFORT": "",
            # PIN the shim verify window (review P1-1): launch-session.sh inherits
            # SL_LAUNCH_VERIFY_SECONDS, and an ambient large value (a debugging export, a
            # LaunchAgent env) would let the launch outlive WATCHDOG_LAUNCH_TIMEOUT — rc=124

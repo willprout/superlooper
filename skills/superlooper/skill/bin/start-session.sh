@@ -7,7 +7,7 @@
 # SL_ISSUE_ID + SL_RUN_ROOT arrive in the environment (set by launch-session.sh's --command prefix);
 # re-export them so agent hook children inherit them.
 #
-# <id> is the loop id: i<N> for an issue worker, a<N> for an answerer (both share this launcher and
+# <id> is the loop id: i<N> for an issue worker, d<N> for a debugger (both share this launcher and
 # the same marker discipline; the runner tells them apart, not this script).
 set -uo pipefail
 ID="${1:?usage: start-session.sh <id>}"

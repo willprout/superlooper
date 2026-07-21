@@ -152,9 +152,10 @@ EXIT_REPLY_WINDOW_SECONDS = 600
 NUDGE_GRACE_WINDOW_SECONDS = 480
 # How long a session may sit at its OWN in-window question before the owner is told (issue #151).
 # A lane at a dialog is never parked — it is alive — but it must not be SILENT either: the loop's
-# channel for "worker needs input" is state/blocked/<id> -> hire_answerer, and an in-window
-# AskUserQuestion is off that channel, so nobody will ever answer it and the lane's slot (frozen is
-# an INFLIGHT status) would leak forever. 30 min is far past any dialog a watching owner answers,
+# channel for "worker needs input" is state/blocked/<id> -> a durable GitHub question (#163), and
+# an in-window AskUserQuestion is off that channel, so nobody will ever answer it and the lane's
+# slot (frozen is an INFLIGHT status) would leak forever. 30 min is far past any dialog a watching
+# owner answers,
 # and far inside the 94-minute class of silence this issue exists to end.
 AT_DIALOG_ALERT_SECONDS = 1800
 LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LAUNCHVERIFY x2)
@@ -220,10 +221,12 @@ PARK_LABEL_STUCK_ALERT_SECONDS = 600
 # standing-rule work, not an agent applying William's word. Do not add, drop, or reorder.
 FIX_ISSUE_LABELS = ["type:diagnose-and-fix", "agent-ready", "auto-approved:nightly-red", "expedite"]
 
-# Statuses that occupy a lane (a blocked/frozen/exited session still owns its worktree+branch)
+# Statuses that occupy a lane (a running/frozen/exited session still owns its worktree+branch)
 # vs statuses from which a (re)launch is legitimate. gating/holding hold NO lane: the build is
 # done and only merge mechanics remain, so a lane frees the moment the report lands.
-INFLIGHT_STATUSES = {"running", "blocked", "frozen", "exited"}
+# `blocked` is NOT here (#194): a worker asking a question stays `running` until the runner posts
+# the question and releases the lane to `awaiting_answer`, which holds no lane by design (#163).
+INFLIGHT_STATUSES = {"running", "frozen", "exited"}
 TERRITORY_CLAIM_STATUSES = INFLIGHT_STATUSES | {"gating", "holding"}
 TERMINAL_STATUSES = {"merged", "parked", "needs_william", "bounced"}
 RELAUNCHABLE_STATUSES = {None, "ready", "parked", "needs_william", "bounced"}
@@ -379,7 +382,7 @@ def _alert_message(reason):
         return (f"{iid}'s session has been sitting at its OWN question dialog in-window for "
                 f"{AT_DIALOG_ALERT_SECONDS // 60}+ min — it asked something and is waiting for an "
                 "answer nobody is going to give: an in-window question bypasses the loop's "
-                "blocked-file/answerer channel entirely. The lane is ALIVE and is not parked, but "
+                "blocked-file question channel entirely. The lane is ALIVE and is not parked, but "
                 "it is holding its slot and cannot progress. Open its tab and answer the dialog "
                 "(or press Esc so it writes a blocked file instead). Clears by itself once the "
                 "dialog is gone.")
@@ -1961,7 +1964,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # i328 stalled the afternoon queue for two hours: its PR was merged out-of-band while the
         # runner, which associated branch->PR only when an issue FINISHED, carried pr: null and never
         # learned the PR existed. _refresh_inflight_prs now reconciles every in-flight lane each
-        # tick, so the fact is in the view; this acts on it. Checked BEFORE the blocked/answerer and
+        # tick, so the fact is in the view; this acts on it. Checked BEFORE the blocked-question and
         # frozen/idle lifecycles below, so a concluded lane stops spinning them (that spinning WAS
         # the stall) — and only on a POSITIVE answer about this lane's ACTIVE branch:
         #   * a FRESH view, and the read PRESENT (`iid in prs`). The refused!=empty discipline (#61):
@@ -2172,7 +2175,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             #     to wait on an answer is not a fault, and parking a working lane on that evidence
             #     is the exact bug this issue exists to end. But "waiting on a human" would be too
             #     generous a reading: nobody is watching that pane, and an in-window question
-            #     bypasses the blocked-file/answerer channel, so the wait can be endless — which is
+            #     bypasses the blocked-file question channel, so the wait can be endless — which is
             #     why refusing to park it obliges the bounded session_at_dialog ALERT above. Alive
             #     is not the same as fine.
             # The recover still fires (below). That is deliberate and load-bearing: `recover` is
@@ -2228,7 +2231,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 attempts, attempts_corrupt = _counter(ist, "probe_attempts")
                 if attempts_corrupt:
                     # A wrong-typed probe counter means the cap can't be trusted — fail CLOSED to a
-                    # park (the same discipline retries/merge_refusals/answerer_failures hold), never
+                    # park (the same discipline retries/merge_refusals/launch_failures hold), never
                     # re-read it as 0 and re-probe (that is the fail-OPEN-on-wrong-typed defect class).
                     park(iid, num, f"{iid}: progress-stall park (issue #157) — the probe-attempt "
                                    f"counter is unreadable (corrupt state), so the bounded ladder "

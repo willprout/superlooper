@@ -31,9 +31,6 @@ Scenarios:
                   the test asserts the RUNNER does the memo comment + label mechanics.
   vanish          exit instantly with no markers (start-session.sh writes `exited` — the silent
                   death the relaunch ladder must cap and park).
-  answerer / answerer-park / answerer-silent
-                  play the hired answerer: write a decisive answer / a `PARK:` line / nothing
-                  to the answer path parsed from the answerer brief.
 
 Shared params (all optional): "edit" ({"file","append"} or {"file","line","text"} — same-line
 edits are how two issues manufacture a REAL merge conflict), "question", "memo", "answer",
@@ -433,27 +430,6 @@ def scenario_resolve_conflict(spec, brief):
     finish(spec, contract)
 
 
-def scenario_answerer(spec):
-    brief = sys.argv[-1]
-    m = re.search(r"([^\s`]*/answers/i\d+\.md)", brief)
-    if not m:
-        log("answerer brief is missing the answer path")
-        sys.exit(1)
-    path = m.group(1)
-    kind = spec["scenario"]
-    if kind == "answerer-silent":
-        log("answerer staying silent (timeout scenario)")
-        return
-    text = ("PARK: this is a product/owner decision — William must choose."
-            if kind == "answerer-park"
-            else spec.get("answer", "Use approach A — it matches the existing pattern in "
-                                    "src/ and needs no new dependency."))
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        f.write(text)
-    log("answer written")
-
-
 def main():
     if not ID or not RUN_ROOT:
         log("SL_ISSUE_ID / SL_RUN_ROOT missing — not launched through the real stack?")
@@ -463,9 +439,6 @@ def main():
     name = spec["scenario"]
     log("playing scenario %r (branch %r)" % (name, spec.get("branch")))
 
-    if ID.startswith("a"):
-        scenario_answerer(spec)
-        return
     if "Resolve the merge conflict on PR #" in brief:
         scenario_resolve_conflict(spec, brief)
         return

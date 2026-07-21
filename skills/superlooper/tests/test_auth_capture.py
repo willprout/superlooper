@@ -35,7 +35,7 @@ def make_config(**over):
         "ship_cmd": None, "ship_recheck_cmd": None,
         "report_required_sections": ["Tests"], "bright_lines": [],
         "cleanup_merged_worktrees": True, "report_time": "08:45",
-        "models": {"worker": "opus", "answerer": "fable"},
+        "models": {"worker": "opus", "debugger": "fable"},
         "session": {"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2, "conflict_cap": 2},
         "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
                "quarantine": [], "nightly_time": "02:00"},
