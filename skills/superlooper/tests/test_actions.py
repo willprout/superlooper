@@ -694,12 +694,19 @@ def test_a_corrupt_deferral_counter_with_no_live_lock_still_rebuilds():
     assert len(only(out, "reapprove")) == 1 and only(out, "park") == []
 
 
+def test_the_first_hand_back_never_claims_the_owner_re_approved():
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=_deferred()), "park")[0]["memo"]
+    assert "NOTHING WAS RETRIED" not in memo and "re-approved, but" not in memo
+
+
 def test_re_approving_a_still_locked_lane_answers_the_owner_instead_of_silently_re_parking():
     # A re-approval this ladder REFUSES (the counter is already at cap, so nothing is retried) must
     # not just strip `agent-ready` and go quiet — an owner action silently undone is the same
-    # silence #169 exists to end. The prior park LANDED (status needs_william, its cause stamped),
-    # so this agent-ready is the owner's: distinct cause -> park() texts and memos again.
-    dsk = _deferred(status="needs_william", park_notify_cause=actions.TEARDOWN_CAUSE)
+    # silence #169 exists to end. The prior park LANDED (park_landed_cause is written only past a
+    # successful set_labels, the call that strips agent-ready), so this agent-ready can only be one
+    # the owner put back: distinct cause -> park() texts and memos again.
+    dsk = _deferred(status="needs_william", park_notify_cause=actions.TEARDOWN_CAUSE,
+                    park_landed_cause=actions.TEARDOWN_CAUSE)
     out = decide(parsed_issues=[parsed(5)], dsk=dsk)
     p = only(out, "park")
     assert len(p) == 1 and p[0]["cause"] == actions.TEARDOWN_CAUSE_REAPPROVED
@@ -708,12 +715,17 @@ def test_re_approving_a_still_locked_lane_answers_the_owner_instead_of_silently_
     assert "NOTHING WAS RETRIED" in p[0]["memo"] and "4242" in p[0]["memo"]
 
 
-def test_a_park_whose_label_move_failed_is_still_a_silent_retry_not_an_owner_re_approval():
-    # The counter-case for the above, and why the cause reads BOTH the stamp and the status: when a
-    # park's label move fails (the #61 dead zone), status never settles and the OLD agent-ready is
-    # still standing. That is the first park re-deriving, not an owner act — it must stay the
-    # deduped silent retry, or the dead zone re-opens the 41-text storm #61 closed.
-    dsk = _deferred(status="parked", park_notify_cause=actions.TEARDOWN_CAUSE)
+@pytest.mark.parametrize("status", ["parked", "needs_william"])
+def test_a_park_whose_label_move_failed_is_still_a_silent_retry_not_an_owner_re_approval(status):
+    # The counter-case, and why the cause reads park_landed_cause rather than the status: when a
+    # park's label move fails (the #61 dead zone) the notify marker IS stamped but the labels never
+    # moved, so the OLD agent-ready is still standing — that is the first park re-deriving, not an
+    # owner act. `needs_william` is the load-bearing half of the parametrize: a lane parked
+    # needs-owner earlier for another cause is already in that status, so status alone cannot tell
+    # the two apart. Reading it as a re-approval would text a falsehood AND burn the re-approved
+    # cause, making the owner's real re-approval the silent one — the very defect this pair fixes.
+    dsk = _deferred(status=status, park_notify_cause=actions.TEARDOWN_CAUSE,
+                    park_landed_cause="launch_delivery")     # the last park that ACTUALLY landed
     out = decide(parsed_issues=[parsed(5)], dsk=dsk)
     p = only(out, "park")
     assert len(p) == 1 and p[0]["cause"] == actions.TEARDOWN_CAUSE and p[0].get("retry") is True
@@ -750,6 +762,17 @@ def test_a_conflict_regenerate_that_cannot_clear_its_worktree_parks_at_the_cap()
     p = only(out, "park")
     assert len(p) == 1 and p[0]["needs_william"] is True and "4242" in p[0]["memo"]
     assert has_notify(out)
+
+
+def test_a_capped_conflict_regenerate_whose_lock_is_gone_still_rebuilds():
+    # The regenerate face of the escape hatch: the cap must bite only while the cause stands, here
+    # too. Without this, a lane whose stale lock finally died would never regenerate again.
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING"), live_lock_ids=set())
+    d["issues_state"]["issues"]["i5"].update(
+        update_result="conflict", update_head_oid=HEAD1, conflicts=0,
+        teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP, teardown_deferral_pid=4242)
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    assert len(only(out, "regenerate")) == 1 and only(out, "park") == []
 
 
 def test_a_conflict_regenerate_under_the_cap_is_untouched():

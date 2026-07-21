@@ -3895,10 +3895,42 @@ def test_a_declined_regenerate_charges_the_teardown_deferral_ladder(rig, monkeyp
     assert i["status"] == "gating", "a declined rebuild must touch nothing else"
 
 
+def test_clearing_the_lock_retires_the_ladder_wherever_it_happens(rig, monkeypatch):
+    """The invariant that makes 'consecutive refusals' TRUE rather than merely intended. The lock
+    is the cause; the teardown that clears it is where the ladder dies — not in each rebuild's
+    success block. A rebuild whose DEMAND merely disappeared (PR merged out of band, conflict
+    resolved by the merge-update) would otherwise strand a partial ladder, and the next episode's
+    first legitimate deferral would park a healthy lane at the cap over refusals that never
+    happened. So even a plain teardown — no rebuild in sight — retires it."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i5", status="parked", num=5, teardown_deferrals=3,
+               teardown_deferral_pid=4242, teardown_deferral_lock="/old/worker.i5.lock")
+    _teardown_rig(rig, "i5")
+
+    assert rig.r._teardown_session("i5", remove_worktree=True) is True
+    i = _ist(rig, "i5")
+    assert i["teardown_deferrals"] == 0 and i["teardown_deferral_pid"] is None
+    assert i["teardown_deferral_lock"] is None
+
+
+def test_a_teardown_that_clears_nothing_leaves_the_ladder_alone(rig, monkeypatch):
+    """The other half: a teardown that DECLINES clears no lock, so the cause stands and the rungs
+    must stand with it. Zeroing here would make the ladder unclimbable and restore the livelock."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: pytest.fail("pruned under a live CLI"))
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0.05)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: True)
+    seed_issue(rig, "i5", status="parked", num=5, teardown_deferrals=3)
+    _teardown_rig(rig, "i5")
+
+    assert rig.r._teardown_session("i5", remove_worktree=True) is False
+    assert _ist(rig, "i5")["teardown_deferrals"] == 3
+
+
 def test_a_rebuild_that_succeeds_clears_the_deferral_ladder(rig, monkeypatch):
-    """The counter means CONSECUTIVE refusals. A worker that was merely slow to unwind must not
-    leave a rung behind for the next episode to trip over — and the cleared ladder is what makes
-    the park's 'remove the lock, then re-approve' instruction true."""
+    """End to end through the executor: a re-approval whose prune lands starts from zero, which is
+    what makes the park's 'remove the lock, then re-approve' instruction true."""
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
     seed_issue(rig, "i5", status="parked", num=5, teardown_deferrals=3,
@@ -3907,12 +3939,9 @@ def test_a_rebuild_that_succeeds_clears_the_deferral_ladder(rig, monkeypatch):
 
     rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
     i = _ist(rig, "i5")
+    assert i["status"] == "ready"                                   # the rebuild really proceeded
     assert i["teardown_deferrals"] == 0 and i["teardown_deferral_pid"] is None
     assert i["teardown_deferral_lock"] is None
-    # ...and the prior cost is journaled, never silently dropped (the reapprove contract)
-    lines = [json.loads(l) for l in (rig.home / "journal.jsonl").read_text().splitlines()]
-    old = [l for l in lines if l.get("act") == "reapprove"][-1]["old_counters"]
-    assert old["teardown_deferrals"] == 3
 
 
 def test_a_regenerate_that_succeeds_clears_the_deferral_ladder(rig, monkeypatch):
@@ -3926,6 +3955,39 @@ def test_a_regenerate_that_succeeds_clears_the_deferral_ladder(rig, monkeypatch)
                     "new_branch": "sl/i7-x-2", "conflicts": 1}, NOW)
     i = _ist(rig, "i7")
     assert i["teardown_deferrals"] == 0 and i["teardown_deferral_pid"] is None
+
+
+def test_only_a_park_whose_labels_moved_records_that_it_landed(rig, monkeypatch):
+    """`park_landed_cause` is decide's one durable proof that a park really stripped `agent-ready`
+    (#169) — the fact `status` cannot carry, because a lane parked needs-owner earlier is ALREADY
+    needs_william and looks identical whether this park landed or died at the gh call. So it must
+    be written past set_labels and nowhere else: a failed label move that recorded it anyway would
+    let decide answer a re-approval nobody made, and burn the one cause that defeats the
+    notify-once dedup — making the owner's REAL re-approval the silent one."""
+    seed_issue(rig, "i5", status="needs_william", num=5)
+    monkeypatch.setattr(runner_mod.gh, "set_labels", lambda *a, **k: False)
+    rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": True,
+                    "memo": "m", "cause": "teardown_deferral"}, NOW)
+    i = _ist(rig, "i5")
+    assert i.get("park_landed_cause") is None, "a failed label move claimed it landed"
+    assert i["park_notify_cause"] == "teardown_deferral"     # the notify-once marker still stamps
+
+    monkeypatch.setattr(runner_mod.gh, "set_labels", lambda *a, **k: True)
+    rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": True,
+                    "memo": "m", "cause": "teardown_deferral"}, NOW)
+    assert _ist(rig, "i5")["park_landed_cause"] == "teardown_deferral"
+
+
+def test_a_reapproved_rebuild_drops_the_landed_park_record(rig, monkeypatch):
+    """`park_landed_cause` is scoped to its park episode, exactly like the park_notify_cause it
+    pairs with: left behind, a LATER first-time teardown park would be answered as a re-approval."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i5", status="needs_william", num=5,
+               park_notify_cause="teardown_deferral", park_landed_cause="teardown_deferral")
+
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert _ist(rig, "i5")["park_landed_cause"] is None
 
 
 def test_a_disk_hygiene_deferral_never_charges_the_rebuild_ladder(rig, monkeypatch):

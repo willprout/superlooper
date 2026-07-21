@@ -2205,6 +2205,15 @@ class Runner:
                   os.path.join(self.state, "panes", f"{iid}.ws"),
                   self._lock_path(iid)):
             _rm(p)
+        # (#169) The lock is gone, so whatever refused this lane's rebuilds is provably gone with it
+        # — every rung charged against it is history. Cleared HERE, at the one place that proves the
+        # cause is over, and not in each rebuild's success block: a rebuild whose DEMAND merely
+        # disappeared (its PR merged out of band, its conflict resolved by the merge-update) would
+        # otherwise strand a partial ladder, and the next episode's very first legitimate deferral —
+        # a worker taking one tick to unwind — would park a healthy lane at the cap, over a memo
+        # claiming N consecutive refusals that never happened. Clearing here makes "consecutive"
+        # true by construction, on every path that clears a lock.
+        self._clear_teardown_deferrals(iid)
         if remove_worktree:
             # (#190) The unsaved-work guard, for the disk-hygiene reclaim only. The worker is gone
             # (step 2), so the checkout is nobody's cwd — but if it still holds the sole copy of the
@@ -2243,6 +2252,17 @@ class Runner:
                 f.write(f"pid={pid} still alive at teardown\n")
         except OSError:
             pass
+
+    def _clear_teardown_deferrals(self, iid):
+        """Retire this lane's declined-prune ladder and the evidence explaining it (#169). Guarded
+        on a non-zero counter: _teardown_session runs for every reclaimable lane on every tick, and
+        an unconditional locked read-modify-write there would be a per-lane, per-tick cost for
+        nothing. The stamps go with the count — evidence for a count of zero is a lie, and the memo
+        that would quote it names a pid from an episode that is over."""
+        if not self._issue_field(iid, "teardown_deferrals"):
+            return
+        self._update_issue(iid, {"teardown_deferrals": 0, "teardown_deferral_pid": None,
+                                 "teardown_deferral_lock": None})
 
     def _charge_teardown_deferral(self, iid):
         """Charge ONE refused rebuild to this lane's teardown-deferral ladder (issue #169), the
@@ -2684,6 +2704,7 @@ class Runner:
                             if isinstance(v, dict) and v.get("for") == iid]:
                     recs.pop(aid, None)
             i.update({"status": "merged", "park_notify_cause": None, "park_notify_at": None,
+                      "park_landed_cause": None,       # the pair (#169)
                       "park_comment_posted": False})
         self._update_issue(iid, fn=settle)
         # Reclaim the worktree, exactly as _exec_absorb_merged does for its 'merged' settle — a
@@ -2748,6 +2769,15 @@ class Runner:
                     recs.pop(aid, None)
             i = st["issues"].setdefault(iid, loopstate.new_issue())
             i["status"] = "needs_william" if a.get("needs_william") else "parked"
+            # (#169) The one durable record that a park's LABELS actually moved — written here and
+            # nowhere else, because this block runs only past the set_labels above. `status` cannot
+            # carry that fact: a lane that was ALREADY needs_william (parked before, for some other
+            # cause) looks identical whether this park landed or died at the gh call, and decide
+            # needs the difference. It reads this to tell "the owner put `agent-ready` back" (only
+            # possible after a park that really stripped it) from "my label move failed and the old
+            # label is simply still standing" — the #61 dead-zone state, which must stay a silent
+            # retry. Cleared wherever park_notify_cause is, so it never outlives its episode.
+            i["park_landed_cause"] = cause
         loopstate.update(self.issues_path, m)
         return "ok"
 
@@ -2763,12 +2793,11 @@ class Runner:
     _REAPPROVE_COUNTERS = ("launches", "retries", "conflicts", "launch_failures",
                            "answerer_failures", "answer_delivery_failures", "merge_refusals",
                            "questions_asked",   # a fresh approval resets the 2-question cap too (#163)
-                           "exit_asks",         # ...and the exit-interview ask ladder (#215)
-                           "teardown_deferrals")   # ...and the declined-prune ladder (#169): this
-                                                   # reset only ever runs AFTER the teardown it
-                                                   # counts SUCCEEDED, so the counter means
-                                                   # CONSECUTIVE refusals, and a lane freed by
-                                                   # deleting a stale lock starts from zero
+                           "exit_asks")         # ...and the exit-interview ask ladder (#215)
+    # (`teardown_deferrals` is deliberately NOT here: the #169 ladder is retired by the teardown
+    # that clears the lock — _teardown_session — which this executor has already run by the time it
+    # resets anything. Listing it too would zero a counter that is provably 0 and imply this reset
+    # is what makes it consecutive, which would be a lie about where the invariant lives.)
 
     def _exec_reapprove(self, a, now):
         """D7-sibling operator fix: William re-approving a parked/needs-william/bounced issue (a
@@ -2832,15 +2861,14 @@ class Runner:
                       "pr_read_pending_since": None,   # a re-run's refused-read hold times fresh (#61)
                       "comments_read_pending_since": None,   # ...and its comments-read hold too (#78)
                       "park_notify_cause": None, "park_notify_at": None,
+                      "park_landed_cause": None,       # ...and the landed-park record (#169)
                       "park_comment_posted": False,    # ...and its own park (if any) texts again (#61)
                       "pending_question": None, "qa_log": [],   # a clean-slate rebuild drops the
                       "question_posted": False,        # prior Q&A trail, its post time, and the
                       "question_posted_at": None,      # post-once stamp (#163)
                       "exit_asked_at": None, "exit_asked_key": None,   # a fresh episode gets a
                       "exit_nonce": None, "exit_verify": None,         # fresh exit interview,
-                      "exit_ack_relayed": None,        # paired with exit_asks=0 above (#215)
-                      "teardown_deferral_pid": None,   # the ladder's evidence, dropped with the
-                      "teardown_deferral_lock": None})  # counter it explains (#169)
+                      "exit_ack_relayed": None})       # paired with exit_asks=0 above (#215)
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()
@@ -2891,6 +2919,7 @@ class Runner:
                       "checks_pending_since": None, "comments_read_pending_since": None,
                       "pr_read_pending_since": None, "read_waited": False,
                       "park_notify_cause": None, "park_notify_at": None,
+                      "park_landed_cause": None,       # its pair (#169)
                       "park_comment_posted": False,
                       # (#169) The declined-prune ladder is one of those transient fields too, and
                       # it belongs to the ACTION that charged it (a reapprove/regenerate rebuild),
@@ -3288,6 +3317,7 @@ class Runner:
         Clearing the marker lets a LATER genuine park on this issue text again — the guard is
         per-cause-episode, never forever."""
         self._update_issue(a["id"], {"park_notify_cause": None, "park_notify_at": None,
+                                     "park_landed_cause": None,   # its pair (#169)
                                      "park_comment_posted": False})
         return "ok"
 
@@ -3517,17 +3547,14 @@ class Runner:
                                  "review_carry": None,   # fresh branch, fresh review (#154)
                                  "nudged": [], "nudged_at": {},   # fresh nudge+grace window (#222)
                                  "pr": None, "recheck_failed": False,
-                                 # (#169) The prune this rebuild needed just SUCCEEDED, so the
-                                 # declined-prune ladder starts over: the counter means CONSECUTIVE
-                                 # refusals, never a lifetime tally that would park a later episode
-                                 # on a worker that merely took a few ticks to unwind.
-                                 "teardown_deferrals": 0, "teardown_deferral_pid": None,
-                                 "teardown_deferral_lock": None,
+                                 # (the #169 declined-prune ladder is already retired by the
+                                 # _teardown_session above — it clears the lock, which IS the cause)
                                  "checks_pending_since": None, "merge_refusals": 0,
                                  "merge_refusal_reason": None,
                                  "pr_read_pending_since": None,   # fresh branch, fresh episodes (#61)
                                  "comments_read_pending_since": None,   # ...comments-read hold too (#78)
                                  "park_notify_cause": None, "park_notify_at": None,
+                                 "park_landed_cause": None,       # its pair (#169)
                                  "park_comment_posted": False})
         # 3. GitHub: supersede the PR (branch preserved on the remote, PR left open — nothing
         #    auto-closed), tell the issue, requeue it front-of-band.

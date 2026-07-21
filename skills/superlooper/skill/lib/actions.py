@@ -586,22 +586,32 @@ TEARDOWN_CAUSE = "teardown_deferral"
 # The SECOND hand-back: the owner re-approved a lane whose lock is still live, so the rebuild was
 # refused again — this time without even retrying, because the counter is already at the cap. It
 # gets its own cause so park()'s notify-once dedup (#61) treats it as a NEW episode and answers the
-# owner instead of silently stripping their `agent-ready` a second time. Repeat re-approvals of an
-# unchanged situation then dedup on THIS cause, as every park does.
+# owner instead of silently stripping their `agent-ready` a second time. Re-approvals PAST that one
+# then dedup on THIS cause and go quiet, which is a deliberate asymmetry with every other ladder:
+# elsewhere a re-approval reaches _exec_reapprove, which clears park_notify_cause and so re-texts
+# each time. Here the executor never runs (the rebuild is refused before it), so the marker stands
+# and the owner is answered ONCE per unchanged situation — the memo a third re-approval would
+# repeat is already on the issue, word for word.
 TEARDOWN_CAUSE_REAPPROVED = "teardown_deferral_reapproved"
 
 
-def _teardown_park_cause(ist, status):
+def _teardown_park_cause(ist):
     """Which of the two #169 hand-backs is this — the first, or the answer to a re-approval that
-    did not clear the cause? A PRIOR teardown park that LANDED is the tell, and both halves are
-    needed to read it: the executor sets status only after the label move succeeds, so
-    `needs_william` means the park really landed and really stripped `agent-ready` — therefore the
-    `agent-ready` we are looking at now is one the owner put back. (A park whose label move FAILED
-    leaves status `parked` and the old label standing; that is a silent retry of the FIRST park,
-    which is exactly what the #61 dedup is for, and it must not be mistaken for an owner act.)"""
-    prior = ist.get("park_notify_cause") if isinstance(ist, dict) else None
-    landed = isinstance(prior, str) and prior.startswith(TEARDOWN_CAUSE)
-    return TEARDOWN_CAUSE_REAPPROVED if landed and status == "needs_william" else TEARDOWN_CAUSE
+    did not clear the cause?
+
+    The tell is `park_landed_cause`: the executor writes it ONLY past a successful `set_labels`,
+    and that set_labels is the one that strips `agent-ready`. So a teardown cause recorded there
+    means the label really went — and the `agent-ready` we are looking at now can only be one the
+    owner put back. Nothing weaker works. `status == "needs_william"` looks like the same fact and
+    is NOT: a lane parked needs-owner earlier for some OTHER cause is already `needs_william`, so a
+    teardown park that DIED at the gh call leaves state indistinguishable from the owner's
+    re-approval — and answering that with the re-approved memo would both tell the owner they did
+    something they did not, and burn the one cause that can defeat park()'s notify-once dedup, so
+    their real re-approval (once GitHub recovers) would be the silent one. A failed label move is
+    the #61 dead-zone retry and must stay deduped."""
+    landed = ist.get("park_landed_cause") if isinstance(ist, dict) else None
+    return (TEARDOWN_CAUSE_REAPPROVED
+            if isinstance(landed, str) and landed.startswith(TEARDOWN_CAUSE) else TEARDOWN_CAUSE)
 
 
 def _teardown_deferral_memo(ist, iid, corrupt=False, reapproved=False):
@@ -1297,7 +1307,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                         # end. Retrying instead is NOT the alternative: a park whose label move
                         # failed would then re-enter the rebuild every cap's worth of ticks, the
                         # park->reapprove churn loop _forget_cached_label exists to prevent.
-                        cause = _teardown_park_cause(ist, status)
+                        # Re-approvals PAST that answer dedup on the re-approved cause, as every
+                        # park does — the memo they would repeat is already on the issue.
+                        cause = _teardown_park_cause(ist)
                         park(iid, _iid_num(iid),
                              _teardown_deferral_memo(ist, iid, corrupt=_teardown_corrupt(ist),
                                                      reapproved=cause == TEARDOWN_CAUSE_REAPPROVED),
