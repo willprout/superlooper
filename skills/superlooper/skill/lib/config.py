@@ -46,15 +46,22 @@ _TOP_DEFAULTS = {
     # required list is vacuously ok at the gate, silently disabling the section check.
     "report_required_sections": ["Tests", "Review"],
     "bright_lines": [],
+    # Prune a merged lane's WORKTREE once its session has ended. Strictly about the checkout (#178):
+    # false keeps the merged worktree on disk for inspection, and nothing else — the session is still
+    # closed, under auto_close_merged_windows just below. It used to imply "leave the coding CLI
+    # running" too, which since #155 (absorb_merged can fire on an in-flight lane) meant a worker left
+    # building against a branch that had already merged.
     "cleanup_merged_worktrees": True,
-    # Auto-close a lane's cmux window (and, ordered by #149, reclaim its worktree) once it has
-    # SUCCESSFULLY MERGED and landed — owner ruling 2026-07-16 (#168). Default True: a merged lane is
-    # truly done and never resurrected, so its finished session need not linger. Set false to keep
-    # merged windows/worktrees for inspection — the pre-#149 "nothing auto-closed" posture as an
-    # explicit opt-out; `superlooper tidy` then remains the owner's explicit word to close the WINDOW
-    # (tidy closes windows only, never prunes a worktree, so the merged checkout then stays on disk
-    # for manual inspection). This is the only #149-family auto-close of a merged lane; park-family
-    # lanes are NEVER auto-closed while live (see below).
+    # Auto-close a lane's cmux window (and, ordered by #149, reclaim its worktree unless
+    # cleanup_merged_worktrees says keep it) once it has SUCCESSFULLY MERGED and landed — owner ruling
+    # 2026-07-16 (#168). Default True: a merged lane is truly done and never resurrected, so its
+    # finished session need not linger. Set false to keep merged windows/worktrees for inspection —
+    # the pre-#149 "nothing auto-closed" posture as an explicit opt-out; `superlooper tidy` then
+    # remains the owner's explicit word to close the WINDOW (tidy closes windows only, never prunes a
+    # worktree, so the merged checkout then stays on disk for manual inspection). Off, the worktree
+    # persists too: a prune can never run under the live CLI this would leave open (#149). This is the
+    # only #149-family auto-close of a merged lane; park-family lanes are NEVER auto-closed while
+    # live (see below).
     "auto_close_merged_windows": True,
     # Reclaim the worktrees of park-family terminal issues (parked/needs-william/bounced) on every
     # tick. Owner ruling 2026-07-16 (#168): DEFAULT FALSE — the owner must be able to open the window

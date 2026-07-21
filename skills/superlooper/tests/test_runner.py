@@ -4347,6 +4347,91 @@ def test_merge_auto_closes_by_default(rig, monkeypatch):
     assert order == ["close", "prune"]
 
 
+# --- cleanup_merged_worktrees keeps the CHECKOUT, never the running CLI (issue #178) ---
+# The two knobs used to be ANDed, so `cleanup_merged_worktrees: false` — a choice about keeping the
+# checkout for inspection — also skipped the teardown entirely and left the session running. Since
+# #155 absorb_merged fires on an IN-FLIGHT lane, that left a worker actively building against an
+# already-merged PR, on a lane local state had already freed. Now the window knob alone decides
+# whether the session ends; the worktree knob decides only whether the checkout is pruned.
+
+def _close_but_keep_checkout(rig, monkeypatch):
+    """Prune gated off, window knob at its default. `_pid_alive` says True on purpose: the #178 case
+    is a worker still BUILDING, which is exactly what must be closed."""
+    closed, pruned = [], []
+    def run_script(args, env=None, timeout=None):
+        if "close-surface" in [str(a) for a in args]:
+            closed.append(1)
+        return 0
+    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: pruned.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: True)
+    rig.r.config = make_config(cleanup_merged_worktrees=False)
+    (rig.home / "worktrees" / "i7").mkdir(parents=True, exist_ok=True)
+    return closed, pruned
+
+
+def _assert_session_ended_checkout_kept(rig, closed, pruned):
+    assert closed == [1], "the merged lane's live CLI must be closed"
+    assert pruned == [], "cleanup_merged_worktrees: false keeps the checkout"
+    assert (rig.home / "worktrees" / "i7").exists()          # kept for inspection
+    assert not (rig.home / "state" / "panes" / "i7").exists()
+    assert not (rig.home / "state" / "worker.i7.lock").exists()
+    # nothing was DEFERRED: a lane whose prune is gated off must never enter the drain, which
+    # retries with remove_worktree=True and would prune the checkout the config says to keep.
+    assert not (rig.home / "state" / "pending_teardown" / "i7").exists()
+
+
+def test_absorb_merged_closes_the_live_session_when_only_the_prune_is_gated_off(rig, monkeypatch):
+    """The #178 headline: a PR merged out of band while the worker is still building. Under
+    `cleanup_merged_worktrees: false` the lane settles to merged either way — but the builder must
+    not be left running against a branch that has already landed."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"
+    _assert_session_ended_checkout_kept(rig, closed, pruned)
+
+
+def test_merge_closes_the_live_session_when_only_the_prune_is_gated_off(rig, monkeypatch):
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    seed_issue(rig, "i7", status="gating", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "merge", "id": "i7", "num": 7, "pr": 7,
+                           "method": "squash"}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"
+    _assert_session_ended_checkout_kept(rig, closed, pruned)
+
+
+def test_absorb_close_closes_the_live_session_when_only_the_prune_is_gated_off(rig, monkeypatch):
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    seed_issue(rig, "i7", status="bounced", num=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "absorb_close", "id": "i7", "num": 7}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"
+    _assert_session_ended_checkout_kept(rig, closed, pruned)
+
+
+def test_window_knob_off_keeps_the_checkout_even_with_the_prune_knob_on(rig, monkeypatch):
+    """The #168 property splitting the pair must not lose: an operator who set EITHER knob to keep
+    a finished checkout still gets it kept. With the window open there is nothing to prune under —
+    a prune can never run beneath the live CLI it would leave standing (#149)."""
+    closed, pruned = _no_close_no_prune(rig, monkeypatch)     # auto_close_merged_windows=False
+    assert rig.r.config["cleanup_merged_worktrees"] is True
+    (rig.home / "worktrees" / "i7").mkdir(parents=True, exist_ok=True)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+    assert closed == [] and pruned == []
+    assert (rig.home / "worktrees" / "i7").exists()
+    assert (rig.home / "state" / "worker.i7.lock").exists()   # session left fully intact
+
+
 def test_reclaim_terminal_worktrees_routes_through_the_one_teardown(rig, monkeypatch):
     """The parked-worktree reaper must clear the lane's stale pane markers too (D9), not just
     unlink its directory behind their back."""

@@ -2131,17 +2131,42 @@ class Runner:
                 return False
             time.sleep(WORKER_EXIT_POLL)
 
-    def _auto_close_merged(self):
-        """May a lane that just MERGED and landed have its cmux window auto-closed and its worktree
-        reclaimed? Owner ruling 2026-07-16 (#168): auto-closing a window is allowed ONLY for a
-        merged-and-landed lane, and even that is gated by `auto_close_merged_windows` (default True).
-        Composed (AND) with the pre-existing `cleanup_merged_worktrees` so a repo that set EITHER knob
-        to keep its finished checkouts is honored; #178 tracks unifying the overlapping pair. Off, the
-        merged window — and, since a prune can never run under the live CLI it would leave open (#149),
-        its worktree — persists; `superlooper tidy` is the owner's explicit word to close the WINDOW
-        (tidy never prunes a worktree, so the checkout then stays on disk for manual inspection)."""
-        return (self.config.get("auto_close_merged_windows", True)
-                and self.config.get("cleanup_merged_worktrees", True))
+    def _settle_merged_lane(self, iid):
+        """End the session of a lane that has settled TERMINAL-GOOD (merged, or closed by the owner)
+        and reclaim its checkout — each under its OWN knob (issue #178).
+
+            auto_close_merged_windows (default True)   may the SESSION be ended?
+            cleanup_merged_worktrees  (default True)   may the CHECKOUT then be pruned?
+
+        Owner ruling 2026-07-16 (#168): auto-closing a window is allowed ONLY for a merged-and-landed
+        lane, and even that is gated by `auto_close_merged_windows`. That knob is the whole of the
+        window question, and it is asked here alone.
+
+        The two used to be ANDed, and that is the bug this method exists to close. A knob whose name
+        is about WORKTREES — an operator keeping the checkout to look at it — silently also meant
+        "leave the coding CLI running", because with no teardown at all nothing closed the session
+        (and no pending_teardown marker was written either, so nothing ever retried). Before #155
+        that was untidy but inert: the lane could only be a FINISHED one whose worker idled at the
+        prompt. #155 lets absorb_merged fire on an IN-FLIGHT lane — a PR merged out of band while the
+        worker is still BUILDING — and there it is not inert at all: the builder keeps going against a
+        branch that has already landed, free to commit and push to it and (GitHub refuses only a
+        second OPEN PR on a head) open a fresh PR nobody asked for, while local status already reads
+        `merged`, the lane is freed, and nothing is watching it.
+
+        Splitting the pair keeps the #168 property that motivated the AND: an operator who set EITHER
+        knob to keep a finished checkout still gets it kept. Window knob off -> no teardown, so the
+        worktree persists too (a prune can never run under the live CLI it would leave open — #149);
+        `superlooper tidy` is then the owner's explicit word to close the WINDOW (tidy never prunes a
+        worktree, so the checkout stays on disk for manual inspection). Prune knob off -> the session
+        ends and the checkout stays, which is what that knob's name promised all along.
+
+        Returns _teardown_session's bool (False = a live worker still holds the lane), or False when
+        the window knob is off and nothing was attempted. No caller acts on it today; the retry for a
+        declined prune is _drain_pending_teardowns, as everywhere else."""
+        if not self.config.get("auto_close_merged_windows", True):
+            return False
+        return self._teardown_session(
+            iid, remove_worktree=self.config.get("cleanup_merged_worktrees", True))
 
     def _close_pane(self, iid):
         """Close the id's recorded surface. Best-effort; rc ignored (a dead surface = a no-op)."""
@@ -2736,13 +2761,12 @@ class Runner:
                       "park_landed_cause": None,       # the pair (#169)
                       "park_comment_posted": False})
         self._update_issue(iid, fn=settle)
-        # Reclaim the worktree, exactly as _exec_absorb_merged does for its 'merged' settle — a
-        # bounce/park absorbed this way would otherwise leave its worktree behind to accumulate. The
-        # owner's close IS the owner verb that resolved this lane (#168), so auto-closing its window
-        # here is not the "auto-close stalled work" the ruling forbids; it is gated by the same
-        # merged knob for an operator who keeps finished windows for inspection.
-        if self._auto_close_merged():
-            self._teardown_session(iid, remove_worktree=True)      # ordered (#149)
+        # End the session and reclaim the worktree, exactly as _exec_absorb_merged does for its
+        # 'merged' settle — a bounce/park absorbed this way would otherwise leave its worktree behind
+        # to accumulate. The owner's close IS the owner verb that resolved this lane (#168), so
+        # auto-closing its window here is not the "auto-close stalled work" the ruling forbids; it is
+        # gated by the same merged knobs for an operator who keeps finished windows/checkouts.
+        self._settle_merged_lane(iid)                             # ordered (#149); per-knob (#178)
         return "ok"
 
     def _forget_cached_label(self, iid, label):
@@ -3613,12 +3637,11 @@ class Runner:
                             "evidence + required checks + mergeable).")
         gh.set_labels(num, remove=["in-progress"])
         self._update_issue(iid, {"status": "merged"})
-        if self._auto_close_merged():
-            # (#149) The D14 hot path: the lane that just merged still has its worker idling at the
-            # prompt in this very worktree, so the old bare prune unlinked a live CLI's cwd at the
-            # exact moment the lane finished. Ordered teardown: close, see it go, then reclaim.
-            # (#168) A merged-and-landed lane is the ONE case the owner allows to auto-close.
-            self._teardown_session(iid, remove_worktree=True)
+        # (#149) The D14 hot path: the lane that just merged still has its worker idling at the
+        # prompt in this very worktree, so the old bare prune unlinked a live CLI's cwd at the
+        # exact moment the lane finished. Ordered teardown: close, see it go, then reclaim.
+        # (#168) A merged-and-landed lane is the ONE case the owner allows to auto-close.
+        self._settle_merged_lane(iid)                              # per-knob (#178)
         return "ok"
 
     def _review_carry(self, iid, head, pre, wt):
@@ -3976,8 +3999,10 @@ class Runner:
         if not gh.set_labels(num, remove=["in-progress"]):
             return "label cleanup failed (will retry next tick)"
         self._update_issue(iid, {"status": "merged"})
-        if self._auto_close_merged():
-            self._teardown_session(iid, remove_worktree=True)      # ordered (#149); merged-only (#168)
+        # (#178) Since #155 this can fire on an IN-FLIGHT lane — a PR merged out of band while the
+        # worker is still building — so ending that session is the point, not tidiness: the knob that
+        # keeps the CHECKOUT must not leave a builder running against a branch that already landed.
+        self._settle_merged_lane(iid)         # ordered (#149); merged-only (#168); per-knob (#178)
         return "ok"
 
     def _exec_file_fix_issue(self, a, now):
