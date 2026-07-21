@@ -72,8 +72,16 @@ thing that lands under ``~/.claude``, and its own inertness is enforced separate
 
 And a naming ratchet cannot see a destination that never appears in the repo at all — a path read
 from JSON config, from ``os.environ``, or assembled from fragments (``"." + "claude"``). Nothing
-static can. What it does guarantee is that the door cannot be written *in the open*, which is the
-form every real one has taken. Two narrower limits, accepted rather than fixed: a shell verb hidden
+static can. ``skill/lib/ops_docs.py`` (issue #199) is the live example of that shape and is
+worth naming: it writes the ops-doc mirror into whatever ``--dest`` it is handed, so pointing
+it at an installed engine home rewrites ``docs/ops`` there ungated. It stays invisible here by
+construction, deliberately — a module that cannot spell the home cannot become the door for the
+payload. What limits it is scope, not this test: both ends of its table are pinned to ``.md`` by
+``test_ops_docs.py``, so it can carry prose and never engine code, and it refuses a destination
+that does not already carry a publish stamp.
+
+What the naming ratchet DOES guarantee is that the door cannot be written *in the open*, which is
+the form every real one has taken. Two narrower limits, accepted rather than fixed: a shell verb hidden
 behind a variable or ``eval`` (``$RSYNC -a …``), and a path held in an attribute or a dict rather
 than a name (``self.dest``, ``cfg["dest"]``), are invisible to the write ban — layer 1 still stops
 them anywhere outside the allow-list.

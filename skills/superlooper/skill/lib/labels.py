@@ -72,8 +72,22 @@ _SPEC = {name: (color, desc) for name, color, desc in LABELS}
 # hand-back that writes the NEW label fails and re-notifies forever (the 2026-07-13 bounce storm,
 # ~15 texts). Renaming in place PRESERVES it on every issue that carries it, unlike creating a fresh
 # new-name label and orphaning the old one.
-_RENAME_OLD = "needs-william"
-_RENAME_NEW = "needs-owner"
+# Retired label name -> the name that replaced it. PUBLIC because it is the only record of the
+# loop's dead vocabulary, and the doc-lint (issue #199, defect class D12) needs it: an ops doc that
+# describes today's behaviour in a retired name sends the reader hunting a label the runner never
+# writes. Keeping the map here — beside LABELS — means the lint reads the same source of truth the
+# migration does, and a future rename is one edit, not two.
+RETIRED_LABELS = {
+    "needs-william": "needs-owner",
+}
+
+# Label families whose VALUE set is deliberately open (owner ruling 2026-07-07, see the model:/effort:
+# block above): the runner has no allowlist, so any `model:<x>` / `effort:<x>` a repo creates and
+# applies works, and LABELS carries only a starter set. PUBLIC for the same reason RETIRED_LABELS is
+# — the doc-lint has to know that `model:haiku` in an ops doc is a legitimate example and not a typo
+# for a label that does not exist. Without this the lint would redden CI over an instruction that
+# genuinely works, which is how a guard gets deleted rather than fixed.
+OPEN_LABEL_FAMILIES = ("model", "effort")
 
 
 def runner_managed_labels():
@@ -106,18 +120,24 @@ def label_migration_plan(existing):
         {"kind": "rename", "old": "needs-william", "new": "needs-owner"}
         {"kind": "create", "name": <a runner-managed label still missing>}
 
-    Empty when the repo is already migrated (a no-op boot). The RENAME comes first and, when it
-    applies, is accounted for before the create scan — so the label it produces (needs-owner) is not
+    Empty when the repo is already migrated (a no-op boot). RENAMES come first and, when they apply,
+    are accounted for before the create scan — so a label a rename produces (needs-owner) is not
     then also queued for creation. Wrong-typed `existing` fails closed to empty (via
     missing_runner_labels), so a garbage read plans to (re)create the runner-managed set rather than
-    silently plan nothing."""
+    silently plan nothing.
+
+    EVERY entry in RETIRED_LABELS is planned, not just the first: that map is public (the doc-lint
+    reads it), so a future rename will be added there and would otherwise be lint-visible but never
+    actually migrated — the exact shape of the 2026-07-13 bounce storm, where a merged rename had
+    not been applied to the repo. Sorted so the plan is deterministic."""
     have = set(existing) if isinstance(existing, (set, list, tuple, frozenset)) else set()
     steps = []
-    if _RENAME_OLD in have and _RENAME_NEW not in have:
-        steps.append({"kind": "rename", "old": _RENAME_OLD, "new": _RENAME_NEW})
-        have = set(have)
-        have.discard(_RENAME_OLD)
-        have.add(_RENAME_NEW)                  # the rename produced it — don't also create it
+    for old, new in sorted(RETIRED_LABELS.items()):
+        if old in have and new not in have:
+            steps.append({"kind": "rename", "old": old, "new": new})
+            have = set(have)
+            have.discard(old)
+            have.add(new)                      # the rename produced it — don't also create it
     for name in missing_runner_labels(have):
         steps.append({"kind": "create", "name": name})
     return steps

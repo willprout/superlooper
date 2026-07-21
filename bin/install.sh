@@ -75,6 +75,50 @@ DENY_CMD='$HOME/.claude/skills/superlooper/bin/pretooluse-hook.sh'
 
 [ -d "$SRC" ] || { echo "install: payload not found at $SRC" >&2; exit 1; }
 
+# THE OPERATIONAL DOCS (issue #199, defect class D12). Beyond the payload, this installer also
+# mirrors the operator-facing docs — STACK.md, runner-ops, the approval protocol and the whole
+# sl-debugger playbook — into $DEST/docs/ops. D12's third root cause was "the debugger playbook
+# wasn't installed on the machine having the incident": since the plugin restructure those docs
+# travel as optional plugin CONTENT, so a machine can run the loop with no playbook at 3am, and the
+# watchdog's unattended brief points a fresh session straight at a reference that isn't there.
+# Mirroring them here makes the ONE gated publisher put them on the machine, and
+# `superlooper doctor --stack`'s `installed ops docs` block FAILs when they are absent or stale.
+#
+# The table of what ships lives in the payload's lib/ops_docs.py, not here, so the installer and
+# the doctor read the same source of truth. $OPS_DOC_PATHS carries the source paths into the
+# engine-diff gate below: a doc that lands on the machine must be shown to the human first, exactly
+# like every other published file.
+#
+# PARSED, NOT IMPORTED. This runs BEFORE the gate, so it must not execute a single line of the
+# payload the human has not yet approved — running `ops_docs.py --list` would execute its module
+# body, and until this gate says yes that file is unreviewed engine code. So we read OPS_DOCS out
+# of the source with `ast`, which evaluates nothing. (The publish call at step 6 does run the
+# module, and by then the human has said yes.) The gate's own promise — nothing on this MACHINE is
+# touched before the OK — was never in question here; this is about not executing the diff's
+# subject while deciding whether to accept the diff.
+#
+# `|| OPS_DOC_PATHS=""` is load-bearing: under `set -e` a bare assignment whose command
+# substitution fails aborts the script on the spot, and the refusal below — written for exactly
+# that case — would never print. stderr is deliberately NOT swallowed, so python's own reason
+# (syntax error, missing file, no python3) reaches the operator before this script gives up.
+OPS_DOCS_PY="$REPO_ROOT/$PAYLOAD_REL/lib/ops_docs.py"
+OPS_DOC_PATHS="$(python3 -c '
+import ast, sys
+tree = ast.parse(open(sys.argv[1], "rb").read())
+for node in tree.body:
+    if isinstance(node, ast.Assign) and any(
+            getattr(t, "id", None) == "OPS_DOCS" for t in node.targets):
+        for pair in node.value.elts:
+            print(ast.literal_eval(pair)[0])
+        sys.exit(0)
+sys.exit("ops_docs.py defines no OPS_DOCS table")
+' "$OPS_DOCS_PY" | tr '\n' ' ')" || OPS_DOC_PATHS=""
+if [ -z "${OPS_DOC_PATHS// }" ]; then
+  echo "install: could not read the ops-doc list from $OPS_DOCS_PY — refusing to publish a" >&2
+  echo "install: machine whose gate would not show the docs it is about to install." >&2
+  exit 1
+fi
+
 # VERSION stamp: git SHA of THIS source repo + the install date. `nogit` if the tree has no git
 # (published tarball); the date always lands so a VERSION is never empty.
 SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)"
@@ -99,19 +143,25 @@ engine_gate() {  # engine_gate <report|gate>
     baseline_ok=true
   fi
 
-  echo "[install] engine-diff gate (payload: $PAYLOAD_REL)"
+  # The gate's scope is the payload PLUS the ops-doc sources (issue #199): both land on the machine
+  # when this script runs, so both have to be in the list the human says yes to. Unquoted on
+  # purpose — $OPS_DOC_PATHS is a space-separated list of repo paths and must word-split into
+  # separate pathspecs.
+  echo "[install] engine-diff gate (payload: $PAYLOAD_REL + ops docs)"
   if ! $baseline_ok; then
     echo "  no in-history baseline (first publish on this machine, or the last-published commit is"
     echo "  not in this repo's history) — treating the ENTIRE payload as new:"
-    git -C "$REPO_ROOT" ls-files -- "$PAYLOAD_REL" 2>/dev/null | sed 's/^/    A       /' || true
+    # shellcheck disable=SC2086
+    git -C "$REPO_ROOT" ls-files -- "$PAYLOAD_REL" $OPS_DOC_PATHS 2>/dev/null | sed 's/^/    A       /' || true
   else
     # Capture the diff's exit status explicitly (set -e is disabled inside this function, invoked
     # as `engine_gate gate || exit`). A git ERROR must NOT be mistaken for "no changes" and waved
     # through — that would be the one fail-OPEN branch in an otherwise fail-safe gate. On error we
     # fall through to requiring an explicit OK, exactly as if the payload had changed.
-    if changed="$(git -C "$REPO_ROOT" diff --name-status "$last_sha" HEAD -- "$PAYLOAD_REL" 2>/dev/null)"; then
+    # shellcheck disable=SC2086
+    if changed="$(git -C "$REPO_ROOT" diff --name-status "$last_sha" HEAD -- "$PAYLOAD_REL" $OPS_DOC_PATHS 2>/dev/null)"; then
       if [ -z "$changed" ]; then
-        echo "  no engine changes since last publish ($last_sha) — payload is unchanged."
+        echo "  no engine changes since last publish ($last_sha) — payload and ops docs unchanged."
         return 0
       fi
       echo "  engine files changed since last publish ($last_sha):"
@@ -314,6 +364,9 @@ if $DRY; then
   engine_gate report
   echo "[install] would publish : $SRC/ -> $DEST/   (rsync -a --delete)"
   echo "[install] would stamp   : $DEST/VERSION = $VERSION"
+  echo "[install] would mirror  : ops docs -> $DEST/docs/ops/ (stamped $VERSION)"
+  # shellcheck disable=SC2086
+  printf '%s\n' $OPS_DOC_PATHS | sed 's/^/    /'
   echo "[install] settings hooks ($SETTINGS):"
   merge_hooks report
   echo "[install] codex hooks ($CODEX_HOOKS):"
@@ -362,6 +415,18 @@ printf '%s\n' "$VERSION" > "$DEST/VERSION"
 #    command is "command not found". The linker writes a thin shim into a standard user bin dir and,
 #    if that dir is not on PATH, prints the exact line to add it — it never silently skips. Idempotent.
 "$SRC/bin/install-cli-link.sh"
+
+# 6) Mirror the operational docs into $DEST/docs/ops (issue #199). AFTER the rsync, for the same
+#    reason the VERSION stamp is: --delete would otherwise sweep them straight back out — and LAST,
+#    after the shim and the PATH link, deliberately. Under `set -e` a failure here aborts the run,
+#    and doing it earlier would leave a first-time install with an engine but no launch shim and no
+#    `superlooper` on PATH. Note what a failure HERE leaves: step 2's `rsync --delete` has already
+#    swept the previous mirror, so an aborted publish leaves the machine with NO ops docs rather
+#    than the older ones — which `doctor --stack` then FAILs on, loudly, by design. The helper
+#    rebuilds the mirror whole, so a doc retired upstream does not linger as a page an operator can
+#    still find and act on, and it fails loud (non-zero) rather than publishing a partial playbook.
+python3 "$OPS_DOCS_PY" --publish --repo-root "$REPO_ROOT" --dest "$DEST" --version "$VERSION" \
+  | sed 's/^/[install] ops doc      -> /'
 
 echo "[install] published skill -> $DEST"
 echo "[install] VERSION         -> $VERSION"

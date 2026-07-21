@@ -63,7 +63,7 @@ Step by step:
    follow-up filed by an investigation, a cleanup sweep, a bot), each piece of work is a
    GitHub issue, scoped small, carrying the context a fresh agent will need.
 
-   <img src="docs/assets/hiw/hiw-1-issue.png" width="700" alt="a real loop issue in the queue: title, needs-william label, opened by the owner">
+   <img src="docs/assets/hiw/hiw-1-issue.png" width="700" alt="a real loop issue in the queue: title, the owner-decision label needs-owner (this screenshot predates its rename from needs-william), opened by the owner">
 
 2. You approve and steer with labels. Saying yes puts the `agent-ready` label on an
    issue. That label is your word: no agent is allowed to apply it, ever. It's also your

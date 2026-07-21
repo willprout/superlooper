@@ -94,7 +94,7 @@ him **pre-authorize** it. Pre-authorization is *still his word* — just granted
   *only* the referee stop: every other gate (report, review evidence, checks, mergeability) still
   applies, so a pre-authorized PR merges only when everything else is green too.
 - **The bright line is untouched for un-authorized diffs.** Without the label, *any* diff that
-  reaches `.superlooper/**` or `.github/workflows/**` still parks needs-william — no label, no
+  reaches `.superlooper/**` or `.github/workflows/**` still parks `needs-owner` — no label, no
   referee merge, ever. An agent never applies the label on its own judgment; only William's explicit
   say-so does. (Note: the launch-gate hold above only fires where the referee touch is *mechanically*
   foreseeable — the issue's declared `touches:` resolve to a referee glob, which needs the repo to
