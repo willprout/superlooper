@@ -183,6 +183,12 @@ RESTART_MARKER = "runner.restart"
 QUESTION_MARKER = "<!-- superlooper-question -->"
 ANSWER_MARKER = "<!-- superlooper-answer -->"
 
+# The rotation notice a re-approval posts (#177). Marked for the same reason as the two above: it
+# is the RUNNER's bookkeeping addressed to the owner ("your re-approval retired branch X"), and an
+# un-marked comment would land in every rebuilt brief under the binding-owner-amendment header —
+# runner prose read to the worker as William's word.
+REBUILD_MARKER = "<!-- superlooper-rebuild -->"
+
 
 def _latest_answer(comments, owner, after_iso):
     """The owner's typed answer to the CURRENT question: the body (marker line stripped) of the
@@ -1726,8 +1732,12 @@ class Runner:
         terminal issues (parked / needs-william / bounced), which otherwise linger forever (only
         MERGED worktrees are auto-removed today). tidy.reclaimable_worktrees is the pure, fail-closed
         selector — it never returns an in-flight/gating/holding/ready lane, so a LIVE build is never
-        touched. Safe because re-approval rebuilds from the issue on a fresh branch (the committed
-        work survives on the branch ref; worktree_remove drops only the checkout).
+        touched. Safe because re-approval rebuilds from the issue on a fresh branch — _exec_reapprove
+        ROTATES the branch to its next unburned generation (#177), so the rebuild starts from
+        origin/<dev> rather than re-attaching the parked episode's checkout — while the committed
+        work survives on the retired branch ref (worktree_remove drops only the checkout). Unsaved
+        work is not this sweep's to lose either: it prunes through guard_worktree=True, so the #190
+        guard refuses a dirty/unpushed checkout outright and only ever drops a saved one.
 
         OFF BY DEFAULT since owner ruling 2026-07-16 (#168): `cleanup_parked_worktrees` now defaults
         FALSE, so this sweep is a no-op unless a repo explicitly opts in. The owner must be able to
@@ -2835,9 +2845,21 @@ class Runner:
         launch-session.sh derives `retries = launches - 1`, so a non-zero launches would restore
         the retry count and re-park at cap) and re-release to `ready`. The old counters are
         JOURNALED (never lost — the honest record of what the issue already cost). actions.decide
-        holds the launch back one tick so it fires against the reset state."""
+        holds the launch back one tick so it fires against the reset state.
+
+        (#177) And the rebuild gets a genuinely FRESH BRANCH. This reset used to clear everything
+        EXCEPT `branch` — so _launch_branch preferred the stale stamp and launch-session.sh's
+        fallback re-ATTACHED the existing branch: the "clean slate" resumed on the parked episode's
+        commits, pr_for_branch rediscovered its still-open PR, and `gh pr create` would refuse a
+        second PR on the same head (no force path exists anywhere by design). That made the
+        fresh-branch claim in _reclaim_terminal_worktrees / tidy.reclaimable_worktrees — the safety
+        argument for pruning a parked lane's worktree — false. The branch is now rotated to the next
+        unburned generation, exactly as a conflict-regenerate does, and the PR left open on the
+        retired branch is handed to the janitor's existing `superseded` lane."""
         iid, num = a["id"], a.get("num")
         old = {}
+        rotated = {}                               # {"old": ..., "new": ...} once the reset rotates
+        meta = {}                                  # pre-reset facts the gh bookkeeping below needs
         # 1. local hygiene FIRST (mirrors _exec_regenerate): stale artifacts must be unable to
         #    drive decide() before the fresh launch. Best-effort — no-ops when nothing is there;
         #    launch-session.sh recreates the worktree.
@@ -2870,6 +2892,21 @@ class Runner:
         #    would otherwise re-park, plus any active answerer record (a fresh approval is a fresh
         #    question too — mirrors _exec_park's answerer cleanup).
         def reset(st, i):
+            # (#177) Rotate BEFORE the counters are zeroed: next_generation reads `conflicts` as one
+            # of the two burned-generation sources, and a zeroed count would let this rebuild re-mint
+            # a name the conflict ladder already used. A lane with NO branch stamp was never even
+            # handed to the launcher, so there is nothing to retire — leave the stamp None and let
+            # _launch_branch mint the clean base name.
+            #
+            # A stamp does NOT prove the branch exists (_exec_launch stamps it BEFORE invoking
+            # launch-session.sh, so a lane parked on the launch-delivery ladder carries a name that
+            # was never created). Rotating anyway is the fail-safe direction: the alternative —
+            # probing whether the branch exists — answers "no" for a branch that survives only on the
+            # REMOTE, which is precisely the case whose push this issue exists to stop refusing. The
+            # cost of guessing wrong this way is a cosmetic `-r1`; the other way it is the bug back.
+            meta["type"] = i.get("type")
+            old_branch = i.get("branch")
+            new_branch = brief.rotate_branch(old_branch, actions.next_generation(i))
             for k in self._REAPPROVE_COUNTERS:
                 if i.get(k):                           # record only non-zero prior cost
                     old[k] = i.get(k)
@@ -2895,13 +2932,21 @@ class Runner:
                       "exit_asked_at": None, "exit_asked_key": None,   # a fresh episode gets a
                       "exit_nonce": None, "exit_verify": None,         # fresh exit interview,
                       "exit_ack_relayed": None})       # paired with exit_asks=0 above (#215)
+            if new_branch:
+                rotated.update(old=old_branch, new=new_branch)
+                i["branch"] = new_branch
             recs = st.get("answerers")
             if isinstance(recs, dict):
                 for aid in [k for k, v in recs.items()
                             if isinstance(v, dict) and v.get("for") == iid]:
                     recs.pop(aid, None)
         self._update_issue(iid, fn=reset)
-        journal.append(self.home, {"act": "reapprove", "id": iid, "old_counters": old}, now)
+        # The rotation is journaled with the counters — the record of where the retired episode's
+        # committed work went is exactly as load-bearing as the record of what it cost.
+        rec = {"act": "reapprove", "id": iid, "old_counters": old}
+        if rotated:
+            rec.update(old_branch=rotated["old"], new_branch=rotated["new"])
+        journal.append(self.home, rec, now)
         # Clear the park-family labels the owner re-approved past; the next tick's launch moves
         # agent-ready -> in-progress. Best-effort: a gh blip only leaves a cosmetic stale label,
         # never blocks the relaunch (phase E keys off agent-ready, not the parked label). Remove BOTH
@@ -2919,7 +2964,93 @@ class Runner:
         # backstop.
         if a.get("had_rebuild"):
             gh.set_labels(num, remove=["rebuild"])
-        return f"reapproved (reset {old or 'nothing'})"
+        # An INVESTIGATION is exempt: it opens no PR by contract, so the lookup is the pure waste
+        # issue #21 already refuses elsewhere, and a branch-retirement notice about a branch that
+        # carries no code is noise on the owner's issue. It still rotates — one invariant, no
+        # per-type carve-out in the naming.
+        labelled, failed = ((None, []) if not rotated or meta.get("type") == "investigate"
+                            else self._retire_old_branch(num, rotated))
+        parts = [f"reset {old or 'nothing'}"]
+        if rotated:
+            parts.append(f"rebuilding on {rotated['new']}")
+        if labelled:
+            parts.append(f"superseded PR #{labelled}")
+        if failed:
+            # NEVER report bookkeeping that did not land, and NAME what did not (fresh review P1 +
+            # P2): nothing retries this — the state reset has already dropped `pr` and left
+            # REAPPROVAL_STATUSES, so decide will not re-emit a completed reapprove, and every
+            # downstream reconciliation (janitor close-pr, delete-branch) keys off the `superseded`
+            # LABEL. A silent or misattributed failure orphans the retired PR forever behind a
+            # journal line that says it was handled.
+            parts.append("gh bookkeeping incomplete: " + ", ".join(failed))
+        return "reapproved (" + "; ".join(parts) + ")"
+
+    def _retire_old_branch(self, num, rotated):
+        """(#177) Record the rotation on GitHub and hand any PR still OPEN on the retired branch to
+        the janitor's `superseded` lane. Returns (pr_number_actually_labelled_or_None, [what failed]).
+
+        Two duties, both owed to the owner:
+          * the ISSUE comment always fires — a re-approval that silently retires a branch leaves the
+            episode's committed-but-unpushed work reachable only from the journal, and the owner is
+            the one who decides whether to go get it. It carries REBUILD_MARKER so brief.build reads
+            it as the runner's own bookkeeping, never as a binding owner amendment.
+          * a PR still OPEN on that branch is now an orphan (no issue points at it, nothing will
+            ever push to it again), and the janitor's sweeps — close-pr, delete-branch — only act on
+            a PR carrying the `superseded` label. Labelling it is the same bookkeeping
+            _exec_regenerate does for the identical situation, so a rebuild reached by re-approval
+            lands in the same lane as one reached by a conflict. The number comes back ONLY when the
+            LABEL landed, because the label IS what the janitor can see.
+
+        Reads the branch instead of trusting the recorded `pr`: the stamp can be stale or never
+        discovered, and pr_for_branch answers with the STATE too — only an OPEN PR is superseded (a
+        merged/closed one is history, and labelling it would feed the janitor's branch-delete sweep a
+        branch it must never touch). Its `--state all --limit 1` contract means a branch carrying
+        BOTH a closed and an open PR can answer with the closed one; that under-labels (leaves the
+        open PR for the owner) rather than mis-labelling, which is the safe side.
+
+        Nothing here can fail the re-approval — the fresh branch is the safety property and this is
+        bookkeeping — but every result travels back so the outcome names what really landed. It runs
+        AFTER the state write deliberately: running it first would make it retryable through decide's
+        re-emission, at the price of double-posting the notice on every partial failure, and a
+        duplicated owner-facing comment is the worse of the two (the failure is at least named)."""
+        read = gh.pr_for_branch(rotated["old"])
+        failed, labelled = [], None
+        if not read.ok:
+            # A REFUSED read is NOT "no PR" (#61's refused != empty discipline). Reporting it as a
+            # clean no-PR retirement would assert something we never looked at and hand back an
+            # outcome nothing retries, while an open PR sat unlabelled — invisible to the janitor
+            # forever. Say so in BOTH channels instead.
+            failed.append(f"the PR on `{rotated['old']}` could not be read (refused), so nothing "
+                          "was labelled `superseded`")
+            tail = (" Its PR could not be read just now, so nothing was labelled `superseded` — "
+                    "worth a look by hand.")
+        else:
+            pv = read.pr if isinstance(read.pr, dict) else {}
+            n = pv.get("number") if pv.get("state") == "OPEN" else None
+            pr = n if type(n) is int else None
+            if pr:
+                if gh.pr_add_labels(pr, ["superseded"]):
+                    labelled = pr
+                else:
+                    failed.append(f"the `superseded` label on PR #{pr}")
+                if not gh.pr_comment(pr, "Superseded by superlooper: this issue was re-approved and "
+                                         "is being rebuilt from scratch on a fresh branch "
+                                         f"(`{rotated['new']}`). Branch preserved; nothing "
+                                         "auto-closed."):
+                    failed.append(f"the supersede note on PR #{pr}")
+                tail = (f" PR #{pr} on `{rotated['old']}` is superseded (branch preserved on the "
+                        "remote, nothing auto-closed).")
+            else:
+                # True whether or not the branch was ever created: a launch that never delivered
+                # leaves a stamp for a branch that exists nowhere, and "anything committed on it"
+                # is then vacuously nothing.
+                tail = (f" Anything committed on `{rotated['old']}` stays there — nothing is "
+                        "auto-closed or deleted.")
+        if not gh.comment(num, f"{REBUILD_MARKER}\nRe-approved — rebuilding from this issue on a "
+                               f"fresh branch (`{rotated['new']}`), retiring `{rotated['old']}`."
+                               f"{tail}"):
+            failed.append(f"the retirement comment on issue #{num}")
+        return labelled, failed
 
     def _exec_resume_at_gate(self, a, now):
         """D11 fix (issue #161): re-approving a FINISHED build RESUMES AT THE GATE — it re-enters the

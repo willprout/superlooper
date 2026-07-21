@@ -2909,6 +2909,22 @@ def test_real_conflict_under_cap_regenerates_on_a_fresh_generation_branch():
     assert r[0]["pr"] == 555
 
 
+def test_regenerate_never_reuses_a_generation_the_branch_already_burned():
+    """Issue #177: `conflicts` is no longer the sole generation source, because a re-approval zeroes
+    it while the branch it already minted survives on the remote. A lane sitting on `-r1` with
+    conflicts=0 (the post-reapprove shape) must regenerate onto `-r2` — minting `-r1` again would
+    hand the rebuild a branch whose superseded PR is still open, exactly what generations exist to
+    prevent."""
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING"))
+    d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid=HEAD1,
+                                             conflicts=0, branch="sl/i5-issue-5-r1")
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    r = only(out, "regenerate")
+    assert len(r) == 1
+    assert r[0]["new_branch"] == "sl/i5-issue-5-r2"
+    assert r[0]["conflicts"] == 1                     # the CAP counter is still its own count
+
+
 def test_conflict_cap_parks_needs_william_with_notify():
     d, g = _gating(pv=pr_view(mergeable="CONFLICTING"))
     d["issues_state"]["issues"]["i5"].update(update_result="conflict", update_head_oid=HEAD1,

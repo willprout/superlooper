@@ -2805,6 +2805,195 @@ def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(ri
     assert st["answerers"] == {}                                    # active answerer dropped
 
 
+# ---------------- re-approval rebuilds on a genuinely FRESH branch (issue #177) -------------------
+# The reclaim/tidy docstrings justified pruning a parked lane's worktree with "re-approval rebuilds
+# from the issue on a fresh branch". It was FALSE: the reset never touched `branch`, _launch_branch
+# prefers the stamp, and launch-session.sh's fallback re-ATTACHES the existing branch — so the
+# "clean slate" resumed on the parked episode's commits, its still-open PR was rediscovered by
+# pr_for_branch, and `gh pr create` would refuse a second PR on the same head.
+
+def _no_pr(monkeypatch):
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead({}, True))
+
+
+def test_reapprove_rotates_the_branch_to_the_next_generation(rig, monkeypatch):
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _no_pr(monkeypatch)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", conflicts=0)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"
+    # the journal names where the retired episode's committed work went
+    rec = [r for r in journal.read(rig.home) if r.get("act") == "reapprove"][-1]
+    assert rec["old_branch"] == "sl/i5-x" and rec["new_branch"] == "sl/i5-x-r1"
+    # ...and a SECOND re-approval rotates again rather than landing back on a burned name
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r2"
+
+
+def test_reapprove_skips_every_generation_the_conflict_ladder_already_burned(rig, monkeypatch):
+    """The generation must clear BOTH prior sources: the suffix on the stamped branch and the
+    conflict count that minted the generations before it. A lane that conflicted twice (branch
+    `-r2`) re-approved onto `-r1` would hand the rebuild a name whose superseded PR is still open."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _no_pr(monkeypatch)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x-r2", conflicts=2)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r3"
+
+
+def test_reapprove_leaves_the_stamp_alone_when_no_branch_was_ever_minted(rig, monkeypatch):
+    """Nothing was ever created (a lane parked before its first launch landed), so there is no
+    branch to retire — rotating here would mint a pointless `-r1` for a name nobody has pushed.
+    Leaving the stamp None lets _launch_branch compute the clean base name from the issue."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _no_pr(monkeypatch)
+    seed_issue(rig, "i5", status="parked", launch_failures=2)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert issue_state(rig, "i5")["branch"] is None
+
+
+def test_reapprove_supersedes_the_open_pr_left_on_the_retired_branch(rig, monkeypatch):
+    """Rotation retires the old branch, so the PR still open on it would linger forever: the
+    janitor's close-PR/delete-branch sweeps only ever act on a `superseded` label. Hand it to that
+    existing lane exactly as _exec_regenerate does — label, PR comment, and one issue comment
+    naming the fresh branch."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead(
+                            {"number": 555, "state": "OPEN", "headRefName": b}, True)
+                        if b == "sl/i5-x" else runner_mod.gh.PrRead({}, True))
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", pr=555)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+
+    muts = mutations(rig)
+    lab = [m for m in muts if m["kind"] == "pr_add_labels"]
+    assert lab and lab[-1]["num"] == "555" and "superseded" in lab[-1]["add"]
+    prc = [m for m in muts if m["kind"] == "pr_comment"]
+    assert prc and "sl/i5-x-r1" in prc[-1]["body"]
+    ic = [m for m in muts if m["kind"] == "comment"]
+    assert ic and "sl/i5-x-r1" in ic[-1]["body"]
+
+
+def test_reapprove_records_the_retirement_on_the_issue_even_with_no_pr(rig, monkeypatch):
+    """A rotation that said nothing would leave the retired episode's committed-but-unpushed work
+    reachable only from the journal. The owner decides whether to go get it, so he is told which
+    branch was retired whether or not a PR was ever opened on it."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _no_pr(monkeypatch)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    ic = [m for m in mutations(rig) if m["kind"] == "comment"]
+    assert ic and "sl/i5-x-r1" in ic[-1]["body"] and "sl/i5-x" in ic[-1]["body"]
+    # ...as the RUNNER's own marked bookkeeping: un-marked, brief.build would render it in the
+    # rebuilt session's brief under the binding-owner-amendment header (#163's rule).
+    assert ic[-1]["body"].startswith(runner_mod.REBUILD_MARKER)
+    assert runner_mod.REBUILD_MARKER.startswith(runner_mod.brief._MARKER_PREFIX)
+
+
+def test_reapprove_never_reports_a_supersede_that_did_not_land(rig, monkeypatch):
+    """Nothing retries this bookkeeping — the reset has already dropped `pr` and left
+    REAPPROVAL_STATUSES, so decide will not re-emit, and the janitor only ever sees a PR through the
+    `superseded` LABEL. A failed label write must therefore reach the journal as a NAMED failure,
+    never as 'superseded PR #N' (the #165 inert-label trap: a repo that never re-ran `adopt` has no
+    such label and `gh pr edit` hard-fails)."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead(
+                            {"number": 555, "state": "OPEN", "headRefName": b}, True))
+    monkeypatch.setattr(runner_mod.gh, "pr_add_labels", lambda n, labels: False)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", pr=555)
+    out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert "superseded PR #555" not in out, "a label that never landed must not read as done"
+    assert "incomplete" in out and "`superseded` label on PR #555" in out
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"       # the rebuild still gets its branch
+
+
+def test_reapprove_names_which_write_failed_not_a_generic_incomplete(rig, monkeypatch):
+    """The outcome is the only record of what did not land, so it must point at the right thing: a
+    failed ISSUE comment on a PR-less lane must not be reported as a PR that may lack `superseded`
+    (the misattribution the fresh review caught)."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _no_pr(monkeypatch)
+    monkeypatch.setattr(runner_mod.gh, "comment", lambda n, body: False)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
+    out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert "retirement comment on issue #5" in out
+    assert "superseded" not in out, "there is no PR here to say anything about"
+
+
+def test_reapprove_treats_a_refused_pr_read_as_unfinished_never_as_no_pr(rig, monkeypatch):
+    """#61's refused != empty discipline, at the one place it decides whether an OPEN PR is left
+    unlabelled forever. A refused lookup must not report a clean no-PR retirement — it looked at
+    nothing, and nothing retries it."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead({}, False))
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", pr=555)
+    out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert "incomplete" in out and "refused" in out
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"       # the rotation still lands
+    # ...and the owner-facing comment says the same thing rather than asserting a clean sweep
+    ic = [m for m in mutations(rig) if m["kind"] == "comment"]
+    assert ic and "could not be read" in ic[-1]["body"]
+
+
+def test_reapprove_of_an_investigation_does_no_pr_bookkeeping(rig, monkeypatch):
+    """An investigation opens no PR by contract, so the lookup is the pure waste #21 refuses
+    elsewhere and a branch-retirement notice is noise on the owner's issue. It still rotates — the
+    naming invariant has no per-type carve-out."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    looked = []
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: looked.append(b) or runner_mod.gh.PrRead({}, True))
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", type="investigate")
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert looked == [], "an investigation has no PR to look up"
+    assert not [m for m in mutations(rig) if m["kind"] == "comment"]
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"
+
+
+def test_reapprove_never_supersedes_a_pr_that_is_not_open(rig, monkeypatch):
+    """A merged/closed PR on the retired branch is history, not a rebuild's leftover — labelling it
+    `superseded` would feed the janitor's branch-delete sweep a branch it should never touch."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead(
+                            {"number": 555, "state": "MERGED", "headRefName": b}, True))
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", pr=555)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert [m for m in mutations(rig) if m["kind"] == "pr_add_labels"] == []
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"        # rotation still happened
+
+
+def test_reapprove_rotates_even_when_the_pr_lookup_is_refused(rig, monkeypatch):
+    """A refused lookup (the GraphQL dead zone) must never hold back the rotation: the rebuild's
+    fresh branch is the safety property, the supersede bookkeeping is best-effort. The old PR is
+    left unlabelled — visible to the owner rather than silently mis-swept. (What the outcome must
+    SAY about that is pinned by test_reapprove_treats_a_refused_pr_read_as_unfinished... below.)"""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead({}, False))
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", pr=555)
+    out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert out.startswith("reapproved")
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"
+    assert [m for m in mutations(rig) if m["kind"] == "pr_add_labels"] == []
+
+
+def test_reapprove_that_defers_on_a_live_worker_rotates_nothing(rig, monkeypatch):
+    """The declined-prune abort must touch NO state (#169) — including the branch. A rotation
+    stamped by an aborted re-approval would retire a branch the still-live worker is committing to."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: False)
+    _no_pr(monkeypatch)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
+    (rig.home / "state" / "panes" / "i5").write_text("SURFACE")
+    (rig.home / "state" / "worker.i5.lock").write_text(str(os.getpid()))
+    out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert "deferring" in out
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x"
+
+
 # ---------------- resume at the gate: D11 non-destructive re-approval (issue #161) ----------------
 
 def test_resume_at_gate_preserves_the_worktree_report_pr_and_review_carry(rig, monkeypatch):
@@ -5577,19 +5766,26 @@ def test_record_pr_stamps_the_pr_number_durably(rig):
 
 def test_a_reapproved_lane_is_not_re_parked_by_its_previous_episodes_closed_pr(rig, monkeypatch):
     """The trap the fresh-agent review found, driven through the REAL executors: park -> reapprove
-    -> relaunch -> reconcile. `reapprove` clears `pr` but KEEPS the branch stamp, and the old CLOSED
-    PR still answers a lookup on that head — so an unscoped close-absorb fires a tick after launch
-    (before the worker can push) and re-parks forever, the owner's only remedy being the very
-    re-approval that re-triggers it. Scoped to the episode's own `pr`, the ghost is ignored and the
-    worker goes on to open its own PR — which GitHub permits, refusing only a second OPEN PR."""
+    -> relaunch -> reconcile. `reapprove` clears `pr`, and the previous episode's CLOSED PR still
+    answers a lookup — so an unscoped close-absorb fires a tick after launch (before the worker can
+    push) and re-parks forever, the owner's only remedy being the very re-approval that re-triggers
+    it. Scoped to the episode's own `pr`, the ghost is ignored and the worker goes on to open its
+    own PR — which GitHub permits, refusing only a second OPEN PR.
+
+    (#177) The lane's branch is now ROTATED by the re-approval, which is a second, independent
+    defense: the ghost is no longer even on the rebuild's head. The lookup below is stubbed to
+    answer for ANY branch precisely so the `pr`-scoping fix stays under test on its own merits — a
+    fix that only holds while the other one does is not a fix."""
     monkeypatch.setattr(rig.r, "_teardown_session", lambda *a, **k: True)
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead({}, True))     # nothing to supersede
     seed_issue(rig, "i7", status="needs_william", branch="sl/i7-x", num=7, pr=42,
                park_notify_cause="pr_closed")
     rig.r._execute({"act": "reapprove", "id": "i7", "num": 7}, NOW)
 
     ist = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]["i7"]
-    assert ist["branch"] == "sl/i7-x"      # the stamp survives reapprove — the trap's whole setup
-    assert ist["pr"] is None               # ...but the episode's PR does not: the ghost is disowned
+    assert ist["branch"] == "sl/i7-x-r1"   # the retired branch is not the rebuild's head (#177)
+    assert ist["pr"] is None               # ...and the episode's PR is disowned too
 
     seed_issue(rig, "i7", status="running")          # the relaunch puts it back in flight
     rig.r.gh_view = {"stale": False, "consecutive_failures": 0, "closed_nums": set(),

@@ -27,10 +27,12 @@ INVESTIGATION_MARKER = "<!-- superlooper-investigation -->"
 #   legacy  <!-- superlooper-review -->                  unpinned: cannot prove WHAT it reviewed
 #
 # Only a PIN that matches the PR's current head is a verdict for the code being merged. Without
-# this, `review_evidence_ok` accepted any marker comment on the PR regardless of diff: reapprove
-# preserves the branch, so a rebuilt gen-2 PR still carried its gen-1 review comment and the gate
-# mechanically vouched for code no reviewer ever saw — the README bright line ("no verdict, no
-# merge") silently void for every post-reapprove generation. Caught before it fired a bad merge.
+# this, `review_evidence_ok` accepted any marker comment on the PR regardless of diff — and at the
+# time reapprove PRESERVED the branch (retired by #177, which rotates it), so a rebuilt gen-2 PR
+# still carried its gen-1 review comment and the gate mechanically vouched for code no reviewer had
+# seen: the README bright line ("no verdict, no merge") silently void for every post-reapprove
+# generation. Caught before it fired a bad merge. The pin is no less load-bearing now — ANY push
+# after a posted verdict moves the head out from under it, on the same branch or a rebuilt one.
 # The legacy form is accepted as a SHAPE (so the gate can say "repin it" instead of "no review at
 # all") but never as EVIDENCE — back-compat here is fail-closed, like every other unreadable input.
 #
@@ -845,9 +847,11 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     # ship_cmd (else review_evidence_ok would be True), so the comments read is genuinely load-
     # bearing. A CLEAN read — a real list, even empty — keeps the nudge->park ladder intact; only
     # an unreadable/absent read waits, mirroring step-3's unreadable-files WAIT.
-    # The verdict must also PIN the diff it reviewed (issue #154): reapprove preserves the branch,
-    # so a gen-1 review comment outlives the code it vouched for and would merge a gen-2 rebuild
-    # the reviewer never saw. A pin for a superseded head is not evidence — it takes the same
+    # The verdict must also PIN the diff it reviewed (issue #154): any push after the verdict is
+    # posted — a re-push to the same PR, or (before #177 rotated the branch) a reapproved rebuild
+    # landing on the preserved one — moves the head out from under it, so an unpinned verdict
+    # outlives the code it vouched for and would merge work no reviewer saw.
+    # A pin for a superseded head is not evidence — it takes the same
     # nudge->park ladder as no evidence at all, under its own key so each cause gets its one nudge.
     rstate = review_evidence_state(cfg, pv.get("comments"), pv.get("headRefOid"),
                                    ist.get("review_carry"))
