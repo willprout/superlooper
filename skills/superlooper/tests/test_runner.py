@@ -4919,6 +4919,9 @@ def test_crash_recovery_never_launches_a_session_past_an_open_blocker(rig):
     ist = issue_state(rig, "i103")
     assert ist["status"] == "running"                   # held in place: not parked, not requeued
     assert "#101" in ist["launch_hold_reason"] and "#102" in ist["launch_hold_reason"]
+    # A LANDED closed read (#172): GitHub answered and the blockers really are absent from it, so the
+    # hold keeps #150's non-committal wording — it never claims to have watched them stay open.
+    assert "not confirmed closed" in ist["launch_hold_reason"]
     held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
     assert len(held) == 1 and "blocked-by" in held[0]["outcome"]     # the hold says WHY
 
@@ -4994,7 +4997,108 @@ def test_a_refused_closed_read_holds_without_claiming_the_blockers_are_open(rig)
     reason = issue_state(rig, "i103")["launch_hold_reason"]
     assert _launches_of(rig, "i103") == []              # still refuses: same as a fresh launch
     assert "still open" not in reason                   # ...but never asserts what it didn't observe
-    assert "not confirmed closed" in reason and "#101" in reason
+    # #172 STRENGTHENED the prose: the poll now carries the closed read's health into the view, so
+    # the hold names the REFUSAL itself rather than staying non-committal about the dependency. The
+    # invariant #150 bought — never narrate a closure state the loop did not observe — is unchanged
+    # and still asserted above; the "not confirmed closed" wording now belongs to a LANDED read
+    # (test_a_held_restart_relaunches_the_moment_its_blockers_close's world), not to this one.
+    assert "closed-issue list could not be read" in reason and "#101" in reason
+
+
+# ====== issue #172: the poll's closed-list read carries its HEALTH into the view ======
+# #150 fixed the legibility half (a held restart says "not confirmed closed"). The VIEW itself still
+# lied: a throttled `issue list --state closed` fails closed to an empty set, `probe` (rate_limit) is
+# exempt from throttling so the poll completes and stamps `stale: False` — and the loop then holds
+# EVERY blocked-by issue while believing it has a fresh, trustworthy view in which nothing is closed.
+# These drive the real Runner with ONLY the closed list throttled.
+
+def _unblock_the_fixture_world(rig):
+    """#101/#102 CLOSED — so they leave the open queue and i103's `blocked-by` is genuinely
+    satisfied. i103 is then the only candidate, with a free lane and nothing to overlap: the ONLY
+    thing that can hold it is the closed-list read itself, which is what these tests isolate."""
+    (rig.fixdir / "issue_list_closed.json").write_text(
+        json.dumps([{"number": 41}, {"number": 52}, {"number": 101}, {"number": 102}]))
+    still_open = [i for i in json.loads((rig.fixdir / "issue_list.json").read_text())
+                  if i.get("number") not in (101, 102)]
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(still_open))
+
+
+def _throttle_the_closed_list(rig, times=99):
+    # Only `issue list --state closed` is refused — every other read (including the probe) answers,
+    # which is exactly what a GraphQL/REST throttle looks like from inside the poll.
+    (rig.fixdir / "fail_rules.json").write_text(
+        json.dumps([{"match": "--state closed", "times": times}]))
+
+
+def _published_view(rig):
+    return json.loads((rig.home / "state" / "gh_view.json").read_text())
+
+
+def test_a_clean_poll_vouches_for_its_closed_read(rig):
+    rig.r.tick(now=NOW)
+    assert rig.r.gh_view["stale"] is False
+    assert rig.r.gh_view["closed_read_ok"] is True
+    assert _published_view(rig)["closed_read_ok"] is True
+
+
+def test_a_throttled_closed_read_is_published_as_refused_not_as_an_empty_closed_set(rig):
+    _unblock_the_fixture_world(rig)
+    _throttle_the_closed_list(rig)
+    rig.r.tick(now=NOW)
+    assert rig.r.gh_view["stale"] is False            # the probe still answers: the view IS fresh
+    assert rig.r.gh_view["closed_nums"] == set()      # ...and the closed set IS empty
+    assert rig.r.gh_view["closed_read_ok"] is False   # but it is now marked as UNVOUCHED, not fact
+    doc = _published_view(rig)
+    assert doc["closed_nums"] == [] and doc["closed_read_ok"] is False
+
+
+def test_a_throttled_closed_read_holds_a_fresh_launch_out_loud(rig):
+    # THE defect this issue names: i103 is genuinely unblocked (#101/#102 are closed), but the
+    # refused read makes it read as blocked and it never launches — silently, for as long as the
+    # throttle lasts. Holding is right; holding with NOTHING said is not.
+    _unblock_the_fixture_world(rig)
+    _throttle_the_closed_list(rig)
+    rig.r.tick(now=NOW)
+    assert _launches_of(rig, "i103") == []              # still held: never launched past a blocker
+    reason = issue_state(rig, "i103")["launch_hold_reason"]
+    assert "closed-issue list" in reason and "#101" in reason and "#102" in reason
+    assert "still open" not in reason
+    held = [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
+    assert len(held) == 1
+
+
+def test_the_throttled_hold_launches_the_moment_a_clean_closed_read_lands(rig):
+    # The hold is a WAIT, not a verdict: it self-heals on the next clean poll, with no owner touch.
+    _unblock_the_fixture_world(rig)
+    _throttle_the_closed_list(rig, times=1)            # one refused read, then GitHub recovers
+    rig.r.tick(now=NOW)
+    assert _launches_of(rig, "i103") == []
+    rig.calls.clear()
+    rig.r.tick(now=NOW + 200)                          # >GH_POLL_SECONDS: the closed list reads clean
+    assert rig.r.gh_view["closed_read_ok"] is True
+    assert len(_launches_of(rig, "i103")) == 1
+    assert issue_state(rig, "i103")["launch_hold_reason"] is None
+
+
+def test_a_genuinely_blocked_issue_still_waits_quietly_under_a_clean_read(rig):
+    # No new noise for the honest case: #101/#102 really are open, i103 waits, and nothing is
+    # journalled — a long-open dependency must not walk the journal every tick.
+    rig.r.tick(now=NOW)
+    assert _launches_of(rig, "i103") == []
+    assert not [j for j in _journal(rig) if j.get("act") == "launch_hold" and j.get("id") == "i103"]
+
+
+def test_a_throttled_closed_read_names_the_refusal_on_a_recovery_relaunch_too(rig):
+    # The restart path already held (#150) but narrated it as "not confirmed closed" — honest, yet
+    # silent about WHY. With the read health in the view it names the refused read itself.
+    _unblock_the_fixture_world(rig)
+    _throttle_the_closed_list(rig)
+    _blocked_and_exited(rig, NOW)
+    rig.r.tick(now=NOW + 60)
+    reason = issue_state(rig, "i103")["launch_hold_reason"]
+    assert _launches_of(rig, "i103") == []
+    assert "closed-issue list" in reason and "#101" in reason
+    assert "still open" not in reason
 
 
 # ---------------------------------------------------------------------------

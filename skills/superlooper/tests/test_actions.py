@@ -1240,6 +1240,50 @@ def test_touches_required_does_not_park_a_blocked_issue_early():
     assert len(only(out2, "park")) == 1 and only(out2, "park")[0]["needs_william"] is True
 
 
+# ---- issue #172: a REFUSED closed-list read is not an answered-empty closed set ----
+# gh's closed-list read fails CLOSED to an empty set while `probe` (`gh api rate_limit`) is EXEMPT
+# from rate limiting — so a THROTTLED poll still stamps the view FRESH and every `blocked-by` issue
+# reads as unmet. Holding is the right call (it is what a clean read of an open blocker would do,
+# and it self-heals on the next poll), but the loop must not act on, or narrate, a closure state it
+# never observed. `closed_read_ok` is the view's vouch for that read.
+
+def test_a_refused_closed_read_holds_a_fresh_launch_out_loud():
+    # THE defect: the fresh launch path drops such a candidate SILENTLY — the queue simply stops
+    # moving, with nothing anywhere saying why. It must hold with an honest, named reason.
+    out = decide(parsed_issues=[parsed(5, blocked_by=[3])],
+                 gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert only(out, "launch") == []
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and holds[0]["id"] == "i5"
+    reason = holds[0]["reason"]
+    assert "closed-issue list" in reason and "#3" in reason
+    assert "still open" not in reason        # never asserts a closure state it did not observe
+
+
+def test_a_clean_closed_read_leaves_a_genuinely_blocked_issue_waiting_quietly():
+    # The honest case is untouched: GitHub ANSWERED, #3 really is open, the issue waits — and no
+    # hold episode is opened, so a long-open dependency never walks the journal.
+    out = decide(parsed_issues=[parsed(5, blocked_by=[3])],
+                 gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+    assert only(out, "launch") == [] and only(out, "launch_hold") == []
+
+
+def test_a_refused_closed_read_does_not_hold_an_issue_with_no_blocked_by():
+    # Scope: the refusal only touches dependency eligibility. An unblocked issue never consults the
+    # closed set, so it launches through a throttle exactly as it does today.
+    out = decide(parsed_issues=[parsed(5)], gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert len(only(out, "launch")) == 1 and only(out, "launch_hold") == []
+
+
+def test_a_view_that_never_vouched_for_its_closed_read_keeps_todays_prose():
+    # The flag is trusted ONLY in the direction it explicitly asserts. A view with no `closed_read_ok`
+    # at all (an older document) must not manufacture a refusal that never happened.
+    g = ghv(closed_nums=set())
+    g.pop("closed_read_ok", None)
+    out = decide(parsed_issues=[parsed(5, blocked_by=[3])], gh_view=g)
+    assert only(out, "launch") == [] and only(out, "launch_hold") == []
+
+
 def test_touches_required_does_not_mislabel_a_control_label_conflict_issue():
     # P2-1: a no-touches issue that is ALSO ineligible for a control-label conflict must not be
     # parked with a "missing touches" memo (a misdiagnosis). It is left for its own handling.

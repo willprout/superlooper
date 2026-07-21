@@ -218,6 +218,13 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
         "issues": issues,
         "titles": titles,
         "closed_nums": _closed_list(view.get("closed_nums")),
+        # Does the runner VOUCH for that closed set (issue #172)? An empty `closed_nums` is
+        # ambiguous on its own — GitHub answered "nothing is closed", or it REFUSED the read and the
+        # fail-closed parser produced the same empty — and the probe (`gh api rate_limit`) is exempt
+        # from throttling, so `stale` stays False through a throttle either way. Trusted ONLY in the
+        # direction it explicitly asserts: True demands an explicit True, so a view that never
+        # claimed the read landed publishes an honest False rather than a confident all-clear.
+        "closed_read_ok": view.get("closed_read_ok") is True,
         "prs": prs,
         "dev_checks": _dict(view.get("dev_checks")),
     }

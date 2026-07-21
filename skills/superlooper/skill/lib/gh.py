@@ -187,10 +187,16 @@ def ready_issues_health(limit=200):
 
 
 def closed_issue_nums_health(limit=200):
-    """closed_issue_nums() as a ReadHealth(nums_set, ok) — the watchdog's read-health variant
-    (issue #92). A refused closed-list read (ok=False) must not reset the detector's clocks: an
-    empty closed set makes every blocked-by dependency read as unmet, which could wrongly shrink
-    the eligible set and stand an episode down."""
+    """closed_issue_nums() as a ReadHealth(nums_set, ok) — the read-health variant (issue #92). A
+    refused closed-list read (ok=False) must not reset the detector's clocks: an empty closed set
+    makes every blocked-by dependency read as unmet, which could wrongly shrink the eligible set and
+    stand an episode down.
+
+    THIS is the variant the runner's poll uses too (issue #172). It read the bare set for five
+    releases, and a throttled closed list therefore reached decide as a fresh, confident "nothing is
+    closed" — `probe` (`gh api rate_limit`) is EXEMPT from rate limiting, so the poll completed and
+    stamped the view `stale: False` right through the throttle, and every blocked-by issue went
+    silently un-launchable. `ok` rides into gh_view as `closed_read_ok` so the hold is SAID."""
     rh = _json_list_health(["issue", "list", "--state", "closed", "--json", "number",
                             "--limit", str(limit)])
     nums = {i["number"] for i in rh.value
@@ -209,7 +215,10 @@ def open_issues(label, limit=200):
 def closed_issue_nums(limit=200):
     """Numbers of closed issues, as a set (blocked-by eligibility: a dependency counts as done
     only when its issue is CLOSED). Fails closed to an empty set — with no readable closed list,
-    every blocked-by dependency reads as unmet and the dependent issue simply waits."""
+    every blocked-by dependency reads as unmet and the dependent issue simply waits.
+
+    Waiting is the safe direction, but the empty set alone cannot say WHY it is empty. Any caller
+    that will narrate or act on the emptiness wants closed_issue_nums_health() instead (#172)."""
     lst = _json_list(["issue", "list", "--state", "closed", "--json", "number",
                       "--limit", str(limit)])
     return {i["number"] for i in lst

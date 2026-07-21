@@ -51,7 +51,16 @@ The view contract (assembled by runner.py each tick):
                   "local_date": "YYYY-MM-DD", "local_hhmm": "HH:MM",
                   "last_report_date": str|None}
   gh_view        {"stale": bool (fresh ONLY when exactly False), "consecutive_failures": int,
-                  "closed_nums": set, "prs": {id: pr_view (+comments attached ONLY on a clean
+                  "closed_nums": set,
+                  "closed_read_ok": bool — did the read that produced closed_nums actually LAND
+                  (issue #172)? An empty closed_nums is ambiguous without it: GitHub answered
+                  "nothing is closed", or it REFUSED the read and the fail-closed parser produced
+                  the same empty — and `probe` (rate_limit) is exempt from throttling, so `stale`
+                  stays False through a throttle either way. Trusted only in the direction it
+                  explicitly asserts: an EXPLICIT False means refused; anything else (including a
+                  key-absent older view) reads as a landed read, so no refusal is ever manufactured
+                  out of missing data,
+                  "prs": {id: pr_view (+comments attached ONLY on a clean
                   CommentRead; a refused/starved comments read leaves 'comments' ABSENT, so the
                   build gate HOLDs via await_comments_read, issue #78); {} = GitHub ANSWERED "none
                   exists"; KEY ABSENT = no trustworthy lookup — not fetched yet, or REFUSED (the
@@ -551,7 +560,28 @@ def _touches_required_memo(num):
             "`touches:` line to the Loop metadata and re-approve.")
 
 
-def _launch_gate_reason(p, closed_nums, usage, config=None):
+def _refused_closed_read_deps(p, closed_nums, closed_read_ok):
+    """The `blocked-by` numbers this issue is held on WHILE the closed-list read stands REFUSED
+    (issue #172) — empty when the read landed, when the issue declares no dependency, or when the
+    dependency is satisfied anyway. This is the ONE condition under which "blocked" is a statement
+    about GitHub's refusal rather than about the dependency: the fail-closed empty set cannot tell
+    the two apart, so the caller names the refusal instead of the (unobserved) closure state."""
+    if closed_read_ok or not isinstance(p, dict):
+        return []
+    deps = p.get("blocked_by") if isinstance(p.get("blocked_by"), list) else []
+    return [d for d in deps if d not in closed_nums]
+
+
+def _refused_closed_read_reason(open_deps):
+    return ("the closed-issue list could not be read this poll — GitHub REFUSED it (a throttle "
+            "refuses the list read while `gh api rate_limit`, which is exempt, still answers), so "
+            "its `blocked-by` ("
+            + ", ".join("#%s" % d for d in open_deps)
+            + ") cannot be verified as closed. A refused read is never taken as 'nothing is "
+              "closed': held until a clean closed-list read lands, which is the next poll.")
+
+
+def _launch_gate_reason(p, closed_nums, usage, config=None, closed_read_ok=True):
     """WHY the one launch gate (scheduler.launch_ok) refused to start or restart this session —
     the SPECIFIC failing condition, named. This is what makes a refusal a legible hold instead of
     the silent launch D8 caught: the board and the journal say which dependency is open, or which
@@ -577,12 +607,19 @@ def _launch_gate_reason(p, closed_nums, usage, config=None):
     deps = p.get("blocked_by") if isinstance(p.get("blocked_by"), list) else []
     open_deps = [d for d in deps if d not in closed_nums]
     if open_deps:
+        # The view now VOUCHES for its closed read (issue #172), so when the read was REFUSED we say
+        # THAT — the honest cause — instead of describing the dependency at all. #150 could only be
+        # non-committal here ("not confirmed closed") because the poll handed decide a bare set with
+        # no way to tell a refusal from an answer; carrying the read health closes that gap.
+        if not closed_read_ok:
+            return _refused_closed_read_reason(open_deps)
         # Says "not confirmed closed", never "still open" (fresh-agent review P2-1). gh's closed-list
         # read fails CLOSED to an empty set, and `probe` (rate_limit) is exempt from throttling — so
         # a THROTTLED poll still stamps the view fresh while every dependency reads as unmet. The
         # refusal to launch is right either way (a fresh launch does the same, and it self-heals on
         # the next clean read), but the loop must not durably stamp the board and the journal with a
         # closure state it did not actually observe — the refused≠empty trap of #21/#61/#78/#92/#108.
+        # (Kept as the wording for a LANDED read: a view with no vouch is never narrated as refused.)
         return ("its `blocked-by` is not satisfied in the latest GitHub read: "
                 + ", ".join("#%s" % d for d in open_deps)
                 + " not confirmed closed. The restart waits for the dependency to close — a recovery "
@@ -851,6 +888,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     issue_comments = _dget(gv, "issue_comments", dict)
     raw_closed = gv.get("closed_nums")
     closed_nums = set(raw_closed) if isinstance(raw_closed, (set, frozenset, list, tuple)) else set()
+    # Does the poll VOUCH for that closed set (issue #172)? Only an EXPLICIT False is a refusal — a
+    # view that never carried the key (an older document) keeps today's non-committal prose rather
+    # than having a refusal invented for it. Eligibility is UNCHANGED either way: a refused read
+    # still holds every `blocked-by` issue, which is the safe direction (waiting beats launching
+    # past a blocker). What changes is that the hold is now SAID, and named for its real cause.
+    closed_read_ok = gv.get("closed_read_ok") is not False
 
     out = []
     parked_now = set()
@@ -917,7 +960,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         but the labels went ambiguous) still speaks rather than leaving stale prose on the board. An
         explicit `reason` overrides the usage/eligibility reason (the auth gate names auth)."""
         reason = reason if isinstance(reason, str) and reason \
-            else _launch_gate_reason(p, closed_nums, usage_sched, config=cfg)
+            else _launch_gate_reason(p, closed_nums, usage_sched, config=cfg,
+                                     closed_read_ok=closed_read_ok)
         if ist_of(iid).get("launch_hold_reason") == reason:
             return
         out.append({"act": "launch_hold", "id": iid, "num": num, "reason": reason})
@@ -2077,6 +2121,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             if gate.foreseeable_referee_stop(c.get("touches"), cfg) \
                     and not gate.preauthorized_referee(c.get("labels")):
                 launch_hold(cid, c.get("num"), c)
+                continue
+            # Refused closed-list read (issue #172). launch_ok withheld this candidate because its
+            # `blocked-by` is unsatisfied in a closed set the poll could not actually READ — so on
+            # the fresh path it was dropped SILENTLY, and a throttle made every blocked-by issue
+            # quietly un-launchable for as long as it lasted. Journal WHY, through the same #150
+            # ledger (deduped once per cause), naming the refusal rather than the dependency.
+            # Deliberately NOT emitted for a LANDED read: a genuinely open dependency is the loop
+            # working as designed and must not walk the journal every tick.
+            refused_deps = _refused_closed_read_deps(c, closed_nums, closed_read_ok)
+            if refused_deps:
+                launch_hold(cid, c.get("num"), c, reason=_refused_closed_read_reason(refused_deps))
     elif (systemic_launch and not anchor_down and not auth_invalid and not display_asleep
             and not gh_stale and not issue_state_corrupt_for_launches):
         # ...and NOT while the display sleeps (#124): a canary into a sleeping display would just
