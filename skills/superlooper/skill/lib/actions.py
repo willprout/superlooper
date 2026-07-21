@@ -699,19 +699,29 @@ UNLANDED_CLOSED_READ_PREFIX = "the closed-issue list read did not land this poll
 # the meter dies or a control label goes ambiguous. A stamp that cannot be recognized cannot be
 # corrected, and this one would then stand — silently — through every later cause. Whatever writes
 # a durable claim must leave the next tick able to tell that it wrote it.
+#
+# So it gets a PREFIX of its own, matched exactly like the unlanded one, and the same warning:
+# THIS STRING IS A CROSS-RELEASE COMPATIBILITY SURFACE. `launch_hold_reason` is durable loopstate
+# that outlives a republish, so a stamp written by the previous release is still on disk when the
+# next one boots. Matching the WHOLE string would make one prose tweak reproduce the very defect
+# this constant was introduced to fix — an unrecognizable stamp, standing forever. Change the TAIL
+# freely; leave the prefix alone.
+_LANE_BOUND_PREFIX = "the closed-issue list read has since LANDED"
 _LANE_BOUND_AFTER_UNLANDED_READ = (
-    "the closed-issue list read has since LANDED and its `blocked-by` is satisfied — this issue is "
-    "no longer held by the eligibility gate at all. What it is waiting on is scheduling: lane "
-    "capacity, an anti-affinity overlap, or a territory claim a finished-but-unmerged lane still "
-    "holds. It launches on the first tick that clears; nothing here needs an owner.")
+    _LANE_BOUND_PREFIX + " and its `blocked-by` is satisfied — this issue is no longer held by the "
+    "eligibility gate at all. What it is waiting on is scheduling: lane capacity, an anti-affinity "
+    "overlap, or a territory claim a finished-but-unmerged lane still holds. It launches on the "
+    "first tick that clears; nothing here needs an owner.")
 
 
 def _is_i172_hold_stamp(reason):
     """Is this durable `launch_hold_reason` one THIS path wrote (issue #172) — either an
     unlanded-read hold or its lane-bound retirement? Both must stay correctable: the ledger dedups
     on the stored string, so a stamp left standing after its cause ended both misdescribes the board
-    and silences the next episode."""
-    return _is_unlanded_closed_read_stamp(reason) or reason == _LANE_BOUND_AFTER_UNLANDED_READ
+    and silences the next episode. Both are matched on their PREFIX, so a stamp written by an older
+    release (whose tail prose differed) is still recognized and still correctable."""
+    return isinstance(reason, str) and (reason.startswith(UNLANDED_CLOSED_READ_PREFIX)
+                                        or reason.startswith(_LANE_BOUND_PREFIX))
 
 
 def _dep_unmet(d, closed_nums):

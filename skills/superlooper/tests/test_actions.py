@@ -1693,6 +1693,22 @@ def test_the_retirement_stamp_is_corrected_when_the_control_labels_GO_AMBIGUOUS(
     assert len(holds) == 1 and "control labels conflict" in holds[0]["reason"]
 
 
+def test_both_i172_stamps_are_recognized_by_PREFIX_so_an_older_release_stamp_still_corrects():
+    # FOURTH review round. `launch_hold_reason` is durable loopstate that outlives a republish, so a
+    # stamp written by the PREVIOUS release is on disk when the next one boots. Matching either stamp
+    # on its whole string would make one prose tweak reproduce the exact defect the retirement stamp
+    # was introduced to fix: unrecognizable, therefore uncorrectable, therefore standing forever.
+    for prefix in (actions.UNLANDED_CLOSED_READ_PREFIX, actions._LANE_BOUND_PREFIX):
+        older = prefix + " — wording from some earlier release entirely"
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": ist(status=None, launch_hold_reason=older)}})
+        out = decide(parsed_issues=[parsed(5, blocked_by=[3])], dsk=d,
+                     gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+        holds = only(out, "launch_hold")
+        assert len(holds) == 1, (prefix, holds)
+        assert "not confirmed closed" in holds[0]["reason"]
+
+
 def test_the_retirement_stamp_still_re_arms_the_ledger_for_a_new_throttle():
     out = _wearing_retirement(parsed(5, blocked_by=[3]),
                               gh_view=ghv(closed_nums=set(), closed_read_ok=False))
