@@ -3850,6 +3850,222 @@ def test_reapprove_never_prunes_under_a_live_worker(rig, monkeypatch):
     assert removed == [], "reapprove pruned a worktree under a live CLI"
 
 
+# --------- issue #169: the declined prune is COUNTED, so decide can bound it ---------
+# The deferral above is correct and must stay — but a stale lock naming a REUSED pid never goes
+# dead, so the rebuild aborts every tick forever. start-session.sh's own acquire_worker has the
+# identical exposure and its refusal is COUNTED (launch_failures) and eventually parks with a memo;
+# this one was counted nowhere. These charge the ladder decide caps on.
+
+def _deferring(rig, iid, monkeypatch, num=5, status="parked"):
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: pytest.fail("pruned under a live CLI"))
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0.05)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: True)
+    seed_issue(rig, iid, status=status, num=num)
+    _teardown_rig(rig, iid, pid="4242")
+
+
+def _ist(rig, iid):
+    return loopstate.load(str(rig.home / "state" / "issues.json"))["issues"][iid]
+
+
+def test_a_declined_reapprove_charges_the_teardown_deferral_ladder(rig, monkeypatch):
+    """Each refused rebuild is one rung, stamped with the pid and the lock path that refused it —
+    the two facts the park memo needs and the owner cannot otherwise get."""
+    _deferring(rig, "i5", monkeypatch)
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+
+    i = _ist(rig, "i5")
+    assert i["teardown_deferrals"] == 1
+    assert i["teardown_deferral_pid"] == 4242
+    assert i["teardown_deferral_lock"] == str(rig.home / "state" / "worker.i5.lock")
+    assert i["status"] == "parked", "a declined rebuild must touch nothing else"
+
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert _ist(rig, "i5")["teardown_deferrals"] == 2, "the ladder must climb, not re-stamp 1"
+
+
+def test_a_declined_regenerate_charges_the_teardown_deferral_ladder(rig, monkeypatch):
+    _deferring(rig, "i7", monkeypatch, num=7, status="gating")
+    rig.r._execute({"act": "regenerate", "id": "i7", "num": 7, "pr": 7,
+                    "new_branch": "sl/i7-x-2", "conflicts": 1}, NOW)
+
+    i = _ist(rig, "i7")
+    assert i["teardown_deferrals"] == 1 and i["teardown_deferral_pid"] == 4242
+    assert i["status"] == "gating", "a declined rebuild must touch nothing else"
+
+
+def test_clearing_the_lock_retires_the_ladder_wherever_it_happens(rig, monkeypatch):
+    """The invariant that makes 'consecutive refusals' TRUE rather than merely intended. The lock
+    is the cause; the teardown that clears it is where the ladder dies — not in each rebuild's
+    success block. A rebuild whose DEMAND merely disappeared (PR merged out of band, conflict
+    resolved by the merge-update) would otherwise strand a partial ladder, and the next episode's
+    first legitimate deferral would park a healthy lane at the cap over refusals that never
+    happened. So even a plain teardown — no rebuild in sight — retires it."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i5", status="parked", num=5, teardown_deferrals=3,
+               teardown_deferral_pid=4242, teardown_deferral_lock="/old/worker.i5.lock")
+    _teardown_rig(rig, "i5")
+
+    assert rig.r._teardown_session("i5", remove_worktree=True) is True
+    i = _ist(rig, "i5")
+    assert i["teardown_deferrals"] == 0 and i["teardown_deferral_pid"] is None
+    assert i["teardown_deferral_lock"] is None
+
+
+def test_a_teardown_that_clears_nothing_leaves_the_ladder_alone(rig, monkeypatch):
+    """The other half: a teardown that DECLINES clears no lock, so the cause stands and the rungs
+    must stand with it. Zeroing here would make the ladder unclimbable and restore the livelock."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: pytest.fail("pruned under a live CLI"))
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0.05)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: True)
+    seed_issue(rig, "i5", status="parked", num=5, teardown_deferrals=3)
+    _teardown_rig(rig, "i5")
+
+    assert rig.r._teardown_session("i5", remove_worktree=True) is False
+    assert _ist(rig, "i5")["teardown_deferrals"] == 3
+
+
+@pytest.mark.parametrize("bad", [None, "", False, [], "lots"])
+def test_a_wrong_typed_ladder_is_repaired_by_the_teardown_that_clears_the_lock(rig, monkeypatch,
+                                                                              bad):
+    """decide fails CLOSED on a wrong-typed counter — it parks the lane on its FIRST tick, zero
+    deferrals attempted — so the repair has to reach every wrong-typed value, not just the truthy
+    ones. Under a truthiness guard the falsy half (`null` most of all: the value _counter's own
+    docstring names) would be skipped by the only path that rewrites the field, and the lane would
+    latch: the owner clears the lock, the rebuild runs, the next one parks instantly, forever."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i5", status="parked", num=5, teardown_deferrals=bad)
+    _teardown_rig(rig, "i5")
+
+    assert rig.r._teardown_session("i5", remove_worktree=True) is True
+    # `is int` matters as much as `== 0`: a leftover False satisfies `== 0` while still being the
+    # wrong-typed value decide fails closed on, so the bool case — the subtlest one the type guard
+    # exists for — would pass vacuously against the truthiness guard this replaced.
+    v = _ist(rig, "i5")["teardown_deferrals"]
+    assert type(v) is int and v == 0, f"a wrong-typed ladder survived its repair: {v!r}"
+
+
+@pytest.mark.parametrize("ladder", [{}, {"teardown_deferrals": 0}])
+def test_a_lane_with_no_ladder_pays_no_state_write_for_the_clear(rig, monkeypatch, ladder):
+    """The guard is the entire cost argument for calling this from the every-tick teardown: an
+    unconditional locked read-modify-write per deferred lane per tick would be a real cost for
+    nothing. A refactor that drops the guard must fail here, not silently."""
+    writes = []
+    real = runner_mod.loopstate.update
+    monkeypatch.setattr(runner_mod.loopstate, "update",
+                        lambda path, m, **kw: writes.append(1) or real(path, m, **kw))
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i5", status="parked", num=5, **ladder)   # absent, and an honest zero
+    _teardown_rig(rig, "i5")
+
+    writes.clear()
+    assert rig.r._teardown_session("i5", remove_worktree=True) is True
+    assert writes == [], "the clear wrote state for a lane that had no deferrals"
+
+
+def test_a_rebuild_that_succeeds_clears_the_deferral_ladder(rig, monkeypatch):
+    """End to end through the executor: a re-approval whose prune lands starts from zero, which is
+    what makes the park's 'remove the lock, then re-approve' instruction true."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i5", status="parked", num=5, teardown_deferrals=3,
+               teardown_deferral_pid=4242, teardown_deferral_lock="/old/worker.i5.lock")
+    _teardown_rig(rig, "i5")
+
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    i = _ist(rig, "i5")
+    assert i["status"] == "ready"                                   # the rebuild really proceeded
+    assert i["teardown_deferrals"] == 0 and i["teardown_deferral_pid"] is None
+    assert i["teardown_deferral_lock"] is None
+
+
+def test_a_regenerate_that_succeeds_clears_the_deferral_ladder(rig, monkeypatch):
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i7", status="gating", num=7, pr=7, teardown_deferrals=3,
+               teardown_deferral_pid=4242, teardown_deferral_lock="/old/worker.i7.lock")
+    _teardown_rig(rig, "i7")
+
+    rig.r._execute({"act": "regenerate", "id": "i7", "num": 7, "pr": 7,
+                    "new_branch": "sl/i7-x-2", "conflicts": 1}, NOW)
+    i = _ist(rig, "i7")
+    assert i["teardown_deferrals"] == 0 and i["teardown_deferral_pid"] is None
+
+
+def test_only_a_park_whose_labels_moved_records_that_it_landed(rig, monkeypatch):
+    """`park_landed_cause` is decide's one durable proof that a park really stripped `agent-ready`
+    (#169) — the fact `status` cannot carry, because a lane parked needs-owner earlier is ALREADY
+    needs_william and looks identical whether this park landed or died at the gh call. So it must
+    be written past set_labels and nowhere else: a failed label move that recorded it anyway would
+    let decide answer a re-approval nobody made, and burn the one cause that defeats the
+    notify-once dedup — making the owner's REAL re-approval the silent one."""
+    seed_issue(rig, "i5", status="needs_william", num=5)
+    monkeypatch.setattr(runner_mod.gh, "set_labels", lambda *a, **k: False)
+    rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": True,
+                    "memo": "m", "cause": "teardown_deferral"}, NOW)
+    i = _ist(rig, "i5")
+    assert i.get("park_landed_cause") is None, "a failed label move claimed it landed"
+    assert i["park_notify_cause"] == "teardown_deferral"     # the notify-once marker still stamps
+
+    monkeypatch.setattr(runner_mod.gh, "set_labels", lambda *a, **k: True)
+    rig.r._execute({"act": "park", "id": "i5", "num": 5, "needs_william": True,
+                    "memo": "m", "cause": "teardown_deferral"}, NOW)
+    assert _ist(rig, "i5")["park_landed_cause"] == "teardown_deferral"
+
+
+def test_a_reapproved_rebuild_drops_the_landed_park_record(rig, monkeypatch):
+    """`park_landed_cause` is scoped to its park episode, exactly like the park_notify_cause it
+    pairs with: left behind, a LATER first-time teardown park would be answered as a re-approval."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i5", status="needs_william", num=5,
+               park_notify_cause="teardown_deferral", park_landed_cause="teardown_deferral")
+
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert _ist(rig, "i5")["park_landed_cause"] is None
+
+
+def test_a_disk_hygiene_deferral_never_charges_the_rebuild_ladder(rig, monkeypatch):
+    """ONLY the two rebuild paths livelock. The merge auto-close, the parked reaper and the
+    pending-teardown drain defer for the SAME reason every tick — a merged lane's worker idles at
+    the prompt by design — and their retry is the drain, not a rebuild. Charging them would park
+    healthy lanes for finishing normally."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: pytest.fail("pruned under a live CLI"))
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0.05)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: True)
+    seed_issue(rig, "i7", status="merged", num=7)
+    _teardown_rig(rig, "i7")
+
+    rig.r._teardown_session("i7", remove_worktree=True)
+    rig.r._drain_pending_teardowns(loopstate.load(str(rig.home / "state" / "issues.json")))
+    assert "teardown_deferrals" not in _ist(rig, "i7"), "a disk-hygiene defer charged the ladder"
+    assert (rig.home / "state" / "pending_teardown" / "i7").exists()   # the drain IS its retry
+
+
+def test_resume_at_the_gate_clears_the_deferral_ladder_it_did_not_charge(rig, monkeypatch):
+    """The ladder belongs to the ACTION that charged it, never to the lane at large. A lane can
+    reach resume_at_gate carrying an at-cap counter (the owner switched from Rebuild to Resume mid
+    -ladder), and a resumed lane's worker is idling at the prompt HOLDING its lock — that is what a
+    finished session does. Stranded, the counter would park a perfectly healthy lane needs-owner at
+    the FIRST declined prune of its next regenerate, ~10s in, quoting the PREVIOUS episode's pid at
+    the owner. The stamps go with the counter: evidence for a count of zero is a lie."""
+    seed_issue(rig, "i5", status="parked", num=5, pr=5,
+               teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP,
+               teardown_deferral_pid=4242, teardown_deferral_lock="/old/worker.i5.lock")
+
+    rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
+    i = _ist(rig, "i5")
+    assert i["status"] == "gating"                        # the resume itself still happens
+    assert i["teardown_deferrals"] == 0
+    assert i["teardown_deferral_pid"] is None and i["teardown_deferral_lock"] is None
+
+
 def test_absorb_merged_closes_the_pane_before_reclaiming(rig, monkeypatch):
     order = []
     def run_script(args, env=None, timeout=None):
