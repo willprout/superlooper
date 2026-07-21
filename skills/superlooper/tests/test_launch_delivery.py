@@ -333,9 +333,11 @@ def test_worker_command_names_model_and_effort_env(tmp_path):
 def test_launched_command_names_the_attended_flag(tmp_path):
     """#185: SL_ATTENDED is what tells the PreToolUse deny that a PERSON is at this pane (the
     `superlooper debug` owner tap sets it; every unattended launch leaves it empty). The fresh tab
-    inherits nothing, so it must be NAMED in the dropped command or the carve-out never arrives —
-    and an unattended launch must carry it EMPTY, never absent-and-then-inherited from a stray
-    ambient export in whatever shell the runner was started from."""
+    inherits nothing, so it must be NAMED in the dropped command or the carve-out never arrives.
+    This script passes the caller's value through verbatim — the CALLERS pin it (runner._script_env
+    and _debugger_shim_run, each with its own test); what is pinned here is that an empty value is
+    still NAMED (`SL_ATTENDED=''`), so the tab's shell cannot fall back to an ambient export of its
+    own."""
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
     capture = tmp_path / "attended.cmd"
     r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",

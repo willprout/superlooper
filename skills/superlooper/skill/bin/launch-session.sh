@@ -31,12 +31,15 @@ CODEX_DANGEROUS_BYPASS="${SL_CODEX_DANGEROUS_BYPASS:-}"
 CODEX_BYPASS_HOOK_TRUST="${SL_CODEX_BYPASS_HOOK_TRUST:-}"
 CODEX_NO_ALT_SCREEN="${SL_CODEX_NO_ALT_SCREEN:-}"
 AGENT="${SL_AGENT:-claude}"
-# Is a PERSON at the keyboard for the session we are about to launch? Empty for every launch this
-# script makes on the loop's behalf (workers, the watchdog's debugger); `1` only when the caller is
+# Is a PERSON at the keyboard for the session we are about to launch? `1` only when the caller is
 # `superlooper debug`'s owner tap (issue #144), which launches a d<N> session a human just asked
-# for. The PreToolUse deny (issue #185) reads it to stand its AskUserQuestion duty down rather than
-# tell an attended session the falsehood "no human is at this pane". Passed through verbatim — the
-# callers pin it; this script does not judge it.
+# for; EMPTY for every unattended launch — the runner (_script_env) and the watchdog
+# (_debugger_shim_run) each pin it so an ambient `export SL_ATTENDED=1` in the shell or LaunchAgent
+# they were started from cannot ride in. The PreToolUse deny (issue #185) reads it to stand its
+# AskUserQuestion duty down rather than tell an attended session the falsehood "no human is at this
+# pane" — and ignores it for worker ids regardless, so the two halves back each other up. Passed
+# through verbatim: this script does not judge it, it only makes sure the fresh tab shell (which
+# inherits nothing) is TOLD it.
 ATTENDED="${SL_ATTENDED:-}"
 case "$AGENT" in
   claude) ;;

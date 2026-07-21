@@ -46,7 +46,18 @@ pattern can match the owner's live processes whether or not anyone is watching, 
 promises pattern-kills (the sl-debugger contract forbids them at every authority tier, `full`
 included). The flag is honored for `d<N>` ALONE, because the owner tap is the only attended launch
 that exists: a worker's env descends from the runner's shell, and an ambient `export SL_ATTENDED=1`
-there must never quietly disarm the deny i280 paid for.
+there must never quietly disarm the deny i280 paid for. (Belt AND suspenders: runner._script_env
+and _debugger_shim_run both PIN the flag empty on every unattended launch, so the leak is closed at
+the launcher too — neither half relies on the other.)
+
+Two accepted limits of that flag, stated so they stay conscious choices (same posture as the kill
+matcher's documented misses — this is a safety net for ACCIDENTAL drift, not an adversarial jail):
+a `d<N>` session's cwd IS the repo, so an in-repo `.claude/settings.json` env block could assert
+attendance for the watchdog's debugger (nothing in this repo does, and writing one is a deliberate
+act, not a slip); and `superlooper debug` asserts attendance for every --source, the command
+center's button included, which is the same claim debugger-brief-owner.md already makes to the
+session in words — the person who clicked is at the machine, and nothing re-arms the duty if they
+then walk away.
 
 CLAUDE ONLY. Codex has no PreToolUse event (spike verdict); its backstop is the classifier's
 at_dialog/logged_out states. run() no-ops for SL_AGENT=codex so a global registration is inert there.
@@ -129,7 +140,10 @@ _KILL_REASON = (
     "Killing processes by name or pattern (pkill / killall) is forbidden in a superlooper loop "
     "session: the pattern can also match the OWNER's own live processes — a worker once killed the "
     "owner's live dashboard this way. Record the PID of anything you background ($!) and kill only "
-    "that exact PID (`kill <pid>` / `kill -9 <pid>`)."
+    "that exact PID (`kill <pid>` / `kill -9 <pid>`). If you were only SEARCHING for those words — "
+    "a grep over docs or logs — this is the documented false positive: a `|` or `;` inside your "
+    "quoted pattern reads as a command position. Rephrase it (`grep -e pkill -e killall …`) and the "
+    "call goes through."
 )
 
 # `pkill` / `killall` invoked as a COMMAND, not as an incidental substring. It matches only at a
