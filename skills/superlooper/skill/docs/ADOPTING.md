@@ -340,6 +340,37 @@ report.
    your approvals in hand first. Approve issues by conversation (William's word applies
    `agent-ready`); the runner picks them up on its next tick.
 
+## The weekly once-over — `superlooper upkeep`
+
+Once the loop is running, a handful of things want a glance about once a week. Rather than
+remembering them, run one command:
+
+```
+superlooper upkeep --repo <path>
+```
+
+It prints one short page: the machine stack's failures and warnings, how far the installed engine
+has drifted from the mainline, what GitHub debris the janitor would propose, whether the ops docs
+still name live verbs/labels/paths, the `sl/*` branch and lane-worktree census, whether the notify
+channel actually delivered its last push, and the week's owner-question / park / merge counts.
+
+**It is read-only, by contract.** It executes nothing, writes nothing, and — unlike
+`superlooper doctor --stack` — does not even send the notify test message. Every finding names the
+existing command that acts on it (`superlooper janitor` for GitHub debris, `bin/install.sh` for
+publish drift, a doc edit for a lint finding), and you run that command yourself. There is no
+`--execute` and there is not going to be one; batching the *looking* is the whole point, and an
+acting flag would turn one safe habit back into a decision you have to make at speed.
+
+Two rows are worth knowing how to read:
+
+- **worktrees** — "holding unsaved work" means a *finished-with* checkout (parked, bounced, or with
+  no lane record) whose branch has uncommitted or unpushed work. Nothing will ever reclaim it —
+  that refusal is deliberate — so it is yours to save or discard by hand. A live lane's worktree is
+  dirty because a worker is writing in it, and is never listed.
+- **branches** — "not provably landed" counts the `sl/*` branches the janitor will *not* propose
+  deleting, because it cannot prove their work merged or was superseded. Nothing mechanical will
+  ever clear those; a climbing count is the signal to look.
+
 ## The config file is trusted, executable data — protect it accordingly
 
 `.superlooper/config.json` names commands the runner executes verbatim (`ship_cmd`,

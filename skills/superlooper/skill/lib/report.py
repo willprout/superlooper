@@ -281,32 +281,74 @@ def _questions(records, window_start):
     return lines, total
 
 
-def _notify_channel(records):
-    """The notify-channel canary line (issue #164). The daily morning push doubles as the channel
-    heartbeat: the runner journals its delivery result as `notify_canary`, and this surfaces the
-    LATEST one — so a SILENTLY dead channel (once dead for days, found only by a human reading the
-    journal) shows up HERE, on the owner-read report + dashboard: the out-of-band surface a dead
-    channel could never itself reach. Fail closed: a wrong-typed/absent record reads as 'not
-    verified', never a false green; a `log-only` result is named as UNCONFIGURED, never 'healthy'."""
-    canaries = [r for r in records if r.get("act") == "notify_canary"]
+def notify_canary(records, now=None, max_age_seconds=None):
+    """What the LATEST notify-channel canary says, as a verdict dict (issue #164).
+
+    The daily morning push doubles as the channel heartbeat: the runner journals its delivery result
+    as `notify_canary`, and this reads the newest one back — so a SILENTLY dead channel (once dead
+    for days, found only by a human reading the journal) is visible on the surfaces a dead channel
+    could never itself reach. Returns
+    ``{"status": "unverified"|"unconfigured"|"healthy"|"dead", "channel": str, "rc": int|None,
+    "detail": str}``.
+
+    Fail closed: a wrong-typed/absent record reads as `unverified`, never a false green; a
+    `log-only` result is `unconfigured`, never 'healthy'; and `ok` must be EXACTLY True (a truthy
+    string in a hand-edited journal must not read as delivered).
+
+    Freshness (issue #200): the morning report calls this with a canary minutes old, so by default
+    there is no age bound. A WEEKLY reader (`superlooper upkeep`) passes `now` and
+    `max_age_seconds`: a delivered canary older than the window is downgraded to `unverified` —
+    a channel nothing has exercised in a week is not "healthy", it is unproven. Only a DELIVERED
+    canary is aged out; a `dead`/`unconfigured` one stays as-is (its warning does not go stale).
+
+    Structured rather than pre-rendered because there are now two readers with different shapes —
+    the morning report's markdown bullet (``_notify_channel`` below) and ``superlooper upkeep``'s
+    one-line weekly census. One verdict, two renderings; the verdict lives here."""
+    canaries = [r for r in _records(records) if r.get("act") == "notify_canary"]
     if not canaries:
-        return "- Notify channel: not verified this cycle (no canary recorded)."
+        return {"status": "unverified", "channel": "?", "rc": None, "detail": ""}
     latest = max(canaries, key=lambda r: _ts(r) if _ts(r) is not None else float("-inf"))
     channel = latest.get("channel")
     channel = channel if isinstance(channel, str) and channel else "?"
+    rc = latest.get("rc")
+    rc = rc if isinstance(rc, int) and not isinstance(rc, bool) else None
+    detail = latest.get("detail")
+    detail = detail.strip() if isinstance(detail, str) and detail.strip() else ""
     if channel == "log-only":
+        return {"status": "unconfigured", "channel": channel, "rc": rc, "detail": detail}
+    if latest.get("ok") is True:               # `is True`: a truthy string must never read as green
+        # Age-out a stale delivery for a windowed (weekly) reader. A missing/corrupt ts fails
+        # CLOSED — it cannot prove freshness, so it cannot read as healthy.
+        if isinstance(now, (int, float)) and not isinstance(now, bool) \
+                and isinstance(max_age_seconds, (int, float)) and not isinstance(max_age_seconds, bool):
+            ts = _ts(latest)
+            if ts is None or ts < now - max_age_seconds:
+                why = ("last delivery was %dd ago — older than the report window"
+                       % int((now - ts) // 86400)) if ts is not None else \
+                      "last delivery has no readable timestamp — cannot confirm it is recent"
+                return {"status": "unverified", "channel": channel, "rc": rc, "detail": why}
+        return {"status": "healthy", "channel": channel, "rc": rc, "detail": detail}
+    return {"status": "dead", "channel": channel, "rc": rc,
+            "detail": detail or "(no error captured)"}
+
+
+def _notify_channel(records):
+    """The notify-channel canary line (issue #164) — the morning report's rendering of
+    `notify_canary`'s verdict."""
+    v = notify_canary(records)
+    channel = v["channel"]
+    if v["status"] == "unverified":
+        return "- Notify channel: not verified this cycle (no canary recorded)."
+    if v["status"] == "unconfigured":
         return ("- Notify channel: **no channel configured** — pushes go to the journal only; set "
                 "`notify.imessage_to` or `notify.cmd` so alerts can reach your phone.")
-    if latest.get("ok") is True:               # `is True`: a truthy string must never read as green
+    if v["status"] == "healthy":
         return f"- Notify channel: healthy (last push delivered via {channel})."
-    # ok is not True -> the last push did NOT deliver. Say so loudly, naming the channel + reason:
-    # this line is the whole point — the owner reads it here even when the channel can't reach them.
-    rc = latest.get("rc")
-    rc_s = f", rc={rc}" if isinstance(rc, int) and not isinstance(rc, bool) else ""
-    detail = latest.get("detail")
-    detail = detail.strip() if isinstance(detail, str) and detail.strip() else "(no error captured)"
+    # dead -> the last push did NOT deliver. Say so loudly, naming the channel + reason: this line
+    # is the whole point — the owner reads it here even when the channel can't reach them.
+    rc_s = f", rc={v['rc']}" if v["rc"] is not None else ""
     return (f"- Notify channel: **DEAD** — the last push did not deliver via {channel}{rc_s}: "
-            f"{detail}. Pushes are **not reaching you**; fix the channel and re-run "
+            f"{v['detail']}. Pushes are **not reaching you**; fix the channel and re-run "
             "`superlooper doctor --stack`.")
 
 
