@@ -270,6 +270,16 @@ def test_a_stale_delivery_is_downgraded_from_healthy_to_unverified():
     assert "not verified" in out and "superlooper doctor --stack" in out
 
 
+def test_an_undated_delivered_canary_fails_closed_to_unverified():
+    """A delivered canary with no readable ts cannot prove it is recent, so a WINDOWED reader must
+    not read it as healthy — it fails closed to unverified, with wording that says why (not the
+    clumsy 'unknown ago')."""
+    v = report.notify_canary([{"act": "notify_canary", "ok": True, "channel": "imessage"}],
+                             now=NOW, max_age_seconds=WEEK)
+    assert v["status"] == "unverified"
+    assert "no readable timestamp" in v["detail"] and "ago" not in v["detail"]
+
+
 def test_the_stack_summary_names_every_failure_and_warning_but_not_the_passes():
     stack = [{"name": "gh auth", "ok": False, "warn": False, "detail": "not logged in"},
              {"name": "notify channel", "ok": True, "warn": True, "detail": "not sent"},

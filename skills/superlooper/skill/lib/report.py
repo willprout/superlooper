@@ -323,9 +323,10 @@ def notify_canary(records, now=None, max_age_seconds=None):
                 and isinstance(max_age_seconds, (int, float)) and not isinstance(max_age_seconds, bool):
             ts = _ts(latest)
             if ts is None or ts < now - max_age_seconds:
-                age = ("%dd" % int((now - ts) // 86400)) if ts is not None else "unknown"
-                return {"status": "unverified", "channel": channel, "rc": rc,
-                        "detail": "last delivery was %s ago — older than the report window" % age}
+                why = ("last delivery was %dd ago — older than the report window"
+                       % int((now - ts) // 86400)) if ts is not None else \
+                      "last delivery has no readable timestamp — cannot confirm it is recent"
+                return {"status": "unverified", "channel": channel, "rc": rc, "detail": why}
         return {"status": "healthy", "channel": channel, "rc": rc, "detail": detail}
     return {"status": "dead", "channel": channel, "rc": rc,
             "detail": detail or "(no error captured)"}
