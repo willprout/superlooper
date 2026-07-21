@@ -36,13 +36,21 @@ _ENGINE_SKILL = _REPO / "skills" / "superlooper" / "skill"
 _RUNNER_OPS_NEW = "plugin/skills/superlooper/references/runner-ops.md"
 # The stale skill-relative form no engine file may keep after the move.
 _RUNNER_OPS_OLD = "references/runner-ops.md"
-# Legitimate longer paths that END in the stale form and must be stripped before looking for it.
-# The mirror path (issue #199): the gated installer publishes the ops docs into the installed engine
-# home keeping the plugin's directory shape, so the playbook's `../superlooper/references/…` sibling
-# link still resolves there. That target is a DESTINATION inside the published tree, not a pointer
-# back at a pre-move source, so it is not the drift this guard is about.
-_RUNNER_OPS_MIRROR = "superlooper/references/runner-ops.md"
-_RUNNER_OPS_LEGIT = (_RUNNER_OPS_NEW, _RUNNER_OPS_MIRROR)
+# Legitimate longer strings that END in the stale form and must be stripped before looking for it.
+# Issue #199's publish mirror keeps the plugin's directory shape inside the installed engine home,
+# so the playbook's `../superlooper/references/…` sibling link still resolves there — a DESTINATION
+# inside the published tree, not a pointer back at a pre-move source.
+#
+# Each is spelled WITH ITS DELIMITERS on purpose. A bare `superlooper/references/runner-ops.md`
+# would strip too much: it also matches `~/.claude/skills/superlooper/references/runner-ops.md` —
+# a plausible wrong installed path that omits the mirror directory — and this branch is exactly
+# when someone starts writing installed-mirror paths into the brief, so that mistake became
+# newly easy to make at the moment the guard stopped catching it.
+_RUNNER_OPS_LEGIT = (
+    _RUNNER_OPS_NEW,                                       # the repo home, in prose
+    "../superlooper/references/runner-ops.md",             # the mirror's sibling link
+    '"superlooper/references/runner-ops.md"',              # the mirror target, as a code literal
+)
 
 
 # ---- manifests ---------------------------------------------------------------------------

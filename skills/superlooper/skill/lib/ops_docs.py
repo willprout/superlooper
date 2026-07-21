@@ -29,8 +29,9 @@ Design notes that are load-bearing rather than incidental:
   * **The mirror preserves the plugin's own directory shape**, so the cross-links the docs already
     carry keep resolving: the playbook's ``references/…`` links and its
     ``../superlooper/references/runner-ops.md`` sibling link both land where they point.
-    ``tests/test_ops_docs.py`` walks every relative link in the mirrored set and fails on one that
-    does not resolve in the mirror layout — otherwise this module would ship D12's own defect.
+    ``tests/test_ops_docs.py`` holds that to a rule: every reference that RESOLVES relative to a
+    doc where it lives in the repo must also resolve relative to it in the mirror. Without that,
+    this module would ship D12's own defect — a correct doc pointing at a page that is not there.
   * **The list is explicit, and a test pins its completeness against the source trees.** ``publish``
     runs from the repo and could glob, but ``expected_paths`` runs on a machine with no checkout and
     cannot. One explicit table read by both sides keeps them symmetrical, and the tests fail if a
@@ -140,10 +141,13 @@ def publish(repo_root, dest, version):
     # rsyncs the payload into it before calling here. Checking is what makes the rmtree below safe
     # to describe as guarded: a mistyped or empty `dest` refuses instead of creating a stray tree
     # somewhere and then deleting the `docs/ops` inside it.
-    if not os.path.isdir(str(dest)):
+    if not os.path.isdir(str(dest)) or not os.path.isfile(os.path.join(str(dest), STAMP_NAME)):
         raise MissingOpsDoc(
-            "refusing to mirror ops docs into %r — it is not an existing directory. The install "
-            "destination is created and populated before the docs are mirrored into it." % (dest,))
+            "refusing to mirror ops docs into %r — it is not a published install destination (an "
+            "existing directory carrying a %s stamp). The installer creates it, syncs the payload "
+            "and stamps it BEFORE the docs are mirrored in, so anything else is a mistyped "
+            "destination — and this refusal is what stops the rebuild below from clearing a "
+            "%s directory inside it." % (dest, STAMP_NAME, "/".join(MIRROR_REL)))
 
     missing = [src for src, _dst in OPS_DOCS if not os.path.isfile(os.path.join(repo_root, src))]
     if missing:

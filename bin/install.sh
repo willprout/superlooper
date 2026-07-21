@@ -62,6 +62,19 @@ CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 CODEX_HOOKS="$CODEX_DIR/hooks.json"
 PAYLOAD_REL="skills/superlooper/skill"                   # repo-relative, for the diff gate
 
+# The two hooks, registered EXACTLY as autocode registers its own (decision B.3): $HOME is left
+# LITERAL — Claude Code expands it when it fires the hook, so the entry is portable across HOMEs.
+# Both hooks are strict no-ops in any session that isn't a superlooper worker (they exit early
+# unless SL_ISSUE_ID + SL_RUN_ROOT are exported), so registering them globally is safe.
+ACT_CMD='$HOME/.claude/skills/superlooper/bin/activity-hook.sh'
+STOP_CMD='$HOME/.claude/skills/superlooper/bin/stop-hook.sh'
+# PreToolUse deny hook (issue #156). CLAUDE ONLY — registered in settings.json below but NOT in the
+# Codex hooks.json (Codex has no PreToolUse event — spike verdict), so it lives on the Claude side of
+# merge_hooks alone. A strict no-op outside a worker session, like the other two.
+DENY_CMD='$HOME/.claude/skills/superlooper/bin/pretooluse-hook.sh'
+
+[ -d "$SRC" ] || { echo "install: payload not found at $SRC" >&2; exit 1; }
+
 # THE OPERATIONAL DOCS (issue #199, defect class D12). Beyond the payload, this installer also
 # mirrors the operator-facing docs — STACK.md, runner-ops, the approval protocol and the whole
 # sl-debugger playbook — into $DEST/docs/ops. D12's third root cause was "the debugger playbook
@@ -89,19 +102,6 @@ if [ -z "${OPS_DOC_PATHS// }" ]; then
   echo "install: machine whose gate would not show the docs it is about to install." >&2
   exit 1
 fi
-
-# The two hooks, registered EXACTLY as autocode registers its own (decision B.3): $HOME is left
-# LITERAL — Claude Code expands it when it fires the hook, so the entry is portable across HOMEs.
-# Both hooks are strict no-ops in any session that isn't a superlooper worker (they exit early
-# unless SL_ISSUE_ID + SL_RUN_ROOT are exported), so registering them globally is safe.
-ACT_CMD='$HOME/.claude/skills/superlooper/bin/activity-hook.sh'
-STOP_CMD='$HOME/.claude/skills/superlooper/bin/stop-hook.sh'
-# PreToolUse deny hook (issue #156). CLAUDE ONLY — registered in settings.json below but NOT in the
-# Codex hooks.json (Codex has no PreToolUse event — spike verdict), so it lives on the Claude side of
-# merge_hooks alone. A strict no-op outside a worker session, like the other two.
-DENY_CMD='$HOME/.claude/skills/superlooper/bin/pretooluse-hook.sh'
-
-[ -d "$SRC" ] || { echo "install: payload not found at $SRC" >&2; exit 1; }
 
 # VERSION stamp: git SHA of THIS source repo + the install date. `nogit` if the tree has no git
 # (published tarball); the date always lands so a VERSION is never empty.
@@ -391,13 +391,6 @@ rsync -a --delete "$SRC"/ "$DEST"/
 # 3) Stamp VERSION into the installed copy (after rsync --delete, which would otherwise remove it).
 printf '%s\n' "$VERSION" > "$DEST/VERSION"
 
-# 3b) Mirror the operational docs into $DEST/docs/ops (issue #199). AFTER the rsync, for the same
-#     reason the VERSION stamp is: --delete would otherwise sweep them straight back out. The helper
-#     rebuilds the mirror whole, so a doc retired upstream does not linger as a page an operator can
-#     still find and act on, and it fails loud (non-zero) rather than publishing a partial playbook.
-python3 "$OPS_DOCS_PY" --publish --repo-root "$REPO_ROOT" --dest "$DEST" --version "$VERSION" \
-  | sed 's/^/[install] ops doc      -> /'
-
 # 4) Install the keystroke-free launch shim (idempotent; its own installer guards the ~/.zshrc line).
 "$SRC/bin/install-launch-shim.sh"
 
@@ -406,6 +399,16 @@ python3 "$OPS_DOCS_PY" --publish --repo-root "$REPO_ROOT" --dest "$DEST" --versi
 #    command is "command not found". The linker writes a thin shim into a standard user bin dir and,
 #    if that dir is not on PATH, prints the exact line to add it — it never silently skips. Idempotent.
 "$SRC/bin/install-cli-link.sh"
+
+# 6) Mirror the operational docs into $DEST/docs/ops (issue #199). AFTER the rsync, for the same
+#    reason the VERSION stamp is: --delete would otherwise sweep them straight back out — and LAST,
+#    after the shim and the PATH link, deliberately. Under `set -e` a failure here aborts the run,
+#    and doing it earlier would leave a first-time install with an engine but no launch shim and no
+#    `superlooper` on PATH — a worse machine than one whose docs simply did not land. The helper
+#    rebuilds the mirror whole, so a doc retired upstream does not linger as a page an operator can
+#    still find and act on, and it fails loud (non-zero) rather than publishing a partial playbook.
+python3 "$OPS_DOCS_PY" --publish --repo-root "$REPO_ROOT" --dest "$DEST" --version "$VERSION" \
+  | sed 's/^/[install] ops doc      -> /'
 
 echo "[install] published skill -> $DEST"
 echo "[install] VERSION         -> $VERSION"

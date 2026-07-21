@@ -151,9 +151,11 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   with `SL_SOURCE_REPO`.
 - `installed ops docs`: republish through the gated `bin/install.sh` from a superlooper source
   checkout — it mirrors the operational docs into `~/.claude/skills/superlooper/docs/ops/` and
-  stamps them with the same publish as the engine. FAILs in two states: the files are missing (the
-  state every machine is in until it republishes past issue #199, and the state D12 recorded — the
-  debugger playbook absent on the machine having the incident), or their stamp does not match the
+  stamps them with the same publish as the engine. FAILs in two states: the files are missing —
+  the state D12 recorded, the debugger playbook absent on the machine having the incident (the
+  mirror and this check ship in the same publish, so through the installed CLI you see this only
+  when the mirror step failed; running the CLI straight out of a source checkout against an older
+  installed engine is the other way to reach it) — or their stamp does not match the
   installed engine's, meaning the mirror survived from an older publish and may describe an engine
   that is not the one running. A machine with no installed engine home at all passes cleanly: there
   is nothing published to check, and the launch-shim and hook blocks already name that problem.

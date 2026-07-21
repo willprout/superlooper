@@ -14,15 +14,30 @@ The cure is a manifest that is GENERATED, never written:
   * **labels** — ``labels.LABELS``, imported. The one source of truth for the loop's §C.2 label
     vocabulary, so importing it is definitionally current. Retired names (``needs-william`` ->
     ``needs-owner``) come from ``labels.RETIRED_LABELS``, the same module's own migration record.
-  * **doctor block names** — every ``CheckResult`` name reachable from ``stack_doctor.check_stack``,
-    read by AST so BRANCH-ONLY names count too. This is deliberately stronger than the dynamic
-    ``_emitted_block_names`` check in ``test_stack_doctor.py`` (issue #142), which calls
-    ``check_stack`` once with a FakeProbe and therefore sees only the names that one machine-state
-    happens to emit. The two are complementary and both stay: the dynamic one proves the names a
-    real call produces, this one proves the names the code can produce at all.
+  * **doctor block names** — every ``CheckResult`` name in the functions ``check_stack`` calls
+    DIRECTLY, read by AST so BRANCH-ONLY names count too. One call level, not transitively: a name
+    moved down into a helper would drop out of the manifest, which is why
+    ``test_the_static_and_dynamic_block_readings_agree_on_what_ships`` cross-checks it against a
+    real ``check_stack`` call. This static read is otherwise stronger than the dynamic
+    ``_emitted_block_names`` check in ``test_stack_doctor.py`` (issue #142), which sees only the
+    names one FakeProbe machine-state happens to emit. Both stay: the dynamic one proves the names
+    a real call produces, this one proves the names the code can produce at all.
   * **repo paths** — a doc that cites `skills/…`, `plugin/…`, `dashboard/…`, `.superlooper/…` or
     `.github/…` is naming a file in THIS repo, so the file has to be there. This is the "a sync
     orphaned the installed docs" third of D12: the reference outlives the move.
+
+What this lint does NOT cover, stated so nobody reads more into it than it does:
+
+  * **Verbs only in the two-word ``superlooper <verb>`` form.** Docs also name verbs bare in
+    backticks (`` `doctor` ``, `` `tidy` ``); bare words cannot be checked without flagging
+    ordinary English. Renaming a verb is caught wherever a doc writes the invocation, not
+    everywhere the verb is mentioned. Flags (``--stack``) are not covered at all.
+  * **Block names both ways only inside STACK.md**, which is the only doc making an "emits these
+    exact block names" claim — the completeness the DoD asks for. STACK.md's Tier lists get a
+    one-way phantom check; block names mentioned in the other ops docs are unchecked, because
+    nothing distinguishes a doctor block name from an ordinary backticked phrase without a registry
+    of retired names to compare against.
+  * **Invented BARE labels** (`needs-attention`) — see ``documented_labels``.
 
 Three properties keep the lint from rotting into decoration:
 
@@ -69,15 +84,19 @@ def live_verbs(cli_path=None):
     AST, not a regex over the source: ``superlooper``'s module docstring is itself a help table
     full of verb names, and the file is thick with prose comments. A textual scan would mint
     phantom verbs out of either. Walking the tree means only a real call expression counts.
+
+    Scoped to BARE ``add(...)`` calls — the local helper ``main()`` defines to register a
+    subparser — and never to ``<something>.add(...)``. The CLI is full of set-building
+    (``seen.add(fp)``, ``out.add(name)``); those take non-literals today, but one future
+    ``some_set.add("foo")`` would otherwise silently mint a verb ``foo`` that the lint would then
+    accept in any ops doc. A manifest that can be widened by an unrelated line is not a manifest.
     """
     src = Path(cli_path or _CLI).read_text(encoding="utf-8")
     found = set()
     for node in ast.walk(ast.parse(src)):
         if not isinstance(node, ast.Call) or not node.args:
             continue
-        func = node.func
-        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-        if name != "add":
+        if not (isinstance(node.func, ast.Name) and node.func.id == "add"):
             continue
         first = node.args[0]
         if isinstance(first, ast.Constant) and isinstance(first.value, str):
@@ -121,8 +140,11 @@ def live_doctor_blocks(module_path=None):
 
     Scoping matters: ``stack_doctor`` is free to grow ``CheckResult``s that the machine-level
     ``--stack`` run never returns, and STACK.md's list is explicitly about the ``--stack`` blocks.
-    So we read the functions ``check_stack`` calls, then take every ``CheckResult(...)`` first
-    argument inside them — string literal or a locally-bound string name.
+    So we read the functions ``check_stack`` calls DIRECTLY — one level, not a transitive walk —
+    then take every ``CheckResult(...)`` first argument inside them, string literal or a
+    locally-bound string name. A block whose name moved into a deeper helper would silently leave
+    the manifest; ``test_the_static_and_dynamic_block_readings_agree_on_what_ships`` is the
+    backstop that notices.
 
     Raises rather than guesses if a name cannot be resolved statically: an unresolvable name means
     the lint would quietly stop covering a block, which is the exact failure mode being closed.
@@ -361,14 +383,18 @@ _PATH_RE = re.compile(
 
 
 def documented_repo_paths(text):
-    """Repo-relative paths cited in code formatting, minus glob patterns.
+    """Repo-relative paths cited in code formatting OR in a markdown link target.
 
     A trailing `*`/`?` in the source span means the doc is naming a FAMILY of files
     (`skills/superlooper/docs/INCIDENT-*.md`); the character class stops before the wildcard, so we
     look at what follows the match and drop it rather than checking a truncated stem.
+
+    Link targets are included because `[the ladder](skills/superlooper/docs/repair.md)` is a
+    citation a reader will actually click, and it carries no backticks — code formatting is the
+    right discipline for COMMAND names, not for hyperlinks.
     """
     found = set()
-    for span in code_spans(text):
+    for span in code_spans(text) + re.findall(r"\]\(([^)\s]+)[^)]*\)", text):
         for match in _PATH_RE.finditer(span):
             rel = match.group(1)
             if "*" in rel or "?" in rel:
@@ -474,6 +500,43 @@ def _documented_block_names():
         if match:
             names.append(match.group(1))
     return names
+
+
+def _tier_bullet_names():
+    """Block names bulleted in STACK.md's Tier sections, written `- \\`name\\` - description`.
+
+    A SECOND place the same names are spelled. Renaming a block and updating only the fixes list
+    leaves these stale, and the fixes-list check cannot see it — the two lists use different bullet
+    punctuation, which is exactly why the drift would survive. Not every Tier bullet is a block
+    (`Publish discipline`, `Repo-level doctor green` are prose headings), so this reads names and
+    the caller judges only the ones that CLAIM to be blocks.
+    """
+    lines = _STACK_MD.read_text(encoding="utf-8").splitlines()
+    try:
+        end = lines.index(_CHECK_NAMES_HEADING)
+    except ValueError:
+        raise AssertionError("STACK.md must keep the %r heading" % _CHECK_NAMES_HEADING)
+    return [m.group(1) for m in
+            (re.match(r"- `([^`]+)` - ", line) for line in lines[:end]) if m]
+
+
+def test_stack_md_tier_lists_name_no_block_the_code_cannot_emit():
+    """The fixes list is not the only place STACK.md spells block names.
+
+    A Tier bullet naming a block that no longer exists is the same lie in a different section, and
+    it is the section an operator reads FIRST — the tiers are the "what does this machine need"
+    walkthrough; the fixes list is what they turn to after a red line.
+    """
+    live = live_doctor_blocks()
+    documented_fixes = set(_documented_block_names())
+    # A Tier bullet is treated as a block claim when the fixes list also carries that name, or when
+    # it looks like a block name and is not one — i.e. anything that is neither a live block nor a
+    # prose heading. Prose headings are capitalised phrases; block names are not.
+    phantom = [name for name in _tier_bullet_names()
+               if name not in live and (name in documented_fixes or name.islower())]
+    assert not phantom, (
+        "STACK.md's Tier lists name blocks doctor --stack cannot emit: %s — the tiers are the "
+        "first thing an operator reads." % sorted(set(phantom)))
 
 
 def test_stack_md_documents_every_block_name_the_code_can_emit():

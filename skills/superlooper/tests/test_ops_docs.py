@@ -89,36 +89,53 @@ def test_the_operator_facing_ops_docs_ship():
         assert rel in mirrored, "%s must ship with the engine publish" % rel
 
 
-def _relative_links(text):
-    """Relative markdown/backtick references to a sibling .md, as written in the doc."""
-    found = set()
-    for match in re.finditer(r"\]\(([^)\s]+\.md)[^)]*\)", text):     # [text](path.md)
-        found.add(match.group(1))
-    for match in re.finditer(r"`((?:\.\./|\./)[^`\s]+\.md)`", text):  # `../path.md`
-        found.add(match.group(1))
-    return {link for link in found
-            if not link.startswith(("http://", "https://", "/", "~"))}
+def _md_references(text):
+    """Every string in the doc that could be a relative reference to another `.md` page.
 
-
-def test_every_relative_link_between_mirrored_docs_resolves_in_the_mirror(tmp_path):
-    """The mirror must not ship a broken cross-reference — that is D12's own defect class.
-
-    The playbook links sideways to `../superlooper/references/runner-ops.md`. Flattening the
-    mirror would leave that pointing at nothing, and an operator following it mid-incident would
-    hit exactly the dead end this whole issue is about. So the mirror keeps the plugin's directory
-    shape, and this walks every relative .md link in the published tree to prove it.
+    Deliberately over-inclusive — markdown link targets AND backticked paths, including bare
+    `foo.md` filenames. Which of these are real links is decided by resolution against the SOURCE
+    tree, below, not by guessing here from the shape of the string.
     """
-    dest = tmp_path / "installed"
-    dest.mkdir()
+    found = set(re.findall(r"\]\(([^)\s]+\.md)[^)]*\)", text))     # [text](path.md)
+    found |= set(re.findall(r"`([\w./-]+\.md)`", text))            # `path.md`, `../path.md`
+    return {ref for ref in found if not ref.startswith(("http://", "https://", "/", "~"))}
+
+
+def test_the_mirror_preserves_every_link_that_resolves_in_the_source_tree(tmp_path):
+    """The invariant: a reference that works where the doc LIVES must work where it is PUBLISHED.
+
+    That is the whole correctness condition for the mirror layout, and it is self-calibrating —
+    resolution against the source tree decides what counts as a link, so there is no hand-written
+    list of prefixes to fall behind. A bare `runner-ops.md` mentioned by name in STACK.md does not
+    resolve beside STACK.md, so it was never a link and is not held to one; the playbook's
+    `references/unattended-contract.md` and its `../superlooper/references/runner-ops.md` sibling
+    both do resolve, so the mirror has to keep them resolving.
+
+    An earlier version of this test extracted only `./`- and `../`-prefixed backticks and therefore
+    walked exactly ONE link, leaving the playbook's whole routing table — five bare
+    `references/<page>.md` pointers, including the contract the 3am brief sends the session to —
+    unchecked. A mirror that flattened `sl-debugger/references/` would have broken every one of
+    them with this test green.
+    """
+    dest = _published_dest(tmp_path)
     ops_docs.publish(_REPO, dest, "abc1234 2026-07-21")
     root = Path(ops_docs.mirror_dir(dest))
 
-    broken = []
-    for page in sorted(root.rglob("*.md")):
-        for link in _relative_links(page.read_text(encoding="utf-8")):
-            if not (page.parent / link).resolve().exists():
-                broken.append("%s -> %s" % (page.relative_to(root).as_posix(), link))
-    assert not broken, "the published ops-doc mirror carries dead links: %s" % broken
+    broken, walked = [], 0
+    for src, dst in ops_docs.OPS_DOCS:
+        source_page = _REPO / src
+        mirror_page = root / dst
+        for ref in sorted(_md_references(source_page.read_text(encoding="utf-8"))):
+            if not (source_page.parent / ref).exists():
+                continue                      # not a relative link where it lives — a mention
+            walked += 1
+            if not (mirror_page.parent / ref).exists():
+                broken.append("%s -> %s (resolves at %s, not in the mirror)" % (dst, ref, src))
+    assert not broken, "the published ops-doc mirror breaks links that work in the repo: %s" % broken
+    # A link-walk that walks nothing is the failure mode this test is most likely to rot into:
+    # tighten the extractor by accident and it goes quietly, permanently green. The playbook's
+    # entry page alone carries its four references plus the runner-ops sibling.
+    assert walked >= 5, "the link extractor found only %d links — it has stopped looking" % walked
 
 
 def test_the_playbooks_sibling_link_is_the_one_this_layout_exists_for():
@@ -149,9 +166,21 @@ def test_mirror_targets_are_unique_and_relative():
 # publish()
 # --------------------------------------------------------------------------------------------
 
-def test_publish_writes_every_doc_and_the_stamp(tmp_path):
+def _published_dest(tmp_path, version="abc1234 2026-07-21"):
+    """An install destination in the state the installer leaves it in before step 6.
+
+    publish() refuses anything else — a directory with no VERSION stamp is not a published engine
+    home, it is a mistyped path, and refusing is what makes the rmtree inside it safe. So the
+    tests build the real precondition rather than a bare mkdir.
+    """
     dest = tmp_path / "installed"
     dest.mkdir()
+    (dest / "VERSION").write_text(version + "\n", encoding="utf-8")
+    return dest
+
+
+def test_publish_writes_every_doc_and_the_stamp(tmp_path):
+    dest = _published_dest(tmp_path)
     written = ops_docs.publish(_REPO, dest, "abc1234 2026-07-21")
 
     assert sorted(written) == sorted(dst for _src, dst in ops_docs.OPS_DOCS)
@@ -163,8 +192,7 @@ def test_publish_writes_every_doc_and_the_stamp(tmp_path):
 
 
 def test_publish_clears_a_stale_mirror_and_is_idempotent(tmp_path):
-    dest = tmp_path / "installed"
-    dest.mkdir()
+    dest = _published_dest(tmp_path)
     ops_docs.publish(_REPO, dest, "old 2026-01-01")
     orphan = Path(ops_docs.mirror_dir(dest)) / "retired-page.md"
     orphan.write_text("a doc that no longer exists upstream\n", encoding="utf-8")
@@ -178,19 +206,37 @@ def test_publish_clears_a_stale_mirror_and_is_idempotent(tmp_path):
 
 
 def test_publish_refuses_a_missing_source(tmp_path, monkeypatch):
-    dest = tmp_path / "installed"
-    dest.mkdir()
+    dest = _published_dest(tmp_path)
     monkeypatch.setattr(ops_docs, "OPS_DOCS",
                         (("plugin/skills/sl-debugger/NOPE.md", "sl-debugger/NOPE.md"),))
     with pytest.raises(ops_docs.MissingOpsDoc):
         ops_docs.publish(_REPO, dest, "abc1234 2026-07-21")
 
 
+def test_publish_refuses_a_destination_that_is_not_a_published_engine_home(tmp_path):
+    """The rmtree's real guard: `--dest ~` must not clear `~/docs/ops`.
+
+    `publish` deletes and rebuilds `<dest>/docs/ops`, so the only thing standing between a
+    mistyped `--dest` and someone's directory is this precondition. Requiring the VERSION stamp
+    the installer writes at step 3 costs nothing (it is always there by step 6) and is not a
+    property any ordinary directory has.
+    """
+    plain = tmp_path / "somebody-elses-home"
+    (plain / "docs" / "ops").mkdir(parents=True)
+    keep = plain / "docs" / "ops" / "notes.md"
+    keep.write_text("not ours\n", encoding="utf-8")
+
+    with pytest.raises(ops_docs.MissingOpsDoc):
+        ops_docs.publish(_REPO, plain, "abc1234 2026-07-21")
+    assert keep.exists(), "publish cleared a directory that was not a published engine home"
+
+    with pytest.raises(ops_docs.MissingOpsDoc):
+        ops_docs.publish(_REPO, tmp_path / "does-not-exist", "abc1234 2026-07-21")
+
+
 def test_publish_never_escapes_the_mirror_directory(tmp_path):
     """Everything publish() touches lives under <dest>/docs/ops — it is not a general copier."""
-    dest = tmp_path / "installed"
-    dest.mkdir()
-    (dest / "VERSION").write_text("abc1234 2026-07-21\n", encoding="utf-8")
+    dest = _published_dest(tmp_path)
     (dest / "lib").mkdir()
     (dest / "lib" / "gate.py").write_text("payload\n", encoding="utf-8")
 
@@ -219,8 +265,7 @@ def test_list_cli_prints_the_sources_for_the_installer(tmp_path):
 
 
 def test_publish_cli_mirrors_the_docs(tmp_path):
-    dest = tmp_path / "installed"
-    dest.mkdir()
+    dest = _published_dest(tmp_path)
     proc = subprocess.run(
         [sys.executable, str(_ENGINE / "skill" / "lib" / "ops_docs.py"), "--publish",
          "--repo-root", str(_REPO), "--dest", str(dest), "--version", "abc1234 2026-07-21"],
@@ -343,7 +388,8 @@ def test_ops_docs_block_fails_when_the_mirror_is_from_an_older_publish():
 
 
 def test_ops_docs_block_fails_when_nothing_was_mirrored_at_all():
-    """The state every machine is in until it republishes past this change."""
+    """A published engine with no mirror beside it: the mirror step failed, or the CLI is being
+    run from a source checkout against an engine published before this change."""
     dest = _install_home()
     result = stack_doctor.check_ops_docs(
         FakeProbe(files={os.path.join(dest, "VERSION"): "abc1234 2026-07-21\n"}))
@@ -382,14 +428,39 @@ def test_check_stack_emits_the_ops_docs_block():
 # The brief the 3am session actually reads
 # --------------------------------------------------------------------------------------------
 
+def _mirror_rel():
+    """The mirror's location as the CODE defines it — never as a test spells it."""
+    return "/".join(ops_docs.MIRROR_REL)
+
+
 def test_the_unattended_brief_names_the_installed_playbook_fallback():
     """D12's actual failure: the brief said "follow the skill" on a machine with no skill.
 
     The brief must name a path that exists on a machine the gated installer has published to, so a
     session whose plugin is missing or disabled can still read the contract it is being held to.
+
+    Derived from ``MIRROR_REL`` + ``OPS_DOCS``, never spelled: a hand-written `"docs/ops/…"` here
+    would survive a rename of the mirror directory and leave this test confidently green while the
+    brief pointed a 3am session at a path that no longer exists — which is precisely the defect
+    class the whole issue is about, reintroduced inside its own fix.
     """
     brief = (_ENGINE / "skill" / "templates" / "debugger-brief.md").read_text(encoding="utf-8")
-    assert "unattended-contract.md" in brief
-    assert "docs/ops/sl-debugger" in brief, (
+    playbook = dict(ops_docs.OPS_DOCS)["plugin/skills/sl-debugger/SKILL.md"]
+    assert "%s/%s" % (_mirror_rel(), playbook) in brief, (
         "the unattended brief must route to the installed ops-docs mirror when the sl-debugger "
-        "skill is not on the machine")
+        "skill is not on the machine, and must name it where the code actually publishes it")
+    assert "unattended-contract.md" in brief
+
+
+def test_the_stack_doc_names_the_mirror_where_the_code_publishes_it():
+    """STACK.md tells the operator where the ops docs land; same derive-don't-spell discipline."""
+    stack = (_ENGINE / "docs" / "STACK.md").read_text(encoding="utf-8")
+    assert "%s/" % _mirror_rel() in stack, (
+        "STACK.md's `installed ops docs` entry must name the directory ops_docs.MIRROR_REL "
+        "actually publishes into")
+
+
+def test_the_doctor_reports_the_mirror_where_the_code_publishes_it():
+    """And the block's own detail/fix text, so all three operator-facing spellings move together."""
+    result = stack_doctor.check_ops_docs(FakeProbe(files=_healthy_files()))
+    assert _mirror_rel() in result.detail
