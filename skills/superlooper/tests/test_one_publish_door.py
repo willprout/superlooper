@@ -27,11 +27,16 @@ Two layers, because a door can be opened two ways:
    later passed to ``shutil.copytree`` — because that is precisely how the gated installer itself is
    written, and a copycat would be written the same way.
 
-**Scanned surface.** Every ``.sh`` and ``.py`` file in the repo except test files and ``conftest.py``.
-Tests are exempt on purpose: they exercise the real installers against a fixture ``HOME``
-(``tmp_path``) and must name the path to assert on it — including this file, whose meta-tests
-construct violations deliberately. No test publishes into a real ``~/.claude`` (each overrides
-``HOME``), and CI runs nothing but ``pytest``.
+**Scanned surface.** Every script in the repo — by extension (``.sh``, ``.bash``, ``.zsh``, ``.py``)
+*and* by shebang, because the load-bearing ones carry no extension at all: the engine CLI
+``skill/bin/superlooper``, ``dashboard/bin/command-center`` and ``dashboard/bin/liftoff`` are
+extensionless ``#!/usr/bin/env python3`` files, and an extension-only sweep would leave the engine's
+own entry point outside the fence.
+
+Test files and ``conftest.py`` are exempt on purpose: they exercise the real installers against a
+fixture ``HOME`` (``tmp_path``) and must name the path to assert on it — including this file, whose
+meta-tests construct violations deliberately. No test publishes into a real ``~/.claude`` (each
+overrides ``HOME``), and CI runs nothing but ``pytest``.
 
 **Out of scope, stated so the boundary is honest.** This fence guards the installed-skill home. It
 does not guard the other places the gated installer writes on its way past (``~/.zshrc`` via
@@ -89,8 +94,11 @@ _SKILL_HOME = re.compile(r"\.claude\W{1,8}?skills\b")
 # Shell verbs that mutate the filesystem. `install` needs its coreutils flag form so the word
 # "install" in prose or a filename (install-cli-link.sh) is not mistaken for the command.
 _SH_WRITE = re.compile(
-    r"(?:^|[\s;&|(`$])(?:rsync|cp|mv|ln|scp|tee|touch|mkdir|rmdir|rm|chmod|chown|unzip|tar)\b"
+    r"(?:^|[\s;&|(`$])(?:rsync|cp|mv|ln|scp|tee|touch|mkdir|rmdir|rm|chmod|chown|unzip|tar"
+    r"|dd|ditto|unlink|truncate)\b"
     r"|\binstall\s+-"
+    r"|\bsed\s+-i"
+    r"|\bgit\s+(?:clone|checkout|worktree\s+add)\b"
 )
 # A redirect into a file. `2>&1`, `>&2`, `<<'HEREDOC'` and a prose arrow `->` are not writes.
 _SH_REDIRECT = re.compile(r"(?<![0-9<>&=-])>>?(?![&|])")
@@ -99,7 +107,8 @@ _SH_REDIRECT = re.compile(r"(?<![0-9<>&=-])>>?(?![&|])")
 _PY_WRITE_FUNCS = frozenset({
     "open", "makedirs", "mkdir", "replace", "rename", "remove", "unlink", "rmdir",
     "copy", "copy2", "copyfile", "copytree", "move", "rmtree", "symlink", "link",
-    "write_text", "write_bytes", "touch", "run", "call", "check_call", "Popen",
+    "write_text", "write_bytes", "touch", "run", "call", "check_call", "check_output",
+    "Popen", "system", "popen", "unpack_archive", "extractall",
 })
 
 
@@ -114,19 +123,44 @@ def _is_test_file(rel):
     )
 
 
+def _shebang_kind(path):
+    """'py' / 'sh' / None from a file's shebang, read without slurping the whole file."""
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(256).decode("utf-8", "replace")
+    except OSError:
+        return None
+    if not first.startswith("#!"):
+        return None
+    if "python" in first:
+        return "py"
+    # Any other shebang (sh/bash/zsh/node/ruby/perl) is read with the line-based detector. It is
+    # looser than the Python AST pass, but the naming ratchet — the layer that actually stops a new
+    # door — does not depend on getting the language right.
+    return "sh"
+
+
+def _kind(path, rel):
+    if rel.endswith(".py"):
+        return "py"
+    if rel.endswith((".sh", ".bash", ".zsh")):
+        return "sh"
+    return _shebang_kind(path)
+
+
 def _surface():
-    """(relpath, text) for every non-test script in the repo."""
+    """(relpath, kind, text) for every non-test script in the repo."""
     out = []
     for root, dirs, files in os.walk(_REPO):
         dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
         for name in sorted(files):
-            if not name.endswith((".sh", ".py")):
-                continue
             path = Path(root) / name
             rel = path.relative_to(_REPO).as_posix()
             if _is_test_file(rel):
                 continue
-            out.append((rel, path.read_text(encoding="utf-8", errors="replace")))
+            kind = _kind(path, rel)
+            if kind:
+                out.append((rel, kind, path.read_text(encoding="utf-8", errors="replace")))
     return out
 
 
@@ -248,14 +282,14 @@ def _py_offences(text):
     return hits
 
 
-def _offences(rel, text):
-    return _sh_offences(text) if rel.endswith(".sh") else _py_offences(text)
+def _offences(kind, text):
+    return _py_offences(text) if kind == "py" else _sh_offences(text)
 
 
 # --------------------------------------------------------------- layer 1: the naming ratchet
 
 def test_only_allow_listed_scripts_name_the_installed_skill_home():
-    strays = [rel for rel, text in _surface()
+    strays = [rel for rel, _kind_, text in _surface()
               if _names_skill_home(text) and rel not in _ALLOWED]
     assert not strays, (
         "these scripts name ~/.claude/skills but are not on the one-door allow-list: %s.\n"
@@ -263,6 +297,17 @@ def test_only_allow_listed_scripts_name_the_installed_skill_home():
         "(it shows the diff and requires an explicit OK). If it only READS or references the "
         "path, add it to _ALLOWED in this file with the reason." % (strays, _THE_DOOR)
     )
+
+
+def test_extensionless_scripts_are_on_the_scanned_surface():
+    # The reason the sweep reads shebangs and not just suffixes: the engine's own CLI and both
+    # dashboard entry points carry no extension. An extension-only fence would leave the most
+    # obvious place to bolt a republish command onto entirely unwatched.
+    scanned = {rel for rel, _kind_, _text in _surface()}
+    for rel in ("skills/superlooper/skill/bin/superlooper",
+                "dashboard/bin/command-center",
+                "dashboard/bin/liftoff"):
+        assert rel in scanned, "extensionless script %s must be scanned (shebang sweep)" % rel
 
 
 def test_the_allow_list_has_not_rotted():
@@ -278,10 +323,10 @@ def test_the_allow_list_has_not_rotted():
 
 def test_only_the_gated_installer_writes_into_the_installed_skill_home():
     offenders = {}
-    for rel, text in _surface():
+    for rel, kind, text in _surface():
         if rel == _THE_DOOR or not _names_skill_home(text):
             continue
-        hits = _offences(rel, text)
+        hits = _offences(kind, text)
         if hits:
             offenders[rel] = hits
     assert not offenders, (
@@ -385,6 +430,17 @@ def test_fence_does_not_flag_a_read_only_reference():
     # function for an unrelated write — scope-aware binding is what keeps that from tripping.
     assert not _sh_offences(_READ_ONLY_SH)
     assert not _py_offences(_READ_ONLY_PY)
+
+
+def test_fence_classifies_an_extensionless_publisher_by_its_shebang(tmp_path):
+    for shebang, expected in (("#!/usr/bin/env python3", "py"), ("#!/usr/bin/env bash", "sh")):
+        script = tmp_path / ("republish-" + expected)
+        script.write_text(shebang + "\n# body\n")
+        assert _kind(script, script.name) == expected, (
+            "a script with no extension must still be read as %s" % expected)
+    plain = tmp_path / "notes.txt"
+    plain.write_text("just prose about ~/.claude/skills\n")
+    assert _kind(plain, plain.name) is None, "a non-script must not enter the surface"
 
 
 def test_fence_would_have_caught_the_original_second_door():
