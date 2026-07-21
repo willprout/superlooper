@@ -4374,8 +4374,8 @@ def _close_but_keep_checkout(rig, monkeypatch, close_kills=True):
     return closed, pruned
 
 
-def _assert_session_ended_checkout_kept(rig, closed, pruned):
-    assert closed == [1], "the merged lane's live CLI must be closed"
+def _assert_session_ended_checkout_kept(rig, closed, pruned, closes=1):
+    assert closed == [1] * closes, "the merged lane's live CLI must be closed"
     assert pruned == [], "cleanup_merged_worktrees: false keeps the checkout"
     assert (rig.home / "worktrees" / "i7").exists()          # kept for inspection
     assert not (rig.home / "state" / "panes" / "i7").exists()
@@ -4475,8 +4475,58 @@ def test_the_drain_finishes_a_kept_checkout_lane_once_its_builder_is_gone(rig, m
 
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)      # the builder finally died
     rig.r._drain_pending_teardowns(loopstate.load(str(rig.home / "state" / "issues.json")))
-    _assert_session_ended_checkout_kept(rig, [1], pruned)                 # 2 closes, 1 asserted shape
-    assert closed == [1, 1]
+    _assert_session_ended_checkout_kept(rig, closed, pruned, closes=2)
+
+
+# The three above hand the drain a FRESHLY loaded state. The real tick did not: it snapshotted
+# issues.json before decide and handed that same snapshot to the drain after the executors ran, so
+# the drain judged every lane by its PRE-execute status. The settle's marker is written during
+# _execute — so on the tick it was created the drain read a lane that still said `running`, took the
+# "back in flight" branch and deleted it; and read one that still said `bounced` as a park-family
+# prune. These two drive the tick's own ordering instead of imitating it.
+
+def _one_action_tick(rig, monkeypatch, act):
+    """The REAL tick around a single action — production's snapshot -> execute -> hygiene-sweep
+    ordering, not a hand-rolled imitation. Only decide is stubbed, to emit exactly this act."""
+    monkeypatch.setattr(runner_mod.actions, "decide", lambda *a, **k: [dict(act)])
+    rig.r.tick(now=NOW)
+
+
+def test_the_owed_close_survives_the_tick_that_created_it(rig, monkeypatch):
+    """The marker is written mid-tick by the settle, and the drain runs later in that SAME tick.
+    Judged against the pre-execute snapshot the lane still says `running`, so the drain called it
+    'back in flight' and dropped the marker — deleting, on the tick it was created, the retry the
+    whole #149 safety argument rests on."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+
+    _one_action_tick(rig, monkeypatch, {"act": "absorb_merged", "id": "i7", "num": 7})
+    assert issue_state(rig, "i7")["status"] == "merged"
+    assert (rig.home / "state" / "pending_teardown" / "i7").exists(), \
+        "the tick that wrote the marker must not also eat it"
+    assert pruned == [] and (rig.home / "worktrees" / "i7").exists()
+
+
+def test_a_kept_checkout_is_not_pruned_by_the_same_tick_that_deferred_it(rig, monkeypatch):
+    """The same staleness from the other side, and the sharper harm. absorb_close settles a
+    park-family lane to `merged`; judged against the pre-execute snapshot it still says `bounced`,
+    so the drain took the park-family branch and pruned with remove_worktree=True — deleting the
+    very checkout `cleanup_merged_worktrees: false` asked to keep, on the tick the settle deferred
+    it, and #190's guard saves only a DIRTY tree, never a clean pushed one."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="bounced", num=7)
+    _teardown_rig(rig, "i7")
+    # The builder outlives the settle's wait and dies before the retry, so no live pid refuses a
+    # stale prune. Keyed on the close COUNT, not on a call count: tick() probes pids elsewhere too.
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: len(closed) < 2)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: None)  # clean tree
+
+    _one_action_tick(rig, monkeypatch, {"act": "absorb_close", "id": "i7", "num": 7})
+    assert issue_state(rig, "i7")["status"] == "merged"
+    assert closed == [1, 1], "the settle deferred, so the retry must re-issue the close"
+    assert pruned == [], "the checkout the config said to keep must survive the tick"
+    assert (rig.home / "worktrees" / "i7").exists()
 
 
 def test_window_knob_off_keeps_the_checkout_even_with_the_prune_knob_on(rig, monkeypatch):

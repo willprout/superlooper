@@ -1882,8 +1882,17 @@ class Runner:
         # safety — each is self-guarded so it can never crash the tick or block the heartbeat.
         if written:                                    # processed/ only grew if events were archived
             self._prune_processed_events()             # keep next_seq + rebuild scan history-independent
-        self._reclaim_terminal_worktrees(st)           # opt-in only (#168): OFF by default, park-family persists
-        self._drain_pending_teardowns(st)              # (#149) retry prunes declined under a live CLI
+        # POST-EXECUTE truth, not the pre-decide snapshot `st` (#178). Both sweeps judge a lane by
+        # its status, and the executors above have just moved statuses AND written the very markers
+        # the drain reads: a teardown that declined this tick settled its lane terminal in the same
+        # breath, but `st` still calls it running/bounced. Judged against that, the drain took the
+        # "back in flight" branch and deleted the marker it had just been handed — the retry the
+        # #149 safety argument rests on, gone on the tick it was created — or, worse, read a stale
+        # park-family status and pruned with remove_worktree=True a checkout the merged knobs had
+        # just decided to keep. One re-read, once per tick, off the hot path.
+        fresh = self._load_state()
+        self._reclaim_terminal_worktrees(fresh)        # opt-in only (#168): OFF by default, park-family persists
+        self._drain_pending_teardowns(fresh)           # (#149) retry prunes declined under a live CLI
         if now - self._last_journal_rotate >= JOURNAL_ROTATE_SECONDS:
             try:
                 journal.rotate(self.home, now)         # archive the journal's stale tail -> read() stays bounded
@@ -2448,8 +2457,9 @@ class Runner:
             elif status in actions.TERMINAL_STATUSES:
                 # (#190) Inherit the reaper's unsaved-work guard for park-family lanes: a declined
                 # prune deferred here can be a parked lane whose worktree still holds the only copy
-                # of its work. A MERGED lane never guards — its work is on the mainline by
-                # definition.
+                # of its work. A lane that reached `merged` by MERGING has its work on the mainline
+                # and needs no guard; one that got there via the owner's close (_exec_absorb_close)
+                # does not, and prunes unguarded — pre-existing, tracked separately.
                 guard = status in actions.REAPPROVAL_STATUSES
                 self._teardown_session(iid, remove_worktree=True, exit_timeout=0, guard_worktree=guard)
             else:
