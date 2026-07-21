@@ -181,8 +181,10 @@ def main(argv=None):
         prog="ops_docs.py",
         description="publish (or list) the operational docs that ride the gated engine install")
     ap.add_argument("--list", action="store_true",
-                    help="print the repo-relative source paths, one per line (the publish gate's "
-                         "diff scope)")
+                    help="print the repo-relative source paths, one per line — for a human asking "
+                         "what ships. NOT how bin/install.sh reads the table: the gate runs before "
+                         "the human approves this file, so it parses OPS_DOCS with `ast` rather "
+                         "than executing anything here")
     ap.add_argument("--publish", action="store_true", help="mirror the docs into --dest")
     ap.add_argument("--repo-root", default=None, help="the monorepo checkout to publish from")
     ap.add_argument("--dest", default=None, help="the installed engine home to publish into")

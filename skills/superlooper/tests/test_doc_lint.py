@@ -306,11 +306,12 @@ def label_families(live):
 
 def _label_candidates(span, retired, families):
     for tok in _LABEL_TOKEN_RE.findall(span):
-        # Strip sentence punctuation the token class swallows. `.` has to be IN the class (labels
-        # can carry one, and a version-ish value must not be split), so a name ending a sentence
-        # arrives as `needs-william.` and would otherwise match nothing — the single most common
-        # shape in prose, and the exact shape of the approval-protocol.md sentence this lint was
-        # written to catch.
+        # Strip sentence punctuation. `.` is in the token class so a dotted string is read as ONE
+        # token rather than silently split into a label-shaped fragment — but that means a name
+        # ending a sentence arrives as `needs-william.` and would otherwise match nothing. That is
+        # the single most common shape in prose, and one edit away from the approval-protocol.md
+        # sentence this lint was written to catch. (No live label contains a `.`, and the pair
+        # regex's value class excludes it, so nothing legitimate is lost by stripping.)
         tok = tok.strip(".,;:")
         if not tok:
             continue
@@ -539,14 +540,20 @@ def _tier_bullet_names():
     leaves these stale, and the fixes-list check cannot see it — the two lists use different bullet
     punctuation, which is exactly why that drift would survive. Prose-heading bullets (`Publish
     discipline`, `Repo-level doctor green`) carry no backticks, so the regex never returns them.
+
+    Scoped to the Tier sections proper (first ``## Tier`` heading onward), not the whole preamble:
+    the intro prose is about the doctor's behaviour rather than its block list, and a backticked
+    bullet there would be flagged as a phantom block it never claimed to be.
     """
     lines = _STACK_MD.read_text(encoding="utf-8").splitlines()
     try:
         end = lines.index(_CHECK_NAMES_HEADING)
     except ValueError:
         raise AssertionError("STACK.md must keep the %r heading" % _CHECK_NAMES_HEADING)
+    start = next((i for i, line in enumerate(lines) if line.startswith("## Tier")), None)
+    assert start is not None, "STACK.md must keep its '## Tier ...' sections"
     return [m.group(1) for m in
-            (re.match(r"- `([^`]+)` - ", line) for line in lines[:end]) if m]
+            (re.match(r"- `([^`]+)` - ", line) for line in lines[start:end]) if m]
 
 
 def test_stack_md_tier_lists_name_no_block_the_code_cannot_emit():

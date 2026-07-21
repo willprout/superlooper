@@ -177,6 +177,9 @@ def test_mirror_targets_are_unique_and_relative():
     assert len(targets) == len(set(targets)), "two sources mirror onto the same target"
     for dst in targets:
         assert not os.path.isabs(dst) and ".." not in Path(dst).parts, dst
+        # Markdown only. test_one_publish_door.py's boundary note leans on this: what keeps
+        # ops_docs from being a second door for the ENGINE is that it can only ever carry prose.
+        assert dst.endswith(".md"), "ops_docs may publish documentation only, never code: %s" % dst
 
 
 # --------------------------------------------------------------------------------------------
@@ -273,7 +276,7 @@ def test_expected_paths_covers_every_doc_plus_the_stamp(tmp_path):
         assert os.path.join(ops_docs.mirror_dir(dest), *dst.split("/")) in expected
 
 
-def test_list_cli_prints_the_sources_for_the_installer(tmp_path):
+def test_list_cli_prints_the_sources_for_a_human_asking_what_ships(tmp_path):
     proc = subprocess.run([sys.executable, str(_ENGINE / "skill" / "lib" / "ops_docs.py"), "--list"],
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
@@ -316,13 +319,17 @@ def test_the_installer_reads_the_table_without_executing_unreviewed_payload_code
     ``ops_docs.sources()``, so the two readings of one table cannot drift apart.
     """
     text = _installer_text()
-    start = text.index("OPS_DOC_PATHS=\"$(python3 -c '")
-    body_start = text.index("'", start + len("OPS_DOC_PATHS=\"$(python3 -c")) + 1
+    anchor = "OPS_DOC_PATHS=\"$(python3 -c '"
+    assert anchor in text, (
+        "cannot find the installer's inline table reader — if its spelling changed, re-point this "
+        "test; if it went back to executing ops_docs.py, that is the regression this guards")
+    body_start = text.index(anchor) + len(anchor)
     snippet = text[body_start:text.index("'", body_start)]
     assert "ast.parse" in snippet, "the installer must PARSE ops_docs.py, not import it"
-    # Comments are stripped first: the block above legitimately EXPLAINS why `--list` is not used,
-    # and a guard that cannot tell an explanation from the thing it warns against is unfixable.
-    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    # Comments stripped — whole-line AND trailing — because the block above legitimately EXPLAINS
+    # why `--list` is not used, and a guard that cannot tell an explanation from the thing it warns
+    # against gets deleted rather than fixed.
+    code = "\n".join(l.split("#", 1)[0] for l in text.splitlines())
     assert "--list" not in code and "import ops_docs" not in code, (
         "the installer must not execute the payload module before the gate")
 

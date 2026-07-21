@@ -104,12 +104,12 @@ DENY_CMD='$HOME/.claude/skills/superlooper/bin/pretooluse-hook.sh'
 OPS_DOCS_PY="$REPO_ROOT/$PAYLOAD_REL/lib/ops_docs.py"
 OPS_DOC_PATHS="$(python3 -c '
 import ast, sys
-tree = ast.parse(open(sys.argv[1]).read())
+tree = ast.parse(open(sys.argv[1], "rb").read())
 for node in tree.body:
     if isinstance(node, ast.Assign) and any(
             getattr(t, "id", None) == "OPS_DOCS" for t in node.targets):
         for pair in node.value.elts:
-            print(ast.literal_eval(pair).__getitem__(0))
+            print(ast.literal_eval(pair)[0])
         sys.exit(0)
 sys.exit("ops_docs.py defines no OPS_DOCS table")
 ' "$OPS_DOCS_PY" | tr '\n' ' ')" || OPS_DOC_PATHS=""
