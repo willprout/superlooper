@@ -158,8 +158,9 @@ def reclaimable_worktrees(issues, worktree_ids):
     in-flight veto, so an in-flight lane ({running,blocked,frozen,exited}) or an in-between gate lane
     ({gating,holding}) or a not-yet-started/unknown status is NEVER reclaimed — its worktree is a
     LIVE lane still being written. Reclaiming a park-family worktree is safe: re-approval rebuilds
-    from the issue on a fresh branch (runner _exec_reapprove/_exec_launch recreate it), and the
-    committed work is preserved on the branch ref (worktree_remove drops only the checkout). merged is
+    from the issue on a fresh branch — _exec_reapprove rotates the stamp to the next unburned
+    generation and _exec_launch recreates the worktree off origin/<dev> (#177) — and the committed
+    work is preserved on the RETIRED branch ref (worktree_remove drops only the checkout). merged is
     DELIBERATELY EXCLUDED — it stays on the existing merge-time removal path and its own
     cleanup_merged_worktrees gate, so this sweep never overrides that config.
 

@@ -338,6 +338,40 @@ def test_branch_for_wrong_typed_generation_fails_closed_to_base():
         assert brief.branch_for(p, generation=bad) == "sl/i5-fix-the-widget"
 
 
+# --------------------------- generation_of / rotate_branch (issue #177) ---------------------------
+# The generation is READ BACK OFF THE BRANCH NAME so the "a rebuild never reuses its branch name"
+# rule survives a re-approval, which zeroes `conflicts` (the old sole generation source) but cannot
+# un-push the branch. Rotation works off the STAMPED name, not a freshly-minted one, so an issue
+# whose GitHub title was edited mid-flight rotates its real branch instead of jumping to a
+# different base name nobody has ever pushed.
+
+def test_generation_of_reads_the_suffix_back():
+    assert brief.generation_of("sl/i5-fix-the-widget") == 0
+    assert brief.generation_of("sl/i5-fix-the-widget-r1") == 1
+    assert brief.generation_of("sl/i5-fix-the-widget-r12") == 12
+
+
+def test_generation_of_wrong_typed_or_unsuffixed_is_zero():
+    for bad in (None, 5, [], "", "sl/i5-fix-r", "sl/i5-fix-rX", "sl/i5-fix-r-1"):
+        assert brief.generation_of(bad) == 0
+
+
+def test_rotate_branch_replaces_the_suffix_never_stacks_it():
+    assert brief.rotate_branch("sl/i5-fix-the-widget", 1) == "sl/i5-fix-the-widget-r1"
+    assert brief.rotate_branch("sl/i5-fix-the-widget-r1", 2) == "sl/i5-fix-the-widget-r2"
+    # ...and it rotates the name it was GIVEN, so an edited title never re-bases the branch
+    assert brief.rotate_branch("sl/i5-some-older-title-r3", 4) == "sl/i5-some-older-title-r4"
+
+
+def test_rotate_branch_fails_closed_on_a_missing_or_wrong_typed_branch():
+    # Nothing was ever stamped -> nothing to rotate: the caller must leave the stamp alone rather
+    # than mint a generation for a branch that does not exist.
+    for bad in (None, "", "   ", 5, []):
+        assert brief.rotate_branch(bad, 1) is None
+    # a wrong-typed generation degrades to the base name (branch_for's own discipline)
+    assert brief.rotate_branch("sl/i5-fix-r2", True) == "sl/i5-fix"
+
+
 # ============================ post-approval owner comments (incident 2026-07-07 §8) ============================
 # Comments William writes AFTER approving an issue (but before it launches) must reach the worker.
 # The brief embeds the launch-time comment thread, with a trust rule that keeps HIS word binding:

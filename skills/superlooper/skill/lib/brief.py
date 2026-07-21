@@ -120,6 +120,43 @@ def branch_for(parsed, generation=0):
     return base
 
 
+_GEN_SUFFIX = re.compile(r"-r([0-9]+)$")
+
+
+def generation_of(branch):
+    """The generation encoded in a branch name minted by branch_for — 0 for a base name, and 0 for
+    anything unparseable (wrong-typed, empty, `-r` with no digits, `-r-1`).
+
+    Why read it back at all (issue #177): the generation used to live ONLY in the `conflicts`
+    counter, which a re-approval zeroes — while the branch that counter already minted survives on
+    the remote with its superseded PR still open. The NAME is the honest record of which
+    generations are burned, so callers derive the next one from it. (A title whose own slug ends in
+    `-r<digits>` reads as that generation; harmless — the result is still monotonic, never a reused
+    name.)"""
+    if not isinstance(branch, str):
+        return 0
+    m = _GEN_SUFFIX.search(branch)
+    return int(m.group(1)) if m else 0
+
+
+def rotate_branch(branch, generation):
+    """`branch` re-minted at `generation` — the SAME base name with its `-r<N>` suffix replaced
+    (never stacked). None when there is no branch to rotate (missing / wrong-typed / blank), so a
+    caller with nothing stamped leaves its stamp alone rather than minting a generation for a name
+    nobody ever pushed.
+
+    Rotates the STAMPED name rather than re-deriving one from the issue: a GitHub title edited
+    mid-flight would re-slug to a different base, and the rebuild would "rotate" onto a branch
+    unrelated to the one it is retiring. Wrong-typed generation degrades to the base name, the same
+    fail-closed shape branch_for uses (bool is an int subclass — True must not mint -r1)."""
+    if not isinstance(branch, str) or not branch.strip():
+        return None
+    base = _GEN_SUFFIX.sub("", branch.strip())
+    if type(generation) is int and generation >= 1:
+        return f"{base}-r{generation}"
+    return base
+
+
 def _bright_lines_block(config):
     """Render config.bright_lines as a hard-constraints block, or "" when there are none. Fail
     closed on a wrong-typed value (a non-list): treat as no bright lines rather than raise/leak."""

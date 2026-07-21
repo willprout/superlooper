@@ -159,8 +159,10 @@ def test_wrong_typed_scope_all_falls_to_the_default_merged_scope():
 # Worktrees are auto-removed only for MERGED issues, so a parked / needs-william / bounced lane's
 # worktree lingers forever. reclaimable_worktrees() is the SAME pure fail-closed selector shape as
 # closable(): it names the park-family terminal statuses whose worktree still exists on disk, and it
-# is safe because re-approval rebuilds from the issue on a fresh branch (nothing durable is lost —
-# the branch is on the remote, the audit trail in the journal). merged is deliberately EXCLUDED: it
+# is safe because re-approval rebuilds from the issue on a fresh branch — _exec_reapprove rotates
+# the branch stamp to its next unburned generation (#177), so the rebuild bases off origin/<dev>
+# instead of re-attaching the pruned lane's own branch, and nothing durable is lost (the retired
+# branch is on the remote, the audit trail in the journal). merged is deliberately EXCLUDED: it
 # stays on the existing merge-time removal path (its own cleanup_merged_worktrees gate). The runner
 # sweeps this each tick to bound long-run disk growth; a live lane is NEVER touched.
 

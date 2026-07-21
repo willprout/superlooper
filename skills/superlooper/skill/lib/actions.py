@@ -577,6 +577,23 @@ def _counter(ist, key):
     return 0, True
 
 
+def next_generation(ist):
+    """The branch generation a REBUILD of this lane must mint: one past every generation the lane
+    has already burned. PURE — reads the issue's own state, mutates nothing.
+
+    Two sources, because neither alone is complete (issue #177):
+      * `conflicts` — what the regenerate ladder used to be the sole source of. A re-approval
+        ZEROES it (a fresh cap), so on its own it would hand a rebuilt lane a generation it already
+        used, whose superseded PR is still open on that branch.
+      * the `-r<N>` suffix on the stamped `branch` — the honest record of the last name actually
+        minted, and the only one a counter reset cannot erase. It also carries a generation minted
+        by a re-approval, which no counter records at all.
+    max() of both, so the result is monotonic across BOTH ladders and never repeats a name whether
+    the lane got here by conflicting, by being re-approved, or by alternating the two."""
+    ist = ist if isinstance(ist, dict) else {}
+    return max(_count(ist.get("conflicts")), brief.generation_of(ist.get("branch")), 0) + 1
+
+
 def _iid_num(iid):
     """i<N> -> N, else None (a loopstate key that isn't an issue id is corruption, skipped)."""
     if isinstance(iid, str) and iid.startswith("i") and iid[1:].isdigit():
@@ -1886,8 +1903,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 new_conflicts = _count(conflicts) + 1
                 src = p if isinstance(p, dict) else {"num": num, "id": iid,
                                                      "title": ist.get("title", "")}
+                # The branch generation is NOT the conflict count (issue #177): a re-approval zeroes
+                # `conflicts` but leaves the branch it minted open on the remote, so deriving the
+                # name from the count alone would re-mint a burned one. next_generation clears both
+                # ladders; `conflicts` stays its own honest count toward the conflict CAP.
                 out.append({"act": "regenerate", "id": iid, "num": num, "pr": pv.get("number"),
-                            "new_branch": brief.branch_for(src, generation=new_conflicts),
+                            "new_branch": brief.branch_for(src, generation=next_generation(ist)),
                             "conflicts": new_conflicts, "wander": wander})
             elif act == "resolve_conflict":
                 # (#150 / D8) The gate's verdict is "hire a session to resolve this conflict" — a

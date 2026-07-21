@@ -1114,6 +1114,53 @@ def test_a_stale_worker_lock_bounds_the_rebuild_instead_of_livelocking_the_lane(
 
 
 # =====================================================================================
+# re-approval rebuilds on a genuinely FRESH branch (issue #177)
+# =====================================================================================
+
+def test_reapproved_rebuild_opens_its_own_pr_on_a_fresh_branch(sim_factory):
+    """#177 end to end, against the real tick loop: a lane parks with an OPEN PR, the owner presses
+    the destructive `rebuild` re-approval, and the rebuild must NOT resume on the parked episode's
+    branch. Nothing in this system can force-push, and GitHub refuses a second open PR on the same
+    head (fake-gh refuses it too) — so a same-branch "clean slate" rebuilds onto a branch it cannot
+    reshape and a PR it cannot open. The rebuild takes the next generation, opens its own PR and
+    merges, while the retired branch keeps its work and its PR is labeled `superseded` — the only
+    handle the janitor's close-PR sweep has on it."""
+    sim = sim_factory()
+    num = sim.add_issue(title="Rebuild me on a fresh branch",
+                        scenario={"scenario": "no-review", "linger": True,
+                                  "gen1": {"scenario": "happy", "linger": False}})
+    sid = "i%d" % num
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "parked"), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    branch0 = sim.loop_issue(sid)["branch"]
+    tip0 = sim.origin_tip(branch0)
+    assert tip0, "the parked episode really pushed its branch"
+    assert [p for p in sim.prs_for() if p["headRefName"] == branch0 and p["state"] == "OPEN"]
+
+    # the owner's destructive verb (the dashboard's Rebuild): agent-ready + rebuild
+    sim.edit_gh_state(
+        lambda st: st["issues"][str(num)]["labels"].extend(["agent-ready", "rebuild"]))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("branch", "").endswith("-r1"), ticks=12), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    # the retired branch: work preserved on the remote, PR left OPEN and labeled for the janitor
+    assert sim.origin_tip(branch0) == tip0, "the retired branch must keep its committed work"
+    pr0 = [p for p in sim.prs_for() if p["headRefName"] == branch0][0]
+    assert pr0["state"] == "OPEN" and "superseded" in pr0["labels"], pr0
+
+    # ...and the rebuild does the thing a same-branch rebuild could not: open its OWN PR, and merge
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "merged", ticks=25), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    rebuilt = [p for p in sim.prs_for() if p["headRefName"] == branch0 + "-r1"]
+    assert len(rebuilt) == 1 and rebuilt[0]["state"] == "MERGED", sim.prs_for()
+    assert sim.issue(num)["state"] == "closed"
+    assert not [m for m in sim.mutations("merge_pr") if m["num"] == str(pr0["number"])], \
+        "the superseded PR must never merge"
+
+
+# =====================================================================================
 # launch anchor liveness (#24): a dead launch anchor must never walk the queue
 # =====================================================================================
 
