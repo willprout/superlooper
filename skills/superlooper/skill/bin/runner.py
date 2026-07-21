@@ -2260,8 +2260,16 @@ class Runner:
         the disk-hygiene deferrals do not charge). So without this line a builder that survived its
         close, still standing in a checkout whose branch is already on the mainline, would be visible
         nowhere: not in the journal, not in the report, not on the dashboard. The pid is named because
-        it is the one thing that makes the survivor actionable."""
-        if self._close_held.get(iid) == pid:
+        it is the one thing that makes the survivor actionable.
+
+        `iid in` before the compare, not a bare .get() == pid: `_lock_pid` returns None for a lock
+        that is absent, empty or garbage, and .get() returns None for an id never held — so the
+        cheaper test would read "already journaled" for a lane journaled nowhere, and silently record
+        nothing either. Reachable in the window between the decline and this re-read, when the
+        worker's own EXIT trap frees the lock. Harmless in outcome (the next drain finds no lock and
+        retires the lane), but _hold_reclaim's shape does not protect against it — its `reason` is
+        never None on that path — so it is spelled out here rather than inherited."""
+        if iid in self._close_held and self._close_held[iid] == pid:
             return
         self._close_held[iid] = pid
         journal.append(self.home, {"act": "merged_close_declined", "id": iid, "pid": pid})

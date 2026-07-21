@@ -4527,7 +4527,26 @@ def test_a_builder_that_survived_its_close_is_journaled_once(rig, monkeypatch):
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)   # the builder finally dies
     rig.r._drain_pending_teardowns(rig.r._load_state())
     assert not (rig.home / "state" / "pending_teardown" / "i7").exists()
-    assert rig.r._close_held.get("i7") is None, "a settled lane must journal afresh next episode"
+    assert "i7" not in rig.r._close_held, "a settled lane must journal afresh next episode"
+
+
+def test_an_unreadable_lock_still_journals_the_declined_close(rig, monkeypatch):
+    """_lock_pid maps an absent/empty/garbage lock to None — which is also what an unheld id reads
+    as. A dedup keyed on `.get() == pid` would call that 'already journaled' for a lane journaled
+    nowhere, and record nothing either. Reachable when the worker's own EXIT trap frees the lock in
+    the window between the settle's decline and this re-read."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch, close_kills=False)
+    seed_issue(rig, "i7", status="running", branch="sl/i7-x", num=7, pr=7)
+    _teardown_rig(rig, "i7")
+    # alive at the teardown's entry (so it declines), gone by the time the settle re-reads it —
+    # the worker's own EXIT trap freeing the lock in that window
+    reads = []
+    monkeypatch.setattr(rig.r, "_lock_pid",
+                        lambda iid: (reads.append(1), 4242 if len(reads) == 1 else None)[1])
+
+    rig.r._execute({"act": "absorb_merged", "id": "i7", "num": 7}, NOW)
+    held = [j for j in _journal(rig) if j.get("act") == "merged_close_declined"]
+    assert len(held) == 1 and held[0]["pid"] is None, held
 
 
 def test_the_reclaim_sweep_also_reads_post_execute_truth(rig, monkeypatch):
