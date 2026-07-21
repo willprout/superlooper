@@ -44,8 +44,8 @@ directives are fixed points — never relitigate them, never safety-creep around
   highest-judgment work).
 - **No headless `claude -p` anywhere in the machinery** (owner billing rule, 2026-07-02:
   print-mode/headless calls may be metered separately by Anthropic in the future). Every
-  model invocation — workers AND answerers — runs as a normal interactive session through
-  the same launch stack.
+  model invocation — the issue worker, the sl-debugger seat — runs as a normal interactive
+  session through the same launch stack.
 - TDD with pytest, same layout as autocode (`lib/` pure core, `tests/` unit tests, shell
   machinery tested via injected stubs — see autocode's `tests/` for the pattern). Pure logic
   lives in `lib/` so it is testable without cmux/GitHub.

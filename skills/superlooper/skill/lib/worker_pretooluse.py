@@ -20,19 +20,21 @@ DENY ONLY THE TWO NAMED HAZARDS. Everything else is allowed — no broad allowli
 legitimate tool use (issue Boundaries).
 
 EVERY UNATTENDED SESSION THE LOOP LAUNCHES (owner ruling on #185, 2026-07-16). #156 shipped this
-worker-scoped and left the question open; the ruling closed it — an answerer and a watchdog
-debugger are unattended too, so both hazards apply to them as well. Each of the three ids the
-loop's launchers can produce gets its OWN AskUserQuestion fallback (_ROLES):
+worker-scoped and left the question open; the ruling closed it — the watchdog's sl-debugger is
+unattended too, so both hazards apply to it as well. Each id the loop's launchers can produce gets
+its OWN AskUserQuestion fallback (_ROLES):
 
   * `i<N>` WORKER   -> write state/blocked/<id>; the runner acts on that file, and only for `i<N>`.
-  * `a<N>` ANSWERER -> be decisive, or a `PARK:` line in the one answer file it was hired to write.
-                       (Post-#163 the runner no longer hires answerers and #194 retires the leftover
-                       scaffolding; this covers any that still exist — the ruling's "while any
-                       remain pre-#194" — and costs one table row once they are gone.)
   * `d<N>` DEBUGGER -> the memo under <state home>/reports/ plus the notify that EVERY unattended
                        sl-debugger run ends with (plugin/skills/sl-debugger/references/
                        unattended-contract.md). Never the worker's blocked file: nothing reads one
                        for a `d<N>`, so that fallback would be a dead drop.
+
+The ruling named a third seat — the answerer `a<N>` — conditionally: "while any remain pre-#194".
+None remain. #194 merged on 2026-07-21 and retired the answerer scaffolding outright, narrowing
+launch-session.sh's `--cwd` mode to `^d[0-9]+$`, so NO launcher can produce an `a<N>` any more.
+Carrying a role for a session that cannot exist would re-add the very scaffolding #194 removed, so
+it is out: the ruling's condition, not the ruling, is what lapsed.
 
 An id of any other shape is a session whose protocol we do not know, so we hand it nothing and deny
 nothing — the same fail-open posture as everything else here.
@@ -95,20 +97,9 @@ def _worker_ask_reason(state_home, issue_id):
         "stating it in the PR body over blocking." % _blocked_path(state_home, issue_id))
 
 
-def _answerer_ask_reason(state_home, issue_id):
-    # An answerer must NOT be sent to state/blocked/<id>: the runner acts on that file only for a
-    # worker id, so an answerer writing one would be shouting down a well. Its brief gives it two
-    # legitimate exits and this names both.
-    return _ASK_PREFIX % "answerer" + (
-        "You were hired to be DECISIVE: give ONE recommendation with a one-line why. If the "
-        "question is genuinely the owner's to decide (money, scope, product judgment, a bright-line "
-        "area), do not guess — write a single line beginning `PARK: ` saying why it needs the owner. "
-        "Either way it goes in the one answer file your brief names, as your final action.")
-
-
 def _debugger_ask_reason(state_home, issue_id):
-    # The unattended sl-debugger has neither of the other two channels; its contract ends EVERY run
-    # the same way — memo + notify — so an unanswerable question is a finding, not a dialog.
+    # The unattended sl-debugger has no blocked file to write; its contract ends EVERY run the same
+    # way — memo + notify — so an unanswerable question is a finding, not a dialog.
     return _ASK_PREFIX % "sl-debugger" + (
         "The watchdog launched you, not a person, so behave as unattended (the stricter mode is "
         "always safe): decide from the state home's own truth within your authority tier, and turn "
@@ -117,19 +108,19 @@ def _debugger_ask_reason(state_home, issue_id):
         % os.path.join(state_home, "reports"))
 
 
-# The ONE place session id -> role -> fallback is decided. `i<N>` / `a<N>` / `d<N>` are exactly the
-# shapes launch-session.sh's own mode guards enforce (`^i[0-9]+$` for a worker, `^[ad][0-9]+$` for
-# the --cwd modes), so this cannot recognize a session the loop cannot launch. ASCII digits only,
+# The ONE place session id -> role -> fallback is decided. `i<N>` and `d<N>` are exactly the shapes
+# launch-session.sh's own mode guards enforce (`^i[0-9]+$` for a worker, `^d[0-9]+$` for --cwd since
+# #194), so this cannot recognize a session the loop cannot launch — and it stays in step with the
+# launcher: a seat retired there falls out of here, which is why `a<N>` is gone. ASCII digits only,
 # deliberately: `str.isdigit()` would also accept unicode digits that no launcher can produce.
 _ROLES = {"i": ("worker", _worker_ask_reason),
-          "a": ("answerer", _answerer_ask_reason),
           "d": ("debugger", _debugger_ask_reason)}
-_ID_RE = re.compile(r"^([iad])([0-9]+)$")
+_ID_RE = re.compile(r"^([id])([0-9]+)$")
 
 
 def _role(issue_id):
-    """('worker'|'answerer'|'debugger', reason_fn) for a loop session id, else None. None means a
-    session whose escalation protocol we do not know — we deny it nothing (fail open)."""
+    """('worker'|'debugger', reason_fn) for a loop session id, else None. None means a session whose
+    escalation protocol we do not know — we deny it nothing (fail open)."""
     m = _ID_RE.match(issue_id) if isinstance(issue_id, str) else None
     return _ROLES[m.group(1)] if m else None
 
@@ -189,9 +180,9 @@ _TRUE = {"1", "true", "yes", "on"}
 
 def _attended(env, role):
     """True only for the OWNER TAP: a `d<N>` session that `superlooper debug` marked SL_ATTENDED=1,
-    meaning a person is at this pane right now. Honored for the debugger role ALONE — a worker or
-    answerer is never attended, and reading the flag for them would let an ambient export in the
-    runner's shell disarm duty 1 (see the module docstring)."""
+    meaning a person is at this pane right now. Honored for the debugger role ALONE — a worker is
+    never attended, and reading the flag for one would let an ambient export in the runner's shell
+    disarm duty 1 (see the module docstring)."""
     return role == "debugger" and (env.get("SL_ATTENDED") or "").strip().lower() in _TRUE
 
 
@@ -220,7 +211,7 @@ def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=Fal
 def run(payload, env):
     """Decide the PreToolUse outcome for one loop session. Returns the deny-reason string, or None
     to ALLOW. No-ops (returns None) outside the session ids the loop's own launchers produce —
-    `i<N>`/`a<N>`/`d<N>`, so an ad-hoc or owner's-own session is untouched — and for Codex, and for
+    `i<N>`/`d<N>`, so an ad-hoc or owner's-own session is untouched — and for Codex, and for
     any non-PreToolUse payload, so the hook is safe to register globally."""
     if (env.get("SL_AGENT") or "claude").strip() == "codex":
         return None                      # Codex has no PreToolUse event; Claude-only (spike verdict)

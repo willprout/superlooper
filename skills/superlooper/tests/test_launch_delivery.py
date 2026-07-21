@@ -395,13 +395,13 @@ def test_codex_worker_command_names_agent_specific_env(tmp_path):
     assert "SL_CODEX_NO_ALT_SCREEN=1" in cmd
 
 
-def test_answerer_cwd_mode_launches_in_place_without_worktree(tmp_path):
-    """The answerer second mode (`--cwd <dir> a<N>`): a fresh session launched IN an existing dir —
-    no worktree, no branch, no git, no issues.json counter (an answerer is not a tracked issue) —
-    but the SAME delivery verification + pane/activity recording (Task 10 hires answerers this way)."""
+def test_cwd_mode_launches_in_place_without_worktree(tmp_path):
+    """The second launch mode (`--cwd <dir> d<N>`): a fresh session launched IN an existing dir — no
+    worktree, no branch, no git, no issues.json counter (a debugger is not a tracked issue) — but the
+    SAME delivery verification + pane/activity recording. The mode also carried the answerer (a<N>)
+    until #194 retired that seat; it is the debugger's alone now."""
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
-    answers = run_root / "answers"; answers.mkdir()
-    (run_root / "briefs" / "a1.md").write_text("answer the question")
+    (run_root / "briefs" / "d1.md").write_text("diagnose the instance")
     launch_dir = os.path.join(os.path.dirname(str(run_root)), "launchdir_a")
     env = {
         **os.environ,
@@ -416,22 +416,21 @@ def test_answerer_cwd_mode_launches_in_place_without_worktree(tmp_path):
         "STUB_MODE": "deliver",
         "SL_LAUNCH_VERIFY_SECONDS": "5",
     }
-    r = subprocess.run([LAUNCH, "--cwd", str(answers), "a1"], env=env,
+    r = subprocess.run([LAUNCH, "--cwd", str(run_root), "d1"], env=env,
                        capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, f"answerer launch must succeed, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
-    assert (run_root / "state" / "activity" / "a1").exists(), "answerer activity must be recorded"
-    assert (run_root / "state" / "panes" / "a1").exists(), "answerer pane must be recorded"
-    assert not (run_root / "worktrees" / "a1").exists(), "answerer must NOT create a worktree"
-    # a1 is not a tracked issue -> no counter entry was fabricated in issues.json
+    assert r.returncode == 0, f"--cwd launch must succeed, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert (run_root / "state" / "activity" / "d1").exists(), "activity must be recorded"
+    assert (run_root / "state" / "panes" / "d1").exists(), "the pane must be recorded"
+    assert not (run_root / "worktrees" / "d1").exists(), "--cwd mode must NOT create a worktree"
+    # d1 is not a tracked issue -> no counter entry was fabricated in issues.json
     st = json.load(open(run_root / "state" / "issues.json"))
-    assert "a1" not in st["issues"], "an answerer must not be stamped as an issue"
+    assert "d1" not in st["issues"], "a --cwd session must not be stamped as an issue"
 
 
-def test_debugger_cwd_mode_launches_like_an_answerer(tmp_path):
-    """The watchdog's unattended sl-debugger session (issue #66) rides the SAME --cwd mode as an
-    answerer, with a d<N> id: launched in an existing dir (the target repo checkout), no worktree,
-    no issues.json entry, and the identical shim delivery verification — never a headless
-    `claude -p` (owner billing rule)."""
+def test_debugger_cwd_mode_launches_in_the_target_repo(tmp_path):
+    """The watchdog's unattended sl-debugger session (issue #66) is the mode's remaining caller:
+    launched in an existing dir (the target repo checkout), no worktree, no issues.json entry, and
+    the identical shim delivery verification — never a headless `claude -p` (owner billing rule)."""
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
     (run_root / "briefs" / "d1.md").write_text("diagnose the instance")
     launch_dir = os.path.join(os.path.dirname(str(run_root)), "launchdir_d")
@@ -458,10 +457,10 @@ def test_debugger_cwd_mode_launches_like_an_answerer(tmp_path):
     assert "d1" not in st["issues"], "a debugger session must not be stamped as an issue"
 
 
-def test_answerer_missing_cwd_dir_fails(tmp_path):
-    """A --cwd dir that does not exist is a runner bug — fail before creating a tab, not silently."""
+def test_missing_cwd_dir_fails(tmp_path):
+    """A --cwd dir that does not exist is a caller bug — fail before creating a tab, not silently."""
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
-    (run_root / "briefs" / "a1.md").write_text("answer")
+    (run_root / "briefs" / "d1.md").write_text("diagnose")
     env = {
         **os.environ, "HOME": str(home), "PATH": f"{stubdir}:{os.environ['PATH']}",
         "SL_RUN_ROOT": str(run_root), "SL_PANE": "pane:1", "SL_CMUX": str(cmux),
@@ -469,16 +468,16 @@ def test_answerer_missing_cwd_dir_fails(tmp_path):
         "SL_LAUNCH_DIR": os.path.join(os.path.dirname(str(run_root)), "launchdir_a2"),
         "STUB_MODE": "deliver", "SL_LAUNCH_VERIFY_SECONDS": "5",
     }
-    r = subprocess.run([LAUNCH, "--cwd", str(run_root / "nope"), "a1"], env=env,
+    r = subprocess.run([LAUNCH, "--cwd", str(run_root / "nope"), "d1"], env=env,
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 1, f"a missing --cwd dir must fail (exit 1), got rc={r.returncode}"
 
 
-def test_cwd_mode_rejects_non_answerer_id(tmp_path):
-    # cross-review Task 6: --cwd mode is answerer-only. A caller bug that routes an ISSUE id (i<N>)
-    # through it would silently skip worktree creation + the issue counter — fail closed instead.
+def test_cwd_mode_rejects_an_issue_id(tmp_path):
+    # cross-review Task 6: --cwd mode is debugger-only (#194 narrowed it from debugger-or-answerer).
+    # A caller bug that routes an ISSUE id (i<N>) through it would silently skip worktree creation +
+    # the issue counter — fail closed instead.
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
-    answers = run_root / "answers"; answers.mkdir()
     (run_root / "briefs" / "i9.md").write_text("x")
     env = {
         **os.environ, "HOME": str(home), "PATH": f"{stubdir}:{os.environ['PATH']}",
@@ -487,19 +486,19 @@ def test_cwd_mode_rejects_non_answerer_id(tmp_path):
         "SL_LAUNCH_DIR": os.path.join(os.path.dirname(str(run_root)), "launchdir_i9"),
         "STUB_MODE": "deliver", "SL_LAUNCH_VERIFY_SECONDS": "5",
     }
-    r = subprocess.run([LAUNCH, "--cwd", str(answers), "i9"], env=env,
+    r = subprocess.run([LAUNCH, "--cwd", str(run_root), "i9"], env=env,
                        capture_output=True, text=True, timeout=60)
-    assert r.returncode == 1, f"--cwd must reject a non-answerer id, got rc={r.returncode}"
+    assert r.returncode == 1, f"--cwd must reject an issue id, got rc={r.returncode}"
     assert not (run_root / "state" / "panes" / "i9").exists(), "must refuse before creating a tab"
 
 
-def test_answerer_cwd_resolved_to_absolute_path(tmp_path):
+def test_cwd_resolved_to_absolute_path(tmp_path):
     # cross-review Task 6: a RELATIVE --cwd must be resolved to an absolute path before it reaches the
     # dropped `cd %q` (which runs in the new tab's fresh shell, not the launcher's cwd). Passing the
-    # answers dir as a path relative to SL_RUN_ROOT must still launch + verify.
+    # dir as a path relative to SL_RUN_ROOT must still launch + verify.
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
-    (run_root / "answers").mkdir()
-    (run_root / "briefs" / "a1.md").write_text("answer")
+    (run_root / "logs").mkdir(exist_ok=True)
+    (run_root / "briefs" / "d1.md").write_text("diagnose")
     env = {
         **os.environ, "HOME": str(home), "PATH": f"{stubdir}:{os.environ['PATH']}",
         "SL_RUN_ROOT": str(run_root), "SL_PANE": "pane:1", "SL_CMUX": str(cmux),
@@ -507,8 +506,8 @@ def test_answerer_cwd_resolved_to_absolute_path(tmp_path):
         "SL_LAUNCH_DIR": os.path.join(os.path.dirname(str(run_root)), "launchdir_rel"),
         "STUB_MODE": "deliver", "SL_LAUNCH_VERIFY_SECONDS": "5",
     }
-    # cwd = run_root so "answers" is relative; the launcher must resolve it to an absolute path.
-    r = subprocess.run([LAUNCH, "--cwd", "answers", "a1"], env=env, cwd=str(run_root),
+    # cwd = run_root so "logs" is relative; the launcher must resolve it to an absolute path.
+    r = subprocess.run([LAUNCH, "--cwd", "logs", "d1"], env=env, cwd=str(run_root),
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, f"relative --cwd must resolve + launch, got rc={r.returncode}\n{r.stderr}"
-    assert (run_root / "state" / "panes" / "a1").exists(), "answerer pane must be recorded"
+    assert (run_root / "state" / "panes" / "d1").exists(), "the pane must be recorded"

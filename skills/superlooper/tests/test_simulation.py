@@ -19,7 +19,7 @@ instead of sleeping. Every wait in the harness and in the fakes is BOUNDED (the 
 teardown touches a global SIM_STOP file so no fake session outlives its test.
 
 This suite is the evidence William sees before ANY live run (plan Task 15): every §C.4 gate
-path, the answerer loop, the conflict ladder, freeze ownership, restart reconciliation, and the
+path, the durable-question loop, the conflict ladder, freeze ownership, restart reconciliation, and the
 paid-for pokes from waves 3-4 are asserted here against the real tick loop.
 """
 import contextlib
@@ -809,9 +809,9 @@ def test_bounce_runner_posts_memo_and_moves_labels(sim_factory):
     assert bounce_comments, "the worker's memo must be posted verbatim by the RUNNER"
     assert "needs-owner" in sim.issue(num)["labels"]
     assert "in-progress" not in sim.issue(num)["labels"]
-    # the runner consumed the marker; NO answerer was ever hired for a bounce
+    # the runner consumed the marker; NO second session was ever launched for a bounce
     assert not os.path.exists(os.path.join(sim.home, "state", "blocked", sid))
-    assert len(sim.surfaces()) == 1, "a bounce must not hire an answerer session"
+    assert len(sim.surfaces()) == 1, "a bounce must not launch a second session"
     assert any("bounced" in ln for ln in sim.notify_lines())
     assert not sim.mutations("merge_pr")
 
@@ -923,7 +923,7 @@ def test_blocked_question_durable_roundtrip_resumes_and_merges(sim_factory):
 
     # tick 1: the worker asks, pushes its WIP, and EXITS. The runner posts a DURABLE question
     # comment, closes the window, and RELEASES the lane (awaiting_answer) — no live-frozen session,
-    # no answerer, no lane held on the question.
+    # no second session, no lane held on the question.
     sim.tick()
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "awaiting_answer"), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
@@ -948,7 +948,7 @@ def test_blocked_question_durable_roundtrip_resumes_and_merges(sim_factory):
     qa = sim.loop_issue(sid).get("qa_log") or []
     assert qa and "approach A" in (qa[-1].get("answer") or ""), qa
     assert len(sim.mutations("merge_pr")) == 1
-    # the relaunch reused the SAME issue worktree (never an answerer's --cwd session)
+    # the relaunch reused the SAME issue worktree (never a --cwd session)
     assert not os.path.isdir(os.path.join(sim.home, "worktrees", "a1"))
 
 
@@ -2001,7 +2001,7 @@ def test_orphaned_pushed_branch_no_pr_blocks_and_preserves_remote_work(sim_facto
     assert "refused" in blocked_q and "force" in blocked_q
 
     # #163: the refusal becomes a DURABLE question and the lane is released (awaiting_answer) — no
-    # answerer, no needs-owner park; the owner decides how to reconcile the orphaned branch.
+    # second session, no needs-owner park; the owner decides how to reconcile the orphaned branch.
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "awaiting_answer"), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
     assert "awaiting-answer" in sim.issue(num)["labels"]

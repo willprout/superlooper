@@ -194,8 +194,8 @@ on dev.)
 | Field | Default | Meaning |
 |---|---|---|
 | `models.worker` | `"opus[1m]"` | Model for the build sessions. `opus[1m]` = the latest Opus (the `opus` alias auto-tracks it) with the 1M-token context window (`[1m]` opts in; bare `opus` is standard ~200K). Passed to `claude --model`; any valid model string works. |
-| `models.answerer` | `"opus[1m]"` | Model for the one-shot answerer that unblocks a stuck worker — the loop's highest-judgment hire (resolve vs. escalate), so it defaults to the strongest configuration (latest Opus + 1M context). |
-| `models.worker_effort` | `null` | Repo-wide reasoning-effort default for **worker** launches, passed to `claude --effort`. `null` = today's behaviour (no `--effort` flag). A per-issue `effort:<level>` label overrides it; the answerer never reads it. Any value the agent accepts works — a bad value fails the launch and parks the issue (no allowlist). |
+| `models.debugger` | `"opus[1m]"` | Model for the watchdog's unattended `sl-debugger` session (and `superlooper debug`) — the loop's one hired-judgment seat (diagnose vs. escalate), so it defaults to the strongest configuration (latest Opus + 1M context). Was `models.answerer` until the answerer was retired; an old config still using that name fails loud at load. |
+| `models.worker_effort` | `null` | Repo-wide reasoning-effort default for **worker** launches, passed to `claude --effort`. `null` = today's behaviour (no `--effort` flag). A per-issue `effort:<level>` label overrides it; the debugger never reads it. Any value the agent accepts works — a bad value fails the launch and parks the issue (no allowlist). |
 | `session.idle_seconds` | `480` | A launched, unresolved session with no activity for this long gets a safe peek-nudge (8 min). |
 | `session.freeze_seconds` | `2700` | The hard stall backstop (45 min) → the recovery ladder. |
 | `session.retry_cap` | `2` | Relaunch attempts before an issue is parked. |
@@ -258,7 +258,7 @@ rest are workflow state the runner and William drive.
   `effort:high`, `effort:xhigh`, `effort:max`.
 - **Exactly one of each per issue** (2+ makes the issue wait for you, like a duplicate `type:`).
   The value is pass-through — no allowlist — so an **unknown** value fails the launch and parks the
-  issue with a memo. The one-shot answerer is unaffected (config-only). See
+  issue with a memo. The debugger seat is unaffected (config-only). See
   `plugin/skills/superlooper/references/runner-ops.md`.
 
 **Workflow state (the runner drives these):**

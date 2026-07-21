@@ -26,8 +26,6 @@ LOCK_STALE_SECONDS = 120
 # The per-issue lifecycle statuses the runner tracks (replaces autocode's run/PR status set):
 #   ready    - eligible, not yet launched
 #   running  - a worker session is live in a lane
-#   blocked  - worker asked a question (state/blocked/<id>); transient — the runner posts the
-#              question durably and moves the issue to awaiting_answer within a tick (#163)
 #   awaiting_answer - worker exited cleanly on an owner-decision question (durable GitHub comment);
 #              the lane is RELEASED and the window CLOSED — nothing relaunches until the owner
 #              answers (re-applies agent-ready). Exempt from every liveness/recovery path (#163).
@@ -39,7 +37,13 @@ LOCK_STALE_SECONDS = 120
 #   parked   - handed back to William with a memo (terminal-until-William)
 #   needs_william - an owner decision is required (bounce / cap hit / recheck fail)
 #   bounced  - the worker rejected the issue's premise (BOUNCED: marker); runner posted the memo
-VALID = ["ready", "running", "blocked", "awaiting_answer", "frozen", "exited",
+#
+# There is deliberately NO `blocked` status (retired by #194). A worker with a question writes the
+# blocked FILE while its status stays `running`; the runner posts the question durably and settles
+# the issue to `awaiting_answer` in the same tick, so nothing ever occupies a "blocked" state. The
+# member survived #163's wiring removal as a writerless enum value — an invitation for a future
+# edit to re-introduce the live-frozen-session model this repo removed on purpose.
+VALID = ["ready", "running", "awaiting_answer", "frozen", "exited",
          "gating", "holding", "merged", "parked", "needs_william", "bounced"]
 
 # One issue's initial state TEMPLATE. `launches` is stamped mechanically by launch-session.sh at

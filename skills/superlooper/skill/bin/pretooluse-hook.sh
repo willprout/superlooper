@@ -2,12 +2,11 @@
 # Claude "PreToolUse" hook. Fires before EVERY tool call. Denies exactly two named hazards —
 # AskUserQuestion, and pattern-kills (pkill -f / killall) — in the UNATTENDED sessions superlooper
 # launches, and lets everything else proceed untouched. This script fences on SL_ISSUE_ID +
-# SL_RUN_ROOT (present for the whole family — start-session.sh launches issue workers, answerers and
-# the watchdog's sl-debugger through it) and on Claude; lib/worker_pretooluse.py then makes the fine
+# SL_RUN_ROOT (present for the whole family — start-session.sh launches issue workers AND the
+# watchdog's sl-debugger through it) and on Claude; lib/worker_pretooluse.py then makes the fine
 # decision, adapting the AskUserQuestion fallback to the session's own role (`i<N>` worker ->
-# blocked file, `a<N>` answerer -> `PARK:` in its answer file, `d<N>` debugger -> memo + notify) and
-# no-opping for ad-hoc and everything else. Safe to register globally: outside that family this
-# exits before reading a byte.
+# blocked file, `d<N>` debugger -> memo + notify) and no-opping for ad-hoc and everything else.
+# Safe to register globally: outside that family this exits before reading a byte.
 #
 # The deny makes two of the costliest session-instruction-drift incidents mechanically impossible
 # rather than instructed-against (issue #156, widened to every unattended session by the owner

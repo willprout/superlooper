@@ -39,7 +39,7 @@ def cfg(**over):
         "ship_cmd": None, "ship_recheck_cmd": None,
         "report_required_sections": ["Tests"],
         "bright_lines": [], "cleanup_merged_worktrees": True, "report_time": "08:45",
-        "models": {"worker": "opus", "answerer": "fable"},
+        "models": {"worker": "opus", "debugger": "fable"},
         "session": {"idle_seconds": 480, "freeze_seconds": 2700, "retry_cap": 2, "conflict_cap": 2},
         "qa": {"nightly_cmd": None, "results_glob": None, "retry_once": True,
                "quarantine": [], "nightly_time": "02:00"},
@@ -79,7 +79,7 @@ def ist(status="running", **over):
 
 def disk(**over):
     d = {"issues_state": {"version": 1, "issues": {}}, "blocked": {}, "reports": {},
-         "answers": {}, "exited": {}, "launch_stderr": {}, "frozen": None, "alert": None,
+         "exited": {}, "launch_stderr": {}, "frozen": None, "alert": None,
          "live_lock_ids": set(), "filed_fingerprints": {}, "local_date": "2026-07-02",
          "local_hhmm": "12:00", "last_report_date": "2026-07-02"}
     d.update(over)
@@ -3806,7 +3806,9 @@ def test_inflight_reconcile_ignores_a_superseded_pr():
 def test_absorbed_merge_wins_over_the_question_lifecycle():
     # The stall itself: i328's lane sat in the blocked/question machinery while its PR was ALREADY
     # merged. The merged fact must win over every lifecycle the lane would otherwise keep spinning.
-    d, g = _inflight(pv=pr_view(state="MERGED"), status="blocked", pr=555)
+    # (The lane is `running` with a blocked FILE on disk — the real shape of a worker with a
+    # question; there is no `blocked` STATUS to sit in any more, #194.)
+    d, g = _inflight(pv=pr_view(state="MERGED"), status="running", pr=555)
     d["blocked"] = {"i5": "which approach should I take?"}
     out = decide(dsk=d, gh_view=g)
     assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
@@ -4321,7 +4323,7 @@ def test_safety_actions_precede_work_actions():
 def test_lane_state_from_counts_only_inflight_statuses():
     st = {"version": 1, "issues": {
         "i1": ist("running", declared_touches=["api"], type="build"),
-        "i2": ist("blocked", type="investigate"), "i3": ist("frozen"), "i4": ist("exited"),
+        "i2": ist("running", type="investigate"), "i3": ist("frozen"), "i4": ist("exited"),
         "i5": ist("gating"), "i6": ist("merged"), "i7": ist("parked"),
         "i8": "corrupt"}}
     lanes = actions.lane_state_from(st)

@@ -2,7 +2,7 @@
 # Mechanical launch of ONE session. Called by the runner (never a background watcher).
 # Two modes:
 #   launch-session.sh <i-id>            worker: create the issue's worktree off origin/<dev>, launch
-#   launch-session.sh --cwd <dir> <a-id>  answerer: launch in an existing dir (no worktree/branch)
+#   launch-session.sh --cwd <dir> <d-id>  debugger: launch in an existing dir (no worktree/branch)
 # Both open a visible cmux tab, pre-trust the folder, and fire the brief into an interactive
 # bypass-permission Claude — via the keystroke-free launch shim, then VERIFY delivery.
 set -euo pipefail
@@ -12,10 +12,10 @@ CWD_MODE=0
 CWD=""
 if [ "${1:-}" = "--cwd" ]; then
   CWD_MODE=1
-  CWD="${2:?usage: launch-session.sh --cwd <dir> <a-id>}"
-  ID_IN="${3:?usage: launch-session.sh --cwd <dir> <a-id>}"
+  CWD="${2:?usage: launch-session.sh --cwd <dir> <d-id>}"
+  ID_IN="${3:?usage: launch-session.sh --cwd <dir> <d-id>}"
 else
-  ID_IN="${1:?usage: launch-session.sh <i-id>  (or --cwd <dir> <a-id>)}"
+  ID_IN="${1:?usage: launch-session.sh <i-id>  (or --cwd <dir> <d-id>)}"
 fi
 
 SL_RUN_ROOT="${SL_RUN_ROOT:?SL_RUN_ROOT required}"
@@ -52,8 +52,8 @@ esac
 
 # ---- Resolve identity + worktree ----------------------------------------------------------------
 if [ "$CWD_MODE" -eq 1 ]; then
-  # Answerer: no worktree, no branch. Validate the id, use the provided dir verbatim as the cwd.
-  # (The runner passes the state-home answers/ dir; nothing here is created or checked out.)
+  # Debugger: no worktree, no branch. Validate the id, use the provided dir verbatim as the cwd.
+  # (The caller passes the target repo checkout; nothing here is created or checked out.)
   if ! ID="$(python3 - "$HERE/../lib" "$ID_IN" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])          # $HERE/../lib — robust regardless of cwd
@@ -64,14 +64,15 @@ PY
     echo "[$ID_IN] id sanitize validation failed — not launching" >&2
     exit 1
   fi
-  # --cwd is the in-place path: ANSWERER ids (a<N>) and the watchdog's unattended sl-debugger
-  # sessions (d<N>, issue #66) — both launch in an existing dir, no worktree, no branch. The id
-  # shape is enforced so a runner bug can never route an issue id (i<N>) through here and silently
-  # skip worktree creation + the issue counter (fail closed on wrong-typed input, not just unsafe
-  # input — cross-review, Task 6). worktree_id already rejected unsafe chars; this pins the mode's
-  # contract.
-  if ! [[ "$ID" =~ ^[ad][0-9]+$ ]]; then
-    echo "[$ID] --cwd mode is for answerer (a<N>) / debugger (d<N>) ids only — refusing" >&2; exit 1
+  # --cwd is the in-place path: the watchdog's unattended sl-debugger sessions (d<N>, issue #66),
+  # which launch in an existing dir with no worktree and no branch. It ALSO carried the answerer
+  # (a<N>) until #194 retired that seat, so the shape is now d<N> alone — narrowed, not deleted.
+  # The id shape is enforced so a caller bug can never route an issue id (i<N>) through here and
+  # silently skip worktree creation + the issue counter (fail closed on wrong-typed input, not just
+  # unsafe input — cross-review, Task 6). worktree_id already rejected unsafe chars; this pins the
+  # mode's contract.
+  if ! [[ "$ID" =~ ^d[0-9]+$ ]]; then
+    echo "[$ID] --cwd mode is for debugger (d<N>) ids only — refusing" >&2; exit 1
   fi
   BRANCH=""
   NAME="superlooper $ID"
@@ -109,8 +110,8 @@ PY
     echo "[$ID_IN] issues.json load / sanitize validation failed — not launching" >&2
     exit 1
   fi
-  # Worker path is for issue ids (i<N>) only — the symmetric contract to --cwd's a<N> check above,
-  # so an answerer id can never accidentally spin up a worktree here (cross-review, Task 6).
+  # Worker path is for issue ids (i<N>) only — the symmetric contract to --cwd's d<N> check above,
+  # so a debugger id can never accidentally spin up a worktree here (cross-review, Task 6).
   if ! [[ "$ID" =~ ^i[0-9]+$ ]]; then
     echo "[$ID] worker mode expects an issue id (i<N>) — refusing" >&2; exit 1
   fi
@@ -279,7 +280,7 @@ rm -f "$STARTED" 2>/dev/null || true                   # the per-launch proof ha
 
 # Honest retry telemetry (fact-4): stamp launches/retries mechanically at the ONE point a worker
 # verifiably started — never AI-remembered (both audited autocode runs showed retries:0 beside real
-# redos). retries = launches - 1 (first launch = 0). Worker ids only — an answerer (a<N>) is not a
+# redos). retries = launches - 1 (first launch = 0). Worker ids only — a debugger (d<N>) is not a
 # tracked issue, so it has no counter. setdefault covers an id the runner registered without a
 # counter yet. Guarded: telemetry must never fail a delivered launch.
 if [ "$CWD_MODE" -eq 0 ]; then
