@@ -23,8 +23,10 @@
 # gate; it is now a tombstone that refuses and points here. Two mechanical guards keep it that way:
 # skills/superlooper/tests/test_install.py drives the tombstone, and
 # skills/superlooper/tests/test_one_publish_door.py fails if ANY script but this one names — or
-# writes to — the installed-skill home. That fence also pins this script's own gate (engine diff,
-# explicit OK, refuse-not-assume when it cannot ask), so the door cannot quietly stop asking.
+# writes to — the installed-skill home. That fence also pins the SHAPE of this script's own gate
+# (engine diff, explicit OK, the TTY test, consent defaulting to false) so the pieces cannot be
+# deleted quietly. It reads for those strings; it does not execute the gate, so it is a tripwire
+# against removal, not a proof the gate still behaves.
 #
 # Idempotent: re-running re-syncs the payload, never duplicates a hook or the shim block, and leaves
 # an unchanged settings.json byte-for-byte. --dry-run prints what WOULD change (including the gate

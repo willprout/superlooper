@@ -1,5 +1,12 @@
 # Superlooper V1 Implementation Plan
 
+> **Historical record — one path has moved.** This plan was written when the engine was a
+> standalone repo, so every `bin/install.sh` below means *this directory's* installer. After the
+> 2026-07-08 monorepo migration the publish step is the **repo-root** `bin/install.sh` (it shows
+> the engine diff and requires an explicit OK); `skills/superlooper/bin/install.sh` is a tombstone
+> that refuses. See issue #197 and `tests/test_one_publish_door.py`. The rest of the plan stands as
+> the record of what was built.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking. Exec sessions run **Opus**. Read
