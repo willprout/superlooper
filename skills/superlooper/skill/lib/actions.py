@@ -302,6 +302,64 @@ ALERT_MESSAGES = {
 }
 
 
+# THE OWNER'S REMEDY, PER AUTH-DEATH BANNER (issue #174).
+#
+# #151 gave the logged_out alert one body naming one remedy: "/login". For the rest of the family
+# that instruction is actively WRONG — an owner told to run /login when the real fault is a bad
+# ANTHROPIC_API_KEY will try it, watch it not stick, and lose the night. This table is the whole
+# point of carrying a variant at all: the state, the refusal and the hold are identical for every
+# member (which is why there is one state, not ten), and the ONLY thing that differs is the
+# sentence below.
+#
+# Each entry states the fault first and the action second, and is written for someone reading a
+# phone notification at 3am with no context. Keyed by pane_state's variant keys; None is the
+# fallback for a banner caught by pane_state's generic nets whose tail was wrapped away, and it
+# must stay useful on its own — an unknown variant is not a reason to say nothing.
+AUTH_DEATH_REMEDIES = {
+    None: ("The specific banner was not recognised, so the remedy cannot be named from this "
+           "reading — open the tab and read the screen. Most often it is the subscription login: "
+           "known from the 2026-07-14 night, running /login INSIDE the wedged window did not "
+           "stick — closing the window and starting a fresh session did."),
+    "login": ("The subscription login is gone ('Not logged in · Please run /login'). Known from "
+              "the 2026-07-14 night: running /login INSIDE the wedged window did not stick — "
+              "closing the window and starting a fresh session did."),
+    "login_remote": ("Same fault as a plain logged-out session, rendered the way Claude Code shows "
+                     "it under CLAUDE_CODE_REMOTE ('Authentication error · Try again') — this "
+                     "session is running in a REMOTE environment, so re-authenticate there, not "
+                     "on this machine."),
+    "oauth_revoked": ("The OAuth token was revoked or expired server-side and could not be "
+                      "refreshed. Re-login the loop's account. If it comes back within the hour "
+                      "the token is being revoked deliberately — check the account rather than "
+                      "re-logging in again."),
+    "invalid_api_key": ("An EXTERNAL API key is in force and is bad ('Invalid API key · Fix "
+                        "external API key') — this is NOT the subscription login, and /login will "
+                        "not fix it. Fix or unset ANTHROPIC_API_KEY (or the apiKeyHelper setting); "
+                        "unsetting it is what falls back to the subscription."),
+    "api_key_org_disabled": ("ANTHROPIC_API_KEY belongs to a DISABLED organization. /login will "
+                             "not fix it — unset ANTHROPIC_API_KEY to fall back to the "
+                             "subscription, or get the org re-enabled."),
+    "org_api_key_disabled": ("Your organization has disabled API-key authentication, so the key "
+                             "this session is using is refused by policy. Unset ANTHROPIC_API_KEY "
+                             "(and any apiKeyHelper setting), then run /login to sign in with the "
+                             "claude.ai account instead."),
+    "subscription_disabled": ("Your organization has disabled Claude subscription access for "
+                              "Claude Code — the account itself is fine, the policy is not. Use an "
+                              "Anthropic API key instead, or ask your admin to enable access. "
+                              "Re-logging in will not change it."),
+    "apikey_helper_failing": ("The apiKeyHelper script is failing, so no credential is being "
+                              "produced at all — the fault is in YOUR script, not in the account. "
+                              "Run /status in the session's window to see the script's own error "
+                              "output."),
+    "gateway_auth": ("The API gateway could not authenticate with its upstream provider. Nothing "
+                     "local fixes this — not /login, not the key. Contact whoever administers the "
+                     "gateway."),
+    "auth_error": ("Claude Code reported an authentication error it believes may be transient "
+                   "(network). The lane is held rather than nudged because the pane cannot answer "
+                   "while it stands. Check status.claude.com and the machine's network first; if "
+                   "it persists past a few minutes, treat it as real auth death and re-login."),
+}
+
+
 def _alert_message(reason):
     if isinstance(reason, str) and reason.startswith("session_at_dialog:"):
         iid = reason.split(":", 1)[1]
@@ -313,14 +371,14 @@ def _alert_message(reason):
                 "(or press Esc so it writes a blocked file instead). Clears by itself once the "
                 "dialog is gone.")
     if isinstance(reason, str) and reason.startswith("session_logged_out:"):
-        iid = reason.split(":", 1)[1]
-        return (f"{iid}'s session is logged OUT in-window ('Not logged in · Please run /login') — "
-                "its auth died mid-run, so the CLI is still up but every turn is refused. The loop "
-                "will NOT nudge it (a nudge cannot be answered) and will NOT relaunch it (the "
-                "relaunch would re-enter dead auth); the lane is held as-is for you. Known from the "
-                "2026-07-14 night: running /login INSIDE the wedged window did not stick — closing "
-                "the window and starting a fresh session did. The alert clears by itself once the "
-                "lane reads healthy again.")
+        parts = reason.split(":")
+        iid = parts[1]
+        variant = parts[2] if len(parts) > 2 else None
+        return (f"{iid}'s session auth is DEAD in-window — the CLI is still up but every turn is "
+                "refused. The loop will NOT nudge it (a nudge cannot be answered) and will NOT "
+                "relaunch it (the relaunch would re-enter dead auth); the lane is held as-is for "
+                f"you. {AUTH_DEATH_REMEDIES.get(variant, AUTH_DEATH_REMEDIES[None])} The alert "
+                "clears by itself once the lane reads healthy again.")
     if isinstance(reason, str) and reason.startswith("park_label_stuck:"):
         iid = reason.split(":", 1)[1]
         return (f"{iid} handed back to the owner but its label move has been failing for "
@@ -1269,9 +1327,18 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # nothing will ever re-sense it to clear the field — and an un-clearable reason would pin
         # the ALERT open forever AND poison the dedup for every other reason (the `existing !=
         # reasons` compare below is what decides whether anything at all gets said).
+        #
+        # The sensed VARIANT (issue #174) is appended to the reason, not carried beside it, for one
+        # reason: this list IS the dedup key. When the banner changes mid-episode — the owner fixes
+        # the API key and the session falls back to a dead subscription login — the REMEDY changed,
+        # and an owner silenced by a dedup against the old reason would keep applying the old fix.
+        # A reading with no variant (pane_state's generic nets, or a stubbed rc that captured no
+        # stderr) keeps #151's original reason string byte-for-byte and gets the generic body.
         if (ist_of(iid).get("sensed_state") == "logged_out"
                 and _status_of(ist_of(iid)) not in TERMINAL_STATUSES):
-            reasons.append(f"session_logged_out:{iid}")
+            variant = ist_of(iid).get("sensed_auth")
+            variant = variant if isinstance(variant, str) and variant.strip() else None
+            reasons.append(f"session_logged_out:{iid}" + (f":{variant}" if variant else ""))
         # A session sitting at its OWN in-window question, past the bound. It is never parked (it
         # is alive), but refusing to park it is exactly why it must speak: nothing else in the loop
         # will ever notice it, and its lane slot is held the whole time. Needs a REAL stamp — an

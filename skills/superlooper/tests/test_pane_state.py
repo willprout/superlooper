@@ -407,3 +407,238 @@ def test_a_markdown_blockquote_of_a_dialog_row_is_not_a_dialog():
     # stops a quoted row in a review comment or chat log from reading as a live dialog.
     assert ps.classify_screen("> 3. Type something.") != "at_dialog"
     assert ps.classify_screen("> 4. Chat about this") != "at_dialog"
+
+
+# ---------------------------------------------------------------------------
+# Issue #174: the REST of the auth-death family.
+#
+# #151 closed i336's exact shape — the "/login" banner. But Claude Code renders a WIDER family of
+# unanswerable auth-death messages through the same bare-line shape, and every one of them still
+# classified as 'idle' (= safe to send), which is the i336 mechanism exactly.
+#
+# Every string below is VERIFIED against the installed binary
+# (~/.local/share/claude/versions/2.1.216), read out of the interned string table at file offsets
+# 0x414_1xxx and 0x804_2xxx — not invented. The full block is reproduced in the PR body.
+#
+# The DoD asked which shape these should take: ONE refusing state or several. They are one state —
+# `logged_out` — carrying a VARIANT tag. The send-safety verdict is identical for all of them
+# ("never type here"), and every downstream guard that acts on it (nudge-pane's rc 5, the runner's
+# rc->state map, decide's never-park set, the TERMINAL_STATUSES fence) treats them identically —
+# so a second state buys no behaviour and multiplies the chance one site forgets a member, which
+# would silently reopen the hole. What genuinely differs is the OWNER'S REMEDY, and that lives in
+# the alert body; the variant is how it gets there.
+# ---------------------------------------------------------------------------
+
+# The banner -> variant table, exactly as captured. Each tuple is (screen line, expected variant).
+AUTH_DEATH_BANNERS = [
+    # the /login family (#151's four, plus the fifth the binary carries beside them)
+    ("Not logged in · Please run /login", "login"),
+    ("Not logged in · Run /login", "login"),
+    ("Not logged in. Run claude auth login to authenticate.", "login"),
+    ("Session expired. Please run /login to sign in again.", "login"),
+    ("Login expired · Please run /login", "login"),
+    # the CLAUDE_CODE_REMOTE render of that SAME banner — the bundle's own ternary is
+    #   Wt(process.env.CLAUDE_CODE_REMOTE) ? "Authentication error · Try again"
+    #                                      : "Not logged in · Run /login"
+    # so the DoD's last two bullets ("Authentication error · Try again" and "the CLAUDE_CODE_REMOTE
+    # variant of the login banner") turn out to be the same string at the same code site.
+    ("Authentication error · Try again", "login_remote"),
+    # the token was killed server-side
+    ("OAuth token revoked · Please run /login", "oauth_revoked"),
+    ("Failed to authenticate: OAuth session expired and could not be refreshed", "oauth_revoked"),
+    # an EXTERNAL key is in force and is bad
+    ("Invalid API key · Fix external API key", "invalid_api_key"),
+    ("Your ANTHROPIC_API_KEY belongs to a disabled organization · Unset the environment variable "
+     "to use your subscription instead", "api_key_org_disabled"),
+    ("Your ANTHROPIC_API_KEY belongs to a disabled organization · Update or unset the environment "
+     "variable", "api_key_org_disabled"),
+    # org policy forbids the auth method in use
+    ("Your organization has disabled API key authentication · Run /login to sign in with your "
+     "claude.ai account", "org_api_key_disabled"),
+    ("Your organization has disabled API key authentication · Unset ANTHROPIC_API_KEY to use your "
+     "claude.ai account instead", "org_api_key_disabled"),
+    ("Your organization has disabled API key authentication · Unset ANTHROPIC_API_KEY and run "
+     "/login to sign in with your claude.ai account", "org_api_key_disabled"),
+    ("Your organization has disabled API key authentication · Unset the apiKeyHelper setting and "
+     "run /login to sign in with your claude.ai account", "org_api_key_disabled"),
+    ("Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic "
+     "API key instead, or ask your admin to enable access", "subscription_disabled"),
+    # the credential SOURCE is broken rather than the credential
+    ("Your apiKeyHelper script is failing · This usually means you need to re-authenticate with "
+     "your provider · Run /status to see the script's error output", "apikey_helper_failing"),
+    ("Authentication error · The gateway could not authenticate with its upstream provider — "
+     "contact your gateway administrator", "gateway_auth"),
+    ("Authentication error · This may be a temporary network issue, please try again", "auth_error"),
+]
+
+
+def test_every_auth_death_banner_refuses_instead_of_reading_as_idle():
+    """The whole issue in one assertion: before this, every banner below classified as 'idle' —
+    safe to send — so the runner would keep nudging a pane that can never answer and the freeze
+    ladder would read the silence as a liveness problem rather than an auth one."""
+    for banner, _variant in AUTH_DEATH_BANNERS:
+        assert ps.classify_screen(banner) == "logged_out", banner
+
+
+def test_each_banner_reports_its_own_variant():
+    """The variant is what lets the alert name the RIGHT remedy: 'unset ANTHROPIC_API_KEY' is not
+    the same instruction as '/login', and telling an owner the wrong one costs them the night."""
+    for banner, variant in AUTH_DEATH_BANNERS:
+        assert ps.auth_death_variant(banner) == variant, banner
+
+
+def test_a_screen_with_no_auth_banner_has_no_variant():
+    for screen in ("❯ ", "✻ Thinking… (esc to interrupt)", "", "❯ 1. Yes  2. No"):
+        assert ps.auth_death_variant(screen) is None, screen
+
+
+def test_auth_death_banners_survive_inside_a_live_tui_frame():
+    """i336's actual shape: the banner rendered INSIDE a live composer frame, which is exactly why
+    it read as a normal idle prompt and got typed into for 94 minutes."""
+    for banner, variant in AUTH_DEATH_BANNERS:
+        screen = ("╭──────────────────────────────╮\n"
+                  f"│ {banner} │\n"
+                  "╰──────────────────────────────╯\n"
+                  "❯ \n")
+        assert ps.classify_screen(screen) == "logged_out", banner
+        assert ps.auth_death_variant(screen) == variant, banner
+
+
+def test_auth_death_banners_are_caught_behind_a_status_glyph():
+    """Same evidence as #151's glyph fence: Claude Code renders auth-adjacent warnings behind a
+    leading status glyph, and a MISS here is silent."""
+    for glyph in ("⏺", "●", "⚠", "✗", "⎿"):
+        for banner, variant in AUTH_DEATH_BANNERS:
+            screen = f"{glyph} {banner}"
+            assert ps.classify_screen(screen) == "logged_out", screen
+            assert ps.auth_death_variant(screen) == variant, screen
+
+
+def test_a_wrapped_banner_is_still_caught():
+    """The new members are LONG — the org-policy one is 138 characters — so an 80-column pane wraps
+    them and #151's whole-banner fullmatch would miss every one. The head clause plus its separator
+    is what is anchored on, so the FIRST wrapped line still fires."""
+    screen = ("Your organization has disabled API key authentication · Unset the apiKeyHelper\n"
+              "setting and run /login to sign in with your claude.ai account\n"
+              "❯ ")
+    assert ps.classify_screen(screen) == "logged_out"
+    assert ps.auth_death_variant(screen) == "org_api_key_disabled"
+
+
+def test_auth_death_beats_busy_and_is_never_typed_into():
+    """'busy' is a SAFE-TO-SEND state (Claude queues input), so a stale generation footer under an
+    auth-death banner must not hand back a green light on a pane that cannot act."""
+    for banner, _variant in AUTH_DEATH_BANNERS:
+        assert ps.classify_screen(f"{banner}\n✻ Thinking… (esc to interrupt)") == "logged_out"
+
+
+def test_dead_still_beats_every_auth_death_banner():
+    """A banner scrolled into a dead bash pane stays DEAD: typing there would run the nudge as a
+    permission-bypassed shell command (RC-DEADPANE), the worst outcome on the table."""
+    for banner, _variant in AUTH_DEATH_BANNERS:
+        assert ps.classify_screen(f"{banner}\nwilliam@mac probe % ") == "dead", banner
+        assert ps.classify_screen(banner, exited_marker=True) == "dead", banner
+
+
+def test_auth_death_variants_require_the_claude_agent_path():
+    """Mirrors the existing Codex-leak fence: Claude-specific labels must not appear for codex."""
+    for banner, _variant in AUTH_DEATH_BANNERS:
+        assert ps.classify_screen(banner, agent="codex") != "logged_out", banner
+
+
+def test_the_generic_login_suffix_net_catches_a_render_this_list_has_not_seen():
+    """The bundle carries its own normalizer for these banners, and its regexes say the stable
+    shapes are `Please run /login · <detail>`, `Failed to authenticate. <detail>` and
+    `<detail> · Please run /login`. Anchoring those shapes too means the NEXT renamed variant is
+    caught on arrival instead of silently reopening i336 until someone greps the binary again."""
+    for screen in ("Please run /login · API Error: 401 unauthorized",
+                   "Failed to authenticate. API Error: 403 forbidden",
+                   "Credential handoff went sideways · Please run /login"):
+        assert ps.classify_screen(screen) == "logged_out", screen
+
+
+# --- the fences: these must NOT fire ------------------------------------------------------------
+
+def test_the_new_patterns_do_not_fire_on_neighbouring_non_auth_messages():
+    """Every string here is a REAL Claude Code message from the same region of the bundle that is
+    NOT auth death — the session can still take a turn. Refusing on these would hold a healthy lane
+    and page the owner for nothing.
+
+    'Invalid API key format. …' is the sharp one: it shares a head clause with a genuine banner and
+    is separated only by an ordinary space, which is precisely why the separator is an explicit
+    punctuation class rather than #151's loose `\\W`."""
+    for screen in (
+        "Invalid API key format. API key must contain only alphanumeric characters, dashes, and "
+        "underscores.",
+        "Credit balance is too low",
+        "Prompt is too long",
+        "Repeated 529 Overloaded errors",
+        "Server is temporarily limiting requests (not your usage limit)",
+        "Request timed out",
+        "Opus is experiencing high load, please use /model to switch to Sonnet",
+        "⚠ 3 MCP servers need authentication · run /mcp",
+    ):
+        assert ps.classify_screen(screen) != "logged_out", screen
+        assert ps.auth_death_variant(screen) is None, screen
+
+
+def test_prose_and_code_mentioning_the_new_banners_are_not_the_banners():
+    """The #151 discipline, extended: a banner is a LINE the TUI draws; a sentence containing the
+    words is someone talking ABOUT it. A worker session renders its own conversation — the diff it
+    writes, the issue it was briefed on — so a bare substring search means the worker assigned THIS
+    issue reads its own screen as a broken session and disables its own lane."""
+    for screen in (
+        'I added a variant for "Invalid API key · Fix external API key" this morning.',
+        '    ("invalid_api_key", _banner(r"invalid api key", r"fix external api key")),',
+        "| variant | Invalid API key · Fix external API key | unset the key |",
+        "- `OAuth token revoked · …`",
+        "the alert body says (Authentication error · Try again) so the owner knows",
+        "> Your organization has disabled API key authentication · Run /login to sign in",
+        "see Authentication error · Try again in the table above for the remote render",
+    ):
+        assert ps.classify_screen(screen) != "logged_out", screen
+
+
+def test_the_classifier_still_does_not_fire_on_this_repo_s_own_source():
+    """#151's fence, re-run against the files this issue ADDS the literals to. Verified before the
+    #151 fix that a 40-line window of these files each classified as 'logged_out'; the same must
+    stay false now that the family is ten times larger and the alert bodies quote the banners."""
+    import os
+    here = os.path.dirname(__file__)
+    targets = [os.path.join(here, "..", "skill", "lib", "pane_state.py"),
+               os.path.join(here, "..", "skill", "lib", "actions.py"),
+               os.path.join(here, "..", "skill", "bin", "runner.py"),
+               os.path.join(here, "..", "skill", "bin", "nudge-pane.sh"),
+               os.path.join(here, "test_pane_state.py")]
+    for path in targets:
+        with open(path) as f:
+            lines = f.read().splitlines()
+        for i in range(0, max(1, len(lines) - 40)):
+            window = "\n".join(lines[i:i + 40])
+            state = ps.classify_screen(window)
+            assert state not in ("logged_out", "at_dialog"), (
+                f"{os.path.basename(path)} line {i+1} reads as {state}")
+
+
+def test_a_real_healthy_pane_carrying_auth_warnings_is_still_idle():
+    """REAL capture, Claude Code 2.1.216, driven live in a pty at 100x40 and rendered through a
+    terminal emulator (tests/fixtures/screens/claude-idle-with-auth-warnings.txt).
+
+    This is the fixture that matters most for #174, and it was found by accident while trying to
+    induce a real auth-death screen: a perfectly HEALTHY session renders
+
+        ⚠ Your login expires in 4 days · run /login to renew
+
+    which is a `·`-separated line, behind a ⚠ glyph, that names /login — the exact shape every
+    pattern in this family matches on. The session is fine; the warning is a courtesy. Any looser
+    net over the /login shape reads this as auth death, refuses to nudge a working lane, and pages
+    the owner at 3am about a session that is doing its job. That is the false-positive direction
+    #174 has to stay on the right side of, and a hand-written screen would never have shown it."""
+    screen = _screen("claude-idle-with-auth-warnings.txt")
+    assert ps.classify_screen(screen) == "idle"
+    assert ps.auth_death_variant(screen) is None
+    # and each warning line on its own, so a future re-capture cannot hide a regression in chrome
+    for line in ("⚠ Your login expires in 4 days · run /login to renew",
+                 "⚠ 4 MCP servers need authentication · run /mcp"):
+        assert ps.classify_screen(line) == "idle", line
+        assert ps.auth_death_variant(line) is None, line

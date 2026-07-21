@@ -1,0 +1,23 @@
+╭─── Claude Code v2.1.216 ─────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                 Welcome back User!                 │ started                 │
+│                                                    │ Run /init to create a … │
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new              │
+│                        ▘▘ ▝▝                       │ Added `sandbox.filesys… │
+│   Opus 4.8 (1M context) with hi… · Claude Max ·    │ Fixed a slowdown in lo… │
+│   owner@example.com's Organization                 │ Fixed auto mode denyin… │
+│                /…/tmp/workdir                      │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 4 MCP servers need authentication · run /mcp
+ ⚠ Your login expires in 4 days · run /login to renew
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+❯ Try "how do I log an error?"
+────────────────────────────────────────────────────────────────────────────────
+  ⬡ Opus 4.8 (1M context)  ╱  ◈ ░░░░░░░░░░  —  ╱  ● default
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

@@ -4763,3 +4763,98 @@ def test_quiet_hours_helper_windows_and_disable():
     assert not actions._in_quiet_hours("03:00", {"start": "06:00", "end": "06:00"})
     assert not actions._in_quiet_hours("²³:00", q)          # unicode "digits": False, never int() raise
     assert not actions._in_quiet_hours("03:00", {"start": "²³:00", "end": "08:00"})
+
+
+# ===================== issue #174: the alert names the RIGHT remedy per variant =====================
+# #151's alert had ONE body, and it named ONE remedy: "/login". For the rest of the auth-death
+# family that instruction is wrong — an owner told to run /login when the actual fault is a bad
+# ANTHROPIC_API_KEY will try it, watch it not stick, and lose the night. The variant the runner
+# sensed off the pane is what makes the body correct.
+
+AUTH_REMEDY_CASES = [
+    # (variant, a phrase the body MUST contain, a phrase it must NOT contain)
+    ("invalid_api_key", "ANTHROPIC_API_KEY", None),
+    ("api_key_org_disabled", "ANTHROPIC_API_KEY", None),
+    ("org_api_key_disabled", "/login", None),
+    ("subscription_disabled", "admin", None),
+    ("apikey_helper_failing", "apiKeyHelper", None),
+    ("gateway_auth", "gateway", None),
+    ("oauth_revoked", "revoked", None),
+    ("login_remote", "CLAUDE_CODE_REMOTE", None),
+    ("auth_error", "transient", None),
+    ("login", "/login", None),
+]
+
+
+def _alert_body(**ist_over):
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", **ist_over)}})
+    out = decide(dsk=d)
+    return [a for a in out if a["act"] == "notify"][0]["body"]
+
+
+def test_each_auth_variant_gets_its_own_remedy_in_the_alert_body():
+    for variant, must, must_not in AUTH_REMEDY_CASES:
+        body = _alert_body(sensed_state="logged_out", sensed_auth=variant)
+        assert "i5" in body, variant
+        assert must in body, f"{variant}: body must name {must!r}; got {body!r}"
+        if must_not:
+            assert must_not not in body, variant
+
+
+def test_the_api_key_variants_do_not_tell_the_owner_to_run_login():
+    """The sharpest wrong answer available. When an EXTERNAL key is the fault, /login is not the
+    fix — the key has to be fixed or unset, and unsetting is what falls back to the subscription.
+    #151's single body said '/login' unconditionally."""
+    body = _alert_body(sensed_state="logged_out", sensed_auth="invalid_api_key")
+    assert "unset" in body.lower() and "ANTHROPIC_API_KEY" in body
+
+
+def test_the_variant_rides_in_the_reason_so_a_changed_remedy_re_alerts():
+    """The reason list is what decide dedupes on. If the banner changes (the owner fixes the key
+    and the session falls back to a dead login), the remedy changed — so the owner must be told
+    again, not silenced by a dedup against the old reason."""
+    d = disk(alert={"reasons": ["session_logged_out:i5:invalid_api_key"]},
+             issues_state={"version": 1,
+                           "issues": {"i5": ist("running", sensed_state="logged_out",
+                                                sensed_auth="login")}})
+    out = decide(dsk=d)
+    assert has_notify(out)
+    assert "session_logged_out:i5:login" in only(out, "alert")[0]["reasons"]
+
+
+def test_an_unrecognised_banner_keeps_the_original_reason_and_a_generic_body():
+    """Fail OPEN on the wording, never on the hold. A banner caught by pane_state's generic nets
+    arrives with no variant; the lane is still auth-dead and must still be alerted and held, with
+    #151's original reason string and body unchanged."""
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist("running", sensed_state="logged_out")}})
+    out = decide(dsk=d)
+    assert "session_logged_out:i5" in only(out, "alert")[0]["reasons"]
+    body = [a for a in out if a["act"] == "notify"][0]["body"]
+    assert "i5" in body and "login" in body.lower()
+
+
+def test_every_auth_variant_still_refuses_to_park_or_nudge_the_lane(monkeypatch):
+    """The load-bearing invariant behind 'one state, not several': every member of the family gets
+    the identical never-park/never-type treatment, and no guard downstream has to enumerate them.
+    A variant that slipped past one of these guards would be parked with a memo naming the wrong
+    cause — worse than the silence it replaced."""
+    for variant, _must, _mn in AUTH_REMEDY_CASES:
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": ist("running", sensed_state="logged_out",
+                                                    sensed_auth=variant)}},
+                 frozen={"i5": True})
+        out = decide(dsk=d)
+        assert only(out, "park") == [], variant
+        assert not any(a["act"] == "nudge" for a in out), variant
+
+
+def test_a_terminal_lane_never_alerts_on_a_stale_variant():
+    """Same TERMINAL_STATUSES fence #151's fresh review added: a merged/parked lane's last reading
+    is history, nothing will re-sense it to clear the field, and an un-clearable reason would pin
+    the alert open forever AND poison the dedup for every other reason."""
+    for status in ("merged", "parked"):
+        d = disk(issues_state={"version": 1,
+                               "issues": {"i5": ist(status, sensed_state="logged_out",
+                                                    sensed_auth="invalid_api_key")}})
+        out = decide(dsk=d)
+        assert only(out, "alert") == [], status

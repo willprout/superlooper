@@ -4,6 +4,9 @@ classify_screen(text, exited_marker=False, orchestrator=False, agent='claude')
   Claude -> 'dead' | 'logged_out' | 'menu' | 'at_dialog' | 'busy' | 'idle'
   Codex  -> 'dead' | 'busy' | 'idle' | 'trust_blocked' | 'permission_blocked' |
             'quota_blocked' | 'unknown'
+auth_death_variant(text) -> which auth-death banner is showing, or None (issue #174). Not a
+  send-safety verdict — classify_screen already refuses on all of them — but the only thing the
+  OWNER can act on, so it is what the alert body is written from.
 
 The single decision behind every write into a pane (the doorbell AND the orchestrator's
 resume/answer/nudge), via bin/nudge-pane.sh:
@@ -11,6 +14,11 @@ resume/answer/nudge), via bin/nudge-pane.sh:
               run as a shell command, permission-bypassed). Caller restarts instead.
   - 'logged_out' -> auth died IN-PROCESS; the TUI is alive but every turn is refused. NEVER type:
               it cannot act, and a nudge just accrues silent failures. Caller alerts the owner.
+              Covers the WHOLE auth-death family, not just the /login banner (#174): a bad external
+              API key, a revoked OAuth token, an org policy that forbids the auth method in use, a
+              failing apiKeyHelper, a gateway that cannot authenticate upstream. One state, because
+              the send-safety answer is identical for all of them; auth_death_variant() below says
+              WHICH, so the caller's alert can name the owner's actual remedy.
   - 'menu'  -> an interactive selection/confirm/trust prompt is showing; pressing Enter would
               SELECT an item and corrupt state. Defer (retry later).
   - 'at_dialog' -> the session raised its OWN question dialog (AskUserQuestion) and is waiting on
@@ -119,12 +127,123 @@ def _banner_lines(raw):
 # its siblings are covered too; the separator is matched loosely (\W) because only the WORDS are
 # stable — a render that swaps "·" for "-" must not silently reopen the hole. That looseness is
 # safe ONLY because these are fullmatched against a single line.
+#
+# ISSUE #174 widened this to the REST of the family. Claude Code 2.1.216 renders TEN distinct
+# unanswerable auth-death messages through this same bare-line shape, and before #174 every one of
+# them except the four above still classified as 'idle' — safe to send — which is the i336
+# mechanism exactly: the runner keeps nudging a pane that can never answer, and the freeze ladder
+# reads the silence as a liveness problem rather than an auth one.
+#
+# ONE STATE, NOT SEVERAL. #174's DoD asked which shape this should take. They are all `logged_out`,
+# carrying a VARIANT tag. The send-safety verdict — the only question this module answers — is
+# identical for every member ("never type here"), and every downstream guard that acts on it
+# (nudge-pane's rc 5, the runner's rc->state map, decide's never-park set, the TERMINAL_STATUSES
+# fence) treats them identically. A second state would buy no behaviour while multiplying the
+# chance that one of those sites forgets a member — and a forgotten member is SILENT, which is how
+# i336 happened. What genuinely differs is the OWNER'S REMEDY ("unset ANTHROPIC_API_KEY" is not
+# "/login"), and the remedy belongs in the alert body; the variant is how it gets there.
+#
+# HOW THE NEW ONES ARE ANCHORED, and why it differs from the four above. The new members are LONG —
+# the org-policy banner is 138 characters — so an 80-column pane WRAPS them and #151's
+# whole-banner fullmatch would miss every one. So each is anchored on its head clause plus the
+# separator, with the rest of the line free (it may be cut mid-word by the wrap). That is still a
+# whole-LINE fullmatch, not a substring search: the line must BEGIN with the banner's own opening
+# clause, which is what keeps a worker rendering its own conversation from reading its screen as a
+# broken session (#151's fresh-review P1 fence, re-run over these files).
+#
+# The separator is an explicit punctuation class, NOT #151's loose `\W`. `\W` matches a plain
+# space, and the bundle also ships "Invalid API key format. API key must contain only alphanumeric
+# characters, …" — a NON-fatal validation message that shares a head clause with a genuine banner
+# and is separated from its tail by nothing but a space. Loose matching would refuse on it and hold
+# a healthy lane. The class stays wider than the literal "·" for #151's reason: only the WORDS are
+# stable, and a render that swaps the middle dot must not silently reopen the hole.
+_AUTH_SEP = r"\s*[·•:.–—-]\s+"
+
+
+def _banner(head, tail=r".*"):
+    """A whole-LINE pattern for `<head clause> <sep> <tail>` — the shape every one of these
+    banners has. `tail` defaults to open because an 80-column wrap can cut it anywhere."""
+    return re.compile(head + _AUTH_SEP + tail, re.I)
+
+
+# (variant, pattern) in match order — the FIRST match wins, so the specific banners must precede
+# the generic nets at the bottom. Every literal is verified against the installed binary
+# (~/.local/share/claude/versions/2.1.216), read out of the interned string table; none is invented.
 _LOGGED_OUT_PATTERNS = [
-    re.compile(r"not logged in\s*\W\s*please run /login", re.I),   # the DoD's exact string
-    re.compile(r"not logged in\s*\W\s*run /login", re.I),
-    re.compile(r"not logged in\W+run claude auth login to authenticate\W*", re.I),
-    re.compile(r"session expired\W+please run /login to sign in again\W*", re.I),
+    # --- the /login family: #151's four, byte-for-byte, plus the fifth the binary carries beside
+    # them. Kept on the original loose `\W` because they are short enough never to wrap and because
+    # they are the proven anchors i336 was closed on.
+    ("login", re.compile(r"not logged in\s*\W\s*please run /login", re.I)),  # #151's exact string
+    ("login", re.compile(r"not logged in\s*\W\s*run /login", re.I)),
+    ("login", re.compile(r"not logged in\W+run claude auth login to authenticate\W*", re.I)),
+    ("login", re.compile(r"session expired\W+please run /login to sign in again\W*", re.I)),
+    ("login", _banner(r"login expired", r"please run /login\W*")),
+    # The CLAUDE_CODE_REMOTE render of that SAME banner. The bundle's own ternary is
+    #   Wt(process.env.CLAUDE_CODE_REMOTE) ? "Authentication error \xB7 Try again"
+    #                                      : "Not logged in \xB7 Run /login"
+    # so #174's last two DoD bullets ("Authentication error · Try again" and "the CLAUDE_CODE_REMOTE
+    # variant of the login banner") are the same string at the same code site. It is tagged
+    # separately anyway: an owner who sees it is in a remote environment, and the remedy differs.
+    ("login_remote", _banner(r"authentication error", r"try again\W*")),
+    # --- the token was killed or expired server-side: /login again, and if it RECURS the token was
+    # revoked deliberately, which no amount of re-login fixes.
+    ("oauth_revoked", _banner(r"oauth token revoked")),
+    ("oauth_revoked", _banner(r"failed to authenticate",
+                              r"oauth session expired and could not be refreshed\W*")),
+    # --- an EXTERNAL credential is in force and is bad. The remedy is the opposite of "/login":
+    # the key must be FIXED or UNSET, and unsetting is what falls back to the subscription.
+    ("invalid_api_key", _banner(r"invalid api key", r"fix external api key\W*")),
+    ("api_key_org_disabled",
+     _banner(r"your anthropic_api_key belongs to a disabled organization")),
+    # --- org POLICY forbids the auth method in use. Nothing the loop can do; the owner must switch
+    # methods or get an admin.
+    ("org_api_key_disabled",
+     _banner(r"your organization has disabled api key authentication")),
+    ("subscription_disabled",
+     _banner(r"your organization has disabled claude subscription access for claude code")),
+    # --- the credential SOURCE is broken rather than the credential itself.
+    ("apikey_helper_failing", _banner(r"your apikeyhelper script is failing")),
+    ("gateway_auth", _banner(r"authentication error", r"the gateway could not authenticate.*")),
+    ("auth_error", _banner(r"authentication error", r"this may be a temporary network issue.*")),
+    # --- generic nets for renders this list has not seen. Claude Code carries its OWN normalizer
+    # for these banners, and its regexes name the stable shapes: `^Please run /login · `,
+    # `^Failed to authenticate\. `, ` · Please run /login$`. Anchoring the SHAPES means the next
+    # renamed variant is caught on arrival instead of silently reopening i336 until someone greps
+    # the binary again.
+    ("login", _banner(r"please run /login")),
+    # The SUFFIX net is the one dangerous shape here, because its head is open — and the first cut
+    # of it re-opened exactly the substring hole #151 closed: with a tolerant `\W*` tail it fired on
+    # this module's own comment, on actions.py's alert body, and on a markdown table row, because
+    # `\W*` happily ate the closing `",` / ` |`. So it is pinned on both ends: the line must END at
+    # `/login` with nothing after it, and the free head is a SHORT run that may not contain the
+    # quote/backslash/pipe characters that mark source or a table cell rather than a rendered
+    # banner. The fence tests over this repo's own files are what hold that line.
+    ("login", re.compile(r"[^\"'`\\|]{0,60}\s[·•]\s*please run /login", re.I)),
+    ("auth_error", _banner(r"failed to authenticate")),
 ]
+
+
+def _auth_death(lines):
+    """The variant key of the auth-death banner on one of `lines`, or None. First match wins."""
+    for variant, pat in _LOGGED_OUT_PATTERNS:
+        if any(pat.fullmatch(ln) for ln in lines):
+            return variant
+    return None
+
+
+def auth_death_variant(text):
+    """Which auth-death banner a screen is showing — the key the ALERT uses to name the owner's
+    actual remedy — or None if there is none.
+
+    Split out from classify_screen because the two answer different questions and only one of them
+    is a send-safety decision. classify_screen says "never type here" (identical for every member);
+    this says WHY, which is the only part the owner can act on. Pure and separately unit-tested for
+    the same reason the rest of this module is: it is render-version-sensitive.
+
+    Callers must treat None as "no usable variant" and fall back to generic wording, never assume
+    a key: a screen can be auth-dead through the generic nets while the tail is wrapped away.
+    """
+    return _auth_death(list(_banner_lines(text or "")))
 
 # THE SESSION'S OWN QUESTION DIALOG (issue #151 / incident i280). A worker blocked on its own
 # AskUserQuestion went stale, tripped the frozen tier, and the nudge ladder walked a LIVE, working
@@ -225,9 +344,8 @@ def classify_screen(text, exited_marker=False, orchestrator=False, agent="claude
     # green light on a pane that cannot act. Refusing a genuinely-busy pane costs one retry; typing
     # into dead auth is the 94-minute failure this state exists to end.
     lines = list(_banner_lines(raw))
-    for pat in _LOGGED_OUT_PATTERNS:
-        if any(pat.fullmatch(ln) for ln in lines):
-            return "logged_out"
+    if _auth_death(lines):
+        return "logged_out"
     if _BUSY.search(flat):
         return "busy"
 
