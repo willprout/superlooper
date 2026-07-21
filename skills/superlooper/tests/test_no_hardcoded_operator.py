@@ -13,7 +13,7 @@ What it scans, and why comments are exempt:
   which is genuinely about William and must stay). Module/class/function DOCSTRINGS are internal
   documentation too, so they are excluded alongside comments.
 * Non-Python files (templates, shell, plists) are checked line-by-line: they carry emitted prose
-  (the brief footer, the answerer brief) plus a few install-time comments, all genericized.
+  (the brief footer, the debugger briefs) plus a few install-time comments, all genericized.
 
 The neutral machine label ids ``needs-owner`` / ``needs_william`` are NOT operator names — the
 label was renamed to ``needs-owner`` but the legacy ``needs-william`` label id and the persisted

@@ -1,6 +1,6 @@
-"""The Task-10 templates: the answerer brief (the hired judgment's entire world) and the
-launchd NIGHTLY plist. Both are consumed by substituting {name} placeholders literally
-(brief.py's _sub convention — never str.format, which chokes on prose braces).
+"""The shipped templates: the launchd NIGHTLY plist, and the launchd RUNNER plist that must never
+appear. (The answerer brief lived here until #194 retired that seat — its absence is pinned in
+tests/test_answerer_retired.py alongside the rest of the retirement.)
 
 There is deliberately NO launchd RUNNER plist (issue #33): a launchd-started runner is a
 detached daemon with no cmux tab, so it can never self-detect a pane; its startup preflight
@@ -19,33 +19,6 @@ def _sub(text, mapping):
     for k, v in mapping.items():
         text = text.replace("{" + k + "}", v)
     return text
-
-
-# --------------------------- answerer brief ---------------------------
-
-def test_answerer_brief_carries_the_full_contract():
-    t = (_TEMPLATES / "answerer-brief.md").read_text()
-    # every placeholder the runner substitutes
-    for ph in ("{issue_num}", "{issue_body}", "{question}", "{worktree}", "{answer_path}", "{operator}"):
-        assert ph in t, f"missing placeholder {ph}"
-    # the plan's contract phrases: one question, read-only worktree, <=10 lines or PARK:,
-    # the answer file is the FINAL action (its existence is the done signal)
-    low = t.lower()
-    assert "one question" in low
-    assert "PARK: " in t          # the exact (case-sensitive) marker decide() matches on
-    assert "change nothing" in low or "read-only" in low or "change no" in low
-    assert "final action" in low
-    assert "10 lines" in low
-
-
-def test_answerer_brief_renders_clean():
-    t = (_TEMPLATES / "answerer-brief.md").read_text()
-    out = _sub(t, {"issue_num": "42", "issue_body": "## Goal\nDo the thing.",
-                   "question": "A or B?", "worktree": "/tmp/wt/i42",
-                   "answer_path": "/tmp/home/answers/i42.md", "operator": "acme"})
-    assert "{" not in out.replace("{}", ""), "unsubstituted placeholder left behind"
-    assert "#42" in out and "A or B?" in out and "/tmp/home/answers/i42.md" in out
-    assert "genuinely acme's to decide" in out and "why this needs acme." in out
 
 
 # --------------------------- launchd templates ---------------------------

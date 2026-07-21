@@ -18,13 +18,13 @@ proved a PreToolUse hook returning permissionDecision:"deny" blocks the call eve
 DENY ONLY THE TWO NAMED HAZARDS. Everything else is allowed — no broad allowlist that could break
 legitimate worker tool use (issue Boundaries).
 
-WORKER SESSIONS ONLY. start-session.sh launches BOTH issue workers (id `i<N>`) and answerers
-(id `a<N>`) through the same stack, so both carry SL_ISSUE_ID + SL_RUN_ROOT. This deny is
-worker-scoped: the AskUserQuestion fallback it hands back — write state/blocked/<id> — is a WORKER
-protocol the runner acts on (it recognizes only `i<N>`), and would be wrong for an answerer, which
-is told to touch nothing but its one answer file and to escalate with a `PARK:` line. So run()
-denies only in worker sessions and no-ops for answerers, ad-hoc, and everything else. (Whether the
-same deny should also cover answerer sessions — also unattended — is a separate owner call.)
+WORKER SESSIONS ONLY. start-session.sh launches BOTH issue workers (id `i<N>`) and the watchdog's
+unattended sl-debugger sessions (id `d<N>`, issue #66) through the same stack, so both carry
+SL_ISSUE_ID + SL_RUN_ROOT. This deny is worker-scoped: the AskUserQuestion fallback it hands back —
+write state/blocked/<id> — is a WORKER protocol the runner acts on (it recognizes only `i<N>`), and
+would be wrong for a debugger, whose escalation path is its own. So run() denies only in worker
+sessions and no-ops for debuggers, ad-hoc, and everything else. (Whether the same deny should also
+cover debugger sessions — also unattended — is a separate owner call.)
 
 CLAUDE ONLY. Codex has no PreToolUse event (spike verdict); its backstop is the classifier's
 at_dialog/logged_out states. run() no-ops for SL_AGENT=codex so a global registration is inert there.
@@ -105,8 +105,8 @@ def _is_pattern_kill(command):
 # --------------------------- the decision ---------------------------
 
 def _is_worker(issue_id):
-    """A superlooper WORKER id is `i<N>`; an answerer is `a<N>`. Mirrors actions._iid_num's
-    convention exactly (start-session.sh's own id contract), so worker-vs-answerer is decided the
+    """A superlooper WORKER id is `i<N>`; a debugger is `d<N>`. Mirrors actions._iid_num's
+    convention exactly (start-session.sh's own id contract), so worker-vs-other is decided the
     one way the whole runner already decides it."""
     return isinstance(issue_id, str) and issue_id.startswith("i") and issue_id[1:].isdigit()
 
@@ -125,7 +125,7 @@ def decide(tool_name, tool_input, state_home, issue_id):
 
 def run(payload, env):
     """Decide the PreToolUse outcome for a worker session. Returns the deny-reason string, or None
-    to ALLOW. No-ops (returns None) outside a superlooper WORKER session — answerers (`a<N>`),
+    to ALLOW. No-ops (returns None) outside a superlooper WORKER session — debuggers (`d<N>`),
     ad-hoc, and every other session — and for Codex, and for any non-PreToolUse payload, so the hook
     is safe to register globally."""
     if (env.get("SL_AGENT") or "claude").strip() == "codex":
@@ -133,7 +133,7 @@ def run(payload, env):
     issue_id = (env.get("SL_ISSUE_ID") or "").strip()
     state_home = (env.get("SL_RUN_ROOT") or "").strip()
     if not state_home or not _is_worker(issue_id):
-        return None                      # not a WORKER session (answerer / ad-hoc / anything else)
+        return None                      # not a WORKER session (debugger / ad-hoc / anything else)
     if not isinstance(payload, dict) or payload.get("hook_event_name") != "PreToolUse":
         return None
     return decide(payload.get("tool_name"), payload.get("tool_input"), state_home, issue_id)

@@ -2010,72 +2010,39 @@ def test_janitor_execute_keys_unreadable_loopstate_refuses(rig):
     assert mutations(rig) == []
 
 
-# --------------------------- tidy: answerer windows (issue #132) ---------------------------
-# `superlooper tidy` must ALSO close the cmux windows of FINISHED answerer sessions (a<N>), which
-# are not tracked issues and so were invisible to the issue selector — leaving state/panes/a<N>
-# behind after a Q&A concluded. The safety is proven at the CLI here with the stub cmux the rig
-# already wires (SL_CMUX=/bin/ls — no real window is ever touched): a delivered answerer (record
-# popped, counter past it) IS listed and its markers cleaned; an ACTIVE answerer (a live record)
-# and a MID-HIRE answerer (counter not yet past it) are NEVER listed. The whole selection is the
-# pure, table-tested tidy.closable_answerers; this drives it through the real entry point.
+# --------------------------- tidy: retired answerer windows (#194) ---------------------------
+# `superlooper tidy` used to ALSO close finished answerer session windows (a<N>) — issue #132's
+# fold-in over tidy.closable_answerers. #194 retired the answerer seat, so nothing mints an a<N>
+# id any more and the selector is gone. What must be true now: a LEFTOVER a<N> pane marker on a
+# long-lived state home (there are real ones on disk from the pre-#163 era) is simply IGNORED —
+# tidy neither lists it nor deletes it. Silently ignoring is the right landing: those markers point
+# at surfaces nothing will ever relaunch, and tidy's whole contract is "only act on a window I can
+# positively name as a finished, tracked session".
 
 def _tidy_state_home(rig):
     return rig.tmp / "slhome" / "o__r"
 
 
-def _seed_answerer_panes(rig):
-    """A state home where a1 is delivered (closable), a2 is active (a live record → protected), and
-    a3 is mid-hire (marker written but the counter has not passed it → protected). Returns the panes
-    dir. next_answerer=3 is the high-water mark: 1<3 and 2<3 are past, 3<3 is not."""
+def test_tidy_ignores_a_leftover_answerer_pane_marker(rig):
     home = _tidy_state_home(rig)
     panes = home / "state" / "panes"
     panes.mkdir(parents=True)
-    for aid in ("a1", "a2", "a3"):
-        (panes / aid).write_text("surface-%s" % aid)
-        (panes / (aid + ".ws")).write_text("ws-%s" % aid)
+    for name in ("a1", "a1.ws"):
+        (panes / name).write_text("leftover-" + name)
+    (panes / "i7").write_text("surf-i7")
+    (panes / "i7.ws").write_text("ws-i7")
     loopstate.save(str(home / "state" / "issues.json"),
-                   {"version": 1, "issues": {},
-                    "answerers": {"a2": {"for": "i9", "launched_at": 123}},
-                    "next_answerer": 3})
-    return panes
+                   {"version": 1, "issues": {"i7": {"status": "merged", "branch": None}}})
 
-
-def test_tidy_dry_run_lists_only_the_finished_answerer(rig):
-    panes = _seed_answerer_panes(rig)
     r = cli(rig, "tidy", "--repo", str(rig.repo), "--dry-run")
     assert r.returncode == 0, r.stderr
-    assert re.search(r"^  a1\s+finished\s+surface-a1\s*$", r.stdout, re.M), r.stdout
-    assert re.search(r"^\s+a2\b", r.stdout, re.M) is None      # active answerer never listed
-    assert re.search(r"^\s+a3\b", r.stdout, re.M) is None      # mid-hire answerer never listed
-    # dry-run closes nothing: every marker survives.
-    for aid in ("a1", "a2", "a3"):
-        assert (panes / aid).exists() and (panes / (aid + ".ws")).exists()
+    assert re.findall(r"^  (\w+)\s", r.stdout, re.M) == ["i7"], r.stdout
+    assert "a1" not in r.stdout
 
-
-def test_tidy_execute_closes_the_finished_answerer_and_cleans_its_markers(rig):
-    panes = _seed_answerer_panes(rig)
     r = cli(rig, "tidy", "--repo", str(rig.repo), "--yes")
     assert r.returncode == 0, r.stderr
     assert "closed 1 window(s)." in r.stdout, r.stdout
-    # a1's window markers are removed (race-free — an aid never relaunches); a2/a3 are untouched.
-    assert not (panes / "a1").exists() and not (panes / "a1.ws").exists()
-    for aid in ("a2", "a3"):
-        assert (panes / aid).exists() and (panes / (aid + ".ws")).exists()
-
-
-def test_tidy_lists_merged_issue_and_finished_answerer_together(rig):
-    # The answerer selection folds into the SAME close path as issues: a merged issue window and a
-    # delivered answerer window are listed together, issues first (sorted) then answerers (sorted).
-    home = _tidy_state_home(rig)
-    panes = home / "state" / "panes"
-    panes.mkdir(parents=True)
-    (panes / "i7").write_text("surf-i7")
-    (panes / "i7.ws").write_text("ws-i7")
-    (panes / "a1").write_text("surf-a1")
-    (panes / "a1.ws").write_text("ws-a1")
-    loopstate.save(str(home / "state" / "issues.json"),
-                   {"version": 1, "issues": {"i7": {"status": "merged", "branch": None}},
-                    "answerers": {}, "next_answerer": 2})
-    r = cli(rig, "tidy", "--repo", str(rig.repo), "--dry-run")
-    assert r.returncode == 0, r.stderr
-    assert re.findall(r"^  ([ia]\d+)\s", r.stdout, re.M) == ["i7", "a1"], r.stdout
+    # the merged issue's markers are cleaned; the orphaned a<N> pair is left exactly as found
+    assert not (panes / "i7").exists() and not (panes / "i7.ws").exists()
+    assert (panes / "a1").read_text() == "leftover-a1"
+    assert (panes / "a1.ws").read_text() == "leftover-a1.ws"

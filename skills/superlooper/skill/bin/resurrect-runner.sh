@@ -27,8 +27,8 @@ set -euo pipefail
 [ "${1:-}" = "--cwd" ] || { echo "usage: resurrect-runner.sh --cwd <repo> <r-id>" >&2; exit 64; }
 CWD="${2:?usage: resurrect-runner.sh --cwd <repo> <r-id>}"
 ID_IN="${3:?usage: resurrect-runner.sh --cwd <repo> <r-id>}"
-# Runner-resurrection ids are r<N> ONLY — the symmetric contract to launch-session.sh's a<N>/d<N>
-# --cwd ids, so a stray issue/answerer id can never route a session launch through the runner path.
+# Runner-resurrection ids are r<N> ONLY — the symmetric contract to launch-session.sh's d<N>
+# --cwd ids, so a stray issue/debugger id can never route a session launch through the runner path.
 # ANCHORED (^r[0-9]+$), matching launch-session.sh: a `case` glob of `r[0-9]*` accepts everything
 # trailing the first digit ("r1; touch ..."), which today is harmless only because $ID reaches
 # nothing but quoted argv. Refuse at the door rather than rest on that downstream accident.

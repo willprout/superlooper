@@ -408,7 +408,9 @@ def test_snapshot_reads_c3_markers(tmp_path):
     (home / "state" / "awaiting" / "i4").write_text("")
     (home / "state" / "activity" / "i4").write_text("")
 
-    issues_state = {"issues": {"i1": {"status": "running"}, "i2": {"status": "blocked"},
+    # i2 is a worker with a question: `running` with a blocked FILE on disk (there is no `blocked`
+    # status — #194); the snapshot's blocked_hash comes off the file, never the status.
+    issues_state = {"issues": {"i1": {"status": "running"}, "i2": {"status": "running"},
                                "i3": {"status": "exited"}, "i4": {"status": "running"}}}
     snaps = {s["id"]: s for s in
              events.snapshot(home, ["i1", "i2", "i3", "i4", "i9"], issues_state, now=5000)}

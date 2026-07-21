@@ -58,7 +58,7 @@ def test_minimal_config_fills_defaults(tmp_path):
     # reviewer/reviewer_effort (issue #158): the cross-reviewer's pin. Unlike worker_effort (null =
     # no flag), BOTH default to concrete non-null values so the review is NEVER invoked bare and
     # never inherits the machine-global ~/.codex/config.toml — the 2026-07-14→15 incident's root cause.
-    assert cfg["models"] == {"worker": "opus[1m]", "answerer": "opus[1m]", "worker_effort": None,
+    assert cfg["models"] == {"worker": "opus[1m]", "debugger": "opus[1m]", "worker_effort": None,
                              "reviewer": "gpt-5.5", "reviewer_effort": "medium"}
     assert cfg["session"] == {"idle_seconds": 480, "freeze_seconds": 2700,
                               "retry_cap": 2, "conflict_cap": 2, "checks_pending_cap": 10800}
@@ -196,7 +196,7 @@ def test_worker_effort_default_is_null_and_settable(tmp_path):
     _write_cfg(tmp_path, {"repo": "a/b", "models": {"worker_effort": "high"}})
     cfg = config.load(tmp_path)
     assert cfg["models"]["worker_effort"] == "high"
-    assert cfg["models"]["worker"] == "opus[1m]" and cfg["models"]["answerer"] == "opus[1m]"
+    assert cfg["models"]["worker"] == "opus[1m]" and cfg["models"]["debugger"] == "opus[1m]"
 
 
 def test_reviewer_model_and_effort_default_and_settable(tmp_path):
@@ -213,13 +213,13 @@ def test_reviewer_model_and_effort_default_and_settable(tmp_path):
     cfg = config.load(tmp_path)
     assert cfg["models"]["reviewer"] == "o4-mini"
     assert cfg["models"]["reviewer_effort"] == "high"
-    assert cfg["models"]["worker"] == "opus[1m]" and cfg["models"]["answerer"] == "opus[1m]"
+    assert cfg["models"]["worker"] == "opus[1m]" and cfg["models"]["debugger"] == "opus[1m]"
 
 
 def test_reviewer_must_be_a_nonempty_string(tmp_path):
     # Unlike worker_effort, reviewer has NO valid null: a null model would omit `-m` and let codex
     # read the machine-global model — exactly the ambient-poison the pin exists to end. So null/blank
-    # fails loud at load, like worker/answerer.
+    # fails loud at load, like worker/debugger.
     for bad in (None, "", "   ", 5):
         _write_cfg(tmp_path, {"repo": "a/b", "models": {"reviewer": bad}})
         with pytest.raises(ValueError) as e:
@@ -496,7 +496,7 @@ def test_bad_nested_field_types_rejected(tmp_path):
     # load, not blow up later in the runner/notify/QA code (cross-review, Task 2).
     bad_cases = [
         {"models": {"worker": False}},          # model name must be a non-empty string
-        {"models": {"answerer": ""}},           # empty string not allowed
+        {"models": {"debugger": ""}},           # empty string not allowed
         {"models": {"worker_effort": ""}},      # null or non-empty string
         {"models": {"worker_effort": 5}},       # null or non-empty string
         {"qa": {"retry_once": "false"}},        # must be a real bool
