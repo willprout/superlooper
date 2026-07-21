@@ -49,7 +49,8 @@ Two layers, because a door can be opened two ways:
 
 **Scanned surface.** Every tracked script in the repo — by extension (``.sh``, ``.bash``, ``.zsh``,
 ``.py``) *and* by shebang, because the load-bearing ones carry no extension at all: the engine CLI
-``skill/bin/superlooper``, ``dashboard/bin/command-center`` and ``dashboard/bin/liftoff`` are
+``skills/superlooper/skill/bin/superlooper``, ``dashboard/bin/command-center`` and
+``dashboard/bin/liftoff`` are
 extensionless ``#!/usr/bin/env python3`` files, and an extension-only sweep would leave the engine's
 own entry point outside the fence. The surface is ``git ls-files`` (with a filesystem walk as the
 fallback for a git-less tree), so it judges exactly what CI checks out — an untracked scratch script
@@ -65,7 +66,17 @@ fixtures, helper scripts — IS scanned.
 does not guard the other places the gated installer writes on its way past (``~/.zshrc`` via
 ``install-launch-shim.sh``, a 755 shim on ``PATH`` via ``install-cli-link.sh``) — those carry no
 engine payload, and both are runnable standalone. That gap is filed as issue #280 rather than
-widened into this issue.
+widened into this issue. It also does not guard ``~/.claude/plugins``: the plugin is the other
+thing that lands under ``~/.claude``, and its own inertness is enforced separately by
+``test_plugin_inert_fence.py``.
+
+And a naming ratchet cannot see a destination that never appears in the repo at all — a path read
+from JSON config, from ``os.environ``, or assembled from fragments (``"." + "claude"``). Nothing
+static can. What it does guarantee is that the door cannot be written *in the open*, which is the
+form every real one has taken. Two narrower limits, accepted rather than fixed: a shell verb hidden
+behind a variable or ``eval`` (``$RSYNC -a …``), and a path held in an attribute or a dict rather
+than a name (``self.dest``, ``cfg["dest"]``), are invisible to the write ban — layer 1 still stops
+them anywhere outside the allow-list.
 
 The ``test_fence_flags_*`` meta-tests construct each violation class from synthetic source and
 assert the fence catches it, so this guard can never rot into a vacuously-green test — the failure
@@ -119,8 +130,17 @@ _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_c
 _SKILL_HOME = re.compile(r"\.claude\W{1,8}?skills\b")
 # The two halves, for the split-path case: a value that reaches `.claude`, and a value that adds
 # `skills` onto one. Neither alone is the installed-skill home; joined across bindings, they are.
-_CLAUDE_DIR = re.compile(r"\.claude\b")
-_SKILLS_WORD = re.compile(r"\bskills\b")
+#
+# `(?![\w.])` keeps `.claude` a PATH segment: without it, `status.claude.com` — which appears in a
+# live engine error string — makes a variable a `.claude` root, and any later mention of the word
+# "skills" would redden the suite over a status-page URL. A fence that cries wolf gets muted, and
+# the muting here would be an allow-list entry on a 900-line engine file.
+_CLAUDE_DIR = re.compile(r"\.claude(?![\w.])")
+# `skills` joined onto a `.claude` root has to be joined, not merely co-located: `$ROOT/skills/…`
+# in shell, a string literal carrying `skills` in Python. Otherwise a log line that writes to
+# `~/.claude/settings.json` and happens to say the word "skills" reads as a publish.
+_SH_JOINS_SKILLS = r"\$\{?%s\}?[^\s\"'`;|&]*/skills\b"
+_PY_JOINS_SKILLS = re.compile(r"['\"][^'\"]*skills")
 
 # Names that already RESOLVE to the install dir. Borrowing one of these from an allow-listed module
 # is a way to reach the installed-skill home without ever spelling it, so they count as naming it.
@@ -149,7 +169,7 @@ _SH_REDIRECT = re.compile(r"(?<![<>&=-])>>?(?![&|])(?!\s*/dev/null)")
 _PY_WRITE_FUNCS = frozenset({
     "open", "makedirs", "mkdir", "replace", "rename", "remove", "unlink", "rmdir",
     "copy", "copy2", "copyfile", "copytree", "move", "rmtree", "symlink", "link",
-    "write_text", "write_bytes", "touch", "unpack_archive", "extractall",
+    "write_text", "write_bytes", "touch", "unpack_archive", "make_archive", "extractall",
 })
 # Calls that shell out. These write only if the command they carry writes — `subprocess.run(["git",
 # "log", path])` over the installed VERSION is a read, and flagging it would push a maintainer to
@@ -241,7 +261,17 @@ def _mentions_home(text):
 
 # --------------------------------------------------------------- resolving bindings
 
-def _taint(bindings, seed_home=(), seed_root=()):
+def _sh_joined(text, roots):
+    """Shell: does ``text`` continue one of ``roots`` into a `skills` path segment?"""
+    return any(re.search(_SH_JOINS_SKILLS % re.escape(r), text) for r in roots)
+
+
+def _py_joined(text, _roots):
+    """Python: does ``text`` carry `skills` in a string literal (a path piece, not prose)?"""
+    return bool(_PY_JOINS_SKILLS.search(text))
+
+
+def _taint(bindings, joined, seed_home=(), seed_root=()):
     """``(home, root)`` name sets, given ``{name: (value_text, refs)}``.
 
     A path spelled in halves is the cheapest way around a literal check, so taint propagates over
@@ -271,19 +301,19 @@ def _taint(bindings, seed_home=(), seed_root=()):
                 changed = True
             if name in home:
                 continue
-            if (refs & home) or (refs & root and _SKILLS_WORD.search(text)):
+            if (refs & home) or (refs & root and joined(text, refs & root)):
                 home.add(name)
                 changed = True
     return home, root
 
 
-def _resolves(text, refs, home, root):
+def _resolves(text, refs, home, root, joined):
     """Does this fragment reach the installed-skill home — spelled, or joined on the spot?"""
     if _mentions_home(text):
         return True
     if refs & home:
         return True
-    return bool(refs & root) and bool(_SKILLS_WORD.search(text))
+    return bool(refs & root) and joined(text, refs & root)
 
 
 # --------------------------------------------------------------- shell write detection
@@ -316,31 +346,53 @@ def _sh_taints(lines):
         m = _SH_ASSIGN.match(line)
         if m:
             values[m.group(1)] = values.get(m.group(1), "") + " " + m.group(2)
-    return _taint({n: (v, set(_SH_REF.findall(v))) for n, v in values.items()})
+    return _taint({n: (v, set(_SH_REF.findall(v))) for n, v in values.items()}, _sh_joined)
 
 
 def _sh_lines(text):
-    return [_strip_sh_comment(l) for l in text.splitlines()]
+    """Comment-stripped logical lines: a `\\`-continued command is ONE line.
+
+    Splitting on newlines alone would let the most ordinary formatting hide a write —
+    ``rsync -a "$SRC"/ \\`` / ``  "$HOME/.claude/skills/superlooper"/`` puts the verb and the
+    target on different physical lines. Line numbers stay those of the line the command STARTS on.
+    """
+    out = []
+    pending, start = None, 0
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = _strip_sh_comment(raw)
+        if pending is None:
+            pending, start = line, n
+        else:
+            pending += " " + line.strip()
+        if pending.rstrip().endswith("\\"):
+            pending = pending.rstrip()[:-1]
+            continue
+        out.append((start, pending))
+        pending = None
+    if pending is not None:
+        out.append((start, pending))
+    return out
 
 
 def _sh_names_home(text):
     lines = _sh_lines(text)
     if _mentions_home(text):
         return True
-    home, root = _sh_taints(lines)
-    return any(_resolves(l, set(_SH_REF.findall(l)), home, root) for l in lines)
+    home, root = _sh_taints([l for _n, l in lines])
+    return any(_resolves(l, set(_SH_REF.findall(l)), home, root, _sh_joined)
+               for _n, l in lines)
 
 
 def _sh_offences(text):
     """Lines in a shell script that write to the installed-skill home — spelled outright, reached
     through a variable, or joined onto a `.claude`-rooted variable right at the write."""
     lines = _sh_lines(text)
-    home, root = _sh_taints(lines)
+    home, root = _sh_taints([l for _n, l in lines])
     hits = []
-    for n, line in enumerate(lines, 1):
+    for n, line in lines:
         if not (_SH_WRITE.search(line) or _SH_REDIRECT.search(line)):
             continue
-        if _resolves(line, set(_SH_REF.findall(line)), home, root):
+        if _resolves(line, set(_SH_REF.findall(line)), home, root, _sh_joined):
             hits.append((n, line.strip()))
     return hits
 
@@ -452,7 +504,30 @@ def _py_scope_taints(scope, inherited_home, inherited_root):
         for name in names:
             prev = bindings.get(name, ("", set()))
             bindings[name] = (prev[0] + " " + src, prev[1] | refs)
-    return _taint(bindings, seed_home=inherited_home, seed_root=inherited_root)
+    home, root = _taint(bindings, _py_joined, seed_home=inherited_home, seed_root=inherited_root)
+
+    # A resolver is as good as the path it returns. `dashboard/lib/engine.py` defines
+    # `install_dir()` AND is allow-listed, so layer 2 is its only guard — and a publish helper
+    # there would most naturally call the local resolver by its bare name. Promote any function in
+    # this scope whose own `return` resolves the home, then re-run the fixpoint so callers and
+    # everything bound from them are tainted too.
+    promoted = set()
+    for node in _own_scope_nodes(scope):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        inner_home, inner_root = _py_scope_taints(node, home, root)
+        for ret in _own_scope_nodes(node):
+            if not isinstance(ret, ast.Return) or ret.value is None:
+                continue
+            src = ast.unparse(ret.value)
+            refs = {n.id for n in ast.walk(ret.value) if isinstance(n, ast.Name)}
+            if _resolves(src, refs, inner_home, inner_root, _py_joined):
+                promoted.add(node.name)
+                break
+    if promoted:
+        home, root = _taint(bindings, _py_joined,
+                            seed_home=home | promoted, seed_root=root)
+    return home, root
 
 
 def _py_scan(scope, inherited_home, inherited_root, write_names, hits, seen):
@@ -460,13 +535,21 @@ def _py_scan(scope, inherited_home, inherited_root, write_names, hits, seen):
     # locals must not leak sideways into its siblings, or one honest helper taints the whole module
     # and the fence starts crying wolf. ``seen`` accumulates what the naming ratchet needs.
     home, root = _py_scope_taints(scope, inherited_home, inherited_root)
-    seen["home"] |= home
-    seen["root"] |= root
+    if home - set(inherited_home):
+        seen["named"] = True
 
     for node in _own_scope_nodes(scope):
         if isinstance(node, ast.Call):
             name = _call_name(node.func)
             src = ast.unparse(node)
+            names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+            # Every call is checked for NAMING (an `os.path.join(CLAUDE, "skills", …)` anywhere
+            # resolves the home whether or not it writes) — the ratchet decides per file, and
+            # deciding it on real expressions beats "a `.claude` root and the word skills both
+            # appear somewhere in this file", which a status-page URL could satisfy.
+            resolved = _resolves(src, names, home, root, _py_joined)
+            if resolved:
+                seen["named"] = True
             if name in _PY_SUBPROCESS_FUNCS:
                 if not (_SH_WRITE.search(src) or _ARGV_WRITE.search(src)):
                     continue
@@ -475,8 +558,7 @@ def _py_scan(scope, inherited_home, inherited_root, write_names, hits, seen):
                     continue
             else:
                 continue
-            names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
-            if _resolves(src, names, home, root):
+            if resolved:
                 hits.append((getattr(node, "lineno", 0), src.splitlines()[0][:120]))
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             _py_scan(node, home, root, write_names, hits, seen)
@@ -496,12 +578,7 @@ def _py_names_home(text):
     tree = _py_parse(text)
     if tree is None:
         return False
-    seen = _py_scan(tree, set(), set(), _PY_WRITE_FUNCS, [], {"home": set(), "root": set()})
-    if seen["home"]:
-        return True
-    # The ratchet decides per FILE, so a `.claude`-rooted name plus the word `skills` anywhere in
-    # the module is the right granularity — the second half of the path need not be a binding.
-    return bool(seen["root"]) and bool(_SKILLS_WORD.search(text))
+    return bool(_py_scan(tree, set(), set(), _PY_WRITE_FUNCS, [], {"named": False})["named"])
 
 
 def _py_offences(text):
@@ -513,7 +590,7 @@ def _py_offences(text):
         return []
     hits = []
     _py_scan(tree, set(), set(), _PY_WRITE_FUNCS | _py_write_aliases(tree), hits,
-             {"home": set(), "root": set()})
+             {"named": False})
     return hits
 
 
@@ -742,6 +819,58 @@ def test_fence_follows_bindings_that_are_not_plain_assignment():
     # The write ban is the ONLY guard on the allow-listed files, so it cannot only understand `=`.
     assert _py_offences(_UNGATED_PY_AUGASSIGN), "an augmented assignment still binds the path"
     assert _py_offences(_UNGATED_PY_PATHLIB_OPEN), "pathlib's `p.open('w')` is a write"
+
+
+_UNGATED_SH_CONTINUED = """#!/usr/bin/env bash
+rsync -a --delete "$SRC"/ \\
+  "$HOME/.claude/skills/superlooper"/
+"""
+
+_UNGATED_PY_HELPER_RETURN = """import os, shutil
+def install_dir(cli):
+    return os.path.join(os.path.dirname(os.path.dirname(cli)), ".claude", "skills", "superlooper")
+def republish(payload, cli):
+    shutil.copytree(payload, install_dir(cli), dirs_exist_ok=True)
+"""
+
+_STATUS_URL_PY = """REMEDIES = {
+    "auth": "Check status.claude.com and the machine's network before retrying.",
+}
+def summarize():
+    # the skills the loop can run are listed elsewhere
+    return REMEDIES["auth"]
+"""
+
+_SETTINGS_LOG_SH = """#!/usr/bin/env bash
+S="$HOME/.claude/settings.json"
+echo "wrote hooks to $S (skills are published separately)" > "$S.log"
+"""
+
+
+def test_fence_joins_shell_line_continuations():
+    # The most ordinary formatting there is: verb on one physical line, target on the next.
+    assert _sh_offences(_UNGATED_SH_CONTINUED), (
+        "a `\\`-continued rsync must be read as one command")
+
+
+def test_fence_follows_a_helper_that_returns_the_path():
+    # dashboard/lib/engine.py both DEFINES install_dir() and is allow-listed, so layer 2 is its
+    # only guard — and a publish helper there would call the local resolver by its bare name.
+    assert _py_offences(_UNGATED_PY_HELPER_RETURN), (
+        "a function whose return resolves the home must taint its call sites")
+
+
+def test_fence_is_not_fooled_by_a_status_page_url():
+    # `status.claude.com` is in a live engine error string. If that made a value a `.claude` root,
+    # the word "skills" anywhere in the same file would redden CI over a status page — and the
+    # only way out would be an allow-list entry on a 900-line engine module.
+    assert not _py_names_home(_STATUS_URL_PY), "a hostname is not a path into ~/.claude"
+
+
+def test_fence_does_not_read_the_word_skills_in_prose_as_a_path():
+    # Writing a log beside ~/.claude/settings.json is not publishing, however the message reads.
+    assert not _sh_offences(_SETTINGS_LOG_SH), (
+        "`skills` must be JOINED onto the .claude root, not merely mentioned near it")
 
 
 def test_fence_stays_quiet_on_existence_probes():
