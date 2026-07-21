@@ -92,7 +92,9 @@ state = pane_state.classify_screen(
 print(state)
 # Line 2 is the AUTH-DEATH VARIANT (issue #174), and is emitted ONLY for logged_out — an auth
 # verdict printed beside any other state would be a reader trap. Blank when the state is anything
-# else, or when the banner matched only a generic net whose tail was wrapped away.
+# else. It is NEVER blank for a logged_out state: classify_screen and auth_death_variant read the
+# same table, so a logged_out verdict always has a variant. The blank case exists for the READER
+# (a state that is not logged_out), not for a banner we half-recognised (fresh-review P2-6).
 print(pane_state.auth_death_variant(raw) or "" if state == "logged_out" else "")
 print("---8<--- screen ---8<---")
 print(evidence.bound(raw, limit=evidence.SCREEN_SNIPPET_MAX))

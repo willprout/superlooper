@@ -4772,17 +4772,22 @@ def test_quiet_hours_helper_windows_and_disable():
 # sensed off the pane is what makes the body correct.
 
 AUTH_REMEDY_CASES = [
-    # (variant, a phrase the body MUST contain, a phrase it must NOT contain)
-    ("invalid_api_key", "ANTHROPIC_API_KEY", None),
-    ("api_key_org_disabled", "ANTHROPIC_API_KEY", None),
-    ("org_api_key_disabled", "/login", None),
-    ("subscription_disabled", "admin", None),
-    ("apikey_helper_failing", "apiKeyHelper", None),
-    ("gateway_auth", "gateway", None),
-    ("oauth_revoked", "revoked", None),
-    ("login_remote", "CLAUDE_CODE_REMOTE", None),
-    ("auth_error", "transient", None),
-    ("login", "/login", None),
+    # (variant, a phrase the body MUST contain). Each phrase is chosen to be absent from the
+    # GENERIC fallback body — fresh-review P2-3: the first cut asserted "/login" for two variants,
+    # which the fallback also contains, so those two rows passed with the whole variant plumbing
+    # ripped out. Every row below now fails if the variant does not reach the body.
+    ("invalid_api_key", "EXTERNAL API key"),
+    ("api_key_org_disabled", "DISABLED organization"),
+    ("org_api_key_disabled", "disabled API-key authentication"),
+    ("subscription_disabled", "ask your admin"),
+    ("apikey_helper_failing", "apiKeyHelper"),
+    ("gateway_auth", "gateway"),
+    ("oauth_revoked", "revoked or expired server-side"),
+    ("login_remote", "CLAUDE_CODE_REMOTE"),
+    ("auth_error", "transient"),
+    ("no_account_access", "does not have access"),
+    ("cloud_credentials", "BEDROCK / VERTEX"),
+    ("login", "subscription login is gone"),
 ]
 
 
@@ -4793,12 +4798,31 @@ def _alert_body(**ist_over):
 
 
 def test_each_auth_variant_gets_its_own_remedy_in_the_alert_body():
-    for variant, must, must_not in AUTH_REMEDY_CASES:
+    generic = _alert_body(sensed_state="logged_out")          # no variant -> the fallback body
+    for variant, must in AUTH_REMEDY_CASES:
         body = _alert_body(sensed_state="logged_out", sensed_auth=variant)
         assert "i5" in body, variant
         assert must in body, f"{variant}: body must name {must!r}; got {body!r}"
-        if must_not:
-            assert must_not not in body, variant
+        assert must not in generic, (
+            f"{variant}: {must!r} is also in the GENERIC body, so this row proves nothing")
+        assert body != generic, variant
+
+
+def test_every_variant_pane_state_can_emit_has_a_remedy_written_for_it():
+    """FRESH-REVIEW P2-2. AUTH_REMEDY_CASES above is a hand-maintained list, so adding a variant to
+    pane_state without adding a remedy here would silently degrade that banner's alert to the
+    generic body with no test failing — the exact 'a forgotten member is SILENT' failure the
+    one-state design argues against, displaced one layer up. This ties the two together
+    mechanically: the classifier's variant vocabulary IS the remedy table's key set."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "skill", "lib"))
+    import pane_state
+    emitted = {v for v, _pat in pane_state._LOGGED_OUT_PATTERNS}
+    written = {k for k in actions.AUTH_DEATH_REMEDIES if k is not None}
+    assert emitted <= written, f"variants with no remedy written: {sorted(emitted - written)}"
+    assert written <= emitted, f"remedies for variants nothing emits: {sorted(written - emitted)}"
+    covered = {v for v, _m in AUTH_REMEDY_CASES}
+    assert emitted <= covered, f"variants with no alert-body test: {sorted(emitted - covered)}"
 
 
 def test_the_api_key_variants_do_not_tell_the_owner_to_run_login():
@@ -4838,7 +4862,7 @@ def test_every_auth_variant_still_refuses_to_park_or_nudge_the_lane(monkeypatch)
     the identical never-park/never-type treatment, and no guard downstream has to enumerate them.
     A variant that slipped past one of these guards would be parked with a memo naming the wrong
     cause — worse than the silence it replaced."""
-    for variant, _must, _mn in AUTH_REMEDY_CASES:
+    for variant, _must in AUTH_REMEDY_CASES:
         d = disk(issues_state={"version": 1,
                                "issues": {"i5": ist("running", sensed_state="logged_out",
                                                     sensed_auth=variant)}},

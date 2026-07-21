@@ -546,15 +546,27 @@ def test_auth_death_variants_require_the_claude_agent_path():
         assert ps.classify_screen(banner, agent="codex") != "logged_out", banner
 
 
-def test_the_generic_login_suffix_net_catches_a_render_this_list_has_not_seen():
-    """The bundle carries its own normalizer for these banners, and its regexes say the stable
-    shapes are `Please run /login · <detail>`, `Failed to authenticate. <detail>` and
-    `<detail> · Please run /login`. Anchoring those shapes too means the NEXT renamed variant is
-    caught on arrival instead of silently reopening i336 until someone greps the binary again."""
+def test_the_bundles_own_generic_render_shapes_are_anchored_too():
+    """Claude Code carries its own normalizer for these banners, and its regexes name the stable
+    generic shapes: `^Please run /login \xB7 `, `^Failed to authenticate\\. ` and `^Not logged in$`.
+    Those shapes are anchored so a renamed variant is caught on arrival.
+
+    Their tails are pinned to "API Error" rather than left open. That is the fresh review's P1-2/P1-3
+    lesson: an open tail on an ordinary English head ("Failed to authenticate: ...") fires on half
+    the tool output a worker's own screen carries, and the false positive is NOT self-clearing."""
     for screen in ("Please run /login · API Error: 401 unauthorized",
                    "Failed to authenticate. API Error: 403 forbidden",
-                   "Credential handoff went sideways · Please run /login"):
+                   "Not logged in"):
         assert ps.classify_screen(screen) == "logged_out", screen
+
+
+def test_the_open_headed_suffix_net_is_gone():
+    """It was the only pattern here with a free HEAD, and the fresh review showed what that costs:
+    Claude Code's markdown renderer strips inline-code backticks, so a reviewer's own sentence about
+    this feature renders as a bare `<something> · Please run /login` line and disables the lane of
+    the worker discussing it. Dropping it costs a hypothetical future variant; keeping it cost a
+    demonstrated false positive on the very screen this code runs under."""
+    assert ps.classify_screen("Credential handoff went sideways · Please run /login") != "logged_out"
 
 
 # --- the fences: these must NOT fire ------------------------------------------------------------
@@ -605,15 +617,24 @@ def test_the_classifier_still_does_not_fire_on_this_repo_s_own_source():
     stay false now that the family is ten times larger and the alert bodies quote the banners."""
     import os
     here = os.path.dirname(__file__)
+    # Every file that now carries the banner literals — the fresh review (P2-5) caught the first
+    # cut omitting the three test files and the fixture README, which is where most of the literals
+    # actually live.
     targets = [os.path.join(here, "..", "skill", "lib", "pane_state.py"),
                os.path.join(here, "..", "skill", "lib", "actions.py"),
                os.path.join(here, "..", "skill", "bin", "runner.py"),
                os.path.join(here, "..", "skill", "bin", "nudge-pane.sh"),
-               os.path.join(here, "test_pane_state.py")]
+               os.path.join(here, "test_pane_state.py"),
+               os.path.join(here, "test_actions.py"),
+               os.path.join(here, "test_nudge_pane.py"),
+               os.path.join(here, "test_runner.py"),
+               os.path.join(here, "fixtures", "screens", "README.md")]
     for path in targets:
         with open(path) as f:
             lines = f.read().splitlines()
-        for i in range(0, max(1, len(lines) - 40)):
+        # range end is len-39, not len-40: the last window must REACH the final line (P2-5). With
+        # len-40 the sweep stopped one line short and never looked at the end of any file.
+        for i in range(0, max(1, len(lines) - 39)):
             window = "\n".join(lines[i:i + 40])
             state = ps.classify_screen(window)
             assert state not in ("logged_out", "at_dialog"), (
@@ -642,3 +663,84 @@ def test_a_real_healthy_pane_carrying_auth_warnings_is_still_idle():
                  "⚠ 4 MCP servers need authentication · run /mcp"):
         assert ps.classify_screen(line) == "idle", line
         assert ps.auth_death_variant(line) is None, line
+
+
+# --- fresh-review P1s (issue #174) --------------------------------------------------------------
+
+def test_a_clipped_banner_still_refuses_at_a_narrow_pane_width():
+    """FRESH-REVIEW P1-1. The first cut required whitespace AFTER the separator, so any wrap or
+    clip that landed the separator at end-of-line killed the match outright and the screen went
+    back to reading 'idle' — i336 restored, silently, on the exact members this issue exists for.
+
+    It is not hypothetical: the reviewer measured it at a plain 80 columns with the message list's
+    normal 2-character indent, where 'Your organization has disabled Claude subscription access for
+    Claude Code ·' is the whole first line. And several of these render inside a fixed-height box in
+    the bundle, so they CLIP — the tail is gone entirely, not pushed to a second line.
+
+    The long heads are unmistakable on their own, so they now match head-only too."""
+    heads = [
+        ("Your organization has disabled Claude subscription access for Claude Code",
+         "subscription_disabled"),
+        ("Your organization has disabled API key authentication", "org_api_key_disabled"),
+        ("Your ANTHROPIC_API_KEY belongs to a disabled organization", "api_key_org_disabled"),
+        ("Your apiKeyHelper script is failing", "apikey_helper_failing"),
+        ("OAuth token revoked", "oauth_revoked"),
+        ("Invalid API key", "invalid_api_key"),
+    ]
+    for head, variant in heads:
+        for line in (head, head + " ·", head + " · ", f"  {head} ·"):
+            assert ps.classify_screen(line) == "logged_out", repr(line)
+            assert ps.auth_death_variant(line) == variant, repr(line)
+
+
+def test_the_full_family_survives_a_hard_clip_at_every_realistic_width():
+    """The same P1-1 defect, swept rather than spot-checked: clip each banner to every width a real
+    pane could have and assert it never reads as safe-to-send."""
+    for banner, _variant in AUTH_DEATH_BANNERS:
+        for width in (80, 100, 120):
+            clipped = banner[:width].rstrip()
+            assert ps.classify_screen(clipped) == "logged_out", f"{width}: {clipped!r}"
+
+
+def test_unrelated_tool_output_mentioning_authentication_is_not_claude_auth_death():
+    """FRESH-REVIEW P1-2, the false-positive direction, and the expensive one. A worker's own screen
+    is full of tool results — a curl against a registry, a failing deploy — and '⎿' is stripped as
+    TUI chrome, so a bash result line reduces to a bare English sentence. None of these say anything
+    about CLAUDE's auth, and refusing on one holds a working lane.
+
+    The cost is worse than 'one self-clearing cycle': decide suppresses the park and the only
+    follow-up is a recover that nudge-pane refuses to type into — so nothing ever writes to the
+    pane, the offending line never scrolls out of the 40-line window, and the alert stands until a
+    human intervenes. That is why the separator class is now only what Claude Code actually renders
+    ('·' and the ':'/'.' the two 'Failed to authenticate' forms use) and why the open-tailed
+    'Failed to authenticate' net was replaced by its two real shapes."""
+    for screen in (
+        "⎿  Failed to authenticate: bad credentials",
+        "⎿  Failed to authenticate. Retrying in 5s",
+        "Failed to authenticate: 401 from the artifact registry",
+        "OAuth token revoked - see the runbook",
+        "Authentication error - try again",
+        "⎿  Invalid API key - the deploy token expired",
+        "Login expired - re-run the fixture generator",
+    ):
+        assert ps.classify_screen(screen) != "logged_out", screen
+        assert ps.auth_death_variant(screen) is None, screen
+
+
+def test_rendered_markdown_prose_about_this_feature_is_not_a_banner():
+    """FRESH-REVIEW P1-3, and the sharpest one: the source fence tests RAW files, where quotes and
+    backticks are still present — but Claude Code's markdown renderer strips inline-code backticks
+    before drawing the line, and '⏺' (the assistant-message prefix) is stripped as chrome. So a
+    sentence a reviewer of this very PR would plausibly write renders as a bare banner-shaped line.
+
+    The generic '<anything> · Please run /login' suffix net was the only pattern here with an open
+    HEAD, and this is what it cost: the worker assigned this issue disabling its own lane while
+    talking about the fix. It is gone. Every remaining pattern is anchored on a verified head
+    clause, which is #151's discipline and the reason that fence held for two issues."""
+    for screen in (
+        "⏺ I anchored the generic suffix net on · Please run /login",
+        "⏺ The banner reads Not logged in · Please run /login when auth dies",
+        "the shape is <detail> · Please run /login and it is now gone",
+        "⏺ see the table: variant login · Please run /login",
+    ):
+        assert ps.classify_screen(screen) != "logged_out", screen

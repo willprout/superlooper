@@ -313,8 +313,10 @@ ALERT_MESSAGES = {
 #
 # Each entry states the fault first and the action second, and is written for someone reading a
 # phone notification at 3am with no context. Keyed by pane_state's variant keys; None is the
-# fallback for a banner caught by pane_state's generic nets whose tail was wrapped away, and it
-# must stay useful on its own — an unknown variant is not a reason to say nothing.
+# fallback for a reading that reached us with NO variant — which cannot happen from the pane
+# (classify_screen and auth_death_variant read the same table, so a logged_out verdict always
+# has a variant) but does happen when the stderr carrying it was lost or a stubbed rc captured
+# nothing. It must stay useful on its own: an unknown variant is not a reason to say nothing.
 AUTH_DEATH_REMEDIES = {
     None: ("The specific banner was not recognised, so the remedy cannot be named from this "
            "reading — open the tab and read the screen. Most often it is the subscription login: "
@@ -353,10 +355,21 @@ AUTH_DEATH_REMEDIES = {
     "gateway_auth": ("The API gateway could not authenticate with its upstream provider. Nothing "
                      "local fixes this — not /login, not the key. Contact whoever administers the "
                      "gateway."),
-    "auth_error": ("Claude Code reported an authentication error it believes may be transient "
-                   "(network). The lane is held rather than nudged because the pane cannot answer "
-                   "while it stands. Check status.claude.com and the machine's network first; if "
-                   "it persists past a few minutes, treat it as real auth death and re-login."),
+    "auth_error": ("Claude Code reported an authentication error it calls possibly transient "
+                   "(network). Treat that wording with suspicion: in the bundle this is also the "
+                   "CATCH-ALL for every 401/403 in a remote environment, not only network blips, "
+                   "so it may be ordinary dead auth wearing a softer label. The lane is held rather "
+                   "than nudged because the pane cannot answer while it stands. Check "
+                   "status.claude.com and the machine's network first; if it persists past a few "
+                   "minutes, treat it as real auth death and re-login."),
+    "no_account_access": ("The account has no access to Claude at all — 'Your account does not "
+                          "have access to Claude'. Re-logging in may help if the wrong account is "
+                          "signed in; otherwise this needs an administrator, not a retry."),
+    "cloud_credentials": ("The BEDROCK / VERTEX credential path is dead (an AWS or Google Cloud "
+                          "credential expired, or its auth failed) — this session is not on the "
+                          "claude.ai subscription at all, so /login is not the fix. Refresh the "
+                          "cloud credentials (`aws sso login` / `gcloud auth application-default "
+                          "login`) and check the role still has model access."),
 }
 
 

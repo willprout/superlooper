@@ -3196,6 +3196,7 @@ class Runner:
             i["last_recover_at"] = None            # a later re-freeze nudges fresh, not on a stale clock
             i["sensed_state"] = None               # a working lane: drop any frozen-era screen reading
             i["sensed_since"] = None
+            i["sensed_auth"] = None                # (#174) the variant has exactly sensed_state's life
         self._update_issue(iid, fn=m)
         _rm(os.path.join(self.state, "ack", iid))  # the fresh episode: any old probe ack is moot
         return f"un-latched frozen -> running ({a.get('evidence_class') or 'progress clock advanced'})"
