@@ -1969,9 +1969,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         #   * a real PR number. Answered-empty ({}) is the NORMAL mid-build state — the worker has
         #     not pushed yet — so it means KEEP BUILDING. It is never "no PR exists", never a park.
         #   * not `superseded` — a belt-and-braces guard mirroring the orphan sweep's own rule. In
-        #     practice a superseded PR cannot BE the active branch's answer (regenerate stamps the
-        #     new branch before it ever labels the old PR), so this should never fire; it costs one
-        #     condition to stay correct if that ordering is ever relaxed.
+        #     practice a superseded PR cannot BE the active branch's answer: regenerate stamps the
+        #     new branch before it ever labels the old PR, and reapprove's rotation (#177) has the
+        #     same ordering — the branch is written in the state reset, the old PR is labelled after.
+        #     So this should never fire; it costs one condition to stay correct if that is relaxed.
         if status in INFLIGHT_STATUSES and not gh_stale and iid in prs:
             pv = prs.get(iid) if isinstance(prs.get(iid), dict) else {}
             pr_num = pv.get("number")

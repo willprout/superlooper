@@ -847,9 +847,10 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
     # ship_cmd (else review_evidence_ok would be True), so the comments read is genuinely load-
     # bearing. A CLEAN read — a real list, even empty — keeps the nudge->park ladder intact; only
     # an unreadable/absent read waits, mirroring step-3's unreadable-files WAIT.
-    # The verdict must also PIN the diff it reviewed (issue #154): any push after the comment —
-    # a re-push to the same PR, or (before #177 rotated the branch) a reapproved rebuild landing on
-    # the preserved one — outlives the code it vouched for and would merge work no reviewer saw.
+    # The verdict must also PIN the diff it reviewed (issue #154): any push after the verdict is
+    # posted — a re-push to the same PR, or (before #177 rotated the branch) a reapproved rebuild
+    # landing on the preserved one — moves the head out from under it, so an unpinned verdict
+    # outlives the code it vouched for and would merge work no reviewer saw.
     # A pin for a superseded head is not evidence — it takes the same
     # nudge->park ladder as no evidence at all, under its own key so each cause gets its one nudge.
     rstate = review_evidence_state(cfg, pv.get("comments"), pv.get("headRefOid"),

@@ -2885,14 +2885,18 @@ def test_reapprove_records_the_retirement_on_the_issue_even_with_no_pr(rig, monk
     rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
     ic = [m for m in mutations(rig) if m["kind"] == "comment"]
     assert ic and "sl/i5-x-r1" in ic[-1]["body"] and "sl/i5-x" in ic[-1]["body"]
+    # ...as the RUNNER's own marked bookkeeping: un-marked, brief.build would render it in the
+    # rebuilt session's brief under the binding-owner-amendment header (#163's rule).
+    assert ic[-1]["body"].startswith(runner_mod.REBUILD_MARKER)
+    assert runner_mod.REBUILD_MARKER.startswith(runner_mod.brief._MARKER_PREFIX)
 
 
 def test_reapprove_never_reports_a_supersede_that_did_not_land(rig, monkeypatch):
-    """Nothing retries this bookkeeping — the reset has already dropped `pr`, decide will not
-    re-emit a completed reapprove, and the janitor only ever sees a PR through the `superseded`
-    LABEL. So a failed label write must reach the journal as a failure, never as a silent
-    'superseded PR #N' (the #165 inert-label trap: a repo that never re-ran `adopt` has no such
-    label and `gh pr edit` hard-fails)."""
+    """Nothing retries this bookkeeping — the reset has already dropped `pr` and left
+    REAPPROVAL_STATUSES, so decide will not re-emit, and the janitor only ever sees a PR through the
+    `superseded` LABEL. A failed label write must therefore reach the journal as a NAMED failure,
+    never as 'superseded PR #N' (the #165 inert-label trap: a repo that never re-ran `adopt` has no
+    such label and `gh pr edit` hard-fails)."""
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
     monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
                         lambda b: runner_mod.gh.PrRead(
@@ -2900,8 +2904,53 @@ def test_reapprove_never_reports_a_supersede_that_did_not_land(rig, monkeypatch)
     monkeypatch.setattr(runner_mod.gh, "pr_add_labels", lambda n, labels: False)
     seed_issue(rig, "i5", status="parked", branch="sl/i5-x", pr=555)
     out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
-    assert "incomplete" in out and "superseded" in out
+    assert "superseded PR #555" not in out, "a label that never landed must not read as done"
+    assert "incomplete" in out and "`superseded` label on PR #555" in out
     assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"       # the rebuild still gets its branch
+
+
+def test_reapprove_names_which_write_failed_not_a_generic_incomplete(rig, monkeypatch):
+    """The outcome is the only record of what did not land, so it must point at the right thing: a
+    failed ISSUE comment on a PR-less lane must not be reported as a PR that may lack `superseded`
+    (the misattribution the fresh review caught)."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _no_pr(monkeypatch)
+    monkeypatch.setattr(runner_mod.gh, "comment", lambda n, body: False)
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x")
+    out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert "retirement comment on issue #5" in out
+    assert "superseded" not in out, "there is no PR here to say anything about"
+
+
+def test_reapprove_treats_a_refused_pr_read_as_unfinished_never_as_no_pr(rig, monkeypatch):
+    """#61's refused != empty discipline, at the one place it decides whether an OPEN PR is left
+    unlabelled forever. A refused lookup must not report a clean no-PR retirement — it looked at
+    nothing, and nothing retries it."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: runner_mod.gh.PrRead({}, False))
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", pr=555)
+    out = rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert "incomplete" in out and "refused" in out
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"       # the rotation still lands
+    # ...and the owner-facing comment says the same thing rather than asserting a clean sweep
+    ic = [m for m in mutations(rig) if m["kind"] == "comment"]
+    assert ic and "could not be read" in ic[-1]["body"]
+
+
+def test_reapprove_of_an_investigation_does_no_pr_bookkeeping(rig, monkeypatch):
+    """An investigation opens no PR by contract, so the lookup is the pure waste #21 refuses
+    elsewhere and a branch-retirement notice is noise on the owner's issue. It still rotates — the
+    naming invariant has no per-type carve-out."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    looked = []
+    monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
+                        lambda b: looked.append(b) or runner_mod.gh.PrRead({}, True))
+    seed_issue(rig, "i5", status="parked", branch="sl/i5-x", type="investigate")
+    rig.r._execute({"act": "reapprove", "id": "i5", "num": 5}, NOW)
+    assert looked == [], "an investigation has no PR to look up"
+    assert not [m for m in mutations(rig) if m["kind"] == "comment"]
+    assert issue_state(rig, "i5")["branch"] == "sl/i5-x-r1"
 
 
 def test_reapprove_never_supersedes_a_pr_that_is_not_open(rig, monkeypatch):
@@ -2920,7 +2969,8 @@ def test_reapprove_never_supersedes_a_pr_that_is_not_open(rig, monkeypatch):
 def test_reapprove_rotates_even_when_the_pr_lookup_is_refused(rig, monkeypatch):
     """A refused lookup (the GraphQL dead zone) must never hold back the rotation: the rebuild's
     fresh branch is the safety property, the supersede bookkeeping is best-effort. The old PR is
-    left unlabelled — visible to the owner rather than silently mis-swept."""
+    left unlabelled — visible to the owner rather than silently mis-swept. (What the outcome must
+    SAY about that is pinned by test_reapprove_treats_a_refused_pr_read_as_unfinished... below.)"""
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
     monkeypatch.setattr(runner_mod.gh, "pr_for_branch",
                         lambda b: runner_mod.gh.PrRead({}, False))
