@@ -38,6 +38,9 @@ What this lint does NOT cover, stated so nobody reads more into it than it does:
     nothing distinguishes a doctor block name from an ordinary backticked phrase without a registry
     of retired names to compare against.
   * **Invented BARE labels** (`needs-attention`) — see ``documented_labels``.
+  * **Repo paths under `bin/` and `docs/`** — those two prefixes are ambiguous in these docs (they
+    are also payload- and installed-home-relative), so citations of `bin/install.sh` and
+    `docs/ADOPTING.md` go unchecked. See ``_REPO_TOP_DIRS``.
 
 Three properties keep the lint from rotting into decoration:
 
@@ -90,6 +93,11 @@ def live_verbs(cli_path=None):
     (``seen.add(fp)``, ``out.add(name)``); those take non-literals today, but one future
     ``some_set.add("foo")`` would otherwise silently mint a verb ``foo`` that the lint would then
     accept in any ops doc. A manifest that can be widened by an unrelated line is not a manifest.
+
+    The converse matters too: a verb registered by some other form — ``sub.add_parser("x")``
+    directly, or an alias table — drops OUT of the manifest, and the lint then rejects a doc naming
+    a perfectly real verb. That failure is loud and points at the doc rather than at the extractor,
+    so if a ``superlooper <verb>`` assertion ever fails on a verb that plainly exists, look here.
     """
     src = Path(cli_path or _CLI).read_text(encoding="utf-8")
     found = set()
@@ -298,6 +306,14 @@ def label_families(live):
 
 def _label_candidates(span, retired, families):
     for tok in _LABEL_TOKEN_RE.findall(span):
+        # Strip sentence punctuation the token class swallows. `.` has to be IN the class (labels
+        # can carry one, and a version-ish value must not be split), so a name ending a sentence
+        # arrives as `needs-william.` and would otherwise match nothing — the single most common
+        # shape in prose, and the exact shape of the approval-protocol.md sentence this lint was
+        # written to catch.
+        tok = tok.strip(".,;:")
+        if not tok:
+            continue
         if tok in retired:
             yield tok
         elif _LABEL_PAIR_RE.match(tok) and tok.split(":", 1)[0] in families:
@@ -373,9 +389,13 @@ def documented_labels(text, live, retired):
     return unknown, stale
 
 
-# Repo-relative paths a doc cites. Anchored on the repo's real top-level directories and guarded by
-# a lookbehind so an INSTALLED path (`~/.claude/skills/superlooper/bin/superlooper`) or a
-# state-home path is not mistaken for a repo path — those legitimately do not exist in the tree.
+# Repo-relative paths a doc cites. Anchored on the repo top-level directories that are UNAMBIGUOUS
+# in these docs, which is five of the eight that exist. `bin/` and `docs/` are deliberately left
+# out: the ops docs use both as payload- and installed-home-relative prefixes (`bin/liftoff`,
+# `docs/ADOPTING.md`), so including them would flag correct references — at the cost that a
+# citation of `bin/install.sh` or `docs/ADOPTING.md` is never existence-checked. A lookbehind keeps
+# an INSTALLED path (`~/.claude/skills/superlooper/bin/superlooper`) or a state-home path from being
+# read as a repo path; those legitimately do not exist in the tree.
 _REPO_TOP_DIRS = ("plugin", "skills", "dashboard", ".superlooper", ".github")
 _PATH_RE = re.compile(
     r"(?<![/~\w.-])((?:%s)/[A-Za-z0-9_./-]*[A-Za-z0-9_-])"
@@ -397,8 +417,9 @@ def documented_repo_paths(text):
     for span in code_spans(text) + re.findall(r"\]\(([^)\s]+)[^)]*\)", text):
         for match in _PATH_RE.finditer(span):
             rel = match.group(1)
-            if "*" in rel or "?" in rel:
-                continue
+            # The character class stops before a wildcard, so the trailing character is where a
+            # glob shows up: `skills/superlooper/docs/INCIDENT-*.md` arrives here as the stem
+            # `…/INCIDENT-` with `*` next. That is a doc naming a FAMILY, not a file.
             tail = span[match.end():match.end() + 1]
             if tail in ("*", "?"):
                 continue
@@ -502,14 +523,22 @@ def _documented_block_names():
     return names
 
 
+# Backticked Tier bullets in STACK.md that are deliberately NOT doctor block names. Empty today:
+# every one of them is a live block. An explicit list is the point — adding a non-block bullet is
+# then a conscious one-line edit with a reason, rather than something a shape heuristic waves
+# through. (An earlier version guessed with `name.islower()`, which was deaf to `gh API headroom`,
+# `codex CLI` and `cmux App Nap disabled` — one of issue #142's own three blocks — and would have
+# false-flagged a future `` `conflict_cap` `` bullet.)
+_TIER_NON_BLOCK_BULLETS = ()
+
+
 def _tier_bullet_names():
-    """Block names bulleted in STACK.md's Tier sections, written `- \\`name\\` - description`.
+    """Backticked names bulleted in STACK.md's Tier sections, written ``- `name` - description``.
 
     A SECOND place the same names are spelled. Renaming a block and updating only the fixes list
     leaves these stale, and the fixes-list check cannot see it — the two lists use different bullet
-    punctuation, which is exactly why the drift would survive. Not every Tier bullet is a block
-    (`Publish discipline`, `Repo-level doctor green` are prose headings), so this reads names and
-    the caller judges only the ones that CLAIM to be blocks.
+    punctuation, which is exactly why that drift would survive. Prose-heading bullets (`Publish
+    discipline`, `Repo-level doctor green`) carry no backticks, so the regex never returns them.
     """
     lines = _STACK_MD.read_text(encoding="utf-8").splitlines()
     try:
@@ -528,15 +557,13 @@ def test_stack_md_tier_lists_name_no_block_the_code_cannot_emit():
     walkthrough; the fixes list is what they turn to after a red line.
     """
     live = live_doctor_blocks()
-    documented_fixes = set(_documented_block_names())
-    # A Tier bullet is treated as a block claim when the fixes list also carries that name, or when
-    # it looks like a block name and is not one — i.e. anything that is neither a live block nor a
-    # prose heading. Prose headings are capitalised phrases; block names are not.
-    phantom = [name for name in _tier_bullet_names()
-               if name not in live and (name in documented_fixes or name.islower())]
+    named = _tier_bullet_names()
+    assert named, "STACK.md's Tier lists must bullet the block names in backticks"
+    phantom = sorted({n for n in named if n not in live and n not in _TIER_NON_BLOCK_BULLETS})
     assert not phantom, (
         "STACK.md's Tier lists name blocks doctor --stack cannot emit: %s — the tiers are the "
-        "first thing an operator reads." % sorted(set(phantom)))
+        "first thing an operator reads. If one of these is deliberately not a block name, add it "
+        "to _TIER_NON_BLOCK_BULLETS with a reason." % phantom)
 
 
 def test_stack_md_documents_every_block_name_the_code_can_emit():
@@ -643,6 +670,28 @@ def test_lint_flags_a_retired_label_used_as_current_behaviour():
     unknown, stale = documented_labels("A sensitive-area diff still parks `needs-william`.\n",
                                        m["labels"], m["retired_labels"])
     assert stale == {"needs-william"} and not unknown
+
+
+def test_lint_flags_a_retired_label_that_ends_a_sentence():
+    """The most common shape in prose, and the one the tokeniser swallowed.
+
+    `.` has to be inside the token class (a label value may carry one), so `needs-william.` used to
+    match nothing at all — and the approval-protocol.md sentence this lint was written to catch was
+    one edit away from that exact form.
+    """
+    m = manifest()
+    for doc in ("A sensitive-area diff still parks needs-william.\n",
+                "A sensitive-area diff still parks needs-william,\n",
+                "A sensitive-area diff still parks **needs-william**.\n"):
+        _unknown, stale = documented_labels(doc, m["labels"], m["retired_labels"])
+        assert stale == {"needs-william"}, "missed the retired label in %r" % doc
+
+
+def test_lint_flags_a_bad_label_that_ends_a_sentence():
+    m = manifest()
+    unknown, _stale = documented_labels("Drop `priority:urgent`.\n",
+                                        m["labels"], m["retired_labels"])
+    assert unknown == {"priority:urgent"}
 
 
 def test_lint_allows_a_retired_label_in_a_sentence_that_names_its_replacement():

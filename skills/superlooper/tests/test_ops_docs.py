@@ -72,7 +72,7 @@ def test_the_whole_ops_reference_set_ships_not_just_runner_ops():
     machine — the identical rot the sl-debugger guard above prevents, one directory over.
     """
     on_disk = {p.relative_to(_REPO).as_posix()
-               for p in (_REPO / "plugin" / "skills" / "superlooper" / "references").glob("*.md")}
+               for p in (_REPO / "plugin" / "skills" / "superlooper" / "references").rglob("*.md")}
     mirrored = {src for src, _dst in ops_docs.OPS_DOCS}
     assert on_disk, "the superlooper skill's references have moved — this guard sees nothing"
     assert on_disk <= mirrored, (
@@ -89,16 +89,21 @@ def test_the_operator_facing_ops_docs_ship():
         assert rel in mirrored, "%s must ship with the engine publish" % rel
 
 
-def _md_references(text):
-    """Every string in the doc that could be a relative reference to another `.md` page.
+def _external(ref):
+    return ref.startswith(("http://", "https://", "/", "~"))
 
-    Deliberately over-inclusive — markdown link targets AND backticked paths, including bare
-    `foo.md` filenames. Which of these are real links is decided by resolution against the SOURCE
-    tree, below, not by guessing here from the shape of the string.
-    """
-    found = set(re.findall(r"\]\(([^)\s]+\.md)[^)]*\)", text))     # [text](path.md)
-    found |= set(re.findall(r"`([\w./-]+\.md)`", text))            # `path.md`, `../path.md`
-    return {ref for ref in found if not ref.startswith(("http://", "https://", "/", "~"))}
+
+def _md_link_targets(text):
+    """`[text](path.md)` targets. A markdown link is UNAMBIGUOUSLY a link — there is no reading of
+    it as an incidental mention — so these are held to resolving, never excused by not resolving."""
+    return {r for r in re.findall(r"\]\(([^)\s]+\.md)[^)]*\)", text) if not _external(r)}
+
+
+def _backticked_paths(text):
+    """`path.md` / `../path.md` in code formatting. AMBIGUOUS: a doc naming `runner-ops.md` in
+    prose is talking about a file, not linking to one. Resolution against the source tree is what
+    separates the two — see the walk below."""
+    return {r for r in re.findall(r"`([\w./-]+\.md)`", text) if not _external(r)}
 
 
 def test_the_mirror_preserves_every_link_that_resolves_in_the_source_tree(tmp_path):
@@ -111,11 +116,15 @@ def test_the_mirror_preserves_every_link_that_resolves_in_the_source_tree(tmp_pa
     `references/unattended-contract.md` and its `../superlooper/references/runner-ops.md` sibling
     both do resolve, so the mirror has to keep them resolving.
 
-    An earlier version of this test extracted only `./`- and `../`-prefixed backticks and therefore
-    walked exactly ONE link, leaving the playbook's whole routing table — five bare
-    `references/<page>.md` pointers, including the contract the 3am brief sends the session to —
-    unchecked. A mirror that flattened `sl-debugger/references/` would have broken every one of
-    them with this test green.
+    Markdown link targets are held to a STRICTER rule: they must resolve in the source too. The
+    resolve-first test is a way of deciding whether an ambiguous backticked string was ever meant
+    as a link; a `](…)` target has no such ambiguity, so letting one be excused for not resolving
+    at home would classify an already-orphaned link as "a mention" and ship it to every machine —
+    D12's exact defect, laundered through this test's own leniency.
+
+    An earlier version extracted only `./`- and `../`-prefixed backticks and therefore walked
+    exactly ONE link, leaving the playbook's whole routing table — five bare `references/<page>.md`
+    pointers, including the contract the 3am brief sends the session to — unchecked.
     """
     dest = _published_dest(tmp_path)
     ops_docs.publish(_REPO, dest, "abc1234 2026-07-21")
@@ -125,17 +134,25 @@ def test_the_mirror_preserves_every_link_that_resolves_in_the_source_tree(tmp_pa
     for src, dst in ops_docs.OPS_DOCS:
         source_page = _REPO / src
         mirror_page = root / dst
-        for ref in sorted(_md_references(source_page.read_text(encoding="utf-8"))):
-            if not (source_page.parent / ref).exists():
+        text = source_page.read_text(encoding="utf-8")
+        targets = _md_link_targets(text)
+        for ref in sorted(targets | _backticked_paths(text)):
+            resolves_at_home = (source_page.parent / ref).exists()
+            if ref in targets and not resolves_at_home:
+                broken.append("%s -> %s (a markdown link that is already dead in the repo)"
+                              % (src, ref))
+                continue
+            if not resolves_at_home:
                 continue                      # not a relative link where it lives — a mention
             walked += 1
             if not (mirror_page.parent / ref).exists():
                 broken.append("%s -> %s (resolves at %s, not in the mirror)" % (dst, ref, src))
     assert not broken, "the published ops-doc mirror breaks links that work in the repo: %s" % broken
     # A link-walk that walks nothing is the failure mode this test is most likely to rot into:
-    # tighten the extractor by accident and it goes quietly, permanently green. The playbook's
-    # entry page alone carries its four references plus the runner-ops sibling.
-    assert walked >= 5, "the link extractor found only %d links — it has stopped looking" % walked
+    # tighten the extractor by accident and it goes quietly, permanently green. The floor tracks
+    # the real count (14 today) closely enough that losing a whole page's routing table shows up,
+    # rather than sitting so low that only total collapse trips it.
+    assert walked >= 12, "the link extractor found only %d links — it has stopped looking" % walked
 
 
 def test_the_playbooks_sibling_link_is_the_one_this_layout_exists_for():
@@ -287,6 +304,33 @@ def test_the_gated_installer_publishes_the_ops_docs():
     text = _installer_text()
     assert "ops_docs.py" in text, "bin/install.sh must invoke the ops-docs mirror"
     assert "--publish" in text and "--repo-root" in text, text[-2000:]
+
+
+def test_the_installer_reads_the_table_without_executing_unreviewed_payload_code():
+    """Before the gate says yes, ops_docs.py is unreviewed engine code — parse it, never run it.
+
+    The gate exists so a human sees an engine change before it goes live. Importing a payload
+    module to compute the gate's own scope would execute the very diff being judged, one step
+    before the judging. So the installer reads OPS_DOCS with `ast`. This test runs the installer's
+    ACTUAL snippet — lifted out of the script, not a copy — and requires it to agree with
+    ``ops_docs.sources()``, so the two readings of one table cannot drift apart.
+    """
+    text = _installer_text()
+    start = text.index("OPS_DOC_PATHS=\"$(python3 -c '")
+    body_start = text.index("'", start + len("OPS_DOC_PATHS=\"$(python3 -c")) + 1
+    snippet = text[body_start:text.index("'", body_start)]
+    assert "ast.parse" in snippet, "the installer must PARSE ops_docs.py, not import it"
+    # Comments are stripped first: the block above legitimately EXPLAINS why `--list` is not used,
+    # and a guard that cannot tell an explanation from the thing it warns against is unfixable.
+    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    assert "--list" not in code and "import ops_docs" not in code, (
+        "the installer must not execute the payload module before the gate")
+
+    proc = subprocess.run([sys.executable, "-c", snippet,
+                           str(_ENGINE / "skill" / "lib" / "ops_docs.py")],
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert [l for l in proc.stdout.splitlines() if l.strip()] == ops_docs.sources()
 
 
 def test_the_engine_diff_gate_covers_the_ops_doc_sources():
@@ -461,6 +505,11 @@ def test_the_stack_doc_names_the_mirror_where_the_code_publishes_it():
 
 
 def test_the_doctor_reports_the_mirror_where_the_code_publishes_it():
-    """And the block's own detail/fix text, so all three operator-facing spellings move together."""
+    """The doctor names the mirror via ops_docs, not via a string of its own.
+
+    Weaker than the two above by construction — both sides derive from MIRROR_REL, so a rename
+    moves them together and this stays green. What it does pin is that the block's detail line is
+    built from the shared constant at all, so an operator reading a FAIL is told the directory the
+    installer actually writes to."""
     result = stack_doctor.check_ops_docs(FakeProbe(files=_healthy_files()))
     assert _mirror_rel() in result.detail

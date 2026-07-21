@@ -88,15 +88,31 @@ DENY_CMD='$HOME/.claude/skills/superlooper/bin/pretooluse-hook.sh'
 # the doctor read the same source of truth. $OPS_DOC_PATHS carries the source paths into the
 # engine-diff gate below: a doc that lands on the machine must be shown to the human first, exactly
 # like every other published file.
-# This is a READ of the same checkout the gate is about to diff — no machine state is touched, so
-# it does not break the "nothing is touched before the human OK" promise in the header above.
+#
+# PARSED, NOT IMPORTED. This runs BEFORE the gate, so it must not execute a single line of the
+# payload the human has not yet approved — running `ops_docs.py --list` would execute its module
+# body, and until this gate says yes that file is unreviewed engine code. So we read OPS_DOCS out
+# of the source with `ast`, which evaluates nothing. (The publish call at step 6 does run the
+# module, and by then the human has said yes.) The gate's own promise — nothing on this MACHINE is
+# touched before the OK — was never in question here; this is about not executing the diff's
+# subject while deciding whether to accept the diff.
 #
 # `|| OPS_DOC_PATHS=""` is load-bearing: under `set -e` a bare assignment whose command
 # substitution fails aborts the script on the spot, and the refusal below — written for exactly
 # that case — would never print. stderr is deliberately NOT swallowed, so python's own reason
 # (syntax error, missing file, no python3) reaches the operator before this script gives up.
 OPS_DOCS_PY="$REPO_ROOT/$PAYLOAD_REL/lib/ops_docs.py"
-OPS_DOC_PATHS="$(python3 "$OPS_DOCS_PY" --list | tr '\n' ' ')" || OPS_DOC_PATHS=""
+OPS_DOC_PATHS="$(python3 -c '
+import ast, sys
+tree = ast.parse(open(sys.argv[1]).read())
+for node in tree.body:
+    if isinstance(node, ast.Assign) and any(
+            getattr(t, "id", None) == "OPS_DOCS" for t in node.targets):
+        for pair in node.value.elts:
+            print(ast.literal_eval(pair).__getitem__(0))
+        sys.exit(0)
+sys.exit("ops_docs.py defines no OPS_DOCS table")
+' "$OPS_DOCS_PY" | tr '\n' ' ')" || OPS_DOC_PATHS=""
 if [ -z "${OPS_DOC_PATHS// }" ]; then
   echo "install: could not read the ops-doc list from $OPS_DOCS_PY — refusing to publish a" >&2
   echo "install: machine whose gate would not show the docs it is about to install." >&2
@@ -404,7 +420,9 @@ printf '%s\n' "$VERSION" > "$DEST/VERSION"
 #    reason the VERSION stamp is: --delete would otherwise sweep them straight back out — and LAST,
 #    after the shim and the PATH link, deliberately. Under `set -e` a failure here aborts the run,
 #    and doing it earlier would leave a first-time install with an engine but no launch shim and no
-#    `superlooper` on PATH — a worse machine than one whose docs simply did not land. The helper
+#    `superlooper` on PATH. Note what a failure HERE leaves: step 2's `rsync --delete` has already
+#    swept the previous mirror, so an aborted publish leaves the machine with NO ops docs rather
+#    than the older ones — which `doctor --stack` then FAILs on, loudly, by design. The helper
 #    rebuilds the mirror whole, so a doc retired upstream does not linger as a page an operator can
 #    still find and act on, and it fails loud (non-zero) rather than publishing a partial playbook.
 python3 "$OPS_DOCS_PY" --publish --repo-root "$REPO_ROOT" --dest "$DEST" --version "$VERSION" \
