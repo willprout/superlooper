@@ -625,29 +625,45 @@ def _teardown_deferral_memo(ist, iid, corrupt=False, reapproved=False):
     known = type(raw) is int and raw > 0
     pid = str(raw) if known else "the pid it records"
     lock = ist.get("teardown_deferral_lock") if isinstance(ist, dict) else None
-    lock = lock if isinstance(lock, str) and lock.strip() else f"the state dir's worker.{iid}.lock"
-    how_many = ("the teardown-deferral counter is unreadable" if corrupt else
-                f"superlooper refused {TEARDOWN_DEFERRAL_CAP} consecutive times")
+    lock_known = isinstance(lock, str) and bool(lock.strip())
+    # Backticks ONLY around a real path: quoting the fallback prose as code would hand the owner
+    # ``remove `the lane's worker.i5.lock ...` `` — the same un-runnable-command defect the pid
+    # fallback above exists to avoid, relocated one field over.
+    lock_text = f"`{lock}`" if lock_known else \
+        f"the lane's worker.{iid}.lock file in superlooper's state dir"
+    how_many = ("refused to prune this lane's worktree" if corrupt else
+                f"refused {TEARDOWN_DEFERRAL_CAP} consecutive times to prune this lane's worktree")
     if reapproved:
         lead = (f"re-approved, but NOTHING WAS RETRIED and the lane is handed straight back: "
-                f"`{lock}` still names a LIVE pid ({pid}) — the same reason this issue was parked "
-                f"in the first place, unchanged. superlooper will not rebuild over a worktree it "
-                f"cannot clear (a pruned cwd kills a running worker's next hook spawn outright — "
-                f"the D14 mechanism #149 exists to stop), and re-approving does not make the lock "
-                f"go away.")
+                f"{lock_text} still names a LIVE pid ({pid}) — the same reason this issue was "
+                f"parked in the first place, unchanged. superlooper will not rebuild over a "
+                f"worktree it cannot clear (a pruned cwd kills a running worker's next hook spawn "
+                f"outright — the D14 mechanism #149 exists to stop), and re-approving does not "
+                f"make the lock go away.")
     else:
-        lead = (f"the rebuild cannot start: `{lock}` names a LIVE pid ({pid}), so {how_many} to "
-                f"prune this lane's worktree rather than unlink a running worker's cwd (a pruned "
-                f"cwd kills the next hook spawn outright — the D14 mechanism #149 exists to stop). "
-                f"Nothing is wrong with the refusal; what is wrong is that it cannot end on its "
-                f"own.")
-    check = (f"Check with `ps -p {pid}`" if known
-             else f"Read the pid with `cat {lock}` and check it with `ps -p <pid>`")
-    return (f"{lead} Either that worker really is still running (let it finish, or close its "
-            f"window), or the lock is STALE: a SIGKILLed session never runs the EXIT trap that "
+        lead = (f"the rebuild cannot start: {lock_text} names a LIVE pid ({pid}), so superlooper "
+                f"{how_many} rather than unlink a running worker's cwd (a pruned cwd kills the "
+                f"next hook spawn outright — the D14 mechanism #149 exists to stop). Nothing is "
+                f"wrong with the refusal; what is wrong is that it cannot end on its own.")
+    # The corruption is its own fact and belongs on BOTH leads: it says the count above is the cap
+    # rather than a real tally, and it points at a second thing to look at (a damaged state file).
+    # Spliced into the count clause instead, it read as "so the teardown-deferral counter is
+    # unreadable to prune this lane's worktree" — the one owner-facing artifact this issue exists
+    # to produce, ungrammatical, with its actual signal buried.
+    damaged = (" superlooper's own teardown-deferral counter for this lane is UNREADABLE (a "
+               "wrong-typed value in its state file), which is why it stopped here rather than "
+               "counting further — that state file wants a look too." if corrupt else "")
+    if known:
+        check = f"Check with `ps -p {pid}`"
+    elif lock_known:
+        check = f"Read the pid with `cat {lock}` and check it with `ps -p <pid>`"
+    else:
+        check = "Read the pid out of that lock file and check it with `ps -p <pid>`"
+    return (f"{lead}{damaged} Either that worker really is still running (let it finish, or close "
+            f"its window), or the lock is STALE: a SIGKILLed session never runs the EXIT trap that "
             f"frees it, and pids recycle, so an unrelated process can inherit the number and hold "
             f"this lane off for its whole lifetime. {check}; if it is not this lane's worker, "
-            f"remove `{lock}` and re-approve — the rebuild then runs on the next tick.")
+            f"remove {lock_text} and re-approve — the rebuild then runs on the next tick.")
 
 
 def _launch_gate_reason(p, closed_nums, usage, config=None):

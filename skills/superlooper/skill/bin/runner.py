@@ -2255,11 +2255,20 @@ class Runner:
 
     def _clear_teardown_deferrals(self, iid):
         """Retire this lane's declined-prune ladder and the evidence explaining it (#169). Guarded
-        on a non-zero counter: _teardown_session runs for every reclaimable lane on every tick, and
-        an unconditional locked read-modify-write there would be a per-lane, per-tick cost for
-        nothing. The stamps go with the count — evidence for a count of zero is a lie, and the memo
-        that would quote it names a pid from an episode that is over."""
-        if not self._issue_field(iid, "teardown_deferrals"):
+        so the common case costs no write: _teardown_session runs for every deferred lane on every
+        tick, and an unconditional locked read-modify-write there would be a per-lane, per-tick cost
+        for nothing. The stamps go with the count — evidence for a count of zero is a lie, and the
+        memo that would quote it names a pid from an episode that is over.
+
+        The guard is a TYPE test, not a truth test, and that is the whole of it. decide's `_counter`
+        calls any present non-int corrupt — `null` by name — and fails closed to the park, so a
+        falsy-corrupt value (None, "", False, []) would park the lane on its first tick with zero
+        deferrals actually attempted. Under a `if not ...` guard THIS repair would then skip exactly
+        those values, and no other path rewrites the field: the owner would clear the lock, the
+        rebuild would run, and the next one would park instantly again, forever. Only an honest int
+        0 (or an absent key) may be left alone."""
+        v = self._issue_field(iid, "teardown_deferrals", 0)
+        if type(v) is int and v == 0:
             return
         self._update_issue(iid, {"teardown_deferrals": 0, "teardown_deferral_pid": None,
                                  "teardown_deferral_lock": None})

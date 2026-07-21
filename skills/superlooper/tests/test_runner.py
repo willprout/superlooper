@@ -3928,6 +3928,41 @@ def test_a_teardown_that_clears_nothing_leaves_the_ladder_alone(rig, monkeypatch
     assert _ist(rig, "i5")["teardown_deferrals"] == 3
 
 
+@pytest.mark.parametrize("bad", [None, "", False, [], "lots"])
+def test_a_wrong_typed_ladder_is_repaired_by_the_teardown_that_clears_the_lock(rig, monkeypatch,
+                                                                              bad):
+    """decide fails CLOSED on a wrong-typed counter — it parks the lane on its FIRST tick, zero
+    deferrals attempted — so the repair has to reach every wrong-typed value, not just the truthy
+    ones. Under a truthiness guard the falsy half (`null` most of all: the value _counter's own
+    docstring names) would be skipped by the only path that rewrites the field, and the lane would
+    latch: the owner clears the lock, the rebuild runs, the next one parks instantly, forever."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i5", status="parked", num=5, teardown_deferrals=bad)
+    _teardown_rig(rig, "i5")
+
+    assert rig.r._teardown_session("i5", remove_worktree=True) is True
+    assert _ist(rig, "i5")["teardown_deferrals"] == 0, "a wrong-typed ladder survived its repair"
+
+
+def test_a_lane_with_no_ladder_pays_no_state_write_for_the_clear(rig, monkeypatch):
+    """The guard is the entire cost argument for calling this from the every-tick teardown: an
+    unconditional locked read-modify-write per deferred lane per tick would be a real cost for
+    nothing. A refactor that drops the guard must fail here, not silently."""
+    writes = []
+    real = runner_mod.loopstate.update
+    monkeypatch.setattr(runner_mod.loopstate, "update",
+                        lambda path, m, **kw: writes.append(1) or real(path, m, **kw))
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i5", status="parked", num=5)          # no ladder at all
+    _teardown_rig(rig, "i5")
+
+    writes.clear()
+    assert rig.r._teardown_session("i5", remove_worktree=True) is True
+    assert writes == [], "the clear wrote state for a lane that had no deferrals"
+
+
 def test_a_rebuild_that_succeeds_clears_the_deferral_ladder(rig, monkeypatch):
     """End to end through the executor: a re-approval whose prune lands starts from zero, which is
     what makes the park's 'remove the lock, then re-approve' instruction true."""

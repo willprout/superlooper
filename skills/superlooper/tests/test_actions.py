@@ -686,6 +686,36 @@ def test_a_corrupt_deferral_counter_fails_closed_to_the_park():
     assert only(out, "reapprove") == [] and len(only(out, "park")) == 1
 
 
+@pytest.mark.parametrize("bad", [None, "", False, [], 0.0, "lots", {"n": 1}])
+def test_every_wrong_typed_deferral_counter_parks_with_a_readable_memo(bad):
+    # `_counter` calls ANY present non-int corrupt — `null` by name — so the FALSY wrong types are
+    # as real as the truthy ones and must land identically. The memo must also stay a sentence: the
+    # corruption is its own fact appended to the hand-back, never spliced into the count clause
+    # (which once rendered "so the teardown-deferral counter is unreadable to prune this lane's
+    # worktree" — the one owner-facing artifact this issue produces, ungrammatical).
+    p = only(decide(parsed_issues=[parsed(5)], dsk=_deferred(deferrals=bad)), "park")
+    assert len(p) == 1 and p[0]["cause"] == actions.TEARDOWN_CAUSE
+    assert "UNREADABLE" in p[0]["memo"] and "unreadable to prune" not in p[0]["memo"]
+    assert "4242" in p[0]["memo"], "a corrupt counter must not cost the actionable facts"
+
+
+def test_a_refused_re_approval_on_a_corrupt_counter_still_reports_the_corruption():
+    # The corruption rides BOTH leads: the re-approved hand-back once dropped it silently.
+    dsk = _deferred(deferrals=None, status="needs_william",
+                    park_notify_cause=actions.TEARDOWN_CAUSE,
+                    park_landed_cause=actions.TEARDOWN_CAUSE)
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")[0]["memo"]
+    assert "NOTHING WAS RETRIED" in memo and "UNREADABLE" in memo
+
+
+def test_a_memo_with_no_recorded_lock_path_never_quotes_prose_as_a_command():
+    # The pid fallback's own defect class, one field over: backticks belong around a real path only.
+    dsk = _deferred(teardown_deferral_lock=None)
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")[0]["memo"]
+    assert "`the lane's" not in memo and "cat the lane's" not in memo
+    assert "worker.i5.lock" in memo          # still names WHAT to look for
+
+
 def test_a_corrupt_deferral_counter_with_no_live_lock_still_rebuilds():
     # The other half of that rule, and the reason the corrupt check is ANDed with live_locks: fail
     # closed must not mean strand-forever. With the cause gone there is nothing to protect the lane
