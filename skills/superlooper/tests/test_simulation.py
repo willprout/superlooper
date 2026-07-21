@@ -1088,6 +1088,20 @@ def test_a_stale_worker_lock_bounds_the_rebuild_instead_of_livelocking_the_lane(
         assert [r for r in sim.journal("park") if r.get("cause") == "teardown_deferral"]
         assert "agent-ready" not in sim.issue(num)["labels"], "the retry must stop retrying"
 
+        # Re-approving WITHOUT doing what the memo asked is refused (the counter is already at cap,
+        # so nothing is retried) — but it must be refused OUT LOUD. An owner action answered by a
+        # silently stripped label is the same silence this issue exists to end.
+        notified, memos = len(sim.notify_lines()), len(sim.mutations("comment"))
+        sim.edit_gh_state(lambda st: st["issues"][str(num)]["labels"].append("agent-ready"))
+        assert sim.tick_until(
+            lambda: "agent-ready" not in sim.issue(num)["labels"], ticks=4), sim.issue(num)["labels"]
+        assert len(sim.notify_lines()) > notified, "the re-approval was swallowed in silence"
+        assert len(sim.mutations("comment")) > memos
+        assert [r for r in sim.journal("park")
+                if r.get("cause") == "teardown_deferral_reapproved"], sim.journal("park")
+        assert sim.loop_issue(sid)["teardown_deferrals"] == actions_lib.TEARDOWN_DEFERRAL_CAP, \
+            "a refused re-approval must not silently re-run the whole ladder"
+
         # ...and the escape the memo promises: drop the stale lock, re-approve, the rebuild runs.
         os.remove(lock)
         sim.edit_gh_state(lambda st: st["issues"][str(num)]["labels"].append("agent-ready"))

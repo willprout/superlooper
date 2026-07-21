@@ -3942,7 +3942,26 @@ def test_a_disk_hygiene_deferral_never_charges_the_rebuild_ladder(rig, monkeypat
 
     rig.r._teardown_session("i7", remove_worktree=True)
     rig.r._drain_pending_teardowns(loopstate.load(str(rig.home / "state" / "issues.json")))
-    assert _ist(rig, "i7").get("teardown_deferrals", 0) == 0
+    assert "teardown_deferrals" not in _ist(rig, "i7"), "a disk-hygiene defer charged the ladder"
+    assert (rig.home / "state" / "pending_teardown" / "i7").exists()   # the drain IS its retry
+
+
+def test_resume_at_the_gate_clears_the_deferral_ladder_it_did_not_charge(rig, monkeypatch):
+    """The ladder belongs to the ACTION that charged it, never to the lane at large. A lane can
+    reach resume_at_gate carrying an at-cap counter (the owner switched from Rebuild to Resume mid
+    -ladder), and a resumed lane's worker is idling at the prompt HOLDING its lock — that is what a
+    finished session does. Stranded, the counter would park a perfectly healthy lane needs-owner at
+    the FIRST declined prune of its next regenerate, ~10s in, quoting the PREVIOUS episode's pid at
+    the owner. The stamps go with the counter: evidence for a count of zero is a lie."""
+    seed_issue(rig, "i5", status="parked", num=5, pr=5,
+               teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP,
+               teardown_deferral_pid=4242, teardown_deferral_lock="/old/worker.i5.lock")
+
+    rig.r._execute({"act": "resume_at_gate", "id": "i5", "num": 5}, NOW)
+    i = _ist(rig, "i5")
+    assert i["status"] == "gating"                        # the resume itself still happens
+    assert i["teardown_deferrals"] == 0
+    assert i["teardown_deferral_pid"] is None and i["teardown_deferral_lock"] is None
 
 
 def test_absorb_merged_closes_the_pane_before_reclaiming(rig, monkeypatch):

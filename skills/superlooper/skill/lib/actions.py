@@ -582,27 +582,62 @@ def _teardown_livelocked(ist, iid, live_locks):
     return (corrupt or n >= TEARDOWN_DEFERRAL_CAP) and iid in live_locks
 
 
-def _teardown_deferral_memo(ist, iid, corrupt=False):
+TEARDOWN_CAUSE = "teardown_deferral"
+# The SECOND hand-back: the owner re-approved a lane whose lock is still live, so the rebuild was
+# refused again — this time without even retrying, because the counter is already at the cap. It
+# gets its own cause so park()'s notify-once dedup (#61) treats it as a NEW episode and answers the
+# owner instead of silently stripping their `agent-ready` a second time. Repeat re-approvals of an
+# unchanged situation then dedup on THIS cause, as every park does.
+TEARDOWN_CAUSE_REAPPROVED = "teardown_deferral_reapproved"
+
+
+def _teardown_park_cause(ist, status):
+    """Which of the two #169 hand-backs is this — the first, or the answer to a re-approval that
+    did not clear the cause? A PRIOR teardown park that LANDED is the tell, and both halves are
+    needed to read it: the executor sets status only after the label move succeeds, so
+    `needs_william` means the park really landed and really stripped `agent-ready` — therefore the
+    `agent-ready` we are looking at now is one the owner put back. (A park whose label move FAILED
+    leaves status `parked` and the old label standing; that is a silent retry of the FIRST park,
+    which is exactly what the #61 dedup is for, and it must not be mistaken for an owner act.)"""
+    prior = ist.get("park_notify_cause") if isinstance(ist, dict) else None
+    landed = isinstance(prior, str) and prior.startswith(TEARDOWN_CAUSE)
+    return TEARDOWN_CAUSE_REAPPROVED if landed and status == "needs_william" else TEARDOWN_CAUSE
+
+
+def _teardown_deferral_memo(ist, iid, corrupt=False, reapproved=False):
     """The hand-back for a rebuild that cannot clear its worktree (#169). It exists to name the two
     facts the owner cannot get any other way — WHICH pid is holding the lane and WHICH lock file
     records it — because deleting that lock is the only thing that frees the lane. The runner stamps
     both when it charges the rung; a state file that predates the stamp still gets an actionable
-    memo, just without the specifics."""
-    pid = ist.get("teardown_deferral_pid") if isinstance(ist, dict) else None
-    pid = str(pid) if type(pid) is int and pid > 0 else "(pid not recorded)"
+    memo, just without the specifics (it points at the lock to read the pid from, never at a
+    `ps -p (pid not recorded)` that cannot be run)."""
+    raw = ist.get("teardown_deferral_pid") if isinstance(ist, dict) else None
+    known = type(raw) is int and raw > 0
+    pid = str(raw) if known else "the pid it records"
     lock = ist.get("teardown_deferral_lock") if isinstance(ist, dict) else None
     lock = lock if isinstance(lock, str) and lock.strip() else f"the state dir's worker.{iid}.lock"
     how_many = ("the teardown-deferral counter is unreadable" if corrupt else
                 f"superlooper refused {TEARDOWN_DEFERRAL_CAP} consecutive times")
-    return (f"the rebuild cannot start: `{lock}` names a LIVE pid ({pid}), so {how_many} to prune "
-            f"this lane's worktree rather than unlink a running worker's cwd (a pruned cwd kills "
-            f"the next hook spawn outright — the D14 mechanism #149 exists to stop). Nothing is "
-            f"wrong with the refusal; what is wrong is that it cannot end on its own. Either that "
-            f"worker really is still running (let it finish, or close its window), or the lock is "
-            f"STALE: a SIGKILLed session never runs the EXIT trap that frees it, and pids recycle, "
-            f"so an unrelated process can inherit the number and hold this lane off for its whole "
-            f"lifetime. Check with `ps -p {pid}`; if it is not this lane's worker, remove `{lock}` "
-            f"and re-approve — the rebuild then runs on the next tick.")
+    if reapproved:
+        lead = (f"re-approved, but NOTHING WAS RETRIED and the lane is handed straight back: "
+                f"`{lock}` still names a LIVE pid ({pid}) — the same reason this issue was parked "
+                f"in the first place, unchanged. superlooper will not rebuild over a worktree it "
+                f"cannot clear (a pruned cwd kills a running worker's next hook spawn outright — "
+                f"the D14 mechanism #149 exists to stop), and re-approving does not make the lock "
+                f"go away.")
+    else:
+        lead = (f"the rebuild cannot start: `{lock}` names a LIVE pid ({pid}), so {how_many} to "
+                f"prune this lane's worktree rather than unlink a running worker's cwd (a pruned "
+                f"cwd kills the next hook spawn outright — the D14 mechanism #149 exists to stop). "
+                f"Nothing is wrong with the refusal; what is wrong is that it cannot end on its "
+                f"own.")
+    check = (f"Check with `ps -p {pid}`" if known
+             else f"Read the pid with `cat {lock}` and check it with `ps -p <pid>`")
+    return (f"{lead} Either that worker really is still running (let it finish, or close its "
+            f"window), or the lock is STALE: a SIGKILLed session never runs the EXIT trap that "
+            f"frees it, and pids recycle, so an unrelated process can inherit the number and hold "
+            f"this lane off for its whole lifetime. {check}; if it is not this lane's worker, "
+            f"remove `{lock}` and re-approve — the rebuild then runs on the next tick.")
 
 
 def _launch_gate_reason(p, closed_nums, usage, config=None):
@@ -1252,9 +1287,21 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                         # the retry blocks its own escape hatch, forever, with nothing counting.
                         # Hand it to the owner with the pid and the lock path, exactly as the
                         # launch-failure and merge-refusal ladders hand back theirs.
+                        #
+                        # The cause is the FIRST hand-back's, or the re-approved one when this is
+                        # the owner putting `agent-ready` back on a lane whose lock is unchanged.
+                        # That distinction is the whole reason it exists: this refusal does NOT
+                        # retry (the counter is already at cap), so on the shared cause park()'s
+                        # notify-once dedup would strip their label and say nothing — an owner
+                        # action silently undone, which is the same silence this issue exists to
+                        # end. Retrying instead is NOT the alternative: a park whose label move
+                        # failed would then re-enter the rebuild every cap's worth of ticks, the
+                        # park->reapprove churn loop _forget_cached_label exists to prevent.
+                        cause = _teardown_park_cause(ist, status)
                         park(iid, _iid_num(iid),
-                             _teardown_deferral_memo(ist, iid, corrupt=_teardown_corrupt(ist)),
-                             needs_william=True, cause="teardown_deferral")
+                             _teardown_deferral_memo(ist, iid, corrupt=_teardown_corrupt(ist),
+                                                     reapproved=cause == TEARDOWN_CAUSE_REAPPROVED),
+                             needs_william=True, cause=cause)
                         continue
                     else:
                         # `had_rebuild` tells the executor whether the one-shot `rebuild` label is
@@ -1599,9 +1646,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # on the OLD conflicted branch), and the gate re-derives this verdict every tick
                     # from the same unchanged conflict — so an unclearable worktree means a rebuild
                     # that is emitted forever and lands never. Hand it back with the pid and lock.
+                    # Always the first-hand-back cause here: a park settles this lane terminal, and
+                    # a re-approval of a finished-and-parked build routes to the reapprove branch
+                    # above (or to resume_at_gate, which clears the ladder outright), never back
+                    # through the gate — so the re-approved face belongs there, not here.
                     park(iid, num,
                          _teardown_deferral_memo(ist, iid, corrupt=_teardown_corrupt(ist)),
-                         needs_william=True, cause="teardown_deferral")
+                         needs_william=True, cause=TEARDOWN_CAUSE)
                     continue
                 new_conflicts = _count(conflicts) + 1
                 src = p if isinstance(p, dict) else {"num": num, "id": iid,

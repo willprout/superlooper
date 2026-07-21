@@ -680,10 +680,52 @@ def test_a_capped_lane_whose_lock_is_gone_rebuilds_instead_of_re_parking():
 
 
 def test_a_corrupt_deferral_counter_fails_closed_to_the_park():
-    # The project's fail-OPEN-on-wrong-TYPE rule: an unreadable counter must land on the safe
-    # action (park), never re-allow the capped retry forever.
+    # The fail-OPEN-on-wrong-TYPE defect class (_counter's own docstring): an unreadable counter
+    # must land on the SAFE action (park), never be read as 0 and re-allow the capped retry forever.
     out = decide(parsed_issues=[parsed(5)], dsk=_deferred(deferrals="lots"))
     assert only(out, "reapprove") == [] and len(only(out, "park")) == 1
+
+
+def test_a_corrupt_deferral_counter_with_no_live_lock_still_rebuilds():
+    # The other half of that rule, and the reason the corrupt check is ANDed with live_locks: fail
+    # closed must not mean strand-forever. With the cause gone there is nothing to protect the lane
+    # from, and the rebuild it falls through to rewrites the unreadable counter honestly.
+    out = decide(parsed_issues=[parsed(5)], dsk=_deferred(deferrals="lots", live=False))
+    assert len(only(out, "reapprove")) == 1 and only(out, "park") == []
+
+
+def test_re_approving_a_still_locked_lane_answers_the_owner_instead_of_silently_re_parking():
+    # A re-approval this ladder REFUSES (the counter is already at cap, so nothing is retried) must
+    # not just strip `agent-ready` and go quiet — an owner action silently undone is the same
+    # silence #169 exists to end. The prior park LANDED (status needs_william, its cause stamped),
+    # so this agent-ready is the owner's: distinct cause -> park() texts and memos again.
+    dsk = _deferred(status="needs_william", park_notify_cause=actions.TEARDOWN_CAUSE)
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["cause"] == actions.TEARDOWN_CAUSE_REAPPROVED
+    assert "retry" not in p[0], "a new cause is a new episode, never a suppressed retry"
+    assert has_notify(out)
+    assert "NOTHING WAS RETRIED" in p[0]["memo"] and "4242" in p[0]["memo"]
+
+
+def test_a_park_whose_label_move_failed_is_still_a_silent_retry_not_an_owner_re_approval():
+    # The counter-case for the above, and why the cause reads BOTH the stamp and the status: when a
+    # park's label move fails (the #61 dead zone), status never settles and the OLD agent-ready is
+    # still standing. That is the first park re-deriving, not an owner act — it must stay the
+    # deduped silent retry, or the dead zone re-opens the 41-text storm #61 closed.
+    dsk = _deferred(status="parked", park_notify_cause=actions.TEARDOWN_CAUSE)
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0]["cause"] == actions.TEARDOWN_CAUSE and p[0].get("retry") is True
+    assert not has_notify(out)
+
+
+def test_a_memo_with_no_recorded_pid_still_gives_a_runnable_check():
+    # State that predates the stamp (or a lock removed between the refusal and the charge) must not
+    # produce `ps -p (pid not recorded)`. Point at the lock to read the pid out of instead.
+    dsk = _deferred(teardown_deferral_pid=None)
+    memo = only(decide(parsed_issues=[parsed(5)], dsk=dsk), "park")[0]["memo"]
+    assert "not recorded" not in memo and "cat /run/state/worker.i5.lock" in memo
 
 
 def test_a_resume_at_the_gate_is_never_capped_by_the_deferral_ladder():

@@ -2879,7 +2879,9 @@ class Runner:
         agent-ready -> in-progress (the finished/gate path keys off the report on disk, and the launch
         phase skips an in-progress lane, so no fresh session ever rebuilds over the preserved work).
         The attempt counters are DELIBERATELY not zeroed: a resume is a continuation of the same
-        episode, not a fresh cap, so the honest prior cost stays. No _teardown_session: a park-family
+        episode, not a fresh cap, so the honest prior cost stays. The ONE exception is the #169
+        declined-prune ladder below — not an attempt counter but a record of one specific action's
+        refusals, which this resume is not making. No _teardown_session: a park-family
         lane has no live session (the park stood it down), and tearing one down is exactly what this
         fix exists to avoid."""
         iid, num = a["id"], a.get("num")
@@ -2890,6 +2892,16 @@ class Runner:
                       "pr_read_pending_since": None, "read_waited": False,
                       "park_notify_cause": None, "park_notify_at": None,
                       "park_comment_posted": False,
+                      # (#169) The declined-prune ladder is one of those transient fields too, and
+                      # it belongs to the ACTION that charged it (a reapprove/regenerate rebuild),
+                      # never to the lane at large. A resume tears nothing down, so it charges
+                      # nothing — but a resumed lane's worker is idling at the prompt HOLDING its
+                      # lock (that is what a finished session does), so a stranded at-cap counter
+                      # would park it needs-owner at the FIRST declined prune of its next
+                      # regenerate, ~10s in, quoting the previous episode's pid at the owner. Clear
+                      # the stamps with the counter: evidence for a count of zero is a lie.
+                      "teardown_deferrals": 0, "teardown_deferral_pid": None,
+                      "teardown_deferral_lock": None,
                       # issue #222: the nudge ledger is the archetypal "transient field that re-parks
                       # the gate the instant it re-runs" — a leftover key + its stale (long-expired)
                       # `nudged_at` stamp would make the gate park INSTANTLY at the first gate hiccup,
