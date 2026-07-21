@@ -23,15 +23,40 @@ from pathlib import Path
 
 import pytest
 
+import report
 import upkeep
 
-from test_cli import cli, rig, mutations, ALL_LABELS      # noqa: F401  (rig is a fixture)
+from test_cli import cli, rig, mutations, ALL_LABELS, _stack_env  # noqa: F401  (rig is a fixture)
+
+
+def report_notify_canary_at(ts):
+    """report.notify_canary over a single delivered canary stamped `ts`, aged against NOW/WEEK —
+    the exact call upkeep's CLI makes, so the freshness bound is tested through the real function."""
+    return report.notify_canary(
+        [{"ts": ts, "act": "notify_canary", "ok": True, "channel": "imessage", "rc": 0}],
+        now=NOW, max_age_seconds=WEEK)
 
 _ROOT = Path(__file__).resolve().parent.parent
 _REPO_ROOT = _ROOT.parent.parent
 
 WEEK = 7 * 24 * 3600
 NOW = 1_700_000_000.0
+
+
+def _upkeep_env(rig):                                     # noqa: F811
+    """The env every `upkeep` CLI call runs under.
+
+    `cmd_upkeep` builds a REAL stack_doctor.Probe, so — exactly like `doctor --stack` — it would
+    shell the host's real `claude`, `codex` and `defaults` if their SL_* overrides were absent
+    (Probe.command() falls back to shutil.which; conftest's delenv does not stop that). `_stack_env`
+    stubs all of them. But we KEEP the fixture-driven fake-gh (rig's own SL_GH), not `_stack_env`'s
+    minimal gh stub, so the branch/janitor census reads the committed gh fixtures rather than an
+    empty sweep. This is the CLAUDE.md ratchet: no test may reach a real external binary.
+    """
+    env = _stack_env(rig)
+    env["SL_GH"] = rig.env["SL_GH"]
+    env["GH_FIXTURES"] = rig.env["GH_FIXTURES"]
+    return env
 
 
 # --------------------------------------------------------------------------------------------
@@ -95,6 +120,17 @@ def test_week_counts_counts_only_successful_in_window_records():
     assert c["merges"] == 2
 
 
+def test_week_counts_merges_include_absorbed_out_of_band_landings():
+    """`absorb_merged` is a landing too — a PR that merged on GitHub between merge and poll.
+
+    The morning report's Merged section counts both (report._MERGE_ACTS); upkeep's merge
+    denominator must agree, or "3 questions across N merges" understates N.
+    """
+    records = [{"ts": NOW - 10, "act": "merge", "num": 1, "outcome": "ok"},
+               {"ts": NOW - 20, "act": "absorb_merged", "num": 2, "outcome": "ok"}]
+    assert upkeep.week_counts(records, NOW)["merges"] == 2
+
+
 def test_week_counts_fails_closed_on_garbage():
     for junk in (None, "records", 7, [None, "x", 3, {"act": "park"}]):
         c = upkeep.week_counts(junk, NOW)
@@ -124,6 +160,9 @@ def test_branch_census_separates_proposed_deletions_from_branches_that_stay():
 def test_branch_census_fails_closed_on_wrong_typed_input():
     c = upkeep.branch_census("not-a-dict", "not-a-list")
     assert c == {"total": 0, "sl": 0, "proposed": 0, "kept": 0}
+    # a wrong-typed (unhashable) proposal target must be skipped, never raise inside the set build
+    c = upkeep.branch_census({"sl/i5-a": "x"}, [{"kind": "branch", "target": ["a"]}])
+    assert c == {"total": 1, "sl": 1, "proposed": 0, "kept": 1}
 
 
 def test_worktree_census_names_the_checkouts_that_hold_unsaved_work():
@@ -195,13 +234,40 @@ def test_a_refused_janitor_read_is_reported_not_swallowed():
     assert "unreadable" in out
 
 
+def _notify_line(text):
+    """The `notify` ROW itself — the label line, not the wrapped remedy under it (which contains
+    the word 'notify' inside `notify.imessage_to`). Tested directly so the assertion cannot pass by
+    reading the wrong line."""
+    for line in text.splitlines():
+        if line.startswith("notify"):
+            return line
+    raise AssertionError("no notify row in:\n" + text)
+
+
 def test_a_dead_notify_channel_is_loud_and_a_log_only_channel_is_not_green():
     dead = _text(_view(notify={"status": "dead", "channel": "imessage", "rc": 2,
                                "detail": "recipient file gone"}))
     assert "DEAD" in dead and "recipient file gone" in dead
     unconfigured = _text(_view(notify={"status": "unconfigured", "channel": "log-only",
                                        "rc": None, "detail": ""}))
-    assert "healthy" not in unconfigured.lower().split("notify")[-1].split("\n")[0]
+    row = _notify_line(unconfigured)
+    assert "NO CHANNEL CONFIGURED" in row
+    assert "healthy" not in row.lower(), "a log-only channel must never read as green"
+
+
+def test_a_stale_delivery_is_downgraded_from_healthy_to_unverified():
+    """A DELIVERED canary older than the report window is not 'healthy' — it is unproven.
+
+    This is the weekly-cadence exposure: the morning report's canary is minutes old, but a channel
+    nothing has exercised in a week must not read green on the once-over.
+    """
+    fresh = report_notify_canary_at(NOW - 100)
+    stale = report_notify_canary_at(NOW - WEEK - 100)
+    assert fresh["status"] == "healthy"
+    assert stale["status"] == "unverified" and "ago" in stale["detail"]
+    # rendered, the stale row says why and names the command that proves the channel
+    out = _text(_view(notify=stale))
+    assert "not verified" in out and "superlooper doctor --stack" in out
 
 
 def test_the_stack_summary_names_every_failure_and_warning_but_not_the_passes():
@@ -222,6 +288,36 @@ def test_doc_lint_findings_are_shown_and_a_skip_says_why():
     skipped = _text(_view(doc_lint={"status": "skipped", "docs": 0, "findings": [],
                                     "detail": "not a superlooper source checkout"}))
     assert "not a superlooper source checkout" in skipped
+
+
+def test_a_garbage_stack_entry_never_reads_as_a_pass():
+    """A non-dict entry is corrupt, not a passing block. Counting it as `ok` would read a broken
+    stack as a greener one — the fail-open-on-wrong-typed defect class pointing the wrong way."""
+    out = _text(_view(stack=["junk", {"name": "gh auth", "ok": True, "warn": False}]))
+    row = next(ln for ln in out.splitlines() if ln.startswith("stack"))
+    assert "1 ok" in row and "1 unreadable" in row
+
+
+def test_a_multi_line_stack_detail_is_collapsed_to_one_line():
+    """A `claude auth status --json` dump on a FAIL is multiple lines; the one-page layout assumes
+    one line per sub-entry, so the detail is whitespace-collapsed."""
+    blob = '{\n  "loggedIn": true,\n  "authMethod": "api_key"\n}'
+    out = _text(_view(stack=[{"name": "claude login", "ok": False, "warn": False, "detail": blob}]))
+    detail_lines = [ln for ln in out.splitlines() if "claude login" in ln]
+    assert len(detail_lines) == 1
+    assert "\n" not in detail_lines[0] and "loggedIn" in detail_lines[0]
+
+
+def test_render_fails_closed_on_wrong_typed_census_counts():
+    """render()'s docstring promises 'fails closed to an honest row rather than raising' — so a
+    wrong-typed count in a hand-built view must never reach a `%d` and raise."""
+    # would have raised `TypeError: %d format: a real number is required, not str` before the fix
+    out = _text(_view(branches={"sl": "x", "kept": None, "proposed": []},
+                      worktrees={"total": "nope", "reclaimable": "x", "held": "y"}))
+    assert "branches" in out and "worktrees" in out
+    # and the whole page still renders — no row swallowed the ones after it
+    for label in upkeep.SECTIONS:
+        assert label in out
 
 
 # --------------------------------------------------------------------------------------------
@@ -280,7 +376,7 @@ def test_upkeep_runs_read_only_and_exits_zero(upkeep_rig):
     home = Path(rig.env["SL_HOME"])
     before_home, before_repo = _snapshot(home), _snapshot(rig.repo)
 
-    r = cli(rig, "upkeep", "--repo", str(rig.repo))
+    r = cli(rig, "upkeep", "--repo", str(rig.repo), env_over=_upkeep_env(rig))
 
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
@@ -293,10 +389,11 @@ def test_upkeep_runs_read_only_and_exits_zero(upkeep_rig):
 
 
 def test_upkeep_reads_the_journal_for_the_weeks_counts_and_the_notify_canary(upkeep_rig):
-    r = cli(upkeep_rig, "upkeep", "--repo", str(upkeep_rig.repo))
+    r = cli(upkeep_rig, "upkeep", "--repo", str(upkeep_rig.repo), env_over=_upkeep_env(upkeep_rig))
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
-    # the canary the morning report journaled — NOT a fresh send
+    # the canary the morning report journaled — NOT a fresh send (and seeded recent, so within the
+    # weekly freshness window)
     assert "healthy" in out and "imessage" in out
     assert "1 owner question" in out
     assert "1 park" in out
@@ -317,7 +414,7 @@ def test_upkeep_never_sends_a_notify_message(rig):                     # noqa: F
     cfg["notify"] = {"cmd": "touch %s" % beacon, "imessage_to": None}
     cfg_path.write_text(json.dumps(cfg))
 
-    r = cli(rig, "upkeep", "--repo", str(rig.repo))
+    r = cli(rig, "upkeep", "--repo", str(rig.repo), env_over=_upkeep_env(rig))
 
     assert r.returncode == 0, r.stdout + r.stderr
     assert not beacon.exists(), "upkeep sent a notify message — it is read-only"
@@ -358,12 +455,30 @@ def test_a_failing_block_with_its_own_row_is_never_folded_away():
 
 
 def test_upkeep_reports_the_branch_and_worktree_census(upkeep_rig):
-    r = cli(upkeep_rig, "upkeep", "--repo", str(upkeep_rig.repo))
+    r = cli(upkeep_rig, "upkeep", "--repo", str(upkeep_rig.repo), env_over=_upkeep_env(upkeep_rig))
     assert r.returncode == 0, r.stdout + r.stderr
-    # branches.json carries main + two sl/* branches
-    assert "2 remote `sl/*` branch" in r.stdout or "sl/*" in r.stdout
+    # branches.json carries main + two sl/* branches — assert the real rendered row, so the COUNT
+    # is checked, not just the presence of the substring "sl/*"
+    assert "2 `sl/*` branches on the remote" in r.stdout, r.stdout
     # the fixture home has exactly one worktree on disk (i7, parked)
     assert "1 on disk" in r.stdout
+
+
+def test_upkeep_marks_the_gh_backed_rows_unread_when_github_is_down(upkeep_rig):
+    """gh reads fail closed to empty — correct for the acting verbs, wrong for a weekly glance.
+
+    "0 branches, nothing to propose" for a repo that was simply unreachable is the exact reassuring
+    page upkeep must never fabricate. With GH_FAIL the probe fails and both rows must say UNREAD,
+    while the report still exits 0 (it is a report, not a gate).
+    """
+    env = {**_upkeep_env(upkeep_rig), "GH_FAIL": "1"}
+    r = cli(upkeep_rig, "upkeep", "--repo", str(upkeep_rig.repo), env_over=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = {ln.split()[0]: ln for ln in r.stdout.splitlines() if ln and not ln.startswith(" ")}
+    assert "not read — gh was unreachable" in lines.get("janitor", ""), r.stdout
+    assert "not read — gh was unreachable" in lines.get("branches", ""), r.stdout
+    # ...and it still changed nothing
+    assert mutations(upkeep_rig) == []
 
 
 def test_upkeep_refuses_an_unadopted_repo_and_names_adopt(rig):        # noqa: F811

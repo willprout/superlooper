@@ -281,7 +281,7 @@ def _questions(records, window_start):
     return lines, total
 
 
-def notify_canary(records):
+def notify_canary(records, now=None, max_age_seconds=None):
     """What the LATEST notify-channel canary says, as a verdict dict (issue #164).
 
     The daily morning push doubles as the channel heartbeat: the runner journals its delivery result
@@ -294,6 +294,12 @@ def notify_canary(records):
     Fail closed: a wrong-typed/absent record reads as `unverified`, never a false green; a
     `log-only` result is `unconfigured`, never 'healthy'; and `ok` must be EXACTLY True (a truthy
     string in a hand-edited journal must not read as delivered).
+
+    Freshness (issue #200): the morning report calls this with a canary minutes old, so by default
+    there is no age bound. A WEEKLY reader (`superlooper upkeep`) passes `now` and
+    `max_age_seconds`: a delivered canary older than the window is downgraded to `unverified` —
+    a channel nothing has exercised in a week is not "healthy", it is unproven. Only a DELIVERED
+    canary is aged out; a `dead`/`unconfigured` one stays as-is (its warning does not go stale).
 
     Structured rather than pre-rendered because there are now two readers with different shapes —
     the morning report's markdown bullet (``_notify_channel`` below) and ``superlooper upkeep``'s
@@ -311,6 +317,15 @@ def notify_canary(records):
     if channel == "log-only":
         return {"status": "unconfigured", "channel": channel, "rc": rc, "detail": detail}
     if latest.get("ok") is True:               # `is True`: a truthy string must never read as green
+        # Age-out a stale delivery for a windowed (weekly) reader. A missing/corrupt ts fails
+        # CLOSED — it cannot prove freshness, so it cannot read as healthy.
+        if isinstance(now, (int, float)) and not isinstance(now, bool) \
+                and isinstance(max_age_seconds, (int, float)) and not isinstance(max_age_seconds, bool):
+            ts = _ts(latest)
+            if ts is None or ts < now - max_age_seconds:
+                age = ("%dd" % int((now - ts) // 86400)) if ts is not None else "unknown"
+                return {"status": "unverified", "channel": channel, "rc": rc,
+                        "detail": "last delivery was %s ago — older than the report window" % age}
         return {"status": "healthy", "channel": channel, "rc": rc, "detail": detail}
     return {"status": "dead", "channel": channel, "rc": rc,
             "detail": detail or "(no error captured)"}

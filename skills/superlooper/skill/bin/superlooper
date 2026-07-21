@@ -1517,6 +1517,7 @@ def cmd_upkeep(args):
 
     home = str(config_lib.state_home(cfg))
     dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
+    now = time.time()
     records = journal.read(home)
 
     # SKIP_SEND: doctor --stack proves the notify channel by SENDING one live message; upkeep must
@@ -1526,7 +1527,17 @@ def cmd_upkeep(args):
     stack = stack_doctor.check_stack(cfg, sender=stack_doctor.SKIP_SEND,
                                      announce=lambda *a, **k: None, repo_path=args.repo)
 
-    janitor_view, branches = _upkeep_janitor_view(home, cfg, dev)
+    # Probe GitHub ONCE, up front. The janitor and branch censuses read from gh, and gh reads fail
+    # CLOSED to empty — correct for the acting verbs, but here it would render "nothing to propose,
+    # 0 branches" for a repo that was simply unreachable, the exact reassuring page a weekly glance
+    # should never fabricate. So when gh is down we mark both rows UNREAD rather than reading a
+    # refusal as a clean result. (check_stack already surfaces the gh outage as its own FAIL.)
+    if gh.probe():
+        janitor_view, branches = _upkeep_janitor_view(home, cfg, dev)
+        branches_view = upkeep_lib.branch_census(branches, janitor_view["proposals"])
+    else:
+        janitor_view = {"error": None, "proposals": [], "held": [], "unread": True}
+        branches_view = {"unread": True}
 
     try:
         st = loopstate.load(os.path.join(home, "state", "issues.json"))
@@ -1549,10 +1560,14 @@ def cmd_upkeep(args):
         # engine's own monorepo there are none, and lint() skips cleanly rather than inventing a
         # verdict — the same posture engine_drift takes with no source checkout.
         "doc_lint": doc_lint.lint(args.repo),
-        "branches": upkeep_lib.branch_census(branches, janitor_view["proposals"]),
+        "branches": branches_view,
         "worktrees": upkeep_lib.worktree_census(wt_ids, issues, wt_blocks),
-        "notify": report.notify_canary(records),
-        "week": upkeep_lib.week_counts(records, time.time()),
+        # WEEK_SECONDS window: a delivered canary older than the report window is not "healthy",
+        # it is unproven — the weekly cadence is what makes that freshness bound necessary (the
+        # morning report's canary is minutes old, so it passes no window).
+        "notify": report.notify_canary(records, now=now,
+                                       max_age_seconds=upkeep_lib.WEEK_SECONDS),
+        "week": upkeep_lib.week_counts(records, now),
     }
     for line in upkeep_lib.render(view):
         print(line)

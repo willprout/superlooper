@@ -30,6 +30,12 @@ terminal screen — the report is meant to be GLANCED at, and anything that scro
 
 WEEK_SECONDS = 7 * 24 * 3600
 
+# What counts as a landing for the week's merge denominator: a clean gate merge AND an out-of-band
+# merge the runner absorbed (a PR that landed on GitHub between merge and poll). Same pair
+# report._MERGE_ACTS uses, so upkeep's "N merges landed" agrees with the morning report's Merged
+# section for the same window rather than undercounting it.
+_MERGE_ACTS = ("merge", "absorb_merged")
+
 # The section labels, in report order. Public because the tests assert the page is complete by
 # iterating this rather than by re-typing the list — a section quietly dropped would otherwise pass.
 SECTIONS = ("stack", "engine", "janitor", "docs", "branches", "worktrees", "notify", "week")
@@ -68,6 +74,21 @@ def _num(v):
 
 def _s(v, default=""):
     return v if isinstance(v, str) else default
+
+
+def _int(v, default=0):
+    """A plain int (bool excluded) or `default`. The census dicts come from other pure functions
+    here so they are well-typed, but render()'s docstring promises "fails closed rather than
+    raising" for hand-built views too — a wrong-typed count must never reach a `%d` and raise."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else default
+
+
+def _oneline(v):
+    """Collapse a detail to a single line. A stack block's detail can be a multi-line blob (a
+    `claude auth status --json` dump on a FAIL was five unindented lines mid-report), and the
+    one-page layout assumes one line per `_sub`. Whitespace-collapsed and length-capped."""
+    text = " ".join(_s(v).split())
+    return text if len(text) <= 200 else text[:197] + "..."
 
 
 def _plural(n, word, suffix="s"):
@@ -116,7 +137,7 @@ def week_counts(records, now):
                 counts["needs_owner"] += 1
         elif act == "bounce":
             counts["bounces"] += 1
-        elif act == "merge":
+        elif act in _MERGE_ACTS:
             counts["merges"] += 1
     counts["question_issues"] = len(question_nums)
     return counts
@@ -135,7 +156,11 @@ def branch_census(branches, proposals):
     list. Both fail closed to empty."""
     names = [b for b in branches if isinstance(b, str)] if isinstance(branches, dict) else []
     sl = [b for b in names if b.startswith("sl/")]
-    proposed = {p.get("target") for p in _records(proposals) if p.get("kind") == "branch"}
+    # `target` filtered to str: a wrong-typed target (a list from a corrupt proposal) is unhashable
+    # and would raise inside the set comprehension — the contract is "fail closed to empty", so it
+    # is skipped, never a crash.
+    proposed = {p.get("target") for p in _records(proposals)
+                if p.get("kind") == "branch" and isinstance(p.get("target"), str)}
     hit = [b for b in sl if b in proposed]
     return {"total": len(names), "sl": len(sl), "proposed": len(hit),
             "kept": len(sl) - len(hit)}
@@ -162,8 +187,17 @@ def worktree_census(worktree_ids, issues, blocks):
     the lane building this very feature was the first thing it flagged.) `merged` is excluded too —
     its removal rides the merge-time path and its own ``cleanup_merged_worktrees`` gate.
 
-    `blocks` is {iid: reason-or-None} from ``gitops.worktree_reclaim_block``; a missing entry reads
-    as "not checked", which is neither reclaimable nor held. Every wrong-typed input -> empty."""
+    The exclusion is a NEGATIVE veto — a live-or-reaped status — not a positive park-family
+    allowlist, and that direction is the fail-closed one: a not-yet-started ``ready`` checkout that
+    somehow holds unsaved work, or a status typo the code has never seen, is INCLUDED as a finding.
+    A checkout we cannot positively classify as "a worker is writing here" must fail toward VISIBLE,
+    never toward silence.
+
+    `blocks` is {iid: reason-or-None} from ``gitops.worktree_reclaim_block``. A missing/None/empty
+    entry means "no reclaim-block known": eligible for the runner's own reaper (which re-guards each
+    checkout with ``worktree_reclaim_block`` again at reap time), and not a held finding (no
+    evidence of unsaved work). Every wrong-typed input -> empty."""
+    import actions
     import tidy
 
     ids = sorted({w for w in worktree_ids if isinstance(w, str)}
@@ -172,15 +206,17 @@ def worktree_census(worktree_ids, issues, blocks):
     blocks = blocks if isinstance(blocks, dict) else {}
     safe = [i for i in tidy.reclaimable_worktrees(issues, ids)
             if not _s(blocks.get(i))]
+    # A worker may still be writing in a territory-claim lane; a merged checkout is reclaimed on the
+    # merge path. Everything else that holds unsaved work is a finding.
+    live_or_reaped = actions.TERRITORY_CLAIM_STATUSES | {"merged"}
     held = []
     for iid in ids:
         ist = issues.get(iid)
-        known = isinstance(ist, dict) and isinstance(ist.get("status"), str)
-        status = ist["status"] if known else "(no lane record)"
+        status = ist.get("status") if isinstance(ist, dict) else None
+        status = status if isinstance(status, str) else None
         block = _s(blocks.get(iid))
-        # Only a checkout nobody is still writing in, and that nothing will come back for.
-        if block and (not known or status in tidy.REAPPROVABLE):
-            held.append({"id": iid, "status": status, "block": block})
+        if block and status not in live_or_reaped:
+            held.append({"id": iid, "status": status or "(no lane record)", "block": block})
     return {"total": len(ids), "reclaimable": safe, "held": held}
 
 
@@ -232,15 +268,25 @@ def _stack_row(stack, repo_path, out):
         _row("stack", "not read — the machine-level checks could not run.", out)
         _remedy("superlooper doctor --stack --repo %s" % repo_path, out)
         return
-    fails = [r for r in stack if isinstance(r, dict) and not r.get("ok")]
-    warns = [r for r in stack if isinstance(r, dict) and r.get("ok") and r.get("warn")]
-    passes = len(stack) - len(fails) - len(warns)
-    _row("stack", "%d FAIL, %d WARN, %d ok" % (len(fails), len(warns), passes), out)
+    dicts = [r for r in stack if isinstance(r, dict)]
+    fails = [r for r in dicts if not r.get("ok")]
+    warns = [r for r in dicts if r.get("ok") and r.get("warn")]
+    # Count passes from the DICTS only — a non-dict entry is garbage, not a passing block, and
+    # counting it (len(stack) - fails - warns) would read a corrupt stack as a greener one. Surface
+    # the unreadable count rather than folding it into "ok".
+    passes = len(dicts) - len(fails) - len(warns)
+    junk = len(stack) - len(dicts)
+    summary = "%d FAIL, %d WARN, %d ok" % (len(fails), len(warns), passes)
+    if junk:
+        summary += ", %d unreadable" % junk
+    _row("stack", summary, out)
     # Only what needs looking at. A one-page report that re-prints twelve passing blocks buries
-    # the one line that matters — `doctor --stack` is where the full readout lives.
+    # the one line that matters — `doctor --stack` is where the full readout lives. A block's detail
+    # can be a multi-line blob (a JSON auth dump on a FAIL), so it is collapsed to one line here.
     for r in fails + warns:
+        detail = _oneline(r.get("detail"))
         _sub("%s %s%s" % ("FAIL" if not r.get("ok") else "WARN", _s(r.get("name"), "?"),
-                          (" — " + _s(r.get("detail"))) if _s(r.get("detail")) else ""), out)
+                          (" — " + detail) if detail else ""), out)
     if fails or warns:
         _remedy("superlooper doctor --stack --repo %s   (also sends the live notify test)"
                 % repo_path, out)
@@ -273,6 +319,9 @@ def _engine_row(drift, out):
 
 def _janitor_row(janitor, repo_path, out):
     janitor = janitor if isinstance(janitor, dict) else {}
+    if janitor.get("unread"):                       # gh was unreachable — an empty sweep read
+        _row("janitor", "not read — gh was unreachable this run", out)   # NOTHING, never "clean"
+        return
     error = _s(janitor.get("error"))
     if error:
         _row("janitor", "could not propose — %s" % error, out)
@@ -326,9 +375,12 @@ def _docs_row(lint, out):
 
 def _branches_row(census, repo_path, out):
     census = census if isinstance(census, dict) else {}
-    sl = census.get("sl", 0)
-    kept = census.get("kept", 0)
-    proposed = census.get("proposed", 0)
+    if census.get("unread"):                        # gh was unreachable this run — say so, never 0
+        _row("branches", "not read — gh was unreachable this run", out)
+        return
+    sl = _int(census.get("sl"))
+    kept = _int(census.get("kept"))
+    proposed = _int(census.get("proposed"))
     _row("branches", "%s on the remote; %d proposed for deletion, %d not provably landed"
          % (_plural(sl, "`sl/*` branch", "es"), proposed, kept), out)
     if proposed:
@@ -337,9 +389,11 @@ def _branches_row(census, repo_path, out):
 
 def _worktrees_row(census, out):
     census = census if isinstance(census, dict) else {}
-    total = census.get("total", 0)
+    total = _int(census.get("total"))
     reclaimable = census.get("reclaimable") or []
     held = census.get("held") or []
+    reclaimable = reclaimable if isinstance(reclaimable, list) else []
+    held = held if isinstance(held, list) else []
     _row("worktrees", "%d on disk; %d park-family reclaimable, %d holding unsaved work"
          % (total, len(reclaimable), len(held)), out)
     if held:
@@ -360,7 +414,10 @@ def _notify_row(canary, out):
         _row("notify", "healthy — the last push delivered via %s" % channel, out)
         return
     if status == "unverified":
-        _row("notify", "not verified — no canary recorded in the journal window", out)
+        # Two shapes reach here: no canary at all, and a delivery too old for the report window
+        # (report.notify_canary ages a stale one out). The detail distinguishes them.
+        why = _s(canary.get("detail")) or "no canary recorded in the journal window"
+        _row("notify", "not verified — %s" % why, out)
         _remedy("superlooper doctor --stack sends a live test message and proves the channel", out)
         return
     if status == "unconfigured":

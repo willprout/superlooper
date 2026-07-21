@@ -404,9 +404,12 @@ def documented_labels(text, live, retired):
 # in these docs, which is five of the eight that exist. `bin/` and `docs/` are deliberately left
 # out: the ops docs use both as payload- and installed-home-relative prefixes (a `bin/<script>`
 # invocation, `docs/ADOPTING.md`), so including them would flag correct references — at the cost
-# that a citation of `bin/install.sh` or `docs/ADOPTING.md` is never existence-checked. A lookbehind
-# keeps an INSTALLED path (`~/.claude/skills/superlooper/bin/superlooper`) or a state-home path from
-# being read as a repo path; those legitimately do not exist in the tree.
+# that a citation of `bin/install.sh` or `docs/ADOPTING.md` is never existence-checked. The
+# lookbehind keeps a path that only LOOKS repo-relative — one rooted at the installed skills home
+# under the user's home dir, or under a state home — from being read as a repo path; those
+# legitimately do not exist in the tree. (This comment names no literal install path on purpose:
+# the one-publish-door fence in tests/test_one_publish_door.py reads engine-lib prose too, and a
+# module that neither writes nor publishes must not trip it.)
 _REPO_TOP_DIRS = ("plugin", "skills", "dashboard", ".superlooper", ".github")
 _PATH_RE = re.compile(
     r"(?<![/~\w.-])((?:%s)/[A-Za-z0-9_./-]*[A-Za-z0-9_-])"

@@ -112,6 +112,11 @@ def test_the_linted_doc_set_is_complete_and_real():
     assert "plugin/skills/sl-debugger/references/unattended-contract.md" in docs
     assert "plugin/skills/superlooper/references/runner-ops.md" in docs
     assert "skills/superlooper/docs/STACK.md" in docs
+    # dashboard/README.md is a component README, picked up by the `*/README.md` glob (issue #200
+    # swapped it out of NAMED so engine code needn't name the dashboard — test_dashboard_agnostic).
+    # A NAMED doc that vanishes fails loudly above; a globbed one just drops out, so pin it here.
+    assert "dashboard/README.md" in docs, "the dashboard README fell out of the linted set"
+    assert "README.md" in docs
     # And nothing operational hides in skills/superlooper/docs/ without being linted or explicitly
     # classified as a dated record.
     linted = set(docs)
@@ -263,6 +268,9 @@ def test_lint_agrees_with_the_per_doc_tests_on_this_checkout():
     result = doc_lint.lint(_REPO)
     assert result["status"] == "clean", result["findings"]
     assert result["docs"] == len(ops_docs())
+    # a concrete floor, so the check is not merely ops_docs() == ops_docs(): this repo really does
+    # carry a double-digit operational doc set, and a lint that silently linted zero would fail here.
+    assert result["docs"] >= 10
 
 
 def test_lint_skips_cleanly_outside_a_superlooper_checkout(tmp_path):
