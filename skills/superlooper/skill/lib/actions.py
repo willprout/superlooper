@@ -1345,8 +1345,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # reason: this list IS the dedup key. When the banner changes mid-episode — the owner fixes
         # the API key and the session falls back to a dead subscription login — the REMEDY changed,
         # and an owner silenced by a dedup against the old reason would keep applying the old fix.
-        # A reading with no variant (pane_state's generic nets, or a stubbed rc that captured no
-        # stderr) keeps #151's original reason string byte-for-byte and gets the generic body.
+        # A reading with no variant — which means the stderr channel lost it, not that the pane
+        # was half-recognised — keeps #151's reason string byte-for-byte and gets the generic body.
         if (ist_of(iid).get("sensed_state") == "logged_out"
                 and _status_of(ist_of(iid)) not in TERMINAL_STATUSES):
             variant = ist_of(iid).get("sensed_auth")

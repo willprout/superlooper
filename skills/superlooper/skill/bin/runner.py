@@ -3105,10 +3105,11 @@ class Runner:
         deliberately not a second sensed_state: the send-safety verdict is identical for every
         member of the family and every guard downstream keys off `logged_out`, so splitting the
         state would only multiply the places that can silently forget a member. It rides on
-        nudge-pane's stderr — the channel ScriptRC already carries — and fails OPEN to None: a
-        stubbed plain-int rc captured nothing, and an unrecognised banner reaches us through
-        pane_state's generic nets with no variant at all. Either way the lane is still auth-dead
-        and still held; only the wording degrades."""
+        nudge-pane's stderr — the channel ScriptRC already carries — and fails OPEN to None. The
+        pane itself never produces a variant-less logged_out (classify_screen and auth_death_variant
+        read the same table), so None means the CHANNEL lost it: a stubbed plain-int rc that
+        captured nothing, or a stderr tail that did not survive. Either way the lane is still
+        auth-dead and still held; only the wording degrades."""
         sensed = {5: "logged_out", 6: "at_dialog"}.get(rc)
         auth = self._auth_variant(rc) if sensed == "logged_out" else None
 

@@ -469,7 +469,26 @@ AUTH_DEATH_BANNERS = [
     ("Authentication error · The gateway could not authenticate with its upstream provider — "
      "contact your gateway administrator", "gateway_auth"),
     ("Authentication error · This may be a temporary network issue, please try again", "auth_error"),
+    ("Your session has expired. Please run /login to sign in again.", "login"),
+    ("Your account does not have access to Claude. Please login again or contact your "
+     "administrator.", "no_account_access"),
+    # The Bedrock / Vertex credential paths. The bundle always renders these with the "·" tail
+    # (`${msg} · run `${cmd}` and retry · API Error: ${detail}`), and the tail is REQUIRED — a bare
+    # "AWS authentication failed" is what the owner's own aws CLI prints in a tool result.
+    ("AWS credentials expired or invalid · run `aws sso login` and retry", "cloud_credentials"),
+    ("AWS authentication failed · run `aws sso login` and retry", "cloud_credentials"),
+    ("Google Cloud credentials expired or invalid · run `gcloud auth application-default login` "
+     "and retry", "cloud_credentials"),
+    ("Google Cloud authentication failed · if credentials are current, check GCP IAM permissions",
+     "cloud_credentials"),
 ]
+
+# The narrowest pane, in AVAILABLE columns, at which each banner must still refuse. This is not
+# decoration: it is the residual clip floor, and it is inherent to anchoring on a head clause —
+# below it, the head itself is cut and nothing can recognise the line short of re-joining wrapped
+# rows. Writing it down turns "we think 80 is fine" into an assertion that breaks if a pattern's
+# required tail ever grows. Anything at or under 80 is safe on any real cmux pane.
+CLIP_FLOOR = 73          # the worst case: subscription_disabled's head is exactly 73 characters
 
 
 def test_every_auth_death_banner_refuses_instead_of_reading_as_idle():
@@ -555,9 +574,14 @@ def test_the_bundles_own_generic_render_shapes_are_anchored_too():
     lesson: an open tail on an ordinary English head ("Failed to authenticate: ...") fires on half
     the tool output a worker's own screen carries, and the false positive is NOT self-clearing."""
     for screen in ("Please run /login · API Error: 401 unauthorized",
-                   "Failed to authenticate. API Error: 403 forbidden",
-                   "Not logged in"):
+                   "Failed to authenticate. API Error: 403 forbidden"):
         assert ps.classify_screen(screen) == "logged_out", screen
+    # `^Not logged in$` is NOT anchored, though the bundle's normalizer names it. Round 2 of the
+    # review read that normalizer properly: it is a REPLACE CHAIN, and `^Not logged in$` only ever
+    # sees the residue left after ` · Please run /login$` has already been stripped — so it is not
+    # evidence of a standalone render, and a bare "Not logged in" line is something `gh` and
+    # `docker` print. Both real siblings are matched literally above.
+    assert ps.classify_screen("Not logged in") != "logged_out"
 
 
 def test_the_open_headed_suffix_net_is_gone():
@@ -678,28 +702,41 @@ def test_a_clipped_banner_still_refuses_at_a_narrow_pane_width():
     the bundle, so they CLIP — the tail is gone entirely, not pushed to a second line.
 
     The long heads are unmistakable on their own, so they now match head-only too."""
+    # The `_clipped` set, and only it. Round 2 pulled `OAuth token revoked` and `Invalid API key`
+    # back out: both banners are under 40 characters, so no realistic pane ever clips them, and both
+    # heads are sentences other tools print. Every head below names a Claude-specific condition in
+    # full and could not plausibly be anything else.
     heads = [
         ("Your organization has disabled Claude subscription access for Claude Code",
          "subscription_disabled"),
         ("Your organization has disabled API key authentication", "org_api_key_disabled"),
         ("Your ANTHROPIC_API_KEY belongs to a disabled organization", "api_key_org_disabled"),
         ("Your apiKeyHelper script is failing", "apikey_helper_failing"),
-        ("OAuth token revoked", "oauth_revoked"),
-        ("Invalid API key", "invalid_api_key"),
+        ("Your account does not have access to Claude", "no_account_access"),
     ]
     for head, variant in heads:
-        for line in (head, head + " ·", head + " · ", f"  {head} ·"):
+        seps = [".", " ."] if variant == "no_account_access" else ["·", " ·"]
+        for line in [head] + [head + " " + sp for sp in seps] + [f"  {head} {seps[0]}"]:
             assert ps.classify_screen(line) == "logged_out", repr(line)
             assert ps.auth_death_variant(line) == variant, repr(line)
 
 
 def test_the_full_family_survives_a_hard_clip_at_every_realistic_width():
-    """The same P1-1 defect, swept rather than spot-checked: clip each banner to every width a real
-    pane could have and assert it never reads as safe-to-send."""
+    """The P1-1 defect, swept rather than spot-checked — and swept for real this time.
+
+    ROUND 2 of the review caught the first version of this test being a tautology: it tried only
+    widths 80/100/120 at indent 0, and at none of those does any banner's clip land on its
+    separator, so it was green against the buggy code it claimed to guard. It was written from the
+    patch, not from the risk.
+
+    This version sweeps every width from the declared CLIP_FLOOR up, at every indent a real render
+    puts in front of a message, and clips the way a fixed-height box actually does."""
     for banner, _variant in AUTH_DEATH_BANNERS:
-        for width in (80, 100, 120):
-            clipped = banner[:width].rstrip()
-            assert ps.classify_screen(clipped) == "logged_out", f"{width}: {clipped!r}"
+        for indent in range(0, 8):
+            for width in range(CLIP_FLOOR + indent, 141):
+                clipped = (" " * indent + banner)[:width].rstrip()
+                assert ps.classify_screen(clipped) == "logged_out", (
+                    f"width={width} indent={indent}: {clipped!r}")
 
 
 def test_unrelated_tool_output_mentioning_authentication_is_not_claude_auth_death():
@@ -722,6 +759,25 @@ def test_unrelated_tool_output_mentioning_authentication_is_not_claude_auth_deat
         "Authentication error - try again",
         "⎿  Invalid API key - the deploy token expired",
         "Login expired - re-run the fixture generator",
+        # ROUND 2 of the review: the first fence only tried the "-" forms — i.e. exactly the
+        # characters that cut had just deleted from the separator class — so it was written from the
+        # patch rather than from the risk and proved nothing. These are the ":" and "." forms, and
+        # they are the shapes ordinary English actually uses to introduce an explanation.
+        "OAuth token revoked: see the runbook",
+        "OAuth token revoked. See the runbook.",
+        "Authentication error: try again",
+        "Failed to authenticate: OAuth session token was not returned by the provider",
+        "AWS authentication failed: check ~/.aws/credentials",
+        "Google Cloud authentication failed: no ADC found",
+        "AWS authentication failed",
+        "Not logged in",
+        "Not logged in: run `gh auth login` first",
+        "Not logged in. Run `docker login` to continue.",
+        "Session expired",
+        "Session expired.",
+        "Invalid API key",
+        "Invalid API key.",
+        "Invalid API key:",
     ):
         assert ps.classify_screen(screen) != "logged_out", screen
         assert ps.auth_death_variant(screen) is None, screen

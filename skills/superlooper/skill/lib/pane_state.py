@@ -151,73 +151,79 @@ def _banner_lines(raw):
 # clause, which is what keeps a worker rendering its own conversation from reading its screen as a
 # broken session (#151's fresh-review P1 fence, re-run over these files).
 #
-# THE SEPARATOR is an explicit punctuation class, NOT #151's loose `\W`, and it holds ONLY the
-# characters Claude Code actually renders: "·" for the whole `·`-separated family, and the ":"/"."
-# the two "Failed to authenticate" forms use. Two independent reasons, both found the hard way:
+# THE SEPARATOR is PER PATTERN, and holds only the character that pattern's banner actually uses.
+# A single shared class was wrong twice over, both times found by review:
 #
-#   - `\W` matches a plain SPACE, and the bundle ships "Invalid API key format. API key must
-#     contain only alphanumeric characters, …" — a NON-fatal validation message sharing a head
-#     clause with a genuine banner, separated from its tail by nothing but a space.
-#   - the first cut also admitted "-" and the dashes, which made ordinary tool output match:
-#     "OAuth token revoked - see the runbook", "Authentication error - try again",
-#     "Invalid API key - the deploy token expired". A worker's screen is FULL of tool results, and
-#     "⎿" is stripped as chrome, so such a line reduces to exactly this shape (fresh-review P1-2).
+#   - #151's loose `\W` matches a plain SPACE, and the bundle ships "Invalid API key format. API key
+#     must contain only alphanumeric characters, …" — a NON-fatal validation message sharing a head
+#     clause with a genuine banner and separated from its tail by nothing but a space.
+#   - a shared `[·•:.]` still let ordinary tool output through, because ":" and "." are how ENGLISH
+#     separates a clause from its explanation: "OAuth token revoked: see the runbook",
+#     "Authentication error: try again", "AWS authentication failed: check ~/.aws/credentials".
+#     A worker's screen is full of tool results and "⎿" is stripped as chrome, so such a line
+#     reduces to exactly this shape. Only three banners genuinely use a sentence separator
+#     ("Not logged in.", "Session expired.", "Failed to authenticate:"); everything else is "·".
 #
 # The cost of a false positive here is not "one self-clearing cycle", which is what the #151-era
 # comment assumed. For an IDLE pane it is unbounded: decide suppresses the park, the only follow-up
 # is a recover that nudge-pane refuses to type into, so nothing ever writes to the pane, the
 # offending line never scrolls out of the 40-line window, and the alert stands until a human looks.
-# That asymmetry is why every pattern below is anchored on a VERIFIED head clause and why the one
-# pattern that had an open head is gone.
-_AUTH_SEP = r"\s*[·•:.]\s*"
+# That asymmetry is why every pattern below is anchored on a VERIFIED head clause, why the one
+# pattern that had a free head is gone, and why a bare head is allowed ONLY where the head alone
+# could not plausibly be anything else.
+_SEP_DOT = r"\s*[·•]\s*"          # the "·"-separated family — the overwhelming majority
+_SEP_SENTENCE = r"\s*[.:]\s*"     # the three that separate with ordinary sentence punctuation
 
 
-def _banner(head, tail):
-    """`<head clause> <sep> <tail>`, fullmatched against ONE line. `tail` is required: these heads
-    are ordinary English and need their tail to be identifiable."""
-    return re.compile(head + _AUTH_SEP + tail, re.I)
+def _banner(head, tail, sep=_SEP_DOT):
+    """`<head clause> <sep> <tail>`, fullmatched against ONE line. The tail is REQUIRED: these heads
+    are ordinary English ("Authentication error", "Invalid API key", "Not logged in") and it is the
+    tail that makes the line Claude Code's rather than some other tool's."""
+    return re.compile(head + sep + tail, re.I)
 
 
-def _clipped(head, tail=r".*"):
-    """Same, but the separator AND tail are OPTIONAL — for heads that are unmistakable alone.
+def _clipped(head, tail=r".*", sep=_SEP_DOT):
+    """Same, but the separator AND the tail are OPTIONAL — for heads unmistakable on their own.
 
-    FRESH-REVIEW P1-1: the first cut required the tail, and a pane narrow enough to wrap or CLIP the
-    banner at its separator therefore read as plain 'idle' = safe to send. Measured at a plain 80
-    columns with the message list's normal 2-char indent, "Your organization has disabled Claude
-    subscription access for Claude Code ·" was the entire first line and classified as idle — i336
-    restored, silently, on the exact members this issue exists to catch. Several of these render
-    inside a fixed-height box in the bundle, so they CLIP: the tail is not on a second line, it is
-    gone. Heads this specific never appear in ordinary text, so head-only is safe here in a way it
-    would not be for "Authentication error" or "Failed to authenticate".
+    FRESH-REVIEW P1-1: requiring the tail meant a pane narrow enough to wrap or CLIP the banner at
+    its separator read as plain 'idle' = safe to send. Measured at a plain 80 columns with the
+    message list's normal 2-char indent, "Your organization has disabled Claude subscription access
+    for Claude Code ·" was the entire first line and classified idle — i336 restored, silently, on
+    the exact members this issue exists to catch. Several of these render inside a fixed-height box
+    in the bundle, so they CLIP: the tail is not on a second line, it is gone.
 
-    The tail is optional INSIDE the optional separator group, not just alongside it: a clip can land
-    one character past the separator ("Invalid API key ·") as easily as before it."""
-    return re.compile(head + r"(?:" + _AUTH_SEP + r"(?:" + tail + r")?)?", re.I)
+    Reserved for the five heads that name a Claude-specific condition in full ("Your organization
+    has disabled …", "Your apiKeyHelper script is failing", "Your account does not have access to
+    Claude"). Round 2 of the review pulled `not logged in`, `session expired`, `oauth token revoked`,
+    `invalid api key` and the four cloud-credential strings BACK out of this set: each is short
+    enough that a realistic pane never clips it, and each is a sentence some other tool on the
+    machine emits. The tail here is left OPEN rather than pinned, because a pinned tail leaves a
+    dead band — a clip landing inside the tail matches neither arm.
+
+    The tail is optional INSIDE the separator group, not just alongside it: a clip can land one
+    character past the separator ("… Claude Code ·") as easily as before it."""
+    return re.compile(head + r"(?:" + sep + r"(?:" + tail + r")?)?", re.I)
 
 
 # (variant, pattern) in match order — the FIRST match wins, so more specific tails precede looser
 # ones on a shared head. Every literal is verified against the installed binary
 # (~/.local/share/claude/versions/2.1.216), read out of its interned string table; none is invented.
 _LOGGED_OUT_PATTERNS = [
-    # --- the /login family: #151's four, byte-for-byte, plus the siblings the binary carries beside
-    # them. #151's keep the original loose `\W` — they are short enough never to clip and they are
-    # the proven anchors i336 was closed on.
+    # --- the /login family: #151's four, byte-for-byte. They keep the original loose `\W` because
+    # they are the proven anchors i336 was closed on and nothing has been reported against them.
     ("login", re.compile(r"not logged in\s*\W\s*please run /login", re.I)),  # #151's exact string
     ("login", re.compile(r"not logged in\s*\W\s*run /login", re.I)),
     ("login", re.compile(r"not logged in\W+run claude auth login to authenticate\W*", re.I)),
     ("login", re.compile(r"session expired\W+please run /login to sign in again\W*", re.I)),
-    ("login", _banner(r"login expired", r"please run /login\W*")),
-    ("login", _banner(r"your session has expired", r"please run /login.*")),
-    # The head clauses on their own. The bundle's OWN normalizer for these banners strips
-    # `^Please run /login \xB7 `, `^Failed to authenticate\. `, ` \xB7 Please run /login$` and
-    # `^Not logged in$` — that last one is direct evidence that a bare "Not logged in" line is a
-    # shape Claude Code produces, and it is what a narrow pane leaves of every member of this
-    # sub-family once the tail is clipped (fresh-review P1-1).
-    ("login", _clipped(r"not logged in")),
-    ("login", _clipped(r"session expired", r"please run /login.*")),
+    # The same two, tolerant of a CLIPPED tail (P1-1) but with the tail still PINNED (round-2 P1-2):
+    # a bare "Not logged in" or "Session expired" line is something `gh`, `docker` and half the CLIs
+    # on the machine print, and it says nothing about THIS session's auth.
+    ("login", _banner(r"not logged in", r"run claude auth login.*", sep=_SEP_SENTENCE)),
+    ("login", _banner(r"session expired", r"please run /login.*", sep=_SEP_SENTENCE)),
+    ("login", _banner(r"your session has expired", r"please run /login.*", sep=_SEP_SENTENCE)),
+    ("login", _banner(r"login expired", r"please run /login.*")),
     # The bundle's own generic first-party render: `Please run /login \xB7 ${API Error}: ${detail}`.
-    # The tail is pinned to "API error" rather than left open, because "Please run /login" is a
-    # sentence a human writes (fresh-review P1-2/P1-3).
+    # Tail pinned to "API error", because "Please run /login" is a sentence a human writes.
     ("login", _banner(r"please run /login", r"api error\b.*")),
     # The CLAUDE_CODE_REMOTE render of the SAME banner. The bundle's own ternary is
     #   Wt(process.env.CLAUDE_CODE_REMOTE) ? "Authentication error \xB7 Try again"
@@ -228,25 +234,30 @@ _LOGGED_OUT_PATTERNS = [
     ("login_remote", _banner(r"authentication error", r"try again\W*")),
     # --- the token was killed or expired server-side: /login again, and if it RECURS the token was
     # revoked deliberately, which no amount of re-login fixes.
-    ("oauth_revoked", _clipped(r"oauth token revoked")),
-    ("oauth_revoked", _banner(r"failed to authenticate", r"oauth session.*")),
+    ("oauth_revoked", _banner(r"oauth token revoked", r"(?:please )?run /login.*")),
+    # Tail carries "expired" (round-2 P1-2): a bare "oauth session" prefix also matches sentences
+    # like "Failed to authenticate: OAuth session token was not returned by the provider", which is
+    # somebody else's OAuth, not Claude's. Clip floor is 45 columns — well inside any real pane.
+    ("oauth_revoked",
+     _banner(r"failed to authenticate", r"oauth session expired.*", sep=_SEP_SENTENCE)),
     # `Failed to authenticate. ${API Error}: ${detail}` — the remote sibling of the /login render
     # above. Pinned to "API error" for the same reason: a bare "Failed to authenticate: …" is a
     # sentence half the tools on the machine emit, and it is not about Claude's auth.
-    ("auth_error", _banner(r"failed to authenticate", r"api error\b.*")),
+    ("auth_error", _banner(r"failed to authenticate", r"api error\b.*", sep=_SEP_SENTENCE)),
     # --- an EXTERNAL credential is in force and is bad. The remedy is the opposite of "/login":
     # the key must be FIXED or UNSET, and unsetting is what falls back to the subscription.
-    ("invalid_api_key", _clipped(r"invalid api key", r"fix external api key\W*")),
+    ("invalid_api_key", _banner(r"invalid api key", r"fix external api key.*")),
+    # --- org POLICY, or a disabled org, forbids the credential in use. Nothing the loop can do.
+    # These four heads are long, Claude-specific and clip at realistic widths, so they are the
+    # `_clipped` set.
     ("api_key_org_disabled",
      _clipped(r"your anthropic_api_key belongs to a disabled organization")),
-    # --- org POLICY forbids the auth method in use. Nothing the loop can do; the owner must switch
-    # methods or get an admin.
     ("org_api_key_disabled",
      _clipped(r"your organization has disabled api key authentication")),
     ("subscription_disabled",
      _clipped(r"your organization has disabled claude subscription access for claude code")),
     ("no_account_access",
-     _clipped(r"your account does not have access to claude", r"please login again.*")),
+     _clipped(r"your account does not have access to claude", sep=_SEP_SENTENCE)),
     # --- the credential SOURCE is broken rather than the credential itself.
     ("apikey_helper_failing", _clipped(r"your apikeyhelper script is failing")),
     # Tails deliberately short: at a narrow pane the long ones clip, and "the gateway"/"this may be"
@@ -254,11 +265,14 @@ _LOGGED_OUT_PATTERNS = [
     ("gateway_auth", _banner(r"authentication error", r"the gateway.*")),
     ("auth_error", _banner(r"authentication error", r"this may be a temporary.*")),
     # --- the Bedrock / Vertex credential paths. Same block in the bundle, same consequence (the
-    # session cannot take a turn), and the loop is agent-config-agnostic about which the owner runs.
-    ("cloud_credentials", _clipped(r"aws credentials expired or invalid")),
-    ("cloud_credentials", _clipped(r"aws authentication failed")),
-    ("cloud_credentials", _clipped(r"google cloud credentials expired or invalid")),
-    ("cloud_credentials", _clipped(r"google cloud authentication failed")),
+    # session cannot take a turn). The "·" tail is REQUIRED (round-2 P1-2): the bundle always
+    # renders these as `${msg} \xB7 run \`${cmd}\` and retry \xB7 ${API Error}: ${detail}`, while a
+    # BARE "AWS authentication failed" is exactly what the owner's own aws CLI prints in a tool
+    # result — and that says nothing about this session's auth.
+    ("cloud_credentials", _banner(r"aws credentials expired or invalid", r".*")),
+    ("cloud_credentials", _banner(r"aws authentication failed", r".*")),
+    ("cloud_credentials", _banner(r"google cloud credentials expired or invalid", r".*")),
+    ("cloud_credentials", _banner(r"google cloud authentication failed", r".*")),
 ]
 
 
