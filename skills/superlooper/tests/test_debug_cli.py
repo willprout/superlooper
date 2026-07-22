@@ -42,6 +42,7 @@ _FAKE_LAUNCH = """#!/bin/bash
   printf 'ROOT %s\\n' "${SL_RUN_ROOT:-}"
   printf 'MODEL %s\\n' "${SL_MODEL:-}"
   printf 'AGENT %s\\n' "${SL_AGENT:-}"
+  printf 'ATTENDED %s\\n' "${SL_ATTENDED:-}"
   printf 'VERIFY %s\\n' "${SL_LAUNCH_VERIFY_SECONDS:-unset}"
   # What the watchdog counter looked like AS THE LAUNCHER SAW IT: proof the id was durably
   # advanced BEFORE anything could launch, not merely after the shim returned.
@@ -149,6 +150,10 @@ def test_debug_launches_one_session_through_the_shim(rig):
     assert call["VERIFY"] == "30"                        # PINNED, never inherited
     assert call["AGENT"] == "claude"
     assert call["MODEL"] == "opus[1m]"
+    # #185: the owner tap is the one loop-launched session with a PERSON at the keyboard, and its
+    # brief says so. SL_ATTENDED is how the PreToolUse deny learns that, so its AskUserQuestion
+    # duty (whose whole premise is "nobody is here") stands down instead of contradicting the brief.
+    assert call["ATTENDED"] == "1"
 
 
 def test_the_launched_id_is_durably_advanced_before_the_shim_runs(rig):

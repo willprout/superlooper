@@ -1807,10 +1807,18 @@ def _watchdog_pane(state_dir):
     return detect_self_anchor()["pane"]
 
 
-def _debugger_shim_run(cfg, repo, home, pane, sid):
+def _debugger_shim_run(cfg, repo, home, pane, sid, attended=False):
     """Run ONE debugger session (``d<N>``) through the launch shim — the single handshake shared by
     the watchdog's UNATTENDED launch and ``superlooper debug``'s owner tap (issue #144). Returns
     ``(rc, stdout, stderr, spawned)``; NEVER raises.
+
+    ``attended`` is the ONE thing the two callers genuinely disagree about: the owner tap has a
+    person at the keyboard and its brief invites them to ask, the watchdog's does not. It rides in
+    as ``SL_ATTENDED`` so the PreToolUse deny (issue #185) can stand its AskUserQuestion duty down
+    for the tap instead of telling that session "no human is at this pane" — which its own brief
+    contradicts. PINNED on both paths, never inherited: an ambient ``export SL_ATTENDED=1`` in
+    whatever shell a watchdog check runs from would otherwise hand the unattended session a dialog
+    nobody can answer — the exact all-night stall (i280) the deny exists to prevent.
 
     Sharing it is the point: the ``--cwd`` invocation form, the ``SL_RUN_ROOT``/``SL_PANE`` contract,
     the seat defaults and the pinned verify window are ONE fact with one place to change, so a second
@@ -1836,6 +1844,7 @@ def _debugger_shim_run(cfg, repo, home, pane, sid):
            # so a later check could launch a SECOND session for one episode. 30s is the
            # script's own default and sits far under the 180s timeout.
            "SL_LAUNCH_VERIFY_SECONDS": "30",
+           "SL_ATTENDED": "1" if attended else "",
            "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
     try:
         r = subprocess.run([script, "--cwd", os.path.abspath(repo), sid],
@@ -2330,7 +2339,8 @@ def cmd_debug(args):
             brief_path = None
             return refuse("could not write the session brief: %s" % e, id=sid)
 
-        rc, out, err, spawned = _debugger_shim_run(cfg, args.repo, home, pane, sid)
+        # attended=True: a person typed this. It is the only launch in the whole engine that says so.
+        rc, out, err, spawned = _debugger_shim_run(cfg, args.repo, home, pane, sid, attended=True)
         if not spawned:
             # Nothing ever ran: the brief reached no one, so it must not linger (it would read to a
             # later reader as a session that existed). The BURNED id stands — never re-handed out.
