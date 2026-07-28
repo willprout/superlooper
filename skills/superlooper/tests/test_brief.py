@@ -200,7 +200,12 @@ def test_bright_line_with_brace_stays_literal(_sl_home):
 # Two hard-won worker rules (incident 2026-07-07) live in the UNIVERSAL footer, so every adopted
 # repo inherits them — not just the one repo whose CLAUDE.md first carried them:
 #   1. Image/binary evidence goes under `reports/screenshots/`; only `.md` at the top level of
-#      `reports/` (one loose binary there wedges the runner's every tick — 40+ min silent stall).
+#      `reports/`. The 2026-07-07 wedge that first bought this rule is FIXED (runner._read fails
+#      closed on UnicodeDecodeError), so the rule now stands on its live consequence instead: a
+#      file the scan cannot decode, or one whose name is not the lane's `i<N>`, is invisible to it
+#      — the report reads as missing. (Driven on the real scan: a PNG drops at _read, and
+#      `report-for-i233.md` drops at the `_iid_num` filter; `i232.txt` does NOT — the stem is what
+#      the harvest keys on, so the footer names the stem, not the extension.)
 #   2. Never kill by name/pattern (`pkill -f`, `killall`) — that once collateral-killed the owner's
 #      live dashboard; background processes are killed by recorded PID only.
 # They live in the template body (not {work_block}), so they render for EVERY issue type.
@@ -218,6 +223,31 @@ def test_footer_screenshots_evidence_subdirectory_rule(_sl_home, itype):
     assert "reports/screenshots/" in footer, "image/binary evidence must be routed to reports/screenshots/"
     assert "`.md`" in footer and "top level of `reports/`" in footer, \
         "the footer must state that only .md files belong at the top level of reports/"
+
+
+@pytest.mark.parametrize("itype", ["build", "investigate", "diagnose-and-fix"])
+def test_footer_reports_rule_states_the_true_consequence(_sl_home, itype):
+    """#230: the rule used to justify itself with "the runner reads every file as text (a loose
+    binary there once wedged the runner)". That is FALSE on current main — runner._read catches
+    UnicodeDecodeError and _scan_dir drops what it returns None for, so the runner fails CLOSED on
+    an undecodable file and the 2026-07-07 wedge cannot recur. The live consequence is the opposite,
+    and worse for being silent: such a file is INVISIBLE to the runner — it reads as no report at
+    all, so the ship gate sees a worker that never reported.
+
+    Both invisibility mechanisms were driven against the real scan: a PNG drops at runner._read
+    (undecodable), and `report-for-i233.md` drops at the `_iid_num` filter (wrong stem). `i232.txt`
+    does NOT drop — the harvest keys on the name's STEM, not its extension — so the footer names the
+    stem, and the last assert refuses the looser "any non-.md file is invisible" phrasing, which
+    would be a fresh piece of the very drift this issue exists to remove."""
+    footer = _footer(brief.build(_issue(type=itype), _cfg(_sl_home)))
+    assert "reads every file as text" not in footer, \
+        "false since the UnicodeDecodeError guard: the runner does NOT read every file as text"
+    assert "wedged the runner" not in footer, \
+        "the wedge is fixed; teaching it as the live risk hides the real one"
+    assert "invisible" in footer.lower(), \
+        "the footer must state the TRUE consequence — such a file reads as no report at all"
+    assert "`i<N>`" in footer, \
+        "name the stem the harvest actually keys on, not merely the .md extension"
 
 
 @pytest.mark.parametrize("itype", ["build", "investigate", "diagnose-and-fix"])

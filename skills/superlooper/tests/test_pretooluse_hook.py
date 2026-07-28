@@ -64,6 +64,56 @@ def test_ask_user_question_is_denied_with_the_blocked_file_fallback():
     assert "/runs/willprout/state/blocked/i7" in reason
 
 
+# --------------------------- #230: the worker deny must match the LIVE contract ---------------------------
+# A deny reason is delivered to the model VERBATIM at the exact moment it errs, so a stale one is
+# worse than none: the worker acts on it. These pin the four ways the #156 text had drifted off the
+# contract by the 2026-07-16 first-prompt audit.
+
+def test_worker_deny_does_not_teach_the_retired_answerer_flow():
+    """The original text promised "a fresh answerer replies into this session". Nobody does. #163
+    changed the shape entirely: the runner posts the question DURABLY as a GitHub comment, closes
+    the window, and releases the lane; a FRESH session later resumes the issue with the owner's
+    answer embedded in its brief. #194 then retired the answerer seat outright. A worker believing
+    the old text waits in a closing window for a reply that is never coming."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    assert "answerer" not in reason.lower(), "the answerer seat is retired (#194) — never teach it"
+    assert "replies into this session" not in reason
+    assert "fresh session" in reason.lower(), "the deny must name what ACTUALLY resumes the issue"
+    assert "end the session" in reason.lower(), "the deny must tell the worker to end, not to wait"
+
+
+def test_worker_deny_requires_committing_and_pushing_the_wip():
+    """The blocked protocol is write + COMMIT AND PUSH + end (brief-footer.md). The old text said
+    only "write ... and end your turn", so a worker obeying it VERBATIM ended its session with the
+    worktree holding the only copy of its work — the i153/i163 loss #190 now fences. The resume
+    reuses the PUSHED branch, so unpushed work is work no fresh session can pick up."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    low = reason.lower()
+    assert "commit" in low, "the deny must require committing the WIP"
+    assert "push" in low, "the deny must require pushing the WIP, not just writing the file"
+
+
+def test_worker_deny_states_the_three_part_question_form():
+    """A human reads the blocked file and the brief pins its three parts. Naming the path but not
+    the form invites a bare sentence the owner cannot act on — and the runner quotes that file
+    straight into a GitHub comment, so the shape IS the deliverable."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    for part in ("QUESTION:", "OPTIONS:", "RECOMMENDATION:"):
+        assert part in reason, "the deny must name the %s part the brief requires" % part
+
+
+def test_worker_deny_assumption_hint_is_not_pr_only():
+    """An `investigate` worker opens ZERO pull requests — brief.py special-cases the assumption
+    hint (_ASSUME_INVESTIGATE) for exactly this. The hook cannot see the issue type (no launcher
+    exports one), so its hint must be type-NEUTRAL: it may offer the PR body, but never as the only
+    place, or it hands every investigate worker an impossible instruction."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    low = reason.lower()
+    assert "report" in low, \
+        "the hint must also cover the no-PR (investigate) worker, whose deliverable is a report"
+    assert "pr body" in low, "the hint must still name the PR body for the code types"
+
+
 def test_debugger_ask_user_question_is_denied_with_the_memo_fallback():
     """#185: the watchdog's unattended sl-debugger (d<N>) has neither protocol — it ends every run
     with a memo in the state home's reports/ plus a notify, so that is what the deny hands back."""
