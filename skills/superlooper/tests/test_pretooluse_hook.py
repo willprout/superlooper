@@ -84,13 +84,22 @@ def test_worker_deny_does_not_teach_the_retired_answerer_flow():
 
 def test_worker_deny_requires_committing_and_pushing_the_wip():
     """The blocked protocol is write + COMMIT AND PUSH + end (brief-footer.md). The old text said
-    only "write ... and end your turn", so a worker obeying it VERBATIM ended its session with the
-    worktree holding the only copy of its work — the i153/i163 loss #190 now fences. The resume
-    reuses the PUSHED branch, so unpushed work is work no fresh session can pick up."""
+    only "write ... and end your turn", so a worker obeying it VERBATIM ended its session with this
+    checkout holding the only copy of its work — the i153/i163 loss #190 now fences.
+
+    The REASON given for the push must stay honest (fresh-agent review P0). The resume does not
+    depend on it: _exec_post_question tears down with remove_worktree=False and launch-session.sh
+    creates a worktree only when none exists, so the relaunch reuses the PRESERVED WIP. Claiming
+    unpushed work is unrecoverable would be a new falsehood of the very class this issue removes,
+    and a worker whose push failed would then refuse to end its session — the i280 stall, re-entered
+    through the deny's own words. So: require the push, forbid the scare story."""
     reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
     low = reason.lower()
     assert "commit" in low, "the deny must require committing the WIP"
-    assert "push" in low, "the deny must require pushing the WIP, not just writing the file"
+    assert "git push -u origin head" in low, \
+        "the deny must give the actual push command, not merely mention a pushed branch"
+    assert "cannot pick up" not in low and "only copy of your work" in low, \
+        "the push's stated reason must be the second copy, never 'the resume cannot see your work'"
 
 
 def test_worker_deny_states_the_three_part_question_form():
@@ -109,9 +118,21 @@ def test_worker_deny_assumption_hint_is_not_pr_only():
     place, or it hands every investigate worker an impossible instruction."""
     reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
     low = reason.lower()
-    assert "report" in low, \
-        "the hint must also cover the no-PR (investigate) worker, whose deliverable is a report"
+    # "root-cause report", not a bare "report": the loose token would pass on any incidental mention
+    # (the debugger's reports/ path, "your report"), and the phrase must match brief.py's own
+    # _ASSUME_INVESTIGATE so the deny and the brief name the SAME deliverable.
+    assert "root-cause report" in low, \
+        "the hint must also cover the no-PR (investigate) worker, whose deliverable is that report"
     assert "pr body" in low, "the hint must still name the PR body for the code types"
+
+
+def test_worker_deny_states_the_two_question_cap():
+    """The deny restates the whole protocol, so dropping the cap would leave a worker believing
+    blocking is free. It is not: actions.QUESTION_CAP is 2 and a THIRD question PARKS the issue
+    needs-owner instead of posting-and-resuming. The cap is what makes the assumption hint that
+    follows it the cheaper move."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    assert "TWO questions" in reason, "the deny must state the 2-question cap the runner enforces"
 
 
 def test_debugger_ask_user_question_is_denied_with_the_memo_fallback():

@@ -27,8 +27,9 @@ its OWN AskUserQuestion fallback (_ROLES):
   * `i<N>` WORKER   -> write state/blocked/<id> in QUESTION/OPTIONS/RECOMMENDATION form, COMMIT AND
                        PUSH the WIP, END the session. The runner acts on that file — and only for
                        `i<N>` — by posting the question durably and closing the window; a FRESH
-                       session resumes the issue later with the owner's answer in its brief (#163).
-                       No session is nudged awake and none is answered in place.
+                       session resumes the issue later with the owner's answer in its brief (#163),
+                       reusing the PRESERVED worktree. No session is nudged awake to answer it, and
+                       none is answered in place.
   * `d<N>` DEBUGGER -> the memo under <state home>/reports/ plus the notify that EVERY unattended
                        sl-debugger run ends with (plugin/skills/sl-debugger/references/
                        unattended-contract.md). Never the worker's blocked file: nothing reads one
@@ -104,9 +105,16 @@ def _worker_ask_reason(state_home, issue_id):
     #     the old model waits in a closing window for a reply that never comes — the i280 stall the
     #     deny exists to prevent, re-entered through the deny's own words.
     #   * it said "write ... and end your turn", omitting the COMMIT AND PUSH the footer requires, so
-    #     obeying it verbatim stranded the work in a worktree that held its only copy (the i153/i163
-    #     loss #190 fences). The push is load-bearing, not hygiene: the resume reuses the PUSHED
-    #     branch, so unpushed work is work no fresh session can pick up.
+    #     obeying it verbatim ended the session with this checkout holding the only copy of the work
+    #     (the i153/i163 loss #190 fences). State the push's reason CAREFULLY: the resume does NOT
+    #     depend on it — _exec_post_question tears down with remove_worktree=False and
+    #     launch-session.sh only creates a worktree when none exists, so the relaunch reuses the
+    #     PRESERVED WIP, uncommitted files included. Telling a worker its unpushed work is
+    #     unrecoverable would be a NEW falsehood in the same class this issue removes, and a costly
+    #     one: a worker whose push fails would then refuse to end the session (the i280 stall) or
+    #     reach for something the bright lines forbid. The push is a SECOND copy, which is what the
+    #     runner's own docstring claims ("no live window is the only copy") and what #190's guard
+    #     reads to decide a checkout is safe to reclaim.
     #   * its assumption hint named the PR body ALONE, which an `investigate` worker cannot use —
     #     it opens zero PRs, and brief.py (_ASSUME_INVESTIGATE) special-cases the hint for exactly
     #     that. The hook cannot see the issue type (no launcher exports one, and inventing that
@@ -116,13 +124,15 @@ def _worker_ask_reason(state_home, issue_id):
         "Use the durable protocol instead: write your single, specific question to %s as three "
         "parts — `QUESTION:` the one decision, `OPTIONS:` the choices you see, `RECOMMENDATION:` "
         "the one you would take if forced — then COMMIT AND PUSH your work-in-progress on this "
-        "issue's branch (`git push -u origin HEAD`) and END the session. The push is part of the "
-        "protocol, not a nicety: the runner posts your question as a durable comment on the issue, "
-        "closes this window and releases the lane, and a FRESH session resumes the issue with the "
-        "owner's answer in its brief, reusing your PUSHED branch — work that never left this "
-        "worktree is work that resume cannot pick up. If you can safely proceed on one reasonable "
-        "assumption, prefer stating it in your deliverable — the PR body, or your root-cause "
-        "report if this issue opens no PR — over blocking."
+        "issue's branch (`git push -u origin HEAD`) and END the session. The runner then posts your "
+        "question as a durable comment on the issue, closes this window and releases the lane, and "
+        "a FRESH session resumes the issue with the owner's answer in its brief, reusing this "
+        "worktree's work-in-progress. Push before you end anyway: the runner is what closes this "
+        "window, so the push is your last chance to stop this one checkout being the only copy of "
+        "your work. You get at most TWO questions on one issue — a third hands the issue to the "
+        "owner as a scoping problem instead of resuming you — so if you can safely proceed on one "
+        "reasonable assumption, prefer stating it in your deliverable (the PR body, or your "
+        "root-cause report if this issue opens no PR) over blocking."
         % _blocked_path(state_home, issue_id))
 
 

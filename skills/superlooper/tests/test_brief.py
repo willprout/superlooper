@@ -234,11 +234,15 @@ def test_footer_reports_rule_states_the_true_consequence(_sl_home, itype):
     and worse for being silent: such a file is INVISIBLE to the runner — it reads as no report at
     all, so the ship gate sees a worker that never reported.
 
-    Both invisibility mechanisms were driven against the real scan: a PNG drops at runner._read
-    (undecodable), and `report-for-i233.md` drops at the `_iid_num` filter (wrong stem). `i232.txt`
-    does NOT drop — the harvest keys on the name's STEM, not its extension — so the footer names the
-    stem, and the last assert refuses the looser "any non-.md file is invisible" phrasing, which
-    would be a fresh piece of the very drift this issue exists to remove."""
+    The two mechanisms are DIFFERENT and the footer must not merge them (fresh-agent review P1).
+    Driven against the real scan: a PNG drops at runner._read (undecodable) — but that only loses
+    THAT file, and a correctly-named `i<N>.md` sitting beside it is still harvested, so a loose
+    binary does not make your report count as missing. What does is the name: `report-for-i233.md`
+    drops at the `_iid_num` filter, while `i232.txt` does NOT drop — the harvest keys on the name's
+    STEM, not its extension. So the footer says "silently skipped" for the binary and reserves
+    "invisible / no report at all" for the wrong stem, and the last assert refuses the looser "any
+    non-.md file is invisible" phrasing, which would be a fresh piece of the drift this issue
+    exists to remove."""
     footer = _footer(brief.build(_issue(type=itype), _cfg(_sl_home)))
     assert "reads every file as text" not in footer, \
         "false since the UnicodeDecodeError guard: the runner does NOT read every file as text"
