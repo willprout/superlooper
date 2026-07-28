@@ -191,17 +191,22 @@ def _lint_touches(declared, blocks, areas, section_present=False, bare=None, no_
             "touches_outside_section", blocks,
             "a `touches:` line is written but the runner parses no declaration from it — it is not "
             "a plain `touches: ...` line inside a `## Loop metadata` section",
-            "Put it under a `## Loop metadata` heading, in this exact shape:\n%s" % METADATA_SHAPE,
+            "Put that line under a `## Loop metadata` heading.",
             choices=[bare])]
 
     where = ("no `## Loop metadata` section at all" if no_section_hint and not section_present
              else "the `## Loop metadata` section declares no `touches:` line")
+    choices = _touches_choices(areas)
+    example = choices[0] if choices else "<area>"
     return [_defect(
         "touches_missing", blocks,
         "%s — so the runner reads no `touches:` declaration, and that declaration is what "
         "anti-affinity and the gate's wander check verify against" % where,
-        "Add:\n%s" % METADATA_SHAPE,
-        choices=_touches_choices(areas))]
+        # Deliberately a ONE-LINE fix: describe() collapses newlines, and every surface that prints
+        # a defect prints describe(), so a multi-line shape embedded here reads as mush wherever it
+        # lands. The shape gets its own block in the surfaces that have room for one (the deny).
+        "Add a `## Loop metadata` section with a `touches:` line — e.g. `touches: %s`." % example,
+        choices=choices)]
 
 
 def lint(labels, body, areas=None, touches_required=True):

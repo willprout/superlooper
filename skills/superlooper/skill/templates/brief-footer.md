@@ -13,6 +13,7 @@ the labels — you touch no labels and you never edit the issue's Goal/DoD yours
 **Scope.** Work in this worktree on branch `{branch}`. Stay strictly inside the issue's
 Boundaries. Work this issue should NOT do — and any promise that spills into another PR —
 becomes a NEW issue labeled `needs-owner`, never a code comment.
+Such an issue needs exactly one `type:` label and a `## Loop metadata` section with a `touches:` line naming this repo's areas — `gh issue create` is refused with the exact fix if it doesn't, so just re-run the corrected command.
 
 {work_block}
 

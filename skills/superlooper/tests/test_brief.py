@@ -594,3 +594,37 @@ def test_build_does_not_mutate_comments(_sl_home):
     before = copy.deepcopy(comments)
     brief.build(_issue(), _cfg(_sl_home), comments=comments)
     assert comments == before, "build must not mutate the caller's comments list/entries"
+
+
+# --------------------------------------------------------------------------- the format pointer (#225)
+# The owner's redesign of 2026-07-16 in one sentence: extra instructions in the very first prompt
+# get ignored half the time, so the format is TAUGHT by the PreToolUse deny at the moment a session
+# files wrong — not by a block in the brief nobody reads. The brief keeps exactly one line: a
+# pointer, so a worker who wants to get it right first time can, and nothing more.
+
+def _filing_clause(out):
+    """The sentence in the brief's Scope block that tells a worker how to file a follow-up."""
+    for para in out.split("\n\n"):
+        if "needs-owner" in para and "NEW issue" in para:
+            return para
+    raise AssertionError("the brief no longer tells a worker how to file a follow-up:\n" + out)
+
+
+def test_the_brief_points_at_the_format(_sl_home):
+    clause = _filing_clause(brief.build(_issue(), _cfg(_sl_home)))
+    assert "type:" in clause and "## Loop metadata" in clause
+
+
+def test_the_pointer_is_ONE_line_not_a_teaching_block(_sl_home):
+    # The whole point of the redesign. If this ever grows into a lesson, the hook has stopped being
+    # the teacher and we are back to instructing at the one moment nobody is listening.
+    clause = _filing_clause(brief.build(_issue(), _cfg(_sl_home)))
+    added = [ln for ln in clause.splitlines() if "type:" in ln or "## Loop metadata" in ln]
+    assert len(added) == 1, added
+
+
+def test_the_pointer_says_the_deny_will_catch_it(_sl_home):
+    # A worker who knows the bounce exists reads the deny reason as a correction rather than as a
+    # broken tool, and retries instead of working around it.
+    clause = _filing_clause(brief.build(_issue(), _cfg(_sl_home)))
+    assert "refuse" in clause.lower() or "denie" in clause.lower() or "blocked" in clause.lower()
