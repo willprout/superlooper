@@ -1401,36 +1401,41 @@ def _janitor_execute_subset(args, home, days, dev):
         print(json.dumps({"ok": False, "error": err}))
         return 1
     now = time.time()
-    # refused=set(): the holdback is applied per-key below (an explicit tap of a held key with
-    # --retry-refused must be able to run); reconcile just needs the full fresh eligibility set.
+    # The holdback is decided HERE, before the re-derivation, rather than per-key after it. It used
+    # to be applied afterwards with `refused=set()` passed to propose — harmless while every class
+    # was selected independently of `refused`, but the accidental-close class is CAPPED per sweep
+    # and skips refused keys when filling the cap (issue #229), so a propose() that disagrees with
+    # the listing about `refused` selects a DIFFERENT set of reopens. The owner then approves ten,
+    # six run, and four are reported "no longer eligible (state moved)" when nothing moved at all.
+    # One refused set, used by both the listing and this re-derivation, and the divergence is gone.
+    refused_now = set() if args.retry_refused else set(refused_map)
+    held_keys = [k for k in keys if k in refused_now]
     fresh = janitor_lib.propose(**_janitor_fetch(ls), now=now, aged_park_days=days,
-                                refused=set(), dev_branch=dev)
-    to_run, skipped = janitor_lib.reconcile([{"key": k} for k in keys], fresh["proposals"])
+                                refused=refused_now, dev_branch=dev)
+    to_run, skipped = janitor_lib.reconcile(
+        [{"key": k} for k in keys if k not in refused_now], fresh["proposals"])
     refused_path = os.path.join(home, "state", _REFUSED_FILE)
     results, executed, failed = [], 0, 0
     for p in skipped:
         results.append({"key": p["key"], "outcome": "skipped",
                         "reason": "no longer eligible (state moved, or not a current proposal)"})
+    for k in held_keys:
+        # held back from a prior failure — an explicit tap does not silently retry it; the owner
+        # must ask for a retry (parity with the CLI's --retry-refused holdback).
+        results.append({"key": k, "outcome": "held",
+                        "reason": "held back from a prior failure — retry to act"})
     if getattr(args, "dry_run", False):
         # --dry-run wins over --execute-keys: report what WOULD run, write NOTHING (no gh write, no
         # journal, no refused-map save) — the CLI's documented "change nothing" contract holds even
         # when a subset was named. (Not a path the command center takes; a CLI-only safety net.)
         for p in to_run:
-            outcome = ("held" if (p["key"] in refused_map and not args.retry_refused)
-                       else "would-run")
             results.append({"key": p["key"], "action": p["action"], "target": p["target"],
-                            "outcome": outcome})
+                            "outcome": "would-run"})
         print(json.dumps({"ok": True, "results": results, "executed": 0, "failed": 0,
                           "skipped": sum(1 for r in results if r["outcome"] == "skipped"),
                           "held": sum(1 for r in results if r["outcome"] == "held")}))
         return 0
     for p in to_run:
-        if p["key"] in refused_map and not args.retry_refused:
-            # held back from a prior failure — an explicit tap does not silently retry it; the
-            # owner must ask for a retry (parity with the CLI's --retry-refused holdback).
-            results.append({"key": p["key"], "outcome": "held",
-                            "reason": "held back from a prior failure — retry to act"})
-            continue
         ok, reason = _janitor_execute(p)
         journal.append(home, {"act": "janitor", "action": p["action"], "target": p["target"],
                               "why": p["why"], "outcome": "ok" if ok else "fail",
@@ -1526,8 +1531,13 @@ def cmd_janitor(args):
         print("janitor: state/issues.json became unreadable during the wait — refusing to "
               "execute (nothing is provably idle anymore).", file=sys.stderr)
         return 1
+    # The SAME refused set the listing used. A key held back there was never proposed and so was
+    # never approved, so nothing changes for the three tidy classes — but the accidental-close
+    # class fills its per-sweep cap from the non-refused ones (issue #229), so a re-derivation that
+    # disagreed about `refused` would select different reopens and then skip the owner's approved
+    # ones as "state moved during the wait" when nothing moved.
     fresh = janitor_lib.propose(**_janitor_fetch(ls2), now=time.time(), aged_park_days=days,
-                                refused=set(), dev_branch=dev)
+                                refused=refused_keys, dev_branch=dev)
     to_run, skipped = janitor_lib.reconcile(props, fresh["proposals"])
     now = time.time()
     executed = failed = 0

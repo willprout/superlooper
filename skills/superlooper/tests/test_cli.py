@@ -2017,6 +2017,50 @@ def test_janitor_caps_the_reopen_class_and_says_what_it_withheld(rig):
     assert doc["reopen_withheld"] == 15
 
 
+def test_janitor_executes_every_reopen_the_owner_was_shown(rig):
+    # The reopen class fills its per-sweep cap from the NON-refused candidates, so the listing and
+    # the act-time re-derivation must agree about which keys are refused. When they disagreed, the
+    # owner approved a list, some of it ran, and the rest was reported "no longer eligible (state
+    # moved)" — when nothing had moved at all. Approve what was listed; run exactly that.
+    _seed_janitor_fixtures(rig)
+    # 20 keyword-closed issues, the 5 newest stuck in the refused map -> 15 fresh, cap 10 shown.
+    _seed_closed_issues(rig, *[_keyword_closed(n) for n in range(100, 120)])
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "janitor_refused.json").write_text(json.dumps(
+        {"reopen:%d" % n: {"reason": "gh refused", "ts": 1} for n in range(115, 120)}))
+    listed = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
+    shown = [p["key"] for p in listed["proposals"] if p["kind"] == "issue-reopen"]
+    assert len(shown) == 10                       # a full cap of FRESH work, none of it stuck
+    assert listed["reopen_withheld"] == 5
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    reopened = {"reopen:%s" % m["num"] for m in mutations(rig) if m["kind"] == "reopen_issue"}
+    assert reopened == set(shown)                 # every listed reopen ran; none was false-skipped
+    assert "no longer eligible" not in r.stdout and "state moved" not in r.stdout
+
+
+def test_janitor_execute_keys_holds_a_tapped_refused_reopen_with_the_right_reason(rig):
+    # holdback parity survives the fix: a tapped-but-held key still reports "held back from a
+    # prior failure", never the act-time "no longer eligible" skip.
+    _seed_janitor_fixtures(rig)
+    _seed_closed_issues(rig, _keyword_closed(189))
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "janitor_refused.json").write_text(json.dumps(
+        {"reopen:189": {"reason": "gh refused", "ts": 1}}))
+    doc = json.loads(cli(rig, "janitor", "--execute-keys", "reopen:189",
+                         "--repo", str(rig.repo)).stdout)
+    assert doc["held"] == 1 and doc["executed"] == 0
+    assert doc["results"][0]["reason"].startswith("held back from a prior failure")
+    assert mutations(rig) == []
+    # ...and --retry-refused lets the same explicit tap through
+    r = cli(rig, "janitor", "--execute-keys", "reopen:189", "--retry-refused",
+            "--repo", str(rig.repo))
+    assert json.loads(r.stdout)["executed"] == 1
+    assert [m["kind"] for m in mutations(rig)] == ["reopen_issue"]
+
+
 def test_janitor_proposes_no_reopens_when_the_closed_read_is_refused(rig):
     # a refused GraphQL read fails closed to [] — the sweep proposes fewer things, never more.
     _seed_janitor_fixtures(rig)
