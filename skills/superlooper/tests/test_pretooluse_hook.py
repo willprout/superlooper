@@ -64,6 +64,86 @@ def test_ask_user_question_is_denied_with_the_blocked_file_fallback():
     assert "/runs/willprout/state/blocked/i7" in reason
 
 
+# --------------------------- #230: the worker deny must match the LIVE contract ---------------------------
+# A deny reason is delivered to the model VERBATIM at the exact moment it errs, so a stale one is
+# worse than none: the worker acts on it. These pin the four ways the #156 text had drifted off the
+# contract by the 2026-07-16 first-prompt audit.
+
+def test_worker_deny_does_not_teach_the_retired_answerer_flow():
+    """The original text promised "a fresh answerer replies into this session". Nobody does. #163
+    changed the shape entirely: the runner posts the question DURABLY as a GitHub comment, closes
+    the window, and releases the lane; a FRESH session later resumes the issue with the owner's
+    answer embedded in its brief. #194 then retired the answerer seat outright. A worker believing
+    the old text waits in a closing window for a reply that is never coming."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    assert "answerer" not in reason.lower(), "the answerer seat is retired (#194) — never teach it"
+    assert "replies into this session" not in reason
+    assert "fresh session" in reason.lower(), "the deny must name what ACTUALLY resumes the issue"
+    assert "end the session" in reason.lower(), "the deny must tell the worker to end, not to wait"
+
+
+def test_worker_deny_requires_committing_and_pushing_the_wip():
+    """The blocked protocol is write + COMMIT AND PUSH + end (brief-footer.md). The old text said
+    only "write ... and end your turn", so a worker obeying it VERBATIM ended its session with this
+    checkout holding the only copy of its work — the i153/i163 loss #190 now fences.
+
+    The REASON given for the push must stay honest (fresh-agent review P0). The resume does not
+    depend on it: _exec_post_question tears down with remove_worktree=False and launch-session.sh
+    creates a worktree only when none exists, so the relaunch reuses the PRESERVED WIP. Claiming
+    unpushed work is unrecoverable would be a new falsehood of the very class this issue removes,
+    and a worker whose push failed would then refuse to end its session — the i280 stall, re-entered
+    through the deny's own words. So: require the push, forbid the scare story."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    low = reason.lower()
+    assert "commit" in low, "the deny must require committing the WIP"
+    assert "git push -u origin head" in low, \
+        "the deny must give the actual push command, not merely mention a pushed branch"
+    # Pin the SUBSTANCE, not the phrasing: the resume must be described as reusing the preserved
+    # worktree's WIP, and the scare story must not come back. An earlier version of this test also
+    # pinned the noun phrase "only copy of your work", which pinned an over-claim of its own — the
+    # push buys a copy off this MACHINE, not off this checkout (a committed branch ref survives the
+    # checkout). Wording is free to move; these two facts are not.
+    assert "work-in-progress" in low and "worktree" in low, \
+        "the deny must say the resume reuses the PRESERVED worktree's WIP"
+    assert "cannot pick up" not in low, \
+        "never tell a worker the resume cannot see unpushed work — it reuses this very worktree"
+
+
+def test_worker_deny_states_the_three_part_question_form():
+    """A human reads the blocked file and the brief pins its three parts. Naming the path but not
+    the form invites a bare sentence the owner cannot act on — and the runner quotes that file
+    straight into a GitHub comment, so the shape IS the deliverable."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    for part in ("QUESTION:", "OPTIONS:", "RECOMMENDATION:"):
+        assert part in reason, "the deny must name the %s part the brief requires" % part
+
+
+def test_worker_deny_assumption_hint_is_not_pr_only():
+    """An `investigate` worker opens ZERO pull requests — brief.py special-cases the assumption
+    hint (_ASSUME_INVESTIGATE) for exactly this. The hook cannot see the issue type (no launcher
+    exports one), so its hint must be type-NEUTRAL: it may offer the PR body, but never as the only
+    place, or it hands every investigate worker an impossible instruction."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    low = reason.lower()
+    # "root-cause report", not a bare "report": the loose token would pass on any incidental mention
+    # (the debugger's reports/ path, "your report"), and the phrase must match brief.py's own
+    # _ASSUME_INVESTIGATE so the deny and the brief name the SAME deliverable.
+    assert "root-cause report" in low, \
+        "the hint must also cover the no-PR (investigate) worker, whose deliverable is that report"
+    assert "pr body" in low, "the hint must still name the PR body for the code types"
+
+
+def test_worker_deny_states_the_two_question_cap():
+    """The deny restates the whole protocol, so dropping the cap would leave a worker believing
+    blocking is free. It is not: actions.QUESTION_CAP is 2 and a THIRD question PARKS the issue
+    needs-owner instead of posting-and-resuming. The cap is what makes the assumption hint that
+    follows it the cheaper move."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
+    # Case-insensitive: the cap is the fact under test, not the SHOUTING that currently renders it.
+    assert "two questions" in reason.lower(), \
+        "the deny must state the 2-question cap the runner enforces (actions.QUESTION_CAP)"
+
+
 def test_debugger_ask_user_question_is_denied_with_the_memo_fallback():
     """#185: the watchdog's unattended sl-debugger (d<N>) has neither protocol — it ends every run
     with a memo in the state home's reports/ plus a notify, so that is what the deny hands back."""
