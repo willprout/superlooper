@@ -4900,3 +4900,77 @@ def test_a_terminal_lane_never_alerts_on_a_stale_variant():
                                                     sensed_auth="invalid_api_key")}})
         out = decide(dsk=d)
         assert only(out, "alert") == [], status
+
+
+# =========================== the refusal journal (issue #225) ===========================
+# The 2026-07-16 audit's real damage was SILENCE. An `agent-ready` issue with no `type:` label is
+# dropped by issues.eligible before the scheduler ever sees it, so it sat in the queue looking like
+# work waiting its turn — 16 of them at once — while the runner would never take any of them. The
+# refusal now SAYS itself: one record naming the exact defect and its fix, once per complaint.
+
+def test_a_mechanically_invalid_approved_issue_is_journaled_not_silently_skipped():
+    out = decide(parsed_issues=[parsed(5, labels=("agent-ready",))])
+    assert only(out, "launch") == []
+    rec = only(out, "queue_invalid")
+    assert len(rec) == 1 and rec[0]["id"] == "i5" and rec[0]["num"] == 5
+    assert "type:" in rec[0]["reason"]
+
+
+def test_the_record_names_the_exact_defect_and_the_exact_fix():
+    out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "type:build", "type:investigate"))])
+    reason = only(out, "queue_invalid")[0]["reason"]
+    assert "type:build" in reason and "type:investigate" in reason
+    assert "Remove all but one" in reason
+
+
+def test_an_undeclared_area_is_journaled_even_though_the_runner_still_launches_it():
+    # `touches: plugin` in a repo that never declared `plugin`: the runner launches it and the GATE
+    # later reads the diff as an out-of-lane wander. Saying it at launch is the whole point.
+    out = decide(parsed_issues=[parsed(5, touches=("plugin",))])
+    assert len(only(out, "launch")) == 1              # still launched — this is not a refusal
+    rec = only(out, "queue_invalid")
+    assert len(rec) == 1 and "plugin" in rec[0]["reason"]
+
+
+def test_the_record_dedupes_once_per_complaint():
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("ready", queue_invalid_signature="type_missing")}})
+    out = decide(parsed_issues=[parsed(5, labels=("agent-ready",))], dsk=dsk)
+    assert only(out, "queue_invalid") == []
+
+
+def test_a_CHANGED_complaint_speaks_up_again():
+    # A half-fix that trades one defect for another must not inherit the old record's silence.
+    dsk = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("ready", queue_invalid_signature="type_missing")}})
+    out = decide(parsed_issues=[parsed(5, labels=("agent-ready", "type:nonsense"))], dsk=dsk)
+    rec = only(out, "queue_invalid")
+    assert len(rec) == 1 and rec[0]["signature"] == "type_unknown"
+
+
+def test_a_valid_issue_is_never_journaled_as_invalid():
+    out = decide(parsed_issues=[parsed(5)])
+    assert only(out, "queue_invalid") == []
+    assert len(only(out, "launch")) == 1
+
+
+def test_the_touches_park_keeps_owning_the_missing_touches_case():
+    # A no-touches issue that is otherwise valid already PARKS with its own memo and notify (#36).
+    # The journal record must not double up on it — one loud hand-back per situation.
+    out = decide(config=cfg(touches_required=True), parsed_issues=[parsed(5, touches=())])
+    assert len(only(out, "park")) == 1
+    assert only(out, "queue_invalid") == []
+
+
+def test_an_unapproved_invalid_issue_is_not_journaled():
+    # The queue this speaks about is the APPROVED queue. An invalid `needs-owner` issue is the
+    # doctor's and the janitor's business, not a per-tick record on every poll forever.
+    out = decide(parsed_issues=[parsed(5, labels=("needs-owner",))])
+    assert only(out, "queue_invalid") == []
+
+
+def test_a_blocked_by_issue_waiting_on_a_dependency_is_not_called_invalid():
+    # Waiting is not invalidity. The board already renders it as "awaiting connection"; a refusal
+    # record here would turn every legitimately-queued dependency into a false alarm.
+    out = decide(parsed_issues=[parsed(5, blocked_by=[4])])
+    assert only(out, "queue_invalid") == []

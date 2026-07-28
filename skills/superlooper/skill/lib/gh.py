@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from urllib.parse import quote
 
 import issues as _issues  # pure sibling module; used only to filter child_issues by parent
@@ -210,6 +211,38 @@ def open_issues(label, limit=200):
     belongs back in the queue or in a relaunch)."""
     return _json_list(["issue", "list", "--state", "open", "--label", label,
                        "--json", _ISSUE_FIELDS, "--limit", str(limit)])
+
+
+def open_issues_all(limit=200):
+    """EVERY open issue, raw gh dicts — the queue lint's read (issue #225).
+
+    Deliberately unlabelled: the 2026-07-16 audit's whole point was that the defect lives in issues
+    nobody has approved YET, so filtering by `agent-ready` would find only the wedges already
+    burning and none of the ones about to. Fails closed to [] like every other list read, and the
+    caller must treat an empty answer as "no verdict" rather than "the queue is clean" — a refused
+    read and a spotless repo look identical from here."""
+    return _json_list(["issue", "list", "--state", "open",
+                       "--json", _ISSUE_FIELDS, "--limit", str(limit)])
+
+
+def set_issue_body(num, body):
+    """Replace an issue's body — the janitor's approved metadata repair (issue #225), only ever on
+    the owner's explicit word, never from any automatic path. True on success.
+
+    Written through a FILE (`--body-file`), not `--body`: an issue body is multi-KB markdown with
+    newlines and backticks, and passing it as an argv string is how a repair truncates or a shell
+    quirk mangles the very metadata it was meant to fix."""
+    fd, path = tempfile.mkstemp(prefix="sl-issue-body-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body if isinstance(body, str) else "")
+        rc, _ = _run(["issue", "edit", str(num), "--body-file", path])
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return rc == 0
 
 
 def closed_issue_nums(limit=200):

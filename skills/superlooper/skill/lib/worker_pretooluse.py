@@ -15,8 +15,16 @@ proved a PreToolUse hook returning permissionDecision:"deny" blocks the call eve
   2. PATTERN-KILLS. `pkill -f` / `killall` match by name/pattern, so a session's kill can also match
      the OWNER's own live processes — a worker once killed the owner's live dashboard this way. The
      deny restates the standing CLAUDE.md rule: record the PID ($!) and kill only that exact PID.
+  3. MECHANICALLY-INVALID `gh issue create` (issue #225). The 2026-07-16 queue audit found 25 of 35
+     open issues unschedulable — 16 of them `agent-ready` — for want of a `type:` label and/or a
+     parseable `## Loop metadata` section. Workers file follow-ups all day and were never handed
+     the mechanical format. The owner's redesign (2026-07-16) is this module's own principle
+     applied to a third hazard: stop TEACHING the format in the first prompt ("extra instructions
+     in the very first prompt get ignored half the time" — his words) and BOUNCE the session at the
+     moment it files wrong. The issue is validated BEFORE it exists; the deny names exactly what is
+     missing and the required shape; the session retries correctly on the freshest possible turn.
 
-DENY ONLY THE TWO NAMED HAZARDS. Everything else is allowed — no broad allowlist that could break
+DENY ONLY THE THREE NAMED HAZARDS. Everything else is allowed — no broad allowlist that could break
 legitimate tool use (issue Boundaries).
 
 EVERY UNATTENDED SESSION THE LOOP LAUNCHES (owner ruling on #185, 2026-07-16). #156 shipped this
@@ -65,14 +73,27 @@ CLAUDE ONLY. Codex has no PreToolUse event (spike verdict); its backstop is the 
 at_dialog/logged_out states. run() no-ops for SL_AGENT=codex so a global registration is inert there.
 
 FAIL OPEN, ALWAYS. This fires before EVERY tool call. A broken duty must degrade to "allow" (today's
-behavior — the brief still instructs against both), never to blocking every tool and wedging the
+behavior — the brief still instructs against them), never to blocking every tool and wedging the
 session. The hook speaks to Claude ONLY by printing deny JSON on stdout; printing nothing lets the
 call proceed untouched.
+
+Duty 3 sharpens that to FAIL OPEN PER DIMENSION, because it is the first duty that must READ an
+argument rather than recognize a shape. Each dimension answers only from evidence it actually has:
+a body built by command substitution stands the BODY dimension down while the labels are still
+judged; a `--repo` pointing who-knows-where stands the whole duty down (another repo has another
+contract); a command line shlex cannot split is never judged at all. A deny of a legitimate
+`gh issue create` the hook merely could not READ would cost more than the defect it prevents.
 """
 import json
 import os
 import re
+import shlex
 import sys
+
+try:
+    import queue_lint
+except Exception:          # a half-published engine must not take duties 1 and 2 down with it
+    queue_lint = None
 
 
 # --------------------------- duty 1: AskUserQuestion ---------------------------
@@ -171,6 +192,222 @@ def _is_pattern_kill(command):
     return isinstance(command, str) and bool(_KILL_RE.search(command))
 
 
+# --------------------------- duty 3: `gh issue create` (issue #225) ---------------------------
+
+# Shell separators shlex.split leaves as their own tokens. A `gh` right after one of these is at a
+# COMMAND position (`cd x && gh issue create …`), which is how the ordinary compound line is read
+# without also reading `echo gh issue create` as a call.
+_SEPARATORS = frozenset(("&&", "||", ";", "|", "&", "(", ")", "{", "}"))
+
+# Anything that puts the body somewhere this parser cannot see. Each stands the BODY dimension down
+# (the labels are still judged) rather than the whole duty: they are honest "we don't know", not
+# evidence of a defect.
+_BODY_ELSEWHERE = frozenset(("--body-file", "-F", "--editor", "--web", "--template", "--fill",
+                             "--fill-first", "--fill-verbose", "--recover"))
+# Shell constructs that mean the quoted text is NOT the final body: a command substitution, a
+# process substitution, a variable expansion. shlex keeps them literal, so seeing one is exactly
+# the signal that what we hold is a recipe rather than the text.
+_UNEXPANDED = ("$(", "${", "`", "<(", ">(")
+
+
+def _split_command(command):
+    """The command's tokens, or None when it cannot be read (unbalanced quotes, a heredoc, a
+    non-string). Never judged is always safer than judged wrong."""
+    if not isinstance(command, str) or "gh" not in command:
+        return None
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return None
+
+
+def _issue_create_span(tokens):
+    """(start, end) of the ONE `gh issue create` argument run in these tokens, else None.
+
+    `gh` is recognized at a command position only — the line start or right after a separator — so
+    `echo gh issue create` and a quoted mention inside a commit message are not calls. An absolute
+    or relative path to the binary (`/opt/homebrew/bin/gh`) is seen through. TWO calls on one line
+    stand the duty down: which one a defect belongs to stops being answerable, and the compound is
+    rare enough that a rephrase costs nothing."""
+    spans = []
+    for i, tok in enumerate(tokens):
+        if not (tok == "gh" or tok.endswith("/gh")):
+            continue
+        if i and tokens[i - 1] not in _SEPARATORS:
+            continue
+        if tokens[i + 1:i + 3] != ["issue", "create"]:
+            continue
+        end = len(tokens)
+        for j in range(i + 3, len(tokens)):
+            if tokens[j] in _SEPARATORS:
+                end = j
+                break
+        spans.append((i + 3, end))
+    return spans[0] if len(spans) == 1 else None
+
+
+def _flag_value(tokens, idx, name):
+    """The value of a `--flag value` / `--flag=value` / `-f value` argument at `idx`, as
+    (value, next_index), or (None, idx+1) when this token is not that flag."""
+    tok = tokens[idx]
+    if tok == name:
+        return (tokens[idx + 1], idx + 2) if idx + 1 < len(tokens) else (None, idx + 1)
+    if name.startswith("--") and tok.startswith(name + "="):
+        return tok[len(name) + 1:], idx + 1
+    return None, idx + 1
+
+
+def parse_issue_create(command):
+    """What a `gh issue create` command line declares, or None when it is not confidently one.
+
+    Returns {"labels": [...] or None, "body": str or None}, where None on a FIELD means that
+    dimension could not be read and must not be judged. `labels: []` is different from
+    `labels: None`: the line parsed and simply carries no `--label`, which is confident evidence of
+    a missing `type:` label (two live issues in this repo, #284 and #286, were filed exactly so).
+
+    `--repo`/`-R` stands the WHOLE duty down: another repo has another contract (its own `areas`,
+    its own `touches_required`), and this repo's rules are not held over an issue filed there."""
+    tokens = _split_command(command)
+    if not tokens:
+        return None
+    span = _issue_create_span(tokens)
+    if span is None:
+        return None
+    start, end = span
+    labels, body, body_readable = [], None, True
+    i = start
+    while i < end:
+        tok = tokens[i]
+        if tok in ("--repo", "-R") or tok.startswith("--repo="):
+            return None
+        if tok in _BODY_ELSEWHERE:
+            body_readable = False
+            i += 1
+            continue
+        for name in ("--label", "-l"):
+            val, nxt = _flag_value(tokens, i, name)
+            if val is not None:
+                labels += [p.strip() for p in val.split(",") if p.strip()]
+                i = nxt
+                break
+        else:
+            for name in ("--body", "-b"):
+                val, nxt = _flag_value(tokens, i, name)
+                if val is not None:
+                    body = val
+                    i = nxt
+                    break
+            else:
+                i += 1
+    if body is not None and any(marker in body for marker in _UNEXPANDED):
+        body, body_readable = None, False    # a recipe for the text, not the text
+    return {"labels": labels,
+            # No `--body` at all is not a missing body — gh then prompts or errors, so there is no
+            # text to judge either way. Only a body we READ may be judged.
+            "body": body if (body_readable and body is not None) else None}
+
+
+def _read_config(path):
+    """A repo's `.superlooper/config.json` as a dict, or None. Every failure — absent, a directory,
+    unreadable, unparseable, wrong-typed — is the same answer: we do not know this repo's contract."""
+    try:
+        with open(path) as f:
+            body = json.load(f)
+    except Exception:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _walk_up_for_config(cwd):
+    """The nearest `.superlooper/config.json` at or above `cwd`, or None."""
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    here = os.path.abspath(cwd)
+    while True:
+        cfg = _read_config(os.path.join(here, ".superlooper", "config.json"))
+        if cfg is not None:
+            return cfg
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+
+
+def repo_contract(state_home, issue_id, cwd=None):
+    """This repo's half of the mechanical contract: {"areas", "touches_required"}.
+
+    Two routes to the same file, because the two session shapes sit in different places. A worker's
+    cwd IS its worktree — `<state home>/worktrees/<id>` is exactly what launch-session.sh creates —
+    while the `d<N>` debugger runs `--cwd` against a checkout with no worktree at all. The payload's
+    own cwd is tried first (walked UP, so a session working inside a subdirectory still finds it)
+    and the derived worktree path second, so neither shape depends on the other's luck.
+
+    With NO config in reach the touches dimension STANDS DOWN entirely (`touches_required: False`)
+    rather than defaulting to the engine's enforce-on-garbage posture. That default is right for the
+    runner, which knows it is looking at its own adopted repo; here, not finding a config means we
+    do not know that we are — and a confident demand on evidence we do not have is the one thing
+    this duty must never make. The `type:` vocabulary is superlooper's own and repo-independent, so
+    it is still judged."""
+    cfg = _walk_up_for_config(cwd)
+    if cfg is None and isinstance(state_home, str) and isinstance(issue_id, str):
+        cfg = _read_config(os.path.join(state_home, "worktrees", issue_id,
+                                        ".superlooper", "config.json"))
+    if cfg is None:
+        return {"areas": None, "touches_required": False}
+    tr = cfg.get("touches_required")
+    return {"areas": cfg.get("areas"),
+            "touches_required": tr if isinstance(tr, bool) else True}
+
+
+_CREATE_PREAMBLE = (
+    "`gh issue create` refused: this issue would be MECHANICALLY INVALID, so superlooper could "
+    "never launch it — it would sit in the queue looking like work that is waiting its turn. (The "
+    "2026-07-16 audit found 25 of 35 open issues in exactly that state.) Nothing was created. Fix "
+    "these and re-run the SAME command:\n")
+
+_CREATE_SHAPE = (
+    "\nThe body needs a section in EXACTLY this shape (it is what anti-affinity and the gate's "
+    "wander check verify against):\n\n%s\n" % queue_lint.METADATA_SHAPE if queue_lint else "")
+
+
+def _issue_create_reason(defects, areas):
+    """The deny text: every defect at once, each with its own fix, then — only when a metadata
+    defect is among them — the required shape and this repo's real area names.
+
+    Every defect at once, not one per retry: a session bounced three times for three halves of one
+    format has been taught nothing. And the shape block is CONDITIONAL for the same reason the body
+    dimension can stand down: a deny over labels alone must not also lecture about a body this hook
+    never read."""
+    lines = [_CREATE_PREAMBLE]
+    for d in defects:
+        lines.append("  • " + queue_lint.describe(d))
+    if any(d["code"] == "metadata_missing" or d["code"].startswith("touches") for d in defects):
+        lines.append(_CREATE_SHAPE)
+        names = [a for a in areas if isinstance(a, str)] if isinstance(areas, dict) else []
+        if names:
+            lines.append("This repo declares these areas: %s (or `*` for genuinely unknown scope)."
+                         % ", ".join(names))
+    return "\n".join(lines)
+
+
+def _issue_create_deny(tool_input, contract):
+    """The duty-3 verdict for one Bash call: a deny reason, or None to allow."""
+    if queue_lint is None:
+        return None                      # no contract module in reach — allow, as always
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    parsed = parse_issue_create(command)
+    if parsed is None:
+        return None                      # not confidently a `gh issue create`
+    got = contract() if callable(contract) else {"areas": None, "touches_required": False}
+    areas = got.get("areas")
+    body = parsed["body"]
+    defects = queue_lint.lint(parsed["labels"], body if body is not None else "",
+                              areas=areas,
+                              # An unreadable body must never be reported as a missing section.
+                              touches_required=bool(got.get("touches_required")) and body is not None)
+    return _issue_create_reason(defects, areas) if defects else None
+
+
 # --------------------------- attendance ---------------------------
 
 # The same words start-session.sh's truthy() accepts, so one boolean is read one way across the
@@ -188,15 +425,22 @@ def _attended(env, role):
 
 # --------------------------- the decision ---------------------------
 
-def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=False):
-    """Return a deny-reason string, or None to let the call proceed. Deny ONLY the two named
+def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=False,
+           contract=None):
+    """Return a deny-reason string, or None to let the call proceed. Deny ONLY the three named
     hazards — no broad allowlist. `ask_reason` is the caller's role-specific fallback text builder;
     `attended` stands duty 1 down when a human is genuinely present.
 
     `ask_reason` is REQUIRED, deliberately (fresh-agent review): a default would mean a caller that
     forgets it silently hands some other role the WORKER's protocol — the exact drift this module
     says is worse than no deny at all. Better a TypeError, which main() turns into a fail-open
-    allow, than a confident wrong instruction."""
+    allow, than a confident wrong instruction.
+
+    `contract` is a ZERO-ARG CALLABLE returning this repo's {"areas", "touches_required"} — a
+    thunk, not a value, because resolving it reads a file and this runs before EVERY tool call. It
+    is invoked only once a command has already parsed as a `gh issue create`, which is rare. Its
+    default is the fail-open contract (nothing known), so a caller that omits it can only ever deny
+    LESS, never more."""
     if tool_name == "AskUserQuestion":
         if attended:
             return None                  # a person IS at this pane — the dialog will be answered
@@ -205,6 +449,7 @@ def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=Fal
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
         if _is_pattern_kill(command):
             return _KILL_REASON          # never carved out, attended or not
+        return _issue_create_deny(tool_input, contract)
     return None
 
 
@@ -223,7 +468,8 @@ def run(payload, env):
     if not isinstance(payload, dict) or payload.get("hook_event_name") != "PreToolUse":
         return None
     return decide(payload.get("tool_name"), payload.get("tool_input"), state_home, issue_id,
-                  ask_reason=role[1], attended=_attended(env, role[0]))
+                  ask_reason=role[1], attended=_attended(env, role[0]),
+                  contract=lambda: repo_contract(state_home, issue_id, payload.get("cwd")))
 
 
 # --------------------------- the turn ---------------------------

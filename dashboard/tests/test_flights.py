@@ -1482,3 +1482,76 @@ def test_a_park_after_a_bounce_still_wins():
          "activity_mtime": None, "journal": journal},
         {"now": 1000, "idle_seconds": 480, "freeze_seconds": 2700, "required_checks": []})
     assert f["memo"] == "the current park reason"
+
+
+# ---- queue_rows: the territory half of the paperwork verdict (issue #225) ----
+# `touches_required` + declared `areas` are the repo's own facts (config._enrich_repo reads them
+# from its `.superlooper/config.json`). With them, the board can finally say what the runner will
+# do about an approved issue that declares no territory: PARK it. Without them — a standalone
+# dashboard, a repo that never declared either — the check stands DOWN and the board judges labels
+# alone, exactly as it did before.
+
+_AREAS_225 = {"engine": ["skills/**"], "dashboard": ["dashboard/**"]}
+_META_225 = "## Loop metadata\ntouches: engine\n"
+
+
+def _rows225(*cands, **kw):
+    kw.setdefault("areas", _AREAS_225)
+    kw.setdefault("touches_required", True)
+    return flights.queue_rows(list(cands), satisfied=_sat_none, **kw)
+
+
+def test_an_approved_issue_declaring_no_touches_is_paperwork_not_a_queued_flight():
+    rows = _rows225(_cand(5, body="## Goal\nship it\n"))
+    assert rows[0]["status"] == "paperwork"
+    assert rows[0]["launchable"] is False
+    assert rows[0]["refusal"] == "touches_missing"
+    assert "TOUCHES" in rows[0]["status_text"]
+
+
+def test_the_row_carries_the_plain_fix_so_the_owner_can_act_from_the_board():
+    rows = _rows225(_cand(5, body="## Goal\nship it\n"))
+    assert "## Loop metadata" in rows[0]["refusal_text"]
+    assert "engine" in rows[0]["refusal_text"]          # the repo's REAL areas, not a placeholder
+
+
+def test_a_no_touches_flight_is_never_crowned_next_off_the_stand():
+    # The exact shape the 2026-07-16 audit found: the board advertised flights the runner would
+    # never take, and an expedited issue sat behind them.
+    rows = _rows225(_cand(5, body="## Goal\nx\n"), _cand(9, body=_META_225))
+    assert [r["num"] for r in rows] == [9, 5]            # the launchable one leads
+    assert rows[0]["status_text"] == "NEXT OFF THE STAND"
+    assert rows[1]["status"] == "paperwork"
+
+
+def test_expedite_never_lifts_a_paperwork_flight():
+    rows = _rows225(_cand(5, labels=_lbl("expedite"), body="## Goal\nx\n"), _cand(9, body=_META_225))
+    assert [r["num"] for r in rows] == [9, 5]
+    assert rows[1]["expedited"] is False
+
+
+def test_a_declared_flight_is_untouched():
+    rows = _rows225(_cand(5, body=_META_225))
+    assert rows[0]["launchable"] is True and rows[0]["refusal"] is None
+
+
+def test_an_undeclared_AREA_still_flies_because_the_runner_still_launches_it():
+    # The board mirrors the runner. `touches: plugin` in a repo with no `plugin` area is a real
+    # defect — surfaced by doctor, the journal and the janitor — but not one that stops a launch.
+    rows = _rows225(_cand(5, body="## Loop metadata\ntouches: plugin\n"))
+    assert rows[0]["launchable"] is True and rows[0]["refusal"] is None
+
+
+def test_without_the_repos_territory_facts_the_check_stands_down():
+    rows = flights.queue_rows([_cand(5, body="## Goal\nx\n")], satisfied=_sat_none)
+    assert rows[0]["launchable"] is True and rows[0]["refusal"] is None
+
+
+def test_an_investigation_is_never_held_for_paperwork_it_does_not_need():
+    rows = _rows225(_cand(5, labels=_lbl("type:investigate"), typed=False, body="## Goal\nwhy?\n"))
+    assert rows[0]["launchable"] is True
+
+
+def test_the_label_refusal_still_wins_when_both_are_wrong():
+    rows = _rows225(_cand(5, typed=False, body="## Goal\nx\n"))
+    assert rows[0]["refusal"] == "type_missing"          # the rule the runner hits FIRST

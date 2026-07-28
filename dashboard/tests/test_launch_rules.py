@@ -301,3 +301,140 @@ def test_parity_the_board_refuses_exactly_what_the_runner_refuses():
 
 def test_parity_the_mirrors_type_kinds_are_the_engines():
     assert tuple(launch_rules.TYPE_KINDS) == tuple(_engine_issues().VALID_TYPES)
+
+
+# =========================================================================== the territory half
+# Issue #225. The label half of the contract has been mirrored since #138; the TERRITORY half had
+# not, so an approved merge-producing issue with no `touches:` declaration read as a normal queued
+# flight — right up until the runner parked it (or, while the runner was quiet, forever). The
+# 2026-07-16 audit found 25 of 35 open issues mechanically unlaunchable, and the owner discovered it
+# only by noticing an expedited issue sitting LAST on this very board.
+#
+# What is mirrored is the RUNNER's verdict and nothing more. An unknown AREA NAME is deliberately
+# NOT a board refusal: the runner never validates area names and launches such an issue happily, so
+# crying INVALID over it would be the #138 drift pointed the other way. That defect is surfaced by
+# `superlooper doctor --repo`, the runner's own journal, and the janitor — never here.
+
+_AREAS = {"engine": ["skills/**"], "dashboard": ["dashboard/**"]}
+_META = "## Loop metadata\ntouches: engine\n"
+
+
+def _refusal(labels, body, **kw):
+    kw.setdefault("areas", _AREAS)
+    kw.setdefault("touches_required", True)
+    return launch_rules.refusal(_lbl(*labels), body=body, **kw)
+
+
+def test_a_declared_touches_is_no_refusal():
+    assert _refusal(["type:build"], _META) is None
+
+
+def test_no_loop_metadata_section_refuses_the_flight():
+    r = _refusal(["type:build"], "## Goal\nship it\n")
+    assert r["code"] == "touches_missing"
+    assert "touches" in r["flap"].lower()
+    assert "## Loop metadata" in r["text"]
+
+
+def test_the_refusal_text_names_the_repos_real_areas_so_the_owner_can_act_from_the_board():
+    # Design record §0.3, tap-where-you-read: the fix must be legible where it is read.
+    r = _refusal(["type:build"], "## Goal\nship it\n")
+    assert "engine" in r["text"] and "dashboard" in r["text"]
+
+
+def test_a_touches_line_outside_the_section_is_its_own_refusal():
+    r = _refusal(["type:build"], "## Goal\nship it\n\ntouches: engine\n")
+    assert r["code"] == "touches_outside_section"
+
+
+def test_an_investigation_is_never_refused_for_touches():
+    assert _refusal(["type:investigate"], "## Goal\nfind out\n") is None
+
+
+def test_a_repo_that_does_not_require_touches_refuses_nothing():
+    assert _refusal(["type:build"], "## Goal\nship it\n", touches_required=False) is None
+
+
+def test_an_unknown_area_is_NOT_a_board_refusal():
+    # The runner launches it. The board mirrors the runner.
+    assert _refusal(["type:build"], "## Loop metadata\ntouches: plugin\n") is None
+
+
+def test_the_label_verdict_still_comes_first():
+    # The engine hits the type rule before it ever reaches the touches park, so the board must name
+    # the rule the runner actually hits first — never a second-order one.
+    assert _refusal([], "## Goal\nship it\n")["code"] == "type_missing"
+
+
+def test_the_touches_check_is_OFF_by_default_so_an_old_caller_is_untouched():
+    # `refusal(labels)` keeps its pre-#225 meaning exactly: a standalone dashboard, or any caller
+    # that has no repo config in reach, judges labels alone.
+    assert launch_rules.refusal(_lbl("type:build")) is None
+    assert launch_rules.refusal(_lbl("type:build"), body="## Goal\nx\n") is None
+
+
+@pytest.mark.parametrize("body", [None, 42, "", ["## Loop metadata"]])
+def test_a_wrong_typed_body_is_treated_as_no_declaration_and_never_raises(body):
+    assert _refusal(["type:build"], body)["code"] == "touches_missing"
+
+
+def test_the_declaration_is_read_only_inside_the_section_exactly_as_the_engine_reads_it():
+    # A `touches:`-like phrase in Goal prose must never count as a declaration — the engine's
+    # parse_loop_metadata reads inside the section only, and so must this.
+    body = "## Goal\nThis work touches: the engine, probably.\n\n## Loop metadata\ntouches: engine\n"
+    assert _refusal(["type:build"], body) is None
+
+
+# --- the engine bridge for the territory half ---
+
+def _engine_queue_lint():
+    """The engine's own ``lib/queue_lint.py`` — the module that DEFINES the mechanical contract —
+    loaded read-only, exactly as _engine_issues loads ``issues.py``."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    lib = os.path.join(root, "skills", "superlooper", "skill", "lib")
+    path = os.path.join(lib, "queue_lint.py")
+    if not os.path.exists(path):
+        if os.path.isdir(os.path.join(root, "skills")):
+            pytest.fail("the engine is in this checkout but its queue_lint.py is not at %s — the "
+                        "parity bridge must never silently disarm." % path)
+        pytest.skip("engine source not on disk (standalone dashboard install)")
+    import sys
+    sys.path.insert(0, lib)               # queue_lint imports the engine's own `issues`
+    try:
+        spec = importlib.util.spec_from_file_location("engine_queue_lint_readonly", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.remove(lib)
+    return mod
+
+
+_TERRITORY_FIXTURES = [
+    ("valid", ["agent-ready", "type:build"], _META),
+    ("no metadata section", ["agent-ready", "type:build"], "## Goal\nship it\n"),
+    ("metadata, no touches line", ["agent-ready", "type:build"], "## Loop metadata\nparent: #7\n"),
+    ("touches outside the section", ["agent-ready", "type:build"], "## Goal\nx\n\ntouches: engine\n"),
+    ("undeclared area", ["agent-ready", "type:build"], "## Loop metadata\ntouches: plugin\n"),
+    ("investigation, no touches", ["agent-ready", "type:investigate"], "## Goal\nwhy?\n"),
+    ("no type AND no touches", ["agent-ready"], "## Goal\nx\n"),
+    ("wildcard scope", ["agent-ready", "type:build"], "## Loop metadata\ntouches: *\n"),
+]
+
+
+def test_parity_the_board_refuses_exactly_the_territory_defects_the_engine_calls_blocking():
+    eng = _engine_queue_lint()
+    for name, labels, body in _TERRITORY_FIXTURES:
+        engine_blocks = eng.blocking(eng.lint(labels, body, areas=_AREAS, touches_required=True))
+        board_refuses = _refusal(labels, body) is not None
+        assert board_refuses == engine_blocks, name
+
+
+def test_parity_the_refusal_codes_are_the_engines_own_codes():
+    eng = _engine_queue_lint()
+    for name, labels, body in _TERRITORY_FIXTURES:
+        r = _refusal(labels, body)
+        if r is None:
+            continue
+        engine_codes = [d["code"] for d in eng.lint(labels, body, areas=_AREAS,
+                                                    touches_required=True) if d["blocks_launch"]]
+        assert r["code"] == engine_codes[0], name

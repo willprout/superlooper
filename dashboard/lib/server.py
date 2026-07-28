@@ -1134,7 +1134,7 @@ def _connection_resolver(gh_mod, slug):
     return satisfied
 
 
-def _departures(gh_mod, slug, titles, issues_state):
+def _departures(gh_mod, slug, titles, issues_state, areas=None, touches_required=False):
     """The launch queue in REAL order (design record §3 / Task 8) — the RUNNER's order, mirrored.
 
     The candidates are the open ``agent-ready`` issues the runner would still launch. Launching
@@ -1148,7 +1148,11 @@ def _departures(gh_mod, slug, titles, issues_state):
 
     The ordering, the eligibility refusals and the connection semantics are all the tested pure
     :func:`flights.queue_rows`; this only gathers facts and hands it a fail-closed connection
-    resolver. Empty when GitHub is unreachable (the honest empty board)."""
+    resolver. Empty when GitHub is unreachable (the honest empty board).
+
+    ``areas``/``touches_required`` are the repo's own territory facts, forwarded so the board can
+    also name the runner's touches-required park (issue #225). Both default to "unknown", which
+    stands that check down — see :func:`flights.queue_rows`."""
     if gh_mod is None:
         return []
     candidates = []
@@ -1165,7 +1169,8 @@ def _departures(gh_mod, slug, titles, issues_state):
                            "labels": iss.get("labels"), "body": iss.get("body"),
                            "created_at": iss.get("createdAt"),
                            "requeue_front": launch_rules.requeue_front(state)})
-    return flights.queue_rows(candidates, satisfied=_connection_resolver(gh_mod, slug))
+    return flights.queue_rows(candidates, satisfied=_connection_resolver(gh_mod, slug),
+                              areas=areas, touches_required=touches_required)
 
 
 # The field's physical row of jet-bridged west gates (issue #32). The engine parks a queued plane at
@@ -1519,7 +1524,9 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     # Codex review): the reachability probe is our oracle, so we never fly a stale-cached agent-ready
     # list that could outlive the probe's failure by a cache window — the dark-tower state and a
     # populated departures board must never contradict each other.
-    departures = [] if gh_unreachable else _departures(source, slug, titles, issues_state)
+    departures = [] if gh_unreachable else _departures(
+        source, slug, titles, issues_state,
+        areas=repo.get("areas"), touches_required=bool(repo.get("touches_required")))
     stand = _stand(departures, flying_nums)
 
     repo_snap = {

@@ -2644,6 +2644,7 @@ class Runner:
         self._update_issue(iid, {"branch": branch, "num": num, "type": p.get("type"),
                                  "declared_touches": list(p.get("touches") or []),
                                  "wildcard_hold_journaled": False,    # launch ends the hold episode (#36)
+                                 "queue_invalid_signature": None,     # ...and the lint complaint (#225)
                                  "launch_hold_reason": None})         # ...and the eligibility hold (#150)
         # NB: the per-issue model/effort override is stamped into durable state by _worker_env below
         # (it refreshes on EVERY worker launch so the stamp tracks William's current labels) — see
@@ -3058,6 +3059,7 @@ class Runner:
                       "review_carry": None,            # a rebuild is reviewed on its own diff (#154)
                       "read_waited": False, "checks_pending_since": None,
                       "wildcard_hold_journaled": False,   # a fresh approval re-journals its own hold (#36)
+                      "queue_invalid_signature": None,  # ...and re-says a still-broken lint (#225)
                       "launch_hold_reason": None,      # ...and re-journals an eligibility hold (#150)
                       "merge_refusal_reason": None,    # paired with merge_refusals=0 above (#27)
                       "pr_read_pending_since": None,   # a re-run's refused-read hold times fresh (#61)
@@ -3653,6 +3655,19 @@ class Runner:
         so a later, fresh episode re-journals. Journal-only: no label move, no notify."""
         self._update_issue(a["id"], {"wildcard_hold_journaled": True})
         return a.get("reason", "launch held by a no-touches wildcard — the lane serializes")
+
+    def _exec_queue_invalid(self, a, now):
+        """Issue #225: this approved issue fails the mechanical contract, so the runner would never
+        launch it (or would launch it into a territory the gate then reads as a wander). decide
+        emitted this ONCE per COMPLAINT — deduped on the defect signature — so stamp the signature
+        and return the defect list as the outcome, which is what puts the exact fix in the journal.
+
+        The stamp clears on launch (_exec_launch) and on reapprove, so a fresh episode speaks again;
+        a CHANGED complaint re-journals immediately because its signature no longer matches.
+        Journal-only: no label move, no notify, no park — the queue is untouched and the issue
+        launches the tick its metadata is fixed."""
+        self._update_issue(a["id"], {"queue_invalid_signature": a.get("signature")})
+        return a.get("reason", "the issue fails the mechanical queue contract")
 
     def _exec_launch_hold(self, a, now):
         """Issue #150 (D8): the one launch gate refused to start/restart this session. decide emitted
