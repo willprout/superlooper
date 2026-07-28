@@ -169,7 +169,10 @@ opposite meanings — on a finished issue with a live PR it wipes the finish rep
 from scratch; **D12** doc drift as a root cause (ops docs name dead verbs, a sync orphaned the
 installed docs, the debugger playbook wasn't installed on the machine having the incident);
 **D13** the debugger rails and the verified recovery procedure contradict each other on
-hand-merging; **D14** stop hooks failed `posix_spawn '/bin/sh'` ENOENT (root-caused same day —
+hand-merging *(fixed 2026-07-16: William ruled the supervised/unattended split — a supervised
+session with him present follows his direct instruction, an unattended session never
+hand-merges — and #209 wrote that split into the sl-debugger rails, repair ladder, and
+unattended contract; see #209's PR)*; **D14** stop hooks failed `posix_spawn '/bin/sh'` ENOENT (root-caused same day —
 see the forensics entry). A reapprove cycle also forced a full re-review by wiping finish
 evidence. *Correction (2026-07-15, i154 reconciliation):* this entry originally said the deleted
 worktree held "the only copy of the gate's review attestation" — wrong: the attestation is a PR

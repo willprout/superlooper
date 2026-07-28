@@ -107,11 +107,22 @@ The protocol, every time:
 6. **The human restarts the runner** (rung 2's restart procedure), and you watch the first
    ticks in the journal to confirm the story reads healthy again.
 
-## What no rung ever touches
+## What no rung ever touches — and the one class the split governs
 
-The constitution holds at every rung, with the human present or not: never apply
-`agent-ready` (or any approval label — that's the owner's word); never force-push; never
-merge or close PRs by hand; never edit frozen issue text; never modify `.superlooper/**`
-(the referee's own rulebook) or `.github/workflows/**` (the referee itself); never kill a
-process by name or pattern — never `pkill -f`, never `killall`; a PID you positively
-identified, or nothing.
+**Two lines hold at every rung, with the human present or not** — they are the owner's own
+signals, or machinery that deliberately does not exist, not recovery actions an agent
+performs: never apply `agent-ready` (or any approval label — that's the owner's word, which
+he applies himself) and never edit frozen issue text (a William-signed Goal/DoD — he edits
+his own issue); never force-push (the repos take merge-based updates only; the constitution
+builds no `--force` path). And, at every rung, never kill a process by name or pattern —
+never `pkill -f`, never `killall`; a PID you positively identified, or nothing.
+
+**Hand-merging and closing a PR follow the supervised/unattended split** (SKILL.md rails,
+William's 2026-07-16 D13 ruling) — exactly like the state surgery of rung 3. *Unattended* —
+the #66 watchdog, or any session unsure a human is present — you never hand-merge, never
+self-merge, never close a PR. *Supervised*, with William present and directing, his
+instruction to hand-merge a PR is authority, full stop (the verified i336/i337 recovery
+hand-merged three PRs with him present — the case the old absolute wording contradicted).
+`.superlooper/**` (the referee's own rulebook) and `.github/workflows/**` (the referee
+itself) are the same shape: untouched unattended, changed only through a supervised session
+on his direct word.
