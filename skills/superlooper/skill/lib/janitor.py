@@ -47,6 +47,9 @@ BRANCH_PREFIX = "sl/"
 # operator-name rename (issue #58) — or one mid-migration — keeps being read correctly.
 SUPERSEDED_LABEL = "superseded"
 PARK_LABELS = ("parked", "needs-owner", "needs-william")
+# How many accidental-close REOPENs one sweep may propose (issue #229). See the class's own comment
+# in propose() for why this class alone is capped; the remainder is reported, never dropped silently.
+REOPEN_SWEEP_CAP = 10
 
 _BRANCH_NUM_RE = re.compile(r"^sl/i(\d+)(?:-|$)")
 _ISO_Z = "%Y-%m-%dT%H:%M:%SZ"
@@ -157,7 +160,7 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
     if not isinstance(ls_issues, dict):
         # the exclusion source is unreadable: nothing is provably idle, so the whole sweep
         # fails closed — no proposals at all, whatever the candidates' own evidence says.
-        return {"proposals": [], "refused": []}
+        return {"proposals": [], "refused": [], "reopen_withheld": 0}
     ex_nums, ex_branches = _exclusions(ls_issues)
     refused = refused if isinstance(refused, (set, frozenset)) else frozenset()
     # A wrong-typed threshold must NOT coerce to the most aggressive setting (0d — propose
@@ -261,16 +264,33 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
     # regression vector recorded as fixed. It stays a PROPOSAL anyway: reopening an issue the owner
     # closed on purpose is its own harm, and only he can tell the two apart. closures.flagged owns
     # the proof (it flags nothing it cannot prove); the exclusions below are the janitor's own.
+    #
+    # And it is CAPPED, which no other class needs to be. Every other class is bounded by proof —
+    # a branch must be provably landed AND its tip unmoved, a parked issue must be past
+    # aged_park_days — but "closed by a commit keyword" is ordinary practice in a repo that does not
+    # run this loop, so an adopted repo can legitimately have hundreds. `--yes` is a blanket
+    # approval, and a blanket approval that fires hundreds of reopens (each posting a comment and
+    # notifying subscribers, with no one command to undo) is a harm the owner never asked for. The
+    # sweep therefore proposes at most REOPEN_SWEEP_CAP of them, newest-first — a recent accidental
+    # close is the urgent one — and reports the remainder rather than dropping it silently
+    # (`reopen_withheld`); the doctor still lists every one, and later sweeps propose the rest.
     seen_reopens = set()
-    for f in closures.flagged(list(closed_issues) if isinstance(closed_issues, list) else []):
+    flagged = [f for f in closures.flagged(list(closed_issues)
+                                           if isinstance(closed_issues, (list, tuple)) else [])
+               # a lane mid-flight on it is already dealing with it; and a close of the SAME issue
+               # proposed above would pair with this into two contradictory actions in one sweep
+               if f["num"] not in ex_nums and f["num"] not in seen_issues]
+    withheld = flagged[:-REOPEN_SWEEP_CAP] if len(flagged) > REOPEN_SWEEP_CAP else []
+    for f in sorted(flagged[-REOPEN_SWEEP_CAP:], key=lambda f: f["num"]):
         num = f["num"]
-        if num in ex_nums or num in seen_reopens:
-            continue                             # a lane is mid-flight on it: already being dealt with
+        if num in seen_reopens:
+            continue
         seen_reopens.add(num)
         emit({"kind": "issue-reopen", "key": f"reopen:{num}", "action": "reopen-issue",
               "target": num, "title": f["title"], "commit": f["commit"], "why": f["why"]})
 
-    return {"proposals": proposals, "refused": sorted(p["key"] for p in held)}
+    return {"proposals": proposals, "refused": sorted(p["key"] for p in held),
+            "reopen_withheld": len(withheld)}
 
 
 def reconcile(approved, fresh_proposals):

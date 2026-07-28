@@ -123,7 +123,7 @@ def flagged(closed_issues):
     return out
 
 
-def evidence(num, prs=(), branches=()):
+def evidence(num, prs=(), branches=(), proven=True):
     """One plain sentence: did an `sl/i<num>` branch or PR ever exist? — the third column of the
     doctor's listing (issue #229's DoD), and the fact that separates the two ways an issue can be
     keyword-closed. An approved loop fix that was never BUILT leaves no trace anywhere: no PR, no
@@ -133,9 +133,16 @@ def evidence(num, prs=(), branches=()):
 
     prs       gh.sl_head_prs()'s list — {"number", "state", "headRefName"} for every PR the repo
               has had on an sl/* head, any state.
-    branches  gh.remote_branches()'s {name: tip} — branches on the remote RIGHT NOW. A deleted
-              branch leaves nothing to find, so its absence is reported as "none on the remote
-              now", never as "none ever existed".
+    branches  gh.remote_branches_health()'s {name: tip} — branches on the remote RIGHT NOW. A
+              deleted branch leaves nothing to find, so its absence is reported as "none on the
+              remote now", never as "none ever existed".
+    proven    were BOTH reads clean and complete (their ReadHealth `ok`)? This gates the strongest
+              sentence this module can say. A refused read, or one truncated by its own bound,
+              yields the same empty list as a genuinely PR-less issue — and printing "nothing was
+              ever built for it" off that is exactly the trusted-signal failure #229 exists to
+              stop, one layer down. With proven=False the absence half is reported as unproven and
+              whatever WAS found is still named (found evidence stays true; only absence needs
+              a complete read).
 
     Wrong-typed inputs render as "nothing found" and never raise — this runs inside a doctor line."""
     pr_bits = []
@@ -153,16 +160,23 @@ def evidence(num, prs=(), branches=()):
                   if branch_issue_num(b) == num)
 
     if not pr_bits and not live:
+        if not proven:
+            return ("could not read the repo's PR and branch history completely this run — "
+                    "whether anything was ever built for sl/i%d is UNPROVEN, not disproven" % num)
         return ("no sl/i%d PR was ever opened and no sl/i%d branch is on the remote now — "
                 "nothing was ever built for it" % (num, num))
     parts = []
     if pr_bits:
         parts.append("PR%s %s" % ("s" if len(pr_bits) > 1 else "", ", ".join(sorted(pr_bits))))
-    else:
+    elif proven:
         parts.append("no sl/i%d PR was ever opened" % num)
+    else:
+        parts.append("no sl/i%d PR found (PR history read incomplete — unproven)" % num)
     if live:
         parts.append("branch%s %s still on the remote" % ("es" if len(live) > 1 else "",
                                                           ", ".join(live)))
-    else:
+    elif proven:
         parts.append("no sl/i%d branch on the remote now" % num)
+    else:
+        parts.append("no sl/i%d branch found (branch list read incomplete — unproven)" % num)
     return "; ".join(parts)

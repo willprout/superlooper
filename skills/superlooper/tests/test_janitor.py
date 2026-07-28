@@ -443,11 +443,13 @@ def test_reopen_proposals_ride_the_refused_holdback_like_every_other_class():
 
 
 def test_reopen_keys_never_collide_with_the_close_issue_keys():
-    # both classes target issue numbers; an `issue:9` close and a `reopen:9` must stay distinct
-    # keys, or the command center's per-key tap and the refused map would conflate them.
-    r = propose(parked_issues=[_issue(9, ("parked",), NOW - 30 * DAY)],
-                closed_issues=[_closed(9, closer=_bare())])
-    assert sorted(p["key"] for p in r["proposals"]) == ["issue:9", "reopen:9"]
+    # both classes target issue numbers, so their KEYS must stay distinct — the command center
+    # taps by key and the refused map is keyed the same way; one shared "issue:9" would let a
+    # refused close hold back a reopen (and a tap on one run the other).
+    close_key = propose(parked_issues=[_issue(9, ("parked",), NOW - 30 * DAY)])["proposals"][0]
+    reopen_key = propose(closed_issues=[_closed(9, closer=_bare())])["proposals"][0]
+    assert close_key["key"] == "issue:9" and reopen_key["key"] == "reopen:9"
+    assert close_key["action"] == "close-issue" and reopen_key["action"] == "reopen-issue"
 
 
 def test_reopen_proposals_are_deduped_sorted_and_emitted_last():
@@ -470,7 +472,7 @@ def test_an_unreadable_loopstate_still_fails_the_whole_sweep_closed_including_re
     r = janitor.propose(branches={}, branch_prs={}, superseded_prs=[], parked_issues=[],
                         closed_issues=[_closed(189, closer=_bare())], ls_issues="garbage",
                         now=NOW, aged_park_days=14)
-    assert r == {"proposals": [], "refused": []}
+    assert r == {"proposals": [], "refused": [], "reopen_withheld": 0}
 
 
 def test_closed_issues_defaults_to_nothing_so_every_existing_caller_keeps_working():
@@ -478,7 +480,42 @@ def test_closed_issues_defaults_to_nothing_so_every_existing_caller_keeps_workin
     # rather than raising (the CLI, upkeep and the dashboard all reach propose()).
     assert janitor.propose(branches={}, branch_prs={}, superseded_prs=[], parked_issues=[],
                            ls_issues={}, now=NOW, aged_park_days=14) == \
-        {"proposals": [], "refused": []}
+        {"proposals": [], "refused": [], "reopen_withheld": 0}
+
+
+def test_a_tuple_of_closed_issues_is_accepted_like_a_list():
+    # the parameter's own default is a tuple, so a caller passing one must not silently
+    # propose nothing (fail-closed is right for a WRONG type, not for a sequence).
+    r = propose(closed_issues=(_closed(189, closer=_bare()),))
+    assert [p["key"] for p in r["proposals"]] == ["reopen:189"]
+
+
+def test_the_reopen_class_is_capped_per_sweep_and_the_remainder_is_reported():
+    # UNLIKE every other class, "closed by a commit keyword" is ordinary practice in a repo that
+    # does not run this loop — an adopted repo can legitimately have hundreds. `--yes` is a
+    # blanket approval, so an uncapped class would fire hundreds of reopens (each a comment, each
+    # a notification) on one word. The cap is stated, never silent.
+    closed = [_closed(n, closer=_bare()) for n in range(1, 26)]
+    r = propose(closed_issues=closed)
+    reopens = [p for p in r["proposals"] if p["kind"] == "issue-reopen"]
+    assert len(reopens) == janitor.REOPEN_SWEEP_CAP
+    assert r["reopen_withheld"] == 25 - janitor.REOPEN_SWEEP_CAP
+    # newest-first selection (a recent accidental close is the urgent one), emitted sorted
+    assert [p["target"] for p in reopens] == list(range(16, 26))
+
+
+def test_nothing_is_withheld_when_the_sweep_fits_under_the_cap():
+    r = propose(closed_issues=[_closed(189, closer=_bare())])
+    assert r["reopen_withheld"] == 0
+
+
+def test_an_issue_proposed_for_closing_is_never_also_proposed_for_reopening():
+    # the two sources are disjoint in production (open parks vs closed issues), but a close
+    # landing between the two fetches would pair them — and executing both under --yes would
+    # close then reopen the same issue, leaving two contradictory audit comments.
+    r = propose(parked_issues=[_issue(9, ("parked",), NOW - 30 * DAY)],
+                closed_issues=[_closed(9, closer=_bare())])
+    assert [p["key"] for p in r["proposals"]] == ["issue:9"]
 
 
 def test_reopen_inputs_are_never_mutated():

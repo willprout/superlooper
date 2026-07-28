@@ -724,11 +724,27 @@ def main_fixture():
             # parser reads as a clean "nothing closed" rather than a refusal.
             m = re.search(r"query\s+(\w+)", " ".join(ARGS))
             name = "graphql_%s.json" % m.group(1) if m else "graphql.json"
-            if not os.path.isfile(os.path.join(FIX, name)):
+            path_ = os.path.join(FIX, name)
+            if not os.path.isfile(path_):
                 print(json.dumps({"data": {"repository": {"issues": {
                     "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}}}))
                 sys.exit(0)
-            serve_first([name])
+            with open(path_) as f:
+                body = f.read()
+            # `@@COUNTER@@` in a fixture becomes a FRESH value on every call — the degraded-endpoint
+            # shape (always "more pages", never a repeated cursor) that only a hard page counter
+            # can stop. Nothing else uses it, so an ordinary fixture is served verbatim.
+            if "@@COUNTER@@" in body:
+                cpath = os.path.join(FIX, "fake_cursor_counter")
+                try:
+                    n = int(open(cpath).read().strip() or "0")
+                except (OSError, ValueError):
+                    n = 0
+                with open(cpath, "w") as f:
+                    f.write(str(n + 1))
+                body = body.replace("@@COUNTER@@", "cursor-%d" % n)
+            sys.stdout.write(body)
+            sys.exit(0)
         serve_first(["api.json"])
 
     elif sub == ["issue", "edit"]:

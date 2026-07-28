@@ -854,9 +854,45 @@ def test_closed_issue_closers_stops_on_a_repeated_cursor(ghenv):
             "pageInfo": {"hasNextPage": True, "endCursor": "SAME"},
             "nodes": [{"number": 5, "stateReason": "COMPLETED", "timelineItems": {"nodes": []}}]}}}}))
     rh = gh.closed_issue_closers()
-    assert rh.ok is True
+    # more pages EXIST and we cannot follow them: a window, not a finished repo
+    assert rh.ok is True and rh.truncated is True
     graphql_calls = [c for c in _calls(ghenv) if c[:2] == ["api", "graphql"]]
     assert len(graphql_calls) == 2          # the second read repeats the cursor -> stop
+
+
+def test_closed_issue_closers_stops_on_a_forever_advancing_empty_cursor(ghenv):
+    # The nastier shape the repeated-cursor guard alone does not catch: a degraded endpoint that
+    # answers "more pages" with a FRESH cursor and NO usable nodes. `out` never grows and no
+    # cursor ever repeats, so only a hard page counter stops an unbounded run of 30s subprocesses.
+    (ghenv / "fake_cursor_counter").write_text("0")
+    (ghenv / "graphql_ClosedIssueClosers.json").write_text(json.dumps(
+        {"data": {"repository": {"issues": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "@@COUNTER@@"},
+            "nodes": ["not-a-dict"]}}}}))
+    rh = gh.closed_issue_closers(limit=200)
+    assert rh.value == [] and rh.ok is True and rh.truncated is True
+    graphql_calls = [c for c in _calls(ghenv) if c[:2] == ["api", "graphql"]]
+    assert len(graphql_calls) <= 4          # ceil(200/100) + 1 slack, never unbounded
+
+
+def test_closed_issue_closers_reports_a_truncated_window(ghenv):
+    # `truncated` is the difference between "no issue in this repo was accidentally closed" and
+    # "no issue in the window I looked at was" — the doctor prints an unqualified "every" off it.
+    (ghenv / "graphql_ClosedIssueClosers.json").write_text(json.dumps(
+        {"data": {"repository": {"issues": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "NEXT"},
+            "nodes": [{"number": n, "stateReason": "COMPLETED", "timelineItems": {"nodes": []}}
+                      for n in range(1, 3)]}}}}))
+    rh = gh.closed_issue_closers(limit=2)
+    assert rh.truncated is True and rh.ok is True and len(rh.value) == 2
+
+
+def test_closed_issue_closers_orders_by_update_not_creation(ghenv):
+    # a close BUMPS updatedAt, so the issues this audit is about sort to the front whatever their
+    # age; CREATED_AT would drop an old, low-numbered issue keyword-closed today out of the window.
+    gh.closed_issue_closers()
+    query = next(a for a in _calls(ghenv)[-1] if a.startswith("query="))
+    assert "field: UPDATED_AT" in query and "CREATED_AT" not in query
 
 
 def test_closed_issue_closers_honours_its_bound(ghenv):
@@ -866,16 +902,42 @@ def test_closed_issue_closers_honours_its_bound(ghenv):
 
 
 def test_sl_head_prs_keeps_only_loop_branches(ghenv):
-    prs = gh.sl_head_prs()
-    assert [p["number"] for p in prs] == [12, 14, 240]      # hotfix/… and the null head are dropped
-    assert prs[2] == {"number": 240, "state": "CLOSED", "headRefName": "sl/i151-the-fix"}
+    rh = gh.sl_head_prs()
+    assert rh.ok is True
+    assert [p["number"] for p in rh.value] == [12, 14, 240]   # hotfix/… + the null head dropped
+    assert rh.value[2] == {"number": 240, "state": "CLOSED", "headRefName": "sl/i151-the-fix"}
     argv = _calls(ghenv)[-1]
     assert _after(argv, "--state") == "all" and "headRefName" in _after(argv, "--json")
 
 
 def test_sl_head_prs_fails_closed(ghenv, monkeypatch):
     monkeypatch.setenv("GH_FAIL", "1")
-    assert gh.sl_head_prs() == []
+    rh = gh.sl_head_prs()
+    assert rh.value == [] and rh.ok is False
+
+
+def test_sl_head_prs_reports_a_full_page_as_unproven(ghenv):
+    # a list capped at `limit` cannot prove a PR's ABSENCE: an old sl/i5 PR falls off the end long
+    # before anything is wrong with GitHub, and the evidence line would then claim the work never
+    # existed. A full page reads ok=False for exactly that reason.
+    (ghenv / "pr_list_heads.json").write_text(json.dumps(
+        [{"number": n, "state": "MERGED", "headRefName": "sl/i%d-x" % n} for n in range(1, 6)]))
+    assert gh.sl_head_prs(limit=5).ok is False
+    assert gh.sl_head_prs(limit=6).ok is True
+
+
+def test_remote_branches_health_carries_the_same_proof_flag(ghenv):
+    rh = gh.remote_branches_health()
+    assert rh.ok is True
+    assert rh.value == {"main": "aaa111", "sl/i5-fix-thing": "bbb222",
+                        "sl/i7-old-thing": "ccc333"}
+
+
+def test_remote_branches_health_fails_closed_and_flags_a_full_page(ghenv, monkeypatch):
+    assert gh.remote_branches_health(limit=3).ok is False    # 3 branches in a 3-slot page
+    monkeypatch.setenv("GH_FAIL", "1")
+    rh = gh.remote_branches_health()
+    assert rh.value == {} and rh.ok is False
 
 
 def test_reopen_issue_records_with_the_audit_comment(ghenv):

@@ -342,7 +342,49 @@ def test_doctor_is_clean_when_every_close_has_a_merged_pr_or_the_owners_hand(rig
     r = cli(rig, "doctor", "--repo", str(rig.repo))
     assert r.returncode == 0, r.stdout + r.stderr
     assert "ok   accidental issue closes" in r.stdout
-    assert "2 checked" in r.stdout                            # says how much it actually audited
+    assert "all 2 closed issues" in r.stdout                  # the window it actually audited
+
+
+def test_doctor_does_not_count_a_not_planned_close_as_audited(rig):
+    # a NOT_PLANNED close never claimed the work was done; counting it would overstate the audit.
+    _seed_closed_issues(rig, _pr_closed(150, 242),
+                        {"number": 60, "title": "Won't fix", "stateReason": "NOT_PLANNED",
+                         "closedAt": "z", "timelineItems": {"nodes": []}})
+    out = cli(rig, "doctor", "--repo", str(rig.repo)).stdout
+    assert "all 2 closed issues" in out and "every one of the 1 closed as COMPLETED" in out
+
+
+def test_doctor_says_when_it_only_audited_a_window(rig):
+    # an unqualified "every" is a completeness claim, and the read is bounded. A repo with more
+    # closed issues than the bound must be told it was a window, or a clean line over-claims.
+    (rig.fixdir / "graphql_ClosedIssueClosers.json").write_text(json.dumps(
+        {"data": {"repository": {"issues": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "NEXT"},
+            "nodes": [_pr_closed(n, 100 + n) for n in range(1, 6)]}}}}))
+    out = cli(rig, "doctor", "--repo", str(rig.repo)).stdout
+    assert "ok   accidental issue closes" in out
+    assert "most recently updated" in out and "older ones were NOT checked" in out
+
+
+def test_doctor_never_claims_nothing_was_built_off_an_unreadable_pr_history(rig):
+    # the never-built clause is the strongest sentence in the block; a refused PR list produces
+    # the same empty answer as a genuinely PR-less issue, and asserting the negative off it would
+    # be this very defect class one layer down.
+    _seed_closed_issues(rig, _keyword_closed(189))
+    (rig.fixdir / "pr_list_heads.json").write_text("{not json")
+    out = cli(rig, "doctor", "--repo", str(rig.repo)).stdout
+    assert "#189" in out
+    assert "nothing was ever built" not in out
+    assert "UNPROVEN" in out
+
+
+def test_doctor_caps_the_printed_list_and_says_how_many_it_left_out(rig):
+    _seed_closed_issues(rig, *[_keyword_closed(n, title="Never built %d" % n)
+                               for n in range(1, 31)])
+    out = cli(rig, "doctor", "--repo", str(rig.repo)).stdout
+    assert "30 of all 30 closed issues" in out          # the COUNT is always the true total
+    assert "…and 10 more" in out                        # the cap is stated, never silent
+    assert out.count("closed by commit") == 20
 
 
 def test_doctor_says_it_could_not_read_rather_than_giving_a_clean_bill(rig):
@@ -1937,11 +1979,12 @@ def test_janitor_json_carries_the_reopen_key_for_a_one_touch_approval(rig):
     # the command center approves per KEY; a reopen must be tappable exactly like every other
     # proposal, and its key must not collide with a close of the same issue number.
     _seed_janitor_fixtures(rig)
-    _seed_closed_issues(rig, _keyword_closed(9))
+    _seed_closed_issues(rig, _keyword_closed(189))
     doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
     keys = {p["key"] for p in doc["proposals"]}
-    assert "reopen:9" in keys and "issue:9" in keys      # aged-park close AND reopen, distinct
-    r = cli(rig, "janitor", "--execute-keys", "reopen:9", "--repo", str(rig.repo))
+    # the aged-park close of #9 and the reopen of #189 sit side by side under distinct key spaces
+    assert "reopen:189" in keys and "issue:9" in keys
+    r = cli(rig, "janitor", "--execute-keys", "reopen:189", "--repo", str(rig.repo))
     assert r.returncode == 0, r.stdout + r.stderr
     assert [m["kind"] for m in mutations(rig)] == ["reopen_issue"]
 
@@ -1957,6 +2000,21 @@ def test_janitor_never_proposes_reopening_an_issue_a_lane_is_working(rig):
     r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
     assert r.returncode == 0, r.stdout + r.stderr
     assert "REOPEN" not in r.stdout
+
+
+def test_janitor_caps_the_reopen_class_and_says_what_it_withheld(rig):
+    # `--yes` is a blanket approval. In a repo whose humans close issues from commit messages as
+    # a matter of course, an uncapped class would fire hundreds of reopens — each a comment, each
+    # a notification, with no one command to undo — on a single word.
+    _seed_janitor_fixtures(rig)
+    _seed_closed_issues(rig, *[_keyword_closed(n) for n in range(100, 125)])
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.count("REOPEN issue #") == 10
+    assert "15 more keyword-closed issue(s) were found and NOT proposed" in r.stdout
+    assert "a later sweep proposes the rest" in r.stdout
+    doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
+    assert doc["reopen_withheld"] == 15
 
 
 def test_janitor_proposes_no_reopens_when_the_closed_read_is_refused(rig):

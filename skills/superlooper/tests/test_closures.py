@@ -165,3 +165,33 @@ def test_evidence_fails_closed_on_wrong_typed_inputs():
     # an unreadable evidence read must render as "none found", never raise into the doctor.
     for prs, branches in ((None, None), ("x", "y"), ([None, 7], {7: "x"}), ([{}], {"": ""})):
         assert isinstance(closures.evidence(189, prs=prs, branches=branches), str)
+
+
+# --- an unproven read must never render as a proven negative (review P1-1) ---------------------
+# The strongest sentence this module says is "nothing was ever built for it", and a refused or
+# bound-truncated read produces the same empty list as a genuinely PR-less issue. Printing the
+# never-built claim off that would be the exact trusted-signal failure #229 exists to stop, one
+# layer down — a proven-sounding negative asserted from a read that proved nothing.
+
+def test_an_unproven_empty_read_never_claims_nothing_was_ever_built():
+    line = closures.evidence(189, prs=[], branches={}, proven=False)
+    assert "nothing was ever built" not in line
+    assert "UNPROVEN" in line
+
+
+def test_a_proven_empty_read_still_says_nothing_was_ever_built():
+    assert "nothing was ever built" in closures.evidence(189, prs=[], branches={}, proven=True)
+
+
+def test_evidence_found_under_an_unproven_read_is_still_named():
+    # absence needs a complete read; PRESENCE does not — a PR we DID see really exists.
+    line = closures.evidence(189, prs=[{"number": 240, "state": "CLOSED",
+                                        "headRefName": "sl/i189-x"}],
+                             branches={}, proven=False)
+    assert "#240" in line
+    assert "unproven" in line.lower()          # the branch half is still hedged
+
+
+def test_proven_defaults_true_so_existing_callers_are_unchanged():
+    assert closures.evidence(189, prs=[], branches={}) == \
+        closures.evidence(189, prs=[], branches={}, proven=True)

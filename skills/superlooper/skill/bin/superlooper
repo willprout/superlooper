@@ -542,34 +542,60 @@ def cmd_stack_doctor(args):
 _ACCIDENTAL_CLOSE_NAME = "accidental issue closes"
 
 
+# How many flagged issues the block prints in full before it summarizes. A repo that closes issues
+# from commit messages as a matter of course can have hundreds, and 3 lines each would bury every
+# other doctor block. The cap is STATED with the remainder, never silently applied — the count above
+# it is always the true total.
+_ACCIDENTAL_CLOSE_LIST_CAP = 20
+
+
 def _doctor_accidental_closes():
     """Print the accidental-close audit block. Never raises and never fails the doctor — see the
     comment above for why this is a WARN. Costs ONE GraphQL read on a clean repo, plus two list
     reads only when something is actually flagged."""
-    rh = gh.closed_issue_closers()
-    if not rh.ok:
+    read = gh.closed_issue_closers()
+    if not read.ok:
         # refused != "nothing was accidentally closed": say which one this is, or a GitHub outage
         # renders as a clean bill of health (the #21/#61 discipline, applied to a human-read line).
         print(f"  WARN {_ACCIDENTAL_CLOSE_NAME} — GitHub refused the closed-issue read; could not "
               "audit for keyword-closed issues this run. Re-run doctor.")
         return
-    found = closures.flagged(rh.value)
+    # Only COMPLETED closes are in scope, so only they may be counted as checked — a NOT_PLANNED
+    # close never claimed the work was done and inflating the number with them would overstate
+    # what the audit actually looked at.
+    completed = sum(1 for r in read.value
+                    if isinstance(r, dict) and r.get("stateReason") == closures.COMPLETED)
+    # The window is part of the answer: an unqualified "every" is a completeness claim, and this
+    # read is bounded. Say which one it is.
+    window = (f"the {len(read.value)} most recently updated closed issues; older ones were NOT "
+              "checked this run" if read.truncated else f"all {len(read.value)} closed issues")
+    found = closures.flagged(read.value)
     if not found:
-        print(f"  ok   {_ACCIDENTAL_CLOSE_NAME} — every issue closed as COMPLETED "
-              f"({len(rh.value)} checked) has a merged PR or the owner's own hand behind it")
+        print(f"  ok   {_ACCIDENTAL_CLOSE_NAME} — of {window}, every one of the {completed} "
+              "closed as COMPLETED has a merged PR or the owner's own hand behind it")
         return
-    print(f"  WARN {_ACCIDENTAL_CLOSE_NAME} — {len(found)} issue(s) closed as COMPLETED by a bare "
-          "commit-message keyword, with no merged PR behind them; each reads as fixed while "
+    print(f"  WARN {_ACCIDENTAL_CLOSE_NAME} — {len(found)} of {window}: closed as COMPLETED by a "
+          "bare commit-message keyword, with no merged PR behind them; each reads as fixed while "
           "nothing shipped:")
-    prs, branches = gh.sl_head_prs(), gh.remote_branches()
-    for f in found:
+    # `ok` on BOTH reads is what licenses the evidence line's strongest sentence. A refused or
+    # bound-truncated read yields the same empty list as a genuinely PR-less issue, and an
+    # unproven "nothing was ever built for it" is the very failure this block exists to catch.
+    pr_read, branch_read = gh.sl_head_prs(), gh.remote_branches_health()
+    proven = pr_read.ok and branch_read.ok
+    for f in found[:_ACCIDENTAL_CLOSE_LIST_CAP]:
         title = f" {f['title'][:60]!r}" if f["title"] else ""
+        evidence = closures.evidence(f["num"], prs=pr_read.value,
+                                     branches=branch_read.value, proven=proven)
         print(f"         #{f['num']}{title}")
         print(f"           closed by commit {f['commit'][:8]} "
               f"({f['headline'] or 'no commit subject'})")
-        print(f"           {closures.evidence(f['num'], prs=prs, branches=branches)}")
-    print("       `superlooper janitor` proposes reopening each one, with an audit comment naming "
-          "the closing commit — nothing reopens without your y/N.")
+        print(f"           {evidence}")
+    if len(found) > _ACCIDENTAL_CLOSE_LIST_CAP:
+        print(f"         …and {len(found) - _ACCIDENTAL_CLOSE_LIST_CAP} more (listed in full by "
+              "`superlooper janitor --json`)")
+    print("       `superlooper janitor` proposes reopening these, with an audit comment naming "
+          f"the closing commit — nothing reopens without your y/N, and it proposes at most "
+          f"{janitor_lib.REOPEN_SWEEP_CAP} per sweep.")
 
 
 def cmd_doctor(args):
@@ -1445,21 +1471,29 @@ def cmd_janitor(args):
     result = janitor_lib.propose(**_janitor_fetch(ls), now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)
     props, held = result["proposals"], result["refused"]
+    withheld = result.get("reopen_withheld") or 0
 
     if getattr(args, "json", False):
         # machine-readable propose: the full snapshot, one JSON object, and NOTHING is executed
         # or written. The command center renders this exactly the way `--dry-run` prints for a
         # human — same pure propose(), no re-derived safety anywhere.
         print(json.dumps({"ok": True, "proposals": props, "held": held,
-                          "aged_park_days": days}))
+                          "aged_park_days": days, "reopen_withheld": withheld}))
         return 0
 
     held_note = (f"({len(held)} previously refused action(s) held back — --retry-refused "
                  f"re-proposes them; see state/{_REFUSED_FILE})" if held else "")
+    # A cap that is not SAID reads as "there was nothing else" — the same over-claim the
+    # accidental-close audit exists to stop (issue #229). Say what was left out and why.
+    withheld_note = (f"({withheld} more keyword-closed issue(s) were found and NOT proposed this "
+                     f"sweep — at most {janitor_lib.REOPEN_SWEEP_CAP} reopens per sweep; "
+                     f"`superlooper doctor` lists them all and a later sweep proposes the rest)"
+                     if withheld else "")
 
     if not props:
         print("janitor: nothing to propose — no GitHub-side debris found."
-              + (" " + held_note if held_note else ""))
+              + (" " + held_note if held_note else "")
+              + (" " + withheld_note if withheld_note else ""))
         return 0
 
     print(f"janitor proposals ({len(props)}) — nothing executes without your approval:")
@@ -1467,6 +1501,8 @@ def cmd_janitor(args):
         print(_janitor_line(p))
     if held_note:
         print(held_note)
+    if withheld_note:
+        print(withheld_note)
     if args.dry_run:
         print("dry-run: nothing executed, nothing written.")
         return 0

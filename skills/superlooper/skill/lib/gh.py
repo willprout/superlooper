@@ -471,7 +471,7 @@ _CLOSERS_QUERY = """
 query ClosedIssueClosers($owner: String!, $name: String!, $page: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     issues(states: CLOSED, first: $page, after: $cursor,
-           orderBy: {field: CREATED_AT, direction: DESC}) {
+           orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number
@@ -499,6 +499,14 @@ query ClosedIssueClosers($owner: String!, $name: String!, $page: Int!, $cursor: 
 }
 """
 _CLOSERS_PAGE = 100          # GitHub's max page size for a connection
+
+# closed_issue_closers' read-health contract, one field wider than ReadHealth. `truncated` is the
+# difference between "no issue in this repo was accidentally closed" and "no issue in the WINDOW I
+# looked at was" — and the doctor prints an unqualified "every" off this call, so the window has to
+# be part of the answer rather than a docstring's promise. Ordering is UPDATED_AT DESC, not
+# CREATED_AT: a close bumps updatedAt, so the issues this audit is about sort to the front whatever
+# their age, and truncation drops the least-recently-touched instead of the oldest-numbered.
+ClosedRead = collections.namedtuple("ClosedRead", ["value", "ok", "truncated"])
 
 
 def _closer_of(node):
@@ -533,8 +541,8 @@ def _closer_of(node):
 
 
 def closed_issue_closers(limit=400):
-    """Every CLOSED issue with WHAT closed it, as a ReadHealth(list, ok) — the accidental-close
-    audit's one read (issue #229). Each record:
+    """Every CLOSED issue with WHAT closed it, as a ClosedRead(list, ok, truncated) — the
+    accidental-close audit's one read (issue #229). Each record:
         {"number": int, "title": str, "stateReason": str, "closedAt": str, "closer": <see
          _closer_of> | None}
     consumed by lib/closures.flagged.
@@ -545,30 +553,37 @@ def closed_issue_closers(limit=400):
     off a GitHub outage. With `ok` it says "could not read" instead. ok=False on any refused page,
     an unparseable/wrong-typed body, or a GraphQL `errors` payload; `value` is then [].
 
-    Paginated newest-first and BOUNDED at `limit` issues (4 pages of 100). Beyond that the audit
-    stops looking rather than walking a decade of history on every doctor run; the bound is
-    reported by the caller, never silently applied (the doctor prints how far back it looked)."""
-    out, cursor, seen_cursors = [], None, set()
-    ok = True
-    while len(out) < max(0, int(limit)):
+    `truncated` is True when the repo has MORE closed issues than `limit` — the audit looked at a
+    window, not at everything, and the caller must not render that as "every issue". Bounded at
+    `limit` (4 pages of 100 by default) rather than walking a decade of history on every doctor run.
+
+    The page loop is bounded three ways, because an unbounded `while` around a 30s subprocess is a
+    hang: the running total against `limit`, a hard page counter, and a repeated-cursor guard. A
+    degraded endpoint that answers `{"nodes": [], "hasNextPage": true}` with a FRESH cursor every
+    time defeats the first two on their own."""
+    limit = max(0, int(limit))
+    max_pages = -(-limit // _CLOSERS_PAGE) + 1        # ceil, +1 slack for short pages
+    out, cursor, seen_cursors, pages = [], None, set(), 0
+    while len(out) < limit and pages < max_pages:
         args = ["api", "graphql", "-F", "owner=:owner", "-F", "name=:repo",
-                "-F", "page=%d" % min(_CLOSERS_PAGE, max(1, int(limit) - len(out))),
+                "-F", "page=%d" % min(_CLOSERS_PAGE, max(1, limit - len(out))),
                 "-f", "query=" + _CLOSERS_QUERY]
         if cursor:
             args += ["-f", "cursor=" + cursor]
         rc, body = _run(args)
+        pages += 1
         if rc != 0:
-            return ReadHealth([], False)         # refused: never a partial list dressed as whole
+            return ClosedRead([], False, False)  # refused: never a partial list dressed as whole
         try:
             doc = json.loads(body)
         except (json.JSONDecodeError, ValueError):
-            return ReadHealth([], False)
+            return ClosedRead([], False, False)
         if not isinstance(doc, dict) or doc.get("errors"):
-            return ReadHealth([], False)         # a GraphQL error payload is rc 0 but not an answer
+            return ClosedRead([], False, False)  # a GraphQL error payload is rc 0 but not an answer
         repo = (doc.get("data") or {}).get("repository") if isinstance(doc.get("data"), dict) else None
         conn = repo.get("issues") if isinstance(repo, dict) else None
         if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
-            return ReadHealth([], False)         # wrong-typed body: not a clean answer
+            return ClosedRead([], False, False)  # wrong-typed body: not a clean answer
         for node in conn["nodes"]:
             if not isinstance(node, dict):
                 continue
@@ -576,27 +591,56 @@ def closed_issue_closers(limit=400):
                         "stateReason": node.get("stateReason"), "closedAt": node.get("closedAt"),
                         "closer": _closer_of(node)})
         page = conn.get("pageInfo") if isinstance(conn.get("pageInfo"), dict) else {}
+        if page.get("hasNextPage") is not True:
+            return ClosedRead(out, True, False)  # genuinely the end: the audit saw everything
+        # More pages EXIST. Whether we stopped by our own bound or because the server stopped
+        # handing out usable cursors, the answer is a window either way — a missing or repeated
+        # cursor under hasNextPage=true is a server we cannot follow, not a repo we finished.
         cursor = page.get("endCursor")
-        # A server that never advances the cursor (or repeats one) must not spin this loop forever.
-        if page.get("hasNextPage") is not True or not isinstance(cursor, str) or not cursor \
-                or cursor in seen_cursors:
-            break
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            return ClosedRead(out, True, True)
         seen_cursors.add(cursor)
-    return ReadHealth(out, ok)
+    # Left the loop with pages still waiting: the audit saw a window, and must say so.
+    return ClosedRead(out, True, True)
 
 
-def sl_head_prs(limit=300):
-    """Every PR the repo has ever had on an `sl/*` head — {"number", "state", "headRefName"} —
-    for the doctor's "did an sl/i<N> PR ever exist?" evidence column (issue #229). ONE list read
-    however many issues are flagged, and it is issued only when at least one IS flagged. Fails
-    closed to [] — no evidence found, which the evidence line states honestly."""
-    lst = _json_list(["pr", "list", "--state", "all", "--json", "number,state,headRefName",
-                      "--limit", str(limit)])
-    return [{"number": p.get("number"), "state": p.get("state"),
-             "headRefName": p["headRefName"]}
-            for p in lst
-            if isinstance(p, dict) and isinstance(p.get("headRefName"), str)
-            and p["headRefName"].startswith("sl/")]
+def sl_head_prs(limit=1000):
+    """Every PR the repo has ever had on an `sl/*` head — {"number", "state", "headRefName"} — as a
+    ReadHealth(list, ok), for the doctor's "did an sl/i<N> PR ever exist?" evidence column (issue
+    #229). ONE list read however many issues are flagged, and it is issued only when at least one
+    IS flagged.
+
+    `ok` is what stops the evidence line from FABRICATING a negative. Its strongest sentence is
+    "nothing was ever built for it", and an unhealthy read produces the same [] as a genuinely
+    PR-less issue — so without `ok` a rate-limit blip (or a repo that outgrew the bound) prints a
+    proven-sounding never-built claim about work that shipped months ago. ok=False on any refusal
+    AND on a full page, because a list capped at `limit` cannot prove a PR's absence: an old
+    `sl/i5` PR falls off the end long before anything is wrong with GitHub."""
+    rh = _json_list_health(["pr", "list", "--state", "all", "--json", "number,state,headRefName",
+                            "--limit", str(limit)])
+    prs = [{"number": p.get("number"), "state": p.get("state"),
+            "headRefName": p["headRefName"]}
+           for p in rh.value
+           if isinstance(p, dict) and isinstance(p.get("headRefName"), str)
+           and p["headRefName"].startswith("sl/")]
+    return ReadHealth(prs, rh.ok and len(rh.value) < limit)
+
+
+def remote_branches_health(limit=200):
+    """remote_branches() as a ReadHealth({name: tip}, ok) — the evidence column's branch half
+    (issue #229). Same reasoning as sl_head_prs: absence is only evidence when the read was clean
+    AND complete, so a full page (the repo has more branches than one page holds) reads ok=False
+    rather than letting a truncated list prove a branch never existed. The janitor keeps using the
+    bare remote_branches(): there, an unreadable branch simply is not proposed, which is already
+    the safe direction."""
+    lst = _json_list_health(["api", "repos/{owner}/{repo}/branches?per_page=%d" % limit])
+    out = {}
+    for b in lst.value:
+        if isinstance(b, dict) and isinstance(b.get("name"), str):
+            commit = b.get("commit")
+            sha = commit.get("sha") if isinstance(commit, dict) else None
+            out[b["name"]] = sha if isinstance(sha, str) and sha else None
+    return ReadHealth(out, lst.ok and len(lst.value) < limit)
 
 
 def default_branch():
