@@ -1,16 +1,25 @@
-"""Issue #156 — the Claude worker PreToolUse deny hook.
+"""Issues #156 / #185 — the Claude PreToolUse deny hook for UNATTENDED loop sessions.
 
 Two of the costliest worker-instruction-drift incidents are made mechanically impossible here
 rather than merely instructed-against:
 
   * AskUserQuestion in an unattended lane (i280): a human-facing dialog with no human at the pane,
-    which stalled the lane all night. The deny points the worker at the DURABLE protocol — write
-    the blocked-question file — that the runner turns into a durable GitHub question (#163).
+    which stalled the lane all night. The deny points the session at the DURABLE protocol its OWN
+    role uses — the worker's blocked-question file, the debugger's memo + notify.
   * a pattern-kill (`pkill -f`, `killall`) that matched and killed the owner's own live process
     (the dashboard). The deny restates the standing CLAUDE.md rule: kill exact PIDs only.
 
+#185 (owner ruling 2026-07-16) widened the scope from workers alone to EVERY unattended session
+the loop launches, with the AskUserQuestion reason adapted per role. The ruling named the answerer
+`a<N>` conditionally ("while any remain pre-#194"); #194 has since merged and retired that seat, so
+the live roles are the worker `i<N>` and the watchdog debugger `d<N>`. The one carve-out is ATTENDANCE, not role: `superlooper
+debug`'s owner tap launches a `d<N>` session with a person at the keyboard (SL_ATTENDED=1), and
+that duty's whole premise ("no human is here to answer") is false there, so the dialog is allowed.
+The pattern-kill duty's premise (the pattern can match the OWNER's live processes) holds either
+way, so it is NEVER carved out.
+
 Both are Claude-only (Codex has no PreToolUse event — spike verdict), and both must be strict
-no-ops outside a superlooper worker session so the hook is safe to register globally.
+no-ops outside a superlooper session so the hook is safe to register globally.
 
 Two layers under test:
   * lib/worker_pretooluse.py — the pure decision core (`run`, `decide`), tested directly.
@@ -31,6 +40,10 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 PRE_HOOK = os.path.join(REPO_ROOT, "skill", "bin", "pretooluse-hook.sh")
 
 WORKER_ENV = {"SL_ISSUE_ID": "i7", "SL_RUN_ROOT": "/runs/willprout"}
+DEBUGGER_ENV = {"SL_ISSUE_ID": "d3", "SL_RUN_ROOT": "/runs/willprout"}
+# The owner tap (`superlooper debug`, issue #144): the SAME d<N> shape, but a person is at the
+# keyboard — launch-session.sh carries SL_ATTENDED=1 into the session for exactly this distinction.
+ATTENDED_DEBUGGER_ENV = {**DEBUGGER_ENV, "SL_ATTENDED": "1"}
 
 
 # --------------------------- the pure decision core: run() ---------------------------
@@ -49,6 +62,61 @@ def test_ask_user_question_is_denied_with_the_blocked_file_fallback():
     # The deny must hand the worker the DURABLE protocol: its blocked-question file, at the exact
     # path the brief names (state/blocked/<id> under the run root).
     assert "/runs/willprout/state/blocked/i7" in reason
+
+
+def test_debugger_ask_user_question_is_denied_with_the_memo_fallback():
+    """#185: the watchdog's unattended sl-debugger (d<N>) has neither protocol — it ends every run
+    with a memo in the state home's reports/ plus a notify, so that is what the deny hands back."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), DEBUGGER_ENV)
+    assert reason, "AskUserQuestion must be denied in an unattended debugger session"
+    assert "/runs/willprout/reports" in reason, "the memo path is the debugger's escalation channel"
+    assert "state/blocked" not in reason, "the worker blocked-file protocol is wrong for a debugger"
+
+
+def test_attended_owner_tap_debugger_may_still_ask():
+    """`superlooper debug` (issue #144) puts a PERSON at the keyboard and its brief says so. The
+    AskUserQuestion duty exists only because nobody is there — with SL_ATTENDED=1 it must not fire,
+    or the deny would tell the session a falsehood and push it into the unattended contract."""
+    assert wp.run(_pre("AskUserQuestion", {"questions": []}), ATTENDED_DEBUGGER_ENV) is None
+
+
+def test_attendance_cannot_be_claimed_by_a_worker():
+    """The owner tap (`d<N>`) is the ONLY attended session the loop can launch, so the flag is
+    honored for that role alone. A worker inherits its env from the runner's shell — an ambient
+    `export SL_ATTENDED=1` there must not quietly disarm the deny that i280 bought."""
+    assert wp.run(_pre("AskUserQuestion", {}), {**WORKER_ENV, "SL_ATTENDED": "1"}) is not None
+
+
+@pytest.mark.parametrize("truthy", ["1", "true", "TRUE", "yes", "on"])
+def test_attended_is_read_the_same_way_the_launch_stack_reads_booleans(truthy):
+    env = {**DEBUGGER_ENV, "SL_ATTENDED": truthy}
+    assert wp.run(_pre("AskUserQuestion", {}), env) is None
+
+
+@pytest.mark.parametrize("falsy", ["", "0", "false", "no", "off", "maybe"])
+def test_a_non_truthy_attended_flag_is_still_unattended(falsy):
+    env = {**DEBUGGER_ENV, "SL_ATTENDED": falsy}
+    assert wp.run(_pre("AskUserQuestion", {}), env) is not None
+
+
+def test_attendance_never_unlocks_the_pattern_kill_deny():
+    """The kill duty's premise — the pattern can also match the OWNER's own live processes — does
+    not depend on anyone watching, and no brief ever promises a debugger pattern-kills (the
+    sl-debugger contract forbids them outright). Attendance carves out the dialog duty ONLY."""
+    reason = wp.run(_pre("Bash", {"command": "pkill -f runner"}), ATTENDED_DEBUGGER_ENV)
+    assert reason and "PID" in reason
+
+
+@pytest.mark.parametrize("env", [DEBUGGER_ENV, ATTENDED_DEBUGGER_ENV])
+def test_pattern_kills_are_denied_in_every_loop_session(env):
+    reason = wp.run(_pre("Bash", {"command": "pkill -f dashboard"}), env)
+    assert reason, "pattern-kill must be denied in %s" % env["SL_ISSUE_ID"]
+    assert "pkill" in reason and "PID" in reason
+
+
+@pytest.mark.parametrize("env", [WORKER_ENV, DEBUGGER_ENV, ATTENDED_DEBUGGER_ENV])
+def test_benign_bash_stays_allowed_in_every_loop_session(env):
+    assert wp.run(_pre("Bash", {"command": "kill 4242"}), env) is None
 
 
 @pytest.mark.parametrize("command", [
@@ -125,17 +193,15 @@ def test_noop_outside_a_worker_session():
     assert wp.run(_pre("AskUserQuestion", {}), {"SL_RUN_ROOT": "/runs"}) is None
 
 
-def test_noop_in_a_debugger_session():
-    # An ANSWERER (id `a<N>`) is launched through the same start-session.sh, so it carries BOTH gate
-    # vars — but it is not a worker: its blocked-file protocol doesn't exist (it writes one answer
-    # file and escalates via `PARK:`). The deny must NOT fire for it, for either hazard.
-    debugger = {"SL_ISSUE_ID": "d5", "SL_RUN_ROOT": "/runs/willprout"}
-    assert wp.run(_pre("AskUserQuestion", {}), debugger) is None
-    assert wp.run(_pre("Bash", {"command": "pkill -f x"}), debugger) is None
-    # And a malformed / non-`i<N>` id is likewise never treated as a worker.
-    for bad_id in ("", "i", "iabc", "7", "worker"):
+def test_noop_for_an_unrecognized_session_id():
+    # Only the ids the loop's own launchers can produce (`i<N>` and `d<N>` — the exact shapes
+    # launch-session.sh enforces) name a session whose escalation protocol we know. Anything else is
+    # a session we cannot hand a correct fallback to, so we deny nothing. `a5` is in this list on
+    # purpose: #194 retired the answerer seat, so an a<N> is now an unrecognized id like any other.
+    for bad_id in ("", "i", "iabc", "7", "worker", "x9", "i7x", "d", "a5", "a-1", "I7"):
         env = {"SL_ISSUE_ID": bad_id, "SL_RUN_ROOT": "/runs"}
-        assert wp.run(_pre("AskUserQuestion", {}), env) is None, "id %r must not be a worker" % bad_id
+        assert wp.run(_pre("AskUserQuestion", {}), env) is None, "id %r must not be a session" % bad_id
+        assert wp.run(_pre("Bash", {"command": "pkill -f x"}), env) is None
 
 
 def test_noop_for_codex_agent():
@@ -161,8 +227,11 @@ def test_malformed_tool_input_never_raises():
 
 # --------------------------- the entry-point script: pretooluse-hook.sh ---------------------------
 
-def _run_hook(run_root, payload, agent="claude", issue_id="i7", cwd=None):
+def _run_hook(run_root, payload, agent="claude", issue_id="i7", cwd=None, attended=None):
     env = {**os.environ, "SL_AGENT": agent, "SL_ISSUE_ID": issue_id, "SL_RUN_ROOT": str(run_root)}
+    env.pop("SL_ATTENDED", None)
+    if attended is not None:
+        env["SL_ATTENDED"] = attended
     stdin = payload if isinstance(payload, str) else json.dumps(payload)
     return subprocess.run(["bash", PRE_HOOK], input=stdin, env=env, cwd=cwd,
                           capture_output=True, text=True, timeout=10)
@@ -224,11 +293,34 @@ def test_hook_is_a_noop_when_not_a_worker_session(tmp_path):
     assert _decision(r.stdout) is None
 
 
-def test_hook_is_a_noop_for_a_debugger_session(tmp_path):
-    # A debugger (id `d<N>`) carries both gate vars but is not a worker — the deny must not fire.
-    r = _run_hook(tmp_path / "run", _pre("AskUserQuestion", {}), issue_id="d5")
+def test_hook_denies_ask_user_question_for_an_unattended_debugger(tmp_path):
+    run_root = tmp_path / "run"
+    r = _run_hook(run_root, _pre("AskUserQuestion", {}), issue_id="d3")
     assert r.returncode == 0, r.stderr
-    assert _decision(r.stdout) is None, "the deny is worker-scoped; a debugger must be untouched"
+    d = _decision(r.stdout)
+    assert d["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert str(run_root / "reports") in d["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_hook_lets_the_attended_owner_tap_debugger_ask(tmp_path):
+    # `superlooper debug` sets SL_ATTENDED=1 — a person IS at this pane, so the dialog stands.
+    r = _run_hook(tmp_path / "run", _pre("AskUserQuestion", {}), issue_id="d3", attended="1")
+    assert r.returncode == 0, r.stderr
+    assert _decision(r.stdout) is None, "an attended session must keep its dialog"
+
+
+def test_hook_still_denies_a_pattern_kill_in_the_attended_debugger(tmp_path):
+    r = _run_hook(tmp_path / "run", _pre("Bash", {"command": "killall node"}),
+                  issue_id="d3", attended="1")
+    assert r.returncode == 0, r.stderr
+    d = _decision(r.stdout)
+    assert d["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_hook_is_a_noop_for_an_unrecognized_session_id(tmp_path):
+    r = _run_hook(tmp_path / "run", _pre("AskUserQuestion", {}), issue_id="nonsense")
+    assert r.returncode == 0, r.stderr
+    assert _decision(r.stdout) is None, "an id whose protocol we don't know gets no deny"
 
 
 def test_hook_fails_open_when_the_lib_is_missing(tmp_path):

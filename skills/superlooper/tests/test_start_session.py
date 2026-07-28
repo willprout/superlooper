@@ -254,3 +254,63 @@ def test_a_stale_tail_does_not_bleed_into_a_later_healthy_launch(tmp_path):
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     assert (not tail_path.exists()) or tail_path.read_text().strip() == ""
+
+
+# --------------------------- the PreToolUse deny's env reaches the hook ---------------------------
+
+# Issue #185's carve-out is only as real as the environment that carries it: the launcher names
+# SL_ATTENDED in the command it drops into the tab, and the hook — a GRANDCHILD of that command
+# (start-session.sh -> claude -> hook) — must actually see it. Everything else about #185 is unit
+# tested; this is the one link that is pure process inheritance, so it is pinned end to end with a
+# stub agent that asks the REAL hook script the same question Claude would.
+_HOOK = os.path.join(REPO_ROOT, "skill", "bin", "pretooluse-hook.sh")
+
+HOOK_PROBE_AGENT = """#!/usr/bin/env bash
+# stands in for `claude`: runs the real PreToolUse hook and records what it decided.
+payload='{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{}}'
+out="$(printf '%s' "$payload" | bash "$SL_TEST_HOOK")"
+{ printf 'SL_ATTENDED=[%s]\\n' "${SL_ATTENDED-<unset>}"
+  if [ -z "$out" ]; then printf 'DECISION=allow\\n'; else printf 'DECISION=deny\\n'; fi
+} > "$SL_TEST_ARGS"
+exit 0
+"""
+
+
+def _probe_hook(tmp_path, issue_id, attended=None):
+    """Run start-session.sh for `issue_id` with a stub agent that consults the real hook; return
+    its recorded lines."""
+    run_root = tmp_path / "run"
+    (run_root / "briefs").mkdir(parents=True)
+    (run_root / "state").mkdir()
+    (run_root / "briefs" / ("%s.md" % issue_id)).write_text("the brief")
+    stubdir = tmp_path / "stub"
+    stubdir.mkdir()
+    _x(str(stubdir / "claude"), HOOK_PROBE_AGENT)
+    args_file = tmp_path / "probe"
+    env = {k: v for k, v in os.environ.items() if k != "SL_ATTENDED"}
+    env.update({"PATH": f"{stubdir}:{os.environ['PATH']}", "HOME": str(tmp_path / "home"),
+                "SL_RUN_ROOT": str(run_root), "SL_TEST_ARGS": str(args_file),
+                "SL_TEST_HOOK": _HOOK, "SL_AGENT": "claude"})
+    if attended is not None:
+        env["SL_ATTENDED"] = attended
+    r = subprocess.run([START, issue_id], env=env, cwd=str(run_root),
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    return args_file.read_text().splitlines()
+
+
+def test_the_attended_flag_survives_into_the_hook_the_agent_spawns(tmp_path):
+    # The owner tap's launch: SL_ATTENDED=1 must arrive intact two processes down, or the deny
+    # would tell a session with a person at the keyboard that nobody is there.
+    assert _probe_hook(tmp_path, "d7", attended="1") == ["SL_ATTENDED=[1]", "DECISION=allow"]
+
+
+def test_an_unattended_launch_reaches_the_hook_as_unattended(tmp_path):
+    # The watchdog's launch names the flag EMPTY; the deny must fire for the debugger's own protocol.
+    assert _probe_hook(tmp_path, "d7", attended="") == ["SL_ATTENDED=[]", "DECISION=deny"]
+
+
+def test_a_worker_launch_is_denied_even_with_an_ambient_attended_flag(tmp_path):
+    # Belt and suspenders: the runner pins SL_ATTENDED="" for workers, AND the hook ignores the flag
+    # for a worker id. This drives the second half — an ambient export that slipped past the first.
+    assert _probe_hook(tmp_path, "i9", attended="1") == ["SL_ATTENDED=[1]", "DECISION=deny"]

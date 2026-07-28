@@ -47,6 +47,7 @@ _FAKE_LAUNCH = """#!/bin/bash
   printf 'MODEL %s\\n' "${SL_MODEL:-}"
   printf 'AGENT %s\\n' "${SL_AGENT:-}"
   printf 'VERIFY %s\\n' "${SL_LAUNCH_VERIFY_SECONDS:-unset}"
+  printf 'ATTENDED [%s]\\n' "${SL_ATTENDED:-}"
 } >> "$STUB_LOG"
 exit "${STUB_RC:-0}"
 """
@@ -221,6 +222,21 @@ def test_launch_env_pins_the_verify_window(tmp_path):
     r = rig.run(SL_LAUNCH_VERIFY_SECONDS="600")
     assert r.returncode == 0, r.stderr
     assert "VERIFY 30" in rig.stub_log.read_text()
+
+
+def test_the_watchdog_launch_is_never_marked_attended(tmp_path):
+    """#185: SL_ATTENDED=1 stands the AskUserQuestion deny down because a PERSON is at the pane.
+    The watchdog's debugger is the archetypal unattended session, so it must pin the flag EMPTY —
+    including against an ambient `export SL_ATTENDED=1` in whatever shell the check runs from
+    (a LaunchAgent env, an owner's debugging export), which would otherwise be inherited straight
+    through and hand an unattended session a dialog nobody can answer."""
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.episode(age_seconds=3600)
+    rig.anchor()
+    r = rig.run(SL_ATTENDED="1")
+    assert r.returncode == 0, r.stderr
+    assert "ATTENDED []" in rig.stub_log.read_text(), rig.stub_log.read_text()
 
 
 def test_env_pane_overrides_the_anchor(tmp_path):

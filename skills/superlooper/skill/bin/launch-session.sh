@@ -31,6 +31,16 @@ CODEX_DANGEROUS_BYPASS="${SL_CODEX_DANGEROUS_BYPASS:-}"
 CODEX_BYPASS_HOOK_TRUST="${SL_CODEX_BYPASS_HOOK_TRUST:-}"
 CODEX_NO_ALT_SCREEN="${SL_CODEX_NO_ALT_SCREEN:-}"
 AGENT="${SL_AGENT:-claude}"
+# Is a PERSON at the keyboard for the session we are about to launch? `1` only when the caller is
+# `superlooper debug`'s owner tap (issue #144), which launches a d<N> session a human just asked
+# for; EMPTY for every unattended launch — the runner (_script_env) and the watchdog
+# (_debugger_shim_run) each pin it so an ambient `export SL_ATTENDED=1` in the shell or LaunchAgent
+# they were started from cannot ride in. The PreToolUse deny (issue #185) reads it to stand its
+# AskUserQuestion duty down rather than tell an attended session the falsehood "no human is at this
+# pane" — and ignores it for worker ids regardless, so the two halves back each other up. Passed
+# through verbatim: this script does not judge it, it only makes sure the fresh tab shell (which
+# inherits nothing) is TOLD it.
+ATTENDED="${SL_ATTENDED:-}"
 case "$AGENT" in
   claude) ;;
   codex) ;;
@@ -217,8 +227,8 @@ WS_ARGS=()
 # default path; set only by a per-issue effort:* label) — %q-quoted like the rest so a value with
 # brackets/spaces can't break or inject the command. Codex-specific knobs are named too, because the
 # fresh tab shell inherits none of the runner's environment.
-printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
-  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
+printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_ATTENDED=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
+  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$ATTENDED" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
 # Drop the command FIRST — before any further cmux RPC — so the new tab's shell finds it immediately
 # and the shim's bounded wait can't be eaten by an unrelated slow RPC (e.g. rename-tab; review B6).
 # Atomic write (tmp + mv) so the shim never reads a half-written command; refresh .active so its

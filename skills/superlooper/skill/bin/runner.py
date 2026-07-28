@@ -1990,6 +1990,13 @@ class Runner:
                 "SL_DEV_BRANCH": str(self.config.get("dev_branch", "main")),
                 "SL_MODEL": str(model or ""), "SL_EFFORT": str(effort or ""),
                 "SL_AGENT": self.agent,
+                # PINNED EMPTY, like SL_LAUNCH_VERIFY_SECONDS on the watchdog's launch path: a
+                # worker is never attended, and _run_script merges over os.environ, so an ambient
+                # `export SL_ATTENDED=1` in the shell or LaunchAgent that started the runner would
+                # otherwise ride into every worker session. The PreToolUse deny (issue #185) also
+                # ignores the flag for worker ids, so this is the launcher half of a belt-and-
+                # suspenders pair — the launcher promises it, the hook does not rely on it.
+                "SL_ATTENDED": "",
                 "SL_CODEX_DANGEROUS_BYPASS": env_bool(
                     "SL_CODEX_DANGEROUS_BYPASS", bool(codex.get("dangerous_bypass", False))),
                 "SL_CODEX_BYPASS_HOOK_TRUST": env_bool(

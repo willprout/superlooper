@@ -536,6 +536,7 @@ def test_launch_env_contract_and_registration(rig):
     assert env["SL_DEV_BRANCH"] == "main"
     assert env["SL_MODEL"] == "opus"                   # models.worker
     assert env["SL_AGENT"] == "claude"                  # default agent path stays Claude
+    assert env["SL_ATTENDED"] == ""                     # a worker is never attended (issue #185)
     ist = issue_state(rig, "i101")
     assert ist["status"] == "running" and ist["branch"] == "sl/i101-render-the-widget"
     brief_text = (rig.home / "briefs" / "i101.md").read_text()
