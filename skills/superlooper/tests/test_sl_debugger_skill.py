@@ -32,6 +32,9 @@ README = _REPO / "skills" / "sl-debugger" / "README.md"
 OLD_HOME = _REPO / "skills" / "sl-debugger" / "skill"
 # runner-ops lives in the SIBLING superlooper skill inside the same plugin (moved there by #83).
 RUNNER_OPS = _REPO / "plugin" / "skills" / "superlooper" / "references" / "runner-ops.md"
+# The reliability ledger — a dated record (doc-lint excludes it), pinned here only for the D13
+# fix pointer this issue (#209) owes it.
+LEDGER = _REPO / "skills" / "superlooper" / "docs" / "RELIABILITY-LEDGER.md"
 
 
 def read(path):
@@ -252,3 +255,99 @@ def test_health_readout_is_read_only_and_names_the_probes():
     for probe in ("runner.heartbeat", "state/alert", "journal.jsonl",
                   "superlooper status", "superlooper doctor", "issues.json"):
         assert probe in lowered, f"health readout must cover: {probe}"
+
+
+# --------------------------------------------------- #209: the supervised/unattended split (D13)
+
+def test_skill_md_states_the_supervised_unattended_split():
+    """#209 DoD: the rails must state the split, not the old absolute prohibition.
+
+    William's 2026-07-16 D13 ruling: anything done with him present and directing is allowed,
+    always; prohibitions like "never hand-merge" bind UNATTENDED contexts only. The rails must
+    name both halves and route hand-merging by them, so a helper agent mid-incident does not
+    guess.
+    """
+    lowered = read(SKILL_MD).lower()
+    assert "supervised" in lowered, "the rails must name the supervised mode"
+    assert "unattended" in lowered, "the rails must name the unattended mode"
+    # the D13 ruling is cited so the split is anchored to its authority, not a passing phrase
+    assert "d13" in lowered or "2026-07-16" in lowered, (
+        "the rails must anchor the split to William's D13 ruling"
+    )
+    # unattended never hand-merges / self-merges — the strict half
+    assert re.search(r"never\s+hand-merge", lowered), (
+        "the rails must state that an unattended session never hand-merges"
+    )
+    # supervised follows his DIRECT INSTRUCTION, full stop — the released half
+    assert re.search(r"direct[^.\n]*instruction", lowered), (
+        "the rails must state that a supervised session follows William's direct instruction"
+    )
+
+
+def test_skill_md_states_installed_engine_is_read_only_for_every_session():
+    """#209 binding amendment (William, 2026-07-16): the installed engine tree is read-only for
+    EVERY session, including a supervised debugger. Engine bugs go to a GitHub issue on the
+    source repo; an emergency fix reaches the machine only through the gated bin/install.sh
+    republish — never an in-place edit (the cb161ef loss). Phrased repo-agnostically."""
+    text = read(SKILL_MD)
+    lowered = text.lower()
+    assert "~/.claude/skills/superlooper" in text, (
+        "the amendment must name the installed engine home"
+    )
+    assert re.search(r"read-only for every session", lowered), (
+        "the installed engine must be declared read-only for every session"
+    )
+    assert "github issue" in lowered, (
+        "an engine bug must be routed to a GitHub issue on the source repo"
+    )
+    assert "bin/install.sh" in text, (
+        "an emergency fix must reach the machine through the gated bin/install.sh republish"
+    )
+    assert "cb161ef" in lowered, "the rationale (the cb161ef silent-loss incident) must be cited"
+    # Repo-agnostic: no hardcoded repo slug or URL, so a fork points at its own fork.
+    assert "willprout/superlooper" not in lowered, "must not hardcode the source repo slug"
+    assert "github.com/" not in lowered, "must not hardcode a GitHub repo URL"
+
+
+def test_repair_ladder_states_the_split_for_hand_merging():
+    """#209 DoD: the playbook that repeated the old absolute prohibition ("never merge or close
+    PRs by hand ... with the human present or not") is amended to the same split."""
+    ladder = read(REFERENCES / "repair-ladder.md").lower()
+    assert "supervised" in ladder and "unattended" in ladder, (
+        "the ladder's 'what no rung touches' section must name both halves of the split"
+    )
+    assert "split" in ladder, "the ladder must route hand-merging by the split"
+    assert re.search(r"never\s+hand-merge", ladder), (
+        "unattended, no rung hand-merges — the strict half must still be stated"
+    )
+    # The old absolute wording that contradicted D13 — "never ... merge or close PRs by hand"
+    # in the "present or not" breath — must be gone. Collapse whitespace so the line-wrapped
+    # original ("never\nmerge or close PRs by hand") is caught, not missed on the newline.
+    flat = " ".join(ladder.split())
+    assert "merge or close prs by hand" not in flat, (
+        "the old absolute hand-merge prohibition must not survive in the ladder — "
+        "hand-merging now follows the split"
+    )
+
+
+def test_unattended_contract_names_itself_as_the_split_half():
+    """#209: the unattended contract is correctly the STRICT half; it should say so, so an agent
+    reading only this file knows a supervised session is governed elsewhere."""
+    lowered = read(REFERENCES / "unattended-contract.md").lower()
+    assert "split" in lowered, "the unattended contract must name the supervised/unattended split"
+    assert "supervised" in lowered, (
+        "it must point at the supervised half so the reader knows this is only one half"
+    )
+
+
+def test_d13_ledger_line_carries_a_fix_pointer_to_this_issue():
+    """#209 DoD: the D13 ledger line gets a fix pointer to this issue's PR."""
+    text = read(LEDGER)
+    # isolate the D13 clause (bounded by the next defect marker) to pin the pointer to D13 itself
+    m = re.search(r"\*\*D13\*\*(.+?)\*\*D14\*\*", text, re.DOTALL)
+    assert m, "the ledger must still carry the D13 entry"
+    d13 = m.group(1)
+    assert "#209" in d13, "the D13 line must point at issue #209 as its fix"
+    assert "split" in d13.lower() or "supervised" in d13.lower(), (
+        "the fix pointer must name what #209 did — write the supervised/unattended split"
+    )

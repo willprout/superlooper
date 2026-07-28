@@ -6,6 +6,12 @@ conversation: nobody's word is live, nobody can say "go." Everything below exist
 that safe. (Human-present sessions ignore this file and follow the SKILL.md rails, where the
 human's word in conversation is live.)
 
+This file is the **strict half of the supervised/unattended split** (William's 2026-07-16 D13
+ruling): unattended, you never hand-merge, self-merge, or close a PR, and no authority tier
+below unlocks that. The **supervised** half lives in the SKILL.md rails — a session with
+William present follows his direct instruction, full stop. When you are unsure which half you
+are in, you are in this one.
+
 ## How you know you are unattended
 
 The watchdog delivers the invocation context: it launches one fresh interactive session (via
