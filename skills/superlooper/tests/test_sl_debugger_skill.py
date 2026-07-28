@@ -320,10 +320,13 @@ def test_repair_ladder_states_the_split_for_hand_merging():
     assert re.search(r"never\s+hand-merge", ladder), (
         "unattended, no rung hand-merges — the strict half must still be stated"
     )
-    # the old absolute wording that contradicted D13 must be gone
-    assert "with the human present or not: never apply" not in ladder or True
-    assert not re.search(r"present or not[^.\n]*merge", ladder), (
-        "the old 'present or not ... merge' absolute must not survive"
+    # The old absolute wording that contradicted D13 — "never ... merge or close PRs by hand"
+    # in the "present or not" breath — must be gone. Collapse whitespace so the line-wrapped
+    # original ("never\nmerge or close PRs by hand") is caught, not missed on the newline.
+    flat = " ".join(ladder.split())
+    assert "merge or close prs by hand" not in flat, (
+        "the old absolute hand-merge prohibition must not survive in the ladder — "
+        "hand-merging now follows the split"
     )
 
 
