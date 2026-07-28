@@ -114,7 +114,12 @@ def _worker_ask_reason(state_home, issue_id):
     #     one: a worker whose push fails would then refuse to end the session (the i280 stall) or
     #     reach for something the bright lines forbid. The push is a SECOND copy, which is what the
     #     runner's own docstring claims ("no live window is the only copy") and what #190's guard
-    #     reads to decide a checkout is safe to reclaim.
+    #     reads to decide a checkout is safe to reclaim. Name what the push buys with the same care:
+    #     it is a copy OFF THIS MACHINE, not off this checkout. A worktree shares the repo's object
+    #     database, so once the work is COMMITTED the branch ref already carries it (gitops: "The
+    #     branch itself is untouched ... only the checkout dies") and launch-session.sh's
+    #     `worktree add "$WT" "$BRANCH"` fallback re-attaches it. Saying the push is the last chance
+    #     to escape "this one checkout" would be the same over-claim one step smaller.
     #   * its assumption hint named the PR body ALONE, which an `investigate` worker cannot use —
     #     it opens zero PRs, and brief.py (_ASSUME_INVESTIGATE) special-cases the hint for exactly
     #     that. The hook cannot see the issue type (no launcher exports one, and inventing that
@@ -128,8 +133,8 @@ def _worker_ask_reason(state_home, issue_id):
         "question as a durable comment on the issue, closes this window and releases the lane, and "
         "a FRESH session resumes the issue with the owner's answer in its brief, reusing this "
         "worktree's work-in-progress. Push before you end anyway: the runner is what closes this "
-        "window, so the push is your last chance to stop this one checkout being the only copy of "
-        "your work. You get at most TWO questions on one issue — a third hands the issue to the "
+        "window, so the push is your last chance to put the work anywhere but this machine. "
+        "You get at most TWO questions on one issue — a third hands the issue to the "
         "owner as a scoping problem instead of resuming you — so if you can safely proceed on one "
         "reasonable assumption, prefer stating it in your deliverable (the PR body, or your "
         "root-cause report if this issue opens no PR) over blocking."

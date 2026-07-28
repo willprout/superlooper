@@ -98,8 +98,15 @@ def test_worker_deny_requires_committing_and_pushing_the_wip():
     assert "commit" in low, "the deny must require committing the WIP"
     assert "git push -u origin head" in low, \
         "the deny must give the actual push command, not merely mention a pushed branch"
-    assert "cannot pick up" not in low and "only copy of your work" in low, \
-        "the push's stated reason must be the second copy, never 'the resume cannot see your work'"
+    # Pin the SUBSTANCE, not the phrasing: the resume must be described as reusing the preserved
+    # worktree's WIP, and the scare story must not come back. An earlier version of this test also
+    # pinned the noun phrase "only copy of your work", which pinned an over-claim of its own — the
+    # push buys a copy off this MACHINE, not off this checkout (a committed branch ref survives the
+    # checkout). Wording is free to move; these two facts are not.
+    assert "work-in-progress" in low and "worktree" in low, \
+        "the deny must say the resume reuses the PRESERVED worktree's WIP"
+    assert "cannot pick up" not in low, \
+        "never tell a worker the resume cannot see unpushed work — it reuses this very worktree"
 
 
 def test_worker_deny_states_the_three_part_question_form():
@@ -132,7 +139,9 @@ def test_worker_deny_states_the_two_question_cap():
     needs-owner instead of posting-and-resuming. The cap is what makes the assumption hint that
     follows it the cheaper move."""
     reason = wp.run(_pre("AskUserQuestion", {"questions": []}), WORKER_ENV)
-    assert "TWO questions" in reason, "the deny must state the 2-question cap the runner enforces"
+    # Case-insensitive: the cap is the fact under test, not the SHOUTING that currently renders it.
+    assert "two questions" in reason.lower(), \
+        "the deny must state the 2-question cap the runner enforces (actions.QUESTION_CAP)"
 
 
 def test_debugger_ask_user_question_is_denied_with_the_memo_fallback():
