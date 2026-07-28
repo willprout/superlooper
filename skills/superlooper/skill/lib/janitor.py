@@ -6,9 +6,11 @@ owner's y/N, and executes what he approved.
 The janitor is the founding spec's §8 V2 roadmap item (issue #62): as the loop runs, debris
 accumulates that no existing mechanism owns — stale `sl/*` remote branches whose PRs merged or
 were superseded, PRs labeled `superseded` left open by design (§C.4 6b), and parked /
-needs-william issues gathering dust. This module only ever PROPOSES; acting on a proposal is
-William's word, like `agent-ready` (the same propose/approve split as tidy). Nothing is ever
-auto-closed or auto-deleted.
+needs-william issues gathering dust. Issue #229 added a fourth class that is not debris but a
+LIE in the tracker: an issue closed as COMPLETED by a bare commit-message keyword, with nothing
+shipped behind it. This module only ever PROPOSES; acting on a proposal is William's word, like
+`agent-ready` (the same propose/approve split as tidy). Nothing is ever auto-closed, auto-deleted
+or auto-reopened.
 
 Safety, stated as code below and pinned by tests:
   * A branch is proposed ONLY when its work provably landed or was provably replaced: its PR
@@ -25,6 +27,9 @@ Safety, stated as code below and pinned by tests:
     the branch name AND the loopstate-recorded branch. A wrong-typed loopstate record for an
     issue EXCLUDES that issue (can't prove it idle -> don't touch it).
   * Age is proven, never guessed: a parked issue with a missing/unparseable updatedAt is skipped.
+  * A reopen is proposed only when the accidental close is PROVEN — closures.flagged owns that
+    judgement, and it flags nothing it cannot prove (a refused/wrong-typed closer, an owner-closed
+    issue, an issue closed by its own merged PR).
   * Every wrong-typed input fails CLOSED to "propose nothing" — the fail-open-on-wrong-typed
     defect class pointing the safe way: when in doubt, do NOT propose.
 """
@@ -33,6 +38,7 @@ import re
 import time
 
 import actions
+import closures
 
 BRANCH_PREFIX = "sl/"
 # The label the runner leaves on a PR replaced by a rebuild (§C.4 6b) and the park-family labels
@@ -41,6 +47,9 @@ BRANCH_PREFIX = "sl/"
 # operator-name rename (issue #58) — or one mid-migration — keeps being read correctly.
 SUPERSEDED_LABEL = "superseded"
 PARK_LABELS = ("parked", "needs-owner", "needs-william")
+# How many accidental-close REOPENs one sweep may propose (issue #229). See the class's own comment
+# in propose() for why this class alone is capped; the remainder is reported, never dropped silently.
+REOPEN_SWEEP_CAP = 10
 
 _BRANCH_NUM_RE = re.compile(r"^sl/i(\d+)(?:-|$)")
 _ISO_Z = "%Y-%m-%dT%H:%M:%SZ"
@@ -116,8 +125,10 @@ def _pr_int(v):
 
 
 def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
-            now, aged_park_days, refused=frozenset(), dev_branch="main"):
-    """The full proposal list for one sweep, grouped branches -> PRs -> issues, each sorted
+            now, aged_park_days, refused=frozenset(), dev_branch="main",
+            closed_issues=()):
+    """The full proposal list for one sweep, grouped branches -> PRs -> issues -> reopens, each
+    sorted
     (deterministic; no input mutated). Returns {"proposals": [...], "refused": [...]} where
     `refused` holds the keys that WOULD have been proposed but sit in the caller's refused set
     (a previously failed action is surfaced once and never silently retried — the CLI holds
@@ -136,14 +147,20 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
     aged_park_days  the configurable dust threshold (config janitor.aged_park_days).
     refused         action keys previously refused/failed (held back, reported separately).
     dev_branch      never proposed, whatever it is named (belt + braces).
+    closed_issues   gh.closed_issue_closers()'s records — CLOSED issues WITH what closed them
+                    (issue #229). Optional (defaults to nothing proposed) so a caller that never
+                    fetched them, or a GitHub blip that fails the read closed, simply proposes no
+                    reopens.
 
     Each proposal: {"kind", "key", "action", "target", "why"} (+ "head" for PRs, "title" for
-    issues) — `key` is the stable identity ("branch:<name>" / "pr:<num>" / "issue:<num>") the
-    refused map and reconcile() work in."""
+    issues and reopens, "commit" for reopens) — `key` is the stable identity ("branch:<name>" /
+    "pr:<num>" / "issue:<num>" / "reopen:<num>") the refused map and reconcile() work in. A
+    close and a reopen of the SAME issue number are deliberately different keys: they are
+    opposite actions and must never conflate in the refused map or a per-key tap."""
     if not isinstance(ls_issues, dict):
         # the exclusion source is unreadable: nothing is provably idle, so the whole sweep
         # fails closed — no proposals at all, whatever the candidates' own evidence says.
-        return {"proposals": [], "refused": []}
+        return {"proposals": [], "refused": [], "reopen_withheld": 0}
     ex_nums, ex_branches = _exclusions(ls_issues)
     refused = refused if isinstance(refused, (set, frozenset)) else frozenset()
     # A wrong-typed threshold must NOT coerce to the most aggressive setting (0d — propose
@@ -241,7 +258,54 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
               "why": f"{park} and untouched for {int(age // 86400)}d "
                      f"(threshold {threshold_days}d)"})
 
-    return {"proposals": proposals, "refused": sorted(p["key"] for p in held)}
+    # --- issues closed as COMPLETED by a bare commit keyword: propose a REOPEN (issue #229) ---
+    # The only class whose action UNDOES a state change rather than tidying one, and the only one
+    # where "propose nothing" is not automatically the safe direction — a false COMPLETED is a
+    # regression vector recorded as fixed. It stays a PROPOSAL anyway: reopening an issue the owner
+    # closed on purpose is its own harm, and only he can tell the two apart. closures.flagged owns
+    # the proof (it flags nothing it cannot prove); the exclusions below are the janitor's own.
+    #
+    # And it is CAPPED, which no other class needs to be. Every other class is bounded by proof —
+    # a branch must be provably landed AND its tip unmoved, a parked issue must be past
+    # aged_park_days — but "closed by a commit keyword" is ordinary practice in a repo that does not
+    # run this loop, so an adopted repo can legitimately have hundreds. `--yes` is a blanket
+    # approval, and a blanket approval that fires hundreds of reopens (each posting a comment and
+    # notifying subscribers, with no one command to undo) is a harm the owner never asked for. The
+    # sweep therefore proposes at most REOPEN_SWEEP_CAP of them and reports the remainder rather
+    # than dropping it silently (`reopen_withheld`); the doctor still names every one, and later
+    # sweeps propose the rest.
+    #
+    # The cap keeps the MOST RECENTLY CLOSED, by closedAt — not by issue number. An old,
+    # low-numbered issue keyword-closed yesterday is the urgent one; a high-numbered issue
+    # keyword-closed a year ago is not. (Number-as-recency is the same substitution the read one
+    # layer up had to drop — see gh.closed_issue_closers' UPDATED_AT ordering.) A missing closedAt
+    # sorts oldest, so an unprovable date loses its slot rather than taking someone else's.
+    def _key(f):
+        return (f["closedAt"], f["num"])
+
+    cap = max(1, REOPEN_SWEEP_CAP)               # a 0 cap would invert the slices to "propose all"
+    flagged = [f for f in closures.flagged(list(closed_issues)
+                                           if isinstance(closed_issues, (list, tuple)) else [])
+               # a lane mid-flight on it is already dealing with it; and a close of the SAME issue
+               # proposed above would pair with this into two contradictory actions in one sweep
+               if f["num"] not in ex_nums and f["num"] not in seen_issues]
+    # The cap bounds ACTIONS, so it is applied to the actionable ones only. A previously-refused
+    # reopen is a report, not an action — letting it occupy a slot would let a handful of stuck
+    # keys starve the class permanently (nothing new proposed, and the backlog never advancing).
+    stale = [f for f in flagged if f"reopen:{f['num']}" in refused]
+    fresh = sorted((f for f in flagged if f"reopen:{f['num']}" not in refused), key=_key)
+    withheld = len(fresh) - cap if len(fresh) > cap else 0
+    seen_reopens = set()
+    for f in sorted(stale + fresh[-cap:], key=lambda f: f["num"]):
+        num = f["num"]
+        if num in seen_reopens:
+            continue
+        seen_reopens.add(num)
+        emit({"kind": "issue-reopen", "key": f"reopen:{num}", "action": "reopen-issue",
+              "target": num, "title": f["title"], "commit": f["commit"], "why": f["why"]})
+
+    return {"proposals": proposals, "refused": sorted(p["key"] for p in held),
+            "reopen_withheld": withheld}
 
 
 def reconcile(approved, fresh_proposals):

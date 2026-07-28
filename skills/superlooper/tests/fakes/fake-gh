@@ -45,6 +45,7 @@ This is the harness Task 15's offline end-to-end simulation runs on.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -395,6 +396,13 @@ def main_stateful():
         if "rate_limit" in path:
             print(json.dumps({"resources": {}}))
             sys.exit(0)
+        if path == "graphql":
+            # The accidental-close audit (issue #229) reads the ClosedEvent closer, which the
+            # little GitHub in state.json does not model. Answer an EMPTY closed set — a clean
+            # "nothing to audit", never a refusal that would read as a broken GitHub.
+            print(json.dumps({"data": {"repository": {"issues": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}}}))
+            sys.exit(0)
         if "check-runs" in path:
             ref = unquote(path.split("/commits/")[1].split("/check-runs")[0])
             runs = st.get("branch_checks", {}).get(ref, [])
@@ -658,6 +666,10 @@ def main_fixture():
         if opt("--head"):
             serve_first(["pr_list_head_%s.json" % opt("--head").replace("/", "__"),
                          "pr_list.json"])
+        # gh.sl_head_prs (issue #229) is the only unfiltered `pr list` asking for headRefName;
+        # its own fixture keeps it independent of recent_pr_check_entries' statusCheckRollup read.
+        if "headRefName" in (opt("--json") or ""):
+            serve_first(["pr_list_heads.json", "pr_list.json"])
         serve_first(["pr_list.json"])
 
     elif sub == ["pr", "view"]:
@@ -705,6 +717,34 @@ def main_fixture():
             sys.exit(0)
         if "rate_limit" in path:
             serve_first(["rate_limit.json", "api.json"])
+        if path == "graphql":
+            # Served per OPERATION NAME (`query ClosedIssueClosers(...)` -> graphql_
+            # ClosedIssueClosers.json) so a second GraphQL read later gets its own fixture instead
+            # of colliding on one file. No fixture -> an empty repository answer, which every
+            # parser reads as a clean "nothing closed" rather than a refusal.
+            m = re.search(r"query\s+(\w+)", " ".join(ARGS))
+            name = "graphql_%s.json" % m.group(1) if m else "graphql.json"
+            path_ = os.path.join(FIX, name)
+            if not os.path.isfile(path_):
+                print(json.dumps({"data": {"repository": {"issues": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}}}))
+                sys.exit(0)
+            with open(path_) as f:
+                body = f.read()
+            # `@@COUNTER@@` in a fixture becomes a FRESH value on every call — the degraded-endpoint
+            # shape (always "more pages", never a repeated cursor) that only a hard page counter
+            # can stop. Nothing else uses it, so an ordinary fixture is served verbatim.
+            if "@@COUNTER@@" in body:
+                cpath = os.path.join(FIX, "fake_cursor_counter")
+                try:
+                    n = int(open(cpath).read().strip() or "0")
+                except (OSError, ValueError):
+                    n = 0
+                with open(cpath, "w") as f:
+                    f.write(str(n + 1))
+                body = body.replace("@@COUNTER@@", "cursor-%d" % n)
+            sys.stdout.write(body)
+            sys.exit(0)
         serve_first(["api.json"])
 
     elif sub == ["issue", "edit"]:
@@ -744,6 +784,11 @@ def main_fixture():
 
     elif sub == ["issue", "close"]:
         record("close_issue", num=ARGS[2], comment=opt("--comment"))
+        sys.exit(0)
+
+    elif sub == ["issue", "reopen"]:
+        # the janitor's approved accidental-close reopen (issue #229).
+        record("reopen_issue", num=ARGS[2], comment=opt("--comment"))
         sys.exit(0)
 
     elif sub == ["pr", "close"]:
