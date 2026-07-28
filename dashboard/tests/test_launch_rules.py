@@ -438,3 +438,33 @@ def test_parity_the_refusal_codes_are_the_engines_own_codes():
         engine_codes = [d["code"] for d in eng.lint(labels, body, areas=_AREAS,
                                                     touches_required=True) if d["blocks_launch"]]
         assert r["code"] == engine_codes[0], name
+
+
+# --- fresh-agent review (Codex, 2026-07-28), P1: duplicate `## Loop metadata` sections ---
+# The engine's parse_sections builds a DICT, so a second `## Loop metadata` heading OVERWRITES the
+# first and only the LAST section is ever read. The mirror accumulated lines from every matching
+# section, so a body whose declaration sits in the first (dead) section read as declared here and
+# undeclared to the runner — the board showing a flight the runner parks. Exactly the #138 drift.
+
+_DUPLICATE_SECTIONS = ("## Loop metadata\ntouches: engine\n\n## Goal\nx\n\n"
+                       "## Loop metadata\nparent: #7\n")
+
+
+def test_only_the_LAST_loop_metadata_section_counts_as_the_engine_reads_it():
+    assert launch_rules.declared_touches(_DUPLICATE_SECTIONS) == []
+    assert _refusal(["type:build"], _DUPLICATE_SECTIONS)["code"] == "touches_outside_section"
+
+
+def test_a_declaration_in_the_LAST_section_is_read():
+    body = "## Loop metadata\nparent: #7\n\n## Goal\nx\n\n## Loop metadata\ntouches: engine\n"
+    assert launch_rules.declared_touches(body) == ["engine"]
+    assert _refusal(["type:build"], body) is None
+
+
+def test_parity_duplicate_sections_agree_with_the_engine():
+    eng = _engine_queue_lint()
+    for body in (_DUPLICATE_SECTIONS,
+                 "## Loop metadata\nparent: #7\n\n## Loop metadata\ntouches: engine\n"):
+        engine_blocks = eng.blocking(eng.lint(["agent-ready", "type:build"], body,
+                                              areas=_AREAS, touches_required=True))
+        assert (_refusal(["type:build"], body) is not None) == engine_blocks, body

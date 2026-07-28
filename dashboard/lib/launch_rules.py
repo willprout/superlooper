@@ -165,7 +165,14 @@ def _control_conflict(names, prefix):
 def declared_touches(body):
     """The `touches:` areas this issue declares, read EXACTLY where the engine reads them: inside
     the `## Loop metadata` section only. ``[]`` when there is none (or the body is missing or
-    wrong-typed). Mirror of ``issues.parse_loop_metadata``'s touches read."""
+    wrong-typed). Mirror of ``issues.parse_loop_metadata``'s touches read.
+
+    "EXACTLY" includes what happens with TWO `## Loop metadata` headings (fresh-agent review,
+    2026-07-28). The engine's ``parse_sections`` collects sections into a DICT, so a later heading
+    OVERWRITES an earlier one and only the LAST section is ever read. An earlier version of this
+    mirror accumulated lines from every matching section, so a body whose declaration sat in the
+    first (dead) section read as DECLARED here and as undeclared to the runner — the board showing
+    a flight the runner parks, which is precisely the #138 drift this module exists to prevent."""
     if not isinstance(body, str):
         return []
     meta, current = [], None
@@ -173,6 +180,8 @@ def declared_touches(body):
         m = _H2.match(line)
         if m:
             current = m.group(1).strip().lower()
+            if current == "loop metadata":
+                meta = []                # a later section REPLACES an earlier one (dict semantics)
         elif current == "loop metadata":
             meta.append(line)
     for line in meta:

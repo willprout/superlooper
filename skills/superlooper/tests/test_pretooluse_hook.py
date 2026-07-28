@@ -648,3 +648,40 @@ def test_the_hook_script_allows_a_valid_issue_create_end_to_end(tmp_path):
     r = _run_hook(tmp_path, payload)
     assert _decision(r.stdout) is None
     assert r.returncode == 0
+
+
+# --- fresh-agent review (Codex, 2026-07-28), P0: a bare shell variable is not readable text ---
+# `--body "$body"` and `--label "$labels"` are ordinary shapes, and shlex leaves them as the literal
+# strings `$body` / `$labels`. Judging those AS the body or AS the label set denies a perfectly good
+# command over content the hook never read — the exact fail-open-per-dimension violation this duty
+# exists to avoid. An unreadable LABEL set stands the whole duty down, not just the label check:
+# without the labels we cannot know the issue is an investigation, which needs no touches at all.
+
+@pytest.mark.parametrize("body_arg", ['"$body"', '"$BODY_TEXT"', "$body", '"prefix $body"'])
+def test_a_body_held_in_a_shell_variable_stands_the_body_dimension_down(tmp_path, body_arg):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:build --body %s" % body_arg,
+                   tmp_path) is None
+
+
+@pytest.mark.parametrize("label_arg", ['"$labels"', "$LABELS", '"type:build,$extra"'])
+def test_labels_held_in_a_shell_variable_stand_the_WHOLE_duty_down(tmp_path, label_arg):
+    # Not merely the label check: an unreadable label set means we cannot tell an investigation
+    # (which needs no `touches:`) from a build (which does), so demanding one would be a guess.
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label %s --body '## Goal\nx\n'" % label_arg,
+                   tmp_path) is None
+
+
+def test_a_dollar_sign_that_is_merely_TEXT_still_costs_only_a_stood_down_check(tmp_path):
+    # A body legitimately containing `$` reads as unexpanded and is not judged. That is a false
+    # ALLOW — the safe direction — and it is the trade this rule makes deliberately.
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:build --body 'costs 5$ per run'",
+                   tmp_path) is None
+
+
+def test_a_literal_body_and_labels_are_still_judged_normally(tmp_path):
+    # The rule must not gut the duty: nothing here holds a `$`.
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label needs-owner --body '## Goal\nx\n'", tmp_path)

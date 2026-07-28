@@ -368,3 +368,20 @@ def test_with_touches_refuses_an_empty_value_rather_than_writing_a_bare_line():
     # defect while telling the owner it was fixed.
     assert queue_lint.with_touches("## Goal\nx\n", "") is None
     assert queue_lint.with_touches("## Goal\nx\n", None) is None
+
+
+def test_with_touches_repairs_the_section_the_PARSER_reads_not_the_first_one():
+    # Same defect class the fresh-agent review found in the dashboard mirror (Codex, 2026-07-28),
+    # here on the repair side. parse_sections is a DICT, so with two `## Loop metadata` headings
+    # only the LAST is ever read. Writing into the first would report a fix that changes nothing —
+    # the worst possible outcome for a one-tap repair on someone else's issue.
+    body = "## Loop metadata\nparent: #7\n\n## Goal\nx\n\n## Loop metadata\nblocked-by: #9\n"
+    out = touched(body)
+    assert queue_lint.lint(["type:build"], out, areas=AREAS) == []
+    assert out.count("touches:") == 1
+    assert "parent: #7" in out and "blocked-by: #9" in out       # both sections survive intact
+
+
+def test_with_touches_leaves_a_body_whose_LAST_section_already_declares_alone():
+    body = "## Loop metadata\nparent: #7\n\n## Loop metadata\ntouches: engine\n"
+    assert touched(body) == body

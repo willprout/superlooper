@@ -298,9 +298,13 @@ def with_touches(body, value):
     body = body if isinstance(body, str) else ""
 
     lines = body.splitlines()
-    heading_at = next((i for i, ln in enumerate(lines)
-                       if _H2_HEADING.match(ln) and ln.split("##", 1)[1].strip().lower()
-                       == "loop metadata"), None)
+    # The LAST `## Loop metadata` heading, not the first (fresh-agent review, 2026-07-28):
+    # issues.parse_sections collects into a DICT, so a later heading overwrites an earlier one and
+    # only the last section is ever READ. Writing into the first would report a fix that changes
+    # nothing — the worst possible outcome for a one-tap repair on someone else's issue.
+    heading_at = next((i for i in range(len(lines) - 1, -1, -1)
+                       if _H2_HEADING.match(lines[i])
+                       and lines[i].split("##", 1)[1].strip().lower() == "loop metadata"), None)
     if heading_at is not None:
         if issues_mod.parse_loop_metadata(body)["touches"]:
             return body                                  # already parseable: nothing to add

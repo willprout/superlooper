@@ -204,10 +204,22 @@ _SEPARATORS = frozenset(("&&", "||", ";", "|", "&", "(", ")", "{", "}"))
 # evidence of a defect.
 _BODY_ELSEWHERE = frozenset(("--body-file", "-F", "--editor", "--web", "--template", "--fill",
                              "--fill-first", "--fill-verbose", "--recover"))
-# Shell constructs that mean the quoted text is NOT the final body: a command substitution, a
-# process substitution, a variable expansion. shlex keeps them literal, so seeing one is exactly
-# the signal that what we hold is a recipe rather than the text.
-_UNEXPANDED = ("$(", "${", "`", "<(", ">(")
+# Shell constructs that mean the quoted text is NOT what the command will actually send: a command
+# substitution, a process substitution, or a plain variable expansion. shlex keeps every one of
+# them literal, so seeing one is exactly the signal that what we hold is a RECIPE rather than the
+# value. A bare `$var` counts (fresh-agent review, 2026-07-28): `--body "$body"` is an ordinary
+# shape, and judging the seven characters `$body` AS the issue body denies a perfectly good command
+# over content this hook never read.
+#
+# `$` and a backtick are matched anywhere in the value, deliberately coarser than a real shell
+# parser. A body that legitimately contains one ("costs 5$ per run") therefore also stands its check
+# down — a false ALLOW, which is the only direction this duty is permitted to be wrong in.
+_UNEXPANDED = ("$", "`")
+
+
+def _unexpanded(value):
+    """Is this argument a recipe for a value rather than the value? See _UNEXPANDED."""
+    return isinstance(value, str) and any(m in value for m in _UNEXPANDED)
 
 
 def _split_command(command):
@@ -267,6 +279,7 @@ def parse_issue_create(command):
 
     `--repo`/`-R` stands the WHOLE duty down: another repo has another contract (its own `areas`,
     its own `touches_required`), and this repo's rules are not held over an issue filed there."""
+    # (an unreadable LABEL argument also stands the whole duty down — see _issue_create_deny)
     tokens = _split_command(command)
     if not tokens:
         return None
@@ -274,7 +287,7 @@ def parse_issue_create(command):
     if span is None:
         return None
     start, end = span
-    labels, body, body_readable = [], None, True
+    labels, body, body_readable, labels_readable = [], None, True, True
     i = start
     while i < end:
         tok = tokens[i]
@@ -287,7 +300,10 @@ def parse_issue_create(command):
         for name in ("--label", "-l"):
             val, nxt = _flag_value(tokens, i, name)
             if val is not None:
-                labels += [p.strip() for p in val.split(",") if p.strip()]
+                if _unexpanded(val):
+                    labels_readable = False  # `--label "$labels"` — a recipe, not the label set
+                elif labels is not None:
+                    labels += [p.strip() for p in val.split(",") if p.strip()]
                 i = nxt
                 break
         else:
@@ -299,9 +315,9 @@ def parse_issue_create(command):
                     break
             else:
                 i += 1
-    if body is not None and any(marker in body for marker in _UNEXPANDED):
+    if _unexpanded(body):
         body, body_readable = None, False    # a recipe for the text, not the text
-    return {"labels": labels,
+    return {"labels": labels if labels_readable else None,
             # No `--body` at all is not a missing body — gh then prompts or errors, so there is no
             # text to judge either way. Only a body we READ may be judged.
             "body": body if (body_readable and body is not None) else None}
@@ -398,6 +414,12 @@ def _issue_create_deny(tool_input, contract):
     parsed = parse_issue_create(command)
     if parsed is None:
         return None                      # not confidently a `gh issue create`
+    if parsed["labels"] is None:
+        # An unreadable label ARGUMENT (`--label "$labels"`) stands the WHOLE duty down, not just
+        # the label check (fresh-agent review, 2026-07-28). Without the labels we cannot tell an
+        # investigation — which needs no `touches:` at all — from a build, so demanding a
+        # declaration would be a guess dressed as a rule.
+        return None
     got = contract() if callable(contract) else {"areas": None, "touches_required": False}
     areas = got.get("areas")
     body = parsed["body"]
