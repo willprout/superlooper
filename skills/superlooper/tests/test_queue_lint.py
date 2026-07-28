@@ -399,9 +399,11 @@ def test_with_touches_repairs_the_section_the_parser_reads_under_MIXED_CASE_head
     assert "parent: #1" in out and "parent: #2" in out
 
 
-def test_with_touches_output_ALWAYS_lints_clean_across_every_heading_shape():
+def test_with_touches_clears_the_BLOCKING_defect_across_every_heading_shape():
     # The janitor's whole safety story rests on this: what it proposes is what lands, and what
     # lands is launchable. One table, every duplicate/casing/EOF shape the parser distinguishes.
+    # A DECLARED area is used throughout, because that is the only kind of value the janitor may
+    # ever pass — see the next test for what an author-written one leaves behind.
     for body in ["## Goal\nx\n",
                  "",
                  "## Loop metadata\nparent: #7\n",
@@ -412,3 +414,18 @@ def test_with_touches_output_ALWAYS_lints_clean_across_every_heading_shape():
                  "## Goal\nship it\n\ntouches: engine\n"]:
         out = queue_lint.with_touches(body, "engine")
         assert queue_lint.lint(["type:build"], out, areas=AREAS) == [], repr(body)
+
+
+def test_with_touches_promoting_an_authors_own_UNDECLARED_area_leaves_the_advisory_standing():
+    # Named so it stays a conscious choice (fresh-agent verification pass, 2026-07-28). For
+    # `touches_outside_section` the value is not chosen from the repo's areas — it is the AUTHOR's
+    # own words, which is exactly what makes that repair mechanical. If those words name an area the
+    # repo never declared, the repair clears the defect that BLOCKS the launch and leaves the
+    # non-blocking area advisory standing. That is the honest outcome, not a half-done fix: the
+    # issue goes from unlaunchable to launchable, and the area question is one the janitor may not
+    # answer (the right fix may be to declare `plugin` in .superlooper/config.json — a bright-line
+    # file no automatic path may write).
+    out = queue_lint.with_touches("## Goal\nx\n\ntouches: plugin\n", "plugin")
+    found = queue_lint.lint(["type:build"], out, areas=AREAS)
+    assert [d["code"] for d in found] == ["touches_unknown"]
+    assert queue_lint.blocking(found) is False
