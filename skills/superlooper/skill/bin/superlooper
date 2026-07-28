@@ -8,6 +8,7 @@
                   create the §C.2 label set + print branch-protection recommendations
                   (print-only in v1)
   doctor          preflight: config, required_checks (FAILS HARD when empty), gh, labels,
+                  accidental issue closes (COMPLETED with no merged PR behind it, issue #229),
                   cmux, jq, launch shim, activity hooks; --stack checks machine-level blocks
   morning-report  render reports/morning-<date>.md from the journal + notify (Task 11)
   nightly         fresh worktree of origin/<dev> -> qa.nightly_cmd -> flake/persistent triage;
@@ -23,9 +24,11 @@
                   to parked/needs-william/bounced) — manual, never automatic; never touches an
                   in-flight or mid-gate lane, so it is safe to run while the runner is live
   janitor         propose GitHub-side cleanup (stale merged/superseded sl/* branches, open
-                  `superseded` PRs, aged parked/needs-william issues) and execute ONLY what
-                  William approves (y/N or --yes) — list/--dry-run changes nothing anywhere;
-                  nothing is ever auto-closed or auto-deleted (issue #62, spec §8 V2)
+                  `superseded` PRs, aged parked/needs-william issues, and issues closed as
+                  COMPLETED by a bare commit keyword with no merged PR behind them — issue #229)
+                  and execute ONLY what William approves (y/N or --yes) — list/--dry-run changes
+                  nothing anywhere; nothing is ever auto-closed, auto-deleted or auto-reopened
+                  (issue #62, spec §8 V2)
   debug           launch ONE interactive sl-debugger session on this repo because a PERSON asked
                   (issue #144) — the attended sibling of `watchdog`'s unattended fallback. Owns the
                   d<N> id allocation and single-flight under the watchdog's own lock, composes the
@@ -60,6 +63,7 @@ for _p in (os.path.join(_HERE, "..", "lib"), _HERE):
         sys.path.insert(0, _p)
 
 import actions as actions_lib
+import closures
 import config as config_lib
 import doc_lint
 import gate
@@ -519,6 +523,55 @@ def cmd_stack_doctor(args):
     return 0
 
 
+# --- the accidental-close audit (issue #229) ----------------------------------------------------
+# On 2026-07-16 a ledger DOCUMENTATION commit whose message read "…fixes #189/#190…" auto-closed
+# #189 — an approved, priority:high, never-built fix for the previous night's draft-promotion
+# regression. The tracker said COMPLETED; worker_hook.py and gate.py were untouched; the regression
+# vector stayed open for a day while recorded as fixed, and only a hand audit found it. This block
+# is the standing version of that audit: it asks what CLOSED each issue, and names the ones whose
+# answer is "a commit message" rather than "a merged PR".
+#
+# A WARN, deliberately never a FAIL. Two reasons, and they point the same way. (1) `doctor` is also
+# the ADOPTION preflight for a foreign repo, and closing issues from commit messages is ordinary
+# practice outside this loop — failing every adopting repo's doctor over its own normal history
+# would be a false red on a healthy machine, the defect class this repo already refuses elsewhere
+# (check_engine_drift, check_superlooper_plugin). (2) Nothing here is a blocker: the loop runs fine
+# with a mis-closed issue in it; what was missing on 2026-07-16 was VISIBILITY. The evidence line
+# is what separates the two readings — an approved loop fix that was never built leaves no
+# sl/i<N> PR and no sl/i<N> branch anywhere, and the block says so per issue.
+_ACCIDENTAL_CLOSE_NAME = "accidental issue closes"
+
+
+def _doctor_accidental_closes():
+    """Print the accidental-close audit block. Never raises and never fails the doctor — see the
+    comment above for why this is a WARN. Costs ONE GraphQL read on a clean repo, plus two list
+    reads only when something is actually flagged."""
+    rh = gh.closed_issue_closers()
+    if not rh.ok:
+        # refused != "nothing was accidentally closed": say which one this is, or a GitHub outage
+        # renders as a clean bill of health (the #21/#61 discipline, applied to a human-read line).
+        print(f"  WARN {_ACCIDENTAL_CLOSE_NAME} — GitHub refused the closed-issue read; could not "
+              "audit for keyword-closed issues this run. Re-run doctor.")
+        return
+    found = closures.flagged(rh.value)
+    if not found:
+        print(f"  ok   {_ACCIDENTAL_CLOSE_NAME} — every issue closed as COMPLETED "
+              f"({len(rh.value)} checked) has a merged PR or the owner's own hand behind it")
+        return
+    print(f"  WARN {_ACCIDENTAL_CLOSE_NAME} — {len(found)} issue(s) closed as COMPLETED by a bare "
+          "commit-message keyword, with no merged PR behind them; each reads as fixed while "
+          "nothing shipped:")
+    prs, branches = gh.sl_head_prs(), gh.remote_branches()
+    for f in found:
+        title = f" {f['title'][:60]!r}" if f["title"] else ""
+        print(f"         #{f['num']}{title}")
+        print(f"           closed by commit {f['commit'][:8]} "
+              f"({f['headline'] or 'no commit subject'})")
+        print(f"           {closures.evidence(f['num'], prs=prs, branches=branches)}")
+    print("       `superlooper janitor` proposes reopening each one, with an audit comment naming "
+          "the closing commit — nothing reopens without your y/N.")
+
+
 def cmd_doctor(args):
     if getattr(args, "stack", False):
         return cmd_stack_doctor(args)
@@ -650,6 +703,9 @@ def cmd_doctor(args):
                       "there; re-check after a PR CI run.")
             if not (unreported or dev_gap or pr_gap):
                 print("  ok   required_checks names — every name reports on its expected surface(s)")
+
+    if cfg is not None and gh_ok:
+        _doctor_accidental_closes()
 
     cmux = os.environ.get("SL_CMUX", "/Applications/cmux.app/Contents/Resources/bin/cmux")
     check("cmux binary", os.path.exists(cmux), cmux)
@@ -1174,9 +1230,10 @@ def cmd_tidy(args):
 # ------------------------------- janitor -------------------------------
 # `superlooper janitor` (issue #62, spec §8 V2) PROPOSES GitHub-side cleanup and executes ONLY
 # what William approves — the same propose/approve word-discipline as tidy, pointed at GitHub
-# instead of cmux windows. Three debris classes, each with a one-line why: stale sl/* remote
-# branches whose PRs merged or were superseded, PRs labeled `superseded` left open by design
-# (§C.4 6b), and parked / needs-william issues gathering dust past janitor.aged_park_days.
+# instead of cmux windows. Four classes, each with a one-line why: stale sl/* remote branches
+# whose PRs merged or were superseded, PRs labeled `superseded` left open by design (§C.4 6b),
+# parked / needs-william issues gathering dust past janitor.aged_park_days, and — issue #229 —
+# issues closed as COMPLETED by a bare commit-message keyword, which are proposed for REOPEN.
 # The list / --dry-run changes NOTHING anywhere; approved actions run mechanically and are
 # journaled; a refused/failed action is surfaced once and held back (state/janitor_refused.json),
 # never silently retried — --retry-refused re-proposes it. There is no schedule wiring for the
@@ -1239,6 +1296,11 @@ def _janitor_fetch(ls_issues):
             "branch_prs": {b: gh.pr_for_branch(b) for b in sl},
             "superseded_prs": gh.open_prs_labeled(janitor_lib.SUPERSEDED_LABEL),
             "parked_issues": parked,
+            # the accidental-close audit (issue #229). ONE GraphQL read for the whole closed set,
+            # on the sweep's own schedule — nothing on the runner's per-tick path reads it. A
+            # refused read yields [] here, which proposes no reopens (fail closed); `doctor` is the
+            # surface that distinguishes "read refused" from "nothing accidentally closed".
+            "closed_issues": gh.closed_issue_closers().value,
             "ls_issues": ls_issues}
 
 
@@ -1249,6 +1311,9 @@ def _janitor_line(p):
     elif p["kind"] == "pr":
         head = f" ({p['head']})" if p.get("head") else ""
         what = f"close PR #{p['target']}{head}"
+    elif p["kind"] == "issue-reopen":
+        title = p.get("title") or ""
+        what = f"REOPEN issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
     else:
         title = p.get("title") or ""
         what = f"close issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
@@ -1257,13 +1322,18 @@ def _janitor_line(p):
 
 def _janitor_execute(p):
     """One approved action -> (ok, reason). Mechanical verbs only — delete ref / close PR /
-    close issue — each leaving an audit comment where a comment is possible."""
+    close issue / reopen issue — each leaving an audit comment where a comment is possible."""
     if p["action"] == "delete-branch":
         ok = gh.delete_branch(p["target"])
     elif p["action"] == "close-pr":
         ok = gh.close_pr(p["target"], comment=_JANITOR_STAMP + p["why"])
     elif p["action"] == "close-issue":
         ok = gh.close_issue(p["target"], comment=_JANITOR_STAMP + p["why"])
+    elif p["action"] == "reopen-issue":
+        # the audit comment carries the WHY, which names the closing commit — so the reopened
+        # issue explains itself to the next reader without anyone re-deriving the forensics
+        # (issue #229; the 2026-07-16 hand-reopen becomes this one tap).
+        ok = gh.reopen_issue(p["target"], comment=_JANITOR_STAMP + p["why"])
     else:
         return False, f"unknown action {p['action']!r}"      # unreachable; fail closed anyway
     return ok, ("" if ok else "gh refused the write (or was unreachable)")

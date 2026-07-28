@@ -756,6 +756,142 @@ def test_close_pr_without_comment_and_fail_closed(ghenv, monkeypatch):
     assert gh.close_pr(14) is False
 
 
+# --------------- the accidental-close audit's reads (issue #229) ---------------
+# `stateReason` alone cannot tell a shipped fix from a stray "fixes #189" in a ledger commit's
+# message — both read COMPLETED. Only the issue's ClosedEvent carries the closer, and only GraphQL
+# exposes it, so these pin the ONE GraphQL read in the adapter: its normalization, its
+# refused-vs-answered-empty health, and its bound.
+
+def test_closed_issue_closers_normalizes_every_closer_shape(ghenv):
+    rh = gh.closed_issue_closers()
+    assert rh.ok is True
+    by_num = {r["number"]: r for r in rh.value}
+    assert set(by_num) == {189, 150, 98, 60, 151}
+
+    bare = by_num[189]["closer"]
+    assert bare == {"type": "commit",
+                    "oid": "8b79d7ac4f5cb0876e32ae839ab21237989195de",
+                    "headline": "ledger: 07-16 overnight — harvest-promotes-drafts regression",
+                    "merged_prs": []}
+    assert by_num[189]["stateReason"] == "COMPLETED"
+    assert by_num[189]["closedAt"] == "2026-07-16T15:32:28Z"
+
+    assert by_num[150]["closer"] == {"type": "pull_request", "number": 242, "merged": True}
+    assert by_num[98]["closer"] is None            # no ClosedEvent closer: the owner's own hand
+    # the gated exemption rides through as the merged PR that carries the commit
+    assert by_num[151]["closer"]["merged_prs"] == [240]
+
+
+def test_closed_issue_closers_pins_the_graphql_invocation(ghenv):
+    gh.closed_issue_closers()
+    argv = _calls(ghenv)[-1]
+    assert argv[:2] == ["api", "graphql"]
+    # the repo comes from gh's own :owner/:repo placeholders, so GH_REPO (set_repo's pin) decides
+    # the target exactly like the REST {owner}/{repo} reads
+    assert "owner=:owner" in argv and "name=:repo" in argv
+    query = next(a for a in argv if a.startswith("query="))
+    assert "states: CLOSED" in query and "CLOSED_EVENT" in query
+    assert "associatedPullRequests" in query       # the gated-commit exemption's evidence
+
+
+def test_closed_issue_closers_fails_closed_on_a_refused_read(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    rh = gh.closed_issue_closers()
+    # refused != "nothing was accidentally closed": the doctor must be able to SAY it could not read
+    assert rh.value == [] and rh.ok is False
+
+
+def test_closed_issue_closers_treats_a_graphql_error_payload_as_refused(ghenv):
+    # GraphQL answers rc 0 with an `errors` body; reading that as an empty closed set would print
+    # a confident "no accidental closes found" off a broken query.
+    (ghenv / "graphql_ClosedIssueClosers.json").write_text(json.dumps(
+        {"data": {"repository": None}, "errors": [{"message": "Could not resolve to a Repository"}]}))
+    rh = gh.closed_issue_closers()
+    assert rh.value == [] and rh.ok is False
+
+
+@pytest.mark.parametrize("body", [
+    "not json at all",
+    json.dumps([1, 2, 3]),
+    json.dumps({"data": {"repository": {"issues": {"nodes": "nope"}}}}),
+    json.dumps({"data": {"repository": {}}}),
+    json.dumps({"data": None}),
+])
+def test_closed_issue_closers_wrong_typed_bodies_fail_closed(ghenv, body):
+    (ghenv / "graphql_ClosedIssueClosers.json").write_text(body)
+    rh = gh.closed_issue_closers()
+    assert rh.value == [] and rh.ok is False
+
+
+def test_closed_issue_closers_unreadable_associated_prs_carry_no_merged_prs_key(ghenv):
+    # An unreadable associatedPullRequests block must NOT normalize to an empty list: closures
+    # reads an empty list as PROOF the commit was bare, and this read could prove nothing.
+    (ghenv / "graphql_ClosedIssueClosers.json").write_text(json.dumps(
+        {"data": {"repository": {"issues": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"number": 5, "title": "t", "stateReason": "COMPLETED",
+                       "closedAt": "z", "timelineItems": {"nodes": [
+                           {"closer": {"__typename": "Commit", "oid": "abc",
+                                       "messageHeadline": "h",
+                                       "associatedPullRequests": "boom"}}]}}]}}}}))
+    rh = gh.closed_issue_closers()
+    assert rh.ok is True and "merged_prs" not in rh.value[0]["closer"]
+
+
+def test_closed_issue_closers_ignores_an_unknown_closer_type(ghenv):
+    (ghenv / "graphql_ClosedIssueClosers.json").write_text(json.dumps(
+        {"data": {"repository": {"issues": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"number": 5, "stateReason": "COMPLETED",
+                       "timelineItems": {"nodes": [{"closer": {"__typename": "Martian"}}]}}]}}}}))
+    assert gh.closed_issue_closers().value[0]["closer"] is None
+
+
+def test_closed_issue_closers_stops_on_a_repeated_cursor(ghenv):
+    # A server that never advances the cursor must not spin the pagination loop forever.
+    (ghenv / "graphql_ClosedIssueClosers.json").write_text(json.dumps(
+        {"data": {"repository": {"issues": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "SAME"},
+            "nodes": [{"number": 5, "stateReason": "COMPLETED", "timelineItems": {"nodes": []}}]}}}}))
+    rh = gh.closed_issue_closers()
+    assert rh.ok is True
+    graphql_calls = [c for c in _calls(ghenv) if c[:2] == ["api", "graphql"]]
+    assert len(graphql_calls) == 2          # the second read repeats the cursor -> stop
+
+
+def test_closed_issue_closers_honours_its_bound(ghenv):
+    gh.closed_issue_closers(limit=3)
+    argv = _calls(ghenv)[-1]
+    assert "page=3" in argv                 # never asks for more than the bound allows
+
+
+def test_sl_head_prs_keeps_only_loop_branches(ghenv):
+    prs = gh.sl_head_prs()
+    assert [p["number"] for p in prs] == [12, 14, 240]      # hotfix/… and the null head are dropped
+    assert prs[2] == {"number": 240, "state": "CLOSED", "headRefName": "sl/i151-the-fix"}
+    argv = _calls(ghenv)[-1]
+    assert _after(argv, "--state") == "all" and "headRefName" in _after(argv, "--json")
+
+
+def test_sl_head_prs_fails_closed(ghenv, monkeypatch):
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.sl_head_prs() == []
+
+
+def test_reopen_issue_records_with_the_audit_comment(ghenv):
+    assert gh.reopen_issue(189, comment="superlooper janitor: closed by commit 8b79d7ac") is True
+    m = _mutations(ghenv)[-1]
+    assert m["kind"] == "reopen_issue" and m["num"] == "189"
+    assert "8b79d7ac" in m["comment"]
+
+
+def test_reopen_issue_without_comment_and_fail_closed(ghenv, monkeypatch):
+    assert gh.reopen_issue(189) is True
+    assert _mutations(ghenv)[-1]["comment"] is None
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.reopen_issue(189) is False
+
+
 # --------------------------- per-client GitHub API-burn telemetry (issue #15) ---------------------------
 # The runner adapter records one bounded local telemetry row per gh subprocess (client="runner"),
 # plus a free rate-limit snapshot on probe(). Enabled explicitly via gh.set_telemetry(home) — OFF by

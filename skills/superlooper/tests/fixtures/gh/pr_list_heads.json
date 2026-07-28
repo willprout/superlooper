@@ -1,0 +1,7 @@
+[
+  {"number": 12, "state": "MERGED", "headRefName": "sl/i5-fix-thing"},
+  {"number": 14, "state": "OPEN", "headRefName": "sl/i7-old-thing"},
+  {"number": 240, "state": "CLOSED", "headRefName": "sl/i151-the-fix"},
+  {"number": 77, "state": "MERGED", "headRefName": "hotfix/not-a-loop-branch"},
+  {"number": 78, "state": "MERGED", "headRefName": null}
+]

@@ -306,6 +306,55 @@ def test_doctor_warns_when_no_checks_observed_yet(rig):
     assert "no checks observed" in (r.stdout + r.stderr).lower()
 
 
+# --- doctor's accidental-close audit (issue #229) ----------------------------------------------
+# An issue closed as COMPLETED by a bare commit-message keyword reads as fixed while nothing
+# shipped (the 2026-07-16 ledger commit that auto-closed the never-built #189). The doctor's job
+# here is VISIBILITY — it WARNs and lists the evidence; it never fails the preflight, because
+# closing issues from commit messages is ordinary practice in a repo adopting the loop.
+
+def test_doctor_flags_a_keyword_closed_issue_with_the_commit_and_the_missing_branch(rig):
+    _seed_closed_issues(rig, _keyword_closed(189, title="The never-built fix"))
+    (rig.fixdir / "pr_list_heads.json").write_text("[]")
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    out = r.stdout
+    assert "WARN accidental issue closes" in out
+    assert "#189" in out and "The never-built fix" in out
+    assert "8b79d7ac" in out                                  # the closing commit
+    assert "ledger: 07-16 overnight" in out                   # its subject
+    # the third column: nothing was ever built for it
+    assert "no sl/i189 PR was ever opened" in out and "no sl/i189 branch" in out
+    assert "superlooper janitor" in out                       # the one command that acts on it
+    assert r.returncode == 0, out + r.stderr                  # a WARN never fails the preflight
+
+
+def test_doctor_names_the_sl_pr_that_did_exist(rig):
+    _seed_closed_issues(rig, _keyword_closed(5))
+    (rig.fixdir / "pr_list_heads.json").write_text(json.dumps(
+        [{"number": 12, "state": "MERGED", "headRefName": "sl/i5-fix-thing"}]))
+    out = cli(rig, "doctor", "--repo", str(rig.repo)).stdout
+    assert "#12" in out and "MERGED" in out
+    # branches.json still carries sl/i5-fix-thing, so the branch half is named too
+    assert "sl/i5-fix-thing still on the remote" in out
+
+
+def test_doctor_is_clean_when_every_close_has_a_merged_pr_or_the_owners_hand(rig):
+    _seed_closed_issues(rig, _pr_closed(150, 242), _owner_closed(98))
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ok   accidental issue closes" in r.stdout
+    assert "2 checked" in r.stdout                            # says how much it actually audited
+
+
+def test_doctor_says_it_could_not_read_rather_than_giving_a_clean_bill(rig):
+    # a refused read must never render as "no accidental closes found" — that is the exact
+    # trusted-signal failure this block exists to catch, one layer up.
+    (rig.fixdir / "graphql_ClosedIssueClosers.json").write_text("{not json")
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "WARN accidental issue closes" in r.stdout and "refused" in r.stdout
+    assert "ok   accidental issue closes" not in r.stdout
+
+
 def _write_exe(path, body):
     path.write_text(body)
     path.chmod(0o755)
@@ -1621,6 +1670,40 @@ def _seed_janitor_fixtures(rig):
     # The janitor sweeps EVERY park-family label (issue #58: needs-owner + legacy needs-william).
     (rig.fixdir / "issue_list_needs-owner.json").write_text("[]")
     (rig.fixdir / "issue_list_needs-william.json").write_text("[]")
+    # A CLEAN accidental-close audit (issue #229) by default: the committed fixture carries a
+    # keyword-closed issue for the gh/doctor tests, and leaving it in would add a fourth proposal
+    # to every three-class assertion below. The reopen tests seed their own world.
+    _seed_closed_issues(rig)
+
+
+def _seed_closed_issues(rig, *nodes):
+    """Serve `superlooper`'s accidental-close audit exactly `nodes` (issue #229) — one GraphQL
+    page, no more pages. No nodes = a repo with nothing wrongly closed."""
+    (rig.fixdir / "graphql_ClosedIssueClosers.json").write_text(json.dumps(
+        {"data": {"repository": {"issues": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": list(nodes)}}}}))
+
+
+def _keyword_closed(num, *, title="Never built", oid="8b79d7ac4f5cb0876e32ae839ab21237989195de",
+                    headline="ledger: 07-16 overnight — harvest-promotes-drafts regression"):
+    """The 2026-07-16 shape: COMPLETED, closed by a bare commit, no merged PR carrying it."""
+    return {"number": num, "title": title, "stateReason": "COMPLETED",
+            "closedAt": "2026-07-16T15:32:28Z",
+            "timelineItems": {"nodes": [{"closer": {
+                "__typename": "Commit", "oid": oid, "messageHeadline": headline,
+                "associatedPullRequests": {"nodes": []}}}]}}
+
+
+def _pr_closed(num, pr, *, title="Shipped through the gate"):
+    return {"number": num, "title": title, "stateReason": "COMPLETED",
+            "closedAt": "2026-07-15T09:00:00Z",
+            "timelineItems": {"nodes": [
+                {"closer": {"__typename": "PullRequest", "number": pr, "merged": True}}]}}
+
+
+def _owner_closed(num, *, title="Closed by hand"):
+    return {"number": num, "title": title, "stateReason": "COMPLETED",
+            "closedAt": "2026-07-14T09:00:00Z", "timelineItems": {"nodes": []}}
 
 
 def _janitor_journal(rig):
@@ -1801,6 +1884,89 @@ def test_janitor_permission_denied_refused_file_refuses_to_run(rig):
     assert r.returncode != 0
     assert "janitor_refused.json" in (r.stdout + r.stderr)
     assert mutations(rig) == []
+
+
+# --- the accidental-close class: propose a REOPEN, never reopen anything (issue #229) ---------
+# The 2026-07-16 incident end to end: a ledger commit's "fixes #189" keyword closed an approved,
+# never-built fix; the tracker read COMPLETED for a day. The hand-reopen that eventually fixed it
+# becomes one janitor tap — but still a TAP: nothing reopens without the owner's word.
+
+def test_janitor_proposes_reopening_a_keyword_closed_issue_and_changes_nothing(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_closed_issues(rig, _keyword_closed(189))
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "REOPEN issue #189" in r.stdout
+    assert "8b79d7ac" in r.stdout                       # the closing commit is named in the why
+    assert "ledger: 07-16 overnight" in r.stdout
+    assert mutations(rig) == [] and _janitor_journal(rig) == []
+
+
+def test_janitor_never_proposes_reopening_a_pr_closed_or_owner_closed_issue(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_closed_issues(rig, _pr_closed(150, 242), _owner_closed(98))
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "REOPEN" not in r.stdout
+    assert "#150" not in r.stdout and "#98" not in r.stdout
+
+
+def test_janitor_approved_reopen_executes_with_an_audit_comment_naming_the_commit(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_closed_issues(rig, _keyword_closed(189))
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    reopen = next(m for m in mutations(rig) if m["kind"] == "reopen_issue")
+    assert reopen["num"] == "189"
+    assert "janitor" in reopen["comment"] and "8b79d7ac" in reopen["comment"]
+    rec = next(x for x in _janitor_journal(rig) if x.get("action") == "reopen-issue")
+    assert rec["target"] == 189 and rec["outcome"] == "ok" and rec["why"]
+
+
+def test_janitor_sweeps_all_four_classes_in_one_pass(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_closed_issues(rig, _keyword_closed(189))
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert {m["kind"] for m in mutations(rig)} == \
+        {"delete_ref", "close_pr", "close_issue", "reopen_issue"}
+    assert "4 executed" in r.stdout
+
+
+def test_janitor_json_carries_the_reopen_key_for_a_one_touch_approval(rig):
+    # the command center approves per KEY; a reopen must be tappable exactly like every other
+    # proposal, and its key must not collide with a close of the same issue number.
+    _seed_janitor_fixtures(rig)
+    _seed_closed_issues(rig, _keyword_closed(9))
+    doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
+    keys = {p["key"] for p in doc["proposals"]}
+    assert "reopen:9" in keys and "issue:9" in keys      # aged-park close AND reopen, distinct
+    r = cli(rig, "janitor", "--execute-keys", "reopen:9", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert [m["kind"] for m in mutations(rig)] == ["reopen_issue"]
+
+
+def test_janitor_never_proposes_reopening_an_issue_a_lane_is_working(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_closed_issues(rig, _keyword_closed(189))
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    st = loopstate.new_state()
+    st["issues"]["i189"] = dict(loopstate.new_issue(), status="running", branch="sl/i189-x")
+    loopstate.save(str(home / "state" / "issues.json"), st)
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "REOPEN" not in r.stdout
+
+
+def test_janitor_proposes_no_reopens_when_the_closed_read_is_refused(rig):
+    # a refused GraphQL read fails closed to [] — the sweep proposes fewer things, never more.
+    _seed_janitor_fixtures(rig)
+    (rig.fixdir / "graphql_ClosedIssueClosers.json").write_text("{not json")
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "REOPEN" not in r.stdout
+    assert "sl/i5-fix-thing" in r.stdout          # the rest of the sweep still works
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")

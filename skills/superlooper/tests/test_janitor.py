@@ -393,6 +393,101 @@ def test_inputs_are_never_mutated_and_output_is_deterministic():
     assert (branches, prs, issues, ls) == (snap[0], snap[1], snap[2], snap[3])
 
 
+# --------------------------- accidental-close reopens (issue #229) ---------------------------
+# The fourth debris class, and the only one whose action UNDOES a state change rather than
+# tidying one: an issue closed as COMPLETED by a bare commit-message keyword reads as fixed while
+# nothing shipped (the 2026-07-16 ledger commit that auto-closed the never-built #189). Detection
+# lives in lib/closures.py and is tested there; these pin the janitor half — that it proposes,
+# never acts, and that its own exclusions still hold.
+
+def _closed(num, *, reason="COMPLETED", closer=None, title="Never built"):
+    return {"number": num, "title": title, "stateReason": reason,
+            "closedAt": "2026-07-16T15:32:28Z", "closer": closer}
+
+
+def _bare(oid="8b79d7acdeadbeef", headline="ledger: 07-16 overnight"):
+    return {"type": "commit", "oid": oid, "headline": headline, "merged_prs": []}
+
+
+def test_a_keyword_closed_issue_is_proposed_for_reopen_naming_the_commit():
+    r = propose(closed_issues=[_closed(189, closer=_bare())])
+    assert [p["key"] for p in r["proposals"]] == ["reopen:189"]
+    p = r["proposals"][0]
+    assert p["kind"] == "issue-reopen" and p["action"] == "reopen-issue" and p["target"] == 189
+    assert p["title"] == "Never built"
+    # the commit rides on the proposal AND in the why — the why becomes the audit comment
+    assert p["commit"] == "8b79d7acdeadbeef"
+    assert "8b79d7ac" in p["why"] and "ledger: 07-16 overnight" in p["why"]
+
+
+def test_an_issue_closed_by_its_merged_pr_is_never_proposed_for_reopen():
+    r = propose(closed_issues=[_closed(150, closer={"type": "pull_request", "number": 242,
+                                                    "merged": True})])
+    assert r["proposals"] == []
+
+
+def test_an_owner_closed_issue_is_never_proposed_for_reopen():
+    assert propose(closed_issues=[_closed(98, closer=None)])["proposals"] == []
+
+
+def test_a_keyword_closed_issue_held_by_an_in_flight_lane_is_never_proposed():
+    # a lane is mid-flight on that issue: it is already being dealt with — never touch it.
+    r = propose(closed_issues=[_closed(189, closer=_bare())],
+                ls_issues={"i189": {"status": "running", "branch": "sl/i189-x"}})
+    assert r["proposals"] == []
+
+
+def test_reopen_proposals_ride_the_refused_holdback_like_every_other_class():
+    r = propose(closed_issues=[_closed(189, closer=_bare())], refused={"reopen:189"})
+    assert r["proposals"] == [] and r["refused"] == ["reopen:189"]
+
+
+def test_reopen_keys_never_collide_with_the_close_issue_keys():
+    # both classes target issue numbers; an `issue:9` close and a `reopen:9` must stay distinct
+    # keys, or the command center's per-key tap and the refused map would conflate them.
+    r = propose(parked_issues=[_issue(9, ("parked",), NOW - 30 * DAY)],
+                closed_issues=[_closed(9, closer=_bare())])
+    assert sorted(p["key"] for p in r["proposals"]) == ["issue:9", "reopen:9"]
+
+
+def test_reopen_proposals_are_deduped_sorted_and_emitted_last():
+    r = propose(branches={"sl/i5-a": "tip0"},
+                branch_prs={"sl/i5-a": (_pr(12, "MERGED"), True)},
+                superseded_prs=[_pr(14, "OPEN", labels=("superseded",), head="sl/i7-a")],
+                parked_issues=[_issue(9, ("parked",), NOW - 30 * DAY)],
+                closed_issues=[_closed(70, closer=_bare()), _closed(12, closer=_bare()),
+                               _closed(70, closer=_bare())])
+    assert [p["key"] for p in r["proposals"]] == \
+        ["branch:sl/i5-a", "pr:14", "issue:9", "reopen:12", "reopen:70"]
+
+
+def test_a_wrong_typed_closed_issue_list_proposes_no_reopens():
+    for bad in (None, "nope", {}, 42, [None, "x", 7]):
+        assert propose(closed_issues=bad)["proposals"] == []
+
+
+def test_an_unreadable_loopstate_still_fails_the_whole_sweep_closed_including_reopens():
+    r = janitor.propose(branches={}, branch_prs={}, superseded_prs=[], parked_issues=[],
+                        closed_issues=[_closed(189, closer=_bare())], ls_issues="garbage",
+                        now=NOW, aged_park_days=14)
+    assert r == {"proposals": [], "refused": []}
+
+
+def test_closed_issues_defaults_to_nothing_so_every_existing_caller_keeps_working():
+    # the kwarg is optional: a caller that never fetched closed issues proposes no reopens
+    # rather than raising (the CLI, upkeep and the dashboard all reach propose()).
+    assert janitor.propose(branches={}, branch_prs={}, superseded_prs=[], parked_issues=[],
+                           ls_issues={}, now=NOW, aged_park_days=14) == \
+        {"proposals": [], "refused": []}
+
+
+def test_reopen_inputs_are_never_mutated():
+    closed = [_closed(189, closer=_bare())]
+    snap = repr(closed)
+    propose(closed_issues=closed)
+    assert repr(closed) == snap
+
+
 # --------------------------- little parsers ---------------------------
 
 @pytest.mark.parametrize("branch,num", [

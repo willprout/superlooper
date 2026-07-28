@@ -456,6 +456,149 @@ def open_issues_activity(label, limit=200):
                        "--json", "number,title,labels,updatedAt", "--limit", str(limit)])
 
 
+# --------------------------- accidental-close audit (issue #229) ---------------------------
+# What CLOSED an issue is not in any `gh issue list --json` field: `stateReason` says COMPLETED
+# either way, whether a merged PR shipped the fix or a stray "fixes #189" in a ledger commit's
+# message tripped GitHub's keyword close. Only the issue's ClosedEvent carries the closer, and only
+# GraphQL exposes it — so this is the one GraphQL query in the adapter.
+#
+# It is a GraphQL query rather than N REST timeline reads on purpose (the owner's API-burn ruling,
+# 2026-07-16 — one read proving the whole set, never per-issue reads): ONE call answers 100 issues
+# for ~3 rate-limit points, where the REST /issues/{n}/timeline endpoint would cost one call each.
+# Nothing on the runner's per-tick path calls this; `superlooper doctor` and the janitor's sweep do,
+# both of which are on-demand.
+_CLOSERS_QUERY = """
+query ClosedIssueClosers($owner: String!, $name: String!, $page: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(states: CLOSED, first: $page, after: $cursor,
+           orderBy: {field: CREATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        stateReason
+        closedAt
+        timelineItems(last: 1, itemTypes: [CLOSED_EVENT]) {
+          nodes {
+            ... on ClosedEvent {
+              closer {
+                __typename
+                ... on PullRequest { number merged }
+                ... on Commit {
+                  oid
+                  messageHeadline
+                  associatedPullRequests(first: 5) { nodes { number merged } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+_CLOSERS_PAGE = 100          # GitHub's max page size for a connection
+
+
+def _closer_of(node):
+    """The normalized `closer` for one issue node, or None when the issue was closed BY HAND (no
+    closer at all — the owner's own word) or when the timeline is unreadable. Shapes:
+        {"type": "pull_request", "number": int|None, "merged": bool|None}
+        {"type": "commit", "oid": str, "headline": str, "merged_prs": [int, ...]}
+    `merged_prs` is the exemption lib/closures.py needs: a commit that a MERGED PR carries went
+    through the gate, so its keyword close is not the accidental class. An unreadable
+    associatedPullRequests block yields NO merged_prs key at all, which closures fails closed on
+    (it cannot prove the commit was bare) — never an empty list, which would read as proof."""
+    events = (node.get("timelineItems") or {}).get("nodes") if isinstance(node, dict) else None
+    ev = events[-1] if isinstance(events, list) and events and isinstance(events[-1], dict) else {}
+    closer = ev.get("closer")
+    if not isinstance(closer, dict):
+        return None                              # closed by hand, or nothing readable
+    kind = closer.get("__typename")
+    if kind == "PullRequest":
+        return {"type": "pull_request", "number": closer.get("number"),
+                "merged": closer.get("merged")}
+    if kind != "Commit":
+        return None                              # an unknown closer type is not a bare commit
+    out = {"type": "commit", "oid": closer.get("oid"),
+           "headline": closer.get("messageHeadline")}
+    assoc = closer.get("associatedPullRequests")
+    nodes = assoc.get("nodes") if isinstance(assoc, dict) else None
+    if isinstance(nodes, list):
+        out["merged_prs"] = [p["number"] for p in nodes
+                             if isinstance(p, dict) and p.get("merged") is True
+                             and type(p.get("number")) is int]
+    return out
+
+
+def closed_issue_closers(limit=400):
+    """Every CLOSED issue with WHAT closed it, as a ReadHealth(list, ok) — the accidental-close
+    audit's one read (issue #229). Each record:
+        {"number": int, "title": str, "stateReason": str, "closedAt": str, "closer": <see
+         _closer_of> | None}
+    consumed by lib/closures.flagged.
+
+    `ok` follows the #21/#61 refused-vs-answered-empty discipline, and it MATTERS here in the
+    direction the other reads do not: a refused read yields [] which flags nothing, so the janitor
+    stays safe by ignoring it — but the doctor would print a confident "no accidental closes found"
+    off a GitHub outage. With `ok` it says "could not read" instead. ok=False on any refused page,
+    an unparseable/wrong-typed body, or a GraphQL `errors` payload; `value` is then [].
+
+    Paginated newest-first and BOUNDED at `limit` issues (4 pages of 100). Beyond that the audit
+    stops looking rather than walking a decade of history on every doctor run; the bound is
+    reported by the caller, never silently applied (the doctor prints how far back it looked)."""
+    out, cursor, seen_cursors = [], None, set()
+    ok = True
+    while len(out) < max(0, int(limit)):
+        args = ["api", "graphql", "-F", "owner=:owner", "-F", "name=:repo",
+                "-F", "page=%d" % min(_CLOSERS_PAGE, max(1, int(limit) - len(out))),
+                "-f", "query=" + _CLOSERS_QUERY]
+        if cursor:
+            args += ["-f", "cursor=" + cursor]
+        rc, body = _run(args)
+        if rc != 0:
+            return ReadHealth([], False)         # refused: never a partial list dressed as whole
+        try:
+            doc = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return ReadHealth([], False)
+        if not isinstance(doc, dict) or doc.get("errors"):
+            return ReadHealth([], False)         # a GraphQL error payload is rc 0 but not an answer
+        repo = (doc.get("data") or {}).get("repository") if isinstance(doc.get("data"), dict) else None
+        conn = repo.get("issues") if isinstance(repo, dict) else None
+        if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+            return ReadHealth([], False)         # wrong-typed body: not a clean answer
+        for node in conn["nodes"]:
+            if not isinstance(node, dict):
+                continue
+            out.append({"number": node.get("number"), "title": node.get("title"),
+                        "stateReason": node.get("stateReason"), "closedAt": node.get("closedAt"),
+                        "closer": _closer_of(node)})
+        page = conn.get("pageInfo") if isinstance(conn.get("pageInfo"), dict) else {}
+        cursor = page.get("endCursor")
+        # A server that never advances the cursor (or repeats one) must not spin this loop forever.
+        if page.get("hasNextPage") is not True or not isinstance(cursor, str) or not cursor \
+                or cursor in seen_cursors:
+            break
+        seen_cursors.add(cursor)
+    return ReadHealth(out, ok)
+
+
+def sl_head_prs(limit=300):
+    """Every PR the repo has ever had on an `sl/*` head — {"number", "state", "headRefName"} —
+    for the doctor's "did an sl/i<N> PR ever exist?" evidence column (issue #229). ONE list read
+    however many issues are flagged, and it is issued only when at least one IS flagged. Fails
+    closed to [] — no evidence found, which the evidence line states honestly."""
+    lst = _json_list(["pr", "list", "--state", "all", "--json", "number,state,headRefName",
+                      "--limit", str(limit)])
+    return [{"number": p.get("number"), "state": p.get("state"),
+             "headRefName": p["headRefName"]}
+            for p in lst
+            if isinstance(p, dict) and isinstance(p.get("headRefName"), str)
+            and p["headRefName"].startswith("sl/")]
+
+
 def default_branch():
     """The repo's default branch name (e.g. 'main'/'master'/'develop'), or None if gh can't
     answer (unreachable, unauthenticated, or a wrong-typed ref). adopt writes this as `dev_branch`
@@ -563,6 +706,18 @@ def close_issue(num, comment=None):
     """Close an issue (the investigate-type gate: marker comment present -> close the parent).
     True on success."""
     args = ["issue", "close", str(num)]
+    if comment:
+        args += ["--comment", comment]
+    rc, _ = _run(args)
+    return rc == 0
+
+
+def reopen_issue(num, comment=None):
+    """Reopen an issue — the janitor's approved accidental-close action (issue #229), only ever
+    invoked on the owner's explicit word, never from any automatic path. The comment is the audit
+    trail: it names the commit whose message keyword closed the issue, so the reopen explains
+    itself on the issue where the next reader will look. True on success."""
+    args = ["issue", "reopen", str(num)]
     if comment:
         args += ["--comment", comment]
     rc, _ = _run(args)
