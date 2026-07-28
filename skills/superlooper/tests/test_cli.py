@@ -2266,6 +2266,25 @@ def test_janitor_execute_keys_with_dry_run_changes_nothing(rig):
     assert _janitor_refused(rig) is None      # nothing written anywhere
 
 
+def test_janitor_execute_keys_dry_run_still_reports_a_refused_key_as_held(rig):
+    # The holdback is now decided BEFORE the re-derivation rather than per-key after it, which made
+    # --dry-run's own inline `held` branch dead code. The COUNT must still be right: a refused key
+    # in the tap list reports `held`, not `would-run`, and still writes nothing.
+    _seed_janitor_fixtures(rig)
+    home = _janitor_home(rig)
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "janitor_refused.json").write_text(json.dumps(
+        {"issue:9": {"reason": "gh refused", "ts": 1}}))
+    doc = json.loads(cli(rig, "janitor", "--json", "--execute-keys", "pr:14,issue:9", "--dry-run",
+                         "--repo", str(rig.repo)).stdout)
+    assert doc["held"] == 1 and doc["executed"] == 0
+    assert {x["key"]: x["outcome"] for x in doc["results"]} == {
+        "pr:14": "would-run", "issue:9": "held"}
+    assert mutations(rig) == [] and _janitor_journal(rig) == []
+    # ...and the hold-back map is untouched by a dry run
+    assert _janitor_refused(rig) == {"issue:9": {"reason": "gh refused", "ts": 1}}
+
+
 def test_janitor_execute_keys_unreadable_loopstate_refuses(rig):
     _seed_janitor_fixtures(rig)
     home = _janitor_home(rig)
