@@ -685,3 +685,39 @@ def test_a_literal_body_and_labels_are_still_judged_normally(tmp_path):
     # The rule must not gut the duty: nothing here holds a `$`.
     _worktree(tmp_path)
     assert _create("gh issue create --title x --label needs-owner --body '## Goal\nx\n'", tmp_path)
+
+
+# --- fresh-agent review round 2 (Codex, 2026-07-28), P0: gh accepts ATTACHED short options ---
+# `gh` is cobra/pflag-based, so `-ltype:build`, `-b'…'` and `-Rowner/repo` are all valid and all
+# common. The parser read only the separated form, so it saw `-ltype:build` as an unrecognized
+# token: the labels came back EMPTY and a valid command was denied for a `type:` label that was
+# right there. The `-R` miss was the same bug pointed the other way — this repo's contract held
+# over an issue being filed somewhere else entirely.
+
+def test_an_attached_short_label_is_read(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x -ltype:build --body %s" % shlex.quote(VALID_BODY),
+                   tmp_path) is None
+
+
+def test_an_attached_short_body_is_read(tmp_path):
+    _worktree(tmp_path)
+    reason = _create("gh issue create --title x --label type:build -b'## Goal\nx\n'", tmp_path)
+    assert reason and "## Loop metadata" in reason
+
+
+def test_an_attached_short_repo_stands_the_whole_duty_down(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create -Rcli/cli --label type:build --body '## Goal\nx\n'",
+                   tmp_path) is None
+
+
+def test_attached_and_separated_short_options_mix(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create -t x -ltype:build -l needs-owner --body %s"
+                   % shlex.quote(VALID_BODY), tmp_path) is None
+
+
+def test_an_attached_short_label_holding_a_variable_still_stands_the_duty_down(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x -l$labels --body '## Goal\nx\n'", tmp_path) is None

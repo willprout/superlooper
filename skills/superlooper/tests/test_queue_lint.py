@@ -385,3 +385,30 @@ def test_with_touches_repairs_the_section_the_PARSER_reads_not_the_first_one():
 def test_with_touches_leaves_a_body_whose_LAST_section_already_declares_alone():
     body = "## Loop metadata\nparent: #7\n\n## Loop metadata\ntouches: engine\n"
     assert touched(body) == body
+
+
+def test_with_touches_repairs_the_section_the_parser_reads_under_MIXED_CASE_headings():
+    # Review round 2 (Codex, 2026-07-28): parse_sections keys by the RAW heading text, so
+    # `## loop metadata` and `## Loop metadata` are two DISTINCT keys and parse_loop_metadata reads
+    # the FIRST of them. Repairing the LAST would let the janitor execute, journal and comment a
+    # successful body fix whose output still lints as broken — the worst outcome a one-tap repair
+    # on someone else's issue can have.
+    body = "## loop metadata\nparent: #1\n\n## Loop metadata\nparent: #2\n"
+    out = touched(body)
+    assert queue_lint.lint(["type:build"], out, areas=AREAS) == []
+    assert "parent: #1" in out and "parent: #2" in out
+
+
+def test_with_touches_output_ALWAYS_lints_clean_across_every_heading_shape():
+    # The janitor's whole safety story rests on this: what it proposes is what lands, and what
+    # lands is launchable. One table, every duplicate/casing/EOF shape the parser distinguishes.
+    for body in ["## Goal\nx\n",
+                 "",
+                 "## Loop metadata\nparent: #7\n",
+                 "## loop metadata\nparent: #1\n\n## Loop metadata\nparent: #2\n",
+                 "## Loop metadata\nparent: #1\n\n## Goal\nx\n\n## Loop metadata\nparent: #2\n",
+                 "## LOOP METADATA\nparent: #1\n",
+                 "## Goal\nx\n## Loop metadata\nparent: #7",
+                 "## Goal\nship it\n\ntouches: engine\n"]:
+        out = queue_lint.with_touches(body, "engine")
+        assert queue_lint.lint(["type:build"], out, areas=AREAS) == [], repr(body)

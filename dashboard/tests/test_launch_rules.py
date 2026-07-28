@@ -468,3 +468,42 @@ def test_parity_duplicate_sections_agree_with_the_engine():
         engine_blocks = eng.blocking(eng.lint(["agent-ready", "type:build"], body,
                                               areas=_AREAS, touches_required=True))
         assert (_refusal(["type:build"], body) is not None) == engine_blocks, body
+
+
+# --- fresh-agent review round 2 (Codex, 2026-07-28), P1: MIXED-CASE duplicate headings ---
+# Round 1's fix ("a later heading resets the collected lines") was right for two IDENTICAL headings
+# and wrong for two that differ only in case. The engine's parse_sections keys the dict by the RAW
+# heading text, so `## Loop metadata` and `## loop metadata` are two DISTINCT keys; parse_loop_
+# metadata then takes the FIRST key (insertion order) that matches case-insensitively. So:
+#   * same casing twice -> one key, LAST content wins;
+#   * different casing  -> two keys, the FIRST section is the one read.
+# Approximating that was how the mirror drifted twice. It now reproduces parse_sections outright.
+
+def test_mixed_case_duplicate_headings_read_the_FIRST_section_as_the_engine_does():
+    body = "## Loop metadata\ntouches: engine\n\n## loop metadata\nparent: #1\n"
+    assert launch_rules.declared_touches(body) == ["engine"]
+    assert _refusal(["type:build"], body) is None
+
+
+def test_identical_duplicate_headings_still_read_the_LAST_section():
+    body = "## Loop metadata\ntouches: engine\n\n## Goal\nx\n\n## Loop metadata\nparent: #7\n"
+    assert launch_rules.declared_touches(body) == []
+
+
+def test_parity_every_duplicate_heading_shape_agrees_with_the_engine():
+    eng = _engine_queue_lint()
+    bodies = [
+        "## Loop metadata\ntouches: engine\n\n## loop metadata\nparent: #1\n",
+        "## loop metadata\nparent: #1\n\n## Loop metadata\ntouches: engine\n",
+        "## Loop metadata\ntouches: engine\n\n## Goal\nx\n\n## Loop metadata\nparent: #7\n",
+        "## LOOP METADATA\ntouches: engine\n",
+        "## Loop metadata \ntouches: engine\n",
+        "## Loop metadata\n\n### sub\ntouches: engine\n",
+        "## Goal\nx\n## Loop metadata\ntouches: engine",          # section at EOF, no trailing \n
+    ]
+    for body in bodies:
+        engine_touches = _engine_issues().parse_loop_metadata(body)["touches"]
+        assert launch_rules.declared_touches(body) == engine_touches, repr(body)
+        engine_blocks = eng.blocking(eng.lint(["agent-ready", "type:build"], body,
+                                              areas=_AREAS, touches_required=True))
+        assert (_refusal(["type:build"], body) is not None) == engine_blocks, repr(body)

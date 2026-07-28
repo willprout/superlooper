@@ -276,6 +276,29 @@ def lint_issue(gh_issue, areas=None, touches_required=True):
 _METADATA_HEADING = "## Loop metadata"
 
 
+def _read_metadata_heading(lines):
+    """The index of the `## Loop metadata` heading whose section `parse_loop_metadata` ACTUALLY
+    READS, or None when there is no such heading.
+
+    Not simply the first, and not simply the last — it is whichever one that parser lands on, and
+    two rounds of fresh-agent review (2026-07-28) each caught a simpler rule getting it wrong in a
+    different direction. `parse_sections` keys its dict by the RAW heading text, so:
+
+      * two headings with IDENTICAL text are ONE key, and the LAST occurrence's content wins;
+      * `## Loop metadata` and `## loop metadata` are two DISTINCT keys, and `parse_loop_metadata`
+        takes the FIRST key (insertion order) matching case-insensitively.
+
+    So: first matching KEY, then that key's LAST occurrence. Repairing any other heading would let
+    the janitor execute, journal and comment a successful body fix whose output still lints as
+    broken — the worst outcome a one-tap repair on someone else's issue can have."""
+    headings = [(i, ln.split("##", 1)[1].strip())
+                for i, ln in enumerate(lines) if _H2_HEADING.match(ln)]
+    key = next((text for _, text in headings if text.lower() == "loop metadata"), None)
+    if key is None:
+        return None
+    return max(i for i, text in headings if text == key)
+
+
 def with_touches(body, value):
     """`body` rewritten so the runner CAN parse a `touches: <value>` declaration, or None when
     `value` is empty (a blank declaration parses to nothing, so writing one would "repair" an issue
@@ -298,13 +321,7 @@ def with_touches(body, value):
     body = body if isinstance(body, str) else ""
 
     lines = body.splitlines()
-    # The LAST `## Loop metadata` heading, not the first (fresh-agent review, 2026-07-28):
-    # issues.parse_sections collects into a DICT, so a later heading overwrites an earlier one and
-    # only the last section is ever READ. Writing into the first would report a fix that changes
-    # nothing — the worst possible outcome for a one-tap repair on someone else's issue.
-    heading_at = next((i for i in range(len(lines) - 1, -1, -1)
-                       if _H2_HEADING.match(lines[i])
-                       and lines[i].split("##", 1)[1].strip().lower() == "loop metadata"), None)
+    heading_at = _read_metadata_heading(lines)
     if heading_at is not None:
         if issues_mod.parse_loop_metadata(body)["touches"]:
             return body                                  # already parseable: nothing to add

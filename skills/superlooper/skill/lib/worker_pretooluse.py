@@ -259,13 +259,20 @@ def _issue_create_span(tokens):
 
 
 def _flag_value(tokens, idx, name):
-    """The value of a `--flag value` / `--flag=value` / `-f value` argument at `idx`, as
-    (value, next_index), or (None, idx+1) when this token is not that flag."""
+    """The value of a `--flag value` / `--flag=value` / `-f value` / `-fvalue` argument at `idx`,
+    as (value, next_index), or (None, idx+1) when this token is not that flag.
+
+    The ATTACHED short form is not a nicety: `gh` is cobra/pflag-based, so `-ltype:build` and
+    `-b'…'` are as valid as the separated form and workers write them (fresh-agent review round 2,
+    2026-07-28). Missing it read `-ltype:build` as an unrecognized token — the labels came back
+    EMPTY and a valid command was denied for a `type:` label that was right there."""
     tok = tokens[idx]
     if tok == name:
         return (tokens[idx + 1], idx + 2) if idx + 1 < len(tokens) else (None, idx + 1)
     if name.startswith("--") and tok.startswith(name + "="):
         return tok[len(name) + 1:], idx + 1
+    if not name.startswith("--") and len(tok) > len(name) and tok.startswith(name):
+        return tok[len(name):], idx + 1            # -lvalue
     return None, idx + 1
 
 
@@ -291,7 +298,9 @@ def parse_issue_create(command):
     i = start
     while i < end:
         tok = tokens[i]
-        if tok in ("--repo", "-R") or tok.startswith("--repo="):
+        # `--repo x`, `--repo=x`, `-R x` AND the attached `-Rowner/repo` — missing the last one
+        # held THIS repo's contract over an issue being filed somewhere else (review round 2).
+        if tok in ("--repo", "-R") or tok.startswith("--repo=") or tok.startswith("-R"):
             return None
         if tok in _BODY_ELSEWHERE:
             body_readable = False

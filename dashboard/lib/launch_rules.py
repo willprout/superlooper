@@ -167,23 +167,33 @@ def declared_touches(body):
     the `## Loop metadata` section only. ``[]`` when there is none (or the body is missing or
     wrong-typed). Mirror of ``issues.parse_loop_metadata``'s touches read.
 
-    "EXACTLY" includes what happens with TWO `## Loop metadata` headings (fresh-agent review,
-    2026-07-28). The engine's ``parse_sections`` collects sections into a DICT, so a later heading
-    OVERWRITES an earlier one and only the LAST section is ever read. An earlier version of this
-    mirror accumulated lines from every matching section, so a body whose declaration sat in the
-    first (dead) section read as DECLARED here and as undeclared to the runner — the board showing
-    a flight the runner parks, which is precisely the #138 drift this module exists to prevent."""
+    "EXACTLY" is why this REPRODUCES ``parse_sections`` rather than approximating it. Two rounds of
+    fresh-agent review (2026-07-28) each caught the approximation drifting on duplicate headings,
+    and the two cases pull in OPPOSITE directions:
+
+      * ``parse_sections`` keys its dict by the RAW heading text, so two `## Loop metadata`
+        headings are ONE key and the LAST one's content wins;
+      * ``## Loop metadata`` and ``## loop metadata`` are two DISTINCT keys, and
+        ``parse_loop_metadata`` then takes the FIRST key (insertion order) that matches
+        case-insensitively — so there the FIRST section is the one read.
+
+    No clever single-pass loop gets both right, and each time it got one wrong the board either
+    advertised a flight the runner parks or held one the runner would launch — the #138 drift this
+    module exists to prevent. So: build the same dict, then do the same lookup."""
     if not isinstance(body, str):
         return []
-    meta, current = [], None
+    sections, current, buf = {}, None, []
     for line in body.splitlines():
         m = _H2.match(line)
         if m:
-            current = m.group(1).strip().lower()
-            if current == "loop metadata":
-                meta = []                # a later section REPLACES an earlier one (dict semantics)
-        elif current == "loop metadata":
-            meta.append(line)
+            if current is not None:
+                sections[current] = buf          # a repeated heading overwrites, as the engine's does
+            current, buf = m.group(1).strip(), []
+        elif current is not None:
+            buf.append(line)
+    if current is not None:
+        sections[current] = buf
+    meta = next((v for k, v in sections.items() if k.strip().lower() == "loop metadata"), [])
     for line in meta:
         s = line.strip()
         if s.lower().startswith("touches:"):
