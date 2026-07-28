@@ -123,7 +123,7 @@ def flagged(closed_issues):
     return out
 
 
-def evidence(num, prs=(), branches=(), proven=True):
+def evidence(num, prs=(), branches=(), proven=False):
     """One plain sentence: did an `sl/i<num>` branch or PR ever exist? — the third column of the
     doctor's listing (issue #229's DoD), and the fact that separates the two ways an issue can be
     keyword-closed. An approved loop fix that was never BUILT leaves no trace anywhere: no PR, no
@@ -142,7 +142,9 @@ def evidence(num, prs=(), branches=(), proven=True):
               ever built for it" off that is exactly the trusted-signal failure #229 exists to
               stop, one layer down. With proven=False the absence half is reported as unproven and
               whatever WAS found is still named (found evidence stays true; only absence needs
-              a complete read).
+              a complete read). It DEFAULTS to False on purpose: in a module whose whole discipline
+              is "unprovable -> assert nothing", a caller who forgets the flag must inherit the
+              cautious sentence, never the confident one.
 
     Wrong-typed inputs render as "nothing found" and never raise — this runs inside a doctor line."""
     pr_bits = []

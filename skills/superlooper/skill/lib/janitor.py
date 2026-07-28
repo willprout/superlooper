@@ -271,17 +271,32 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
     # run this loop, so an adopted repo can legitimately have hundreds. `--yes` is a blanket
     # approval, and a blanket approval that fires hundreds of reopens (each posting a comment and
     # notifying subscribers, with no one command to undo) is a harm the owner never asked for. The
-    # sweep therefore proposes at most REOPEN_SWEEP_CAP of them, newest-first — a recent accidental
-    # close is the urgent one — and reports the remainder rather than dropping it silently
-    # (`reopen_withheld`); the doctor still lists every one, and later sweeps propose the rest.
-    seen_reopens = set()
+    # sweep therefore proposes at most REOPEN_SWEEP_CAP of them and reports the remainder rather
+    # than dropping it silently (`reopen_withheld`); the doctor still names every one, and later
+    # sweeps propose the rest.
+    #
+    # The cap keeps the MOST RECENTLY CLOSED, by closedAt — not by issue number. An old,
+    # low-numbered issue keyword-closed yesterday is the urgent one; a high-numbered issue
+    # keyword-closed a year ago is not. (Number-as-recency is the same substitution the read one
+    # layer up had to drop — see gh.closed_issue_closers' UPDATED_AT ordering.) A missing closedAt
+    # sorts oldest, so an unprovable date loses its slot rather than taking someone else's.
+    def _key(f):
+        return (f["closedAt"], f["num"])
+
+    cap = max(1, REOPEN_SWEEP_CAP)               # a 0 cap would invert the slices to "propose all"
     flagged = [f for f in closures.flagged(list(closed_issues)
                                            if isinstance(closed_issues, (list, tuple)) else [])
                # a lane mid-flight on it is already dealing with it; and a close of the SAME issue
                # proposed above would pair with this into two contradictory actions in one sweep
                if f["num"] not in ex_nums and f["num"] not in seen_issues]
-    withheld = flagged[:-REOPEN_SWEEP_CAP] if len(flagged) > REOPEN_SWEEP_CAP else []
-    for f in sorted(flagged[-REOPEN_SWEEP_CAP:], key=lambda f: f["num"]):
+    # The cap bounds ACTIONS, so it is applied to the actionable ones only. A previously-refused
+    # reopen is a report, not an action — letting it occupy a slot would let a handful of stuck
+    # keys starve the class permanently (nothing new proposed, and the backlog never advancing).
+    stale = [f for f in flagged if f"reopen:{f['num']}" in refused]
+    fresh = sorted((f for f in flagged if f"reopen:{f['num']}" not in refused), key=_key)
+    withheld = len(fresh) - cap if len(fresh) > cap else 0
+    seen_reopens = set()
+    for f in sorted(stale + fresh[-cap:], key=lambda f: f["num"]):
         num = f["num"]
         if num in seen_reopens:
             continue
@@ -290,7 +305,7 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
               "target": num, "title": f["title"], "commit": f["commit"], "why": f["why"]})
 
     return {"proposals": proposals, "refused": sorted(p["key"] for p in held),
-            "reopen_withheld": len(withheld)}
+            "reopen_withheld": withheld}
 
 
 def reconcile(approved, fresh_proposals):

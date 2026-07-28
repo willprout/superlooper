@@ -940,6 +940,26 @@ def test_remote_branches_health_fails_closed_and_flags_a_full_page(ghenv, monkey
     assert rh.value == {} and rh.ok is False
 
 
+def test_remote_branches_health_never_asks_for_more_than_github_will_give(ghenv):
+    # GitHub CLAMPS per_page at 100 silently — ask for 200 and you get 100 rows, no error, no
+    # signal. A completeness guard compared against 200 could therefore NEVER fire, and a repo
+    # with 140 branches would report its truncated list as complete (the #165 inert-guard class:
+    # a check written against a bound the server does not honor is not a check). Verified against
+    # live GitHub while fixing this. The request must be clamped to what will actually come back.
+    for asked in (200, 1000, gh.REST_PAGE_MAX):
+        gh.remote_branches_health(limit=asked)
+        url = _calls(ghenv)[-1][1]
+        assert "per_page=%d" % gh.REST_PAGE_MAX in url, url
+    assert gh.REST_PAGE_MAX == 100
+
+
+def test_remote_branches_health_flags_a_full_page_at_the_clamped_size(ghenv):
+    # the guard must be judged against the CLAMPED page, not the number the caller asked for
+    (ghenv / "branches.json").write_text(json.dumps(
+        [{"name": "b%d" % n, "commit": {"sha": "s%d" % n}} for n in range(gh.REST_PAGE_MAX)]))
+    assert gh.remote_branches_health(limit=200).ok is False
+
+
 def test_reopen_issue_records_with_the_audit_comment(ghenv):
     assert gh.reopen_issue(189, comment="superlooper janitor: closed by commit 8b79d7ac") is True
     m = _mutations(ghenv)[-1]

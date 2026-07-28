@@ -132,8 +132,9 @@ def test_a_missing_title_renders_as_empty_never_none():
 
 def test_evidence_says_so_when_no_sl_branch_or_pr_ever_existed():
     # the #189 shape: an approved fix that was never built leaves NO trace on the remote. This is
-    # the sentence that tells the owner "this really was never built", not just "closed oddly".
-    line = closures.evidence(189, prs=[], branches={})
+    # the sentence that tells the owner "this really was never built", not just "closed oddly" —
+    # and it is licensed ONLY by proven=True (both reads clean and complete).
+    line = closures.evidence(189, prs=[], branches={}, proven=True)
     assert "no sl/i189" in line and ("PR" in line and "branch" in line)
 
 
@@ -192,6 +193,9 @@ def test_evidence_found_under_an_unproven_read_is_still_named():
     assert "unproven" in line.lower()          # the branch half is still hedged
 
 
-def test_proven_defaults_true_so_existing_callers_are_unchanged():
+def test_proven_defaults_to_the_cautious_direction():
+    # in a module whose whole discipline is "unprovable -> assert nothing", a caller who forgets
+    # the flag must inherit the cautious sentence, never the confident one.
     assert closures.evidence(189, prs=[], branches={}) == \
-        closures.evidence(189, prs=[], branches={}, proven=True)
+        closures.evidence(189, prs=[], branches={}, proven=False)
+    assert "nothing was ever built" not in closures.evidence(189, prs=[], branches={})

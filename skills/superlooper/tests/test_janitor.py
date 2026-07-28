@@ -400,9 +400,10 @@ def test_inputs_are_never_mutated_and_output_is_deterministic():
 # lives in lib/closures.py and is tested there; these pin the janitor half — that it proposes,
 # never acts, and that its own exclusions still hold.
 
-def _closed(num, *, reason="COMPLETED", closer=None, title="Never built"):
+def _closed(num, *, reason="COMPLETED", closer=None, title="Never built",
+            closed="2026-07-16T15:32:28Z"):
     return {"number": num, "title": title, "stateReason": reason,
-            "closedAt": "2026-07-16T15:32:28Z", "closer": closer}
+            "closedAt": closed, "closer": closer}
 
 
 def _bare(oid="8b79d7acdeadbeef", headline="ledger: 07-16 overnight"):
@@ -495,13 +496,53 @@ def test_the_reopen_class_is_capped_per_sweep_and_the_remainder_is_reported():
     # does not run this loop — an adopted repo can legitimately have hundreds. `--yes` is a
     # blanket approval, so an uncapped class would fire hundreds of reopens (each a comment, each
     # a notification) on one word. The cap is stated, never silent.
-    closed = [_closed(n, closer=_bare()) for n in range(1, 26)]
+    closed = [_closed(n, closer=_bare(), closed="2026-07-%02dT00:00:00Z" % n)
+              for n in range(1, 26)]
     r = propose(closed_issues=closed)
     reopens = [p for p in r["proposals"] if p["kind"] == "issue-reopen"]
     assert len(reopens) == janitor.REOPEN_SWEEP_CAP
     assert r["reopen_withheld"] == 25 - janitor.REOPEN_SWEEP_CAP
-    # newest-first selection (a recent accidental close is the urgent one), emitted sorted
+    # the 10 most recently CLOSED survive the cap, emitted sorted by number
     assert [p["target"] for p in reopens] == list(range(16, 26))
+
+
+def test_the_cap_keeps_the_most_recently_closed_not_the_highest_numbered():
+    # an OLD, low-numbered issue keyword-closed yesterday is the urgent one; a high-numbered issue
+    # keyword-closed a year ago is not. Number-as-recency is the same substitution the read one
+    # layer up had to drop (gh.closed_issue_closers orders by UPDATED_AT, not CREATED_AT) — the
+    # cap must not quietly reintroduce it.
+    old_but_high = [_closed(n, closer=_bare(), closed="2025-01-01T00:00:00Z")
+                    for n in range(900, 900 + janitor.REOPEN_SWEEP_CAP)]
+    recent_but_low = _closed(3, closer=_bare(), closed="2026-07-27T00:00:00Z")
+    r = propose(closed_issues=old_but_high + [recent_but_low])
+    kept = [p["target"] for p in r["proposals"] if p["kind"] == "issue-reopen"]
+    assert 3 in kept and len(kept) == janitor.REOPEN_SWEEP_CAP
+    assert r["reopen_withheld"] == 1
+
+
+def test_an_undated_close_loses_its_slot_rather_than_taking_someone_elses():
+    # a missing closedAt is an unprovable date: it sorts oldest, so it is withheld before a
+    # provably-recent one — the same "age is proven, never guessed" rule the park class follows.
+    dated = [_closed(n, closer=_bare(), closed="2026-07-%02dT00:00:00Z" % n)
+             for n in range(1, 1 + janitor.REOPEN_SWEEP_CAP)]
+    undated = _closed(500, closer=_bare(), closed="")
+    r = propose(closed_issues=dated + [undated])
+    kept = [p["target"] for p in r["proposals"] if p["kind"] == "issue-reopen"]
+    assert 500 not in kept and r["reopen_withheld"] == 1
+
+
+def test_a_refused_reopen_never_occupies_a_cap_slot():
+    # the cap bounds ACTIONS. A previously-refused reopen is a report, not an action — letting a
+    # handful of stuck keys eat the whole cap would starve the class permanently: nothing new
+    # proposed, and the backlog never advancing.
+    closed = [_closed(n, closer=_bare(), closed="2026-07-%02dT00:00:00Z" % n)
+              for n in range(1, 26)]
+    stuck = {"reopen:%d" % n for n in range(20, 26)}          # 6 of the newest are held back
+    r = propose(closed_issues=closed, refused=stuck)
+    reopens = [p for p in r["proposals"] if p["kind"] == "issue-reopen"]
+    assert len(reopens) == janitor.REOPEN_SWEEP_CAP           # still a full cap of fresh work
+    assert not (set(p["key"] for p in reopens) & stuck)
+    assert set(r["refused"]) == stuck                          # every stuck one is still reported
 
 
 def test_nothing_is_withheld_when_the_sweep_fits_under_the_cap():

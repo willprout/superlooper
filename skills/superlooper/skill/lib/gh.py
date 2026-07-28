@@ -626,21 +626,35 @@ def sl_head_prs(limit=1000):
     return ReadHealth(prs, rh.ok and len(rh.value) < limit)
 
 
-def remote_branches_health(limit=200):
+# GitHub's REST hard maximum for `per_page`. It CLAMPS silently — ask for 200 and you get 100 rows
+# with no error and no signal — so a completeness guard written against any larger number can never
+# fire, and would report a truncated list as complete. (Verified live: a repo with hundreds of
+# branches answers `branches?per_page=200` with exactly 100.) The #165 inert-guard class: a check
+# written against a bound the server does not honor is not a check.
+REST_PAGE_MAX = 100
+
+
+def remote_branches_health(limit=REST_PAGE_MAX):
     """remote_branches() as a ReadHealth({name: tip}, ok) — the evidence column's branch half
     (issue #229). Same reasoning as sl_head_prs: absence is only evidence when the read was clean
-    AND complete, so a full page (the repo has more branches than one page holds) reads ok=False
-    rather than letting a truncated list prove a branch never existed. The janitor keeps using the
-    bare remote_branches(): there, an unreadable branch simply is not proposed, which is already
-    the safe direction."""
-    lst = _json_list_health(["api", "repos/{owner}/{repo}/branches?per_page=%d" % limit])
+    AND complete, so a FULL page (the repo has more branches than one page holds) reads ok=False
+    rather than letting a truncated list prove a branch never existed — the doctor would otherwise
+    print "nothing was ever built for it" about work sitting on a live `sl/i<N>` branch, and `sl/*`
+    sorts late alphabetically, so loop branches are exactly the ones a cut-off list loses. The
+    janitor keeps using the bare remote_branches(): there, an unreadable branch simply is not
+    proposed, which is already the safe direction.
+
+    `limit` is clamped to REST_PAGE_MAX so the guard is compared against what GitHub will ACTUALLY
+    return, never against a number it silently ignores."""
+    page = max(1, min(int(limit), REST_PAGE_MAX))
+    lst = _json_list_health(["api", "repos/{owner}/{repo}/branches?per_page=%d" % page])
     out = {}
     for b in lst.value:
         if isinstance(b, dict) and isinstance(b.get("name"), str):
             commit = b.get("commit")
             sha = commit.get("sha") if isinstance(commit, dict) else None
             out[b["name"]] = sha if isinstance(sha, str) and sha else None
-    return ReadHealth(out, lst.ok and len(lst.value) < limit)
+    return ReadHealth(out, lst.ok and len(lst.value) < page)
 
 
 def default_branch():

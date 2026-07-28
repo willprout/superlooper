@@ -567,8 +567,8 @@ def _doctor_accidental_closes():
                     if isinstance(r, dict) and r.get("stateReason") == closures.COMPLETED)
     # The window is part of the answer: an unqualified "every" is a completeness claim, and this
     # read is bounded. Say which one it is.
-    window = (f"the {len(read.value)} most recently updated closed issues; older ones were NOT "
-              "checked this run" if read.truncated else f"all {len(read.value)} closed issues")
+    window = (f"the {len(read.value)} most recently updated closed issues (older ones were NOT "
+              "checked this run)" if read.truncated else f"all {len(read.value)} closed issues")
     found = closures.flagged(read.value)
     if not found:
         print(f"  ok   {_ACCIDENTAL_CLOSE_NAME} — of {window}, every one of the {completed} "
@@ -591,8 +591,11 @@ def _doctor_accidental_closes():
               f"({f['headline'] or 'no commit subject'})")
         print(f"           {evidence}")
     if len(found) > _ACCIDENTAL_CLOSE_LIST_CAP:
-        print(f"         …and {len(found) - _ACCIDENTAL_CLOSE_LIST_CAP} more (listed in full by "
-              "`superlooper janitor --json`)")
+        # No pointer to another command here: `janitor --json` shows at most REOPEN_SWEEP_CAP of
+        # these, which is FEWER, and sending the owner somewhere thinner to see "the full list"
+        # would be a worse lie than the cap. This block is the widest view there is.
+        print(f"         …and {len(found) - _ACCIDENTAL_CLOSE_LIST_CAP} more not shown — re-run "
+              "doctor after acting on these")
     print("       `superlooper janitor` proposes reopening these, with an audit comment naming "
           f"the closing commit — nothing reopens without your y/N, and it proposes at most "
           f"{janitor_lib.REOPEN_SWEEP_CAP} per sweep.")
@@ -1585,12 +1588,16 @@ def _upkeep_janitor_view(home, cfg, dev):
     rather than rendering a reassuring empty sweep."""
     ls, _refused_map, refused_keys, err = _janitor_read_state(home, retry_refused=False)
     if err is not None:
-        return {"error": err, "proposals": [], "held": []}, {}
+        return {"error": err, "proposals": [], "held": [], "reopen_withheld": 0}, {}
     fetched = _janitor_fetch(ls)
     days = cfg["janitor"]["aged_park_days"]
     result = janitor_lib.propose(**fetched, now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)
-    return ({"error": None, "proposals": result["proposals"], "held": result["refused"]},
+    # reopen_withheld rides along because upkeep's whole job is "did I miss anything": a weekly
+    # glance that showed the capped ten and never said N more were found would be the one surface
+    # where a bounded list reads as the whole picture (issue #229).
+    return ({"error": None, "proposals": result["proposals"], "held": result["refused"],
+             "reopen_withheld": result.get("reopen_withheld") or 0},
             fetched["branches"])
 
 
