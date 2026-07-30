@@ -8,6 +8,7 @@
                   create the §C.2 label set + print branch-protection recommendations
                   (print-only in v1)
   doctor          preflight: config, required_checks (FAILS HARD when empty), gh, labels,
+                  accidental issue closes (COMPLETED with no merged PR behind it, issue #229),
                   cmux, jq, launch shim, activity hooks; --stack checks machine-level blocks
   morning-report  render reports/morning-<date>.md from the journal + notify (Task 11)
   nightly         fresh worktree of origin/<dev> -> qa.nightly_cmd -> flake/persistent triage;
@@ -23,9 +24,11 @@
                   to parked/needs-william/bounced) — manual, never automatic; never touches an
                   in-flight or mid-gate lane, so it is safe to run while the runner is live
   janitor         propose GitHub-side cleanup (stale merged/superseded sl/* branches, open
-                  `superseded` PRs, aged parked/needs-william issues) and execute ONLY what
-                  William approves (y/N or --yes) — list/--dry-run changes nothing anywhere;
-                  nothing is ever auto-closed or auto-deleted (issue #62, spec §8 V2)
+                  `superseded` PRs, aged parked/needs-william issues, and issues closed as
+                  COMPLETED by a bare commit keyword with no merged PR behind them — issue #229)
+                  and execute ONLY what William approves (y/N or --yes) — list/--dry-run changes
+                  nothing anywhere; nothing is ever auto-closed, auto-deleted or auto-reopened
+                  (issue #62, spec §8 V2)
   debug           launch ONE interactive sl-debugger session on this repo because a PERSON asked
                   (issue #144) — the attended sibling of `watchdog`'s unattended fallback. Owns the
                   d<N> id allocation and single-flight under the watchdog's own lock, composes the
@@ -60,6 +63,7 @@ for _p in (os.path.join(_HERE, "..", "lib"), _HERE):
         sys.path.insert(0, _p)
 
 import actions as actions_lib
+import closures
 import config as config_lib
 import doc_lint
 import gate
@@ -520,6 +524,84 @@ def cmd_stack_doctor(args):
     return 0
 
 
+# --- the accidental-close audit (issue #229) ----------------------------------------------------
+# On 2026-07-16 a ledger DOCUMENTATION commit whose message read "…fixes #189/#190…" auto-closed
+# #189 — an approved, priority:high, never-built fix for the previous night's draft-promotion
+# regression. The tracker said COMPLETED; worker_hook.py and gate.py were untouched; the regression
+# vector stayed open for a day while recorded as fixed, and only a hand audit found it. This block
+# is the standing version of that audit: it asks what CLOSED each issue, and names the ones whose
+# answer is "a commit message" rather than "a merged PR".
+#
+# A WARN, deliberately never a FAIL. Two reasons, and they point the same way. (1) `doctor` is also
+# the ADOPTION preflight for a foreign repo, and closing issues from commit messages is ordinary
+# practice outside this loop — failing every adopting repo's doctor over its own normal history
+# would be a false red on a healthy machine, the defect class this repo already refuses elsewhere
+# (check_engine_drift, check_superlooper_plugin). (2) Nothing here is a blocker: the loop runs fine
+# with a mis-closed issue in it; what was missing on 2026-07-16 was VISIBILITY. The evidence line
+# is what separates the two readings — an approved loop fix that was never built leaves no
+# sl/i<N> PR and no sl/i<N> branch anywhere, and the block says so per issue.
+_ACCIDENTAL_CLOSE_NAME = "accidental issue closes"
+
+
+# How many flagged issues the block prints in full before it summarizes. A repo that closes issues
+# from commit messages as a matter of course can have hundreds, and 3 lines each would bury every
+# other doctor block. The cap is STATED with the remainder, never silently applied — the count above
+# it is always the true total.
+_ACCIDENTAL_CLOSE_LIST_CAP = 20
+
+
+def _doctor_accidental_closes():
+    """Print the accidental-close audit block. Never raises and never fails the doctor — see the
+    comment above for why this is a WARN. Costs ONE GraphQL read on a clean repo, plus two list
+    reads only when something is actually flagged."""
+    read = gh.closed_issue_closers()
+    if not read.ok:
+        # refused != "nothing was accidentally closed": say which one this is, or a GitHub outage
+        # renders as a clean bill of health (the #21/#61 discipline, applied to a human-read line).
+        print(f"  WARN {_ACCIDENTAL_CLOSE_NAME} — GitHub refused the closed-issue read; could not "
+              "audit for keyword-closed issues this run. Re-run doctor.")
+        return
+    # Only COMPLETED closes are in scope, so only they may be counted as checked — a NOT_PLANNED
+    # close never claimed the work was done and inflating the number with them would overstate
+    # what the audit actually looked at.
+    completed = sum(1 for r in read.value
+                    if isinstance(r, dict) and r.get("stateReason") == closures.COMPLETED)
+    # The window is part of the answer: an unqualified "every" is a completeness claim, and this
+    # read is bounded. Say which one it is.
+    window = (f"the {len(read.value)} most recently updated closed issues (older ones were NOT "
+              "checked this run)" if read.truncated else f"all {len(read.value)} closed issues")
+    found = closures.flagged(read.value)
+    if not found:
+        print(f"  ok   {_ACCIDENTAL_CLOSE_NAME} — of {window}, every one of the {completed} "
+              "closed as COMPLETED has a merged PR or the owner's own hand behind it")
+        return
+    print(f"  WARN {_ACCIDENTAL_CLOSE_NAME} — {len(found)} of {window}: closed as COMPLETED by a "
+          "bare commit-message keyword, with no merged PR behind them; each reads as fixed while "
+          "nothing shipped:")
+    # `ok` on BOTH reads is what licenses the evidence line's strongest sentence. A refused or
+    # bound-truncated read yields the same empty list as a genuinely PR-less issue, and an
+    # unproven "nothing was ever built for it" is the very failure this block exists to catch.
+    pr_read, branch_read = gh.sl_head_prs(), gh.remote_branches_health()
+    proven = pr_read.ok and branch_read.ok
+    for f in found[:_ACCIDENTAL_CLOSE_LIST_CAP]:
+        title = f" {f['title'][:60]!r}" if f["title"] else ""
+        evidence = closures.evidence(f["num"], prs=pr_read.value,
+                                     branches=branch_read.value, proven=proven)
+        print(f"         #{f['num']}{title}")
+        print(f"           closed by commit {f['commit'][:8]} "
+              f"({f['headline'] or 'no commit subject'})")
+        print(f"           {evidence}")
+    if len(found) > _ACCIDENTAL_CLOSE_LIST_CAP:
+        # No pointer to another command here: `janitor --json` shows at most REOPEN_SWEEP_CAP of
+        # these, which is FEWER, and sending the owner somewhere thinner to see "the full list"
+        # would be a worse lie than the cap. This block is the widest view there is.
+        print(f"         …and {len(found) - _ACCIDENTAL_CLOSE_LIST_CAP} more not shown — re-run "
+              "doctor after acting on these")
+    print("       `superlooper janitor` proposes reopening these, with an audit comment naming "
+          f"the closing commit — nothing reopens without your y/N, and it proposes at most "
+          f"{janitor_lib.REOPEN_SWEEP_CAP} per sweep.")
+
+
 def cmd_doctor(args):
     if getattr(args, "stack", False):
         return cmd_stack_doctor(args)
@@ -701,6 +783,7 @@ def cmd_doctor(args):
             if not wedged and not backlog:
                 check("queue lint", True, "all %d open issues satisfy the mechanical contract"
                       % total)
+        _doctor_accidental_closes()
 
     cmux = os.environ.get("SL_CMUX", "/Applications/cmux.app/Contents/Resources/bin/cmux")
     check("cmux binary", os.path.exists(cmux), cmux)
@@ -1225,9 +1308,10 @@ def cmd_tidy(args):
 # ------------------------------- janitor -------------------------------
 # `superlooper janitor` (issue #62, spec §8 V2) PROPOSES GitHub-side cleanup and executes ONLY
 # what William approves — the same propose/approve word-discipline as tidy, pointed at GitHub
-# instead of cmux windows. Three debris classes, each with a one-line why: stale sl/* remote
-# branches whose PRs merged or were superseded, PRs labeled `superseded` left open by design
-# (§C.4 6b), and parked / needs-william issues gathering dust past janitor.aged_park_days.
+# instead of cmux windows. Four classes, each with a one-line why: stale sl/* remote branches
+# whose PRs merged or were superseded, PRs labeled `superseded` left open by design (§C.4 6b),
+# parked / needs-william issues gathering dust past janitor.aged_park_days, and — issue #229 —
+# issues closed as COMPLETED by a bare commit-message keyword, which are proposed for REOPEN.
 # The list / --dry-run changes NOTHING anywhere; approved actions run mechanically and are
 # journaled; a refused/failed action is surfaced once and held back (state/janitor_refused.json),
 # never silently retried — --retry-refused re-proposes it. There is no schedule wiring for the
@@ -1295,6 +1379,11 @@ def _janitor_fetch(ls_issues, cfg=None):
             "branch_prs": {b: gh.pr_for_branch(b) for b in sl},
             "superseded_prs": gh.open_prs_labeled(janitor_lib.SUPERSEDED_LABEL),
             "parked_issues": parked,
+            # the accidental-close audit (issue #229). ONE GraphQL read for the whole closed set,
+            # on the sweep's own schedule — nothing on the runner's per-tick path reads it. A
+            # refused read yields [] here, which proposes no reopens (fail closed); `doctor` is the
+            # surface that distinguishes "read refused" from "nothing accidentally closed".
+            "closed_issues": gh.closed_issue_closers().value,
             "lint_issues": gh.open_issues_all(),
             "areas": cfg.get("areas"),
             "touches_required": bool(cfg.get("touches_required")),
@@ -1313,6 +1402,8 @@ def _janitor_what(p):
             return f"add {p['label']} to issue #{p['target']}"
         return f"declare `touches: {p['value']}` on issue #{p['target']}"
     title = p.get("title") or ""
+    if p["kind"] == "issue-reopen":
+        return f"REOPEN issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
     return f"close issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
 
 
@@ -1339,14 +1430,20 @@ def _janitor_menu_lines(menus):
 
 def _janitor_execute(p):
     """One approved action -> (ok, reason). Mechanical verbs only — delete ref / close PR /
-    close issue / add a label / rewrite an issue body — each leaving an audit comment where a
-    comment is possible (issue #225 Boundaries: every executed fix carries its audit comment)."""
+    close issue / reopen issue / add a label / rewrite an issue body — each leaving an audit
+    comment where a comment is possible (issue #225 Boundaries: every executed fix carries its
+    audit comment)."""
     if p["action"] == "delete-branch":
         ok = gh.delete_branch(p["target"])
     elif p["action"] == "close-pr":
         ok = gh.close_pr(p["target"], comment=_JANITOR_STAMP + p["why"])
     elif p["action"] == "close-issue":
         ok = gh.close_issue(p["target"], comment=_JANITOR_STAMP + p["why"])
+    elif p["action"] == "reopen-issue":
+        # the audit comment carries the WHY, which names the closing commit — so the reopened
+        # issue explains itself to the next reader without anyone re-deriving the forensics
+        # (issue #229; the 2026-07-16 hand-reopen becomes this one tap).
+        ok = gh.reopen_issue(p["target"], comment=_JANITOR_STAMP + p["why"])
     elif p["action"] == "add-label":
         ok = gh.set_labels(p["target"], add=[p["label"]])
         if ok:
@@ -1415,11 +1512,23 @@ def _janitor_execute_subset(args, home, days, dev, cfg=None):
         print(json.dumps({"ok": False, "error": err}))
         return 1
     now = time.time()
-    # refused=set(): the holdback is applied per-key below (an explicit tap of a held key with
-    # --retry-refused must be able to run); reconcile just needs the full fresh eligibility set.
+    # The holdback is decided HERE, before the re-derivation, rather than per-key after it. It used
+    # to be applied afterwards with `refused=set()` passed to propose — harmless while every class
+    # was selected independently of `refused`, but the accidental-close class is CAPPED per sweep
+    # and skips refused keys when filling the cap (issue #229), so a propose() that disagrees with
+    # the listing about `refused` selects a DIFFERENT set of reopens. The owner then approves ten,
+    # six run, and four are reported "no longer eligible (state moved)" when nothing moved at all.
+    # One refused set, used by both the listing and this re-derivation, and the divergence is gone.
+    refused_now = set() if args.retry_refused else set(refused_map)
+    held_keys = [k for k in keys if k in refused_now]
     fresh = janitor_lib.propose(**_janitor_fetch(ls, cfg), now=now, aged_park_days=days,
-                                refused=set(), dev_branch=dev)
-    to_run, skipped = janitor_lib.reconcile([{"key": k} for k in keys], fresh["proposals"])
+                                refused=refused_now, dev_branch=dev)
+    to_run, skipped = janitor_lib.reconcile(
+        [{"key": k} for k in keys if k not in refused_now], fresh["proposals"])
+    # ...then the mutual-exclusion rule (issue #225), applied to what survived the re-derivation.
+    # Order matters: this filter must see the SAME candidate set the reconcile produced, so that a
+    # group member held back or dropped above cannot claim its group's one slot and lock out the
+    # member that is actually eligible.
     claimed, exclusive = set(), []
     for p in to_run:
         group = p.get("choose_group")
@@ -1438,26 +1547,23 @@ def _janitor_execute_subset(args, home, days, dev, cfg=None):
                                    "request — these are mutually exclusive, one may run"
                                    if p.get("_exclusive") else
                                    "no longer eligible (state moved, or not a current proposal)")})
+    for k in held_keys:
+        # held back from a prior failure — an explicit tap does not silently retry it; the owner
+        # must ask for a retry (parity with the CLI's --retry-refused holdback).
+        results.append({"key": k, "outcome": "held",
+                        "reason": "held back from a prior failure — retry to act"})
     if getattr(args, "dry_run", False):
         # --dry-run wins over --execute-keys: report what WOULD run, write NOTHING (no gh write, no
         # journal, no refused-map save) — the CLI's documented "change nothing" contract holds even
         # when a subset was named. (Not a path the command center takes; a CLI-only safety net.)
         for p in to_run:
-            outcome = ("held" if (p["key"] in refused_map and not args.retry_refused)
-                       else "would-run")
             results.append({"key": p["key"], "action": p["action"], "target": p["target"],
-                            "outcome": outcome})
+                            "outcome": "would-run"})
         print(json.dumps({"ok": True, "results": results, "executed": 0, "failed": 0,
                           "skipped": sum(1 for r in results if r["outcome"] == "skipped"),
                           "held": sum(1 for r in results if r["outcome"] == "held")}))
         return 0
     for p in to_run:
-        if p["key"] in refused_map and not args.retry_refused:
-            # held back from a prior failure — an explicit tap does not silently retry it; the
-            # owner must ask for a retry (parity with the CLI's --retry-refused holdback).
-            results.append({"key": p["key"], "outcome": "held",
-                            "reason": "held back from a prior failure — retry to act"})
-            continue
         ok, reason = _janitor_execute(p)
         journal.append(home, {"act": "janitor", "action": p["action"], "target": p["target"],
                               "why": p["why"], "outcome": "ok" if ok else "fail",
@@ -1502,21 +1608,29 @@ def cmd_janitor(args):
                                  refused=refused_keys, dev_branch=dev)
     props, held = result["proposals"], result["refused"]
     bulk, menus = _janitor_split_menus(props)
+    withheld = result.get("reopen_withheld") or 0
 
     if getattr(args, "json", False):
         # machine-readable propose: the full snapshot, one JSON object, and NOTHING is executed
         # or written. The command center renders this exactly the way `--dry-run` prints for a
         # human — same pure propose(), no re-derived safety anywhere.
         print(json.dumps({"ok": True, "proposals": props, "held": held,
-                          "aged_park_days": days}))
+                          "aged_park_days": days, "reopen_withheld": withheld}))
         return 0
 
     held_note = (f"({len(held)} previously refused action(s) held back — --retry-refused "
                  f"re-proposes them; see state/{_REFUSED_FILE})" if held else "")
+    # A cap that is not SAID reads as "there was nothing else" — the same over-claim the
+    # accidental-close audit exists to stop (issue #229). Say what was left out and why.
+    withheld_note = (f"({withheld} more keyword-closed issue(s) were found and NOT proposed this "
+                     f"sweep — at most {janitor_lib.REOPEN_SWEEP_CAP} reopens per sweep; "
+                     f"`superlooper doctor` lists them all and a later sweep proposes the rest)"
+                     if withheld else "")
 
     if not props:
         print("janitor: nothing to propose — no GitHub-side debris found."
-              + (" " + held_note if held_note else ""))
+              + (" " + held_note if held_note else "")
+              + (" " + withheld_note if withheld_note else ""))
         return 0
 
     print(f"janitor proposals ({len(props)}) — nothing executes without your approval:")
@@ -1529,6 +1643,8 @@ def cmd_janitor(args):
             print(line)
     if held_note:
         print(held_note)
+    if withheld_note:
+        print(withheld_note)
     if args.dry_run:
         print("dry-run: nothing executed, nothing written.")
         return 0
@@ -1552,8 +1668,19 @@ def cmd_janitor(args):
         print("janitor: state/issues.json became unreadable during the wait — refusing to "
               "execute (nothing is provably idle anymore).", file=sys.stderr)
         return 1
+    # The SAME refused set the listing used. A key held back there was never proposed and so was
+    # never approved, so nothing changes for the three tidy classes — but the accidental-close
+    # class fills its per-sweep cap from the non-refused ones (issue #229), so a re-derivation that
+    # disagreed about `refused` would select different reopens and then skip the owner's approved
+    # ones as "state moved during the wait" when nothing moved.
+    #
+    # What is reconciled is `bulk`, NOT `props` (issue #225): the y/N above offered only the
+    # bulk-approvable proposals, and the grouped alternatives were printed as choices requiring an
+    # explicit `--execute-keys` tap. Passing the full `props` here would let one "y" execute every
+    # member of a `type:` menu at once — manufacturing the `type_duplicate` defect the menu exists
+    # to fix, off an approval the owner was never shown.
     fresh = janitor_lib.propose(**_janitor_fetch(ls2, cfg), now=time.time(), aged_park_days=days,
-                                refused=set(), dev_branch=dev)
+                                refused=refused_keys, dev_branch=dev)
     to_run, skipped = janitor_lib.reconcile(bulk, fresh["proposals"])
     now = time.time()
     executed = failed = 0
@@ -1614,12 +1741,16 @@ def _upkeep_janitor_view(home, cfg, dev):
     rather than rendering a reassuring empty sweep."""
     ls, _refused_map, refused_keys, err = _janitor_read_state(home, retry_refused=False)
     if err is not None:
-        return {"error": err, "proposals": [], "held": []}, {}
+        return {"error": err, "proposals": [], "held": [], "reopen_withheld": 0}, {}
     fetched = _janitor_fetch(ls)
     days = cfg["janitor"]["aged_park_days"]
     result = janitor_lib.propose(**fetched, now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)
-    return ({"error": None, "proposals": result["proposals"], "held": result["refused"]},
+    # reopen_withheld rides along because upkeep's whole job is "did I miss anything": a weekly
+    # glance that showed the capped ten and never said N more were found would be the one surface
+    # where a bounded list reads as the whole picture (issue #229).
+    return ({"error": None, "proposals": result["proposals"], "held": result["refused"],
+             "reopen_withheld": result.get("reopen_withheld") or 0},
             fetched["branches"])
 
 

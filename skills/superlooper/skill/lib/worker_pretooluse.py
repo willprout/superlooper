@@ -32,7 +32,12 @@ worker-scoped and left the question open; the ruling closed it — the watchdog'
 unattended too, so both hazards apply to it as well. Each id the loop's launchers can produce gets
 its OWN AskUserQuestion fallback (_ROLES):
 
-  * `i<N>` WORKER   -> write state/blocked/<id>; the runner acts on that file, and only for `i<N>`.
+  * `i<N>` WORKER   -> write state/blocked/<id> in QUESTION/OPTIONS/RECOMMENDATION form, COMMIT AND
+                       PUSH the WIP, END the session. The runner acts on that file — and only for
+                       `i<N>` — by posting the question durably and closing the window; a FRESH
+                       session resumes the issue later with the owner's answer in its brief (#163),
+                       reusing the PRESERVED worktree. No session is nudged awake to answer it, and
+                       none is answered in place.
   * `d<N>` DEBUGGER -> the memo under <state home>/reports/ plus the notify that EVERY unattended
                        sl-debugger run ends with (plugin/skills/sl-debugger/references/
                        unattended-contract.md). Never the worker's blocked file: nothing reads one
@@ -112,10 +117,49 @@ _ASK_PREFIX = ("AskUserQuestion is forbidden in an unattended superlooper %s ses
 
 
 def _worker_ask_reason(state_home, issue_id):
+    # HELD TO THE LIVE CONTRACT (issue #230). This text reaches the model VERBATIM at the instant it
+    # errs, so a stale sentence here is not a doc bug — the worker ACTS on it. Three drifts the
+    # 2026-07-16 first-prompt audit found in the original #156 wording, each fixed here:
+    #   * it promised "a fresh answerer replies into this session" — nobody does. #163 replaced that
+    #     shape (the runner posts the question durably and CLOSES the window; a FRESH session resumes
+    #     with the answer in its brief) and #194 retired the answerer seat outright. A worker holding
+    #     the old model waits in a closing window for a reply that never comes — the i280 stall the
+    #     deny exists to prevent, re-entered through the deny's own words.
+    #   * it said "write ... and end your turn", omitting the COMMIT AND PUSH the footer requires, so
+    #     obeying it verbatim ended the session with this checkout holding the only copy of the work
+    #     (the i153/i163 loss #190 fences). State the push's reason CAREFULLY: the resume does NOT
+    #     depend on it — _exec_post_question tears down with remove_worktree=False and
+    #     launch-session.sh only creates a worktree when none exists, so the relaunch reuses the
+    #     PRESERVED WIP, uncommitted files included. Telling a worker its unpushed work is
+    #     unrecoverable would be a NEW falsehood in the same class this issue removes, and a costly
+    #     one: a worker whose push fails would then refuse to end the session (the i280 stall) or
+    #     reach for something the bright lines forbid. The push is a SECOND copy, which is what the
+    #     runner's own docstring claims ("no live window is the only copy") and what #190's guard
+    #     reads to decide a checkout is safe to reclaim. Name what the push buys with the same care:
+    #     it is a copy OFF THIS MACHINE, not off this checkout. A worktree shares the repo's object
+    #     database, so once the work is COMMITTED the branch ref already carries it (gitops: "The
+    #     branch itself is untouched ... only the checkout dies") and launch-session.sh's
+    #     `worktree add "$WT" "$BRANCH"` fallback re-attaches it. Saying the push is the last chance
+    #     to escape "this one checkout" would be the same over-claim one step smaller.
+    #   * its assumption hint named the PR body ALONE, which an `investigate` worker cannot use —
+    #     it opens zero PRs, and brief.py (_ASSUME_INVESTIGATE) special-cases the hint for exactly
+    #     that. The hook cannot see the issue type (no launcher exports one, and inventing that
+    #     plumbing is a behavior change this text fix does not need), so the hint is type-NEUTRAL:
+    #     it offers both deliverables and lets the worker pick the one its brief gave it.
     return _ASK_PREFIX % "worker" + (
-        "Instead write your single, specific question to %s and end your turn — a fresh answerer "
-        "replies into this session. If you can safely proceed on one reasonable assumption, prefer "
-        "stating it in the PR body over blocking." % _blocked_path(state_home, issue_id))
+        "Use the durable protocol instead: write your single, specific question to %s as three "
+        "parts — `QUESTION:` the one decision, `OPTIONS:` the choices you see, `RECOMMENDATION:` "
+        "the one you would take if forced — then COMMIT AND PUSH your work-in-progress on this "
+        "issue's branch (`git push -u origin HEAD`) and END the session. The runner then posts your "
+        "question as a durable comment on the issue, closes this window and releases the lane, and "
+        "a FRESH session resumes the issue with the owner's answer in its brief, reusing this "
+        "worktree's work-in-progress. Push before you end anyway: the runner is what closes this "
+        "window, so the push is your last chance to put the work anywhere but this machine. "
+        "You get at most TWO questions on one issue — a third hands the issue to the "
+        "owner as a scoping problem instead of resuming you — so if you can safely proceed on one "
+        "reasonable assumption, prefer stating it in your deliverable (the PR body, or your "
+        "root-cause report if this issue opens no PR) over blocking."
+        % _blocked_path(state_home, issue_id))
 
 
 def _debugger_ask_reason(state_home, issue_id):
