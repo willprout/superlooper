@@ -277,6 +277,26 @@ def _enrich_repo(path, airline=None):
     lanes = body.get("lanes")
     entry["lanes"] = lanes if (_is_int(lanes) and lanes >= 1) else None
 
+    # The repo's TERRITORY contract (issue #225): which area names it declares, and whether a
+    # merge-producing issue must declare `touches:` at all. The departures board needs both to say
+    # INVALID about an issue the runner would park — without them it keeps showing such an issue as
+    # waiting its turn, which is exactly how 16 unlaunchable issues sat unnoticed until the
+    # 2026-07-16 audit.
+    #
+    # Same honest-fallback posture as `lanes` above, and for a sharper reason: these drive a VERDICT
+    # about someone's issue, so an invented value is not merely a wrong number on screen. Absent or
+    # unreadable `areas` records None (the board then judges no area name), and an absent or
+    # unreadable `touches_required` records False (the board then demands no declaration) — the
+    # direction that can only ever accuse LESS. The ENGINE's own default is the opposite (it
+    # enforces on a garbled config), and rightly so: it knows it is looking at its own adopted repo,
+    # where a corrupt knob must not silently launch an undeclared issue. The dashboard is a
+    # renderer; guessing `True` for a repo that never said so would paint every issue in it
+    # PAPERWORK, a board-wide false alarm.
+    areas = body.get("areas")
+    entry["areas"] = areas if isinstance(areas, dict) else None
+    tr = body.get("touches_required")
+    entry["touches_required"] = tr if isinstance(tr, bool) else False
+
     entry["state_home"] = state_home(slug)
     return entry
 

@@ -12,6 +12,23 @@ shipped behind it. This module only ever PROPOSES; acting on a proposal is Willi
 `agent-ready` (the same propose/approve split as tidy). Nothing is ever auto-closed, auto-deleted
 or auto-reopened.
 
+A fifth kind joined them on the owner's amendment of 2026-07-17 (issue #225): **metadata repair**
+for a mechanically-invalid issue — one the runner can never launch for want of a `type:` label or a
+parseable `## Loop metadata`. The 2026-07-16 audit found 25 of 35 open issues in that state and
+they were repaired by hand, once; his ruling was that the janitor's existing propose/approve
+contract fits the fix exactly, "so the manual batch-repair run becomes a janitor tap, never a hand
+job again."
+
+That kind carries one rule the other three did not need: **the janitor never invents a value.**
+Which KIND an issue is, and which TERRITORY it touches, are judgment calls — and there is no
+standing LLM seat to make them (the constitution's first bright line), nor should there be. So the
+sweep never guesses. It offers the closed set of values the repo ITSELF declares — the three type
+kinds, the repo's own `areas` — as mutually-exclusive ALTERNATIVES sharing a `choose_group`, and
+the owner's tap picks one. The CLI's bulk `y/N` path must never execute a grouped alternative (it
+would apply all three type labels and manufacture the very `type_duplicate` it was fixing); only an
+explicit per-key tap does. The ONE ungrouped metadata fix is the case where nothing is being chosen
+at all: the author already wrote the `touches:` value and only the heading above it is missing.
+
 Safety, stated as code below and pinned by tests:
   * A branch is proposed ONLY when its work provably landed or was provably replaced: its PR
     MERGED, or its PR CLOSED and labeled `superseded`. A branch with no PR, a refused PR lookup,
@@ -39,6 +56,7 @@ import time
 
 import actions
 import closures
+import queue_lint
 
 BRANCH_PREFIX = "sl/"
 # The label the runner leaves on a PR replaced by a rebuild (§C.4 6b) and the park-family labels
@@ -124,9 +142,68 @@ def _pr_int(v):
     return v if type(v) is int and v > 0 else None
 
 
+def _metadata_proposals(lint_issues, areas, touches_required, ex_nums):
+    """The metadata-repair proposals for one sweep (issue #225), sorted by issue then key.
+
+    A proposal is emitted ONLY for a defect whose repair is a value the janitor did not invent:
+
+      * a missing `type:` label            -> one `add-label` alternative per KIND (a menu)
+      * a missing/undeclared `touches:`    -> one `set-body` alternative per DECLARED AREA, plus
+                                              the explicit-unknown-scope `*` (a menu)
+      * a `touches:` line the parser misses -> ONE determined `set-body` fix, ungrouped, because
+                                              the author already wrote the value
+
+    Everything else is named by `doctor --repo` and left alone. Two `type:` labels: which one to
+    remove is the owner's call, and the janitor has no verb that could be right. An UNDECLARED area
+    name (`touches: plugin` in a repo with no `plugin` area) likewise — and there the reason is
+    sharper than judgment. The correct repair may well be to add that area to
+    `.superlooper/config.json`, which is a bright-line file no automatic path may write. Offering
+    to overwrite the author's declaration instead would be the janitor picking the OTHER answer,
+    silently, by deleting words it did not write.
+
+    Each `set-body` alternative carries the EXACT body it would write, computed here — nothing is
+    re-derived at execute time, so what the owner approves is what lands (and reconcile's fresh
+    re-derivation recomputes it against the CURRENT body, so a mid-wait edit is never clobbered
+    with a stale one)."""
+    out = []
+    for iss in lint_issues if isinstance(lint_issues, list) else []:
+        num = _pr_int(iss.get("number")) if isinstance(iss, dict) else None
+        if num is None or num in ex_nums:
+            continue
+        body = iss.get("body") if isinstance(iss.get("body"), str) else ""
+        title = iss.get("title") if isinstance(iss.get("title"), str) else ""
+        for d in queue_lint.lint_issue(iss, areas=areas, touches_required=touches_required):
+            code, why = d["code"], queue_lint.describe(d)
+            if code == "type_missing":
+                for kind in d["choices"]:
+                    label = "type:%s" % kind
+                    out.append({"kind": "metadata", "key": "meta:%d:type=%s" % (num, label),
+                                "action": "add-label", "target": num, "title": title,
+                                "label": label, "choose_group": "issue:%d:type" % num,
+                                "why": why})
+            elif code == "touches_outside_section":
+                new_body = queue_lint.with_touches(body, d["choices"][0] if d["choices"] else "")
+                if new_body is None or new_body == body:
+                    continue
+                out.append({"kind": "metadata", "key": "meta:%d:metadata-section" % num,
+                            "action": "set-body", "target": num, "title": title,
+                            "value": d["choices"][0], "choose_group": None,
+                            "body": new_body, "why": why})
+            elif code == "touches_missing":
+                for area in d["choices"]:
+                    new_body = queue_lint.with_touches(body, area)
+                    if new_body is None or new_body == body:
+                        continue
+                    out.append({"kind": "metadata", "key": "meta:%d:touches=%s" % (num, area),
+                                "action": "set-body", "target": num, "title": title,
+                                "value": area, "choose_group": "issue:%d:touches" % num,
+                                "body": new_body, "why": why})
+    return sorted(out, key=lambda p: (p["target"], p["key"]))
+
+
 def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
             now, aged_park_days, refused=frozenset(), dev_branch="main",
-            closed_issues=()):
+            closed_issues=(), lint_issues=None, areas=None, touches_required=False):
     """The full proposal list for one sweep, grouped branches -> PRs -> issues -> reopens, each
     sorted
     (deterministic; no input mutated). Returns {"proposals": [...], "refused": [...]} where
@@ -151,12 +228,23 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
                     (issue #229). Optional (defaults to nothing proposed) so a caller that never
                     fetched them, or a GitHub blip that fails the read closed, simply proposes no
                     reopens.
+    lint_issues     raw gh dicts for EVERY open issue (gh.open_issues_all) — the metadata-repair
+                    input (#225). Omitted or wrong-typed -> no metadata proposals at all, which is
+                    exactly the pre-#225 sweep: a menu built on an unread issue list is a menu
+                    built on nothing.
+    areas           the repo's declared `areas` (name -> globs), or None when unknown.
+    touches_required the repo's own knob. Defaults FALSE here, unlike the ENGINE's enforce-on-
+                    garbage posture: the runner knows it is looking at its own adopted repo, while
+                    a caller that forgets to pass this must propose FEWER edits, never more.
 
     Each proposal: {"kind", "key", "action", "target", "why"} (+ "head" for PRs, "title" for
-    issues and reopens, "commit" for reopens) — `key` is the stable identity ("branch:<name>" /
-    "pr:<num>" / "issue:<num>" / "reopen:<num>") the refused map and reconcile() work in. A
-    close and a reopen of the SAME issue number are deliberately different keys: they are
-    opposite actions and must never conflate in the refused map or a per-key tap."""
+    issues, reopens and metadata, "commit" for reopens, "label"/"value"/"body"/"choose_group" for
+    metadata) — `key` is the stable identity ("branch:<name>" / "pr:<num>" / "issue:<num>" /
+    "reopen:<num>" / "meta:<num>:<what>") the refused map and reconcile() work in. A close and a
+    reopen of the SAME issue number are deliberately different keys: they are opposite actions and
+    must never conflate in the refused map or a per-key tap. A non-null `choose_group` marks
+    mutually-exclusive ALTERNATIVES: at most one member of a group may ever execute, and never
+    from a bulk approval."""
     if not isinstance(ls_issues, dict):
         # the exclusion source is unreadable: nothing is provably idle, so the whole sweep
         # fails closed — no proposals at all, whatever the candidates' own evidence says.
@@ -303,6 +391,15 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
         seen_reopens.add(num)
         emit({"kind": "issue-reopen", "key": f"reopen:{num}", "action": "reopen-issue",
               "target": num, "title": f["title"], "commit": f["commit"], "why": f["why"]})
+
+    # --- mechanically-invalid issues: the metadata the runner cannot launch without (issue #225) ---
+    # `seen_issues` joins the exclusions here for the same reason it bounds the reopens above: an
+    # issue this very sweep proposes CLOSING as aged debris must not also be offered a paperwork
+    # repair. Approving both would file a fix onto an issue the owner just closed — two
+    # contradictory actions in one menu, which is the shape #229's own close/reopen guard exists
+    # to prevent.
+    for p in _metadata_proposals(lint_issues, areas, touches_required, ex_nums | seen_issues):
+        emit(p)
 
     return {"proposals": proposals, "refused": sorted(p["key"] for p in held),
             "reopen_withheld": withheld}

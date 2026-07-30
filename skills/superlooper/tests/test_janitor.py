@@ -586,3 +586,161 @@ def test_parse_epoch_roundtrips_github_timestamps():
                                  "2027-01-15T00:00:00+02:00"])
 def test_parse_epoch_fails_closed_to_none(bad):
     assert janitor.parse_epoch(bad) is None
+
+
+# --------------------------- metadata repair (issue #225) ---------------------------
+# The owner's amendment of 2026-07-17: remediation for a mechanically-invalid issue belongs to the
+# JANITOR, because its existing propose/approve contract fits a metadata fix exactly — "so the
+# manual batch-repair run on 2026-07-16 becomes a janitor tap, never a hand job again."
+#
+# The rule that keeps this honest: **the janitor never invents a value.** Which KIND an issue is,
+# and which TERRITORY it touches, are judgment — so the sweep does not guess one. It offers the
+# closed set of values the repo itself declares as mutually-exclusive ALTERNATIVES, and the owner's
+# tap picks one. A bulk `--yes` can therefore never apply two of them (which would create the very
+# `type_duplicate` defect it was fixing); only an explicit per-key tap executes an alternative.
+
+_AREAS = {"engine": ["skills/**"], "dashboard": ["dashboard/**"]}
+_META = "## Loop metadata\ntouches: engine\n"
+
+
+def _open_issue(num, labels=(), body=_META, title="An issue"):
+    return {"number": num, "title": title, "body": body,
+            "labels": [{"name": n} for n in labels], "updatedAt": _iso(NOW)}
+
+
+def _meta_propose(issues, **kw):
+    kw.setdefault("areas", _AREAS)
+    kw.setdefault("touches_required", True)
+    return propose(lint_issues=issues, **kw)["proposals"]
+
+
+def _of_kind(props, kind="metadata"):
+    return [p for p in props if p["kind"] == kind]
+
+
+def test_a_valid_issue_earns_no_metadata_proposal():
+    assert _of_kind(_meta_propose([_open_issue(5, ["type:build"])])) == []
+
+
+def test_a_missing_type_label_offers_one_alternative_per_KIND_and_never_picks_one():
+    props = _of_kind(_meta_propose([_open_issue(5, ["needs-owner"])]))
+    assert {p["label"] for p in props} == {"type:build", "type:investigate",
+                                           "type:diagnose-and-fix"}
+    assert {p["action"] for p in props} == {"add-label"}
+    assert {p["choose_group"] for p in props} == {"issue:5:type"}
+    assert all(p["target"] == 5 for p in props)
+    assert all(p["key"].startswith("meta:5:type=") for p in props)
+
+
+def test_a_missing_touches_offers_one_alternative_per_DECLARED_AREA_plus_the_wildcard():
+    props = _of_kind(_meta_propose([_open_issue(5, ["type:build"], body="## Goal\nship it\n")]))
+    assert {p["value"] for p in props} == {"engine", "dashboard", "*"}
+    assert {p["action"] for p in props} == {"set-body"}
+    assert {p["choose_group"] for p in props} == {"issue:5:touches"}
+    # every alternative carries the EXACT body it would write — nothing is derived at execute time
+    for p in props:
+        assert "## Loop metadata" in p["body"] and p["value"] in p["body"]
+
+
+def test_a_bare_touches_line_is_the_ONE_fix_with_no_choice_to_make():
+    # The author already wrote the value; only the heading that makes it parseable is missing. So
+    # this is a single determined proposal, not a menu — and it is ungrouped, which means a bulk
+    # `--yes` may execute it.
+    props = _of_kind(_meta_propose([_open_issue(5, ["type:build"],
+                                           body="## Goal\nship it\n\ntouches: engine\n")]))
+    assert len(props) == 1
+    assert props[0]["action"] == "set-body" and props[0].get("choose_group") is None
+    assert props[0]["body"] == "## Goal\nship it\n\n## Loop metadata\ntouches: engine\n"
+
+
+def test_an_undeclared_area_is_named_by_doctor_but_never_repaired_here():
+    # The correct fix may well be to DECLARE that area in `.superlooper/config.json` — a
+    # bright-line file no automatic path may write. Offering to overwrite the author's declaration
+    # instead would be the janitor picking the other answer silently, by deleting words it did not
+    # write. So it proposes nothing, and the lint still names it everywhere else.
+    assert _of_kind(_meta_propose([_open_issue(5, ["type:build"],
+                                          body="## Loop metadata\ntouches: plugin\n")])) == []
+
+
+def test_every_proposal_says_WHY_in_the_words_the_lint_used():
+    props = _of_kind(_meta_propose([_open_issue(5, ["needs-owner"])]))
+    assert all("type:" in p["why"] for p in props)
+
+
+def test_a_type_defect_with_no_mechanical_answer_is_never_proposed():
+    # Two `type:` labels: which one to remove is the owner's call and the janitor has no verb that
+    # could be right, so it proposes nothing rather than guessing. (doctor still NAMES it.)
+    assert _of_kind(_meta_propose([_open_issue(5, ["type:build", "type:investigate"])])) == []
+
+
+def test_nothing_is_proposed_when_the_repo_declares_no_areas():
+    # With no declared vocabulary there is no value the janitor may offer, so the touches menu is
+    # empty rather than invented. The TYPE menu is superlooper's own closed set and still stands.
+    props = _of_kind(_meta_propose([_open_issue(5, ["type:build"], body="## Goal\nx\n")], areas=None))
+    assert props == []
+    assert _of_kind(_meta_propose([_open_issue(5, ["needs-owner"])], areas=None))
+
+
+def test_an_in_flight_issue_is_never_touched():
+    # Same exclusion as every other proposal kind: a lane that is building or mid-gate is off
+    # limits, whichever record survives.
+    ls = {"i5": {"status": "running", "branch": "sl/i5-x"}}
+    assert _of_kind(_meta_propose([_open_issue(5, ["needs-owner"])], ls_issues=ls)) == []
+
+
+def test_a_closed_or_wrong_typed_issue_is_skipped_not_raised_on():
+    props = _of_kind(_meta_propose([None, "nonsense", {"number": None}, 42]))
+    assert props == []
+
+
+def test_metadata_proposals_are_deterministic():
+    a = _of_kind(_meta_propose([_open_issue(5, ["needs-owner"]), _open_issue(3, ["needs-owner"])]))
+    b = _of_kind(_meta_propose([_open_issue(3, ["needs-owner"]), _open_issue(5, ["needs-owner"])]))
+    assert [p["key"] for p in a] == [p["key"] for p in b]
+
+
+def test_a_previously_refused_metadata_key_is_held_back_like_any_other():
+    res = propose(lint_issues=[_open_issue(5, ["needs-owner"])], areas=_AREAS, touches_required=True,
+                  refused={"meta:5:type=type:build"})
+    assert "meta:5:type=type:build" in res["refused"]
+    assert "meta:5:type=type:build" not in {p["key"] for p in res["proposals"]}
+
+
+def test_the_sweep_without_lint_inputs_is_exactly_the_pre_225_sweep():
+    # An older caller (or one that could not read the issue list) proposes no metadata fixes at all
+    # rather than a menu built on nothing.
+    assert _of_kind(propose()["proposals"]) == []
+
+
+def test_a_repo_that_does_not_require_touches_gets_no_touches_menu():
+    props = _of_kind(_meta_propose([_open_issue(5, ["type:build"], body="## Goal\nx\n")],
+                                   touches_required=False))
+    assert props == []
+
+
+def test_an_issue_this_sweep_proposes_CLOSING_is_never_also_offered_a_metadata_repair():
+    # The two classes met when #225 merged with #229's reopen class, and they can contradict: an
+    # aged parked issue is proposed for CLOSING, and the same issue (parked precisely because
+    # nobody could launch it) is exactly the shape the metadata lint flags. Offering both in one
+    # menu invites the owner to approve a paperwork fix onto an issue he just closed — the same
+    # contradictory pair #229's own close/reopen guard exists to prevent.
+    aged = _issue(9, ("parked",), NOW - 21 * DAY)
+    res = propose(parked_issues=[aged],
+                  lint_issues=[_open_issue(9, ["parked"], body="## Goal\nno metadata\n")],
+                  areas=_AREAS, touches_required=True)
+    keys = [p["key"] for p in res["proposals"]]
+    assert keys == ["issue:9"]                       # the close, and ONLY the close
+    assert not [k for k in keys if k.startswith("meta:9:")]
+
+
+def test_a_metadata_repair_still_stands_for_an_issue_the_sweep_leaves_alone():
+    # The guard above must bound itself to issues actually proposed for closing — a FRESH parked
+    # issue is not proposed for close, so its paperwork fix is still on offer. (Without this, the
+    # exclusion could quietly swallow the whole class for parked issues, which is most of them.)
+    fresh = _issue(9, ("parked",), NOW - 2 * DAY)
+    res = propose(parked_issues=[fresh],
+                  lint_issues=[_open_issue(9, ["parked"], body="## Goal\nno metadata\n")],
+                  areas=_AREAS, touches_required=True)
+    keys = [p["key"] for p in res["proposals"]]
+    assert "issue:9" not in keys                     # too fresh to close
+    assert [k for k in keys if k.startswith("meta:9:")]

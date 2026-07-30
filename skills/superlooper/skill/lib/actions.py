@@ -102,6 +102,7 @@ import events as events_mod
 import evidence
 import gate
 import issues as issues_mod
+import queue_lint
 import scheduler
 
 # Staleness / cap constants. The caps that PARK are deliberately small (park is cheap and safe:
@@ -2415,13 +2416,38 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         branch = ist_of(iid).get("branch")
         return branch if isinstance(branch, str) and branch.strip() else brief.branch_for(parsed_by_id[iid])
 
+    def _queue_invalid(iid, p, ist):
+        """The refusal, SAID (issue #225). An approved issue whose labels or `## Loop metadata` fail
+        the mechanical contract is dropped by issues.eligible before the scheduler ever sees it — so
+        for as long as it sits there it LOOKS like work waiting its turn. The 2026-07-16 audit found
+        16 `agent-ready` issues in exactly that state at once, and the owner discovered it only by
+        noticing an expedited issue last on the departures board.
+
+        Journal-only, deliberately: no park, no notify, no label move. The queue is untouched and
+        the issue launches the tick its metadata is fixed. Deduped on the defect SIGNATURE rather
+        than a bare flag, so the same complaint is made ONCE while a CHANGED complaint — a half-fix
+        that traded one defect for another — speaks up again instead of inheriting the old silence.
+
+        An issue that only fails the AREA-NAME check is still journaled even though it launches:
+        the runner never validates area names, so nothing else would say it until the gate reads
+        that diff as an out-of-lane wander, hours later and one PR too late."""
+        defects = queue_lint.lint_parsed(p, areas=cfg.get("areas") if isinstance(cfg, dict) else None,
+                                         touches_required=_touches_required(cfg))
+        sig = queue_lint.signature(defects)
+        if not defects or ist.get("queue_invalid_signature") == sig:
+            return
+        out.append({"act": "queue_invalid", "id": iid, "num": p.get("num"), "signature": sig,
+                    "blocks_launch": queue_lint.blocking(defects),
+                    "reason": "; ".join(queue_lint.describe(d) for d in defects)})
+
     if not gh_stale and not issue_state_corrupt_for_launches and not launches_held:
         candidates = []
         for iid, p, ist in _eligible_launch_ids():
             if _needs_touches(p):
                 park(iid, p.get("num"), _touches_required_memo(p.get("num")),
                      needs_william=True, cause="touches_missing")
-                continue
+                continue                 # the park already SAYS this one, with a memo and a notify
+            _queue_invalid(iid, p, ist)
             candidates.append(dict(p, requeue_front=bool(ist.get("requeue_front"))))
         claims = territory_claims_from(issues_state)
         selected_ids = set()

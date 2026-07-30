@@ -80,6 +80,7 @@ import ledger as ledger_lib
 import loopstate
 import nightly as nightly_lib
 import notify
+import queue_lint
 import report
 import stack_doctor
 import tidy as tidy_lib
@@ -733,7 +734,58 @@ def cmd_doctor(args):
             if not (unreported or dev_gap or pr_gap):
                 print("  ok   required_checks names — every name reports on its expected surface(s)")
 
+    # Issue #225: the queue lint — the 2026-07-16 audit, made runnable. It found 25 of 35 open
+    # issues mechanically unschedulable (16 of them `agent-ready`) for want of a `type:` label or a
+    # parseable `## Loop metadata`, and the owner discovered it only by noticing an expedited issue
+    # sitting last on the departures board. Nothing is edited here: the lint REPORTS, remediation is
+    # the janitor's propose/approve path (issue Boundaries).
+    #
+    # The red/amber split is the honest one. An APPROVED issue that can never launch is a live
+    # wedge — the owner has said go and nothing will ever happen — so it FAILS. Every other open
+    # issue with a defect is backlog hygiene: named with its exact fix, but not a broken stack, so
+    # it WARNs and the doctor still passes. And an issue whose only defect does not stop a launch
+    # (an area name the repo never declared) never turns the doctor red, whatever its labels: the
+    # runner launches it, and the gate is what eventually reads that diff as out-of-lane.
     if cfg is not None and gh_ok:
+        open_issues = gh.open_issues_all()
+        areas = cfg.get("areas")
+        touches_required = cfg.get("touches_required")
+        wedged, backlog = [], []
+        for iss in open_issues:
+            defects = queue_lint.lint_issue(iss, areas=areas, touches_required=touches_required)
+            if not defects:
+                continue
+            num = iss.get("number")
+            title = iss.get("title") if isinstance(iss.get("title"), str) else ""
+            head = "#%s %s" % (num, (title[:60] + "…") if len(title) > 61 else title)
+            lines = ["    %s" % head] + ["      - " + queue_lint.describe(d) for d in defects]
+            # The engine's own label reader, not an inline set comprehension: some gh queries
+            # return labels as bare strings, and under that shape the inline version read NO
+            # labels — quietly demoting a genuine `agent-ready` wedge from FAIL to WARN and
+            # letting `doctor` exit 0 on a queue that cannot launch (fresh-agent review).
+            approved = "agent-ready" in issues_lib._label_names(iss)
+            (wedged if (approved and queue_lint.blocking(defects)) else backlog).append(lines)
+        if not open_issues:
+            # A refused list read and a spotless repo look identical from here, so say neither.
+            print("  WARN queue lint — no open issues were readable; the queue could not be "
+                  "audited (re-run once gh answers).")
+        else:
+            total = len(open_issues)
+            if wedged:
+                check("queue lint", False,
+                      "%d APPROVED issue(s) can never launch as written (of %d open) — "
+                      "`agent-ready` is on and the runner will never take them:"
+                      % (len(wedged), total))
+                for block in wedged:
+                    print("\n".join(block))
+            if backlog:
+                print("  WARN queue lint — %d open issue(s) of %d would not launch as written "
+                      "(none approved yet, so nothing is stuck today):" % (len(backlog), total))
+                for block in backlog:
+                    print("\n".join(block))
+            if not wedged and not backlog:
+                check("queue lint", True, "all %d open issues satisfy the mechanical contract"
+                      % total)
         _doctor_accidental_closes()
 
     cmux = os.environ.get("SL_CMUX", "/Applications/cmux.app/Contents/Resources/bin/cmux")
@@ -1312,15 +1364,20 @@ def _janitor_refused_read(path):
     return v if isinstance(v, dict) else None
 
 
-def _janitor_fetch(ls_issues):
+def _janitor_fetch(ls_issues, cfg=None):
     """One fetched snapshot of everything janitor.propose selects from. Every gh read fails
     closed to empty, so a GitHub blip shrinks the sweep toward proposing NOTHING, never toward
-    proposing more."""
+    proposing more.
+
+    `cfg` carries the repo's territory contract for the metadata sweep (issue #225). Omitted, the
+    metadata kind stands down entirely — a fix menu built on an unread config would be a menu built
+    on nothing."""
     sl = {b: tip for b, tip in gh.remote_branches().items()
           if isinstance(b, str) and b.startswith(janitor_lib.BRANCH_PREFIX)}
     parked = []
     for label in janitor_lib.PARK_LABELS:
         parked += gh.open_issues_activity(label)
+    cfg = cfg if isinstance(cfg, dict) else {}
     return {"branches": sl,
             "branch_prs": {b: gh.pr_for_branch(b) for b in sl},
             "superseded_prs": gh.open_prs_labeled(janitor_lib.SUPERSEDED_LABEL),
@@ -1330,28 +1387,55 @@ def _janitor_fetch(ls_issues):
             # refused read yields [] here, which proposes no reopens (fail closed); `doctor` is the
             # surface that distinguishes "read refused" from "nothing accidentally closed".
             "closed_issues": gh.closed_issue_closers().value,
+            "lint_issues": gh.open_issues_all(),
+            "areas": cfg.get("areas"),
+            "touches_required": bool(cfg.get("touches_required")),
             "ls_issues": ls_issues}
+
+
+def _janitor_what(p):
+    """What one proposal WOULD do, in plain words."""
+    if p["kind"] == "branch":
+        return f"delete branch {p['target']}"
+    if p["kind"] == "pr":
+        head = f" ({p['head']})" if p.get("head") else ""
+        return f"close PR #{p['target']}{head}"
+    if p["kind"] == "metadata":
+        if p["action"] == "add-label":
+            return f"add {p['label']} to issue #{p['target']}"
+        return f"declare `touches: {p['value']}` on issue #{p['target']}"
+    title = p.get("title") or ""
+    if p["kind"] == "issue-reopen":
+        return f"REOPEN issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
+    return f"close issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
 
 
 def _janitor_line(p):
     """One proposal, one line, why included — exactly what William approves."""
-    if p["kind"] == "branch":
-        what = f"delete branch {p['target']}"
-    elif p["kind"] == "pr":
-        head = f" ({p['head']})" if p.get("head") else ""
-        what = f"close PR #{p['target']}{head}"
-    elif p["kind"] == "issue-reopen":
-        title = p.get("title") or ""
-        what = f"REOPEN issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
-    else:
-        title = p.get("title") or ""
-        what = f"close issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
-    return f"  {what} — {p['why']}"
+    return f"  {_janitor_what(p)} — {p['why']}"
+
+
+def _janitor_menu_lines(menus):
+    """The mutually-exclusive alternatives, one issue per block: what is wrong, then the choices
+    with the exact key that executes each. These are NEVER part of the bulk y/N — applying two
+    members of a `type:` menu would manufacture the `type_duplicate` defect the menu was fixing —
+    so the key is the whole point of printing them."""
+    lines = []
+    for group in sorted(menus):
+        items = menus[group]
+        lines.append(f"  issue #{items[0]['target']} — {items[0]['why']}")
+        lines.append("    choose ONE (nothing here runs from a bulk approve):")
+        for p in items:
+            lines.append(f"      {p.get('label') or p.get('value')}"
+                         f"   →  --execute-keys {p['key']}")
+    return lines
 
 
 def _janitor_execute(p):
     """One approved action -> (ok, reason). Mechanical verbs only — delete ref / close PR /
-    close issue / reopen issue — each leaving an audit comment where a comment is possible."""
+    close issue / reopen issue / add a label / rewrite an issue body — each leaving an audit
+    comment where a comment is possible (issue #225 Boundaries: every executed fix carries its
+    audit comment)."""
     if p["action"] == "delete-branch":
         ok = gh.delete_branch(p["target"])
     elif p["action"] == "close-pr":
@@ -1363,9 +1447,34 @@ def _janitor_execute(p):
         # issue explains itself to the next reader without anyone re-deriving the forensics
         # (issue #229; the 2026-07-16 hand-reopen becomes this one tap).
         ok = gh.reopen_issue(p["target"], comment=_JANITOR_STAMP + p["why"])
+    elif p["action"] == "add-label":
+        ok = gh.set_labels(p["target"], add=[p["label"]])
+        if ok:
+            gh.comment(p["target"], _JANITOR_STAMP + f"added `{p['label']}` — {p['why']}")
+    elif p["action"] == "set-body":
+        ok = gh.set_issue_body(p["target"], p["body"])
+        if ok:
+            gh.comment(p["target"], _JANITOR_STAMP
+                       + f"declared `touches: {p['value']}` in `## Loop metadata` — {p['why']}")
     else:
         return False, f"unknown action {p['action']!r}"      # unreachable; fail closed anyway
     return ok, ("" if ok else "gh refused the write (or was unreachable)")
+
+
+def _janitor_split_menus(props):
+    """(bulk-approvable proposals, {choose_group: [alternatives]}).
+
+    The split IS the safety rule (issue #225): a proposal carrying a `choose_group` is one of
+    several mutually-exclusive answers to the same defect, and the janitor never picks between
+    them. It is offered by key and executes only on an explicit tap."""
+    bulk, menus = [], {}
+    for p in props:
+        group = p.get("choose_group")
+        if group:
+            menus.setdefault(group, []).append(p)
+        else:
+            bulk.append(p)
+    return bulk, menus
 
 
 def _janitor_read_state(home, retry_refused):
@@ -1388,13 +1497,18 @@ def _janitor_read_state(home, retry_refused):
     return ls, refused_map, refused_keys, None
 
 
-def _janitor_execute_subset(args, home, days, dev):
+def _janitor_execute_subset(args, home, days, dev, cfg=None):
     """Execute EXACTLY the approved keys the command center tapped (comma-separated in
     --execute-keys), through the SAME reconcile → execute → journal → refused-holdback flow the
     interactive `--yes` path uses. Machine output only: one JSON result object. Nothing weakens
     a safety rule — a FRESH re-derivation still gates every action (act-time re-verification: a
     key that moved, went in-flight, or is no longer proposed is skipped, never forced), and a
-    currently-refused key is held back unless --retry-refused is given (holdback parity)."""
+    currently-refused key is held back unless --retry-refused is given (holdback parity).
+
+    One rule is added rather than weakened (issue #225): at most ONE member of a `choose_group`
+    may run per invocation. The alternatives are mutually exclusive by construction, so executing
+    two `type:` labels would manufacture the very `type_duplicate` defect the menu was fixing —
+    and a double-tap or a raced request must not be able to do it."""
     keys = [k for k in (args.execute_keys or "").split(",") if k]
     ls, refused_map, _refused_keys, err = _janitor_read_state(home, retry_refused=True)
     if err is not None:
@@ -1410,15 +1524,32 @@ def _janitor_execute_subset(args, home, days, dev):
     # One refused set, used by both the listing and this re-derivation, and the divergence is gone.
     refused_now = set() if args.retry_refused else set(refused_map)
     held_keys = [k for k in keys if k in refused_now]
-    fresh = janitor_lib.propose(**_janitor_fetch(ls), now=now, aged_park_days=days,
+    fresh = janitor_lib.propose(**_janitor_fetch(ls, cfg), now=now, aged_park_days=days,
                                 refused=refused_now, dev_branch=dev)
     to_run, skipped = janitor_lib.reconcile(
         [{"key": k} for k in keys if k not in refused_now], fresh["proposals"])
+    # ...then the mutual-exclusion rule (issue #225), applied to what survived the re-derivation.
+    # Order matters: this filter must see the SAME candidate set the reconcile produced, so that a
+    # group member held back or dropped above cannot claim its group's one slot and lock out the
+    # member that is actually eligible.
+    claimed, exclusive = set(), []
+    for p in to_run:
+        group = p.get("choose_group")
+        if group and group in claimed:
+            skipped.append(dict(p, _exclusive=True))
+            continue
+        if group:
+            claimed.add(group)
+        exclusive.append(p)
+    to_run = exclusive
     refused_path = os.path.join(home, "state", _REFUSED_FILE)
     results, executed, failed = [], 0, 0
     for p in skipped:
         results.append({"key": p["key"], "outcome": "skipped",
-                        "reason": "no longer eligible (state moved, or not a current proposal)"})
+                        "reason": ("another answer to the same defect was already applied in this "
+                                   "request — these are mutually exclusive, one may run"
+                                   if p.get("_exclusive") else
+                                   "no longer eligible (state moved, or not a current proposal)")})
     for k in held_keys:
         # held back from a prior failure — an explicit tap does not silently retry it; the owner
         # must ask for a retry (parity with the CLI's --retry-refused holdback).
@@ -1465,7 +1596,7 @@ def cmd_janitor(args):
     dev = cfg.get("dev_branch") if isinstance(cfg.get("dev_branch"), str) else "main"
 
     if getattr(args, "execute_keys", None) is not None:
-        return _janitor_execute_subset(args, home, days, dev)
+        return _janitor_execute_subset(args, home, days, dev, cfg)
 
     ls, refused_map, refused_keys, err = _janitor_read_state(home, args.retry_refused)
     if err is not None:
@@ -1476,9 +1607,10 @@ def cmd_janitor(args):
         return 1
     refused_path = os.path.join(home, "state", _REFUSED_FILE)
 
-    result = janitor_lib.propose(**_janitor_fetch(ls), now=time.time(), aged_park_days=days,
+    result = janitor_lib.propose(**_janitor_fetch(ls, cfg), now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)
     props, held = result["proposals"], result["refused"]
+    bulk, menus = _janitor_split_menus(props)
     withheld = result.get("reopen_withheld") or 0
 
     if getattr(args, "json", False):
@@ -1505,8 +1637,13 @@ def cmd_janitor(args):
         return 0
 
     print(f"janitor proposals ({len(props)}) — nothing executes without your approval:")
-    for p in props:
+    for p in bulk:
         print(_janitor_line(p))
+    if menus:
+        # The alternatives, printed apart from the y/N set they can never join (issue #225).
+        print(f"\n{len(menus)} issue(s) need a value only you can choose — one tap each:")
+        for line in _janitor_menu_lines(menus):
+            print(line)
     if held_note:
         print(held_note)
     if withheld_note:
@@ -1514,9 +1651,12 @@ def cmd_janitor(args):
     if args.dry_run:
         print("dry-run: nothing executed, nothing written.")
         return 0
+    if not bulk:
+        print("\nnothing to execute in bulk — every remaining proposal is a choice above.")
+        return 0
     if not args.yes:
         try:
-            reply = input(f"execute these {len(props)} action(s)? [y/N] ").strip().lower()
+            reply = input(f"execute these {len(bulk)} action(s)? [y/N] ").strip().lower()
         except EOFError:
             reply = ""
         if reply not in ("y", "yes"):
@@ -1536,9 +1676,15 @@ def cmd_janitor(args):
     # class fills its per-sweep cap from the non-refused ones (issue #229), so a re-derivation that
     # disagreed about `refused` would select different reopens and then skip the owner's approved
     # ones as "state moved during the wait" when nothing moved.
-    fresh = janitor_lib.propose(**_janitor_fetch(ls2), now=time.time(), aged_park_days=days,
+    #
+    # What is reconciled is `bulk`, NOT `props` (issue #225): the y/N above offered only the
+    # bulk-approvable proposals, and the grouped alternatives were printed as choices requiring an
+    # explicit `--execute-keys` tap. Passing the full `props` here would let one "y" execute every
+    # member of a `type:` menu at once — manufacturing the `type_duplicate` defect the menu exists
+    # to fix, off an approval the owner was never shown.
+    fresh = janitor_lib.propose(**_janitor_fetch(ls2, cfg), now=time.time(), aged_park_days=days,
                                 refused=refused_keys, dev_branch=dev)
-    to_run, skipped = janitor_lib.reconcile(props, fresh["proposals"])
+    to_run, skipped = janitor_lib.reconcile(bulk, fresh["proposals"])
     now = time.time()
     executed = failed = 0
     for p in skipped:
@@ -1599,7 +1745,10 @@ def _upkeep_janitor_view(home, cfg, dev):
     ls, _refused_map, refused_keys, err = _janitor_read_state(home, retry_refused=False)
     if err is not None:
         return {"error": err, "proposals": [], "held": [], "reopen_withheld": 0}, {}
-    fetched = _janitor_fetch(ls)
+    # `cfg` matters: without it the territory facts are unknown, so the touches menus can never be
+    # proposed and this weekly glance would report a DIFFERENT count than `superlooper janitor` on
+    # the same repo — while pointing at that very command as the remedy (fresh-agent review).
+    fetched = _janitor_fetch(ls, cfg)
     days = cfg["janitor"]["aged_park_days"]
     result = janitor_lib.propose(**fetched, now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)

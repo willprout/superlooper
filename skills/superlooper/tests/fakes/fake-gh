@@ -93,6 +93,16 @@ def has(flag):
     return flag in ARGS
 
 
+def _read_body_file(path):
+    """The text `gh issue edit --body-file <path>` would actually send. Read here so a mutation
+    records the BODY that lands, not the temp path it travelled in (issue #225)."""
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        die("could not read --body-file %s" % path)
+
+
 # --------------------------- stateful mode: lock + state I/O ---------------------------
 
 class _Lock:
@@ -442,6 +452,11 @@ def main_stateful():
         sys.exit(0)
 
     # ---------- writes (mutations.jsonl still records every one) ----------
+    elif sub == ["issue", "edit"] and opt("--body-file"):
+        # The janitor's metadata repair (issue #225) — a body edit, not a label edit.
+        record("set_body", num=ARGS[2], body=_read_body_file(opt("--body-file")))
+        sys.exit(0)
+
     elif sub == ["issue", "edit"]:
         record("set_labels", num=ARGS[2], add=opt("--add-label"), remove=opt("--remove-label"))
         with _Lock(STATE_PATH):
@@ -748,7 +763,12 @@ def main_fixture():
         serve_first(["api.json"])
 
     elif sub == ["issue", "edit"]:
-        record("set_labels", num=ARGS[2], add=opt("--add-label"), remove=opt("--remove-label"))
+        # --body-file is the janitor's metadata repair (issue #225): the new body is handed over a
+        # FILE, so record what would actually land, not the path we were told to read it from.
+        if opt("--body-file"):
+            record("set_body", num=ARGS[2], body=_read_body_file(opt("--body-file")))
+        else:
+            record("set_labels", num=ARGS[2], add=opt("--add-label"), remove=opt("--remove-label"))
         sys.exit(0)
 
     elif sub == ["issue", "comment"]:

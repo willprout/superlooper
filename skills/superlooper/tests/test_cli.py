@@ -2333,3 +2333,217 @@ def test_tidy_ignores_a_leftover_answerer_pane_marker(rig):
     assert not (panes / "i7").exists() and not (panes / "i7.ws").exists()
     assert (panes / "a1").read_text() == "leftover-a1"
     assert (panes / "a1.ws").read_text() == "leftover-a1.ws"
+
+
+# --------------------------- doctor: the queue lint (issue #225) ---------------------------
+# The 2026-07-16 audit, made runnable. It found 25 of 35 open issues mechanically unschedulable —
+# 16 of them `agent-ready` — and it was done by hand, once. Now it is a command.
+#
+# The split is deliberate. An APPROVED issue that cannot launch is a live wedge: the owner has said
+# go and nothing will ever happen, so the doctor FAILS. Any other open issue with a defect is
+# backlog hygiene — real, worth naming with its fix, but not a broken stack — so it WARNs and the
+# doctor still passes.
+
+def _write_issues(rig, issues):
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(issues))
+
+
+def _issue(num, labels=(), body="## Loop metadata\ntouches: engine\n", title="An issue"):
+    return {"number": num, "title": title, "labels": [{"name": n} for n in labels],
+            "body": body, "createdAt": "2026-07-01T00:00:00Z"}
+
+
+def _areas_config(rig, **over):
+    body = {"version": 1, "repo": "o/r",
+            "required_checks": ["review/local-gate", "quality-gate"],
+            "areas": {"engine": ["skills/**"], "dashboard": ["dashboard/**"]},
+            "touches_required": True}
+    body.update(over)
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(body))
+
+
+def test_doctor_queue_lint_passes_a_clean_queue(rig):
+    _areas_config(rig)
+    _write_issues(rig, [_issue(1, ["agent-ready", "type:build"]),
+                        _issue(2, ["needs-owner", "type:investigate"], body="## Goal\nwhy\n")])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "queue lint" in r.stdout
+
+
+def test_doctor_queue_lint_catches_a_missing_type_label_with_its_exact_fix(rig):
+    _areas_config(rig)
+    _write_issues(rig, [_issue(7, ["needs-owner"], title="no kind declared")])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert "#7" in r.stdout
+    assert "type:build" in r.stdout and "type:diagnose-and-fix" in r.stdout
+
+
+def test_doctor_queue_lint_catches_a_bare_touches_line_outside_the_section(rig):
+    _areas_config(rig)
+    _write_issues(rig, [_issue(8, ["needs-owner", "type:build"],
+                               body="## Goal\nship it\n\ntouches: engine\n")])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert "#8" in r.stdout and "## Loop metadata" in r.stdout
+
+
+def test_doctor_queue_lint_catches_an_area_the_repo_never_declared(rig):
+    _areas_config(rig)
+    _write_issues(rig, [_issue(9, ["needs-owner", "type:build"],
+                               body="## Loop metadata\ntouches: plugin\n")])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert "#9" in r.stdout and "plugin" in r.stdout
+    assert "engine" in r.stdout and "dashboard" in r.stdout      # the real areas, named
+
+
+def test_doctor_queue_lint_warns_but_passes_on_an_unapproved_invalid_issue(rig):
+    _areas_config(rig)
+    _write_issues(rig, [_issue(7, ["needs-owner"])])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "WARN" in r.stdout
+
+
+def test_doctor_FAILS_on_an_approved_issue_that_can_never_launch(rig):
+    # The wedge the audit found: `agent-ready` is on, and nothing will ever happen.
+    _areas_config(rig)
+    _write_issues(rig, [_issue(7, ["agent-ready"], title="approved but unlaunchable")])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode != 0
+    assert "queue lint" in (r.stdout + r.stderr)
+    assert "#7" in r.stdout
+
+
+def test_doctor_queue_lint_does_not_fail_over_an_approved_issue_it_would_still_launch(rig):
+    # An undeclared AREA does not stop a launch — the runner never validates area names. It is
+    # named, but it is not a wedge, so it must not turn the doctor red.
+    _areas_config(rig)
+    _write_issues(rig, [_issue(9, ["agent-ready", "type:build"],
+                               body="## Loop metadata\ntouches: plugin\n")])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "#9" in r.stdout
+
+
+def test_doctor_queue_lint_respects_a_repo_that_does_not_require_touches(rig):
+    _areas_config(rig, touches_required=False)
+    _write_issues(rig, [_issue(7, ["agent-ready", "type:build"], body="## Goal\nship it\n")])
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_doctor_queue_lint_skips_itself_when_gh_is_unreachable(rig):
+    # No issue list read means no verdict — never a confident "your whole queue is broken" built
+    # on an empty answer from a refused read.
+    _areas_config(rig)
+    r = cli(rig, "doctor", "--repo", str(rig.repo), env_over={"GH_FAIL": "1"})
+    assert "0 of 0" not in r.stdout
+
+
+# --------------------------- janitor: metadata repair (issue #225) ---------------------------
+# The owner's amendment of 2026-07-17: remediation for a mechanically-invalid issue belongs to the
+# janitor's existing propose/approve contract, "so the manual batch-repair run on 2026-07-16
+# becomes a janitor tap, never a hand job again."
+#
+# The safety rule this section exists to pin: a menu of ALTERNATIVES can never be bulk-approved.
+# `--yes` applying all three `type:` labels would manufacture the very `type_duplicate` defect it
+# was fixing, so the bulk path executes only the determined fixes and prints the menus with their
+# keys for an explicit tap.
+
+def _janitor_repo_config(rig, **over):
+    body = {"version": 1, "repo": "o/r",
+            "required_checks": ["review/local-gate", "quality-gate"],
+            "areas": {"engine": ["skills/**"], "dashboard": ["dashboard/**"]},
+            "touches_required": True}
+    body.update(over)
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(body))
+
+
+def _seed_invalid_queue(rig, issues):
+    _seed_janitor_fixtures(rig)
+    _janitor_repo_config(rig)
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(issues))
+    # nothing else to sweep, so the output is exactly the metadata story
+    (rig.fixdir / "branches.json").write_text(json.dumps({"main": "aaa111"}))
+    (rig.fixdir / "pr_list_superseded.json").write_text("[]")
+    (rig.fixdir / "issue_list_parked.json").write_text("[]")
+
+
+def test_janitor_proposes_a_type_label_menu_and_executes_none_of_it_on_a_bulk_yes(rig):
+    _seed_invalid_queue(rig, [_issue(7, ["needs-owner"], title="no kind declared")])
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "#7" in r.stdout and "type:build" in r.stdout and "type:investigate" in r.stdout
+    assert "meta:7:type=type:build" in r.stdout           # the key to tap
+    assert [m for m in mutations(rig) if m["kind"] == "set_labels"] == []
+
+
+def test_janitor_executes_exactly_the_type_label_the_owner_tapped(rig):
+    _seed_invalid_queue(rig, [_issue(7, ["needs-owner"])])
+    r = cli(rig, "janitor", "--repo", str(rig.repo),
+            "--execute-keys", "meta:7:type=type:build")
+    assert r.returncode == 0, r.stdout + r.stderr
+    labelled = [m for m in mutations(rig) if m["kind"] == "set_labels"]
+    assert len(labelled) == 1
+    assert labelled[0]["num"] == "7" and labelled[0]["add"] == "type:build"
+    # every executed fix carries its audit comment (issue Boundaries)
+    comments = [m for m in mutations(rig) if m["kind"] == "comment"]
+    assert len(comments) == 1 and "janitor" in comments[0]["body"]
+    recs = [x for x in _janitor_journal(rig) if x.get("act") == "janitor"]
+    assert len(recs) == 1 and recs[0]["outcome"] == "ok" and recs[0]["action"] == "add-label"
+
+
+def test_janitor_refuses_to_apply_two_alternatives_from_one_menu(rig):
+    # The whole reason menus exist: applying two would create the defect it was fixing.
+    _seed_invalid_queue(rig, [_issue(7, ["needs-owner"])])
+    r = cli(rig, "janitor", "--repo", str(rig.repo),
+            "--execute-keys", "meta:7:type=type:build,meta:7:type=type:investigate")
+    out = json.loads(r.stdout)
+    assert out["executed"] == 1
+    assert [x for x in out["results"] if x["outcome"] == "skipped"]
+    assert len([m for m in mutations(rig) if m["kind"] == "set_labels"]) == 1
+
+
+def test_janitor_repairs_a_bare_touches_line_on_a_bulk_yes_because_nothing_is_chosen(rig):
+    _seed_invalid_queue(rig, [_issue(8, ["type:build"],
+                                     body="## Goal\nship it\n\ntouches: engine\n")])
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    edits = [m for m in mutations(rig) if m["kind"] == "set_body"]
+    assert len(edits) == 1 and edits[0]["num"] == "8"
+    assert "## Loop metadata\ntouches: engine" in edits[0]["body"]
+
+
+def test_janitor_executes_the_touches_the_owner_tapped(rig):
+    _seed_invalid_queue(rig, [_issue(9, ["type:build"], body="## Goal\nship it\n")])
+    r = cli(rig, "janitor", "--repo", str(rig.repo),
+            "--execute-keys", "meta:9:touches=dashboard")
+    assert r.returncode == 0, r.stdout + r.stderr
+    edits = [m for m in mutations(rig) if m["kind"] == "set_body"]
+    assert len(edits) == 1
+    assert "## Loop metadata" in edits[0]["body"] and "touches: dashboard" in edits[0]["body"]
+    assert "## Goal\nship it" in edits[0]["body"]          # the author's words survive
+
+
+def test_janitor_dry_run_proposes_metadata_fixes_and_writes_nothing(rig):
+    _seed_invalid_queue(rig, [_issue(7, ["needs-owner"])])
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert "#7" in r.stdout and "type:build" in r.stdout
+    assert mutations(rig) == [] and _janitor_journal(rig) == []
+
+
+def test_janitor_json_carries_the_menus_for_the_command_center(rig):
+    _seed_invalid_queue(rig, [_issue(7, ["needs-owner"])])
+    r = cli(rig, "janitor", "--json", "--repo", str(rig.repo))
+    out = json.loads(r.stdout)
+    meta = [p for p in out["proposals"] if p["kind"] == "metadata"]
+    assert {p["label"] for p in meta} == {"type:build", "type:investigate",
+                                           "type:diagnose-and-fix"}
+    assert {p["choose_group"] for p in meta} == {"issue:7:type"}
+    assert mutations(rig) == []
+
+
+def test_janitor_leaves_a_valid_queue_alone(rig):
+    _seed_invalid_queue(rig, [_issue(7, ["type:build"])])
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert "nothing to propose" in r.stdout

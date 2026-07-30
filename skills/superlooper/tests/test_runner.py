@@ -6397,3 +6397,47 @@ def test_a_non_auth_rc_never_grows_a_variant(rig):
     rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
     ist = issue_state(rig, "i5")
     assert ist.get("sensed_state") is None and ist.get("sensed_auth") is None
+
+
+# ============ the refusal journal, end to end (issue #225) ============
+# The real Runner over the real decide + executors: an `agent-ready` issue whose labels fail the
+# mechanical contract must leave a RECORD, not a silence. The 2026-07-16 audit found 16 such issues
+# sitting in the queue at once, each looking exactly like work waiting its turn.
+
+def _queue_invalid_records(rig, iid=None):
+    return [j for j in _journal(rig)
+            if j.get("act") == "queue_invalid" and (iid is None or j.get("id") == iid)]
+
+
+def _add_invalid_issue(rig, num=104, labels=("agent-ready",), body="## Goal\nDo a thing.\n"):
+    lst = json.loads((rig.fixdir / "issue_list.json").read_text())
+    lst.append({"number": num, "title": "An issue nobody can launch",
+                "labels": [{"name": n} for n in labels], "body": body,
+                "createdAt": "2026-07-02T09:00:00Z"})
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(lst))
+
+
+def test_an_approved_issue_with_no_type_label_is_journaled_with_its_fix(rig):
+    _add_invalid_issue(rig)
+    rig.r.tick(now=NOW)
+    recs = _queue_invalid_records(rig, "i104")
+    assert len(recs) == 1
+    assert recs[0]["num"] == 104 and recs[0]["blocks_launch"] is True
+    # the record carries the exact fix, not merely "invalid"
+    assert "type:build" in recs[0]["outcome"] and "type:investigate" in recs[0]["outcome"]
+    # ...and it is genuinely not launched
+    assert [c for c in rig.calls
+            if c["args"][0].endswith("launch-session.sh") and "i104" in c["args"]] == []
+
+
+def test_the_refusal_is_stamped_in_loopstate_and_not_re_journaled_every_tick(rig):
+    _add_invalid_issue(rig)
+    for i in range(4):
+        rig.r.tick(now=NOW + i * 20)
+    assert len(_queue_invalid_records(rig, "i104")) == 1
+    assert issue_state(rig, "i104")["queue_invalid_signature"] == "type_missing"
+
+
+def test_a_valid_approved_issue_earns_no_refusal_record(rig):
+    rig.r.tick(now=NOW)
+    assert _queue_invalid_records(rig) == []

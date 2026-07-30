@@ -23,9 +23,11 @@ _EXAMPLE = _REPO_ROOT / "config.example.json"
 _OMIT = object()   # sentinel: distinguish "omit the key" from writing a literal null/false value
 
 
-def _write_repo(base, name, slug, session=None, lanes=_OMIT):
+def _write_repo(base, name, slug, session=None, lanes=_OMIT, areas=_OMIT,
+                touches_required=_OMIT):
     """A repo checkout dir carrying a skill-shaped ``.superlooper/config.json`` (only the fields
-    the dashboard reads: ``repo`` slug + optional ``session`` thresholds + optional ``lanes``)."""
+    the dashboard reads: ``repo`` slug + optional ``session`` thresholds, ``lanes``, ``areas`` and
+    ``touches_required``)."""
     repo_dir = base / name
     (repo_dir / ".superlooper").mkdir(parents=True)
     body = {"repo": slug}
@@ -33,6 +35,10 @@ def _write_repo(base, name, slug, session=None, lanes=_OMIT):
         body["session"] = session
     if lanes is not _OMIT:
         body["lanes"] = lanes
+    if areas is not _OMIT:
+        body["areas"] = areas
+    if touches_required is not _OMIT:
+        body["touches_required"] = touches_required
     (repo_dir / ".superlooper" / "config.json").write_text(json.dumps(body))
     return repo_dir
 
@@ -555,3 +561,41 @@ def test_operator_resolver_is_defensive():
     assert config.operator({}) == "the owner"
     assert config.operator({"operator": "  "}) == "the owner"
     assert config.operator(None) == "the owner"
+
+
+# --- the repo's territory contract (issue #225: the departures board must be able to say INVALID) ---
+# The board promises the RUNNER's launch order. The runner refuses to launch a merge-producing issue
+# that declares no `touches:` when the repo sets `touches_required` — so without these two facts the
+# board would keep showing such an issue as waiting its turn, which is exactly how 16 unlaunchable
+# issues sat in the queue unnoticed until the 2026-07-16 audit.
+
+def test_reads_the_repos_declared_areas_and_touches_requirement(tmp_path):
+    repo = _write_repo(tmp_path, "co", "acme/widget",
+                       areas={"engine": ["skills/**"], "ui": ["web/**"]}, touches_required=True)
+    entry = config.load(_write_config(tmp_path, {"repos": [{"path": str(repo)}]}))["repos"][0]
+    assert entry["areas"] == {"engine": ["skills/**"], "ui": ["web/**"]}
+    assert entry["touches_required"] is True
+
+
+def test_absent_territory_facts_read_as_unknown_never_as_enforcement(one_repo):
+    # Same honest-fallback posture as `lanes` (issue #35), and for a sharper reason: guessing
+    # `touches_required: True` for a repo that never said so would paint every issue in it PAPERWORK
+    # — a board-wide false alarm. Unknown means the board simply does not judge that dimension.
+    _, _, cfg_path = one_repo
+    entry = config.load(cfg_path)["repos"][0]
+    assert entry["areas"] is None
+    assert entry["touches_required"] is False
+
+
+@pytest.mark.parametrize("bad", ["engine", 42, ["engine"], None])
+def test_unreadable_areas_read_as_unknown(tmp_path, bad):
+    repo = _write_repo(tmp_path, "co", "acme/widget", areas=bad)
+    entry = config.load(_write_config(tmp_path, {"repos": [{"path": str(repo)}]}))["repos"][0]
+    assert entry["areas"] is None
+
+
+@pytest.mark.parametrize("bad", ["yes", 1, None, {}])
+def test_an_unreadable_touches_requirement_never_reads_as_enforced(tmp_path, bad):
+    repo = _write_repo(tmp_path, "co", "acme/widget", touches_required=bad)
+    entry = config.load(_write_config(tmp_path, {"repos": [{"path": str(repo)}]}))["repos"][0]
+    assert entry["touches_required"] is False

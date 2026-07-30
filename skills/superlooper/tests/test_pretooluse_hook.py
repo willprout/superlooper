@@ -1,6 +1,6 @@
-"""Issues #156 / #185 — the Claude PreToolUse deny hook for UNATTENDED loop sessions.
+"""Issues #156 / #185 / #225 — the Claude PreToolUse deny hook for UNATTENDED loop sessions.
 
-Two of the costliest worker-instruction-drift incidents are made mechanically impossible here
+Three of the costliest worker-instruction-drift incidents are made mechanically impossible here
 rather than merely instructed-against:
 
   * AskUserQuestion in an unattended lane (i280): a human-facing dialog with no human at the pane,
@@ -8,6 +8,9 @@ rather than merely instructed-against:
     role uses — the worker's blocked-question file, the debugger's memo + notify.
   * a pattern-kill (`pkill -f`, `killall`) that matched and killed the owner's own live process
     (the dashboard). The deny restates the standing CLAUDE.md rule: kill exact PIDs only.
+  * a mechanically-invalid `gh issue create` (#225): the 2026-07-16 audit found 25 of 35 open
+    issues unlaunchable for want of a `type:` label and/or a parseable `## Loop metadata` section.
+    The deny validates the issue BEFORE it exists and hands back exactly what is missing.
 
 #185 (owner ruling 2026-07-16) widened the scope from workers alone to EVERY unattended session
 the loop launches, with the AskUserQuestion reason adapted per role. The ruling named the answerer
@@ -28,6 +31,7 @@ Two layers under test:
 """
 import json
 import os
+import shlex
 import shutil
 import subprocess
 
@@ -441,3 +445,383 @@ def test_hook_still_denies_from_a_safe_cwd_with_the_worktree_gone(tmp_path):
     assert r.returncode == 0, r.stderr
     d = _decision(r.stdout)
     assert d["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# =============================== duty 3: `gh issue create` (issue #225) ===============================
+# The 2026-07-16 queue audit found 25 of 35 open issues mechanically unlaunchable — 16 of them
+# `agent-ready` — because they lacked a `type:` label and/or a parseable `## Loop metadata` section.
+# Workers file follow-ups all day and were never handed the mechanical format. The owner's redesign
+# (2026-07-16): stop teaching it in the first prompt (his words — extra instructions in the very
+# first prompt get ignored half the time) and BOUNCE the session at the moment it files wrong. The
+# issue is validated BEFORE it exists; the deny reason names exactly what is missing; the session
+# retries correctly on the freshest possible turn.
+#
+# FAIL OPEN PER DIMENSION is the load-bearing half. This fires on every Bash call, and a hook that
+# denied a legitimate `gh issue create` it merely could not READ would cost more than the defect it
+# prevents. So each dimension answers only from evidence it actually has: an unreadable body stands
+# the body dimension down while the labels are still judged, a `--repo` pointing who-knows-where
+# stands the whole duty down, and an unparseable command line is never judged at all.
+
+VALID_BODY = "## Goal\nship it\n\n## Loop metadata\ntouches: engine\n"
+REPO_CFG = {"repo": "willprout/superlooper", "touches_required": True,
+            "areas": {"engine": ["skills/**"], "dashboard": ["dashboard/**"]}}
+
+
+def _worktree(tmp_path, cfg=REPO_CFG, issue_id="i7"):
+    """A worker's real on-disk shape: <run root>/worktrees/<id>/.superlooper/config.json — the
+    path launch-session.sh actually creates, so the hook can find the repo's contract from the
+    environment alone."""
+    wt = tmp_path / "worktrees" / issue_id
+    (wt / ".superlooper").mkdir(parents=True)
+    if cfg is not None:
+        (wt / ".superlooper" / "config.json").write_text(json.dumps(cfg))
+    return wt
+
+
+def _create(command, tmp_path=None, env=None, cwd=None):
+    payload = _pre("Bash", {"command": command})
+    if cwd is not None:
+        payload["cwd"] = str(cwd)
+    e = dict(env or WORKER_ENV)
+    if tmp_path is not None:
+        e["SL_RUN_ROOT"] = str(tmp_path)
+    return wp.run(payload, e)
+
+
+# --- the deny, and what it must say ---
+
+def test_an_issue_with_no_type_label_is_denied_before_it_exists(tmp_path):
+    _worktree(tmp_path)
+    reason = _create("gh issue create --title 'x' --label needs-owner --body %s" % shlex.quote(VALID_BODY),
+                     tmp_path)
+    assert reason, "an issue with no type: label must be refused at creation"
+    assert "type:build" in reason and "type:investigate" in reason
+
+
+def test_two_type_labels_are_denied(tmp_path):
+    _worktree(tmp_path)
+    reason = _create("gh issue create --title x --label type:build --label type:investigate "
+                     "--body %s" % shlex.quote(VALID_BODY), tmp_path)
+    assert reason and "type:build" in reason and "type:investigate" in reason
+
+
+def test_a_missing_loop_metadata_section_is_denied_and_the_shape_is_handed_back(tmp_path):
+    _worktree(tmp_path)
+    reason = _create("gh issue create --title x --label type:build --body '## Goal\nship it\n'",
+                     tmp_path)
+    assert reason
+    assert "## Loop metadata" in reason and "touches:" in reason
+
+
+def test_an_undeclared_area_is_denied_and_the_real_areas_are_named(tmp_path):
+    _worktree(tmp_path)
+    reason = _create("gh issue create --title x --label type:build "
+                     "--body '## Loop metadata\ntouches: plugin\n'", tmp_path)
+    assert reason and "plugin" in reason
+    assert "engine" in reason and "dashboard" in reason
+
+
+def test_a_mechanically_valid_issue_is_allowed_through(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:build,needs-owner --body %s"
+                   % shlex.quote(VALID_BODY), tmp_path) is None
+
+
+def test_the_wildcard_area_is_allowed(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:build "
+                   "--body '## Loop metadata\ntouches: *\n'", tmp_path) is None
+
+
+def test_an_investigation_needs_no_touches(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:investigate --body '## Goal\nwhy?\n'",
+                   tmp_path) is None
+
+
+def test_the_deny_names_every_defect_at_once_not_one_per_retry(tmp_path):
+    _worktree(tmp_path)
+    reason = _create("gh issue create --title x --label needs-owner --body '## Goal\nx\n'",
+                     tmp_path)
+    assert "type:" in reason and "## Loop metadata" in reason
+
+
+# --- label argument shapes gh itself accepts ---
+
+@pytest.mark.parametrize("labels", [
+    "--label type:build --label needs-owner",
+    "--label type:build,needs-owner",
+    "--label=type:build --label=needs-owner",
+    "-l type:build -l needs-owner",
+    "--label 'type:build, needs-owner'",
+])
+def test_every_label_argument_shape_gh_accepts_is_read(tmp_path, labels):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x %s --body %s" % (labels, shlex.quote(VALID_BODY)),
+                   tmp_path) is None
+
+
+@pytest.mark.parametrize("body_flag", ["--body", "-b", "--body="])
+def test_every_body_argument_shape_gh_accepts_is_read(tmp_path, body_flag):
+    _worktree(tmp_path)
+    sep = "" if body_flag.endswith("=") else " "
+    reason = _create("gh issue create --title x --label type:build %s%s'## Goal\nx\n'"
+                     % (body_flag, sep), tmp_path)
+    assert reason and "## Loop metadata" in reason
+
+
+def test_no_label_flag_at_all_is_confident_evidence_of_no_type_label(tmp_path):
+    # Not ambiguity: the whole command line parsed, and it carries no labels. Two live issues in
+    # this very repo (#284, #286) were filed exactly this way — with no labels at all.
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --body %s" % shlex.quote(VALID_BODY), tmp_path)
+
+
+# --- fail open, per dimension ---
+
+def test_a_body_built_by_command_substitution_stands_the_body_dimension_down(tmp_path):
+    # `--body "$(cat notes.md)"` — the text is not knowable from the command line, so it is not
+    # judged. The LABELS still are.
+    _worktree(tmp_path)
+    assert _create('gh issue create --title x --label type:build --body "$(cat notes.md)"',
+                   tmp_path) is None
+    reason = _create('gh issue create --title x --label needs-owner --body "$(cat notes.md)"',
+                     tmp_path)
+    assert reason and "type:" in reason
+    assert "## Loop metadata" not in reason      # never complain about a body we could not read
+
+
+@pytest.mark.parametrize("flag", ["--body-file notes.md", "-F notes.md", "--editor",
+                                  "--template bug.md"])
+def test_a_body_from_somewhere_else_stands_the_body_dimension_down(tmp_path, flag):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:build %s" % flag, tmp_path) is None
+
+
+@pytest.mark.parametrize("flag", ["--web", "--recover draft.json",
+                                  # gh's own documented shorthand, and the attached forms both
+                                  # flags accept — the same gap `-Rowner/repo` was caught on.
+                                  "-w", "--web=true", "--recover=draft.json"])
+def test_a_form_filled_ELSEWHERE_stands_the_whole_duty_down(tmp_path, flag):
+    # Fresh-agent review, 2026-07-30. `--web` hands the form to a browser for the person to fill
+    # in; `--recover` restores a saved draft's fields, labels included. In both, no `--label` on
+    # the command line means labels we did not READ — not the confident evidence of a missing
+    # `type:` label that an ordinary line's absence is. The duty denied over exactly that absence,
+    # complaining about a label the author was about to pick: a verdict on evidence it never had.
+    _worktree(tmp_path)
+    assert _create("gh issue create %s" % flag, tmp_path) is None
+    assert _create("gh issue create %s --title x" % flag, tmp_path) is None
+
+
+def test_no_body_flag_at_all_stands_the_body_dimension_down(tmp_path):
+    # Without --body gh prompts or errors; either way there is no text to judge.
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:build", tmp_path) is None
+
+
+def test_a_blank_area_name_never_reaches_the_sentence_that_teaches_the_format(tmp_path):
+    # The deny reaches the model VERBATIM at the moment it errs, so its area list is the one place
+    # a blank config key would read as an area you may declare ("areas: ,    , engine").
+    _worktree(tmp_path, cfg={"areas": {"": ["a/**"], "   ": ["b/**"], "engine": ["skills/**"]},
+                             "touches_required": True})
+    reason = _create('gh issue create --title x --label type:build --body "## Goal\nx\n"', tmp_path)
+    assert reason and "areas: engine (" in reason
+
+
+@pytest.mark.parametrize("flag", ["--repo other/repo", "-R other/repo"])
+def test_an_explicit_repo_stands_the_WHOLE_duty_down(tmp_path, flag):
+    # A different repo has a different contract (its own areas, its own touches_required). We do
+    # not hold this repo's rules over an issue filed somewhere else.
+    _worktree(tmp_path)
+    assert _create("gh issue create %s --title x --body '## Goal\nx\n'" % flag, tmp_path) is None
+
+
+def test_no_config_in_reach_still_judges_the_type_label_but_not_the_metadata(tmp_path):
+    # The type: vocabulary is superlooper's own and repo-independent; whether touches are required,
+    # and which areas exist, are NOT — so without a config those dimensions stand down.
+    _worktree(tmp_path, cfg=None)
+    assert _create("gh issue create --title x --label type:build --body '## Goal\nx\n'",
+                   tmp_path) is None
+    assert _create("gh issue create --title x --label needs-owner --body '## Goal\nx\n'",
+                   tmp_path)
+
+
+def test_an_unreadable_config_fails_open_the_same_way(tmp_path):
+    _worktree(tmp_path, cfg=None)
+    (tmp_path / "worktrees" / "i7" / ".superlooper" / "config.json").write_text("{not json")
+    assert _create("gh issue create --title x --label type:build --body '## Goal\nx\n'",
+                   tmp_path) is None
+
+
+def test_a_repo_that_does_not_require_touches_is_not_asked_for_them(tmp_path):
+    _worktree(tmp_path, cfg={**REPO_CFG, "touches_required": False})
+    assert _create("gh issue create --title x --label type:build --body '## Goal\nx\n'",
+                   tmp_path) is None
+
+
+def test_the_config_is_also_found_from_the_sessions_own_cwd(tmp_path):
+    # The `d<N>` debugger runs with --cwd against the repo itself and has no worktree under the
+    # state home, so the payload's cwd is its route to the same contract. Walked UP, so a session
+    # sitting in a subdirectory still finds it.
+    repo = tmp_path / "checkout"
+    (repo / ".superlooper").mkdir(parents=True)
+    (repo / ".superlooper" / "config.json").write_text(json.dumps(REPO_CFG))
+    deep = repo / "skills" / "superlooper"
+    deep.mkdir(parents=True)
+    reason = _create("gh issue create --title x --label type:build "
+                     "--body '## Loop metadata\ntouches: plugin\n'",
+                     env=DEBUGGER_ENV, cwd=deep)
+    assert reason and "plugin" in reason
+
+
+@pytest.mark.parametrize("command", [
+    "gh issue create --title 'unbalanced --body x",          # shlex cannot split it
+    "echo gh issue create",                                  # not at a command position
+    "gh issue list",                                         # a different gh verb
+    "gh pr create --fill",                                   # a different noun
+    "git commit -m 'gh issue create'",                       # the words, quoted, inside something else
+    "gh issue create --title a --body x && gh issue create --title b --body y",  # two of them
+])
+def test_anything_we_cannot_confidently_read_as_one_gh_issue_create_is_allowed(tmp_path, command):
+    _worktree(tmp_path)
+    assert _create(command, tmp_path) is None
+
+
+def test_a_gh_issue_create_after_a_separator_is_still_read(tmp_path):
+    # `cd x && gh issue create ...` is the ordinary shape; a separator must not hide the call.
+    _worktree(tmp_path)
+    assert _create("cd /tmp && gh issue create --title x --label needs-owner --body %s"
+                   % shlex.quote(VALID_BODY), tmp_path)
+
+
+def test_an_absolute_path_to_gh_is_still_gh(tmp_path):
+    _worktree(tmp_path)
+    assert _create("/opt/homebrew/bin/gh issue create --title x --label needs-owner --body %s"
+                   % shlex.quote(VALID_BODY), tmp_path)
+
+
+# --- the duty holds for every session the loop launches, and nowhere else ---
+
+@pytest.mark.parametrize("env", [WORKER_ENV, DEBUGGER_ENV, ATTENDED_DEBUGGER_ENV])
+def test_the_deny_holds_for_every_role_attended_or_not(tmp_path, env):
+    # Attendance carves out duty 1 ONLY: a person at the pane does not make an unlaunchable issue
+    # launchable, and the correction is just as cheap for them.
+    _worktree(tmp_path, issue_id=env["SL_ISSUE_ID"])
+    assert _create("gh issue create --title x --label needs-owner --body %s" % shlex.quote(VALID_BODY),
+                   tmp_path, env=env)
+
+
+def test_no_deny_outside_a_loop_session(tmp_path):
+    _worktree(tmp_path)
+    assert wp.run(_pre("Bash", {"command": "gh issue create --title x --body x"}),
+                  {"SL_ISSUE_ID": "", "SL_RUN_ROOT": str(tmp_path)}) is None
+
+
+def test_no_deny_for_codex(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --body '## Goal\nx\n'", tmp_path,
+                   env={**WORKER_ENV, "SL_AGENT": "codex"}) is None
+
+
+def test_a_broken_config_read_never_raises_into_the_hook(tmp_path):
+    # The whole duty runs behind main()'s fail-open catch, but a raise here would also blank the
+    # OTHER two duties for that call. Prove it degrades in place instead.
+    d = tmp_path / "worktrees" / "i7" / ".superlooper"
+    d.mkdir(parents=True)
+    (d / "config.json").mkdir()                  # a DIRECTORY where the config should be
+    assert _create("gh issue create --title x --label type:build --body '## Goal\nx\n'",
+                   tmp_path) is None
+
+
+def test_the_hook_script_denies_an_invalid_issue_create_end_to_end(tmp_path):
+    (tmp_path / "worktrees" / "i7" / ".superlooper").mkdir(parents=True)
+    (tmp_path / "worktrees" / "i7" / ".superlooper" / "config.json").write_text(json.dumps(REPO_CFG))
+    payload = _pre("Bash", {"command": "gh issue create --title x --label needs-owner "
+                                       "--body '## Goal\nx\n'"})
+    r = _run_hook(tmp_path, payload)
+    d = _decision(r.stdout)
+    assert d["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "type:" in d["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_the_hook_script_allows_a_valid_issue_create_end_to_end(tmp_path):
+    (tmp_path / "worktrees" / "i7" / ".superlooper").mkdir(parents=True)
+    (tmp_path / "worktrees" / "i7" / ".superlooper" / "config.json").write_text(json.dumps(REPO_CFG))
+    payload = _pre("Bash", {"command": "gh issue create --title x --label type:build --body %s"
+                                       % shlex.quote(VALID_BODY)})
+    r = _run_hook(tmp_path, payload)
+    assert _decision(r.stdout) is None
+    assert r.returncode == 0
+
+
+# --- fresh-agent review (Codex, 2026-07-28), P0: a bare shell variable is not readable text ---
+# `--body "$body"` and `--label "$labels"` are ordinary shapes, and shlex leaves them as the literal
+# strings `$body` / `$labels`. Judging those AS the body or AS the label set denies a perfectly good
+# command over content the hook never read — the exact fail-open-per-dimension violation this duty
+# exists to avoid. An unreadable LABEL set stands the whole duty down, not just the label check:
+# without the labels we cannot know the issue is an investigation, which needs no touches at all.
+
+@pytest.mark.parametrize("body_arg", ['"$body"', '"$BODY_TEXT"', "$body", '"prefix $body"'])
+def test_a_body_held_in_a_shell_variable_stands_the_body_dimension_down(tmp_path, body_arg):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:build --body %s" % body_arg,
+                   tmp_path) is None
+
+
+@pytest.mark.parametrize("label_arg", ['"$labels"', "$LABELS", '"type:build,$extra"'])
+def test_labels_held_in_a_shell_variable_stand_the_WHOLE_duty_down(tmp_path, label_arg):
+    # Not merely the label check: an unreadable label set means we cannot tell an investigation
+    # (which needs no `touches:`) from a build (which does), so demanding one would be a guess.
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label %s --body '## Goal\nx\n'" % label_arg,
+                   tmp_path) is None
+
+
+def test_a_dollar_sign_that_is_merely_TEXT_still_costs_only_a_stood_down_check(tmp_path):
+    # A body legitimately containing `$` reads as unexpanded and is not judged. That is a false
+    # ALLOW — the safe direction — and it is the trade this rule makes deliberately.
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:build --body 'costs 5$ per run'",
+                   tmp_path) is None
+
+
+def test_a_literal_body_and_labels_are_still_judged_normally(tmp_path):
+    # The rule must not gut the duty: nothing here holds a `$`.
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label needs-owner --body '## Goal\nx\n'", tmp_path)
+
+
+# --- fresh-agent review round 2 (Codex, 2026-07-28), P0: gh accepts ATTACHED short options ---
+# `gh` is cobra/pflag-based, so `-ltype:build`, `-b'…'` and `-Rowner/repo` are all valid and all
+# common. The parser read only the separated form, so it saw `-ltype:build` as an unrecognized
+# token: the labels came back EMPTY and a valid command was denied for a `type:` label that was
+# right there. The `-R` miss was the same bug pointed the other way — this repo's contract held
+# over an issue being filed somewhere else entirely.
+
+def test_an_attached_short_label_is_read(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x -ltype:build --body %s" % shlex.quote(VALID_BODY),
+                   tmp_path) is None
+
+
+def test_an_attached_short_body_is_read(tmp_path):
+    _worktree(tmp_path)
+    reason = _create("gh issue create --title x --label type:build -b'## Goal\nx\n'", tmp_path)
+    assert reason and "## Loop metadata" in reason
+
+
+def test_an_attached_short_repo_stands_the_whole_duty_down(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create -Rcli/cli --label type:build --body '## Goal\nx\n'",
+                   tmp_path) is None
+
+
+def test_attached_and_separated_short_options_mix(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create -t x -ltype:build -l needs-owner --body %s"
+                   % shlex.quote(VALID_BODY), tmp_path) is None
+
+
+def test_an_attached_short_label_holding_a_variable_still_stands_the_duty_down(tmp_path):
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x -l$labels --body '## Goal\nx\n'", tmp_path) is None

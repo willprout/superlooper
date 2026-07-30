@@ -825,7 +825,7 @@ def _queue_status_text(launchable, blocked_by, pos, refusal=None):
     return "QUEUED"
 
 
-def queue_rows(candidates, satisfied):
+def queue_rows(candidates, satisfied, areas=None, touches_required=False):
     """The ordered departures/launch queue (design record §3) — the RUNNER's launch order, mirrored.
 
     The order is exactly ``launch_rules.sort_key``: ⚡ expedite on top, then the priority band, then
@@ -836,11 +836,19 @@ def queue_rows(candidates, satisfied):
     stand:
 
       * **paperwork** — the runner's own eligibility rules would refuse this flight over its labels
-        (a missing/unknown/doubled ``type:``, a doubled or blank ``model:``/``effort:``). The board
-        used to render such an issue as launchable, even NEXT OFF THE STAND, forever — while the
-        runner silently never took it. Now it names the bad label in plain words instead.
+        (a missing/unknown/doubled ``type:``, a doubled or blank ``model:``/``effort:``) or over its
+        TERRITORY (issue #225: a merge-producing issue that declares no parseable ``touches:`` under
+        ``## Loop metadata`` is PARKED, never launched, when the repo requires one). The board used
+        to render such an issue as launchable, even NEXT OFF THE STAND, forever — while the runner
+        silently never took it. Now it names the exact defect in plain words instead.
       * **awaiting connection** — a ``blocked-by`` connection that has NOT arrived. ⚡ cannot
         override it.
+
+    ``areas`` and ``touches_required`` are the repo's own territory facts (``config._enrich_repo``
+    reads them from its ``.superlooper/config.json``). Both default to "unknown", which stands the
+    territory check DOWN entirely: a standalone dashboard, or a repo that declared neither, judges
+    labels alone exactly as it did before #225. Guessing enforcement for a repo that never asked for
+    it would paint its whole queue PAPERWORK at once.
 
     ``candidates`` are the open, ``agent-ready``, still-launchable issues the server gathered, in
     the shape ``{num, title, labels, body, created_at, requeue_front}`` (the last two default to
@@ -856,7 +864,8 @@ def queue_rows(candidates, satisfied):
         # The runner's label verdict comes FIRST: an issue it would refuse is never launchable, so
         # its ⚡ and its queue position are meaningless — it is off the launch order entirely, just
         # as it is in the runner's own candidate list.
-        refusal = launch_rules.refusal(labels)
+        refusal = launch_rules.refusal(labels, body=c.get("body"), areas=areas,
+                                       touches_required=touches_required)
         blockers = parse_blocked_by(c.get("body"))
         unmet = [n for n in blockers if not satisfied(n)]
         blocked_by = unmet[0] if unmet else None          # the first connection still to arrive
