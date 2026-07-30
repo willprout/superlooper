@@ -303,6 +303,14 @@ def test_parity_the_mirrors_type_kinds_are_the_engines():
     assert tuple(launch_rules.TYPE_KINDS) == tuple(_engine_issues().VALID_TYPES)
 
 
+def test_parity_the_mirrors_merge_producing_kinds_are_the_engines():
+    # The other hand-copied constant #225 adds. It agrees today, so this is a ratchet, not a fix:
+    # `queue_lint.MERGE_PRODUCING_TYPES` is a plain literal, and a fourth issue kind that produced
+    # a PR would change it there and silently leave the board exempting an issue the runner parks.
+    assert tuple(launch_rules.MERGE_PRODUCING_KINDS) == \
+        tuple(_engine_queue_lint().MERGE_PRODUCING_TYPES)
+
+
 # =========================================================================== the territory half
 # Issue #225. The label half of the contract has been mirrored since #138; the TERRITORY half had
 # not, so an approved merge-producing issue with no `touches:` declaration read as a normal queued
@@ -461,6 +469,33 @@ def test_a_declaration_in_the_LAST_section_is_read():
     assert _refusal(["type:build"], body) is None
 
 
+def test_the_LAST_touches_line_in_a_section_wins_as_the_engine_reads_it():
+    # A blank `touches:` below a filled one silences it for the runner, so the board must not go
+    # on advertising the flight. The mirror read the FIRST line and did exactly that.
+    body = "## Loop metadata\ntouches: engine\ntouches:\n"
+    assert launch_rules.declared_touches(body) == []
+    assert _refusal(["type:build"], body) is not None
+    # ...and the other direction: a filled line BELOW a blank one is a real declaration.
+    body = "## Loop metadata\ntouches:\ntouches: engine\n"
+    assert launch_rules.declared_touches(body) == ["engine"]
+    assert _refusal(["type:build"], body) is None
+
+
+def test_a_half_filled_template_is_told_to_give_the_line_a_VALUE():
+    # A `touches:` key with no value sits exactly where it belongs, so "put it under a
+    # `## Loop metadata` heading" names a fix the author has already done. The verdict (refused)
+    # is right either way; the SENTENCE is what #225 promises to get right.
+    r = _refusal(["type:build"], "## Loop metadata\ntouches:\n")
+    assert r["code"] == "touches_missing"
+    assert "Put it under" not in r["text"]
+
+
+def test_blank_area_names_never_reach_the_owners_sentence():
+    r = _refusal(["type:build"], "## Goal\nx\n", areas={"": ["a/**"], "  ": ["b/**"],
+                                                        "engine": ["skills/**"]})
+    assert "areas: engine" in r["text"]
+
+
 def test_parity_duplicate_sections_agree_with_the_engine():
     eng = _engine_queue_lint()
     for body in (_DUPLICATE_SECTIONS,
@@ -500,6 +535,15 @@ def test_parity_every_duplicate_heading_shape_agrees_with_the_engine():
         "## Loop metadata \ntouches: engine\n",
         "## Loop metadata\n\n### sub\ntouches: engine\n",
         "## Goal\nx\n## Loop metadata\ntouches: engine",          # section at EOF, no trailing \n
+        # TWO `touches:` lines in one section. The engine's parser has no `break` — it reassigns on
+        # every match, so the LAST line wins. Both directions matter, and they drift OPPOSITE ways:
+        # read the first and the board crowns NEXT OFF THE STAND a flight the runner parks (the
+        # #225 headline defect), or shows PAPERWORK over one the runner launches (#138's, mirrored).
+        # Not a hand-typed curiosity: a half-filled template plus a janitor repair produces exactly
+        # this shape.
+        "## Loop metadata\ntouches: engine\ntouches:\n",
+        "## Loop metadata\ntouches:\ntouches: engine\n",
+        "## Loop metadata\ntouches: engine\ntouches: dashboard\n",
     ]
     for body in bodies:
         engine_touches = _engine_issues().parse_loop_metadata(body)["touches"]

@@ -19,6 +19,7 @@ Two disciplines the tests below pin, because both were paid for elsewhere in thi
 """
 import pytest
 
+import issues
 import queue_lint
 
 
@@ -411,9 +412,34 @@ def test_with_touches_clears_the_BLOCKING_defect_across_every_heading_shape():
                  "## Loop metadata\nparent: #1\n\n## Goal\nx\n\n## Loop metadata\nparent: #2\n",
                  "## LOOP METADATA\nparent: #1\n",
                  "## Goal\nx\n## Loop metadata\nparent: #7",
+                 # a HALF-FILLED template: the heading and the key are there, the value is not.
+                 # The audit was full of these, and the engine reads the LAST `touches:` line in the
+                 # section — so a repair inserted above this one is silently overruled by it.
+                 "## Loop metadata\ntouches:\n",
+                 "## Loop metadata\ntouches:   \n",
+                 "## Loop metadata\ntouches:\nparent: #7\n",
                  "## Goal\nship it\n\ntouches: engine\n"]:
         out = queue_lint.with_touches(body, "engine")
         assert queue_lint.lint(["type:build"], out, areas=AREAS) == [], repr(body)
+
+
+def test_with_touches_never_returns_a_body_its_OWN_parser_cannot_read():
+    # The invariant behind every metadata proposal: what the janitor writes to someone else's issue
+    # must be launchable, or it must not be written at all. A repair that lands, journals `ok` and
+    # posts an audit comment saying `declared touches: engine` — while the issue stays exactly as
+    # unlaunchable as before — is the worst outcome a one-tap repair can have, and it is worse than
+    # offering no repair, because the owner believes the queue is fixed.
+    shapes = ["## Loop metadata\ntouches:\n", "## Loop metadata\ntouches:\nparent: #7\n",
+              "## Goal\nx\n", "", "## Loop metadata\nparent: #7\n",
+              "## Goal\nship it\n\ntouches: engine\n", "## LOOP METADATA\ntouches:\n"]
+    for body in shapes:
+        for value in ("engine", "*", "engine, dashboard"):
+            out = queue_lint.with_touches(body, value)
+            if out is None:
+                continue                       # refusing to repair is always allowed
+            parsed = issues.parse_loop_metadata(out)["touches"]
+            expected = [t.strip() for t in value.split(",") if t.strip()]
+            assert parsed == expected, (repr(body), value, repr(out), parsed)
 
 
 def test_with_touches_promoting_an_authors_own_UNDECLARED_area_leaves_the_advisory_standing():

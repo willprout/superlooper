@@ -759,8 +759,11 @@ def cmd_doctor(args):
             title = iss.get("title") if isinstance(iss.get("title"), str) else ""
             head = "#%s %s" % (num, (title[:60] + "…") if len(title) > 61 else title)
             lines = ["    %s" % head] + ["      - " + queue_lint.describe(d) for d in defects]
-            approved = "agent-ready" in {l.get("name") for l in iss.get("labels") or []
-                                         if isinstance(l, dict)}
+            # The engine's own label reader, not an inline set comprehension: some gh queries
+            # return labels as bare strings, and under that shape the inline version read NO
+            # labels — quietly demoting a genuine `agent-ready` wedge from FAIL to WARN and
+            # letting `doctor` exit 0 on a queue that cannot launch (fresh-agent review).
+            approved = "agent-ready" in issues_lib._label_names(iss)
             (wedged if (approved and queue_lint.blocking(defects)) else backlog).append(lines)
         if not open_issues:
             # A refused list read and a spotless repo look identical from here, so say neither.
@@ -1742,7 +1745,10 @@ def _upkeep_janitor_view(home, cfg, dev):
     ls, _refused_map, refused_keys, err = _janitor_read_state(home, retry_refused=False)
     if err is not None:
         return {"error": err, "proposals": [], "held": [], "reopen_withheld": 0}, {}
-    fetched = _janitor_fetch(ls)
+    # `cfg` matters: without it the territory facts are unknown, so the touches menus can never be
+    # proposed and this weekly glance would report a DIFFERENT count than `superlooper janitor` on
+    # the same repo — while pointing at that very command as the remedy (fresh-agent review).
+    fetched = _janitor_fetch(ls, cfg)
     days = cfg["janitor"]["aged_park_days"]
     result = janitor_lib.propose(**fetched, now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)

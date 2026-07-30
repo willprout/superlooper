@@ -591,11 +591,23 @@ def test_a_body_built_by_command_substitution_stands_the_body_dimension_down(tmp
     assert "## Loop metadata" not in reason      # never complain about a body we could not read
 
 
-@pytest.mark.parametrize("flag", ["--body-file notes.md", "-F notes.md", "--editor", "--web",
+@pytest.mark.parametrize("flag", ["--body-file notes.md", "-F notes.md", "--editor",
                                   "--template bug.md"])
 def test_a_body_from_somewhere_else_stands_the_body_dimension_down(tmp_path, flag):
     _worktree(tmp_path)
     assert _create("gh issue create --title x --label type:build %s" % flag, tmp_path) is None
+
+
+@pytest.mark.parametrize("flag", ["--web", "--recover draft.json"])
+def test_a_form_filled_ELSEWHERE_stands_the_whole_duty_down(tmp_path, flag):
+    # Fresh-agent review, 2026-07-30. `--web` hands the form to a browser for the person to fill
+    # in; `--recover` restores a saved draft's fields, labels included. In both, no `--label` on
+    # the command line means labels we did not READ — not the confident evidence of a missing
+    # `type:` label that an ordinary line's absence is. The duty denied over exactly that absence,
+    # complaining about a label the author was about to pick: a verdict on evidence it never had.
+    _worktree(tmp_path)
+    assert _create("gh issue create %s" % flag, tmp_path) is None
+    assert _create("gh issue create %s --title x" % flag, tmp_path) is None
 
 
 def test_no_body_flag_at_all_stands_the_body_dimension_down(tmp_path):

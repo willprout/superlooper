@@ -246,8 +246,15 @@ _SEPARATORS = frozenset(("&&", "||", ";", "|", "&", "(", ")", "{", "}"))
 # Anything that puts the body somewhere this parser cannot see. Each stands the BODY dimension down
 # (the labels are still judged) rather than the whole duty: they are honest "we don't know", not
 # evidence of a defect.
-_BODY_ELSEWHERE = frozenset(("--body-file", "-F", "--editor", "--web", "--template", "--fill",
-                             "--fill-first", "--fill-verbose", "--recover"))
+_BODY_ELSEWHERE = frozenset(("--body-file", "-F", "--editor", "--template", "--fill",
+                             "--fill-first", "--fill-verbose"))
+# ...and anything that puts the LABELS somewhere this parser cannot see either. These stand the
+# WHOLE duty down, like `--repo` (fresh-agent review, 2026-07-30): `--web` hands the whole form to a
+# browser for the person to fill in, and `--recover` restores a saved draft's fields — including its
+# labels — from a file. In both, an empty `--label` set is UNREAD labels, not the confident evidence
+# of a missing `type:` label that an ordinary command line's absence would be. Denying there is a
+# verdict on evidence we do not have, which is the one direction this duty may never be wrong in.
+_DECLARATION_ELSEWHERE = frozenset(("--web", "--recover"))
 # Shell constructs that mean the quoted text is NOT what the command will actually send: a command
 # substitution, a process substitution, or a plain variable expansion. shlex keeps every one of
 # them literal, so seeing one is exactly the signal that what we hold is a RECIPE rather than the
@@ -329,7 +336,9 @@ def parse_issue_create(command):
     a missing `type:` label (two live issues in this repo, #284 and #286, were filed exactly so).
 
     `--repo`/`-R` stands the WHOLE duty down: another repo has another contract (its own `areas`,
-    its own `touches_required`), and this repo's rules are not held over an issue filed there."""
+    its own `touches_required`), and this repo's rules are not held over an issue filed there.
+    `--web` and `--recover` stand it down for the other reason: the labels and body are chosen in a
+    browser form or restored from a draft file, so this parser reads neither."""
     # (an unreadable LABEL argument also stands the whole duty down — see _issue_create_deny)
     tokens = _split_command(command)
     if not tokens:
@@ -346,6 +355,8 @@ def parse_issue_create(command):
         # held THIS repo's contract over an issue being filed somewhere else (review round 2).
         if tok in ("--repo", "-R") or tok.startswith("--repo=") or tok.startswith("-R"):
             return None
+        if tok in _DECLARATION_ELSEWHERE:
+            return None                      # labels AND body live where this parser cannot look
         if tok in _BODY_ELSEWHERE:
             body_readable = False
             i += 1

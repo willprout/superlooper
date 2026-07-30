@@ -194,11 +194,17 @@ def declared_touches(body):
     if current is not None:
         sections[current] = buf
     meta = next((v for k, v in sections.items() if k.strip().lower() == "loop metadata"), [])
+    # The LAST `touches:` line in the section, not the first: the engine's loop has no `break`, so
+    # it reassigns on every match. Two lines in one section is not a hand-typed curiosity — a
+    # half-filled template (`touches:` with no value) plus a janitor repair produces exactly that
+    # shape — and reading the first one drifts BOTH ways: the board either crowns NEXT OFF THE
+    # STAND a flight the runner parks, or shows PAPERWORK over one the runner launches happily.
+    touches = []
     for line in meta:
         s = line.strip()
         if s.lower().startswith("touches:"):
-            return [t.strip() for t in s.split(":", 1)[1].split(",") if t.strip()]
-    return []
+            touches = [t.strip() for t in s.split(":", 1)[1].split(",") if t.strip()]
+    return touches
 
 
 def _touches_refusal(names, body, areas, touches_required):
@@ -215,11 +221,18 @@ def _touches_refusal(names, body, areas, touches_required):
         return None                      # an investigation, or a type the label half already refused
     if declared_touches(body):
         return None
-    where = ("Add" if not isinstance(body, str) or not _TOUCHES_ANYWHERE.search(body)
+    # A `touches:` line with an EMPTY right-hand side is not "written but unparseable" — it is a
+    # half-filled template, and telling its author to move a line that already sits in the right
+    # place would name the wrong fix while never mentioning the real one (give it a value). Mirror
+    # of queue_lint._bare_touches_value, which requires a non-empty value for the same reason.
+    bare = next((m.group(1).strip() for m in _TOUCHES_ANYWHERE.finditer(body)
+                 if m.group(1).strip()), None) if isinstance(body, str) else None
+    where = ("Add" if bare is None
              else "There is a `touches:` line, but not one the runner can parse. Put it under a "
                   "`## Loop metadata` heading as")
-    code = "touches_missing" if where == "Add" else "touches_outside_section"
-    known = sorted(a for a in areas if isinstance(a, str)) if isinstance(areas, dict) else []
+    code = "touches_missing" if bare is None else "touches_outside_section"
+    known = sorted(a for a in areas if isinstance(a, str) and a.strip()) \
+        if isinstance(areas, dict) else []
     where_areas = (" This repo's areas: %s (or `*` for unknown scope)." % ", ".join(known)
                    if known else "")
     return {"code": code,

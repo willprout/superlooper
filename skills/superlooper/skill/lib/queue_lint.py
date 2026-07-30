@@ -299,6 +299,14 @@ def _read_metadata_heading(lines):
     return max(i for i, text in headings if text == key)
 
 
+def _verified(new_body, value):
+    """`new_body` if the ENGINE's own parser reads exactly the declaration we meant to write, else
+    None. The last gate before a write lands on someone else's issue: this module's job is to say
+    what the runner reads, so a repair is only a repair if the runner reads it."""
+    intended = [t.strip() for t in value.split(",") if t.strip()]
+    return new_body if issues_mod.parse_loop_metadata(new_body)["touches"] == intended else None
+
+
 def with_touches(body, value):
     """`body` rewritten so the runner CAN parse a `touches: <value>` declaration, or None when
     `value` is empty (a blank declaration parses to nothing, so writing one would "repair" an issue
@@ -308,13 +316,23 @@ def with_touches(body, value):
     so it ADDS ONLY. It never deletes a line and never rewrites an author's prose — a repair that
     eats words is worse than the defect it fixes. Three cases, all additive:
 
-      1. a `## Loop metadata` section already exists -> the `touches:` line is inserted into it,
-         keeping its other fields (`parent:`, `blocked-by:`) exactly where they are;
-      2. no section, and the body ENDS with an unparseable `touches:` line — the audit's commonest
-         shape, because the template puts the declaration last — -> the heading is inserted on the
-         line above it. A pure one-line insert; nothing moves and nothing is duplicated;
+      1. a `## Loop metadata` section already exists -> the `touches:` line is inserted at the END
+         of that section, keeping its other fields (`parent:`, `blocked-by:`) exactly where they
+         are. The end, not the top, because `parse_loop_metadata` takes the LAST `touches:` line in
+         the section: a HALF-FILLED template (`touches:` with no value — the shape the 2026-07-16
+         audit was full of) would silently OVERRULE a line inserted above it, and the repair would
+         report success on an issue that stayed exactly as unlaunchable as before;
+      2. no section, and the body ENDS with an unparseable `touches:` line — also common, because
+         the template puts the declaration last — -> the heading is inserted on the line above it.
+         A pure one-line insert; nothing moves and nothing is duplicated;
       3. anything else -> a fresh section is appended. A stray `touches:` line elsewhere stays
-         where the author put it (now as prose), because deleting it is not this function's call."""
+         where the author put it (now as prose), because deleting it is not this function's call.
+
+    Every case is then VERIFIED against the engine's own parser before it is returned, and a body
+    the parser would not read as this exact declaration comes back as None instead. Offering no
+    repair is a safe outcome — `doctor --repo` still names the issue. Writing one that does not
+    repair is not: it lands, journals `ok`, and posts an audit comment claiming a declaration the
+    runner cannot see, so the owner believes the queue is fixed while the issue stays parked."""
     if not isinstance(value, str) or not value.strip():
         return None
     value = value.strip()
@@ -325,18 +343,20 @@ def with_touches(body, value):
     if heading_at is not None:
         if issues_mod.parse_loop_metadata(body)["touches"]:
             return body                                  # already parseable: nothing to add
-        lines.insert(heading_at + 1, "touches: %s" % value)
-        return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
+        end = next((i for i in range(heading_at + 1, len(lines)) if _H2_HEADING.match(lines[i])),
+                   len(lines))
+        lines.insert(end, "touches: %s" % value)
+        return _verified("\n".join(lines) + ("\n" if body.endswith("\n") else ""), value)
 
     last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
     if last is not None and _TOUCHES_LINE.match(lines[last]):
         lines.insert(last, _METADATA_HEADING)
-        return "\n".join(lines) + ("\n" if body.endswith("\n") else "")
+        return _verified("\n".join(lines) + ("\n" if body.endswith("\n") else ""), value)
 
     tail = "%s\ntouches: %s\n" % (_METADATA_HEADING, value)
     if not body:
-        return tail
-    return body + ("\n" if body.endswith("\n") else "\n\n") + tail
+        return _verified(tail, value)
+    return _verified(body + ("\n" if body.endswith("\n") else "\n\n") + tail, value)
 
 
 def describe(defect):
