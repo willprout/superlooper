@@ -423,6 +423,26 @@ def test_with_touches_clears_the_BLOCKING_defect_across_every_heading_shape():
         assert queue_lint.lint(["type:build"], out, areas=AREAS) == [], repr(body)
 
 
+def test_with_touches_refuses_a_value_that_is_nothing_but_separators():
+    # `value.strip()` is truthy for "," so the empty-value guard never fired, and the verifier
+    # then compared [] against [] and called it a successful repair — reopening the false-repair
+    # loop one notch narrower (review round 2). A value that declares nothing is not a repair.
+    for value in (",", ",,", " , , "):
+        assert queue_lint.with_touches("## Goal\nx\n", value) is None, value
+        assert queue_lint.with_touches("## Loop metadata\nparent: #7\n", value) is None, value
+
+
+def test_a_blank_trailing_touches_line_still_earns_a_working_repair():
+    # The audit's commonest shape. Promoting it in place would head a section whose only
+    # declaration is still blank, so the verifier rejects it — and the issue would be left with no
+    # repair on offer at all. It falls through to a freshly appended section instead.
+    out = queue_lint.with_touches("## Goal\nShip it.\n\ntouches:\n", "engine")
+    assert out is not None
+    assert issues.parse_loop_metadata(out)["touches"] == ["engine"]
+    assert queue_lint.lint(["type:build"], out, areas=AREAS) == []
+    assert "## Goal\nShip it.\n" in out          # still additive — the author's words are intact
+
+
 def test_with_touches_never_returns_a_body_its_OWN_parser_cannot_read():
     # The invariant behind every metadata proposal: what the janitor writes to someone else's issue
     # must be launchable, or it must not be written at all. A repair that lands, journals `ok` and

@@ -355,7 +355,11 @@ def parse_issue_create(command):
         # held THIS repo's contract over an issue being filed somewhere else (review round 2).
         if tok in ("--repo", "-R") or tok.startswith("--repo=") or tok.startswith("-R"):
             return None
-        if tok in _DECLARATION_ELSEWHERE:
+        # `-w` is gh's own documented shorthand for `--web`, and both flags also take the attached
+        # `--flag=value` form. Whole-token matching alone missed all three, which is the same
+        # attached-form gap `-Rowner/repo` was caught on (review rounds 2 and 3).
+        if (tok in _DECLARATION_ELSEWHERE or tok == "-w"
+                or tok.startswith("--web=") or tok.startswith("--recover=")):
             return None                      # labels AND body live where this parser cannot look
         if tok in _BODY_ELSEWHERE:
             body_readable = False
@@ -461,9 +465,12 @@ def _issue_create_reason(defects, areas):
     lines = [_CREATE_PREAMBLE]
     for d in defects:
         lines.append("  • " + queue_lint.describe(d))
-    if any(d["code"] == "metadata_missing" or d["code"].startswith("touches") for d in defects):
+    if any(d["code"].startswith("touches") for d in defects):
         lines.append(_CREATE_SHAPE)
-        names = [a for a in areas if isinstance(a, str)] if isinstance(areas, dict) else []
+        # `a.strip()`, like queue_lint._area_names: a blank key would otherwise render as
+        # "areas: ,    , engine" in the one sentence that tells the worker what to write.
+        names = [a for a in areas if isinstance(a, str) and a.strip()] \
+            if isinstance(areas, dict) else []
         if names:
             lines.append("This repo declares these areas: %s (or `*` for genuinely unknown scope)."
                          % ", ".join(names))

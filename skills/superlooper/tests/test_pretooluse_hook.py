@@ -598,7 +598,10 @@ def test_a_body_from_somewhere_else_stands_the_body_dimension_down(tmp_path, fla
     assert _create("gh issue create --title x --label type:build %s" % flag, tmp_path) is None
 
 
-@pytest.mark.parametrize("flag", ["--web", "--recover draft.json"])
+@pytest.mark.parametrize("flag", ["--web", "--recover draft.json",
+                                  # gh's own documented shorthand, and the attached forms both
+                                  # flags accept — the same gap `-Rowner/repo` was caught on.
+                                  "-w", "--web=true", "--recover=draft.json"])
 def test_a_form_filled_ELSEWHERE_stands_the_whole_duty_down(tmp_path, flag):
     # Fresh-agent review, 2026-07-30. `--web` hands the form to a browser for the person to fill
     # in; `--recover` restores a saved draft's fields, labels included. In both, no `--label` on
@@ -614,6 +617,15 @@ def test_no_body_flag_at_all_stands_the_body_dimension_down(tmp_path):
     # Without --body gh prompts or errors; either way there is no text to judge.
     _worktree(tmp_path)
     assert _create("gh issue create --title x --label type:build", tmp_path) is None
+
+
+def test_a_blank_area_name_never_reaches_the_sentence_that_teaches_the_format(tmp_path):
+    # The deny reaches the model VERBATIM at the moment it errs, so its area list is the one place
+    # a blank config key would read as an area you may declare ("areas: ,    , engine").
+    _worktree(tmp_path, cfg={"areas": {"": ["a/**"], "   ": ["b/**"], "engine": ["skills/**"]},
+                             "touches_required": True})
+    reason = _create('gh issue create --title x --label type:build --body "## Goal\nx\n"', tmp_path)
+    assert reason and "areas: engine (" in reason
 
 
 @pytest.mark.parametrize("flag", ["--repo other/repo", "-R other/repo"])

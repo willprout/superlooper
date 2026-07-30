@@ -304,6 +304,12 @@ def _verified(new_body, value):
     None. The last gate before a write lands on someone else's issue: this module's job is to say
     what the runner reads, so a repair is only a repair if the runner reads it."""
     intended = [t.strip() for t in value.split(",") if t.strip()]
+    if not intended:
+        # A value of nothing but separators (`,` / `, ,`) survives the caller's `value.strip()`
+        # guard but parses to NOTHING — so comparing it against the parser would "verify" a
+        # declaration that declares nothing, and the whole false-repair loop would reopen one
+        # notch narrower (fresh-agent review round 2).
+        return None
     return new_body if issues_mod.parse_loop_metadata(new_body)["touches"] == intended else None
 
 
@@ -349,7 +355,12 @@ def with_touches(body, value):
         return _verified("\n".join(lines) + ("\n" if body.endswith("\n") else ""), value)
 
     last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
-    if last is not None and _TOUCHES_LINE.match(lines[last]):
+    # Only a trailing line that carries a VALUE can be promoted by putting a heading over it. A
+    # bare `touches:` promoted that way would head a section whose only declaration is still blank,
+    # which _verified then rejects — leaving the commonest audit shape with no repair at all. Let it
+    # fall through to case 3, which appends a fresh, complete section (review round 2).
+    _trailing = _TOUCHES_LINE.match(lines[last]) if last is not None else None
+    if _trailing is not None and _trailing.group(1).strip():
         lines.insert(last, _METADATA_HEADING)
         return _verified("\n".join(lines) + ("\n" if body.endswith("\n") else ""), value)
 
