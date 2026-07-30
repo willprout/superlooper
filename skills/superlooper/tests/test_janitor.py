@@ -716,3 +716,31 @@ def test_a_repo_that_does_not_require_touches_gets_no_touches_menu():
     props = _of_kind(_meta_propose([_open_issue(5, ["type:build"], body="## Goal\nx\n")],
                                    touches_required=False))
     assert props == []
+
+
+def test_an_issue_this_sweep_proposes_CLOSING_is_never_also_offered_a_metadata_repair():
+    # The two classes met when #225 merged with #229's reopen class, and they can contradict: an
+    # aged parked issue is proposed for CLOSING, and the same issue (parked precisely because
+    # nobody could launch it) is exactly the shape the metadata lint flags. Offering both in one
+    # menu invites the owner to approve a paperwork fix onto an issue he just closed — the same
+    # contradictory pair #229's own close/reopen guard exists to prevent.
+    aged = _issue(9, ("parked",), NOW - 21 * DAY)
+    res = propose(parked_issues=[aged],
+                  lint_issues=[_open_issue(9, ["parked"], body="## Goal\nno metadata\n")],
+                  areas=_AREAS, touches_required=True)
+    keys = [p["key"] for p in res["proposals"]]
+    assert keys == ["issue:9"]                       # the close, and ONLY the close
+    assert not [k for k in keys if k.startswith("meta:9:")]
+
+
+def test_a_metadata_repair_still_stands_for_an_issue_the_sweep_leaves_alone():
+    # The guard above must bound itself to issues actually proposed for closing — a FRESH parked
+    # issue is not proposed for close, so its paperwork fix is still on offer. (Without this, the
+    # exclusion could quietly swallow the whole class for parked issues, which is most of them.)
+    fresh = _issue(9, ("parked",), NOW - 2 * DAY)
+    res = propose(parked_issues=[fresh],
+                  lint_issues=[_open_issue(9, ["parked"], body="## Goal\nno metadata\n")],
+                  areas=_AREAS, touches_required=True)
+    keys = [p["key"] for p in res["proposals"]]
+    assert "issue:9" not in keys                     # too fresh to close
+    assert [k for k in keys if k.startswith("meta:9:")]
