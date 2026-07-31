@@ -2647,6 +2647,20 @@ def test_file_fix_issue_reconciles_an_already_filed_issue_from_github(rig):
     assert filed == {"fp1": 7777}
 
 
+def test_file_fix_issue_replaces_a_retired_fingerprint_record(rig):
+    # Issue #294: decide re-arms a fingerprint whose fix issue is gone. The executor must OVERWRITE
+    # the stale number with the new one — otherwise the map stays poisoned and decide re-emits on
+    # every tick forever. (No open standing-rule issue carries the marker, so this files fresh.)
+    (rig.home / "state" / "fix_issues.json").write_text(json.dumps({"fp1": 270}))
+    out = rig.r._execute({"act": "file_fix_issue", "fingerprint": "fp1",
+                          "title": "Restore green", "body": "## Goal\nfix",
+                          "labels": ["type:diagnose-and-fix", "agent-ready",
+                                     "auto-approved:nightly-red", "expedite"]}, NOW)
+    assert out == "ok"
+    filed = json.loads((rig.home / "state" / "fix_issues.json").read_text())
+    assert filed == {"fp1": 9001}, "the retired record must be replaced, never left beside the new"
+
+
 def test_file_fix_issue_ignores_a_bare_fingerprint_substring(rig):
     # Codex round-2: reconcile only on the CANONICAL marker, never a coincidental substring
     # (e.g. a log excerpt quoted in some other standing-rule issue's body).

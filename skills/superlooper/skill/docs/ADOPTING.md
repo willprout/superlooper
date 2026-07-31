@@ -270,9 +270,14 @@ rest are workflow state the runner and William drive.
 - `parked` — handed back with a memo after a retry/conflict cap.
 - `preserve` — on a PR: resolve conflicts in the PR's own branch instead of regenerating.
 - `superseded` — on a PR the loop replaced by a rebuild (branch kept, PR left open).
-- `auto-approved:nightly-red` — the one standing-rule auto-approval: a fix issue the nightly
-  files to restore a red mainline. This is a distinct label precisely because `agent-ready` is
-  William's word and a standing rule must carry its own.
+- `auto-approved:nightly-red` — the one standing-rule auto-approval: a fix issue the nightly (or
+  the runner, on a red dev check) files to restore a red mainline. This is a distinct label
+  precisely because `agent-ready` is William's word and a standing rule must carry its own. It also
+  buys one scheduling exemption: a restore-green fix declares `touches: *` and is allowed past
+  **finished-but-unmerged territory claims**, because a red mainline freezes merges and those claims
+  would otherwise pile up forever and block the very fix that would release them. Running lanes
+  still hold it — those drain on their own. Auto-restore-green is also re-armed once the fix issue
+  it filed has concluded, so a later recurrence of the same breakage gets a fresh issue.
 - `pre-authorized:referee` — the owner's word, granted at approval, letting the gate MERGE an
   issue's touches to a referee path (`.superlooper/**`, `.github/workflows/**`) instead of parking
   them for him at the finish line. Also what lets the launch gate start such an issue unattended.

@@ -4061,6 +4061,63 @@ def test_filed_fingerprint_freezes_but_does_not_refile():
     assert only(out, "file_fix_issue") == []
 
 
+# ---- issue #294: a fingerprint is retired the moment its fix issue is GONE ----
+# `filed` used to be write-once and never pruned, so the FIRST restore-green issue ever filed for
+# a fingerprint disabled auto-restore-green for that breakage forever. On this repo the key is
+# just (check name, conclusion), so one closed fix issue froze the whole mechanism.
+
+def test_a_merged_fix_issue_no_longer_suppresses_a_fresh_filing():
+    # The durable, truncation-proof signal: the loop's OWN record says the fix issue concluded
+    # (a merged PR, or an owner close absorbed to 'merged' by #108). issues.json is never pruned,
+    # so this recovers an instance poisoned months ago — no hand surgery on the state home.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+             filed_fingerprints={fp: 270},
+             issues_state={"version": 1, "issues": {"i270": ist(status="merged")}})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out, "file_fix_issue")) == 1
+
+
+def test_a_closed_fix_issue_no_longer_suppresses_a_fresh_filing():
+    # The other closure path: the owner closed it on GitHub and the loop has no local record.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+             filed_fingerprints={fp: 270})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED), closed_nums={270}))
+    assert len(only(out, "file_fix_issue")) == 1
+
+
+def test_an_unreadable_fingerprint_record_rearms_the_filing():
+    # A wrong-typed record can't vouch for anything; the executor's GitHub reconcile is the
+    # authority, so re-arm rather than suppress on state we cannot read.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+             filed_fingerprints={fp: ["not", "a", "number"]})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out, "file_fix_issue")) == 1
+
+
+def test_a_still_open_fix_issue_keeps_suppressing_the_filing():
+    # The dedup this mechanism exists for is untouched: a live fix issue is filed ONCE. Parked /
+    # needs-william / bounced all leave the issue OPEN on GitHub, so none of them re-arm.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    for status in ("running", "gating", "holding", "parked", "needs_william", "bounced"):
+        d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+                 filed_fingerprints={fp: 270},
+                 issues_state={"version": 1, "issues": {"i270": ist(status=status)}})
+        out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+        assert only(out, "file_fix_issue") == [], status
+
+
+def test_a_retired_fingerprint_on_a_green_mainline_files_nothing():
+    # Retirement only ever WIDENS the red-dev branch; a green mainline still files nothing.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(filed_fingerprints={fp: 270},
+             issues_state={"version": 1, "issues": {"i270": ist(status="merged")}})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(GREEN)))
+    assert only(out, "file_fix_issue") == []
+
+
 def test_green_dev_unfreezes():
     d = disk(frozen={"reason": "dev red", "fingerprint": "f", "since": NOW - 100})
     out = decide(dsk=d)

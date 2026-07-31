@@ -82,6 +82,14 @@ _REFEREE_PREFIXES = (".superlooper/", ".github/workflows/")
 # un-authorized referee diff still parks needs-william, never auto-merges.
 PREAUTHORIZED_REFEREE_LABEL = "pre-authorized:referee"
 
+# The red-nightly standing rule's auditable marker (spec §4.4). It is what distinguishes an
+# auto-filed restore-green fix from ordinary approved work — the runner-filed and nightly-filed
+# fix issues both carry it (actions.FIX_ISSUE_LABELS / nightly.NIGHTLY_FIX_LABELS), and nothing
+# else does. Lives HERE, beside the other owner-word label, because the scheduler consumes it too
+# (issue #294: a restore-green fix must not be blocked by finished-but-unmerged territory) and
+# scheduler must not import the actions -> brief/gate/scheduler chain.
+RESTORE_GREEN_LABEL = "auto-approved:nightly-red"
+
 # A required H2 section must carry at least this many NON-WHITESPACE characters of prose.
 # Cross-review C3: a report whose headings exist but whose bodies are empty once looked
 # "complete" to a headings-only check — empty headings must never merge.

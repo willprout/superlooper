@@ -12,8 +12,11 @@ Three gates, in order:
   3. ANTI-AFFINITY: under hard affinity, a merge-producing issue whose declared touch-areas
      overlap a merge-producing running lane, held territory claim, or one already selected this
      tick is HELD.
-     Investigations do not produce PRs or merges, so they are exempt in both directions. Under
-     soft affinity the overlap is allowed and flagged (symmetrically) for the journal.
+     Investigations do not produce PRs or merges, so they are exempt in both directions. The
+     standing-rule restore-green fix is exempt from FINISHED-but-unmerged territory claims only
+     (issue #294 — those claims cannot release while the mainline it exists to fix is frozen);
+     running lanes still hold it. Under soft affinity the overlap is allowed and flagged
+     (symmetrically) for the journal.
 
 Eligibility itself (agent-ready, valid type, blocked-by closed) lives in issues.eligible.
 `launch_ok` welds that to the usage rule as the ONE gate every path that starts or restarts a
@@ -152,6 +155,34 @@ def _merge_affinity_subject(itype):
     return itype != "investigate"
 
 
+def _restore_green(parsed):
+    """Is this the standing-rule restore-green fix (spec §4.4) — the auto-filed, auto-approved
+    issue whose whole job is to un-red the mainline? Read from the LIVE labels, so it is exactly
+    the issue the runner (or the nightly) filed under the standing rule and never a look-alike."""
+    labels = parsed.get("labels")
+    if not isinstance(labels, (list, set, tuple)):
+        return False
+    return gate.RESTORE_GREEN_LABEL in labels
+
+
+def _claim_exempt(candidate, blocker_id, finished_claim_ids):
+    """Issue #294 — the red-mainline deadlock. A territory claim outlives its lane through
+    gating/holding and releases only on MERGE; a red mainline FREEZES merges, so those claims
+    accumulate and never release. The restore-green fix declares `touches: *` (its scope is
+    genuinely unknown — whatever broke the check), which overlaps every one of them, so in exactly
+    the situation the fix exists to escape it was blocked by the very PRs that were blocked by it.
+
+    So a restore-green candidate ignores FINISHED-but-unmerged territory. It still respects every
+    RUNNING lane: a live worker is writing files right now, which is the collision anti-affinity
+    exists to prevent, and a running lane always drains (sessions end) — a frozen claim does not.
+    Worst case the fix's diff overlaps a held PR's, and the gate's own overlap step holds that
+    merge until the fix lands; a rebase beats a deadlock.
+
+    `finished_claim_ids` is claims MINUS running lanes deliberately: territory_claims_from()
+    covers in-flight statuses too, so a running issue appears in both lists under one id."""
+    return blocker_id in finished_claim_ids and _restore_green(candidate)
+
+
 def _anti_affinity_blocks(candidate, occupied, affinity):
     if not _merge_affinity_subject(candidate.get("type")):
         return False
@@ -245,6 +276,8 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
                      for lane in lanes_in]
     claim_occupied = [{"id": claim.get("id"), "touches": claim.get("touches", []),
                        "type": claim.get("type")} for claim in claims_in]
+    # FINISHED-but-unmerged territory: the claims that are not also live lanes (issue #294).
+    finished_claim_ids = {cid for cid in claimed_ids if cid not in running_ids}
 
     # The fresh path asks launch_ok — the SAME function every restart path asks (issue #150) — and
     # not a private re-implementation of half of it. The usage half is already settled by the
@@ -267,7 +300,9 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
             # this candidate's pool cap is binding (a build pool full does NOT block investigations,
             # and vice versa) -> lane-bound, NOT an affinity hold, so it carries no wildcard mystery.
             continue
-        blocker = next((ot for ot in occupied if _anti_affinity_blocks(p, ot, affinity)), None)
+        blocker = next((ot for ot in occupied
+                        if _anti_affinity_blocks(p, ot, affinity)
+                        and not _claim_exempt(p, ot.get("id"), finished_claim_ids)), None)
         if blocker is not None:
             holds.append({"p": p, "blocker": blocker})                # affinity conflict -> held this tick
             continue
