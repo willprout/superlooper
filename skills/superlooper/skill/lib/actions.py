@@ -1032,7 +1032,14 @@ def fix_issue_retired(prior, closed_nums, issues_state_map):
         OPEN on GitHub, so none of them retire anything.
 
     An unreadable record retires: it cannot vouch for an issue, and the executor's GitHub reconcile
-    (never a duplicate standing-rule issue) is the authority on whether a filing is really needed."""
+    (never a duplicate standing-rule issue) is the authority on whether a filing is really needed.
+
+    Retirement is only HALF the condition — see the caller. Neither signal proves the issue is gone
+    from GitHub (a merged PR need not have closed its issue, and the closed list can be refused), so
+    a bare level-trigger would either re-emit every tick forever or, in the ~90s window where the
+    dev view still shows the pre-merge head red while the fix issue already reads `merged`, file a
+    duplicate of the fix that just landed. The caller bounds it to ONE authoritative re-check per
+    freeze episode instead."""
     if type(prior) is not int:
         return True
     if prior in closed_nums:
@@ -1493,11 +1500,23 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                        f"required check '{name}' is red on {dev_branch}; fix-forward filed, "
                        "building continues")
             # File ONCE per distinct breakage — but only for as long as the issue that filing
-            # produced is actually standing (issue #294). A retired fingerprint re-arms; the
-            # executor then reconciles against GitHub before creating, so a still-open fix issue
-            # is recorded rather than duplicated. The condition is stable across ticks (not edge-
-            # triggered), so a create that fails is simply retried on the next one.
-            if fp not in filed or fix_issue_retired(filed.get(fp), closed_nums, ist_map):
+            # produced is actually standing (issue #294). A retired fingerprint re-arms, and the
+            # executor reconciles against GitHub before creating, so a still-open fix issue is
+            # recorded rather than duplicated.
+            #
+            # ONE re-check per freeze EPISODE, not per tick. The standing freeze marker records
+            # which issue this episode settled on (`_exec_file_fix_issue` stamps it), and a record
+            # that still names it does not re-arm. That bound is load-bearing three ways: it
+            # converges (a fix issue whose PR merged but whose GitHub issue stayed open would
+            # otherwise re-emit and re-reconcile every 15s forever); it closes the window where the
+            # dev view still shows the pre-merge head red while the fix already reads `merged` —
+            # which would file a duplicate of the fix that just landed; and it keeps spec §4.4's
+            # rule that a fix which failed its cap leaves merges frozen until the owner looks,
+            # rather than the loop instantly re-filing whatever he just closed. A create that FAILS
+            # stamps nothing, so it is still retried on the next tick.
+            settled = frozen.get("fix_issue") if isinstance(frozen, dict) else None
+            if fp not in filed or (fix_issue_retired(filed.get(fp), closed_nums, ist_map)
+                                   and settled != filed.get(fp)):
                 out.append(_fix_issue(dev_branch, name, concl, fp, operator))
         elif dev_state == "green" and frozen:
             out.append({"act": "unfreeze"})

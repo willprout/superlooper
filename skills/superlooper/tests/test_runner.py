@@ -2647,18 +2647,63 @@ def test_file_fix_issue_reconciles_an_already_filed_issue_from_github(rig):
     assert filed == {"fp1": 7777}
 
 
+FIX_LABELS = ["type:diagnose-and-fix", "agent-ready", "auto-approved:nightly-red", "expedite"]
+
+
+def _file_fix(rig, fp="fp1"):
+    return rig.r._execute({"act": "file_fix_issue", "fingerprint": fp,
+                           "title": "Restore green", "body": "## Goal\nfix",
+                           "labels": list(FIX_LABELS)}, NOW)
+
+
 def test_file_fix_issue_replaces_a_retired_fingerprint_record(rig):
     # Issue #294: decide re-arms a fingerprint whose fix issue is gone. The executor must OVERWRITE
     # the stale number with the new one — otherwise the map stays poisoned and decide re-emits on
     # every tick forever. (No open standing-rule issue carries the marker, so this files fresh.)
     (rig.home / "state" / "fix_issues.json").write_text(json.dumps({"fp1": 270}))
-    out = rig.r._execute({"act": "file_fix_issue", "fingerprint": "fp1",
-                          "title": "Restore green", "body": "## Goal\nfix",
-                          "labels": ["type:diagnose-and-fix", "agent-ready",
-                                     "auto-approved:nightly-red", "expedite"]}, NOW)
-    assert out == "ok"
+    assert _file_fix(rig) == "ok"
     filed = json.loads((rig.home / "state" / "fix_issues.json").read_text())
     assert filed == {"fp1": 9001}, "the retired record must be replaced, never left beside the new"
+
+
+def test_file_fix_issue_stamps_the_standing_freeze_with_what_it_settled_on(rig):
+    # The #294 convergence bound: decide re-arms at most once per freeze EPISODE, and this stamp is
+    # what tells it the episode is already settled. Both settle branches must stamp.
+    (rig.home / "state" / "merges_frozen.json").write_text(json.dumps(
+        {"reason": "dev red", "fingerprint": "fp1", "since": NOW - 60, "source": "dev-check"}))
+    assert _file_fix(rig) == "ok"
+    marker = json.loads((rig.home / "state" / "merges_frozen.json").read_text())
+    assert marker["fix_issue"] == 9001
+    assert marker["source"] == "dev-check" and marker["since"] == NOW - 60, \
+        "the stamp must not clobber the freeze's own fields (unfreeze reads `source`)"
+
+
+def test_file_fix_issue_reconciling_a_still_open_issue_also_settles_the_episode(rig):
+    # The non-convergence case the bound exists for: a re-armed filing whose fix issue turns out to
+    # be STILL OPEN (its PR merged without closing it). It is recorded, not duplicated — and the
+    # episode is stamped, so decide stops re-emitting instead of re-reconciling every 15s forever.
+    (rig.fixdir / "issue_list_auto-approved:nightly-red.json").write_text(json.dumps([
+        {"number": 7777, "title": "Restore green: x",
+         "body": "## Goal\nFailure fingerprint: `fp1` (auto-filed once per distinct breakage).",
+         "labels": [{"name": "auto-approved:nightly-red"}], "createdAt": "2026-07-02T00:00:00Z"}]))
+    (rig.home / "state" / "fix_issues.json").write_text(json.dumps({"fp1": 7777}))
+    (rig.home / "state" / "merges_frozen.json").write_text(json.dumps(
+        {"reason": "dev red", "fingerprint": "fp1", "since": NOW - 60, "source": "dev-check"}))
+    out = _file_fix(rig)
+    assert "already" in out and not any(m["kind"] == "create_issue" for m in mutations(rig))
+    assert json.loads((rig.home / "state" / "merges_frozen.json").read_text())["fix_issue"] == 7777
+
+
+def test_file_fix_issue_never_manufactures_a_freeze_marker(rig):
+    # Stamping must never CREATE the marker (existence == frozen), nor repair an unreadable one
+    # into a readable one — `_exec_unfreeze` reads a `source` this code could not restore.
+    fpath = rig.home / "state" / "merges_frozen.json"
+    assert _file_fix(rig) == "ok"
+    assert not fpath.exists(), "no freeze standing -> the executor must not invent one"
+
+    fpath.write_text("{not json at all")
+    assert _file_fix(rig, fp="fp2") == "ok"
+    assert fpath.read_text() == "{not json at all", "an unreadable marker is left exactly as found"
 
 
 def test_file_fix_issue_ignores_a_bare_fingerprint_substring(rig):

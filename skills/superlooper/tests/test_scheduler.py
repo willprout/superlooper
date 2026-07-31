@@ -454,6 +454,28 @@ def test_restore_green_is_not_a_wildcard_launch_hold_behind_a_claim():
                   territory_claims=claims) == []
 
 
+def test_restore_green_is_held_by_a_claim_when_merges_are_NOT_frozen():
+    # The exemption's whole justification is that a frozen mainline never releases the claim. On a
+    # green mainline it releases on its own, so ordinary anti-affinity applies.
+    q = [_restore_green(1)]
+    claims = [{"id": "i533", "type": "build", "touches": ["data", "e2e"]}]
+    assert scheduler.launchable(q, [], _cfg(lanes=1, affinity="hard"), OK, set(), False,
+                                territory_claims=claims) == []
+
+
+def test_restore_green_detection_fails_closed_on_wrong_typed_labels():
+    # Asserted on the predicate itself, not through launchable — a wrong-typed `labels` is also
+    # refused by issues.eligible, which would let this pass for the wrong reason. The comma-joined
+    # STRING is the case that matters: `LABEL in labels` on a str is a SUBSTRING test, the one
+    # input that could hand the exemption to an issue that never carried the standing-rule word.
+    assert scheduler._restore_green(
+        {"labels": ["type:build", "auto-approved:nightly-red"]}) is True
+    for labels in ("type:diagnose-and-fix,agent-ready,auto-approved:nightly-red", None,
+                   {"auto-approved:nightly-red": True}, 7, ["agent-ready"]):
+        assert scheduler._restore_green({"labels": labels}) is False, labels
+    assert scheduler._restore_green({}) is False
+
+
 def test_hard_affinity_wildcard_running_lane_blocks_all():
     q = [_issue(1, touches=["frontend"]), _issue(2, touches=["api"])]
     lanes = [{"id": "i9", "touches": ["*"]}]      # a running lane of unknown scope blocks everything

@@ -165,22 +165,28 @@ def _restore_green(parsed):
     return gate.RESTORE_GREEN_LABEL in labels
 
 
-def _claim_exempt(candidate, blocker_id, finished_claim_ids):
+def _claim_exempt(candidate, blocker_id, finished_claim_ids, frozen):
     """Issue #294 — the red-mainline deadlock. A territory claim outlives its lane through
     gating/holding and releases only on MERGE; a red mainline FREEZES merges, so those claims
     accumulate and never release. The restore-green fix declares `touches: *` (its scope is
     genuinely unknown — whatever broke the check), which overlaps every one of them, so in exactly
     the situation the fix exists to escape it was blocked by the very PRs that were blocked by it.
 
-    So a restore-green candidate ignores FINISHED-but-unmerged territory. It still respects every
-    RUNNING lane: a live worker is writing files right now, which is the collision anti-affinity
-    exists to prevent, and a running lane always drains (sessions end) — a frozen claim does not.
-    Worst case the fix's diff overlaps a held PR's, and the gate's own overlap step holds that
-    merge until the fix lands; a rebase beats a deadlock.
+    So a restore-green candidate ignores FINISHED-but-unmerged territory WHILE MERGES ARE FROZEN.
+    Both halves are the deadlock's own shape and neither is decoration:
+      * frozen — the whole justification is that the claims cannot release. On a green mainline
+        they release on their own within a tick or two, and the bypass would just buy an avoidable
+        overlap for a fix issue that outlived its breakage.
+      * finished-only — a RUNNING lane still holds it. Not because a claim-holding lane is
+        necessarily idle (the gate nudges one to repin a review or chase a check, and it then
+        pushes), but because a running lane always ENDS — sessions have caps — while a claim under
+        a freeze has no such clock. Worst case the fix's diff overlaps a held PR's; the gate's own
+        overlap step holds that merge until the fix lands, and lanes get separate worktrees, so the
+        cost is a rebase, never two writers in one tree. A rebase beats a deadlock.
 
     `finished_claim_ids` is claims MINUS running lanes deliberately: territory_claims_from()
     covers in-flight statuses too, so a running issue appears in both lists under one id."""
-    return blocker_id in finished_claim_ids and _restore_green(candidate)
+    return bool(frozen) and blocker_id in finished_claim_ids and _restore_green(candidate)
 
 
 def _anti_affinity_blocks(candidate, occupied, affinity):
@@ -302,7 +308,7 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
             continue
         blocker = next((ot for ot in occupied
                         if _anti_affinity_blocks(p, ot, affinity)
-                        and not _claim_exempt(p, ot.get("id"), finished_claim_ids)), None)
+                        and not _claim_exempt(p, ot.get("id"), finished_claim_ids, frozen)), None)
         if blocker is not None:
             holds.append({"p": p, "blocker": blocker})                # affinity conflict -> held this tick
             continue
@@ -319,7 +325,10 @@ def launchable(parsed_issues, lane_state, config, usage, closed_nums, frozen,
         {"id", "num", "touches", "soft_overlap": bool}
     `lane_state` is the list of currently OCCUPIED lanes, each {"id", "touches", "type"?}. Each
     `territory_claims` entry has the same shape, but consumes no lane slot; it only participates
-    in anti-affinity.
+    in anti-affinity. Both MUST be derived from the SAME issues_state snapshot (lane_state_from /
+    territory_claims_from of one load, which is what every caller does): the restore-green
+    exemption tells finished claims from running ones by subtracting the lane ids, so claims from a
+    newer snapshot than `lane_state` could read a live lane as finished territory.
     parsed issue may carry a "requeue_front" flag (merged in by the runner from loopstate; default
     False).
     `soft_overlap` (soft affinity only) is True when this launch shares an area with ANY OTHER

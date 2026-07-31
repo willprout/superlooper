@@ -1813,6 +1813,7 @@ def test_a_concluded_fix_issue_never_disables_auto_restore_green(sim_factory):
     sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in RED_CI]))
     sim.tick()
     assert len(sim.mutations("create_issue")) == 1
+    assert len(_fix_map(sim)) == 1, _fix_map(sim)
     first = list(_fix_map(sim).values())[0]
 
     # the breakage is dealt with: the fix issue is closed and the mainline greens -> unfreeze
@@ -1827,6 +1828,7 @@ def test_a_concluded_fix_issue_never_disables_auto_restore_green(sim_factory):
     assert sim.tick_until(lambda: len(sim.mutations("create_issue")) == 2), \
         [(r.get("act"), r.get("outcome")) for r in sim.journal()]
     assert sim.frozen_marker() is not None
+    assert len(_fix_map(sim)) == 1, _fix_map(sim)
     second = list(_fix_map(sim).values())[0]
     assert second != first, "the retired record must be REPLACED, not left beside the new filing"
     assert sim.issue(second)["state"] == "open"
@@ -1868,6 +1870,7 @@ def test_restore_green_launches_past_a_finished_lane_holding_territory(sim_facto
     sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in RED_CI]))
     sim.tick()
     assert sim.frozen_marker() is not None
+    assert len(_fix_map(sim)) == 1, _fix_map(sim)
     fix_id = "i%d" % list(_fix_map(sim).values())[0]
 
     assert sim.tick_until(lambda: sim.loop_issue(fix_id).get("status") == "running", ticks=6), \

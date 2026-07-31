@@ -4130,27 +4130,49 @@ class Runner:
         self._settle_merged_lane(iid)         # ordered (#149); merged-only (#168); per-knob (#178)
         return "ok"
 
-    def _exec_file_fix_issue(self, a, now):
-        fp = a.get("fingerprint")
-        # Crash window (Codex round-1 C3): create_issue may have succeeded on a prior tick
-        # whose fingerprint save never landed. GitHub is the truth — reconcile before filing,
-        # so the standing-rule issue is never duplicated.
-        marker = f"Failure fingerprint: `{fp}`"        # the canonical field _fix_issue emits —
-        for it in gh.open_issues("auto-approved:nightly-red"):     # never a bare substring
-            body = it.get("body") if isinstance(it, dict) else None
-            if isinstance(body, str) and fp and marker in body and type(it.get("number")) is int:
-                path = os.path.join(self.state, "fix_issues.json")
-                filed = _read_json(path) or {}
-                filed[fp] = it["number"]
-                loopstate.save(path, filed)
-                return f"already filed as #{it['number']} (reconciled from GitHub)"
-        num = gh.create_issue(a.get("title"), a.get("body"), labels=a.get("labels"))
-        if num is None:
-            return "issue create failed (will retry next tick)"
+    def _settle_fix_issue(self, fp, num):
+        """Record the issue this fingerprint is now filed as, twice over (issue #294):
+
+          * `fix_issues.json` — the dedup map. OVERWRITES, so a re-armed filing REPLACES the
+            retired number rather than leaving the poisoned record beside the live one.
+          * the STANDING freeze marker's `fix_issue` — which issue this freeze episode settled
+            on. decide reads it to bound the re-arm to one authoritative GitHub re-check per
+            episode (see the section-B comment); without it a retired-but-still-open fix issue
+            re-emits every tick forever, and a fix that merged inside the poll's stale window
+            gets a duplicate filed on top of it.
+
+        The marker is stamped only when one is already STANDING and READABLE: writing here must
+        never manufacture a freeze, nor overwrite an unreadable marker with a readable one
+        (existence = frozen is the fail-closed rule, and `_exec_unfreeze` reads a `source` this
+        could not restore). `_read_json` maps ABSENT to None and PRESENT-but-unreadable to `{}` —
+        deliberately, so existence still counts — so the guard has to reject BOTH, i.e. test
+        truthiness, not just the type."""
         path = os.path.join(self.state, "fix_issues.json")
         filed = _read_json(path) or {}
         filed[fp] = num
         loopstate.save(path, filed)
+        fpath = os.path.join(self.state, "merges_frozen.json")
+        frozen = _read_json(fpath)
+        if isinstance(frozen, dict) and frozen:
+            frozen["fix_issue"] = num
+            loopstate.save(fpath, frozen)
+
+    def _exec_file_fix_issue(self, a, now):
+        fp = a.get("fingerprint")
+        # Crash window (Codex round-1 C3): create_issue may have succeeded on a prior tick
+        # whose fingerprint save never landed. GitHub is the truth — reconcile before filing,
+        # so the standing-rule issue is never duplicated. Since #294 this ALSO catches a re-armed
+        # filing whose fix issue turns out to still be open: it is recorded, not doubled.
+        marker = f"Failure fingerprint: `{fp}`"        # the canonical field _fix_issue emits —
+        for it in gh.open_issues(gate.RESTORE_GREEN_LABEL):        # never a bare substring
+            body = it.get("body") if isinstance(it, dict) else None
+            if isinstance(body, str) and fp and marker in body and type(it.get("number")) is int:
+                self._settle_fix_issue(fp, it["number"])
+                return f"already filed as #{it['number']} (reconciled from GitHub)"
+        num = gh.create_issue(a.get("title"), a.get("body"), labels=a.get("labels"))
+        if num is None:
+            return "issue create failed (will retry next tick)"
+        self._settle_fix_issue(fp, num)
         return "ok"
 
     def _exec_alert(self, a, now):
