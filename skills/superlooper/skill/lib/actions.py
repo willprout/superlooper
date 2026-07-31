@@ -48,6 +48,9 @@ The view contract (assembled by runner.py each tick):
                   "exited": {id: marker-text}, "frozen": dict|None,
                   "alert": dict|None, "live_lock_ids": iterable of ids with a LIVE worker lock,
                   "filed_fingerprints": {fingerprint: issue_num},
+                  "settled_fix_issues": {fingerprint: issue_num} settled during the CURRENT
+                  red-mainline episode (#294) — the runner clears it on both freeze edges,
+                  so it bounds the fix-issue re-arm to one GitHub re-check per episode,
                   "local_date": "YYYY-MM-DD", "local_hhmm": "HH:MM",
                   "last_report_date": str|None}
   gh_view        {"stale": bool (fresh ONLY when exactly False), "consecutive_failures": int,
@@ -1193,6 +1196,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # the single gate start_ok() puts in front of EVERY start and restart. Asking it separately is
     # what let the recovery tier obey usage while skipping eligibility — the D8 drift itself.
     filed = _dget(dsk, "filed_fingerprints", dict)
+    settled_fix = _dget(dsk, "settled_fix_issues", dict)   # this episode's re-arm bound (#294)
 
     gv = gh_view if isinstance(gh_view, dict) else {}
     gh_stale = gv.get("stale") is not False            # fresh ONLY when explicitly False
@@ -1504,9 +1508,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # executor reconciles against GitHub before creating, so a still-open fix issue is
             # recorded rather than duplicated.
             #
-            # ONE re-check per freeze EPISODE, not per tick. The standing freeze marker records
-            # which issue this episode settled on (`_exec_file_fix_issue` stamps it), and a record
-            # that still names it does not re-arm. That bound is load-bearing three ways: it
+            # ONE re-check per red-mainline EPISODE, not per tick. `settled_fix_issues` records
+            # which issue this episode settled each fingerprint on (the executor writes it; the
+            # freeze/unfreeze edges clear it), and a record that still names it does not re-arm.
+            # It is keyed per FINGERPRINT because one episode can see several — a re-run that
+            # flips `failure` to `timed_out`, or a different required check leading — and a single
+            # slot would let two of them alternate and re-arm each other forever. That bound is
+            # load-bearing three ways: it
             # converges (a fix issue whose PR merged but whose GitHub issue stayed open would
             # otherwise re-emit and re-reconcile every 15s forever); it closes the window where the
             # dev view still shows the pre-merge head red while the fix already reads `merged` —
@@ -1514,9 +1522,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # rule that a fix which failed its cap leaves merges frozen until the owner looks,
             # rather than the loop instantly re-filing whatever he just closed. A create that FAILS
             # stamps nothing, so it is still retried on the next tick.
-            settled = frozen.get("fix_issue") if isinstance(frozen, dict) else None
             if fp not in filed or (fix_issue_retired(filed.get(fp), closed_nums, ist_map)
-                                   and settled != filed.get(fp)):
+                                   and settled_fix.get(fp) != filed.get(fp)):
                 out.append(_fix_issue(dev_branch, name, concl, fp, operator))
         elif dev_state == "green" and frozen:
             out.append({"act": "unfreeze"})

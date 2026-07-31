@@ -1595,6 +1595,9 @@ class Runner:
             "alert": alert,
             "live_lock_ids": self._live_lock_ids(),
             "filed_fingerprints": _read_json(os.path.join(self.state, "fix_issues.json")) or {},
+            # {fp: num} settled during THIS red-mainline episode (#294) — the re-arm bound
+            "settled_fix_issues": _read_json(
+                os.path.join(self.state, "fix_issue_episode.json")) or {},
             "local_date": time.strftime("%Y-%m-%d", lt),
             "local_hhmm": time.strftime("%H:%M", lt),
             "last_report_date": (_read(os.path.join(self.state, "last_morning_report")) or "").strip() or None,
@@ -4094,6 +4097,7 @@ class Runner:
         loopstate.save(os.path.join(self.state, "merges_frozen.json"),
                        {"reason": a.get("reason"), "fingerprint": a.get("fingerprint"),
                         "since": now, "source": "dev-check"})
+        self._end_fix_issue_episode()      # a NEW episode re-checks its fingerprints once (#294)
         return "ok"
 
     def _exec_unfreeze(self, a, now):
@@ -4103,6 +4107,9 @@ class Runner:
         # nightly is still red. Codex R2 C2.
         path = os.path.join(self.state, "merges_frozen.json")
         marker = _read_json(path)
+        # Dev is GREEN, so the runner's own red-mainline episode is over on BOTH branches — even
+        # the one where the nightly's marker stays standing (#294).
+        self._end_fix_issue_episode()
         if isinstance(marker, dict) and marker.get("source") == "nightly":
             return "held: nightly-owned freeze (only a green nightly clears it)"
         _rm(path)
@@ -4131,31 +4138,45 @@ class Runner:
         return "ok"
 
     def _settle_fix_issue(self, fp, num):
-        """Record the issue this fingerprint is now filed as, twice over (issue #294):
+        """Record the issue this fingerprint is now filed as, in two places (issue #294):
 
-          * `fix_issues.json` — the dedup map. OVERWRITES, so a re-armed filing REPLACES the
-            retired number rather than leaving the poisoned record beside the live one.
-          * the STANDING freeze marker's `fix_issue` — which issue this freeze episode settled
-            on. decide reads it to bound the re-arm to one authoritative GitHub re-check per
-            episode (see the section-B comment); without it a retired-but-still-open fix issue
-            re-emits every tick forever, and a fix that merged inside the poll's stale window
-            gets a duplicate filed on top of it.
+          * `fix_issue_episode.json` — {fp: num} for the CURRENT red-mainline episode. decide reads
+            it to bound the re-arm to one authoritative GitHub re-check per episode (see the
+            section-B comment); without that bound a retired-but-still-open fix issue re-emits and
+            re-reconciles every tick forever, and a fix that merged inside the poll's ~90s stale
+            window gets a duplicate filed on top of it. `_exec_freeze`/`_exec_unfreeze` own its
+            lifetime, so it tracks the RUNNER's dev-red episode exactly.
+          * `fix_issues.json` — the long-lived dedup map. OVERWRITES, so a re-armed filing REPLACES
+            the retired number rather than leaving the poisoned record beside the live one.
 
-        The marker is stamped only when one is already STANDING and READABLE: writing here must
-        never manufacture a freeze, nor overwrite an unreadable marker with a readable one
-        (existence = frozen is the fail-closed rule, and `_exec_unfreeze` reads a `source` this
-        could not restore). `_read_json` maps ABSENT to None and PRESENT-but-unreadable to `{}` —
-        deliberately, so existence still counts — so the guard has to reject BOTH, i.e. test
-        truthiness, not just the type."""
+        Deliberately its OWN file rather than a field on `merges_frozen.json`: a nightly-owned
+        freeze (`source: "nightly"`) is cleared only by a green nightly, so a marker can outlive
+        the dev-red episode by a day or more — and an episode stamp riding on it would re-suppress
+        the filing for exactly as long, which is the #294 outage reborn. It also self-heals: a
+        corrupt episode file is REPLACED wholesale on the next settle (one wasted re-check), where
+        the freeze marker must never be overwritten (existence = frozen is fail-closed, and
+        `_exec_unfreeze` reads a `source` this could not restore).
+
+        The episode write goes FIRST. A crash between the two leaves an episode entry with no
+        dedup record, and `fp not in filed` re-arms regardless of the episode — so the reconcile
+        settles both next tick. The other order would leave a dedup record with no episode entry,
+        which is the one shape that can file a duplicate."""
+        epath = os.path.join(self.state, "fix_issue_episode.json")
+        episode = _read_json(epath) or {}
+        episode[fp] = num
+        loopstate.save(epath, episode)
         path = os.path.join(self.state, "fix_issues.json")
         filed = _read_json(path) or {}
         filed[fp] = num
         loopstate.save(path, filed)
-        fpath = os.path.join(self.state, "merges_frozen.json")
-        frozen = _read_json(fpath)
-        if isinstance(frozen, dict) and frozen:
-            frozen["fix_issue"] = num
-            loopstate.save(fpath, frozen)
+
+    def _end_fix_issue_episode(self):
+        """A red-mainline episode has ended (or a fresh one has begun) — drop the per-episode
+        settlement so the NEXT one re-checks its fingerprints against GitHub once more (#294).
+        Called from both freeze edges, including the branch where `_exec_unfreeze` leaves a
+        nightly-owned marker standing: the runner's own dev-red episode is over either way, and
+        that asymmetry is precisely what the separate file exists to express."""
+        _rm(os.path.join(self.state, "fix_issue_episode.json"))
 
     def _exec_file_fix_issue(self, a, now):
         fp = a.get("fingerprint")

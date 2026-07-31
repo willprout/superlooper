@@ -172,6 +172,10 @@ def _claim_exempt(candidate, blocker_id, finished_claim_ids, frozen):
     genuinely unknown — whatever broke the check), which overlaps every one of them, so in exactly
     the situation the fix exists to escape it was blocked by the very PRs that were blocked by it.
 
+    This buys the fix a LAUNCH, not the whole escape: gate_decision step 4 still holds its own PR
+    while the freeze stands, so a dev-check freeze does not yet lift itself (issue #295). What
+    changes here is that the fix gets built, reviewed and opened instead of never starting.
+
     So a restore-green candidate ignores FINISHED-but-unmerged territory WHILE MERGES ARE FROZEN.
     Both halves are the deadlock's own shape and neither is decoration:
       * frozen — the whole justification is that the claims cannot release. On a green mainline
@@ -283,7 +287,11 @@ def _plan(parsed_issues, lane_state, config, usage, closed_nums, frozen, territo
     claim_occupied = [{"id": claim.get("id"), "touches": claim.get("touches", []),
                        "type": claim.get("type")} for claim in claims_in]
     # FINISHED-but-unmerged territory: the claims that are not also live lanes (issue #294).
-    finished_claim_ids = {cid for cid in claimed_ids if cid not in running_ids}
+    # An id-less entry is DROPPED, never carried as None — a malformed claim would otherwise put
+    # None in here and make every other id-less occupied entry (a running lane, a same-tick
+    # selection) read as exempt territory.
+    finished_claim_ids = {cid for cid in claimed_ids
+                          if cid is not None and cid not in running_ids}
 
     # The fresh path asks launch_ok — the SAME function every restart path asks (issue #150) — and
     # not a private re-implementation of half of it. The usage half is already settled by the

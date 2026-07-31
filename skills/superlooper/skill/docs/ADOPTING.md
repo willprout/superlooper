@@ -276,7 +276,9 @@ rest are workflow state the runner and William drive.
   buys one scheduling exemption: a restore-green fix declares `touches: *` and is allowed past
   **finished-but-unmerged territory claims** while merges are frozen, because a red mainline freezes
   merges and those claims would otherwise pile up forever and block the very fix that would release
-  them. Running lanes still hold it — those drain on their own. On the **runner's** dev-check path,
+  them. Running lanes still hold it — those drain on their own. That buys the fix a **launch**, not
+  the whole escape: its own PR is still held by the freeze, so a dev-check freeze does not yet lift
+  without you merging that PR. On the **runner's** dev-check path,
   auto-restore-green is also re-armed once the fix issue it filed has concluded, so a later
   recurrence of the same breakage gets a fresh issue (one re-check per freeze episode — a fix that
   failed its cap still leaves merges frozen for you, it is not re-filed at 3am). The **nightly**
