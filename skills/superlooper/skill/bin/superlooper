@@ -953,7 +953,7 @@ def _file_fix_issues(home, failures, dev, operator):
     path = os.path.join(home, "state", "fix_issues.json")
     filed_map = _read_json_file(path, {})
     filed_map = filed_map if isinstance(filed_map, dict) else {}
-    open_bodies = [(it["number"], it["body"]) for it in gh.open_issues("auto-approved:nightly-red")
+    open_bodies = [(it["number"], it["body"]) for it in gh.open_issues(gate.RESTORE_GREEN_LABEL)
                    if isinstance(it, dict) and isinstance(it.get("body"), str)
                    and type(it.get("number")) is int]
     tracking, seen = [], set()

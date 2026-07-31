@@ -399,6 +399,83 @@ def test_hard_affinity_diagnose_and_fix_overlap_with_build_still_held():
     assert scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), False) == []
 
 
+# ------- issue #294: the restore-green fix is exempt from FINISHED territory claims -------
+# A `touches: *` restore-green issue overlaps every claim, and claims persist through
+# gating/holding until MERGE — which a red mainline has frozen. Without the exemption the fix is
+# blocked by exactly the PRs that are blocked by it.
+
+def _restore_green(num, touches=("*",)):
+    return _issue(num, touches=list(touches),
+                  labels=("type:diagnose-and-fix", "agent-ready",
+                          "auto-approved:nightly-red", "expedite"))
+
+
+def test_restore_green_launches_past_a_held_territory_claim():
+    q = [_restore_green(1)]
+    claims = [{"id": "i533", "type": "build", "touches": ["data", "e2e"]}]
+    out = scheduler.launchable(q, [], _cfg(lanes=1, affinity="hard"), OK, set(), True,
+                               territory_claims=claims)
+    assert _nums(out) == [1]
+
+
+def test_restore_green_still_serializes_behind_a_running_lane():
+    # The exemption covers FINISHED territory only. A live worker is still writing files, so the
+    # collision anti-affinity exists to prevent is untouched — and a running lane always drains.
+    q = [_restore_green(1)]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    assert scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), True,
+                                territory_claims=[]) == []
+
+
+def test_restore_green_running_lane_that_also_holds_a_claim_still_blocks():
+    # territory_claims_from() includes in-flight statuses, so a RUNNING issue appears in BOTH
+    # lists. The exemption must key off finished-only claims, never cancel the running lane.
+    q = [_restore_green(1)]
+    lanes = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    claims = [{"id": "i9", "type": "build", "touches": ["frontend"]}]
+    assert scheduler.launchable(q, lanes, _cfg(lanes=2, affinity="hard"), OK, set(), True,
+                                territory_claims=claims) == []
+
+
+def test_ordinary_expedited_issue_is_still_blocked_by_a_held_claim():
+    # The exemption is scoped to the standing-rule label, not to `expedite` or to the type.
+    q = [_issue(1, touches=["frontend"],
+                labels=("type:diagnose-and-fix", "agent-ready", "expedite"))]
+    claims = [{"id": "i533", "type": "build", "touches": ["frontend"]}]
+    assert scheduler.launchable(q, [], _cfg(lanes=1, affinity="hard"), OK, set(), True,
+                                territory_claims=claims) == []
+
+
+def test_restore_green_is_not_a_wildcard_launch_hold_behind_a_claim():
+    # The #36 journal must not narrate a hold that no longer happens.
+    q = [_restore_green(1)]
+    claims = [{"id": "i533", "type": "build", "touches": ["data"]}]
+    assert _holds(q, [], _cfg(lanes=1, affinity="hard"), OK, set(), True,
+                  territory_claims=claims) == []
+
+
+def test_restore_green_is_held_by_a_claim_when_merges_are_NOT_frozen():
+    # The exemption's whole justification is that a frozen mainline never releases the claim. On a
+    # green mainline it releases on its own, so ordinary anti-affinity applies.
+    q = [_restore_green(1)]
+    claims = [{"id": "i533", "type": "build", "touches": ["data", "e2e"]}]
+    assert scheduler.launchable(q, [], _cfg(lanes=1, affinity="hard"), OK, set(), False,
+                                territory_claims=claims) == []
+
+
+def test_restore_green_detection_fails_closed_on_wrong_typed_labels():
+    # Asserted on the predicate itself, not through launchable — a wrong-typed `labels` is also
+    # refused by issues.eligible, which would let this pass for the wrong reason. The comma-joined
+    # STRING is the case that matters: `LABEL in labels` on a str is a SUBSTRING test, the one
+    # input that could hand the exemption to an issue that never carried the standing-rule word.
+    assert scheduler._restore_green(
+        {"labels": ["type:build", "auto-approved:nightly-red"]}) is True
+    for labels in ("type:diagnose-and-fix,agent-ready,auto-approved:nightly-red", None,
+                   {"auto-approved:nightly-red": True}, 7, ["agent-ready"]):
+        assert scheduler._restore_green({"labels": labels}) is False, labels
+    assert scheduler._restore_green({}) is False
+
+
 def test_hard_affinity_wildcard_running_lane_blocks_all():
     q = [_issue(1, touches=["frontend"]), _issue(2, touches=["api"])]
     lanes = [{"id": "i9", "touches": ["*"]}]      # a running lane of unknown scope blocks everything

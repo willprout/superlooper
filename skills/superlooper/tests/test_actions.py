@@ -80,7 +80,8 @@ def ist(status="running", **over):
 def disk(**over):
     d = {"issues_state": {"version": 1, "issues": {}}, "blocked": {}, "reports": {},
          "exited": {}, "launch_stderr": {}, "frozen": None, "alert": None,
-         "live_lock_ids": set(), "filed_fingerprints": {}, "local_date": "2026-07-02",
+         "live_lock_ids": set(), "filed_fingerprints": {}, "settled_fix_issues": {},
+         "local_date": "2026-07-02",
          "local_hhmm": "12:00", "last_report_date": "2026-07-02"}
     d.update(over)
     return d
@@ -4058,6 +4059,142 @@ def test_filed_fingerprint_freezes_but_does_not_refile():
     d = disk(filed_fingerprints={fp: 9001})
     out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
     assert len(only(out, "freeze")) == 1 and has_notify(out)
+    assert only(out, "file_fix_issue") == []
+
+
+# ---- issue #294: a fingerprint is retired the moment its fix issue is GONE ----
+# `filed` used to be write-once and never pruned, so the FIRST restore-green issue ever filed for
+# a fingerprint disabled auto-restore-green for that breakage forever. On this repo the key is
+# just (check name, conclusion), so one closed fix issue froze the whole mechanism.
+
+def test_a_merged_fix_issue_no_longer_suppresses_a_fresh_filing():
+    # The durable, truncation-proof signal: the loop's OWN record says the fix issue concluded
+    # (a merged PR, or an owner close absorbed to 'merged' by #108). issues.json is never pruned,
+    # so this recovers an instance poisoned months ago — no hand surgery on the state home.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+             filed_fingerprints={fp: 270},
+             issues_state={"version": 1, "issues": {"i270": ist(status="merged")}})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out, "file_fix_issue")) == 1
+
+
+def test_a_closed_fix_issue_no_longer_suppresses_a_fresh_filing():
+    # The other closure path: the owner closed it on GitHub and the loop has no local record.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+             filed_fingerprints={fp: 270})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED), closed_nums={270}))
+    assert len(only(out, "file_fix_issue")) == 1
+
+
+def test_an_unreadable_fingerprint_record_rearms_the_filing():
+    # A wrong-typed record can't vouch for anything; the executor's GitHub reconcile is the
+    # authority, so re-arm rather than suppress on state we cannot read.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+             filed_fingerprints={fp: ["not", "a", "number"]})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out, "file_fix_issue")) == 1
+
+
+def test_a_still_open_fix_issue_keeps_suppressing_the_filing():
+    # The dedup this mechanism exists for is untouched: a live fix issue is filed ONCE. Parked /
+    # needs-william / bounced all leave the issue OPEN on GitHub, so none of them re-arm.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    for status in ("running", "gating", "holding", "parked", "needs_william", "bounced"):
+        d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+                 filed_fingerprints={fp: 270},
+                 issues_state={"version": 1, "issues": {"i270": ist(status=status)}})
+        out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+        assert only(out, "file_fix_issue") == [], status
+
+
+def test_a_retired_fingerprint_re_arms_only_once_per_freeze_episode():
+    # The bound that makes the re-arm converge. The freeze marker records the issue THIS episode
+    # settled on; a fix issue whose PR merged but whose GitHub issue stayed open reads `merged`
+    # forever, and without the bound decide would re-emit (and re-reconcile against GitHub) every
+    # single tick for as long as the mainline stayed red.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+             filed_fingerprints={fp: 270}, settled_fix_issues={fp: 270},
+             issues_state={"version": 1, "issues": {"i270": ist(status="merged")}})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert only(out, "file_fix_issue") == []
+
+
+def test_the_episodes_own_fix_landing_inside_a_stale_dev_view_files_no_duplicate():
+    # The regression #295 would otherwise walk into: the fix PR merges, the issue closes and reads
+    # `merged`, but the poll's dev view still shows the PRE-MERGE head red for up to ~90s. Retired
+    # + red would file a duplicate of the fix that just landed — and it is auto-approved and
+    # expedited, so it would immediately launch a worker to fix an already-fixed mainline.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 600},
+             filed_fingerprints={fp: 601}, settled_fix_issues={fp: 601},
+             issues_state={"version": 1, "issues": {"i601": ist(status="merged")}})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED), closed_nums={601}))
+    assert only(out, "file_fix_issue") == []
+
+
+def test_a_new_freeze_episode_re_arms_a_fingerprint_the_last_one_settled():
+    # ...and the bound is per EPISODE, not permanent: the same breakage recurring after an unfreeze
+    # gets its own fix issue. (A fresh freeze writes a fresh marker, so `fix_issue` is absent.)
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(filed_fingerprints={fp: 601},
+             issues_state={"version": 1, "issues": {"i601": ist(status="merged")}})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out, "freeze")) == 1 and len(only(out, "file_fix_issue")) == 1
+
+
+def test_a_nightly_owned_freeze_never_strands_the_episode_bound():
+    # The episode bound rides its OWN file, not the freeze marker, precisely because a nightly
+    # freeze (`source: "nightly"`) is cleared only by a green nightly and can outlive the runner's
+    # dev-red episode by a day. An episode stamp riding on that marker would re-suppress the filing
+    # for exactly as long — #294's outage reborn. decide reads the runner-owned record instead.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(frozen={"reason": "nightly RED", "since": NOW - 90000, "source": "nightly",
+                     "fix_issue": 270},          # a stale field on the marker means NOTHING now
+             filed_fingerprints={fp: 270},
+             issues_state={"version": 1, "issues": {"i270": ist(status="merged")}})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out, "file_fix_issue")) == 1
+
+
+def test_a_wrong_typed_episode_record_never_raises_the_re_arm():
+    # A corrupt/absent episode file must re-arm (it cannot vouch that this episode already
+    # re-checked), and it self-heals: the executor REPLACES the file wholesale on the next settle,
+    # so the cost is one extra GitHub re-check, never a per-tick loop.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    for settled in ({}, {fp: None}, {fp: ["not", "a", "number"]}, {"other-fp": 270}, "corrupt"):
+        d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+                 filed_fingerprints={fp: 270}, settled_fix_issues=settled,
+                 issues_state={"version": 1, "issues": {"i270": ist(status="merged")}})
+        out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+        assert len(only(out, "file_fix_issue")) == 1, settled
+
+
+def test_the_episode_bound_is_per_fingerprint():
+    # One episode can see several fingerprints (a re-run flipping `failure` to `timed_out`, or a
+    # different required check leading). A single settled slot would let two of them alternate and
+    # re-arm each other every tick.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    other = gate.fix_issue_fingerprint("ci", "timed_out")
+    d = disk(frozen={"reason": "dev red", "fingerprint": fp, "since": NOW - 100},
+             filed_fingerprints={fp: 270, other: 271},
+             settled_fix_issues={other: 271},          # a DIFFERENT fingerprint settled here
+             issues_state={"version": 1, "issues": {"i270": ist(status="merged"),
+                                                    "i271": ist(status="merged")}})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(RED)))
+    assert len(only(out, "file_fix_issue")) == 1
+    assert only(out, "file_fix_issue")[0]["fingerprint"] == fp
+
+
+def test_a_retired_fingerprint_on_a_green_mainline_files_nothing():
+    # Retirement only ever WIDENS the red-dev branch; a green mainline still files nothing.
+    fp = actions.dev_fingerprint(list(RED), ["ci"])
+    d = disk(filed_fingerprints={fp: 270},
+             issues_state={"version": 1, "issues": {"i270": ist(status="merged")}})
+    out = decide(dsk=d, gh_view=ghv(dev_checks=list(GREEN)))
     assert only(out, "file_fix_issue") == []
 
 

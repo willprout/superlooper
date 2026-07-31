@@ -48,6 +48,9 @@ The view contract (assembled by runner.py each tick):
                   "exited": {id: marker-text}, "frozen": dict|None,
                   "alert": dict|None, "live_lock_ids": iterable of ids with a LIVE worker lock,
                   "filed_fingerprints": {fingerprint: issue_num},
+                  "settled_fix_issues": {fingerprint: issue_num} settled during the CURRENT
+                  red-mainline episode (#294) — the runner clears it on both freeze edges,
+                  so it bounds the fix-issue re-arm to one GitHub re-check per episode,
                   "local_date": "YYYY-MM-DD", "local_hhmm": "HH:MM",
                   "last_report_date": str|None}
   gh_view        {"stale": bool (fresh ONLY when exactly False), "consecutive_failures": int,
@@ -219,7 +222,7 @@ PARK_LABEL_STUCK_ALERT_SECONDS = 600
 # The red-nightly standing rule's EXACT label set (spec §4.4, owner-defined 2026-07-02). The
 # distinct `auto-approved:nightly-red` label is what makes this auto-approval auditable as
 # standing-rule work, not an agent applying William's word. Do not add, drop, or reorder.
-FIX_ISSUE_LABELS = ["type:diagnose-and-fix", "agent-ready", "auto-approved:nightly-red", "expedite"]
+FIX_ISSUE_LABELS = ["type:diagnose-and-fix", "agent-ready", gate.RESTORE_GREEN_LABEL, "expedite"]
 
 # Statuses that occupy a lane (a running/frozen/exited session still owns its worktree+branch)
 # vs statuses from which a (re)launch is legitimate. gating/holding hold NO lane: the build is
@@ -1010,6 +1013,44 @@ def dev_fingerprint(dev_checks, required):
     return gate.fix_issue_fingerprint(name, concl)
 
 
+def fix_issue_retired(prior, closed_nums, issues_state_map):
+    """Is the fix issue this fingerprint was filed as GONE — i.e. does the record still stand
+    between a red mainline and a fresh restore-green filing? (Issue #294.)
+
+    `state/fix_issues.json` was write-once and never pruned, so the FIRST restore-green issue ever
+    filed for a fingerprint suppressed the mechanism for that breakage FOREVER. The fingerprint is
+    (check name, conclusion) only, so on a typical repo every red mainline shares one key: one
+    long-closed fix issue structurally disabled auto-restore-green. Retirement is what bounds the
+    suppression to the life of the issue it names.
+
+    Two signals, deliberately both:
+      * closed_nums — GitHub's own closed list. Fresh and authoritative, but capped at 200 (issue
+        #267), so an OLD fix issue can fall out of the window entirely. It fails closed to empty on
+        a refused read, which reads here as "not retired" — the safe direction (no spurious file).
+      * the loop's OWN record reaching `merged`. issues.json is never pruned, so this is durable
+        and truncation-proof, and it is where BOTH closure paths land: a merged PR, and an issue
+        the owner closed out of band (#108 absorb_close settles to `merged` too). This is the
+        signal that recovers an instance already poisoned months ago, with no hand surgery on the
+        state home. The other terminal statuses (parked / needs_william / bounced) leave the issue
+        OPEN on GitHub, so none of them retire anything.
+
+    An unreadable record retires: it cannot vouch for an issue, and the executor's GitHub reconcile
+    (never a duplicate standing-rule issue) is the authority on whether a filing is really needed.
+
+    Retirement is only HALF the condition — see the caller. Neither signal proves the issue is gone
+    from GitHub (a merged PR need not have closed its issue, and the closed list can be refused), so
+    a bare level-trigger would either re-emit every tick forever or, in the ~90s window where the
+    dev view still shows the pre-merge head red while the fix issue already reads `merged`, file a
+    duplicate of the fix that just landed. The caller bounds it to ONE authoritative re-check per
+    freeze episode instead."""
+    if type(prior) is not int:
+        return True
+    if prior in closed_nums:
+        return True
+    ist = issues_state_map.get("i%d" % prior) if isinstance(issues_state_map, dict) else None
+    return isinstance(ist, dict) and _status_of(ist) == "merged"
+
+
 def _fix_issue(dev_branch, name, conclusion, fingerprint, operator="the owner"):
     title = f"Restore green: required check '{name}' is red on {dev_branch}"
     body = (
@@ -1028,7 +1069,11 @@ def _fix_issue(dev_branch, name, conclusion, fingerprint, operator="the owner"):
         # so the wildcard is the honest declaration. It also satisfies touches_required (issue #36:
         # an EMPTY touches would be refused at launch, deadlocking auto-restore-green since this
         # issue is auto-approved and the mainline is frozen until it lands). '*' serializes under
-        # hard affinity — correct for an expedited fix while merges are frozen anyway.
+        # hard affinity — correct for an expedited fix while merges are frozen anyway, and it is
+        # SAFE to declare only because the scheduler exempts this issue from finished-but-unmerged
+        # territory claims (issue #294). Without that exemption the wildcard was terminal: a frozen
+        # mainline ACCUMULATES holding claims that release only on merge, so there was never a
+        # clear moment to serialize into and the fix was blocked by the PRs it would have freed.
         f"touches: *\n"
     )
     return {"act": "file_fix_issue", "fingerprint": fingerprint, "title": title, "body": body,
@@ -1151,6 +1196,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # the single gate start_ok() puts in front of EVERY start and restart. Asking it separately is
     # what let the recovery tier obey usage while skipping eligibility — the D8 drift itself.
     filed = _dget(dsk, "filed_fingerprints", dict)
+    settled_fix = _dget(dsk, "settled_fix_issues", dict)   # this episode's re-arm bound (#294)
 
     gv = gh_view if isinstance(gh_view, dict) else {}
     gh_stale = gv.get("stale") is not False            # fresh ONLY when explicitly False
@@ -1457,7 +1503,27 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 notify("superlooper: merges frozen",
                        f"required check '{name}' is red on {dev_branch}; fix-forward filed, "
                        "building continues")
-            if fp not in filed:
+            # File ONCE per distinct breakage — but only for as long as the issue that filing
+            # produced is actually standing (issue #294). A retired fingerprint re-arms, and the
+            # executor reconciles against GitHub before creating, so a still-open fix issue is
+            # recorded rather than duplicated.
+            #
+            # ONE re-check per red-mainline EPISODE, not per tick. `settled_fix_issues` records
+            # which issue this episode settled each fingerprint on (the executor writes it; the
+            # freeze/unfreeze edges clear it), and a record that still names it does not re-arm.
+            # It is keyed per FINGERPRINT because one episode can see several — a re-run that
+            # flips `failure` to `timed_out`, or a different required check leading — and a single
+            # slot would let two of them alternate and re-arm each other forever. That bound is
+            # load-bearing three ways: it
+            # converges (a fix issue whose PR merged but whose GitHub issue stayed open would
+            # otherwise re-emit and re-reconcile every 15s forever); it closes the window where the
+            # dev view still shows the pre-merge head red while the fix already reads `merged` —
+            # which would file a duplicate of the fix that just landed; and it keeps spec §4.4's
+            # rule that a fix which failed its cap leaves merges frozen until the owner looks,
+            # rather than the loop instantly re-filing whatever he just closed. A create that FAILS
+            # stamps nothing, so it is still retried on the next tick.
+            if fp not in filed or (fix_issue_retired(filed.get(fp), closed_nums, ist_map)
+                                   and settled_fix.get(fp) != filed.get(fp)):
                 out.append(_fix_issue(dev_branch, name, concl, fp, operator))
         elif dev_state == "green" and frozen:
             out.append({"act": "unfreeze"})
