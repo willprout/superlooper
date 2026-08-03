@@ -876,6 +876,19 @@ def main():
     if FIX:
         check_fail_rules()
 
+    # `api user` — the loop's own IDENTITY, which the positive gh-auth assert (#299) reads on both
+    # sides of every spawn: launch-session.sh resolves the expected login from it, and the worker's
+    # start-session.sh must answer as that same login or the flight is refused. Answered
+    # mode-independently because identity is not part of the little GitHub in state.json and every
+    # simulated launch goes through it, and placed AFTER the argv log and fail rules above so a
+    # test can still arm an auth blip on this call like any other. `--jq .login` is how real gh
+    # prints the BARE login, and the assert compares that exact string — so honor the selector
+    # rather than dumping the object, which would fail the launcher's login-shape check.
+    if ARGS[:2] == ["api", "user"]:
+        login = os.environ.get("GH_FAKE_LOGIN", "loop-bot")
+        print(login if opt("--jq") == ".login" else json.dumps({"login": login}))
+        sys.exit(0)
+
     if STATE_PATH and os.path.isfile(STATE_PATH):
         main_stateful()
     else:
