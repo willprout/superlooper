@@ -83,8 +83,34 @@ GH="${SL_GH:-gh}"
 TOKEN="${SL_START_TOKEN:-$ID}"
 EXPECT_LOGIN="${SL_EXPECT_GH_LOGIN:-}"
 AUTH_DEAD_RC=4                               # launch-session.sh + evidence.py read this same code
-gh_login() {                                 # one real authenticated read; stdout = the login
-  "$GH" api user --jq .login 2>&1
+# BOUNDED, and the bound matters MORE here than on the launcher side. `gh` has no default request
+# timeout, so an unreachable network can hang this read for tens of seconds — and the launcher is
+# meanwhile counting down its 30s delivery-verify window. Overrun it and the launcher exits rc=2
+# (`shim_not_fired`, a CHANNEL fault) and the memo blames the launch shim: the exact mis-blame the
+# auth marker was added to prevent, reached through the SLOW path instead of the dead one. Two
+# attempts at this bound stay comfortably inside the window.
+# Deliberately duplicated from launch-session.sh rather than sourced: this script runs in a fresh
+# tab shell that inherits nothing and knows no engine paths, so a sourced helper would add a
+# failure mode exactly where the stack is least able to report one.
+GH_PROBE_SECONDS="${SL_GH_PROBE_SECONDS:-8}"
+gh_login() {                                 # one real authenticated read; stdout = login or error
+  local out_file pid waited=0 rc
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sl-ghwho.XXXXXX")" || return 1
+  "$GH" api user --jq .login > "$out_file" 2>&1 &
+  pid=$!
+  while [ "$waited" -lt "$GH_PROBE_SECONDS" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 1; waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true          # OUR pid, captured from $! — never a name/pattern kill
+    wait "$pid" 2>/dev/null || true
+    printf 'no answer within %ss (gh did not return)' "$GH_PROBE_SECONDS" > "$out_file"
+    rc=124
+  else
+    wait "$pid"; rc=$?
+  fi
+  cat "$out_file"; rm -f "$out_file"
+  return "$rc"
 }
 refuse_auth() {                              # loud, torn down, and NAMED — never a live dead-auth session
   local why="$1"

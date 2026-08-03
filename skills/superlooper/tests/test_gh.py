@@ -1086,3 +1086,16 @@ def test_set_telemetry_none_disables_recording(ghenv, tmp_path, monkeypatch):
     gh.set_telemetry(None)                            # disable
     gh.ready_issues()
     assert len([r for r in _tele(home) if r["kind"] == "call"]) == 1   # only the first was recorded
+
+
+def test_default_gh_is_neutralized_in_the_test_suite():
+    """Guard for conftest's `_never_reach_real_gh` (issue #299), the sibling of the cmux toast-spam
+    ratchet. Two shell scripts now resolve gh for the launch-time auth assert, so a test that
+    forgot to stub would reach the owner's REAL, logged-in gh and make live API calls as them.
+
+    The guard is sharper than it looks: launch-session.sh NAMES SL_GH in the dropped worker
+    command, so every worker session — including one running this suite — carries it ambiently, and
+    the neutralization only fires because `_clear_worker_launch_env` scrubs it FIRST. If either
+    half is removed this fails, on every machine rather than only on ones with gh installed."""
+    assert gh._binary() == "/nonexistent/superlooper-test-gh", (
+        "conftest must point SL_GH at an absent path; got %r" % gh._binary())

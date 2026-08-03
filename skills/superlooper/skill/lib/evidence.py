@@ -84,10 +84,15 @@ _LAUNCH_RC = {
         "before the agent starts — a repo/config fault (dev_branch), not a launch-delivery problem"),
     4: ("gh_auth_dead",
         "the positive gh-auth assert refused the flight: `gh` did not answer as the login this "
-        "loop runs as, so the session could not have read its own issue or posted any evidence "
-        "— GitHub auth on this machine is dead or belongs to another account, not a "
-        "launch-delivery problem. Re-login: `gh auth login --hostname github.com` with the "
-        "account that owns the loop repo, then re-approve"),
+        "loop runs as from inside the SESSION's own environment, so the session could not have "
+        "read its own issue or posted any evidence — GitHub auth for that environment is dead or "
+        "belongs to another account, not a launch-delivery problem. Re-login: `gh auth login "
+        "--hostname github.com` with the account that owns the loop repo, then re-approve"),
+    5: ("gh_auth_dead_runner",
+        "the RUNNER's own `gh` could not say who it is, so there was no identity to launch any "
+        "session against and no tab was ever opened — a machine-level GitHub auth fault that no "
+        "queued issue caused and none can fix. Every launch will fail until it is repaired: "
+        "`gh auth login --hostname github.com` with the account that owns the loop repo"),
     64: ("agent_unsupported",
          "the configured agent is not one this launcher can start (expected: claude or codex)"),
     124: ("launch_timeout",
@@ -130,6 +135,33 @@ _RC_TABLES = {"launch": _LAUNCH_RC, "nudge": _NUDGE_RC}
 # These refine an outcome that has ALREADY failed — they never create one. A substring that
 # matches by accident costs a mis-worded reason on a real failure, never a false park.
 _LAUNCH_TEXT = (
+    # FIRST, ahead of every cmux pattern below (issue #299). The auth refusals relay `gh`'s OWN
+    # error text into the launcher's stderr, and gh's wording is not ours to control — a message
+    # containing "could not connect" or "not_found" would otherwise be read as a dead cmux anchor
+    # and raise a socket/workspace alert about a GitHub fault. Both refusal paths emit the literal
+    # "GH AUTH DEAD", so matching it first keeps an auth failure classified as auth.
+    #
+    # A TRANSIENT is split out ahead of the auth reading for the same reason one level down: the
+    # assert cannot tell "not authenticated" from "GitHub did not answer", and rate-limit
+    # exhaustion, a GitHub outage or a dead DNS would otherwise park the issue under a memo telling
+    # the owner to re-login — a confidently WRONG remedy. Named as its own reason, it is a channel
+    # fault (below) and the queue holds until GitHub is reachable again instead.
+    (("rate limit", "429", "http 5", "could not resolve", "dial tcp", "connection refused",
+      "no answer within", "i/o timeout", "network is unreachable", "temporary failure"),
+     ("gh_unreachable",
+      "the gh-auth assert could not get an answer OUT of GitHub — a rate limit, an outage, or a "
+      "network fault, not a credential that has died. Re-authenticating would fix nothing; the "
+      "queue is held until GitHub answers again, and resumes on its own when it does")),
+    (("gh auth dead (runner env)",),
+     ("gh_auth_dead_runner",
+      "the RUNNER's own `gh` could not say who it is, so no session could be launched against any "
+      "identity and no tab was opened — a machine-level GitHub auth fault no queued issue caused. "
+      "Repair with `gh auth login --hostname github.com`")),
+    (("gh auth dead",),
+     ("gh_auth_dead",
+      "the positive gh-auth assert refused the flight: `gh` did not answer as the login this loop "
+      "runs as from inside the session's own environment, so the session could not have read its "
+      "issue or posted any evidence. Re-login with `gh auth login --hostname github.com`")),
     # THE storm (2026-07-09). cmux exits 0 while printing this to stdout, so launch-session.sh's
     # surface-parse guard echoes the whole output to stderr — which is how the cause reaches us.
     (("not_found", "pane or workspace not found", "workspace not found", "pane not found"),
@@ -183,6 +215,13 @@ CHANNEL_FAULT_REASONS = frozenset({
     "launch_timeout",                 # rc=124: the launcher hung — no session ever started
     "launch_script_unrunnable",       # rc=127: the launch script itself could not execute (install)
     "agent_unsupported",              # rc=64: the configured agent is repo-wide wrong, not one issue's
+    # (#299) The RUNNER's own gh cannot authenticate: no tab was ever opened, every launch will fail
+    # identically, and no issue can fix it by re-approving. Charging it per-issue would walk the
+    # whole approved queue into parks over one machine-level fault — the 07-09 shape, new cause.
+    "gh_auth_dead_runner",
+    # (#299) GitHub itself did not answer (rate limit / outage / network). Nothing is wrong with any
+    # issue OR with the credential, and it repairs itself — hold, never park, never say "re-login".
+    "gh_unreachable",
 })
 
 

@@ -26,12 +26,20 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Overridable so the delivery-verification test can inject a stub cmux; defaults to the real app.
 CMUX="${SL_CMUX:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
 # Same override convention as lib/gh.py and stack_doctor: SL_GH names the binary, so no test ever
-# reaches the real `gh`. Used for the launcher's own identity read below AND named in the worker
-# command, so the session's own assert probes with the same binary this launch resolved.
+# reaches the real `gh`. In production it is UNSET, so this is the bare name `gh` and each side
+# resolves it from its OWN PATH — which is what a positive assert of the worker's environment
+# wants: the worker must be authenticated with the gh IT would actually run, not one the launcher
+# hand-picked. Naming it in the dropped command carries a test's override across the spawn (the
+# fresh tab inherits nothing), it does not pin production to the launcher's binary.
 GH="${SL_GH:-gh}"
-# The DISTINCT exit code for "the positive gh-auth assert refused this flight" (issue #299).
-# evidence.py maps it to reason `gh_auth_dead`, so the park memo names auth rather than the shim.
+# Two DISTINCT exit codes for the positive gh-auth assert (issue #299), because the two failures
+# have opposite blast radii and must be charged to opposite parties (issue #153):
+#   4 — THIS SESSION's own environment cannot authenticate: a per-issue fault, parks this issue with
+#       a memo naming auth (evidence.py -> `gh_auth_dead`).
+#   5 — the RUNNER's environment cannot authenticate: no queued issue caused it and none can fix it,
+#       so it is a CHANNEL fault and the queue is held intact (evidence.py -> `gh_auth_dead_runner`).
 AUTH_DEAD_RC=4
+AUTH_DEAD_RUNNER_RC=5
 MODEL="${SL_MODEL:-}"
 EFFORT="${SL_EFFORT:-}"
 CODEX_DANGEROUS_BYPASS="${SL_CODEX_DANGEROUS_BYPASS:-}"
@@ -193,9 +201,42 @@ fi
 # fault is already underway, there is no expectation to check the worker against, and no session
 # started now could do its job. Placed BEFORE worktree creation and before any cmux RPC, so a
 # refusal costs no orphan tab and no leftover checkout — the base-missing discipline (#28).
+# BOUNDED. `gh` has no default request timeout, so on a black-holed network this can hang for tens
+# of seconds — and the runner kills the whole launch at LAUNCH_TIMEOUT=120, turning a diagnosable
+# auth/network fault into an undiagnosable rc=124 hang. stack_doctor already bounds its own gh calls
+# at 10s; this is the same discipline in shell. macOS ships no `timeout(1)`, so we background the
+# read and wait on OUR OWN recorded pid — never a kill by name or pattern (house rule), which could
+# match the owner's live processes.
+GH_PROBE_SECONDS="${SL_GH_PROBE_SECONDS:-10}"
+gh_login_bounded() {                 # stdout = gh's answer (or its error text); rc = gh's, or 124
+  local out_file pid waited=0 rc
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sl-ghwho.XXXXXX")" || return 1
+  "$GH" api user --jq .login > "$out_file" 2>&1 &
+  pid=$!
+  while [ "$waited" -lt "$GH_PROBE_SECONDS" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 1; waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true             # OUR pid, captured from $! — nothing else can match
+    wait "$pid" 2>/dev/null || true
+    printf 'no answer within %ss (gh did not return)' "$GH_PROBE_SECONDS" > "$out_file"
+    rc=124
+  else
+    wait "$pid"; rc=$?
+  fi
+  cat "$out_file"; rm -f "$out_file"
+  return "$rc"
+}
 EXPECT_GH_LOGIN="${SL_EXPECT_GH_LOGIN:-}"
+GH_PROBE_SAID=""
 if [ -z "$EXPECT_GH_LOGIN" ]; then
-  EXPECT_GH_LOGIN="$("$GH" api user --jq .login 2>&1)" || EXPECT_GH_LOGIN=""
+  # Keep gh's OWN WORDS whatever the rc. An `|| EXPECT_GH_LOGIN=""` here would discard the capture
+  # on every real failure — which is every failure — and the refusal below could then only ever say
+  # "no answer", flattening not-logged-in, rate-limited, network-down and gh-not-installed into one
+  # indistinguishable memo. That is precisely the mis-blame evidence.py exists to end, so the text
+  # is preserved and the SHAPE CHECK below (not the rc) decides whether it is a usable login.
+  GH_PROBE_SAID="$(gh_login_bounded)" || true
+  EXPECT_GH_LOGIN="$GH_PROBE_SAID"
 fi
 # A GitHub login is [A-Za-z0-9-] and nothing else, so anything that is not exactly that shape is not
 # an answer we may assert against. This matters beyond tidiness: `gh` merges its diagnostics into
@@ -208,9 +249,14 @@ case "$EXPECT_GH_LOGIN" in
   *)                  EXPECT_GH_LOGIN_OK=1 ;;
 esac
 if [ "$EXPECT_GH_LOGIN_OK" -ne 1 ]; then
-  echo "[$ID] GH AUTH DEAD (launcher): \`$GH api user\` did not return a usable login, so there is no identity to launch this session against — got: ${EXPECT_GH_LOGIN:-<no answer>}" >&2
+  # DISTINCT from the worker-side refusal below (AUTH_DEAD_RC). This one says the RUNNER'S OWN
+  # environment cannot authenticate — a fault no queued issue caused and none can fix, exactly the
+  # shape CHANNEL_FAULT_REASONS exists for (the sibling of anchor_socket_lost). Charging it to an
+  # issue's launch cap would walk the whole approved queue into parks over one machine-level fault,
+  # the 2026-07-09 storm shape. evidence.py maps this rc to a HELD queue instead.
+  echo "[$ID] GH AUTH DEAD (runner env): \`$GH api user\` did not return a usable login, so there is no identity to launch any session against — got: ${GH_PROBE_SAID:-${EXPECT_GH_LOGIN:-<no answer>}}" >&2
   echo "[$ID] Run \`gh auth login --hostname github.com\` as the account that owns the loop repo. NOT launching; no tab was opened." >&2
-  exit "$AUTH_DEAD_RC"
+  exit "$AUTH_DEAD_RUNNER_RC"
 fi
 
 # Create the worktree (worker mode only) off the fresh dev base; the fallback attaches an EXISTING
@@ -277,6 +323,11 @@ fi
 # for a lane whose live session is still editing and pushing that branch. The report is a
 # COMPLETION signal the runner acts on, so a session that has been revived to keep working must
 # re-earn it, exactly as a replacement session must.
+# Sweep this id's auth markers (issue #299). They are token-keyed, so a stale one can never
+# false-fire a later launch — but nothing else prunes them: the launcher only removes the marker it
+# actually OBSERVED inside its verify window, so one written just after a timeout (or after the
+# runner killed the launcher at LAUNCH_TIMEOUT) would otherwise sit in the state tree forever.
+rm -f "$SL_RUN_ROOT/state/authfail/$ID."* 2>/dev/null || true
 rm -f "$SL_RUN_ROOT/reports/$ID.md" \
       "$SL_RUN_ROOT/state/blocked/$ID" "$SL_RUN_ROOT/state/exited/$ID" "$SL_RUN_ROOT/state/awaiting/$ID" \
       "$SL_RUN_ROOT/state/mail/$ID" "$SL_RUN_ROOT/state/status/$ID.json"

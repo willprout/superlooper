@@ -62,6 +62,19 @@ def _clear_worker_launch_env(monkeypatch):
         # green-stack assertion. STACK.md advertises this var to fork users, and a fork user
         # dogfooding this repo is exactly who would have it exported.
         "SL_PLUGIN_ID",
+        # The gh-auth assert's own vars (issue #299). These matter MORE than the rest, because
+        # launch-session.sh now NAMES SL_GH and SL_EXPECT_GH_LOGIN in the dropped worker command —
+        # so once this ships, every worker session (including one running this suite) carries them
+        # ambiently. Left inherited, SL_GH would be set for every test, which would make
+        # _never_reach_real_gh below no-op and quietly re-open the path to the owner's real,
+        # logged-in gh; and an inherited SL_EXPECT_GH_LOGIN would let a launcher under test SKIP the
+        # "resolve the identity in the runner's env" step it is supposed to be proving. Scrubbed
+        # here, BEFORE that fixture runs, so the ratchet actually fires.
+        "SL_GH",
+        "SL_EXPECT_GH_LOGIN",
+        # Same shape: the per-launch delivery token is ambient in a worker pane, and a launcher
+        # test that inherited it would stamp its sentinel under a token it did not mint.
+        "SL_START_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
 

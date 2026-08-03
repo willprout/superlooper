@@ -762,7 +762,8 @@ def test_a_resume_without_a_preamble_aborts_rather_than_substituting_the_real_br
 # auth death. The floor is a POSITIVE assert: after spawn, from inside the session's OWN env, run a
 # real authenticated read and require the EXPECTED login before the flight proceeds. Absence of an
 # error is not auth — the assert must observe success.
-AUTH_RC = 4
+AUTH_RC = 4          # this SESSION's env cannot authenticate -> parks this issue
+AUTH_RUNNER_RC = 5   # the RUNNER's env cannot authenticate -> a channel fault, holds the queue
 
 
 def test_worker_with_dead_gh_auth_never_reaches_the_agent(tmp_path):
@@ -778,6 +779,13 @@ def test_worker_with_dead_gh_auth_never_reaches_the_agent(tmp_path):
         f"dead worker auth must exit {AUTH_RC}, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
     assert not (stubdir / "claude_args").exists(), "the agent must NEVER start with dead gh auth"
     assert "gh auth" in r.stderr.lower(), f"the failure must NAME auth death: {r.stderr!r}"
+    # gh's OWN words must survive into the launcher's stderr — that text is what the runner
+    # captures as evidence and what the park memo shows the owner. Asserting only on our hardcoded
+    # "run gh auth login" line would pass even if the diagnostic were thrown away entirely.
+    assert "gh auth login" in r.stderr and "get started with github cli" in r.stderr.lower(), \
+        f"the session's captured gh error must reach the launcher's stderr: {r.stderr!r}"
+    assert not (run_root / "state" / "authfail" / "i1.11111111-1111-1111-1111-111111111111").exists(), \
+        "the launcher must consume its auth marker, not leave it in the state tree"
     assert not (run_root / "state" / "activity" / "i1").exists(), "must NOT fabricate liveness"
     assert not (run_root / "state" / "panes" / "i1").exists(), "must NOT record a pane"
     assert (stubdir / "closed").exists(), "the refused session's tab must be torn down"
@@ -803,13 +811,20 @@ def test_worker_authed_as_the_wrong_account_is_refused(tmp_path):
 def test_launcher_with_dead_gh_auth_refuses_before_opening_any_tab(tmp_path):
     """The expectation is the loop's OWN identity, read once in the runner's env. When that read
     fails there is nothing to assert against, and a machine whose gh cannot say who it is cannot
-    run a loop — so refuse, fail closed, and cost no orphan tab (the base-missing discipline)."""
+    run a loop — so refuse, fail closed, and cost no orphan tab (the base-missing discipline).
+
+    The exit code is DISTINCT from the worker-side refusal, and that distinction is the whole point:
+    no queued issue caused the runner's env to lose its credential and none can fix it by
+    re-approving, so this must reach the runner as a CHANNEL fault that holds the queue — not as
+    something to charge each issue in turn until the whole queue has parked."""
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
     r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
                     extra_env={"STUB_GH_LOGIN": "DEAD"})
-    assert r.returncode == AUTH_RC, \
-        f"a launcher with dead gh must exit {AUTH_RC}, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert r.returncode == AUTH_RUNNER_RC, \
+        f"a launcher with dead gh must exit {AUTH_RUNNER_RC}, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
     assert "gh auth" in r.stderr.lower()
+    assert "get started with github cli" in r.stderr.lower(), \
+        f"gh's own refusal text must reach the memo, not be flattened to '<no answer>': {r.stderr!r}"
     assert not (stubdir / "surfaces").exists(), "never even opened a tab"
     assert not (run_root / "worktrees" / "i1").exists(), "no worktree for a launch that cannot run"
     assert not (run_root / "state" / "activity" / "i1").exists()

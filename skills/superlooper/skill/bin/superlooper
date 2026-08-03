@@ -2130,6 +2130,10 @@ def _debugger_shim_run(cfg, repo, home, pane, sid, attended=False):
            # launch into a resume of some unrelated conversation. `superlooper resume` sets it
            # deliberately on its own launch; nothing else may inherit it.
            "SL_RESUME_SESSION_ID": "",
+           # PINNED EMPTY (#299), same reasoning: `superlooper debug` is typically typed FROM a
+           # session that already carries SL_EXPECT_GH_LOGIN, and inheriting it would let the
+           # debugger launch skip the launcher's own identity read and trust a second-hand answer.
+           "SL_EXPECT_GH_LOGIN": "",
            "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
     try:
         r = subprocess.run([script, "--cwd", os.path.abspath(repo), sid],
