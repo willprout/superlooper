@@ -597,17 +597,17 @@ def test_the_debugger_mode_also_gets_a_minted_and_recorded_id(tmp_path):
     assert UUID_RE.fullmatch(sid), f"the debugger seat needs a real UUID too, got {sid!r}"
 
 
-def test_a_resume_keeps_the_evidence_the_revived_session_left_behind(tmp_path):
-    """Restart hygiene is written for a session being REPLACED, and a revive inverts two of its
-    reasons. The dead session's mail was addressed to the very conversation we are re-entering — on
-    a resume it is that session's own instruction, not a stranger's — and its report is finished
-    evidence the runner reads as completion proof. Clearing either would destroy the work the
-    resume exists to continue. The DEATH markers still go: the lane is alive again."""
+def test_a_resume_clears_the_report_exactly_like_a_replacement_launch(tmp_path):
+    """Keeping the revived session's report was tried and is wrong in both directions: a present
+    report makes events.py read the lane as `resolved`, which switches OFF the session_idle/frozen
+    tiers (the revived session would run with no liveness net), and it makes actions.decide emit
+    `gate` for a lane whose live session is still editing and pushing that branch. The report is a
+    COMPLETION signal, so a session revived to keep working must re-earn it."""
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
-    (run_root / "reports" / "i1.md").write_text("## Tests\nreal evidence\n")
+    (run_root / "reports" / "i1.md").write_text("## Tests\nfrom before the interruption\n")
     mail_dir = run_root / "state" / "mail"
     mail_dir.mkdir(parents=True)
-    (mail_dir / "i1").write_text("an instruction for THIS conversation")
+    (mail_dir / "i1").write_text("an instruction")
     (run_root / "state" / "exited").mkdir(parents=True, exist_ok=True)
     (run_root / "state" / "exited" / "i1").write_text("1700000000 rc=137")
 
@@ -617,13 +617,36 @@ def test_a_resume_keeps_the_evidence_the_revived_session_left_behind(tmp_path):
                     extra_env={"SL_RESUME_SESSION_ID": "abcdabcd-0000-4000-8000-00000000beef"})
 
     assert r.returncode == 2
-    assert (run_root / "reports" / "i1.md").exists(), "a resume must not destroy the report"
-    assert (mail_dir / "i1").exists(), "the mail belongs to the conversation being revived"
+    assert not (run_root / "reports" / "i1.md").exists(), "a stale report would gate the live lane"
+    assert not (mail_dir / "i1").exists()
     assert not (run_root / "state" / "exited" / "i1").exists(), "the lane is alive again"
 
 
-def test_a_fresh_relaunch_still_clears_everything_it_always_did(tmp_path):
-    # The other half of the fork: with no resume id this is the pre-#298 path, unchanged.
+def test_a_resume_opens_on_its_own_brief_and_leaves_the_lanes_brief_intact(tmp_path):
+    """The re-orientation preamble lives in briefs/<id>.resume.md, NOT over briefs/<id>.md. The
+    runner's crash-recovery relaunch (_exec_recover) re-runs launch-session.sh WITHOUT rebuilding
+    the brief, so a preamble written over the lane's brief would later be handed verbatim to a
+    brand-new, empty session — telling it "your conversation above survived intact" when there is
+    no conversation, and leaving it no work instruction at all."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    (run_root / "briefs" / "i1.resume.md").write_text("RE-ORIENTATION PREAMBLE")
+    capture = tmp_path / "worker.cmd"
+
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"SL_RESUME_SESSION_ID": "abcdabcd-0000-4000-8000-0000000000aa",
+                               "STUB_CMD_CAPTURE": str(capture)})
+    assert r.returncode == 2
+    assert (run_root / "briefs" / "i1.md").read_text() == "do the thing", \
+        "the lane's own brief must survive a resume untouched"
+    assert "SL_RESUME=1" in capture.read_text()
+
+    # ...and a later COLD relaunch gets the real brief back, never the preamble.
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver")
+    assert r.returncode == 0, r.stderr
+
+
+def test_a_fresh_relaunch_clears_everything_it_always_did(tmp_path):
+    # The pre-#298 path, unchanged.
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
     (run_root / "reports" / "i1.md").write_text("a dead session's report")
     mail_dir = run_root / "state" / "mail"
@@ -635,6 +658,19 @@ def test_a_fresh_relaunch_still_clears_everything_it_always_did(tmp_path):
     assert r.returncode == 0, r.stderr
     assert not (run_root / "reports" / "i1.md").exists()
     assert not (mail_dir / "i1").exists()
+
+
+def test_a_codex_repo_mints_no_session_id_it_could_never_spend(tmp_path):
+    # `--session-id`/`--resume` are Claude Code's spelling; start-session.sh does not thread the id
+    # into the codex branch. Recording one anyway would put a UUID in lane state that names no
+    # conversation anywhere — and `superlooper resume --check` would then promise a revive that
+    # cannot happen. A fabricated identity claim is exactly what this feature exists to avoid.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={"SL_AGENT": "codex"})
+    assert r.returncode == 0, r.stderr
+    assert not _sessions_file(run_root, "i1").exists(), \
+        "a codex lane must not carry a session id it can never spend"
 
 
 def test_a_resume_is_not_counted_as_a_retry(tmp_path):

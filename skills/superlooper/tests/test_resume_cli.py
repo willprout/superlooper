@@ -76,11 +76,13 @@ class _Rig:
         d.mkdir(parents=True, exist_ok=True)
         (d / iid).write_text(sid)
 
-    def seed_lane(self, iid="i1", branch="sl/i1-thing", worktree=True):
+    def seed_lane(self, iid="i1", branch="sl/i1-thing", worktree=True, status=None):
         import loopstate
         st = loopstate.new_state()
         issue = loopstate.new_issue()
         issue["branch"] = branch
+        if status:
+            issue["status"] = status
         st["issues"][iid] = issue
         loopstate.save(str(self.home / "state" / "issues.json"), st)
         # A worker resumes INTO its worktree; a lane whose worktree was reclaimed has nowhere to be
@@ -89,7 +91,8 @@ class _Rig:
             (self.home / "worktrees" / iid).mkdir(parents=True, exist_ok=True)
 
     def brief(self, iid="i1"):
-        return (self.home / "briefs" / ("%s.md" % iid)).read_text()
+        """The RESUME brief — a separate file from the lane's own brief, deliberately (P0-1)."""
+        return (self.home / "briefs" / ("%s.resume.md" % iid)).read_text()
 
     def launch_calls(self):
         if not self.stub_log.exists():
@@ -237,7 +240,7 @@ def test_check_is_read_only_and_reports_what_could_be_resumed(rig):
     out = jbody(r)
     assert out["session_id"] == SID and out["resumable"] is True
     assert rig.launch_calls() == [], "--check must launch nothing"
-    assert not (rig.home / "briefs" / "i1.md").exists(), "--check must write nothing"
+    assert not (rig.home / "briefs" / "i1.resume.md").exists(), "--check must write nothing"
 
 
 def test_the_human_output_names_the_session_without_json(rig):
@@ -257,3 +260,131 @@ def test_a_reclaimed_worktree_is_refused_rather_than_resumed_into_nothing(rig):
     assert r.returncode == 1
     assert "worktree" in jbody(r)["error"].lower()
     assert rig.launch_calls() == []
+
+
+def test_the_lanes_own_brief_is_never_overwritten_by_the_preamble(rig):
+    # P0-1. The runner's crash-recovery relaunch re-runs launch-session.sh WITHOUT rebuilding the
+    # brief. A preamble written over briefs/<id>.md would therefore be handed, verbatim, to a
+    # brand-new empty session — "your conversation above survived intact" with no conversation and
+    # no work instruction. The two must be separate files.
+    rig.seed_lane()
+    rig.record_session()
+    (rig.home / "briefs").mkdir(parents=True, exist_ok=True)
+    (rig.home / "briefs" / "i1.md").write_text("THE REAL ISSUE BRIEF: goal, DoD, boundaries")
+    assert run(rig, "resume", "i1", "--json").returncode == 0
+    assert (rig.home / "briefs" / "i1.md").read_text() == \
+        "THE REAL ISSUE BRIEF: goal, DoD, boundaries"
+    assert "Re-orientation" in rig.brief()
+
+
+def test_a_codex_repo_is_refused_rather_than_told_it_was_resumed(rig):
+    # P0-2. start-session.sh does not thread the session id into the codex branch, so a "resume"
+    # there would start a COLD session while handing it a preamble asserting its conversation
+    # survived — and report success. Refusing is the only honest answer.
+    (rig.repo / ".superlooper" / "config.json").write_text(
+        json.dumps({"version": 1, "repo": "o/r", "agent": "codex"}))
+    rig.seed_lane()
+    rig.record_session()
+    r = run(rig, "resume", "i1", "--json")
+    assert r.returncode == 1
+    assert "codex" in jbody(r)["error"].lower()
+    assert rig.launch_calls() == []
+
+
+def test_a_second_debugger_is_refused_even_under_a_different_id(rig):
+    # P1-6. `superlooper debug` refuses on ANY live worker.d*.lock — never two debuggers on one
+    # patient. A revive of d3 while d7 is live must answer to the same rule, or it puts two
+    # permissions-bypassed agents in one checkout.
+    rig.record_session("d3")
+    (rig.home / "state" / "worker.d7.lock").write_text(str(os.getpid()))
+    r = run(rig, "resume", "d3", "--json")
+    assert r.returncode == 1
+    assert "d7" in jbody(r)["error"]
+    assert rig.launch_calls() == []
+
+
+def test_a_corrupt_recorded_id_is_refused_not_handed_to_the_launcher(rig):
+    # Disk state is never trusted on shape. claude refuses a non-UUID, so the operator should get a
+    # sentence here rather than a session that dies with its tab.
+    rig.seed_lane()
+    rig.record_session(sid="not-a-uuid")
+    r = run(rig, "resume", "i1", "--json")
+    assert r.returncode == 1
+    assert "uuid" in jbody(r)["error"].lower()
+    assert rig.launch_calls() == []
+
+
+def test_a_failed_launch_leaves_no_preamble_behind(rig):
+    rig.seed_lane()
+    rig.record_session()
+    assert run(rig, "resume", "i1", "--json", env_over={"STUB_RC": "2"}).returncode == 1
+    assert not (rig.home / "briefs" / "i1.resume.md").exists(), \
+        "a preamble that reached nobody must not linger as the next reader's opening message"
+
+
+def test_check_reports_a_missing_pane_instead_of_promising_a_revive(rig):
+    # A preflight that answers "resumable" and then fails on a missing pane is not a preflight.
+    rig.seed_lane()
+    rig.record_session()
+    # No recorded anchor, no $SL_PANE (the rig pops it), and SL_CMUX names a binary that does not
+    # exist — so detect_self_anchor fails closed to "" and no pane can resolve.
+    (rig.home / "state" / "runner.anchor.json").unlink()
+    r = run(rig, "resume", "i1", "--check", "--json")
+    assert r.returncode == 0
+    out = jbody(r)
+    assert out["verb"] == "resume-check"
+    assert out["resumable"] is False and "pane" in out["error"].lower()
+    assert rig.launch_calls() == []
+
+
+def test_the_preamble_states_the_real_repository_facts(rig):
+    """The collection half, against a REAL git worktree (the suite's ban is on cmux/gh/claude/
+    osascript; git is used throughout these tests). Without this the branch/HEAD/dirty path of
+    _resume_facts is never executed — every fact would degrade to 'unknown' and the tests would
+    still pass."""
+    rig.seed_lane(status="running")
+    rig.record_session()
+    wt = rig.home / "worktrees" / "i1"
+    env = {**os.environ, "HOME": str(rig.tmp / "userhome"), "GIT_TERMINAL_PROMPT": "0"}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(wt)], check=True, env=env)
+    for k, v in (("user.email", "t@example.com"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(wt), "config", k, v], check=True, env=env)
+    (wt / "README").write_text("x\n")
+    subprocess.run(["git", "-C", str(wt), "add", "-A"], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(wt), "commit", "-qm", "init"], check=True,
+                   capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(wt), "checkout", "-qb", "sl/i1-thing"], check=True, env=env)
+    (wt / "SCRATCH").write_text("uncommitted\n")
+    head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, env=env).stdout.strip()
+
+    assert run(rig, "resume", "i1", "--json").returncode == 0
+    brief = rig.brief()
+    assert "sl/i1-thing" in brief, "the branch must be the one git actually reports"
+    assert head[:12] in brief, "the HEAD must be re-read, not remembered"
+    assert "1 uncommitted change" in brief
+    assert "**Lane status:** running" in brief, "the runner's recorded status must be named"
+    # fake-gh answers from the fixture, which carries an OPEN PR on this head — so the whole
+    # gh.pr_for_branch path is genuinely exercised, not just its unknown fallback.
+    assert "**PR:** #555 (OPEN)" in brief
+
+
+def test_a_refused_github_lookup_is_never_rendered_as_no_pr(rig):
+    # The fail-closed half, end to end: gh REFUSES (GH_FAIL), so pr_for_branch returns ok=False.
+    # A revived session told "there is no PR" opens a second one on the same branch.
+    rig.seed_lane()
+    rig.record_session()
+    wt = rig.home / "worktrees" / "i1"
+    env = {**os.environ, "HOME": str(rig.tmp / "userhome"), "GIT_TERMINAL_PROMPT": "0"}
+    subprocess.run(["git", "init", "-q", "-b", "sl/i1-thing", str(wt)], check=True, env=env)
+    for k, v in (("user.email", "t@example.com"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(wt), "config", k, v], check=True, env=env)
+    (wt / "README").write_text("x\n")
+    subprocess.run(["git", "-C", str(wt), "add", "-A"], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(wt), "commit", "-qm", "init"], check=True,
+                   capture_output=True, env=env)
+
+    assert run(rig, "resume", "i1", "--json", env_over={"GH_FAIL": "1"}).returncode == 0
+    brief = rig.brief()
+    assert "GitHub did not answer" in brief
+    assert "no PR exists on this branch" not in brief

@@ -37,11 +37,10 @@ def _pr_line(facts):
     if not number:
         return "**PR:** no PR exists on this branch (a clean answer from GitHub, not a failed read)."
     state = pr.get("state") or "unknown state"
-    line = "**PR:** #%s (%s)" % (number, state)
-    checks = facts.get("checks")
-    if checks:
-        line += " — checks at revive time: %s" % checks
-    return line + "."
+    # Deliberately NOT reporting check status: the caller does not read it, and a line that named
+    # CI would be the one fact here that was remembered rather than re-read.
+    return "**PR:** #%s (%s) — its checks and comments are NOT reported here; go and look." % (
+        number, state)
 
 
 def _tree_line(facts):
@@ -61,9 +60,9 @@ def _or_unknown(value):
 def render(facts):
     """The complete opening message for a revived session.
 
-    ``facts`` keys: id, session_id, branch, worktree, head, dirty, pr, pr_ok, checks, note,
-    lane_status. Everything except ``id``/``session_id`` may be missing or None — it degrades to a
-    named unknown. ``note`` is the operator's new instruction and is placed LAST, after the
+    ``facts`` keys: id, session_id, branch, worktree, head, dirty, pr, pr_ok, note, lane_status.
+    Everything except ``id``/``session_id`` may be missing or None — it degrades to a named
+    unknown. ``note`` is the operator's new instruction and is placed LAST, after the
     re-orientation, so the session can never act on it while still believing a stale world.
     """
     head = facts.get("head")
@@ -71,7 +70,9 @@ def render(facts):
     lines = [
         "# Re-orientation — you were interrupted and have just been resumed",
         "",
-        "This is session `%s` for lane **%s**, revived with `claude --resume`." % (
+        # Agent-neutral by construction: naming a specific CLI's flag would put an agent-specific
+        # fact in a lib module, which the agent-boundary rule reserves for the launcher.
+        "This is session `%s` for lane **%s**, re-entered after an interruption." % (
             facts.get("session_id") or _UNKNOWN, facts.get("id") or _UNKNOWN),
         "",
         "**Read this before you do anything else.** Your conversation above survived intact; the "
@@ -100,8 +101,9 @@ def render(facts):
         "review comments, what landed on the mainline while you were gone — you have not been "
         "told, so go and look.",
         "",
-        "Then pick up where you left off, under your original brief and its ship gate. Nothing "
-        "about the issue, its Boundaries or its Definition of Done has changed.",
+        "Then pick up where you left off, under your original brief and its ship gate. Re-read the "
+        "issue before you rely on your memory of it: nothing here re-read it for you, and it may "
+        "have been amended, relabelled or closed while you were gone.",
     ]
     note = (facts.get("note") or "").strip()
     if note:

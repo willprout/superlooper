@@ -44,6 +44,7 @@ _FAKE_LAUNCH = """#!/bin/bash
   printf 'AGENT %s\\n' "${SL_AGENT:-}"
   printf 'ATTENDED %s\\n' "${SL_ATTENDED:-}"
   printf 'VERIFY %s\\n' "${SL_LAUNCH_VERIFY_SECONDS:-unset}"
+  printf 'RESUME_ID %s\\n' "${SL_RESUME_SESSION_ID-unset}"
   # What the watchdog counter looked like AS THE LAUNCHER SAW IT: proof the id was durably
   # advanced BEFORE anything could launch, not merely after the shim returned.
   printf 'STATE_AT_LAUNCH %s\\n' "$(cat "${SL_RUN_ROOT:-}/state/watchdog.json" 2>/dev/null | tr -d '\\n ')"
@@ -148,6 +149,9 @@ def test_debug_launches_one_session_through_the_shim(rig):
     assert call["PANE"] == "PANE-UUID-1"                 # resolved from the runner's anchor
     assert call["ROOT"] == str(rig.home)
     assert call["VERIFY"] == "30"                        # PINNED, never inherited
+    # (#298) PINNED EMPTY for the same reason: an ambient SL_RESUME_SESSION_ID would silently turn
+    # this FRESH debugger launch into a resume of some unrelated conversation.
+    assert call["RESUME_ID"] == ""
     assert call["AGENT"] == "claude"
     assert call["MODEL"] == "opus[1m]"
     # #185: the owner tap is the one loop-launched session with a PERSON at the keyboard, and its

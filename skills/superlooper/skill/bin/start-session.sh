@@ -74,7 +74,15 @@ printf '%s' "$TOKEN" > "$SL_RUN_ROOT/state/started/$ID.$TOKEN"
 # run_agent (re)writes this file when the agent exits.
 ERR_TAIL="$SL_RUN_ROOT/state/launch_stderr/$ID"
 rm -f "$ERR_TAIL"
+# A REVIVE opens on its own brief — the re-orientation preamble — kept in a SEPARATE file so the
+# lane's original brief survives untouched for any later cold relaunch (#298; the runner's
+# crash-recovery path re-launches without rebuilding the brief, and would otherwise hand a
+# brand-new session a "you were interrupted" preamble and no work instruction). Selection must
+# match launch-session.sh's, which makes the same choice for its existence check.
 BRIEF="$SL_RUN_ROOT/briefs/$ID.md"
+if [ -n "${SL_RESUME:-}" ] && [ -f "$SL_RUN_ROOT/briefs/$ID.resume.md" ]; then
+  BRIEF="$SL_RUN_ROOT/briefs/$ID.resume.md"
+fi
 [ -f "$BRIEF" ] || { echo "[$ID] no brief" >&2; write_exited 1; exit 1; }
 # Name the session so the operator can tell what's running when they're away:
 #   --name           -> local terminal/tab title + /resume picker
