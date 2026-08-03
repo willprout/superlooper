@@ -511,3 +511,195 @@ def test_cwd_resolved_to_absolute_path(tmp_path):
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, f"relative --cwd must resolve + launch, got rc={r.returncode}\n{r.stderr}"
     assert (run_root / "state" / "panes" / "d1").exists(), "the pane must be recorded"
+
+
+# --------------------- session identity minted at spawn (issue #298) ---------------------
+# Before #298 the launch stack passed NEITHER --session-id nor --resume, so any interruption — a
+# killed pane, a crashed host, a closed lid — ended the flight's conversation for good and recovery
+# meant a cold restart from zero. The runner now MINTS the id and hands it down: identity assigned
+# at spawn, never self-asserted (claim c3). These pin the minting half; the flags themselves are
+# start-session.sh's business (test_start_session.py).
+
+def _sessions_file(run_root, iid):
+    return run_root / "state" / "sessions" / iid
+
+
+def test_a_launch_mints_a_session_id_records_it_and_names_it_in_the_command(tmp_path):
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    capture = tmp_path / "worker.cmd"
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"STUB_CMD_CAPTURE": str(capture)})
+    assert r.returncode == 2                            # drop mode never delivers -> fails loudly
+    recorded = _sessions_file(run_root, "i1")
+    assert recorded.exists(), "the minted id must be recorded in lane state"
+    sid = recorded.read_text().strip()
+    assert UUID_RE.fullmatch(sid), f"claude requires a valid UUID, got {sid!r}"
+    # The fresh tab inherits NOTHING, so the id must be NAMED in the dropped command or the session
+    # launches anonymous and the recorded id names a conversation that never existed.
+    assert f"SL_SESSION_ID={sid}" in capture.read_text()
+
+
+def test_the_id_is_recorded_at_spawn_even_when_delivery_never_lands(tmp_path):
+    # Deliberately UNLIKE the activity/pane stamps, which are withheld until delivery is verified
+    # because writing them early once fabricated "launched & alive". An id is an IDENTITY claim, not
+    # a liveness one: nothing reads it as proof anything is running, and the verify window is up to
+    # 30s — a host that dies inside it must still leave a handle to resume by.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop")
+    assert r.returncode == 2
+    assert not (run_root / "state" / "activity" / "i1").exists(), "liveness must NOT be fabricated"
+    assert _sessions_file(run_root, "i1").exists(), "the id must survive a failed launch"
+
+
+def test_each_launch_of_a_lane_mints_a_fresh_id(tmp_path):
+    # `--session-id` on an id that ALREADY exists is an error, so a relaunch cannot re-use the dead
+    # session's id — it is a new conversation and must say so. (Reviving the old one is `--resume`,
+    # which is the resume path's job, not the launcher's.)
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver")
+    first = _sessions_file(run_root, "i1").read_text().strip()
+    # the stub agent exits immediately, so start-session.sh's EXIT trap already freed the worker
+    # lock — the second launch is a legitimate relaunch of a lane whose session is gone.
+    _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver")
+    second = _sessions_file(run_root, "i1").read_text().strip()
+    assert UUID_RE.fullmatch(second) and second != first, "a relaunch must mint a NEW conversation"
+
+
+def test_a_resume_reuses_the_recorded_id_instead_of_minting_one(tmp_path):
+    # The revive seam: the caller (superlooper resume) hands the launcher the id it recorded, and
+    # the launcher must pass it through UNCHANGED with the resume flag set — minting here would
+    # strand the very transcript the operator asked to re-enter.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    known = "abcdabcd-0000-4000-8000-00000000dead"
+    (run_root / "briefs" / "i1.resume.md").write_text("RE-ORIENTATION PREAMBLE")
+    capture = tmp_path / "worker.cmd"
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"SL_RESUME_SESSION_ID": known, "STUB_CMD_CAPTURE": str(capture)})
+    assert r.returncode == 2
+    cmd = capture.read_text()
+    assert f"SL_SESSION_ID={known}" in cmd, "the caller's id must survive verbatim"
+    assert "SL_RESUME=1" in cmd, "without this the session gets --session-id and the resume fails"
+    assert _sessions_file(run_root, "i1").read_text().strip() == known
+
+
+def test_the_debugger_mode_also_gets_a_minted_and_recorded_id(tmp_path):
+    # d<N> is half the DoD: the debugger seat is a session like any other and dies the same way.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    (run_root / "briefs" / "d1.md").write_text("diagnose the instance")
+    env = {**os.environ, "HOME": str(home), "PATH": f"{stubdir}:{os.environ['PATH']}",
+           "SL_RUN_ROOT": str(run_root), "SL_PANE": "pane:1", "SL_CMUX": str(cmux),
+           "STUB_DIR": str(stubdir), "SHIM_PATH": SHIM_PATH,
+           "SL_LAUNCH_DIR": os.path.join(os.path.dirname(str(run_root)), "launchdir_d"),
+           "STUB_MODE": "deliver", "SL_LAUNCH_VERIFY_SECONDS": "5"}
+    r = subprocess.run([LAUNCH, "--cwd", str(run_root), "d1"], env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"--cwd launch must succeed, got rc={r.returncode}\n{r.stderr}"
+    sid = _sessions_file(run_root, "d1").read_text().strip()
+    assert UUID_RE.fullmatch(sid), f"the debugger seat needs a real UUID too, got {sid!r}"
+
+
+def test_a_resume_clears_the_report_exactly_like_a_replacement_launch(tmp_path):
+    """Keeping the revived session's report was tried and is wrong in both directions: a present
+    report makes events.py read the lane as `resolved`, which switches OFF the session_idle/frozen
+    tiers (the revived session would run with no liveness net), and it makes actions.decide emit
+    `gate` for a lane whose live session is still editing and pushing that branch. The report is a
+    COMPLETION signal, so a session revived to keep working must re-earn it."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    (run_root / "reports" / "i1.md").write_text("## Tests\nfrom before the interruption\n")
+    mail_dir = run_root / "state" / "mail"
+    mail_dir.mkdir(parents=True)
+    (mail_dir / "i1").write_text("an instruction")
+    (run_root / "state" / "exited").mkdir(parents=True, exist_ok=True)
+    (run_root / "state" / "exited" / "i1").write_text("1700000000 rc=137")
+    (run_root / "briefs" / "i1.resume.md").write_text("RE-ORIENTATION PREAMBLE")
+
+    # drop mode: hygiene runs before the tab is created, and no agent process runs afterwards to
+    # write a FRESH exited marker of its own — so what is on disk here is the launcher's own doing.
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"SL_RESUME_SESSION_ID": "abcdabcd-0000-4000-8000-00000000beef"})
+
+    assert r.returncode == 2
+    assert not (run_root / "reports" / "i1.md").exists(), "a stale report would gate the live lane"
+    assert not (mail_dir / "i1").exists()
+    assert not (run_root / "state" / "exited" / "i1").exists(), "the lane is alive again"
+
+
+def test_a_resume_opens_on_its_own_brief_and_leaves_the_lanes_brief_intact(tmp_path):
+    """The re-orientation preamble lives in briefs/<id>.resume.md, NOT over briefs/<id>.md. The
+    runner's crash-recovery relaunch (_exec_recover) re-runs launch-session.sh WITHOUT rebuilding
+    the brief, so a preamble written over the lane's brief would later be handed verbatim to a
+    brand-new, empty session — telling it "your conversation above survived intact" when there is
+    no conversation, and leaving it no work instruction at all."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    (run_root / "briefs" / "i1.resume.md").write_text("RE-ORIENTATION PREAMBLE")
+    capture = tmp_path / "worker.cmd"
+
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"SL_RESUME_SESSION_ID": "abcdabcd-0000-4000-8000-0000000000aa",
+                               "STUB_CMD_CAPTURE": str(capture)})
+    assert r.returncode == 2
+    assert (run_root / "briefs" / "i1.md").read_text() == "do the thing", \
+        "the lane's own brief must survive a resume untouched"
+    assert "SL_RESUME=1" in capture.read_text()
+
+    # ...and a later COLD relaunch gets the real brief back, never the preamble.
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver")
+    assert r.returncode == 0, r.stderr
+
+
+def test_a_fresh_relaunch_clears_everything_it_always_did(tmp_path):
+    # The pre-#298 path, unchanged.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    (run_root / "reports" / "i1.md").write_text("a dead session's report")
+    mail_dir = run_root / "state" / "mail"
+    mail_dir.mkdir(parents=True)
+    (mail_dir / "i1").write_text("a dead session's instruction")
+
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver")
+
+    assert r.returncode == 0, r.stderr
+    assert not (run_root / "reports" / "i1.md").exists()
+    assert not (mail_dir / "i1").exists()
+
+
+def test_a_codex_repo_mints_no_session_id_it_could_never_spend(tmp_path):
+    # `--session-id`/`--resume` are Claude Code's spelling; start-session.sh does not thread the id
+    # into the codex branch. Recording one anyway would put a UUID in lane state that names no
+    # conversation anywhere — and `superlooper resume --check` would then promise a revive that
+    # cannot happen. A fabricated identity claim is exactly what this feature exists to avoid.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={"SL_AGENT": "codex"})
+    assert r.returncode == 0, r.stderr
+    assert not _sessions_file(run_root, "i1").exists(), \
+        "a codex lane must not carry a session id it can never spend"
+
+
+def test_a_resume_is_not_counted_as_a_retry(tmp_path):
+    # `retries = launches - 1` is deliberately mechanical telemetry about how many times a lane had
+    # to be STARTED OVER. A resume is the opposite of starting over — it re-enters the same
+    # conversation — so counting it would inflate the one number nobody can audit after the fact.
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver")
+    st = json.load(open(run_root / "state" / "issues.json"))
+    assert st["issues"]["i1"]["launches"] == 1 and st["issues"]["i1"]["retries"] == 0
+
+    _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                extra_env={"SL_RESUME_SESSION_ID": "abcdabcd-0000-4000-8000-00000000feed"})
+
+    st = json.load(open(run_root / "state" / "issues.json"))
+    assert st["issues"]["i1"]["launches"] == 1, "a resume is not a fresh launch"
+    assert st["issues"]["i1"]["retries"] == 0, "a resume must never read as a retry"
+
+
+def test_a_resume_without_a_preamble_aborts_rather_than_substituting_the_real_brief(tmp_path):
+    """FAIL CLOSED. The brief selection must never fall back to briefs/<id>.md on a resume: doing
+    so would deliver the whole issue brief — goal, DoD, boundaries — as a NEW instruction into a
+    conversation that already built it, with no re-orientation first. That is exactly the ordering
+    the resume exists to guarantee, so a missing preamble is an abort, not a substitution."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    assert (run_root / "briefs" / "i1.md").exists()      # the original brief IS present...
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={"SL_RESUME_SESSION_ID": "abcdabcd-0000-4000-8000-00000000cafe"})
+    assert r.returncode == 1, "...and must still not be used as a resume's opening message"
+    assert "i1.resume.md" in r.stderr

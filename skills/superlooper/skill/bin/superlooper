@@ -34,6 +34,13 @@
                   d<N> id allocation and single-flight under the watchdog's own lock, composes the
                   brief from --note + --context-file, and journals the tap. A local ops UI over the
                   loop shells this instead of re-implementing the launch handshake
+  resume          re-enter an interrupted session's CONVERSATION instead of restarting it cold
+                  (issue #298). Every launch mints a session id at spawn and records it in
+                  state/sessions/<id>; this verb spends that record — `claude --resume <id>` back
+                  into the same transcript, opening on a re-orientation preamble (branch, HEAD,
+                  tree, PR — all re-read now), because a revived session remembers the conversation
+                  and not the world. Refuses when the lane has no recorded id, when a session is
+                  still live on it, or when its worktree is gone; --check is the read-only preflight
   upkeep          the WEEKLY once-over as one READ-ONLY command (issue #200): the machine stack,
                   installed-engine publish drift, the janitor's proposals, the ops-doc lint, the
                   branch/worktree census, the notify channel's last real delivery, and the week's
@@ -81,6 +88,7 @@ import loopstate
 import nightly as nightly_lib
 import notify
 import queue_lint
+import reorient
 import report
 import stack_doctor
 import tidy as tidy_lib
@@ -2117,6 +2125,11 @@ def _debugger_shim_run(cfg, repo, home, pane, sid, attended=False):
            # script's own default and sits far under the 180s timeout.
            "SL_LAUNCH_VERIFY_SECONDS": "30",
            "SL_ATTENDED": "1" if attended else "",
+           # PINNED EMPTY (#298), same reasoning as SL_ATTENDED above: this env is merged over
+           # os.environ, so an ambient SL_RESUME_SESSION_ID would silently turn a FRESH debugger
+           # launch into a resume of some unrelated conversation. `superlooper resume` sets it
+           # deliberately on its own launch; nothing else may inherit it.
+           "SL_RESUME_SESSION_ID": "",
            "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
     try:
         r = subprocess.run([script, "--cwd", os.path.abspath(repo), sid],
@@ -2636,6 +2649,279 @@ def cmd_debug(args):
     return 1
 
 
+# ------------------------------- resume (issue #298) -------------------------------
+#
+# Re-enter an interrupted session's CONVERSATION instead of restarting it cold from zero.
+#
+# The launch stack mints each flight's session id at spawn and records it in lane state
+# (state/sessions/<id>) — identity assigned by the runner, never self-asserted. This verb is the
+# door that spends that record: it hands the id back to the SAME launch stack as
+# SL_RESUME_SESSION_ID, which turns `--session-id <new>` into `--resume <recorded>`.
+#
+# Deliberately MINIMAL and owner-driven (issue #298 Boundaries): a person decides that a lane is
+# worth reviving and types this. Automatic revive policy — who watches for a dead pane, how often,
+# with what anti-storm rails — is the herdr epic's territory and is not smuggled in here.
+#
+# It goes through launch-session.sh rather than around it for the same reason `debug` does: the
+# tab, the folder pre-trust, the keystroke-free delivery handshake, the delivery VERIFICATION, the
+# worker singleton and the pane/activity records are one contract with one implementation. A
+# revive that re-implemented any of them would be a second launch stack with no tests.
+
+_LANE_ID_RE = re.compile(r"^[id][0-9]+$")
+# The recorded id is disk state, and disk state is never trusted on shape (the fail-closed rule the
+# rest of the engine applies to a wrong-typed status or a numberless PR). claude REFUSES a
+# non-UUID, so a corrupt record must be caught here — where the operator gets a sentence — rather
+# than inside the launcher where it dies with the tab.
+_SESSION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _git_read(cwd, *args):
+    """`git -C cwd <args>` -> stripped stdout, or None if git could not answer. Fail closed: the
+    preamble prints a NAMED unknown rather than a guess, because a revived session that is told
+    nothing assumes its stale memory still holds."""
+    try:
+        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _resume_facts(home, iid, session_id, worktree, note):
+    """Everything the re-orientation preamble states, RE-READ now (never remembered). Each fact is
+    independently optional: a missing worktree, a detached HEAD or a refused GitHub read degrades
+    that one line to a named unknown instead of failing the revive — a session resumed with a
+    partial map is strictly better than a session not resumed at all."""
+    branch = _git_read(worktree, "rev-parse", "--abbrev-ref", "HEAD") if worktree else None
+    if branch == "HEAD":                      # detached: not a branch name, do not print one
+        branch = None
+    head = _git_read(worktree, "rev-parse", "HEAD") if worktree else None
+    porcelain = _git_read(worktree, "status", "--porcelain") if worktree else None
+    dirty = None if porcelain is None else len([l for l in porcelain.splitlines() if l.strip()])
+    facts = {"id": iid, "session_id": session_id, "branch": branch, "worktree": worktree,
+             "head": head, "dirty": dirty, "pr": {}, "pr_ok": False, "note": note}
+    if branch:
+        read = gh.pr_for_branch(branch)
+        facts["pr"], facts["pr_ok"] = read.pr, read.ok
+    else:
+        # No branch to look one up BY. That is an unknown, not a clean "no PR" — same fail-closed
+        # rule as a refused lookup: emptiness must never read as an answer.
+        facts["pr_ok"] = False
+    st = _read_json_file(os.path.join(home, "state", "issues.json"), None)
+    if isinstance(st, dict):
+        issue = (st.get("issues") or {}).get(iid)
+        if isinstance(issue, dict) and issue.get("status"):
+            facts["lane_status"] = "%s (as the runner last recorded it)" % issue["status"]
+    return facts
+
+
+def _resume_launch(cfg, repo, home, pane, iid, session_id, worktree):
+    """Run the revive through the SAME launch shim every other session uses. Returns
+    ``(rc, stdout, stderr, spawned)``; never raises. Mirrors _debugger_shim_run's contract."""
+    models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    script = os.environ.get("SL_LAUNCH_SESSION") or os.path.join(_HERE, "launch-session.sh")
+    is_worker = iid.startswith("i")
+    env = {**os.environ,
+           "SL_RUN_ROOT": home, "SL_PANE": pane, "SL_REPO": os.path.abspath(repo),
+           "SL_DEV_BRANCH": str(cfg.get("dev_branch", "main")),
+           # The model still applies to a resumed conversation. A hand-run revive uses the repo
+           # default for the seat — a per-issue `model:*` label is the RUNNER's resolution and is
+           # not re-derived here (that precedence ladder has one owner, runner._worker_env).
+           "SL_MODEL": str((models.get("worker") if is_worker else models.get("debugger"))
+                           or ("" if is_worker else "opus[1m]")),
+           "SL_EFFORT": "",
+           # THE seam: launch-session.sh passes this straight through as `--resume <id>` instead of
+           # minting a fresh `--session-id`. Without it the launch is an ordinary cold start.
+           "SL_RESUME_SESSION_ID": session_id,
+           "SL_LAUNCH_VERIFY_SECONDS": "30",     # pinned, exactly as _debugger_shim_run pins it
+           # A PERSON typed this, so the PreToolUse deny (#185) must not tell the revived session
+           # that nobody is at the pane — the same reasoning as `debug`'s owner tap.
+           "SL_ATTENDED": "1",
+           "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
+    argv = [script, iid] if is_worker else [script, "--cwd", worktree or os.path.abspath(repo), iid]
+    try:
+        r = subprocess.run(argv, env=env, capture_output=True, text=True,
+                           timeout=WATCHDOG_LAUNCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out", True
+    except (OSError, ValueError):
+        return 127, "", "could not run the launch shim", False
+    return r.returncode, r.stdout, r.stderr, True
+
+
+def _emit_resume(args, result):
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(result) + "\n")
+        return
+    if result.get("verb") == "resume-check":
+        sys.stdout.write("%s can be resumed — session %s\n" % (result.get("id"),
+                                                               result.get("session_id"))
+                         if result.get("resumable")
+                         else "%s cannot be resumed: %s\n" % (result.get("id"),
+                                                              result.get("error")))
+    elif not result.get("ok"):
+        sys.stdout.write("nothing was resumed: %s\n" % result.get("error"))
+    else:
+        # "launched" and not "resumed": rc=0 from the shim means DELIVERY was verified, which is
+        # not the same as the conversation having been re-entered. If the recorded id names no
+        # transcript (recorded at spawn, launch never delivered) claude says so in the tab, and
+        # this line must not have already claimed otherwise.
+        sys.stdout.write("launched %s to resume session %s — watch the tab to confirm it "
+                         "re-entered. brief: %s\n"
+                         % (result.get("id"), result.get("session_id"), result.get("brief")))
+
+
+def cmd_resume(args):
+    """Re-enter lane <id>'s recorded session after an interruption, with a re-orientation preamble.
+
+    Refuses — launching nothing, writing nothing — when the lane has no recorded session id (it
+    predates #298, or never launched), when a LIVE worker still holds the lane, or when no cmux
+    pane resolves. ``--check`` is the read-only preflight."""
+    cfg = _load_config(args.repo)
+    home = str(config_lib.state_home(cfg))
+    state_dir = os.path.join(home, "state")
+
+    def refuse(error, **extra):
+        out = {"ok": False, "verb": "resume", "id": getattr(args, "id", None),
+               "session_id": None, "error": error}
+        out.update(extra)
+        _emit_resume(args, out)
+        return 1
+
+    iid = (args.id or "").strip()
+    # Shape-checked BEFORE the id reaches a path join or the shell: the same fail-closed contract
+    # launch-session.sh applies to its own argument, applied here so a bad id is refused before a
+    # byte is written rather than deep inside the launcher.
+    if not _LANE_ID_RE.match(iid):
+        return refuse("'%s' is not a lane id — expected i<N> (an issue worker) or d<N> "
+                      "(a debugger session)" % iid)
+
+    # Resume is a Claude Code capability (`--session-id`/`--resume`). Codex has its own
+    # `codex resume`, which this engine does not drive, and start-session.sh deliberately does not
+    # thread the id into that branch — so on a codex repo a "resume" would silently start a COLD
+    # session while telling it that its conversation survived. Refusing is the only honest answer
+    # (fresh-agent review P0-2).
+    agent = cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"
+    if agent != "claude":
+        return refuse("this repo runs the '%s' agent, and resume is a Claude Code capability — a "
+                      "'%s' session cannot be re-entered by this engine." % (agent, agent))
+
+    session_id = (_read(os.path.join(state_dir, "sessions", iid)) or "").strip()
+    if not session_id:
+        return refuse("no recorded session id for %s — it was launched before session identity "
+                      "existed, or it never launched. There is no conversation to re-enter; start "
+                      "a fresh session instead." % iid)
+    if not _SESSION_ID_RE.match(session_id):
+        return refuse("the recorded session id for %s is not a UUID (%r) — the record is corrupt, "
+                      "and claude would refuse it. Start a fresh session instead."
+                      % (iid, session_id[:60]))
+
+    live = _live_lock(os.path.join(state_dir, "worker.%s.lock" % iid))
+    if live:
+        return refuse("a session is already live for %s — never two agents on one lane. Resume is "
+                      "for a lane whose session is GONE." % iid, session_id=session_id)
+    worktree = os.path.join(home, "worktrees", iid) if iid.startswith("i") \
+        else os.path.abspath(args.repo)
+    if not os.path.isdir(worktree):
+        # A worker whose worktree was reclaimed has nowhere to be revived: the conversation would
+        # resume in a directory that no longer holds its branch.
+        return refuse("%s has no working directory at %s — its worktree is gone, so there is "
+                      "nothing to resume into." % (iid, worktree), session_id=session_id)
+
+    # Resolved BEFORE --check answers: a preflight that says "resumable" and then fails on a
+    # missing pane is a preflight that does not fly the flight.
+    pane = _watchdog_pane(state_dir)
+    if getattr(args, "check", False):
+        # Returns here, ABOVE the debugger lock: --check writes nothing anywhere, and taking a
+        # lock is a write (cmd_debug's --check returns above its lock for the same reason).
+        _emit_resume(args, {"ok": True, "verb": "resume-check", "id": iid,
+                            "session_id": session_id, "resumable": bool(pane),
+                            "worktree": worktree,
+                            "error": None if pane else "no cmux pane resolves for this loop"})
+        return 0
+    if not pane:
+        return refuse("no cmux pane resolves for this loop (no $SL_PANE, no recorded runner "
+                      "anchor, not inside cmux) — the revived session's tab has nowhere to be "
+                      "born", session_id=session_id)
+
+    # A DEBUGGER lane answers to a second singleton: never two debuggers on one patient, whichever
+    # ids they carry (the rule `superlooper debug` enforces). Reviving d3 while d7 is live would
+    # put two permissions-bypassed agents in one checkout — the shared-checkout bright line. The
+    # `_debug_live_id` read ALONE is not enough, for the reason cmd_debug documents: a just-
+    # launched debugger does not hold its worker.d<N>.lock until start-session.sh acquires it in
+    # the new tab, up to 30s later, so a resume landing inside a watchdog's launch window would see
+    # "nobody home" and launch anyway. Holding the watchdog's OWN lock across the whole
+    # check-and-launch is what makes the two mutually exclusive rather than merely polite.
+    debug_lock = os.path.join(state_dir, "watchdog.lock") if iid.startswith("d") else None
+    if debug_lock:
+        try:
+            acquired = _watchdog_acquire_lock(debug_lock)
+        except OSError as e:
+            return refuse("could not take this loop's watchdog lock (%s is unwritable): %s"
+                          % (state_dir, e), session_id=session_id)
+        if not acquired:
+            return refuse("a watchdog check is running for this state home right now — nothing "
+                          "was resumed; try again in a moment", session_id=session_id)
+
+    brief_path = os.path.join(home, "briefs", "%s.resume.md" % iid)
+    try:
+        if debug_lock:
+            other = _debug_live_id(state_dir)
+            if other is not None:
+                return refuse("a debugger session (%s) is already running for this repo — never "
+                              "two debuggers on one patient" % other, session_id=session_id)
+
+        note = _debug_bounded(getattr(args, "note", None), _DEBUG_NOTE_MAX, "note")
+        facts = _resume_facts(home, iid, session_id, worktree, note)
+        # A SEPARATE file from the lane's own brief, never over it: the runner's crash-recovery
+        # relaunch re-runs launch-session.sh without rebuilding the brief, so a preamble written to
+        # briefs/<id>.md would later open a brand-new, empty session on "your conversation above
+        # survived intact" with no work instruction anywhere (fresh-agent review P0-1). Both
+        # launchers select this file, and only when SL_RESUME is set.
+        try:
+            os.makedirs(os.path.join(home, "briefs"), exist_ok=True)
+            with open(brief_path, "w") as f:
+                f.write(reorient.render(facts))
+        except OSError as e:
+            # open(,"w") truncates before write(), so a failure mid-write would leave the revived
+            # session opening on a half-written preamble — worse than none (as in cmd_debug).
+            _rm_quiet(brief_path)
+            return refuse("could not write the re-orientation preamble: %s" % e,
+                          session_id=session_id)
+
+        rc, out, err, spawned = _resume_launch(cfg, args.repo, home, pane, iid, session_id,
+                                               worktree)
+    finally:
+        if debug_lock:
+            _watchdog_release_lock(debug_lock)
+    # Remove the preamble only where it PROVABLY reached nobody: `not spawned` (the exec itself
+    # failed, as in cmd_debug), or rc=2, which launch-session.sh returns exactly when no worker
+    # started within the verify window — and start-session.sh stamps its start sentinel BEFORE it
+    # reads the brief, so a missing sentinel proves the brief was never read WITHIN THAT WINDOW.
+    # The remainder — a straggler shell that boots after the window, stamps late and then reads —
+    # is covered not by the sentinel ordering but by the FAIL-CLOSED brief selection in both
+    # launchers: it finds no preamble, exits cleanly, and the runner recovers the lane. Those two
+    # changes are load-bearing together; relax the selection back to a fallback and this cleanup
+    # silently becomes unsafe again.
+    # Deliberately NOT a blanket `rc != 0`: a TIMEOUT (rc=124) is spawned=True precisely because
+    # the tab may yet deliver late, and pulling the preamble out from under it would abort that
+    # session at the now fail-closed brief selection.
+    if not spawned or rc == 2:
+        _rm_quiet(brief_path)
+    if rc == 0:
+        _debug_journal(home, {"act": "resume", "outcome": "resumed", "id": iid,
+                              "session_id": session_id,
+                              "operator": (args.operator or "").strip() or "the owner",
+                              "source": (args.source or "").strip() or "cli"})
+        _emit_resume(args, {"ok": True, "verb": "resume", "id": iid, "session_id": session_id,
+                            "brief": brief_path})
+        return 0
+    error = _debug_error(rc, err, out)
+    _debug_journal(home, {"act": "resume", "outcome": "resume_failed", "id": iid,
+                          "session_id": session_id, "error": error})
+    return refuse(error, session_id=session_id)
+
+
 # ------------------------------- stubs -------------------------------
 
 def _stub(which, wave):
@@ -2716,6 +3002,19 @@ def main(argv=None):
                           help="emit a single JSON object (for a UI over the loop to parse)"),
            "--operator": dict(default=None,
                               help="who tapped — named in the brief and the journal line (audit)"),
+           "--source": dict(default=None,
+                            help="what asked (audit only; default 'cli')")})
+    add("resume", cmd_resume,
+        **{"id": dict(help="the lane to revive: i<N> (an issue worker) or d<N> (a debugger)"),
+           "--note": dict(default=None,
+                          help="a new instruction, placed AFTER the re-orientation so the session "
+                               "re-reads the world before acting on it"),
+           "--check": dict(action="store_true",
+                           help="report whether this lane can be resumed and write nothing "
+                                "(a read-only preflight)"),
+           "--json": dict(action="store_true",
+                          help="emit a single JSON object (for a UI over the loop to parse)"),
+           "--operator": dict(default=None, help="who asked — named in the journal line (audit)"),
            "--source": dict(default=None,
                             help="what asked (audit only; default 'cli')")})
     add("janitor", cmd_janitor,

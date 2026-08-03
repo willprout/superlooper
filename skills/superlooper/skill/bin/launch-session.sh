@@ -120,7 +120,55 @@ PY
   NAME="superlooper $ID ($BRANCH)"
 fi
 
+# ---- SESSION IDENTITY, MINTED HERE (issue #298) ----
+# The runner assigns each flight its conversation id BEFORE the session exists — identity handed
+# down, never self-asserted (claim c3) — so that after ANY interruption (killed pane, crashed host,
+# closed lid) the same conversation can be re-entered with `claude --resume <id>` instead of
+# restarting cold from zero. The 2026-07-29 spikes passed this unqualified and host-independent;
+# the 2026-07-30 supervised run proved it live through two kill -9s and a real sleep.
+#
+# SL_RESUME_SESSION_ID is the REVIVE seam: `superlooper resume` hands back the id it read from lane
+# state, and we pass that through verbatim rather than minting. Minting on a revive would strand
+# the very transcript the operator asked to re-enter. Empty/absent -> a fresh conversation.
+# A RELAUNCH always mints anew: `--session-id` on an already-used id is an error, so a dead
+# session's id can never be recycled as a fresh one (reviving it is the resume path's job).
+#
+# CLAUDE ONLY. `--session-id`/`--resume` are Claude Code's spelling; codex has its own `codex
+# resume` and start-session.sh deliberately does not thread the id into that branch. Minting for a
+# codex repo anyway would write a UUID into lane state that names no conversation anywhere — a
+# fabricated identity claim, and `superlooper resume --check` would then promise a revive that
+# cannot happen (fresh-agent review P0-2).
+RESUME=""
+SESSION_ID=""
+if [ "$AGENT" = "claude" ]; then
+  SESSION_ID="${SL_RESUME_SESSION_ID:-}"
+  if [ -n "$SESSION_ID" ]; then
+    RESUME=1
+  else
+    SESSION_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')" || {
+      echo "[$ID] could not mint a session id" >&2; exit 1; }
+  fi
+fi
+
+# A REVIVE opens on its own brief — the re-orientation preamble `superlooper resume` composed —
+# and the lane's ORIGINAL brief is left untouched beside it. They must be separate files: the
+# runner's crash-recovery relaunch (_exec_recover) re-runs this script WITHOUT rebuilding the
+# brief, so a preamble written over briefs/<id>.md would later be delivered verbatim to a
+# brand-new, empty session — telling it "your conversation above survived intact" when there is no
+# conversation and no work instruction anywhere (fresh-agent review P0-1). Selected on RESUME
+# alone, so a cold relaunch always gets the real brief back.
+#
+# FAIL CLOSED, never fall back: if this is a resume and the preamble is missing, ABORT. Silently
+# substituting the lane's original brief would deliver the whole issue brief — goal, DoD,
+# boundaries — as a NEW instruction into a conversation that already built it, with no
+# re-orientation first, which is exactly the ordering the resume exists to guarantee.
+# The test is spelled to MATCH start-session.sh's `truthy "$SL_RESUME"` on the far side, so the
+# invariant "these two selections are the same selection" is visible here rather than inferred
+# from RESUME happening to have only two assignment sites.
 BRIEF="$SL_RUN_ROOT/briefs/$ID.md"
+if [ "$RESUME" = "1" ]; then
+  BRIEF="$SL_RUN_ROOT/briefs/$ID.resume.md"
+fi
 [ -f "$BRIEF" ] || { echo "[$ID] missing brief $BRIEF" >&2; exit 1; }
 
 # Create the worktree (worker mode only) off the fresh dev base; the fallback attaches an EXISTING
@@ -144,7 +192,28 @@ fi
 "$HERE/pretrust.sh" "$WT"                       # first-run trust prompt won't hang
 mkdir -p "$SL_RUN_ROOT/state/activity" "$SL_RUN_ROOT/state/panes" "$SL_RUN_ROOT/state/started" \
          "$SL_RUN_ROOT/state/blocked" "$SL_RUN_ROOT/state/exited" "$SL_RUN_ROOT/state/awaiting" \
-         "$SL_RUN_ROOT/reports"
+         "$SL_RUN_ROOT/state/sessions" "$SL_RUN_ROOT/reports"
+# Record the id NOW, before the tab exists. Deliberately UNLIKE the activity/pane stamps below,
+# which are withheld until delivery is verified because writing them early once fabricated
+# "launched & alive" for 45 minutes: an id is an IDENTITY claim, not a liveness one — nothing reads
+# this file as proof anything is running. The verify window is up to 30s, and a host that dies
+# inside it must still leave behind the handle to resume by; a failed launch therefore leaves the
+# record in place rather than deleting it (a stale id costs a clean "no conversation found" at
+# resume time, while a deleted one loses the only handle on a straggler shell that started late).
+# Written tmp+mv like every other durable state write in this stack, so a reader can never see a
+# half-written id.
+# Guarded at each step like the other multi-step writes here: a half-done write must NAME itself,
+# not abort the launch with a bare rc=1 under `set -e`, and a failed mv must not leave its temp
+# behind in a directory readers scan.
+if [ -n "$SESSION_ID" ]; then
+  if ! sid_tmp="$(mktemp "$SL_RUN_ROOT/state/sessions/.$ID.XXXXXX")" \
+     || ! printf '%s' "$SESSION_ID" > "$sid_tmp" \
+     || ! mv -f "$sid_tmp" "$SL_RUN_ROOT/state/sessions/$ID"; then
+    rm -f "${sid_tmp:-}" 2>/dev/null || true
+    echo "[$ID] could not record the session id — this session will not be resumable" >&2
+    exit 1
+  fi
+fi
 # Restart hygiene: clear ONLY this id's run-state markers so a prior session's report/exited/blocked
 # can't mis-fire for the fresh session. The worktree and any committed work are PRESERVED (never
 # touched here). Scope is strictly these named markers — a wrong glob would discard a real report, so
@@ -159,6 +228,13 @@ mkdir -p "$SL_RUN_ROOT/state/activity" "$SL_RUN_ROOT/state/panes" "$SL_RUN_ROOT/
 # that has not yet rested look like it had already stamped HEAD. Delivery RECEIPTS
 # (mail/<id>.consumed.*/.claimed.*/.discarded.*) are deliberately NOT cleared: they are the record
 # of what was actually handed over, and history survives a restart.
+# A RESUME (#298) clears exactly the same set. Keeping the report for the revived session was
+# tried and is WRONG in both directions (fresh-agent review P1-4): a present report makes
+# events.py read the lane as `resolved`, which switches OFF the session_idle/frozen tiers — the
+# revived session would run with no liveness net at all — and it makes actions.decide emit `gate`
+# for a lane whose live session is still editing and pushing that branch. The report is a
+# COMPLETION signal the runner acts on, so a session that has been revived to keep working must
+# re-earn it, exactly as a replacement session must.
 rm -f "$SL_RUN_ROOT/reports/$ID.md" \
       "$SL_RUN_ROOT/state/blocked/$ID" "$SL_RUN_ROOT/state/exited/$ID" "$SL_RUN_ROOT/state/awaiting/$ID" \
       "$SL_RUN_ROOT/state/mail/$ID" "$SL_RUN_ROOT/state/status/$ID.json"
@@ -227,8 +303,8 @@ WS_ARGS=()
 # default path; set only by a per-issue effort:* label) — %q-quoted like the rest so a value with
 # brackets/spaces can't break or inject the command. Codex-specific knobs are named too, because the
 # fresh tab shell inherits none of the runner's environment.
-printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_ATTENDED=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
-  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$ATTENDED" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
+printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_ATTENDED=%q SL_SESSION_ID=%q SL_RESUME=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
+  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$ATTENDED" "$SESSION_ID" "$RESUME" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
 # Drop the command FIRST — before any further cmux RPC — so the new tab's shell finds it immediately
 # and the shim's bounded wait can't be eaten by an unrelated slow RPC (e.g. rename-tab; review B6).
 # Atomic write (tmp + mv) so the shim never reads a half-written command; refresh .active so its
@@ -283,7 +359,11 @@ rm -f "$STARTED" 2>/dev/null || true                   # the per-launch proof ha
 # redos). retries = launches - 1 (first launch = 0). Worker ids only — a debugger (d<N>) is not a
 # tracked issue, so it has no counter. setdefault covers an id the runner registered without a
 # counter yet. Guarded: telemetry must never fail a delivered launch.
-if [ "$CWD_MODE" -eq 0 ]; then
+# A RESUME is deliberately NOT counted (#298): `retries` is mechanical telemetry about how many
+# times a lane had to be STARTED OVER, and re-entering the same conversation is the opposite of
+# starting over. Counting it would inflate the one number nobody can audit after the fact — the
+# same honesty this block was written to protect.
+if [ "$CWD_MODE" -eq 0 ] && [ -z "$RESUME" ]; then
   python3 - "$HERE/../lib" "$SL_RUN_ROOT/state/issues.json" "$ID" <<'PY' || echo "[$ID] WARN: launch counter not updated" >&2
 import sys
 sys.path.insert(0, sys.argv[1])

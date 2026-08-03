@@ -74,7 +74,28 @@ printf '%s' "$TOKEN" > "$SL_RUN_ROOT/state/started/$ID.$TOKEN"
 # run_agent (re)writes this file when the agent exits.
 ERR_TAIL="$SL_RUN_ROOT/state/launch_stderr/$ID"
 rm -f "$ERR_TAIL"
+# Defined HERE, above its first use (the brief selection just below) rather than beside the other
+# flag helpers: this script runs under `set -uo pipefail` with no `-e`, so calling truthy before it
+# exists would not abort — it would return non-zero and silently leave the ORIGINAL brief selected,
+# which is the exact fail-open the selection below is written to prevent.
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# A REVIVE opens on its own brief — the re-orientation preamble — kept in a SEPARATE file so the
+# lane's original brief survives untouched for any later cold relaunch (#298; the runner's
+# crash-recovery path re-launches without rebuilding the brief, and would otherwise hand a
+# brand-new session a "you were interrupted" preamble and no work instruction). Selection must
+# match launch-session.sh's, which makes the same choice for its existence check — including
+# FAILING CLOSED: this check runs in the new tab up to 30s after the launcher's, so a preamble
+# that disappeared in between must abort, never silently become the lane's original brief
+# delivered as a new instruction into a conversation that already built it.
+# `truthy` is the SAME predicate the --resume flag is chosen by, below: two different tests for
+# one variable is how SL_RESUME=0 would pick the resume brief and `--session-id` together.
 BRIEF="$SL_RUN_ROOT/briefs/$ID.md"
+truthy "${SL_RESUME:-}" && BRIEF="$SL_RUN_ROOT/briefs/$ID.resume.md"
 [ -f "$BRIEF" ] || { echo "[$ID] no brief" >&2; write_exited 1; exit 1; }
 # Name the session so the operator can tell what's running when they're away:
 #   --name           -> local terminal/tab title + /resume picker
@@ -91,13 +112,17 @@ MODEL="${SL_MODEL:-}"
 # non-empty — no forced default when it's empty. Same %q-quoted stack as --model.
 EFFORT="${SL_EFFORT:-}"
 AGENT="${SL_AGENT:-claude}"
-
-truthy() {
-  case "${1:-}" in
-    1|true|TRUE|yes|YES|on|ON) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# ---- SESSION IDENTITY (issue #298) ----
+# The per-flight conversation id, MINTED BY THE RUNNER at spawn (launch-session.sh) and handed down
+# here — identity ASSIGNED, never self-asserted (claim c3). Two spellings, one id:
+#   SL_RESUME empty -> `--session-id <id>`: pre-assign the id this brand-new conversation will own.
+#   SL_RESUME truthy -> `--resume <id>`:    re-enter that SAME conversation after an interruption.
+# Passing `--session-id` for an id that already exists is an ERROR, so the two are exclusive — the
+# resume path must never also assign. Both are Claude Code's own spelling and so live ONLY here
+# (agent-boundary rule); codex has its own `codex resume` and would abort on an unknown flag, so the
+# id is deliberately not threaded into that branch.
+SESSION_ID="${SL_SESSION_ID:-}"
+RESUME="${SL_RESUME:-}"
 
 toml_string() {
   local s="${1:-}"
@@ -138,6 +163,18 @@ case "$AGENT" in
     [ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
     [ -n "$EFFORT" ] && CLAUDE_ARGS+=(--effort "$EFFORT")
     CLAUDE_ARGS+=(--name "$NAME" --remote-control "$NAME")
+    # Guarded on NON-EMPTY exactly like --model/--effort above: `--session-id ""` fails the UUID
+    # check and kills the launch with the tab. A bare `--resume` (no value) is worse than useless —
+    # the flag takes an OPTIONAL value, so with nothing after it claude opens its interactive
+    # session PICKER and an unattended launch sits at that menu until the freeze-net times out. No
+    # id => neither flag, and the session behaves exactly as it did before #298.
+    if [ -n "$SESSION_ID" ]; then
+      if truthy "$RESUME"; then
+        CLAUDE_ARGS+=(--resume "$SESSION_ID")
+      else
+        CLAUDE_ARGS+=(--session-id "$SESSION_ID")
+      fi
+    fi
     # Do NOT pipe Claude's STDOUT through tee/cat — piping stdout drops it into print mode and kills
     # the interactive pane you want to watch. (No headless `claude -p` anywhere — owner billing rule
     # B.9.) run_agent captures only STDERR (stdout stays the TTY via fd3), so the TUI is unaffected.
@@ -173,6 +210,8 @@ rc=$AGENT_RC        # the AGENT's own exit code, captured through run_agent (PIP
 # trap then frees the worker lock so a legitimate restart can take this id over.
 write_exited "$rc"
 echo
-resume_cmd="claude --resume"
+# NAME the id when we have one (#298). A bare `claude --resume` drops the operator into the session
+# picker and makes them guess which entry was this pane; with the id it is a command they can paste.
+resume_cmd="claude --resume${SESSION_ID:+ $SESSION_ID}"
 [ "$AGENT" = "codex" ] && resume_cmd="codex resume"
 echo "[$ID] session ended $(date '+%H:%M') rc=$rc — scroll up to inspect, or: $resume_cmd"

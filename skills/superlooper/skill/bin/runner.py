@@ -2000,6 +2000,11 @@ class Runner:
                 # ignores the flag for worker ids, so this is the launcher half of a belt-and-
                 # suspenders pair — the launcher promises it, the hook does not rely on it.
                 "SL_ATTENDED": "",
+                # PINNED EMPTY for the same reason, and it matters more here (#298): an ambient
+                # `export SL_RESUME_SESSION_ID=…` would turn EVERY worker launch into a `--resume`
+                # of that one conversation. A revive is always someone's explicit act, never
+                # something a launch inherits from the shell the runner happens to live in.
+                "SL_RESUME_SESSION_ID": "",
                 "SL_CODEX_DANGEROUS_BYPASS": env_bool(
                     "SL_CODEX_DANGEROUS_BYPASS", bool(codex.get("dangerous_bypass", False))),
                 "SL_CODEX_BYPASS_HOOK_TRUST": env_bool(
@@ -2380,6 +2385,12 @@ class Runner:
             return False                                   # the ONE meaning: still held
         for p in (os.path.join(self.state, "panes", iid),
                   os.path.join(self.state, "panes", f"{iid}.ws"),
+                  # (#298) The session record dies with the lane it identified. Left behind, it
+                  # would let `superlooper resume` revive a RETIRED episode's conversation into
+                  # whatever lane later takes this id — a re-approval rebuilds on a fresh branch
+                  # with a wiped report, and the old transcript's memory of the world would be
+                  # wrong in every particular.
+                  os.path.join(self.state, "sessions", iid),
                   self._lock_path(iid)):
             _rm(p)
         # (#169) The lock is gone, so whatever refused this lane's rebuilds is provably gone with it

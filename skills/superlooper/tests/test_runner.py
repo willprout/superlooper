@@ -537,6 +537,11 @@ def test_launch_env_contract_and_registration(rig):
     assert env["SL_MODEL"] == "opus"                   # models.worker
     assert env["SL_AGENT"] == "claude"                  # default agent path stays Claude
     assert env["SL_ATTENDED"] == ""                     # a worker is never attended (issue #185)
+    # (#298) PINNED EMPTY for the same reason SL_ATTENDED is: this env is merged over os.environ,
+    # so an ambient `export SL_RESUME_SESSION_ID=…` in the shell or LaunchAgent the runner was
+    # started from would otherwise turn EVERY worker launch into a `--resume` of that one
+    # conversation — and silently suppress the restart hygiene and the retry counter with it.
+    assert env["SL_RESUME_SESSION_ID"] == ""
     ist = issue_state(rig, "i101")
     assert ist["status"] == "running" and ist["branch"] == "sl/i101-render-the-widget"
     brief_text = (rig.home / "briefs" / "i101.md").read_text()

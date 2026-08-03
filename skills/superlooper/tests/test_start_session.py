@@ -21,6 +21,12 @@ START = os.path.join(REPO_ROOT, "skill", "bin", "start-session.sh")
 # records every argv element on its own line, then exits (a real worker would idle at the prompt).
 STUB_AGENT = '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$SL_TEST_ARGS"\nexit 0\n'
 
+# Scrubbed from every child env below for a sharper reason than tidiness (#298): a worker pane
+# running this suite has its OWN runner-minted session id live in the environment (start-session.sh
+# reads it from exactly there), so without this the "no id was minted" cases would inherit the
+# test-runner session's id and quietly assert nothing.
+_SESSION_ENV = ("SL_SESSION_ID", "SL_RESUME")
+
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 
 
@@ -30,13 +36,18 @@ def _x(path, body):
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _run_start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None):
+def _run_start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
+               resume_brief=None):
     """Run start-session.sh i1 with a stub agent; return its recorded argv (list of tokens).
-    model/effort default to unset (env var absent); pass "" to exercise the empty-string path."""
+    model/effort default to unset (env var absent); pass "" to exercise the empty-string path.
+    `resume_brief` seeds briefs/i1.resume.md — a resume launch REQUIRES it (the selection fails
+    closed rather than substituting the lane's own brief)."""
     run_root = tmp_path / "run"
     (run_root / "briefs").mkdir(parents=True)
     (run_root / "state").mkdir()
     (run_root / "briefs" / "i1.md").write_text("do the thing")
+    if resume_brief is not None:
+        (run_root / "briefs" / "i1.resume.md").write_text(resume_brief)
     stubdir = tmp_path / "stub"
     stubdir.mkdir()
     _x(str(stubdir / "claude"), STUB_AGENT)
@@ -45,7 +56,8 @@ def _run_start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=N
     # start from a copy that never leaks the parent's SL_MODEL/SL_EFFORT into the child.
     env = {k: v for k, v in os.environ.items()
            if k not in ("SL_MODEL", "SL_EFFORT", "SL_CODEX_DANGEROUS_BYPASS",
-                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN")}
+                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN",
+                        _SESSION_ENV[0], _SESSION_ENV[1])}
     env.update({
         "PATH": f"{stubdir}:{os.environ['PATH']}",
         "HOME": str(tmp_path / "home"),
@@ -156,7 +168,8 @@ def _run_start_capture(tmp_path, stub_body, *, agent="claude", model=None, extra
     args_file = tmp_path / f"{agent}_args"
     env = {k: v for k, v in os.environ.items()
            if k not in ("SL_MODEL", "SL_EFFORT", "SL_CODEX_DANGEROUS_BYPASS",
-                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN")}
+                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN",
+                        _SESSION_ENV[0], _SESSION_ENV[1])}
     env.update({
         "PATH": f"{stubdir}:{os.environ['PATH']}",
         "HOME": str(tmp_path / "home"),
@@ -225,7 +238,8 @@ def test_a_stale_tail_is_cleared_on_a_brief_missing_relaunch(tmp_path):
     stubdir = run_root.parent / "stub"
     env = {k: v for k, v in os.environ.items()
            if k not in ("SL_MODEL", "SL_EFFORT", "SL_CODEX_DANGEROUS_BYPASS",
-                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN")}
+                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN",
+                        _SESSION_ENV[0], _SESSION_ENV[1])}
     env.update({"PATH": f"{stubdir}:{os.environ['PATH']}", "HOME": str(run_root.parent / "home"),
                 "SL_RUN_ROOT": str(run_root), "SL_TEST_ARGS": str(run_root.parent / "unused"),
                 "SL_AGENT": "claude"})
@@ -246,7 +260,8 @@ def test_a_stale_tail_does_not_bleed_into_a_later_healthy_launch(tmp_path):
     _x(str(stubdir / "claude"), STUB_AGENT)
     env = {k: v for k, v in os.environ.items()
            if k not in ("SL_MODEL", "SL_EFFORT", "SL_CODEX_DANGEROUS_BYPASS",
-                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN")}
+                        "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN",
+                        _SESSION_ENV[0], _SESSION_ENV[1])}
     env.update({"PATH": f"{stubdir}:{os.environ['PATH']}", "HOME": str(run_root.parent / "home"),
                 "SL_RUN_ROOT": str(run_root), "SL_TEST_ARGS": str(run_root.parent / "claude_args2"),
                 "SL_AGENT": "claude"})
@@ -297,6 +312,78 @@ def _probe_hook(tmp_path, issue_id, attended=None):
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     return args_file.read_text().splitlines()
+
+
+# ---- session identity: --session-id at spawn, --resume on revive (issue #298) ----
+#
+# The launch stack used NEITHER flag before #298, so any interruption — a killed pane, a crashed
+# host, a closed lid — ended the flight's conversation for good. These pin the two halves of the
+# fix at the ONE place the Claude-specific flags may live (agent-boundary rule): a runner-minted id
+# is ASSIGNED at spawn, and a revive re-enters that same id instead of minting a new conversation.
+
+
+def test_session_id_is_passed_when_the_runner_minted_one(tmp_path):
+    argv = _run_start(tmp_path, extra_env={"SL_SESSION_ID": "d1e1e1e1-0000-4000-8000-000000000001"})
+    assert _flag_value(argv, "--session-id") == "d1e1e1e1-0000-4000-8000-000000000001"
+    assert "--resume" not in argv, "a FRESH launch assigns an id; it does not resume one"
+
+
+def test_no_session_flag_when_no_id_was_minted(tmp_path):
+    # The pre-#298 shape must survive untouched: an unset id means the session launches exactly as
+    # it always did, so this change can never break a caller that has not adopted it yet.
+    assert "--session-id" not in _run_start(tmp_path)
+
+
+def test_no_session_flag_when_the_minted_id_is_empty(tmp_path):
+    # Empty must never become `--session-id ""` — claude rejects a non-UUID and the launch would
+    # die with the tab, exactly like the `--model ""` case this file already pins.
+    assert "--session-id" not in _run_start(tmp_path, extra_env={"SL_SESSION_ID": ""})
+
+
+def test_resume_re_enters_the_recorded_session_instead_of_minting_one(tmp_path):
+    argv = _run_start(tmp_path, resume_brief="RE-ORIENTATION FIRST",
+                      extra_env={"SL_SESSION_ID": "d1e1e1e1-0000-4000-8000-000000000002",
+                                 "SL_RESUME": "1"})
+    assert _flag_value(argv, "--resume") == "d1e1e1e1-0000-4000-8000-000000000002"
+    assert "--session-id" not in argv, "--session-id on an EXISTING id is an error, not a resume"
+    # A resume opens on the PREAMBLE, never on the lane's own brief — the ordering the DoD names.
+    assert argv[-1] == "RE-ORIENTATION FIRST"
+
+
+def test_resume_without_an_id_cannot_open_the_interactive_picker(tmp_path):
+    # `--resume` takes an OPTIONAL value: a bare `--resume` opens claude's interactive session
+    # PICKER and the unattended launch would sit there forever. No id => no flag, ever.
+    argv = _run_start(tmp_path, resume_brief="preamble", extra_env={"SL_RESUME": "1"})
+    assert "--resume" not in argv and "--session-id" not in argv
+
+
+def test_the_session_id_is_claude_specific_and_never_reaches_codex(tmp_path):
+    # Agent boundary: `--session-id`/`--resume` are Claude Code's spelling. Codex has its own
+    # `codex resume` and would abort on an unknown flag — the id must not leak into its argv.
+    argv = _run_start(tmp_path, agent="codex",
+                      extra_env={"SL_SESSION_ID": "d1e1e1e1-0000-4000-8000-000000000003"})
+    assert "--session-id" not in argv and "--resume" not in argv
+
+
+def test_the_exit_hint_names_the_actual_session_to_resume(tmp_path):
+    # The pane's parting line is a human's recovery handle. A bare `claude --resume` drops the
+    # operator into the picker; naming the id is the difference between a hint and an instruction.
+    run_root = tmp_path / "run"
+    (run_root / "briefs").mkdir(parents=True)
+    (run_root / "state").mkdir()
+    (run_root / "briefs" / "i1.md").write_text("do the thing")
+    stubdir = tmp_path / "stub"
+    stubdir.mkdir()
+    _x(str(stubdir / "claude"), STUB_AGENT)
+    env = {k: v for k, v in os.environ.items() if k not in ("SL_MODEL", "SL_EFFORT")}
+    env.update({"PATH": f"{stubdir}:{os.environ['PATH']}", "HOME": str(tmp_path / "home"),
+                "SL_RUN_ROOT": str(run_root), "SL_TEST_ARGS": str(tmp_path / "a"),
+                "SL_AGENT": "claude",
+                "SL_SESSION_ID": "d1e1e1e1-0000-4000-8000-000000000004"})
+    r = subprocess.run([START, "i1"], env=env, cwd=str(run_root),
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert "claude --resume d1e1e1e1-0000-4000-8000-000000000004" in r.stdout
 
 
 def test_the_attended_flag_survives_into_the_hook_the_agent_spawns(tmp_path):
