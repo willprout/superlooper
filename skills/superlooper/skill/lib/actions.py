@@ -162,6 +162,15 @@ NUDGE_GRACE_WINDOW_SECONDS = 480
 # owner answers, and far inside the 94-minute class of silence this issue exists to end.
 AT_DIALOG_ALERT_SECONDS = 1800
 LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LAUNCHVERIFY x2)
+# (#299) EVIDENCE reason -> the ALERT reason that names it, for the channel-attributable gh faults.
+# Without this the systemic-launch alert is the only thing said about them, and it blames the cmux
+# anchor and App Nap. `gh_probe_unreachable` maps onto the EXISTING `gh_unreachable` alert reason
+# rather than minting a second name for one condition: both mean "GitHub did not answer", whether
+# the runner noticed it while polling or while asserting its identity at launch.
+GH_LAUNCH_ALERT_REASONS = {
+    "gh_auth_dead_runner": "gh_auth_dead_runner",
+    "gh_probe_unreachable": "gh_unreachable",
+}
 # A dead DELIVERY CHANNEL — the cmux launch anchor (the pane every worker tab is born in), the
 # launch shim, or the launch machinery — is a RUNNER-level fault, never N per-issue parks (incident
 # 2026-07-09: a dead anchor walked 10 approved issues into 10 parks in ~8 min). The runner records
@@ -297,6 +306,15 @@ ALERT_MESSAGES = {
                                "(or re-run bin/install-launch-shim.sh), then FULLY QUIT and "
                                "relaunch cmux in a visible tab and restart the runner — the flag is "
                                "read only at app launch. If it persists, check the cmux anchor.",
+    "gh_auth_dead_runner": "the RUNNER's own GitHub CLI cannot say who it is — `gh api user` "
+                           "returns no usable login, so the launcher has no identity to start any "
+                           "session against and refuses BEFORE opening a tab (issue #299). This is "
+                           "NOT a cmux/App Nap fault: the delivery channel is fine and nothing is "
+                           "wrong with any issue. Launches are HELD (the queue is intact, nothing "
+                           "parked, no issue charged) and resume automatically once auth reads "
+                           "healthy. Fix: `gh auth login --hostname github.com` as the account that "
+                           "owns the loop repo. This is the gh-side sibling of the claude-side "
+                           "auth_dead banner.",
     "auth_dead": "the account AUTH probe reads DEAD — `claude auth status` reports not-logged-in "
                  "(or the Claude Code credential keychain item is gone), so a fresh launch or a "
                  "recovery relaunch would start LOGGED OUT and burn the spend (the i336 class). "
@@ -490,6 +508,17 @@ def _count(x, default=0):
     """A usable counter: a real int (bool excluded), else the default. Wrong-typed counters are
     the fail-OPEN defect class — callers decide whether default or park is the safe landing."""
     return x if type(x) is int else default
+
+
+def _launch_ev_reason(ist):
+    """The reason the runner stamped for this lane's last failed launch, or None (#299).
+
+    Degrades to None on anything unusable — absent, corrupt, wrong-typed — because the ONE caller
+    uses it to make an alert more specific, and an unreadable stamp must fall back to the generic
+    systemic message rather than suppress the alert entirely."""
+    ev = ist.get("launch_evidence") if isinstance(ist, dict) else None
+    reason = ev.get("reason") if isinstance(ev, dict) else None
+    return reason if isinstance(reason, str) and reason else None
 
 
 # Night-batching (issue #164). Routine owner-DECISION hand-backs (a park, a bounce, a durable
@@ -1438,7 +1467,18 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     if anchor_down and has_pending_launch:             # a dead anchor only matters with work to launch
         reasons.append("launch_anchor_down")
     if systemic_launch:
-        reasons.append("launch_systemic_failure")
+        # NAME THE CAUSE (issue #299). The generic systemic body tells the owner to disable macOS
+        # App Nap and restart cmux — right for a dead shim, actively WRONG for a logged-out gh. And
+        # because these faults HOLD rather than park, no park memo is ever written: this alert body
+        # is the only thing the owner is told, so a wrong one is the whole story. The failing lanes
+        # carry the launcher's own classification in their stamped evidence, so speak it.
+        # Mixed / unclassified streaks still raise the generic reason, so nothing goes unreported.
+        ev_reasons = {_launch_ev_reason(ist_of(i)) for i in fail_ids}
+        named = sorted({GH_LAUNCH_ALERT_REASONS[r] for r in ev_reasons
+                        if r in GH_LAUNCH_ALERT_REASONS})
+        reasons.extend(named)
+        if not named or (ev_reasons - set(GH_LAUNCH_ALERT_REASONS)):
+            reasons.append("launch_systemic_failure")
     if auth_invalid and (has_pending_launch or has_relaunch_demand):   # dead auth only matters with a
         reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
     reasons.sort()

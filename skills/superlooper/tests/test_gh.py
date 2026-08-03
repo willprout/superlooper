@@ -1093,9 +1093,10 @@ def test_default_gh_is_neutralized_in_the_test_suite():
     ratchet. Two shell scripts now resolve gh for the launch-time auth assert, so a test that
     forgot to stub would reach the owner's REAL, logged-in gh and make live API calls as them.
 
-    The guard is sharper than it looks: launch-session.sh NAMES SL_GH in the dropped worker
-    command, so every worker session — including one running this suite — carries it ambiently, and
-    the neutralization only fires because `_clear_worker_launch_env` scrubs it FIRST. If either
-    half is removed this fails, on every machine rather than only on ones with gh installed."""
+    What this pins exactly: on a clean shell, that the neutralization exists at all. Inside a worker
+    pane — where launch-session.sh's dropped command makes SL_GH ambient — it ALSO pins the scrub
+    that lets the neutralization fire, since the guard is conditional on SL_GH being unset. The two
+    fixtures are wired by an explicit parameter dependency rather than definition order, so the
+    ordering half cannot silently rot."""
     assert gh._binary() == "/nonexistent/superlooper-test-gh", (
         "conftest must point SL_GH at an absent path; got %r" % gh._binary())

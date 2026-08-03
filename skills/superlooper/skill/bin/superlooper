@@ -2738,6 +2738,12 @@ def _resume_launch(cfg, repo, home, pane, iid, session_id, worktree):
            # minting a fresh `--session-id`. Without it the launch is an ordinary cold start.
            "SL_RESUME_SESSION_ID": session_id,
            "SL_LAUNCH_VERIFY_SECONDS": "30",     # pinned, exactly as _debugger_shim_run pins it
+           # PINNED EMPTY (#299) — and this is the call site that needs it MOST. `superlooper
+           # resume` is BY DESIGN typed from inside a session, which is precisely the environment
+           # that carries a stale SL_EXPECT_GH_LOGIN; inheriting it would let the revive skip the
+           # launcher's own identity read and accept that session's second-hand answer as proof of
+           # who this machine is now.
+           "SL_EXPECT_GH_LOGIN": "",
            # A PERSON typed this, so the PreToolUse deny (#185) must not tell the revived session
            # that nobody is at the pane — the same reasoning as `debug`'s owner tap.
            "SL_ATTENDED": "1",

@@ -106,7 +106,11 @@ def _never_reach_real_cmux(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _never_reach_real_gh(monkeypatch):
+def _never_reach_real_gh(monkeypatch, _clear_worker_launch_env):
+    # The `_clear_worker_launch_env` parameter is an ORDERING DEPENDENCY, not a value: this guard
+    # only fires when SL_GH is unset, and inside a worker pane SL_GH is ambient (launch-session.sh
+    # names it in the dropped command). Declaring the scrub as a dependency makes "scrub first, then
+    # neutralize" explicit rather than an accident of definition order.
     # Same ratchet as _never_reach_real_cmux, for the GitHub CLI. lib/gh.py, stack_doctor and — since
     # the positive auth assert (issue #299) — launch-session.sh + start-session.sh ALL resolve their
     # gh through SL_GH, falling back to whatever `gh` is on PATH. On a dogfooding machine that is a

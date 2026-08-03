@@ -343,7 +343,7 @@ def test_github_not_answering_is_not_a_dead_credential(captured):
     rate limit or an outage is a confidently WRONG remedy — the mis-blame class this whole table
     exists to end. These hold the queue and resume on their own instead."""
     rec = evidence.build("launch", rc=4, captured=captured)
-    assert rec["reason"] == "gh_unreachable", rec
+    assert rec["reason"] == "gh_probe_unreachable", rec
     assert evidence.is_channel_fault(rec) is True
     assert "login" not in rec["detail"].lower() or "fix nothing" in rec["detail"].lower()
 
@@ -355,4 +355,38 @@ def test_gh_error_text_cannot_be_read_as_a_dead_cmux_anchor():
     rec = evidence.build("launch", rc=4,
                          captured="[i5] GH AUTH DEAD: gh: could not connect to github.com")
     assert rec["reason"] != "anchor_socket_lost"
-    assert rec["reason"] in ("gh_auth_dead", "gh_unreachable"), rec
+    assert rec["reason"] in ("gh_auth_dead", "gh_probe_unreachable"), rec
+
+
+@pytest.mark.parametrize("captured,reason", [
+    ("[i429] could not create the worktree at '/run/worktrees/i429' for branch 'sl/i429-x'",
+     "worktree_create_failed"),
+    ("[i429] missing brief /run/briefs/i429.md", "brief_missing"),
+    ("[i429] issues.json load / sanitize validation failed — not launching", "identity_invalid"),
+    ("[i429] new-surface failed: Pane or workspace not found", "anchor_workspace_missing"),
+])
+def test_an_issue_number_can_never_be_read_as_a_github_status_code(captured, reason):
+    """THE bomb a bare "429" needle planted. Every launcher line is prefixed `[$ID]`, so on issue
+    i429 (and i1429, i4290…) a substring match on "429" turned four unrelated launch faults into
+    "GitHub is rate-limited" — a CHANNEL fault, which holds the whole queue on something that never
+    self-heals, and which also masked anchor_workspace_missing, the 2026-07-09 storm's own reason.
+
+    The needles that map to channel reasons must be impossible in our own launcher text."""
+    rec = evidence.build("launch", rc=1, captured=captured)
+    assert rec["reason"] == reason, rec
+    assert rec["reason"] != "gh_probe_unreachable"
+
+
+def test_the_id_prefix_never_swallows_a_shim_failure_either():
+    rec = evidence.build("launch", rc=2,
+                         captured="[i429] LAUNCH NOT DELIVERED: no worker started in tab 429e")
+    assert rec["reason"] == "shim_not_fired"
+
+
+def test_a_real_github_rate_limit_still_reads_as_unreachable():
+    # The other side of the same coin: tightening the needles must not stop them matching what gh
+    # actually prints.
+    for text in ("[i5] GH AUTH DEAD: HTTP 429: You have exceeded a secondary rate limit",
+                 "[i5] GH AUTH DEAD: API rate limit exceeded for user",
+                 "[i5] GH AUTH DEAD: HTTP 503: Service Unavailable"):
+        assert evidence.build("launch", rc=4, captured=text)["reason"] == "gh_probe_unreachable", text

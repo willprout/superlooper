@@ -2604,9 +2604,9 @@ def test_freeze_unfreeze_alert_and_fix_issue_files(rig):
     rig.r._execute({"act": "unfreeze"}, NOW)
     assert not (rig.home / "state" / "merges_frozen.json").exists()
 
-    rig.r._execute({"act": "alert", "reasons": ["gh_unreachable"]}, NOW)
+    rig.r._execute({"act": "alert", "reasons": ["gh_probe_unreachable"]}, NOW)
     alert = json.loads((rig.home / "state" / "ALERT").read_text())
-    assert alert["reasons"] == ["gh_unreachable"]
+    assert alert["reasons"] == ["gh_probe_unreachable"]
     rig.r._execute({"act": "clear_alert"}, NOW)
     assert not (rig.home / "state" / "ALERT").exists()
 
@@ -6590,7 +6590,7 @@ def test_github_being_unreachable_holds_rather_than_parking_with_a_relogin_memo(
     ist = issue_state(rig, "i101")
     assert ist.get("launch_failures", 0) == 0
     assert "i101" in rig.r._launch_fail_ids
-    assert ist["launch_evidence"]["reason"] == "gh_unreachable"
+    assert ist["launch_evidence"]["reason"] == "gh_probe_unreachable"
 
 
 def test_the_worker_env_never_inherits_a_second_hand_gh_identity(rig):

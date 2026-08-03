@@ -5111,3 +5111,71 @@ def test_a_blocked_by_issue_waiting_on_a_dependency_is_not_called_invalid():
     # record here would turn every legitimately-queued dependency into a false alarm.
     out = decide(parsed_issues=[parsed(5, blocked_by=[4])])
     assert only(out, "queue_invalid") == []
+
+
+# --------- the systemic alert must NAME a gh fault, not blame cmux (issue #299) ---------
+# These faults HOLD the queue, and a held queue writes no park memo — so this alert body is the ONLY
+# thing the owner is ever told about them. The generic systemic message instructs them to disable
+# macOS App Nap and restart cmux, which is the right fix for a dead shim and a confidently wrong one
+# for a logged-out gh.
+
+def _gh_streak(reason, iid="i5"):
+    return disk(launch_anchor=_anchor_ok(),
+                launch_fail_ids=[iid],
+                issues_state={"version": 1, "issues": {
+                    iid: ist("ready", launch_evidence={"reason": reason, "rc": 5,
+                                                       "captured": "x", "kind": "launch"})}})
+
+
+def test_a_dead_runner_gh_alerts_about_gh_not_about_the_cmux_anchor():
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=_gh_streak("gh_auth_dead_runner"))
+    assert only(out, "launch") == [] and only(out, "park") == []      # still held, still nothing parked
+    a = only(out, "alert")
+    assert a[0]["reasons"] == ["gh_auth_dead_runner"], a
+    # The body must carry the RIGHT INSTRUCTION. It may mention App Nap/cmux only to rule them out
+    # (the owner has read the generic banner many times and needs to know this is not that), but it
+    # must never carry the generic banner's actual remedy.
+    msg = actions._alert_message("gh_auth_dead_runner")
+    assert "gh auth login" in msg
+    assert "defaults write" not in msg, "must not send the owner to reconfigure App Nap"
+    assert "NSAppSleepDisabled" not in msg and "relaunch cmux" not in msg
+
+
+def test_github_unreachable_at_launch_reuses_the_existing_gh_alert_reason():
+    # One condition, one owner-facing name: `gh_unreachable` already means "GitHub did not answer"
+    # when the runner hits it while POLLING. Hitting it while asserting identity at launch is the
+    # same fact and must not mint a second vocabulary word for it.
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=_gh_streak("gh_probe_unreachable"))
+    assert only(out, "alert")[0]["reasons"] == ["gh_unreachable"]
+
+
+def test_a_non_gh_channel_streak_still_raises_the_generic_systemic_alert():
+    # The regression guard for the wiring above: a dead shim must be unaffected.
+    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=["i5"],
+               issues_state={"version": 1, "issues": {
+                   "i5": ist("ready", launch_evidence={"reason": "shim_not_fired", "rc": 2,
+                                                       "captured": "x", "kind": "launch"})}})
+    assert only(decide(parsed_issues=[parsed(5)], dsk=dsk), "alert")[0]["reasons"] == \
+        ["launch_systemic_failure"]
+
+
+def test_a_mixed_streak_reports_both_causes():
+    # A gh fault and a shim fault in the same streak: naming one must not silence the other.
+    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=["i5", "i6"],
+               issues_state={"version": 1, "issues": {
+                   "i5": ist("ready", launch_evidence={"reason": "gh_auth_dead_runner", "rc": 5,
+                                                       "captured": "x", "kind": "launch"}),
+                   "i6": ist("ready", launch_evidence={"reason": "shim_not_fired", "rc": 2,
+                                                       "captured": "x", "kind": "launch"})}})
+    assert set(only(decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk), "alert")[0]["reasons"]) \
+        == {"gh_auth_dead_runner", "launch_systemic_failure"}
+
+
+def test_an_unreadable_evidence_stamp_falls_back_to_the_generic_alert():
+    # Fail SAFE: a corrupt or missing stamp must never SUPPRESS the alert — the queue is held either
+    # way, and silence is the one outcome the owner cannot act on.
+    for ev in (None, {}, {"reason": None}, "garbage", {"reason": 5}):
+        dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=["i5"],
+                   issues_state={"version": 1, "issues": {"i5": ist("ready", launch_evidence=ev)}})
+        assert only(decide(parsed_issues=[parsed(5)], dsk=dsk), "alert")[0]["reasons"] == \
+            ["launch_systemic_failure"], ev

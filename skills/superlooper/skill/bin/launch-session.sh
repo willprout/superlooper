@@ -209,12 +209,18 @@ fi
 # match the owner's live processes.
 GH_PROBE_SECONDS="${SL_GH_PROBE_SECONDS:-10}"
 gh_login_bounded() {                 # stdout = gh's answer (or its error text); rc = gh's, or 124
-  local out_file pid waited=0 rc
+  # Polled in TENTHS, not seconds: the child is always still alive at the first check, so a 1s
+  # granularity charged EVERY healthy launch a full second of dead wait. Both BSD and GNU sleep
+  # take fractions. `rc=0; wait || rc=$?` rather than `wait; rc=$?` because this file runs under
+  # `set -e` — a bare failing `wait` aborts inside the command substitution before `cat` runs,
+  # silently returning an EMPTY capture and leaking the temp file: P1-1 through a second door.
+  local out_file pid ticks=0 limit rc
+  limit=$((GH_PROBE_SECONDS * 10))
   out_file="$(mktemp "${TMPDIR:-/tmp}/sl-ghwho.XXXXXX")" || return 1
   "$GH" api user --jq .login > "$out_file" 2>&1 &
   pid=$!
-  while [ "$waited" -lt "$GH_PROBE_SECONDS" ] && kill -0 "$pid" 2>/dev/null; do
-    sleep 1; waited=$((waited + 1))
+  while [ "$ticks" -lt "$limit" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1; ticks=$((ticks + 1))
   done
   if kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true             # OUR pid, captured from $! — nothing else can match
@@ -222,7 +228,7 @@ gh_login_bounded() {                 # stdout = gh's answer (or its error text);
     printf 'no answer within %ss (gh did not return)' "$GH_PROBE_SECONDS" > "$out_file"
     rc=124
   else
-    wait "$pid"; rc=$?
+    rc=0; wait "$pid" || rc=$?
   fi
   cat "$out_file"; rm -f "$out_file"
   return "$rc"
@@ -323,11 +329,15 @@ fi
 # for a lane whose live session is still editing and pushing that branch. The report is a
 # COMPLETION signal the runner acts on, so a session that has been revived to keep working must
 # re-earn it, exactly as a replacement session must.
-# Sweep this id's auth markers (issue #299). They are token-keyed, so a stale one can never
-# false-fire a later launch — but nothing else prunes them: the launcher only removes the marker it
-# actually OBSERVED inside its verify window, so one written just after a timeout (or after the
-# runner killed the launcher at LAUNCH_TIMEOUT) would otherwise sit in the state tree forever.
-rm -f "$SL_RUN_ROOT/state/authfail/$ID."* 2>/dev/null || true
+# Sweep this id's STALE auth markers (issue #299). Nothing else prunes them: the launcher only
+# removes the marker it actually OBSERVED inside its verify window, so one written just after a
+# timeout (or after the runner killed the launcher at LAUNCH_TIMEOUT) would otherwise sit here
+# forever. AGE-BOUNDED on purpose — an id-wide `rm` would delete an OVERLAPPING launch's live
+# marker, and that launch would then time out and report `shim_not_fired`, blaming the shim for an
+# auth fault: the same class of bug as the shared start sentinel that codex-verify P1-b caught, and
+# the reason `started` is per-token AND excluded from the hygiene block just below. Five minutes is
+# far beyond any verify window, so only genuinely abandoned markers can match.
+find "$SL_RUN_ROOT/state/authfail" -maxdepth 1 -name "$ID.*" -mmin +5 -delete 2>/dev/null || true
 rm -f "$SL_RUN_ROOT/reports/$ID.md" \
       "$SL_RUN_ROOT/state/blocked/$ID" "$SL_RUN_ROOT/state/exited/$ID" "$SL_RUN_ROOT/state/awaiting/$ID" \
       "$SL_RUN_ROOT/state/mail/$ID" "$SL_RUN_ROOT/state/status/$ID.json"

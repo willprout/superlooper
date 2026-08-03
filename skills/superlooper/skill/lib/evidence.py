@@ -132,8 +132,13 @@ _RC_TABLES = {"launch": _LAUNCH_RC, "nudge": _NUDGE_RC}
 # emit (cmux's own error text, and the scripts' own `echo ... >&2` diagnostics). Order is
 # significant: first match wins, so the most specific patterns lead.
 #
-# These refine an outcome that has ALREADY failed — they never create one. A substring that
-# matches by accident costs a mis-worded reason on a real failure, never a false park.
+# These refine an outcome that has ALREADY failed — they never create one. For a PER-ISSUE reason a
+# substring that matches by accident costs a mis-worded reason on a real failure, never a false
+# park. For a CHANNEL reason the cost is higher and asymmetric: an accidental match turns one
+# issue's own fault into a HELD QUEUE, which `is_channel_fault` calls the bigger, quieter outage.
+# So a needle that maps to a channel reason must be impossible in the loop's own launcher text —
+# see the note on the gh needles below, which a bare "429" violated by matching the `[i429]` id
+# prefix that every single launcher line carries.
 _LAUNCH_TEXT = (
     # FIRST, ahead of every cmux pattern below (issue #299). The auth refusals relay `gh`'s OWN
     # error text into the launcher's stderr, and gh's wording is not ours to control — a message
@@ -146,9 +151,18 @@ _LAUNCH_TEXT = (
     # exhaustion, a GitHub outage or a dead DNS would otherwise park the issue under a memo telling
     # the owner to re-login — a confidently WRONG remedy. Named as its own reason, it is a channel
     # fault (below) and the queue holds until GitHub is reachable again instead.
-    (("rate limit", "429", "http 5", "could not resolve", "dial tcp", "connection refused",
+    # Every needle here must be a string the LOOP'S OWN launcher text can never contain. That is a
+    # sharper bar than the cmux patterns below, because these reasons are CHANNEL faults: a stray
+    # match no longer costs a mis-worded reason on an already-failed launch, it converts a
+    # one-issue park into a HELD QUEUE on a fault that never self-heals. A bare "429" cost exactly
+    # that — every launcher line is prefixed `[$ID]`, so on issue i429 a missing brief, a failed
+    # worktree and a dead cmux workspace all read as "GitHub is rate-limited" and froze the queue.
+    # Hence `http 429` / `api rate limit` over `429`, and the enumerated 5xx over `http 5`.
+    (("api rate limit", "secondary rate limit", "http 429",
+      "http 500", "http 502", "http 503", "http 504",
+      "could not resolve", "dial tcp", "connection refused",
       "no answer within", "i/o timeout", "network is unreachable", "temporary failure"),
-     ("gh_unreachable",
+     ("gh_probe_unreachable",
       "the gh-auth assert could not get an answer OUT of GitHub — a rate limit, an outage, or a "
       "network fault, not a credential that has died. Re-authenticating would fix nothing; the "
       "queue is held until GitHub answers again, and resumes on its own when it does")),
@@ -221,7 +235,7 @@ CHANNEL_FAULT_REASONS = frozenset({
     "gh_auth_dead_runner",
     # (#299) GitHub itself did not answer (rate limit / outage / network). Nothing is wrong with any
     # issue OR with the credential, and it repairs itself — hold, never park, never say "re-login".
-    "gh_unreachable",
+    "gh_probe_unreachable",
 })
 
 

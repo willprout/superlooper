@@ -94,12 +94,17 @@ AUTH_DEAD_RC=4                               # launch-session.sh + evidence.py r
 # failure mode exactly where the stack is least able to report one.
 GH_PROBE_SECONDS="${SL_GH_PROBE_SECONDS:-8}"
 gh_login() {                                 # one real authenticated read; stdout = login or error
-  local out_file pid waited=0 rc
+  # Polled in TENTHS: the child is always still alive at the first check, so a 1s granularity would
+  # charge every healthy launch a full second of dead wait on BOTH sides of the spawn. Both BSD and
+  # GNU sleep accept fractions. (`rc=0; wait || rc=$?` is the errexit-safe spelling its launcher
+  # twin needs; kept identical here so the two cannot drift.)
+  local out_file pid ticks=0 limit rc
+  limit=$((GH_PROBE_SECONDS * 10))
   out_file="$(mktemp "${TMPDIR:-/tmp}/sl-ghwho.XXXXXX")" || return 1
   "$GH" api user --jq .login > "$out_file" 2>&1 &
   pid=$!
-  while [ "$waited" -lt "$GH_PROBE_SECONDS" ] && kill -0 "$pid" 2>/dev/null; do
-    sleep 1; waited=$((waited + 1))
+  while [ "$ticks" -lt "$limit" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1; ticks=$((ticks + 1))
   done
   if kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true          # OUR pid, captured from $! — never a name/pattern kill
@@ -107,7 +112,7 @@ gh_login() {                                 # one real authenticated read; stdo
     printf 'no answer within %ss (gh did not return)' "$GH_PROBE_SECONDS" > "$out_file"
     rc=124
   else
-    wait "$pid"; rc=$?
+    rc=0; wait "$pid" || rc=$?
   fi
   cat "$out_file"; rm -f "$out_file"
   return "$rc"
@@ -136,7 +141,7 @@ fi
 # consecutive launches lost to one would park the issue. Deliberately not more — every attempt can
 # cost gh's own multi-second timeout on an unreachable network, and the whole probe has to finish
 # inside the launcher's verify window (30s) or the launch reads as a shim that never fired, which
-# is the mis-blame this code exists to prevent. A healthy env answers first try and never sleeps.
+# is the mis-blame this code exists to prevent. A healthy env answers on the first try, inside one 100ms poll tick.
 ACTUAL_LOGIN=""
 attempt=1
 while : ; do
