@@ -35,6 +35,13 @@ def _clear_worker_launch_env(monkeypatch):
         "SL_CODEX_DANGEROUS_BYPASS",
         "SL_CODEX_BYPASS_HOOK_TRUST",
         "SL_CODEX_NO_ALT_SCREEN",
+        # Session identity (issue #298). A worker pane running this suite carries its OWN minted
+        # session id and (on a revived lane) SL_RESUME=1, both live in the environment. Inherited
+        # into a launcher under test, they would silently turn a "fresh launch" case into a resume
+        # of the test runner's own conversation.
+        "SL_SESSION_ID",
+        "SL_RESUME",
+        "SL_RESUME_SESSION_ID",
         # Drift-check overrides (issue #39): a dogfooding machine may export these ambiently. If a
         # future test calls stack_doctor.engine_drift() without a FakeProbe, an ambient
         # SL_SOURCE_REPO/SL_GIT would send it to real git — against the "no test reaches a real
