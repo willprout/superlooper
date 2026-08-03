@@ -388,3 +388,50 @@ def test_a_refused_github_lookup_is_never_rendered_as_no_pr(rig):
     brief = rig.brief()
     assert "GitHub did not answer" in brief
     assert "no PR exists on this branch" not in brief
+
+
+# ---- the watchdog-lock singleton for debugger revives (fresh-agent review, round 3) ----
+# These pin behaviour added late; without them a future edit could drop the lock and keep a green
+# suite. `superlooper debug` holds watchdog.lock across check-and-launch because a just-launched
+# debugger does not hold its worker.d<N>.lock until start-session.sh acquires it in the new tab,
+# up to 30s later — so the lock, not the lock-file read, is what makes the two exclusive.
+
+def test_a_live_watchdog_check_blocks_a_debugger_revive_and_keeps_its_own_lock(rig):
+    rig.record_session("d3")
+    lock = rig.home / "state" / "watchdog.lock"
+    lock.write_text(str(os.getpid()))          # a LIVE holder — this very process
+    r = run(rig, "resume", "d3", "--json")
+    assert r.returncode == 1
+    assert "watchdog" in jbody(r)["error"].lower()
+    assert rig.launch_calls() == []
+    # _watchdog_release_lock is ownership-checked, so our finally must not steal a stranger's lock.
+    assert lock.exists() and lock.read_text() == str(os.getpid())
+
+
+def test_a_debugger_revive_releases_the_lock_so_the_next_one_can_run(rig):
+    rig.record_session("d3")
+    assert run(rig, "resume", "d3", "--json").returncode == 0
+    assert not (rig.home / "state" / "watchdog.lock").exists(), "the lock must not be held after"
+    assert run(rig, "resume", "d3", "--json").returncode == 0, "a second revive must not deadlock"
+    assert len(rig.launch_calls()) == 2
+
+
+def test_a_worker_revive_takes_no_watchdog_lock_at_all(rig):
+    # The lock belongs to the debugger seat's singleton; an i-lane has no business touching it.
+    rig.seed_lane()
+    rig.record_session()
+    assert run(rig, "resume", "i1", "--json").returncode == 0
+    assert not (rig.home / "state" / "watchdog.lock").exists()
+
+
+def test_a_spawned_but_failed_launch_keeps_its_preamble(rig):
+    """The counterpart to test_a_failed_launch_leaves_no_preamble_behind. A launch that SPAWNED but
+    returned neither 0 nor 2 may still have a tab about to read the preamble — _resume_launch
+    reports a timeout as spawned=True for exactly that reason. Removing it would abort that session
+    at the (now fail-closed) brief selection."""
+    rig.seed_lane()
+    rig.record_session()
+    r = run(rig, "resume", "i1", "--json", env_over={"STUB_RC": "1"})
+    assert r.returncode == 1                    # honest failure...
+    assert (rig.home / "briefs" / "i1.resume.md").exists(), \
+        "...but the preamble stays: only rc=2 and a never-spawned exec prove nobody read it"

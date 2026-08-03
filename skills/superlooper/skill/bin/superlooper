@@ -2897,7 +2897,12 @@ def cmd_resume(args):
     # Remove the preamble only where it PROVABLY reached nobody: `not spawned` (the exec itself
     # failed, as in cmd_debug), or rc=2, which launch-session.sh returns exactly when no worker
     # started within the verify window — and start-session.sh stamps its start sentinel BEFORE it
-    # reads the brief, so a missing sentinel proves the brief was never read.
+    # reads the brief, so a missing sentinel proves the brief was never read WITHIN THAT WINDOW.
+    # The remainder — a straggler shell that boots after the window, stamps late and then reads —
+    # is covered not by the sentinel ordering but by the FAIL-CLOSED brief selection in both
+    # launchers: it finds no preamble, exits cleanly, and the runner recovers the lane. Those two
+    # changes are load-bearing together; relax the selection back to a fallback and this cleanup
+    # silently becomes unsafe again.
     # Deliberately NOT a blanket `rc != 0`: a TIMEOUT (rc=124) is spawned=True precisely because
     # the tab may yet deliver late, and pulling the preamble out from under it would abort that
     # session at the now fail-closed brief selection.

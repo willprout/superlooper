@@ -105,3 +105,12 @@ def test_unknown_facts_degrade_honestly_rather_than_inventing():
     low = out.lower()
     assert "unknown" in low or "could not" in low
     assert "none" not in low.replace("no one", ""), "a Python None leaked into the prose"
+
+
+def test_it_tells_the_session_its_report_and_mail_were_cleared_on_revive():
+    # The launcher's restart hygiene runs on a revive too, and the session cannot see it happen.
+    # Left unsaid, a session whose last act was writing the report believes it is still there and
+    # that it is finished — a belief the launcher KNOWS is false the moment it clears the marker.
+    low = _render().lower()
+    assert "report" in low and "cleared" in low
+    assert "mail" in low

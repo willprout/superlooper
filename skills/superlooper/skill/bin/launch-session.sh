@@ -162,8 +162,11 @@ fi
 # substituting the lane's original brief would deliver the whole issue brief — goal, DoD,
 # boundaries — as a NEW instruction into a conversation that already built it, with no
 # re-orientation first, which is exactly the ordering the resume exists to guarantee.
+# The test is spelled to MATCH start-session.sh's `truthy "$SL_RESUME"` on the far side, so the
+# invariant "these two selections are the same selection" is visible here rather than inferred
+# from RESUME happening to have only two assignment sites.
 BRIEF="$SL_RUN_ROOT/briefs/$ID.md"
-if [ -n "$RESUME" ]; then
+if [ "$RESUME" = "1" ]; then
   BRIEF="$SL_RUN_ROOT/briefs/$ID.resume.md"
 fi
 [ -f "$BRIEF" ] || { echo "[$ID] missing brief $BRIEF" >&2; exit 1; }
