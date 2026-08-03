@@ -101,6 +101,13 @@ def render(facts):
         "review comments, what landed on the mainline while you were gone — you have not been "
         "told, so go and look.",
         "",
+        # The launcher's restart hygiene runs on a revive too, and the session cannot see it
+        # happen. Left unsaid, a session whose last act was writing the report believes it is
+        # still there and that it is finished — a belief the launcher KNOWS is false.
+        "One thing the revive itself changed: your run-state markers were cleared when this "
+        "session came back — including your report and any pending mail. If you had already "
+        "written your report, it is gone and must be written again as your last action.",
+        "",
         "Then pick up where you left off, under your original brief and its ship gate. Re-read the "
         "issue before you rely on your memory of it: nothing here re-read it for you, and it may "
         "have been amended, relabelled or closed while you were gone.",

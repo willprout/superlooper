@@ -74,15 +74,28 @@ printf '%s' "$TOKEN" > "$SL_RUN_ROOT/state/started/$ID.$TOKEN"
 # run_agent (re)writes this file when the agent exits.
 ERR_TAIL="$SL_RUN_ROOT/state/launch_stderr/$ID"
 rm -f "$ERR_TAIL"
+# Defined HERE, above its first use (the brief selection just below) rather than beside the other
+# flag helpers: this script runs under `set -uo pipefail` with no `-e`, so calling truthy before it
+# exists would not abort — it would return non-zero and silently leave the ORIGINAL brief selected,
+# which is the exact fail-open the selection below is written to prevent.
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 # A REVIVE opens on its own brief — the re-orientation preamble — kept in a SEPARATE file so the
 # lane's original brief survives untouched for any later cold relaunch (#298; the runner's
 # crash-recovery path re-launches without rebuilding the brief, and would otherwise hand a
 # brand-new session a "you were interrupted" preamble and no work instruction). Selection must
-# match launch-session.sh's, which makes the same choice for its existence check.
+# match launch-session.sh's, which makes the same choice for its existence check — including
+# FAILING CLOSED: this check runs in the new tab up to 30s after the launcher's, so a preamble
+# that disappeared in between must abort, never silently become the lane's original brief
+# delivered as a new instruction into a conversation that already built it.
+# `truthy` is the SAME predicate the --resume flag is chosen by, below: two different tests for
+# one variable is how SL_RESUME=0 would pick the resume brief and `--session-id` together.
 BRIEF="$SL_RUN_ROOT/briefs/$ID.md"
-if [ -n "${SL_RESUME:-}" ] && [ -f "$SL_RUN_ROOT/briefs/$ID.resume.md" ]; then
-  BRIEF="$SL_RUN_ROOT/briefs/$ID.resume.md"
-fi
+truthy "${SL_RESUME:-}" && BRIEF="$SL_RUN_ROOT/briefs/$ID.resume.md"
 [ -f "$BRIEF" ] || { echo "[$ID] no brief" >&2; write_exited 1; exit 1; }
 # Name the session so the operator can tell what's running when they're away:
 #   --name           -> local terminal/tab title + /resume picker
@@ -110,13 +123,6 @@ AGENT="${SL_AGENT:-claude}"
 # id is deliberately not threaded into that branch.
 SESSION_ID="${SL_SESSION_ID:-}"
 RESUME="${SL_RESUME:-}"
-
-truthy() {
-  case "${1:-}" in
-    1|true|TRUE|yes|YES|on|ON) return 0 ;;
-    *) return 1 ;;
-  esac
-}
 
 toml_string() {
   local s="${1:-}"

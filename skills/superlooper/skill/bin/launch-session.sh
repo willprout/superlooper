@@ -157,8 +157,13 @@ fi
 # brand-new, empty session — telling it "your conversation above survived intact" when there is no
 # conversation and no work instruction anywhere (fresh-agent review P0-1). Selected on RESUME
 # alone, so a cold relaunch always gets the real brief back.
+#
+# FAIL CLOSED, never fall back: if this is a resume and the preamble is missing, ABORT. Silently
+# substituting the lane's original brief would deliver the whole issue brief — goal, DoD,
+# boundaries — as a NEW instruction into a conversation that already built it, with no
+# re-orientation first, which is exactly the ordering the resume exists to guarantee.
 BRIEF="$SL_RUN_ROOT/briefs/$ID.md"
-if [ -n "$RESUME" ] && [ -f "$SL_RUN_ROOT/briefs/$ID.resume.md" ]; then
+if [ -n "$RESUME" ]; then
   BRIEF="$SL_RUN_ROOT/briefs/$ID.resume.md"
 fi
 [ -f "$BRIEF" ] || { echo "[$ID] missing brief $BRIEF" >&2; exit 1; }
@@ -194,10 +199,17 @@ mkdir -p "$SL_RUN_ROOT/state/activity" "$SL_RUN_ROOT/state/panes" "$SL_RUN_ROOT/
 # resume time, while a deleted one loses the only handle on a straggler shell that started late).
 # Written tmp+mv like every other durable state write in this stack, so a reader can never see a
 # half-written id.
+# Guarded at each step like the other multi-step writes here: a half-done write must NAME itself,
+# not abort the launch with a bare rc=1 under `set -e`, and a failed mv must not leave its temp
+# behind in a directory readers scan.
 if [ -n "$SESSION_ID" ]; then
-  sid_tmp="$(mktemp "$SL_RUN_ROOT/state/sessions/.$ID.XXXXXX")"
-  printf '%s' "$SESSION_ID" > "$sid_tmp"
-  mv -f "$sid_tmp" "$SL_RUN_ROOT/state/sessions/$ID"
+  if ! sid_tmp="$(mktemp "$SL_RUN_ROOT/state/sessions/.$ID.XXXXXX")" \
+     || ! printf '%s' "$SESSION_ID" > "$sid_tmp" \
+     || ! mv -f "$sid_tmp" "$SL_RUN_ROOT/state/sessions/$ID"; then
+    rm -f "${sid_tmp:-}" 2>/dev/null || true
+    echo "[$ID] could not record the session id — this session will not be resumable" >&2
+    exit 1
+  fi
 fi
 # Restart hygiene: clear ONLY this id's run-state markers so a prior session's report/exited/blocked
 # can't mis-fire for the fresh session. The worktree and any committed work are PRESERVED (never

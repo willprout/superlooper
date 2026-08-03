@@ -571,6 +571,7 @@ def test_a_resume_reuses_the_recorded_id_instead_of_minting_one(tmp_path):
     # strand the very transcript the operator asked to re-enter.
     run_root, repo, home, stubdir, cmux = _setup(tmp_path)
     known = "abcdabcd-0000-4000-8000-00000000dead"
+    (run_root / "briefs" / "i1.resume.md").write_text("RE-ORIENTATION PREAMBLE")
     capture = tmp_path / "worker.cmd"
     r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
                     extra_env={"SL_RESUME_SESSION_ID": known, "STUB_CMD_CAPTURE": str(capture)})
@@ -610,6 +611,7 @@ def test_a_resume_clears_the_report_exactly_like_a_replacement_launch(tmp_path):
     (mail_dir / "i1").write_text("an instruction")
     (run_root / "state" / "exited").mkdir(parents=True, exist_ok=True)
     (run_root / "state" / "exited" / "i1").write_text("1700000000 rc=137")
+    (run_root / "briefs" / "i1.resume.md").write_text("RE-ORIENTATION PREAMBLE")
 
     # drop mode: hygiene runs before the tab is created, and no agent process runs afterwards to
     # write a FRESH exited marker of its own — so what is on disk here is the launcher's own doing.
@@ -688,3 +690,16 @@ def test_a_resume_is_not_counted_as_a_retry(tmp_path):
     st = json.load(open(run_root / "state" / "issues.json"))
     assert st["issues"]["i1"]["launches"] == 1, "a resume is not a fresh launch"
     assert st["issues"]["i1"]["retries"] == 0, "a resume must never read as a retry"
+
+
+def test_a_resume_without_a_preamble_aborts_rather_than_substituting_the_real_brief(tmp_path):
+    """FAIL CLOSED. The brief selection must never fall back to briefs/<id>.md on a resume: doing
+    so would deliver the whole issue brief — goal, DoD, boundaries — as a NEW instruction into a
+    conversation that already built it, with no re-orientation first. That is exactly the ordering
+    the resume exists to guarantee, so a missing preamble is an abort, not a substitution."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    assert (run_root / "briefs" / "i1.md").exists()      # the original brief IS present...
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={"SL_RESUME_SESSION_ID": "abcdabcd-0000-4000-8000-00000000cafe"})
+    assert r.returncode == 1, "...and must still not be used as a resume's opening message"
+    assert "i1.resume.md" in r.stderr

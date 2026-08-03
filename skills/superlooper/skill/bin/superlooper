@@ -2820,15 +2820,6 @@ def cmd_resume(args):
     if live:
         return refuse("a session is already live for %s — never two agents on one lane. Resume is "
                       "for a lane whose session is GONE." % iid, session_id=session_id)
-    # A DEBUGGER lane answers to a second singleton: never two debuggers on one patient, whichever
-    # ids they carry (the rule `superlooper debug` enforces via the same read). Reviving d3 while
-    # d7 is live would put two permissions-bypassed agents in one checkout.
-    if iid.startswith("d"):
-        other = _debug_live_id(state_dir)
-        if other is not None:
-            return refuse("a debugger session (%s) is already running for this repo — never two "
-                          "debuggers on one patient" % other, session_id=session_id)
-
     worktree = os.path.join(home, "worktrees", iid) if iid.startswith("i") \
         else os.path.abspath(args.repo)
     if not os.path.isdir(worktree):
@@ -2837,45 +2828,80 @@ def cmd_resume(args):
         return refuse("%s has no working directory at %s — its worktree is gone, so there is "
                       "nothing to resume into." % (iid, worktree), session_id=session_id)
 
+    # Resolved BEFORE --check answers: a preflight that says "resumable" and then fails on a
+    # missing pane is a preflight that does not fly the flight.
     pane = _watchdog_pane(state_dir)
     if getattr(args, "check", False):
-        # A FULL preflight, pane included — a check that answered "resumable" and then failed on a
-        # missing pane would be a preflight that does not fly the flight.
-        if not pane:
-            _emit_resume(args, {"ok": True, "verb": "resume-check", "id": iid,
-                                "session_id": session_id, "resumable": False,
-                                "error": "no cmux pane resolves for this loop", "worktree": worktree})
-            return 0
+        # Returns here, ABOVE the debugger lock: --check writes nothing anywhere, and taking a
+        # lock is a write (cmd_debug's --check returns above its lock for the same reason).
         _emit_resume(args, {"ok": True, "verb": "resume-check", "id": iid,
-                            "session_id": session_id, "resumable": True, "worktree": worktree})
+                            "session_id": session_id, "resumable": bool(pane),
+                            "worktree": worktree,
+                            "error": None if pane else "no cmux pane resolves for this loop"})
         return 0
     if not pane:
         return refuse("no cmux pane resolves for this loop (no $SL_PANE, no recorded runner "
                       "anchor, not inside cmux) — the revived session's tab has nowhere to be "
                       "born", session_id=session_id)
 
-    note = _debug_bounded(getattr(args, "note", None), _DEBUG_NOTE_MAX, "note")
-    facts = _resume_facts(home, iid, session_id, worktree, note)
-    # A SEPARATE file from the lane's own brief, never over it: the runner's crash-recovery
-    # relaunch re-runs launch-session.sh without rebuilding the brief, so a preamble written to
-    # briefs/<id>.md would later open a brand-new, empty session on "your conversation above
-    # survived intact" with no work instruction anywhere (fresh-agent review P0-1). Both launchers
-    # select this file only when SL_RESUME is set.
+    # A DEBUGGER lane answers to a second singleton: never two debuggers on one patient, whichever
+    # ids they carry (the rule `superlooper debug` enforces). Reviving d3 while d7 is live would
+    # put two permissions-bypassed agents in one checkout — the shared-checkout bright line. The
+    # `_debug_live_id` read ALONE is not enough, for the reason cmd_debug documents: a just-
+    # launched debugger does not hold its worker.d<N>.lock until start-session.sh acquires it in
+    # the new tab, up to 30s later, so a resume landing inside a watchdog's launch window would see
+    # "nobody home" and launch anyway. Holding the watchdog's OWN lock across the whole
+    # check-and-launch is what makes the two mutually exclusive rather than merely polite.
+    debug_lock = os.path.join(state_dir, "watchdog.lock") if iid.startswith("d") else None
+    if debug_lock:
+        try:
+            acquired = _watchdog_acquire_lock(debug_lock)
+        except OSError as e:
+            return refuse("could not take this loop's watchdog lock (%s is unwritable): %s"
+                          % (state_dir, e), session_id=session_id)
+        if not acquired:
+            return refuse("a watchdog check is running for this state home right now — nothing "
+                          "was resumed; try again in a moment", session_id=session_id)
+
     brief_path = os.path.join(home, "briefs", "%s.resume.md" % iid)
     try:
-        os.makedirs(os.path.join(home, "briefs"), exist_ok=True)
-        with open(brief_path, "w") as f:
-            f.write(reorient.render(facts))
-    except OSError as e:
-        # open(,"w") truncates before write(), so a failure mid-write would leave the revived
-        # session opening on a half-written preamble — worse than none (same care as cmd_debug).
-        _rm_quiet(brief_path)
-        return refuse("could not write the re-orientation preamble: %s" % e, session_id=session_id)
+        if debug_lock:
+            other = _debug_live_id(state_dir)
+            if other is not None:
+                return refuse("a debugger session (%s) is already running for this repo — never "
+                              "two debuggers on one patient" % other, session_id=session_id)
 
-    rc, out, err, spawned = _resume_launch(cfg, args.repo, home, pane, iid, session_id, worktree)
-    if rc != 0:
-        # The preamble reached nobody (or a session that failed to start). Leaving it would let the
-        # NEXT resume — or a stale-file reader — mistake it for the live session's opening message.
+        note = _debug_bounded(getattr(args, "note", None), _DEBUG_NOTE_MAX, "note")
+        facts = _resume_facts(home, iid, session_id, worktree, note)
+        # A SEPARATE file from the lane's own brief, never over it: the runner's crash-recovery
+        # relaunch re-runs launch-session.sh without rebuilding the brief, so a preamble written to
+        # briefs/<id>.md would later open a brand-new, empty session on "your conversation above
+        # survived intact" with no work instruction anywhere (fresh-agent review P0-1). Both
+        # launchers select this file, and only when SL_RESUME is set.
+        try:
+            os.makedirs(os.path.join(home, "briefs"), exist_ok=True)
+            with open(brief_path, "w") as f:
+                f.write(reorient.render(facts))
+        except OSError as e:
+            # open(,"w") truncates before write(), so a failure mid-write would leave the revived
+            # session opening on a half-written preamble — worse than none (as in cmd_debug).
+            _rm_quiet(brief_path)
+            return refuse("could not write the re-orientation preamble: %s" % e,
+                          session_id=session_id)
+
+        rc, out, err, spawned = _resume_launch(cfg, args.repo, home, pane, iid, session_id,
+                                               worktree)
+    finally:
+        if debug_lock:
+            _watchdog_release_lock(debug_lock)
+    # Remove the preamble only where it PROVABLY reached nobody: `not spawned` (the exec itself
+    # failed, as in cmd_debug), or rc=2, which launch-session.sh returns exactly when no worker
+    # started within the verify window — and start-session.sh stamps its start sentinel BEFORE it
+    # reads the brief, so a missing sentinel proves the brief was never read.
+    # Deliberately NOT a blanket `rc != 0`: a TIMEOUT (rc=124) is spawned=True precisely because
+    # the tab may yet deliver late, and pulling the preamble out from under it would abort that
+    # session at the now fail-closed brief selection.
+    if not spawned or rc == 2:
         _rm_quiet(brief_path)
     if rc == 0:
         _debug_journal(home, {"act": "resume", "outcome": "resumed", "id": iid,

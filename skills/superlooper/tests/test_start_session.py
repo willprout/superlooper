@@ -36,13 +36,18 @@ def _x(path, body):
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _run_start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None):
+def _run_start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
+               resume_brief=None):
     """Run start-session.sh i1 with a stub agent; return its recorded argv (list of tokens).
-    model/effort default to unset (env var absent); pass "" to exercise the empty-string path."""
+    model/effort default to unset (env var absent); pass "" to exercise the empty-string path.
+    `resume_brief` seeds briefs/i1.resume.md — a resume launch REQUIRES it (the selection fails
+    closed rather than substituting the lane's own brief)."""
     run_root = tmp_path / "run"
     (run_root / "briefs").mkdir(parents=True)
     (run_root / "state").mkdir()
     (run_root / "briefs" / "i1.md").write_text("do the thing")
+    if resume_brief is not None:
+        (run_root / "briefs" / "i1.resume.md").write_text(resume_brief)
     stubdir = tmp_path / "stub"
     stubdir.mkdir()
     _x(str(stubdir / "claude"), STUB_AGENT)
@@ -336,19 +341,19 @@ def test_no_session_flag_when_the_minted_id_is_empty(tmp_path):
 
 
 def test_resume_re_enters_the_recorded_session_instead_of_minting_one(tmp_path):
-    argv = _run_start(tmp_path, extra_env={"SL_SESSION_ID": "d1e1e1e1-0000-4000-8000-000000000002",
-                                           "SL_RESUME": "1"})
+    argv = _run_start(tmp_path, resume_brief="RE-ORIENTATION FIRST",
+                      extra_env={"SL_SESSION_ID": "d1e1e1e1-0000-4000-8000-000000000002",
+                                 "SL_RESUME": "1"})
     assert _flag_value(argv, "--resume") == "d1e1e1e1-0000-4000-8000-000000000002"
     assert "--session-id" not in argv, "--session-id on an EXISTING id is an error, not a resume"
-    # the brief is still the opening message — on a resume that brief IS the re-orientation
-    # preamble, so it must reach the CLI as the first thing the revived session reads.
-    assert argv[-1] == "do the thing"
+    # A resume opens on the PREAMBLE, never on the lane's own brief — the ordering the DoD names.
+    assert argv[-1] == "RE-ORIENTATION FIRST"
 
 
 def test_resume_without_an_id_cannot_open_the_interactive_picker(tmp_path):
     # `--resume` takes an OPTIONAL value: a bare `--resume` opens claude's interactive session
     # PICKER and the unattended launch would sit there forever. No id => no flag, ever.
-    argv = _run_start(tmp_path, extra_env={"SL_RESUME": "1"})
+    argv = _run_start(tmp_path, resume_brief="preamble", extra_env={"SL_RESUME": "1"})
     assert "--resume" not in argv and "--session-id" not in argv
 
 
