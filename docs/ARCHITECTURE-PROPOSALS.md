@@ -319,6 +319,13 @@ adoption claims were deduped to 36 and adversarially verified (code-truth + cons
   wrapped in distrust (herdr = muscle never truth: --wait always, transcript delivery checks,
   process-fact liveness, robot viewer per workspace, fence fork before unattended). Four upstream
   issue candidates listed in the evidence file §12. Owner decision pending.
+- **Overnight 2026-07-30 wrap:** clientless `--wait` PASS (fresh spawns deliver on a
+  never-attached server, transcript-verified; no-`--wait` rc=0 in 13ms with state unobserved —
+  banned; evidence docs/SPIKES-2026-07-30-clientless.md). Upstream issues #2063/#2064/#2065/#2066
+  filed live on **herdrdev/herdr** (repo moved from ogulcancelik to an org — bus-factor signal;
+  their CONTRIBUTING now permits agent-filed reproduced bug reports); filing timestamps in
+  docs/HERDR-UPSTREAM-ISSUES.md for response-time measurement. Evaluation COMPLETE; sleep soak
+  unscheduled (needs an agent-free night); host decision with the owner.
 - **Session-host decision: DEFERRED and re-framed.** Owner de-weights survivability ("the loop
   may stop when the lid closes — Amphetamine or a Mac mini solves that; my wifi can die anyway;
   flights happen"). **Stop-and-resume after ANY interruption is a first-class requirement**;
@@ -328,3 +335,10 @@ adoption claims were deduped to 36 and adversarially verified (code-truth + cons
   a package across the launch/sensing/messaging/recovery rows (adopting herdr would cover several
   at once), to be walked as a set. Herdr's open fleet-socket needs a fence (env strip / PreToolUse
   deny on fleet verbs / upstream auth PR) — mitigation required, not a disqualifier.
+- **Session-host decision: RULED 2026-07-30 — ADOPT HERDR.** Owner's direct word to the
+  orchestrator ("I'm good with Herdr"), in answer to the standing open question — distinct from
+  the earlier retracted over-read. Plan of record: docs/HERDR-ADOPTION-PLAN.md. Posture:
+  attended-preferred, headless-capable (owner keeps a viewer window; nothing load-bearing may
+  depend on a client being attached; acceptance tests run clientless). Sequencing unchanged:
+  floor work first, then wrapper + fence, parallel-run canary, S-criteria acceptance, only then
+  cmux retires.
