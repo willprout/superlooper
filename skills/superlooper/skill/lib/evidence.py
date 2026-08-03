@@ -82,6 +82,12 @@ _LAUNCH_RC = {
     3: ("base_missing",
         "the worktree base branch does not exist on origin, so every worktree creation fails "
         "before the agent starts — a repo/config fault (dev_branch), not a launch-delivery problem"),
+    4: ("gh_auth_dead",
+        "the positive gh-auth assert refused the flight: `gh` did not answer as the login this "
+        "loop runs as, so the session could not have read its own issue or posted any evidence "
+        "— GitHub auth on this machine is dead or belongs to another account, not a "
+        "launch-delivery problem. Re-login: `gh auth login --hostname github.com` with the "
+        "account that owns the loop repo, then re-approve"),
     64: ("agent_unsupported",
          "the configured agent is not one this launcher can start (expected: claude or codex)"),
     124: ("launch_timeout",
@@ -159,8 +165,16 @@ _LAUNCH_TEXT = (
 # The runner holds the queue systemically and probes with a canary (#24/#115) for these instead.
 # Every OTHER launch failure names THIS issue's own state — its base branch, its worktree, its
 # identity, its brief — and still parks that one issue. These are the reasons _classify() emits for
-# the machinery-level faults; a reason absent here (base_missing, worktree_create_failed,
+# the machinery-level faults; a reason absent here (base_missing, gh_auth_dead, worktree_create_failed,
 # identity_invalid, brief_missing, or any unmapped rc) is treated as per-issue.
+#
+# gh_auth_dead (rc=4, issue #299) is deliberately NOT here, for the same reason base_missing is not:
+# it is an ENVIRONMENT fault whose memo the owner must actually READ. Routed to the channel it would
+# hold the queue behind the systemic-launch ALERT, whose body names App Nap and the cmux anchor —
+# so dead GitHub auth would be reported to the owner as a cmux problem, the exact mis-blame the
+# text table above exists to end. Parked per-issue, the memo names the auth and the `gh auth login`
+# remedy. (A SYSTEMIC gh-auth hold — the sibling of #159's pre-launch claude-auth gate — is a
+# runner-side probe, not a launch rc, and is not built here.)
 CHANNEL_FAULT_REASONS = frozenset({
     "anchor_workspace_missing",       # the 07-09 storm: anchor targets a deleted cmux workspace
     "anchor_socket_lost",             # the runner lost its cmux socket — it reaches no pane at all
@@ -184,7 +198,7 @@ def is_channel_fault(rec):
     worker; nothing about the session itself is at fault', and its per-issue rc=1 causes
     (worktree_create_failed, identity_invalid, brief_missing) each echo a distinguishing stderr line.
     So the contract the classifier relies on is the launcher's: a per-issue fault must carry either its
-    own rc (base_missing=3) or a matching stderr line — a future per-issue rc=1 added WITHOUT one would
+    own rc (base_missing=3, gh_auth_dead=4) or a matching stderr line — a future per-issue rc=1 added WITHOUT one would
     be read as channel. A wrongly-held queue is a bigger, quieter outage than one wrongly-parked issue
     the owner can see and re-approve, so the default leans to holding on the machinery-level reasons."""
     return isinstance(rec, dict) and rec.get("reason") in CHANNEL_FAULT_REASONS

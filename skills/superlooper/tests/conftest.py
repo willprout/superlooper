@@ -93,6 +93,18 @@ def _never_reach_real_cmux(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _never_reach_real_gh(monkeypatch):
+    # Same ratchet as _never_reach_real_cmux, for the GitHub CLI. lib/gh.py, stack_doctor and — since
+    # the positive auth assert (issue #299) — launch-session.sh + start-session.sh ALL resolve their
+    # gh through SL_GH, falling back to whatever `gh` is on PATH. On a dogfooding machine that is a
+    # real, logged-in gh: a test that forgot to stub would quietly make live GitHub calls as the
+    # owner's account. Point the default at a guaranteed-absent path so a missed stub fails loudly
+    # (rc 127) instead of succeeding for real. Tests that exercise gh set their own SL_GH in-body.
+    if not os.environ.get("SL_GH"):
+        monkeypatch.setenv("SL_GH", "/nonexistent/superlooper-test-gh")
+
+
+@pytest.fixture(autouse=True)
 def _never_probe_real_auth(monkeypatch):
     # Same ratchet as _never_reach_real_cmux, for the account-auth probe (issue #159). The runner's
     # default Runner._probe_auth shells out to the REAL `claude auth status` + `security` keychain on

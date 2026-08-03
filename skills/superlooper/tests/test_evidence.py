@@ -280,3 +280,31 @@ def test_unrecognized_or_corrupt_records_fail_safe_to_per_issue(bad):
     # channel fault. A novel per-issue fault must never silently freeze the whole loop; only the KNOWN
     # channel reasons hold it. (The worse failure is a wrongly-held queue, not one wrongly-parked issue.)
     assert evidence.is_channel_fault(bad) is False
+
+
+# ---- rc=4: the positive gh-auth assert refused the flight (issue #299) --------------------------
+
+def test_dead_gh_auth_is_its_own_reason_and_names_auth_not_the_shim():
+    # The whole point of the distinct code: without it, an auth-death refusal reads as a generic
+    # non-delivery and the park memo sends the reader to debug the launch shim — the wrong
+    # component, exactly the 2026-07-09 mis-blame that _LAUNCH_TEXT was written to end.
+    rec = evidence.build("launch", rc=4,
+                         captured="[i5] GH AUTH DEAD: `gh api user` did not answer as 'loopbot'")
+    assert rec["reason"] == "gh_auth_dead"
+    assert "auth" in rec["detail"].lower()
+    assert "shim" not in rec["detail"].lower()
+
+
+def test_the_park_memo_for_dead_gh_auth_names_the_remedy():
+    # A newcomer reading the memo at 3am must know what to type. `gh auth login` is the fix.
+    rec = evidence.build("launch", rc=4, captured="[i5] GH AUTH DEAD: not logged in")
+    memo = evidence.park_memo(rec, attempts=2)
+    assert "gh auth login" in memo
+    assert "gh_auth_dead" in memo
+
+
+def test_dead_gh_auth_is_a_per_issue_fault():
+    # Same call as base_missing (rc=3): an ENVIRONMENT fault whose memo the owner must actually see.
+    # Routing it to the channel would hold the queue behind the systemic-launch ALERT, whose body
+    # names App Nap and the cmux anchor — dead gh auth would then be reported as a cmux problem.
+    assert evidence.is_channel_fault(evidence.build("launch", rc=4, captured=None)) is False

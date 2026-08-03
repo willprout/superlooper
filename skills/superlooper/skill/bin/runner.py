@@ -623,7 +623,8 @@ class Runner:
         self.state = os.path.join(self.home, "state")
         self.issues_path = os.path.join(self.state, "issues.json")
         for sub in ("state/activity", "state/blocked", "state/exited", "state/awaiting",
-                    "state/panes", "state/started", "state/launch_stderr", "state/events/processed",
+                    "state/panes", "state/started", "state/authfail",   # (#299) refused-on-auth marks
+                    "state/launch_stderr", "state/events/processed",
                     "state/pending_teardown",           # (#149) prunes declined under a live CLI
                     "briefs", "reports", "worktrees", "logs"):
             os.makedirs(os.path.join(self.home, sub), exist_ok=True)

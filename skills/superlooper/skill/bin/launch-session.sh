@@ -25,6 +25,13 @@ SL_PANE="${SL_PANE:?SL_PANE (target cmux pane id for tabs) required}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # Overridable so the delivery-verification test can inject a stub cmux; defaults to the real app.
 CMUX="${SL_CMUX:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
+# Same override convention as lib/gh.py and stack_doctor: SL_GH names the binary, so no test ever
+# reaches the real `gh`. Used for the launcher's own identity read below AND named in the worker
+# command, so the session's own assert probes with the same binary this launch resolved.
+GH="${SL_GH:-gh}"
+# The DISTINCT exit code for "the positive gh-auth assert refused this flight" (issue #299).
+# evidence.py maps it to reason `gh_auth_dead`, so the park memo names auth rather than the shim.
+AUTH_DEAD_RC=4
 MODEL="${SL_MODEL:-}"
 EFFORT="${SL_EFFORT:-}"
 CODEX_DANGEROUS_BYPASS="${SL_CODEX_DANGEROUS_BYPASS:-}"
@@ -171,6 +178,41 @@ if [ "$RESUME" = "1" ]; then
 fi
 [ -f "$BRIEF" ] || { echo "[$ID] missing brief $BRIEF" >&2; exit 1; }
 
+# ---- THE EXPECTED gh LOGIN (issue #299) --------------------------------------------------------
+# The session's own assert (start-session.sh) needs something to assert AGAINST, and the honest
+# expectation is the loop's OWN identity: the gh account the runner acts as — the one that writes
+# labels, posts comments and merges PRs. A worker answering as anyone else is not this loop, and a
+# worker answering as nobody cannot read its issue or post its evidence.
+#
+# Read it ONCE here, in the runner's env, and hand it down. Deriving it rather than configuring it
+# means every adopted repo gets the floor with no new config key to set (and nothing to leave
+# unset), and it catches the exact 2026-07-29 spike shape: an inherited XDG_CONFIG_HOME that
+# de-authenticates gh in the WORKER's fresh env while the runner's own gh stays healthy.
+#
+# FAIL CLOSED and fail EARLY: if the launcher's own gh cannot say who it is, a machine-level auth
+# fault is already underway, there is no expectation to check the worker against, and no session
+# started now could do its job. Placed BEFORE worktree creation and before any cmux RPC, so a
+# refusal costs no orphan tab and no leftover checkout — the base-missing discipline (#28).
+EXPECT_GH_LOGIN="${SL_EXPECT_GH_LOGIN:-}"
+if [ -z "$EXPECT_GH_LOGIN" ]; then
+  EXPECT_GH_LOGIN="$("$GH" api user --jq .login 2>&1)" || EXPECT_GH_LOGIN=""
+fi
+# A GitHub login is [A-Za-z0-9-] and nothing else, so anything that is not exactly that shape is not
+# an answer we may assert against. This matters beyond tidiness: `gh` merges its diagnostics into
+# the capture, and an error path prints a MULTI-LINE message. A line-anchored regex would happily
+# match a bare word on line 2 of that message and hand a launcher's error text down as the
+# "expected login" — so the test is a whole-string glob (a `case` negated class matches a newline
+# like any other stray character), not a per-line one.
+case "$EXPECT_GH_LOGIN" in
+  ""|*[!A-Za-z0-9-]*) EXPECT_GH_LOGIN_OK=0 ;;
+  *)                  EXPECT_GH_LOGIN_OK=1 ;;
+esac
+if [ "$EXPECT_GH_LOGIN_OK" -ne 1 ]; then
+  echo "[$ID] GH AUTH DEAD (launcher): \`$GH api user\` did not return a usable login, so there is no identity to launch this session against — got: ${EXPECT_GH_LOGIN:-<no answer>}" >&2
+  echo "[$ID] Run \`gh auth login --hostname github.com\` as the account that owns the loop repo. NOT launching; no tab was opened." >&2
+  exit "$AUTH_DEAD_RC"
+fi
+
 # Create the worktree (worker mode only) off the fresh dev base; the fallback attaches an EXISTING
 # branch (a relaunch/regenerate reuses the same branch name). Both attempts are guarded so a
 # failure is DIAGNOSED here, not left to abort with git's generic code under set -e (issue #28): if
@@ -192,7 +234,7 @@ fi
 "$HERE/pretrust.sh" "$WT"                       # first-run trust prompt won't hang
 mkdir -p "$SL_RUN_ROOT/state/activity" "$SL_RUN_ROOT/state/panes" "$SL_RUN_ROOT/state/started" \
          "$SL_RUN_ROOT/state/blocked" "$SL_RUN_ROOT/state/exited" "$SL_RUN_ROOT/state/awaiting" \
-         "$SL_RUN_ROOT/state/sessions" "$SL_RUN_ROOT/reports"
+         "$SL_RUN_ROOT/state/sessions" "$SL_RUN_ROOT/state/authfail" "$SL_RUN_ROOT/reports"
 # Record the id NOW, before the tab exists. Deliberately UNLIKE the activity/pane stamps below,
 # which are withheld until delivery is verified because writing them early once fabricated
 # "launched & alive" for 45 minutes: an id is an IDENTITY claim, not a liveness one — nothing reads
@@ -303,8 +345,14 @@ WS_ARGS=()
 # default path; set only by a per-issue effort:* label) — %q-quoted like the rest so a value with
 # brackets/spaces can't break or inject the command. Codex-specific knobs are named too, because the
 # fresh tab shell inherits none of the runner's environment.
-printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_ATTENDED=%q SL_SESSION_ID=%q SL_RESUME=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
-  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$ATTENDED" "$SESSION_ID" "$RESUME" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
+# SL_EXPECT_GH_LOGIN + SL_GH ride here for the same "the fresh tab inherits nothing" reason
+# (issue #299): the session's own auth assert has nothing to compare against unless the expectation
+# is NAMED, and it must probe with the binary this launch resolved rather than whatever `gh` the
+# tab's PATH happens to find. Omitting either would not weaken the assert — start-session.sh fails
+# closed on a missing expectation — it would refuse every launch, which is the loud failure a
+# silently-disabled floor deserves.
+printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_ATTENDED=%q SL_SESSION_ID=%q SL_RESUME=%q SL_EXPECT_GH_LOGIN=%q SL_GH=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
+  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$ATTENDED" "$SESSION_ID" "$RESUME" "$EXPECT_GH_LOGIN" "$GH" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
 # Drop the command FIRST — before any further cmux RPC — so the new tab's shell finds it immediately
 # and the shim's bounded wait can't be eaten by an unrelated slow RPC (e.g. rename-tab; review B6).
 # Atomic write (tmp + mv) so the shim never reads a half-written command; refresh .active so its
@@ -324,14 +372,38 @@ mv -f "$cmd_tmp" "$CMD_FILE"
 # verify P1-b). If it never appears, the shim did not fire (not installed, or a deeper delivery
 # failure) — fail LOUDLY without fabricating liveness, exactly as the old keystroke path did on a
 # locked Mac.
+#
+# The loop watches for TWO outcomes, not one. The second is the auth marker (issue #299): a tab
+# whose session ran the positive gh-auth assert and REFUSED will never stamp the sentinel, so
+# without this it would look identical to a shim that never fired — and 30s later the park memo
+# would send the owner to debug the launch shim while the real fault was dead GitHub auth. Keyed on
+# the same per-launch token as the sentinel, so a stale or overlapping launch's marker cannot
+# false-fire this one.
 STARTED="$SL_RUN_ROOT/state/started/$ID.$SURF"
+AUTHFAIL="$SL_RUN_ROOT/state/authfail/$ID.$SURF"
 VERIFY_WINDOW="${SL_LAUNCH_VERIFY_SECONDS:-30}"   # generous single window; << the 45-min freeze
 delivered=0
+auth_dead=0
 waited=0
 while [ "$waited" -lt "$VERIFY_WINDOW" ]; do
   if [ -e "$STARTED" ]; then delivered=1; break; fi
+  if [ -e "$AUTHFAIL" ]; then auth_dead=1; break; fi
   sleep 1; waited=$((waited + 1))
 done
+
+if [ "$auth_dead" -eq 1 ]; then
+  # The session told us, from inside its own environment, that its gh auth is dead. Tear the tab
+  # down on the SAME terms as a non-delivery — it never became a worker, so nothing of value is
+  # lost — but exit with the DISTINCT auth code and speak the session's own diagnosis, so the
+  # runner's memo names auth death instead of the launch machinery.
+  why="$(cat "$AUTHFAIL" 2>/dev/null || true)"
+  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" "$AUTHFAIL" 2>/dev/null || true
+  "$CMUX" close-surface --surface "$SURF" ${WS_ARGS[@]+"${WS_ARGS[@]}"} >/dev/null 2>&1 || true
+  echo "[$ID] GH AUTH DEAD in the session's own environment — the flight was refused before it started." >&2
+  echo "[$ID] ${why:-the session reported no detail}" >&2
+  echo "[$ID] Closed the tab; NOT marking active. This is an auth fault, not a launch-delivery one." >&2
+  exit "$AUTH_DEAD_RC"
+fi
 
 if [ "$delivered" -ne 1 ]; then
   # FAIL LOUDLY and leave NO time-bomb. Remove the dropped command so no shell can pick it up later,
@@ -339,7 +411,7 @@ if [ "$delivered" -ne 1 ]; then
   # marker is absent → nothing of value is lost), so this never closes a real worker session.
   # start-session.sh's worker singleton lock is the backstop: at most ONE worker exists per id even
   # if a straggler shell runs the command late.
-  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" 2>/dev/null || true
+  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" "$AUTHFAIL" 2>/dev/null || true
   "$CMUX" close-surface --surface "$SURF" ${WS_ARGS[@]+"${WS_ARGS[@]}"} >/dev/null 2>&1 || true
   echo "[$ID] LAUNCH NOT DELIVERED: no worker started in tab $SURF within ${VERIFY_WINDOW}s." >&2
   echo "[$ID] the launch shim did not run the command — is it installed? (bin/install-launch-shim.sh)" >&2

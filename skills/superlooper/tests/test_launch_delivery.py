@@ -46,6 +46,7 @@ STUB_CMUX = textwrap.dedent("""\
     case "$sub" in
       new-surface)
         # Tab creation is an RPC that works even when the display sleeps -> always OK, real uuids shape.
+        printf 'new-surface\\n' >> "$STUB_DIR/surfaces"   # so a test can prove NO tab was ever opened
         echo "OK $SURF 22222222-2222-2222-2222-222222222222 33333333-3333-3333-3333-333333333333"
         case "${STUB_MODE:-drop}" in
           deliver)
@@ -75,8 +76,35 @@ STUB_CMUX = textwrap.dedent("""\
     exit 0
 """)
 
-STUB_CLAUDE = "#!/usr/bin/env bash\nexit 0\n"
+STUB_CLAUDE = ("#!/usr/bin/env bash\n"
+               # Record the fact of the agent ever running, so a test can prove a REFUSED launch
+               # never reached it (issue #299: dead auth must stop before the flight, not after).
+               "printf \"%s\\n\" \"$@\" >> \"$STUB_DIR/claude_args\"\nexit 0\n")
 STUB_CODEX = "#!/usr/bin/env bash\nprintf \"%s\\n\" \"$@\" > \"$STUB_DIR/codex_args\"\nexit 0\n"
+
+# Stub `gh` for the POSITIVE auth assert (issue #299). It answers exactly one call —
+# `gh api user --jq .login` — and answers it DIFFERENTLY on the two sides of the spawn, keyed on
+# SL_ISSUE_ID: only the dropped worker command names that var, so the launcher's env and the
+# worker's own env can be de-authed independently. That asymmetry is the whole point — the
+# 2026-07-29 spike's failure mode is an inherited XDG_CONFIG_HOME that de-authenticates gh in the
+# WORKER while the runner's own gh stays perfectly healthy.
+# A login of "DEAD" makes that side answer like a logged-out gh (nonzero, its real refusal text).
+STUB_GH = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    set -u
+    if [ "${1:-}" = "api" ] && [ "${2:-}" = "user" ]; then
+      if [ -n "${SL_ISSUE_ID:-}" ]; then login="${STUB_GH_WORKER_LOGIN:-loopbot}"
+      else                               login="${STUB_GH_LOGIN:-loopbot}"; fi
+      if [ "$login" = "DEAD" ]; then
+        echo "gh: To get started with GitHub CLI, please run:  gh auth login" >&2
+        exit 4
+      fi
+      printf '%s\\n' "$login"
+      exit 0
+    fi
+    echo "stub gh: unsupported call: $*" >&2
+    exit 1
+""")
 
 pytestmark = pytest.mark.skipif(shutil.which("zsh") is None, reason="zsh required for the launch shim")
 
@@ -87,6 +115,29 @@ def _x(path, body):
     with open(path, "w") as f:
         f.write(body)
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+@pytest.fixture(autouse=True)
+def _stub_gh(tmp_path_factory, monkeypatch):
+    """Every launch in this file now runs the positive gh-auth assert (#299) on BOTH sides of the
+    spawn, so EVERY case needs a `gh` that answers — and none may reach the real one (CLAUDE.md's
+    no-real-external-binary ratchet; conftest's default points SL_GH at an absent path). Set it
+    here for the whole file rather than in each test's env dict: the subprocess env dicts are all
+    built from os.environ, so they inherit it without touching a single existing case. A case that
+    wants dead or mismatched auth overrides STUB_GH_LOGIN / STUB_GH_WORKER_LOGIN.
+
+    SL_ISSUE_ID is deleted for the same reason test_start_session scrubs SL_SESSION_ID: a worker
+    pane running this suite has its OWN id ambient in the environment, and the stub reads exactly
+    that var to tell the launcher's side from the worker's — inherited, it would make every
+    launcher-side probe answer as the worker and silently invert the asymmetry cases below."""
+    gh = tmp_path_factory.mktemp("ghstub") / "gh"
+    _x(str(gh), STUB_GH)
+    monkeypatch.setenv("SL_GH", str(gh))
+    monkeypatch.setenv("STUB_GH_LOGIN", "loopbot")
+    monkeypatch.setenv("STUB_GH_WORKER_LOGIN", "loopbot")
+    monkeypatch.delenv("SL_ISSUE_ID", raising=False)
+    monkeypatch.delenv("SL_EXPECT_GH_LOGIN", raising=False)
+    return gh
 
 
 def _seed_issue(run_root, iid="i1", branch="sl/i1-thing"):
@@ -703,3 +754,116 @@ def test_a_resume_without_a_preamble_aborts_rather_than_substituting_the_real_br
                     extra_env={"SL_RESUME_SESSION_ID": "abcdabcd-0000-4000-8000-00000000cafe"})
     assert r.returncode == 1, "...and must still not be used as a resume's opening message"
     assert "i1.resume.md" in r.stderr
+
+
+# ---- POSITIVE gh-auth assert after every spawn (issue #299) -------------------------------------
+# A worker whose `gh` auth has died does not stop — it works on confidently: it cannot read its
+# issue, cannot post evidence, and every downstream failure reads as worker misbehavior instead of
+# auth death. The floor is a POSITIVE assert: after spawn, from inside the session's OWN env, run a
+# real authenticated read and require the EXPECTED login before the flight proceeds. Absence of an
+# error is not auth — the assert must observe success.
+AUTH_RC = 4
+
+
+def test_worker_with_dead_gh_auth_never_reaches_the_agent(tmp_path):
+    """THE case. Deliver mode runs the real shim -> start-session.sh in the worker's own env, where
+    `gh` answers like a logged-out CLI while the launcher's own gh is healthy (the inherited
+    XDG_CONFIG_HOME shape from the 2026-07-29 spikes). The launch must fail with the DISTINCT auth
+    code, never start the agent, close the orphan tab, and stamp no liveness — a session that got
+    this far and started anyway is precisely the failure this exists to prevent."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={"STUB_GH_WORKER_LOGIN": "DEAD"})
+    assert r.returncode == AUTH_RC, \
+        f"dead worker auth must exit {AUTH_RC}, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert not (stubdir / "claude_args").exists(), "the agent must NEVER start with dead gh auth"
+    assert "gh auth" in r.stderr.lower(), f"the failure must NAME auth death: {r.stderr!r}"
+    assert not (run_root / "state" / "activity" / "i1").exists(), "must NOT fabricate liveness"
+    assert not (run_root / "state" / "panes" / "i1").exists(), "must NOT record a pane"
+    assert (stubdir / "closed").exists(), "the refused session's tab must be torn down"
+    st = json.load(open(run_root / "state" / "issues.json"))
+    assert st["issues"]["i1"].get("launches", 0) == 0, "a refused launch is not a launch"
+
+
+def test_worker_authed_as_the_wrong_account_is_refused(tmp_path):
+    """POSITIVE, not merely non-erroring: `gh` answering happily as SOMEBODY ELSE is not this
+    loop's auth. A worker running as a stranger's account would write labels and comments under
+    that identity, so the assert compares the login rather than settling for a clean exit."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={"STUB_GH_WORKER_LOGIN": "somebody-else"})
+    assert r.returncode == AUTH_RC, \
+        f"a mismatched login must exit {AUTH_RC}, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert not (stubdir / "claude_args").exists(), "the agent must NEVER start as the wrong account"
+    assert "somebody-else" in r.stderr and "loopbot" in r.stderr, \
+        f"the memo must name BOTH the login found and the one expected: {r.stderr!r}"
+    assert not (run_root / "state" / "activity" / "i1").exists()
+
+
+def test_launcher_with_dead_gh_auth_refuses_before_opening_any_tab(tmp_path):
+    """The expectation is the loop's OWN identity, read once in the runner's env. When that read
+    fails there is nothing to assert against, and a machine whose gh cannot say who it is cannot
+    run a loop — so refuse, fail closed, and cost no orphan tab (the base-missing discipline)."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={"STUB_GH_LOGIN": "DEAD"})
+    assert r.returncode == AUTH_RC, \
+        f"a launcher with dead gh must exit {AUTH_RC}, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert "gh auth" in r.stderr.lower()
+    assert not (stubdir / "surfaces").exists(), "never even opened a tab"
+    assert not (run_root / "worktrees" / "i1").exists(), "no worktree for a launch that cannot run"
+    assert not (run_root / "state" / "activity" / "i1").exists()
+
+
+def test_the_expected_login_is_named_in_the_worker_command(tmp_path):
+    """The fresh tab inherits NOTHING, so the expectation (and the gh binary the assert runs) must
+    be NAMED in the dropped command or the worker-side assert has nothing to compare against —
+    the same integration gap SL_EFFORT once fell through."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    capture = tmp_path / "auth.cmd"
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"STUB_CMD_CAPTURE": str(capture)})
+    assert r.returncode == 2                                  # drop mode never delivers
+    cmd = capture.read_text()
+    assert "SL_EXPECT_GH_LOGIN=loopbot" in cmd, f"the expected login must be named: {cmd!r}"
+    assert "SL_GH=" in cmd, f"the gh binary must be named for the worker's own probe: {cmd!r}"
+
+
+def test_a_healthy_launch_is_unaffected_by_the_assert(tmp_path):
+    """The other half of the DoD: an AUTHED env proceeds. Pinned explicitly (not just implied by
+    the other cases) so a future assert that refuses everything cannot pass this file."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver")
+    assert r.returncode == 0, f"healthy auth must proceed, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert (stubdir / "claude_args").exists(), "the agent must actually have started"
+    assert (run_root / "state" / "activity" / "i1").exists()
+
+
+def test_the_debugger_spawn_path_asserts_gh_auth_too(tmp_path):
+    """DoD: BOTH spawn paths. The `--cwd d<N>` debugger has no worktree and no issue counter, but it
+    reads and writes GitHub exactly like a worker does — a d-session diagnosing a stuck lane with
+    dead auth would report the lane as unreadable rather than report its own auth."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    (run_root / "briefs" / "d1.md").write_text("diagnose the instance")
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{stubdir}:{os.environ['PATH']}",
+        "SL_RUN_ROOT": str(run_root),
+        "SL_PANE": "pane:1",
+        "SL_CMUX": str(cmux),
+        "STUB_DIR": str(stubdir),
+        "SHIM_PATH": SHIM_PATH,
+        "SL_LAUNCH_DIR": os.path.join(os.path.dirname(str(run_root)), "launchdir_auth"),
+        "STUB_MODE": "deliver",
+        "SL_LAUNCH_VERIFY_SECONDS": "5",
+        "STUB_GH_WORKER_LOGIN": "DEAD",
+    }
+    r = subprocess.run([LAUNCH, "--cwd", str(repo), "d1"], env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == AUTH_RC, \
+        f"a debugger with dead gh must exit {AUTH_RC}, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert not (stubdir / "claude_args").exists(), "the debugger must NEVER start with dead auth"
+    assert not (run_root / "state" / "activity" / "d1").exists()
+    assert not (run_root / "state" / "panes" / "d1").exists()
+    assert (stubdir / "closed").exists(), "the refused debugger's tab must be torn down"

@@ -21,6 +21,20 @@ START = os.path.join(REPO_ROOT, "skill", "bin", "start-session.sh")
 # records every argv element on its own line, then exits (a real worker would idle at the prompt).
 STUB_AGENT = '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$SL_TEST_ARGS"\nexit 0\n'
 
+# Stub `gh` for the positive auth assert (issue #299): answers `api user --jq .login` with
+# $STUB_GH_LOGIN, or refuses like a logged-out CLI when that is "DEAD". No test may reach the real
+# gh (CLAUDE.md ratchet), and start-session.sh runs the probe on EVERY launch, so every case here
+# needs one.
+STUB_GH = ('#!/usr/bin/env bash\n'
+           'set -u\n'
+           'login="${STUB_GH_LOGIN:-loopbot}"\n'
+           'if [ "$login" = "DEAD" ]; then\n'
+           '  echo "gh: To get started with GitHub CLI, please run:  gh auth login" >&2\n'
+           '  exit 4\n'
+           'fi\n'
+           'printf "%s\\n" "$login"\n'
+           'exit 0\n')
+
 # Scrubbed from every child env below for a sharper reason than tidiness (#298): a worker pane
 # running this suite has its OWN runner-minted session id live in the environment (start-session.sh
 # reads it from exactly there), so without this the "no id was minted" cases would inherit the
@@ -36,9 +50,24 @@ def _x(path, body):
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _run_start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
-               resume_brief=None):
-    """Run start-session.sh i1 with a stub agent; return its recorded argv (list of tokens).
+@pytest.fixture(autouse=True)
+def _stub_gh(tmp_path_factory, monkeypatch):
+    """start-session.sh now gates EVERY launch on the positive gh-auth assert (#299), so every case
+    in this file needs a `gh` that answers and a login to answer as — and none may reach the real
+    gh (CLAUDE.md ratchet; conftest points SL_GH at an absent path by default). Set the healthy
+    defaults here rather than in each helper's env dict: they are all built from os.environ, so
+    they inherit it. The auth cases below override STUB_GH_LOGIN / SL_EXPECT_GH_LOGIN in-body."""
+    gh = tmp_path_factory.mktemp("ghstub") / "gh"
+    _x(str(gh), STUB_GH)
+    monkeypatch.setenv("SL_GH", str(gh))
+    monkeypatch.setenv("STUB_GH_LOGIN", "loopbot")
+    monkeypatch.setenv("SL_EXPECT_GH_LOGIN", "loopbot")
+    return gh
+
+
+def _start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
+           resume_brief=None):
+    """Run start-session.sh i1 with a stub agent; return (CompletedProcess, run_root, args_file).
     model/effort default to unset (env var absent); pass "" to exercise the empty-string path.
     `resume_brief` seeds briefs/i1.resume.md — a resume launch REQUIRES it (the selection fails
     closed rather than substituting the lane's own brief)."""
@@ -73,6 +102,12 @@ def _run_start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=N
         env.update(extra_env)
     r = subprocess.run([START, "i1"], env=env, cwd=str(run_root),
                        capture_output=True, text=True, timeout=30)
+    return r, run_root, args_file
+
+
+def _run_start(tmp_path, **kw):
+    """The flag-shape helper: a SUCCESSFUL start, returning the agent's recorded argv."""
+    r, _run_root, args_file = _start(tmp_path, **kw)
     assert r.returncode == 0, f"start-session.sh failed rc={r.returncode}\nSTDERR:\n{r.stderr}"
     return args_file.read_text().splitlines()
 
@@ -401,3 +436,72 @@ def test_a_worker_launch_is_denied_even_with_an_ambient_attended_flag(tmp_path):
     # Belt and suspenders: the runner pins SL_ATTENDED="" for workers, AND the hook ignores the flag
     # for a worker id. This drives the second half — an ambient export that slipped past the first.
     assert _probe_hook(tmp_path, "i9", attended="1") == ["SL_ATTENDED=[1]", "DECISION=deny"]
+
+
+# ---- the positive gh-auth assert, in the worker's OWN env (issue #299) --------------------------
+# start-session.sh is the ONE place that runs inside the spawned session's environment and worktree
+# — the fresh tab inherits nothing from the runner, which is exactly why an env-level auth death
+# (the 2026-07-29 XDG_CONFIG_HOME spike) is invisible to any check the launcher makes about itself.
+AUTH_RC = 4
+
+
+def _authfail_markers(run_root):
+    d = run_root / "state" / "authfail"
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def test_dead_gh_auth_refuses_before_the_agent_and_leaves_a_named_marker(tmp_path):
+    r, run_root, args_file = _start(tmp_path, extra_env={"STUB_GH_LOGIN": "DEAD",
+                                                         "SL_START_TOKEN": "TOK"})
+    assert r.returncode == AUTH_RC, f"expected rc={AUTH_RC}, got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists(), "the agent must never be started with dead gh auth"
+    assert "gh auth" in r.stderr.lower(), f"the refusal must NAME auth death: {r.stderr!r}"
+    # The launcher is waiting on the delivery sentinel; the auth marker is what tells it the tab is
+    # dead on arrival AND why, so it can tear down at once instead of blaming the shim 30s later.
+    assert _authfail_markers(run_root) == ["i1.TOK"], "a per-launch auth marker must be left"
+    assert "gh" in (run_root / "state" / "authfail" / "i1.TOK").read_text().lower()
+    assert not (run_root / "state" / "started" / "i1.TOK").exists(), \
+        "a refused session must NOT stamp the delivery sentinel — it never became a worker"
+
+
+def test_a_stranger_login_is_refused_even_though_gh_answers_happily(tmp_path):
+    # POSITIVE: absence of an error is not auth. gh exits 0 and answers a real login here — just
+    # not the one this loop runs as.
+    r, run_root, args_file = _start(tmp_path, extra_env={"STUB_GH_LOGIN": "stranger",
+                                                         "SL_START_TOKEN": "TOK"})
+    assert r.returncode == AUTH_RC, f"expected rc={AUTH_RC}, got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists(), "the agent must never run as an unexpected account"
+    assert "stranger" in r.stderr and "loopbot" in r.stderr, \
+        f"name the login found AND the one expected: {r.stderr!r}"
+
+
+def test_a_missing_expectation_fails_closed(tmp_path):
+    # The launcher ALWAYS hands the expectation down. If it ever stops, there is nothing to assert
+    # against — and a floor that silently disables itself when its input goes missing is not a
+    # floor. Refuse rather than degrade to "some gh answered".
+    r, run_root, args_file = _start(tmp_path, extra_env={"SL_EXPECT_GH_LOGIN": ""})
+    assert r.returncode == AUTH_RC, f"expected rc={AUTH_RC}, got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists(), "no expectation must never mean 'start anyway'"
+
+
+def test_a_refused_launch_writes_no_exited_marker(tmp_path):
+    # The exited marker means "a worker WAS running and its process is gone" — the runner recovers
+    # from it by RELAUNCHING. No worker ever ran here, and a relaunch into the same dead auth would
+    # just burn the lane again; the launcher's rc is the whole signal.
+    r, run_root, _args = _start(tmp_path, extra_env={"STUB_GH_LOGIN": "DEAD"})
+    assert r.returncode == AUTH_RC
+    assert not (run_root / "state" / "exited" / "i1").exists()
+
+
+def test_healthy_gh_auth_proceeds_to_the_agent(tmp_path):
+    argv = _run_start(tmp_path, model="fable")
+    assert argv[-1] == "do the thing", "an authed env must reach the agent with its brief"
+
+
+def test_the_assert_also_gates_the_codex_agent(tmp_path):
+    # gh auth is agent-independent: the assert sits ABOVE the agent branch, so a codex repo is
+    # covered by construction rather than by a second copy of the check.
+    r, _run_root, args_file = _start(tmp_path, agent="codex",
+                                     extra_env={"STUB_GH_LOGIN": "DEAD"})
+    assert r.returncode == AUTH_RC, f"expected rc={AUTH_RC}, got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists()
