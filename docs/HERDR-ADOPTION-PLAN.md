@@ -5,7 +5,9 @@
 **attended-preferred, headless-capable** — the owner keeps a viewer window (nice UX, and it covers
 the §5.4 revive gap until the #2064 fix ships), but nothing load-bearing may depend on a client
 being attached, and acceptance tests run clientless. Evidence basis: docs/TOOL-DIVE-2026-07-28.md,
-docs/SPIKES-2026-07-29/30-*.md, docs/HERDR-UPSTREAM-ISSUES.md, ARCHITECTURE-PROPOSALS.md §4.
+docs/SPIKES-2026-07-29/30-*.md, ARCHITECTURE-PROPOSALS.md §4, and HERDR-UPSTREAM-ISSUES.md (a
+local working file, deliberately not committed — the filed issues live on the herdrdev/herdr
+tracker: #2063–#2066).
 Operating principle throughout: **herdr is muscle, never truth.**
 
 ## 1. Use as-is (stock herdr)

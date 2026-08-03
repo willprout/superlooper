@@ -324,7 +324,9 @@ adoption claims were deduped to 36 and adversarially verified (code-truth + cons
   banned; evidence docs/SPIKES-2026-07-30-clientless.md). Upstream issues #2063/#2064/#2065/#2066
   filed live on **herdrdev/herdr** (repo moved from ogulcancelik to an org — bus-factor signal;
   their CONTRIBUTING now permits agent-filed reproduced bug reports); filing timestamps in
-  docs/HERDR-UPSTREAM-ISSUES.md for response-time measurement. Evaluation COMPLETE; sleep soak
+  docs/HERDR-UPSTREAM-ISSUES.md (a local working file, deliberately not committed — see the live
+  herdrdev/herdr tracker for the issues themselves) for response-time measurement. Evaluation
+  COMPLETE; sleep soak
   unscheduled (needs an agent-free night); host decision with the owner.
 - **Session-host decision: DEFERRED and re-framed.** Owner de-weights survivability ("the loop
   may stop when the lid closes — Amphetamine or a Mac mini solves that; my wifi can die anyway;
