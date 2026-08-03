@@ -2647,6 +2647,95 @@ def test_file_fix_issue_reconciles_an_already_filed_issue_from_github(rig):
     assert filed == {"fp1": 7777}
 
 
+FIX_LABELS = ["type:diagnose-and-fix", "agent-ready", "auto-approved:nightly-red", "expedite"]
+
+
+def _file_fix(rig, fp="fp1"):
+    return rig.r._execute({"act": "file_fix_issue", "fingerprint": fp,
+                           "title": "Restore green", "body": "## Goal\nfix",
+                           "labels": list(FIX_LABELS)}, NOW)
+
+
+def test_file_fix_issue_replaces_a_retired_fingerprint_record(rig):
+    # Issue #294: decide re-arms a fingerprint whose fix issue is gone. The executor must OVERWRITE
+    # the stale number with the new one — otherwise the map stays poisoned and decide re-emits on
+    # every tick forever. (No open standing-rule issue carries the marker, so this files fresh.)
+    (rig.home / "state" / "fix_issues.json").write_text(json.dumps({"fp1": 270}))
+    assert _file_fix(rig) == "ok"
+    filed = json.loads((rig.home / "state" / "fix_issues.json").read_text())
+    assert filed == {"fp1": 9001}, "the retired record must be replaced, never left beside the new"
+
+
+def _episode(rig):
+    path = rig.home / "state" / "fix_issue_episode.json"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def test_file_fix_issue_records_what_this_episode_settled_on(rig):
+    # The #294 convergence bound: decide re-arms at most once per red-mainline EPISODE, and this
+    # record is what tells it the episode is already settled.
+    assert _file_fix(rig) == "ok"
+    assert _episode(rig) == {"fp1": 9001}
+
+
+def test_file_fix_issue_reconciling_a_still_open_issue_also_settles_the_episode(rig):
+    # The non-convergence case the bound exists for: a re-armed filing whose fix issue turns out to
+    # be STILL OPEN (its PR merged without closing it). It is recorded, not duplicated — and the
+    # episode is settled, so decide stops re-emitting instead of re-reconciling every 15s forever.
+    (rig.fixdir / "issue_list_auto-approved:nightly-red.json").write_text(json.dumps([
+        {"number": 7777, "title": "Restore green: x",
+         "body": "## Goal\nFailure fingerprint: `fp1` (auto-filed once per distinct breakage).",
+         "labels": [{"name": "auto-approved:nightly-red"}], "createdAt": "2026-07-02T00:00:00Z"}]))
+    (rig.home / "state" / "fix_issues.json").write_text(json.dumps({"fp1": 7777}))
+    out = _file_fix(rig)
+    assert "already" in out and not any(m["kind"] == "create_issue" for m in mutations(rig))
+    assert _episode(rig) == {"fp1": 7777}
+
+
+def test_file_fix_issue_never_touches_the_freeze_marker(rig):
+    # The episode record is deliberately its OWN file. The freeze marker must be left exactly as
+    # found: writing there could manufacture a freeze (existence == frozen), and a nightly-owned
+    # marker outlives the runner's episode, which would re-suppress the filing for a whole day.
+    fpath = rig.home / "state" / "merges_frozen.json"
+    assert _file_fix(rig) == "ok"
+    assert not fpath.exists(), "no freeze standing -> the executor must not invent one"
+
+    fpath.write_text("{not json at all")
+    assert _file_fix(rig, fp="fp2") == "ok"
+    assert fpath.read_text() == "{not json at all", "an unreadable marker is left exactly as found"
+    assert _episode(rig) == {"fp1": 9001, "fp2": 9001}   # the stub creates one fixed number
+
+
+def test_file_fix_issue_replaces_a_corrupt_episode_record(rig):
+    # Self-healing: an unreadable episode file costs ONE extra GitHub re-check, never a per-tick
+    # loop — unlike the freeze marker, this file is the runner's own and is rewritten wholesale.
+    (rig.home / "state" / "fix_issue_episode.json").write_text("{not json at all")
+    assert _file_fix(rig) == "ok"
+    assert _episode(rig) == {"fp1": 9001}
+
+
+def test_both_freeze_edges_end_the_fix_issue_episode(rig):
+    # A new episode (freeze) and the end of one (unfreeze) must each re-arm the next re-check.
+    for act in ({"act": "freeze", "reason": "dev red", "fingerprint": "fp1"}, {"act": "unfreeze"}):
+        (rig.home / "state" / "fix_issue_episode.json").write_text(json.dumps({"fp1": 9001}))
+        rig.r._execute(act, NOW)
+        assert _episode(rig) is None, act
+
+
+def test_unfreeze_ends_the_episode_even_when_it_leaves_a_nightly_marker_standing(rig):
+    # THE P0 the separate file exists for. Dev is green, so the runner's red-mainline episode is
+    # over — but a nightly-owned freeze is not the runner's to clear. If the episode record rode on
+    # that marker it would survive for as long as the nightly freeze does, and the same breakage
+    # recurring would file nothing: #294's 22h outage, reborn.
+    (rig.home / "state" / "merges_frozen.json").write_text(json.dumps(
+        {"reason": "nightly RED", "since": NOW - 90000, "source": "nightly"}))
+    (rig.home / "state" / "fix_issue_episode.json").write_text(json.dumps({"fp1": 9001}))
+    out = rig.r._execute({"act": "unfreeze"}, NOW)
+    assert out.startswith("held:"), out
+    assert (rig.home / "state" / "merges_frozen.json").exists(), "the nightly's freeze stands"
+    assert _episode(rig) is None, "...but the runner's own episode ended with it"
+
+
 def test_file_fix_issue_ignores_a_bare_fingerprint_substring(rig):
     # Codex round-2: reconcile only on the CANONICAL marker, never a coincidental substring
     # (e.g. a log excerpt quoted in some other standing-rule issue's body).
@@ -6397,3 +6486,47 @@ def test_a_non_auth_rc_never_grows_a_variant(rig):
     rig.r._execute({"act": "recover", "id": "i5", "tier": "frozen"}, NOW)
     ist = issue_state(rig, "i5")
     assert ist.get("sensed_state") is None and ist.get("sensed_auth") is None
+
+
+# ============ the refusal journal, end to end (issue #225) ============
+# The real Runner over the real decide + executors: an `agent-ready` issue whose labels fail the
+# mechanical contract must leave a RECORD, not a silence. The 2026-07-16 audit found 16 such issues
+# sitting in the queue at once, each looking exactly like work waiting its turn.
+
+def _queue_invalid_records(rig, iid=None):
+    return [j for j in _journal(rig)
+            if j.get("act") == "queue_invalid" and (iid is None or j.get("id") == iid)]
+
+
+def _add_invalid_issue(rig, num=104, labels=("agent-ready",), body="## Goal\nDo a thing.\n"):
+    lst = json.loads((rig.fixdir / "issue_list.json").read_text())
+    lst.append({"number": num, "title": "An issue nobody can launch",
+                "labels": [{"name": n} for n in labels], "body": body,
+                "createdAt": "2026-07-02T09:00:00Z"})
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(lst))
+
+
+def test_an_approved_issue_with_no_type_label_is_journaled_with_its_fix(rig):
+    _add_invalid_issue(rig)
+    rig.r.tick(now=NOW)
+    recs = _queue_invalid_records(rig, "i104")
+    assert len(recs) == 1
+    assert recs[0]["num"] == 104 and recs[0]["blocks_launch"] is True
+    # the record carries the exact fix, not merely "invalid"
+    assert "type:build" in recs[0]["outcome"] and "type:investigate" in recs[0]["outcome"]
+    # ...and it is genuinely not launched
+    assert [c for c in rig.calls
+            if c["args"][0].endswith("launch-session.sh") and "i104" in c["args"]] == []
+
+
+def test_the_refusal_is_stamped_in_loopstate_and_not_re_journaled_every_tick(rig):
+    _add_invalid_issue(rig)
+    for i in range(4):
+        rig.r.tick(now=NOW + i * 20)
+    assert len(_queue_invalid_records(rig, "i104")) == 1
+    assert issue_state(rig, "i104")["queue_invalid_signature"] == "type_missing"
+
+
+def test_a_valid_approved_issue_earns_no_refusal_record(rig):
+    rig.r.tick(now=NOW)
+    assert _queue_invalid_records(rig) == []

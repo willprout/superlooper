@@ -21,13 +21,29 @@ What is mirrored (engine source → what's here):
                                       ``model:`` / ``effort:`` label reading inside :func:`refusal`
   ``issues.eligible``               → :func:`refusal` — a bad ``type:`` or a control-label conflict
                                       never launches, so the board must never show it launchable
+  ``queue_lint.lint``               → :func:`refusal`'s TERRITORY half (issue #225) — a
+                                      merge-producing issue that declares no parseable ``touches:``
+                                      under ``## Loop metadata`` is PARKED by the runner, so it is
+                                      never a flight waiting its turn
   ``issues.sort_key``               → :func:`sort_key`
   ``actions.RELAUNCHABLE_STATUSES`` → :data:`RELAUNCHABLE_STATUSES`
 
 What is deliberately NOT mirrored: lane capacity, anti-affinity, usage caps, the launch-failure cap,
-the ``in-progress`` label check, and the touches-required park. These gate whether the runner
-launches a candidate AT ALL on a given tick; none of them REORDERS the queue. The board shows the
-launch ORDER; it does not predict the tick.
+and the ``in-progress`` label check. These gate whether the runner launches a candidate AT ALL on a
+given tick; none of them REORDERS the queue. The board shows the launch ORDER; it does not predict
+the tick.
+
+One rule is mirrored only HALFWAY, on purpose. ``queue_lint`` also reports a ``touches:`` naming an
+area the repo never declared — and that is NOT a board refusal, because the runner does not validate
+area names and launches such an issue happily (the gate's wander check is what eventually catches
+its diff). Rendering INVALID over something the runner is about to launch would be the very drift
+#138 was filed for, pointed the other way. That defect is surfaced by ``superlooper doctor --repo``,
+by the runner's own refusal journal, and by the janitor's remediation — never here.
+
+The territory half also needs two facts the label half does not: the repo's declared ``areas`` and
+its ``touches_required`` knob. Both arrive from the repo entry (``config._enrich_repo``) and both
+default to "unknown", which stands the check DOWN — a board that guessed ``touches_required: True``
+for a repo that never said so would paint every issue in it PAPERWORK at once.
 
 Two of those are worth naming honestly rather than waving at, because they are not strictly
 transient. ``launch_failures`` is a PERSISTENT per-issue counter, and the runner's ``base_missing``
@@ -42,12 +58,27 @@ simply drops a dependency-blocked issue from its candidates, while the board kee
 "awaiting connection SL-N", never launchable (design record §3). That is a rendering of the same
 verdict, not a different verdict.
 
-Everything here is a pure function of a label list and a loopstate dict — no I/O, no ``gh``.
+Everything here is a pure function of a label list, an issue body and a loopstate dict — no I/O,
+no ``gh``.
 """
+import re
 
 # The three issue kinds. Mirror of issues.VALID_TYPES — an issue whose `type:` label is missing,
 # unknown, or doubled parses to "invalid", and eligible() refuses to launch it.
 TYPE_KINDS = ("build", "investigate", "diagnose-and-fix")
+
+# Investigations produce no PR and no merge, so a territory declaration is meaningless for them.
+# Mirror of actions._MERGE_PRODUCING_TYPES (via queue_lint.MERGE_PRODUCING_TYPES).
+MERGE_PRODUCING_KINDS = ("build", "diagnose-and-fix")
+
+# The `## Loop metadata` section, and the `touches:` line inside it. Mirror of
+# issues.parse_sections + issues.parse_loop_metadata: a section runs from its `## X` line to the
+# next `## `, and only a plain `touches:`-prefixed line INSIDE it is a declaration — so a
+# "this work touches: the engine" phrase in Goal prose is never mistaken for one.
+_H2 = re.compile(r"^##\s+(.*\S)\s*$")
+_TOUCHES_ANYWHERE = re.compile(r"^[ \t]*touches[ \t]*:(.*)$", re.IGNORECASE | re.MULTILINE)
+# The canonical shape every surface quotes. Mirror of queue_lint.METADATA_SHAPE.
+METADATA_SHAPE = "## Loop metadata / touches: <area>[, <area>...]"
 
 # The loopstate statuses from which the runner will still launch an issue (mirror of
 # actions.RELAUNCHABLE_STATUSES). `None` is the never-launched issue that has no loopstate entry at
@@ -131,16 +162,100 @@ def _control_conflict(names, prefix):
     return None if vals[0].strip() else "blank"
 
 
-def refusal(labels):
+def declared_touches(body):
+    """The `touches:` areas this issue declares, read EXACTLY where the engine reads them: inside
+    the `## Loop metadata` section only. ``[]`` when there is none (or the body is missing or
+    wrong-typed). Mirror of ``issues.parse_loop_metadata``'s touches read.
+
+    "EXACTLY" is why this REPRODUCES ``parse_sections`` rather than approximating it. Two rounds of
+    fresh-agent review (2026-07-28) each caught the approximation drifting on duplicate headings,
+    and the two cases pull in OPPOSITE directions:
+
+      * ``parse_sections`` keys its dict by the RAW heading text, so two `## Loop metadata`
+        headings are ONE key and the LAST one's content wins;
+      * ``## Loop metadata`` and ``## loop metadata`` are two DISTINCT keys, and
+        ``parse_loop_metadata`` then takes the FIRST key (insertion order) that matches
+        case-insensitively — so there the FIRST section is the one read.
+
+    No clever single-pass loop gets both right, and each time it got one wrong the board either
+    advertised a flight the runner parks or held one the runner would launch — the #138 drift this
+    module exists to prevent. So: build the same dict, then do the same lookup."""
+    if not isinstance(body, str):
+        return []
+    sections, current, buf = {}, None, []
+    for line in body.splitlines():
+        m = _H2.match(line)
+        if m:
+            if current is not None:
+                sections[current] = buf          # a repeated heading overwrites, as the engine's does
+            current, buf = m.group(1).strip(), []
+        elif current is not None:
+            buf.append(line)
+    if current is not None:
+        sections[current] = buf
+    meta = next((v for k, v in sections.items() if k.strip().lower() == "loop metadata"), [])
+    # The LAST `touches:` line in the section, not the first: the engine's loop has no `break`, so
+    # it reassigns on every match. Two lines in one section is not a hand-typed curiosity — a
+    # half-filled template (`touches:` with no value) plus a janitor repair produces exactly that
+    # shape — and reading the first one drifts BOTH ways: the board either crowns NEXT OFF THE
+    # STAND a flight the runner parks, or shows PAPERWORK over one the runner launches happily.
+    touches = []
+    for line in meta:
+        s = line.strip()
+        if s.lower().startswith("touches:"):
+            touches = [t.strip() for t in s.split(":", 1)[1].split(",") if t.strip()]
+    return touches
+
+
+def _touches_refusal(names, body, areas, touches_required):
+    """The TERRITORY half of :func:`refusal` (issue #225), or ``None``.
+
+    Mirror of the blocking half of ``queue_lint.lint``: for a merge-producing issue in a repo that
+    requires a declaration, a body the engine parses no ``touches:`` from means the runner PARKS it
+    rather than launching it. An area name the repo never declared is NOT mirrored — see the module
+    docstring."""
+    if not touches_required:
+        return None
+    type_vals = [n[len(_TYPE_PREFIX):] for n in names if n.startswith(_TYPE_PREFIX)]
+    if len(type_vals) != 1 or type_vals[0] not in MERGE_PRODUCING_KINDS:
+        return None                      # an investigation, or a type the label half already refused
+    if declared_touches(body):
+        return None
+    # A `touches:` line with an EMPTY right-hand side is not "written but unparseable" — it is a
+    # half-filled template, and telling its author to move a line that already sits in the right
+    # place would name the wrong fix while never mentioning the real one (give it a value). Mirror
+    # of queue_lint._bare_touches_value, which requires a non-empty value for the same reason.
+    bare = next((m.group(1).strip() for m in _TOUCHES_ANYWHERE.finditer(body)
+                 if m.group(1).strip()), None) if isinstance(body, str) else None
+    where = ("Add" if bare is None
+             else "There is a `touches:` line, but not one the runner can parse. Put it under a "
+                  "`## Loop metadata` heading as")
+    code = "touches_missing" if bare is None else "touches_outside_section"
+    known = sorted(a for a in areas if isinstance(a, str) and a.strip()) \
+        if isinstance(areas, dict) else []
+    where_areas = (" This repo's areas: %s (or `*` for unknown scope)." % ", ".join(known)
+                   if known else "")
+    return {"code": code,
+            "flap": "NO TOUCHES DECLARED" if code == "touches_missing" else "TOUCHES NOT IN METADATA",
+            "text": "The runner parks this flight: it declares no `touches:` the loop can read, and "
+                    "that declaration is what anti-affinity and the gate's wander check verify "
+                    "against. %s `%s`.%s" % (where, METADATA_SHAPE, where_areas)}
+
+
+def refusal(labels, body=None, areas=None, touches_required=False):
     """Why the RUNNER would refuse to launch this issue, or ``None`` if it would launch it.
 
     Mirror of ``issues.eligible``'s label rules — a valid ``type:`` and no ``model:``/``effort:``
-    conflict — checked in the ENGINE'S OWN ORDER (type first, then the control knobs), so the reason
-    the board names is the rule the runner actually hits first, never a second-order one.
+    conflict — plus (issue #225) the runner's touches-required park, checked in the ENGINE'S OWN
+    ORDER (type, then the control knobs, then the territory declaration), so the reason the board
+    names is the rule the runner actually hits first, never a second-order one.
 
     Returns ``None``, or ``{"code", "flap", "text"}``: ``code`` is the discrete reason (the pixels
-    never parse prose), ``flap`` the split-flap phrase, ``text`` the plain sentence naming the bad
-    label and how to fix it.
+    never parse prose), ``flap`` the split-flap phrase, ``text`` the plain sentence naming what is
+    wrong and how to fix it.
+
+    ``body``/``areas``/``touches_required`` default to the pre-#225 behaviour — labels alone — so a
+    caller with no repo config in reach (a standalone dashboard) judges exactly what it can prove.
 
     The two rules eligible() also applies are handled by the caller, not here: ``agent-ready`` is
     how the candidates were queried in the first place, and ``blocked-by`` is the board's richer
@@ -172,7 +287,7 @@ def refusal(labels):
             return {"code": kind + "_blank", "flap": "%s LABEL BLANK" % kind.upper(),
                     "text": "The %s label has no value — the runner won't guess, so it won't launch "
                             "this flight. Give it a value or remove the label." % prefix}
-    return None
+    return _touches_refusal(names, body, areas, touches_required)
 
 
 def sort_key(num, expedite, rank, requeue_front, created_at):

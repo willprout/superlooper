@@ -38,10 +38,11 @@ def home(tmp_path):
     return dst
 
 
-def _config(home, **over):
+def _config(home, repo_over=None, **over):
     repo = {"slug": SLUG, "owner": "will-titan", "name": "superlooper-sandbox",
             "state_home": str(home), "idle_seconds": 480, "freeze_seconds": 2700,
             "required_checks": ["tests"], "airline": "Sandbox Air"}
+    repo.update(repo_over or {})
     cfg = {"poll_seconds": 2, "heartbeat_down_seconds": 300, "repos": [repo]}
     cfg.update(over)
     return cfg
@@ -1372,3 +1373,49 @@ def test_reachability_rides_the_existing_open_issue_read_no_extra_gh_call(tmp_pa
     server.assemble_snapshot(_config(dst), now=NOW, gh_mod=gh)
     assert gh.probe_calls == 1                    # one unlabeled probe carries reachability + titles
     assert gh.open_issues_unlabeled_calls == 0    # …and it REPLACED the old unlabeled open_issues read
+
+
+# =============================== the territory verdict reaches the board (issue #225) ===============================
+# The repo's own `.superlooper/config.json` declares its areas and whether a merge-producing issue
+# must name the territory it touches. config._enrich_repo folds both into the repo entry; these
+# prove they travel the whole way to a rendered departures row, and that a repo that declares
+# neither is judged exactly as it was before.
+
+_TERRITORY = {"areas": {"engine": ["skills/**"]}, "touches_required": True}
+
+
+def test_an_approved_issue_with_no_touches_renders_as_paperwork_on_the_board(home):
+    ready = [{"number": 60, "title": "nobody can launch me", "body": "## Goal\nship it\n",
+              "labels": [{"name": "agent-ready"}, {"name": "type:build"}]}]
+    snap = server.assemble_snapshot(_config(home, repo_over=_TERRITORY), now=NOW,
+                                    gh_mod=_QueueGh(ready))
+    d = snap["repos"][0]["boards"]["departures"][0]
+    assert d["status"] == "paperwork" and d["launchable"] is False
+    assert d["refusal"] == "touches_missing"
+    assert "## Loop metadata" in d["refusal_text"] and "engine" in d["refusal_text"]
+
+
+def test_such_a_flight_never_parks_a_plane_at_a_gate(home):
+    # §3: a paperwork row is never in the air and never at the stand — it lives on the board only.
+    ready = [{"number": 60, "title": "nobody can launch me", "body": "## Goal\nship it\n",
+              "labels": [{"name": "agent-ready"}, {"name": "type:build"}]}]
+    snap = server.assemble_snapshot(_config(home, repo_over=_TERRITORY), now=NOW,
+                                    gh_mod=_QueueGh(ready))
+    assert [s for s in snap["repos"][0]["stand"] if s["num"] == 60] == []
+
+
+def test_a_declared_issue_flies_normally(home):
+    ready = [{"number": 61, "title": "declared", "body": "## Loop metadata\ntouches: engine\n",
+              "labels": [{"name": "agent-ready"}, {"name": "type:build"}]}]
+    snap = server.assemble_snapshot(_config(home, repo_over=_TERRITORY), now=NOW,
+                                    gh_mod=_QueueGh(ready))
+    d = snap["repos"][0]["boards"]["departures"][0]
+    assert d["launchable"] is True and d["refusal"] is None
+
+
+def test_a_repo_that_declares_no_territory_contract_judges_labels_alone(home):
+    ready = [{"number": 60, "title": "no touches, no contract", "body": "## Goal\nship it\n",
+              "labels": [{"name": "agent-ready"}, {"name": "type:build"}]}]
+    snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_QueueGh(ready))
+    d = snap["repos"][0]["boards"]["departures"][0]
+    assert d["launchable"] is True and d["refusal"] is None

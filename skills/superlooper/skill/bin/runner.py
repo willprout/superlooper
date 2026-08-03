@@ -1595,6 +1595,9 @@ class Runner:
             "alert": alert,
             "live_lock_ids": self._live_lock_ids(),
             "filed_fingerprints": _read_json(os.path.join(self.state, "fix_issues.json")) or {},
+            # {fp: num} settled during THIS red-mainline episode (#294) — the re-arm bound
+            "settled_fix_issues": _read_json(
+                os.path.join(self.state, "fix_issue_episode.json")) or {},
             "local_date": time.strftime("%Y-%m-%d", lt),
             "local_hhmm": time.strftime("%H:%M", lt),
             "last_report_date": (_read(os.path.join(self.state, "last_morning_report")) or "").strip() or None,
@@ -2644,6 +2647,7 @@ class Runner:
         self._update_issue(iid, {"branch": branch, "num": num, "type": p.get("type"),
                                  "declared_touches": list(p.get("touches") or []),
                                  "wildcard_hold_journaled": False,    # launch ends the hold episode (#36)
+                                 "queue_invalid_signature": None,     # ...and the lint complaint (#225)
                                  "launch_hold_reason": None})         # ...and the eligibility hold (#150)
         # NB: the per-issue model/effort override is stamped into durable state by _worker_env below
         # (it refreshes on EVERY worker launch so the stamp tracks William's current labels) — see
@@ -3058,6 +3062,7 @@ class Runner:
                       "review_carry": None,            # a rebuild is reviewed on its own diff (#154)
                       "read_waited": False, "checks_pending_since": None,
                       "wildcard_hold_journaled": False,   # a fresh approval re-journals its own hold (#36)
+                      "queue_invalid_signature": None,  # ...and re-says a still-broken lint (#225)
                       "launch_hold_reason": None,      # ...and re-journals an eligibility hold (#150)
                       "merge_refusal_reason": None,    # paired with merge_refusals=0 above (#27)
                       "pr_read_pending_since": None,   # a re-run's refused-read hold times fresh (#61)
@@ -3654,6 +3659,19 @@ class Runner:
         self._update_issue(a["id"], {"wildcard_hold_journaled": True})
         return a.get("reason", "launch held by a no-touches wildcard — the lane serializes")
 
+    def _exec_queue_invalid(self, a, now):
+        """Issue #225: this approved issue fails the mechanical contract, so the runner would never
+        launch it (or would launch it into a territory the gate then reads as a wander). decide
+        emitted this ONCE per COMPLAINT — deduped on the defect signature — so stamp the signature
+        and return the defect list as the outcome, which is what puts the exact fix in the journal.
+
+        The stamp clears on launch (_exec_launch) and on reapprove, so a fresh episode speaks again;
+        a CHANGED complaint re-journals immediately because its signature no longer matches.
+        Journal-only: no label move, no notify, no park — the queue is untouched and the issue
+        launches the tick its metadata is fixed."""
+        self._update_issue(a["id"], {"queue_invalid_signature": a.get("signature")})
+        return a.get("reason", "the issue fails the mechanical queue contract")
+
     def _exec_launch_hold(self, a, now):
         """Issue #150 (D8): the one launch gate refused to start/restart this session. decide emitted
         this ONCE per CAUSE (deduped on the stamped reason); stamp it so the same standing hold does
@@ -4079,6 +4097,7 @@ class Runner:
         loopstate.save(os.path.join(self.state, "merges_frozen.json"),
                        {"reason": a.get("reason"), "fingerprint": a.get("fingerprint"),
                         "since": now, "source": "dev-check"})
+        self._end_fix_issue_episode()      # a NEW episode re-checks its fingerprints once (#294)
         return "ok"
 
     def _exec_unfreeze(self, a, now):
@@ -4088,6 +4107,9 @@ class Runner:
         # nightly is still red. Codex R2 C2.
         path = os.path.join(self.state, "merges_frozen.json")
         marker = _read_json(path)
+        # Dev is GREEN, so the runner's own red-mainline episode is over on BOTH branches — even
+        # the one where the nightly's marker stays standing (#294).
+        self._end_fix_issue_episode()
         if isinstance(marker, dict) and marker.get("source") == "nightly":
             return "held: nightly-owned freeze (only a green nightly clears it)"
         _rm(path)
@@ -4115,27 +4137,63 @@ class Runner:
         self._settle_merged_lane(iid)         # ordered (#149); merged-only (#168); per-knob (#178)
         return "ok"
 
-    def _exec_file_fix_issue(self, a, now):
-        fp = a.get("fingerprint")
-        # Crash window (Codex round-1 C3): create_issue may have succeeded on a prior tick
-        # whose fingerprint save never landed. GitHub is the truth — reconcile before filing,
-        # so the standing-rule issue is never duplicated.
-        marker = f"Failure fingerprint: `{fp}`"        # the canonical field _fix_issue emits —
-        for it in gh.open_issues("auto-approved:nightly-red"):     # never a bare substring
-            body = it.get("body") if isinstance(it, dict) else None
-            if isinstance(body, str) and fp and marker in body and type(it.get("number")) is int:
-                path = os.path.join(self.state, "fix_issues.json")
-                filed = _read_json(path) or {}
-                filed[fp] = it["number"]
-                loopstate.save(path, filed)
-                return f"already filed as #{it['number']} (reconciled from GitHub)"
-        num = gh.create_issue(a.get("title"), a.get("body"), labels=a.get("labels"))
-        if num is None:
-            return "issue create failed (will retry next tick)"
+    def _settle_fix_issue(self, fp, num):
+        """Record the issue this fingerprint is now filed as, in two places (issue #294):
+
+          * `fix_issue_episode.json` — {fp: num} for the CURRENT red-mainline episode. decide reads
+            it to bound the re-arm to one authoritative GitHub re-check per episode (see the
+            section-B comment); without that bound a retired-but-still-open fix issue re-emits and
+            re-reconciles every tick forever, and a fix that merged inside the poll's ~90s stale
+            window gets a duplicate filed on top of it. `_exec_freeze`/`_exec_unfreeze` own its
+            lifetime, so it tracks the RUNNER's dev-red episode exactly.
+          * `fix_issues.json` — the long-lived dedup map. OVERWRITES, so a re-armed filing REPLACES
+            the retired number rather than leaving the poisoned record beside the live one.
+
+        Deliberately its OWN file rather than a field on `merges_frozen.json`: a nightly-owned
+        freeze (`source: "nightly"`) is cleared only by a green nightly, so a marker can outlive
+        the dev-red episode by a day or more — and an episode stamp riding on it would re-suppress
+        the filing for exactly as long, which is the #294 outage reborn. It also self-heals: a
+        corrupt episode file is REPLACED wholesale on the next settle (one wasted re-check), where
+        the freeze marker must never be overwritten (existence = frozen is fail-closed, and
+        `_exec_unfreeze` reads a `source` this could not restore).
+
+        The episode write goes FIRST. A crash between the two leaves an episode entry with no
+        dedup record, and `fp not in filed` re-arms regardless of the episode — so the reconcile
+        settles both next tick. The other order would leave a dedup record with no episode entry,
+        which is the one shape that can file a duplicate."""
+        epath = os.path.join(self.state, "fix_issue_episode.json")
+        episode = _read_json(epath) or {}
+        episode[fp] = num
+        loopstate.save(epath, episode)
         path = os.path.join(self.state, "fix_issues.json")
         filed = _read_json(path) or {}
         filed[fp] = num
         loopstate.save(path, filed)
+
+    def _end_fix_issue_episode(self):
+        """A red-mainline episode has ended (or a fresh one has begun) — drop the per-episode
+        settlement so the NEXT one re-checks its fingerprints against GitHub once more (#294).
+        Called from both freeze edges, including the branch where `_exec_unfreeze` leaves a
+        nightly-owned marker standing: the runner's own dev-red episode is over either way, and
+        that asymmetry is precisely what the separate file exists to express."""
+        _rm(os.path.join(self.state, "fix_issue_episode.json"))
+
+    def _exec_file_fix_issue(self, a, now):
+        fp = a.get("fingerprint")
+        # Crash window (Codex round-1 C3): create_issue may have succeeded on a prior tick
+        # whose fingerprint save never landed. GitHub is the truth — reconcile before filing,
+        # so the standing-rule issue is never duplicated. Since #294 this ALSO catches a re-armed
+        # filing whose fix issue turns out to still be open: it is recorded, not doubled.
+        marker = f"Failure fingerprint: `{fp}`"        # the canonical field _fix_issue emits —
+        for it in gh.open_issues(gate.RESTORE_GREEN_LABEL):        # never a bare substring
+            body = it.get("body") if isinstance(it, dict) else None
+            if isinstance(body, str) and fp and marker in body and type(it.get("number")) is int:
+                self._settle_fix_issue(fp, it["number"])
+                return f"already filed as #{it['number']} (reconciled from GitHub)"
+        num = gh.create_issue(a.get("title"), a.get("body"), labels=a.get("labels"))
+        if num is None:
+            return "issue create failed (will retry next tick)"
+        self._settle_fix_issue(fp, num)
         return "ok"
 
     def _exec_alert(self, a, now):

@@ -329,10 +329,19 @@ def _janitor_row(janitor, repo_path, out):
     props = _records(janitor.get("proposals"))
     held = [h for h in (janitor.get("held") or []) if isinstance(h, str)] \
         if isinstance(janitor.get("held"), list) else []
+    # The accidental-close class is capped per sweep (janitor.REOPEN_SWEEP_CAP, issue #229). A
+    # weekly glance whose whole job is "did I miss anything" must SAY when a bounded list is not
+    # the whole picture — otherwise the cap reads as "that was all of it".
+    withheld = janitor.get("reopen_withheld")
+    withheld = withheld if type(withheld) is int and withheld > 0 else 0
+    withheld_note = ("%s more keyword-closed issue(s) found beyond this sweep's reopen cap — "
+                     "`superlooper doctor` names them all" % withheld) if withheld else ""
     if not props:
         _row("janitor", "nothing to propose"
              + (" (%s held back from a prior failure)" % _plural(len(held), "action")
                 if held else ""), out)
+        if withheld_note:
+            _sub("(%s)" % withheld_note, out)
         return
     kinds = {}
     for p in props:
@@ -344,6 +353,8 @@ def _janitor_row(janitor, repo_path, out):
     if held:
         _sub("(%s held back from a prior failure — --retry-refused re-proposes)"
              % _plural(len(held), "action"), out)
+    if withheld_note:
+        _sub("(%s)" % withheld_note, out)
     # Nothing here executes without the owner's word — that is the janitor's whole contract, and
     # naming the command rather than doing it is why upkeep can stay read-only.
     _remedy("superlooper janitor --repo %s   (y/N per sweep; the command center taps the same "

@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from urllib.parse import quote
 
 import issues as _issues  # pure sibling module; used only to filter child_issues by parent
@@ -210,6 +211,38 @@ def open_issues(label, limit=200):
     belongs back in the queue or in a relaunch)."""
     return _json_list(["issue", "list", "--state", "open", "--label", label,
                        "--json", _ISSUE_FIELDS, "--limit", str(limit)])
+
+
+def open_issues_all(limit=200):
+    """EVERY open issue, raw gh dicts — the queue lint's read (issue #225).
+
+    Deliberately unlabelled: the 2026-07-16 audit's whole point was that the defect lives in issues
+    nobody has approved YET, so filtering by `agent-ready` would find only the wedges already
+    burning and none of the ones about to. Fails closed to [] like every other list read, and the
+    caller must treat an empty answer as "no verdict" rather than "the queue is clean" — a refused
+    read and a spotless repo look identical from here."""
+    return _json_list(["issue", "list", "--state", "open",
+                       "--json", _ISSUE_FIELDS, "--limit", str(limit)])
+
+
+def set_issue_body(num, body):
+    """Replace an issue's body — the janitor's approved metadata repair (issue #225), only ever on
+    the owner's explicit word, never from any automatic path. True on success.
+
+    Written through a FILE (`--body-file`), not `--body`: an issue body is multi-KB markdown with
+    newlines and backticks, and passing it as an argv string is how a repair truncates or a shell
+    quirk mangles the very metadata it was meant to fix."""
+    fd, path = tempfile.mkstemp(prefix="sl-issue-body-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body if isinstance(body, str) else "")
+        rc, _ = _run(["issue", "edit", str(num), "--body-file", path])
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return rc == 0
 
 
 def closed_issue_nums(limit=200):
@@ -456,6 +489,207 @@ def open_issues_activity(label, limit=200):
                        "--json", "number,title,labels,updatedAt", "--limit", str(limit)])
 
 
+# --------------------------- accidental-close audit (issue #229) ---------------------------
+# What CLOSED an issue is not in any `gh issue list --json` field: `stateReason` says COMPLETED
+# either way, whether a merged PR shipped the fix or a stray "fixes #189" in a ledger commit's
+# message tripped GitHub's keyword close. Only the issue's ClosedEvent carries the closer, and only
+# GraphQL exposes it — so this is the one GraphQL query in the adapter.
+#
+# It is a GraphQL query rather than N REST timeline reads on purpose (the owner's API-burn ruling,
+# 2026-07-16 — one read proving the whole set, never per-issue reads): ONE call answers 100 issues
+# for ~3 rate-limit points, where the REST /issues/{n}/timeline endpoint would cost one call each.
+# Nothing on the runner's per-tick path calls this; `superlooper doctor` and the janitor's sweep do,
+# both of which are on-demand.
+_CLOSERS_QUERY = """
+query ClosedIssueClosers($owner: String!, $name: String!, $page: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(states: CLOSED, first: $page, after: $cursor,
+           orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        stateReason
+        closedAt
+        timelineItems(last: 1, itemTypes: [CLOSED_EVENT]) {
+          nodes {
+            ... on ClosedEvent {
+              closer {
+                __typename
+                ... on PullRequest { number merged }
+                ... on Commit {
+                  oid
+                  messageHeadline
+                  associatedPullRequests(first: 5) { nodes { number merged } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+_CLOSERS_PAGE = 100          # GitHub's max page size for a connection
+
+# closed_issue_closers' read-health contract, one field wider than ReadHealth. `truncated` is the
+# difference between "no issue in this repo was accidentally closed" and "no issue in the WINDOW I
+# looked at was" — and the doctor prints an unqualified "every" off this call, so the window has to
+# be part of the answer rather than a docstring's promise. Ordering is UPDATED_AT DESC, not
+# CREATED_AT: a close bumps updatedAt, so the issues this audit is about sort to the front whatever
+# their age, and truncation drops the least-recently-touched instead of the oldest-numbered.
+ClosedRead = collections.namedtuple("ClosedRead", ["value", "ok", "truncated"])
+
+
+def _closer_of(node):
+    """The normalized `closer` for one issue node, or None when the issue was closed BY HAND (no
+    closer at all — the owner's own word) or when the timeline is unreadable. Shapes:
+        {"type": "pull_request", "number": int|None, "merged": bool|None}
+        {"type": "commit", "oid": str, "headline": str, "merged_prs": [int, ...]}
+    `merged_prs` is the exemption lib/closures.py needs: a commit that a MERGED PR carries went
+    through the gate, so its keyword close is not the accidental class. An unreadable
+    associatedPullRequests block yields NO merged_prs key at all, which closures fails closed on
+    (it cannot prove the commit was bare) — never an empty list, which would read as proof."""
+    events = (node.get("timelineItems") or {}).get("nodes") if isinstance(node, dict) else None
+    ev = events[-1] if isinstance(events, list) and events and isinstance(events[-1], dict) else {}
+    closer = ev.get("closer")
+    if not isinstance(closer, dict):
+        return None                              # closed by hand, or nothing readable
+    kind = closer.get("__typename")
+    if kind == "PullRequest":
+        return {"type": "pull_request", "number": closer.get("number"),
+                "merged": closer.get("merged")}
+    if kind != "Commit":
+        return None                              # an unknown closer type is not a bare commit
+    out = {"type": "commit", "oid": closer.get("oid"),
+           "headline": closer.get("messageHeadline")}
+    assoc = closer.get("associatedPullRequests")
+    nodes = assoc.get("nodes") if isinstance(assoc, dict) else None
+    if isinstance(nodes, list):
+        out["merged_prs"] = [p["number"] for p in nodes
+                             if isinstance(p, dict) and p.get("merged") is True
+                             and type(p.get("number")) is int]
+    return out
+
+
+def closed_issue_closers(limit=400):
+    """Every CLOSED issue with WHAT closed it, as a ClosedRead(list, ok, truncated) — the
+    accidental-close audit's one read (issue #229). Each record:
+        {"number": int, "title": str, "stateReason": str, "closedAt": str, "closer": <see
+         _closer_of> | None}
+    consumed by lib/closures.flagged.
+
+    `ok` follows the #21/#61 refused-vs-answered-empty discipline, and it MATTERS here in the
+    direction the other reads do not: a refused read yields [] which flags nothing, so the janitor
+    stays safe by ignoring it — but the doctor would print a confident "no accidental closes found"
+    off a GitHub outage. With `ok` it says "could not read" instead. ok=False on any refused page,
+    an unparseable/wrong-typed body, or a GraphQL `errors` payload; `value` is then [].
+
+    `truncated` is True when the repo has MORE closed issues than `limit` — the audit looked at a
+    window, not at everything, and the caller must not render that as "every issue". Bounded at
+    `limit` (4 pages of 100 by default) rather than walking a decade of history on every doctor run.
+
+    The page loop is bounded three ways, because an unbounded `while` around a 30s subprocess is a
+    hang: the running total against `limit`, a hard page counter, and a repeated-cursor guard. A
+    degraded endpoint that answers `{"nodes": [], "hasNextPage": true}` with a FRESH cursor every
+    time defeats the first two on their own."""
+    limit = max(0, int(limit))
+    max_pages = -(-limit // _CLOSERS_PAGE) + 1        # ceil, +1 slack for short pages
+    out, cursor, seen_cursors, pages = [], None, set(), 0
+    while len(out) < limit and pages < max_pages:
+        args = ["api", "graphql", "-F", "owner=:owner", "-F", "name=:repo",
+                "-F", "page=%d" % min(_CLOSERS_PAGE, max(1, limit - len(out))),
+                "-f", "query=" + _CLOSERS_QUERY]
+        if cursor:
+            args += ["-f", "cursor=" + cursor]
+        rc, body = _run(args)
+        pages += 1
+        if rc != 0:
+            return ClosedRead([], False, False)  # refused: never a partial list dressed as whole
+        try:
+            doc = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return ClosedRead([], False, False)
+        if not isinstance(doc, dict) or doc.get("errors"):
+            return ClosedRead([], False, False)  # a GraphQL error payload is rc 0 but not an answer
+        repo = (doc.get("data") or {}).get("repository") if isinstance(doc.get("data"), dict) else None
+        conn = repo.get("issues") if isinstance(repo, dict) else None
+        if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+            return ClosedRead([], False, False)  # wrong-typed body: not a clean answer
+        for node in conn["nodes"]:
+            if not isinstance(node, dict):
+                continue
+            out.append({"number": node.get("number"), "title": node.get("title"),
+                        "stateReason": node.get("stateReason"), "closedAt": node.get("closedAt"),
+                        "closer": _closer_of(node)})
+        page = conn.get("pageInfo") if isinstance(conn.get("pageInfo"), dict) else {}
+        if page.get("hasNextPage") is not True:
+            return ClosedRead(out, True, False)  # genuinely the end: the audit saw everything
+        # More pages EXIST. Whether we stopped by our own bound or because the server stopped
+        # handing out usable cursors, the answer is a window either way — a missing or repeated
+        # cursor under hasNextPage=true is a server we cannot follow, not a repo we finished.
+        cursor = page.get("endCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            return ClosedRead(out, True, True)
+        seen_cursors.add(cursor)
+    # Left the loop with pages still waiting: the audit saw a window, and must say so.
+    return ClosedRead(out, True, True)
+
+
+def sl_head_prs(limit=1000):
+    """Every PR the repo has ever had on an `sl/*` head — {"number", "state", "headRefName"} — as a
+    ReadHealth(list, ok), for the doctor's "did an sl/i<N> PR ever exist?" evidence column (issue
+    #229). ONE list read however many issues are flagged, and it is issued only when at least one
+    IS flagged.
+
+    `ok` is what stops the evidence line from FABRICATING a negative. Its strongest sentence is
+    "nothing was ever built for it", and an unhealthy read produces the same [] as a genuinely
+    PR-less issue — so without `ok` a rate-limit blip (or a repo that outgrew the bound) prints a
+    proven-sounding never-built claim about work that shipped months ago. ok=False on any refusal
+    AND on a full page, because a list capped at `limit` cannot prove a PR's absence: an old
+    `sl/i5` PR falls off the end long before anything is wrong with GitHub."""
+    rh = _json_list_health(["pr", "list", "--state", "all", "--json", "number,state,headRefName",
+                            "--limit", str(limit)])
+    prs = [{"number": p.get("number"), "state": p.get("state"),
+            "headRefName": p["headRefName"]}
+           for p in rh.value
+           if isinstance(p, dict) and isinstance(p.get("headRefName"), str)
+           and p["headRefName"].startswith("sl/")]
+    return ReadHealth(prs, rh.ok and len(rh.value) < limit)
+
+
+# GitHub's REST hard maximum for `per_page`. It CLAMPS silently — ask for 200 and you get 100 rows
+# with no error and no signal — so a completeness guard written against any larger number can never
+# fire, and would report a truncated list as complete. (Verified live: a repo with hundreds of
+# branches answers `branches?per_page=200` with exactly 100.) The #165 inert-guard class: a check
+# written against a bound the server does not honor is not a check.
+REST_PAGE_MAX = 100
+
+
+def remote_branches_health(limit=REST_PAGE_MAX):
+    """remote_branches() as a ReadHealth({name: tip}, ok) — the evidence column's branch half
+    (issue #229). Same reasoning as sl_head_prs: absence is only evidence when the read was clean
+    AND complete, so a FULL page (the repo has more branches than one page holds) reads ok=False
+    rather than letting a truncated list prove a branch never existed — the doctor would otherwise
+    print "nothing was ever built for it" about work sitting on a live `sl/i<N>` branch, and `sl/*`
+    sorts late alphabetically, so loop branches are exactly the ones a cut-off list loses. The
+    janitor keeps using the bare remote_branches(): there, an unreadable branch simply is not
+    proposed, which is already the safe direction.
+
+    `limit` is clamped to REST_PAGE_MAX so the guard is compared against what GitHub will ACTUALLY
+    return, never against a number it silently ignores."""
+    page = max(1, min(int(limit), REST_PAGE_MAX))
+    lst = _json_list_health(["api", "repos/{owner}/{repo}/branches?per_page=%d" % page])
+    out = {}
+    for b in lst.value:
+        if isinstance(b, dict) and isinstance(b.get("name"), str):
+            commit = b.get("commit")
+            sha = commit.get("sha") if isinstance(commit, dict) else None
+            out[b["name"]] = sha if isinstance(sha, str) and sha else None
+    return ReadHealth(out, lst.ok and len(lst.value) < page)
+
+
 def default_branch():
     """The repo's default branch name (e.g. 'main'/'master'/'develop'), or None if gh can't
     answer (unreachable, unauthenticated, or a wrong-typed ref). adopt writes this as `dev_branch`
@@ -563,6 +797,18 @@ def close_issue(num, comment=None):
     """Close an issue (the investigate-type gate: marker comment present -> close the parent).
     True on success."""
     args = ["issue", "close", str(num)]
+    if comment:
+        args += ["--comment", comment]
+    rc, _ = _run(args)
+    return rc == 0
+
+
+def reopen_issue(num, comment=None):
+    """Reopen an issue — the janitor's approved accidental-close action (issue #229), only ever
+    invoked on the owner's explicit word, never from any automatic path. The comment is the audit
+    trail: it names the commit whose message keyword closed the issue, so the reopen explains
+    itself on the issue where the next reader will look. True on success."""
+    args = ["issue", "reopen", str(num)]
     if comment:
         args += ["--comment", comment]
     rc, _ = _run(args)

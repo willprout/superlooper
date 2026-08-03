@@ -1795,6 +1795,92 @@ def test_red_dev_freezes_files_once_builds_continue_green_unfreezes(sim_factory)
     assert [r for r in sim.journal("unfreeze") if r.get("outcome") == "ok"]
 
 
+# ---------------- issue #294: the red-mainline deadlock, end to end ----------------
+# Two composing defects took a live instance out for 22h. Neither is survivable in the long run:
+# a fix-issue fingerprint was never retired when its issue closed (so ONE closed issue disabled
+# auto-restore-green for that breakage forever), and the restore-green issue's `touches: *`
+# could not co-schedule against the territory claims a frozen mainline accumulates.
+
+def _fix_map(sim):
+    path = os.path.join(sim.home, "state", "fix_issues.json")
+    return json.load(open(path)) if os.path.exists(path) else {}
+
+
+def test_a_concluded_fix_issue_never_disables_auto_restore_green(sim_factory):
+    # The SAME required check breaks twice. The fingerprint is (check name, conclusion) only, so
+    # both breakages share one key — and the second one must still get its restore-green issue.
+    sim = sim_factory()
+    sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in RED_CI]))
+    sim.tick()
+    assert len(sim.mutations("create_issue")) == 1
+    assert len(_fix_map(sim)) == 1, _fix_map(sim)
+    first = list(_fix_map(sim).values())[0]
+
+    # the breakage is dealt with: the fix issue is closed and the mainline greens -> unfreeze
+    sim.edit_gh_state(lambda st: st["issues"][str(first)].update(state="closed"))
+    sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in GREEN_CI]))
+    assert sim.tick_until(lambda: sim.frozen_marker() is None), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+
+    # ...and now it recurs. Before #294 this filed NOTHING, ever again: the write-once map still
+    # named the closed issue, so the machinery meant to break a red-mainline freeze was mute.
+    sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in RED_CI]))
+    assert sim.tick_until(lambda: len(sim.mutations("create_issue")) == 2), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert sim.frozen_marker() is not None
+    assert len(_fix_map(sim)) == 1, _fix_map(sim)
+    second = list(_fix_map(sim).values())[0]
+    assert second != first, "the retired record must be REPLACED, not left beside the new filing"
+    assert sim.issue(second)["state"] == "open"
+
+    # and the dedup this mechanism exists for is intact: no third filing while #2 stands open
+    sim.tick()
+    sim.tick()
+    assert len(sim.mutations("create_issue")) == 2
+
+
+def test_a_poisoned_fingerprint_map_recovers_without_hand_surgery(sim_factory):
+    # The live instance's state home: {"5e20e1f8419bb87c": 270} for an issue closed weeks earlier.
+    # #270 is long past the 200-issue closed-list window (#267), so GitHub's closed list cannot
+    # speak for it — here it does not exist on GitHub at all. The loop's OWN record (issues.json,
+    # never pruned) says that fix issue concluded, and THAT is what re-arms the mechanism.
+    sim = sim_factory()
+    fp = actions_lib.dev_fingerprint([dict(c) for c in RED_CI], ["ci"])
+    loopstate.save(os.path.join(sim.home, "state", "fix_issues.json"), {fp: 270})
+    loopstate.update(os.path.join(sim.home, "state", "issues.json"),
+                     lambda st: st["issues"].update({"i270": {"status": "merged"}}))
+
+    sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in RED_CI]))
+    sim.tick()
+    assert len(sim.mutations("create_issue")) == 1, \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert list(_fix_map(sim).values()) != [270], "the poisoned record must be replaced in place"
+
+
+def test_restore_green_launches_past_a_finished_lane_holding_territory(sim_factory):
+    # A frozen mainline stops merges, so gating/holding claims ACCUMULATE — there is never a clear
+    # moment for a `touches: *` fix to serialize into. Before #294 the restore-green issue was
+    # blocked by exactly the finished PRs that were blocked by it.
+    sim = sim_factory()
+    loopstate.update(os.path.join(sim.home, "state", "issues.json"),
+                     lambda st: st["issues"].update(
+                         {"i900": {"status": "holding", "type": "build",
+                                   "declared_touches": ["data", "e2e"]}}))
+
+    sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in RED_CI]))
+    sim.tick()
+    assert sim.frozen_marker() is not None
+    assert len(_fix_map(sim)) == 1, _fix_map(sim)
+    fix_id = "i%d" % list(_fix_map(sim).values())[0]
+
+    assert sim.tick_until(lambda: sim.loop_issue(fix_id).get("status") == "running", ticks=6), \
+        [(r.get("act"), r.get("id"), r.get("outcome")) for r in sim.journal()]
+    assert [r for r in sim.journal("launch")
+            if r.get("id") == fix_id and r.get("outcome") == "ok"]
+    # the claim it launched past is still standing — the freeze never let it merge
+    assert sim.loop_issue("i900").get("status") == "holding"
+
+
 def test_dev_commit_status_freeze_auto_lifts_when_status_greens(sim_factory):
     # issue #23: the required check reports on the dev branch ONLY as a commit STATUS (a
     # ship-script stamp), never a check-run. A dev poll that read only the REST check-runs API

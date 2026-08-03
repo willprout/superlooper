@@ -13,6 +13,7 @@ the labels — you touch no labels and you never edit the issue's Goal/DoD yours
 **Scope.** Work in this worktree on branch `{branch}`. Stay strictly inside the issue's
 Boundaries. Work this issue should NOT do — and any promise that spills into another PR —
 becomes a NEW issue labeled `needs-owner`, never a code comment.
+Such an issue needs exactly one `type:` label and a `## Loop metadata` section with a `touches:` line naming this repo's areas — `gh issue create` is refused with the exact fix if it doesn't, so just re-run the corrected command.
 
 {work_block}
 
@@ -29,7 +30,7 @@ still applies cleanly. You get at most TWO questions on one issue — a third ha
 
 **Long background wait?** touch {awaiting_path} first, and remove it when you resume.
 
-**House rules (every session).** Image and binary evidence (screenshots, PNGs, PDFs) goes in a `reports/screenshots/` subdirectory beside your report — only `.md` files belong at the top level of `reports/`, where the runner reads every file as text (a loose binary there once wedged the runner). Never kill a process by name or pattern (`pkill -f`, `killall`) — the pattern can also match the owner's own live processes; record the PID (`$!`) of anything you background and kill only that PID.
+**House rules (every session).** Image and binary evidence (screenshots, PNGs, PDFs) goes in a `reports/screenshots/` subdirectory beside your report — only `.md` files belong at the top level of `reports/`, which the runner scans as text: a file it cannot decode is silently skipped, and a report whose name-stem is not your `i<N>` is INVISIBLE to it — read as no report at all, so your report silently counts as never written. Never kill a process by name or pattern (`pkill -f`, `killall`) — the pattern can also match the owner's own live processes; record the PID (`$!`) of anything you background and kill only that PID.
 
 **Finish.** {finish_deliverable}Then write {report_path} with EXACTLY these H2 sections:
 {report_sections} — the runner mechanically checks they exist and carry real prose. The

@@ -1,0 +1,85 @@
+{
+  "data": {
+    "repository": {
+      "issues": {
+        "pageInfo": { "hasNextPage": false, "endCursor": "Y3Vyc29yOnYyOpHOAAAAAQ==" },
+        "nodes": [
+          {
+            "number": 189,
+            "title": "Worker hook: the report harvest must not promote an in-progress draft",
+            "stateReason": "COMPLETED",
+            "closedAt": "2026-07-16T15:32:28Z",
+            "timelineItems": {
+              "nodes": [
+                {
+                  "closer": {
+                    "__typename": "Commit",
+                    "oid": "8b79d7ac4f5cb0876e32ae839ab21237989195de",
+                    "messageHeadline": "ledger: 07-16 overnight — harvest-promotes-drafts regression",
+                    "associatedPullRequests": { "nodes": [] }
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "number": 150,
+            "title": "Shipped through the gate",
+            "stateReason": "COMPLETED",
+            "closedAt": "2026-07-15T09:00:00Z",
+            "timelineItems": {
+              "nodes": [
+                { "closer": { "__typename": "PullRequest", "number": 242, "merged": true } }
+              ]
+            }
+          },
+          {
+            "number": 98,
+            "title": "Closed by the owner's own hand",
+            "stateReason": "COMPLETED",
+            "closedAt": "2026-07-14T09:00:00Z",
+            "timelineItems": { "nodes": [] }
+          },
+          {
+            "number": 60,
+            "title": "Not planned",
+            "stateReason": "NOT_PLANNED",
+            "closedAt": "2026-07-13T09:00:00Z",
+            "timelineItems": {
+              "nodes": [
+                {
+                  "closer": {
+                    "__typename": "Commit",
+                    "oid": "cafebabe1234567890",
+                    "messageHeadline": "wontfix #60",
+                    "associatedPullRequests": { "nodes": [] }
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "number": 151,
+            "title": "Squash commit carried the keyword but rode a merged PR",
+            "stateReason": "COMPLETED",
+            "closedAt": "2026-07-12T09:00:00Z",
+            "timelineItems": {
+              "nodes": [
+                {
+                  "closer": {
+                    "__typename": "Commit",
+                    "oid": "deadbeefdeadbeefdeadbeef",
+                    "messageHeadline": "i151: the fix (#240)",
+                    "associatedPullRequests": {
+                      "nodes": [{ "number": 240, "merged": true }]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
