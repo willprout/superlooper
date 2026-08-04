@@ -55,13 +55,24 @@ Where it lives and what it is not:
 | What it is NOT | a credential taught to the vendor hook. That script is untouched — the carry-verbatim rule from #307 stands, so any credential the host accepts is one the HOST resolves |
 | Its width | one method. The report's own neighbours (`pane.report_agent`, `pane.report_metadata`) stay refused, and `tests/test_fence_token_auth.py` asserts that against a real server |
 
-**Two properties worth not breaking if you rework this.**
+**Three properties worth not breaking if you rework this.** Each is a tidy-up somebody will
+reasonably propose, and each re-opens the hole.
 
-1. **The allowance does not vary with `Expectation`.** A `Misconfigured` server admits the state
+1. **A request is an OBJECT, and `envelope()` has to say so.** A derived `Deserialize` struct also
+   accepts a positional **sequence**, so without the `starts_with('{')` test
+   `["1","<token>","server.stop"]` fills `(id, auth, method)` by position and
+   `["1",null,"pane.report_agent_session"]` walks through the allowance. Measured before the check
+   existed: both reached the `Request` parse and came back `invalid_request` while every other
+   tokenless line came back `unauthorized` — an error-code oracle telling a caller with no
+   credential which method is open. The obvious "cleaner" rewrite (parse to `serde_json::Value` and
+   test `is_object`) is the WRONG one: a `Value` collapses duplicate keys last-wins while both the
+   derived struct here and upstream's `Request` refuse them, and that difference re-opens the same
+   oracle from the other side.
+2. **The allowance does not vary with `Expectation`.** A `Misconfigured` server admits the state
    report exactly as a `Token` one does, because the allowance is a statement about that method's
    blast radius rather than about the credential. It does not soften the fail-closed rule below:
    every verb an operator or the runner actually drives is still refused, so a typo is still loud.
-2. **The envelope and the dispatcher must agree about which method a line names.** The line is
+3. **The envelope and the dispatcher must agree about which method a line names.** The line is
    parsed twice — once as `auth::Envelope` to judge it, once as `Request` to run it — and if those
    could ever disagree, the allowance would be a way to smuggle a different verb past the fence
    (judged as the harmless report, dispatched as something else). `the_admitted_method_is_the_one_
@@ -96,7 +107,7 @@ conflict; the four edits to existing files are small and sit in stable places.
 
 | File | Size | What |
 |---|---|---|
-| `src/api/auth.rs` | +452 | **New file.** Token resolution (env or file), the `Expectation` states, constant-time compare, the request `Envelope`, the `authorize()` / `admit()` decisions (#331's allowance included) + their unit tests. |
+| `src/api/auth.rs` | +504 | **New file.** Token resolution (env or file), the `Expectation` states, constant-time compare, the request `Envelope`, the `authorize()` / `admit()` decisions (#331's allowance included) + their unit tests. |
 | `src/api/server.rs` | +33 | The gate in `handle_connection`, before dispatch. Four lines of decision, all of it delegated to `auth`. |
 | `src/api/client.rs` | +25 | `serialize_request` attaches the token so every CLI path presents it transparently. |
 | `src/pane.rs` | +25 | Scrub the token from inherited pane env; substitute the real token for the grant sentinel. |
@@ -197,9 +208,10 @@ it answers.
 1. **Re-apply.** `git apply --3way` the patch against the new tag. If a hunk conflicts, read
    upstream to resolve it — that is explicitly allowed. (What is *not* allowed, per the ruling, is
    an upstream PR, issue or ask about auth.)
-2. **Re-read the three invariants above** — the `pane.rs` ordering, that the gate still sits before
-   `match request.method`, and that the `envelope`/`Request` agreement test still exists. A
-   refactor upstream can move dispatch, or rename a method, without conflicting.
+2. **Re-read the four invariants above** — the `pane.rs` ordering, that the gate still sits before
+   `match request.method`, that `envelope()` still refuses a line that is not an object, and that
+   the `envelope`/`Request` agreement test still exists. A refactor upstream can move dispatch, or
+   rename a method, without conflicting.
 3. **Build**, then run upstream's own api tests as a smoke signal:
    ```sh
    cargo test --bin herdr api:: -- --test-threads=1
@@ -207,7 +219,7 @@ it answers.
    Serial matters: several upstream plugin/graphics tests are timing-flaky — measured failing on
    an **unpatched** v0.8.0 tree too (`inactive_owner_cancels_idle_stream_and_dispatches_close`
    failed 1 run in 6 on pristine v0.8.0, and again 1 run in 4 while building #331, while the patched
-   tree ran 292/292 green on 3 consecutive serial runs). A red there is not evidence
+   tree ran 294/294 green on 3 consecutive serial runs). A red there is not evidence
    against the patch; re-run it before investigating.
 4. **Run the negative test against the built binary** — the check that actually matters:
    ```sh

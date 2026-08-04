@@ -522,6 +522,12 @@ def fence_probe(socket_path, env=None, timeout=5.0, connect=None):
     Returns FENCED (refused — the good answer), OPEN (a tokenless caller was SERVED, i.e. there is
     no fence), or UNREACHABLE. Silence is UNREACHABLE, never FENCED: absence of signal is UNKNOWN
     (c2), and a socket that accepts and then says nothing has proven nothing.
+
+    ``env`` is accepted for signature symmetry with the rest of this module and is DELIBERATELY
+    NOT READ. Both probes here present no credential by construction, so passing one an environment
+    holding the token does not authenticate it — and must not be read as doing so. (Not a raise:
+    the runner's own environment legitimately holds the token, and the launch pre-flight #326 will
+    call these from exactly there.)
     """
     line = (connect or _speak)(socket_path, json.dumps(
         {"id": "superlooper-fence-probe", "method": "ping", "params": {}}) + "\n", timeout)
@@ -551,7 +557,8 @@ def state_report_probe(socket_path, env=None, timeout=5.0, connect=None):
 
     Presents NO token, for the same reason `fence_probe` does not: it must ask exactly what the
     hook in a worker pane asks, and a probe that authenticated itself would report an allowance
-    that no worker actually enjoys.
+    that no worker actually enjoys. ``env`` is accepted for signature symmetry and deliberately
+    unread — see `fence_probe`.
 
     Returns ADMITTED (the call reached the method body), REFUSED (`unauthorized` — the fence turned
     it away, so this host captures no session ids), or UNREACHABLE.
