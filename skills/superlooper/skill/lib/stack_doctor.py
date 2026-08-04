@@ -94,6 +94,25 @@ class Probe:
     def exists(self, path):
         return os.path.exists(path)
 
+    def executable(self, path):
+        """Can this path actually be RUN? `exists` is not enough for a binary pin (issue #303):
+        the shell ladder in start-session.sh tests `-x`, and a doctor that tested only presence
+        would pass a pin the launcher is about to refuse."""
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+
+    def read_head(self, path, limit=4096):
+        """The first `limit` BYTES of a file, decoded leniently — never the whole file.
+
+        The bound is the point. The one caller sniffs a candidate `claude` for a wrapper marker,
+        and the standalone build is a ~270MB single binary: `read_text` on it would pull a quarter
+        of a gigabyte through memory on every doctor run. Binary content decodes with replacement
+        rather than raising, so an unreadable head is 'no marker', never an exception."""
+        try:
+            with open(path, "rb") as f:
+                return f.read(limit).decode("utf-8", "replace")
+        except OSError:
+            return None
+
     def read_text(self, path):
         try:
             with open(path) as f:
@@ -204,13 +223,190 @@ def check_cmux(probe):
     )
 
 
+# --- which `claude` the launch stack actually runs (issue #303) --------------------------------
+# The tool-dive gap-fill (docs/TOOL-DIVE-2026-07-28.md, 2026-07-29) found a machine whose only
+# `claude` was cmux's BUNDLED wrapper. That wrapper contains no Claude Code: it walks PATH for some
+# OTHER claude and execs it, injecting cmux's own hooks on the way. Two consequences the stack was
+# blind to, and this block exists for:
+#   * retire cmux and every launch path loses its binary at the exact moment of migration — the
+#     sequencing gate docs/HERDR-ADOPTION-PLAN.md §6 puts BEFORE any cmux removal;
+#   * until then, WHICH claude a worker tab runs is decided by PATH order, which no one configured
+#     and nothing reports. That is the "PATH luck" this ladder replaces.
+#
+# THE LADDER. start-session.sh (the agent-boundary file that owns the claude command line) resolves
+# the binary by exactly these three steps, and `resolve_claude` below is its Python TWIN — the
+# doctor must judge the same binary the launcher will run, or its verdict is about a different
+# process. The two are deliberately duplicated rather than shared: start-session.sh runs in a fresh
+# tab shell that inherits nothing and knows no engine paths (the same reasoning that duplicates the
+# gh probe there), so the agreement is pinned by a test that drives BOTH, not by an import.
+#   1. SL_CLAUDE — an explicit operator pin. FAILS CLOSED: a pin naming something unrunnable is
+#      refused, never quietly downgraded to PATH, because a silent fallback restores the exact luck
+#      the pin was set to remove, at the moment the operator most believes it is pinned.
+#   2. ~/.local/bin/claude — Claude Code's standalone native install (a symlink into
+#      ~/.local/share/claude/versions/<v>, maintained across upgrades by `claude install`). This is
+#      the DEFAULT pin and it is cmux-independent by construction: no PATH entry participates.
+#   3. PATH — the last-resort fallback, so a machine with a claude installed some other way still
+#      launches. It works, but nothing pinned it, so the block WARNs.
+CLAUDE_STANDALONE_REL = os.path.join(".local", "bin", "claude")
+# Where `claude install` unpacks the native build. Step 2's symlink points inside it, and a resolved
+# path that already lives here is the standalone build reached by another name.
+_CLAUDE_STANDALONE_PAYLOAD = os.path.join(".local", "share", "claude", "versions")
+# cmux ships its wrapper inside the app bundle; the marker is the wrapper's own header comment
+# (verified against /Applications/cmux.app/Contents/Resources/bin/claude, 2026-08-03). The path test
+# is the cheap one and the marker backs it up for a wrapper copied out of the bundle.
+_CMUX_BUNDLE_MARK = "cmux.app/"
+_CMUX_SHIM_MARKER = "cmux claude wrapper"
+# What the last REAL worker launch resolved, stamped by start-session.sh. The doctor resolves in the
+# OPERATOR's environment; a worker resolves in its own fresh tab's. That is the same gap #299/#301
+# were written for, so the stamp — not this process's re-resolution — is what proves what ran.
+CLAUDE_BIN_RECORD_REL = os.path.join(".superlooper", "claude-bin.last")
+
+
+def resolve_claude(probe):
+    """Which `claude` the launch stack will run, and why — the twin of start-session.sh's ladder.
+
+    Returns {"path": str|None, "source": "pin"|"standalone"|"PATH"|None, "ok": bool}. `ok` is False
+    only for a pin that names nothing runnable (the fail-closed case) or for a machine with no
+    claude at all; the caller decides severity."""
+    env = getattr(probe, "env", {}) or {}
+    pin = env.get("SL_CLAUDE")
+    if _nonempty_string(pin):
+        return {"path": pin, "source": "pin", "ok": bool(probe.executable(pin))}
+    # probe.home, like every other block here, is $HOME with a passwd-entry fallback; the shell twin
+    # can only read $HOME. They differ ONLY when HOME is unset — where the shell simply misses this
+    # rung and falls through to PATH, which is safe in the one direction that matters (it never
+    # launches a binary the doctor did not consider).
+    standalone = os.path.join(probe.home, CLAUDE_STANDALONE_REL)
+    if probe.executable(standalone):
+        return {"path": standalone, "source": "standalone", "ok": True}
+    # No envvar here: the pin was already consulted above, and passing it again would let a broken
+    # pin fall through to PATH — the fallback this ladder exists to refuse.
+    found = probe.command("claude")
+    if found:
+        return {"path": found, "source": "PATH", "ok": True}
+    return {"path": None, "source": None, "ok": False}
+
+
+def classify_claude(probe, path):
+    """`standalone`, `cmux-shim`, or `other` for a resolved claude path.
+
+    Ordered so the standalone build is decided on PATH ALONE — it is a ~270MB single binary, and
+    only the cheap string tests ever touch it. The content sniff is reached only for a candidate
+    that is neither the standalone install nor inside a cmux bundle, i.e. a small wrapper script."""
+    if not _nonempty_string(path):
+        return "other"
+    if (path == os.path.join(probe.home, CLAUDE_STANDALONE_REL)
+            or os.path.join(probe.home, _CLAUDE_STANDALONE_PAYLOAD) in path):
+        return "standalone"
+    if _CMUX_BUNDLE_MARK in path:
+        return "cmux-shim"
+    head = probe.read_head(path, 4096) or ""
+    if _CMUX_SHIM_MARKER in head:
+        return "cmux-shim"
+    return "other"
+
+
+_CLAUDE_INSTALL_FIX = (
+    "Install Claude Code's standalone native build so `~/.local/bin/claude` exists — "
+    "`claude install stable` from a working claude, or Claude Code's own installer on a machine "
+    "that has none. The launch stack then pins that binary and cmux can be retired without "
+    "stranding a launch path."
+)
+
+
+def check_claude_binary(probe):
+    """doctor --stack's "which claude does a worker actually run" line (issue #303).
+
+    Two independent readings, and the second can veto the first:
+      * what the ladder resolves HERE, now — the binary a launch started from this environment
+        would use, classified standalone / cmux-shim / other;
+      * what the LAST REAL WORKER LAUNCH stamped (~/.superlooper/claude-bin.last). A worker's fresh
+        tab has its own PATH, so a healthy resolution in the operator's shell is not evidence about
+        the worker's; only the stamp is. A stamp naming cmux's shim FAILs even when this process
+        resolves the standalone install.
+
+    FAILs on the states that either break a launch now or strand it at cmux retirement (a broken
+    pin, no claude at all, cmux's shim on either reading); WARNs when resolution fell through to
+    PATH — that works and is cmux-independent, but nothing pinned it. This is the block the cmux
+    cutover issue asserts cmux-independence against before retiring anything."""
+    name = "claude binary"
+    r = resolve_claude(probe)
+    path, source = r["path"], r["source"]
+
+    if source == "pin" and not r["ok"]:
+        return CheckResult(
+            name, False,
+            "SL_CLAUDE pins %s, which is not an executable file — start-session.sh refuses the "
+            "launch rather than falling back to PATH, so every worker launch fails here." % path,
+            "Point SL_CLAUDE at a real claude binary, or unset it to take the standalone install "
+            "at ~/%s." % CLAUDE_STANDALONE_REL)
+    if path is None:
+        return CheckResult(
+            name, False,
+            "no claude binary found: SL_CLAUDE is unset, ~/%s does not exist, and no `claude` is on "
+            "PATH — no worker session can start." % CLAUDE_STANDALONE_REL,
+            _CLAUDE_INSTALL_FIX)
+
+    kind = classify_claude(probe, path)
+    where = {"pin": "pinned by SL_CLAUDE", "standalone": "the standalone native install",
+             "PATH": "found on PATH"}[source]
+    resolved = "the launch stack resolves %s (%s)" % (path, where)
+
+    # What actually ran, read before any verdict: it can veto a healthy-looking resolution.
+    record = probe.read_text(os.path.join(probe.home, CLAUDE_BIN_RECORD_REL))
+    last = record.strip() if _nonempty_string(record) else None
+    last_kind = classify_claude(probe, last) if last else None
+    if last:
+        launched = "the last worker launch ran %s (%s)" % (last, last_kind)
+    else:
+        launched = "no worker launch has recorded a binary yet"
+
+    if last_kind == "cmux-shim":
+        return CheckResult(
+            name, False,
+            "%s, but %s — a worker tab resolves in its OWN environment, and that one ran cmux's "
+            "bundled wrapper, which contains no Claude Code (it execs another claude off PATH). "
+            "Retiring cmux takes that launch path with it." % (resolved, launched),
+            _CLAUDE_INSTALL_FIX)
+    if kind == "cmux-shim":
+        return CheckResult(
+            name, False,
+            "%s — that is cmux's BUNDLED wrapper, not Claude Code: it walks PATH for another "
+            "claude and execs it. Retiring cmux removes this launch path outright, and today "
+            "nothing but PATH order decides it. (%s.)" % (resolved, launched),
+            _CLAUDE_INSTALL_FIX)
+    if source == "PATH":
+        return CheckResult(
+            name, True,
+            "%s — it is not cmux's shim, so it survives a cmux retirement, but nothing PINS it: "
+            "PATH order decides which claude a worker tab runs, and the operator's PATH is not the "
+            "worker's. Install the standalone build at ~/%s (`claude install stable`) to pin it, or "
+            "set SL_CLAUDE. (%s.)" % (resolved, CLAUDE_STANDALONE_REL, launched),
+            warn=True)
+    return CheckResult(name, True, "%s; %s" % (resolved, launched))
+
+
 def check_claude(probe):
-    claude = probe.command("claude", envvar="SL_CLAUDE")
+    # Probe the binary the LAUNCH STACK resolved, not whatever `claude` this process's PATH offers:
+    # a login verdict read off a different binary is a confident statement about the wrong process,
+    # the same class of mistake as asserting gh auth in the launcher's environment (#299).
+    r = resolve_claude(probe)
+    claude = r["path"]
     if not claude:
         return CheckResult(
             "claude login", False, "claude not found",
             "Install Claude Code, then run `claude auth login` with a subscription account.",
         )
+    if not r["ok"]:
+        # A pin naming something unrunnable. Still a FAIL — a machine that cannot run claude cannot
+        # be logged in — but it must not ALSO invent a second diagnosis: running the broken pin here
+        # would return 127 and this block would report a garbled `authMethod=None loggedIn=None`,
+        # sending the operator to re-login over a binary-path typo. One cause, one alarm; the same
+        # deference check_superlooper_plugin pays this block.
+        return CheckResult(
+            "claude login", False,
+            "cannot read the login: %s is not a runnable claude" % claude,
+            "The `claude binary` block above names the real problem; fix that first.")
     proc = probe.run([claude, "auth", "status", "--json"], timeout=10)
     data = _json(proc)
     logged_in = data.get("loggedIn") is True
@@ -812,7 +1008,9 @@ def check_superlooper_plugin(probe):
     env = getattr(probe, "env", {}) or {}
     plugin_id = env.get("SL_PLUGIN_ID") or _PLUGIN_ID
 
-    claude = probe.command("claude", envvar="SL_CLAUDE")
+    # Same binary the launch stack runs (issue #303), for the same reason check_claude uses it:
+    # plugin state read off a different claude describes a machine the workers do not live on.
+    claude = resolve_claude(probe)["path"]
     if not claude:
         return CheckResult(
             name, True,
@@ -884,6 +1082,9 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
     return [
         check_codex(probe, required=_codex_required(config)),
         check_cmux(probe),
+        # Before `claude login`, deliberately: which binary is in use is upstream of whether it is
+        # logged in, and the login block probes whatever this one resolved (issue #303).
+        check_claude_binary(probe),
         check_claude(probe),
         check_gh_auth(probe),
         check_gh_headroom(probe),

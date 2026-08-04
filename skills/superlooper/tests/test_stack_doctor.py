@@ -28,6 +28,15 @@ class FakeProbe:
             return self.commands[name].get("path", name)
         return default if default and default in self.commands else None
 
+    def executable(self, path):
+        # Every injected file/command stands in for an executable unless the test says otherwise —
+        # `not_executable` is how a case reproduces a pin that names a real but unrunnable file.
+        return self.exists(path) and path not in getattr(self, "not_executable", ())
+
+    def read_head(self, path, limit=4096):
+        text = self.read_text(path)
+        return None if text is None else text[:limit]
+
     def run(self, argv, timeout=10):
         self.calls.append(list(argv))
         spec = self.commands.get(argv[0])
@@ -51,6 +60,23 @@ class FakeProbe:
         return path.replace("~", self.home, 1) if path.startswith("~") else path
 
 
+# The three claude binaries the machine can offer (issue #303), as literal paths so every case
+# below reads as the real layout it reproduces:
+#   _STANDALONE — the native install the launch ladder pins by default (`~/.local/bin/claude`,
+#                 a symlink into `~/.local/share/claude/versions/<v>`), independent of cmux;
+#   _SHIM       — cmux's BUNDLED wrapper, which only ever execs some OTHER claude found on PATH,
+#                 so a machine that resolves it is one cmux uninstall away from no launcher at all;
+#   _OTHER      — anything else on PATH (homebrew, an npm global): it works, but nothing pinned it.
+_STANDALONE = "/home/will/.local/bin/claude"
+_SHIM = "/Applications/cmux.app/Contents/Resources/bin/claude"
+_OTHER = "/opt/homebrew/bin/claude"
+# The first line of cmux's real wrapper (verified against
+# /Applications/cmux.app/Contents/Resources/bin/claude on 2026-08-03) — the content signal that
+# still identifies the shim when it has been copied out of the bundle.
+_SHIM_HEAD = ("#!/usr/bin/env bash\n"
+              "# cmux claude wrapper - injects hooks and session tracking\n")
+
+
 def _plugin_row(plugin_id="superlooper@superlooper", enabled=True, scope="user"):
     """One row of `claude plugin list --json`, shaped exactly as the real CLI emits it (verified
     against Claude Code's own output on 2026-07-15): the marketplace-qualified id, the enable flag,
@@ -67,8 +93,12 @@ def _healthy_probe():
                 "path": "/bin/codex",
                 ("login", "status"): (0, "Logged in using ChatGPT\n", ""),
             },
+            # The healthy machine's claude is the STANDALONE native install (issue #303) — the
+            # binary the launch ladder pins by default, independent of cmux's bundled shim. Both
+            # claude-facing blocks (login, plugin) probe whatever the ladder resolved, so putting it
+            # here rather than at a bare /bin/claude keeps the reference machine the one we ship for.
             "claude": {
-                "path": "/bin/claude",
+                "path": _STANDALONE,
                 ("auth", "status", "--json"): (
                     0,
                     json.dumps({"loggedIn": True, "authMethod": "claude.ai"}),
@@ -122,6 +152,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
     assert [(r.name, r.ok) for r in results] == [
         ("codex CLI", True),
         ("cmux present", True),
+        ("claude binary", True),             # the standalone install, pinned by the ladder (#303)
         ("claude login", True),
         ("gh auth", True),
         ("gh API headroom", True),
@@ -903,7 +934,7 @@ def test_superlooper_plugin_reads_the_documented_cli_not_the_internal_registry_f
     r = stack_doctor.check_superlooper_plugin(probe)
 
     assert r.ok is True and r.warn is False       # the CLI's truth wins; the file is irrelevant
-    assert ["/bin/claude", "plugin", "list", "--json"] in probe.calls
+    assert [_STANDALONE, "plugin", "list", "--json"] in probe.calls
     assert not any("installed_plugins" in p for p in reads)
 
 
@@ -986,3 +1017,207 @@ def test_stack_md_names_no_block_the_doctor_no_longer_emits():
     assert not phantom, (
         "STACK.md documents block names doctor --stack no longer emits (renamed or removed): %s"
         % phantom)
+
+
+# --- the claude binary: pinned, named, and never cmux's bundled shim (issue #303) ---------------
+# The tool-dive gap-fill (docs/TOOL-DIVE-2026-07-28.md) found a machine whose only `claude` was
+# cmux's BUNDLED shim. That shim does not contain Claude Code — it locates some OTHER claude on
+# PATH and execs it — so on such a machine retiring cmux takes the launcher's binary with it, and
+# nothing in the stack would have said so first. These cases pin the ladder start-session.sh
+# resolves by (pin -> standalone -> PATH), the standalone-vs-shim discrimination the cutover issue
+# needs to assert cmux-independence, and the doctor line that names which binary is actually in use.
+
+def _bin_probe(*, pin=None, pin_exists=True, standalone=False, path_claude=None, record=None,
+               files=None, not_executable=()):
+    """A probe whose machine offers exactly the claude binaries a case names.
+
+    `standalone` puts the native install at ~/.local/bin/claude; `path_claude` puts one on PATH
+    (pass _SHIM to reproduce the cmux-only machine); `pin` sets SL_CLAUDE (with `pin_exists=False`
+    for a pin that names nothing); `record` seeds the binary the last real worker launch stamped."""
+    files = dict(files or {})
+    commands = {}
+    if standalone:
+        files[_STANDALONE] = "#!/bin/sh\n"
+    if path_claude:
+        commands["claude"] = {"path": path_claude}
+        files.setdefault(path_claude, _SHIM_HEAD if path_claude == _SHIM else "#!/bin/sh\n")
+    if pin and pin_exists:
+        files.setdefault(pin, _SHIM_HEAD if pin == _SHIM else "#!/bin/sh\n")
+    if record is not None:
+        files["/home/will/.superlooper/claude-bin.last"] = record + "\n"
+    probe = FakeProbe(commands=commands, files=files, env={"SL_CLAUDE": pin} if pin else {})
+    probe.not_executable = set(not_executable)
+    return probe
+
+
+def test_resolve_claude_prefers_the_standalone_install_over_whatever_path_offers():
+    # The whole point of the pin: PATH order stops deciding which binary a worker tab runs.
+    probe = _bin_probe(standalone=True, path_claude=_SHIM)
+
+    r = stack_doctor.resolve_claude(probe)
+
+    assert r["path"] == _STANDALONE
+    assert r["source"] == "standalone"
+
+
+def test_resolve_claude_honours_an_explicit_pin_over_everything():
+    probe = _bin_probe(pin=_OTHER, standalone=True, path_claude=_SHIM)
+
+    r = stack_doctor.resolve_claude(probe)
+
+    assert r["path"] == _OTHER and r["source"] == "pin"
+
+
+def test_resolve_claude_falls_back_to_path_only_when_nothing_is_pinned():
+    probe = _bin_probe(path_claude=_OTHER)
+
+    r = stack_doctor.resolve_claude(probe)
+
+    assert r["path"] == _OTHER and r["source"] == "PATH"
+
+
+def test_resolve_claude_reports_a_pin_that_names_no_executable_rather_than_falling_back():
+    # FAIL CLOSED, exactly as start-session.sh does: silently falling back to PATH would restore the
+    # very PATH luck the pin exists to remove, and it would do so at the moment the operator most
+    # believes the binary is pinned.
+    probe = _bin_probe(pin="/nowhere/claude", pin_exists=False, standalone=True)
+
+    r = stack_doctor.resolve_claude(probe)
+
+    assert r["path"] == "/nowhere/claude" and r["source"] == "pin" and r["ok"] is False
+
+
+def test_classify_claude_tells_the_standalone_install_from_cmux_s_shim():
+    probe = _bin_probe(standalone=True, path_claude=_SHIM)
+
+    assert stack_doctor.classify_claude(probe, _STANDALONE) == "standalone"
+    assert stack_doctor.classify_claude(probe, _SHIM) == "cmux-shim"
+    assert stack_doctor.classify_claude(probe, _OTHER) == "other"
+
+
+def test_classify_claude_recognises_the_shim_by_content_outside_a_cmux_bundle():
+    # A shim copied onto PATH (or a differently-named bundle) is the same trap with a different
+    # path, so the content marker backs the path test up rather than the path test standing alone.
+    probe = _bin_probe(path_claude="/usr/local/bin/claude",
+                       files={"/usr/local/bin/claude": _SHIM_HEAD})
+
+    assert stack_doctor.classify_claude(probe, "/usr/local/bin/claude") == "cmux-shim"
+
+
+def test_classify_claude_never_reads_the_standalone_binary_itself():
+    # The standalone build is a ~270MB single file; deciding what it is must be a path decision, or
+    # the doctor pulls a quarter of a gigabyte through memory on every run.
+    probe = _bin_probe(standalone=True)
+    reads = []
+    probe.read_head = lambda p, limit=4096: reads.append(p)
+
+    assert stack_doctor.classify_claude(probe, _STANDALONE) == "standalone"
+    assert reads == []
+
+
+def test_claude_binary_block_passes_and_names_the_standalone_binary():
+    probe = _bin_probe(standalone=True)
+
+    r = stack_doctor.check_claude_binary(probe)
+
+    assert r.ok is True and r.warn is False
+    assert _STANDALONE in r.detail
+
+
+def test_claude_binary_block_fails_when_the_launch_stack_would_run_the_cmux_shim():
+    # The tool-dive machine: no standalone install, and the only claude on PATH is cmux's wrapper.
+    probe = _bin_probe(path_claude=_SHIM)
+
+    r = stack_doctor.check_claude_binary(probe)
+
+    assert r.ok is False
+    assert _SHIM in r.detail and "cmux" in r.detail.lower()
+    assert "claude install" in r.fix          # the one command that ends it
+
+
+def test_claude_binary_block_fails_when_the_pin_names_no_executable():
+    probe = _bin_probe(pin="/nowhere/claude", pin_exists=False, standalone=True)
+
+    r = stack_doctor.check_claude_binary(probe)
+
+    assert r.ok is False
+    assert "SL_CLAUDE" in r.detail and "/nowhere/claude" in r.detail
+
+
+def test_claude_binary_block_fails_when_a_real_pin_names_a_file_that_cannot_run():
+    probe = _bin_probe(pin=_OTHER, not_executable=(_OTHER,))
+
+    r = stack_doctor.check_claude_binary(probe)
+
+    assert r.ok is False and _OTHER in r.detail
+
+
+def test_claude_binary_block_fails_when_there_is_no_claude_at_all():
+    r = stack_doctor.check_claude_binary(_bin_probe())
+
+    assert r.ok is False
+    assert "not found" in r.detail.lower() or "no claude" in r.detail.lower()
+
+
+def test_claude_binary_block_warns_when_resolution_falls_through_to_path():
+    # It works today and it is cmux-independent, so it never fails the stack — but nothing pinned
+    # it, so PATH order still decides, and that is worth seeing before the cutover.
+    probe = _bin_probe(path_claude=_OTHER)
+
+    r = stack_doctor.check_claude_binary(probe)
+
+    assert r.ok is True and r.warn is True
+    assert _OTHER in r.detail and "PATH" in r.detail
+
+
+def test_claude_binary_block_fails_when_the_last_real_launch_ran_the_shim():
+    # The #299/#301 lesson applied to the binary: the doctor resolves in the OPERATOR's environment,
+    # a worker resolves in its own fresh tab's. Only the launch's own stamp can say what actually
+    # ran there, so a healthy-looking resolution here never overrides it.
+    probe = _bin_probe(standalone=True, record=_SHIM)
+
+    r = stack_doctor.check_claude_binary(probe)
+
+    assert r.ok is False
+    assert _SHIM in r.detail
+    assert "launch" in r.detail.lower()
+
+
+def test_claude_binary_block_names_the_last_launch_when_it_agrees():
+    probe = _bin_probe(standalone=True, record=_STANDALONE)
+
+    r = stack_doctor.check_claude_binary(probe)
+
+    assert r.ok is True and r.warn is False
+    assert r.detail.count(_STANDALONE) >= 2      # resolved now, and what the last launch ran
+
+
+def test_claude_binary_block_says_so_when_no_launch_has_recorded_a_binary_yet():
+    probe = _bin_probe(standalone=True)
+
+    r = stack_doctor.check_claude_binary(probe)
+
+    assert "no worker launch" in r.detail.lower()
+
+
+def test_claude_login_probes_the_binary_the_launch_stack_resolved():
+    # A login verdict read off a DIFFERENT binary than the launcher runs is a confident lie about
+    # the wrong process — the same class as asserting gh auth in the launcher's env (#299).
+    probe = _healthy_probe()
+    probe.commands["claude"]["path"] = _STANDALONE
+
+    stack_doctor.check_claude(probe)
+
+    assert [_STANDALONE, "auth", "status", "--json"] in probe.calls
+
+
+def test_claude_login_defers_to_the_binary_block_instead_of_raising_a_second_alarm():
+    # One cause, one alarm. Running a broken pin here would come back 127 and this block would
+    # report `authMethod=None loggedIn=None` — sending the operator to re-login over a path typo.
+    probe = _bin_probe(pin="/nowhere/claude", pin_exists=False, standalone=True)
+
+    r = stack_doctor.check_claude(probe)
+
+    assert r.ok is False
+    assert "claude binary" in r.fix
+    assert probe.calls == []                  # and it never ran the thing it knows cannot run

@@ -30,8 +30,21 @@ A loop user needs enough local stack for a worker session to launch, work, repor
 - `cmux present` - cmux must be installed, and the runner must be started from a visible cmux tab in
   the same workspace as the target pane. The run command's pane preflight checks the same-workspace
   rule before the loop starts.
+- `claude binary` - the launch stack must resolve `claude` by configuration, not by PATH order, and
+  what it resolves must not be cmux's bundled wrapper. `start-session.sh` walks one ladder —
+  `SL_CLAUDE` if set (fail-closed: a pin naming something unrunnable refuses the launch rather than
+  quietly falling back), else `~/.local/bin/claude` (Claude Code's standalone native install, which
+  no PATH entry participates in), else PATH as a last resort — and stamps the binary it actually ran
+  to `~/.superlooper/claude-bin.last`. The doctor re-walks that ladder AND reads the stamp, because
+  the operator's shell is not the worker tab's: a stamp naming cmux's wrapper fails the block even
+  when this shell resolves the standalone build. cmux ships a `claude` wrapper inside its own app
+  bundle that contains no Claude Code — it walks PATH for another claude and execs it — so a machine
+  that resolves the wrapper loses every launch path the moment cmux is retired. Distinguishing the
+  two is what lets the cmux cutover assert cmux-independence before retiring anything.
 - `claude login` - Claude Code must be logged in through the `claude.ai` subscription account used
-  for workers, not only through an API key.
+  for workers, not only through an API key. The login is read from whatever binary the
+  `claude binary` block resolved, never from a different `claude` this shell's PATH happens to
+  offer.
 - `gh auth` - GitHub CLI must be authenticated to `github.com` as the account that owns the loop
   repo and can read issues, PRs, labels, checks, and rate limits.
 - `gh API headroom` - the active GitHub token needs hourly core API quota left. The stack doctor
@@ -107,6 +120,12 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   stack still passes, because a fresh same-model subagent is a valid review path; install it only if
   you switch a repo to `--agent codex`.
 - `cmux present`: install cmux or set `SL_CMUX` to the runner's cmux binary.
+- `claude binary`: install Claude Code's standalone native build so `~/.local/bin/claude` exists
+  (`claude install stable` from a working claude, or Claude Code's own installer on a machine that
+  has none). FAILs when `SL_CLAUDE` pins something that cannot run (the launcher refuses rather
+  than falling back to PATH — point it at a real binary or unset it), when no claude exists
+  anywhere, or when either reading lands on cmux's bundled wrapper. WARNs when the resolution fell
+  through to PATH: that binary works and survives a cmux retirement, but nothing pinned it.
 - `claude login`: run `claude auth login` with the subscription account.
 - `gh auth`: run `gh auth login --hostname github.com`.
 - `gh API headroom`: wait for the hourly quota reset or switch `gh auth` to an account with enough

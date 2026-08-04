@@ -348,6 +348,73 @@ run_agent() {                            # "$@" = the full agent command line
 
 case "$AGENT" in
   claude)
+    # ---- THE CLAUDE BINARY, RESOLVED EXPLICITLY (issue #303) ------------------------------------
+    # This used to be a bare `claude`, which meant PATH ORDER decided which binary a worker ran —
+    # and nobody had configured that order, nothing reported it, and it differs between the
+    # operator's shell and a fresh tab's. The tool-dive gap-fill (docs/TOOL-DIVE-2026-07-28.md,
+    # 2026-07-29) found the sharp edge: a machine whose only `claude` was cmux's BUNDLED wrapper.
+    # That wrapper contains no Claude Code — it walks PATH for some OTHER claude and execs it — so
+    # on such a machine retiring cmux takes the launcher's binary with it, at the exact moment of
+    # migration. docs/HERDR-ADOPTION-PLAN.md §6 sequences this pin BEFORE any cmux removal.
+    #
+    # THE LADDER, and lib/stack_doctor.py's resolve_claude is its TWIN — the doctor must judge the
+    # same binary this runs, or its verdict describes a different process. Deliberately duplicated
+    # rather than sourced, for the reason the gh probe above is: this script runs in a fresh tab
+    # shell that inherits nothing and knows no engine paths, so a sourced helper would add a failure
+    # mode exactly where the stack is least able to report one. tests/test_start_session.py drives
+    # BOTH ladders and compares, so the duplication cannot silently drift.
+    #   1. SL_CLAUDE — an explicit operator pin, read from THIS session's own environment (a shell
+    #      rc file or a LaunchAgent), never threaded through the launcher: `claude` is an
+    #      agent-specific name and launch-session.sh is the agent-AGNOSTIC half of the stack.
+    #   2. $HOME/.local/bin/claude — Claude Code's standalone native install (a symlink into
+    #      ~/.local/share/claude/versions/<v>, re-pointed across upgrades by `claude install`).
+    #      This is the DEFAULT pin, and it is cmux-independent by construction: no PATH entry takes
+    #      part in the decision, so cmux's shim can neither be chosen nor be missed when it goes.
+    #   3. PATH — the last resort, so a machine that installed Claude Code some other way still
+    #      launches. `doctor --stack`'s `claude binary` block WARNs on this rung.
+    #
+    # A PIN THAT NAMES NOTHING RUNNABLE REFUSES THE LAUNCH. It does not fall back: a silent
+    # fallback would restore the exact PATH luck the pin was set to remove, at the moment the
+    # operator most believes the binary is pinned. The refusal writes the launch-stderr tail the
+    # relaunch-cap park memo reads (issue #40), so the park NAMES the pin instead of the machinery.
+    refuse_claude_bin() {
+      printf '[%s] %s\n' "$ID" "$1" > "$ERR_TAIL" 2>/dev/null || true
+      echo "[$ID] $1" >&2
+      write_exited 127                   # 127 = "command not found", which is exactly what this is
+      exit 127
+    }
+    CLAUDE_STANDALONE="${HOME:-}/.local/bin/claude"
+    if [ -n "${SL_CLAUDE:-}" ]; then
+      CLAUDE_BIN="$SL_CLAUDE"
+      [ -x "$CLAUDE_BIN" ] || refuse_claude_bin \
+        "SL_CLAUDE pins '$CLAUDE_BIN', which is not an executable file — refusing to fall back to whatever \`claude\` this session's PATH happens to offer. Point SL_CLAUDE at a real claude binary, or unset it to take the standalone install at $CLAUDE_STANDALONE"
+    elif [ -x "$CLAUDE_STANDALONE" ]; then
+      CLAUDE_BIN="$CLAUDE_STANDALONE"
+    else
+      CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+      [ -n "$CLAUDE_BIN" ] || refuse_claude_bin \
+        "no claude binary to launch: SL_CLAUDE is unset, $CLAUDE_STANDALONE does not exist, and no \`claude\` is on this session's PATH. Install Claude Code's standalone native build (\`claude install stable\`), then re-run \`superlooper doctor --stack\`"
+    fi
+    # Stamp what THIS launch resolved, machine-wide. The doctor re-walks the ladder in the
+    # OPERATOR's environment, and a worker tab's is not the same one — the same gap #299/#301 were
+    # written for. Only a stamp written from inside the session can say what actually ran, so
+    # `doctor --stack` reads this file and lets it VETO an otherwise-healthy resolution.
+    # ONE machine-wide file, not one per id, and deliberately so: the question it answers is "which
+    # claude does a session on this MACHINE end up running", which is a machine fact — and a
+    # per-lane file would need its own hygiene and would go stale on a lane that switched agents.
+    # Concurrent launches race to last-writer-wins, which costs nothing: they walk the same ladder
+    # in the same environment, so they agree. Written tmp+mv so a reader never sees a half-written
+    # path, and best-effort throughout: telemetry must never fail a launch that is ready to fly.
+    if [ -n "${HOME:-}" ] && mkdir -p "$HOME/.superlooper" 2>/dev/null; then
+      if _sl_bin_tmp="$(mktemp "$HOME/.superlooper/.claude-bin.XXXXXX" 2>/dev/null)"; then
+        if printf '%s\n' "$CLAUDE_BIN" > "$_sl_bin_tmp" 2>/dev/null; then
+          mv -f "$_sl_bin_tmp" "$HOME/.superlooper/claude-bin.last" 2>/dev/null || \
+            rm -f "$_sl_bin_tmp" 2>/dev/null || true
+        else
+          rm -f "$_sl_bin_tmp" 2>/dev/null || true
+        fi
+      fi
+    fi
     CLAUDE_ARGS=(--dangerously-skip-permissions)
     [ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
     [ -n "$EFFORT" ] && CLAUDE_ARGS+=(--effort "$EFFORT")
@@ -367,7 +434,7 @@ case "$AGENT" in
     # Do NOT pipe Claude's STDOUT through tee/cat — piping stdout drops it into print mode and kills
     # the interactive pane you want to watch. (No headless `claude -p` anywhere — owner billing rule
     # B.9.) run_agent captures only STDERR (stdout stays the TTY via fd3), so the TUI is unaffected.
-    run_agent claude "${CLAUDE_ARGS[@]}" "$(cat "$BRIEF")"
+    run_agent "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" "$(cat "$BRIEF")"
     ;;
   codex)
     WORKTREE="$(pwd -P)"
