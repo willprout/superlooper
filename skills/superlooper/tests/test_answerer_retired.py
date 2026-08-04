@@ -156,7 +156,7 @@ def test_models_debugger_is_validated_like_worker(tmp_path, tmp_path_factory):
 
 # --------------------------- the launch mode ---------------------------
 
-_LAUNCH = str(_BIN / "launch-session.sh")
+_LAUNCH = str(_BIN / "launch-session.py")
 
 
 def test_cwd_mode_refuses_an_answerer_id(tmp_path):
@@ -166,9 +166,8 @@ def test_cwd_mode_refuses_an_answerer_id(tmp_path):
     run_root = tmp_path / "run"
     (run_root / "state").mkdir(parents=True)
     (run_root / "answers").mkdir()
-    env = {**os.environ, "SL_RUN_ROOT": str(run_root), "SL_PANE": "pane:1",
-           "SL_CMUX": "/bin/false"}
-    r = subprocess.run([_LAUNCH, "--cwd", str(run_root / "answers"), "a1"],
+    env = {**os.environ, "SL_RUN_ROOT": str(run_root), "SL_HERDR": "/bin/false"}
+    r = subprocess.run(["python3", _LAUNCH, "--cwd", str(run_root / "answers"), "a1"],
                        env=env, capture_output=True, text=True, timeout=60)
     assert r.returncode == 1, f"--cwd must reject an answerer id, got rc={r.returncode}"
     assert "d<N>" in r.stderr, f"the refusal must name the surviving mode, got: {r.stderr!r}"
@@ -176,7 +175,9 @@ def test_cwd_mode_refuses_an_answerer_id(tmp_path):
 
 
 def test_launcher_id_guard_is_debugger_only():
-    # Belt-and-braces on the regex itself: the shell guard must not admit `a<N>` any more.
-    src = (_BIN / "launch-session.sh").read_text()
-    assert not re.search(r"\^\[ad\]", src), "the --cwd id guard must no longer accept a<N>"
-    assert re.search(r"\^d\[0-9\]\+\$", src), "the --cwd id guard must pin d<N>"
+    # Belt-and-braces on the regex itself, which survived the port to lib/launch.py (issue #308):
+    # the --cwd guard must still pin d<N> and admit no a<N>.
+    import launch
+    assert launch.DEBUGGER_RE.pattern == r"^d[0-9]+$", "the --cwd id guard must pin d<N>"
+    assert not launch.DEBUGGER_RE.match("a1")
+    assert launch.WORKER_RE.pattern == r"^i[0-9]+$", "the worker guard must pin i<N>"

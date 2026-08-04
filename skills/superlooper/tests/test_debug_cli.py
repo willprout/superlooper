@@ -300,17 +300,18 @@ def test_a_successful_launch_releases_the_watchdog_lock(rig):
 
 # --------------------------- refusals that change nothing ---------------------------
 
-def test_debug_refuses_when_no_cmux_pane_resolves(rig):
-    # No recorded anchor and not inside cmux: the shim would abort anyway, and a launch that
-    # half-happens is worse than one that plainly did not. Refuse BEFORE burning an id.
+def test_the_owner_tap_needs_no_cmux_pane_to_launch_into(rig):
+    """Issue #308 removed this gate, and the owner tap is the case it mattered most for.
+
+    The launcher creates a workspace against the session host's server — there is no anchor to
+    find and nothing to place. Under a login-item runner (#306) no pane resolves at all, and the
+    dashboard shells this verb from its own non-cmux process, so the gate would have made Deploy
+    Fixer's Debug button permanently dead on exactly the machine the migration is for."""
     rig.wstate(next_debugger=4)
     r = run(rig, "debug", "--repo", str(rig.repo), "--json", "--note", "x")
-    assert r.returncode != 0
-    b = body(r)
-    assert b["ok"] is False and "pane" in b["error"]
-    assert rig.launch_calls() == []
-    assert rig.read_wstate()["next_debugger"] == 4
-    assert not (rig.home / "briefs").exists()
+    assert r.returncode == 0, r.stderr
+    assert rig.launch_calls(), "the repair must launch with no pane to launch into"
+    assert rig.read_wstate()["next_debugger"] == 5
 
 
 def test_debug_reports_a_failed_launch_honestly(rig):

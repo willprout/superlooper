@@ -45,7 +45,7 @@ its OWN AskUserQuestion fallback (_ROLES):
 
 The ruling named a third seat — the answerer `a<N>` — conditionally: "while any remain pre-#194".
 None remain. #194 merged on 2026-07-21 and retired the answerer scaffolding outright, narrowing
-launch-session.sh's `--cwd` mode to `^d[0-9]+$`, so NO launcher can produce an `a<N>` any more.
+the launcher's `--cwd` mode to `^d[0-9]+$`, so NO launcher can produce an `a<N>` any more.
 Carrying a role for a session that cannot exist would re-add the very scaffolding #194 removed, so
 it is out: the ruling's condition, not the ruling, is what lapsed.
 
@@ -129,7 +129,7 @@ def _worker_ask_reason(state_home, issue_id):
     #     obeying it verbatim ended the session with this checkout holding the only copy of the work
     #     (the i153/i163 loss #190 fences). State the push's reason CAREFULLY: the resume does NOT
     #     depend on it — _exec_post_question tears down with remove_worktree=False and
-    #     launch-session.sh only creates a worktree when none exists, so the relaunch reuses the
+    #     the launcher only creates a worktree when none exists, so the relaunch reuses the
     #     PRESERVED WIP, uncommitted files included. Telling a worker its unpushed work is
     #     unrecoverable would be a NEW falsehood in the same class this issue removes, and a costly
     #     one: a worker whose push fails would then refuse to end the session (the i280 stall) or
@@ -138,7 +138,7 @@ def _worker_ask_reason(state_home, issue_id):
     #     reads to decide a checkout is safe to reclaim. Name what the push buys with the same care:
     #     it is a copy OFF THIS MACHINE, not off this checkout. A worktree shares the repo's object
     #     database, so once the work is COMMITTED the branch ref already carries it (gitops: "The
-    #     branch itself is untouched ... only the checkout dies") and launch-session.sh's
+    #     branch itself is untouched ... only the checkout dies") and the launcher's
     #     `worktree add "$WT" "$BRANCH"` fallback re-attaches it. Saying the push is the last chance
     #     to escape "this one checkout" would be the same over-claim one step smaller.
     #   * its assumption hint named the PR body ALONE, which an `investigate` worker cannot use —
@@ -174,7 +174,7 @@ def _debugger_ask_reason(state_home, issue_id):
 
 
 # The ONE place session id -> role -> fallback is decided. `i<N>` and `d<N>` are exactly the shapes
-# launch-session.sh's own mode guards enforce (`^i[0-9]+$` for a worker, `^d[0-9]+$` for --cwd since
+# lib/launch.py's own mode guards enforce (`^i[0-9]+$` for a worker, `^d[0-9]+$` for --cwd since
 # #194), so this cannot recognize a session the loop cannot launch — and it stays in step with the
 # launcher: a seat retired there falls out of here, which is why `a<N>` is gone. ASCII digits only,
 # deliberately: `str.isdigit()` would also accept unicode digits that no launcher can produce.
@@ -421,7 +421,7 @@ def repo_contract(state_home, issue_id, cwd=None):
     """This repo's half of the mechanical contract: {"areas", "touches_required"}.
 
     Two routes to the same file, because the two session shapes sit in different places. A worker's
-    cwd IS its worktree — `<state home>/worktrees/<id>` is exactly what launch-session.sh creates —
+    cwd IS its worktree — `<state home>/worktrees/<id>` is exactly what the launcher creates —
     while the `d<N>` debugger runs `--cwd` against a checkout with no worktree at all. The payload's
     own cwd is tried first (walked UP, so a session working inside a subdirectory still finds it)
     and the derived worktree path second, so neither shape depends on the other's luck.

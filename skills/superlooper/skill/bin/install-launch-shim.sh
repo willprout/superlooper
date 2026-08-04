@@ -3,7 +3,7 @@
 #
 # What it does:
 #   1. Installs shell/launch-shim.zsh to ~/.superlooper/launch-shim.zsh
-#   2. Creates ~/.superlooper/launch/ (mode 700) — where launch-session.sh drops per-tab commands
+#   2. Creates ~/.superlooper/launch/ (mode 700) — where resurrect-runner.sh drops its command
 #   3. Appends ONE guarded line to ~/.zshrc that sources the shim (only if not already present)
 #
 # The shim is a strict no-op in every normal shell (see shell/launch-shim.zsh), so this is safe to
@@ -62,7 +62,7 @@ echo "[install-launch-shim] sourced from  -> $ZSHRC"
 # ---- Nap-proof cmux (issue #120) ----------------------------------------------------------------
 # Overnight launch delivery was dying ~40 min after the operator walked away: macOS App Nap suspends
 # the idle/occluded cmux, which then still answers new-surface (a tab appears, a UUID comes back) but
-# defers spawning that tab's shell past launch-session.sh's 30s verify window — so the shim never
+# defers spawning that tab's shell past the launcher's 30s verify window — so the shim never
 # runs, no worker starts (rc=2), and back-to-back failures trip the systemic launch breaker. Set the
 # persistent NSAppSleepDisabled default on the cmux bundle so App Nap stays off. It is read only at
 # app LAUNCH, so this needs a cmux relaunch to take effect — hence the loud restart note. Best-effort:

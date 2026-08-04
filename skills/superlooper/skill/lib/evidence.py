@@ -24,7 +24,7 @@ Three rules hold it together:
     the size and strips control bytes; every entry point runs through it, and the park memo bounds
     a second time (the same belt-and-suspenders `_launch_stderr_memo` uses for issue #40).
   * READ THE TEXT, NOT JUST THE CODE. An rc is a category; the captured text is the cause.
-    launch-session.sh exits 1 for five different faults, so rc alone can never name one. The
+    the launcher exits 1 for five different faults, so rc alone can never name one. The
     stderr patterns below refine an ALREADY-FAILED outcome — they never manufacture a failure, so
     a stray substring costs a mis-worded reason, never a false park.
 """
@@ -73,12 +73,13 @@ def bound(text, limit=STDERR_TAIL_MAX):
 
 _LAUNCH_RC = {
     1: ("launch_failed_before_delivery",
-        "the launch aborted before any tab could host a worker — no worker was ever started, so "
+        "the launch aborted before any pane could host a worker — no worker was ever started, so "
         "nothing about the session itself is at fault; the captured stderr names the step that "
         "failed"),
     2: ("shim_not_fired",
-        "a tab WAS created but no worker ever started in it within the verify window: the launch "
-        "shim did not run the dropped command — is it installed? (bin/install-launch-shim.sh)"),
+        "no worker started for this launch: either the session host would not give it a pane, or "
+        "a pane was created and the launch shim never handed the agent verb to start-session.sh "
+        "— is the shim installed? (bin/install-launch-shim.sh). The captured stderr says which"),
     3: ("base_missing",
         "the worktree base branch does not exist on origin, so every worktree creation fails "
         "before the agent starts — a repo/config fault (dev_branch), not a launch-delivery problem"),
@@ -90,7 +91,7 @@ _LAUNCH_RC = {
         "--hostname github.com` with the account that owns the loop repo, then re-approve"),
     5: ("gh_auth_dead_runner",
         "the RUNNER's own `gh` could not say who it is, so there was no identity to launch any "
-        "session against and no tab was ever opened — a machine-level GitHub auth fault that no "
+        "session against and no pane was ever opened — a machine-level GitHub auth fault that no "
         "queued issue caused and none can fix. Every launch will fail until it is repaired: "
         "`gh auth login --hostname github.com` with the account that owns the loop repo"),
     6: ("env_poisoned",
@@ -135,7 +136,7 @@ _NUDGE_RC = {
 _RC_TABLES = {"launch": _LAUNCH_RC, "nudge": _NUDGE_RC}
 
 # ---- what the captured TEXT means --------------------------------------------------------------
-# Checked BEFORE the rc-only reading, because launch-session.sh exits 1 for five distinct faults
+# Checked BEFORE the rc-only reading, because the launcher exits 1 for five distinct faults
 # and only its stderr says which. Matched case-insensitively against the real strings the tools
 # emit (cmux's own error text, and the scripts' own `echo ... >&2` diagnostics). Order is
 # significant: first match wins, so the most specific patterns lead.
@@ -202,7 +203,7 @@ _LAUNCH_TEXT = (
       "the positive gh-auth assert refused the flight: `gh` did not answer as the login this loop "
       "runs as from inside the session's own environment, so the session could not have read its "
       "issue or posted any evidence. Re-login with `gh auth login --hostname github.com`")),
-    # THE storm (2026-07-09). cmux exits 0 while printing this to stdout, so launch-session.sh's
+    # THE storm (2026-07-09). cmux exited 0 while printing this to stdout, so the cmux launcher's
     # surface-parse guard echoes the whole output to stderr — which is how the cause reaches us.
     (("not_found", "pane or workspace not found", "workspace not found", "pane not found"),
      ("anchor_workspace_missing",
@@ -219,8 +220,10 @@ _LAUNCH_TEXT = (
       "session had nothing to work from")),
     (("could not create the worktree",),
      ("worktree_create_failed",
-      "the worktree could not be created even though its base branch exists — a git-level fault "
-      "(a leftover worktree, a locked index, or a branch already checked out elsewhere)")),
+      "the worktree could not be created — a git-level fault (a leftover worktree, a locked index, "
+      "a branch already checked out elsewhere), or a git that could not be asked at all. The "
+      "captured stderr names the rcs; the base branch is NOT claimed either way here, because the "
+      "one case that proves it missing has its own exit code (base_missing) and this one does not")),
     (("sanitize validation failed", "issues.json load"),
      ("identity_invalid",
       "the issue's identity or branch failed validation before anything reached git or the shell "
@@ -279,7 +282,7 @@ def is_channel_fault(rec):
     per-issue fault), so a genuinely novel exit code can never silently freeze the whole loop. This is
     NOT a blanket 'only these reasons ever hold' guarantee, though: `launch_failed_before_delivery` is
     the reason `_classify` returns for ANY rc=1 whose stderr matches no per-issue pattern, and it IS a
-    channel reason — because launch-session.sh defines rc=1 as 'aborted before any tab could host a
+    channel reason — because the launcher defines rc=1 as 'aborted before any pane could host a
     worker; nothing about the session itself is at fault', and its per-issue rc=1 causes
     (worktree_create_failed, identity_invalid, brief_missing) each echo a distinguishing stderr line.
     So the contract the classifier relies on is the launcher's: a per-issue fault must carry either its

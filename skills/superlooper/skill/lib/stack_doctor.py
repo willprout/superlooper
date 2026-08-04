@@ -638,7 +638,7 @@ def check_cmux_app_nap(probe):
     walks away (issue #120). With display/system sleep disabled (`pmset` displaysleep=0, sleep=0),
     macOS App Nap is the ONE mechanism that suspends an idle, occluded cmux while the rest of the
     machine stays fully awake: a napped cmux still answers `new-surface` (a surface UUID comes back
-    and a tab appears) but defers spawning that tab's shell past launch-session.sh's 30s verify
+    and a tab appears) but defers spawning that tab's shell past the launcher's 30s verify
     window — so the launch shim never runs, no worker starts (rc=2 'LAUNCH NOT DELIVERED'), and
     enough back-to-back failures trip the systemic launch breaker. The cure is the persistent
     `NSAppSleepDisabled` default on the cmux bundle, which AppKit reads at app launch.
@@ -931,7 +931,7 @@ def check_runner_anchor(probe, config):
             "visible cmux tab to record one" % pid, warn=True)
 
     # Scope the probe to the runner's OWN recorded workspace. cmux resolves --pane within the
-    # caller's workspace by default (nudge-pane.sh / launch-session.sh: the 156/156-lost-rings
+    # caller's workspace by default (nudge-pane.sh / the cmux launcher: the 156/156-lost-rings
     # trap), and doctor runs from a DIFFERENT tab than the foreground runner — so without the
     # recorded --workspace this would resolve from the doctor's workspace and false-FAIL a healthy
     # runner. detect_self_anchor recorded caller.workspace_id, the same space --workspace expects.

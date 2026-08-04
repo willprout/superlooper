@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""A stand-in for the SESSION HOST — what lib/session_host.py's five verbs actually talk to.
+
+Used by the offline simulation (issue #308) in place of the real host binary. It speaks the same
+newline-JSON envelope the real one does — ``{"id", "result": {...}}`` on success, ``{"id",
+"error": {"code", "message"}}`` with rc=1 on failure — because that envelope is what the wrapper
+parses, and a fake speaking a friendlier dialect would prove nothing about the wrapper.
+
+Two modes, via ``$HOST_MODE``:
+
+``deliver``
+    ``agent start`` really does start the pane: a DETACHED shell holding exactly the environment
+    ``workspace create`` was given (a pane inherits nothing from the launcher), which sources the
+    REAL shell/launch-shim.zsh and then runs the agent verb. So the simulation exercises the whole
+    chain — launcher → wrapper → pane shell → shim handoff → start-session.sh → the floor → the
+    agent — rather than a mock of it.
+``hollow``
+    ``agent start`` REPORTS success and starts nothing. This is the measured phantom (the host
+    classified a pane with no agent behind it as ``idle``/``interactive_ready``), and it is what
+    the old ``drop`` mode is now: the launch that must never be reported as a launch.
+
+Liveness is a PROCESS FACT to the wrapper, so ``pane process-info`` answers with the real pid of
+the pane shell this fake started. In hollow mode it answers with a pid that is alive and CHILDLESS
+— a bare shell — which is precisely what the wrapper's post-spawn confirmation must catch.
+
+State lives under ``$FAKE_HOST_DIR``, one directory per simulation.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+DIR = os.environ.get("FAKE_HOST_DIR", "")
+MODE = os.environ.get("HOST_MODE", "deliver")
+SHIM = os.environ.get("FAKE_HOST_SHIM", "")
+
+def opt(args, flag):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+# One workspace per launch, allocated from a counter — NEVER a fixed id. The simulation runs
+# several lanes at once, and a shared id makes every per-workspace fact (its pane environment, its
+# pid, whether it is still open) collide across lanes: closing one lane's window would kill
+# another's worker. The cmux fake this replaces minted a fresh surface uuid per tab for exactly
+# this reason.
+def allocate():
+    path = state("counter")
+    try:
+        with open(path) as f:
+            n = int(f.read().strip()) + 1
+    except (OSError, ValueError):
+        n = 1
+    with open(path, "w") as f:
+        f.write(str(n))
+    return "w%d" % n
+
+
+def pane_of(ws):
+    return "%s:p1" % ws
+
+
+def ws_of(pane):
+    return str(pane).split(":", 1)[0]
+
+
+def emit(result):
+    sys.stdout.write(json.dumps({"id": "fake", "result": result}) + "\n")
+    sys.exit(0)
+
+
+def fail(code, message):
+    sys.stdout.write(json.dumps({"id": "fake", "error": {"code": code, "message": message}}) + "\n")
+    sys.exit(1)
+
+
+def log(name, rec):
+    with open(os.path.join(DIR, name), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def state(name):
+    return os.path.join(DIR, name)
+
+
+def start_pane(ws, name, agent):
+    """Start the pane for real, detached, in the environment `workspace create` was given."""
+    env = {}
+    try:
+        with open(state("pane.env.%s" % ws)) as f:
+            for line in f:
+                key, _, value = line.rstrip("\n").partition("=")
+                if key:
+                    env[key] = value
+    except OSError:
+        pass
+    try:
+        with open(state("cwd.%s" % ws)) as f:
+            cwd = f.read().strip()
+    except OSError:
+        cwd = os.getcwd()
+    # PATH must survive so the pane can find zsh and the fake agent; everything else is exactly
+    # what the launcher chose to hand this pane, and nothing more.
+    env.setdefault("PATH", os.environ.get("PATH", ""))
+    env.setdefault("HOME", os.environ.get("HOME", ""))
+    for carry in ("SIM_SCENARIO_DIR", "SIM_STOP", "GH_FIXTURES", "GH_GIT_REPO",
+                  "FAKE_CMUX_DIR", "SL_CMUX", "TMPDIR"):
+        if carry in os.environ:
+            env.setdefault(carry, os.environ[carry])
+    logfile = open(state("pane-%s.log" % name), "ab")
+    if shutil.which("zsh") and SHIM and not os.environ.get("FAKE_HOST_NO_ZSH"):
+        # The REAL pane: a zsh that sources the REAL shim, which arms the agent verb, which hands
+        # off to start-session.sh. This is the whole chain and it is what runs on the fleet.
+        argv = ["zsh", "-c", "source %s; %s" % (json.dumps(SHIM), agent)]
+    else:
+        # No zsh (CI runs on Linux): EMULATE the handoff's net effect — run start-session.sh with
+        # the lane id, which is exactly what the armed function does. The shim itself is covered by
+        # tests/test_launch_shim.py and tests/test_launch_delivery.py, both of which skip without
+        # zsh; what this harness is for is the RUNNER's behaviour around a session, and that must
+        # not silently stop being tested on the platform CI uses. (The cmux fake this replaces made
+        # the same choice for the same reason — it re-implemented the shim's contract in bash.)
+        # NOT `exec`, for the same reason the real shim is not (shell/launch-shim.zsh): the pane
+        # process must PERSIST with start-session.sh as its live child. The wrapper's post-spawn
+        # confirmation is a process fact — the pane shell must have a live child — and an exec'd
+        # pane IS start-session.sh, whose own children (the gh probe, then the agent) are
+        # transient. On a loaded runner the confirmation window can land entirely in a gap between
+        # them, and the launch is refused as hollow: a flaky red that says "no worker started"
+        # about a worker that started fine.
+        argv = ["sh", "-c", '"$1" "$2"', "sh",
+                env.get("SL_START_SESSION", ""), env.get("SL_ISSUE_ID", "")]
+    proc = subprocess.Popen(
+        argv, env=env, cwd=cwd, stdout=logfile, stderr=logfile, stdin=subprocess.DEVNULL,
+        start_new_session=True)
+    return proc.pid
+
+
+def main():
+    args = sys.argv[1:]
+    if not DIR:
+        sys.stderr.write("fake-sessionhost: FAKE_HOST_DIR is required\n")
+        return 2
+    os.makedirs(DIR, exist_ok=True)
+    log("calls.jsonl", args)
+    group = args[0] if args else ""
+    verb = args[1] if len(args) > 1 else ""
+    rest = args[2:]
+
+    if (group, verb) == ("workspace", "create"):
+        ws = allocate()
+        # Record the pane environment EXACTLY as argv carried it — this is where the fence's token
+        # wiring is decided, and where a simulation can see what a pane was (and was not) handed.
+        with open(state("pane.env.%s" % ws), "w") as f:
+            i = 0
+            while i < len(rest):
+                if rest[i] == "--env" and i + 1 < len(rest):
+                    f.write(rest[i + 1] + "\n")
+                    i += 2
+                    continue
+                i += 1
+        with open(state("cwd.%s" % ws), "w") as f:
+            f.write(opt(rest, "--cwd") or "")
+        open(state("live.%s" % ws), "w").close()
+        emit({"type": "workspace_created",
+              "workspace": {"workspace_id": ws},
+              "tab": {"tab_id": "%s:t1" % ws},
+              "root_pane": {"pane_id": pane_of(ws)}})
+
+    if (group, verb) == ("agent", "start"):
+        name = rest[0] if rest else "?"
+        kind = opt(rest, "--kind") or "claude"
+        ws = ws_of(opt(rest, "--pane") or "w1:p1")
+        log("agents.jsonl", {"name": name, "kind": kind, "mode": MODE, "workspace": ws})
+        if MODE == "deliver":
+            pid = start_pane(ws, name, kind)
+        else:
+            # A pid that is ALIVE and CHILDLESS: the pane is a bare shell. The phantom.
+            # EVERY standard stream is detached. A child that inherits this process's stdout keeps
+            # the pipe open after we exit, and the wrapper — which reads the CLI's output — then
+            # blocks until its own call timeout: a 65-second "the agent did not start" that names
+            # a timeout instead of the phantom. (Caught by the simulation, and worth knowing: it is
+            # what a real host binary leaking a child would do to a launch.)
+            pid = subprocess.Popen(["sleep", "120"], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True).pid
+        with open(state("pid.%s" % ws), "w") as f:
+            f.write(str(pid))
+        with open(state("agent.%s" % name), "w") as f:
+            f.write(ws)
+        emit({"type": "agent_started",
+              "agent": {"name": name, "pane_id": pane_of(ws), "agent_status": "idle"}})
+
+    if (group, verb) == ("agent", "get"):
+        try:
+            with open(state("agent.%s" % (rest[0] if rest else ""))) as f:
+                ws = f.read().strip()
+        except OSError:
+            fail("agent_not_found", "no such agent")
+        if not os.path.exists(state("live.%s" % ws)):
+            fail("agent_not_found", "no such agent")     # names clear when the agent goes
+        emit({"type": "agent", "agent": {"pane_id": pane_of(ws), "agent_status": "idle"}})
+
+    if (group, verb) == ("pane", "process-info"):
+        ws = ws_of(opt(rest, "--pane") or "")
+        try:
+            with open(state("pid.%s" % ws)) as f:
+                pid = int(f.read().strip())
+        except (OSError, ValueError):
+            fail("pane_not_found", "no pane")
+        emit({"type": "process_info", "process_info": {"shell_pid": pid}})
+
+    if (group, verb) == ("workspace", "close"):
+        ws = rest[0] if rest else ""
+        log("closed.jsonl", {"workspace": ws})
+        try:
+            os.remove(state("live.%s" % ws))
+        except OSError:
+            pass
+        # Kill THIS workspace's own pane process GROUP — by the pid this fake recorded when it
+        # started it, never by name or pattern (the house rule), and never another workspace's.
+        try:
+            with open(state("pid.%s" % ws)) as f:
+                os.killpg(int(f.read().strip()), 9)
+        except (OSError, ValueError):
+            pass
+        emit({"type": "workspace_closed"})
+
+    if (group, verb) == ("workspace", "get"):
+        ws = rest[0] if rest else ""
+        if not os.path.exists(state("live.%s" % ws)):
+            fail("workspace_not_found", "no such workspace")
+        emit({"type": "workspace", "workspace": {"workspace_id": ws}})
+
+    fail("unsupported", "fake-sessionhost: %s %s" % (group, verb))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

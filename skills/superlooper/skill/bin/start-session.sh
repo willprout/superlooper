@@ -4,7 +4,7 @@
 # auto-closes a lane's window after a SUCCESSFUL merge — owner ruling 2026-07-16 / #168, config
 # auto_close_merged_windows — and never while a parked/needs-william/bounced session is still live;
 # see runner.py _teardown_session / _reclaim_terminal_worktrees.)
-# SL_ISSUE_ID + SL_RUN_ROOT arrive in the environment (set by launch-session.sh's --command prefix);
+# SL_ISSUE_ID + SL_RUN_ROOT arrive in the environment (named by lib/launch.py's pane_environment);
 # re-export them so agent hook children inherit them.
 #
 # <id> is the loop id: i<N> for an issue worker, d<N> for a debugger (both share this launcher and
@@ -14,6 +14,15 @@ ID="${1:?usage: start-session.sh <id>}"
 : "${SL_RUN_ROOT:?}"
 export SL_ISSUE_ID="$ID"
 export SL_RUN_ROOT
+# DISARM the pane's launch handoff (issue #308). shell/launch-shim.zsh arms a one-shot function
+# named after the agent verb whenever it sees SL_ISSUE_ID + SL_RUN_ROOT + SL_START_SESSION, which
+# is how the host's typed `claude` reaches this script at all. The first two must SURVIVE (hooks
+# and the agent's own children read them); this one must not, or a nested shell inside the live
+# session — a worker typing `zsh`, a hook that spawns one — would re-arm the handoff and its next
+# `claude` would start a SECOND worker in this lane instead of the binary it asked for. The worker
+# singleton below would refuse that second worker, but silently and one step too late: it would
+# also have stamped no sentinel, which reads as a launch that never delivered.
+unset SL_START_SESSION
 mkdir -p "$SL_RUN_ROOT/state/started" "$SL_RUN_ROOT/state/exited" "$SL_RUN_ROOT/state/launch_stderr"
 
 write_exited() {  # the deterministic process-gone signal the runner recovers from (RC-DEADPANE)
@@ -29,7 +38,7 @@ write_exited() {  # the deterministic process-gone signal the runner recovers fr
 # empty pid, call it stale, and double-acquire — codex verify P1-a). `ln` fails if the lock exists,
 # so it is the exclusive primitive; the pid gives liveness (a dead holder is reclaimed). A duplicate
 # that finds a LIVE holder exits 0 (idempotent) WITHOUT stamping the start sentinel, so
-# launch-session.sh does not mistake this tab for the real worker — it times out and closes it.
+# the launcher does not mistake this pane for the real worker — it times out and tears it down.
 WLOCK="$SL_RUN_ROOT/state/worker.$ID.lock"
 acquire_worker() {
   local tries=0 opid tmp
@@ -76,7 +85,7 @@ trap release_worker EXIT                     # free the slot when THIS worker tr
 # script runs. A launcher that scrubbed its own environment would prove nothing about the one the
 # worker actually gets. Same reason the gh-auth assert lives here (#299), one step earlier in the
 # chain. Above the agent branch, so claude and codex are covered by construction, and shared by
-# `launch-session.sh --cwd d<N>`, so both spawn paths are the same code rather than two copies.
+# the launcher's `--cwd d<N>` mode, so both spawn paths are the same code rather than two copies.
 #
 # DENYLIST, never an aggressive allowlist. c25's documented landmine is that overriding HOME breaks
 # macOS keychain OAuth and kills the standalone story outright; PATH, HOME and the keychain context
@@ -120,7 +129,7 @@ unset _sl_n
 # death it produces (XDG_CONFIG_HOME is exactly how gh dies), so probing first would park the issue
 # under a memo telling the owner to re-login — a confidently wrong remedy for an environment fault.
 # It is also network-free, so it costs a healthy launch nothing.
-ENV_DEAD_RC=6                                # launch-session.sh + evidence.py read this same code
+ENV_DEAD_RC=6                                # lib/launch.py + evidence.py read this same code
 TOKEN="${SL_START_TOKEN:-$ID}"               # per-launch key, shared with the auth marker below
 refuse_env() {                               # loud, torn down, and NAMED — never a live poisoned session
   local why="$1"
@@ -173,14 +182,14 @@ fi
 # a real credential fault, not an environment one wearing its costume.
 GH="${SL_GH:-gh}"
 EXPECT_LOGIN="${SL_EXPECT_GH_LOGIN:-}"       # TOKEN was resolved by the env floor above (same key)
-AUTH_DEAD_RC=4                               # launch-session.sh + evidence.py read this same code
+AUTH_DEAD_RC=4                               # lib/launch.py + evidence.py read this same code
 # BOUNDED, and the bound matters MORE here than on the launcher side. `gh` has no default request
 # timeout, so an unreachable network can hang this read for tens of seconds — and the launcher is
 # meanwhile counting down its 30s delivery-verify window. Overrun it and the launcher exits rc=2
 # (`shim_not_fired`, a CHANNEL fault) and the memo blames the launch shim: the exact mis-blame the
 # auth marker was added to prevent, reached through the SLOW path instead of the dead one. Two
 # attempts at this bound stay comfortably inside the window.
-# Deliberately duplicated from launch-session.sh rather than sourced: this script runs in a fresh
+# Deliberately duplicated from the launcher rather than sourced: this script runs in a fresh
 # tab shell that inherits nothing and knows no engine paths, so a sourced helper would add a
 # failure mode exactly where the stack is least able to report one.
 GH_PROBE_SECONDS="${SL_GH_PROBE_SECONDS:-8}"
@@ -225,7 +234,7 @@ refuse_auth() {                              # loud, torn down, and NAMED — ne
   exit "$AUTH_DEAD_RC"
 }
 if [ -z "$EXPECT_LOGIN" ]; then
-  # launch-session.sh ALWAYS names the expectation in the dropped command. If it ever stops, there
+  # the launcher ALWAYS names the expectation in the pane environment. If it ever stops, there
   # is nothing to assert against — and a floor that silently disables itself when its input goes
   # missing is not a floor. Fail closed rather than degrade to "some gh answered".
   refuse_auth "no expected gh login was handed to this session (SL_EXPECT_GH_LOGIN empty) — the launcher must name it, so refusing rather than starting a session whose identity cannot be checked"
@@ -248,7 +257,7 @@ fi
 
 # DELIVERY PROOF (RC-LAUNCHVERIFY — the run-20260625-1857 overnight killer). Now that we hold the
 # worker lock and are about to start Claude, stamp the PER-LAUNCH start marker. Its NAME carries the
-# launch token (this tab's surface UUID, passed by launch-session.sh), so it is unique to THIS launch
+# launch token (minted per launch by lib/launch.py), so it is unique to THIS launch
 # — concurrent or stale launches use different filenames and cannot stomp each other's proof (codex
 # verify P1-b: a single shared state/started/<id> let an overlapping launch's hygiene delete the
 # proof and the real launch then close its OWN worker tab). Stamped before the brief check so
@@ -277,7 +286,7 @@ truthy() {
 # lane's original brief survives untouched for any later cold relaunch (#298; the runner's
 # crash-recovery path re-launches without rebuilding the brief, and would otherwise hand a
 # brand-new session a "you were interrupted" preamble and no work instruction). Selection must
-# match launch-session.sh's, which makes the same choice for its existence check — including
+# match the launcher's, which makes the same choice for its existence check — including
 # FAILING CLOSED: this check runs in the new tab up to 30s after the launcher's, so a preamble
 # that disappeared in between must abort, never silently become the lane's original brief
 # delivered as a new instruction into a conversation that already built it.
@@ -302,7 +311,7 @@ MODEL="${SL_MODEL:-}"
 EFFORT="${SL_EFFORT:-}"
 AGENT="${SL_AGENT:-claude}"
 # ---- SESSION IDENTITY (issue #298) ----
-# The per-flight conversation id, MINTED BY THE RUNNER at spawn (launch-session.sh) and handed down
+# The per-flight conversation id, MINTED BY THE RUNNER at spawn (lib/launch.py) and handed down
 # here — identity ASSIGNED, never self-asserted (claim c3). Two spellings, one id:
 #   SL_RESUME empty -> `--session-id <id>`: pre-assign the id this brand-new conversation will own.
 #   SL_RESUME truthy -> `--resume <id>`:    re-enter that SAME conversation after an interruption.
@@ -365,7 +374,7 @@ case "$AGENT" in
     # BOTH ladders and compares, so the duplication cannot silently drift.
     #   1. SL_CLAUDE — an explicit operator pin, read from THIS session's own environment (a shell
     #      rc file or a LaunchAgent), never threaded through the launcher: `claude` is an
-    #      agent-specific name and launch-session.sh is the agent-AGNOSTIC half of the stack.
+    #      agent-specific name and the launcher is the agent-AGNOSTIC half of the stack.
     #   2. $HOME/.local/bin/claude — Claude Code's standalone native install (a symlink into
     #      ~/.local/share/claude/versions/<v>, re-pointed across upgrades by `claude install`).
     #      This is the DEFAULT pin, and it is cmux-independent by construction: no PATH entry takes

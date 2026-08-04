@@ -3,7 +3,7 @@
 disk markers, events.py), DECIDES (actions.decide — one pure function, the only brain), and
 ACTS (this file's executors, all thin I/O over the Task-6/9 machinery). No model call exists
 anywhere in this process — LLM judgment is hired per-event as VISIBLE interactive sessions
-through launch-session.sh, and the runner never waits on judgment to act safely.
+through lib/launch.py, and the runner never waits on judgment to act safely.
 
 Failure posture (the nobody-responds-for-8-hours standard, EVENT-MODEL.md):
   * a tick NEVER raises: every helper fails closed to an empty/error shape, every executor is
@@ -42,6 +42,7 @@ import journal
 import loopstate
 import published_view
 import runner_home
+import session_host
 import tidy
 import usage as usage_mod
 import worker_hook
@@ -108,10 +109,20 @@ JOURNAL_ROTATE_SECONDS = 6 * 3600   # how often to archive the journal's stale t
                                     # then at most every 6h — cheap, and read()/status stay bounded
 MAX_POLL_CALLS = 30            # budget cap per poll cycle (poll_ship discipline): the tail of
                                # an oversized fetch list simply waits for the next cycle
-LAUNCH_TIMEOUT = 120           # launch-session.sh verifies delivery within ~30s; be generous
-# launch-session.sh's DISTINCT exit code for "the worktree base branch origin/<dev_branch> does not
+# THE launcher — the single spawn path (issue #308). The runner, the watchdog, the dashboard
+# Fixer and `superlooper resume` all drive this one program, so the exit-code contract evidence.py
+# reads has exactly one author. It is named here rather than spelled at each of the three call
+# sites below for the reason the whole issue exists: three copies of a spawn path is how the
+# watchdog and Fixer get left behind calling a launcher that no longer exists.
+LAUNCHER = "launch-session.py"
+# How long ONE session-host control call may hang when the RUNNER makes it. Deliberately far below
+# the doorway's own default: the runner's teardown sweeps run every tick over every lane, so the
+# bound that matters is the tick's, not one call's.
+SESSION_CALL_SECONDS = 5
+LAUNCH_TIMEOUT = 120           # the launcher verifies delivery within ~30s; be generous
+# The launcher's DISTINCT exit code for "the worktree base branch origin/<dev_branch> does not
 # exist" (issue #28) — a per-repo config fault, kept out of the systemic-anchor streak so the park
-# memo can name the branch instead of the launch shim. Must match launch-session.sh's `exit 3`.
+# memo can name the branch instead of the launch machinery. Must match lib/launch.BASE_MISSING.
 LAUNCH_BASE_MISSING_RC = 3
 NUDGE_TIMEOUT = 60
 # The exit interview's wake ping (issue #215). On Claude the interview PAYLOAD rides the mailbox
@@ -157,7 +168,6 @@ class Outcome(str):
         o.evidence = evidence_rec
         return o
 RECHECK_TIMEOUT = 600
-CLOSE_TIMEOUT = 15             # bound the best-effort close of a stale session's pane (D4)
 # (#149) After the pane close, how long teardown waits to OBSERVE the worker CLI actually go before
 # it will prune the worktree. A closed surface does not mean a dead process: the CLI unwinds on its
 # own clock, and its start-session.sh holds worker.<id>.lock until it truly exits. Bounded because a
@@ -464,10 +474,10 @@ def display_asleep(run=None):
     None = unreadable (issue #124). Read-only, bounded, injectable for tests. Fail-open lives in the
     CALLER: decide holds launches only on an explicit True, so None/False both launch normally.
 
-    WHY this exists: macOS does NOT schedule a fresh cmux tab's shell to boot while the display
-    sleeps (the live 2026-07-13 launch killer). launch-session.sh drops the worker command in a file
-    the tab's ~/.zshrc shim runs (keystroke-free, RC6), but that shim never runs because the shell
-    itself is not scheduled — so the 30s delivery sentinel expires and the tab is closed as an orphan
+    WHY this exists: macOS does NOT schedule a fresh tab's shell to boot while the display sleeps
+    (the live 2026-07-13 launch killer). The launch reaches the session through that shell — under
+    cmux a dropped command it picked up, and now the ~/.zshrc shim's agent-verb handoff — but the
+    shell itself is never scheduled, so the delivery sentinel expires and the pane is torn down
     (exit 2): a burned launch attempt, a systemic-streak entry (#24), and an alert, every sleeping
     episode. #115's canary makes THAT self-recover, but the cleaner fix is to not ATTEMPT delivery
     into a sleeping display at all. The runner calls this once per tick (only when there is launch
@@ -1913,8 +1923,8 @@ class Runner:
             # D14 prune-under-a-live-CLI shape. It also clears the lane's stale pane markers, which
             # a bare worktree_remove left behind to outlive their session (D9).
             # exit_timeout=0: this loop is unbounded in N and runs every tick, so it does not add a
-            # per-lane WAIT on top of the close it already pays (that close is bounded by
-            # CLOSE_TIMEOUT and is a fast no-op on an already-dead surface). Disk hygiene has no
+            # per-lane WAIT on top of the close it already pays (the doorway bounds its own calls,
+            # and a session that is already gone is a fast no-op). Disk hygiene has no
             # deadline — a lane whose CLI is still unwinding is reclaimed on the next sweep, by
             # which time the pane close issued here has landed.
             # guard_worktree=True (#190): these park-family lanes are NOT merged, so their worktree
@@ -2141,7 +2151,7 @@ class Runner:
                 # something a launch inherits from the shell the runner happens to live in.
                 "SL_RESUME_SESSION_ID": "",
                 # PINNED EMPTY for the same inheritance reason (#299), and it matters because this
-                # env is merged over os.environ: launch-session.sh NAMES SL_EXPECT_GH_LOGIN in every
+                # env is merged over os.environ: the launcher NAMES SL_EXPECT_GH_LOGIN in every
                 # worker command, so a runner started from inside a worker or debugger pane would
                 # inherit that session's value and SKIP its own identity read — accepting a stale,
                 # second-hand answer as proof of who this machine is. The launcher must resolve the
@@ -2433,15 +2443,58 @@ class Runner:
         journal.append(self.home, {"act": "merged_close_declined", "id": iid, "pid": pid})
 
     def _close_pane(self, iid):
-        """Close the id's recorded surface. Best-effort; rc ignored (a dead surface = a no-op)."""
-        surface = self._surface(iid)
-        if not surface:
+        """End the id's recorded session, through the doorway. Best-effort: a session that is
+        already gone is a no-op, exactly as it was when this closed a cmux surface.
+
+        It had to move with the spawn (issue #308), and the simulation is what proved it: the
+        handles this reads — ``state/panes/<id>`` and its ``.ws`` — are written by the launcher, so
+        after the spawn moved they name the session HOST's workspace and pane. Left on cmux, this
+        asked cmux about identifiers cmux never issued: it no-opped silently, the finished-but-alive
+        prior session kept ``worker.<id>.lock``, and the D4 relaunch could not take the singleton —
+        its start-session exits 0 without stamping a sentinel, so the launch reads as never
+        delivered and the lane false-parks. That is the same landmine this issue exists for, one
+        verb along.
+
+        ``exit`` first, then ``kill``: the doorway's ``exit`` is a positive allowlist that closes
+        only a session it can NAME as finished, and the case this is most often called for — a
+        worker that wrote its report and is idling at the prompt — reads ALIVE. Escalating is what
+        `close-surface` did unconditionally, so this preserves the behaviour rather than quietly
+        becoming gentler; the callers that must NOT end a live session gate on that themselves
+        (#168), before they ever reach here.
+        """
+        pane = self._surface(iid)
+        workspace = (_read(os.path.join(self.state, "panes", f"{iid}.ws")) or "").strip()
+        if not workspace:
+            # Without a workspace the doorway has nothing to close, and it refuses rather than
+            # guess — which is right: closing "whatever is at that pane" is how a stale handle
+            # ends someone else's window.
             return
-        ws = (_read(os.path.join(self.state, "panes", f"{iid}.ws")) or "").strip()
-        args = [os.environ.get("SL_CMUX", _CMUX_DEFAULT), "close-surface", "--surface", surface]
-        if ws:
-            args += ["--workspace", ws]
-        self._run_script(args, timeout=CLOSE_TIMEOUT)
+        session = session_host.Session(name=iid, workspace=workspace, pane=pane or None,
+                                       owned=True)
+        host = self._session_host()
+        try:
+            host.exit(session)
+        except session_host.TeardownRefused:
+            try:
+                host.kill(session)
+            except session_host.HostError as e:
+                self._log(f"[{iid}] could not end the recorded session: {e}")
+        except session_host.HostError as e:
+            self._log(f"[{iid}] could not end the recorded session: {e}")
+
+    def _session_host(self):                                         # injectable, like _run_script
+        """The doorway, BOUNDED for the runner's own deadlines.
+
+        `_close_pane` is best-effort and is reached from sweeps that run every tick over every
+        eligible lane (`_reclaim_terminal_worktrees`, `_drain_pending_teardowns`). A teardown makes
+        several control calls, so against a host that is present but wedged the doorway's own
+        20s-per-call default would cost a couple of minutes PER LANE and stall the tick — which is
+        how the cmux path's `CLOSE_TIMEOUT` was chosen, and the bound this replaces. A close that
+        cannot be verified inside it raises, and the caller treats that as "not verified" — which
+        is the safe direction: nothing is pruned on an unverified teardown.
+        """
+        return session_host.SessionHost(call_seconds=SESSION_CALL_SECONDS,
+                                        teardown_reads=2, teardown_pause=0.5)
 
     def _teardown_session(self, iid, remove_worktree=False, exit_timeout=None, guard_worktree=False,
                           await_exit=None):
@@ -2840,7 +2893,7 @@ class Runner:
         # D4: free any prior (finished-but-alive) session for this id before relaunching, so its
         # still-held worker singleton lock can't block this launch's delivery. No-op on a first launch.
         self._close_stale_session(iid)
-        rc = self._run_script([self._script("launch-session.sh"), iid],
+        rc = self._run_script([self._script(LAUNCHER), iid],
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             gh.set_labels(num, add=["in-progress"], remove=["agent-ready"])
@@ -3116,7 +3169,7 @@ class Runner:
         return "ok"
 
     # Per-issue attempt counters a fresh approval zeroes. `launches` MUST be reset alongside
-    # `retries`: launch-session.sh recomputes `retries = launches - 1` on every verified delivery,
+    # `retries`: the launcher recomputes `retries = launches - 1` on every verified delivery,
     # so leaving `launches` at its old value would silently restore `retries` on the next launch
     # and re-park the issue at the retry cap. `conflicts` is reset too so re-approval is a clean
     # slate on every ladder, not just the launch one. `merge_refusals`
@@ -3139,13 +3192,13 @@ class Runner:
         artifact FIRST (a leftover report would re-gate, an `exited` marker would `recover` and
         double-launch, a `blocked` marker would re-enter the question flow, a `recheck_failed`
         field would re-park immediately). Then zero the attempt counters (`launches` MUST reset —
-        launch-session.sh derives `retries = launches - 1`, so a non-zero launches would restore
+        the launcher derives `retries = launches - 1`, so a non-zero launches would restore
         the retry count and re-park at cap) and re-release to `ready`. The old counters are
         JOURNALED (never lost — the honest record of what the issue already cost). actions.decide
         holds the launch back one tick so it fires against the reset state.
 
         (#177) And the rebuild gets a genuinely FRESH BRANCH. This reset used to clear everything
-        EXCEPT `branch` — so _launch_branch preferred the stale stamp and launch-session.sh's
+        EXCEPT `branch` — so _launch_branch preferred the stale stamp and the launcher's
         fallback re-ATTACHED the existing branch: the "clean slate" resumed on the parked episode's
         commits, pr_for_branch rediscovered its still-open PR, and `gh pr create` would refuse a
         second PR on the same head (no force path exists anywhere by design). That made the
@@ -3159,13 +3212,13 @@ class Runner:
         meta = {}                                  # pre-reset facts the gh bookkeeping below needs
         # 1. local hygiene FIRST (mirrors _exec_regenerate): stale artifacts must be unable to
         #    drive decide() before the fresh launch. Best-effort — no-ops when nothing is there;
-        #    launch-session.sh recreates the worktree.
+        #    the launcher recreates the worktree.
         #    (#149) This USED to prune the worktree outright and leave the pane/lock for the launch
         #    to clean up later — i.e. it unlinked the cwd of a session that was, by this function's
         #    own D4 reasoning, quite possibly still alive: the D14 sequence verbatim. The ordered
         #    teardown closes that session and sees it go first.
         #    A declined prune ABORTS the re-approval, touching no state (same reason as
-        #    _exec_regenerate): launch-session.sh reuses a surviving worktree rather than failing,
+        #    _exec_regenerate): the launcher reuses a surviving worktree rather than failing,
         #    so a fresh start would silently inherit the parked run's stale checkout — the opposite
         #    of the clean slate this executor promises. decide re-emits while `agent-ready` stands.
         #    (#169) The deferral is COUNTED. It is right to abort, but a stale lock naming a reused
@@ -3182,7 +3235,7 @@ class Runner:
         # episode's fresh session would consume the stale ask at its first rest and could post
         # NO-FINDINGS before re-investigating anything, closing the re-run without its own
         # interview. Pending mail only: the .consumed/.claimed/.discarded receipts are the
-        # history of what was actually delivered and stay (launch-session.sh's own rule).
+        # history of what was actually delivered and stay (the launcher's own rule).
         for sub in ("blocked", "exited", "awaiting", "started", "mail", "ack"):
             _rm(os.path.join(self.state, sub, iid))
         # 2. durable state: zero the attempt counters and clear the stale run/gate fields that
@@ -3195,7 +3248,7 @@ class Runner:
             # _launch_branch mint the clean base name.
             #
             # A stamp does NOT prove the branch exists (_exec_launch stamps it BEFORE invoking
-            # launch-session.sh, so a lane parked on the launch-delivery ladder carries a name that
+            # the launcher, so a lane parked on the launch-delivery ladder carries a name that
             # was never created). Rotating anyway is the fail-safe direction: the alternative —
             # probing whether the branch exists — answers "no" for a branch that survives only on the
             # REMOTE, which is precisely the case whose push this issue exists to stop refusing. The
@@ -3422,7 +3475,7 @@ class Runner:
             # journal — decide dedups on this stamp, so a genuinely new hold whose reason still
             # matched it never spoke.
             self._update_issue(iid, {"launch_hold_reason": None})
-            rc = self._run_script([self._script("launch-session.sh"), iid],
+            rc = self._run_script([self._script(LAUNCHER), iid],
                                   env=self._worker_env(iid),
                                   timeout=LAUNCH_TIMEOUT)
             if rc == 0:
@@ -4012,7 +4065,7 @@ class Runner:
         #    (#149) Ordered: the superseded session is closed and observed gone before its worktree
         #    is pruned — this path used to unlink the cwd of a session it knew might still be live
         #    (D4), which is the D14 stamp-killer.
-        #    A declined prune must ABORT the regenerate, touching no state: launch-session.sh only
+        #    A declined prune must ABORT the regenerate, touching no state: the launcher only
         #    creates the worktree `if [ ! -d "$WT" ]`, so relaunching over a surviving stale
         #    worktree does not fail — it SILENTLY reuses it, and the rebuild would run on the OLD
         #    conflicted branch while its brief names the new one, pushing commits onto a superseded
@@ -4089,7 +4142,7 @@ class Runner:
         # The eligibility-hold episode ended when start_ok passed, not when this launch lands — clear
         # the stamp before the attempt, as _exec_launch/_exec_recover do (review P2-2, #150).
         self._update_issue(iid, {"launch_hold_reason": None})
-        rc = self._run_script([self._script("launch-session.sh"), iid],
+        rc = self._run_script([self._script(LAUNCHER), iid],
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,

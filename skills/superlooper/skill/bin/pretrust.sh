@@ -26,7 +26,7 @@ CONF="$HOME/.claude.json"
 [ -f "$CONF" ] || echo '{}' > "$CONF"
 
 # Serialize the read-modify-write against CONCURRENT superlooper launches (RC-DEADFEATURES): two
-# launch-session.sh runs editing ~/.claude.json at once would lost-update each other's trust
+# launches editing ~/.claude.json at once would lost-update each other's trust
 # entries. flock on a sibling lockfile makes the whole check-and-write a critical section.
 # (Best-effort vs Claude Code's OWN writes to the same file — a different process that may not honor
 # the lock — but the realistic loop-vs-loop race is the one this closes.)
