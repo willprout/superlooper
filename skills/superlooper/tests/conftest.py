@@ -80,6 +80,12 @@ def _clear_worker_launch_env(monkeypatch):
         # Same shape: the per-launch delivery token is ambient in a worker pane, and a launcher
         # test that inherited it would stamp its sentinel under a token it did not mint.
         "SL_START_TOKEN",
+        # The session-host binary override (issue #304). Same shape as SL_GH/SL_CLAUDE one line up,
+        # with a sharper blast radius: the wrapper's verbs SPAWN, PROMPT and CLOSE sessions, so a
+        # test that reached a real host binary would not just read the owner's fleet — it could
+        # drive it. Scrubbed here so _never_reach_real_session_host below can set the fail-closed
+        # default.
+        "SL_HERDR",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -141,6 +147,20 @@ def _never_reach_real_claude(monkeypatch, _clear_worker_launch_env):
     # _never_reach_real_gh's: scrub an ambient value first, then neutralize.
     if not os.environ.get("SL_CLAUDE"):
         monkeypatch.setenv("SL_CLAUDE", "/nonexistent/superlooper-test-claude")
+
+
+@pytest.fixture(autouse=True)
+def _never_reach_real_session_host(monkeypatch, _clear_worker_launch_env):
+    # Same ratchet as _never_reach_real_cmux / _never_reach_real_gh / _never_reach_real_claude, for
+    # the session host (issue #304). lib/session_host.py resolves its binary through SL_HERDR and
+    # falls back to the bare name on PATH — and on the fleet machine that is a real binary talking
+    # to a real server over a socket. Unlike the read-only probes above, this one's verbs CREATE and
+    # CLOSE sessions: a test that forgot to inject a probe could tear down the owner's own window.
+    # Point the default at a guaranteed-absent path so a missed injection fails loudly (rc 127)
+    # instead of driving the live fleet. The ordering dependency on _clear_worker_launch_env is the
+    # same as the others': scrub an ambient value first, then neutralize.
+    if not os.environ.get("SL_HERDR"):
+        monkeypatch.setenv("SL_HERDR", "/nonexistent/superlooper-test-herdr")
 
 
 @pytest.fixture(autouse=True)

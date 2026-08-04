@@ -24,6 +24,12 @@ Pure and side-effect free — no git, no gh, no cmux. The CALLER reads the facts
 
 _UNKNOWN = "unknown (could not be read at revive time — check it yourself before relying on it)"
 
+# The preamble's own first line, named so a caller can RECOGNISE it rather than re-spell it. The
+# five-verb wrapper (lib/session_host.py) refuses a revived send whose text does not carry this,
+# and pinning the check to this constant is what stops the two from drifting apart: change the
+# heading here and the check follows, instead of silently passing every revive.
+HEADING = "# Re-orientation — you were interrupted and have just been resumed"
+
 
 def _pr_line(facts):
     """One honest sentence about the PR. A REFUSED lookup must never read as "there is no PR":
@@ -68,7 +74,7 @@ def render(facts):
     head = facts.get("head")
     head_txt = ("`%s`" % head[:12]) if head else _UNKNOWN
     lines = [
-        "# Re-orientation — you were interrupted and have just been resumed",
+        HEADING,
         "",
         # Agent-neutral by construction: naming a specific CLI's flag would put an agent-specific
         # fact in a lib module, which the agent-boundary rule reserves for the launcher.
