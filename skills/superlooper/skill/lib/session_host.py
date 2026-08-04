@@ -63,6 +63,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -85,6 +86,36 @@ ADVISORY_STATES = ("idle", "working", "blocked", "done", "unknown")
 # proof the workspace went (see _workspace_gone). Its errors are spelled `<thing>_not_found`; the
 # published schema types the envelope but does not enumerate the codes, so this is the assertion.
 _GONE_CODES = re.compile(r"not[_ ]?found|no[_ ]?such|does[_ ]?not[_ ]?exist")
+
+# --------------------------------------------------------------------------- the fence (#305)
+# Token auth on the host's control socket, carried as a patch against the pinned release
+# (vendor/herdr/). The patch is what ENFORCES it — inside the host process, where a worker cannot
+# argue with it. What lives here is the other half: who is handed the token.
+#
+# Why a token rather than scrubbing the environment: the socket path is deterministic AND injected
+# into every pane, the protocol is plain newline-JSON (so a worker needs no `herdr` binary to drive
+# the fleet), and the socket's 0600 bit excludes other UNIX USERS while a worker runs as the same
+# uid as the server. The env scrub below is the second layer, never the fence.
+
+API_TOKEN_ENV_VAR = "HERDR_API_TOKEN"
+# Preferred where it can be arranged: a pane inherits the SERVER's environment, so a token that
+# lives only in a file was never in a position to be inherited out of one.
+API_TOKEN_FILE_ENV_VAR = "HERDR_API_TOKEN_FILE"
+
+# The launcher's own mode guard, spelled the same way here on purpose (launch-session.sh refuses
+# `--cwd` for anything but `^d[0-9]+$`). Repair sessions must be able to drive herdr — revive, kill
+# and read panes — so they RECEIVE the token; workers never do.
+_DEBUGGER_RE = re.compile(r"^d[0-9]+$")
+
+# Every variable the host uses to tell a pane where its control surface is. Stripped from what we
+# forward for a worker spawn. Note what this does NOT do: the host injects its own pane-identity
+# vars (HERDR_ENV, HERDR_PANE_ID, HERDR_SOCKET_PATH) whatever we pass — verified end-to-end — which
+# is precisely why the token, and not this, is the fence.
+_HOST_ENV_PREFIX = "HERDR"
+
+# What a tokenless probe of the socket found. FENCED is the only good answer; OPEN is the dangerous
+# one, because an unfenced socket does not look broken from the runner's seat — it answers.
+FENCED, OPEN, UNREACHABLE = "fenced", "open", "unreachable"
 
 _DEFAULT_BINARY = "herdr"
 _CALL_SECONDS = 20                 # a control call that hangs is a dead host, not a slow one
@@ -401,6 +432,102 @@ def _name_of(session):
     return session.name if isinstance(session, Session) else session
 
 
+# --------------------------------------------------------------------------- the fence
+
+def receives_token(name):
+    """Is this session one that is GIVEN the control-socket token? (issue #305)
+
+    The NAME decides, and nothing else does. There is deliberately no parameter anywhere in this
+    module that grants the token, because "the ``i<N>`` spawn path provably never gets it" has to
+    be a property of the code's shape rather than of every caller's care — a flag that can be
+    passed is a flag that will one day be passed by the wrong call site.
+
+    Deny by default: only a real ``d<N>`` id is a repair session. Anything unrecognised is treated
+    as a worker, which is the direction a mistake here should fail in.
+
+    Holding the token is CAPABILITY, never PERMISSION — the D13 supervised/unattended rails still
+    govern what a ``d<N>`` session may actually do with it.
+    """
+    return bool(isinstance(name, str) and _DEBUGGER_RE.match(name))
+
+
+def _token(env):
+    """The control-socket token this process holds, or None if the host is unfenced.
+
+    None is a legitimate, common answer: with no token configured the patch is inert and the host
+    is stock herdr. A spawn must still work in that world — a dev machine running an unpatched
+    host is a real case — so this never raises. If the fence IS up and this process somehow has no
+    token, nothing here needs to detect it: the very next call to the host comes back
+    ``unauthorized`` and the spawn fails loudly on its own.
+    """
+    path = env.get(API_TOKEN_FILE_ENV_VAR)
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                # rstrip newlines only: a trailing newline is how every editor ends a file, while
+                # a leading space would be a token character.
+                return handle.read().rstrip("\r\n") or None
+        except OSError:
+            # An unreadable token file is "no token", not a crash: see above — the host itself is
+            # the thing that refuses, and it will.
+            return None
+    return env.get(API_TOKEN_ENV_VAR) or None
+
+
+def fence_probe(socket_path, env=None, timeout=5.0, connect=None):
+    """Ask the host's socket the question a WORKER would ask, and report what came back.
+
+    This is the check that turns "the fence is up" from an assumption into an observation, and the
+    one a version bump re-runs (vendor/herdr/README.md). It presents NO token on purpose: a probe
+    that authenticated itself would report the fence up on a socket that is wide open to everyone
+    else.
+
+    Returns FENCED (refused — the good answer), OPEN (a tokenless caller was SERVED, i.e. there is
+    no fence), or UNREACHABLE. Silence is UNREACHABLE, never FENCED: absence of signal is UNKNOWN
+    (c2), and a socket that accepts and then says nothing has proven nothing.
+    """
+    line = (connect or _speak)(socket_path, json.dumps(
+        {"id": "superlooper-fence-probe", "method": "ping", "params": {}}) + "\n", timeout)
+    if not line:
+        return UNREACHABLE
+    try:
+        reply = json.loads(line)
+    except (TypeError, ValueError):
+        return UNREACHABLE
+    error = reply.get("error") if isinstance(reply, dict) else None
+    if isinstance(error, dict) and error.get("code") == "unauthorized":
+        return FENCED
+    if isinstance(reply, dict) and reply.get("result"):
+        return OPEN
+    # Some other error: the host spoke but not about auth. That is not a fence, and it is not a
+    # served request either — refuse to call it either one.
+    return UNREACHABLE
+
+
+def _speak(socket_path, payload, timeout):
+    """One newline-JSON exchange over the control socket. The only place this module opens it.
+
+    No `herdr` binary is involved — which is the whole point of the fence: this is exactly what a
+    worker could do with ten lines of python and a path it already has.
+    """
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(socket_path)
+        client.sendall(payload.encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode(errors="replace").strip()
+    except (OSError, ValueError):
+        return ""
+    finally:
+        client.close()
+
+
 # --------------------------------------------------------------------------- the doorway
 
 class SessionHost:
@@ -434,7 +561,7 @@ class SessionHost:
         create = ["workspace", "create", "--cwd", str(cwd), "--no-focus"]
         if label:
             create += ["--label", str(label)]
-        for key, value in sorted((env or {}).items()):
+        for key, value in sorted(self._pane_env(name, env).items()):
             create += ["--env", "%s=%s" % (key, value)]
         reply = self._call(create)
         if not reply.ok:
@@ -665,6 +792,30 @@ class SessionHost:
                % (recorded, before.detail) if unattributed else ""))
 
     # ---- private -----------------------------------------------------------------------
+    def _pane_env(self, name, env):
+        """The environment this spawn asks the host to set on the new pane — the fence's own half
+        of the launch (#305).
+
+        Two rules, in this order, and the order is the whole design:
+
+        1. **Drop every ``HERDR_*`` the caller handed us.** Whatever a call site believes it is
+           doing, a worker's pane does not get host-control variables from us. This runs FIRST so
+           that a caller cannot smuggle the token in under its own name.
+        2. **Then, for a ``d<N>`` only, add the token.** After the scrub, so the value comes from
+           the token this process holds and never from caller-supplied data.
+
+        The scrub is defense in depth, not the fence: the host injects its own ``HERDR_ENV`` /
+        ``HERDR_PANE_ID`` / ``HERDR_SOCKET_PATH`` into every pane no matter what we pass here
+        (observed, not assumed — see reports/i305.md). A worker therefore still LEARNS where the
+        control socket is; what the carried patch takes away is its ability to be served by it.
+        """
+        out = {k: v for k, v in (env or {}).items() if not str(k).startswith(_HOST_ENV_PREFIX)}
+        if receives_token(name):
+            token = _token(self.env)
+            if token:
+                out[API_TOKEN_ENV_VAR] = token
+        return out
+
     def _call(self, args, timeout=None):
         argv = [self.binary] + [str(a) for a in args]
         return _parse(self._probe.run(argv, timeout=timeout or _CALL_SECONDS))
