@@ -29,6 +29,7 @@ protects. It also performs no cutover: standing the fleet server up on its own n
 the machine's existing sessions exactly where they were, which is what "fresh build-up beside
 untouched production" means mechanically.
 """
+import hashlib
 import json
 import os
 import re
@@ -146,6 +147,24 @@ def token_file(fleet_prefix):
     `launchctl print` requires knowing nothing.
     """
     return os.path.join(fleet_prefix, "token")
+
+
+def token_provenance_file(fleet_prefix):
+    """Sidecar recording that THIS build-up minted the token beside it.
+
+    The token file has no room for a marker — its whole content is the secret, and the server reads
+    it verbatim. So provenance lives next to it. Without this, `--install` would adopt any regular
+    file it found at the token path: a same-uid process that dropped a token of its own choosing
+    there before the first install would have the fence configured to accept a secret it already
+    knows, and every block would go green (fresh-agent review round 4). A fence whose secret someone
+    else chose is not a fence.
+    """
+    return os.path.join(fleet_prefix, "token.provenance")
+
+
+def token_provenance(token_text):
+    """What the sidecar holds for a given token: a digest, never the secret itself."""
+    return hashlib.sha256((token_text or "").encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def log_dir(fleet_prefix):
@@ -301,12 +320,25 @@ def _read_toml_ish(text):
             seen.add(table)
             data.setdefault(table, {})
             continue
-        if line.startswith("[["):                    # an array of tables: not a table we read
+        if line.startswith("[["):
+            # An array of tables — not a table this reads, but its SHAPE still has to be valid, or
+            # `[[broken` sails past as "some array header" in a file that already carried both
+            # settings (fresh-agent review round 4).
+            if not re.match(r"^\[\[[^\[\]]+\]\]$", line):
+                return None, ("it is not valid TOML: this interpreter has no TOML parser, and the "
+                              "fallback reader cannot classify %r — upgrade to Python 3.11+ for an "
+                              "exact answer, or simplify the file" % line[:60])
             table = None
             continue
         pair = re.match(r"^([A-Za-z0-9_-]+)\s*=\s*(\S+)\s*$", line)
         if not pair:
-            continue
+            # FAIL CLOSED on anything this walker cannot classify (fresh-agent review round 4).
+            # Skipping it would let `[[broken` sit in a file that already carried both settings and
+            # report healthy — while the host refuses to start on it. This reader is narrow and
+            # says so; a line it cannot read is a config it cannot vouch for.
+            return None, ("it is not valid TOML: this interpreter has no TOML parser, and the "
+                          "fallback reader cannot classify %r — upgrade to Python 3.11+ for an "
+                          "exact answer, or simplify the file" % line[:60])
         value = _BOOLS.get(pair.group(2).lower(), pair.group(2))
         if table is None:
             data[pair.group(1)] = value
@@ -616,8 +648,16 @@ def plist_runs_problem(text, *, binary, session, token_file_path):
     if argv[0] != binary:
         return ("it runs %s, not the fleet's own %s — every other block here inspects the latter, "
                 "so they would all be describing a binary nothing runs" % (argv[0], binary))
-    if session not in argv:
-        return "it does not name the %r session, so it would bind a different socket" % session
+    try:
+        named = argv[argv.index("--session") + 1]
+    except (ValueError, IndexError):
+        named = None
+    if named != session:
+        # The VALUE of the flag, not merely the word appearing somewhere in argv (fresh-agent
+        # review round 4): `--session default server fleet` contains "fleet" and binds the default
+        # session, which is the owner's own — the one thing this build-up exists not to share.
+        return ("its --session is %r, not %r, so it would bind a different socket"
+                % (named, session))
     try:
         job = plistlib.loads(text.encode())
         env = job.get("EnvironmentVariables") or {}

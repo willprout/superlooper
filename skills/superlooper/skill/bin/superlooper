@@ -552,12 +552,35 @@ def cmd_fleet(args):
             # window where the fence's whole secret is readable. O_EXCL so a race cannot land the
             # secret in a file that appeared underneath us.
             fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            minted = secrets.token_urlsafe(32) + "\n"
             with os.fdopen(fd, "w") as f:
-                f.write(secrets.token_urlsafe(32) + "\n")
+                f.write(minted)
+            # The digest, never the secret — the sidecar exists to prove origin, not to hold a
+            # second copy of the thing the fence protects.
+            with open(fleet.token_provenance_file(prefix), "w") as f:
+                f.write(fleet.token_provenance(minted) + "\n")
             print("  minted %s (0600)" % token)
         elif not os.path.islink(token) and os.path.isfile(token):
+            with open(token) as f:
+                held = f.read()
+            recorded = None
+            try:
+                with open(fleet.token_provenance_file(prefix)) as f:
+                    recorded = f.read().strip()
+            except OSError:
+                pass
+            if recorded != fleet.token_provenance(held):
+                # An UNVOUCHED token is worse than none (fresh-agent review round 4): a same-uid
+                # process that dropped its own secret here before the first install would have the
+                # fence configured to accept a token it already knows, and every block would go
+                # green. A fence whose secret somebody else chose is not a fence.
+                print("FATAL: %s exists but was not minted here — no matching provenance record at "
+                      "%s. A token this build-up cannot vouch for may be one somebody else chose. "
+                      "Move it aside and re-run to mint a fresh one."
+                      % (token, fleet.token_provenance_file(prefix)), file=sys.stderr)
+                return 2
             os.chmod(token, 0o600)
-            print("  kept %s (0600)" % token)
+            print("  kept %s (0600, minted here)" % token)
         else:
             # `lexists` above, `islink` here (fresh-agent review round 2): a SYMLINK at this path
             # would have `os.path.exists` follow it, `chmod` change the permissions of whatever it
@@ -621,7 +644,13 @@ def cmd_fleet(args):
         if args.load:
             subprocess.run(runner_home.bootout_argv(_launchctl_bin(), uid, fleet.SERVER_LABEL),
                            capture_output=True, text=True, timeout=30)
+            # A bounded retry, found by driving this for real: launchd answers a bootstrap issued
+            # while it is still tearing the old job down with `Input/output error` (5), which reads
+            # like a broken plist and is not one. One retry after a beat is the whole cure.
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                time.sleep(2)
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
             if proc.returncode != 0:
                 print("FATAL: %s\n%s" % (" ".join(argv[1:]),
                                          (proc.stderr or proc.stdout).strip()), file=sys.stderr)

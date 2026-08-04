@@ -155,6 +155,13 @@ def test_both_config_readers_give_the_same_verdicts(monkeypatch):
         "version_check = false\n[session]\nresume_agents_on_restore = false\n",
         "# version_check = false\n[session]\nresume_agents_on_restore = true\n",
     ]
+    cases += [
+        # Anything the walker cannot classify must fail CLOSED: the host refuses to start on a
+        # config it cannot parse, and a file that already carried both settings must not sail past
+        # on the strength of them.
+        "version_check = false\n[session]\nresume_agents_on_restore = true\n[[broken\n",
+        "version_check = false\n[session]\nresume_agents_on_restore = true\nthis is = = junk\n",
+    ]
     real = [fleet.host_config_problem(c) for c in cases]
     monkeypatch.setattr(fleet, "tomllib", None)
     fallback = [fleet.host_config_problem(c) for c in cases]
@@ -464,6 +471,13 @@ def test_a_job_that_runs_something_other_than_the_fleet_is_refused():
             (good.replace(_BIN, "/opt/homebrew/bin/other"), "binary"),
             (good.replace("<string>%s</string>" % fleet.SESSION_NAME, "<string>other</string>"),
              "session"),
+            # The VALUE of --session, not the word appearing somewhere in argv: this one binds the
+            # DEFAULT session — the owner's own — which is the one thing the build-up must not share.
+            (good.replace("<string>--session</string>\n        <string>%s</string>"
+                          % fleet.SESSION_NAME,
+                          "<string>--session</string>\n        <string>default</string>\n"
+                          "        <string>%s</string>" % fleet.SESSION_NAME),
+             "session value"),
             (good.replace(fleet.token_file(_PREFIX), "/somewhere/else/token"), "token file")):
         probe = _green_probe(files={fleet.server_plist_path(_HOME): broken})
         r = fleet.check_login_item(probe, uid=501, home=_HOME, fleet_prefix=_PREFIX)
@@ -547,6 +561,18 @@ def test_the_identity_block_says_what_it_does_not_prove():
     # environment carries, and that gap is the c1 silent-billing-flip in a new costume.
     r = fleet.check_identity(_green_probe(), _FLEET_CLAUDE_DIR, claude=_CLAUDE)
     assert r.ok and "#314" in r.detail and "not that a launch uses it" in r.detail
+
+
+def test_a_token_this_build_up_cannot_vouch_for_is_not_adopted():
+    # A fence whose secret somebody else chose is not a fence: a same-uid process that dropped its
+    # own token at the path before the first install would have the server configured to accept a
+    # secret it already knows, with every block green.
+    minted = "s3cret\n"
+    assert fleet.token_provenance(minted) == fleet.token_provenance("s3cret\n")
+    assert fleet.token_provenance(minted) != fleet.token_provenance("someone-elses\n")
+    # The sidecar holds a DIGEST, never a second copy of the thing the fence protects.
+    assert minted.strip() not in fleet.token_provenance(minted)
+    assert fleet.token_provenance_file(_PREFIX) != fleet.token_file(_PREFIX)
 
 
 def test_the_isolation_check_refuses_a_readable_fence_token():
