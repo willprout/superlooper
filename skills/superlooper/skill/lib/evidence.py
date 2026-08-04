@@ -82,6 +82,17 @@ _LAUNCH_RC = {
     3: ("base_missing",
         "the worktree base branch does not exist on origin, so every worktree creation fails "
         "before the agent starts — a repo/config fault (dev_branch), not a launch-delivery problem"),
+    4: ("gh_auth_dead",
+        "the positive gh-auth assert refused the flight: `gh` did not answer as the login this "
+        "loop runs as from inside the SESSION's own environment, so the session could not have "
+        "read its own issue or posted any evidence — GitHub auth for that environment is dead or "
+        "belongs to another account, not a launch-delivery problem. Re-login: `gh auth login "
+        "--hostname github.com` with the account that owns the loop repo, then re-approve"),
+    5: ("gh_auth_dead_runner",
+        "the RUNNER's own `gh` could not say who it is, so there was no identity to launch any "
+        "session against and no tab was ever opened — a machine-level GitHub auth fault that no "
+        "queued issue caused and none can fix. Every launch will fail until it is repaired: "
+        "`gh auth login --hostname github.com` with the account that owns the loop repo"),
     64: ("agent_unsupported",
          "the configured agent is not one this launcher can start (expected: claude or codex)"),
     124: ("launch_timeout",
@@ -121,9 +132,56 @@ _RC_TABLES = {"launch": _LAUNCH_RC, "nudge": _NUDGE_RC}
 # emit (cmux's own error text, and the scripts' own `echo ... >&2` diagnostics). Order is
 # significant: first match wins, so the most specific patterns lead.
 #
-# These refine an outcome that has ALREADY failed — they never create one. A substring that
-# matches by accident costs a mis-worded reason on a real failure, never a false park.
+# These refine an outcome that has ALREADY failed — they never create one. For a PER-ISSUE reason a
+# substring that matches by accident costs a mis-worded reason on a real failure, never a false
+# park. For a CHANNEL reason the cost is higher and asymmetric: an accidental match turns one
+# issue's own fault into a HELD QUEUE, which `is_channel_fault` calls the bigger, quieter outage.
+# So a needle that maps to a channel reason must be impossible in the loop's own launcher text —
+# see the note on the gh needles below, which a bare "429" violated by matching the `[i429]` id
+# prefix that every single launcher line carries.
 _LAUNCH_TEXT = (
+    # FIRST, ahead of every cmux pattern below (issue #299). The auth refusals relay `gh`'s OWN
+    # error text into the launcher's stderr, and gh's wording is not ours to control — a message
+    # containing "could not connect" or "not_found" would otherwise be read as a dead cmux anchor
+    # and raise a socket/workspace alert about a GitHub fault. Both refusal paths emit the literal
+    # "GH AUTH DEAD", so matching it first keeps an auth failure classified as auth.
+    #
+    # A TRANSIENT is split out ahead of the auth reading for the same reason one level down: the
+    # assert cannot tell "not authenticated" from "GitHub did not answer", and rate-limit
+    # exhaustion, a GitHub outage or a dead DNS would otherwise park the issue under a memo telling
+    # the owner to re-login — a confidently WRONG remedy. Named as its own reason, it is a channel
+    # fault (below) and the queue holds until GitHub is reachable again instead.
+    # Every needle here must be a string the LOOP'S OWN launcher text can never contain. That is a
+    # sharper bar than the cmux patterns below, because these reasons are CHANNEL faults: a stray
+    # match no longer costs a mis-worded reason on an already-failed launch, it converts a
+    # one-issue park into a HELD QUEUE on a fault that never self-heals. A bare "429" cost exactly
+    # that — every launcher line is prefixed `[$ID]`, so on issue i429 a missing brief, a failed
+    # worktree and a dead cmux workspace all read as "GitHub is rate-limited" and froze the queue.
+    # Hence `http 429` / `api rate limit` over `429`, and the enumerated 5xx over `http 5`.
+    #
+    # `connection refused` is DELIBERATELY ABSENT for the same reason one rung up: cmux's own
+    # socket error carries it too, and this tuple is ordered ahead of `anchor_socket_lost`, so
+    # including it turned a dead cmux socket into "wait for GitHub to come back" — a remedy for
+    # a fault that never self-recovers. gh's Go error always spells the whole
+    # `dial tcp <ip>:443: connect: connection refused`, which `dial tcp` already catches.
+    (("api rate limit", "secondary rate limit", "http 429",
+      "http 500", "http 502", "http 503", "http 504",
+      "could not resolve", "dial tcp",
+      "no answer within", "i/o timeout", "network is unreachable", "temporary failure"),
+     ("gh_probe_unreachable",
+      "the gh-auth assert could not get an answer OUT of GitHub — a rate limit, an outage, or a "
+      "network fault, not a credential that has died. Re-authenticating would fix nothing; the "
+      "queue is held until GitHub answers again, and resumes on its own when it does")),
+    (("gh auth dead (runner env)",),
+     ("gh_auth_dead_runner",
+      "the RUNNER's own `gh` could not say who it is, so no session could be launched against any "
+      "identity and no tab was opened — a machine-level GitHub auth fault no queued issue caused. "
+      "Repair with `gh auth login --hostname github.com`")),
+    (("gh auth dead",),
+     ("gh_auth_dead",
+      "the positive gh-auth assert refused the flight: `gh` did not answer as the login this loop "
+      "runs as from inside the session's own environment, so the session could not have read its "
+      "issue or posted any evidence. Re-login with `gh auth login --hostname github.com`")),
     # THE storm (2026-07-09). cmux exits 0 while printing this to stdout, so launch-session.sh's
     # surface-parse guard echoes the whole output to stderr — which is how the cause reaches us.
     (("not_found", "pane or workspace not found", "workspace not found", "pane not found"),
@@ -159,8 +217,16 @@ _LAUNCH_TEXT = (
 # The runner holds the queue systemically and probes with a canary (#24/#115) for these instead.
 # Every OTHER launch failure names THIS issue's own state — its base branch, its worktree, its
 # identity, its brief — and still parks that one issue. These are the reasons _classify() emits for
-# the machinery-level faults; a reason absent here (base_missing, worktree_create_failed,
+# the machinery-level faults; a reason absent here (base_missing, gh_auth_dead, worktree_create_failed,
 # identity_invalid, brief_missing, or any unmapped rc) is treated as per-issue.
+#
+# gh_auth_dead (rc=4, issue #299) is deliberately NOT here, for the same reason base_missing is not:
+# it is an ENVIRONMENT fault whose memo the owner must actually READ. Routed to the channel it would
+# hold the queue behind the systemic-launch ALERT, whose body names App Nap and the cmux anchor —
+# so dead GitHub auth would be reported to the owner as a cmux problem, the exact mis-blame the
+# text table above exists to end. Parked per-issue, the memo names the auth and the `gh auth login`
+# remedy. (A SYSTEMIC gh-auth hold — the sibling of #159's pre-launch claude-auth gate — is a
+# runner-side probe, not a launch rc, and is not built here.)
 CHANNEL_FAULT_REASONS = frozenset({
     "anchor_workspace_missing",       # the 07-09 storm: anchor targets a deleted cmux workspace
     "anchor_socket_lost",             # the runner lost its cmux socket — it reaches no pane at all
@@ -169,6 +235,13 @@ CHANNEL_FAULT_REASONS = frozenset({
     "launch_timeout",                 # rc=124: the launcher hung — no session ever started
     "launch_script_unrunnable",       # rc=127: the launch script itself could not execute (install)
     "agent_unsupported",              # rc=64: the configured agent is repo-wide wrong, not one issue's
+    # (#299) The RUNNER's own gh cannot authenticate: no tab was ever opened, every launch will fail
+    # identically, and no issue can fix it by re-approving. Charging it per-issue would walk the
+    # whole approved queue into parks over one machine-level fault — the 07-09 shape, new cause.
+    "gh_auth_dead_runner",
+    # (#299) GitHub itself did not answer (rate limit / outage / network). Nothing is wrong with any
+    # issue OR with the credential, and it repairs itself — hold, never park, never say "re-login".
+    "gh_probe_unreachable",
 })
 
 
@@ -184,7 +257,7 @@ def is_channel_fault(rec):
     worker; nothing about the session itself is at fault', and its per-issue rc=1 causes
     (worktree_create_failed, identity_invalid, brief_missing) each echo a distinguishing stderr line.
     So the contract the classifier relies on is the launcher's: a per-issue fault must carry either its
-    own rc (base_missing=3) or a matching stderr line — a future per-issue rc=1 added WITHOUT one would
+    own rc (base_missing=3, gh_auth_dead=4) or a matching stderr line — a future per-issue rc=1 added WITHOUT one would
     be read as channel. A wrongly-held queue is a bigger, quieter outage than one wrongly-parked issue
     the owner can see and re-approve, so the default leans to holding on the machinery-level reasons."""
     return isinstance(rec, dict) and rec.get("reason") in CHANNEL_FAULT_REASONS

@@ -57,6 +57,104 @@ if ! acquire_worker; then
 fi
 trap release_worker EXIT                     # free the slot when THIS worker truly ends (only ours)
 
+# ---- POSITIVE gh-AUTH ASSERT (issue #299) ------------------------------------------------------
+# THIS is the only code in the stack that runs inside the spawned session's OWN environment and
+# worktree, which is exactly why the assert lives here and not in the launcher: the fresh tab
+# inherits nothing, so a launcher that checks ITSELF proves nothing about the env the worker is
+# actually about to run in. The 2026-07-29 spikes showed an inherited XDG_CONFIG_HOME
+# de-authenticating `gh` while it keeps answering, and herdr's tracker carries an unresolved
+# keychain-in-launchd incident that presents as intermittent gh auth death (tool-dive c27).
+#
+# A worker whose gh auth has died does not stop — it works on CONFIDENTLY: it cannot read its own
+# issue, cannot post evidence, cannot open its PR, and every one of those failures reads downstream
+# as worker misbehavior instead of auth death. So the flight never starts.
+#
+# POSITIVE means the assert must OBSERVE SUCCESS: a real authenticated read (`gh api user`) that
+# answers with the login this loop runs as. Absence of an error is not auth — a `gh` answering
+# happily as somebody else's account is a worker that would write labels and comments under a
+# stranger's identity, so the login is COMPARED, never merely "did it exit 0".
+#
+# Runs ABOVE the agent branch: gh auth is agent-independent, so claude and codex are covered by
+# construction rather than by a second copy of the check that could drift.
+# Runs BEFORE the start sentinel below on purpose. The sentinel means "a worker started here"; a
+# refused session never became one, and stamping it would tell the launcher the launch succeeded
+# moments before this script exits with no agent — a lane the runner would then read as live.
+GH="${SL_GH:-gh}"
+TOKEN="${SL_START_TOKEN:-$ID}"
+EXPECT_LOGIN="${SL_EXPECT_GH_LOGIN:-}"
+AUTH_DEAD_RC=4                               # launch-session.sh + evidence.py read this same code
+# BOUNDED, and the bound matters MORE here than on the launcher side. `gh` has no default request
+# timeout, so an unreachable network can hang this read for tens of seconds — and the launcher is
+# meanwhile counting down its 30s delivery-verify window. Overrun it and the launcher exits rc=2
+# (`shim_not_fired`, a CHANNEL fault) and the memo blames the launch shim: the exact mis-blame the
+# auth marker was added to prevent, reached through the SLOW path instead of the dead one. Two
+# attempts at this bound stay comfortably inside the window.
+# Deliberately duplicated from launch-session.sh rather than sourced: this script runs in a fresh
+# tab shell that inherits nothing and knows no engine paths, so a sourced helper would add a
+# failure mode exactly where the stack is least able to report one.
+GH_PROBE_SECONDS="${SL_GH_PROBE_SECONDS:-8}"
+gh_login() {                                 # one real authenticated read; stdout = login or error
+  # Polled in TENTHS: the child is always still alive at the first check, so a 1s granularity would
+  # charge every healthy launch a full second of dead wait on BOTH sides of the spawn. Both BSD and
+  # GNU sleep accept fractions. (`rc=0; wait || rc=$?` is the errexit-safe spelling its launcher
+  # twin needs; kept identical here so the two cannot drift.)
+  local out_file pid ticks=0 limit rc
+  case "$GH_PROBE_SECONDS" in ""|*[!0-9]*) GH_PROBE_SECONDS=8 ;; esac   # a typo must not mean "refuse"
+  limit=$((GH_PROBE_SECONDS * 10))
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sl-ghwho.XXXXXX")" || return 1
+  "$GH" api user --jq .login > "$out_file" 2>&1 &
+  pid=$!
+  while [ "$ticks" -lt "$limit" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1 2>/dev/null || sleep 1   # a sleep without fractions must cost
+    ticks=$((ticks + 1))                # granularity, never a refused launch
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true          # OUR pid, captured from $! — never a name/pattern kill
+    wait "$pid" 2>/dev/null || true
+    printf 'no answer within %ss (gh did not return)' "$GH_PROBE_SECONDS" > "$out_file"
+    rc=124
+  else
+    rc=0; wait "$pid" || rc=$?
+  fi
+  cat "$out_file"; rm -f "$out_file"
+  return "$rc"
+}
+refuse_auth() {                              # loud, torn down, and NAMED — never a live dead-auth session
+  local why="$1"
+  mkdir -p "$SL_RUN_ROOT/state/authfail"
+  # The launcher is sitting in its delivery-verify window waiting on the start sentinel that will
+  # now never appear. This per-launch marker (same token discipline as the sentinel, so a stale or
+  # overlapping launch cannot false-fire it) is what lets it tear the tab down AT ONCE and blame
+  # auth, instead of timing out 30s later and blaming the launch shim.
+  printf '%s\n' "$why" > "$SL_RUN_ROOT/state/authfail/$ID.$TOKEN"
+  echo "[$ID] GH AUTH DEAD: $why" >&2
+  # Deliberately NO exited marker: that marker means "a worker WAS running and its process is
+  # gone", and the runner recovers from it by RELAUNCHING — straight back into the same dead auth.
+  # No worker ever ran here; the launcher's rc is the whole signal.
+  exit "$AUTH_DEAD_RC"
+}
+if [ -z "$EXPECT_LOGIN" ]; then
+  # launch-session.sh ALWAYS names the expectation in the dropped command. If it ever stops, there
+  # is nothing to assert against — and a floor that silently disables itself when its input goes
+  # missing is not a floor. Fail closed rather than degrade to "some gh answered".
+  refuse_auth "no expected gh login was handed to this session (SL_EXPECT_GH_LOGIN empty) — the launcher must name it, so refusing rather than starting a session whose identity cannot be checked"
+fi
+# ONE retry: a single momentary network blip is not auth death, and with LAUNCH_FAILURE_CAP=2 two
+# consecutive launches lost to one would park the issue. Deliberately not more — every attempt can
+# cost gh's own multi-second timeout on an unreachable network, and the whole probe has to finish
+# inside the launcher's verify window (30s) or the launch reads as a shim that never fired, which
+# is the mis-blame this code exists to prevent. A healthy env answers on the first try, inside one 100ms poll tick.
+ACTUAL_LOGIN=""
+attempt=1
+while : ; do
+  ACTUAL_LOGIN="$(gh_login)" && [ -n "$ACTUAL_LOGIN" ] && break
+  [ "$attempt" -ge 2 ] && break
+  attempt=$((attempt + 1)); sleep 1
+done
+if [ "$ACTUAL_LOGIN" != "$EXPECT_LOGIN" ]; then
+  refuse_auth "\`$GH api user\` did not answer as '$EXPECT_LOGIN' from inside this session's own environment (got: ${ACTUAL_LOGIN:-<no answer>}). Run \`gh auth login --hostname github.com\` as the account that owns the loop repo"
+fi
+
 # DELIVERY PROOF (RC-LAUNCHVERIFY — the run-20260625-1857 overnight killer). Now that we hold the
 # worker lock and are about to start Claude, stamp the PER-LAUNCH start marker. Its NAME carries the
 # launch token (this tab's surface UUID, passed by launch-session.sh), so it is unique to THIS launch
@@ -64,8 +162,8 @@ trap release_worker EXIT                     # free the slot when THIS worker tr
 # verify P1-b: a single shared state/started/<id> let an overlapping launch's hygiene delete the
 # proof and the real launch then close its OWN worker tab). Stamped before the brief check so
 # delivery is proven even if the brief is missing — that branch writes the exited marker so the
-# dead state is observed promptly, not 45 min later.
-TOKEN="${SL_START_TOKEN:-$ID}"
+# dead state is observed promptly, not 45 min later. (TOKEN is resolved by the auth assert above,
+# which needs the same per-launch key for its own marker.)
 printf '%s' "$TOKEN" > "$SL_RUN_ROOT/state/started/$ID.$TOKEN"
 # Clear THIS launch's captured stderr tail now (issue #40, review P1-1) — AFTER the singleton lock
 # (so a duplicate launch of a still-live worker can never wipe the real worker's tail) but BEFORE the

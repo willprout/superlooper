@@ -623,7 +623,8 @@ class Runner:
         self.state = os.path.join(self.home, "state")
         self.issues_path = os.path.join(self.state, "issues.json")
         for sub in ("state/activity", "state/blocked", "state/exited", "state/awaiting",
-                    "state/panes", "state/started", "state/launch_stderr", "state/events/processed",
+                    "state/panes", "state/started", "state/authfail",   # (#299) refused-on-auth marks
+                    "state/launch_stderr", "state/events/processed",
                     "state/pending_teardown",           # (#149) prunes declined under a live CLI
                     "briefs", "reports", "worktrees", "logs"):
             os.makedirs(os.path.join(self.home, sub), exist_ok=True)
@@ -2005,6 +2006,13 @@ class Runner:
                 # of that one conversation. A revive is always someone's explicit act, never
                 # something a launch inherits from the shell the runner happens to live in.
                 "SL_RESUME_SESSION_ID": "",
+                # PINNED EMPTY for the same inheritance reason (#299), and it matters because this
+                # env is merged over os.environ: launch-session.sh NAMES SL_EXPECT_GH_LOGIN in every
+                # worker command, so a runner started from inside a worker or debugger pane would
+                # inherit that session's value and SKIP its own identity read — accepting a stale,
+                # second-hand answer as proof of who this machine is. The launcher must resolve the
+                # loop's identity itself, every launch.
+                "SL_EXPECT_GH_LOGIN": "",
                 "SL_CODEX_DANGEROUS_BYPASS": env_bool(
                     "SL_CODEX_DANGEROUS_BYPASS", bool(codex.get("dangerous_bypass", False))),
                 "SL_CODEX_BYPASS_HOOK_TRUST": env_bool(

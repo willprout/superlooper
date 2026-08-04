@@ -2604,9 +2604,9 @@ def test_freeze_unfreeze_alert_and_fix_issue_files(rig):
     rig.r._execute({"act": "unfreeze"}, NOW)
     assert not (rig.home / "state" / "merges_frozen.json").exists()
 
-    rig.r._execute({"act": "alert", "reasons": ["gh_unreachable"]}, NOW)
+    rig.r._execute({"act": "alert", "reasons": ["gh_probe_unreachable"]}, NOW)
     alert = json.loads((rig.home / "state" / "ALERT").read_text())
-    assert alert["reasons"] == ["gh_unreachable"]
+    assert alert["reasons"] == ["gh_probe_unreachable"]
     rig.r._execute({"act": "clear_alert"}, NOW)
     assert not (rig.home / "state" / "ALERT").exists()
 
@@ -6535,3 +6535,66 @@ def test_the_refusal_is_stamped_in_loopstate_and_not_re_journaled_every_tick(rig
 def test_a_valid_approved_issue_earns_no_refusal_record(rig):
     rig.r.tick(now=NOW)
     assert _queue_invalid_records(rig) == []
+
+
+# ------------------- the positive gh-auth assert reaches the runner (#299) -------------------
+# The two refusals share a fault CLASS but have opposite blast radii, and the runner is where that
+# distinction is actually spent. Pinned here rather than only as an evidence unit test, because the
+# thing that matters is what happens to the QUEUE — the 2026-07-09 lesson.
+
+def test_a_sessions_dead_gh_auth_parks_that_issue_and_not_the_queue(rig):
+    # rc=4: the SESSION's own environment could not authenticate. That is this lane's problem — it
+    # charges the per-issue cap so the issue parks with a memo naming auth, and stays OUT of the
+    # systemic streak, whose alert body names App Nap and the cmux anchor (dead GitHub auth must
+    # never reach the owner as a cmux problem).
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(runner_mod.ScriptRC(
+        4, "[i101] GH AUTH DEAD: `gh api user` did not answer as 'loopbot'"))
+    out = rig.r._execute(_launch_action(), NOW)
+    assert out != "ok"
+    ist = issue_state(rig, "i101")
+    assert ist["status"] == "ready" and ist["launch_failures"] == 1
+    assert "i101" not in rig.r._launch_fail_ids
+    assert ist["launch_evidence"]["reason"] == "gh_auth_dead"
+
+
+def test_the_runners_own_dead_gh_auth_holds_the_queue_and_charges_no_issue(rig):
+    # rc=5: the RUNNER's environment could not authenticate, so no tab was ever opened and EVERY
+    # launch will fail identically. Charging this per-issue would walk the whole approved queue into
+    # parks over one machine-level fault — the 07-09 storm shape with a new cause. It must feed the
+    # systemic streak instead, leaving the queue intact for a 30-second `gh auth login`.
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    before = len(mutations(rig))
+    rig.rc_queue.append(runner_mod.ScriptRC(
+        5, "[i101] GH AUTH DEAD (runner env): `gh api user` did not return a usable login"))
+    out = rig.r._execute(_launch_action(), NOW)
+    assert out != "ok"
+    ist = issue_state(rig, "i101")
+    assert ist.get("launch_failures", 0) == 0, "no issue may be charged for the runner's own env"
+    assert "i101" in rig.r._launch_fail_ids, "it must feed the systemic streak so the queue holds"
+    assert ist["launch_evidence"]["reason"] == "gh_auth_dead_runner"
+    assert len(mutations(rig)) == before
+
+
+def test_github_being_unreachable_holds_rather_than_parking_with_a_relogin_memo(rig):
+    # A rate limit or an outage is not a dead credential. Parking the issue under "run gh auth
+    # login" would send the owner to fix something that was never broken, and the fault clears
+    # itself — so it holds, exactly like a dead anchor, and no issue is charged.
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(runner_mod.ScriptRC(
+        4, "[i101] GH AUTH DEAD: API rate limit exceeded for user"))
+    rig.r._execute(_launch_action(), NOW)
+    ist = issue_state(rig, "i101")
+    assert ist.get("launch_failures", 0) == 0
+    assert "i101" in rig.r._launch_fail_ids
+    assert ist["launch_evidence"]["reason"] == "gh_probe_unreachable"
+
+
+def test_the_worker_env_never_inherits_a_second_hand_gh_identity(rig):
+    # #299: launch-session.sh NAMES SL_EXPECT_GH_LOGIN in every worker command, so a runner started
+    # from inside a worker or debugger pane would inherit that session's value. Pinned EMPTY here so
+    # the launcher always resolves the loop's identity itself rather than trusting a stale answer.
+    assert rig.r._worker_env("i101")["SL_EXPECT_GH_LOGIN"] == ""

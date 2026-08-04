@@ -25,6 +25,21 @@ SL_PANE="${SL_PANE:?SL_PANE (target cmux pane id for tabs) required}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # Overridable so the delivery-verification test can inject a stub cmux; defaults to the real app.
 CMUX="${SL_CMUX:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
+# Same override convention as lib/gh.py and stack_doctor: SL_GH names the binary, so no test ever
+# reaches the real `gh`. In production it is UNSET, so this is the bare name `gh` and each side
+# resolves it from its OWN PATH — which is what a positive assert of the worker's environment
+# wants: the worker must be authenticated with the gh IT would actually run, not one the launcher
+# hand-picked. Naming it in the dropped command carries a test's override across the spawn (the
+# fresh tab inherits nothing), it does not pin production to the launcher's binary.
+GH="${SL_GH:-gh}"
+# Two DISTINCT exit codes for the positive gh-auth assert (issue #299), because the two failures
+# have opposite blast radii and must be charged to opposite parties (issue #153):
+#   4 — THIS SESSION's own environment cannot authenticate: a per-issue fault, parks this issue with
+#       a memo naming auth (evidence.py -> `gh_auth_dead`).
+#   5 — the RUNNER's environment cannot authenticate: no queued issue caused it and none can fix it,
+#       so it is a CHANNEL fault and the queue is held intact (evidence.py -> `gh_auth_dead_runner`).
+AUTH_DEAD_RC=4
+AUTH_DEAD_RUNNER_RC=5
 MODEL="${SL_MODEL:-}"
 EFFORT="${SL_EFFORT:-}"
 CODEX_DANGEROUS_BYPASS="${SL_CODEX_DANGEROUS_BYPASS:-}"
@@ -171,6 +186,87 @@ if [ "$RESUME" = "1" ]; then
 fi
 [ -f "$BRIEF" ] || { echo "[$ID] missing brief $BRIEF" >&2; exit 1; }
 
+# ---- THE EXPECTED gh LOGIN (issue #299) --------------------------------------------------------
+# The session's own assert (start-session.sh) needs something to assert AGAINST, and the honest
+# expectation is the loop's OWN identity: the gh account the runner acts as — the one that writes
+# labels, posts comments and merges PRs. A worker answering as anyone else is not this loop, and a
+# worker answering as nobody cannot read its issue or post its evidence.
+#
+# Read it ONCE here, in the runner's env, and hand it down. Deriving it rather than configuring it
+# means every adopted repo gets the floor with no new config key to set (and nothing to leave
+# unset), and it catches the exact 2026-07-29 spike shape: an inherited XDG_CONFIG_HOME that
+# de-authenticates gh in the WORKER's fresh env while the runner's own gh stays healthy.
+#
+# FAIL CLOSED and fail EARLY: if the launcher's own gh cannot say who it is, a machine-level auth
+# fault is already underway, there is no expectation to check the worker against, and no session
+# started now could do its job. Placed BEFORE worktree creation and before any cmux RPC, so a
+# refusal costs no orphan tab and no leftover checkout — the base-missing discipline (#28).
+# BOUNDED. `gh` has no default request timeout, so on a black-holed network this can hang for tens
+# of seconds — and the runner kills the whole launch at LAUNCH_TIMEOUT=120, turning a diagnosable
+# auth/network fault into an undiagnosable rc=124 hang. stack_doctor already bounds its own gh calls
+# at 10s; this is the same discipline in shell. macOS ships no `timeout(1)`, so we background the
+# read and wait on OUR OWN recorded pid — never a kill by name or pattern (house rule), which could
+# match the owner's live processes.
+GH_PROBE_SECONDS="${SL_GH_PROBE_SECONDS:-10}"
+gh_login_bounded() {                 # stdout = gh's answer (or its error text); rc = gh's, or 124
+  # Polled in TENTHS, not seconds: the child is always still alive at the first check, so a 1s
+  # granularity charged EVERY healthy launch a full second of dead wait. Both BSD and GNU sleep
+  # take fractions. `rc=0; wait || rc=$?` rather than `wait; rc=$?` because this file runs under
+  # `set -e` — a bare failing `wait` aborts inside the command substitution before `cat` runs,
+  # silently returning an EMPTY capture and leaking the temp file: P1-1 through a second door.
+  local out_file pid ticks=0 limit rc
+  case "$GH_PROBE_SECONDS" in ""|*[!0-9]*) GH_PROBE_SECONDS=10 ;; esac   # a typo must not mean "refuse"
+  limit=$((GH_PROBE_SECONDS * 10))
+  out_file="$(mktemp "${TMPDIR:-/tmp}/sl-ghwho.XXXXXX")" || return 1
+  "$GH" api user --jq .login > "$out_file" 2>&1 &
+  pid=$!
+  while [ "$ticks" -lt "$limit" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1 2>/dev/null || sleep 1   # a sleep without fractions must cost
+    ticks=$((ticks + 1))                # granularity, never a refused launch
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true             # OUR pid, captured from $! — nothing else can match
+    wait "$pid" 2>/dev/null || true
+    printf 'no answer within %ss (gh did not return)' "$GH_PROBE_SECONDS" > "$out_file"
+    rc=124
+  else
+    rc=0; wait "$pid" || rc=$?
+  fi
+  cat "$out_file"; rm -f "$out_file"
+  return "$rc"
+}
+EXPECT_GH_LOGIN="${SL_EXPECT_GH_LOGIN:-}"
+GH_PROBE_SAID=""
+if [ -z "$EXPECT_GH_LOGIN" ]; then
+  # Keep gh's OWN WORDS whatever the rc. An `|| EXPECT_GH_LOGIN=""` here would discard the capture
+  # on every real failure — which is every failure — and the refusal below could then only ever say
+  # "no answer", flattening not-logged-in, rate-limited, network-down and gh-not-installed into one
+  # indistinguishable memo. That is precisely the mis-blame evidence.py exists to end, so the text
+  # is preserved and the SHAPE CHECK below (not the rc) decides whether it is a usable login.
+  GH_PROBE_SAID="$(gh_login_bounded)" || true
+  EXPECT_GH_LOGIN="$GH_PROBE_SAID"
+fi
+# A GitHub login is [A-Za-z0-9-] and nothing else, so anything that is not exactly that shape is not
+# an answer we may assert against. This matters beyond tidiness: `gh` merges its diagnostics into
+# the capture, and an error path prints a MULTI-LINE message. A line-anchored regex would happily
+# match a bare word on line 2 of that message and hand a launcher's error text down as the
+# "expected login" — so the test is a whole-string glob (a `case` negated class matches a newline
+# like any other stray character), not a per-line one.
+case "$EXPECT_GH_LOGIN" in
+  ""|*[!A-Za-z0-9-]*) EXPECT_GH_LOGIN_OK=0 ;;
+  *)                  EXPECT_GH_LOGIN_OK=1 ;;
+esac
+if [ "$EXPECT_GH_LOGIN_OK" -ne 1 ]; then
+  # DISTINCT from the worker-side refusal below (AUTH_DEAD_RC). This one says the RUNNER'S OWN
+  # environment cannot authenticate — a fault no queued issue caused and none can fix, exactly the
+  # shape CHANNEL_FAULT_REASONS exists for (the sibling of anchor_socket_lost). Charging it to an
+  # issue's launch cap would walk the whole approved queue into parks over one machine-level fault,
+  # the 2026-07-09 storm shape. evidence.py maps this rc to a HELD queue instead.
+  echo "[$ID] GH AUTH DEAD (runner env): \`$GH api user\` did not return a usable login, so there is no identity to launch any session against — got: ${GH_PROBE_SAID:-${EXPECT_GH_LOGIN:-<no answer>}}" >&2
+  echo "[$ID] Run \`gh auth login --hostname github.com\` as the account that owns the loop repo. NOT launching; no tab was opened." >&2
+  exit "$AUTH_DEAD_RUNNER_RC"
+fi
+
 # Create the worktree (worker mode only) off the fresh dev base; the fallback attaches an EXISTING
 # branch (a relaunch/regenerate reuses the same branch name). Both attempts are guarded so a
 # failure is DIAGNOSED here, not left to abort with git's generic code under set -e (issue #28): if
@@ -192,7 +288,7 @@ fi
 "$HERE/pretrust.sh" "$WT"                       # first-run trust prompt won't hang
 mkdir -p "$SL_RUN_ROOT/state/activity" "$SL_RUN_ROOT/state/panes" "$SL_RUN_ROOT/state/started" \
          "$SL_RUN_ROOT/state/blocked" "$SL_RUN_ROOT/state/exited" "$SL_RUN_ROOT/state/awaiting" \
-         "$SL_RUN_ROOT/state/sessions" "$SL_RUN_ROOT/reports"
+         "$SL_RUN_ROOT/state/sessions" "$SL_RUN_ROOT/state/authfail" "$SL_RUN_ROOT/reports"
 # Record the id NOW, before the tab exists. Deliberately UNLIKE the activity/pane stamps below,
 # which are withheld until delivery is verified because writing them early once fabricated
 # "launched & alive" for 45 minutes: an id is an IDENTITY claim, not a liveness one — nothing reads
@@ -235,6 +331,15 @@ fi
 # for a lane whose live session is still editing and pushing that branch. The report is a
 # COMPLETION signal the runner acts on, so a session that has been revived to keep working must
 # re-earn it, exactly as a replacement session must.
+# Sweep this id's STALE auth markers (issue #299). Nothing else prunes them: the launcher only
+# removes the marker it actually OBSERVED inside its verify window, so one written just after a
+# timeout (or after the runner killed the launcher at LAUNCH_TIMEOUT) would otherwise sit here
+# forever. AGE-BOUNDED on purpose — an id-wide `rm` would delete an OVERLAPPING launch's live
+# marker, and that launch would then time out and report `shim_not_fired`, blaming the shim for an
+# auth fault: the same class of bug as the shared start sentinel that codex-verify P1-b caught, and
+# the reason `started` is per-token AND excluded from the hygiene block just below. Five minutes is
+# far beyond any verify window, so only genuinely abandoned markers can match.
+find "$SL_RUN_ROOT/state/authfail" -maxdepth 1 -name "$ID.*" -mmin +5 -delete 2>/dev/null || true
 rm -f "$SL_RUN_ROOT/reports/$ID.md" \
       "$SL_RUN_ROOT/state/blocked/$ID" "$SL_RUN_ROOT/state/exited/$ID" "$SL_RUN_ROOT/state/awaiting/$ID" \
       "$SL_RUN_ROOT/state/mail/$ID" "$SL_RUN_ROOT/state/status/$ID.json"
@@ -303,8 +408,14 @@ WS_ARGS=()
 # default path; set only by a per-issue effort:* label) — %q-quoted like the rest so a value with
 # brackets/spaces can't break or inject the command. Codex-specific knobs are named too, because the
 # fresh tab shell inherits none of the runner's environment.
-printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_ATTENDED=%q SL_SESSION_ID=%q SL_RESUME=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
-  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$ATTENDED" "$SESSION_ID" "$RESUME" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
+# SL_EXPECT_GH_LOGIN + SL_GH ride here for the same "the fresh tab inherits nothing" reason
+# (issue #299): the session's own auth assert has nothing to compare against unless the expectation
+# is NAMED, and it must probe with the binary this launch resolved rather than whatever `gh` the
+# tab's PATH happens to find. Omitting either would not weaken the assert — start-session.sh fails
+# closed on a missing expectation — it would refuse every launch, which is the loud failure a
+# silently-disabled floor deserves.
+printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_ATTENDED=%q SL_SESSION_ID=%q SL_RESUME=%q SL_EXPECT_GH_LOGIN=%q SL_GH=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
+  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$ATTENDED" "$SESSION_ID" "$RESUME" "$EXPECT_GH_LOGIN" "$GH" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
 # Drop the command FIRST — before any further cmux RPC — so the new tab's shell finds it immediately
 # and the shim's bounded wait can't be eaten by an unrelated slow RPC (e.g. rename-tab; review B6).
 # Atomic write (tmp + mv) so the shim never reads a half-written command; refresh .active so its
@@ -324,14 +435,38 @@ mv -f "$cmd_tmp" "$CMD_FILE"
 # verify P1-b). If it never appears, the shim did not fire (not installed, or a deeper delivery
 # failure) — fail LOUDLY without fabricating liveness, exactly as the old keystroke path did on a
 # locked Mac.
+#
+# The loop watches for TWO outcomes, not one. The second is the auth marker (issue #299): a tab
+# whose session ran the positive gh-auth assert and REFUSED will never stamp the sentinel, so
+# without this it would look identical to a shim that never fired — and 30s later the park memo
+# would send the owner to debug the launch shim while the real fault was dead GitHub auth. Keyed on
+# the same per-launch token as the sentinel, so a stale or overlapping launch's marker cannot
+# false-fire this one.
 STARTED="$SL_RUN_ROOT/state/started/$ID.$SURF"
+AUTHFAIL="$SL_RUN_ROOT/state/authfail/$ID.$SURF"
 VERIFY_WINDOW="${SL_LAUNCH_VERIFY_SECONDS:-30}"   # generous single window; << the 45-min freeze
 delivered=0
+auth_dead=0
 waited=0
 while [ "$waited" -lt "$VERIFY_WINDOW" ]; do
   if [ -e "$STARTED" ]; then delivered=1; break; fi
+  if [ -e "$AUTHFAIL" ]; then auth_dead=1; break; fi
   sleep 1; waited=$((waited + 1))
 done
+
+if [ "$auth_dead" -eq 1 ]; then
+  # The session told us, from inside its own environment, that its gh auth is dead. Tear the tab
+  # down on the SAME terms as a non-delivery — it never became a worker, so nothing of value is
+  # lost — but exit with the DISTINCT auth code and speak the session's own diagnosis, so the
+  # runner's memo names auth death instead of the launch machinery.
+  why="$(cat "$AUTHFAIL" 2>/dev/null || true)"
+  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" "$AUTHFAIL" 2>/dev/null || true
+  "$CMUX" close-surface --surface "$SURF" ${WS_ARGS[@]+"${WS_ARGS[@]}"} >/dev/null 2>&1 || true
+  echo "[$ID] GH AUTH DEAD in the session's own environment — the flight was refused before it started." >&2
+  echo "[$ID] ${why:-the session reported no detail}" >&2
+  echo "[$ID] Closed the tab; NOT marking active. This is an auth fault, not a launch-delivery one." >&2
+  exit "$AUTH_DEAD_RC"
+fi
 
 if [ "$delivered" -ne 1 ]; then
   # FAIL LOUDLY and leave NO time-bomb. Remove the dropped command so no shell can pick it up later,
@@ -339,7 +474,7 @@ if [ "$delivered" -ne 1 ]; then
   # marker is absent → nothing of value is lost), so this never closes a real worker session.
   # start-session.sh's worker singleton lock is the backstop: at most ONE worker exists per id even
   # if a straggler shell runs the command late.
-  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" 2>/dev/null || true
+  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" "$AUTHFAIL" 2>/dev/null || true
   "$CMUX" close-surface --surface "$SURF" ${WS_ARGS[@]+"${WS_ARGS[@]}"} >/dev/null 2>&1 || true
   echo "[$ID] LAUNCH NOT DELIVERED: no worker started in tab $SURF within ${VERIFY_WINDOW}s." >&2
   echo "[$ID] the launch shim did not run the command — is it installed? (bin/install-launch-shim.sh)" >&2

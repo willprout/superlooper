@@ -62,6 +62,19 @@ def _clear_worker_launch_env(monkeypatch):
         # green-stack assertion. STACK.md advertises this var to fork users, and a fork user
         # dogfooding this repo is exactly who would have it exported.
         "SL_PLUGIN_ID",
+        # The gh-auth assert's own vars (issue #299). These matter MORE than the rest, because
+        # launch-session.sh now NAMES SL_GH and SL_EXPECT_GH_LOGIN in the dropped worker command —
+        # so once this ships, every worker session (including one running this suite) carries them
+        # ambiently. Left inherited, SL_GH would be set for every test, which would make
+        # _never_reach_real_gh below no-op and quietly re-open the path to the owner's real,
+        # logged-in gh; and an inherited SL_EXPECT_GH_LOGIN would let a launcher under test SKIP the
+        # "resolve the identity in the runner's env" step it is supposed to be proving. Scrubbed
+        # here, BEFORE that fixture runs, so the ratchet actually fires.
+        "SL_GH",
+        "SL_EXPECT_GH_LOGIN",
+        # Same shape: the per-launch delivery token is ambient in a worker pane, and a launcher
+        # test that inherited it would stamp its sentinel under a token it did not mint.
+        "SL_START_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -90,6 +103,22 @@ def _never_reach_real_cmux(monkeypatch):
     # subprocess-driven tests pass explicit env dicts, untouched by this.
     if not os.environ.get("SL_CMUX"):
         monkeypatch.setenv("SL_CMUX", "/nonexistent/superlooper-test-cmux")
+
+
+@pytest.fixture(autouse=True)
+def _never_reach_real_gh(monkeypatch, _clear_worker_launch_env):
+    # The `_clear_worker_launch_env` parameter is an ORDERING DEPENDENCY, not a value: this guard
+    # only fires when SL_GH is unset, and inside a worker pane SL_GH is ambient (launch-session.sh
+    # names it in the dropped command). Declaring the scrub as a dependency makes "scrub first, then
+    # neutralize" explicit rather than an accident of definition order.
+    # Same ratchet as _never_reach_real_cmux, for the GitHub CLI. lib/gh.py, stack_doctor and — since
+    # the positive auth assert (issue #299) — launch-session.sh + start-session.sh ALL resolve their
+    # gh through SL_GH, falling back to whatever `gh` is on PATH. On a dogfooding machine that is a
+    # real, logged-in gh: a test that forgot to stub would quietly make live GitHub calls as the
+    # owner's account. Point the default at a guaranteed-absent path so a missed stub fails loudly
+    # (rc 127) instead of succeeding for real. Tests that exercise gh set their own SL_GH in-body.
+    if not os.environ.get("SL_GH"):
+        monkeypatch.setenv("SL_GH", "/nonexistent/superlooper-test-gh")
 
 
 @pytest.fixture(autouse=True)

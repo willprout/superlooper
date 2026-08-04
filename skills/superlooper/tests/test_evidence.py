@@ -280,3 +280,127 @@ def test_unrecognized_or_corrupt_records_fail_safe_to_per_issue(bad):
     # channel fault. A novel per-issue fault must never silently freeze the whole loop; only the KNOWN
     # channel reasons hold it. (The worse failure is a wrongly-held queue, not one wrongly-parked issue.)
     assert evidence.is_channel_fault(bad) is False
+
+
+# ---- rc=4: the positive gh-auth assert refused the flight (issue #299) --------------------------
+
+def test_dead_gh_auth_is_its_own_reason_and_names_auth_not_the_shim():
+    # The whole point of the distinct code: without it, an auth-death refusal reads as a generic
+    # non-delivery and the park memo sends the reader to debug the launch shim — the wrong
+    # component, exactly the 2026-07-09 mis-blame that _LAUNCH_TEXT was written to end.
+    rec = evidence.build("launch", rc=4,
+                         captured="[i5] GH AUTH DEAD: `gh api user` did not answer as 'loopbot'")
+    assert rec["reason"] == "gh_auth_dead"
+    assert "auth" in rec["detail"].lower()
+    assert "shim" not in rec["detail"].lower()
+
+
+def test_the_park_memo_for_dead_gh_auth_names_the_remedy():
+    # A newcomer reading the memo at 3am must know what to type. `gh auth login` is the fix.
+    rec = evidence.build("launch", rc=4, captured="[i5] GH AUTH DEAD: not logged in")
+    memo = evidence.park_memo(rec, attempts=2)
+    assert "gh auth login" in memo
+    assert "gh_auth_dead" in memo
+
+
+def test_dead_gh_auth_is_a_per_issue_fault():
+    # Same call as base_missing (rc=3): an ENVIRONMENT fault whose memo the owner must actually see.
+    # Routing it to the channel would hold the queue behind the systemic-launch ALERT, whose body
+    # names App Nap and the cmux anchor — dead gh auth would then be reported as a cmux problem.
+    assert evidence.is_channel_fault(evidence.build("launch", rc=4, captured=None)) is False
+
+
+def test_a_dead_runner_env_is_a_channel_fault_that_holds_the_queue():
+    """rc=5 — the RUNNER's own gh cannot authenticate. No tab was opened, every launch will fail
+    identically, and no issue can fix it by re-approving. That is the definition of a channel
+    fault (#153), and getting it wrong is the 2026-07-09 storm shape with a new cause: one
+    machine-level fault walking the entire approved queue into per-issue parks."""
+    rec = evidence.build("launch", rc=5,
+                         captured="[i5] GH AUTH DEAD (runner env): `gh api user` did not return")
+    assert rec["reason"] == "gh_auth_dead_runner"
+    assert evidence.is_channel_fault(rec) is True
+    assert "runner" in rec["detail"].lower()
+
+
+def test_the_two_auth_refusals_are_charged_to_opposite_parties():
+    # The pair is the point: same fault CLASS, opposite blast radius. A session whose own env is
+    # broken parks that issue; a runner whose env is broken must never charge any issue at all.
+    session = evidence.build("launch", rc=4, captured="[i5] GH AUTH DEAD: not logged in")
+    runner = evidence.build("launch", rc=5, captured="[i5] GH AUTH DEAD (runner env): nope")
+    assert evidence.is_channel_fault(session) is False
+    assert evidence.is_channel_fault(runner) is True
+
+
+@pytest.mark.parametrize("captured", [
+    "[i5] GH AUTH DEAD: `gh api user` said: API rate limit exceeded for user",
+    "[i5] GH AUTH DEAD: dial tcp: lookup api.github.com: no such host",
+    "[i5] GH AUTH DEAD: no answer within 8s (gh did not return)",
+    "[i5] GH AUTH DEAD: HTTP 503: Service Unavailable",
+])
+def test_github_not_answering_is_not_a_dead_credential(captured):
+    """The assert cannot tell 'not authenticated' from 'GitHub did not answer', so the classifier
+    must. Parking an issue under 'your auth is dead, run gh auth login' when the real fault is a
+    rate limit or an outage is a confidently WRONG remedy — the mis-blame class this whole table
+    exists to end. These hold the queue and resume on their own instead."""
+    rec = evidence.build("launch", rc=4, captured=captured)
+    assert rec["reason"] == "gh_probe_unreachable", rec
+    assert evidence.is_channel_fault(rec) is True
+    assert "login" not in rec["detail"].lower() or "fix nothing" in rec["detail"].lower()
+
+
+def test_gh_error_text_cannot_be_read_as_a_dead_cmux_anchor():
+    """The refusals relay gh's OWN words, and gh's wording is not ours to control. `_LAUNCH_TEXT` is
+    consulted BEFORE the rc table, so an auth message containing a cmux-ish phrase would otherwise
+    classify as anchor_socket_lost and raise a socket alert about a GitHub fault."""
+    rec = evidence.build("launch", rc=4,
+                         captured="[i5] GH AUTH DEAD: gh: could not connect to github.com")
+    assert rec["reason"] != "anchor_socket_lost"
+    assert rec["reason"] in ("gh_auth_dead", "gh_probe_unreachable"), rec
+
+
+@pytest.mark.parametrize("captured,reason", [
+    ("[i429] could not create the worktree at '/run/worktrees/i429' for branch 'sl/i429-x'",
+     "worktree_create_failed"),
+    ("[i429] missing brief /run/briefs/i429.md", "brief_missing"),
+    ("[i429] issues.json load / sanitize validation failed — not launching", "identity_invalid"),
+    ("[i429] new-surface failed: Pane or workspace not found", "anchor_workspace_missing"),
+])
+def test_an_issue_number_can_never_be_read_as_a_github_status_code(captured, reason):
+    """THE bomb a bare "429" needle planted. Every launcher line is prefixed `[$ID]`, so on issue
+    i429 (and i1429, i4290…) a substring match on "429" turned four unrelated launch faults into
+    "GitHub is rate-limited" — a CHANNEL fault, which holds the whole queue on something that never
+    self-heals, and which also masked anchor_workspace_missing, the 2026-07-09 storm's own reason.
+
+    The needles that map to channel reasons must be impossible in our own launcher text."""
+    rec = evidence.build("launch", rc=1, captured=captured)
+    assert rec["reason"] == reason, rec
+    assert rec["reason"] != "gh_probe_unreachable"
+
+
+def test_the_id_prefix_never_swallows_a_shim_failure_either():
+    rec = evidence.build("launch", rc=2,
+                         captured="[i429] LAUNCH NOT DELIVERED: no worker started in tab 429e")
+    assert rec["reason"] == "shim_not_fired"
+
+
+def test_a_real_github_rate_limit_still_reads_as_unreachable():
+    # The other side of the same coin: tightening the needles must not stop them matching what gh
+    # actually prints.
+    for text in ("[i5] GH AUTH DEAD: HTTP 429: You have exceeded a secondary rate limit",
+                 "[i5] GH AUTH DEAD: API rate limit exceeded for user",
+                 "[i5] GH AUTH DEAD: HTTP 503: Service Unavailable"):
+        assert evidence.build("launch", rc=4, captured=text)["reason"] == "gh_probe_unreachable", text
+
+
+def test_a_dead_cmux_socket_is_not_reported_as_an_unreachable_github():
+    """`connection refused` reads as a network fault, but cmux's OWN socket error carries it too —
+    and the gh needles are ordered ahead of anchor_socket_lost, so including it flipped a dead cmux
+    socket to "wait for GitHub to come back": a remedy for a fault that never self-recovers. gh's Go
+    error always spells the whole `dial tcp <ip>:443: connect: connection refused`, so dropping the
+    bare phrase costs nothing."""
+    dead_socket = ("[i7] new-surface failed (rc=1) targeting pane 'pane:1': "
+                   "could not connect to cmux: connect: connection refused")
+    assert evidence.build("launch", rc=1, captured=dead_socket)["reason"] == "anchor_socket_lost"
+    # ...while gh's own refused connection is still caught, via `dial tcp`:
+    gh_refused = "[i5] GH AUTH DEAD: dial tcp 140.82.113.6:443: connect: connection refused"
+    assert evidence.build("launch", rc=4, captured=gh_refused)["reason"] == "gh_probe_unreachable"
