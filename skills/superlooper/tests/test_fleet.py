@@ -130,6 +130,20 @@ def test_the_host_config_check_names_each_missing_setting():
     assert "resume_agents_on_restore" in fleet.host_config_problem(off)
     # A commented-out setting is not a setting.
     assert fleet.host_config_problem("# resume_agents_on_restore = true\n[session]\n")
+    # A file the HOST would refuse is not a file this may call merely incomplete: the config is
+    # PARSED, so invalid TOML is reported as invalid rather than judged on its spelling.
+    dup = "version_check = false\n[session]\nresume_agents_on_restore = true\n[session]\n"
+    assert "not valid TOML" in fleet.host_config_problem(dup)
+    assert "not valid TOML" in fleet.host_config_problem("this is = = not toml\n")
+
+
+def test_the_merge_instructions_carry_no_ownership_marker():
+    # A refusal tells an operator to paste these into a file they maintain. If they carried the
+    # marker, the NEXT install would read it as ownership and replace the whole file.
+    settings = fleet.host_config_settings()
+    assert fleet.CONFIG_MARKER not in settings
+    assert fleet.host_config_problem(settings) is None       # ...and they are still sufficient
+    assert fleet.CONFIG_MARKER in fleet.render_host_config()  # the managed file still claims it
 
 
 def test_the_host_config_is_written_where_the_host_reads_it():
@@ -408,6 +422,27 @@ def test_a_plist_with_no_path_at_all_is_the_worse_case_not_the_neutral_one():
     r = fleet.check_login_item(_green_probe(files={fleet.server_plist_path(_HOME): naked}),
                                uid=501, home=_HOME)
     assert not r.ok and "no PATH at all" in r.detail
+
+
+def test_a_job_that_runs_something_other_than_the_fleet_is_refused():
+    # Every other block inspects the artefacts under the prefix. If the JOB runs a different
+    # binary, names a different session, or reads a different token file, all of them are
+    # describing files nothing uses — and the whole report goes green about a fleet that is not
+    # the one running.
+    good = _green_plist()
+    for broken, why in (
+            (good.replace(_BIN, "/opt/homebrew/bin/other"), "binary"),
+            (good.replace("<string>%s</string>" % fleet.SESSION_NAME, "<string>other</string>"),
+             "session"),
+            (good.replace(fleet.token_file(_PREFIX), "/somewhere/else/token"), "token file")):
+        probe = _green_probe(files={fleet.server_plist_path(_HOME): broken})
+        r = fleet.check_login_item(probe, uid=501, home=_HOME, fleet_prefix=_PREFIX)
+        assert not r.ok, why
+    assert fleet.check_login_item(_green_probe(), uid=501, home=_HOME,
+                                  fleet_prefix=_PREFIX).ok
+    # An unparseable plist is not a passing one.
+    junk = _green_probe(files={fleet.server_plist_path(_HOME): "not a plist at all"})
+    assert not fleet.check_login_item(junk, uid=501, home=_HOME, fleet_prefix=_PREFIX).ok
 
 
 def test_a_loaded_but_idle_job_is_a_failure_not_a_pass():

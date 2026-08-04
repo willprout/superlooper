@@ -441,7 +441,7 @@ def _state_base():
     return os.environ.get("SL_HOME") or os.path.expanduser("~/.superlooper")
 
 
-def _write_once(path, text, marker, what):
+def _write_once(path, text, marker, what, merge_text=None):
     """Write `text` to `path` unless somebody else's file is already there.
 
     The build-up writes into the HOST's own config directory, which is shared with whatever
@@ -468,8 +468,15 @@ def _write_once(path, text, marker, what):
     if existing is not None and marker not in existing:
         print("  REFUSED %s: %s already exists and was not written by superlooper, so it is "
               "not ours to rewrite — merge these lines into it by hand:" % (what, path))
-        for line in text.rstrip("\n").splitlines():
+        # `merge_text`, not `text` (fresh-agent review round 2). `text` carries the ownership
+        # marker, and printing it invites the operator to paste the marker into a file they
+        # maintain — after which the NEXT install would read it as ownership and replace the whole
+        # thing. What a refusal hands over is the SETTINGS; the file stays theirs, and the block
+        # for it stays red until they say otherwise.
+        for line in (merge_text or text).rstrip("\n").splitlines():
             print("    | %s" % line)
+        print("    (superlooper will keep refusing to manage this file, which is the point — the "
+              "block for it stays red until you decide it is done.)")
         return "refused"
     if existing == text:
         return "kept"
@@ -511,32 +518,49 @@ def cmd_fleet(args):
     home = os.path.expanduser("~")
 
     if args.install:
+        # Judged BEFORE anything is written or loaded (fresh-agent review round 2). The report at
+        # the end would catch a stock or wrong-version binary — but only after --load had already
+        # started it, which is a real open control socket on a real machine for as long as it takes
+        # somebody to read the red line. Fail-closed means refusing before the launch.
         binary = fleet.host_binary(prefix)
-        if not os.access(binary, os.X_OK):
-            print("FATAL: no host binary at %s. Build it from the SOURCE checkout first:\n"
-                  "  skills/superlooper/vendor/herdr/build.sh\n"
-                  "It clones the pinned release, applies the fence patch beside it, and installs "
-                  "the result here. An install that configured a host nobody had built would "
-                  "produce a green-looking job that starts nothing." % binary, file=sys.stderr)
+        ready = fleet.check_host_binary(probe, prefix)
+        if not ready.ok:
+            print("FATAL: %s\n  Fix: %s\n"
+                  "Nothing was written or started. `vendor/herdr/build.sh` is what produces a host "
+                  "this command will configure; it needs the SOURCE checkout, because the fence "
+                  "patch is a build input and never ships inside the published payload."
+                  % (ready.detail, ready.fix or "build it first"), file=sys.stderr)
             return 2
         print("superlooper fleet --install")
         for d in (os.path.join(prefix, "bin"), fleet.log_dir(prefix)):
             os.makedirs(d, exist_ok=True)
 
         token = fleet.token_file(prefix)
-        if not os.path.exists(token):
+        if not os.path.lexists(token):
             # 0600 before the secret is in it: creating world-readable and then chmod-ing leaves a
-            # window where the fence's whole secret is readable.
+            # window where the fence's whole secret is readable. O_EXCL so a race cannot land the
+            # secret in a file that appeared underneath us.
             fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(secrets.token_urlsafe(32) + "\n")
             print("  minted %s (0600)" % token)
-        else:
+        elif not os.path.islink(token) and os.path.isfile(token):
             os.chmod(token, 0o600)
             print("  kept %s (0600)" % token)
+        else:
+            # `lexists` above, `islink` here (fresh-agent review round 2): a SYMLINK at this path
+            # would have `os.path.exists` follow it, `chmod` change the permissions of whatever it
+            # points at, and launchd hand the server a secret of somebody else's choosing. The
+            # token's provenance is the fence's whole basis, so an unexpected object here is
+            # refused rather than adopted.
+            print("FATAL: %s is not a regular file (it is a symlink or a directory). The fence "
+                  "token's provenance is the fence itself — move it aside and re-run."
+                  % token, file=sys.stderr)
+            return 2
 
         cfg_path = fleet.host_config_path(host_config_dir)
-        wrote = _write_once(cfg_path, fleet.render_host_config(), fleet.CONFIG_MARKER, "config")
+        wrote = _write_once(cfg_path, fleet.render_host_config(), fleet.CONFIG_MARKER, "config",
+                            merge_text=fleet.host_config_settings())
         if wrote != "refused":
             print("  %s %s" % (wrote, cfg_path))
 
@@ -568,17 +592,19 @@ def cmd_fleet(args):
         # Through the SAME door as the shared config (fresh-agent review): our launchd label is
         # not proof the plist under it is ours. An operator's own experiment, or a hand-tuned job,
         # is exactly what "never clobber a file it did not write" has to protect.
-        if _write_once(plist, text, fleet.PLIST_MARKER, "server job") == "refused":
+        wrote = _write_once(plist, text, fleet.PLIST_MARKER, "server job")
+        if wrote == "refused":
             return 2
-        print("  wrote %s" % plist)  # noqa: the refusal path returned above
+        print("  %s %s" % (wrote, plist))
 
         viewer = fleet.viewer_command(prefix)
-        if _write_once(viewer, fleet.render_viewer_command(binary=binary,
-                                                           session=fleet.SESSION_NAME),
-                       fleet.VIEWER_MARKER, "viewer script") != "refused":
+        wrote = _write_once(viewer, fleet.render_viewer_command(binary=binary,
+                                                                session=fleet.SESSION_NAME),
+                            fleet.VIEWER_MARKER, "viewer script")
+        if wrote != "refused":
             os.chmod(viewer, 0o755)
-            print("  wrote %s (register it as a Login Item yourself if you want the window)"
-                  % viewer)
+            print("  %s %s (register it as a Login Item yourself if you want the window)"
+                  % (wrote, viewer))
 
         argv = runner_home.bootstrap_argv(_launchctl_bin(), uid, plist)
         if args.load:

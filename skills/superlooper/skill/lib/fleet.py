@@ -33,6 +33,8 @@ import json
 import os
 import re
 import time
+import tomllib
+import plistlib
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -188,6 +190,17 @@ def host_config_path(host_config_dir):
     return os.path.join(host_config_dir, "config.toml")
 
 
+def host_config_settings():
+    """Just the two settings, with no ownership marker — what a REFUSAL tells an operator to merge.
+
+    The full rendered file carries `CONFIG_MARKER`, which is how `--install` recognises a file as
+    its own. Printing that in a refusal would invite the operator to paste it into a file they
+    maintain by hand, and the NEXT install would then read the marker as ownership and replace the
+    whole thing (fresh-agent review round 2). So the merge instructions carry settings only.
+    """
+    return "version_check = false\n\n[session]\nresume_agents_on_restore = true\n"
+
+
 def render_host_config():
     """The host's `config.toml` as the fleet needs it (plan §2).
 
@@ -214,27 +227,33 @@ def render_host_config():
 
 
 def host_config_problem(text):
-    """None, or what is missing from an installed host config."""
+    """None, or what is missing from — or wrong with — an installed host config.
+
+    PARSED, not pattern-matched (fresh-agent review round 2). Two settings in two different tables
+    is exactly the shape text-matching gets wrong in both directions: a key in a later table looks
+    like it is in `[session]`, a duplicate table reads as fine while the host refuses the file
+    outright. A parser answers the question the host will actually ask, and a file it cannot parse
+    is reported as unreadable rather than judged on its spelling.
+    """
     if text is None:
         return "no config file"
-    body = re.sub(r"^\s*#.*$", "", text, flags=re.M)
-    found = re.search(r"^\s*\[session\]\s*$", body, re.M)
-    if not found:
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        return ("it is not valid TOML (%s) — the host refuses to start on a config it cannot "
+                "parse, so this is not a state to report as merely incomplete" % e)
+    except (TypeError, ValueError) as e:
+        return "it could not be parsed (%s)" % e
+    session = data.get("session")
+    if not isinstance(session, dict):
         return "no [session] table"
-    # Split at the table header: TOML keys belong to the table they follow, and the two settings
-    # live in DIFFERENT tables. Checking either one against the whole file would accept it in the
-    # wrong place — where it parses as valid TOML and is silently ignored, which is the one failure
-    # mode a config check exists to catch.
-    rest = body[found.end():]
-    nxt = re.search(r"^\s*\[", rest, re.M)
-    top, session_body = body[:found.start()], rest[:nxt.start()] if nxt else rest
-    if not re.search(r"^\s*resume_agents_on_restore\s*=\s*true\s*$", session_body, re.M):
-        return ("session.resume_agents_on_restore is not explicitly true under [session] — a "
-                "restored server brings its panes back as bare shells")
-    if not re.search(r"^\s*version_check\s*=\s*false\s*$", top, re.M):
+    if session.get("resume_agents_on_restore") is not True:
+        return ("session.resume_agents_on_restore is not true — a restored server brings its panes "
+                "back as bare shells")
+    if data.get("version_check") is not False:
         return ("a top-level version_check = false is missing — an unattended server nagged toward "
-                "a newer build is a fleet that can quietly stop being the build you fenced (under "
-                "[session] it would parse and be ignored)")
+                "a newer build is a fleet that can quietly stop being the build you fenced (nested "
+                "under a table it would parse and be ignored)")
     return None
 
 
@@ -494,6 +513,45 @@ def check_host_binary(probe, fleet_prefix):
                                                                                 PINNED_VERSION))
 
 
+def _plist_program(text):
+    """The job's ProgramArguments, or None. Parsed, because this is what it will really run."""
+    try:
+        job = plistlib.loads((text or "").encode())
+    except Exception:                                  # plistlib raises a family, not one class
+        return None
+    args = job.get("ProgramArguments") if isinstance(job, dict) else None
+    return [str(a) for a in args] if isinstance(args, list) and args else None
+
+
+def plist_runs_problem(text, *, binary, session, token_file_path):
+    """None, or why the INSTALLED job would not run the fleet this build-up configured.
+
+    Every other block reads the artefacts on disk: `host binary` inspects `<prefix>/bin/`,
+    `fleet isolation` stats `<prefix>/token`. If the job runs something else, all of them are
+    describing files nothing uses — the whole report goes green about a fleet that is not the one
+    running (fresh-agent review round 2). So the job's own argv and environment are the join.
+    """
+    argv = _plist_program(text)
+    if not argv:
+        return "its ProgramArguments could not be read"
+    if argv[0] != binary:
+        return ("it runs %s, not the fleet's own %s — every other block here inspects the latter, "
+                "so they would all be describing a binary nothing runs" % (argv[0], binary))
+    if session not in argv:
+        return "it does not name the %r session, so it would bind a different socket" % session
+    try:
+        job = plistlib.loads(text.encode())
+        env = job.get("EnvironmentVariables") or {}
+    except Exception:
+        return "its EnvironmentVariables could not be read"
+    named = env.get(session_host.API_TOKEN_FILE_ENV_VAR)
+    if named != token_file_path:
+        return ("it reads its fence token from %r, not %s — the token this build-up minted and "
+                "checks the permissions of is not the one the server uses"
+                % (named, token_file_path))
+    return None
+
+
 def check_login_item(probe, uid, home, fleet_prefix=None):
     """`host login item` — the server is a loaded gui/$UID LaunchAgent with an explicit PATH.
 
@@ -531,6 +589,12 @@ def check_login_item(probe, uid, home, fleet_prefix=None):
             "same-uid process. The job must name the 0600 FILE (%s) instead"
             % (plist, session_host.API_TOKEN_ENV_VAR, target, session_host.API_TOKEN_FILE_ENV_VAR),
             "re-run `superlooper fleet --install`, then rotate the token — it has been published")
+    if fleet_prefix:
+        problem = plist_runs_problem(text, binary=host_binary(fleet_prefix),
+                                     session=SESSION_NAME,
+                                     token_file_path=token_file(fleet_prefix))
+        if problem:
+            return CheckResult(name, False, "%s is installed but %s" % (plist, problem), fix)
     launchctl = probe.command("launchctl", envvar="SL_LAUNCHCTL", default="/bin/launchctl")
     if not launchctl:
         # NOT a warn. A plist on disk starts nothing, and "I could not ask whether the job is
