@@ -171,13 +171,27 @@ def test_a_debugger_launches_in_place_with_no_worktree_and_no_branch(tmp_path):
 def test_a_missing_base_ref_exits_3_and_names_the_branch(tmp_path):
     """Issue #28's distinct code. A missing base must never become a hollow launch, and the park
     memo must blame the branch rather than the launch machinery."""
+    # rc=1 is what `rev-parse --verify --quiet` returns for a ref that is genuinely not there.
     edges = FakeEdges({"worktree add": (1, "", "fatal: invalid reference"),
-                       "rev-parse --verify": (128, "", "unknown revision")})
+                       "rev-parse --verify": (1, "", "")})
     spec = _spec(tmp_path)
     result, _edges, host = _run(spec, edges=edges)
     assert result.rc == launch.BASE_MISSING
     assert "origin/main" in result.stderr
     assert host.spawned == [], "a missing base costs no pane"
+
+
+def test_a_git_that_could_not_answer_is_never_read_as_a_missing_base(tmp_path):
+    """Exit 3's memo tells the owner to change dev_branch and re-approve. A hung or unrunnable git
+    has not said the ref is absent — it has said nothing — and sending the owner to edit config for
+    it is the confidently-wrong remedy the evidence table exists to end."""
+    for rc in (124, 127, 128):
+        edges = FakeEdges({"worktree add": (1, "", "fatal: could not read"),
+                           "rev-parse --verify": (rc, "", "git said nothing useful")})
+        spec = _spec(tmp_path)
+        result, _edges, _host = _run(spec, edges=edges)
+        assert result.rc == launch.ABORTED, "rc=%s must not become exit 3" % rc
+        assert "could not create the worktree" in result.stderr
 
 
 def test_a_git_level_worktree_failure_is_not_a_missing_base(tmp_path):
@@ -196,10 +210,31 @@ def test_a_git_level_worktree_failure_is_not_a_missing_base(tmp_path):
 def test_worktree_creation_holds_a_lock_for_the_whole_critical_section(tmp_path):
     """c17's salvaged half. Two launches racing on one repo must not both run `worktree add`."""
     spec = _spec(tmp_path)
-    result, edges, _host = _run(spec)
-    assert result.rc == launch.OK, result.stderr
     lock = os.path.join(spec.run_root, "state", "worktree.lock")
+
+    class Watching(FakeEdges):
+        """Answers `git worktree add` only while the lock is genuinely held by this process."""
+
+        def run(self, argv, timeout=None, cwd=None, env=None):
+            if "worktree" in argv and "add" in argv:
+                probe = open(lock, "a+")
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    held.append(True)          # someone holds it — which is the point
+                else:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                    held.append(False)
+                finally:
+                    probe.close()
+            return super().run(argv, timeout=timeout, cwd=cwd, env=env)
+
+    held = []
+    result, edges, _host = _run(spec, edges=Watching())
+    assert result.rc == launch.OK, result.stderr
     assert os.path.exists(lock), "the worktree critical section takes a real lock file"
+    assert held and all(held), \
+        "the lock must be HELD across `git worktree add`, not merely taken beside it"
     # And it is a REAL exclusive lock, not a marker file: a second holder must wait for it.
     with launch.WorktreeLock(lock) as held:
         assert held._fh is not None
@@ -540,4 +575,34 @@ def test_a_worker_launch_without_a_repo_names_that_rather_than_the_branch(tmp_pa
     result, _edges, host = _run(spec, started=False)
     assert result.rc == launch.ABORTED
     assert "SL_REPO" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_failed_pretrust_refuses_the_launch_rather_than_flying_into_a_dialog(tmp_path):
+    """herdr does NOT remove the first-run trust dialog, and the host classifies a pane blocked on
+    one as `idle`. Ignoring pretrust's rc fails OPEN into exactly that stall: the pane opens, the
+    agent blocks, no sentinel is stamped, and the launch reads as rc=2 — a CHANNEL fault that holds
+    the whole queue and blames the launch shim for a missing `jq`."""
+    edges = FakeEdges({"pretrust.sh": (1, "", "jq: command not found")})
+    spec = _spec(tmp_path)
+    result, _edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.ABORTED
+    assert "pre-trust" in result.stderr and "jq" in result.stderr
+    assert host.spawned == [], "nothing is created for a folder we could not pre-trust"
+
+
+def test_a_session_id_that_could_not_be_recorded_refuses_the_launch(tmp_path):
+    """The id is minted so the flight can be re-entered after any interruption. A session that
+    launched without its handle recorded is one `superlooper resume` can never find, with nothing
+    anywhere saying why."""
+    spec = _spec(tmp_path)
+    sessions = os.path.join(spec.run_root, "state", "sessions")
+    os.makedirs(sessions, exist_ok=True)
+    os.chmod(sessions, 0o500)                       # writable by nobody
+    try:
+        result, _edges, host = _run(spec, started=False)
+    finally:
+        os.chmod(sessions, 0o700)
+    assert result.rc == launch.ABORTED
+    assert "resumable" in result.stderr
     assert host.spawned == []

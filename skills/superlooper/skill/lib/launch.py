@@ -108,6 +108,7 @@ _START_TIMEOUT_MS = 45000       # the pane's floor (a bounded gh read) runs befo
 _VERIFY_SECONDS = 30            # the floor stamps its sentinel BEFORE the agent starts, so this
 _VERIFY_PAUSE = 0.25            # window is nearly always already satisfied when spawn returns
 _MARKER_STALE_MINUTES = 5       # only genuinely abandoned self-refusal markers are swept
+_REFUSAL_GRACE = 3.0            # a pane's own refusal can land just after the host gives up
 
 # A GitHub login is [A-Za-z0-9-] and nothing else. `gh` merges its diagnostics into the capture and
 # an error path prints MULTI-LINE text, so the test is a whole-string match: a line-anchored one
@@ -343,7 +344,22 @@ def _launch(spec, host, edges):
     # launcher called exactly this one whatever the configured agent was, and `pretrust-codex.sh`
     # has no caller anywhere. Wiring it here would be a real fix and an unrequested behaviour
     # change inside a migration, so it is filed rather than smuggled in (see the follow-up issue).
-    edges.run([os.path.join(spec.engine_bin, "pretrust.sh"), worktree], timeout=60)
+    #
+    # ITS RC IS THE GATE, not decoration. The cmux launcher ran under `set -e`, so a pretrust that
+    # failed aborted the launch before any tab existed; ignoring it here would fail OPEN into the
+    # exact stall this step prevents — the pane opens, the agent blocks on the trust dialog, no
+    # sentinel is ever stamped, and the launch reads as rc=2, a CHANNEL fault that holds the whole
+    # queue and blames the launch shim. pretrust.sh exits nonzero on a missing `jq`, an
+    # unsupported agent and an unwritable trust store, all of which are real and none of which the
+    # launch machinery caused.
+    trusted = edges.run([os.path.join(spec.engine_bin, "pretrust.sh"), worktree], timeout=60)
+    if trusted.rc != 0:
+        return Result(ABORTED,
+                      "[%s] could not pre-trust %s (pretrust.sh rc=%s) — refusing to launch into a "
+                      "folder whose first-run trust dialog would block the session with nobody "
+                      "there to answer it: %s"
+                      % (iid, worktree, trusted.rc,
+                         (trusted.stderr or trusted.stdout or "").strip()[:400]))
 
     # ---- session identity (issue #298) ----------------------------------------------------
     # Identity handed down, never self-asserted. A RELAUNCH always mints anew (`--session-id` on
@@ -374,7 +390,7 @@ def _launch(spec, host, edges):
         # floor's own markers BEFORE blaming the machinery: without them a poisoned environment
         # and dead GitHub auth both read as "the launch never delivered", and the park memo would
         # send the owner to debug the launch stack.
-        refusal = _self_refusal(spec, iid, token)
+        refusal = _self_refusal(spec, iid, token, edges=edges, seconds=_REFUSAL_GRACE)
         if refusal is not None:
             return refusal
         return Result(NOT_DELIVERED, "\n".join([
@@ -431,7 +447,11 @@ def _make_worktree(spec, edges, iid, worktree, branch, base):
             return None
         exists = edges.run(["git", "-C", spec.repo, "rev-parse", "--verify", "--quiet",
                             "%s^{commit}" % base], timeout=30)
-        if exists.rc != 0:
+        # rc=1 is git's own "that ref is not here" under `--verify --quiet`. Anything else — a
+        # timeout (124), an unrunnable git (127), a broken repo — is a fault this probe could not
+        # answer, and reading it as a missing base would tell the owner to fix a dev_branch that
+        # was never the problem. Fall through to the generic refusal, which carries git's words.
+        if exists.rc == 1:
             # Issue #28's DISTINCT code, so the park memo blames the branch rather than the launch
             # machinery — and a missing base never becomes a hollow launch.
             return Result(BASE_MISSING,
@@ -439,10 +459,14 @@ def _make_worktree(spec, edges, iid, worktree, branch, base):
                           "dev_branch is not on origin, so no worktree can be created. Run "
                           "'superlooper doctor' and set dev_branch to the repo's default, then "
                           "re-approve." % (iid, base, spec.repo))
+        # Git's OWN words are deliberately NOT appended. evidence.py classifies this line, and its
+        # channel needles ("no answer within", "dial tcp", "could not resolve") are matched BEFORE
+        # the worktree needle — so third-party text here could turn one issue's local git fault
+        # into a held queue. Its own file states the rule: a needle that maps to a channel reason
+        # must be impossible in the loop's own launcher text.
         return Result(ABORTED,
                       "[%s] could not create the worktree at '%s' for branch '%s' (base '%s' "
-                      "exists): %s" % (iid, worktree, branch, base,
-                                       (attach.stderr or fresh.stderr or "").strip()))
+                      "exists; git rc=%s/%s)" % (iid, worktree, branch, base, fresh.rc, attach.rc))
 
 
 def pane_environment(spec, iid, session_id, resume, expect_login, token,
@@ -541,8 +565,11 @@ def _prepare_state(spec, iid, session_id, token):
     # which is withheld until delivery is verified: an id is an IDENTITY claim, not a liveness one
     # — nothing reads this file as proof anything is running — and a host that dies inside the
     # verify window must still leave behind the handle to resume by.
-    if session_id:
-        _write_atomic(os.path.join(state, "sessions", iid), session_id)
+    if session_id and not _write_atomic(os.path.join(state, "sessions", iid), session_id):
+        # The old launcher exited 1 here. Flying anyway produces a session nobody can `resume`,
+        # with nothing anywhere saying why — the handle is the whole point of minting the id.
+        raise OSError("could not record the session id for %s — this session would not be "
+                      "resumable" % iid)
 
     # Restart hygiene: clear ONLY this id's run-state markers, so a prior session's
     # report/exited/blocked cannot mis-fire for the fresh one. Intentionally explicit rather than a
@@ -614,10 +641,22 @@ def _refusal_marker(spec, iid, token):
     return None
 
 
-def _self_refusal(spec, iid, token):
+def _self_refusal(spec, iid, token, edges=None, seconds=0.0):
     """The Result for a session that refused itself, or None. Speaks the session's OWN diagnosis
-    so the memo names the fault instead of the launch machinery."""
+    so the memo names the fault instead of the launch machinery.
+
+    ``seconds`` is a short GRACE for the path where the host gave up first: the pane writes its
+    marker a beat after `agent start` has already failed, and reading once would report rc=2 (a
+    channel fault that holds the queue, blaming the launch machinery) for what is really a poisoned
+    environment or dead auth (per-issue, with a memo that names it). The shell launcher watched all
+    three markers in ONE window and never had this race.
+    """
     marker = _refusal_marker(spec, iid, token)
+    waited = 0.0
+    while marker is None and edges is not None and waited < seconds:
+        edges.sleep(_VERIFY_PAUSE)
+        waited += _VERIFY_PAUSE
+        marker = _refusal_marker(spec, iid, token)
     if marker is None:
         return None
     kind, why = marker
@@ -672,15 +711,17 @@ def _record_delivery(spec, iid, session, debugger, resume):
 
 def _write_atomic(path, text):
     """tmp + mv, like every other durable state write in this stack, so a reader can never see a
-    half-written value."""
+    half-written value. True when it landed — the caller decides whether a miss is fatal."""
     tmp = "%s.tmp.%d" % (path, os.getpid())
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(tmp, "w") as f:
             f.write(text)
         os.replace(tmp, path)
+        return True
     except OSError:
         _rm_quiet(tmp)
+        return False
 
 
 def _rm_quiet(path):

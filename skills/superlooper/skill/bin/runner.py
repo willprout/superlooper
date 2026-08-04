@@ -115,6 +115,10 @@ MAX_POLL_CALLS = 30            # budget cap per poll cycle (poll_ship discipline
 # sites below for the reason the whole issue exists: three copies of a spawn path is how the
 # watchdog and Fixer get left behind calling a launcher that no longer exists.
 LAUNCHER = "launch-session.py"
+# How long ONE session-host control call may hang when the RUNNER makes it. Deliberately far below
+# the doorway's own default: the runner's teardown sweeps run every tick over every lane, so the
+# bound that matters is the tick's, not one call's.
+SESSION_CALL_SECONDS = 5
 LAUNCH_TIMEOUT = 120           # the launcher verifies delivery within ~30s; be generous
 # The launcher's DISTINCT exit code for "the worktree base branch origin/<dev_branch> does not
 # exist" (issue #28) — a per-repo config fault, kept out of the systemic-anchor streak so the park
@@ -2479,7 +2483,18 @@ class Runner:
             self._log(f"[{iid}] could not end the recorded session: {e}")
 
     def _session_host(self):                                         # injectable, like _run_script
-        return session_host.SessionHost()
+        """The doorway, BOUNDED for the runner's own deadlines.
+
+        `_close_pane` is best-effort and is reached from sweeps that run every tick over every
+        eligible lane (`_reclaim_terminal_worktrees`, `_drain_pending_teardowns`). A teardown makes
+        several control calls, so against a host that is present but wedged the doorway's own
+        20s-per-call default would cost a couple of minutes PER LANE and stall the tick — which is
+        how the cmux path's `CLOSE_TIMEOUT` was chosen, and the bound this replaces. A close that
+        cannot be verified inside it raises, and the caller treats that as "not verified" — which
+        is the safe direction: nothing is pruned on an unverified teardown.
+        """
+        return session_host.SessionHost(call_seconds=SESSION_CALL_SECONDS,
+                                        teardown_reads=2, teardown_pause=0.5)
 
     def _teardown_session(self, iid, remove_worktree=False, exit_timeout=None, guard_worktree=False,
                           await_exit=None):

@@ -322,19 +322,20 @@ def test_a_failed_launch_leaves_no_preamble_behind(rig):
         "a preamble that reached nobody must not linger as the next reader's opening message"
 
 
-def test_check_reports_a_missing_pane_instead_of_promising_a_revive(rig):
-    # A preflight that answers "resumable" and then fails on a missing pane is not a preflight.
+def test_check_no_longer_answers_a_cmux_question_the_launch_never_asks(rig):
+    """The preflight used to report `resumable: false` whenever no cmux pane resolved. Issue #308
+    made the launch ask the session host for a workspace instead, so that answer described a fact
+    the revive no longer depends on — and on a login-item runner (#306) it would have reported
+    every recorded session unresumable."""
     rig.seed_lane()
     rig.record_session()
-    # No recorded anchor, no $SL_PANE (the rig pops it), and SL_CMUX names a binary that does not
-    # exist — so detect_self_anchor fails closed to "" and no pane can resolve.
     (rig.home / "state" / "runner.anchor.json").unlink()
     r = run(rig, "resume", "i1", "--check", "--json")
     assert r.returncode == 0
     out = jbody(r)
     assert out["verb"] == "resume-check"
-    assert out["resumable"] is False and "pane" in out["error"].lower()
-    assert rig.launch_calls() == []
+    assert out["resumable"] is True and out["error"] is None
+    assert rig.launch_calls() == [], "--check writes nothing and launches nothing"
 
 
 def test_the_preamble_states_the_real_repository_facts(rig):

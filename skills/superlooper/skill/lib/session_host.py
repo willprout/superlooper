@@ -528,7 +528,8 @@ class SessionHost:
 
     def __init__(self, probe=None, binary=None, env=None, prompt_timeout_ms=_PROMPT_TIMEOUT_MS,
                  confirm_reads=_CONFIRM_READS, confirm_pause=_CONFIRM_PAUSE,
-                 teardown_reads=_TEARDOWN_READS, teardown_pause=_TEARDOWN_PAUSE):
+                 teardown_reads=_TEARDOWN_READS, teardown_pause=_TEARDOWN_PAUSE,
+                 call_seconds=_CALL_SECONDS):
         self._probe = probe if probe is not None else Probe()
         self.env = env if env is not None else os.environ
         # Same override convention as SL_CMUX / SL_GH / SL_CLAUDE, and for the same reason: it is
@@ -539,6 +540,10 @@ class SessionHost:
         self._confirm_pause = confirm_pause
         self._teardown_reads = int(teardown_reads)
         self._teardown_pause = teardown_pause
+        # How long ONE control call may hang. A verb makes several, so a caller whose own deadline
+        # is short — a sweep that runs every tick over every lane — has to be able to say so, or a
+        # single wedged host turns a best-effort teardown into minutes of stalled tick.
+        self._call_seconds = float(call_seconds)
 
     # ---- verb 1: spawn -----------------------------------------------------------------
     def spawn(self, name, cwd, env=None, kind="claude", agent_args=(), label=None,
@@ -830,7 +835,7 @@ class SessionHost:
 
     def _call(self, args, timeout=None):
         argv = [self.binary] + [str(a) for a in args]
-        return _parse(self._probe.run(argv, timeout=timeout or _CALL_SECONDS))
+        return _parse(self._probe.run(argv, timeout=timeout or self._call_seconds))
 
     def _process_facts(self, pane):
         """``(shell_pid, liveness, detail)`` for a pane — the OS's answer, not the host's.

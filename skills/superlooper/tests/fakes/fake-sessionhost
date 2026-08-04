@@ -27,6 +27,7 @@ State lives under ``$FAKE_HOST_DIR``, one directory per simulation.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -111,9 +112,21 @@ def start_pane(ws, name, agent):
         if carry in os.environ:
             env.setdefault(carry, os.environ[carry])
     logfile = open(state("pane-%s.log" % name), "ab")
+    if shutil.which("zsh") and SHIM:
+        # The REAL pane: a zsh that sources the REAL shim, which arms the agent verb, which hands
+        # off to start-session.sh. This is the whole chain and it is what runs on the fleet.
+        argv = ["zsh", "-c", "source %s; %s" % (json.dumps(SHIM), agent)]
+    else:
+        # No zsh (CI runs on Linux): EMULATE the handoff's net effect — run start-session.sh with
+        # the lane id, which is exactly what the armed function does. The shim itself is covered by
+        # tests/test_launch_shim.py and tests/test_launch_delivery.py, both of which skip without
+        # zsh; what this harness is for is the RUNNER's behaviour around a session, and that must
+        # not silently stop being tested on the platform CI uses. (The cmux fake this replaces made
+        # the same choice for the same reason — it re-implemented the shim's contract in bash.)
+        argv = ["sh", "-c", 'exec "$1" "$2"', "sh",
+                env.get("SL_START_SESSION", ""), env.get("SL_ISSUE_ID", "")]
     proc = subprocess.Popen(
-        ["zsh", "-c", "source %s; %s" % (json.dumps(SHIM), agent)],
-        env=env, cwd=cwd, stdout=logfile, stderr=logfile, stdin=subprocess.DEVNULL,
+        argv, env=env, cwd=cwd, stdout=logfile, stderr=logfile, stdin=subprocess.DEVNULL,
         start_new_session=True)
     return proc.pid
 

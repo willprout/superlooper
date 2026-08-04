@@ -135,9 +135,12 @@ will "restart itself in its own cmux tab". Same follow-up.
 ## Where the login-item home is NOT yet operational
 
 Stated plainly because a half-migrated home that *looks* complete is worse than one that announces
-its gap. This issue moves the **supervisor's own process**. The launch path it drives —
-the launcher, which under cmux resolved a pane and birthed a tab — belonged to the wrapper
-migration, and landed in #308 as `launch-session.py` on the session host. So on a machine set to `login-item` today the runner boots, preflights, ticks,
-restarts and is doctored correctly, and its *worker launches* still expect the old launcher. The
-parallel-run plan sequences it that way on purpose: the pieces land first, the cutover is one
-deliberate event, and production stays on `pane` throughout.
+its gap. This issue moved the **supervisor's own process**; the launch path it drives — which under
+cmux resolved a pane and birthed a tab — belonged to the wrapper migration and landed separately in
+#308, as `launch-session.py` against the session host. With both in, a `login-item` runner boots,
+preflights, ticks, restarts, is doctored, and launches workers that need no cmux anchor at all.
+
+What is still outstanding is the OTHER direction of the same seam: the engine's pane-shaped verbs
+— the nudge and the screen reads — still address cmux with handles the session host now issues
+(#334). The parallel-run plan sequences it that way on purpose: the pieces land first, the cutover
+is one deliberate event, and production stays on `pane` throughout.

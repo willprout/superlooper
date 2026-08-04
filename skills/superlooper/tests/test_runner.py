@@ -6614,3 +6614,52 @@ def test_the_worker_env_never_inherits_a_second_hand_gh_identity(rig):
     # from inside a worker or debugger pane would inherit that session's value. Pinned EMPTY here so
     # the launcher always resolves the loop's identity itself rather than trusting a stale answer.
     assert rig.r._worker_env("i101")["SL_EXPECT_GH_LOGIN"] == ""
+
+
+def test_close_pane_ends_a_finished_session_with_exit_not_kill(rig):
+    """The doorway's `exit` is the positive-allowlist path for a session it can NAME as finished.
+    Only the escalation was covered before, so an unconditional `kill` would have passed — and the
+    difference matters: `kill` signals a process, `exit` closes a window whose agent already went."""
+    rig.host.live = False                                # this one reads as finished
+    (rig.home / "state" / "panes" / "i3").write_text("PANE-3")
+    (rig.home / "state" / "panes" / "i3.ws").write_text("WS-3")
+    rig.r._close_pane("i3")
+    assert [verb for verb, _ws, _pane in rig.teardowns] == ["exit"]
+
+
+def test_close_pane_escalates_to_kill_only_when_exit_refuses(rig):
+    """A worker that wrote its report and idles at the prompt reads ALIVE, so `exit` refuses it.
+    cmux's close-surface ended such a session unconditionally, so the escalation preserves the
+    behaviour rather than quietly becoming gentler."""
+    rig.host.live = True
+    (rig.home / "state" / "panes" / "i3").write_text("PANE-3")
+    (rig.home / "state" / "panes" / "i3.ws").write_text("WS-3")
+    rig.r._close_pane("i3")
+    assert [verb for verb, _ws, _pane in rig.teardowns] == ["kill"]
+
+
+def test_close_pane_refuses_to_guess_a_workspace(rig):
+    """Closing "whatever is at that pane" is how a stale handle ends someone else's window."""
+    (rig.home / "state" / "panes" / "i3").write_text("PANE-3")   # no .ws sibling
+    rig.r._close_pane("i3")
+    assert rig.teardowns == []
+
+
+def test_close_pane_never_raises_into_the_tick(rig, monkeypatch):
+    """It is reached from sweeps that run every tick; a host that cannot answer must cost a log
+    line, not the tick."""
+    def boom(session):
+        raise runner_mod.session_host.TeardownUnverified("the host stopped answering")
+    monkeypatch.setattr(rig.host, "kill", boom)
+    (rig.home / "state" / "panes" / "i3").write_text("PANE-3")
+    (rig.home / "state" / "panes" / "i3.ws").write_text("WS-3")
+    rig.r._close_pane("i3")                              # must not raise
+
+
+def test_the_runners_doorway_is_bounded_for_its_own_sweeps(rig):
+    """A teardown makes several control calls and the sweeps run every tick over every lane, so
+    the bound that matters is the tick's. The doorway's own 20s-per-call default would cost minutes
+    per lane against a host that is present but wedged."""
+    host = runner_mod.Runner._session_host(rig.r)
+    assert host._call_seconds <= runner_mod.SESSION_CALL_SECONDS
+    assert host._teardown_reads * host._teardown_pause <= 2
