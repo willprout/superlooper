@@ -456,12 +456,20 @@ def _write_once(path, text, marker, what):
     try:
         with open(path) as f:
             existing = f.read()
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as e:
+        # NOT absence (fresh-agent review). A file we could not READ is a file we could not prove
+        # we own, and treating the failure as "nothing is there" turns a permissions problem, an
+        # ACL or a broken symlink into permission to overwrite somebody else's file.
+        print("  REFUSED %s: %s exists but could not be read (%s), so it cannot be shown to be "
+              "ours to rewrite." % (what, path, e))
+        return "refused"
     if existing is not None and marker not in existing:
-        print("  REFUSED %s: %s already exists and was not written by superlooper. It is the "
-              "host's shared %s, so overwriting it would delete settings this machine already "
-              "relies on — merge the block below by hand." % (what, path, what))
+        print("  REFUSED %s: %s already exists and was not written by superlooper, so it is "
+              "not ours to rewrite — merge these lines into it by hand:" % (what, path))
+        for line in text.rstrip("\n").splitlines():
+            print("    | %s" % line)
         return "refused"
     if existing == text:
         return "kept"
@@ -528,8 +536,9 @@ def cmd_fleet(args):
             print("  kept %s (0600)" % token)
 
         cfg_path = fleet.host_config_path(host_config_dir)
-        print("  %s %s" % (_write_once(cfg_path, fleet.render_host_config(),
-                                       "superlooper fleet", "config"), cfg_path))
+        wrote = _write_once(cfg_path, fleet.render_host_config(), fleet.CONFIG_MARKER, "config")
+        if wrote != "refused":
+            print("  %s %s" % (wrote, cfg_path))
 
         source = probe.read_text(session_host.remote_manifest_path(host_state_dir, args.agent))
         override = fleet.override_path(host_config_dir, args.agent)
@@ -538,8 +547,10 @@ def cmd_fleet(args):
                   "host once so it fetches one, then re-run — the `screen fallback` block below "
                   "stays red until then." % (override, args.agent))
         else:
-            print("  %s %s" % (_write_once(override, fleet.render_manifest_override(source),
-                                           "superlooper", "manifest override"), override))
+            wrote = _write_once(override, fleet.render_manifest_override(source),
+                                fleet.CATCHALL_RULE_ID, "manifest override")
+            if wrote != "refused":
+                print("  %s %s" % (wrote, override))
 
         plist = fleet.server_plist_path(home)
         found, missing = runner_home.resolve_commands(_resolve_command)
@@ -554,17 +565,20 @@ def cmd_fleet(args):
             binary=binary, session=fleet.SESSION_NAME, token_file=token,
             log_dir=fleet.log_dir(prefix),
             path=runner_home.launch_path(sorted({os.path.dirname(p) for p in found.values()})))
-        tmp = plist + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(text)
-        os.replace(tmp, plist)
-        print("  wrote %s" % plist)
+        # Through the SAME door as the shared config (fresh-agent review): our launchd label is
+        # not proof the plist under it is ours. An operator's own experiment, or a hand-tuned job,
+        # is exactly what "never clobber a file it did not write" has to protect.
+        if _write_once(plist, text, fleet.PLIST_MARKER, "server job") == "refused":
+            return 2
+        print("  wrote %s" % plist)  # noqa: the refusal path returned above
 
         viewer = fleet.viewer_command(prefix)
-        with open(viewer, "w") as f:
-            f.write(fleet.render_viewer_command(binary=binary, session=fleet.SESSION_NAME))
-        os.chmod(viewer, 0o755)
-        print("  wrote %s (register it as a Login Item yourself if you want the window)" % viewer)
+        if _write_once(viewer, fleet.render_viewer_command(binary=binary,
+                                                           session=fleet.SESSION_NAME),
+                       fleet.VIEWER_MARKER, "viewer script") != "refused":
+            os.chmod(viewer, 0o755)
+            print("  wrote %s (register it as a Login Item yourself if you want the window)"
+                  % viewer)
 
         argv = runner_home.bootstrap_argv(_launchctl_bin(), uid, plist)
         if args.load:
@@ -590,7 +604,7 @@ def cmd_fleet(args):
     results = fleet.check_fleet(probe, state_base=state_base, host_config_dir=host_config_dir,
                                 fleet_config_dir=fleet_config_dir, uid=uid, home=home,
                                 agent=args.agent,
-                                live_manifest_version=_manifest_version(
+                                live_manifest_version=fleet.manifest_version(
                                     probe.read_text(session_host.remote_manifest_path(
                                         host_state_dir, args.agent))))
     for line in stack_doctor.format_results(results):
@@ -603,11 +617,6 @@ def cmd_fleet(args):
     print("\nfleet build-up complete%s"
           % (" (warnings: %s)" % ", ".join(warnings) if warnings else ""))
     return 0
-
-
-def _manifest_version(text):
-    found = re.search(r'^\s*version\s*=\s*"([^"]+)"', text or "", re.M)
-    return found.group(1) if found else None
 
 
 # ------------------------------- run -------------------------------

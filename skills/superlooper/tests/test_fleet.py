@@ -49,7 +49,16 @@ class EnvProbe(FakeProbe):
     def __init__(self, *args, accounts=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.accounts = accounts or {}
+        self.modes = {}
         self.run_env = []
+
+    def mode(self, path):
+        return self.modes.get(path, 0o600) if self.exists(path) else None
+
+    def contains(self, path, needle):
+        if not self.exists(path):
+            return None
+        return needle in (self.files.get(path) or "")
 
     def run(self, argv, timeout=10, env=None):
         self.run_env.append((list(argv), dict(env or {})))
@@ -264,7 +273,7 @@ def _green_plist():
 
 def _green_probe(files=None, commands=None, env=None, accounts=None):
     all_files = {
-        _BIN: "",
+        _BIN: "ELF-ish bytes " + fleet.FENCE_SIGNATURE + " more bytes",
         fleet.token_file(_PREFIX): "s3cret\n",
         fleet.server_plist_path(_HOME): _green_plist(),
         fleet.host_config_path(_HOST_CONFIG_DIR): fleet.render_host_config(),
@@ -300,6 +309,25 @@ def test_the_binary_check_names_the_build_script_when_nothing_is_installed():
 
 def test_the_binary_check_passes_only_on_the_pin():
     assert fleet.check_host_binary(_green_probe(), _PREFIX).ok
+
+
+def test_a_stock_binary_at_the_pinned_version_is_not_a_fenced_one():
+    # The version cannot tell them apart — a stock v0.8.0 hand-copied into the fleet prefix reports
+    # exactly the pinned string. The patch's own refusal message, compiled in, is what can.
+    stock = _green_probe(files={_BIN: "ELF-ish bytes with no patch in them"})
+    r = fleet.check_host_binary(stock, _PREFIX)
+    assert not r.ok and "stock build" in r.detail
+    assert "--force" in (r.fix or "")
+
+
+def test_an_unreadable_binary_is_not_a_fenced_one_either():
+    class Blind(EnvProbe):
+        def contains(self, path, needle):
+            return None
+    probe = _green_probe()
+    probe.__class__ = Blind
+    r = fleet.check_host_binary(probe, _PREFIX)
+    assert not r.ok and "not being able to look is not proof" in r.detail
 
 
 def test_the_fence_check_is_red_on_an_open_socket_and_on_silence():
@@ -352,6 +380,36 @@ def test_the_login_item_check_refuses_a_plist_carrying_only_launchds_own_path():
     assert not r.ok and "PATH" in r.detail
 
 
+def test_an_unresolvable_launchctl_is_a_failure_not_a_passing_warn():
+    # Absence of signal is never health (c2): a plist on disk starts nothing, and a WARN here would
+    # let the whole build-up exit ready on a job nobody proved was loaded.
+    blind = _green_probe(commands={"launchctl": {}})
+    blind.commands.pop("launchctl")
+    r = fleet.check_login_item(blind, uid=501, home=_HOME)
+    assert not r.ok and not r.warn and "could not be read" in r.detail
+
+
+def test_a_plist_that_spells_the_token_itself_is_refused():
+    # The renderer never writes this; the judge reads what is INSTALLED. `launchctl print` echoes
+    # EnvironmentVariables verbatim, so such a plist publishes the fence token to every same-uid
+    # process — the worker the fence exists to keep out.
+    leaky = _green_plist().replace(
+        "<key>%s</key>" % session_host.API_TOKEN_FILE_ENV_VAR,
+        "<key>%s</key>" % session_host.API_TOKEN_ENV_VAR)
+    r = fleet.check_login_item(_green_probe(files={fleet.server_plist_path(_HOME): leaky}),
+                               uid=501, home=_HOME)
+    assert not r.ok and "rotate" in (r.fix or "")
+
+
+def test_a_plist_with_no_path_at_all_is_the_worse_case_not_the_neutral_one():
+    naked = _green_plist().replace(
+        "<key>PATH</key>\n        <string>/opt/homebrew/bin:%s</string>\n        "
+        % runner_home.LAUNCHD_PATH, "")
+    r = fleet.check_login_item(_green_probe(files={fleet.server_plist_path(_HOME): naked}),
+                               uid=501, home=_HOME)
+    assert not r.ok and "no PATH at all" in r.detail
+
+
 def test_a_loaded_but_idle_job_is_a_failure_not_a_pass():
     idle = _green_probe(commands={"launchctl": {
         "path": "/bin/launchctl",
@@ -380,6 +438,36 @@ def test_the_screen_fallback_check_fails_on_absence_and_only_warns_on_staleness(
     assert not r.ok and "idle" in r.detail
 
 
+def test_a_key_in_a_later_table_does_not_satisfy_the_session_setting():
+    # TOML keys belong to the table they follow. This parses, and the host reads
+    # `ui.resume_agents_on_restore` — which it ignores.
+    assert fleet.host_config_problem(
+        "version_check = false\n[session]\n[ui]\nresume_agents_on_restore = true\n")
+    # ...and the top-level setting must not be satisfied from inside [session] either.
+    assert fleet.host_config_problem(
+        "[session]\nresume_agents_on_restore = true\nversion_check = false\n")
+
+
+def test_a_commented_out_or_absent_rule_is_not_an_installed_override():
+    good = fleet.render_manifest_override('id = "claude"\nversion = "9"\n', source_version="9")
+    assert fleet.has_catchall_rule(good)
+    assert not fleet.has_catchall_rule('# id = "%s"' % fleet.CATCHALL_RULE_ID)
+    assert not fleet.has_catchall_rule('id = "%s"' % fleet.CATCHALL_RULE_ID)   # no [[rules]] header
+    # The rule is there but its state has been edited to the very answer we are refusing.
+    assert not fleet.has_catchall_rule(good.replace('state = "unknown"', 'state = "idle"'))
+    assert not fleet.has_catchall_rule(None)
+
+
+def test_the_isolation_check_refuses_a_readable_fence_token():
+    loose = _green_probe()
+    loose.modes[fleet.token_file(_PREFIX)] = 0o644
+    r = fleet.check_isolation(loose, _PREFIX, _HOST_CONFIG_DIR)
+    assert not r.ok and "644" in r.detail
+    # A token that cannot be stat-ed at all is not a token whose permissions are fine.
+    r = fleet.check_isolation(EnvProbe(home=_HOME), _PREFIX, _HOST_CONFIG_DIR)
+    assert not r.ok and "unknown" in r.detail
+
+
 def test_the_identity_check_fails_when_the_fleet_dir_reads_the_owners_login():
     same = _green_probe(accounts={_FLEET_CLAUDE_DIR: _auth_json(_OWNER),
                                   None: _auth_json(_OWNER)})
@@ -397,10 +485,19 @@ def test_the_identity_check_passes_on_two_different_billing_orgs():
     assert r.ok and not r.warn and _FLEET["org"] in r.detail
 
 
-def test_an_unprovisioned_fleet_dir_warns_about_the_screen_no_manifest_covers():
-    probe = _green_probe(files={_FLEET_CLAUDE_DIR + "/.claude.json": "{}"})
-    r = fleet.check_identity(probe, _FLEET_CLAUDE_DIR, claude=_CLAUDE)
-    assert r.ok and r.warn and "onboarding" in r.detail
+def test_an_unprovisioned_fleet_dir_fails_the_build_up():
+    # A FAIL, not a warn: an unprovisioned config dir parks the first worker at the theme picker,
+    # a screen no auth manifest covers and the host reports as idle. #313's DoD lists provisioning
+    # past onboarding for exactly this reason.
+    for onboarding in ("{}", '{"hasCompletedOnboarding": false}', "not json at all"):
+        probe = _green_probe(files={_FLEET_CLAUDE_DIR + "/.claude.json": onboarding})
+        r = fleet.check_identity(probe, _FLEET_CLAUDE_DIR, claude=_CLAUDE)
+        assert not r.ok and "onboarding" in r.detail, onboarding
+    # Both spellings of the flag are the same fact — a check that knew only one would false-red a
+    # perfectly provisioned dir.
+    for spelling in ('{"hasCompletedOnboarding":true}', '{"hasCompletedOnboarding": true}'):
+        probe = _green_probe(files={_FLEET_CLAUDE_DIR + "/.claude.json": spelling})
+        assert fleet.check_identity(probe, _FLEET_CLAUDE_DIR, claude=_CLAUDE).ok, spelling
 
 
 def test_the_identity_check_refuses_a_credential_redirect_it_inherited():

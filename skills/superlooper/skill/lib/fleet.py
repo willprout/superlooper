@@ -32,12 +32,14 @@ untouched production" means mechanically.
 import json
 import os
 import re
+import time
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
 
 import herdr_hook
 import runner_home
 import session_host
+import stack_doctor
 from stack_doctor import CheckResult
 
 # The pin has ONE machine-readable home and this is not it — a second copy is how a bump leaves two
@@ -69,6 +71,22 @@ SERVER_LABEL = "com.superlooper.session-host"
 # that later flies another agent overrides that one too, which is why this is a parameter
 # everywhere below and a default only here.
 DEFAULT_AGENT = "claude"
+
+# The carried fence patch's own refusal message (vendor/herdr/, `UNAUTHORIZED_MESSAGE`), used as the
+# patch's signature AT REST. A stock build and a patched one report the same version and answer the
+# same verbs, so the version alone can never tell them apart — and the difference is the whole
+# security posture. Measured to discriminate: present once in the built binary, absent from the
+# stock release. It is a string, not a checksum, on purpose: the binary's hash changes with every
+# toolchain and every build, and a check nobody can keep green is a check that gets deleted.
+FENCE_SIGNATURE = "unauthorized: this socket requires a token"
+
+# The strings that identify a file as one THIS build-up wrote. `--install` rewrites a file carrying
+# its marker (that is what makes it idempotent) and REFUSES anything else — the host's config
+# directory is shared with whatever sessions the machine already runs, and our own launchd label is
+# not proof that the plist under it is ours.
+CONFIG_MARKER = "superlooper fleet"
+PLIST_MARKER = "superlooper FLEET SESSION HOST"
+VIEWER_MARKER = "superlooper fleet viewer"
 
 # Our one appended rule. The id is namespaced on purpose: the file is a copy of the vendor's
 # manifest, and a reader has to be able to tell at a glance which rule is not theirs.
@@ -200,15 +218,23 @@ def host_config_problem(text):
     if text is None:
         return "no config file"
     body = re.sub(r"^\s*#.*$", "", text, flags=re.M)
-    if not re.search(r"^\s*\[session\]", body, re.M):
+    found = re.search(r"^\s*\[session\]\s*$", body, re.M)
+    if not found:
         return "no [session] table"
-    session_body = body[body.index("[session]"):]
+    # Split at the table header: TOML keys belong to the table they follow, and the two settings
+    # live in DIFFERENT tables. Checking either one against the whole file would accept it in the
+    # wrong place — where it parses as valid TOML and is silently ignored, which is the one failure
+    # mode a config check exists to catch.
+    rest = body[found.end():]
+    nxt = re.search(r"^\s*\[", rest, re.M)
+    top, session_body = body[:found.start()], rest[:nxt.start()] if nxt else rest
     if not re.search(r"^\s*resume_agents_on_restore\s*=\s*true\s*$", session_body, re.M):
-        return ("session.resume_agents_on_restore is not explicitly true — a restored server "
-                "brings its panes back as bare shells")
-    if not re.search(r"^\s*version_check\s*=\s*false\s*$", body, re.M):
-        return ("version_check is not false — an unattended server nagged toward a newer build "
-                "is a fleet that can quietly stop being the build you fenced")
+        return ("session.resume_agents_on_restore is not explicitly true under [session] — a "
+                "restored server brings its panes back as bare shells")
+    if not re.search(r"^\s*version_check\s*=\s*false\s*$", top, re.M):
+        return ("a top-level version_check = false is missing — an unattended server nagged toward "
+                "a newer build is a fleet that can quietly stop being the build you fenced (under "
+                "[session] it would parse and be ignored)")
     return None
 
 
@@ -235,7 +261,7 @@ def render_manifest_override(source_toml, source_version=None):
     """
     body = _strip_catchall(source_toml)
     if source_version is None:
-        source_version = _manifest_version(body) or "unknown"
+        source_version = manifest_version(body) or "unknown"
     return (body.rstrip("\n") + "\n\n"
             + _SOURCE_MARKER + str(source_version) + "\n"
             + "# Appended by superlooper (issue #309). Everything above is the vendor's own\n"
@@ -271,9 +297,33 @@ def _strip_catchall(text):
     return body.rstrip("\n") + "\n"
 
 
-def _manifest_version(text):
+def manifest_version(text):
+    """The `version = "..."` a screen-detection manifest declares, or None."""
     found = re.search(r'^\s*version\s*=\s*"([^"]+)"', text or "", re.M)
     return found.group(1) if found else None
+
+
+def has_catchall_rule(text):
+    """Is our catch-all actually an ACTIVE rule in this file — not a comment, not a leftover id?
+
+    Substring presence is not the question (fresh-agent review). A file whose only mention of the
+    id is inside a comment, or whose rule body has been commented out, would satisfy a naive `in`
+    while the host still answers `idle` for every screen it does not recognise — the exact state
+    this block exists to detect, sailing past the block that exists to detect it.
+    """
+    if not text:
+        return False
+    body = re.sub(r"^\s*#.*$", "", text, flags=re.M)
+    found = re.search(r"""^\s*id\s*=\s*['"]%s['"]\s*$""" % re.escape(CATCHALL_RULE_ID),
+                      body, re.M)
+    if not found:
+        return False
+    head = body.rfind("[[rules]]", 0, found.start())
+    if head == -1:
+        return False
+    nxt = body.find("[[rules]]", found.end())
+    block = body[head:nxt if nxt != -1 else len(body)]
+    return bool(re.search(r"""^\s*state\s*=\s*['"]unknown['"]\s*$""", block, re.M))
 
 
 def override_source_version(text):
@@ -421,10 +471,30 @@ def check_host_binary(probe, fleet_prefix):
             "%s reports %s and the pin is %s — the pinned release is the one carrying the "
             "clientless-restore and prompt-submission fixes the adoption rests on"
             % (path, got, PINNED_VERSION), fix)
-    return CheckResult(name, True, "%s reports the pinned %s" % (path, PINNED_VERSION))
+    # The version says nothing about the patch: a stock build and a fenced one report the same
+    # string and answer the same verbs. This is the fence AT REST — the carried patch's own refusal
+    # message, compiled into the binary. Verified to discriminate: 1 occurrence in the built
+    # binary, 0 in the stock release. `host fence` proves the running server; this proves the file,
+    # which is what a `--force`-less rebuild or a hand-copied binary would otherwise slip past.
+    fenced = probe.contains(path, FENCE_SIGNATURE)
+    if fenced is None:
+        return CheckResult(name, False,
+                           "%s reports the pinned %s but could not be read to check whether the "
+                           "fence patch is in it — not being able to look is not proof"
+                           % (path, PINNED_VERSION), fix)
+    if not fenced:
+        return CheckResult(
+            name, False,
+            "%s reports the pinned %s but carries NO fence patch — it is a stock build, and a "
+            "stock build's control socket serves every worker on this machine"
+            % (path, PINNED_VERSION),
+            "rebuild it: `vendor/herdr/build.sh --force`")
+    return CheckResult(name, True,
+                       "%s reports the pinned %s and carries the fence patch" % (path,
+                                                                                PINNED_VERSION))
 
 
-def check_login_item(probe, uid, home):
+def check_login_item(probe, uid, home, fleet_prefix=None):
     """`host login item` — the server is a loaded gui/$UID LaunchAgent with an explicit PATH.
 
     The domain is the keychain rule and is never a parameter (see `runner_home.domain`). The PATH
@@ -438,16 +508,38 @@ def check_login_item(probe, uid, home):
     text = probe.read_text(plist)
     if text is None:
         return CheckResult(name, False, "no LaunchAgent at %s" % plist, fix)
-    if runner_home.LAUNCHD_PATH == _plist_path_value(text):
+    job_path = _plist_path_value(text)
+    if job_path is None or job_path == runner_home.LAUNCHD_PATH:
+        # No PATH at all is the WORSE case, not the neutral one — launchd hands the job its own
+        # four directories either way, so both spellings produce a server that finds no Homebrew
+        # and no ~/.local/bin and passes that on to every pane it spawns. Reading a missing key as
+        # "fine" would be a check that passes hardest on the plist nobody wrote properly.
         return CheckResult(
             name, False,
-            "%s carries only launchd's own PATH (%s) — no Homebrew, no ~/.local/bin, so the server "
-            "cannot find the tools its panes need" % (plist, runner_home.LAUNCHD_PATH), fix)
+            "%s %s — launchd hands a job only %s, so the server finds no Homebrew and no "
+            "~/.local/bin, and every pane it spawns inherits that"
+            % (plist, "sets no PATH at all" if job_path is None else "carries only launchd's own "
+               "PATH", runner_home.LAUNCHD_PATH), fix)
+    if re.search(r"<key>\s*%s\s*</key>" % re.escape(session_host.API_TOKEN_ENV_VAR), text):
+        # The RENDERER never writes this, but the judge reads what is INSTALLED, not what we would
+        # have written — an older or hand-edited plist is exactly the case a judge exists for.
+        # `launchctl print` echoes EnvironmentVariables verbatim, so this is the fence token
+        # published to every same-uid process, i.e. to the worker the fence exists to keep out.
+        return CheckResult(
+            name, False,
+            "%s sets %s directly — `launchctl print %s` then prints the fence token to any "
+            "same-uid process. The job must name the 0600 FILE (%s) instead"
+            % (plist, session_host.API_TOKEN_ENV_VAR, target, session_host.API_TOKEN_FILE_ENV_VAR),
+            "re-run `superlooper fleet --install`, then rotate the token — it has been published")
     launchctl = probe.command("launchctl", envvar="SL_LAUNCHCTL", default="/bin/launchctl")
     if not launchctl:
-        return CheckResult(name, True,
-                           "%s is installed; launchctl is not resolvable from here, so whether it "
-                           "is LOADED could not be read" % plist, warn=True)
+        # NOT a warn. A plist on disk starts nothing, and "I could not ask whether the job is
+        # loaded" is absence of signal — which this stack never reads as health (c2). A WARN here
+        # would let the whole build-up exit ready on a LaunchAgent nobody proved was running.
+        return CheckResult(name, False,
+                           "%s is installed, but launchctl is not resolvable from here, so whether "
+                           "the job is LOADED could not be read at all" % plist,
+                           "put launchctl on PATH (or set SL_LAUNCHCTL) and re-run")
     proc = probe.run(runner_home.print_argv(launchctl, uid, SERVER_LABEL), timeout=10)
     if getattr(proc, "returncode", 1) != 0:
         return CheckResult(
@@ -460,11 +552,11 @@ def check_login_item(probe, uid, home):
     if pid:
         return CheckResult(name, True, "%s loaded in %s, pid %d" % (SERVER_LABEL, target, pid))
     if runner_home.service_is_idle(out) is True:
+        where = (" read %s" % os.path.join(log_dir(fleet_prefix), "server.log")
+                 if fleet_prefix else "")
         return CheckResult(name, False,
                            "%s is loaded in %s but NOT running — a KeepAlive job that is idle has "
-                           "exited and been throttled; read %s" % (SERVER_LABEL, target,
-                                                                  os.path.join(log_dir("<prefix>"),
-                                                                               "server.log")), fix)
+                           "exited and been throttled;%s" % (SERVER_LABEL, target, where), fix)
     return CheckResult(name, False,
                        "%s is loaded in %s but its state could not be read — absence of signal is "
                        "not health" % (SERVER_LABEL, target), fix)
@@ -513,7 +605,7 @@ def wait_for_fence(socket, fence=None, sleep=None, attempts=15, pause=1.0):
     answers still returns UNREACHABLE rather than a guess.
     """
     probe_fn = fence or session_host.fence_probe
-    sleep = sleep or __import__("time").sleep
+    sleep = sleep or time.sleep
     verdict = session_host.UNREACHABLE
     for attempt in range(max(1, attempts)):
         verdict = probe_fn(socket)
@@ -554,7 +646,7 @@ def check_screen_fallback(probe, host_config_dir, agent=DEFAULT_AGENT, live_vers
     name = "screen fallback"
     path = override_path(host_config_dir, agent)
     text = probe.read_text(path)
-    if text is None or CATCHALL_RULE_ID not in text:
+    if not has_catchall_rule(text):
         return CheckResult(
             name, False,
             "no local manifest override at %s — with no rule matching, the host answers `idle` for "
@@ -602,21 +694,43 @@ def check_identity(probe, fleet_config_dir, claude=None):
         return CheckResult(name, False, problem,
                            "log the fleet dir into its own account in a supervised window (#313); "
                            "a session cannot drive a browser sign-in")
-    onboarding = probe.read_text(os.path.join(fleet_config_dir, ".claude.json"))
-    if onboarding is None or '"hasCompletedOnboarding": true' not in " ".join(onboarding.split()):
+    if _onboarded(probe.read_text(os.path.join(fleet_config_dir, ".claude.json"))) is not True:
+        # A FAIL, not a warn (fresh-agent review). This block is a BUILD-UP gate, and an
+        # unprovisioned config dir parks the first worker at the theme picker — a screen no auth
+        # manifest covers and the host classifies `idle`. #313's own DoD lists provisioning past
+        # onboarding for exactly this reason, so "logged in, provisioning unconfirmed" is not a
+        # state the build-up may be declared complete in.
         return CheckResult(
-            name, True,
-            "%s is logged in as %s (org %s) but its onboarding flag could not be confirmed — an "
+            name, False,
+            "%s is logged in as %s (org %s) but its onboarding flag is not a confirmed true — an "
             "unprovisioned config dir parks a worker at the theme picker, a screen no auth "
-            "manifest covers" % (fleet_config_dir, fleet_status.get("email"),
-                                 fleet_status.get("orgId")),
-            warn=True)
+            "manifest covers and the host reports as idle"
+            % (fleet_config_dir, fleet_status.get("email"), fleet_status.get("orgId")),
+            "open one interactive `claude` under that config dir and finish first-run (#313)")
     other = (owner_status or {}).get("orgId")
     return CheckResult(
         name, True,
         "%s rides its own subscription (%s, org %s%s)"
         % (fleet_config_dir, fleet_status.get("subscriptionType") or "?",
            fleet_status.get("orgId"), "; the owner's default dir is org %s" % other if other else ""))
+
+
+def _onboarded(text):
+    """True / False / None(unreadable) for a config dir's first-run state.
+
+    PARSED, never substring-matched: `"hasCompletedOnboarding":true` and the spaced spelling are
+    the same fact, and a check that recognised only one would warn about a perfectly provisioned
+    dir — the kind of false red that teaches an operator to skim the block.
+    """
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or "hasCompletedOnboarding" not in data:
+        return None
+    return data.get("hasCompletedOnboarding") is True
 
 
 def check_isolation(probe, fleet_prefix, host_config_dir):
@@ -629,6 +743,18 @@ def check_isolation(probe, fleet_prefix, host_config_dir):
     name = "fleet isolation"
     fleet_socket = socket_path(host_config_dir)
     default_socket = session_host.session_socket_path(host_config_dir, None)
+    token = token_file(fleet_prefix)
+    mode = probe.mode(token)
+    if mode is None:
+        return CheckResult(name, False, "the fence token at %s could not be stat-ed, so whether it "
+                                        "is readable by anything on this machine is unknown" % token,
+                           "run `superlooper fleet --install` to mint it")
+    if mode & 0o077:
+        return CheckResult(
+            name, False,
+            "the fence token at %s is mode %o — group- or world-readable. It is the whole secret "
+            "the control socket's auth rests on" % (token, mode),
+            "chmod 600 %s and restart the server (the token is read once at start)" % token)
     if fleet_socket == default_socket:
         return CheckResult(
             name, False,
@@ -651,7 +777,6 @@ def check_fleet(probe, state_base, host_config_dir=None, fleet_config_dir=None, 
     Binary before login item before fence before config: each one is upstream of the next, and a
     reader who fixes the first red line usually clears several.
     """
-    import stack_doctor                      # local: only the CLI's own report needs both modules
     home = home or getattr(probe, "home", None) or os.path.expanduser("~")
     host_config_dir = host_config_dir or session_host.config_dir(getattr(probe, "env", None))
     uid = os.getuid() if uid is None else uid
@@ -659,7 +784,7 @@ def check_fleet(probe, state_base, host_config_dir=None, fleet_config_dir=None, 
     claude = stack_doctor.resolve_claude(probe)
     return [
         check_host_binary(probe, fleet_prefix),
-        check_login_item(probe, uid, home),
+        check_login_item(probe, uid, home, fleet_prefix=fleet_prefix),
         check_fence(socket_path(host_config_dir), fence=fence),
         check_host_config(probe, host_config_dir),
         check_screen_fallback(probe, host_config_dir, agent=agent,

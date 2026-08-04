@@ -149,6 +149,42 @@ class Probe:
         except OSError:
             return None
 
+    def contains(self, path, needle):
+        """Does `path` contain `needle` anywhere? True / False / None (unreadable).
+
+        Streamed in chunks with an overlap, because the one caller asks a ~18MB binary whether the
+        carried patch's own error string is compiled into it — `read_head` is bounded at 4KB by
+        design and `read_text` would pull the whole thing through memory. None is UNKNOWN and the
+        caller fails closed on it: "I could not look" is not "it is not there", and here it is not
+        "it is there" either.
+        """
+        blob = needle.encode() if isinstance(needle, str) else needle
+        keep = max(0, len(blob) - 1)
+        try:
+            with open(path, "rb") as f:
+                tail = b""
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        return False
+                    if blob in tail + chunk:
+                        return True
+                    tail = (tail + chunk)[-keep:] if keep else b""
+        except OSError:
+            return None
+
+    def mode(self, path):
+        """The permission bits of `path`, or None if it cannot be stat-ed.
+
+        None is UNKNOWN and every caller fails closed on it — "I could not read the mode" is not
+        "the mode is fine", which is exactly the reading that would let a world-readable secret
+        pass a permissions check.
+        """
+        try:
+            return os.stat(path).st_mode & 0o777
+        except OSError:
+            return None
+
     def expanduser(self, path):
         return os.path.expanduser(path)
 

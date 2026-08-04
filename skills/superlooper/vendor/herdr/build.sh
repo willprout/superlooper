@@ -64,16 +64,32 @@ if [ ! -f "$PATCH" ]; then
   exit 1
 fi
 
+# The fence AT REST: the carried patch's own refusal message, compiled into the binary. A stock
+# build and a patched one report the same version and answer the same verbs, so the version can
+# never tell them apart — and the difference is the whole security posture. Read out of the patch
+# rather than spelled again, so the two cannot drift apart.
+SIGNATURE="$(sed -n 's/^+pub const UNAUTHORIZED_MESSAGE: &str = "\(.*\)";$/\1/p' "$PATCH" | head -1)"
+[ -n "$SIGNATURE" ] || { echo "build: could not read the fence signature out of $PATCH" >&2; exit 1; }
+
+is_fenced() { grep -aqF -- "$SIGNATURE" "$1"; }
+
 # Already there? An idempotent build-up is the whole point: the operator re-runs this after a
 # reboot, after a bump, or because they are not sure, and it must be cheap and honest about it.
+# But the version alone is NOT enough to skip on (fresh-agent review): a stock v0.8.0 copied into
+# this path by hand would match it exactly, and the script would report success while leaving in
+# place the one artifact it exists to prevent.
 if [ "$FORCE" -eq 0 ] && [ -x "$DEST" ]; then
   have="$("$DEST" --version 2>/dev/null | tr -d '\r' | awk '{print $NF}')" || have=""
-  if [ "$have" = "$VERSION" ]; then
-    say "already installed and reporting v$VERSION — nothing to do (use --force to rebuild)"
-    say "the fence is NOT proven by this check: run \`superlooper fleet\` for that"
+  if [ "$have" = "$VERSION" ] && is_fenced "$DEST"; then
+    say "already installed, reporting v$VERSION and carrying the fence patch — nothing to do"
+    say "that the RUNNING server is fenced is a separate question: \`superlooper fleet\` asks it"
     exit 0
   fi
-  say "installed binary reports '${have:-unreadable}', wanted '$VERSION' — rebuilding"
+  if [ "$have" = "$VERSION" ]; then
+    say "installed binary reports v$VERSION but carries NO fence patch — rebuilding"
+  else
+    say "installed binary reports '${have:-unreadable}', wanted '$VERSION' — rebuilding"
+  fi
 fi
 
 RUSTUP="$(command -v rustup || true)"
@@ -130,6 +146,12 @@ install -m 0755 "$BUILT" "$DEST"
 got="$("$DEST" --version 2>/dev/null | tr -d '\r' | awk '{print $NF}')" || got=""
 if [ "$got" != "$VERSION" ]; then
   echo "build: the installed binary reports '${got:-unreadable}', not the pinned '$VERSION'" >&2
+  exit 1
+fi
+if ! is_fenced "$DEST"; then
+  echo "build: the installed binary does not carry the fence patch's own refusal message. The" >&2
+  echo "       patch applied and the build succeeded, so something between the two dropped it —" >&2
+  echo "       do NOT run a fleet on this binary: its control socket serves every worker." >&2
   exit 1
 fi
 
