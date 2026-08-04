@@ -455,7 +455,63 @@ case "$AGENT" in
         fi
       fi
     fi
-    CLAUDE_ARGS=(--dangerously-skip-permissions)
+    # ---- THE PER-WORKER HOOK CONFIG (issue #307) ------------------------------------------------
+    # The session host resumes a crashed agent by re-running `claude --resume <id>`, and the only
+    # way it ever learns that id is a state-report hook the agent fires at session start. The host's
+    # own installer writes that hook into the machine's GLOBAL Claude settings file — a
+    # hand-maintained, version-controlled file the operator owns — so this loop does not run that
+    # installer on any machine it manages. It renders the SAME hook into a settings file belonging
+    # to THIS lane and hands it to this session alone with `--settings`, which Claude Code merges
+    # over the user's settings rather than replacing them (so the engine's own three hooks, which
+    # are registered globally by bin/install.sh, keep firing untouched).
+    #
+    # Measured end-to-end on the pinned host build (reports/i307.md): with this file the host
+    # reported `agent_session` = the id the runner minted; with the flag removed and nothing else
+    # changed it reported none, so this — not argv — is the capture. After `kill -9` of the host
+    # and a headless restart the lane came back as `claude --resume <that id>` with its memory
+    # intact, and the operator's global settings file was byte-identical throughout.
+    #
+    # OUTSIDE THE WORKTREE, deliberately. The obvious alternative — a project-level
+    # `<worktree>/.claude/settings.json` — is one `git add -A` away from being committed into
+    # somebody's pull request, and would collide with an adopted repo's own settings file.
+    #
+    # CLAUDE ONLY: `--settings` is a Claude Code spelling, and codex aborts on an unknown flag
+    # (agent-boundary rule — this branch is where Claude-specific flags live).
+    #
+    # LOUD, NOT FATAL. A machine whose engine was published without the vendored asset still flies:
+    # the engine's OWN resurrection floor (#298, `--session-id`/`--resume` minted by the runner) is
+    # the primary revive path and does not depend on this hook at all. So a failure here warns to
+    # the launch-stderr tail the relaunch-cap park memo reads (#40) and launches without the flag —
+    # a settings file naming a hook script that is not there would be worse than none, producing a
+    # session that runs perfectly and is invisible to the host's revive machinery.
+    # `doctor --stack`'s `host state hook` block is what turns this from a whisper into a red line.
+    SL_HOOK_LIB="$(cd "$(dirname "$0")" && pwd)/../lib/herdr_hook.py"
+    # THE PATH IS OURS, never read back out of the renderer's output (fresh-agent review round 2).
+    # Taking it from stdout meant anything else that printed became part of it: a `sitecustomize.py`
+    # on PYTHONPATH, a deprecation warning, any site noise — the render would succeed and Claude
+    # would be handed a `--settings` argument with a warning glued to the front of it. So we name
+    # the file, pass it in, and CHECK IT EXISTS afterwards; the renderer's stdout is informational.
+    SL_HOOK_SETTINGS="$SL_RUN_ROOT/state/hooks/$ID.settings.json"
+    if [ -f "$SL_HOOK_LIB" ]; then
+      # The renderer takes the script path as an argument so the launcher never hand-builds JSON,
+      # and so the rendering under test is literally the rendering a launch runs. The override is
+      # for an operator pin and for the tests' absent-asset case; unset takes the vendored asset.
+      SL_HOOK_ARGS=("$SL_HOOK_SETTINGS")
+      [ -n "${SL_HOST_STATE_HOOK:-}" ] && SL_HOOK_ARGS+=("$SL_HOST_STATE_HOOK")
+      # `2>&1 >/dev/null` (in THAT order) keeps stderr — the renderer's own reason for refusing —
+      # and throws stdout away, so the message below names the real cause.
+      if SL_HOOK_WHY="$(python3 "$SL_HOOK_LIB" "${SL_HOOK_ARGS[@]}" 2>&1 >/dev/null)" \
+         && [ -f "$SL_HOOK_SETTINGS" ]; then
+        CLAUDE_ARGS_HOOK=(--settings "$SL_HOOK_SETTINGS")
+      else
+        echo "[$ID] no per-worker hook config, so this session will be invisible to the session host's revive machinery (the loop's own --resume floor is unaffected): ${SL_HOOK_WHY:-the renderer exited 0 but wrote no $SL_HOOK_SETTINGS}" >&2
+        CLAUDE_ARGS_HOOK=()
+      fi
+    else
+      echo "[$ID] no per-worker hook config: the engine on this machine has no lib/herdr_hook.py — republish it with bin/install.sh" >&2
+      CLAUDE_ARGS_HOOK=()
+    fi
+    CLAUDE_ARGS=(--dangerously-skip-permissions "${CLAUDE_ARGS_HOOK[@]+"${CLAUDE_ARGS_HOOK[@]}"}")
     [ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
     [ -n "$EFFORT" ] && CLAUDE_ARGS+=(--effort "$EFFORT")
     CLAUDE_ARGS+=(--name "$NAME" --remote-control "$NAME")

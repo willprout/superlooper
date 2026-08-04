@@ -8,6 +8,9 @@ import config as config_lib
 import notify
 import stack_doctor
 
+# tests/ -> superlooper: the root that holds skill/, for reading the vendored asset under test.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+
 
 class FakeProbe:
     def __init__(self, commands=None, files=None, env=None, home="/home/will", alive_pids=None):
@@ -163,6 +166,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("runner home", True),               # ditto (#306): no config names no home to judge
         ("installed engine current", True),  # no VERSION stamp injected -> cleanly skipped, passes
         ("installed ops docs", True),        # no installed engine home injected -> clean skip (#199)
+        ("host state hook", True),           # clean global settings, no engine home yet (#307)
         ("superlooper plugin", True),        # installed + enabled in the healthy probe
     ]
 
@@ -1329,3 +1333,98 @@ def test_the_standalone_install_is_recognised_through_a_trailing_slash_home():
     assert stack_doctor.classify_claude(probe, "/home/will//.local/bin/claude") == "standalone"
     r = stack_doctor.check_claude_binary(probe)
     assert r.ok is True and "other" not in r.detail
+
+
+# --- the session host's state-report hook (issue #307) -------------------------------------------
+# Two questions in one block, and they fail for opposite reasons:
+#   * is the machine's GLOBAL settings file clean — i.e. was the host's `integration install`
+#     never run here? (that is the issue's own definition of done)
+#   * can a worker actually GET the hook — i.e. did the vendored asset publish, unmodified?
+# A machine can be clean and useless (nothing to hand a worker) or wired and wrong (the installer
+# touched the operator's file), so neither question stands in for the other.
+
+def _hook_probe(*, global_settings=None, asset=True, asset_body=None, home="/home/will"):
+    import herdr_hook
+    files = {}
+    if global_settings is not None:
+        files[os.path.join(home, ".claude", "settings.json")] = json.dumps(global_settings)
+    engine = os.path.join(home, ".claude", "skills", "superlooper")
+    files[engine] = ""
+    if asset:
+        body = asset_body
+        if body is None:
+            body = open(herdr_hook.vendored_script(home=os.path.join(_REPO_ROOT, "skill"))).read()
+        files[os.path.join(engine, "vendor", "herdr", herdr_hook.SCRIPT_NAME)] = body
+    return FakeProbe(files=files, home=home, env={"HOME": home})
+
+
+_INSTALLED_GLOBAL = {"hooks": {"SessionStart": [{"matcher": "*", "hooks": [
+    {"type": "command", "command": "bash '/home/will/.claude/hooks/herdr-agent-state.sh' session",
+     "timeout": 10}]}]}}
+
+_CLEAN_GLOBAL = {"hooks": {"Stop": [{"matcher": "*", "hooks": [
+    {"type": "command", "command": "$HOME/.claude/skills/superlooper/bin/stop-hook.sh"}]}]}}
+
+
+def test_host_state_hook_ok_when_the_global_file_is_clean_and_the_asset_is_pinned():
+    r = stack_doctor.check_host_state_hook(_hook_probe(global_settings=_CLEAN_GLOBAL))
+    assert r.ok and not r.warn, r.detail
+
+
+def test_host_state_hook_ok_when_there_is_no_global_settings_file_at_all():
+    """A machine that never wrote one is trivially clean; it must not read as unknown."""
+    r = stack_doctor.check_host_state_hook(_hook_probe(global_settings=None))
+    assert r.ok, r.detail
+
+
+def test_host_state_hook_fails_when_the_installer_touched_the_global_file():
+    r = stack_doctor.check_host_state_hook(_hook_probe(global_settings=_INSTALLED_GLOBAL))
+    assert not r.ok
+    assert "settings.json" in r.detail
+    assert r.fix, "a FAIL that does not say how to undo it is a puzzle, not a check"
+
+
+def test_host_state_hook_fails_when_the_vendored_asset_never_published():
+    r = stack_doctor.check_host_state_hook(_hook_probe(global_settings=_CLEAN_GLOBAL, asset=False))
+    assert not r.ok
+    assert "install.sh" in (r.fix or ""), "the fix for a missing asset is a republish"
+
+
+def test_host_state_hook_fails_when_the_published_asset_is_not_the_pinned_one():
+    """A hand-edited or newer asset is a DIFFERENT integration contract, and the whole point of
+    pinning is that such a change is a deliberate acceptance event, never a surprise."""
+    r = stack_doctor.check_host_state_hook(
+        _hook_probe(global_settings=_CLEAN_GLOBAL, asset_body="#!/bin/sh\n# not the pinned one\n"))
+    assert not r.ok
+    assert "checksum" in r.detail.lower() or "pinned" in r.detail.lower()
+
+
+def test_host_state_hook_reports_the_dirty_global_file_even_when_the_asset_is_fine():
+    """Precedence: the operator's own file being edited by a third-party installer is the finding
+    this issue exists for, so it must not be masked by a healthy asset."""
+    r = stack_doctor.check_host_state_hook(_hook_probe(global_settings=_INSTALLED_GLOBAL))
+    assert not r.ok and "integration install" in r.detail
+
+
+def test_host_state_hook_says_nothing_alarming_before_the_engine_is_published():
+    """Same posture as `installed ops docs`: with no engine home at all another block already names
+    the machine's real problem, and the doctor never invents a second alarm for one cause."""
+    probe = FakeProbe(files={}, home="/home/will", env={"HOME": "/home/will"})
+    r = stack_doctor.check_host_state_hook(probe)
+    assert r.ok, r.detail
+
+
+def test_host_state_hook_is_wired_into_the_stack_run():
+    names = [r.name for r in stack_doctor.check_stack({}, probe=_hook_probe())]
+    assert "host state hook" in names
+
+
+def test_host_state_hook_follows_the_config_dir_override():
+    """herdr's installer resolves $CLAUDE_CONFIG_DIR before $HOME/.claude, so a fleet config dir is
+    the file it would have written — and the one this block has to read."""
+    files = {"/fleet/cfg/settings.json": json.dumps(_INSTALLED_GLOBAL),
+             "/home/will/.claude/skills/superlooper": ""}
+    probe = FakeProbe(files=files, home="/home/will",
+                      env={"HOME": "/home/will", "CLAUDE_CONFIG_DIR": "/fleet/cfg"})
+    r = stack_doctor.check_host_state_hook(probe)
+    assert not r.ok and "/fleet/cfg/settings.json" in r.detail
