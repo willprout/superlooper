@@ -1,9 +1,9 @@
 diff --git a/src/api/auth.rs b/src/api/auth.rs
 new file mode 100644
-index 0000000..fdb353b
+index 0000000..2b346a4
 --- /dev/null
 +++ b/src/api/auth.rs
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,221 @@
 +//! Token auth for the control socket — superlooper's carried fence (issue #305).
 +//!
 +//! Upstream herdr deliberately exposes every capability twice (CLI + newline-JSON socket) so that
@@ -47,6 +47,15 @@ index 0000000..fdb353b
 +/// so the check never has to parse, and never has to trust, the request body.
 +pub const AUTH_FIELD: &str = "auth";
 +
++/// What a client passes as the VALUE of `--env HERDR_API_TOKEN=…` to ask the server to give this
++/// new pane the token. It is not the secret; it is a request for the secret.
++///
++/// This exists because of a measured asymmetry on macOS: a same-uid reader is refused another
++/// process's environment but is served its argv. `workspace create --env K=V` becomes argv, so a
++/// client passing the real token would publish it to precisely the workers being fenced out. See
++/// `apply_pane_launch_env` in `pane.rs`, which is where the substitution happens.
++pub const GRANT_SENTINEL: &str = "@superlooper-fence-grant";
++
 +/// The error code an unauthenticated caller gets back. Callers match on this exact string.
 +pub const UNAUTHORIZED_CODE: &str = "unauthorized";
 +
@@ -54,7 +63,24 @@ index 0000000..fdb353b
 +/// or which methods exist. A refused caller learns only that it was refused.
 +pub const UNAUTHORIZED_MESSAGE: &str = "unauthorized: this socket requires a token";
 +
-+fn read_configured_token() -> Option<String> {
++/// What this server was configured to expect.
++#[derive(Debug, PartialEq, Eq)]
++pub enum Expectation {
++    /// Neither variable set: stock herdr, every connection allowed. See the module note.
++    Unconfigured,
++    /// A token this server will honour.
++    Token(String),
++    /// Explicitly pointed at a token file that could not be read, or that was empty.
++    ///
++    /// This is its own state rather than collapsing into `Unconfigured`, and the distinction is a
++    /// security one: an operator who set `HERDR_API_TOKEN_FILE` asked for a fence, and silently
++    /// downgrading their typo to "no auth at all" would leave the socket wide open at exactly the
++    /// moment they believed they had closed it. Auth stays REQUIRED and nothing can satisfy it, so
++    /// the misconfiguration is loud (every call refused) instead of invisible.
++    Misconfigured,
++}
++
++fn read_configured_token() -> Expectation {
 +    // File first: a value that was never in the environment cannot be inherited out of it.
 +    if let Some(path) = std::env::var_os(API_TOKEN_FILE_ENV_VAR) {
 +        if !path.is_empty() {
@@ -62,50 +88,68 @@ index 0000000..fdb353b
 +                // trim_end only: a leading space is a token character, a trailing newline is how
 +                // every editor and `printf` ends a file.
 +                Ok(contents) => match contents.trim_end_matches(['\r', '\n']) {
-+                    "" => None,
-+                    token => Some(token.to_string()),
++                    "" => Expectation::Misconfigured,
++                    token => Expectation::Token(token.to_string()),
 +                },
-+                Err(_) => None,
++                Err(_) => Expectation::Misconfigured,
 +            };
 +        }
 +    }
 +    match std::env::var(API_TOKEN_ENV_VAR) {
-+        Ok(token) if !token.is_empty() => Some(token),
-+        _ => None,
++        Ok(token) if !token.is_empty() => Expectation::Token(token),
++        _ => Expectation::Unconfigured,
 +    }
 +}
 +
-+/// The server's expected token, resolved ONCE per process.
++/// What this server expects, resolved ONCE per process.
 +///
 +/// Once, not per connection, for two reasons: the environment of a running process does not change
 +/// under it, and rotating the token is a deliberate event (restart the server) rather than a thing
 +/// that should quietly take effect mid-flight on whichever connection happens to arrive next.
++pub fn expectation() -> &'static Expectation {
++    static EXPECTED: OnceLock<Expectation> = OnceLock::new();
++    EXPECTED.get_or_init(read_configured_token)
++}
++
++/// The token itself, for the one caller that must hand it onward: the pane grant in `pane.rs`.
 +pub fn expected() -> Option<&'static str> {
-+    static EXPECTED: OnceLock<Option<String>> = OnceLock::new();
-+    EXPECTED
-+        .get_or_init(read_configured_token)
-+        .as_deref()
++    match expectation() {
++        Expectation::Token(token) => Some(token.as_str()),
++        _ => None,
++    }
 +}
 +
 +/// The token a CLIENT should present, read fresh — client processes are short-lived and a cached
 +/// answer would only ever be staler than the environment they were launched with.
 +pub fn client_token() -> Option<String> {
-+    read_configured_token()
++    match read_configured_token() {
++        Expectation::Token(token) => Some(token),
++        // Nothing to present. The server will refuse, which is the correct visible outcome for a
++        // client whose token file is broken — better than presenting something that is not a token.
++        Expectation::Unconfigured | Expectation::Misconfigured => None,
++    }
 +}
 +
 +/// Is `presented` good enough for `expected`?
 +///
 +/// Pure, and separated from the env reads above precisely so the decision can be tested without
 +/// mutating process environment from test threads.
-+pub fn authorize(expected: Option<&str>, presented: Option<&str>) -> bool {
++pub fn authorize(expected: &Expectation, presented: Option<&str>) -> bool {
 +    match expected {
 +        // Unconfigured: stock herdr, everything is allowed. See the module note.
-+        None => true,
-+        Some(expected) => match presented {
++        Expectation::Unconfigured => true,
++        // Configured and broken: nothing is allowed. Fail closed, loudly.
++        Expectation::Misconfigured => false,
++        Expectation::Token(expected) => match presented {
 +            None => false,
 +            Some(presented) => constant_time_eq(expected.as_bytes(), presented.as_bytes()),
 +        },
 +    }
++}
++
++/// Does this server require a token at all? Used to decide whether to run the check.
++pub fn is_enforcing() -> bool {
++    !matches!(expectation(), Expectation::Unconfigured)
 +}
 +
 +/// Compares without an early exit on the first differing byte.
@@ -128,29 +172,49 @@ index 0000000..fdb353b
 +mod tests {
 +    use super::*;
 +
++    fn token(value: &str) -> Expectation {
++        Expectation::Token(value.to_string())
++    }
++
 +    #[test]
 +    fn unconfigured_allows_everything() {
-+        assert!(authorize(None, None));
-+        assert!(authorize(None, Some("anything")));
++        assert!(authorize(&Expectation::Unconfigured, None));
++        assert!(authorize(&Expectation::Unconfigured, Some("anything")));
++    }
++
++    #[test]
++    fn a_broken_configuration_allows_nothing() {
++        // The whole point of the Misconfigured state: an operator who asked for a fence and got a
++        // typo must not silently end up with an open socket.
++        assert!(!authorize(&Expectation::Misconfigured, None));
++        assert!(!authorize(&Expectation::Misconfigured, Some("anything")));
++        assert!(!authorize(&Expectation::Misconfigured, Some("")));
 +    }
 +
 +    #[test]
 +    fn configured_refuses_a_caller_that_presents_nothing() {
-+        assert!(!authorize(Some("secret"), None));
++        assert!(!authorize(&token("secret"), None));
 +    }
 +
 +    #[test]
 +    fn configured_refuses_a_wrong_token() {
-+        assert!(!authorize(Some("secret"), Some("guess")));
-+        assert!(!authorize(Some("secret"), Some("")));
++        assert!(!authorize(&token("secret"), Some("guess")));
++        assert!(!authorize(&token("secret"), Some("")));
 +        // A prefix must not pass: the comparison is over the whole value, not a starts_with.
-+        assert!(!authorize(Some("secret"), Some("secr")));
-+        assert!(!authorize(Some("secret"), Some("secretsecret")));
++        assert!(!authorize(&token("secret"), Some("secr")));
++        assert!(!authorize(&token("secret"), Some("secretsecret")));
 +    }
 +
 +    #[test]
 +    fn configured_accepts_the_exact_token() {
-+        assert!(authorize(Some("secret"), Some("secret")));
++        assert!(authorize(&token("secret"), Some("secret")));
++    }
++
++    #[test]
++    fn the_grant_sentinel_is_not_a_usable_token() {
++        // It travels in argv, which any same-uid process can read. If it were ever accepted as a
++        // credential the fence would be decorative.
++        assert!(!authorize(&token("secret"), Some(GRANT_SENTINEL)));
 +    }
 +
 +    #[test]
@@ -213,7 +277,7 @@ index 7520d83..2a3bfed 100644
  mod event_hub;
  pub mod schema;
 diff --git a/src/api/server.rs b/src/api/server.rs
-index 0598fae..5e48b32 100644
+index 0598fae..fb09121 100644
 --- a/src/api/server.rs
 +++ b/src/api/server.rs
 @@ -136,6 +136,19 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
@@ -236,7 +300,7 @@ index 0598fae..5e48b32 100644
  fn handle_connection(
      mut stream: LocalStream,
      api_tx: &ApiRequestSender,
-@@ -156,6 +169,35 @@ fn handle_connection(
+@@ -156,6 +169,36 @@ fn handle_connection(
          return Ok(());
      }
  
@@ -250,9 +314,10 @@ index 0598fae..5e48b32 100644
 +    // new field there would make this carried patch enormous and conflict-prone at every version
 +    // bump. `AuthEnvelope` ignores unknown members, so it parses any well-formed request object and
 +    // this hunk stays four lines wide.
-+    if let Some(expected) = crate::api::auth::expected() {
++    if crate::api::auth::is_enforcing() {
 +        let envelope = serde_json::from_str::<AuthEnvelope>(line).unwrap_or_default();
-+        if !crate::api::auth::authorize(Some(expected), envelope.auth.as_deref()) {
++        if !crate::api::auth::authorize(crate::api::auth::expectation(),
++                                        envelope.auth.as_deref()) {
 +            // No token material in the log line, and no request body either — just the fact.
 +            warn!("api connection refused: unauthenticated");
 +            write_json_line_allow_disconnect(
@@ -273,20 +338,39 @@ index 0598fae..5e48b32 100644
          Ok(request) => request,
          Err(request_error) => {
 diff --git a/src/pane.rs b/src/pane.rs
-index 7669fc1..6202ae2 100644
+index 7669fc1..7223bb4 100644
 --- a/src/pane.rs
 +++ b/src/pane.rs
-@@ -111,6 +111,13 @@ impl PaneLaunchEnv {
+@@ -111,7 +111,32 @@ impl PaneLaunchEnv {
  
  fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
      cmd.env_remove("CODEX_THREAD_ID");
 +    // superlooper fence (#305). A pane inherits the SERVER's environment — everything below only
 +    // ever ADDS to it — so a server holding the control-socket token in its own env would hand
-+    // that token to every pane it spawned, workers included. Scrub it here, and note the position:
-+    // BEFORE the `extra` loop, so an explicit `--env HERDR_API_TOKEN=…` (the sl-debugger spawn
-+    // path, which is meant to drive herdr) still lands, while inheritance alone never grants it.
++    // that token to every pane it spawned, workers included. Scrub it here, BEFORE the `extra`
++    // loop, so inheritance alone can never grant it.
 +    cmd.env_remove(crate::api::auth::API_TOKEN_ENV_VAR);
 +    cmd.env_remove(crate::api::auth::API_TOKEN_FILE_ENV_VAR);
      for (key, value) in &launch_env.extra {
++        if key == crate::api::auth::API_TOKEN_ENV_VAR {
++            // The GRANT, and the reason a caller may not simply pass the token itself.
++            //
++            // `workspace create --env K=V` becomes process ARGV, and on macOS a same-uid reader
++            // is refused a process's environment but served its argv (measured both ways while
++            // building this). A client that put the real token on that command line would publish
++            // it to exactly the workers the fence exists to keep out, for the lifetime of the
++            // call. So the client sends only a SENTINEL and the server substitutes the secret it
++            // already holds — the token never leaves this process.
++            //
++            // A literal value is dropped rather than honoured: nothing a caller supplies should be
++            // able to choose what this pane's credential is.
++            if value == crate::api::auth::GRANT_SENTINEL {
++                if let Some(token) = crate::api::auth::expected() {
++                    cmd.env(key, token);
++                }
++            }
++            continue;
++        }
          cmd.env(key, value);
      }
+     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);

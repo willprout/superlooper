@@ -134,11 +134,24 @@ def test_a_worker_spawn_never_carries_the_token(tmp_path):
     assert TOKEN not in " ".join(fake.create_argv())
 
 
-def test_a_debugger_spawn_carries_the_token(tmp_path):
+def test_a_debugger_spawn_asks_for_the_token_with_the_sentinel_not_the_secret(tmp_path):
     fake = FakeHerdr()
     _host(fake, _fenced_env()).spawn("d12", cwd=tmp_path)
 
-    assert "%s=%s" % (session_host.API_TOKEN_ENV_VAR, TOKEN) in fake.env_flags()
+    assert "%s=%s" % (session_host.API_TOKEN_ENV_VAR,
+                      session_host.GRANT_SENTINEL) in fake.env_flags()
+
+
+def test_no_spawn_ever_puts_the_secret_in_argv(tmp_path):
+    # The finding that reshaped this design. These arguments become a process's argv, and on macOS
+    # a same-uid reader is REFUSED another process's environment but SERVED its argv (both
+    # measured — reports/i305.md). A debugger spawn carrying the real token would therefore publish
+    # it to every worker on the machine for the duration of the call. The wrapper never holds the
+    # token, so there is nothing for it to leak.
+    for name in ("i305", "d12"):
+        fake = FakeHerdr()
+        _host(fake, _fenced_env()).spawn(name, cwd=tmp_path)
+        assert TOKEN not in " ".join(fake.create_argv()), (name, fake.create_argv())
 
 
 def test_the_name_decides_and_a_caller_cannot_override_it(tmp_path):
@@ -180,7 +193,8 @@ def test_a_debugger_keeps_its_other_variables(tmp_path):
 
     flags = fake.env_flags()
     assert "SL_ISSUE_ID=d12" in flags
-    assert "%s=%s" % (session_host.API_TOKEN_ENV_VAR, TOKEN) in flags
+    assert "%s=%s" % (session_host.API_TOKEN_ENV_VAR,
+                      session_host.GRANT_SENTINEL) in flags
 
 
 @pytest.mark.parametrize("name", ["i305", "i1", "runner", "d12x", "debugger", "dd1"])
@@ -195,41 +209,31 @@ def test_a_debugger_id_is_recognised(name):
 
 # --------------------------------------------------------------------- where the token is read
 
-def test_the_token_can_come_from_a_file_so_it_need_not_sit_in_an_inheritable_env(tmp_path):
-    # A pane inherits the SERVER's environment, so a token that lives only in a file was never in
-    # a position to leak that way. The carried patch prefers the file for the same reason.
+def test_the_wrapper_never_reads_a_token_from_anywhere(tmp_path):
+    """The strongest form of "it cannot leak the token": it never obtains one.
+
+    Where the token lives, whether the file is readable, and what happens when it is broken are
+    all questions for the HOST now (``src/api/auth.rs``, which fails closed on a token file it was
+    told to use and could not read). The wrapper's spawn behaves identically however this process
+    is configured — so there is no configuration in which it starts handling the secret.
+    """
     path = tmp_path / "token"
     path.write_text(TOKEN + "\n")
-    fake = FakeHerdr()
-    _host(fake, {session_host.API_TOKEN_FILE_ENV_VAR: str(path)}).spawn("d12", cwd=tmp_path)
+    configurations = (
+        {},                                                          # unfenced host
+        {session_host.API_TOKEN_ENV_VAR: TOKEN},                     # token in env
+        {session_host.API_TOKEN_ENV_VAR: ""},                        # empty
+        {session_host.API_TOKEN_FILE_ENV_VAR: str(path)},            # token in a file
+        {session_host.API_TOKEN_FILE_ENV_VAR: str(tmp_path / "no")},  # broken file
+    )
+    flags = []
+    for env in configurations:
+        fake = FakeHerdr()
+        _host(fake, env).spawn("d12", cwd=tmp_path)
+        assert TOKEN not in " ".join(fake.create_argv()), env
+        flags.append(fake.env_flags())
 
-    # The trailing newline is how every editor ends a file; it is not part of the secret.
-    assert "%s=%s" % (session_host.API_TOKEN_ENV_VAR, TOKEN) in fake.env_flags()
-
-
-def test_an_unfenced_host_spawns_a_debugger_with_no_token(tmp_path):
-    # No token configured = stock herdr = there is nothing to inject. The spawn must still work:
-    # a dev machine running an unpatched host is a real case, and failing here would make the
-    # wrapper unusable everywhere the fence is not deployed.
-    fake = FakeHerdr()
-    _host(fake, {}).spawn("d12", cwd=tmp_path)
-
-    assert not [f for f in fake.env_flags() if f.startswith("HERDR")]
-
-
-def test_an_empty_token_is_not_a_token(tmp_path):
-    fake = FakeHerdr()
-    _host(fake, {session_host.API_TOKEN_ENV_VAR: ""}).spawn("d12", cwd=tmp_path)
-
-    assert not [f for f in fake.env_flags() if f.startswith("HERDR")]
-
-
-def test_an_unreadable_token_file_does_not_crash_a_spawn(tmp_path):
-    fake = FakeHerdr()
-    _host(fake, {session_host.API_TOKEN_FILE_ENV_VAR: str(tmp_path / "nope")}).spawn(
-        "d12", cwd=tmp_path)
-
-    assert not [f for f in fake.env_flags() if f.startswith("HERDR")]
+    assert all(f == flags[0] for f in flags), flags
 
 
 # --------------------------------------------------------------------- proving the fence is up
@@ -382,6 +386,52 @@ def test_a_tokenless_connection_to_a_real_patched_server_is_refused(sock_dir):
         reply = client.recv(65536).decode()
         client.close()
         assert "pong" in reply, reply
+
+        # ---- the pane grant, which is the other load-bearing half of the patch ----------------
+        # Without this, a re-apply could silently drop or move the `pane.rs` hunk and everything
+        # above would still pass while every worker pane quietly inherited the server's token.
+        def pane_env(label, extra_args):
+            """What the pane ACTUALLY got, reported by the pane itself.
+
+            Not `ps -Eww`: macOS returns no environment for another process, so reading it that
+            way is a check that passes whether or not the token is there. That mistake was made
+            once here already.
+            """
+            out = root / (label + ".env")
+            created = subprocess.run(
+                [_REAL, "workspace", "create", "--cwd", str(root), "--label", label,
+                 "--no-focus"] + extra_args,
+                env=env, capture_output=True, text=True, timeout=60)
+            pane = json.loads(created.stdout)["result"]["root_pane"]["pane_id"]
+            subprocess.run([_REAL, "pane", "run", pane, "sh", "-c", "env > %s" % out],
+                           env=env, capture_output=True, text=True, timeout=60)
+            for _ in range(80):
+                if out.exists() and out.stat().st_size:
+                    break
+                __import__("time").sleep(0.25)
+            assert out.exists() and out.stat().st_size, "pane %s never reported its env" % label
+            return out.read_text()
+
+        # A worker pane, spawned by a server that HOLDS the token in its own environment.
+        worker = pane_env("worker", [])
+        assert "HERDR_SOCKET_PATH" in worker, (
+            "precondition: the host injects the socket path into every pane — if this ever stops "
+            "being true the fence is still right, but its rationale has changed")
+        assert token not in worker, "a worker pane inherited the server's token"
+        assert session_host.API_TOKEN_ENV_VAR + "=" not in worker
+
+        # A debugger pane, asking with the sentinel: the server substitutes the real token.
+        debugger = pane_env("debugger", ["--env", "%s=%s" % (session_host.API_TOKEN_ENV_VAR,
+                                                             session_host.GRANT_SENTINEL)])
+        assert token in debugger, "the grant did not deliver the token to a d<N> pane"
+        assert session_host.GRANT_SENTINEL not in debugger, (
+            "the sentinel reached the pane verbatim — the server did not substitute it")
+
+        # A caller supplying a literal value must NOT get to choose a pane's credential.
+        forged = pane_env("forged", ["--env", "%s=%s" % (session_host.API_TOKEN_ENV_VAR,
+                                                         "attacker-chosen")])
+        assert "attacker-chosen" not in forged
+        assert token not in forged
     finally:
         # By the pid we recorded, never by name or pattern (house rule).
         try:

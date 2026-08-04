@@ -102,6 +102,15 @@ API_TOKEN_ENV_VAR = "HERDR_API_TOKEN"
 # lives only in a file was never in a position to be inherited out of one.
 API_TOKEN_FILE_ENV_VAR = "HERDR_API_TOKEN_FILE"
 
+# What a d<N> spawn passes INSTEAD of the token, for the patched host to substitute.
+#
+# This is the whole reason the wrapper never touches the secret. `workspace create --env K=V`
+# becomes process argv, and on macOS a same-uid reader is refused another process's ENVIRONMENT but
+# is served its ARGV — both measured while building this (reports/i305.md). Putting the real token
+# on that command line would publish it, for the duration of the call, to exactly the workers the
+# fence exists to keep out. So the request travels in argv and the secret never does.
+GRANT_SENTINEL = "@superlooper-fence-grant"
+
 # The launcher's own mode guard, spelled the same way here on purpose (launch-session.sh refuses
 # `--cwd` for anything but `^d[0-9]+$`). Repair sessions must be able to drive herdr — revive, kill
 # and read panes — so they RECEIVE the token; workers never do.
@@ -451,29 +460,6 @@ def receives_token(name):
     return bool(isinstance(name, str) and _DEBUGGER_RE.match(name))
 
 
-def _token(env):
-    """The control-socket token this process holds, or None if the host is unfenced.
-
-    None is a legitimate, common answer: with no token configured the patch is inert and the host
-    is stock herdr. A spawn must still work in that world — a dev machine running an unpatched
-    host is a real case — so this never raises. If the fence IS up and this process somehow has no
-    token, nothing here needs to detect it: the very next call to the host comes back
-    ``unauthorized`` and the spawn fails loudly on its own.
-    """
-    path = env.get(API_TOKEN_FILE_ENV_VAR)
-    if path:
-        try:
-            with open(path, encoding="utf-8") as handle:
-                # rstrip newlines only: a trailing newline is how every editor ends a file, while
-                # a leading space would be a token character.
-                return handle.read().rstrip("\r\n") or None
-        except OSError:
-            # An unreadable token file is "no token", not a crash: see above — the host itself is
-            # the thing that refuses, and it will.
-            return None
-    return env.get(API_TOKEN_ENV_VAR) or None
-
-
 def fence_probe(socket_path, env=None, timeout=5.0, connect=None):
     """Ask the host's socket the question a WORKER would ask, and report what came back.
 
@@ -800,20 +786,24 @@ class SessionHost:
 
         1. **Drop every ``HERDR_*`` the caller handed us.** Whatever a call site believes it is
            doing, a worker's pane does not get host-control variables from us. This runs FIRST so
-           that a caller cannot smuggle the token in under its own name.
-        2. **Then, for a ``d<N>`` only, add the token.** After the scrub, so the value comes from
-           the token this process holds and never from caller-supplied data.
+           that a caller cannot smuggle anything in under its own name.
+        2. **Then, for a ``d<N>`` only, ask for the token** — with the sentinel, never the secret.
+
+        **This wrapper never handles the token at all**, and that is deliberate. These arguments
+        become the argv of a `herdr` process, and a same-uid reader is served another process's
+        argv while being refused its environment (both measured — reports/i305.md). So the real
+        token would be readable by every worker on the machine for the duration of a debugger
+        spawn. The patched host substitutes its own secret when it sees the sentinel, and ignores a
+        literal value outright, so nothing a caller supplies can choose a pane's credential.
 
         The scrub is defense in depth, not the fence: the host injects its own ``HERDR_ENV`` /
         ``HERDR_PANE_ID`` / ``HERDR_SOCKET_PATH`` into every pane no matter what we pass here
-        (observed, not assumed — see reports/i305.md). A worker therefore still LEARNS where the
-        control socket is; what the carried patch takes away is its ability to be served by it.
+        (observed, not assumed). A worker therefore still LEARNS where the control socket is; what
+        the carried patch takes away is its ability to be served by it.
         """
         out = {k: v for k, v in (env or {}).items() if not str(k).startswith(_HOST_ENV_PREFIX)}
         if receives_token(name):
-            token = _token(self.env)
-            if token:
-                out[API_TOKEN_ENV_VAR] = token
+            out[API_TOKEN_ENV_VAR] = GRANT_SENTINEL
         return out
 
     def _call(self, args, timeout=None):
