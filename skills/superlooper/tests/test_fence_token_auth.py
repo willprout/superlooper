@@ -423,7 +423,8 @@ def test_a_tokenless_connection_to_a_real_patched_server_is_refused(sock_dir):
         # A debugger pane, asking with the sentinel: the server substitutes the real token.
         debugger = pane_env("debugger", ["--env", "%s=%s" % (session_host.API_TOKEN_ENV_VAR,
                                                              session_host.GRANT_SENTINEL)])
-        assert token in debugger, "the grant did not deliver the token to a d<N> pane"
+        assert "%s=%s" % (session_host.API_TOKEN_ENV_VAR, token) in debugger, (
+            "the grant did not deliver the token to a d<N> pane under its own variable")
         assert session_host.GRANT_SENTINEL not in debugger, (
             "the sentinel reached the pane verbatim — the server did not substitute it")
 

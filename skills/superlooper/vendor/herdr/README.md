@@ -100,7 +100,7 @@ re-introducing the leak.
 |---|---|---|
 | `Unconfigured` | neither env var set | stock herdr — everything allowed |
 | `Token(..)` | a token resolved | the fence |
-| `Misconfigured` | `HERDR_API_TOKEN_FILE` set but unreadable or empty | **every connection refused** |
+| `Misconfigured` | either variable present but empty / unreadable / non-UTF-8, or a token equal to the public grant sentinel | **every connection refused** |
 
 `Misconfigured` does not collapse into `Unconfigured`, because an operator who set the file
 variable asked for a fence; silently downgrading their typo to "no auth at all" would leave the
@@ -111,9 +111,16 @@ mistake loud instead of invisible.
 
 The token is read once at server start, from either:
 
-- `HERDR_API_TOKEN_FILE` — a path to a file containing the token. **Preferred**: a value that was
-  never in the environment cannot be inherited out of one.
-- `HERDR_API_TOKEN` — the token directly.
+- `HERDR_API_TOKEN` — the token directly. **This is the recommended one.** Under this threat model
+  the reader is the same uid, and macOS refuses a same-uid process another process's environment
+  (measured: `ps -Eww` returns nothing at all), so the server's env is genuinely out of a worker's
+  reach. Panes would inherit it — which is exactly what the `pane.rs` scrub prevents.
+- `HERDR_API_TOKEN_FILE` — a path to a file containing the token. **Not preferred by default:**
+  `0600` does not exclude the same uid, so a worker that discovers the path can simply read it.
+  Use it only if you have somewhere genuinely outside a worker's reach to put the file.
+
+Either way, a variable that is PRESENT BUT EMPTY (or unreadable, or non-UTF-8, or set to the public
+grant sentinel) is `Misconfigured`, not "no auth" — see the fail-closed table above.
 
 With **neither** set the patch is inert and the server is stock herdr. That is deliberate — it is
 what lets upstream's own test suite pass unmodified, which is the cheap signal the procedure below
@@ -151,7 +158,7 @@ it answers.
    ```
    Serial matters: several upstream plugin/graphics tests are timing-flaky — measured failing on
    an **unpatched** v0.8.0 tree too (`inactive_owner_cancels_idle_stream_and_dispatches_close`
-   failed 1 run in 6 on pristine v0.8.0, while passing 3/3 patched). A red there is not evidence
+   failed 1 run in 6 on pristine v0.8.0, while the patched tree ran 284/284 green on 3 consecutive serial runs). A red there is not evidence
    against the patch; re-run it before investigating.
 4. **Run the negative test against the built binary** — the check that actually matters:
    ```sh

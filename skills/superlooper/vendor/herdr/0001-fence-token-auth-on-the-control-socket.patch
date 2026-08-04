@@ -1,9 +1,9 @@
 diff --git a/src/api/auth.rs b/src/api/auth.rs
 new file mode 100644
-index 0000000..2b346a4
+index 0000000..08d7efb
 --- /dev/null
 +++ b/src/api/auth.rs
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,263 @@
 +//! Token auth for the control socket — superlooper's carried fence (issue #305).
 +//!
 +//! Upstream herdr deliberately exposes every capability twice (CLI + newline-JSON socket) so that
@@ -30,11 +30,19 @@ index 0000000..2b346a4
 +//! proves by probing, which is what the negative test in
 +//! `skills/superlooper/tests/test_fence_token_auth.py` exists to do.
 +//!
-+//! **Where the token may live.** `HERDR_API_TOKEN_FILE` is preferred for the SERVER, because a pane
-+//! inherits the server's environment (`apply_pane_launch_env` only ever ADDS variables) — a server
-+//! holding the secret in its own env would hand it to every worker it spawned. The companion hunk
-+//! in `pane.rs` scrubs the variable out of the inherited pane environment for that reason, so both
-+//! sources are safe; the file is simply the one that was never in the pane's env to begin with.
++//! **Where the token may live — and why the ENV is the better of the two.** Under this threat
++//! model the reader we care about runs as the SAME uid, so "who can read it" is decided by the
++//! kernel, not by file permissions:
++//!
++//! * `HERDR_API_TOKEN` in the server's environment is NOT readable by a worker — macOS refuses a
++//!   same-uid process another process's environment (measured: `ps -Eww` returns nothing at all).
++//!   Panes would inherit it, which is what the `pane.rs` scrub exists to prevent.
++//! * `HERDR_API_TOKEN_FILE` points at an ordinary file. A worker that discovers the path can just
++//!   read it — `0600` does not exclude the same uid. It is offered for operators who have somewhere
++//!   genuinely out of a worker's reach to put it, and it is NOT the default recommendation.
++//!
++//! An earlier draft of this patch had that backwards, reasoning about inheritance while ignoring
++//! readability; the pane scrub already closes the inheritance path for both.
 +
 +use std::sync::OnceLock;
 +
@@ -81,23 +89,39 @@ index 0000000..2b346a4
 +}
 +
 +fn read_configured_token() -> Expectation {
-+    // File first: a value that was never in the environment cannot be inherited out of it.
++    // PRESENT-BUT-EMPTY IS NOT ABSENT. Throughout this function, a variable that exists is read as
++    // intent to fence, so an empty or unreadable one lands in Misconfigured rather than falling
++    // back to "no auth". The distinction only ever bites a machine whose operator meant to switch
++    // the fence ON, which is the one direction a mistake here must not go quietly.
 +    if let Some(path) = std::env::var_os(API_TOKEN_FILE_ENV_VAR) {
-+        if !path.is_empty() {
-+            return match std::fs::read_to_string(&path) {
-+                // trim_end only: a leading space is a token character, a trailing newline is how
-+                // every editor and `printf` ends a file.
-+                Ok(contents) => match contents.trim_end_matches(['\r', '\n']) {
-+                    "" => Expectation::Misconfigured,
-+                    token => Expectation::Token(token.to_string()),
-+                },
-+                Err(_) => Expectation::Misconfigured,
-+            };
++        if path.is_empty() {
++            return Expectation::Misconfigured;
 +        }
++        return match std::fs::read_to_string(&path) {
++            // trim_end only: a leading space is a token character, a trailing newline is how
++            // every editor and `printf` ends a file.
++            Ok(contents) => vet(contents.trim_end_matches(['\r', '\n'])),
++            Err(_) => Expectation::Misconfigured,
++        };
 +    }
-+    match std::env::var(API_TOKEN_ENV_VAR) {
-+        Ok(token) if !token.is_empty() => Expectation::Token(token),
-+        _ => Expectation::Unconfigured,
++    match std::env::var_os(API_TOKEN_ENV_VAR) {
++        None => Expectation::Unconfigured,
++        // Non-UTF-8 is not a token anybody could present over a JSON socket, so it is a broken
++        // configuration rather than an absent one.
++        Some(raw) => match raw.to_str() {
++            Some(token) => vet(token),
++            None => Expectation::Misconfigured,
++        },
++    }
++}
++
++/// A candidate token, judged. Empty is a typo, not a secret — and the grant sentinel is PUBLIC
++/// (it travels in argv by design), so a server configured to expect it would accept the whole
++/// fleet's worth of workers as authenticated. Refuse both.
++fn vet(candidate: &str) -> Expectation {
++    match candidate {
++        "" | GRANT_SENTINEL => Expectation::Misconfigured,
++        token => Expectation::Token(token.to_string()),
 +    }
 +}
 +
@@ -215,6 +239,24 @@ index 0000000..2b346a4
 +        // It travels in argv, which any same-uid process can read. If it were ever accepted as a
 +        // credential the fence would be decorative.
 +        assert!(!authorize(&token("secret"), Some(GRANT_SENTINEL)));
++    }
++
++    #[test]
++    fn a_server_cannot_be_configured_to_expect_the_public_sentinel() {
++        // The other end of the same hole: expecting the sentinel would authenticate everybody.
++        assert_eq!(vet(GRANT_SENTINEL), Expectation::Misconfigured);
++    }
++
++    #[test]
++    fn an_empty_token_is_a_broken_configuration_not_an_absent_one() {
++        assert_eq!(vet(""), Expectation::Misconfigured);
++        assert!(!authorize(&vet(""), Some("")));
++        assert!(!authorize(&vet(""), None));
++    }
++
++    #[test]
++    fn a_real_token_survives_vetting() {
++        assert_eq!(vet("s3cret"), Expectation::Token("s3cret".to_string()));
 +    }
 +
 +    #[test]
