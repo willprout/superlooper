@@ -5,6 +5,7 @@ ambient machine blocks the loop depends on before it can run reliably overnight.
 edge is behind Probe so tests can inject fake command resolution, command output, file reads, and
 environment without reaching real binaries or the network.
 """
+import hashlib
 import json
 import os
 import plistlib
@@ -13,6 +14,7 @@ import subprocess
 from dataclasses import dataclass
 
 import config as config_lib
+import herdr_hook
 import notify
 import ops_docs
 import runner_home
@@ -1184,6 +1186,90 @@ def check_ops_docs(probe):
         % (len(ops_docs.OPS_DOCS), ops_docs.mirror_dir(dest), engine_stamp))
 
 
+# --- the session host's state-report hook (issue #307) -----------------------------------------
+# The host learns a session's id from ONE hook, and its own installer writes that hook into the
+# machine's GLOBAL Claude settings file. This loop never runs that installer: the launcher renders
+# the same hook into a per-lane settings file instead. Both halves of that promise are checkable on
+# a machine, and they fail for opposite reasons — so this block asks both.
+_HOOK_UNINSTALL_FIX = (
+    "the loop never runs the host's `integration install`, so something else did. Remove the hook "
+    "entry from that settings file by hand (or run the host's own uninstall for its claude "
+    "integration) and re-run this check — the loop's workers get the same hook from their own "
+    "per-lane settings file and need nothing global.")
+_HOOK_PUBLISH_FIX = (
+    "republish the engine with the repo-root bin/install.sh — the vendored asset ships inside the "
+    "gated payload, and until it lands every worker launches without host-side revive.")
+
+
+def check_host_state_hook(probe):
+    """doctor --stack's `host state hook` line.
+
+    Order is the argument. The dirty-global-file case is decided FIRST and never masked by a
+    healthy asset: a third-party installer editing the operator's hand-maintained settings file is
+    the finding this whole issue exists to prevent, while a missing asset only costs host-side
+    revive on a loop that still has its own `--resume` floor (#298).
+
+    A machine with no installed engine at all gets a plain ok, the same posture as `installed ops
+    docs`: another block already names that machine's real problem and the doctor never invents a
+    second alarm for one cause.
+    """
+    name = "host state hook"
+    # HOME from the PROBE, never from this process: an injected probe carries its own home, and a
+    # block that fell through to os.path.expanduser would read the real operator's settings file in
+    # the middle of a test run (the "no test reaches real state" ratchet).
+    env = dict(probe.env)
+    env.setdefault("HOME", probe.home)
+    settings = herdr_hook.global_settings_path(env)
+    text = probe.read_text(settings)
+    if text is not None:
+        try:
+            carried = herdr_hook.carried_hook_commands(json.loads(text))
+        except ValueError:
+            # Somebody's hand-edited settings file is not ours to validate — and an unparseable one
+            # is a real problem this block is not the right messenger for. Say what we could not
+            # read rather than clearing a file we never actually checked.
+            return CheckResult(
+                name, True,
+                "%s could not be parsed as JSON, so this check cannot say whether it carries the "
+                "session host's hook." % settings, warn=True)
+        if carried:
+            return CheckResult(
+                name, False,
+                "%s carries the session host's state-report hook (%s) — `integration install` was "
+                "run on this machine, which is exactly what the per-worker hook config exists to "
+                "avoid." % (settings, carried[0]),
+                _HOOK_UNINSTALL_FIX)
+
+    dest = _installed_home(probe)
+    if not probe.exists(dest):
+        return CheckResult(
+            name, True,
+            "%s carries no host hook (clean). No installed engine at %s yet, so there is no "
+            "vendored asset to check." % (settings, dest))
+
+    asset = herdr_hook.vendored_script(home=dest)
+    body = probe.read_text(asset)
+    if body is None:
+        return CheckResult(
+            name, False,
+            "%s is clean, but the host's state-report hook is not published at %s — workers launch "
+            "without it, so a crashed session cannot be revived by the host (the loop's own "
+            "--resume floor still applies)." % (settings, asset),
+            _HOOK_PUBLISH_FIX)
+    digest = hashlib.sha256(body.encode("utf-8", "surrogateescape")).hexdigest()
+    if digest != herdr_hook.HOOK_SCRIPT_SHA256:
+        return CheckResult(
+            name, False,
+            "the published hook asset at %s does not match the pinned checksum (%s… expected, "
+            "%s… found) — a different integration contract is installed than the one this engine "
+            "was accepted against." % (asset, herdr_hook.HOOK_SCRIPT_SHA256[:12], digest[:12]),
+            _HOOK_PUBLISH_FIX)
+    return CheckResult(
+        name, True,
+        "%s carries no host hook (clean); the pinned state-report asset is published at %s, so "
+        "every worker gets it from its own per-lane settings file." % (settings, asset))
+
+
 # --- superlooper plugin presence (issue #90) ---------------------------------------------------
 # After the plugin restructure (design D10), the loop's SKILL CONTENT ships as a plugin, not inside
 # the gated engine payload. A machine without it silently loses the ops / write-issue / debugger
@@ -1335,6 +1421,7 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_runner_home(probe, config),
         check_engine_drift(probe, repo_path=repo_path, dev_branch=dev),
         check_ops_docs(probe),
+        check_host_state_hook(probe),
         check_superlooper_plugin(probe),
     ]
 

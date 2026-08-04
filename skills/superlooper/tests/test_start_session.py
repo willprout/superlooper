@@ -7,6 +7,7 @@ kickoff rule), pinning exactly which flags reach the CLI:
   * --effort is passed iff SL_EFFORT is non-empty — NEVER a default (owner ruling 2026-07-07);
   * a bracketed model (opus[1m]) survives verbatim through the launch stack.
 """
+import json
 import os
 import re
 import shutil
@@ -922,3 +923,80 @@ def test_a_relative_path_hit_is_refused_rather_than_run_from_the_worktree(tmp_pa
     assert "relative" in r.stderr.lower()
     assert "PLANTED" not in r.stdout
     assert not (tmp_path / "home" / ".superlooper" / "claude-bin.last").exists()
+
+
+# ---- the per-worker hook config (issue #307) ----------------------------------------------------
+# The session host learns a session's id from ONE state-report hook, and its own installer puts
+# that hook in the machine's GLOBAL Claude settings file. These cases pin the alternative: the
+# launcher renders a settings file belonging to THIS worker and hands it to `--settings`, so the
+# operator's own settings file is never a party to the launch.
+
+def _settings_file(argv):
+    return _flag_value(argv, "--settings")
+
+
+def test_a_claude_launch_carries_a_per_worker_settings_file(tmp_path):
+    argv = _run_start(tmp_path)
+    path = _settings_file(argv)
+    assert path, "no --settings on the claude command line"
+    assert os.path.isfile(path), f"--settings names {path}, which was never written"
+
+
+def test_the_settings_file_carries_the_hosts_state_report_hook(tmp_path):
+    import herdr_hook
+    argv = _run_start(tmp_path)
+    doc = json.loads(open(_settings_file(argv)).read())
+    assert herdr_hook.carried_hook_commands(doc), \
+        f"the per-worker settings file carries no state-report hook: {doc}"
+    assert list(doc) == ["hooks"], "a per-worker settings file must add hooks and nothing else"
+
+
+def test_the_settings_file_is_the_lanes_own_and_lives_outside_the_worktree(tmp_path):
+    """Per-worker, not per-machine — and NOT inside the repo the worker is about to commit from.
+    A settings file in the worktree is one `git add -A` away from being pushed into somebody
+    else's pull request, and would collide with an adopted repo's own .claude/settings.json."""
+    r, run_root, args_file = _start(tmp_path)
+    assert r.returncode == 0, r.stderr
+    path = _settings_file(args_file.read_text().splitlines())
+    assert "i1" in os.path.basename(path), f"{path} is not keyed to this lane"
+    assert path.startswith(str(run_root)), f"{path} is not under the run root"
+
+
+def test_the_launch_never_touches_the_global_settings_file(tmp_path):
+    """The whole point of the issue: `integration install` is never run, so nothing on the launch
+    path may create or modify $HOME/.claude/settings.json."""
+    r, _run_root, _args = _start(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert not (tmp_path / "home" / ".claude" / "settings.json").exists()
+
+
+def test_a_codex_launch_gets_no_settings_flag(tmp_path):
+    """Agent boundary: `--settings` is a Claude Code spelling and codex would abort on it."""
+    argv = _run_start(tmp_path, agent="codex")
+    assert "--settings" not in argv
+
+
+def test_a_resumed_launch_carries_the_settings_file_too(tmp_path):
+    """A revived lane is exactly when the host most needs the id: it has to re-report on the new
+    process, or a SECOND crash finds nothing to resume."""
+    argv = _run_start(tmp_path, resume_brief="pick up where you left off",
+                      extra_env={"SL_SESSION_ID": "11111111-2222-4333-8444-555555555555",
+                                 "SL_RESUME": "1"})
+    assert "--resume" in argv
+    assert os.path.isfile(_settings_file(argv))
+
+
+def test_a_missing_hook_asset_does_not_ground_the_launch(tmp_path):
+    """Loud, not fatal. The engine's OWN resurrection floor (#298) is the primary revive path and
+    does not depend on this hook, so a machine whose engine was published without the vendored
+    asset must still fly — while saying so where the launch-stderr park memo will read it.
+    `doctor --stack`'s own block is what turns this from a whisper into a red line."""
+    argv = _run_start(tmp_path, extra_env={"SL_HOST_STATE_HOOK": str(tmp_path / "absent.sh")})
+    assert "--settings" not in argv, "a settings file naming an absent hook is worse than none"
+
+
+def test_a_missing_hook_asset_says_so_on_stderr(tmp_path):
+    r, _run_root, _args = _start(
+        tmp_path, extra_env={"SL_HOST_STATE_HOOK": str(tmp_path / "absent.sh")})
+    assert r.returncode == 0
+    assert "hook" in r.stderr.lower()

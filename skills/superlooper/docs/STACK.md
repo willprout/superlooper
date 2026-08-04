@@ -204,6 +204,13 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   the doctor does not assert a mismatch it could not actually read. A machine with no installed
   engine home at all passes cleanly: there is nothing published to check, and the launch-shim and
   hook blocks already name that problem.
+- `host state hook`: FAILs when the machine's global Claude settings file carries the session
+  host's state-report hook — that means the host's `integration install` was run here, which the
+  loop never does; remove the entry by hand (or run the host's own uninstall) and re-check, because
+  workers get the same hook from their own per-lane settings file and need nothing global. Also
+  FAILs when the vendored hook asset is absent from the installed engine or does not match the
+  pinned checksum: republish with the repo-root `bin/install.sh`. Until it lands, workers launch
+  without host-side revive — the loop's own `--session-id`/`--resume` floor still applies.
 - `superlooper plugin`: install it with `claude plugin marketplace add willprout/superlooper` then
   `claude plugin install superlooper@superlooper --scope user`; if it is installed but disabled, run
   `claude plugin enable superlooper@superlooper`. Always a WARN — the loop runs correctly without
