@@ -10,6 +10,7 @@ import json
 import os
 import plistlib
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 
@@ -174,16 +175,23 @@ class Probe:
             return None
 
     def mode(self, path):
-        """The permission bits of `path`, or None if it cannot be stat-ed.
+        """The permission bits of a REGULAR FILE at `path`, or None.
+
+        `lstat`, not `stat`, and regular-files-only (fresh-agent review): the one caller is asking
+        whether a secret at rest is readable, and `stat` follows a symlink — so a link pointing at
+        somebody else's 0600 file would answer "0600, fine" about a file this machine neither minted
+        nor controls. A symlink, a directory or a socket here is not a permissions question with a
+        reassuring answer; it is an object whose provenance is unknown.
 
         None is UNKNOWN and every caller fails closed on it — "I could not read the mode" is not
-        "the mode is fine", which is exactly the reading that would let a world-readable secret
-        pass a permissions check.
+        "the mode is fine", which is exactly the reading that would let a world-readable secret pass
+        a permissions check.
         """
         try:
-            return os.stat(path).st_mode & 0o777
+            st = os.lstat(path)
         except OSError:
             return None
+        return st.st_mode & 0o777 if stat.S_ISREG(st.st_mode) else None
 
     def expanduser(self, path):
         return os.path.expanduser(path)

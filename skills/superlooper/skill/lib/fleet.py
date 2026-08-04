@@ -291,8 +291,13 @@ def _read_toml_ish(text):
         if header:
             table = header.group(1).strip()
             if table in seen:
-                return None, ("it declares the table [%s] twice, which TOML rejects — the host "
-                              "refuses to start on a config it cannot parse" % table)
+                # Worded to MATCH tomllib's branch above, not merely to be correct. Both readers
+                # answer the same operator, and a message that changed with the interpreter would
+                # make one machine's report unrecognisable beside another's — the same reason the
+                # dual-reader test asserts the shared phrase and not each reader's own.
+                return None, ("it is not valid TOML: the table [%s] is declared twice — the host "
+                              "refuses to start on a config it cannot parse, so this is not a "
+                              "state to report as merely incomplete" % table)
             seen.add(table)
             data.setdefault(table, {})
             continue
@@ -385,6 +390,25 @@ def has_catchall_rule(text):
     """
     if not text:
         return False
+    if tomllib is not None:
+        # PARSED where we can (fresh-agent review): the host reads this file with a real parser and
+        # REFUSES it if it does not parse, so a malformed override is not an installed one. A rule
+        # also has to be able to FIRE — an id and a state with no region or match expression is a
+        # rule the host will never apply, which is the same wrong `idle` with a green line over it.
+        try:
+            data = tomllib.loads(text)
+        except (tomllib.TOMLDecodeError, TypeError, ValueError):
+            return False
+        rules = data.get("rules")
+        if not isinstance(rules, list):
+            return False
+        for rule in rules:
+            if not isinstance(rule, dict) or rule.get("id") != CATCHALL_RULE_ID:
+                continue
+            if rule.get("state") != "unknown" or not rule.get("region"):
+                return False
+            return bool(rule.get("regex") or rule.get("line_regex") or rule.get("contains"))
+        return False
     body = re.sub(r"^\s*#.*$", "", text, flags=re.M)
     found = re.search(r"""^\s*id\s*=\s*['"]%s['"]\s*$""" % re.escape(CATCHALL_RULE_ID),
                       body, re.M)
@@ -395,7 +419,9 @@ def has_catchall_rule(text):
         return False
     nxt = body.find("[[rules]]", found.end())
     block = body[head:nxt if nxt != -1 else len(body)]
-    return bool(re.search(r"""^\s*state\s*=\s*['"]unknown['"]\s*$""", block, re.M))
+    return bool(re.search(r"""^\s*state\s*=\s*['"]unknown['"]\s*$""", block, re.M)
+                and re.search(r"^\s*region\s*=", block, re.M)
+                and re.search(r"^\s*(regex|line_regex|contains)\s*=", block, re.M))
 
 
 def override_source_version(text):
@@ -825,9 +851,17 @@ def check_identity(probe, fleet_config_dir, claude=None):
             % (fleet_config_dir, fleet_status.get("email"), fleet_status.get("orgId")),
             "open one interactive `claude` under that config dir and finish first-run (#313)")
     other = (owner_status or {}).get("orgId")
+    # What this block proves, stated exactly, because the gap is one a green line would otherwise
+    # paper over (fresh-agent review): the fleet's config DIR holds its own login, separate from the
+    # owner's. It does NOT prove any launch points a session at that dir — putting CLAUDE_CONFIG_DIR
+    # on the spawn seam is #314's job, and until that lands a worker still starts on whatever the
+    # environment gives it. Reading this line as "the fleet bills its own subscription" is exactly
+    # the c1 silent-billing-flip in a new costume, so the line says so itself.
     return CheckResult(
         name, True,
-        "%s rides its own subscription (%s, org %s%s)"
+        "%s rides its own subscription (%s, org %s%s). This proves the CONFIG DIR's identity, not "
+        "that a launch uses it — the spawn-seam contract is #314; until it lands, a worker starts "
+        "on whatever CLAUDE_CONFIG_DIR its environment carries"
         % (fleet_config_dir, fleet_status.get("subscriptionType") or "?",
            fleet_status.get("orgId"), "; the owner's default dir is org %s" % other if other else ""))
 
@@ -863,9 +897,12 @@ def check_isolation(probe, fleet_prefix, host_config_dir):
     token = token_file(fleet_prefix)
     mode = probe.mode(token)
     if mode is None:
-        return CheckResult(name, False, "the fence token at %s could not be stat-ed, so whether it "
-                                        "is readable by anything on this machine is unknown" % token,
-                           "run `superlooper fleet --install` to mint it")
+        return CheckResult(
+            name, False,
+            "the fence token at %s is missing, unreadable, or not a regular file (a symlink there "
+            "would have this block report the permissions of a file the fleet never minted) — so "
+            "whether the secret is readable on this machine is unknown" % token,
+            "run `superlooper fleet --install` to mint it; move any non-regular object aside first")
     if mode & 0o077:
         return CheckResult(
             name, False,

@@ -481,10 +481,21 @@ def _write_once(path, text, marker, what, merge_text=None):
     if existing == text:
         return "kept"
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    # A UNIQUE temp name in the same directory, not `<path>.tmp` (fresh-agent review): a fixed
+    # sidecar is itself a file this command promised not to clobber, and `<config>.tmp` is exactly
+    # what a hand-merge or an editor recovery leaves lying around. Same directory so the replace
+    # stays atomic (a cross-filesystem rename is not).
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".sl-fleet-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return "wrote"
 
 

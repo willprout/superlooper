@@ -53,7 +53,11 @@ class EnvProbe(FakeProbe):
         self.run_env = []
 
     def mode(self, path):
-        return self.modes.get(path, 0o600) if self.exists(path) else None
+        # Mirrors the real Probe: None for anything that is not a readable REGULAR file, which is
+        # how a symlinked token reaches the caller.
+        if path in self.modes:
+            return self.modes[path]
+        return 0o600 if self.exists(path) else None
 
     def contains(self, path, needle):
         if not self.exists(path):
@@ -134,7 +138,6 @@ def test_the_host_config_check_names_each_missing_setting():
     # PARSED, so invalid TOML is reported as invalid rather than judged on its spelling.
     dup = "version_check = false\n[session]\nresume_agents_on_restore = true\n[session]\n"
     assert "not valid TOML" in fleet.host_config_problem(dup)
-    assert "not valid TOML" in fleet.host_config_problem("this is = = not toml\n")
 
 
 def test_both_config_readers_give_the_same_verdicts(monkeypatch):
@@ -159,8 +162,9 @@ def test_both_config_readers_give_the_same_verdicts(monkeypatch):
         assert (a is None) == (b is None), (case, a, b)
     assert (real[0], fallback[0]) == (None, None)
     # Both must catch the duplicate table — the case a flat text sweep calls healthy and the host
-    # refuses to start on.
-    assert "twice" in fallback[2] and "not valid TOML" in real[2]
+    # refuses to start on — and both must SAY it the same way, or one machine's report is
+    # unrecognisable beside another's.
+    assert "not valid TOML" in real[2] and "not valid TOML" in fallback[2]
 
 
 def test_the_merge_instructions_carry_no_ownership_marker():
@@ -519,6 +523,32 @@ def test_a_commented_out_or_absent_rule_is_not_an_installed_override():
     assert not fleet.has_catchall_rule(None)
 
 
+def test_an_override_the_host_would_refuse_or_never_apply_is_not_installed(monkeypatch):
+    good = fleet.render_manifest_override('id = "claude"\nversion = "9"\n', source_version="9")
+    # The host reads this with a real parser and refuses what will not parse, so where a parser is
+    # available neither may this. Asserted FIRST, before the fallback is forced on below: the line
+    # walker cannot see malformed TOML and does not claim to.
+    if fleet.tomllib is not None:
+        assert not fleet.has_catchall_rule(good + "\n[[[broken")
+    for reader in ("parser", "line walker"):
+        if reader == "line walker":
+            monkeypatch.setattr(fleet, "tomllib", None)
+        assert fleet.has_catchall_rule(good), reader
+        # A rule with no way to match is a rule the host never applies — the same wrong `idle`
+        # with a green line over it.
+        assert not fleet.has_catchall_rule(good.replace("regex = ['(?s).*']", "")), reader
+        assert not fleet.has_catchall_rule(good.replace('region = "whole_recent"', "")), reader
+        assert not fleet.has_catchall_rule('# id = "%s"' % fleet.CATCHALL_RULE_ID), reader
+
+
+def test_the_identity_block_says_what_it_does_not_prove():
+    # A green line here must not be read as "workers bill the fleet's subscription". Putting
+    # CLAUDE_CONFIG_DIR on the spawn seam is #314; until then a worker starts on whatever its
+    # environment carries, and that gap is the c1 silent-billing-flip in a new costume.
+    r = fleet.check_identity(_green_probe(), _FLEET_CLAUDE_DIR, claude=_CLAUDE)
+    assert r.ok and "#314" in r.detail and "not that a launch uses it" in r.detail
+
+
 def test_the_isolation_check_refuses_a_readable_fence_token():
     loose = _green_probe()
     loose.modes[fleet.token_file(_PREFIX)] = 0o644
@@ -527,6 +557,13 @@ def test_the_isolation_check_refuses_a_readable_fence_token():
     # A token that cannot be stat-ed at all is not a token whose permissions are fine.
     r = fleet.check_isolation(EnvProbe(home=_HOME), _PREFIX, _HOST_CONFIG_DIR)
     assert not r.ok and "unknown" in r.detail
+    # ...and a symlink there is not a permissions question with a reassuring answer: `Probe.mode`
+    # lstats and answers only for regular files, so the judge cannot report the mode of a file the
+    # fleet never minted.
+    linked = _green_probe()
+    linked.modes[fleet.token_file(_PREFIX)] = None
+    monkey = fleet.check_isolation(linked, _PREFIX, _HOST_CONFIG_DIR)
+    assert not monkey.ok and "not a regular file" in monkey.detail
 
 
 def test_the_identity_check_fails_when_the_fleet_dir_reads_the_owners_login():
