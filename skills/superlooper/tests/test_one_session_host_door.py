@@ -95,6 +95,10 @@ _SH_VAR = re.compile(r"\$\{?(?:SL_)?HERDR\w*\}?")
 # `herdr` at a COMMAND position — start of a logical line, or after a pipe/semicolon/&&/subshell,
 # with any leading VAR=value assignments skipped. Prose that merely says the word is not a command.
 _SH_COMMAND = re.compile(r"(?:^|[;&|(`]|\$\()\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:command\s+)?herdr\b")
+# The binary put into a variable first: `BIN=herdr`, `HOST="/opt/homebrew/bin/herdr"`. Neither that
+# line nor the later `"$BIN" agent prompt` matches "herdr at a command position", so the ASSIGNMENT
+# has to count — you cannot run the binary without naming it exactly once.
+_SH_BINARY_ASSIGN = re.compile(r"\b[A-Za-z_]\w*=(['\"]?)(?:[\w./$~{}-]*/)?herdr\1(?:\s|;|$)")
 # A command line in a string constant: `agent prompt <name>` without the binary in front.
 _BARE_COMMAND = re.compile(r"^(?:%s)\s+(?:%s)\b" % ("|".join(_ARGV_GROUPS), "|".join(sorted(_SUBCOMMANDS))))
 
@@ -173,6 +177,36 @@ def _py_source_without_comments(text):
         return text                      # unparseable: scan it raw rather than skip it
 
 
+def _py_string_bindings(tree):
+    """``{name: "literal"}`` for every plain string binding in the module.
+
+    The cheapest way around an adjacent-constants check is to put the group in one variable and the
+    subcommand in another, so the argv list holds no strings at all. Resolving bindings before
+    pairing closes that, the same way the publish fence resolves a path spelled in halves. Scope is
+    deliberately ignored: this is a fence, and a name that means "prompt" in one function and
+    something innocent in another is not a shape worth protecting.
+    """
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Constant):
+            if not isinstance(node.value.value, str):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    out[target.id] = node.value.value
+    return out
+
+
+def _py_word(element, bindings):
+    """The string an argv element carries — spelled, or reached through a name."""
+    if isinstance(element, ast.Constant) and isinstance(element.value, str):
+        return element.value
+    if isinstance(element, ast.Name):
+        return bindings.get(element.id)
+    return None
+
+
 def _py_offences(text):
     hits = []
     stripped = _py_source_without_comments(text)
@@ -188,14 +222,14 @@ def _py_offences(text):
         tree = ast.parse(text)
     except SyntaxError:
         return hits
+    bindings = _py_string_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             value = node.value.strip()
             if _BINARY_LITERAL.match(value) or _BARE_COMMAND.match(value):
                 hits.append((getattr(node, "lineno", 0), "host command literal: %r" % value[:60]))
         elif isinstance(node, (ast.List, ast.Tuple)):
-            words = [e.value if isinstance(e, ast.Constant) and isinstance(e.value, str) else None
-                     for e in node.elts]
+            words = [_py_word(e, bindings) for e in node.elts]
             for first, second in zip(words, words[1:]):
                 if first in _ARGV_GROUPS and second in _SUBCOMMANDS:
                     hits.append((getattr(node, "lineno", 0),
@@ -225,6 +259,7 @@ def _sh_offences(text):
         if not line.strip():
             continue
         for regex, why in ((_SH_COMMAND, "runs the host binary"),
+                           (_SH_BINARY_ASSIGN, "puts the host binary in a variable"),
                            (_SH_VAR, "holds a handle on the host binary"),
                            (_ENV_NAME, "names the host's environment"),
                            (_SOCKET, "names the host control socket")):
@@ -334,6 +369,18 @@ _SH_PIPED = """#!/usr/bin/env bash
 echo hi | herdr pane send-text "$PANE"
 """
 
+_PY_VERBS_VIA_NAMES = """import subprocess
+GROUP = "agent"
+VERB = "prompt"
+def nudge(cfg, name, text):
+    subprocess.run([cfg["host_binary"], GROUP, VERB, name, text, "--wait"])
+"""
+
+_SH_BINARY_IN_A_VARIABLE = """#!/usr/bin/env bash
+BIN=herdr
+"$BIN" agent prompt "$ID" "$BRIEF" --wait
+"""
+
 _PY_PROSE = '''"""The session host is herdr today (docs/HERDR-ADOPTION-PLAN.md).
 
 herdr is muscle, never truth — its idle state means "seen in the focused UI", so the runner reads
@@ -364,6 +411,19 @@ def test_fence_flags_a_python_caller_that_builds_host_argv():
 
 def test_fence_flags_a_command_spelled_in_one_string():
     assert _py_offences(_PY_COMMAND_STRING)
+
+
+def test_fence_follows_verbs_bound_to_names():
+    # The determined-caller case (fresh-agent review): put the group and the subcommand in
+    # constants and the binary in config, and nothing on the line reads as a host call. Bindings
+    # are resolved before pairing, exactly as the publish fence resolves a path spelled in halves.
+    assert _py_offences(_PY_VERBS_VIA_NAMES), "a verb pair reached through names is still a call"
+
+
+def test_fence_flags_a_shell_caller_that_hides_the_binary_in_a_variable():
+    # `BIN=herdr` then `"$BIN" agent prompt …`: neither line matches "herdr at a command position",
+    # so the assignment ITSELF has to count. You cannot run the binary without naming it once.
+    assert _sh_offences(_SH_BINARY_IN_A_VARIABLE)
 
 
 def test_fence_flags_the_socket_and_the_injected_environment():

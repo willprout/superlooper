@@ -30,8 +30,11 @@ each is named where it is enforced so a later reader can tell doctrine from para
   ``agent list``. Absence of signal is UNKNOWN, never idle/done (c2).
 * **exit/kill** — our ordered teardown; the host's verbs are mechanism only. ``exit`` closes a
   FINISHED session's window and refuses anything else (positive allowlist, like ``tidy.closable``).
-  ``kill`` is the forceful path and escalates only against a pid we ourselves recorded — never a
-  name or pattern (house rule: a pattern can match the owner's own processes).
+  ``kill`` is the forceful path and escalates only against a pid THIS read attributed to the
+  session's own pane — never a name or pattern (house rule: a pattern can match the owner's own
+  processes), and never a pid recorded at spawn that nothing can still vouch for. Both verbs report
+  success only on positive evidence that the session went; a host that has stopped answering is
+  silence, not confirmation.
 
 Two addressing rules the host's own documentation dictates (plan §7):
 
@@ -220,15 +223,17 @@ class Probe:
         return int(pid) not in self._defunct([pid])
 
     def child_pids(self, pid):
-        """The pane shell's live children (c8). `pgrep -P` is a READ; nothing here kills by pattern.
+        """The pane shell's live children (c8), or None when the OS could not be asked.
 
-        Defunct children are filtered out for the same reason as above: a pane whose only child is
-        a zombie claude is a bare shell, and calling it occupied is how a hollow pane reads as a
-        working session.
+        `pgrep -P` is a READ; nothing here ends a process by pattern. Two answers that must never
+        collide: rc=1 means "this pane has no children", which ENDS a session, while a timeout or a
+        missing binary means nothing at all — and returning [] for both would let a failed probe
+        authorise ``exit`` to close a working session. Defunct children are filtered out for the
+        same reason as ``pid_alive``: a pane whose only child is a zombie is a bare shell.
         """
         proc = self.run(["pgrep", "-P", str(pid)], timeout=5)
-        if proc.returncode not in (0, 1):        # 1 = no match, which is a real answer
-            return []
+        if proc.returncode not in (0, 1):        # 1 = no match, which IS a real answer
+            return None
         kids = [int(line) for line in (proc.stdout or "").split() if line.isdigit()]
         defunct = self._defunct(kids)
         return [kid for kid in kids if kid not in defunct]
@@ -474,13 +479,15 @@ class SessionHost:
         if delivery is None:
             raise ValueError("a delivery oracle is required: rc carries no delivery information, "
                              "so an unverifiable send is not a send")
-        if revived and reorient.HEADING not in (text or ""):
+        if revived and not (text or "").lstrip().startswith(reorient.HEADING):
             # #298: `--resume` restores the conversation and tells the session NOTHING about what
             # happened to the world. An instruction delivered before the re-orientation is acted on
-            # under a remembered branch, PR and CI.
+            # under a remembered branch, PR and CI — so the test is LEADS WITH, not contains:
+            # reorient.render puts the operator's note last for exactly this reason, and a payload
+            # that opens with the instruction defeats the ordering however much preamble follows.
             raise ReorientationMissing(
-                "[%s] a revived session must be handed the re-orientation preamble before any "
-                "instruction (reorient.render)" % name)
+                "[%s] a revived session must be handed the re-orientation preamble BEFORE any "
+                "instruction — the payload has to lead with reorient.render's output" % name)
 
         ms = int(timeout_ms or self._prompt_timeout_ms)
         mark = delivery.mark()
@@ -559,31 +566,40 @@ class SessionHost:
             raise TeardownRefused(
                 "[%s] exit closes a finished session; this one reads %s (%s). Use kill to end a "
                 "session that is still running." % (before.name, before.liveness, before.detail))
-        self._call(["workspace", "close", session.workspace])
+        close = self._call(["workspace", "close", session.workspace])
         for attempt in range(max(1, self._teardown_reads)):
             if attempt:
                 self._probe.sleep(self._teardown_pause)
             after = self.state(session)
-            if after.name_resolves is not True and after.liveness != ALIVE:
+            # `is False`, not `is not True`: the host SAYING the name is gone is evidence; the host
+            # having stopped answering is silence. Accepting silence here reports a workspace as
+            # reaped while it is still sitting on the machine.
+            if after.name_resolves is False and after.liveness != ALIVE:
                 return Teardown(closed=True, signalled=[],
                                 detail="workspace %s closed and verified gone" % session.workspace)
         raise TeardownUnverified(
-            "[%s] the close returned but the session is still there (workspace %s)"
-            % (before.name, session.workspace))
+            "[%s] the close was issued but nothing confirmed the session went (workspace %s)%s"
+            % (before.name, session.workspace,
+               "; the host answered: " + close.error if not close.ok else ""))
 
     # ---- verb 5: kill ------------------------------------------------------------------
     def kill(self, session):
         """End a session that is still running, and PROVE the process is gone.
 
-        The escalation walks one pid: the live pane's shell, re-read while the pane still exists
-        (after the close there is nothing left to ask), falling back to the pid recorded at spawn.
-        Never a name, never a pattern — that is the house rule, and the reason is that a pattern can
-        also match the owner's own live processes.
+        The escalation walks ONE pid, and only one it can attribute: the live pane's shell, re-read
+        while the pane still exists (after the close there is nothing left to ask). A pid recorded
+        at spawn is deliberately NOT good enough on its own — if the host no longer resolves the
+        name, the OS may have handed that number to anybody, and signalling it would be the
+        pattern-kill hazard with extra steps. Never a name, never a pattern: the house rule exists
+        because such a search can also match the owner's own live processes.
         """
         self._require_ours(session)
         before = self.state(session)
-        pid = before.shell_pid or (session.shell_pid if isinstance(session, Session) else None)
-        self._call(["workspace", "close", session.workspace])
+        recorded = session.shell_pid if isinstance(session, Session) else None
+        # ALIVE is the only verdict state() reaches through FRESH pane process facts, so it is the
+        # only one that attributes a pid to this session.
+        pid = before.shell_pid if before.liveness == ALIVE else None
+        close = self._call(["workspace", "close", session.workspace])
 
         signalled = []
         # (label, escalation) pairs rather than bare callables: a bound method is a fresh object on
@@ -599,15 +615,23 @@ class SessionHost:
             for attempt in range(max(1, self._teardown_reads)):
                 if attempt:
                     self._probe.sleep(self._teardown_pause)
-                if self._gone(session, pid):
+                if self._ended(session, pid, recorded):
                     return Teardown(closed=True, signalled=signalled,
                                     detail="workspace %s closed; %s" % (
                                         session.workspace,
                                         "no signal needed" if not signalled
                                         else "escalated to " + "+".join(signalled)))
+        unattributed = (pid is None and recorded is not None
+                        and self._probe.pid_alive(recorded))
         raise TeardownUnverified(
-            "[%s] the session survived close%s — pid %s is still alive"
-            % (before.name, " and " + "+".join(signalled) if signalled else "", pid))
+            "[%s] nothing confirmed this session ended%s%s%s"
+            % (before.name,
+               " (escalated to %s against pid %s)" % ("+".join(signalled), pid) if signalled
+               else "",
+               "; the host answered: " + close.error if not close.ok else "",
+               "; the pid recorded at spawn (%s) is still alive and this read could not attribute "
+               "it to this session, so it was deliberately NOT signalled — %s"
+               % (recorded, before.detail) if unattributed else ""))
 
     # ---- private -----------------------------------------------------------------------
     def _call(self, args, timeout=None):
@@ -636,17 +660,31 @@ class SessionHost:
         if not self._probe.pid_alive(shell_pid):
             return shell_pid, DEAD, "the pane shell pid %s is gone" % shell_pid
         children = self._probe.child_pids(shell_pid)
+        if children is None:
+            # The probe could not answer. That is not "the pane is empty" — DEAD is what authorises
+            # a teardown, so an unreadable read must never produce it.
+            return shell_pid, UNKNOWN, ("could not read the children of pane shell pid %s — the "
+                                        "process probe did not answer" % shell_pid)
         if not children:
             return shell_pid, DEAD, ("the pane shell pid %s has no live child — the pane is a bare "
                                      "shell, whatever the host reports" % shell_pid)
         return shell_pid, ALIVE, "pane shell pid %s has live child %s" % (shell_pid, children[0])
 
-    def _gone(self, session, pid):
-        """Is this session verifiably over? A recorded pid is the strongest answer available; with
-        no pid we fall back to the name no longer resolving, which the host clears on exit."""
+    def _ended(self, session, pid, recorded):
+        """Is this session verifiably over? Every branch needs POSITIVE evidence.
+
+        * An attributed pid that is gone is the strongest answer there is.
+        * With no pid to watch, the host SAYING the name no longer resolves is the evidence — and
+          `is False` matters: a host that stopped answering has told us nothing.
+        * ...but if a pid we recorded at spawn is still alive, we may neither signal it (we could
+          not attribute it) nor call the session ended over it. That combination is exactly the
+          case the caller must be told about rather than reassured about.
+        """
         if pid is not None:
             return not self._probe.pid_alive(pid)
-        return self.state(session).name_resolves is not True
+        if self.state(session).name_resolves is not False:
+            return False
+        return not (recorded is not None and self._probe.pid_alive(recorded))
 
     def _rollback(self, workspace):
         """Undo a spawn that could not be confirmed. Best effort by design: the raise that follows

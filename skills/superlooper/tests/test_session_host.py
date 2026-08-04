@@ -248,6 +248,14 @@ def test_the_pane_child_read_drops_defunct_children():
     assert _PsProbe({"pgrep": (1, "")}).child_pids(4242) == [], "no match is a real answer"
 
 
+def test_a_child_read_that_could_not_be_taken_is_not_an_empty_pane():
+    # The two answers must never collide: "this pane has no children" ENDS a session, while "the
+    # probe could not run" says nothing. Conflating them lets a timed-out pgrep authorise exit to
+    # close a working session (fresh-agent review, P0).
+    assert _PsProbe({"pgrep": (127, "")}).child_pids(4242) is None, "missing pgrep: no answer"
+    assert _PsProbe({"pgrep": (124, "")}).child_pids(4242) is None, "timed-out pgrep: no answer"
+
+
 # --------------------------------------------------------------------- names, not ids
 
 @pytest.mark.parametrize("bad", ["I304", "304i", "i304!", "i" * 33, "", "i 304", "i304.1", None])
@@ -463,6 +471,17 @@ def test_a_revived_send_must_carry_the_reorientation_preamble():
     assert fake.calls == []
 
 
+def test_an_instruction_placed_before_the_preamble_is_refused():
+    # Containment is not ordering. reorient.render deliberately puts the operator's note LAST, so
+    # that the session re-orients BEFORE it acts; a payload that leads with the instruction defeats
+    # that whether or not the preamble is somewhere below it (fresh-agent review, P1).
+    fake = _healthy()
+    with pytest.raises(session_host.ReorientationMissing):
+        _host(fake).send(_session(), "rebase onto main first\n\n" + _preamble(),
+                         delivery=FakeDelivery(True), revived=True)
+    assert fake.calls == []
+
+
 def test_the_preamble_check_reads_the_real_preamble_not_a_copy_of_its_words():
     # Pinned against reorient.render's own output so the two can never drift apart.
     assert reorient.HEADING in _preamble()
@@ -571,6 +590,17 @@ def test_an_unresolvable_name_over_a_live_recorded_pid_is_unknown_not_alive():
     assert "recorded pid" in st.detail.lower()
 
 
+def test_a_pane_whose_children_cannot_be_read_is_unknown_not_dead():
+    # Same P0 as above, seen from the verb that acts on it: DEAD is what authorises a teardown, so
+    # an unreadable probe must never produce it.
+    fake = _healthy()
+    fake.child_pids = lambda pid: None
+    st = _host(fake).state(_session())
+    assert st.liveness == session_host.UNKNOWN
+    with pytest.raises(session_host.TeardownRefused):
+        _host(fake).exit(_session())
+
+
 def test_state_is_unknown_when_the_host_itself_cannot_be_reached():
     # herdr's server being down is not evidence about the worker. rc=124 is the probe's timeout.
     fake = FakeHerdr(script={}, alive={4242}, children={4242: [4243]})
@@ -611,6 +641,16 @@ def test_exit_closes_the_workspace_of_a_finished_session_and_verifies_it_went():
 def test_exit_raises_when_the_close_did_not_take():
     # A close that returns rc=0 and leaves the agent resolving is a no-op wearing a success code.
     fake = _healthy({("agent", "get"): [(0, _agent(), ""), (0, _agent(), "")]})
+    fake.children[4242] = []
+    with pytest.raises(session_host.TeardownUnverified):
+        _host(fake).exit(_session())
+
+
+def test_exit_will_not_call_a_close_verified_while_the_host_is_silent():
+    # A close is verified by the host SAYING the name is gone. If the host stopped answering, that
+    # silence is not evidence — reporting `closed` there is how a workspace leaks while the runner
+    # believes it was reaped (fresh-agent review, P0).
+    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (1, "", "connection refused")]})
     fake.children[4242] = []
     with pytest.raises(session_host.TeardownUnverified):
         _host(fake).exit(_session())
@@ -685,6 +725,27 @@ def test_kill_raises_rather_than_report_a_teardown_it_could_not_verify():
     with pytest.raises(session_host.TeardownUnverified) as exc:
         _host(fake).kill(_session())
     assert "4242" in str(exc.value), "the memo must name the pid that survived"
+
+
+def test_kill_never_signals_a_pid_it_could_not_attribute_to_this_session():
+    # The module's own pid-reuse warning, obeyed: when the host no longer resolves the name, a
+    # recorded pid that is still alive might be ANY process the OS handed that number to. Signalling
+    # it would be the pattern-kill hazard with extra steps (fresh-agent review, P0).
+    fake = _healthy({("agent", "get"): (1, "", _NOT_FOUND)})
+    with pytest.raises(session_host.TeardownUnverified) as exc:
+        _host(fake).kill(_session())
+    assert fake.signals == [], "an unattributable pid is never signalled"
+    assert "4242" in str(exc.value) and "attribut" in str(exc.value).lower()
+
+
+def test_kill_verifies_by_name_when_there_is_no_pid_to_watch():
+    # The other half of that rule: with no pid in play, the host's own "this name is gone" IS the
+    # evidence — so a session whose process facts were never readable can still be ended.
+    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (1, "", _NOT_FOUND)],
+                     ("pane", "process-info"): (0, _process_info(shell_pid=None), "")})
+    result = _host(fake).kill(_session(shell_pid=None))
+    assert result.closed is True and result.signalled == []
+    assert fake.signals == []
 
 
 def test_kill_reads_the_live_pane_before_closing_it():
