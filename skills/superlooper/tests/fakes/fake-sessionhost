@@ -112,7 +112,7 @@ def start_pane(ws, name, agent):
         if carry in os.environ:
             env.setdefault(carry, os.environ[carry])
     logfile = open(state("pane-%s.log" % name), "ab")
-    if shutil.which("zsh") and SHIM:
+    if shutil.which("zsh") and SHIM and not os.environ.get("FAKE_HOST_NO_ZSH"):
         # The REAL pane: a zsh that sources the REAL shim, which arms the agent verb, which hands
         # off to start-session.sh. This is the whole chain and it is what runs on the fleet.
         argv = ["zsh", "-c", "source %s; %s" % (json.dumps(SHIM), agent)]
@@ -123,7 +123,14 @@ def start_pane(ws, name, agent):
         # zsh; what this harness is for is the RUNNER's behaviour around a session, and that must
         # not silently stop being tested on the platform CI uses. (The cmux fake this replaces made
         # the same choice for the same reason — it re-implemented the shim's contract in bash.)
-        argv = ["sh", "-c", 'exec "$1" "$2"', "sh",
+        # NOT `exec`, for the same reason the real shim is not (shell/launch-shim.zsh): the pane
+        # process must PERSIST with start-session.sh as its live child. The wrapper's post-spawn
+        # confirmation is a process fact — the pane shell must have a live child — and an exec'd
+        # pane IS start-session.sh, whose own children (the gh probe, then the agent) are
+        # transient. On a loaded runner the confirmation window can land entirely in a gap between
+        # them, and the launch is refused as hollow: a flaky red that says "no worker started"
+        # about a worker that started fine.
+        argv = ["sh", "-c", '"$1" "$2"', "sh",
                 env.get("SL_START_SESSION", ""), env.get("SL_ISSUE_ID", "")]
     proc = subprocess.Popen(
         argv, env=env, cwd=cwd, stdout=logfile, stderr=logfile, stdin=subprocess.DEVNULL,
