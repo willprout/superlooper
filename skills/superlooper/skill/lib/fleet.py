@@ -150,14 +150,20 @@ def token_file(fleet_prefix):
 
 
 def token_provenance_file(fleet_prefix):
-    """Sidecar recording that THIS build-up minted the token beside it.
+    """Sidecar recording the digest of the token this build-up minted beside it.
 
     The token file has no room for a marker — its whole content is the secret, and the server reads
-    it verbatim. So provenance lives next to it. Without this, `--install` would adopt any regular
-    file it found at the token path: a same-uid process that dropped a token of its own choosing
-    there before the first install would have the fence configured to accept a secret it already
-    knows, and every block would go green (fresh-agent review round 4). A fence whose secret someone
-    else chose is not a fence.
+    it verbatim — so the record lives next to it. Without it, `--install` adopted any regular file
+    it found at the token path, which meant a file left there by accident, by an aborted install, or
+    by an older prefix became the fence's secret without anyone deciding it should.
+
+    **What it is NOT, stated because the honest limit is easy to overclaim** (fresh-agent review,
+    final pass): this is an INTEGRITY record, not authentication. A same-uid process that can write
+    `<prefix>/token` can equally write this file with the matching digest, so it does not defend
+    against one. Nothing file-based can, on a machine where the fleet and its workers share a UNIX
+    account — which is the same reason the token file itself is readable, and it is exactly the
+    decision filed as **#342**. What this buys is that an UNVOUCHED or CHANGED token is refused
+    rather than silently adopted, and that the refusal is loud enough to be investigated.
     """
     return os.path.join(fleet_prefix, "token.provenance")
 

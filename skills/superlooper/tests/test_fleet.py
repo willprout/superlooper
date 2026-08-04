@@ -573,6 +573,13 @@ def test_a_token_this_build_up_cannot_vouch_for_is_not_adopted():
     # The sidecar holds a DIGEST, never a second copy of the thing the fence protects.
     assert minted.strip() not in fleet.token_provenance(minted)
     assert fleet.token_provenance_file(_PREFIX) != fleet.token_file(_PREFIX)
+    # And the honest limit, asserted so a later reader cannot overclaim it: the record is a plain
+    # digest of the token, so anything that can write one half can write the other. It refuses an
+    # unvouched or CHANGED token; it does not authenticate one against a same-uid process. That
+    # question is #342, and nothing file-based answers it on a shared UNIX account.
+    assert fleet.token_provenance("anything") == fleet.token_provenance("anything")
+    assert "not authentication" in fleet.token_provenance_file.__doc__
+    assert "#342" in fleet.token_provenance_file.__doc__
 
 
 def test_the_isolation_check_refuses_a_readable_fence_token():

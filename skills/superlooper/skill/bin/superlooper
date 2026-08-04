@@ -570,13 +570,13 @@ def cmd_fleet(args):
             except OSError:
                 pass
             if recorded != fleet.token_provenance(held):
-                # An UNVOUCHED token is worse than none (fresh-agent review round 4): a same-uid
-                # process that dropped its own secret here before the first install would have the
-                # fence configured to accept a token it already knows, and every block would go
-                # green. A fence whose secret somebody else chose is not a fence.
-                print("FATAL: %s exists but was not minted here — no matching provenance record at "
-                      "%s. A token this build-up cannot vouch for may be one somebody else chose. "
-                      "Move it aside and re-run to mint a fresh one."
+                # An UNVOUCHED or CHANGED token is refused rather than adopted: a file left here by
+                # an aborted install, by an older prefix, or by anything else becomes the fence's
+                # secret otherwise, without anyone deciding it should. This is an integrity record,
+                # NOT authentication — see token_provenance_file, and #342 for the real question.
+                print("FATAL: %s does not match the token this build-up minted (no matching record "
+                      "at %s, or the file has changed since). Rather than adopt a secret nobody "
+                      "chose, this refuses: move it aside and re-run to mint a fresh one."
                       % (token, fleet.token_provenance_file(prefix)), file=sys.stderr)
                 return 2
             os.chmod(token, 0o600)
