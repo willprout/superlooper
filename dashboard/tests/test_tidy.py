@@ -1,7 +1,7 @@
 """Issue #41 — the Tidy verb: a LOCAL COMMAND execution, the dashboard's second button class.
 
 Every other verb writes a GitHub label/comment/issue (``lib/actions.py``). Tidy is different: it
-runs the local ``superlooper tidy`` CLI to close finished cmux session windows. So its adapter
+runs the local ``superlooper tidy`` CLI to close finished session windows. So its adapter
 (``lib/tidy.py``) mirrors ``lib/gh.py``'s discipline — a subprocess wrapper that NEVER raises into
 the caller, a hard timeout, and fail-closed on any nonzero exit — but keeps the SEMANTICS (turning
 the CLI's human list into structured window rows) as pure, unit-tested functions (design B.1).
@@ -9,7 +9,7 @@ the CLI's human list into structured window rows) as pure, unit-tested functions
 Two properties are load-bearing bright lines:
 
 * **No real binary in tests.** The CLI CLOSES windows; a stray real call would touch William's live
-  cmux. The conftest points ``SL_SUPERLOOPER`` at an absent path by default; these tests override it
+  windows. The conftest points ``SL_SUPERLOOPER`` at an absent path by default; these tests override it
   in-body to ``tests/fakes/fake-superlooper``, which records every invocation.
 * **Merged-only scope.** ``--all`` is NEVER passed (issue #41 — the dashboard does not expose the
   wider scope). The fake logs argv, so a test proves ``--all`` never appears.

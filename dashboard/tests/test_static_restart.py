@@ -1,7 +1,7 @@
 """Issue #116 — the Restart button + its confirm dialog (the shipped static bundle).
 
 Restart is the dashboard's SECOND ops-verb button: tapping it asks the LIVE runner (via the server →
-`superlooper request-restart`) to restart ITSELF in its own cmux tab — never a GitHub write, and
+`superlooper request-restart`) to restart ITSELF where it already lives — never a GitHub write, and
 never a tab launch or placement (owner bright line, 2026-07-09). The two-step, tap-where-you-read
 flow is a bright line of this issue:
 

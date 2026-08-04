@@ -9,7 +9,7 @@ orchestration is testable WITHOUT touching a real port, process, or replacing th
     issue-#104 message that names the absolute path looked at and every way out;
   * idempotent: an up dashboard is not respawned; a live runner is not re-exec'd;
   * both down ⇒ the dashboard is spawned in the BACKGROUND and the runner is exec'd in the
-    FOREGROUND (it takes over this cmux tab — the proven procedure);
+    FOREGROUND (it takes over this session tab — the proven procedure for the `pane` home);
   * an exec failure fails friendly too.
 
 The bin is a hyphenated, extension-less script (conftest already put lib/ + bin/ on sys.path), so it
