@@ -161,28 +161,41 @@ def route_request_restart():
     parses (issue #116). ``SL_RESTART_RUNNING=0`` simulates no live runner (the dead-runner refuse);
     ``SL_RESTART_GARBAGE=1`` prints non-JSON so a test can exercise the adapter's unparseable path.
     ``--check`` reports liveness and writes nothing; the plain form 'writes the marker' (recorded as
-    a mutation so a test can assert the request landed, with its audit fields)."""
+    a mutation so a test can assert the request landed, with its audit fields).
+
+    ``SL_RESTART_HOME`` (``pane``, the default, or ``login-item``) selects which runner home the
+    engine is answering for (issue #306). The real CLI branches on the repo's ``runner_home`` config
+    key and emits a home-correct ``how`` (what a restart DOES) and ``manual`` (the remedy when
+    nothing is live) — the two fields that let the dashboard's dialog tell the truth without knowing
+    which home it is looking at. Both spellings are modelled verbatim from ``cmd_request_restart``
+    so the dashboard's dependency on them is pinned by a test rather than assumed."""
     if os.environ.get("SL_RESTART_GARBAGE"):
         sys.stdout.write("not json — the CLI misbehaved\n")
         sys.exit(0)
     running = os.environ.get("SL_RESTART_RUNNING", "1") != "0"
     repo = opt("--repo") or ""
-    manual = "open a cmux tab and run: superlooper run --repo %s" % repo
+    if os.environ.get("SL_RESTART_HOME") == "login-item":
+        manual = ("restart the login-item job: kickstart -k gui/501/"
+                  "com.superlooper.runner.will-titan-command-center")
+        how = "exit cleanly and be restarted by its supervisor"
+    else:
+        manual = "open a cmux tab and run: superlooper run --repo %s" % repo
+        how = "restart itself in its own cmux tab"
     pid = 4242 if running else None
     if "--check" in ARGS:
         out = {"ok": True, "verb": "request-restart", "running": running, "pid": pid,
-               "requested": False, "manual": manual}
+               "requested": False, "manual": manual, "how": how}
         sys.stdout.write(json.dumps(out) + "\n")
         sys.exit(0)
     if not running:
         out = {"ok": False, "verb": "request-restart", "running": False, "pid": None,
-               "requested": False, "manual": manual,
+               "requested": False, "manual": manual, "how": how,
                "error": "no runner is live for this repo — nothing to restart"}
         sys.stdout.write(json.dumps(out) + "\n")
         sys.exit(1)
     record("restart_request", repo=repo, operator=opt("--operator"), source=opt("--source"))
     out = {"ok": True, "verb": "request-restart", "running": True, "pid": pid,
-           "requested": True, "manual": manual}
+           "requested": True, "manual": manual, "how": how}
     sys.stdout.write(json.dumps(out) + "\n")
     sys.exit(0)
 

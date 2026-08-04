@@ -70,7 +70,7 @@ from pathlib import Path
 
 import flights
 
-# Per-call hard timeout (seconds) for the CLI, which opens a cmux tab and VERIFIES delivery. A
+# Per-call hard timeout (seconds) for the CLI, which opens a session window and VERIFIES delivery. A
 # module constant, not a literal, so a test can shrink it and trip the timeout path (mirrors
 # restart._DEFAULT_TIMEOUT). Matches the engine's own launch timeout.
 _DEFAULT_TIMEOUT = 180

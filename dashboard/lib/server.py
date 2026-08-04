@@ -157,7 +157,8 @@ _ACTION_PATHS = set(_LABEL_VERBS) | {"/api/flag", "/api/discuss", "/api/answer"}
 _TIDY_PATHS = {"/api/tidy/dry-run": "dry_run", "/api/tidy": "execute"}
 # The Restart endpoints (issue #116) — the dashboard's second local-command verb, a sibling of Tidy:
 # ``/api/restart/check`` is the confirm dialog's preflight (is a live runner there to ask?);
-# ``/api/restart`` drops the request the runner honors by re-exec'ing itself in its own cmux tab.
+# ``/api/restart`` drops the request the live runner honors between ticks (how it comes back is the
+# engine's word, carried in the CLI's home-correct ``how`` — issues #306/#310).
 _RESTART_PATHS = {"/api/restart/check": "preflight", "/api/restart": "execute"}
 
 # The Janitor endpoints (issue #121) — the dashboard's THIRD button in the local-command class:
@@ -172,7 +173,6 @@ _JANITOR_PATHS = {"/api/janitor/propose": "propose", "/api/janitor": "execute"}
 # #144). Both are POST-only and same-origin gated: this is the most consequential endpoint in the
 # product — it starts an agent on the owner's machine.
 _FIXER_PATHS = {"/api/fixer/check": "preflight", "/api/fixer": "execute"}
-
 
 def _is_allowed_origin(origin, host):
     """True when a POST's ``Origin`` is our own page — or absent (a non-browser caller like curl or a
@@ -207,11 +207,16 @@ def _num_of(payload):
     """The issue number from a POST body — a POSITIVE int, or a digit-string coerced to one (a JSON
     client may send either). ``None`` for anything else (a bool, a float, ``"abc"``, or a
     non-positive value like ``0``/``-5``) → the caller 400s, so invalid input never reaches the
-    label writer."""
+    label writer.
+
+    The string test is ``isdecimal``, not ``isdigit``: ``"²".isdigit()`` is True but ``int("²")``
+    RAISES, so the obvious spelling turns this "``None`` for anything else" contract into an
+    exception thrown out of the request handler — a dropped connection instead of a 400, on every
+    verb that takes a number, from a body any client can send."""
     n = payload.get("num")
     if isinstance(n, bool):
         return None
-    if isinstance(n, str) and n.strip().lstrip("-").isdigit():
+    if isinstance(n, str) and n.strip().lstrip("-").isdecimal():
         n = int(n)
     if isinstance(n, int) and not isinstance(n, bool) and n > 0:
         return n
@@ -599,8 +604,9 @@ def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, acti
     ``actions`` wires the POST verbs (Task 6); ``desk`` wires the tower-seen watermark write (Task
     9); ``tidy`` wires the Tidy local-command endpoints (issue #41); ``restart`` wires the Restart
     local-command endpoints (issue #116); ``janitor`` wires the Janitor GitHub-sweep endpoints (issue
-    #121); ``fixer`` wires the Deploy Fixer session-launch endpoints (issue #141); ``replay_provider``
-    / ``digest_provider`` wire the on-demand replay + digest GETs (Task 11); ``version`` (a
+    #121); ``fixer`` wires the Deploy Fixer session-launch endpoints (issue #141);
+    ``replay_provider`` / ``digest_provider`` wire the on-demand replay + digest GETs (Task 11);
+    ``version`` (a
     ``lib.version.Version``) wires the boot-identity/skew honesty (issue #136); omit any for a
     surface that stays off. ``port=0`` binds an ephemeral port (tests). Call ``.serve_forever()`` to
     run it."""

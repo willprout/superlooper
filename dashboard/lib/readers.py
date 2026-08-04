@@ -159,8 +159,13 @@ def _scan_mtimes(dir_path):
 
 def _iid_num(name):
     """``i<N>`` -> ``N``, else ``None`` — the skill's rule for "is this an issue id" (used to keep
-    per-issue reports and drop the ``morning-<date>.md`` digest)."""
-    if isinstance(name, str) and name.startswith("i") and name[1:].isdigit():
+    per-issue reports and drop the ``morning-<date>.md`` digest).
+
+    ``isdecimal``, not ``isdigit``: ``"²".isdigit()`` is True but ``int("²")`` RAISES, so a file
+    called ``i²`` in a scanned directory would throw out of a reader — inside the 2-second snapshot
+    poll, blanking the whole board for every repo rather than being ignored as the junk filename it
+    is. Same fail-closed-per-entry direction as every other reader here (the #139 defect class)."""
+    if isinstance(name, str) and name.startswith("i") and name[1:].isdecimal():
         return int(name[1:])
     return None
 

@@ -12,9 +12,10 @@ decorate a screen he isn't looking at:
     log-only           → nothing configured: the content is already journaled by the runner, so it
                          is never lost, only unsent
 
-This is deliberately the skill's precedence MINUS its ``cmux`` desktop-toast tier: a desktop toast
+This is deliberately the skill's precedence MINUS its session-host desktop-toast tier: a toast
 cannot reach the absent owner a runner-down push exists for (issue #10 + BUILD-PLAN Task 10 both
-pin the three tiers above). The conftest still neutralizes ``SL_CMUX`` as a harmless superset guard.
+pin the three tiers above). The conftest still neutralizes the session host's own toast binary as a
+harmless superset guard — nothing here resolves it.
 
 Two hard rules, both bought by the autocode postmortems (a desktop-only alert that never reached
 the phone; a hung notifier that wedged a tick):

@@ -2,11 +2,16 @@
 
 Today the operator starts the runner and the dashboard separately. ``bin/liftoff`` is the single
 documented command that starts — or verifies already-running — BOTH: this dashboard and one watched
-repo's runner. It is run BY HAND inside a cmux tab, exactly like ``superlooper run`` itself: it
-starts the dashboard in the background (a localhost server needs no tab) and then FOREGROUNDS the
-runner in the current tab, so the runner lands in a visible cmux tab — the one proven restart
-procedure (see the engine's runner-ops.md). Automated tab placement stays out; a human's real tab
-is the anchor.
+repo's runner. It always starts the dashboard in the background (a localhost server needs no tab);
+what it does about the RUNNER depends on where that repo's runner lives (``runner_home``, issue
+#306, wired here by #310):
+
+* ``pane`` (the default) — run liftoff BY HAND in a session tab, exactly like ``superlooper run``
+  itself: it FOREGROUNDS the runner in the current tab, so the runner lands in a visible tab — the
+  one proven restart procedure (see the engine's runner-ops.md). Automated tab placement stays out;
+  a human's real tab is the anchor.
+* ``login-item`` — launchd owns the runner's process, so there is no tab to claim: liftoff runs the
+  engine's own bootstrap step, reports both halves up, and hands the terminal back.
 
 Two boundaries shape this file:
 
@@ -37,6 +42,52 @@ three ways out (run from its directory, pass it as an argument, or set ``$CC_CON
 the operator liftoff's cwd-relative resolution, so the next run is right by understanding, not luck.
 """
 import os
+import re
+
+# ---------------------------------------------------------------- the runner's home (issue #306)
+# The runner no longer always lives in the tab you run liftoff from. ``runner_home`` is a per-repo
+# ENGINE config key, and liftoff must never read that file itself (the engine stays a black box we
+# only shell) — it asks ``superlooper runner-home --repo <path>``, which reports the answer
+# read-only, and matches the spelling here. Same two words the engine uses; a third would be a
+# translation layer waiting to drift.
+PANE = "pane"
+LOGIN_ITEM = "login-item"
+_HOMES = (PANE, LOGIN_ITEM)
+
+# The report's first line: ``runner_home: <kind>`` (the pane form continues with an em-dash and a
+# sentence, the login-item form with an indented job/domain/plist/live block — both start here).
+_HOME_RE = re.compile(r"^runner_home:\s*(\S+)", re.M)
+
+
+def parse_runner_home(stdout):
+    """The runner home named by ``superlooper runner-home --repo <path>`` output, or ``None``.
+
+    ``None`` covers three real cases and they all want the same answer: an engine too OLD to have
+    the subcommand (argparse's usage error, no such line), an engine that could not run at all
+    (empty output), and an engine reporting a home this build has never heard of. The caller then
+    keeps the PANE behaviour, and that direction is chosen deliberately: guessing ``login-item``
+    would make liftoff refuse to start the runner at all on a machine where the tab is the whole
+    mechanism, whereas guessing ``pane`` at worst starts a runner in the tab — working, if not
+    where a login-item owner wanted it. Pure: the subprocess lives in the composition root.
+    """
+    m = _HOME_RE.search(stdout or "")
+    if not m:
+        return None
+    return m.group(1) if m.group(1) in _HOMES else None
+
+
+def runner_home_argv(superlooper_cli, repo_path):
+    """The engine's READ-ONLY home report: ``<superlooper_cli> runner-home --repo <path>``. Changes
+    nothing — it is the probe liftoff runs before deciding what starting the runner even means."""
+    return [superlooper_cli, "runner-home", "--repo", repo_path]
+
+
+def runner_job_argv(superlooper_cli, repo_path):
+    """The engine's own setup step for the login-item home: ``runner-home --repo <path> --install
+    --load`` — render the LaunchAgent, place it, and bootstrap it (issue #306). Idempotent by
+    construction (it boots the job out before bootstrapping it back in), which is what lets liftoff
+    keep its never-double-start contract in this home without a second probe."""
+    return [superlooper_cli, "runner-home", "--repo", repo_path, "--install", "--load"]
 
 
 def missing_config_message(looked_at, *, script_dir_config=None, example_config=None):
@@ -204,14 +255,28 @@ def dashboard_restart_decision(url, snapshot, port_busy=False):
             "message": "restarting the dashboard at %s (pid %d — its build is %s)" % (url, pid, was)}
 
 
-def make_plan(repo, url, dashboard_argv_, runner_argv_, *, dashboard_up, runner_pid):
+def make_plan(repo, url, dashboard_argv_, runner_argv_, *, dashboard_up, runner_pid,
+              runner_home=PANE):
     """The idempotent plan: what to start, what to leave, and the plain line to print for each.
 
     ``dashboard_up`` is the port probe (already serving?); ``runner_pid`` is the LIVE runner pid or
     ``None`` (the pidfile read + liveness check). Neither half is ever double-started: an up
-    dashboard and a live runner each resolve to ``start: False`` with a "leaving it" line. Only the
-    runner half is ever run in the FOREGROUND (``foreground: True``) — the dashboard is always a
-    background server.
+    dashboard and a live runner each resolve to ``start: False`` with a "leaving it" line. The
+    dashboard is always a background server.
+
+    ``runner_home`` (issue #306, wired here by issue #310) decides what STARTING the runner means,
+    and it changes exactly one thing: whether liftoff claims this tab.
+
+    * ``PANE`` — the runner's pane IS the launch anchor, so liftoff foregrounds it here and the
+      process it exec's becomes the runner. Unchanged, and still the default: a repo that never set
+      the key behaves exactly as it did before this issue.
+    * ``LOGIN_ITEM`` — launchd owns the runner's process, so there is nothing to foreground. The
+      "start" is the engine's own bootstrap step, run to completion like any other command, and
+      liftoff returns to the shell afterwards with both halves up. Claiming the tab here would be
+      worse than pointless: it would start a SECOND runner outside the home its owner chose.
+
+    ``runner_argv_`` is the argv for the home already selected by the composition root (it knows the
+    home; this stays pure), so this function decides start/leave, foreground, and the plain line.
     """
     if dashboard_up:
         dashboard = {"start": False, "foreground": False,
@@ -219,11 +284,22 @@ def make_plan(repo, url, dashboard_argv_, runner_argv_, *, dashboard_up, runner_
     else:
         dashboard = {"start": True, "foreground": False, "argv": list(dashboard_argv_),
                      "message": "starting the dashboard → %s" % url}
+    # Liveness is home-independent — the runner writes the same pidfile wherever it lives — so the
+    # never-double-start half of the contract needed no change at all for issue #306.
+    foreground = runner_home != LOGIN_ITEM
     if runner_pid is not None:
-        runner = {"start": False, "foreground": True, "pid": runner_pid,
+        runner = {"start": False, "foreground": foreground, "pid": runner_pid,
                   "message": "runner already running for %s (pid %d) — leaving it"
                              % (repo["slug"], runner_pid)}
-    else:
+    elif foreground:
         runner = {"start": True, "foreground": True, "argv": list(runner_argv_), "pid": None,
-                  "message": "starting the runner for %s in this cmux tab" % repo["slug"]}
+                  "message": "starting the runner for %s in this tab" % repo["slug"]}
+    else:
+        # Says what is being ATTEMPTED, not what will be true afterwards: the bootstrap can refuse
+        # (a PATH it cannot honestly record, a launchctl that would not bootstrap), and a line that
+        # promised "launchd keeps it running" followed by its own retraction is the 3am-readability
+        # failure this migration exists to end. The composition root prints the outcome after.
+        runner = {"start": True, "foreground": False, "argv": list(runner_argv_), "pid": None,
+                  "message": "setting up the runner for %s as its login item — launchd will own "
+                             "the process, so this terminal stays yours" % repo["slug"]}
     return {"dashboard": dashboard, "runner": runner}

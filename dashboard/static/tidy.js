@@ -1,6 +1,6 @@
 /* The Tidy button's confirm dialog (issue #41) — the dashboard's FIRST ops-verb button and its
    SECOND button class: tapping Tidy runs the local `superlooper tidy` CLI (via the server) to close
-   the cmux windows of FINISHED sessions. It is NOT a GitHub write — it executes a machine on this
+   the session windows of FINISHED sessions. It is NOT a GitHub write — it executes a machine on this
    box — so the flow is deliberately two-step and confirm-gated (tap-where-you-read, design §0.3):
 
      open → POST /api/tidy/dry-run → dialog lists EXACTLY what dry-run returned →
