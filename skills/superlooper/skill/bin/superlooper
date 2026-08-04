@@ -90,6 +90,7 @@ import notify
 import queue_lint
 import reorient
 import report
+import runner_home
 import stack_doctor
 import tidy as tidy_lib
 import upkeep as upkeep_lib
@@ -214,6 +215,225 @@ def _seed_standing_rules(repo_path):
     return "appended"
 
 
+# ------------------------------- the runner's process home (issue #306) -------------------------
+
+# The name the boot preflight asks the session host about. It is a QUESTION, never an agent: the
+# only thing wanted from it is whether the host's server ANSWERS at all, and a name nothing ever
+# spawns is the cheapest way to ask that without touching a live session. Reserved by shape — real
+# lanes are i<N>/d<N>, so nothing can ever collide with it.
+_HOST_PROBE_NAME = "slhomeprobe"
+
+
+def _launchctl_bin():
+    """SL_LAUNCHCTL overrides — same convention (and same reason) as SL_CMUX/SL_GH/SL_CLAUDE: it is
+    what lets the test suite point every lookup at a stub instead of the real service manager, which
+    can start and stop the owner's own jobs."""
+    return os.environ.get("SL_LAUNCHCTL") or "/bin/launchctl"
+
+
+def _launchd_dir():
+    """Where user LaunchAgents live. SL_LAUNCHD_DIR overrides so an install can be exercised in a
+    sandbox without writing into the real ~/Library/LaunchAgents (the same seam the dashboard's own
+    installer uses)."""
+    return os.environ.get("SL_LAUNCHD_DIR") or os.path.expanduser("~/Library/LaunchAgents")
+
+
+def _home_uid():
+    """The uid whose gui domain the job lives in: THIS process's own, and there is no way to say
+    otherwise.
+
+    There was briefly an ``SL_UID`` override here so tests could pin a uid. A fresh-agent review
+    called it blocking and was right: these verbs bootstrap, bootout and kickstart launchd JOBS, so
+    an override — ambient, exported for debugging, or simply wrong — points them at another user's
+    login session. The keychain rule that says gui/$UID is the whole reason this home exists, and a
+    rule with a runtime escape hatch is not a rule. Tests read the same uid this does.
+    """
+    return os.getuid()
+
+
+def _resolve_command(name):
+    """Resolve one of the runner's own commands the way the RUNNER resolves it — honouring the same
+    SL_* override — so the PATH baked into the plist matches what the loop will actually run.
+
+    An override that names something unrunnable resolves to NOTHING rather than falling through to
+    PATH. Same rule as the coding-agent pin (#303): a pin that cannot be run is a broken pin, and
+    silently using a different binary than the one the operator named is how the loop ends up
+    running something nobody configured.
+    """
+    override = {"gh": "SL_GH"}.get(name)
+    pinned = os.environ.get(override) if override else None
+    if pinned:
+        return pinned if os.path.isfile(pinned) and os.access(pinned, os.X_OK) else None
+    return shutil.which(name)
+
+
+def _manager_name():
+    """What `launchctl managername` calls this process's session ("Aqua" for both an interactive
+    shell and a gui/$UID LaunchAgent). "" when it cannot be asked — which the preflight refuses,
+    because this home is launchd-hosted by definition."""
+    try:
+        proc = subprocess.run([_launchctl_bin(), "managername"], capture_output=True, text=True,
+                              timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (proc.stdout or "").strip() if proc.returncode == 0 else ""
+
+
+def _host_answered():
+    """Did the session host's server answer — asked THROUGH THE WRAPPER, never around it?
+
+    ``state`` is the read-only verb, and it is the whole probe: it returns ``name_resolves=False``
+    when the host SPOKE (a structured "no such agent" for our reserved name) and ``None`` when the
+    call never got through at all. That distinction is exactly the question, and asking it this way
+    means the runner's boot needs no second door to the host.
+
+    True or None, never False. Both non-True answers refuse the boot, but they refuse it with
+    different words, and only one of them is honest here: everything this function can observe —
+    a timeout, a missing binary, the wrapper itself raising — is "we got no answer", never
+    "something answered and said no". Reporting the wrong one sends the operator looking at the
+    wrong end of the connection (fresh-agent review).
+    """
+    try:
+        import session_host
+        spoke = session_host.SessionHost().state(_HOST_PROBE_NAME).name_resolves is not None
+    except Exception:
+        # The wrapper raising here would take the boot down with the host it was asking about.
+        return None
+    return True if spoke else None
+
+
+def _login_item_facts():
+    """Everything the login-item preflight judges, read once. Impure by design — the verdict itself
+    is pure and lives in ``runner_home.preflight``."""
+    found, missing = runner_home.resolve_commands(_resolve_command)
+    return {"found": found,
+            "manager": _manager_name(),
+            "missing": missing,
+            # gh.probe() is the engine's own "reachable AND authenticated right now" read and it is
+            # free (`api rate_limit` is exempt from rate limiting). None only when gh is not there
+            # at all — which `missing` has already named, so the message does not repeat itself.
+            "gh_ok": gh.probe() if "gh" not in missing else None,
+            "host_answered": _host_answered()}
+
+
+def _login_item_preflight():
+    facts = _login_item_facts()
+    ok, why = runner_home.preflight(manager=facts["manager"], missing=facts["missing"],
+                                    gh_ok=facts["gh_ok"], host_answered=facts["host_answered"])
+    return ok, why, facts
+
+
+def _runner_plist_path(job_label):
+    return os.path.join(_launchd_dir(), job_label + ".plist")
+
+
+def cmd_runner_home(args):
+    """Report — and, with --install, create — the runner's own process home (issue #306).
+
+    Read-only by default. The two flags are deliberately separate verbs in one place:
+
+    ``--install`` renders the LaunchAgent for the login-item home and PLACES it, then prints the one
+    command that activates it (``--load`` runs that command too). It refuses the pane home outright:
+    there is no job to install for a home that IS a visible tab, and quietly rendering one would
+    re-create exactly the impossible mode issue #33 deleted.
+
+    ``--verify`` runs the same preflight ``superlooper run`` runs at boot, and nothing else. That is
+    what makes it useful from INSIDE the job — bootstrap a one-shot agent that runs this and you
+    have read the context the runner will actually get, keychain and PATH included, rather than the
+    one your terminal has.
+    """
+    cfg = _load_config(args.repo)
+    home = runner_home.kind(cfg)
+    if home != runner_home.LOGIN_ITEM:
+        print("runner_home: %s — this repo's runner lives in a visible tab that a person opens; "
+              "its pane is the launch anchor every worker session is born in." % home)
+        print("  Start it with: superlooper run --repo %s (from inside that tab)"
+              % os.path.abspath(args.repo))
+        if args.install or args.verify:
+            print("FATAL: there is no launchd job to install or verify for the `pane` home. Set "
+                  "`runner_home: \"login-item\"` in .superlooper/config.json first.",
+                  file=sys.stderr)
+            return 2
+        return 0
+
+    job_label = runner_home.label(cfg["repo"])
+    uid = _home_uid()
+    plist = _runner_plist_path(job_label)
+
+    if args.verify:
+        ok, why, facts = _login_item_preflight()
+        print("runner_home: %s\n  %s" % (home, why))
+        return 0 if ok else 2
+
+    if args.install:
+        found, missing = runner_home.resolve_commands(_resolve_command)
+        if missing:
+            # Refuse rather than bake launchd's own four entries into the plist: the job would come
+            # up, look alive, and fail every GitHub read. An install that cannot be honest about
+            # PATH is worse than no install.
+            print("FATAL: cannot resolve %s on this PATH, so there is no honest PATH to record in "
+                  "the job. Install them (or set SL_GH), then re-run." % ", ".join(missing),
+                  file=sys.stderr)
+            return 2
+        state = str(config_lib.state_home(cfg))
+        os.makedirs(os.path.join(state, "logs"), exist_ok=True)
+        os.makedirs(_launchd_dir(), exist_ok=True)
+        text = runner_home.render_plist(
+            label=job_label, superlooper_bin=os.path.abspath(__file__),
+            repo_path=os.path.abspath(args.repo), state_home=state,
+            path=runner_home.launch_path(sorted({os.path.dirname(p) for p in found.values()})),
+            # A relocated state base must ride along, or the job builds a second, empty state home
+            # under the default while its own log still points at this one (found by driving it).
+            state_base=os.environ.get("SL_HOME") or None)
+        # tmp + replace, like every other write in this engine: a half-written plist in
+        # LaunchAgents is a job launchd may try to parse.
+        tmp = plist + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, plist)
+        print("wrote %s" % plist)
+        for name, path in sorted(found.items()):
+            print("  PATH carries %-4s from %s" % (name, os.path.dirname(path)))
+        argv = runner_home.bootstrap_argv(_launchctl_bin(), uid, plist)
+        if args.load:
+            subprocess.run(runner_home.bootout_argv(_launchctl_bin(), uid, job_label),
+                           capture_output=True, text=True, timeout=30)
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                print("FATAL: %s\n%s" % (" ".join(argv[1:]), (proc.stderr or proc.stdout).strip()),
+                      file=sys.stderr)
+                return 2
+            print("loaded — the runner starts now and at every login.")
+            return 0
+        print("to activate:  %s" % " ".join(argv[1:]))
+        print("to stop:      %s" % " ".join(runner_home.bootout_argv(
+            _launchctl_bin(), uid, job_label)[1:]))
+        return 0
+
+    print("runner_home: %s\n  job:   %s\n  domain: %s\n  plist: %s%s"
+          % (home, job_label, runner_home.domain(uid), plist,
+             "" if os.path.exists(plist) else "  (not installed — run with --install)"))
+    proc = subprocess.run(runner_home.print_argv(_launchctl_bin(), uid, job_label),
+                          capture_output=True, text=True, timeout=15)
+    # Same three-way answer the doctor gives, and for the same reason (confirmation review): a
+    # status line that prints "not running" about a job it could not READ is how a dark runner
+    # comes to look merely idle. Only the service's own word earns that phrase.
+    if proc.returncode != 0:
+        live = "not loaded in %s" % runner_home.domain(uid)
+    else:
+        pid = runner_home.service_pid(proc.stdout)
+        if pid:
+            live = "pid %d" % pid
+        elif runner_home.service_is_idle(proc.stdout) is True:
+            live = "not running (the job says so)"
+        else:
+            live = ("unknown — the job reported neither a pid nor a state this build recognises; "
+                    "read it with: %s"
+                    % " ".join(runner_home.print_argv("launchctl", uid, job_label)[1:]))
+    print("  live:  %s" % live)
+    return 0
+
+
 # ------------------------------- run -------------------------------
 
 def cmd_run(args):
@@ -224,6 +444,26 @@ def cmd_run(args):
     if fake:
         # test/simulation seam (Task 15's offline harness): never touch the Keychain/endpoint
         fetch_usage = lambda: json.loads(fake)
+    agent = args.agent or cfg.get("agent", "claude")
+    if runner_home.kind(cfg) == runner_home.LOGIN_ITEM:
+        # The login-item home (issue #306). No anchor is detected and none is wanted: this runner
+        # is an ordinary gui/$UID process, and asking the multiplexer to identify a tab it is not in
+        # would answer "" and then fail a preflight that has nothing to do with this home's health.
+        r = Runner(repo=args.repo, config=cfg, pane="", agent=agent, fetch_usage=fetch_usage)
+        gh.set_telemetry(r.home)
+        print(f"superlooper run: repo={args.repo} state={r.home} home=login-item agent={r.agent}")
+        # The port of the pane home's D7 refusal, one line below where that refusal lives. The
+        # faults are different — a non-Aqua session, launchd's four-entry PATH, a dead gh login, a
+        # silent session host — but the rule is the same one, paid for the same way: a runner that
+        # starts wrong aborts every launch and burns every issue's retry cap while looking alive.
+        ok, why = _login_item_preflight()[:2]
+        if not ok:
+            print("FATAL: %s" % why, file=sys.stderr)
+            print("Check the job with: superlooper runner-home --repo %s --verify"
+                  % os.path.abspath(args.repo), file=sys.stderr)
+            return 2
+        print("  %s" % why)
+        return r.run(max_ticks=args.ticks)
     # Anchor resolution (owner request 2026-07-06 — never hardcode a pane): one cmux `identify`
     # names the tab THIS `superlooper run` is executing in — its pane (the `new-surface` target) and
     # the workspace/window it lives in. An explicit --pane / $SL_PANE still wins for the pane; the
@@ -233,7 +473,6 @@ def cmd_run(args):
     pane = args.pane or os.environ.get("SL_PANE") or anchor["pane"]
     src = ("--pane" if args.pane else "$SL_PANE" if os.environ.get("SL_PANE")
            else "this cmux tab" if pane else "(none)")
-    agent = args.agent or cfg.get("agent", "claude")
     r = Runner(repo=args.repo, config=cfg, pane=pane, agent=agent,
                workspace=anchor["workspace"], window=anchor["window"], fetch_usage=fetch_usage)
     # GitHub API-burn telemetry (issue #15): enable it here, at the LIVE runner's process entrypoint —
@@ -278,8 +517,8 @@ def _emit_restart(args, result):
         sys.stdout.write(json.dumps(result) + "\n")
         return
     if result.get("requested"):
-        sys.stdout.write("restart requested — the live runner (pid %s) will restart itself in its "
-                         "own cmux tab after the current tick.\n" % result.get("pid"))
+        sys.stdout.write("restart requested — the live runner (pid %s) will %s after the current "
+                         "tick.\n" % (result.get("pid"), result.get("how", "restart itself")))
     elif result.get("running"):
         sys.stdout.write("a runner is live for this repo (pid %s).\n" % result.get("pid"))
     else:
@@ -304,18 +543,28 @@ def cmd_request_restart(args):
     from runner import live_runner_pid, write_restart_request
     cfg = _load_config(args.repo)
     state_dir = os.path.join(str(config_lib.state_home(cfg)), "state")
-    manual = "open a cmux tab and run: superlooper run --repo %s" % os.path.abspath(args.repo)
+    # The manual remedy and the description of what a restart DOES are both home-dependent (issue
+    # #306), and printing the wrong one is the D12 defect class this engine has already paid for:
+    # an ops instruction that names a tab, read at 3am on a machine whose runner is a launchd job.
+    if runner_home.kind(cfg) == runner_home.LOGIN_ITEM:
+        job_label = runner_home.label(cfg["repo"])
+        manual = "restart the login-item job: %s" % " ".join(
+            runner_home.kickstart_argv(_launchctl_bin(), _home_uid(), job_label)[1:])
+        how = "exit cleanly and be restarted by its supervisor"
+    else:
+        manual = "open a cmux tab and run: superlooper run --repo %s" % os.path.abspath(args.repo)
+        how = "restart itself in its own cmux tab"
     pid = live_runner_pid(state_dir)                      # None ⇒ stale/absent pidfile ⇒ no live runner
     running = pid is not None
 
     if getattr(args, "check", False):                    # preflight only — never writes the marker
         _emit_restart(args, {"ok": True, "verb": "request-restart", "running": running,
-                             "pid": pid, "requested": False, "manual": manual})
+                             "pid": pid, "requested": False, "manual": manual, "how": how})
         return 0
 
     if not running:                                      # dead-runner case — launch/place NOTHING
         _emit_restart(args, {"ok": False, "verb": "request-restart", "running": False, "pid": None,
-                             "requested": False, "manual": manual,
+                             "requested": False, "manual": manual, "how": how,
                              "error": "no runner is live for this repo — nothing to restart"})
         return 1
 
@@ -324,7 +573,7 @@ def cmd_request_restart(args):
     write_restart_request(state_dir, {"requested_at": int(time.time()), "target_pid": pid,
                                       "source": args.source or "cli", "operator": args.operator})
     _emit_restart(args, {"ok": True, "verb": "request-restart", "running": True, "pid": pid,
-                         "requested": True, "manual": manual})
+                         "requested": True, "manual": manual, "how": how})
     return 0
 
 
@@ -2178,17 +2427,61 @@ def _watchdog_launch(repo, cfg, home, state_dir, launch, state):
     return rc
 
 
-def _watchdog_resurrect(repo, cfg, home, state_dir, resurrect):
-    """Execute one resurrect request (issue #208): RESTART the provably-gone runner in its recorded
-    anchor pane via resurrect-runner.sh (the keystroke-free shim, running `superlooper run` — a
-    deterministic zero-token process, never an LLM, never a worker tab). Returns the rc fed to
-    watchdog.after_resurrect: 0 only when the runner VERIFIABLY came up (its pidfile names a live
-    pid). A gone/unresolvable pane returns "no_pane" (a new tab cannot be placed without the owner).
+def _watchdog_kickstart(cfg, resurrect):
+    """Restart a provably-gone LOGIN-ITEM runner: ``launchctl kickstart -k`` on its own job
+    (issue #306's half of issue #208).
 
-    The launcher is fully overridable via SL_RESURRECT_RUNNER (tests inject a fake, like the debugger
-    path's SL_LAUNCH_SESSION). `cfg` is accepted for call-site symmetry with _watchdog_launch and is
-    deliberately unread: the runner re-reads the repo's config itself on boot, so nothing from this
-    process's view of it should ride into the restart."""
+    This is the same act as the pane path below and a far simpler one — there is no tab to place,
+    no keystroke delivery to work around, and nothing to verify by polling a pidfile, because the
+    supervisor either accepted the request or refused it. ``-k`` is load-bearing: the case this
+    exists for includes a job that is still loaded around a wedged or dead process, and a plain
+    kickstart would leave that exactly where it was.
+
+    Returns the rc ``watchdog.after_resurrect`` reads — nonzero is journaled and notified as a
+    FAILED restart, never as a recovery.
+    """
+    try:
+        job = runner_home.label(cfg["repo"])
+    except (KeyError, TypeError, ValueError):
+        print("watchdog: cannot derive the runner's job label from `repo` — cannot restart it; "
+              "notifying instead.", file=sys.stderr)
+        return "no_job"
+    argv = runner_home.kickstart_argv(_launchctl_bin(), _home_uid(), job)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=WATCHDOG_LAUNCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 124
+    except OSError:
+        return 127
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if out:
+        print(out)
+    return proc.returncode
+
+
+def _watchdog_resurrect(repo, cfg, home, state_dir, resurrect):
+    """Execute one resurrect request (issue #208): RESTART the provably-gone runner — a
+    deterministic zero-token process, never an LLM, never a worker tab. Returns the rc fed to
+    watchdog.after_resurrect: nonzero is a FAILED restart, never a recovery.
+
+    HOW it restarts is the runner's process home (issue #306), and getting this branch wrong is the
+    adoption plan's named migration landmine: a watchdog left calling a launcher that cannot work
+    means no unattended repair at exactly the moment repair is needed.
+
+    * **login-item** → kickstart the job. No anchor, no tab, no pane to resolve.
+    * **pane** → a fresh tab in the dead runner's recorded anchor pane, via resurrect-runner.sh (the
+      keystroke-free shim, running `superlooper run`), verified by its pidfile naming a live pid. A
+      gone/unresolvable pane returns "no_pane" — a new tab cannot be placed without the owner.
+
+    The pane launcher is fully overridable via SL_RESURRECT_RUNNER (tests inject a fake, like the
+    debugger path's SL_LAUNCH_SESSION). `cfg` was accepted for call-site symmetry with
+    _watchdog_launch and is now read for exactly one thing — which home this runner lives in. The
+    runner still re-reads the repo's config itself on boot, so nothing else from this process's view
+    of it rides into the restart.
+    """
+    if runner_home.kind(cfg) == runner_home.LOGIN_ITEM:
+        return _watchdog_kickstart(cfg, resurrect)
     pane = _watchdog_pane(state_dir)
     if not pane:
         print("watchdog: no cmux pane resolves for the dead runner (no recorded anchor / not inside "
@@ -2964,6 +3257,16 @@ def main(argv=None):
                                 "(default: config agent, else claude)"),
            "--ticks": dict(type=int, default=None,
                            help="stop after N ticks (testing/simulation)")})
+    add("runner-home", cmd_runner_home,
+        **{"--install": dict(action="store_true",
+                             help="render + place the login-item LaunchAgent (gui/$UID) and print "
+                                  "the command that activates it"),
+           "--load": dict(action="store_true",
+                          help="with --install, also bootstrap the job now"),
+           "--verify": dict(action="store_true",
+                            help="run the boot preflight and exit — Aqua session, PATH, gh login, "
+                                 "session host. Run it INSIDE the job to read the context the "
+                                 "runner will actually get")})
     add("status", cmd_status)
     add("adopt", cmd_adopt)
     add("doctor", cmd_doctor,

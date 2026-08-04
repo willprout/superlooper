@@ -7,6 +7,7 @@ environment without reaching real binaries or the network.
 """
 import json
 import os
+import plistlib
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 import config as config_lib
 import notify
 import ops_docs
+import runner_home
 
 
 _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
@@ -722,6 +724,162 @@ def _anchor_where(rec):
     return (" (" + " ".join(parts) + ")") if parts else ""
 
 
+def _state_dir(probe, config):
+    """``<state home>/state`` for this repo, or None when the config cannot name one."""
+    cfg = config if isinstance(config, dict) else {}
+    try:
+        return os.path.join(str(config_lib.state_home(cfg)), "state")
+    except (KeyError, AttributeError, TypeError, ValueError):
+        return None
+
+
+def _live_runner_pid(probe, state):
+    """The pid in ``state/runner.lock`` IF that process is alive, else None. The same read the
+    anchor block has always done, lifted so the home block judges the same 'live' as it does."""
+    lock = probe.read_text(os.path.join(state, "runner.lock"))
+    if not _nonempty_string(lock):
+        return None
+    try:
+        pid = int(lock.strip())
+    except ValueError:
+        return None
+    return pid if probe.pid_alive(pid) else None
+
+
+def check_runner_home(probe, config):
+    """Where this repo's runner LIVES, and whether that home is actually usable (issue #306).
+
+    The pane home is a clean skip — ``check_runner_anchor`` below judges it, and two blocks
+    answering one question is how they come to disagree. For the login-item home this is the whole
+    outside view, and each branch below is a way the runner can be running and WRONG while every
+    other block in the stack reads green:
+
+    * **not installed / not bootstrapped** — nothing is supervising the runner, so the next time it
+      exits (a restart, a crash) nothing brings it back. Silent until the morning it matters.
+    * **launchd's pid ≠ the pidfile's pid** — the dangerous one. launchd believes it supervises the
+      runner while the loop's own singleton names a different process; one is about to be restarted
+      out from under the other.
+    * **the job's PATH lost a required command** — the spike-proven gotcha, caught statically. With
+      launchd's own four entries the job comes up, looks perfectly alive, and fails every GitHub
+      read.
+
+    Read-only throughout: one ``launchctl print`` and two file reads.
+    """
+    name = "runner home"
+    home = runner_home.kind(config)
+    state = _state_dir(probe, config)
+    if state is None:
+        return CheckResult(name, True, "no repo config — runner-home check skipped")
+    if home != runner_home.LOGIN_ITEM:
+        return CheckResult(name, True, "runner_home is `%s` — the runner lives in a visible tab a "
+                                       "person opened; the runner-anchor block judges it" % home)
+
+    try:
+        job = runner_home.label(config["repo"])
+    except (KeyError, TypeError, ValueError) as e:
+        return CheckResult(name, False, "cannot derive a job label for this repo: %s" % e,
+                           "Fix `repo` in .superlooper/config.json (it must be owner/name).")
+    uid = _launchd_uid(probe)
+    plist = os.path.join(_launchagents_dir(probe), job + ".plist")
+    fix = ("Install the job: `superlooper runner-home --repo <path> --install --load`. It records "
+           "where gh and git actually resolve, which launchd's own PATH does not.")
+    if not probe.exists(plist):
+        return CheckResult(name, False, "no LaunchAgent at %s for job %s" % (plist, job), fix)
+
+    proc = probe.run(runner_home.print_argv(_launchctl_bin(probe), uid, job))
+    if getattr(proc, "returncode", 1) != 0:
+        return CheckResult(
+            name, False,
+            "the job %s is installed at %s but not loaded in %s" % (job, plist,
+                                                                    runner_home.domain(uid)),
+            fix)
+
+    job_pid = runner_home.service_pid(_out(proc))
+    runner_pid = _live_runner_pid(probe, state)
+    path_problem = _job_path_problem(probe, plist)
+    # A broken recorded PATH is judged BEFORE liveness, and fails whatever the job is doing right
+    # now (fresh-agent review). It is a static property of the installed home: the job will fail
+    # every GitHub read on its NEXT start too, so downgrading it to a warning because the job
+    # happens to be between runs would hide the one condition this check exists to catch.
+    if path_problem:
+        return CheckResult(name, False, "job %s %s but %s"
+                           % (job, "is running (pid %s)" % job_pid if job_pid else "is installed",
+                              path_problem), fix)
+    if job_pid is None:
+        # No pid. "The service SAYS it is not running" and "we could not tell" are different facts
+        # and are answered differently — folding the second into the first would turn a changed
+        # `launchctl print` shape, or any unreadable answer, into a benign-looking idle job.
+        if runner_home.service_is_idle(_out(proc)) is True:
+            # Genuinely loaded and idle. Between a restart and the next boot this is simply true,
+            # so it is a WARN — failing here would cry wolf every time the owner taps Restart.
+            return CheckResult(name, True, "job %s is loaded in %s and not running"
+                               % (job, runner_home.domain(uid)), warn=True)
+        return CheckResult(
+            name, False,
+            "the job %s is loaded in %s but neither a pid nor a recognisable state could be read "
+            "from it — so nothing here can say whether a runner is supervised at all"
+            % (job, runner_home.domain(uid)),
+            "Read it yourself: `launchctl print %s`. If the output looks unfamiliar, this check's "
+            "reader is out of date with the service manager and lib/runner_home.py needs updating "
+            "— it deliberately refuses to guess." % runner_home.service_target(uid, job))
+    if runner_pid is not None and runner_pid != job_pid:
+        return CheckResult(
+            name, False,
+            "launchd is supervising pid %s for %s, but the loop's own pidfile names a live pid %s "
+            "— two runners, and one is about to be restarted out from under the other"
+            % (job_pid, job, runner_pid),
+            # Deliberately does NOT name either pid as the stray one: `bootout` stops the
+            # LAUNCHD-supervised process, which in a mismatch may well be the legitimate runner.
+            # This block cannot tell which is authoritative, so it must not tell the operator to
+            # act as though it can (fresh-agent review).
+            "Establish which process is the real runner before ending either — `superlooper "
+            "status` and the journal in the state home say which one is ticking. `launchctl "
+            "bootout %s` stops the supervised one; the other must be ended by hand. Then restart "
+            "the job so exactly one runner is live."
+            % runner_home.service_target(uid, job))
+    return CheckResult(name, True, "job %s is running in %s (pid %s)%s"
+                       % (job, runner_home.domain(uid), job_pid,
+                          "" if runner_pid else "; no live runner pidfile yet"))
+
+
+def _launchctl_bin(probe):
+    return probe.command("launchctl", envvar="SL_LAUNCHCTL", default="/bin/launchctl") \
+        or "/bin/launchctl"
+
+
+def _launchagents_dir(probe):
+    env = getattr(probe, "env", {}) or {}
+    return env.get("SL_LAUNCHD_DIR") or os.path.join(probe.home, "Library", "LaunchAgents")
+
+
+def _launchd_uid(probe):
+    """This process's own uid, and nothing else can say otherwise — see the CLI's `_home_uid` for
+    why the override that used to live here was removed (a fresh-agent review called it blocking:
+    a rule with a runtime escape hatch is not a rule, and the remedy this block PRINTS names a
+    launchd domain the operator will type)."""
+    return os.getuid()
+
+
+def _job_path_problem(probe, plist):
+    """"PATH does not resolve gh, git" for a job whose recorded PATH lost a required command, else
+    "". An unreadable/unparseable plist is itself a problem — a job launchd cannot parse is a job
+    that never starts."""
+    text = probe.read_text(plist)
+    if not _nonempty_string(text):
+        return "its LaunchAgent could not be read"
+    try:
+        entries = plistlib.loads(text.encode()).get("EnvironmentVariables", {}).get("PATH", "")
+    except Exception:
+        return "its LaunchAgent is not parseable as a plist"
+    dirs = [d for d in str(entries).split(":") if d]
+    missing = [c for c in runner_home.REQUIRED_COMMANDS
+               if not any(probe.executable(os.path.join(d, c)) for d in dirs)]
+    if not missing:
+        return ""
+    return ("its recorded PATH does not resolve %s — launchd hands a job only %s, so these must be "
+            "on the job's own PATH" % (", ".join(missing), runner_home.LAUNCHD_PATH))
+
+
 def check_runner_anchor(probe, config):
     """A LIVE runner's recorded launch anchor must still resolve — else every worker tab is born in
     a dead/misplaced pane and the whole queue parks (issue #33; the 2026-07-09 misplacement, when a
@@ -729,12 +887,20 @@ def check_runner_anchor(probe, config):
     runner is actually live (its pidfile pid is alive), then re-runs the SAME read-only probe the
     startup preflight uses. No live runner, a stale pidfile, or an unreadable config are clean SKIPS
     (pass, never FAIL) — this only judges a live runner with a resolvable claim to check. A live
-    runner that recorded no anchor is a WARN (older runner, or one started before this shipped)."""
+    runner that recorded no anchor is a WARN (older runner, or one started before this shipped).
+
+    A LOGIN-ITEM runner is skipped outright (issue #306): it has no anchor by design, so without
+    this guard the block would fire its no-matching-anchor WARN on every healthy one — a permanent
+    warning that teaches the operator to ignore the block. ``check_runner_home`` judges that home.
+    """
     name = "runner anchor (live)"
+    home = runner_home.kind(config)
+    if home != runner_home.PANE:
+        return CheckResult(name, True, "runner_home is `%s` — no launch anchor exists in that home; "
+                                       "the runner-home block judges it" % home)
     cfg = config if isinstance(config, dict) else {}
-    try:
-        state = os.path.join(str(config_lib.state_home(cfg)), "state")
-    except (KeyError, AttributeError, TypeError, ValueError):
+    state = _state_dir(probe, cfg)
+    if state is None:
         return CheckResult(name, True, "no repo config — runner-anchor check skipped")
 
     lock = probe.read_text(os.path.join(state, "runner.lock"))
@@ -1166,6 +1332,7 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_launch_shim(probe),
         check_cmux_app_nap(probe),
         check_runner_anchor(probe, config),
+        check_runner_home(probe, config),
         check_engine_drift(probe, repo_path=repo_path, dev_branch=dev),
         check_ops_docs(probe),
         check_superlooper_plugin(probe),

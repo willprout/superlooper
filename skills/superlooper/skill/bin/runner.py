@@ -41,6 +41,7 @@ import gitops
 import journal
 import loopstate
 import published_view
+import runner_home
 import tidy
 import usage as usage_mod
 import worker_hook
@@ -563,10 +564,25 @@ class Runner:
         # the repo from the process cwd, and the runner may be started from anywhere.
         gh.set_repo(config.get("repo") if isinstance(config, dict) else None)
         self.home = os.fspath(state_home) if state_home else str(config_lib.state_home(config))
+        # Which PROCESS HOME this runner lives in (issue #306) — the pane home (a visible tab whose
+        # pane is the launch anchor) or the login-item home (a plain gui/$UID LaunchAgent). Read
+        # from config through runner_home.kind, which fails closed to the pane home, so a runner
+        # handed a half-read config keeps the behaviour that refuses to launch without an anchor.
+        # Resolved FIRST because the pane resolution just below depends on it. Four things branch on
+        # it and nothing else does: the pane, the anchor record, the per-tick anchor probe, and how
+        # a #116 Restart request is executed.
+        self.runner_home = runner_home.kind(config)
         # Explicit override only; the CLI resolves the self-pane default (detect_self_pane) before
         # constructing the Runner. CMUX_PANE_ID is deliberately NOT read — cmux never exports it
         # (only CMUX_SURFACE_ID / CMUX_WORKSPACE_ID), so that old fallback silently never fired.
-        self.pane = pane or os.environ.get("SL_PANE") or ""
+        #
+        # ...and in the login-item home there is NO pane, so none is kept — not the argument, not
+        # the environment. The environment of a shell that starts a runner very often DOES carry a
+        # pane (every session this loop launches exports one), and a stray pane in a home that has
+        # none is worse than an empty one: empty fails loudly at the launch path, stray succeeds
+        # silently and births a worker session into somebody else's window.
+        self.pane = ("" if self.runner_home == runner_home.LOGIN_ITEM
+                     else pane or os.environ.get("SL_PANE") or "")
         # Anchor identity of the runner's own tab (issue #33): the workspace/window the pane lives
         # in. Display + doctor use them to make a misplaced runner visible; they never gate launches
         # (the pane is the only thing new-surface needs). "" when cmux couldn't resolve them.
@@ -719,14 +735,79 @@ class Runner:
     def _anchor_path(self):
         return os.path.join(self.state, "runner.anchor.json")
 
+    def _home_path(self):
+        return os.path.join(self.state, "runner.home.json")
+
+    def _restart_baton_path(self):
+        """The note a departing login-item runner leaves for its successor (issue #306). Named
+        apart from the restart REQUEST marker on purpose: the request is the owner asking, this is
+        one runner telling the next one why it is here."""
+        return os.path.join(self.state, "runner.restarted")
+
+    def _spend_restart_baton(self):
+        """Journal the LANDING of a restart this runner is the successor of, exactly once.
+
+        Only in the home that leaves batons. A repo flipped back to the pane home with one still on
+        disk would otherwise journal a landing for a restart that never happened in that home — a
+        diagnostic that tells a small lie is worse than no diagnostic. It is left in place rather
+        than cleaned up, because a home that does not own a file should not delete it.
+
+        Consumed (removed) whether or not the journal write succeeds — a baton left behind would
+        make the next ordinary boot claim to be a restart landing, which is the same lie in the
+        other direction. Never raises: this is a diagnostic, not a gate.
+        """
+        if self.runner_home != runner_home.LOGIN_ITEM:
+            return
+        rec = _read_json(self._restart_baton_path())
+        if not isinstance(rec, dict):
+            return
+        _rm(self._restart_baton_path())
+        try:
+            journal.append(self.home, {"act": "runner_restart", "phase": "up",
+                                       "old_pid": rec.get("old_pid"), "new_pid": os.getpid()})
+        except Exception:
+            pass
+
+    def _home_record(self):
+        """What a live runner publishes about its own PROCESS HOME (issue #306).
+
+        Written in BOTH homes, so a reader — `doctor`, the watchdog's restart path — answers "where
+        does this runner live?" from a positive statement rather than by inferring it from the
+        ABSENCE of an anchor file (which is also what a crashed runner leaves behind). The label is
+        only meaningful in the login-item home, and a slug we cannot turn into one is recorded as
+        None rather than guessed: this record is read by code that restarts things.
+        """
+        rec = {"kind": self.runner_home, "pid": os.getpid(), "label": None}
+        if self.runner_home == runner_home.LOGIN_ITEM:
+            try:
+                rec["label"] = runner_home.label(self.config.get("repo"))
+            except (ValueError, AttributeError):
+                pass
+        return rec
+
     def _write_anchor(self):
-        """Record THIS live runner's launch anchor (issue #33): the pane every worker tab is born
-        in, the workspace/window it lives in, and our pid. `doctor` reads this to verify a LIVE
-        runner's anchor still resolves — a runner whose tab was dragged to another cmux window (the
-        2026-07-09 misplacement) leaves a recorded anchor that no longer resolves. Written only while
-        the singleton is held and cleared on clean exit, so a present anchor means "a runner claims
-        this pane"; the pid lets a reader pair it with the pidfile and ignore a stale one. Never
-        raises — the anchor is a diagnostic, never a safety gate."""
+        """Record THIS live runner's launch anchor (issue #33) and its process home (issue #306).
+
+        The ANCHOR is the pane every worker tab is born in, the workspace/window it lives in, and
+        our pid. `doctor` reads it to verify a LIVE runner's anchor still resolves — a runner whose
+        tab was dragged to another cmux window (the 2026-07-09 misplacement) leaves a recorded
+        anchor that no longer resolves. Written only while the singleton is held and cleared on
+        clean exit, so a present anchor means "a runner claims this pane"; the pid lets a reader
+        pair it with the pidfile and ignore a stale one.
+
+        In the LOGIN-ITEM home there is no anchor and none is written. That absence is the point: a
+        recorded pane there would send the doctor (and the watchdog's restart path) chasing a pane
+        that never existed, which is worse than no record at all. The home record below is what
+        those readers use instead.
+
+        Never raises — both files are diagnostics, never safety gates.
+        """
+        try:
+            loopstate.save(self._home_path(), self._home_record())
+        except OSError:
+            pass
+        if self.runner_home != runner_home.PANE:
+            return
         try:
             loopstate.save(self._anchor_path(), {"pane": self.pane, "workspace": self.workspace,
                                                  "window": self.window, "pid": os.getpid()})
@@ -734,11 +815,12 @@ class Runner:
             pass
 
     def _clear_anchor(self):
-        """Remove the anchor on clean exit — but only if it is OURS (pid match), so a runner that
-        lost the singleton and is exiting can never delete the live holder's record."""
-        rec = _read_json(self._anchor_path())
-        if isinstance(rec, dict) and rec.get("pid") == os.getpid():
-            _rm(self._anchor_path())
+        """Remove the anchor + home record on clean exit — but only where they are OURS (pid match),
+        so a runner that lost the singleton and is exiting can never delete the live holder's."""
+        for path in (self._anchor_path(), self._home_path()):
+            rec = _read_json(path)
+            if isinstance(rec, dict) and rec.get("pid") == os.getpid():
+                _rm(path)
 
     def _handle_signal(self, signum, frame):
         # Fail-stopped by design: in-flight sessions untouched, nothing merges while down.
@@ -752,14 +834,26 @@ class Runner:
         return read_restart_request(self.state) is not None
 
     def _honor_restart(self):
-        """Honor a Restart request: consume the marker, journal the intent (old pid), then re-exec
-        THIS invocation in place so a fresh process image reloads the currently-installed engine in
-        the SAME cmux tab with cleared in-memory episode state (the systemic-launch streak, the
-        tick-error counter, the wake grace — all reset by construction in a new __init__). The
-        singleton lock is NOT released: the reborn image (same pid, via the SL_RESTART_ADOPT token)
-        adopts it, so there is no window a second runner could double-start. Returns ONLY if the exec
-        itself fails (or under a test's injected _reexec): the marker is already consumed, so the loop
-        simply continues on the old image rather than re-looping the restart."""
+        """Honor a Restart request: consume the marker, journal the intent (old pid), then restart
+        by whatever mechanism THIS process home has (issue #306's disposition of issue #116).
+
+        Both mechanisms buy the same two things — a fresh process image that reloads the currently-
+        installed engine, and cleared in-memory episode state (the systemic-launch streak, the
+        tick-error counter, the wake grace — all reset by construction in a new __init__). They
+        differ in what they have to preserve:
+
+        * **pane home → re-exec in place.** ``os.execv`` PRESERVES the pid, so the runner stays the
+          foreground process of its own tab. The singleton lock is NOT released: the reborn image
+          (same pid, via the SL_RESTART_ADOPT token) adopts it, so there is no window a second
+          runner could double-start. Returns ONLY if the exec itself fails (or under a test's
+          injected _reexec): the marker is already consumed, so the loop simply continues on the old
+          image rather than re-looping the restart.
+        * **login-item home → exit to the supervisor.** There is no tab to stay in front of, so the
+          pid is worth nothing and the image swap is unnecessary. The loop stops; run()'s finally
+          releases the singleton and clears the home record; launchd's KeepAlive starts a fresh
+          process. Nothing adopts anything, which also means none of the SL_RESTART_ADOPT machinery
+          is reachable here.
+        """
         req = read_restart_request(self.state) or {}
         # The marker binds to the pid `request-restart` saw live (fresh-agent review). If that pid is
         # NOT us, the request targeted a DIFFERENT runner that died before honoring it, and we are a
@@ -775,7 +869,28 @@ class Runner:
             except Exception:
                 pass
             return
-        clear_restart_request(self.state)                  # consume BEFORE the exec — never re-loop
+        clear_restart_request(self.state)                  # consume BEFORE the restart — never re-loop
+        if runner_home.restart_mechanism(self.runner_home) == runner_home.EXIT_TO_SUPERVISOR:
+            # Journaled BEFORE stopping, because after this the only trace of what happened is a
+            # process that vanished and a new one that appeared — indistinguishable from a crash
+            # loop in the morning report, which is exactly the report this most needs to be legible
+            # in.
+            try:
+                journal.append(self.home, {"act": "runner_restart", "phase": "exit_to_supervisor",
+                                           "old_pid": os.getpid(), "request": req})
+            except Exception:
+                pass
+            # And leave the note our SUCCESSOR spends to journal the landing. The re-exec path uses
+            # an env token for this; a process that actually dies cannot carry one, so the baton is
+            # a file. Without it, an exit followed by a FAILED restart reads exactly like a
+            # successful one — the single question the morning report is asked about a restart.
+            # Guarded: a diagnostic must never keep a requested restart from happening.
+            try:
+                loopstate.save(self._restart_baton_path(), {"old_pid": os.getpid()})
+            except OSError:
+                pass
+            self.stop = True
+            return
         try:
             journal.append(self.home, {"act": "runner_restart", "phase": "reexec",
                                        "old_pid": os.getpid(), "request": req})
@@ -999,6 +1114,10 @@ class Runner:
                                            "new_pid": os.getpid()})
             except Exception:
                 pass
+        # The login-item home's equivalent (issue #306), read from disk rather than the environment
+        # because that restart is a real process death. No baton = an ordinary boot, and an ordinary
+        # boot is not a restart landing.
+        self._spend_restart_baton()
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
         ticks = 0
@@ -1651,6 +1770,20 @@ class Runner:
         ok, why = preflight_pane(self.pane)
         return {"ok": ok, "reason": why}
 
+    def _probe_launch_anchor(self):
+        """The per-tick launch-anchor signal for decide, or None when there is nothing to probe.
+
+        Two guards, and the second is new with issue #306. There must be launch DEMAND (an idle
+        runner never shells out and never alerts — issue #24), and this home must actually HAVE an
+        anchor. In the login-item home it does not: the probe would ask the multiplexer about a pane
+        that never existed, get a negative answer, and report the launch channel DOWN on a perfectly
+        healthy runner — one alert plus a hold on the entire queue. None means "no signal", which
+        decide already treats as "nothing to say about the anchor" rather than as a failure.
+        """
+        if self.runner_home != runner_home.PANE or not self._wants_launch():
+            return None
+        return self._anchor_status()
+
     def _display_asleep(self):
         """Display-sleep tri-state for decide (issue #124): True = confirmed asleep, False = confirmed
         awake, None = unreadable. A thin wrapper over the module-level probe so tests can override the
@@ -1851,8 +1984,9 @@ class Runner:
         # only when there is demand to launch (so an idle runner never shells out to cmux or alerts).
         disk["launch_fail_ids"] = sorted(self._launch_fail_ids)
         disk["launch_fail_at"] = self._launch_fail_at    # the #115 canary retry clock (decide reads it)
-        if self._wants_launch():
-            disk["launch_anchor"] = self._anchor_status()
+        anchor = self._probe_launch_anchor()             # None = this home has no anchor, or no demand
+        if anchor is not None:
+            disk["launch_anchor"] = anchor
         # Account-auth gate (issue #159): hand decide a fresh-ish `claude auth status` + keychain
         # snapshot ONLY when a spend is pending (a launch OR a relaunch), so it holds a launch/relaunch
         # into dead auth and alerts — but an idle runner never probes or alarms. Fail-open lives in
