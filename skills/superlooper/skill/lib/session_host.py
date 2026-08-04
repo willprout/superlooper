@@ -98,8 +98,9 @@ _GONE_CODES = re.compile(r"not[_ ]?found|no[_ ]?such|does[_ ]?not[_ ]?exist")
 # uid as the server. The env scrub below is the second layer, never the fence.
 
 API_TOKEN_ENV_VAR = "HERDR_API_TOKEN"
-# Preferred where it can be arranged: a pane inherits the SERVER's environment, so a token that
-# lives only in a file was never in a position to be inherited out of one.
+# The host's other accepted source, named here only so the scrub below covers it. It is NOT the
+# recommended one: an ordinary file is readable by the same uid, and the same uid is the worker.
+# (The env var is safer precisely because macOS refuses a worker another process's environment.)
 API_TOKEN_FILE_ENV_VAR = "HERDR_API_TOKEN_FILE"
 
 # What a d<N> spawn passes INSTEAD of the token, for the patched host to substitute.

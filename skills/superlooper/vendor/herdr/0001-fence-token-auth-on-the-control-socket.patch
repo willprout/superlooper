@@ -1,9 +1,9 @@
 diff --git a/src/api/auth.rs b/src/api/auth.rs
 new file mode 100644
-index 0000000..08d7efb
+index 0000000..dab9af8
 --- /dev/null
 +++ b/src/api/auth.rs
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,264 @@
 +//! Token auth for the control socket — superlooper's carried fence (issue #305).
 +//!
 +//! Upstream herdr deliberately exposes every capability twice (CLI + newline-JSON socket) so that
@@ -48,7 +48,8 @@ index 0000000..08d7efb
 +
 +/// The token, presented by a client on each request and held by the server. Read by BOTH sides.
 +pub const API_TOKEN_ENV_VAR: &str = "HERDR_API_TOKEN";
-+/// A file holding the token (trailing whitespace trimmed). Server-side preference — see above.
++/// A file holding the token (trailing newlines trimmed). NOT the default recommendation — an
++/// ordinary file is readable by the same uid, which is the worker. See the module note.
 +pub const API_TOKEN_FILE_ENV_VAR: &str = "HERDR_API_TOKEN_FILE";
 +
 +/// The JSON member a client puts the token in. Deliberately a top-level sibling of `id`/`method`
