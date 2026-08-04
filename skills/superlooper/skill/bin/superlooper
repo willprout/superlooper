@@ -3104,8 +3104,10 @@ def cmd_resume(args):
     """Re-enter lane <id>'s recorded session after an interruption, with a re-orientation preamble.
 
     Refuses — launching nothing, writing nothing — when the lane has no recorded session id (it
-    predates #298, or never launched), when a LIVE worker still holds the lane, or when no cmux
-    pane resolves. ``--check`` is the read-only preflight."""
+    predates #298, or never launched), or when a LIVE worker still holds the lane. It used to
+    refuse on "no cmux pane resolves" too; issue #308 moved the launch onto the session host, which
+    is asked for a workspace rather than told which pane to open a tab in. ``--check`` is the
+    read-only preflight."""
     cfg = _load_config(args.repo)
     home = str(config_lib.state_home(cfg))
     state_dir = os.path.join(home, "state")

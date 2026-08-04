@@ -229,15 +229,15 @@ def test_worktree_creation_holds_a_lock_for_the_whole_critical_section(tmp_path)
                     probe.close()
             return super().run(argv, timeout=timeout, cwd=cwd, env=env)
 
-    held = []
+    held = []                       # one entry per `git worktree add`: was the lock held then?
     result, edges, _host = _run(spec, edges=Watching())
     assert result.rc == launch.OK, result.stderr
     assert os.path.exists(lock), "the worktree critical section takes a real lock file"
     assert held and all(held), \
         "the lock must be HELD across `git worktree add`, not merely taken beside it"
     # And it is a REAL exclusive lock, not a marker file: a second holder must wait for it.
-    with launch.WorktreeLock(lock) as held:
-        assert held._fh is not None
+    with launch.WorktreeLock(lock) as holder:
+        assert holder._fh is not None
         second = launch.WorktreeLock(lock)
         second._fh = open(lock, "a+")
         with pytest.raises(BlockingIOError):
@@ -587,8 +587,23 @@ def test_a_failed_pretrust_refuses_the_launch_rather_than_flying_into_a_dialog(t
     spec = _spec(tmp_path)
     result, _edges, host = _run(spec, edges=edges)
     assert result.rc == launch.ABORTED
-    assert "pre-trust" in result.stderr and "jq" in result.stderr
+    assert "pre-trust" in result.stderr and "rc=1" in result.stderr
     assert host.spawned == [], "nothing is created for a folder we could not pre-trust"
+
+
+def test_a_stalled_pretrust_is_never_reported_as_a_github_outage(tmp_path):
+    """The refusal above carries NO third-party text, and this is why: `Edges.run` renders a
+    timeout as "no answer within Ns", and evidence.py matches that CHANNEL needle before anything
+    else. A stalled local pretrust reported as "GitHub is not answering; the queue resumes on its
+    own" is a remedy for a fault that is not happening — and holds the queue until someone looks."""
+    import evidence
+    edges = FakeEdges({"pretrust.sh": (124, "", "no answer within 60s")})
+    result, _edges, _host = _run(_spec(tmp_path), edges=edges)
+    assert result.rc == launch.ABORTED
+    assert "no answer within" not in result.stderr
+    rec = evidence.build("launch", result.rc, result.stderr)
+    assert rec["reason"] != "gh_probe_unreachable", rec
+    assert not evidence.is_channel_fault(rec) or rec["reason"] == "launch_failed_before_delivery"
 
 
 def test_a_session_id_that_could_not_be_recorded_refuses_the_launch(tmp_path):

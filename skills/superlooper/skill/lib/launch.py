@@ -116,6 +116,15 @@ _REFUSAL_GRACE = 3.0            # a pane's own refusal can land just after the h
 _LOGIN_RE = re.compile(r"^[A-Za-z0-9-]+$")
 
 
+class _Refused(Exception):
+    """A refusal raised from below the top-level flow, carrying its own operator-facing sentence.
+
+    Only for the pre-flight steps that must abort a launch from inside a helper: ``launch``'s
+    catch-all renders these verbatim rather than as "the launcher failed unexpectedly", so a
+    deliberate refusal never reads to the owner as a crash.
+    """
+
+
 @dataclass(frozen=True)
 class Ran:
     """One finished subprocess, as this module needs it."""
@@ -243,6 +252,8 @@ def launch(spec, host=None, edges=None):
     edges = edges if edges is not None else Edges()
     try:
         return _launch(spec, host, edges)
+    except _Refused as e:
+        return Result(ABORTED, str(e))
     except Exception as e:                                   # noqa: BLE001 - a launcher may not
         # A launcher that raised would take its caller's tick with it, and the runner's whole
         # design is that no single lane can stop the loop. Report, never propagate.
@@ -354,12 +365,15 @@ def _launch(spec, host, edges):
     # launch machinery caused.
     trusted = edges.run([os.path.join(spec.engine_bin, "pretrust.sh"), worktree], timeout=60)
     if trusted.rc != 0:
+        # rc ONLY — no third-party text, for the reason the worktree refusal below spells out:
+        # evidence.py classifies this line, and its CHANNEL needles ("no answer within", which is
+        # exactly how a pretrust that HANGS renders here) are matched before anything else. A
+        # stalled local pretrust must not be reported as "GitHub is not answering; the queue will
+        # resume on its own", which is a remedy for a fault that is not happening.
         return Result(ABORTED,
                       "[%s] could not pre-trust %s (pretrust.sh rc=%s) — refusing to launch into a "
                       "folder whose first-run trust dialog would block the session with nobody "
-                      "there to answer it: %s"
-                      % (iid, worktree, trusted.rc,
-                         (trusted.stderr or trusted.stdout or "").strip()[:400]))
+                      "there to answer it" % (iid, worktree, trusted.rc))
 
     # ---- session identity (issue #298) ----------------------------------------------------
     # Identity handed down, never self-asserted. A RELAUNCH always mints anew (`--session-id` on
@@ -450,7 +464,7 @@ def _make_worktree(spec, edges, iid, worktree, branch, base):
         # rc=1 is git's own "that ref is not here" under `--verify --quiet`. Anything else — a
         # timeout (124), an unrunnable git (127), a broken repo — is a fault this probe could not
         # answer, and reading it as a missing base would tell the owner to fix a dev_branch that
-        # was never the problem. Fall through to the generic refusal, which carries git's words.
+        # was never the problem. Fall through to the generic refusal, which names the rcs.
         if exists.rc == 1:
             # Issue #28's DISTINCT code, so the park memo blames the branch rather than the launch
             # machinery — and a missing base never becomes a hollow launch.
@@ -464,9 +478,13 @@ def _make_worktree(spec, edges, iid, worktree, branch, base):
         # the worktree needle — so third-party text here could turn one issue's local git fault
         # into a held queue. Its own file states the rule: a needle that maps to a channel reason
         # must be impossible in the loop's own launcher text.
+        # The base is NOT claimed to exist: on the fall-through path above git did not answer that
+        # question at all, and asserting it would be a second confidently-wrong statement in the
+        # memo the first one was just removed from.
         return Result(ABORTED,
-                      "[%s] could not create the worktree at '%s' for branch '%s' (base '%s' "
-                      "exists; git rc=%s/%s)" % (iid, worktree, branch, base, fresh.rc, attach.rc))
+                      "[%s] could not create the worktree at '%s' for branch '%s' off base '%s' "
+                      "(git rc: create=%s attach=%s verify=%s)"
+                      % (iid, worktree, branch, base, fresh.rc, attach.rc, exists.rc))
 
 
 def pane_environment(spec, iid, session_id, resume, expect_login, token,
@@ -568,8 +586,9 @@ def _prepare_state(spec, iid, session_id, token):
     if session_id and not _write_atomic(os.path.join(state, "sessions", iid), session_id):
         # The old launcher exited 1 here. Flying anyway produces a session nobody can `resume`,
         # with nothing anywhere saying why — the handle is the whole point of minting the id.
-        raise OSError("could not record the session id for %s — this session would not be "
-                      "resumable" % iid)
+        # Raised as this module's own refusal so it renders as a decision, not as a crash.
+        raise _Refused("[%s] could not record the session id under %s — refusing, because this "
+                       "session would not be resumable" % (iid, os.path.join(state, "sessions")))
 
     # Restart hygiene: clear ONLY this id's run-state markers, so a prior session's
     # report/exited/blocked cannot mis-fire for the fresh one. Intentionally explicit rather than a

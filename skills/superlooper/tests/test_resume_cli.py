@@ -436,3 +436,17 @@ def test_a_spawned_but_failed_launch_keeps_its_preamble(rig):
     assert r.returncode == 1                    # honest failure...
     assert (rig.home / "briefs" / "i1.resume.md").exists(), \
         "...but the preamble stays: only rc=2 and a never-spawned exec prove nobody read it"
+
+
+def test_a_revive_launches_with_no_cmux_anchor_at_all(rig):
+    """The LAUNCH half of the gate #308 removed — `--check` is covered above, but a gate re-added
+    below it would not be caught by that. Under a login-item runner (#306) no anchor resolves, and
+    a revive is the operator's own recovery verb: it must still fly."""
+    rig.seed_lane()
+    rig.record_session()
+    (rig.home / "state" / "runner.anchor.json").unlink()
+    r = run(rig, "resume", "i1", "--json")
+    assert r.returncode == 0, r.stderr
+    out = jbody(r)
+    assert out["ok"] is True, out
+    assert rig.launch_calls(), "the revive must reach the launcher with no pane to launch into"
