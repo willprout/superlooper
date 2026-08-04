@@ -155,7 +155,24 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   workspace it launched in — its cmux tab was closed or dragged to another window, so every worker
   launch would be born in a dead pane and the queue parks. The fix there is to stop the runner, open
   a tab in the INTENDED cmux window, and re-run `superlooper run` (see
-  `plugin/skills/superlooper/references/runner-ops.md` → Restarting the runner).
+  `plugin/skills/superlooper/references/runner-ops.md` → Restarting the runner). A repo whose
+  `runner_home` is `login-item` is skipped here — that home has no anchor by design, and the block
+  below judges it instead.
+- `runner home`: which process home this repo's runner lives in, and whether that home works
+  (issue #306). `runner_home: "pane"` — the default, a runner in a visible tab a person opened —
+  prints as a clean skip, because the `runner anchor (live)` block above already judges it. For
+  `runner_home: "login-item"` this is the whole outside view of the job, and each failure is a way
+  the runner can be running and wrong while every other block reads green: the LaunchAgent is not
+  installed, or not loaded in `gui/$UID` (nothing is supervising the runner, so the next time it
+  exits nothing brings it back); launchd's pid and the loop's own pidfile name DIFFERENT live
+  processes (two runners, one about to be restarted out from under the other); or the job's
+  recorded PATH no longer resolves `gh`/`git` — launchd hands a job only
+  `/usr/bin:/bin:/usr/sbin:/sbin`, so a job without an explicit PATH comes up, looks perfectly
+  alive, and fails every GitHub read. A job that is loaded but not currently running is a WARN, not
+  a FAIL: that is simply true between a restart and the next boot. Fix all of them with
+  `superlooper runner-home --repo <path> --install --load`, which records where `gh` and `git`
+  actually resolve on this machine. `SL_LAUNCHCTL` overrides the service-manager binary and
+  `SL_LAUNCHD_DIR` the directory the job is installed into.
 - `installed engine current`: a visibility line that never fails the stack — being behind is by
   design, since a merged engine change is inert until someone republishes through the gated
   `bin/install.sh` (issue #39). It compares the installed copy's VERSION stamp

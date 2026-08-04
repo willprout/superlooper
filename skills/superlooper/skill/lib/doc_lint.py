@@ -58,6 +58,11 @@ GLOBBED = ("plugin/skills/**/*.md", "*/README.md")
 # Named individually because they do not share a directory with anything globbable.
 NAMED = (
     "skills/superlooper/docs/STACK.md",           # the machine-stack ops doc
+    # The runner's process home (issue #306). Classified OPERATIONAL rather than as a dated record
+    # even though it is largely a design decision: it names live verbs, live config keys and live
+    # doctor blocks, and an operator standing up (or debugging) a login-item runner reads it as
+    # instructions. That is exactly the surface D12 is about.
+    "skills/superlooper/docs/RUNNER-HOME.md",
     "skills/superlooper/skill/docs/ADOPTING.md",  # the adoption walkthrough, published with the engine
     "README.md",                                  # a stranger's first contact with the verbs
 )

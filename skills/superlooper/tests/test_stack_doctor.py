@@ -160,6 +160,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("launch shim sourced", True),
         ("cmux App Nap disabled", True),
         ("runner anchor (live)", True),      # no repo in this config -> cleanly skipped, passes
+        ("runner home", True),               # ditto (#306): no config names no home to judge
         ("installed engine current", True),  # no VERSION stamp injected -> cleanly skipped, passes
         ("installed ops docs", True),        # no installed engine home injected -> clean skip (#199)
         ("superlooper plugin", True),        # installed + enabled in the healthy probe

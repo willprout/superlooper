@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- superlooper RUNNER, login-item home (issue #306). Load it as a user LaunchAgent in the
+     gui/$UID domain ONLY (`launchctl bootstrap gui/$UID <plist>`) — never the system domain: a gui
+     agent is in the Aqua session and reads the login keychain, which is what `gh` and the notify
+     channel both depend on (docs/SPIKES-2026-07-29-results.md test 3).
+
+     This template exists because the 2026-07-31 ruling (docs/HERDR-ADOPTION-PLAN.md §8.1) moved
+     the runner OUT of the session host. Issue #33 deleted its predecessor with the reasoning "a
+     launchd runner is a detached daemon with no tab, so it can never self-detect the pane every
+     worker is born in" — true of a host whose spawn needs an anchor, and no longer true of one
+     that does not. Under the `pane` home that prohibition still stands and this template is not
+     installed at all; the per-repo `runner_home` key is what decides, and lib/runner_home.py is
+     where that decision lives.
+
+     RunAtLoad + KeepAlive are the login-item half: the runner comes up with the owner's GUI
+     session, and an exiting runner is restarted — which is exactly how the #116 Restart button
+     works in this home (the runner exits cleanly and launchd brings it back on a fresh process
+     image, with the newly installed engine and no in-memory episode state). ThrottleInterval
+     keeps a genuinely broken runner from spinning.
+
+     PATH is EXPLICIT and load-bearing: launchd hands a job only /usr/bin:/bin:/usr/sbin:/sbin, so
+     a bare `gh` is simply not found and every GitHub read fails on a runner that looks perfectly
+     alive. PYTHONUNBUFFERED is load-bearing for a different reason: with no terminal on the other
+     end, the runner's stdout is BLOCK-buffered, so its boot line, its preflight verdict and every
+     log line sit in a buffer for hours and the log file below stays empty on a perfectly healthy
+     job. The extra_env slot is where the installer records any other variable the job needs and a
+     launchd session would not have — today just SL_HOME, and only when the operator has actually
+     relocated the state base (a job that computed a different state home than the shell that
+     installed it would quietly build a second, empty one).
+
+     The placeholders are named in this comment WITHOUT their braces, deliberately: substitution is
+     a plain textual replace over the whole file, so a braced name here would be substituted into
+     the comment too — and a value containing a double hyphen (any path under a worktree named with
+     one) then makes the comment, and the whole plist, invalid XML. Found by installing it for
+     real. The slots are label, superlooper_bin, repo_path, state_home, path and extra_env, and
+     lib/runner_home.py's render_plist is what fills them. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{superlooper_bin}</string>
+        <string>run</string>
+        <string>--repo</string>
+        <string>{repo_path}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>WorkingDirectory</key>
+    <string>{repo_path}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{path}</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>{extra_env}
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{state_home}/logs/runner.log</string>
+    <key>StandardErrorPath</key>
+    <string>{state_home}/logs/runner.log</string>
+</dict>
+</plist>

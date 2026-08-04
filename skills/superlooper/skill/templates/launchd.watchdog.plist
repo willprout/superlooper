@@ -10,8 +10,17 @@
      journaled + notified outcome, never a fabricated success. Load it as a user LaunchAgent
      (~/Library/LaunchAgents) so notify/osascript run in the owner's GUI session; the one-time
      macOS permission that lets it text (notify.imessage_to) must be granted to that user, same
-     as the nightly (plugin/skills/superlooper/references/runner-ops.md). Placeholders ({label}, {superlooper_bin},
-     {repo_path}, {state_home}, {interval_seconds}) are substituted literally. -->
+     as the nightly (plugin/skills/superlooper/references/runner-ops.md).
+
+     PATH is explicit for the reason issue #306 measured: launchd hands a job only
+     /usr/bin:/bin:/usr/sbin:/sbin — no Homebrew, no ~/.local/bin — so a bare `gh` is not found.
+     A watchdog without it still reads the heartbeat (a file) but every GitHub read refuses, which
+     it correctly treats as UNOBSERVABLE and so freezes its clocks: the no-progress detector never
+     fires, silently, on a job that looks perfectly healthy. Substitute the absolute dirs THIS
+     machine resolves gh and git in, ahead of launchd's own four.
+
+     Placeholders ({label}, {superlooper_bin}, {repo_path}, {state_home}, {interval_seconds},
+     {path}) are substituted literally. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -25,6 +34,11 @@
     </array>
     <key>StartInterval</key>
     <integer>{interval_seconds}</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{path}</string>
+    </dict>
     <key>StandardOutPath</key>
     <string>{state_home}/logs/watchdog.log</string>
     <key>StandardErrorPath</key>

@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 
+import runner_home
+
 # The night window during which routine owner-DECISION pages are batched to the morning report
 # (issue #164). The ONE source of truth: the notify default below embeds it, and actions.py imports
 # it as the fallback for an OLD config.json that predates the key — so the two can never drift.
@@ -71,6 +73,14 @@ _TOP_DEFAULTS = {
     # park-family windows to do so; the #190 dirty/unpushed refusal still guards every prune.
     "cleanup_parked_worktrees": False,
     "report_time": "08:45",
+    # runner_home (issue #306): where the RUNNER's own process lives — "pane" (a visible
+    # multiplexer tab whose pane is the launch anchor) or "login-item" (a plain gui/$UID LaunchAgent
+    # talking to the session host's server, ruled 2026-07-31, HERDR-ADOPTION-PLAN §8.1). It selects
+    # the boot preflight, the #116 Restart mechanism, and how the watchdog restarts a dead runner —
+    # see lib/runner_home.py, which owns every one of those decisions. Default "pane": the
+    # cross-machine parallel run keeps production on the old home untouched, and a repo that says
+    # nothing must not change hosts because a new key appeared.
+    "runner_home": runner_home.PANE,
 }
 
 # Nested dict fields — deep-merged one level so a partial override (e.g. session.retry_cap) keeps
@@ -324,6 +334,13 @@ def _validate_and_fill(raw):
         _err(f"'affinity' must be one of {sorted(_AFFINITIES)}, got {out['affinity']!r}")
     if not isinstance(out["merge_method"], str) or out["merge_method"] not in _MERGE_METHODS:
         _err(f"'merge_method' must be one of {sorted(_MERGE_METHODS)}, got {out['merge_method']!r}")
+    # Validated LOUDLY rather than falling back the way runner_home.kind() does. The two are
+    # deliberately different: kind() is fail-closed for every runtime reader that may be handed a
+    # half-read config, while a config the OWNER wrote with a typo'd home should name the typo at
+    # adopt time — silently running the other home is exactly the misconfiguration this loader exists
+    # to refuse.
+    if not isinstance(out["runner_home"], str) or out["runner_home"] not in runner_home.KINDS:
+        _err(f"'runner_home' must be one of {sorted(runner_home.KINDS)}, got {out['runner_home']!r}")
     for flag in ("touches_required", "cleanup_merged_worktrees", "cleanup_parked_worktrees",
                  "auto_close_merged_windows"):
         if not isinstance(out[flag], bool):

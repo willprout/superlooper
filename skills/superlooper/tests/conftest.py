@@ -86,6 +86,16 @@ def _clear_worker_launch_env(monkeypatch):
         # drive it. Scrubbed here so _never_reach_real_session_host below can set the fail-closed
         # default.
         "SL_HERDR",
+        # The runner's process home (issue #306). SL_LAUNCHCTL steers the service manager the CLI
+        # and doctor talk to, SL_LAUNCHD_DIR steers where a LaunchAgent is PLACED, and SL_UID
+        # steers whose gui domain a job is addressed in. All three are ambient on a machine that
+        # has installed a login-item runner, and all three change what an install/verify under test
+        # actually touches — an inherited SL_LAUNCHD_DIR would let a test write into the owner's
+        # real ~/Library/LaunchAgents. Scrubbed here so _never_reach_real_launchctl below can then
+        # set the fail-closed default.
+        "SL_LAUNCHCTL",
+        "SL_LAUNCHD_DIR",
+        "SL_UID",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -161,6 +171,19 @@ def _never_reach_real_session_host(monkeypatch, _clear_worker_launch_env):
     # same as the others': scrub an ambient value first, then neutralize.
     if not os.environ.get("SL_HERDR"):
         monkeypatch.setenv("SL_HERDR", "/nonexistent/superlooper-test-herdr")
+
+
+@pytest.fixture(autouse=True)
+def _never_reach_real_launchctl(monkeypatch, _clear_worker_launch_env):
+    # Same ratchet as the four above, for macOS's service manager (issue #306). The runner's
+    # login-item home is a launchd job, so the CLI and the doctor shell `launchctl` to bootstrap,
+    # bootout, kickstart and print it — verbs that START AND STOP the owner's own jobs, including
+    # the live runner and the watchdog. `/bin/launchctl` is the unconditional fallback and always
+    # exists on this platform, so an un-stubbed test would reach the real one every time. Point the
+    # default at a guaranteed-absent path so a missed stub fails loudly instead of moving a real
+    # service. Tests that exercise it set their own SL_LAUNCHCTL in-body.
+    if not os.environ.get("SL_LAUNCHCTL"):
+        monkeypatch.setenv("SL_LAUNCHCTL", "/nonexistent/superlooper-test-launchctl")
 
 
 @pytest.fixture(autouse=True)
