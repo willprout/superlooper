@@ -486,17 +486,25 @@ case "$AGENT" in
     # session that runs perfectly and is invisible to the host's revive machinery.
     # `doctor --stack`'s `host state hook` block is what turns this from a whisper into a red line.
     SL_HOOK_LIB="$(cd "$(dirname "$0")" && pwd)/../lib/herdr_hook.py"
-    SL_HOOK_SETTINGS=""
+    # THE PATH IS OURS, never read back out of the renderer's output (fresh-agent review round 2).
+    # Taking it from stdout meant anything else that printed became part of it: a `sitecustomize.py`
+    # on PYTHONPATH, a deprecation warning, any site noise — the render would succeed and Claude
+    # would be handed a `--settings` argument with a warning glued to the front of it. So we name
+    # the file, pass it in, and CHECK IT EXISTS afterwards; the renderer's stdout is informational.
+    SL_HOOK_SETTINGS="$SL_RUN_ROOT/state/hooks/$ID.settings.json"
     if [ -f "$SL_HOOK_LIB" ]; then
       # The renderer takes the script path as an argument so the launcher never hand-builds JSON,
       # and so the rendering under test is literally the rendering a launch runs. The override is
       # for an operator pin and for the tests' absent-asset case; unset takes the vendored asset.
-      SL_HOOK_ARGS=("$SL_RUN_ROOT/state/hooks/$ID.settings.json")
+      SL_HOOK_ARGS=("$SL_HOOK_SETTINGS")
       [ -n "${SL_HOST_STATE_HOOK:-}" ] && SL_HOOK_ARGS+=("$SL_HOST_STATE_HOOK")
-      if SL_HOOK_SETTINGS="$(python3 "$SL_HOOK_LIB" "${SL_HOOK_ARGS[@]}" 2>&1)"; then
+      # `2>&1 >/dev/null` (in THAT order) keeps stderr — the renderer's own reason for refusing —
+      # and throws stdout away, so the message below names the real cause.
+      if SL_HOOK_WHY="$(python3 "$SL_HOOK_LIB" "${SL_HOOK_ARGS[@]}" 2>&1 >/dev/null)" \
+         && [ -f "$SL_HOOK_SETTINGS" ]; then
         CLAUDE_ARGS_HOOK=(--settings "$SL_HOOK_SETTINGS")
       else
-        echo "[$ID] no per-worker hook config, so this session will be invisible to the session host's revive machinery (the loop's own --resume floor is unaffected): $SL_HOOK_SETTINGS" >&2
+        echo "[$ID] no per-worker hook config, so this session will be invisible to the session host's revive machinery (the loop's own --resume floor is unaffected): ${SL_HOOK_WHY:-the renderer exited 0 but wrote no $SL_HOOK_SETTINGS}" >&2
         CLAUDE_ARGS_HOOK=()
       fi
     else

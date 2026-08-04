@@ -1000,3 +1000,22 @@ def test_a_missing_hook_asset_says_so_on_stderr(tmp_path):
         tmp_path, extra_env={"SL_HOST_STATE_HOOK": str(tmp_path / "absent.sh")})
     assert r.returncode == 0
     assert "hook" in r.stderr.lower()
+
+
+def test_site_noise_on_stderr_does_not_corrupt_the_settings_argument(tmp_path):
+    """Round-2 review, P2. The launcher used to read the settings path out of the renderer's
+    COMBINED output, so anything else that printed became part of it — a `sitecustomize.py` on
+    PYTHONPATH, a deprecation warning, any site noise. The render succeeded and claude was handed
+    `--settings "<noise>\\n<path>"`, which silently disables the hook on a machine that looks fine.
+    The launcher now names the file itself and checks that it exists."""
+    noisy = tmp_path / "site"
+    noisy.mkdir()
+    (noisy / "sitecustomize.py").write_text(
+        "import sys; print('deprecation noise from somebody else', file=sys.stderr)\n")
+
+    argv = _run_start(tmp_path, extra_env={"PYTHONPATH": str(noisy)})
+
+    path = _flag_value(argv, "--settings")
+    assert path and os.path.isfile(path), f"--settings names {path!r}"
+    assert "deprecation" not in path and "\n" not in path
+    assert json.loads(open(path).read())["hooks"]
