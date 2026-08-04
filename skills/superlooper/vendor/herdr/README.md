@@ -187,9 +187,8 @@ pre-flight: it returns `FENCED`, `OPEN` or `UNREACHABLE`, presents no token (it 
 
 `fence_probe` exists and is tested, but **nothing calls it in production yet**, so an unfenced or
 misconfigured host is not currently refused at launch. That is not an oversight in this issue: the
-runner and watchdog still spawn through `launch-session.sh`, and `session_host.py` has no
-production callers at all — the doorway landed in #304 and the spawners are ported separately. The
-preflight belongs in that port, where there is a launch path to refuse.
+spawners were ported separately: #308 moved them onto `session_host.py` through `lib/launch.py`,
+so there IS a launch path to refuse now, and wiring the preflight into it is issue #326.
 
 Until then, **the fence being up is verified by running the acceptance check above**, not by the
 runner. Filed as a follow-up: **#326** (`needs-owner`).

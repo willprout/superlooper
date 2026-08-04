@@ -1,13 +1,16 @@
 """Task 15 — the offline end-to-end simulation (the acceptance harness).
 
 REAL runner ticks (the actual Runner class, its actual executors, the actual launch stack:
-launch-session.sh -> fake-cmux's tab-shell/shim -> start-session.sh -> fake-claude) against a
+launch-session.py -> the five-verb wrapper -> fake-sessionhost's pane + the real launch shim
+-> start-session.sh -> fake-claude) against a
 REAL local git repo pair (a bare origin + a working clone in tmp) and three fakes:
 
   fake-gh      a stateful little GitHub (tests/fakes/fake-gh, state.json mode): label moves,
                comments, PR creation and REAL squash-merges into the bare origin's dev branch.
-  fake-cmux    tabs/screens/sends against tmp state; deliver mode executes the dropped .cmd
-               (the launch-shim contract); drop mode loses the keystrokes (the overnight bug).
+  fake-sessionhost  the session host's five verbs against tmp state; deliver mode really starts
+               the pane shell (which sources the real shim and hands off to start-session.sh),
+               hollow mode reports a started agent with nothing behind it (the phantom).
+  fake-cmux    screens/sends/close against tmp state — the verbs that have not moved off cmux yet.
   fake-claude  plays each session per a SCENARIO spec — invoked exactly like the real binary
                (brief contents as final argv, SL_ISSUE_ID/SL_RUN_ROOT from env) and reads its
                contract paths out of the brief text itself, so a broken brief template fails
@@ -25,6 +28,7 @@ paid-for pokes from waves 3-4 are asserted here against the real tick loop.
 import contextlib
 import json
 import os
+import pathlib
 import shutil
 import stat
 import subprocess
@@ -180,6 +184,15 @@ class Sim:
             "SL_CMUX": os.path.join(FAKES, "fake-cmux"),
             "FAKE_CMUX_DIR": str(self.cmux_dir),
             "CMUX_MODE": "deliver",
+            # The SPAWN path is the session host now (issue #308); cmux above survives only for
+            # the verbs that have not moved yet (nudge/close). fake-sessionhost's deliver mode
+            # starts the pane for real, so the simulation still drives the whole chain:
+            # launcher -> wrapper -> pane shell -> shim handoff -> start-session.sh -> fake-claude.
+            "SL_HERDR": os.path.join(FAKES, "fake-sessionhost"),
+            "FAKE_HOST_DIR": str(self.cmux_dir / "host"),
+            "FAKE_HOST_SHIM": str(pathlib.Path(__file__).resolve().parent.parent
+                                  / "skill" / "shell" / "launch-shim.zsh"),
+            "HOST_MODE": "deliver",
             "SL_LAUNCH_DIR": str(self.launch_dir),
             "SIM_SCENARIO_DIR": str(self.scenario_dir),
             "SIM_STOP": str(self.stop_file),
@@ -428,8 +441,20 @@ class Sim:
             return []
         return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
+    def closed_workspaces(self):
+        """Every session this simulation ENDED. Like `surfaces`, the record moved with the spawn
+        path (issue #308): a teardown closes the session host's WORKSPACE now, not a cmux surface.
+        Read defensively — when this regresses NOTHING is ever closed, and a bare read would die
+        with FileNotFoundError instead of naming the property that broke."""
+        log = self.cmux_dir / "host" / "closed.jsonl"
+        return [json.loads(l)["workspace"]
+                for l in (log.read_text() if log.exists() else "").splitlines() if l.strip()]
+
     def surfaces(self):
-        path = self.cmux_dir / "surfaces.jsonl"
+        """Every session this simulation SPAWNED. The record moved with the spawn path (issue
+        #308): it used to be a cmux surface per tab, and it is now an agent the session host was
+        asked to start — one per launch, named by the lane id, either way."""
+        path = self.cmux_dir / "host" / "agents.jsonl"
         if not path.exists():
             return []
         return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
@@ -1573,8 +1598,8 @@ def test_out_of_band_merge_kills_the_builder_even_when_the_worktree_is_kept(sim_
     pr = sim.prs_for()[0]
     assert pr["state"] == "OPEN"
     assert sim.loop_issue(sid).get("status") == "running"          # still building behind it
-    with open(os.path.join(sim.home, "state", "panes", sid)) as f:
-        surf0 = f.read().strip()
+    with open(os.path.join(sim.home, "state", "panes", "%s.ws" % sid)) as f:
+        ws0 = f.read().strip()                        # the workspace a teardown must close
     lock = os.path.join(sim.home, "state", "worker.%s.lock" % sid)
     pid0, alive0 = sim._lock_holder(lock)
     assert pid0 and alive0, "the builder must be a LIVE process — the whole premise"
@@ -1584,12 +1609,8 @@ def test_out_of_band_merge_kills_the_builder_even_when_the_worktree_is_kept(sim_
         "never absorbed the out-of-band merge: %s" % [
             (r.get("act"), r.get("outcome")) for r in sim.journal()]
 
-    # read defensively: when this regresses NOTHING is ever closed, and a bare read_text would die
-    # with FileNotFoundError instead of naming the property that broke
-    log = sim.cmux_dir / "closed.jsonl"
-    closed = [json.loads(l)["surface"]
-              for l in (log.read_text() if log.exists() else "").splitlines() if l.strip()]
-    assert surf0 in closed, "the builder's window was never closed: %s" % closed
+    closed = sim.closed_workspaces()
+    assert ws0 in closed, "the builder's window was never closed: %s" % closed
     assert _wait_dead(pid0), "the builder must be GONE — a merged branch must not keep a live " \
         "worker able to push to it and open a fresh PR"
     assert not os.path.exists(lock)
@@ -1673,8 +1694,8 @@ def test_regenerate_relaunch_survives_finished_but_alive_worker(sim_factory):
     sim.tick()
     assert sim.loop_issue(s1).get("status") == "running"
     assert sim.loop_issue(s2).get("status") == "running"
-    with open(os.path.join(sim.home, "state", "panes", s2)) as f:
-        surf0 = f.read().strip()                      # gen0's tab — must be the one closed
+    with open(os.path.join(sim.home, "state", "panes", "%s.ws" % s2)) as f:
+        ws0 = f.read().strip()                        # gen0's workspace — the one closed
     assert sim.tick_until(lambda: sim.loop_issue(s1).get("status") == "merged")
 
     sync1.write_text("go")
@@ -1694,10 +1715,9 @@ def test_regenerate_relaunch_survives_finished_but_alive_worker(sim_factory):
     assert sim.loop_issue(s2).get("launch_failures") in (None, 0)
     # the stale pane was really closed (fake-cmux records it), and the rebuild — which also
     # lingers — owns a FRESH lock
-    closed = [json.loads(l)["surface"]
-              for l in (sim.cmux_dir / "closed.jsonl").read_text().splitlines() if l.strip()]
-    assert surf0 in closed, closed
-    assert _wait_dead(pid0), "close-surface must KILL the old tab's process tree, " \
+    closed = sim.closed_workspaces()
+    assert ws0 in closed, closed
+    assert _wait_dead(pid0), "the teardown must END the old session's process tree, " \
         "not merely record a close (the lingering gen0 session must be gone)"
     pid1, alive1 = sim._lock_holder(lock)
     assert alive1 and pid1 != pid0, "the rebuild must own a fresh singleton, not the corpse's"
@@ -1729,8 +1749,8 @@ def test_preserve_resolution_survives_finished_but_alive_worker(sim_factory):
 
     sim.tick()
     assert sim.loop_issue(s2).get("status") == "running"
-    with open(os.path.join(sim.home, "state", "panes", s2)) as f:
-        surf0 = f.read().strip()
+    with open(os.path.join(sim.home, "state", "panes", "%s.ws" % s2)) as f:
+        ws0 = f.read().strip()                        # gen0's workspace — the one closed
     assert sim.tick_until(lambda: sim.loop_issue(s1).get("status") == "merged")
     b_branch = sim.loop_issue(s2).get("branch")
 
@@ -1753,10 +1773,9 @@ def test_preserve_resolution_survives_finished_but_alive_worker(sim_factory):
     assert resolves and all(r.get("outcome") == "ok" for r in resolves), resolves
     assert len(resolves) == 1, "one resolve launch — never a retry loop against a stale lock"
     # ...after the stale pane was really closed; and it resolved IN PLACE, never regenerated
-    closed = [json.loads(l)["surface"]
-              for l in (sim.cmux_dir / "closed.jsonl").read_text().splitlines() if l.strip()]
-    assert surf0 in closed, closed
-    assert _wait_dead(pid0), "the lingering gen0 session must be gone after close-surface"
+    closed = sim.closed_workspaces()
+    assert ws0 in closed, closed
+    assert _wait_dead(pid0), "the lingering gen0 session must be gone after the teardown"
     assert not sim.journal("regenerate"), "preserve replaces regenerate — never both"
     assert sim.origin_file("src/shared.txt").splitlines()[2] == "A and B merged"
 
@@ -2344,9 +2363,12 @@ def test_wrong_typed_usage_stops_launches_but_gates_proceed(sim_factory):
 # (issue #153, superseding the old per-issue "is the shim installed?" park — #152/#24).
 # =====================================================================================
 
-def test_shim_not_firing_holds_the_queue_and_never_parks_the_issue(sim_factory, monkeypatch):
+def test_a_hollow_launch_holds_the_queue_and_never_parks_the_issue(sim_factory, monkeypatch):
     sim = sim_factory()
-    monkeypatch.setenv("CMUX_MODE", "drop")            # the shim drops the launch command
+    # The phantom (issue #308): the host reports the agent started and ready with nothing behind
+    # it. Same shape as the cmux keystroke drop this case was written for, new cause — and the same
+    # rule applies, because no queued issue caused either one.
+    monkeypatch.setenv("HOST_MODE", "hollow")
     monkeypatch.setenv("SL_LAUNCH_VERIFY_SECONDS", "2")
     num = sim.add_issue(title="Keystrokes lost", scenario={"scenario": "happy"})
     sid = "i%d" % num
@@ -2367,7 +2389,7 @@ def test_shim_not_firing_holds_the_queue_and_never_parks_the_issue(sim_factory, 
         "a shim fault must not post a per-issue park memo — the systemic alert carries the guidance"
     # Orphan tabs are still CLOSED (no buffered-keystroke time bomb), no liveness was ever fabricated
     # for a worker that never started, and agent-ready was never moved (the queue is intact).
-    closed = (sim.cmux_dir / "closed.jsonl")
+    closed = (sim.cmux_dir / "host" / "closed.jsonl")
     assert closed.exists() and len(closed.read_text().splitlines()) >= 1
     assert not os.path.exists(os.path.join(sim.home, "state", "activity", sid))
     assert "in-progress" not in sim.issue(num)["labels"]

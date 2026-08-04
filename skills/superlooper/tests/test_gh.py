@@ -1094,7 +1094,7 @@ def test_default_gh_is_neutralized_in_the_test_suite():
     forgot to stub would reach the owner's REAL, logged-in gh and make live API calls as them.
 
     What this pins exactly: on a clean shell, that the neutralization exists at all. Inside a worker
-    pane — where launch-session.sh's dropped command makes SL_GH ambient — it ALSO pins the scrub
+    pane — where the launcher's pane environment makes SL_GH ambient — it ALSO pins the scrub
     that lets the neutralization fire, since the guard is conditional on SL_GH being unset. The two
     fixtures are wired by an explicit parameter dependency rather than definition order, so the
     ordering half cannot silently rot."""

@@ -158,7 +158,7 @@ def detect_events(snaps, emitted, now=None, idle_secs=IDLE_SECONDS, freeze_secs=
 
     finished/blocked/exited are EDGE-triggered on a content/mtime token so an identical re-write
     never re-fires (A6) — but the dedup key is UN-LATCHED the moment the marker file is gone
-    (review F1), so after the runner/launch-session.sh removes a marker a true re-create (even
+    (review F1), so after the runner/launcher removes a marker a true re-create (even
     byte-identical) re-fires. 'resolved' (exempt from idle/frozen) is marker EXISTENCE, NOT an
     activity comparison (review P0-1: the Stop/PostToolUse hooks stamp activity AFTER the report,
     so an mtime compare made every finished session look unresolved and fire false idle+frozen).
@@ -385,7 +385,7 @@ def snapshot(state_home, issue_ids, issues_state, now):
 
     exited_token is the marker's mtime_ns (sticky until relaunch clears the file); `launched`
     means the session left SOME trace (activity, report, or exited) — delivery proof lives in
-    state/started/ and is launch-session.sh's business, not an event source (EVENT-MODEL)."""
+    state/started/ and is the launcher's business, not an event source (EVENT-MODEL)."""
     root = os.fspath(state_home)
     state = os.path.join(root, "state")
     issues = (issues_state or {}).get("issues") if isinstance(issues_state, dict) else {}

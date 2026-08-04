@@ -2111,13 +2111,22 @@ def cmd_upkeep(args):
 # No LLM call exists anywhere on this path and it makes no repair decisions: it reads the
 # engine's own signals (state/runner.heartbeat, state/ALERT, the no-progress shape), and per
 # lib/watchdog.py's episode rules notifies -> waits the grace -> launches ONE sl-debugger
-# session through the SAME interactive launch shim workers use (launch-session.sh --cwd,
+# session through the SAME launcher workers use (launch-session.py --cwd,
 # never a headless `claude -p` — owner billing rule). Run it on an interval via
 # templates/launchd.watchdog.plist (it may run under launchd: a check needs no cmux pane;
 # the rare launch targets the RUNNER's recorded anchor and fails loudly when none resolves).
 # state/WATCHDOG_OFF disables the whole path; every transition is journaled.
 
-WATCHDOG_LAUNCH_TIMEOUT = 180   # launch-session.sh verifies delivery within ~30s; generous
+WATCHDOG_LAUNCH_TIMEOUT = 180   # the launcher verifies delivery within ~30s; generous
+
+# THE launcher — the single spawn path (issue #308), shared with the runner (runner.LAUNCHER) so
+# the exit-code contract evidence.py reads has one author. SL_LAUNCH_SESSION stays the test seam
+# it always was; production resolves the engine's own copy beside this script.
+LAUNCHER = "launch-session.py"
+
+
+def _launcher():
+    return os.environ.get("SL_LAUNCH_SESSION") or os.path.join(_HERE, LAUNCHER)
 
 
 def _pid_alive(pid):
@@ -2337,9 +2346,20 @@ def _watchdog_pane(state_dir):
 
 
 def _debugger_shim_run(cfg, repo, home, pane, sid, attended=False):
-    """Run ONE debugger session (``d<N>``) through the launch shim — the single handshake shared by
-    the watchdog's UNATTENDED launch and ``superlooper debug``'s owner tap (issue #144). Returns
+    """Run ONE debugger session (``d<N>``) through the launcher — the single handshake shared by
+    the watchdog's UNATTENDED launch and ``superlooper debug``'s owner tap (issue #144), which is
+    also the dashboard Fixer's spawn (it shells ``superlooper debug``). Returns
     ``(rc, stdout, stderr, spawned)``; NEVER raises.
+
+    Both ``d<N>`` spawners moved onto the session-host wrapper in the SAME wave as the worker
+    (issue #308), through this one function. That is the whole point of it existing: had the runner
+    been rewired alone, the two paths that repair an unattended loop would have been left calling a
+    launcher that no longer exists — no unattended repair at exactly the moment repair is needed.
+
+    ``pane`` is accepted and IGNORED. The host has no launch anchor: a session is created by the
+    wrapper against the server, not born inside some tab whose id the caller had to find first. The
+    parameter stays so the watchdog's own "can I launch at all?" reporting keeps its shape until
+    the cmux retirement settles what replaces it.
 
     ``attended`` is the ONE thing the two callers genuinely disagree about: the owner tap has a
     person at the keyboard and its brief invites them to ask, the watchdog's does not. It rides in
@@ -2358,7 +2378,7 @@ def _debugger_shim_run(cfg, repo, home, pane, sid, attended=False):
     the caller uses it to clean up a brief that reached nobody. A TIMEOUT is spawned=True — the tab
     may yet deliver late, so its brief must stay."""
     models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
-    script = os.environ.get("SL_LAUNCH_SESSION") or os.path.join(_HERE, "launch-session.sh")
+    script = _launcher()
     env = {**os.environ,
            "SL_RUN_ROOT": home, "SL_PANE": pane,
            # The debugger is the loop's one remaining hired-judgment seat (diagnose-vs-escalate on a
@@ -2366,7 +2386,7 @@ def _debugger_shim_run(cfg, repo, home, pane, sid, attended=False):
            # is the per-repo pin — the field was called `models.answerer` until #194 retired the
            # answerer and left the debugger its only reader.
            "SL_MODEL": models.get("debugger") or "opus[1m]", "SL_EFFORT": "",
-           # PIN the shim verify window (review P1-1): launch-session.sh inherits
+           # PIN the launcher's verify window (review P1-1): the launcher inherits
            # SL_LAUNCH_VERIFY_SECONDS, and an ambient large value (a debugging export, a
            # LaunchAgent env) would let the launch outlive WATCHDOG_LAUNCH_TIMEOUT — rc=124
            # counts a FAILED attempt while the tab delivers late and a real session starts,
@@ -2397,7 +2417,7 @@ def _debugger_shim_run(cfg, repo, home, pane, sid, attended=False):
 
 def _watchdog_launch(repo, cfg, home, state_dir, launch, state):
     """Execute one launch request through the SAME shim stack workers use. Returns the rc
-    fed to watchdog.after_launch: 0 only when launch-session.sh VERIFIED delivery."""
+    fed to watchdog.after_launch: 0 only when the launcher VERIFIED delivery."""
     import watchdog as watchdog_lib
     ep = state.get("episode") if isinstance(state.get("episode"), dict) else {}
     wd = cfg.get("watchdog") if isinstance(cfg.get("watchdog"), dict) else {}
@@ -2415,12 +2435,14 @@ def _watchdog_launch(repo, cfg, home, state_dir, launch, state):
     os.makedirs(os.path.join(home, "briefs"), exist_ok=True)
     with open(os.path.join(home, "briefs", f"{launch['id']}.md"), "w") as f:
         f.write(brief)
-    pane = _watchdog_pane(state_dir)
-    if not pane:
-        print("watchdog: no cmux pane resolves (no $SL_PANE, no recorded runner anchor, not "
-              "inside cmux) — cannot launch; notifying instead.", file=sys.stderr)
-        return "no_pane"
-    rc, out, err, _spawned = _debugger_shim_run(cfg, repo, home, pane, launch["id"])
+    # NO PANE GATE ANY MORE (issue #308). The old launcher had to be told which cmux pane to open
+    # a tab in, so a watchdog check that could not resolve one refused up front — and under a
+    # login-item runner (issue #306) none resolves, which would have made every unattended repair
+    # a `no_pane` refusal at exactly the moment repair is needed. The wrapper creates a workspace
+    # against the session host's server; there is no anchor to find and nothing to place. The
+    # resolver survives for the RESURRECT path below, which still needs a pane of its own.
+    rc, out, err, _spawned = _debugger_shim_run(cfg, repo, home, _watchdog_pane(state_dir),
+                                                launch["id"])
     combined = (out or "") + (err or "")
     if combined.strip():
         print(combined.strip())
@@ -2823,7 +2845,7 @@ def _debug_error(rc, stderr, stdout):
     if rc == 124:
         return "the launch timed out — no session was confirmed"
     if rc == 127:
-        return "could not run the engine's launch-session.sh — is superlooper installed?"
+        return "could not run the engine's launcher — is superlooper installed?"
     return msg or ("the launch failed (exit %d) — no session was confirmed" % rc)
 
 
@@ -2831,7 +2853,7 @@ def cmd_debug(args):
     """Launch ONE interactive sl-debugger session on this repo, because a person asked for it.
 
     Refuses — changing nothing, launching nothing — when a debugger is already live, when a watchdog
-    check holds the lock, or when no cmux pane resolves. ``ok`` is the shim's real verdict on
+    check holds the lock. ``ok`` is the shim's real verdict on
     delivery, never a pretend one. ``--check`` is the read-only preflight (writes NOTHING), so a
     confirm dialog can decide what to show before the owner commits."""
     import watchdog as watchdog_lib
@@ -2891,13 +2913,11 @@ def cmd_debug(args):
             return refuse("a debugger session (%s) is already running for this repo — never two "
                           "debuggers on one patient" % live, live=True, live_id=live)
 
-        # Resolve everything the shim REQUIRES before burning an id or writing a byte, so a refusal
-        # is indistinguishable from never having asked.
-        pane = _watchdog_pane(state_dir)
-        if not pane:
-            return refuse("no cmux pane resolves for this loop (no $SL_PANE, no recorded runner "
-                          "anchor, not inside cmux) — start the loop once so the session's tab has "
-                          "somewhere to be born")
+        # NO PANE GATE (issue #308), for the reason the watchdog's identical gate went: the
+        # launcher creates a workspace against the session host's server, so there is no anchor to
+        # find and nothing to place. Under a login-item runner (#306) none resolves at all — this
+        # gate would have made the owner's Debug tap permanently dead on exactly the machine the
+        # migration is for, and the dashboard shells this verb from its own non-cmux process.
 
         try:
             sid = _debug_allocate(os.path.join(state_dir, watchdog_lib.STATE_FILENAME),
@@ -2922,7 +2942,8 @@ def cmd_debug(args):
             return refuse("could not write the session brief: %s" % e, id=sid)
 
         # attended=True: a person typed this. It is the only launch in the whole engine that says so.
-        rc, out, err, spawned = _debugger_shim_run(cfg, args.repo, home, pane, sid, attended=True)
+        rc, out, err, spawned = _debugger_shim_run(cfg, args.repo, home,
+                                                   _watchdog_pane(state_dir), sid, attended=True)
         if not spawned:
             # Nothing ever ran: the brief reached no one, so it must not linger (it would read to a
             # later reader as a session that existed). The BURNED id stands — never re-handed out.
@@ -2959,7 +2980,7 @@ def cmd_debug(args):
 # worth reviving and types this. Automatic revive policy — who watches for a dead pane, how often,
 # with what anti-storm rails — is the herdr epic's territory and is not smuggled in here.
 #
-# It goes through launch-session.sh rather than around it for the same reason `debug` does: the
+# It goes through the launcher rather than around it for the same reason `debug` does: the
 # tab, the folder pre-trust, the keystroke-free delivery handshake, the delivery VERIFICATION, the
 # worker singleton and the pane/activity records are one contract with one implementation. A
 # revive that re-implemented any of them would be a second launch stack with no tests.
@@ -3013,10 +3034,15 @@ def _resume_facts(home, iid, session_id, worktree, note):
 
 
 def _resume_launch(cfg, repo, home, pane, iid, session_id, worktree):
-    """Run the revive through the SAME launch shim every other session uses. Returns
-    ``(rc, stdout, stderr, spawned)``; never raises. Mirrors _debugger_shim_run's contract."""
+    """Run the revive through the SAME launcher every other session uses. Returns
+    ``(rc, stdout, stderr, spawned)``; never raises. Mirrors _debugger_shim_run's contract.
+
+    This is the FOURTH spawner, and it did not exist when the adoption plan inventoried three
+    (#298 added it after that audit). It moved onto the wrapper in the same wave for exactly the
+    reason the plan gave for the other two: a spawn path left behind calls a launcher that is no
+    longer there, and this one is the operator's own recovery verb."""
     models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
-    script = os.environ.get("SL_LAUNCH_SESSION") or os.path.join(_HERE, "launch-session.sh")
+    script = _launcher()
     is_worker = iid.startswith("i")
     env = {**os.environ,
            "SL_RUN_ROOT": home, "SL_PANE": pane, "SL_REPO": os.path.abspath(repo),
@@ -3027,7 +3053,7 @@ def _resume_launch(cfg, repo, home, pane, iid, session_id, worktree):
            "SL_MODEL": str((models.get("worker") if is_worker else models.get("debugger"))
                            or ("" if is_worker else "opus[1m]")),
            "SL_EFFORT": "",
-           # THE seam: launch-session.sh passes this straight through as `--resume <id>` instead of
+           # THE seam: the launcher passes this straight through as `--resume <id>` instead of
            # minting a fresh `--session-id`. Without it the launch is an ordinary cold start.
            "SL_RESUME_SESSION_ID": session_id,
            "SL_LAUNCH_VERIFY_SECONDS": "30",     # pinned, exactly as _debugger_shim_run pins it
@@ -3078,8 +3104,10 @@ def cmd_resume(args):
     """Re-enter lane <id>'s recorded session after an interruption, with a re-orientation preamble.
 
     Refuses — launching nothing, writing nothing — when the lane has no recorded session id (it
-    predates #298, or never launched), when a LIVE worker still holds the lane, or when no cmux
-    pane resolves. ``--check`` is the read-only preflight."""
+    predates #298, or never launched), or when a LIVE worker still holds the lane. It used to
+    refuse on "no cmux pane resolves" too; issue #308 moved the launch onto the session host, which
+    is asked for a workspace rather than told which pane to open a tab in. ``--check`` is the
+    read-only preflight."""
     cfg = _load_config(args.repo)
     home = str(config_lib.state_home(cfg))
     state_dir = os.path.join(home, "state")
@@ -3093,7 +3121,7 @@ def cmd_resume(args):
 
     iid = (args.id or "").strip()
     # Shape-checked BEFORE the id reaches a path join or the shell: the same fail-closed contract
-    # launch-session.sh applies to its own argument, applied here so a bad id is refused before a
+    # the launcher applies to its own argument, applied here so a bad id is refused before a
     # byte is written rather than deep inside the launcher.
     if not _LANE_ID_RE.match(iid):
         return refuse("'%s' is not a lane id — expected i<N> (an issue worker) or d<N> "
@@ -3131,21 +3159,16 @@ def cmd_resume(args):
         return refuse("%s has no working directory at %s — its worktree is gone, so there is "
                       "nothing to resume into." % (iid, worktree), session_id=session_id)
 
-    # Resolved BEFORE --check answers: a preflight that says "resumable" and then fails on a
-    # missing pane is a preflight that does not fly the flight.
-    pane = _watchdog_pane(state_dir)
+    # NO PANE GATE (issue #308), same reason as `debug` above: the launcher asks the session host
+    # for a workspace, so a revive needs no anchor to be born in. It used to gate `--check` too,
+    # which meant `resumable` answered a cmux question about a launch that no longer asks one.
     if getattr(args, "check", False):
         # Returns here, ABOVE the debugger lock: --check writes nothing anywhere, and taking a
         # lock is a write (cmd_debug's --check returns above its lock for the same reason).
         _emit_resume(args, {"ok": True, "verb": "resume-check", "id": iid,
-                            "session_id": session_id, "resumable": bool(pane),
-                            "worktree": worktree,
-                            "error": None if pane else "no cmux pane resolves for this loop"})
+                            "session_id": session_id, "resumable": True,
+                            "worktree": worktree, "error": None})
         return 0
-    if not pane:
-        return refuse("no cmux pane resolves for this loop (no $SL_PANE, no recorded runner "
-                      "anchor, not inside cmux) — the revived session's tab has nowhere to be "
-                      "born", session_id=session_id)
 
     # A DEBUGGER lane answers to a second singleton: never two debuggers on one patient, whichever
     # ids they carry (the rule `superlooper debug` enforces). Reviving d3 while d7 is live would
@@ -3177,7 +3200,7 @@ def cmd_resume(args):
         note = _debug_bounded(getattr(args, "note", None), _DEBUG_NOTE_MAX, "note")
         facts = _resume_facts(home, iid, session_id, worktree, note)
         # A SEPARATE file from the lane's own brief, never over it: the runner's crash-recovery
-        # relaunch re-runs launch-session.sh without rebuilding the brief, so a preamble written to
+        # relaunch re-runs the launcher without rebuilding the brief, so a preamble written to
         # briefs/<id>.md would later open a brand-new, empty session on "your conversation above
         # survived intact" with no work instruction anywhere (fresh-agent review P0-1). Both
         # launchers select this file, and only when SL_RESUME is set.
@@ -3192,13 +3215,14 @@ def cmd_resume(args):
             return refuse("could not write the re-orientation preamble: %s" % e,
                           session_id=session_id)
 
-        rc, out, err, spawned = _resume_launch(cfg, args.repo, home, pane, iid, session_id,
+        rc, out, err, spawned = _resume_launch(cfg, args.repo, home, _watchdog_pane(state_dir),
+                                               iid, session_id,
                                                worktree)
     finally:
         if debug_lock:
             _watchdog_release_lock(debug_lock)
     # Remove the preamble only where it PROVABLY reached nobody: `not spawned` (the exec itself
-    # failed, as in cmd_debug), or rc=2, which launch-session.sh returns exactly when no worker
+    # failed, as in cmd_debug), or rc=2, which the launcher returns exactly when no worker
     # started within the verify window — and start-session.sh stamps its start sentinel BEFORE it
     # reads the brief, so a missing sentinel proves the brief was never read WITHIN THAT WINDOW.
     # The remainder — a straggler shell that boots after the window, stamps late and then reads —

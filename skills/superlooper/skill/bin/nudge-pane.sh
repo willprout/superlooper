@@ -46,7 +46,7 @@ CMUX="${SL_CMUX:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
 # (default = the CALLER's $CMUX_WORKSPACE_ID), so even a globally-unique UUID surface living in a
 # DIFFERENT workspace than the caller resolves as "not found" without it — which is why every
 # send/read failed and all 156/156 doorbell rings fail-closed-DEFERRED in run-20260625-1857.
-# launch-session.sh records state/panes/<id>.ws per session. If the file is missing we omit
+# the launcher records state/panes/<id>.ws per session. If the file is missing we omit
 # --workspace (graceful: the UUID may still resolve when caller and target share a workspace).
 WS_FILE="$SL_RUN_ROOT/state/panes/$ID.ws"
 WS_ARGS=()

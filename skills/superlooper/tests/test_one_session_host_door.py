@@ -56,10 +56,28 @@ _THE_DOOR = "skills/superlooper/skill/lib/session_host.py"
 # Every script allowed to reach the session host, and why. There is one, and adding a second is a
 # decision a human has to make in review — which is the whole mechanism.
 _ALLOWED = {
+    "skills/superlooper/tests/fakes/fake-sessionhost":
+        "A STAND-IN FOR the host, not a second caller of it. The offline simulation needs something "
+        "on the other end of the doorway that speaks the real envelope, and a fake that spoke a "
+        "friendlier dialect would prove nothing about the wrapper. It is exempt for the same reason "
+        "the wrapper's own tests are — it must spell the verbs it answers — and it is listed here "
+        "rather than pattern-exempted so that adding a SECOND such fake is still a decision a human "
+        "makes in review.",
     _THE_DOOR:
         "THE DOORWAY. The five-verb wrapper (spawn/send/state/exit/kill) where every distrust rule "
         "is enforced once: --wait always, transcript-side delivery proof, process-fact liveness, "
         "verify-or-teardown, names-not-ids. Swapping the host is a rewrite of this file alone.",
+    "skills/superlooper/skill/vendor/herdr/herdr-agent-state.sh":
+        "NOT OURS — the host's own state-report hook asset, carried byte-for-byte from the pinned "
+        "release (issue #307; checksum pinned in skill/lib/herdr_hook.py, procedure in that "
+        "directory's README). It does reach the control socket, and that is the vendor's design: "
+        "it is how an agent tells its host which session id to `--resume` after a crash. It is "
+        "listed here rather than rewritten because the issue's boundary is explicit — carry the "
+        "invocation, never fork the script — and because a fork would be OUR code speaking the "
+        "host's protocol, which is exactly what this fence exists to prevent. Nothing in the "
+        "engine calls it: Claude Code does, from the per-worker settings file the launcher writes. "
+        "A host swap deletes this file and the settings composer with it, so the swap stays "
+        "bounded; the distrust rules are untouched because this asset drives no verb.",
 }
 
 _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"}
@@ -466,6 +484,6 @@ def test_the_engines_entry_points_are_on_the_scanned_surface():
     scanned = {rel for rel, _kind_, _text in _surface()}
     for rel in ("skills/superlooper/skill/bin/superlooper",
                 "skills/superlooper/skill/bin/runner.py",
-                "skills/superlooper/skill/bin/launch-session.sh",
+                "skills/superlooper/skill/bin/launch-session.py",
                 "dashboard/bin/command-center"):
         assert rel in scanned, "%s must be scanned (it is exactly where a second door would go)" % rel

@@ -1,7 +1,7 @@
 """runner.py — the deterministic ~15s tick shell. Everything decision-shaped lives in
 actions.decide (tested in test_actions.py); these tests pin what the SHELL must guarantee:
 
-  * the env contract launch-session.sh depends on (SL_RUN_ROOT/SL_REPO/SL_PANE/SL_DEV_BRANCH/
+  * the env contract launch-session.py depends on (SL_RUN_ROOT/SL_REPO/SL_PANE/SL_DEV_BRANCH/
     SL_MODEL/SL_EFFORT/SL_AGENT) on every worker launch, plus the per-issue model/effort
     override (label > config > default; durable across a cold restart);
   * executor mechanics: ordered gh mutations, loopstate stamps, marker hygiene, fail-and-retry
@@ -76,10 +76,44 @@ def rig(tmp_path, monkeypatch):
 
     calls = []
     rc_queue = []
+    teardowns = []
 
     def run_script(args, env=None, timeout=None):
         calls.append({"args": [str(x) for x in args], "env": dict(env or {})})
         return rc_queue.pop(0) if rc_queue else 0
+
+    class _FakeSessionHost:
+        """The five-verb doorway, as the runner uses it (issue #308): ending a lane's session.
+
+        Recorded into the SAME `calls` list as the scripts, because half of what these tests pin
+        is ORDER — the session must end before the worktree is pruned, and before a relaunch. It
+        also lands in `teardowns` so a test can assert WHICH verb ran: `exit` closes a session it
+        can name as finished, `kill` is the escalation for one that is still live, and the runner
+        has always ended a recorded session whichever it was.
+        """
+
+        def __init__(self):
+            self.on_close = None            # a test hook: what the close DOES to the world
+            self.live = True                # a finished-but-alive session refuses `exit`
+
+        def _record(self, verb, session):
+            calls.append({"args": ["session-host", "end-session", verb,
+                                   session.workspace or "", session.pane or ""], "env": {}})
+            teardowns.append((verb, session.workspace, session.pane))
+            if self.on_close is not None:
+                self.on_close(session)
+
+        def exit(self, session):
+            if self.live:
+                raise runner_mod.session_host.TeardownRefused("still live")
+            self._record("exit", session)
+            return runner_mod.session_host.Teardown(closed=True)
+
+        def kill(self, session):
+            self._record("kill", session)
+            return runner_mod.session_host.Teardown(closed=True, signalled=["term"])
+
+    host = _FakeSessionHost()
 
     r = runner_mod.Runner(
         repo=str(repo), config=make_config(), state_home=str(home), pane="pane-1",
@@ -88,8 +122,12 @@ def rig(tmp_path, monkeypatch):
     # Healthy launch anchor by default (mirrors the healthy stub usage/run_script above): the real
     # probe would shell out to cmux, which the suite neutralizes — anchor tests override this.
     r._anchor_status = lambda: {"ok": True, "reason": ""}
-    return type("Rig", (), {"r": r, "calls": calls, "rc_queue": rc_queue,
-                            "home": home, "repo": repo, "fixdir": fixdir})
+    # The doorway is injected for the same reason run_script is: no test may reach a real session
+    # host, whose verbs CREATE and CLOSE windows (conftest's fail-closed default would make every
+    # teardown a silent no-op instead).
+    r._session_host = lambda: host
+    return type("Rig", (), {"r": r, "calls": calls, "rc_queue": rc_queue, "teardowns": teardowns,
+                            "host": host, "home": home, "repo": repo, "fixdir": fixdir})
 
 
 def mutations(rig):
@@ -528,7 +566,7 @@ def test_launch_env_contract_and_registration(rig):
     out = rig.r._execute(_launch_action(), NOW)
     assert out == "ok"
     call = rig.calls[-1]
-    assert call["args"][0].endswith("launch-session.sh") and call["args"][1] == "i101"
+    assert call["args"][0].endswith("launch-session.py") and call["args"][1] == "i101"
     env = call["env"]
     assert env["SL_RUN_ROOT"] == str(rig.home)
     assert env["SL_REPO"] == str(rig.repo)
@@ -584,7 +622,7 @@ def test_launch_env_carries_explicit_codex_agent_without_changing_protocol(rig):
     out = rig.r._execute(_launch_action(), NOW)
     assert out == "ok"
     call = rig.calls[-1]
-    assert call["args"][0].endswith("launch-session.sh") and call["args"][1] == "i101"
+    assert call["args"][0].endswith("launch-session.py") and call["args"][1] == "i101"
     assert call["env"]["SL_AGENT"] == "codex"
     assert call["env"]["SL_MODEL"] == ""
     assert call["env"]["SL_EFFORT"] == ""
@@ -601,7 +639,7 @@ def test_codex_usage_is_deferred_and_does_not_call_claude_usage(rig):
 
     rig.r.tick(now=NOW)
 
-    assert any(c["args"][0].endswith("launch-session.sh") and c["args"][1] == "i101"
+    assert any(c["args"][0].endswith("launch-session.py") and c["args"][1] == "i101"
                for c in rig.calls)
     usage = rig.r.usage_view()
     assert usage["auth_status"] == "ok"
@@ -843,12 +881,12 @@ def test_channel_fault_launch_charges_no_per_issue_cap(rig):
 # --------------------------- launch anchor liveness (#24) ---------------------------
 
 def test_missing_base_branch_launch_records_the_cause_and_skips_the_streak(rig):
-    # issue #28: launch-session.sh exits 3 when the worktree base branch is missing. The runner must
+    # issue #28: launch-session.py exits 3 when the worktree base branch is missing. The runner must
     # stamp launch_error="base_missing" (so the park memo names the branch) and must NOT feed this to
     # the systemic-anchor streak — a missing base is a per-repo config fault, not a dead cmux anchor.
     rig.r.tick(now=NOW)
     rig.calls.clear()
-    rig.rc_queue.append(3)                             # launch-session.sh: worktree base missing
+    rig.rc_queue.append(3)                             # launch-session.py: worktree base missing
     out = rig.r._execute(_launch_action(), NOW)
     assert out != "ok"
     ist = issue_state(rig, "i101")
@@ -993,8 +1031,8 @@ def test_tick_holds_launches_and_alerts_when_the_anchor_is_gone(rig):
     assert alert["reasons"] == ["launch_anchor_down"]
     assert issue_state(rig, "i101") is None            # never launched -> no loopstate stamp
     assert len(mutations(rig)) == before               # agent-ready never moved to in-progress
-    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
-    assert launches == []                              # launch-session.sh never even invoked
+    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.py")]
+    assert launches == []                              # launch-session.py never even invoked
 
 
 def test_tick_launches_normally_when_the_anchor_is_healthy(rig):
@@ -1105,7 +1143,7 @@ def test_a_failed_canary_via_base_missing_charges_no_cap_and_re_spaces_the_clock
     rig.r._launch_fail_ids = {"i101", "i102"}
     rig.r._launch_fail_at = NOW - 500
     rig.calls.clear()
-    rig.rc_queue.append(3)                             # launch-session.sh: worktree base missing
+    rig.rc_queue.append(3)                             # launch-session.py: worktree base missing
     out = rig.r._execute(dict(_launch_action(), canary=True), NOW)
     assert out != "ok"
     assert issue_state(rig, "i101")["launch_failures"] == 1     # NO per-issue cap charged to a probe
@@ -1126,8 +1164,8 @@ def test_a_canary_whose_brief_fails_still_re_spaces_the_retry_clock(rig, monkeyp
     out = rig.r._execute(dict(_launch_action(), canary=True), NOW)
     assert out.startswith("brief failed")
     assert rig.r._launch_fail_at == NOW                         # clock re-spaced despite the brief error
-    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
-    assert launches == []                                       # never even reached launch-session.sh
+    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.py")]
+    assert launches == []                                       # never even reached launch-session.py
 
 
 def test_launch_recovered_executor_is_wired_and_returns_its_reason(rig):
@@ -1143,7 +1181,7 @@ def test_systemic_hold_re_arms_via_canary_end_to_end(rig):
     # launching in priority order.
     # Soft affinity so the resume is a clean parallel launch, not an affinity-serialized dribble.
     rig.r.config["affinity"] = "soft"
-    launches = lambda: [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
+    launches = lambda: [c for c in rig.calls if c["args"][0].endswith("launch-session.py")]
 
     # ---- trip: two DISTINCT issues fail delivery back-to-back (the breaker's own signal) ----
     rig.r._poll_github(NOW)                            # populate the queue WITHOUT auto-launching
@@ -1158,7 +1196,7 @@ def test_systemic_hold_re_arms_via_canary_end_to_end(rig):
     # ---- hold: a tick sees the streak, alerts once, holds every launch, parks nothing ----
     rig.calls.clear()
     rig.r.tick(now=NOW + 15)                           # interval (300s) not elapsed -> no canary
-    assert launches() == []                            # held: launch-session.sh not invoked
+    assert launches() == []                            # held: launch-session.py not invoked
     alert = json.loads((rig.home / "state" / "ALERT").read_text())
     assert alert["reasons"] == ["launch_systemic_failure"]
     assert [i for i in _all_issue_states(rig).values() if i.get("status") == "parked"] == []
@@ -1765,7 +1803,7 @@ def test_recover_exited_relaunches(rig):
     seed_issue(rig, "i5", status="running", branch="sl/i5-x")
     out = rig.r._execute({"act": "recover", "id": "i5", "tier": "exited"}, NOW)
     assert out == "ok"
-    assert rig.calls[-1]["args"][0].endswith("launch-session.sh")
+    assert rig.calls[-1]["args"][0].endswith("launch-session.py")
     assert rig.calls[-1]["args"][1] == "i5"
     assert issue_state(rig, "i5")["status"] == "running"
 
@@ -2380,7 +2418,8 @@ def test_resolve_conflict_launches_in_the_prs_own_branch(rig):
     # D4: the preserve-path resolver also relaunches into the id's own worktree while the finished-
     # but-alive prior session holds worker.<id>.lock — it must close/free it first (else infinite
     # retry). Seed a stale session + lock to assert the close happens before the relaunch.
-    (rig.home / "state" / "panes" / "i123").write_text("PRESERVE-OLD-SURFACE")
+    (rig.home / "state" / "panes" / "i123").write_text("PRESERVE-OLD-PANE")
+    (rig.home / "state" / "panes" / "i123.ws").write_text("PRESERVE-OLD-WS")
     (rig.home / "state" / "worker.i123.lock").write_text("7777")
     rig.calls.clear()
     out = rig.r._execute({"act": "resolve_conflict", "id": "i123", "num": 123, "pr": 555}, NOW)
@@ -2392,9 +2431,9 @@ def test_resolve_conflict_launches_in_the_prs_own_branch(rig):
     assert runner_mod.gate.pinned_review_marker() in b
     assert "$(" not in b, "the conflict brief tells the worker to post a substitution"
     assert "force" not in [w for w in b.lower().split() if w == "force"] or "never force" in b.lower()
-    close_idx = next((i for i, c in enumerate(rig.calls) if "close-surface" in c["args"]), None)
+    close_idx = next((i for i, c in enumerate(rig.calls) if "end-session" in c["args"]), None)
     launch_idx = next((i for i, c in enumerate(rig.calls)
-                       if c["args"][0].endswith("launch-session.sh") and c["args"][1] == "i123"), None)
+                       if c["args"][0].endswith("launch-session.py") and c["args"][1] == "i123"), None)
     assert close_idx is not None and launch_idx is not None and close_idx < launch_idx
     assert not (rig.home / "state" / "worker.i123.lock").exists()     # singleton freed for the relaunch
     ist = issue_state(rig, "i123")
@@ -2582,7 +2621,7 @@ def test_reapprove_clears_stale_interview_mail_and_ack_but_keeps_receipts(rig):
     # episode-1 marker still on the thread, the re-run would close without EVER getting its own
     # interview: the exact #215 incident, one episode removed. Reapprove must clear pending mail
     # (and the stale ack, cheap symmetry) while receipts — the history of what WAS delivered —
-    # stay, mirroring launch-session.sh's own rule.
+    # stay, mirroring launch-session.py's own rule.
     seed_issue(rig, "i7", status="parked", type="investigate", branch="sl/i7-x",
                exit_asks=2, exit_nonce="exit-9")
     mail_dir = rig.home / "state" / "mail"
@@ -2814,7 +2853,7 @@ def test_unknown_action_is_journaled_not_fatal(rig):
 
 def test_reapprove_executor_zeroes_counters_rereleases_and_journals_the_old_ones(rig):
     """A fresh agent-ready on a parked issue is a fresh cap: every attempt counter zeroes (INCLUDING
-    launches — launch-session.sh derives retries from it, so a non-zero launches would restore the
+    launches — launch-session.py derives retries from it, so a non-zero launches would restore the
     retry count on the next launch and re-park at cap), status returns to ready, and the OLD
     counters are journaled so the issue's real prior cost is never lost."""
     seed_issue(rig, "i5", status="parked", launches=3, retries=2, conflicts=1,
@@ -2869,7 +2908,7 @@ def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(ri
 # ---------------- re-approval rebuilds on a genuinely FRESH branch (issue #177) -------------------
 # The reclaim/tidy docstrings justified pruning a parked lane's worktree with "re-approval rebuilds
 # from the issue on a fresh branch". It was FALSE: the reset never touched `branch`, _launch_branch
-# prefers the stamp, and launch-session.sh's fallback re-ATTACHES the existing branch — so the
+# prefers the stamp, and launch-session.py's fallback re-ATTACHES the existing branch — so the
 # "clean slate" resumed on the parked episode's commits, its still-open PR was rediscovered by
 # pr_for_branch, and `gh pr create` would refuse a second PR on the same head.
 
@@ -3364,7 +3403,7 @@ def test_display_probe_is_read_only_pmset_systemstate():
 
 def test_tick_holds_launches_while_the_display_sleeps(rig):
     # End to end at the shell (mirror of the dead-anchor tick test): a tick with launch demand whose
-    # per-tick display probe reads ASLEEP holds every launch — launch-session.sh is never even
+    # per-tick display probe reads ASLEEP holds every launch — launch-session.py is never even
     # invoked, no tab is created, agent-ready is never moved, and NO alert is raised (a sleeping
     # display is normal, not a fault). The held queue resumes automatically when the probe reads awake.
     rig.r._display_asleep = lambda: True
@@ -3373,8 +3412,8 @@ def test_tick_holds_launches_while_the_display_sleeps(rig):
     assert not (rig.home / "state" / "ALERT").exists()     # a sleeping display raises no alert
     assert issue_state(rig, "i101") is None                # never launched -> no loopstate stamp
     assert len(mutations(rig)) == before                   # agent-ready never moved to in-progress
-    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
-    assert launches == []                                  # launch-session.sh never even invoked
+    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.py")]
+    assert launches == []                                  # launch-session.py never even invoked
 
 
 # --------------------------- self-pane auto-detection (owner request 2026-07-06) -----------------
@@ -3823,10 +3862,10 @@ def test_close_stale_session_frees_the_singleton_lock(rig):
 
     rig.r._close_stale_session("i3")
 
-    closes = [c for c in rig.calls if "close-surface" in c["args"]]
-    assert closes, "expected a cmux close-surface call for the stale pane"
+    closes = [c for c in rig.calls if "end-session" in c["args"]]
+    assert closes, "expected the stale session to be ended through the doorway"
     assert "SURFACE-UUID-3" in closes[0]["args"]
-    assert "--workspace" in closes[0]["args"] and "WS-UUID-3" in closes[0]["args"]
+    assert "WS-UUID-3" in closes[0]["args"], "the workspace is what a teardown closes"
     assert not (rig.home / "state" / "panes" / "i3").exists()
     assert not (rig.home / "state" / "panes" / "i3.ws").exists()
     assert not (rig.home / "state" / "worker.i3.lock").exists()       # lock freed for the relaunch
@@ -3835,7 +3874,7 @@ def test_close_stale_session_frees_the_singleton_lock(rig):
 def test_close_stale_session_is_a_noop_without_a_recorded_pane(rig):
     """A first launch (no prior pane) must neither attempt a close nor error."""
     rig.r._close_stale_session("i9")
-    assert not [c for c in rig.calls if "close-surface" in c["args"]]
+    assert not [c for c in rig.calls if "end-session" in c["args"]]
 
 
 # ------------------- issue #149: ONE ORDERED TEARDOWN (the D14 family) -------------------
@@ -3970,13 +4009,9 @@ def test_a_failed_removal_is_not_reported_as_a_live_worker(rig, monkeypatch):
 
 
 def test_teardown_closes_the_pane_before_it_prunes(rig, monkeypatch):
-    """The ORDER is the fix, not the individual steps: close-surface must precede the prune."""
+    """The ORDER is the fix, not the individual steps: the session must END before the prune."""
     order = []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            order.append("close")
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: order.append("close")
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: order.append("prune") or True)
     _teardown_rig(rig, "i3")
@@ -4023,7 +4058,7 @@ def test_teardown_ignores_an_unreadable_lock_pid(rig, monkeypatch):
 
 
 def test_teardown_waits_for_a_worker_that_dies_after_the_close(rig, monkeypatch):
-    """The realistic shape: close-surface returns, and the CLI takes a moment to actually go. The
+    """The realistic shape: the teardown returns, and the CLI takes a moment to actually go. The
     bounded wait must OBSERVE that exit rather than race it."""
     monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 5)
     monkeypatch.setattr(runner_mod, "WORKER_EXIT_POLL", 0.01)
@@ -4056,11 +4091,7 @@ def test_merge_closes_the_pane_before_reclaiming_the_worktree(rig, monkeypatch):
     """The lane that just merged is the D14 hot path: its worker is finished-but-alive at the
     prompt when the runner reclaims the worktree."""
     order = []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            order.append("close")
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: order.append("close")
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: order.append("prune") or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
@@ -4319,11 +4350,7 @@ def test_resume_at_the_gate_clears_the_deferral_ladder_it_did_not_charge(rig, mo
 
 def test_absorb_merged_closes_the_pane_before_reclaiming(rig, monkeypatch):
     order = []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            order.append("close")
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: order.append("close")
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: order.append("prune") or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
@@ -4343,11 +4370,7 @@ def test_absorb_merged_closes_the_pane_before_reclaiming(rig, monkeypatch):
 
 def _no_close_no_prune(rig, monkeypatch):
     closed, pruned = [], []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            closed.append(1)
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: closed.append(1)
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: pruned.append(str(path)) or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
@@ -4394,11 +4417,7 @@ def test_merge_auto_closes_by_default(rig, monkeypatch):
     """The shipped default (auto_close_merged_windows absent -> True) still closes then prunes a
     landed lane — point 1 of the ruling ALLOWS auto-close for merged-and-landed."""
     order = []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            order.append("close")
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: order.append("close")
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: order.append("prune") or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
@@ -4417,16 +4436,12 @@ def test_merge_auto_closes_by_default(rig, monkeypatch):
 # whether the session ends; the worktree knob decides only whether the checkout is pruned.
 
 def _close_but_keep_checkout(rig, monkeypatch, close_kills=True):
-    """Prune gated off, window knob at its default. The worker is ALIVE until close-surface kills
-    its tab — the #178 case is a builder still BUILDING, and the teardown must OBSERVE it go rather
-    than assume it. `close_kills=False` models the close that did not: cmux returned but the process
-    lived (a stale surface id, a vanished workspace)."""
+    """Prune gated off, window knob at its default. The worker is ALIVE until the teardown ends
+    its session — the #178 case is a builder still BUILDING, and the teardown must OBSERVE it go
+    rather than assume it. `close_kills=False` models the close that did not: the host answered but
+    the process lived (a stale handle, a workspace that had already gone)."""
     closed, pruned = [], []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            closed.append(1)
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: closed.append(1)
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: pruned.append(str(path)) or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: not (closed and close_kills))
@@ -4698,7 +4713,7 @@ def test_reclaim_terminal_worktrees_routes_through_the_one_teardown(rig, monkeyp
     _teardown_rig(rig, "i7")
 
     rig.r._reclaim_terminal_worktrees(loopstate.load(str(rig.home / "state" / "issues.json")))
-    assert [c for c in rig.calls if "close-surface" in c["args"]], "expected the pane to be closed"
+    assert [c for c in rig.calls if "end-session" in c["args"]], "expected the session to be ended"
     assert not (rig.home / "state" / "panes" / "i7").exists()
     assert not (rig.home / "state" / "worker.i7.lock").exists()
 
@@ -4763,7 +4778,7 @@ def test_the_drain_keeps_waiting_on_an_unknown_lane(rig, monkeypatch):
 
 
 def test_regenerate_aborts_untouched_rather_than_rebuild_on_a_stale_worktree(rig, monkeypatch):
-    """P0: launch-session.sh only creates the worktree `if [ ! -d "$WT" ]`, so a surviving stale
+    """P0: launch-session.py only creates the worktree `if [ ! -d "$WT" ]`, so a surviving stale
     worktree is not a failed relaunch — it is a SILENT reuse. If regenerate advanced its state
     after a declined prune, the rebuild would run on the OLD conflicted branch while its brief
     named the new one, pushing commits onto a superseded PR. So: touch nothing, retry next tick."""
@@ -4826,22 +4841,23 @@ def test_reclaim_never_stalls_the_tick_waiting_on_a_live_worker(rig, monkeypatch
 
 
 def test_launch_closes_a_stale_session_before_relaunching(rig):
-    """End-to-end: _exec_launch closes the id's stale pane BEFORE invoking launch-session.sh, and
+    """End-to-end: _exec_launch closes the id's stale pane BEFORE invoking launch-session.py, and
     clears the stale singleton lock — so a conflict-regenerate / retry of an id whose old session is
     still alive can actually deliver."""
     rig.r.tick(now=NOW)                                  # i101 lands in the parsed view
-    (rig.home / "state" / "panes" / "i101").write_text("OLD-SURFACE")
+    (rig.home / "state" / "panes" / "i101").write_text("OLD-PANE")
+    (rig.home / "state" / "panes" / "i101.ws").write_text("OLD-WS")
     (rig.home / "state" / "worker.i101.lock").write_text("9999")
     rig.calls.clear()
 
     out = rig.r._execute(_launch_action(), NOW)
     assert out == "ok"
-    close_idx = next((i for i, c in enumerate(rig.calls) if "close-surface" in c["args"]), None)
+    close_idx = next((i for i, c in enumerate(rig.calls) if "end-session" in c["args"]), None)
     launch_idx = next((i for i, c in enumerate(rig.calls)
-                       if c["args"][0].endswith("launch-session.sh")), None)
+                       if c["args"][0].endswith("launch-session.py")), None)
     assert close_idx is not None and launch_idx is not None
     assert close_idx < launch_idx                        # close the old session BEFORE relaunching
-    assert "OLD-SURFACE" in rig.calls[close_idx]["args"]
+    assert "OLD-WS" in rig.calls[close_idx]["args"]
     assert not (rig.home / "state" / "worker.i101.lock").exists()     # freed before the new start-session
 
 
@@ -5641,7 +5657,7 @@ def test_drain_guards_a_parked_lane_but_still_reclaims_a_merged_one(rig):
 # ============ the one launch-eligibility gate, end to end (issue #150 / D8) ============
 # Fixture i103 declares `blocked-by: #101, #102` in its Loop metadata and neither is closed, so no
 # session may start for it BY ANY PATH. These drive the real Runner (real decide, real executors,
-# recording run_script) and assert on launch-session.sh itself — the thing that starts a session —
+# recording run_script) and assert on launch-session.py itself — the thing that starts a session —
 # rather than on decide's action list.
 
 def _blocked_and_exited(rig, now):
@@ -5654,7 +5670,7 @@ def _blocked_and_exited(rig, now):
 
 def _launches_of(rig, iid):
     return [c for c in rig.calls
-            if c["args"][0].endswith("launch-session.sh") and iid in c["args"]]
+            if c["args"][0].endswith("launch-session.py") and iid in c["args"]]
 
 
 def test_crash_recovery_never_launches_a_session_past_an_open_blocker(rig):
@@ -6190,7 +6206,7 @@ def test_a_failed_launch_journals_the_dead_anchor_not_a_bare_code(rig):
 
 
 def test_rc1_and_rc2_launch_failures_journal_different_reasons(rig):
-    """The distinction launch-session.sh draws and the journal used to flatten to
+    """The distinction launch-session.py draws and the journal used to flatten to
     'delivery not verified'."""
     rig.r.tick(now=NOW)
     seen = {}
@@ -6521,7 +6537,7 @@ def test_an_approved_issue_with_no_type_label_is_journaled_with_its_fix(rig):
     assert "type:build" in recs[0]["outcome"] and "type:investigate" in recs[0]["outcome"]
     # ...and it is genuinely not launched
     assert [c for c in rig.calls
-            if c["args"][0].endswith("launch-session.sh") and "i104" in c["args"]] == []
+            if c["args"][0].endswith("launch-session.py") and "i104" in c["args"]] == []
 
 
 def test_the_refusal_is_stamped_in_loopstate_and_not_re_journaled_every_tick(rig):
@@ -6594,7 +6610,56 @@ def test_github_being_unreachable_holds_rather_than_parking_with_a_relogin_memo(
 
 
 def test_the_worker_env_never_inherits_a_second_hand_gh_identity(rig):
-    # #299: launch-session.sh NAMES SL_EXPECT_GH_LOGIN in every worker command, so a runner started
+    # #299: launch-session.py NAMES SL_EXPECT_GH_LOGIN in every worker command, so a runner started
     # from inside a worker or debugger pane would inherit that session's value. Pinned EMPTY here so
     # the launcher always resolves the loop's identity itself rather than trusting a stale answer.
     assert rig.r._worker_env("i101")["SL_EXPECT_GH_LOGIN"] == ""
+
+
+def test_close_pane_ends_a_finished_session_with_exit_not_kill(rig):
+    """The doorway's `exit` is the positive-allowlist path for a session it can NAME as finished.
+    Only the escalation was covered before, so an unconditional `kill` would have passed — and the
+    difference matters: `kill` signals a process, `exit` closes a window whose agent already went."""
+    rig.host.live = False                                # this one reads as finished
+    (rig.home / "state" / "panes" / "i3").write_text("PANE-3")
+    (rig.home / "state" / "panes" / "i3.ws").write_text("WS-3")
+    rig.r._close_pane("i3")
+    assert [verb for verb, _ws, _pane in rig.teardowns] == ["exit"]
+
+
+def test_close_pane_escalates_to_kill_only_when_exit_refuses(rig):
+    """A worker that wrote its report and idles at the prompt reads ALIVE, so `exit` refuses it.
+    cmux's close-surface ended such a session unconditionally, so the escalation preserves the
+    behaviour rather than quietly becoming gentler."""
+    rig.host.live = True
+    (rig.home / "state" / "panes" / "i3").write_text("PANE-3")
+    (rig.home / "state" / "panes" / "i3.ws").write_text("WS-3")
+    rig.r._close_pane("i3")
+    assert [verb for verb, _ws, _pane in rig.teardowns] == ["kill"]
+
+
+def test_close_pane_refuses_to_guess_a_workspace(rig):
+    """Closing "whatever is at that pane" is how a stale handle ends someone else's window."""
+    (rig.home / "state" / "panes" / "i3").write_text("PANE-3")   # no .ws sibling
+    rig.r._close_pane("i3")
+    assert rig.teardowns == []
+
+
+def test_close_pane_never_raises_into_the_tick(rig, monkeypatch):
+    """It is reached from sweeps that run every tick; a host that cannot answer must cost a log
+    line, not the tick."""
+    def boom(session):
+        raise runner_mod.session_host.TeardownUnverified("the host stopped answering")
+    monkeypatch.setattr(rig.host, "kill", boom)
+    (rig.home / "state" / "panes" / "i3").write_text("PANE-3")
+    (rig.home / "state" / "panes" / "i3.ws").write_text("WS-3")
+    rig.r._close_pane("i3")                              # must not raise
+
+
+def test_the_runners_doorway_is_bounded_for_its_own_sweeps(rig):
+    """A teardown makes several control calls and the sweeps run every tick over every lane, so
+    the bound that matters is the tick's. The doorway's own 20s-per-call default would cost minutes
+    per lane against a host that is present but wedged."""
+    host = runner_mod.Runner._session_host(rig.r)
+    assert host._call_seconds <= runner_mod.SESSION_CALL_SECONDS
+    assert host._teardown_reads * host._teardown_pause <= 2

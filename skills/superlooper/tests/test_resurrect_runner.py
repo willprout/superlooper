@@ -172,7 +172,7 @@ def test_the_runner_id_contract_is_anchored_not_a_prefix_glob(tmp_path, rid):
     # Fresh-review P2-3: the id guard was `case $ID_IN in r[0-9]*)`, an UNANCHORED glob that accepts
     # anything trailing the first digit ("r1; touch ..." ACCEPTED). Not exploitable today ($ID only
     # reaches quoted argv, never eval/a filename), but the script's own comment claims the symmetric
-    # contract to launch-session.sh's anchored ^[ad][0-9]+$ — so make the code match the claim
+    # contract to the launcher's anchored ^d[0-9]+$ — so make the code match the claim
     # rather than rest on a downstream accident. Refuse at the door: r<N> and nothing else.
     rig = _Rig(tmp_path)
     r = rig.run("deliver", rid=rid)
