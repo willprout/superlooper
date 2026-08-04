@@ -279,3 +279,23 @@ def test_an_unreachable_session_host_is_reported_as_no_answer_not_as_a_refusal(r
     out = r.stdout + r.stderr
     assert "no answer" in out
     assert "reachable but not answering" not in out
+
+
+def test_the_status_line_never_reports_an_unreadable_job_as_simply_not_running(rig):
+    # Confirmation review: the doctor learned to tell "the service says it is not running" from
+    # "we could not tell", and this surface had the same conflation. A status line that says
+    # "not running" about a job it could not read is the exact shape that makes a dark runner look
+    # merely idle.
+    write_config(rig.repo, runner_home="login-item")
+    cli(rig, "runner-home", "--repo", str(rig.repo), "--install")
+
+    _script(rig.launchctl, 'echo "com.x = {"\necho "\tstate = not running"\necho "}"\nexit 0\n')
+    assert "not running" in cli(rig, "runner-home", "--repo", str(rig.repo)).stdout
+
+    _script(rig.launchctl, 'exit 1\n')                       # the service manager refused
+    out = cli(rig, "runner-home", "--repo", str(rig.repo)).stdout
+    assert "not running" not in out and "not loaded" in out
+
+    _script(rig.launchctl, 'echo "com.x = {"\necho "\tstate = some-future-word"\necho "}"\n')
+    out = cli(rig, "runner-home", "--repo", str(rig.repo)).stdout
+    assert "not running" not in out and "unknown" in out.lower()

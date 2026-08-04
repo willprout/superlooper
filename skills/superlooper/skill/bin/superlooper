@@ -415,8 +415,22 @@ def cmd_runner_home(args):
              "" if os.path.exists(plist) else "  (not installed — run with --install)"))
     proc = subprocess.run(runner_home.print_argv(_launchctl_bin(), uid, job_label),
                           capture_output=True, text=True, timeout=15)
-    pid = runner_home.service_pid(proc.stdout if proc.returncode == 0 else "")
-    print("  live:  %s" % ("pid %d" % pid if pid else "not running"))
+    # Same three-way answer the doctor gives, and for the same reason (confirmation review): a
+    # status line that prints "not running" about a job it could not READ is how a dark runner
+    # comes to look merely idle. Only the service's own word earns that phrase.
+    if proc.returncode != 0:
+        live = "not loaded in %s" % runner_home.domain(uid)
+    else:
+        pid = runner_home.service_pid(proc.stdout)
+        if pid:
+            live = "pid %d" % pid
+        elif runner_home.service_is_idle(proc.stdout) is True:
+            live = "not running (the job says so)"
+        else:
+            live = ("unknown — the job reported neither a pid nor a state this build recognises; "
+                    "read it with: %s"
+                    % " ".join(runner_home.print_argv("launchctl", uid, job_label)[1:]))
+    print("  live:  %s" % live)
     return 0
 
 
