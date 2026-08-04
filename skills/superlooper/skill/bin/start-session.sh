@@ -14,6 +14,15 @@ ID="${1:?usage: start-session.sh <id>}"
 : "${SL_RUN_ROOT:?}"
 export SL_ISSUE_ID="$ID"
 export SL_RUN_ROOT
+# DISARM the pane's launch handoff (issue #308). shell/launch-shim.zsh arms a one-shot function
+# named after the agent verb whenever it sees SL_ISSUE_ID + SL_RUN_ROOT + SL_START_SESSION, which
+# is how the host's typed `claude` reaches this script at all. The first two must SURVIVE (hooks
+# and the agent's own children read them); this one must not, or a nested shell inside the live
+# session — a worker typing `zsh`, a hook that spawns one — would re-arm the handoff and its next
+# `claude` would start a SECOND worker in this lane instead of the binary it asked for. The worker
+# singleton below would refuse that second worker, but silently and one step too late: it would
+# also have stamped no sentinel, which reads as a launch that never delivered.
+unset SL_START_SESSION
 mkdir -p "$SL_RUN_ROOT/state/started" "$SL_RUN_ROOT/state/exited" "$SL_RUN_ROOT/state/launch_stderr"
 
 write_exited() {  # the deterministic process-gone signal the runner recovers from (RC-DEADPANE)

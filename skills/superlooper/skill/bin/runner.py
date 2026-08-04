@@ -108,10 +108,16 @@ JOURNAL_ROTATE_SECONDS = 6 * 3600   # how often to archive the journal's stale t
                                     # then at most every 6h — cheap, and read()/status stay bounded
 MAX_POLL_CALLS = 30            # budget cap per poll cycle (poll_ship discipline): the tail of
                                # an oversized fetch list simply waits for the next cycle
-LAUNCH_TIMEOUT = 120           # launch-session.sh verifies delivery within ~30s; be generous
-# launch-session.sh's DISTINCT exit code for "the worktree base branch origin/<dev_branch> does not
+# THE launcher — the single spawn path (issue #308). The runner, the watchdog, the dashboard
+# Fixer and `superlooper resume` all drive this one program, so the exit-code contract evidence.py
+# reads has exactly one author. It is named here rather than spelled at each of the three call
+# sites below for the reason the whole issue exists: three copies of a spawn path is how the
+# watchdog and Fixer get left behind calling a launcher that no longer exists.
+LAUNCHER = "launch-session.py"
+LAUNCH_TIMEOUT = 120           # the launcher verifies delivery within ~30s; be generous
+# The launcher's DISTINCT exit code for "the worktree base branch origin/<dev_branch> does not
 # exist" (issue #28) — a per-repo config fault, kept out of the systemic-anchor streak so the park
-# memo can name the branch instead of the launch shim. Must match launch-session.sh's `exit 3`.
+# memo can name the branch instead of the launch machinery. Must match lib/launch.BASE_MISSING.
 LAUNCH_BASE_MISSING_RC = 3
 NUDGE_TIMEOUT = 60
 # The exit interview's wake ping (issue #215). On Claude the interview PAYLOAD rides the mailbox
@@ -2840,7 +2846,7 @@ class Runner:
         # D4: free any prior (finished-but-alive) session for this id before relaunching, so its
         # still-held worker singleton lock can't block this launch's delivery. No-op on a first launch.
         self._close_stale_session(iid)
-        rc = self._run_script([self._script("launch-session.sh"), iid],
+        rc = self._run_script([self._script(LAUNCHER), iid],
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             gh.set_labels(num, add=["in-progress"], remove=["agent-ready"])
@@ -3422,7 +3428,7 @@ class Runner:
             # journal — decide dedups on this stamp, so a genuinely new hold whose reason still
             # matched it never spoke.
             self._update_issue(iid, {"launch_hold_reason": None})
-            rc = self._run_script([self._script("launch-session.sh"), iid],
+            rc = self._run_script([self._script(LAUNCHER), iid],
                                   env=self._worker_env(iid),
                                   timeout=LAUNCH_TIMEOUT)
             if rc == 0:
@@ -4089,7 +4095,7 @@ class Runner:
         # The eligibility-hold episode ended when start_ok passed, not when this launch lands — clear
         # the stamp before the attempt, as _exec_launch/_exec_recover do (review P2-2, #150).
         self._update_issue(iid, {"launch_hold_reason": None})
-        rc = self._run_script([self._script("launch-session.sh"), iid],
+        rc = self._run_script([self._script(LAUNCHER), iid],
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:
             self._update_issue(iid, {"status": "running", "update_result": None,

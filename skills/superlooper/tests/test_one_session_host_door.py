@@ -466,6 +466,6 @@ def test_the_engines_entry_points_are_on_the_scanned_surface():
     scanned = {rel for rel, _kind_, _text in _surface()}
     for rel in ("skills/superlooper/skill/bin/superlooper",
                 "skills/superlooper/skill/bin/runner.py",
-                "skills/superlooper/skill/bin/launch-session.sh",
+                "skills/superlooper/skill/bin/launch-session.py",
                 "dashboard/bin/command-center"):
         assert rel in scanned, "%s must be scanned (it is exactly where a second door would go)" % rel

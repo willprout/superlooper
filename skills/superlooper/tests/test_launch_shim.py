@@ -1,23 +1,21 @@
-"""Unit tests for shell/launch-shim.zsh — the keystroke-free launch mechanism (RC6 fix).
+"""Unit tests for shell/launch-shim.zsh — the in-pane handoff that keeps the launch floor ours.
 
-The shim is sourced by ~/.zshrc in every cmux tab's shell. In the ONE tab superlooper just created
-it must self-run the dropped worker command (no `cmux send` keystrokes, so it survives display sleep
-/ lock / app-backgrounding). In EVERY other shell it must be a fast no-op so manually-opened
-terminals are never delayed. These run the real shim under zsh with planted files + a controlled
-environment.
+The shim is sourced by ~/.zshrc in every shell, including the login shell the session host spawns
+in each new pane. Its whole job (issue #308) is to arm a one-shot function named after the agent
+verb, so that when the host TYPES `claude` into the pane it runs start-session.sh — the floor, the
+brief and the real agent — instead of a bare binary with none of that.
 
-Ported verbatim from autocode's test_launch_shim.py; only the env prefix changed
-(AUTOCODE_LAUNCH_DIR -> SL_LAUNCH_DIR, AUTOCODE_SHIM_WAIT_TICKS -> SL_SHIM_WAIT_TICKS) so the
-superlooper shim coexists with autocode's under a different marker dir (plan §B.5).
+In every OTHER shell it must be an instant no-op: a hand-opened terminal, an unrelated pane, and
+the operator's own herdr window are untouched. These run the real shim under zsh with a controlled
+environment and then ask the shell what it is actually holding.
 
-Note: the display-sleep SURVIVAL itself can only be proven by a live test with the screen off (the
-shell runs as a normal child process of cmux, independent of the display) — that is the manual
-acceptance test. These cover everything else: the file/claim/wait/gate logic the shim must get right.
+(This file replaced the cmux command-file suite wholesale. That mechanism existed because cmux had
+no keystroke-free "run a command in a surface" API; the host's `agent start` types the verb itself,
+so there is no command to drop, no marker directory, and no boot race to lose.)
 """
 import os
 import shutil
 import subprocess
-import threading
 import time
 
 import pytest
@@ -26,116 +24,154 @@ HERE = os.path.dirname(__file__)
 REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 SHIM = os.path.join(REPO_ROOT, "skill", "shell", "launch-shim.zsh")
 
-pytestmark = pytest.mark.skipif(shutil.which("zsh") is None, reason="zsh required for the launch shim")
+pytestmark = pytest.mark.skipif(shutil.which("zsh") is None,
+                                reason="zsh required for the launch shim")
 
 
-def _run(launch_dir, surface_id=None, extra_env=None, source_times=1, timeout=20):
-    """Source the shim in a fresh zsh with a controlled env; return (CompletedProcess, elapsed_s)."""
-    env = {"PATH": os.environ["PATH"], "SL_LAUNCH_DIR": str(launch_dir)}
-    if surface_id is not None:
-        env["CMUX_SURFACE_ID"] = surface_id
-    if extra_env:
-        env.update(extra_env)
-    script = "; ".join([f"source '{SHIM}'"] * source_times)
+def _start_session(where, marker, executable=True):
+    """A stand-in for start-session.sh that records the id it was handed."""
+    path = where / "start-session.sh"
+    path.write_text("#!/bin/sh\nprintf '%s' \"$1\" > '" + str(marker) + "'\n")
+    path.chmod(0o755 if executable else 0o644)
+    return path
+
+
+def _run(script, env=None, timeout=20):
+    base = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/tmp")}
+    base.update(env or {})
     t0 = time.monotonic()
-    r = subprocess.run(["zsh", "-c", script], env=env, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(["zsh", "-c", script], env=base, capture_output=True, text=True,
+                       timeout=timeout)
     return r, time.monotonic() - t0
 
 
-def _cmd_file(launch_dir, surface_id, marker):
-    """Plant a per-surface command file whose command touches `marker` (proves the shim ran it)."""
-    (launch_dir / f"{surface_id}.cmd").write_text(f"touch '{marker}'")
+def _pane_env(home, start_session, iid="i308", agent="claude"):
+    return {"HERDR_PANE_ID": "w2:p1", "SL_ISSUE_ID": iid,
+            "SL_RUN_ROOT": str(home), "SL_START_SESSION": str(start_session),
+            "SL_AGENT": agent}
 
 
-def test_runs_command_for_this_surface(tmp_path):
-    d = tmp_path / "launch"; d.mkdir()
-    marker = tmp_path / "ran.S1"
-    _cmd_file(d, "S1", marker)
-    r, _ = _run(d, surface_id="S1")
+# --------------------------------------------------------------------------- the handoff
+
+def test_the_typed_agent_verb_runs_start_session(tmp_path):
+    """The whole point: the host types `claude`, and start-session.sh runs with the lane id."""
+    marker = tmp_path / "handed"
+    start = _start_session(tmp_path, marker)
+    r, _ = _run(f"source '{SHIM}'; claude", env=_pane_env(tmp_path, start))
     assert r.returncode == 0, r.stderr
-    assert marker.exists(), "shim must run the command file for its own surface"
-    assert not (d / "S1.cmd").exists(), "the command file must be claimed (consumed), not left behind"
+    assert marker.read_text() == "i308"
 
 
-def test_noop_outside_cmux(tmp_path):
-    # No CMUX_SURFACE_ID => not a cmux tab => must do nothing (and not hang).
-    d = tmp_path / "launch"; d.mkdir()
-    marker = tmp_path / "ran"
-    (d / ".cmd").write_text(f"touch '{marker}'")   # a stray file; must be ignored
-    r, elapsed = _run(d, surface_id=None)
-    assert r.returncode == 0
+def test_the_codex_verb_is_armed_for_a_codex_repo(tmp_path):
+    marker = tmp_path / "handed"
+    start = _start_session(tmp_path, marker)
+    r, _ = _run(f"source '{SHIM}'; codex",
+                env=_pane_env(tmp_path, start, iid="i42", agent="codex"))
+    assert r.returncode == 0, r.stderr
+    assert marker.read_text() == "i42"
+
+
+def test_no_agent_flag_is_composed_by_the_shim(tmp_path):
+    """The agent boundary: start-session.sh owns every claude/codex flag. The shim hands it the id
+    and nothing else, so the agent command line keeps exactly one author."""
+    log = tmp_path / "argv"
+    start = tmp_path / "start-session.sh"
+    start.write_text("#!/bin/sh\nprintf '%s' \"$*\" > '" + str(log) + "'\n")
+    start.chmod(0o755)
+    r, _ = _run(f"source '{SHIM}'; claude --model opus 'a brief'",
+                env=_pane_env(tmp_path, start))
+    assert r.returncode == 0, r.stderr
+    assert log.read_text() == "i308", "whatever the host typed, only the lane id is handed over"
+
+
+def test_the_handoff_is_one_shot(tmp_path):
+    """A second `claude` in that pane is the REAL binary, never a second worker for the lane."""
+    marker = tmp_path / "handed"
+    start = _start_session(tmp_path, marker)
+    r, _ = _run(f"source '{SHIM}'; claude; whence -w claude || echo none",
+                env=_pane_env(tmp_path, start))
+    assert r.returncode == 0, r.stderr
+    assert "claude: function" not in r.stdout
+
+
+def test_a_state_home_with_spaces_survives_the_arming(tmp_path):
+    """The body is ${(q)}-quoted, so a path with a space can neither break nor inject it."""
+    odd = tmp_path / "a dir with spaces"
+    odd.mkdir()
+    marker = odd / "handed"
+    start = _start_session(odd, marker)
+    r, _ = _run(f"source '{SHIM}'; claude", env=_pane_env(odd, start))
+    assert r.returncode == 0, r.stderr
+    assert marker.read_text() == "i308"
+
+
+# --------------------------------------------------------------------------- the no-op cases
+
+def test_noop_in_an_ordinary_shell(tmp_path):
+    """A terminal the owner opened — and the owner's own hosted window, which looks identical from
+    in here — carries none of this loop's SL_*, so nothing is armed and nothing is delayed."""
+    r, elapsed = _run(f"source '{SHIM}'; whence -w claude || echo none", env={})
+    assert r.returncode == 0, r.stderr
+    assert "claude: function" not in r.stdout
+    assert elapsed < 3, "the shim must never delay an ordinary shell"
+
+
+def test_noop_in_a_nested_shell_inside_a_live_session(tmp_path):
+    """THE disarm (issue #308). A worker's own environment keeps SL_ISSUE_ID and SL_RUN_ROOT —
+    hooks and the agent's children read them — so those two alone must never arm the handoff.
+    start-session.sh unsets SL_START_SESSION for exactly this reason: a worker typing `zsh` and
+    then `claude` must get the binary it asked for, not a second worker in its own lane."""
+    marker = tmp_path / "handed"
+    start = _start_session(tmp_path, marker)
+    env = _pane_env(tmp_path, start)
+    env.pop("SL_START_SESSION")
+    r, _ = _run(f"source '{SHIM}'; whence -w claude || echo none", env=env)
+    assert r.returncode == 0, r.stderr
+    assert "claude: function" not in r.stdout
     assert not marker.exists()
-    assert elapsed < 3, "a non-cmux shell must return immediately"
 
 
-def test_noop_when_idle_no_active(tmp_path):
-    # A normal cmux terminal opened when NO launch is in flight: no cmd file, no .active marker.
-    # Must return instantly (never delay a hand-opened terminal).
-    d = tmp_path / "launch"; d.mkdir()
-    r, elapsed = _run(d, surface_id="S2")
-    assert r.returncode == 0
-    assert elapsed < 3, "no command + no active marker must NOT wait"
+def test_start_session_disarms_the_handoff_for_its_own_children(tmp_path):
+    """The other half of the pair, asserted against the real start-session.sh: whatever the pane
+    handed it, its children must not carry the arming variable."""
+    engine = os.path.join(REPO_ROOT, "skill", "bin", "start-session.sh")
+    with open(engine) as f:
+        source = f.read()
+    assert "unset SL_START_SESSION" in source, \
+        "start-session.sh must disarm the handoff before it launches the agent"
+    assert source.index("unset SL_START_SESSION") < source.index("acquire_worker"), \
+        "the disarm runs before anything that can exit early"
 
 
-def test_stale_active_does_not_wait(tmp_path):
-    # A stale .active (an old launch long finished) must not make a fresh terminal wait.
-    d = tmp_path / "launch"; d.mkdir()
-    active = d / ".active"; active.write_text("")
-    old = time.time() - 600
-    os.utime(active, (old, old))
-    r, elapsed = _run(d, surface_id="S3", extra_env={"SL_SHIM_WAIT_TICKS": "50"})
-    assert r.returncode == 0
-    assert elapsed < 3, "a stale active marker must be ignored (no wait)"
-
-
-def test_fresh_active_waits_then_gives_up(tmp_path):
-    # A launch IS in flight (fresh .active) but no command for THIS surface ever arrives: the shim
-    # waits the bounded window, then returns. Proves the wait gate engages (and is bounded).
-    d = tmp_path / "launch"; d.mkdir()
-    (d / ".active").write_text("")
-    r, elapsed = _run(d, surface_id="S4", extra_env={"SL_SHIM_WAIT_TICKS": "5"})  # 5*0.2s = 1s
-    assert r.returncode == 0
-    assert elapsed >= 0.7, "with a fresh active marker the shim must wait for its command file"
-    assert elapsed < 6, "the wait must be bounded, not indefinite"
-
-
-def test_waits_for_late_command_then_runs_it(tmp_path):
-    # THE boot-race fix: the shell reaches the shim BEFORE launch-session writes the command file.
-    # With a fresh .active marker the shim waits, and when the file appears it runs it.
-    d = tmp_path / "launch"; d.mkdir()
-    (d / ".active").write_text("")
-    marker = tmp_path / "ran.S5"
-
-    def _late_write():
-        time.sleep(0.6)
-        _cmd_file(d, "S5", marker)
-
-    t = threading.Thread(target=_late_write); t.start()
-    try:
-        r, elapsed = _run(d, surface_id="S5", extra_env={"SL_SHIM_WAIT_TICKS": "50"})
-    finally:
-        t.join()
+def test_noop_for_an_agent_this_stack_cannot_launch(tmp_path):
+    marker = tmp_path / "handed"
+    start = _start_session(tmp_path, marker)
+    r, _ = _run(f"source '{SHIM}'; whence -w claude || echo none",
+                env=_pane_env(tmp_path, start, agent="parrot"))
     assert r.returncode == 0, r.stderr
-    assert marker.exists(), "shim must wait for a late-arriving command file and run it"
+    assert "claude: function" not in r.stdout
 
 
-def test_ignores_other_surfaces_command(tmp_path):
-    # The shim must run ONLY its own surface's command, never another tab's.
-    d = tmp_path / "launch"; d.mkdir()
-    marker = tmp_path / "ran.other"
-    _cmd_file(d, "OTHER", marker)
-    r, elapsed = _run(d, surface_id="S6")
-    assert r.returncode == 0
-    assert not marker.exists(), "must not run a different surface's command"
-    assert (d / "OTHER.cmd").exists(), "another surface's command file must be left untouched"
-    assert elapsed < 3
+def test_an_unrunnable_handoff_says_so_and_arms_nothing(tmp_path):
+    """LOUD, and deliberately unarmed. A bare agent started with no floor and no brief would look
+    alive without being this loop's session; leaving the verb unarmed means no start sentinel is
+    stamped, so the launcher refuses the delivery instead of recording a live lane."""
+    marker = tmp_path / "handed"
+    start = _start_session(tmp_path, marker, executable=False)
+    r, _ = _run(f"source '{SHIM}'; whence -w claude || echo none",
+                env=_pane_env(tmp_path, start))
+    assert r.returncode == 0, r.stderr
+    assert "claude: function" not in r.stdout
+    assert "launch handoff unavailable" in r.stderr
 
 
-def test_claim_is_idempotent_across_double_source(tmp_path):
-    # Sourcing ~/.zshrc twice (or a re-source) must not double-run the command.
-    d = tmp_path / "launch"; d.mkdir()
+def test_re_sourcing_is_idempotent(tmp_path):
+    """~/.zshrc can be sourced more than once; arming twice must still hand off exactly once."""
     count = tmp_path / "count"
-    (d / "S7.cmd").write_text(f"printf x >> '{count}'")
-    r, _ = _run(d, surface_id="S7", source_times=2)
+    start = tmp_path / "start-session.sh"
+    start.write_text("#!/bin/sh\nprintf x >> '" + str(count) + "'\n")
+    start.chmod(0o755)
+    r, _ = _run(f"source '{SHIM}'; source '{SHIM}'; claude; claude 2>/dev/null || true",
+                env=_pane_env(tmp_path, start))
     assert r.returncode == 0, r.stderr
-    assert count.read_text() == "x", "the command must run exactly once even if the shim is sourced twice"
+    assert count.read_text() == "x", "the handoff runs exactly once, however often it is armed"
