@@ -222,3 +222,92 @@ def test_the_module_renders_a_file_when_run_as_a_script(tmp_path):
     assert proc.stdout.strip() == str(out), "it prints the path it wrote, for the launcher to use"
     doc = json.loads(out.read_text())
     assert herdr_hook.carried_hook_commands(doc)
+
+
+# --------------------------------------------------------------------------- review round 1
+# Each case below is a defect a fresh reviewer found in this module's first cut. They are kept as
+# regressions because every one of them fails SILENTLY in production: a doctor that answers about
+# the wrong machine, one that accuses a clean machine, and a write that lands somewhere else.
+
+def test_a_tilde_in_the_config_dir_override_expands_against_the_given_env(monkeypatch):
+    """P1. `os.path.expanduser` reads os.environ, so `CLAUDE_CONFIG_DIR=~/.claude` in an injected
+    env resolved to the REAL operator's home — the doctor answering about a different machine than
+    the one it was handed, and a test with an isolated env reading the operator's own settings."""
+    monkeypatch.setenv("HOME", "/real/operator/home")
+    got = herdr_hook.global_settings_path({"HOME": "/fake", "CLAUDE_CONFIG_DIR": "~/.claude"})
+    assert got == "/fake/.claude/settings.json"
+    assert "/real/operator/home" not in got
+
+
+def test_a_bare_home_reference_also_expands_against_the_given_env(monkeypatch):
+    monkeypatch.setenv("HOME", "/real/operator/home")
+    assert herdr_hook.global_settings_path({"HOME": "/fake", "CLAUDE_CONFIG_DIR": "~"}) == \
+        "/fake/settings.json"
+    assert herdr_hook.global_settings_path({"HOME": "/fake"}) == "/fake/.claude/settings.json"
+
+
+@pytest.mark.parametrize("command", [
+    "bash '/x/not-herdr-agent-state.sh' session",     # a DIFFERENT script whose name contains ours
+    "echo herdr-agent-state session",                 # the stem in prose, no script at all
+    "bash '/x/herdr-agent-state.sh' --check session-report",   # not one of the action words
+    "bash '/x/herdr-agent-state.sh'",                 # the script, but not as a state report
+])
+def test_detection_does_not_accuse_a_clean_machine(command):
+    """P2. The predicate used to be a substring test, so it called all of these an installed hook —
+    and a FAIL here tells an operator to go undo something nobody ever did."""
+    doc = {"hooks": {"SessionStart": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": command}]}]}}
+    assert herdr_hook.carried_hook_commands(doc) == []
+
+
+def test_detection_still_catches_the_windows_registration():
+    """The vendor's Windows install name differs, and a machine carrying THAT is just as much a
+    machine the installer was run on — a miss would clear it wrongly."""
+    doc = {"hooks": {"SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command":
+        'powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\u\\.claude\\hooks\\herdr-agent-state.ps1" session'}]}]}}
+    assert herdr_hook.carried_hook_commands(doc)
+
+
+def test_detection_ignores_an_entry_that_is_not_a_command_hook():
+    doc = {"hooks": {"SessionStart": [{"matcher": "*", "hooks": [
+        {"type": "prompt", "command": "bash '/x/herdr-agent-state.sh' session"}]}]}}
+    assert herdr_hook.carried_hook_commands(doc) == []
+
+
+def test_detection_still_reads_an_entry_with_no_type_as_a_command():
+    """Claude Code treats a typeless entry as a command, so a doctor that skipped one would miss a
+    real registration — the worse of the two failures."""
+    doc = {"hooks": {"SessionStart": [{"matcher": "*", "hooks": [
+        {"command": "bash '/x/herdr-agent-state.sh' session"}]}]}}
+    assert herdr_hook.carried_hook_commands(doc)
+
+
+def test_write_settings_refuses_to_follow_a_planted_temp_symlink(tmp_path):
+    """P2. The temp name is predictable, so a plain open() followed a symlink another same-uid
+    process had already put there — writing a document that names a command the agent executes at
+    every session start to wherever that link pointed."""
+    script = tmp_path / "h.sh"
+    script.write_text("#!/bin/sh\n")
+    out = tmp_path / "i1.settings.json"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not clobber me\n")
+    planted = tmp_path / (".%s.tmp.%d" % (out.name, os.getpid()))
+    os.symlink(str(victim), str(planted))
+
+    with pytest.raises(herdr_hook.HookConfigError):
+        herdr_hook.write_settings(str(out), str(script))
+    assert victim.read_text() == "do not clobber me\n"
+
+
+def test_the_carried_asset_presents_no_credential_on_the_control_socket():
+    """The premise of #331, pinned so it cannot be forgotten.
+
+    The asset builds ONE request and sends it over the host's socket with no `auth` member — it is
+    stock upstream, which has no token concept. A host running the carried fence patch (#305)
+    refuses every unauthenticated connection before dispatch, and `i<N>` workers deliberately never
+    hold the token, so on a FENCED host this capture is silent. That is an owner decision (#331),
+    not something to work around here; this test exists so a future reader cannot mistake the
+    settings file's presence for proof that capture works everywhere."""
+    text = open(herdr_hook.vendored_script(home=_SKILL)).read()
+    assert '"method": "pane.report_agent_session"' in text
+    assert '"auth"' not in text and "auth=" not in text

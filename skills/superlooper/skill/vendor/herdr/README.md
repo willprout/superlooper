@@ -96,7 +96,6 @@ capture goes silent** and herdr-side revive stops working — quietly, because a
 report its id still runs perfectly.
 
 That is not a defect in either piece; it is a seam between two accepted decisions, and closing it
-is a security-posture call the owner makes, not something to work around here. Filed as a
-`needs-owner` issue rather than patched in this lane. Until it is decided, the loop's own
+is a security-posture call the owner makes, not something to work around here. Filed as **#331** (`needs-owner`) rather than patched in this lane. Until it is decided, the loop's own
 resurrection floor (#298 — the runner mints `--session-id` and relaunches with `--resume`) is
 unaffected, because it never asks herdr anything.

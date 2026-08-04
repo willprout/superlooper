@@ -34,6 +34,7 @@ vendor maintains it.
 import json
 import hashlib
 import os
+import re
 import sys
 
 # --------------------------------------------------------------------------- the pin
@@ -68,6 +69,16 @@ HOOK_TIMEOUT = 10
 # RECOGNISE a hook somebody else installed — the doctor's question is "was the installer ever run
 # on this machine", and a stale registration from an older release is just as much a yes.
 _KNOWN_ACTIONS = (HOOK_ACTION, "idle", "working", "blocked", "release")
+
+# `…/herdr-agent-state.sh <action>` at the END of a command line, with the script name anchored to
+# a path separator or an opening quote. `.ps1` is included even though this loop is macOS-only: the
+# vendor's Windows install name differs, and a machine carrying THAT registration is just as much a
+# machine the installer was run on — a miss here would clear it wrongly.
+# The boundary class carries a BACKSLASH as well as `/`: the Windows registration is
+# `-File "C:\…\herdr-agent-state.ps1" session`, and a POSIX-only separator would miss it.
+_HOOK_COMMAND_RE = re.compile(
+    r"""(?:^|[/\\'"\s])%s\.(?:sh|ps1)['"]?\s+(?:%s)$"""
+    % (re.escape(SCRIPT_NAME.rsplit(".", 1)[0]), "|".join(_KNOWN_ACTIONS)))
 
 
 class HookConfigError(Exception):
@@ -132,11 +143,17 @@ def write_settings(path, script_path):
     # tmp+rename, like every other config write in this engine: a launcher reading this file
     # concurrently must never see a half-written document, and a failed write must leave the
     # previous one intact rather than a truncated one.
+    #
+    # O_EXCL and a 0600 CREATION mode rather than open()+chmod (fresh-agent review, P2). The temp
+    # name is predictable, so a plain open() would follow a symlink another same-uid process had
+    # already planted there — writing this document, which names a command the agent executes at
+    # every session start, wherever that link pointed. O_EXCL refuses an existing path outright,
+    # and the mode is set by the CREATE, so there is no window where the file exists readable.
     tmp = os.path.join(parent, ".%s.tmp.%d" % (os.path.basename(path), os.getpid()))
     try:
-        with open(tmp, "w") as handle:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as handle:
             handle.write(body)
-        os.chmod(tmp, 0o600)          # it names a command the agent will execute at every start
         os.replace(tmp, path)
     except OSError as exc:
         try:
@@ -154,9 +171,11 @@ def vendored_script(home=None):
 
     ``home`` is the directory that holds ``vendor/`` — ONE meaning for both layouts, which is the
     point: in a checkout that is the payload's ``skill/``, and on a machine it is the installed
-    engine home (``~/.claude/skills/superlooper``), because the publish rsyncs ``skill/``'s
-    CONTENTS. Default is derived from this file, so the installed copy finds the installed asset
-    without any caller knowing which of the two it is running from.
+    engine home, because the publish rsyncs ``skill/``'s CONTENTS rather than the directory. (That
+    home is spelled in exactly one place, ``stack_doctor._installed_home``; naming it here would
+    make this a second file that resolves a path into the install tree, which
+    ``tests/test_one_publish_door.py`` rightly refuses.) Default is derived from this file, so the
+    installed copy finds the installed asset without any caller knowing which layout it is in.
     """
     if home is None:
         home = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))    # …/lib -> …
@@ -189,21 +208,42 @@ def global_settings_path(env=None):
     env = os.environ if env is None else env
     override = env.get("CLAUDE_CONFIG_DIR")
     if override:
-        return os.path.join(os.path.expanduser(override), "settings.json")
+        return os.path.join(_expand_home(override, env), "settings.json")
+    return os.path.join(_expand_home("~", env), ".claude", "settings.json")
+
+
+def _expand_home(path, env):
+    """``~`` expanded against THIS env's HOME, never the process's (fresh-agent review, P1).
+
+    ``os.path.expanduser`` reads ``os.environ``, so an injected env asking about ``~/.claude``
+    resolved to the REAL operator's home — which both answers about the wrong machine and lets a
+    test with an isolated env read the operator's own settings file. The vendor's own
+    ``expand_tilde_path`` expands from its process HOME for the same reason: the answer must be
+    about the environment being asked about.
+    """
     home = env.get("HOME") or os.path.expanduser("~")
-    return os.path.join(home, ".claude", "settings.json")
+    if path == "~":
+        return home
+    if path.startswith("~/"):
+        return os.path.join(home, path[2:])
+    return path                       # a bare `~user` is not ours to resolve; leave it verbatim
 
 
 def _is_carried_hook(command):
     """Does this command line invoke the vendor's state-report script?
 
-    Matched on the SCRIPT NAME plus one of the action words, not on a whole command line: the path
-    in front of it is whatever config dir that machine's installer resolved, and an older release
-    used a different action word for the same script.
+    Matched on the script's FILE NAME at a path boundary, plus one of the action words — not on a
+    whole command line, because the directory in front of it is whichever config dir that machine's
+    installer resolved, and an older release used a different action word for the same script.
+
+    The boundary is what keeps it honest (fresh-agent review, P2). A bare substring test called
+    ``bash '/x/not-herdr-agent-state.sh' session`` a herdr install, and told an operator to go undo
+    something nobody had done. Requiring `/` or a quote in front — which the vendor's own
+    `<dir>/<name>` command line always has — costs no real detection and ends that class.
     """
-    if not isinstance(command, str) or SCRIPT_NAME.rsplit(".", 1)[0] not in command:
+    if not isinstance(command, str):
         return False
-    return any(command.rstrip().endswith(" " + action) for action in _KNOWN_ACTIONS)
+    return bool(_HOOK_COMMAND_RE.search(command.rstrip()))
 
 
 def carried_hook_commands(document):
@@ -228,6 +268,13 @@ def carried_hook_commands(document):
                 continue
             for entry in entries:
                 if not isinstance(entry, dict):
+                    continue
+                # `type` must say command. Claude Code only ever executes a command hook, so an
+                # entry of some other type carrying a matching string is not something the vendor's
+                # installer wrote (fresh-agent review, P2). Absent `type` is still read as a
+                # command: that is how Claude Code itself treats it, and a doctor that missed a
+                # real registration over a missing default would be the worse failure.
+                if entry.get("type", "command") != "command":
                     continue
                 if _is_carried_hook(entry.get("command")):
                     found.append(entry["command"])
