@@ -40,6 +40,10 @@ GH="${SL_GH:-gh}"
 #       so it is a CHANNEL fault and the queue is held intact (evidence.py -> `gh_auth_dead_runner`).
 AUTH_DEAD_RC=4
 AUTH_DEAD_RUNNER_RC=5
+# 6 — the SESSION's own environment is poisoned and the launch-floor scrub could not clean it
+#     (issue #301). Per-issue like rc=4 and for the same reason: it is an environment fault whose
+#     memo the owner must actually READ (evidence.py -> `env_poisoned`).
+ENV_DEAD_RC=6
 MODEL="${SL_MODEL:-}"
 EFFORT="${SL_EFFORT:-}"
 CODEX_DANGEROUS_BYPASS="${SL_CODEX_DANGEROUS_BYPASS:-}"
@@ -64,6 +68,20 @@ case "$AGENT" in
     exit 64
     ;;
 esac
+
+# ---- ONE variable of the launch-floor scrub belongs on THIS side too (issue #301) ---------------
+# The floor itself lives in start-session.sh — it is the only code that runs in the session's own
+# environment, and the tab's shell sources ~/.zshrc AFTER this script has finished, so a scrub here
+# would prove nothing about the worker's env. The agent-specific half (ANTHROPIC_*, CLAUDE_CODE_*)
+# also belongs there by the agent-boundary rule, not in this agent-agnostic launcher.
+#
+# XDG_CONFIG_HOME is the exception, and for a mechanical reason rather than a tidiness one: the
+# worker's floor removes it, and `gh` resolves its config dir from it. If this launcher kept an
+# inherited value while the worker dropped it, the two `gh api user` reads would consult DIFFERENT
+# config dirs — and #299 compares their answers. The expectation would be resolved against one
+# identity and asserted against another, so every launch would refuse with a mismatch that names no
+# real fault. Dropping it here makes both sides read the same config dir, by construction.
+unset XDG_CONFIG_HOME
 
 # ---- Resolve identity + worktree ----------------------------------------------------------------
 if [ "$CWD_MODE" -eq 1 ]; then
@@ -288,7 +306,8 @@ fi
 "$HERE/pretrust.sh" "$WT"                       # first-run trust prompt won't hang
 mkdir -p "$SL_RUN_ROOT/state/activity" "$SL_RUN_ROOT/state/panes" "$SL_RUN_ROOT/state/started" \
          "$SL_RUN_ROOT/state/blocked" "$SL_RUN_ROOT/state/exited" "$SL_RUN_ROOT/state/awaiting" \
-         "$SL_RUN_ROOT/state/sessions" "$SL_RUN_ROOT/state/authfail" "$SL_RUN_ROOT/reports"
+         "$SL_RUN_ROOT/state/sessions" "$SL_RUN_ROOT/state/authfail" "$SL_RUN_ROOT/state/envfail" \
+         "$SL_RUN_ROOT/reports"
 # Record the id NOW, before the tab exists. Deliberately UNLIKE the activity/pane stamps below,
 # which are withheld until delivery is verified because writing them early once fabricated
 # "launched & alive" for 45 minutes: an id is an IDENTITY claim, not a liveness one — nothing reads
@@ -339,7 +358,10 @@ fi
 # auth fault: the same class of bug as the shared start sentinel that codex-verify P1-b caught, and
 # the reason `started` is per-token AND excluded from the hygiene block just below. Five minutes is
 # far beyond any verify window, so only genuinely abandoned markers can match.
+# The env-floor markers (issue #301) are swept on exactly the same terms and for the same reasons —
+# same writer discipline (per-launch token), same abandonment window, same collateral-damage hazard.
 find "$SL_RUN_ROOT/state/authfail" -maxdepth 1 -name "$ID.*" -mmin +5 -delete 2>/dev/null || true
+find "$SL_RUN_ROOT/state/envfail"  -maxdepth 1 -name "$ID.*" -mmin +5 -delete 2>/dev/null || true
 rm -f "$SL_RUN_ROOT/reports/$ID.md" \
       "$SL_RUN_ROOT/state/blocked/$ID" "$SL_RUN_ROOT/state/exited/$ID" "$SL_RUN_ROOT/state/awaiting/$ID" \
       "$SL_RUN_ROOT/state/mail/$ID" "$SL_RUN_ROOT/state/status/$ID.json"
@@ -436,23 +458,44 @@ mv -f "$cmd_tmp" "$CMD_FILE"
 # failure) — fail LOUDLY without fabricating liveness, exactly as the old keystroke path did on a
 # locked Mac.
 #
-# The loop watches for TWO outcomes, not one. The second is the auth marker (issue #299): a tab
-# whose session ran the positive gh-auth assert and REFUSED will never stamp the sentinel, so
-# without this it would look identical to a shim that never fired — and 30s later the park memo
-# would send the owner to debug the launch shim while the real fault was dead GitHub auth. Keyed on
-# the same per-launch token as the sentinel, so a stale or overlapping launch's marker cannot
+# The loop watches for THREE outcomes, not one. The other two are SELF-REFUSALS: a session that
+# refuses itself never stamps the sentinel, so without a marker to read it would look identical to a
+# shim that never fired — and 30s later the park memo would send the owner to debug the launch shim
+# while the real fault was dead GitHub auth (#299) or a poisoned environment (#301). Both are keyed
+# on the same per-launch token as the sentinel, so a stale or overlapping launch's marker cannot
 # false-fire this one.
 STARTED="$SL_RUN_ROOT/state/started/$ID.$SURF"
 AUTHFAIL="$SL_RUN_ROOT/state/authfail/$ID.$SURF"
+ENVFAIL="$SL_RUN_ROOT/state/envfail/$ID.$SURF"
 VERIFY_WINDOW="${SL_LAUNCH_VERIFY_SECONDS:-30}"   # generous single window; << the 45-min freeze
 delivered=0
 auth_dead=0
+env_dead=0
 waited=0
 while [ "$waited" -lt "$VERIFY_WINDOW" ]; do
   if [ -e "$STARTED" ]; then delivered=1; break; fi
+  if [ -e "$ENVFAIL" ]; then env_dead=1; break; fi
   if [ -e "$AUTHFAIL" ]; then auth_dead=1; break; fi
   sleep 1; waited=$((waited + 1))
 done
+
+if [ "$env_dead" -eq 1 ]; then
+  # The session told us, from inside its own environment, that variables which silently flip its
+  # billing (or silently kill its transcript, and with it `--resume`) survived the launch-floor
+  # scrub. Tear the tab down on the SAME terms as a non-delivery — it never became a worker, so
+  # nothing of value is lost — but exit with the DISTINCT env code and speak the session's own
+  # diagnosis, so the runner's memo names the variables instead of the launch machinery.
+  # Read BEFORE the auth marker in the loop above on purpose: a poisoned env is causally upstream of
+  # the auth death it can produce (XDG_CONFIG_HOME), so if both were ever stamped the environment is
+  # the honest reading.
+  why="$(cat "$ENVFAIL" 2>/dev/null || true)"
+  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" "$AUTHFAIL" "$ENVFAIL" 2>/dev/null || true
+  "$CMUX" close-surface --surface "$SURF" ${WS_ARGS[@]+"${WS_ARGS[@]}"} >/dev/null 2>&1 || true
+  echo "[$ID] ENV POISONED in the session's own environment — the flight was refused before it started." >&2
+  echo "[$ID] ${why:-the session reported no detail}" >&2
+  echo "[$ID] Closed the tab; NOT marking active. This is an environment fault, not a launch-delivery one." >&2
+  exit "$ENV_DEAD_RC"
+fi
 
 if [ "$auth_dead" -eq 1 ]; then
   # The session told us, from inside its own environment, that its gh auth is dead. Tear the tab
@@ -460,7 +503,7 @@ if [ "$auth_dead" -eq 1 ]; then
   # lost — but exit with the DISTINCT auth code and speak the session's own diagnosis, so the
   # runner's memo names auth death instead of the launch machinery.
   why="$(cat "$AUTHFAIL" 2>/dev/null || true)"
-  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" "$AUTHFAIL" 2>/dev/null || true
+  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" "$AUTHFAIL" "$ENVFAIL" 2>/dev/null || true
   "$CMUX" close-surface --surface "$SURF" ${WS_ARGS[@]+"${WS_ARGS[@]}"} >/dev/null 2>&1 || true
   echo "[$ID] GH AUTH DEAD in the session's own environment — the flight was refused before it started." >&2
   echo "[$ID] ${why:-the session reported no detail}" >&2
@@ -474,7 +517,7 @@ if [ "$delivered" -ne 1 ]; then
   # marker is absent → nothing of value is lost), so this never closes a real worker session.
   # start-session.sh's worker singleton lock is the backstop: at most ONE worker exists per id even
   # if a straggler shell runs the command late.
-  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" "$AUTHFAIL" 2>/dev/null || true
+  rm -f "$CMD_FILE" "$CMD_FILE".claimed.* "$STARTED" "$AUTHFAIL" "$ENVFAIL" 2>/dev/null || true
   "$CMUX" close-surface --surface "$SURF" ${WS_ARGS[@]+"${WS_ARGS[@]}"} >/dev/null 2>&1 || true
   echo "[$ID] LAUNCH NOT DELIVERED: no worker started in tab $SURF within ${VERIFY_WINDOW}s." >&2
   echo "[$ID] the launch shim did not run the command — is it installed? (bin/install-launch-shim.sh)" >&2

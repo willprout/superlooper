@@ -93,6 +93,14 @@ _LAUNCH_RC = {
         "session against and no tab was ever opened — a machine-level GitHub auth fault that no "
         "queued issue caused and none can fix. Every launch will fail until it is repaired: "
         "`gh auth login --hostname github.com` with the account that owns the loop repo"),
+    6: ("env_poisoned",
+        "the launch-floor env scrub could not clean this session's own environment: variables that "
+        "silently change how a session runs survived into it, so the flight was refused before it "
+        "started. Left alone they are invisible — ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL move the "
+        "session off Max-subscription billing onto API billing with no error and no signal, and an "
+        "inherited CLAUDE_CODE_* turns transcript saving off, which silently breaks `--resume`. "
+        "The captured stderr names the exact variables: find where they are exported (a shell rc "
+        "file, a LaunchAgent, a wrapper) and remove them, then re-approve"),
     64: ("agent_unsupported",
          "the configured agent is not one this launcher can start (expected: claude or codex)"),
     124: ("launch_timeout",
@@ -140,7 +148,19 @@ _RC_TABLES = {"launch": _LAUNCH_RC, "nudge": _NUDGE_RC}
 # see the note on the gh needles below, which a bare "429" violated by matching the `[i429]` id
 # prefix that every single launcher line carries.
 _LAUNCH_TEXT = (
-    # FIRST, ahead of every cmux pattern below (issue #299). The auth refusals relay `gh`'s OWN
+    # FIRST OF ALL (issue #301), ahead of even the gh needles. A poisoned environment is causally
+    # UPSTREAM of the auth death it can produce — an inherited XDG_CONFIG_HOME is exactly how `gh`
+    # dies — so when the session's refusal names the environment, the environment is the honest
+    # reading and "run `gh auth login`" is a confidently wrong remedy. Ordering it here costs the
+    # auth readings nothing: this needle is the loop's OWN words from start-session.sh's refusal,
+    # a phrase gh (and cmux) can never emit.
+    (("env poisoned",),
+     ("env_poisoned",
+      "the launch-floor env scrub could not clean this session's own environment: variables that "
+      "silently change how a session runs — API-key billing, a redirected base URL, transcript "
+      "saving switched off — survived into it, so the flight was refused before it started. The "
+      "captured stderr names them; find where they are exported and remove them")),
+    # THEN, ahead of every cmux pattern below (issue #299). The auth refusals relay `gh`'s OWN
     # error text into the launcher's stderr, and gh's wording is not ours to control — a message
     # containing "could not connect" or "not_found" would otherwise be read as a dead cmux anchor
     # and raise a socket/workspace alert about a GitHub fault. Both refusal paths emit the literal
@@ -217,8 +237,14 @@ _LAUNCH_TEXT = (
 # The runner holds the queue systemically and probes with a canary (#24/#115) for these instead.
 # Every OTHER launch failure names THIS issue's own state — its base branch, its worktree, its
 # identity, its brief — and still parks that one issue. These are the reasons _classify() emits for
-# the machinery-level faults; a reason absent here (base_missing, gh_auth_dead, worktree_create_failed,
-# identity_invalid, brief_missing, or any unmapped rc) is treated as per-issue.
+# the machinery-level faults; a reason absent here (base_missing, gh_auth_dead, env_poisoned,
+# worktree_create_failed, identity_invalid, brief_missing, or any unmapped rc) is treated as per-issue.
+#
+# env_poisoned (rc=6, issue #301) is absent for exactly the reason gh_auth_dead is, and the two were
+# decided together: it is an ENVIRONMENT fault whose memo names variables in a file only the owner
+# can edit. Held as a channel fault it would surface as the systemic-launch ALERT, whose body talks
+# about App Nap and the cmux anchor — so an exported ANTHROPIC_API_KEY would be reported as a cmux
+# problem and the bill would keep arriving. Parked per-issue, the memo names the variables.
 #
 # gh_auth_dead (rc=4, issue #299) is deliberately NOT here, for the same reason base_missing is not:
 # it is an ENVIRONMENT fault whose memo the owner must actually READ. Routed to the channel it would

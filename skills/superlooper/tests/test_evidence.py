@@ -282,6 +282,64 @@ def test_unrecognized_or_corrupt_records_fail_safe_to_per_issue(bad):
     assert evidence.is_channel_fault(bad) is False
 
 
+# ---- rc=6: the launch-floor env scrub could not clean this session's env (issue #301) -----------
+
+def test_a_poisoned_env_is_its_own_reason_and_names_the_environment_not_the_shim():
+    # Without the distinct code, a session that refuses itself over an inherited ANTHROPIC_API_KEY
+    # reads as a generic non-delivery, and the park memo sends the owner to debug the launch shim
+    # over a line in their ~/.zshrc — the mis-blame class this whole table exists to end.
+    rec = evidence.build("launch", rc=6,
+                         captured="[i5] ENV POISONED: the launch env scrub did not remove: "
+                                  "ANTHROPIC_API_KEY")
+    assert rec["reason"] == "env_poisoned"
+    assert "environment" in rec["detail"].lower()
+    assert "shim" not in rec["detail"].lower()
+
+
+def test_the_park_memo_for_a_poisoned_env_names_the_remedy_and_the_stake():
+    """A newcomer reading the memo at 3am must know both what happened and what to do. The stake is
+    what makes this worth parking a lane over: an API-billed session and a session with no
+    transcript both look completely normal from outside."""
+    rec = evidence.build("launch", rc=6,
+                         captured="[i5] ENV POISONED: the launch env scrub did not remove: "
+                                  "ANTHROPIC_API_KEY")
+    memo = evidence.park_memo(rec, attempts=2)
+    assert "env_poisoned" in memo
+    detail = rec["detail"].lower()
+    assert "billing" in detail or "billed" in detail
+    assert "export" in detail, "the memo must point at where the variable comes from"
+
+
+def test_a_poisoned_env_is_a_per_issue_fault():
+    # Same call as gh_auth_dead (rc=4) and base_missing (rc=3): an ENVIRONMENT fault whose memo the
+    # owner must actually SEE. Routed to the channel it would hold the queue behind the
+    # systemic-launch ALERT, whose body names App Nap and the cmux anchor — so an exported API key
+    # would be reported to the owner as a cmux problem.
+    assert evidence.is_channel_fault(evidence.build("launch", rc=6, captured=None)) is False
+
+
+def test_a_poisoned_env_is_read_from_the_text_even_without_the_rc():
+    # The rc can be lost (a wrapper, a timeout kill, a shell that only forwards its own status)
+    # while the captured stderr survives — the same belt-and-suspenders every other launch fault
+    # gets. Ordered so it can never be swallowed by a cmux needle.
+    rec = evidence.build("launch", rc=1,
+                         captured="[i5] ENV POISONED in the session's own environment — the flight "
+                                  "was refused before it started.")
+    assert rec["reason"] == "env_poisoned", rec
+    assert evidence.is_channel_fault(rec) is False
+
+
+def test_an_env_refusal_is_never_read_as_dead_github_auth():
+    """The two self-refusals sit next to each other and must not be confused: `gh auth login` fixes
+    nothing when the fault is an exported API key, and unsetting a variable fixes nothing when the
+    credential really is dead. A poisoned env that ALSO mentions gh (XDG_CONFIG_HOME is exactly how
+    gh dies) must still read as the environment — it is the causally upstream fault."""
+    rec = evidence.build("launch", rc=6,
+                         captured="[i5] ENV POISONED: the launch env scrub did not remove: "
+                                  "XDG_CONFIG_HOME (which de-authenticates gh)")
+    assert rec["reason"] == "env_poisoned", rec
+
+
 # ---- rc=4: the positive gh-auth assert refused the flight (issue #299) --------------------------
 
 def test_dead_gh_auth_is_its_own_reason_and_names_auth_not_the_shim():

@@ -57,6 +57,94 @@ if ! acquire_worker; then
 fi
 trap release_worker EXIT                     # free the slot when THIS worker truly ends (only ours)
 
+# ---- LAUNCH-FLOOR ENV SCRUB + POST-SCRUB ASSERT (issue #301, tool-dive claim c1) ---------------
+# A session inherits the FULL parent environment, and three inherited variables each tell the loop a
+# confident lie rather than raising an error:
+#   * ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL flip the session from Max-subscription billing to API
+#     billing (or to somebody else's gateway) with no error, no signal, just a bill. Two tool
+#     codebases document the flip (tool-dive c1) and it is REALIZED in our own lab: the 2026-07-30
+#     clean-room checkpoint found a LIVE key at the owner's ~/.zshrc:5
+#     (docs/SPIKES-2026-07-30-supervised.md §0.3).
+#   * inherited CLAUDE_CODE_* / CLAUDECODE turn TRANSCRIPT SAVING OFF ("⚠ Transcript saving is off
+#     — inherited CLAUDE_CODE…"). No transcript means nothing to `--resume`, so the entire #298
+#     resurrection floor evaporates silently (docs/SPIKES-2026-07-29-results.md).
+#   * XDG_CONFIG_HOME points `gh` at a config dir with no hosts.yml, and it keeps answering
+#     confidently as nobody — the same spike's second landmine.
+#
+# THIS FILE, and no other. The tab's shell SOURCES ~/.zshrc on the way up — which is exactly where
+# the realized key lived — so the poison is injected AFTER the launcher has finished and BEFORE this
+# script runs. A launcher that scrubbed its own environment would prove nothing about the one the
+# worker actually gets. Same reason the gh-auth assert lives here (#299), one step earlier in the
+# chain. Above the agent branch, so claude and codex are covered by construction, and shared by
+# `launch-session.sh --cwd d<N>`, so both spawn paths are the same code rather than two copies.
+#
+# DENYLIST, never an aggressive allowlist. c25's documented landmine is that overriding HOME breaks
+# macOS keychain OAuth and kills the standalone story outright; PATH, HOME and the keychain context
+# a session legitimately needs must survive untouched. (Per-worker CLAUDE_CONFIG_DIR / GH_CONFIG_DIR
+# is the two-subscription spike's business — issue #300 — and is deliberately NOT touched here: this
+# floor removes poison, it does not assign identity.)
+sl_env_names() {
+  # NAMES ONLY, read from a CHILD process — `env` is what the agent's own process will be handed.
+  # A value may contain newlines and `=`, so only a line that OPENS with a valid shell identifier
+  # followed by `=` names a variable; a continuation line that happens to look like one costs a
+  # false REFUSAL, which fails closed, never a false pass.
+  env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'
+}
+sl_is_poison() {                             # one predicate for BOTH the scrub and the assert, so
+  case "$1" in                               # the assert can never cover less than the scrub strips
+    ANTHROPIC_*|CLAUDE_CODE_*|CLAUDECODE|CLAUDE_PID|CLAUDE_EFFORT|XDG_CONFIG_HOME) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# The scrub. Whole families, not a fixed list of names: a new CLAUDE_CODE_* or ANTHROPIC_* variable
+# shipped by a future release is poison the day it appears, and a list would learn about it from a
+# bill. Nothing in this loop passes model or billing configuration through the environment — the
+# launcher NAMES everything a session needs as SL_*, and --model/--effort are command-line flags —
+# so no legitimate input is lost. (An ADOPTED repo whose own test suite calls the Anthropic API
+# reads its key from that repo's config the way any other secret arrives; inheriting one through
+# the worker's environment is the same door this floor exists to close, and there is deliberately
+# no config key to re-open it — a floor with an off switch is not a floor.) `unset` failures are
+# NOT silenced: bash's own "cannot unset: readonly variable" names the mechanism the assert below
+# can only ever observe the result of.
+for _sl_n in $(sl_env_names); do
+  if sl_is_poison "$_sl_n"; then unset "$_sl_n"; fi
+done
+unset _sl_n
+# The assert. NOT a restatement of the scrub: it re-reads the environment from a fresh child, which
+# is the same thing the agent process will be handed, so it catches what the scrub could not — a
+# readonly variable `unset` refused to remove, a re-injection from anything sourced in between, and
+# a scrub some future edit moved, narrowed or deleted. A scrub that rots is silent by nature; this
+# is what makes it loud.
+#
+# It runs BEFORE the gh-auth assert deliberately. A poisoned env is CAUSALLY UPSTREAM of the auth
+# death it produces (XDG_CONFIG_HOME is exactly how gh dies), so probing first would park the issue
+# under a memo telling the owner to re-login — a confidently wrong remedy for an environment fault.
+# It is also network-free, so it costs a healthy launch nothing.
+ENV_DEAD_RC=6                                # launch-session.sh + evidence.py read this same code
+TOKEN="${SL_START_TOKEN:-$ID}"               # per-launch key, shared with the auth marker below
+refuse_env() {                               # loud, torn down, and NAMED — never a live poisoned session
+  local why="$1"
+  mkdir -p "$SL_RUN_ROOT/state/envfail"
+  # The launcher is sitting in its delivery-verify window waiting on a start sentinel that will now
+  # never appear. This per-launch marker (same token discipline as the sentinel, so a stale or
+  # overlapping launch cannot false-fire it) is what lets it tear the tab down AT ONCE and blame the
+  # environment, instead of timing out 30s later and blaming the launch shim.
+  printf '%s\n' "$why" > "$SL_RUN_ROOT/state/envfail/$ID.$TOKEN"
+  echo "[$ID] ENV POISONED: $why" >&2
+  # Deliberately NO exited marker, for the same reason the auth refusal writes none: that marker
+  # means "a worker WAS running and its process is gone", and the runner recovers from it by
+  # RELAUNCHING — straight back into the same poisoned environment.
+  exit "$ENV_DEAD_RC"
+}
+SL_STILL_POISONED=""
+for _sl_n in $(sl_env_names); do
+  if sl_is_poison "$_sl_n"; then SL_STILL_POISONED="${SL_STILL_POISONED:+$SL_STILL_POISONED }$_sl_n"; fi
+done
+unset _sl_n
+if [ -n "$SL_STILL_POISONED" ]; then
+  refuse_env "the launch env scrub did not remove: $SL_STILL_POISONED — these still reach this session's own process, so it could be billed to an API key instead of the subscription, or start with transcript saving off (which silently breaks --resume). Find where they are exported (a shell rc file, a LaunchAgent, a wrapper) and remove them; if a variable is readonly, whatever made it so is sourced before this launcher"
+fi
+
 # ---- POSITIVE gh-AUTH ASSERT (issue #299) ------------------------------------------------------
 # THIS is the only code in the stack that runs inside the spawned session's OWN environment and
 # worktree, which is exactly why the assert lives here and not in the launcher: the fresh tab
@@ -79,9 +167,12 @@ trap release_worker EXIT                     # free the slot when THIS worker tr
 # Runs BEFORE the start sentinel below on purpose. The sentinel means "a worker started here"; a
 # refused session never became one, and stamping it would tell the launcher the launch succeeded
 # moments before this script exits with no agent — a lane the runner would then read as live.
+#
+# Runs AFTER the env floor above, and depends on it: the 2026-07-29 landmine that kills gh here is
+# an inherited XDG_CONFIG_HOME, which the scrub has already removed — so a refusal at this point is
+# a real credential fault, not an environment one wearing its costume.
 GH="${SL_GH:-gh}"
-TOKEN="${SL_START_TOKEN:-$ID}"
-EXPECT_LOGIN="${SL_EXPECT_GH_LOGIN:-}"
+EXPECT_LOGIN="${SL_EXPECT_GH_LOGIN:-}"       # TOKEN was resolved by the env floor above (same key)
 AUTH_DEAD_RC=4                               # launch-session.sh + evidence.py read this same code
 # BOUNDED, and the bound matters MORE here than on the launcher side. `gh` has no default request
 # timeout, so an unreachable network can hang this read for tens of seconds — and the launcher is
@@ -162,8 +253,8 @@ fi
 # verify P1-b: a single shared state/started/<id> let an overlapping launch's hygiene delete the
 # proof and the real launch then close its OWN worker tab). Stamped before the brief check so
 # delivery is proven even if the brief is missing — that branch writes the exited marker so the
-# dead state is observed promptly, not 45 min later. (TOKEN is resolved by the auth assert above,
-# which needs the same per-launch key for its own marker.)
+# dead state is observed promptly, not 45 min later. (TOKEN is resolved by the env floor above; the
+# env and auth refusals key their own markers on the same per-launch token.)
 printf '%s' "$TOKEN" > "$SL_RUN_ROOT/state/started/$ID.$TOKEN"
 # Clear THIS launch's captured stderr tail now (issue #40, review P1-1) — AFTER the singleton lock
 # (so a duplicate launch of a still-live worker can never wipe the real worker's tail) but BEFORE the
