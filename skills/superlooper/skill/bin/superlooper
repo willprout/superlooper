@@ -57,6 +57,7 @@ import glob
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -431,6 +432,256 @@ def cmd_runner_home(args):
                     "read it with: %s"
                     % " ".join(runner_home.print_argv("launchctl", uid, job_label)[1:]))
     print("  live:  %s" % live)
+    return 0
+
+
+# ------------------------------- fleet -------------------------------
+
+def _state_base():
+    return os.environ.get("SL_HOME") or os.path.expanduser("~/.superlooper")
+
+
+def _write_once(path, text, marker, what, merge_text=None):
+    """Write `text` to `path` unless somebody else's file is already there.
+
+    The build-up writes into the HOST's own config directory, which is shared with whatever
+    sessions the operator already runs on this machine — so an install that simply overwrote would
+    silently delete their settings. A file carrying our marker is ours to rewrite (that is what
+    makes `--install` idempotent); anything else is refused with its content named, and the doctor
+    block for it stays red until a person decides.
+
+    Returns "wrote", "kept" or "refused".
+    """
+    existing = None
+    try:
+        with open(path) as f:
+            existing = f.read()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        # NOT absence (fresh-agent review). A file we could not READ is a file we could not prove
+        # we own, and treating the failure as "nothing is there" turns a permissions problem, an
+        # ACL or a broken symlink into permission to overwrite somebody else's file.
+        print("  REFUSED %s: %s exists but could not be read (%s), so it cannot be shown to be "
+              "ours to rewrite." % (what, path, e))
+        return "refused"
+    if existing is not None and marker not in existing:
+        print("  REFUSED %s: %s already exists and was not written by superlooper, so it is "
+              "not ours to rewrite — merge these lines into it by hand:" % (what, path))
+        # `merge_text`, not `text` (fresh-agent review round 2). `text` carries the ownership
+        # marker, and printing it invites the operator to paste the marker into a file they
+        # maintain — after which the NEXT install would read it as ownership and replace the whole
+        # thing. What a refusal hands over is the SETTINGS; the file stays theirs, and the block
+        # for it stays red until they say otherwise.
+        for line in (merge_text or text).rstrip("\n").splitlines():
+            print("    | %s" % line)
+        print("    (superlooper will keep refusing to manage this file, which is the point — the "
+              "block for it stays red until you decide it is done.)")
+        return "refused"
+    if existing == text:
+        return "kept"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # A UNIQUE temp name in the same directory, not `<path>.tmp` (fresh-agent review): a fixed
+    # sidecar is itself a file this command promised not to clobber, and `<config>.tmp` is exactly
+    # what a hand-merge or an editor recovery leaves lying around. Same directory so the replace
+    # stays atomic (a cross-filesystem rename is not).
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".sl-fleet-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return "wrote"
+
+
+def cmd_fleet(args):
+    """Report — and, with --install, create — the fleet machine's build-up (issue #309).
+
+    Read-only by default, and the default is the point: every property the build-up has to satisfy
+    is one that is silently wrong while the machine still looks alive (an unfenced socket answers,
+    a host one release off the pin starts, a fleet config dir spelled with a trailing slash simply
+    reports logged-out). So `superlooper fleet` is a judge with an exit code, and `--install` is the
+    separate act that makes it green.
+
+    What `--install` deliberately does NOT do: build the host (that needs the source checkout and a
+    Rust toolchain — `vendor/herdr/build.sh`), overwrite a config file somebody else wrote, or
+    register the viewer. The viewer is a terminal program, so it cannot be a LaunchAgent, and since
+    #302 measured the pinned build restoring hosted agents with no client attached it is no longer
+    load-bearing — it ships as an artefact the owner may register, never as something an install
+    silently adds to their login.
+    """
+    import fleet
+    import session_host
+
+    probe = stack_doctor.Probe()
+    state_base = _state_base()
+    prefix = fleet.prefix(state_base)
+    host_config_dir = session_host.config_dir()
+    host_state_dir = session_host.state_dir()
+    fleet_config_dir = os.environ.get("SL_FLEET_CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude-fleet")
+    uid = _home_uid()
+    home = os.path.expanduser("~")
+
+    if args.install:
+        # Judged BEFORE anything is written or loaded (fresh-agent review round 2). The report at
+        # the end would catch a stock or wrong-version binary — but only after --load had already
+        # started it, which is a real open control socket on a real machine for as long as it takes
+        # somebody to read the red line. Fail-closed means refusing before the launch.
+        binary = fleet.host_binary(prefix)
+        ready = fleet.check_host_binary(probe, prefix)
+        if not ready.ok:
+            print("FATAL: %s\n  Fix: %s\n"
+                  "Nothing was written or started. `vendor/herdr/build.sh` is what produces a host "
+                  "this command will configure; it needs the SOURCE checkout, because the fence "
+                  "patch is a build input and never ships inside the published payload."
+                  % (ready.detail, ready.fix or "build it first"), file=sys.stderr)
+            return 2
+        print("superlooper fleet --install")
+        for d in (os.path.join(prefix, "bin"), fleet.log_dir(prefix)):
+            os.makedirs(d, exist_ok=True)
+
+        token = fleet.token_file(prefix)
+        if not os.path.lexists(token):
+            # 0600 before the secret is in it: creating world-readable and then chmod-ing leaves a
+            # window where the fence's whole secret is readable. O_EXCL so a race cannot land the
+            # secret in a file that appeared underneath us.
+            fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            minted = secrets.token_urlsafe(32) + "\n"
+            with os.fdopen(fd, "w") as f:
+                f.write(minted)
+            # The digest, never the secret — the sidecar exists to prove origin, not to hold a
+            # second copy of the thing the fence protects.
+            with open(fleet.token_provenance_file(prefix), "w") as f:
+                f.write(fleet.token_provenance(minted) + "\n")
+            print("  minted %s (0600)" % token)
+        elif not os.path.islink(token) and os.path.isfile(token):
+            with open(token) as f:
+                held = f.read()
+            recorded = None
+            try:
+                with open(fleet.token_provenance_file(prefix)) as f:
+                    recorded = f.read().strip()
+            except OSError:
+                pass
+            if recorded != fleet.token_provenance(held):
+                # An UNVOUCHED or CHANGED token is refused rather than adopted: a file left here by
+                # an aborted install, by an older prefix, or by anything else becomes the fence's
+                # secret otherwise, without anyone deciding it should. This is an integrity record,
+                # NOT authentication — see token_provenance_file, and #342 for the real question.
+                print("FATAL: %s does not match the token this build-up minted (no matching record "
+                      "at %s, or the file has changed since). Rather than adopt a secret nobody "
+                      "chose, this refuses: move it aside and re-run to mint a fresh one."
+                      % (token, fleet.token_provenance_file(prefix)), file=sys.stderr)
+                return 2
+            os.chmod(token, 0o600)
+            print("  kept %s (0600, minted here)" % token)
+        else:
+            # `lexists` above, `islink` here (fresh-agent review round 2): a SYMLINK at this path
+            # would have `os.path.exists` follow it, `chmod` change the permissions of whatever it
+            # points at, and launchd hand the server a secret of somebody else's choosing. The
+            # token's provenance is the fence's whole basis, so an unexpected object here is
+            # refused rather than adopted.
+            print("FATAL: %s is not a regular file (it is a symlink or a directory). The fence "
+                  "token's provenance is the fence itself — move it aside and re-run."
+                  % token, file=sys.stderr)
+            return 2
+
+        cfg_path = fleet.host_config_path(host_config_dir)
+        wrote = _write_once(cfg_path, fleet.render_host_config(), fleet.CONFIG_MARKER, "config",
+                            merge_text=fleet.host_config_settings())
+        if wrote != "refused":
+            print("  %s %s" % (wrote, cfg_path))
+
+        source = probe.read_text(session_host.remote_manifest_path(host_state_dir, args.agent))
+        override = fleet.override_path(host_config_dir, args.agent)
+        if source is None:
+            print("  SKIPPED %s: the host has no cached manifest for %r to snapshot. Start the "
+                  "host once so it fetches one, then re-run — the `screen fallback` block below "
+                  "stays red until then." % (override, args.agent))
+        else:
+            wrote = _write_once(override, fleet.render_manifest_override(source),
+                                fleet.CATCHALL_RULE_ID, "manifest override")
+            if wrote != "refused":
+                print("  %s %s" % (wrote, override))
+
+        plist = fleet.server_plist_path(home)
+        found, missing = runner_home.resolve_commands(_resolve_command)
+        if missing:
+            # Refuse rather than bake launchd's own four entries in: the server would come up, look
+            # alive, and hand every pane it spawns a PATH with no Homebrew and no ~/.local/bin.
+            print("FATAL: cannot resolve %s on this PATH, so there is no honest PATH to record in "
+                  "the job." % ", ".join(missing), file=sys.stderr)
+            return 2
+        os.makedirs(_launchd_dir(), exist_ok=True)
+        text = fleet.render_server_plist(
+            binary=binary, session=fleet.SESSION_NAME, token_file=token,
+            log_dir=fleet.log_dir(prefix),
+            path=runner_home.launch_path(sorted({os.path.dirname(p) for p in found.values()})))
+        # Through the SAME door as the shared config (fresh-agent review): our launchd label is
+        # not proof the plist under it is ours. An operator's own experiment, or a hand-tuned job,
+        # is exactly what "never clobber a file it did not write" has to protect.
+        wrote = _write_once(plist, text, fleet.PLIST_MARKER, "server job")
+        if wrote == "refused":
+            return 2
+        print("  %s %s" % (wrote, plist))
+
+        viewer = fleet.viewer_command(prefix)
+        wrote = _write_once(viewer, fleet.render_viewer_command(binary=binary,
+                                                                session=fleet.SESSION_NAME),
+                            fleet.VIEWER_MARKER, "viewer script")
+        if wrote != "refused":
+            os.chmod(viewer, 0o755)
+            print("  %s %s (register it as a Login Item yourself if you want the window)"
+                  % (wrote, viewer))
+
+        argv = runner_home.bootstrap_argv(_launchctl_bin(), uid, plist)
+        if args.load:
+            subprocess.run(runner_home.bootout_argv(_launchctl_bin(), uid, fleet.SERVER_LABEL),
+                           capture_output=True, text=True, timeout=30)
+            # A bounded retry, found by driving this for real: launchd answers a bootstrap issued
+            # while it is still tearing the old job down with `Input/output error` (5), which reads
+            # like a broken plist and is not one. One retry after a beat is the whole cure.
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                time.sleep(2)
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                print("FATAL: %s\n%s" % (" ".join(argv[1:]),
+                                         (proc.stderr or proc.stdout).strip()), file=sys.stderr)
+                return 2
+            print("  loaded — the host starts now and at every login.")
+            # A server that has not finished binding is UNREACHABLE, and the fence block is right
+            # to refuse to read that as anything good — so wait for its first answer rather than
+            # print a red line this command created one second earlier.
+            fleet.wait_for_fence(fleet.socket_path(host_config_dir))
+        else:
+            print("  to activate:  %s" % " ".join(argv[1:]))
+            print("  to stop:      %s" % " ".join(runner_home.bootout_argv(
+                _launchctl_bin(), uid, fleet.SERVER_LABEL)[1:]))
+        print()
+
+    print("superlooper fleet: %s" % prefix)
+    results = fleet.check_fleet(probe, state_base=state_base, host_config_dir=host_config_dir,
+                                fleet_config_dir=fleet_config_dir, uid=uid, home=home,
+                                agent=args.agent,
+                                live_manifest_version=fleet.manifest_version(
+                                    probe.read_text(session_host.remote_manifest_path(
+                                        host_state_dir, args.agent))))
+    for line in stack_doctor.format_results(results):
+        print(line)
+    failures = [r.name for r in results if not r.ok]
+    if failures:
+        print("\nFLEET NOT READY: %s" % ", ".join(failures))
+        return 1
+    warnings = [r.name for r in results if getattr(r, "warn", False)]
+    print("\nfleet build-up complete%s"
+          % (" (warnings: %s)" % ", ".join(warnings) if warnings else ""))
     return 0
 
 
@@ -3291,6 +3542,15 @@ def main(argv=None):
                             help="run the boot preflight and exit — Aqua session, PATH, gh login, "
                                  "session host. Run it INSIDE the job to read the context the "
                                  "runner will actually get")})
+    add("fleet", cmd_fleet,
+        **{"--install": dict(action="store_true",
+                             help="write the fleet's token, host config, screen-state override, "
+                                  "server LaunchAgent and viewer script, then judge the result"),
+           "--load": dict(action="store_true",
+                          help="with --install, also bootstrap the server job into gui/$UID now"),
+           "--agent": dict(default="claude",
+                           help="which agent's screen-detection manifest to override "
+                                "(default: claude)")})
     add("status", cmd_status)
     add("adopt", cmd_adopt)
     add("doctor", cmd_doctor,

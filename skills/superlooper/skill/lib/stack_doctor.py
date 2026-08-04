@@ -10,6 +10,7 @@ import json
 import os
 import plistlib
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 
@@ -93,9 +94,28 @@ class Probe:
             return default
         return None
 
-    def run(self, argv, timeout=10):
+    def run(self, argv, timeout=10, env=None):
+        """Run `argv`. `env`, when given, is an OVERLAY on this probe's environment, and a value of
+        None REMOVES that variable.
+
+        It exists for one measurement and is shaped for it: reading `claude auth status` twice, once
+        per credential config dir, where the answer is a function of the environment and of nothing
+        else (issue #300 — the credential namespace is keyed by the config-dir string). An overlay
+        rather than a replacement because the command still needs a PATH and a HOME to run at all;
+        an explicit None rather than a sentinel because the case that matters is REMOVING the fleet's
+        config dir to ask the same question about the owner's default one.
+        """
+        run_env = None
+        if env is not None:
+            run_env = dict(self.env)
+            for key, value in env.items():
+                if value is None:
+                    run_env.pop(key, None)
+                else:
+                    run_env[key] = value
         try:
-            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                                  env=run_env)
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(argv, 124, "", "")
         except (OSError, ValueError):
@@ -129,6 +149,49 @@ class Probe:
                 return f.read()
         except OSError:
             return None
+
+    def contains(self, path, needle):
+        """Does `path` contain `needle` anywhere? True / False / None (unreadable).
+
+        Streamed in chunks with an overlap, because the one caller asks a ~18MB binary whether the
+        carried patch's own error string is compiled into it — `read_head` is bounded at 4KB by
+        design and `read_text` would pull the whole thing through memory. None is UNKNOWN and the
+        caller fails closed on it: "I could not look" is not "it is not there", and here it is not
+        "it is there" either.
+        """
+        blob = needle.encode() if isinstance(needle, str) else needle
+        keep = max(0, len(blob) - 1)
+        try:
+            with open(path, "rb") as f:
+                tail = b""
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        return False
+                    if blob in tail + chunk:
+                        return True
+                    tail = (tail + chunk)[-keep:] if keep else b""
+        except OSError:
+            return None
+
+    def mode(self, path):
+        """The permission bits of a REGULAR FILE at `path`, or None.
+
+        `lstat`, not `stat`, and regular-files-only (fresh-agent review): the one caller is asking
+        whether a secret at rest is readable, and `stat` follows a symlink — so a link pointing at
+        somebody else's 0600 file would answer "0600, fine" about a file this machine neither minted
+        nor controls. A symlink, a directory or a socket here is not a permissions question with a
+        reassuring answer; it is an object whose provenance is unknown.
+
+        None is UNKNOWN and every caller fails closed on it — "I could not read the mode" is not
+        "the mode is fine", which is exactly the reading that would let a world-readable secret pass
+        a permissions check.
+        """
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        return st.st_mode & 0o777 if stat.S_ISREG(st.st_mode) else None
 
     def expanduser(self, path):
         return os.path.expanduser(path)
