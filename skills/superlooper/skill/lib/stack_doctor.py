@@ -1070,12 +1070,26 @@ def check_superlooper_plugin(probe):
 
     # Same binary the launch stack runs (issue #303), for the same reason check_claude uses it:
     # plugin state read off a different claude describes a machine the workers do not live on.
-    claude = resolve_claude(probe)["path"]
+    r = resolve_claude(probe)
+    claude = r["path"]
     if not claude:
         return CheckResult(
             name, True,
             "no `claude` CLI found to read plugin state — cannot tell whether %s is installed. The "
             "claude login block above names the real problem; fix that first." % plugin_id,
+            warn=True)
+    if not r["ok"]:
+        # NEVER RUN a path the ladder refused. This is not merely about saying something consistent:
+        # `_plugin_rows` EXECUTES what it is handed, so on a machine whose PATH carries a relative
+        # element this block would run an executable `./claude` out of whatever directory the doctor
+        # was invoked from — the arbitrary-binary-from-the-CWD case the absolute-only invariant
+        # exists to refuse, reached through a read-only block nobody thought of as a launcher
+        # (fresh-agent review, P0). Report the state as unread, and point at the block that owns it.
+        return CheckResult(
+            name, True,
+            "cannot read plugin state: %s is not a claude this stack will run, so it is not run "
+            "here either — the `claude binary` block above names why. Fix that first; whether %s is "
+            "installed is unknown until then." % (claude, plugin_id),
             warn=True)
 
     rows, problem = _plugin_rows(probe, claude)
