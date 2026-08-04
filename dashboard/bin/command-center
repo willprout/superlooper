@@ -41,7 +41,6 @@ import pollers                # noqa: E402
 import janitor as janitor_mod  # noqa: E402
 import restart as restart_mod # noqa: E402
 import server                 # noqa: E402
-import session_window as session_window_mod  # noqa: E402
 import tidy as tidy_mod       # noqa: E402
 import version as version_mod  # noqa: E402
 import watchdog as watchdog_mod  # noqa: E402
@@ -198,14 +197,6 @@ def main(argv):
     fixer = fixer_mod.Fixer(cfg["superlooper_cli"],
                             {r["slug"]: r["path"] for r in cfg["repos"]},
                             operator=config_mod.operator(cfg))
-    # The Open-session-window button (issue #310) — a local-command verb, and the ONLY place in the
-    # dashboard that speaks to the session host directly (the engine keeps its own single doorway,
-    # lib/session_host.py). It asks the host to bring one flight's window to the front — the owner
-    # ruling's replacement for a live view (2026-07-30: attach, which is proven; no observe-stream
-    # plumbing). Bound to the configured host CLI and the same watched-repo allow-list every other
-    # local-command verb draws, so a tap can only ever act for a repo the operator chose to watch.
-    session_window = session_window_mod.SessionWindow(
-        cfg["herdr_cli"], {r["slug"]: r["path"] for r in cfg["repos"]})
     replay_provider, digest_provider = build_data_providers(cfg)
     # The bind (in build_server) is the first thing that can fail on an otherwise-valid config: the
     # configured port may be taken by a second command-center or another app. Answer it the way a bad
@@ -215,8 +206,7 @@ def main(argv):
     try:
         httpd = server.build_server(provider, static_dir, port=cfg["port"], actions=verbs,
                                     desk=dashboard_desk, tidy=tidy, restart=restart, janitor=janitor,
-                                    fixer=fixer, session_window=session_window,
-                                    replay_provider=replay_provider,
+                                    fixer=fixer, replay_provider=replay_provider,
                                     digest_provider=digest_provider, version=code_version)
     except OSError as e:
         sys.stderr.write(_bind_error_line(cfg["port"], e))

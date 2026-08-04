@@ -453,35 +453,6 @@ def test_superlooper_cli_wrong_typed_or_empty_is_rejected_by_name(tmp_path, bad)
     assert "superlooper_cli" in str(e.value)
 
 
-# --- session-host CLI path (issue #310: the Open-session-window button) ----------------------
-
-def test_herdr_cli_defaults_to_the_bare_binary_on_path(tmp_path, monkeypatch):
-    # A BARE name by default, unlike superlooper_cli's absolute skill path: herdr is installed by a
-    # package manager whose prefix differs per machine (/opt/homebrew vs /usr/local), so the only
-    # shareable default is "whatever is on PATH" — exactly the contract gh already has here.
-    monkeypatch.setenv("HOME", str(tmp_path))
-    repo = _write_repo(tmp_path, "co", "acme/widget")
-    cfg = config.load(_write_config(tmp_path, {"repos": [{"path": str(repo)}]}))
-    assert cfg["herdr_cli"] == "herdr"
-
-
-def test_herdr_cli_override_is_honored_and_expanded(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    repo = _write_repo(tmp_path, "co", "acme/widget")
-    cfg = config.load(_write_config(tmp_path, {
-        "repos": [{"path": str(repo)}], "herdr_cli": "~/bin/herdr"}))
-    assert cfg["herdr_cli"] == str(tmp_path / "bin/herdr")
-
-
-@pytest.mark.parametrize("bad", [123, "", "   ", None, True])
-def test_herdr_cli_wrong_typed_or_empty_is_rejected_by_name(tmp_path, bad):
-    repo = _write_repo(tmp_path, "co", "acme/widget")
-    cfg_path = _write_config(tmp_path, {"repos": [{"path": str(repo)}], "herdr_cli": bad})
-    with pytest.raises(ValueError) as e:
-        config.load(cfg_path)
-    assert "herdr_cli" in str(e.value)
-
-
 # --- state-home derivation ------------------------------------------------------------------
 
 def test_state_home_default_base(monkeypatch):

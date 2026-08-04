@@ -59,7 +59,6 @@ Open `config.json` and set the one thing that's actually yours — **`repos`**:
   "gh_poll_seconds": 30,
   "heartbeat_down_seconds": 300,
   "superlooper_cli": "~/.claude/skills/superlooper/bin/superlooper",
-  "herdr_cli": "herdr",
   "notify": { "imessage_to": null, "cmd": null },
   "fun": {
     "master": true,
@@ -92,11 +91,6 @@ Field by field:
   `~/.claude/skills/superlooper/bin/superlooper`, `~` expanded). Change it only if your skill lives
   elsewhere. Tidy always asks first (it shows exactly which windows it will close) and only ever
   closes *finished* sessions — never one still building.
-- **`herdr_cli`** — the session host's CLI, which the flight card's **Open session window** button
-  runs locally to bring that session's window to the front (default `herdr`, resolved against
-  `PATH` like `gh` — herdr's install prefix differs per machine). Set an absolute path if yours
-  isn't on the dashboard's `PATH`. The button changes nothing about the loop; if the host has no
-  window for that flight, it says so in the host's own words rather than pretending it worked.
 - **`notify`** — where the dashboard's one push (RUNNER DOWN) goes. `imessage_to` is a phone
   number/handle to text; `cmd` is a shell command to run instead. Both `null` by default — a
   fresh install nags no one.
@@ -208,15 +202,6 @@ A job that exits on every launch would otherwise relaunch on launchd's implicit 
 that one line to `~/Library/Logs/command-center.log` at most once every 30s — a cool loop that
 leaves you time to free the port or change it, never a runaway. Free the port (or edit `port`) and
 the next relaunch comes up clean; no `unload`/`load` needed.
-
-> **Note (Open session window):** launchd also runs with a minimal *environment*, and the plist
-> sets no `EnvironmentVariables`. Two consequences for the **Open session window** button. First,
-> `herdr_cli` must be an absolute path if `herdr` isn't on launchd's `PATH` (it usually isn't —
-> `/opt/homebrew/bin` is not there). Second, once the session host's control socket is fenced with
-> token auth, the keep-alive job inherits no `HERDR_API_TOKEN`, so the host will refuse and the
-> button will say so honestly on every tap. Whether the dashboard should hold that token is the
-> owner's call and is filed as a follow-up; until it is answered, run `bin/command-center` from a
-> terminal (or via `liftoff`) if you want that button to work.
 
 > **Note:** launchd runs with a minimal `PATH`, so the job uses your system `python3`
 > (`/usr/bin/python3` — the stdlib-only runtime this is built for). If your only Python 3 is a

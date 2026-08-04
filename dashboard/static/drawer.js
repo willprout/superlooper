@@ -127,24 +127,6 @@
       '</div></div>';
   }
 
-  // The Open-session-window button (issue #310). Owner ruling 2026-07-30: the card gets a button
-  // that opens THAT session's window on the session host — attach, which is proven — and no
-  // observe-stream plumbing, so there is no frame to render here and never will be. Every semantic
-  // is the server's (cards._session): whether a session exists at all, and the host name to show.
-  // This layer only decides whether to draw a button and what to put in it.
-  function sessionHTML(d) {
-    var s = d.session;
-    if (!s || !s.present) return "";
-    return '<button class="btn ghost drawer-session" data-act="session-window"' +
-      ' data-repo="' + esc(d.repo) + '" data-num="' + esc(d.num) + '"' +
-      ' title="Open this session’s window on the session host (' + esc(s.name) + ')' +
-      ' — brings its terminal to the front; nothing about the loop changes">' +
-      // U+1F5A5 (desktop computer), not the more literal U+1F5D4 "window": that codepoint has no
-      // glyph in the platform emoji font and renders as tofu — checked in the real browser, not
-      // guessed. It sits in the same family as the Sweep bin and the Fixer wrench already here.
-      '\u{1F5A5}️ Open session window</button>';
-  }
-
   function actionsHTML(d) {
     var da = ' data-repo="' + esc(d.repo) + '" data-num="' + esc(d.num) + '"';
     // The verb + label + whether Discuss is the default are the SERVER's (d.decision) — so a bounced
@@ -152,17 +134,14 @@
     // exactly as on the card. The destructive verbs — Drop, and Rebuild on a finished lane (issue
     // #161) — stay on the card, where their two-tap confirm lives. Discuss is always available.
     var dec = d.decision;
-    // The session-window button leads the row on every flight that has one: it is the only verb
-    // here that is purely a way to LOOK at the work, so it sits ahead of the verbs that change it.
-    var session = sessionHTML(d);
     var discuss = '<button class="btn-note link" data-act="discuss"' + da + '>Discuss →</button>';
-    if (!dec) return '<div class="drawer-actions">' + session + discuss + '</div>';
+    if (!dec) return '<div class="drawer-actions">' + discuss + '</div>';
     var approve = '<button class="btn ' + (dec.discuss_default ? "ghost" : "primary") +
       '" data-act="' + esc(dec.approve_act) + '"' + da + '>' + esc(dec.approve_label) + '</button>';
     var bits = dec.discuss_default
       ? ['<button class="btn primary" data-act="discuss"' + da + '>Discuss →</button>', approve]
       : [approve, discuss];
-    return '<div class="drawer-actions">' + session + bits.join("") + '</div>';
+    return '<div class="drawer-actions">' + bits.join("") + '</div>';
   }
 
   function render(d) {

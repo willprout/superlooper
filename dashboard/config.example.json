@@ -12,7 +12,6 @@
   "runner_silent_seconds": 90,
   "heartbeat_down_seconds": 300,
   "superlooper_cli": "~/.claude/skills/superlooper/bin/superlooper",
-  "herdr_cli": "herdr",
   "notify": {
     "imessage_to": null,
     "cmd": null

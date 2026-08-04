@@ -73,10 +73,10 @@ def _run(binary, args, timeout=None):
 #     tidy: no finished (merged) session windows to close.
 #
 # The SURFACE column is whatever the session HOST calls that window, and it is opaque here on
-# purpose (issue #310): today it reads `<host>:surface-23`, under herdr it is a workspace-qualified
-# id or a bare agent name, and the parser below must not care. That column is the dashboard's whole
-# coupling to the host on this path — the close itself is the engine's — which is why a host swap
-# changes the strings this dialog shows and no code in this file.
+# purpose (issue #310): one host spells it `<host>:surface-23`, the next a workspace-qualified id,
+# the next a bare agent name — and the parser below must not care. That column is the dashboard's
+# whole coupling to the host on this path (the close itself is the engine's), which is why a host
+# swap changes the strings this dialog shows and no code in this file.
 
 # An indented window row: two leading spaces, the id, the single-token status, then the surface
 # (which may itself carry non-space punctuation, e.g. a `host:id` form). The id is `iN` (a tracked

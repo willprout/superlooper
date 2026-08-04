@@ -512,7 +512,6 @@
     if (act === "fixer-open") { if (window.CCFixer) window.CCFixer.open(repo); return; }
     if (act === "replay-open") { if (window.CCReplay) window.CCReplay.open(repo, state.snapshot && state.snapshot.fun); return; }
     if (act === "digest-open") { if (window.CCDigest) window.CCDigest.open(repo); return; }
-    if (act === "session-window") { doSessionWindow(repo, num); return; }
     if (act === "discuss") { doDiscuss(repo, num); return; }
     if (act === "answer") { doAnswer(el, repo, num); return; }
     if (act === "approve") {
@@ -545,27 +544,6 @@
     window.clearTimeout(armThenFire._t);
     state.confirming = null;
     postVerb(path, repo, num, okMsg);
-  }
-
-  // #310: Open this flight's session window on the session host. A LOCAL command, never a GitHub
-  // write — so it deliberately does NOT go through postVerb (whose toast and refresh both speak the
-  // language of a label landing) and it does not re-poll: nothing about the loop changed, only
-  // which window is in front. One tap, no confirm gate: it opens a window the owner already owns.
-  //
-  // The honest-failure case is the common one. "The host has no window for SL-310" is what you get
-  // for a session that exited or was tidied away, and it must reach the owner in the host's own
-  // words rather than as a shrug — so the server's error string is toasted verbatim.
-  function doSessionWindow(repo, num) {
-    postJSON("/api/session-window", { repo: repo, num: Number(num) })
-      .then(function (res) {
-        var b = (res && res.body) || {};
-        if (res.status === 200 && b.ok) {
-          toast("Opened the session window for SL-" + num + " — it's in front now", "ok");
-        } else {
-          toast(b.error || "couldn't open the session window for SL-" + num, "err");
-        }
-      })
-      .catch(function () { toast("couldn't reach the command center", "err"); });
   }
 
   function postVerb(path, repo, num, okMsg) {

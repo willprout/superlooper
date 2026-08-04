@@ -1098,12 +1098,6 @@ html, body {
   border-top: 1px solid #EDF0F4;
 }
 .drawer-actions .btn-note.link { margin-left: auto; }
-/* The Open-session-window button (issue #310) — the one verb in this row that only LOOKS at the
-   work rather than changing it, so it reads quieter than its neighbours: mono, like the terminal it
-   opens, and never the primary weight even when it is the only button present. */
-.drawer-actions .drawer-session {
-  font: 600 10.5px var(--mono); letter-spacing: 0.3px; white-space: nowrap;
-}
 
 /* ============================ Task 11 — night replay + morning digest ============================ */
 
