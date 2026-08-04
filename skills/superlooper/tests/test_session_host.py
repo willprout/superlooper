@@ -678,6 +678,16 @@ def test_the_agent_being_gone_is_not_proof_the_workspace_went():
     assert "workspace is busy" in str(exc.value), "the host's own words belong in the memo"
 
 
+def test_only_a_not_found_answer_means_the_workspace_went():
+    # A "busy" or "refused" reply is the host saying it could not tell us — reading any structured
+    # error as gone would be the same false success in a new costume (review verification pass).
+    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (1, "", _NOT_FOUND)],
+                     ("workspace", "get"): (1, "", _err("workspace_busy", "try again"))})
+    fake.children[4242] = []
+    with pytest.raises(session_host.TeardownUnverified):
+        _host(fake).exit(_session())
+
+
 def test_a_close_that_errored_but_left_nothing_behind_is_still_a_teardown():
     # The other direction, so the fix above does not trade a false success for a false failure: a
     # `workspace_not_found` refusal means the window was ALREADY gone. Refusing THAT would park a

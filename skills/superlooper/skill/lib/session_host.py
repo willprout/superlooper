@@ -81,6 +81,11 @@ ALIVE, DEAD, UNKNOWN = "alive", "dead", "unknown"
 # Nothing in this module branches on them — that is the point (plan §5.2).
 ADVISORY_STATES = ("idle", "working", "blocked", "done", "unknown")
 
+# The host error codes that mean "I do not have that" — the ONLY answer a teardown may read as
+# proof the workspace went (see _workspace_gone). Its errors are spelled `<thing>_not_found`; the
+# published schema types the envelope but does not enumerate the codes, so this is the assertion.
+_GONE_CODES = re.compile(r"not[_ ]?found|no[_ ]?such|does[_ ]?not[_ ]?exist")
+
 _DEFAULT_BINARY = "herdr"
 _CALL_SECONDS = 20                 # a control call that hangs is a dead host, not a slow one
 _PROMPT_TIMEOUT_MS = 120000        # the host's own documented prompt wait
@@ -586,9 +591,17 @@ class SessionHost:
             # test either: a `workspace_not_found` refusal means the window was ALREADY gone, which
             # is a teardown, while a cheerful rc=0 that changed nothing is not.
             if self._workspace_gone(session.workspace) is True and after.liveness != ALIVE:
-                return Teardown(closed=True, signalled=[],
-                                detail="workspace %s is gone (the host no longer has it)"
-                                       % session.workspace)
+                # Same loose end kill can be left holding: the pane shell a finished session leaves
+                # behind may outlive the close. It is reported, never silently dropped.
+                recorded = session.shell_pid
+                orphan = (recorded if recorded is not None and self._probe.pid_alive(recorded)
+                          else None)
+                return Teardown(closed=True, signalled=[], orphan_pid=orphan,
+                                detail="workspace %s is gone (the host no longer has it)%s"
+                                       % (session.workspace,
+                                          "" if orphan is None else
+                                          "; the pid recorded at spawn (%s) is still alive and "
+                                          "could not be attributed to this session" % orphan))
         raise TeardownUnverified(
             "[%s] the close was issued but nothing confirmed the workspace went (%s)%s"
             % (before.name, session.workspace,
@@ -714,16 +727,25 @@ class SessionHost:
     def _workspace_gone(self, workspace):
         """True / False / None — does the host still have this workspace?
 
-        A structured error (``workspace_not_found`` and friends) is the host saying it does not,
-        which is what a teardown needs to hear; a result means it still does. No answer at all is
-        None, and every caller reads None as "not verified".
+        Only a NOT-FOUND answer means gone. Reading any structured error that way would let a
+        "busy" or "refused" reply — the host saying it could not tell us — pass as a completed
+        teardown, which is the same false success in a new costume. Everything else is None, and
+        every caller reads None as "not verified", so the failure mode is a park, not a leak.
+
+        ``_GONE_CODES`` is the one place the host's not-found spelling is asserted (its errors are
+        ``<thing>_not_found``; the schema does not enumerate codes). If a later release renames it,
+        this module refuses to verify teardowns until this line is updated — loudly, and in the
+        safe direction.
         """
         if not workspace:
             return None
         reply = self._call(["workspace", "get", workspace])
         if reply.ok:
             return False
-        return True if reply.spoke else None
+        if not reply.spoke:
+            return None
+        code = (reply.error or "").split(":", 1)[0].strip().lower()
+        return True if _GONE_CODES.search(code) else None
 
     def _rollback(self, workspace):
         """Undo a spawn that could not be confirmed. Best effort by design: the raise that follows
