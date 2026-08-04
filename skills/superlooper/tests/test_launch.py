@@ -619,5 +619,7 @@ def test_a_session_id_that_could_not_be_recorded_refuses_the_launch(tmp_path):
     finally:
         os.chmod(sessions, 0o700)
     assert result.rc == launch.ABORTED
-    assert "resumable" in result.stderr
+    assert "refusing" in result.stderr, \
+        "a deliberate refusal must not render as 'the launcher failed unexpectedly'"
+    assert "could not record the session id" in result.stderr
     assert host.spawned == []

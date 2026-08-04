@@ -220,8 +220,10 @@ _LAUNCH_TEXT = (
       "session had nothing to work from")),
     (("could not create the worktree",),
      ("worktree_create_failed",
-      "the worktree could not be created even though its base branch exists — a git-level fault "
-      "(a leftover worktree, a locked index, or a branch already checked out elsewhere)")),
+      "the worktree could not be created — a git-level fault (a leftover worktree, a locked index, "
+      "a branch already checked out elsewhere), or a git that could not be asked at all. The "
+      "captured stderr names the rcs; the base branch is NOT claimed either way here, because the "
+      "one case that proves it missing has its own exit code (base_missing) and this one does not")),
     (("sanitize validation failed", "issues.json load"),
      ("identity_invalid",
       "the issue's identity or branch failed validation before anything reached git or the shell "
