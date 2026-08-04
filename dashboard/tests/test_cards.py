@@ -767,3 +767,43 @@ def test_memo_history_carries_bounces_too():
     ]
     d = cards.flight_drawer(_flight(memo="a later park reason"), jslice, "r", "Air")
     assert d["memos"] == ["BOUNCED: an earlier push-back", "a later park reason"]
+
+
+# =============================== the session window (issue #310) ===============================
+
+def test_drawer_offers_the_session_window_for_a_flight_that_has_a_session():
+    # Owner ruling 2026-07-30 (HERDR-ADOPTION-PLAN §9): the card gains a button that opens THAT
+    # session's window on the host. The drawer carries the whole decision — present + the host name
+    # — so the JS binds strings it never derives (B.1).
+    d = cards.flight_drawer(_flight(num=310, session_window=True), [], "will-titan/sandbox", "Sandbox Air")
+    assert d["session"]["present"] is True
+    assert d["session"]["name"] == "i310"
+
+
+def test_drawer_offers_no_session_window_for_a_lane_with_no_recorded_window():
+    # A queued lane never had one, and a tidied lane no longer does — either way there is nothing to
+    # open, so the button must not be offered (a button that can only ever fail is a lie).
+    d = cards.flight_drawer(_flight(num=310, session_window=False), [], "r", "Air")
+    assert d["session"]["present"] is False
+
+
+def test_drawer_session_is_absent_rather_than_hopeful_when_the_flight_predates_the_fact():
+    # A flight object without `session_window` (an older snapshot shape) reads as NO session — fail
+    # closed, never a button that addresses a name nothing vouches for.
+    d = cards.flight_drawer(_flight(num=310), [], "r", "Air")
+    assert d["session"]["present"] is False
+
+
+def test_drawer_session_name_is_spelled_exactly_as_the_verb_spells_it():
+    # ONE spelling of the host address: the drawer displays what lib/session_window will actually
+    # send, so a display that says i310 can never be a button that focuses something else.
+    import session_window
+    d = cards.flight_drawer(_flight(num=42, session_window=True), [], "r", "Air")
+    assert d["session"]["name"] == session_window.name_for(42)
+
+
+def test_drawer_session_refuses_a_flight_with_no_usable_number():
+    # No number ⇒ no address ⇒ no button, rather than a name built from None.
+    d = cards.flight_drawer(_flight(num=None, session_window=True), [], "r", "Air")
+    assert d["session"]["present"] is False
+    assert d["session"]["name"] is None

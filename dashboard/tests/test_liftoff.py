@@ -14,6 +14,8 @@ bin and are exercised by test_liftoff_bin.py.
 """
 import os
 
+import pytest
+
 import liftoff
 
 
@@ -169,3 +171,79 @@ def test_missing_config_message_advises_copying_the_example_when_none_exists():
     assert "cp " in msg                                             # the concrete copy command
     assert "/home/op/proj/dashboard/config.json" in msg            # copies TO the sibling config
     assert "CC_CONFIG" in msg                                       # the three ways still listed
+
+
+# =============================== the runner's home (issues #306 / #310) ===============================
+# The runner no longer always lives in the tab you run liftoff from. `runner_home` is a per-repo
+# engine config key: `pane` (today's visible tab, still the default) or `login-item` (a gui/$UID
+# LaunchAgent). liftoff's PROBES are home-independent and unchanged — the dashboard's port, the
+# runner's pidfile + liveness — but its ACTION for the runner half is not: foregrounding
+# `superlooper run` in this tab is a pane-home fact, and doing it under a login-item home would
+# start a SECOND runner outside its own home.
+
+def test_the_home_is_read_from_the_engines_own_read_only_report():
+    # `superlooper runner-home --repo <path>` is the engine's read-only answer (issue #306); this
+    # pins the exact print format the parser depends on, rather than discovering it in production.
+    pane = ("runner_home: pane — this repo's runner lives in a visible tab that a person opens; "
+            "its pane is the launch anchor every worker session is born in.\n"
+            "  Start it with: superlooper run --repo /co/a (from inside that tab)\n")
+    assert liftoff.parse_runner_home(pane) == liftoff.PANE
+
+    job = ("runner_home: login-item\n"
+           "  job:   com.superlooper.runner.o-a\n"
+           "  domain: gui/501\n"
+           "  plist: /Users/pat/Library/LaunchAgents/com.superlooper.runner.o-a.plist\n"
+           "  live:  pid 4321\n")
+    assert liftoff.parse_runner_home(job) == liftoff.LOGIN_ITEM
+
+
+@pytest.mark.parametrize("out", [
+    "", "   \n", None,
+    "usage: superlooper [-h] ...\nsuperlooper: error: invalid choice: 'runner-home'\n",
+    "runner_home: something-new\n",                       # a home this build does not know
+])
+def test_an_unreadable_home_report_is_none_so_the_caller_keeps_todays_behaviour(out):
+    # The fail direction is deliberate. An engine too old to answer, or one answering with a home
+    # this build has never heard of, must not silently become "login-item" — that would refuse to
+    # start the runner at all. None lets the caller keep the pane behaviour, which at worst starts
+    # a runner in the tab (working, if not where a login-item owner wanted it).
+    assert liftoff.parse_runner_home(out) is None
+
+
+def test_the_probe_and_the_setup_step_are_the_engines_own_documented_commands():
+    assert liftoff.runner_home_argv("/cli/superlooper", "/co/a") == [
+        "/cli/superlooper", "runner-home", "--repo", "/co/a"]
+    assert liftoff.runner_job_argv("/cli/superlooper", "/co/a") == [
+        "/cli/superlooper", "runner-home", "--repo", "/co/a", "--install", "--load"]
+
+
+def test_pane_home_still_foregrounds_the_runner_in_this_tab():
+    p = liftoff.make_plan(_R, _URL, _DASH, _RUN, dashboard_up=True, runner_pid=None,
+                          runner_home=liftoff.PANE)
+    assert p["runner"]["start"] is True and p["runner"]["foreground"] is True
+    assert p["runner"]["argv"] == _RUN
+
+
+def test_login_item_home_bootstraps_the_job_instead_of_claiming_this_tab():
+    job = liftoff.runner_job_argv("/cli/superlooper", "/co/a")
+    p = liftoff.make_plan(_R, _URL, _DASH, job, dashboard_up=True, runner_pid=None,
+                          runner_home=liftoff.LOGIN_ITEM)
+    assert p["runner"]["start"] is True
+    assert p["runner"]["foreground"] is False, (
+        "a login-item runner must NOT take over this tab — launchd owns its process")
+    assert p["runner"]["argv"] == job
+    assert "cmux tab" not in p["runner"]["message"]
+    assert "login item" in p["runner"]["message"]
+
+
+def test_a_live_runner_is_left_alone_in_either_home():
+    for home in (liftoff.PANE, liftoff.LOGIN_ITEM):
+        p = liftoff.make_plan(_R, _URL, _DASH, _RUN, dashboard_up=True, runner_pid=999,
+                              runner_home=home)
+        assert p["runner"]["start"] is False and p["runner"]["pid"] == 999
+        assert "leaving it" in p["runner"]["message"]
+
+
+def test_the_default_home_is_the_pane_so_an_unprobed_caller_keeps_todays_behaviour():
+    p = liftoff.make_plan(_R, _URL, _DASH, _RUN, dashboard_up=True, runner_pid=None)
+    assert p["runner"]["foreground"] is True

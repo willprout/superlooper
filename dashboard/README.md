@@ -59,6 +59,7 @@ Open `config.json` and set the one thing that's actually yours — **`repos`**:
   "gh_poll_seconds": 30,
   "heartbeat_down_seconds": 300,
   "superlooper_cli": "~/.claude/skills/superlooper/bin/superlooper",
+  "herdr_cli": "herdr",
   "notify": { "imessage_to": null, "cmd": null },
   "fun": {
     "master": true,
@@ -91,6 +92,11 @@ Field by field:
   `~/.claude/skills/superlooper/bin/superlooper`, `~` expanded). Change it only if your skill lives
   elsewhere. Tidy always asks first (it shows exactly which windows it will close) and only ever
   closes *finished* sessions — never one still building.
+- **`herdr_cli`** — the session host's CLI, which the flight card's **Open session window** button
+  runs locally to bring that session's window to the front (default `herdr`, resolved against
+  `PATH` like `gh` — herdr's install prefix differs per machine). Set an absolute path if yours
+  isn't on the dashboard's `PATH`. The button changes nothing about the loop; if the host has no
+  window for that flight, it says so in the host's own words rather than pretending it worked.
 - **`notify`** — where the dashboard's one push (RUNNER DOWN) goes. `imessage_to` is a phone
   number/handle to text; `cmd` is a shell command to run instead. Both `null` by default — a
   fresh install nags no one.
@@ -120,11 +126,18 @@ is never reachable off your machine, by design.
 The dashboard and the loop runner are two processes. `bin/liftoff` is the single command that
 starts — or verifies already-running — **both**: this dashboard and one watched repo's runner.
 
-**Run it inside a cmux tab, exactly like `superlooper run`.** It starts the dashboard in the
-background (a localhost server needs no tab) and then hands *this* tab to the runner
-(`superlooper run` in the foreground), so the runner lands in a visible cmux tab you can watch —
-the one proven restart procedure. (There is deliberately no automated tab placement; your real tab
-is the anchor.)
+It always starts the dashboard in the background (a localhost server needs no tab). What it does
+about the **runner** follows that repo's `runner_home` — liftoff asks the engine with the read-only
+`superlooper runner-home --repo <path>` rather than reading the engine's config itself:
+
+- **`runner_home: "pane"` (the default) — run liftoff inside a session tab, exactly like
+  `superlooper run`.** It hands *this* tab to the runner (`superlooper run` in the foreground), so
+  the runner lands in a visible tab you can watch — the one proven restart procedure. (There is
+  deliberately no automated tab placement; your real tab is the anchor.)
+- **`runner_home: "login-item"` — no tab is claimed.** launchd owns the runner's process, so liftoff
+  runs the engine's own `runner-home --install --load` bootstrap, reports both halves up, and gives
+  you your terminal back. If that setup refuses (a PATH it can't honestly record, a `launchctl` that
+  wouldn't bootstrap), liftoff says so and exits nonzero — it never reports a runner it didn't start.
 
 ```sh
 bin/liftoff                        # from the dashboard directory: reads ./config.json
@@ -156,9 +169,13 @@ bin/liftoff --restart-dashboard    # the dashboard says STALE TOWER: restart it 
 - **The runner start rides the config contract.** `liftoff` shells the engine's own documented
   `superlooper run` through the config's **`superlooper_cli`** — the dashboard names the engine's
   CLI, the engine never names the dashboard. Nothing engine-specific is hardcoded here.
-- If you're **not** in a cmux tab, the dashboard still comes up, but the runner's own preflight
-  refuses to start (it can't see a tab to open worker sessions in) with a message telling you to
-  run inside a cmux tab — the same guard `superlooper run` has always had.
+- Under the **`pane`** home, if you're **not** in a session tab the dashboard still comes up, but
+  the runner's own preflight refuses to start (it can't see a tab to open worker sessions in) and
+  tells you to run inside one — the same guard `superlooper run` has always had. Under the
+  **`login-item`** home that guard doesn't apply: there is no tab to be in.
+- **An engine too old to report its home keeps the pane behaviour.** The probe is read-only and
+  fail-soft: if `superlooper runner-home` can't answer, liftoff does exactly what it did before
+  either home existed rather than refusing to start your runner.
 
 ### 4 · Keep it always-on (optional, macOS)
 

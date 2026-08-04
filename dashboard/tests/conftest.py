@@ -34,6 +34,10 @@ William's live cmux). Each MUST resolve through an env-var override:
                    session — a stray real call would spawn a live agent on William's machine, the
                    most expensive stray call in this repo. Those tests inject
                    tests/fakes/fake-superlooper in-body.
+    SL_HERDR       the session-host binary (lib/session_window.py — issue #310's Open-session-window
+                   button, the dashboard's ONE doorway to the host). A real call would reach into
+                   William's own live herd and yank the focus of the window he is working in, so it
+                   is neutralized like the rest; that test injects tests/fakes/fake-herdr in-body.
     SL_LAUNCH_SESSION the engine's launch shim. Nothing in the dashboard resolves this any more
                    (before #144, lib/fixer drove the shim directly — that whole handshake now lives
                    behind `superlooper debug`). Kept neutralized anyway: it is the variable the
@@ -76,6 +80,7 @@ NEUTRALIZED_BINARIES = {
     "SL_SECURITY": "/nonexistent/command-center-test-security",
     "SL_SUPERLOOPER": "/nonexistent/command-center-test-superlooper",
     "SL_LAUNCH_SESSION": "/nonexistent/command-center-test-launch-session",
+    "SL_HERDR": "/nonexistent/command-center-test-herdr",
 }
 
 # Set ONLY by the autouse fixture below — the guard asserts it, so deleting the fixture cannot

@@ -33,6 +33,16 @@ def test_external_binary_neutralization_fixture_ran():
             f"{var}={expected!r} must point at an absent path; tests must never reach a live binary")
 
 
+def test_every_external_binary_the_dashboard_shells_is_named_in_the_neutralized_set():
+    # The loop above proves each LISTED var is neutralized; it cannot notice one that was DELETED
+    # from the list. So the vars whose real binary would touch William's live machine are named
+    # here explicitly — the ratchet is only a ratchet if removing a name fails a test.
+    for var in ("SL_GH", "SL_CMUX", "SL_OSASCRIPT", "SL_SUPERLOOPER", "SL_HERDR"):
+        assert var in conftest.NEUTRALIZED_BINARIES, (
+            f"{var} must stay in the fail-closed neutralization set — a real call reaches "
+            f"William's own machine")
+
+
 def test_network_urlopen_is_neutralized():
     # The autouse fixture replaces urllib.request.urlopen with a raiser carrying OUR sentinel
     # message — so this proves the guard is active, not that a real connection merely failed. No

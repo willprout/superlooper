@@ -42,7 +42,8 @@ points** — do not relitigate them, do not optimize them away:
 - **Semantics server-side, pixels client-side (B.1).** Stage mapping, liveness tiers, the
   progress heuristic, the gate checklist, pill aggregation — all derived in pure Python `lib/`
   with tests. The squint test: delete the art and the JSON is still a correct state diagram.
-- **No test may reach a real external binary** (`gh`, `osascript`, `cmux`) or the network.
+- **No test may reach a real external binary** (`gh`, `osascript`, the session host, the
+  `superlooper` CLI) or the network.
   `tests/conftest.py` neutralizes the resolution env vars fail-closed by default (autouse) and a
   guard test fails if that is ever removed — keep it that way (2026-07-03 toast-spam ratchet).
 - **Fresh-agent review, always.** Every change is reviewed by an agent that did NOT write the

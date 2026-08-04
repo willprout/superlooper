@@ -1,18 +1,26 @@
 /* The Restart button's confirm dialog (issue #116) — the dashboard's SECOND ops-verb button and a
    sibling of Tidy: tapping Restart asks the LIVE runner (via the server → `superlooper
-   request-restart`) to restart ITSELF in its own cmux tab. It is NOT a GitHub write — it drops a
-   request the runner honors between ticks by re-exec'ing in place (fresh engine, cleared in-memory
-   state). So the flow is deliberately two-step and confirm-gated (tap-where-you-read, design §0.3):
+   request-restart`) to restart ITSELF. It is NOT a GitHub write — it drops a request the runner
+   honors between ticks (a fresh engine, cleared in-memory state). So the flow is deliberately
+   two-step and confirm-gated (tap-where-you-read, design §0.3):
 
      open → POST /api/restart/check → dialog states EXACTLY what will happen (or, if NO runner is
      live, says so and shows the one-line manual start) → the owner taps "Restart the loop" →
      POST /api/restart → the honest result is shown.
 
-   The bright line the whole design rides on: this NEVER spawns or places a cmux tab (owner ruling,
-   2026-07-09). With no live runner the dialog cannot and must not resurrect one — it reports that
-   plainly and points at the manual procedure; there is no confirm button, because there is nothing
-   to ask. A command failure (missing CLI, crash) comes back as ok:false with an error string and is
-   shown plainly — never a silent success.
+   HOW the loop comes back is deliberately NOT written here (issue #310, following #306). The runner
+   now has two homes: in the `pane` home it re-execs in its own visible tab, and as a `login-item`
+   it exits cleanly and its supervisor brings it back. Those are different sentences, and a dialog
+   that promised a tab to an owner whose runner is a launchd job would be the D12 defect class —
+   an ops instruction that names the wrong mechanism, read at 3am. `request-restart --json` answers
+   with a home-correct `how` (what a restart DOES) and `manual` (the one-line remedy), so this file
+   renders the engine's words and asserts nothing about the host itself.
+
+   The bright line the whole design rides on: this NEVER spawns or places a session window (owner
+   ruling, 2026-07-09). With no live runner the dialog cannot and must not resurrect one — it
+   reports that plainly and points at the manual procedure; there is no confirm button, because
+   there is nothing to ask. A command failure (missing CLI, crash) comes back as ok:false with an
+   error string and is shown plainly — never a silent success.
 
    window.CCRestart is a persistent overlay OUTSIDE #root (like the drawer/tidy) so the 2s poll never
    touches it. Design B.1: this file computes NO semantics — the server already turned the CLI's JSON
@@ -30,7 +38,11 @@
   // the confirm executes against THAT, never the mutable `slug`, so a re-open can't leave the dialog
   // showing repo A while confirm restarts repo B. `gen` supersedes an in-flight preflight when a
   // newer open starts, so an out-of-order response is dropped.
-  var node = null, slug = "", listedRepo = "", busy = false, gen = 0;
+  // `listedHow` is the engine's home-correct phrase for what a restart DOES — one sentence per
+  // runner home, written by the engine because only it knows which home this repo uses. Captured
+  // from the preflight that rendered the confirm and reused by the done line, so both sentences
+  // describe the SAME home the dialog was opened against.
+  var node = null, slug = "", listedRepo = "", listedHow = "", busy = false, gen = 0;
 
   function postJSON(path, payload) {
     return fetch(path, {
@@ -53,7 +65,7 @@
       '<div class="cc-restart-card">' +
         '<div class="cc-restart-head">' +
           '<span class="cc-restart-title">\u{1F504} RESTART <b id="cc-restart-target"></b></span>' +
-          '<span class="cc-restart-sub">asks the running loop to restart itself in its own tab — ' +
+          '<span class="cc-restart-sub">asks the running loop to restart itself — ' +
             'runs <code>superlooper request-restart</code> on this machine. no GitHub, no AI.</span>' +
           '<button class="cc-restart-x" data-restart-close title="close (Esc)">✕</button>' +
         '</div>' +
@@ -84,6 +96,7 @@
     ensure();
     slug = repoSlug;
     listedRepo = "";                 // nothing confirmed-ready yet for this open
+    listedHow = "";                  // ...and no home-correct phrase read yet either
     busy = false;
     el("cc-restart-target").textContent = "→ " + slug;
     node.classList.add("open");
@@ -102,7 +115,7 @@
         if (myGen !== gen || !isOpen()) return;    // superseded / closed → ignore this stale reply
         var b = res.body || {};
         if (res.status !== 200) { renderError(b.error, false, repo); return; }
-        if (b.running === true) { listedRepo = repo; renderConfirm(); return; }
+        if (b.running === true) { listedRepo = repo; listedHow = b.how || ""; renderConfirm(); return; }
         if (b.running === false) { renderNoRunner(b.manual); return; }
         renderError(b.error, false, repo);         // running unknown → the CLI couldn't answer
       })
@@ -124,7 +137,9 @@
         if (myGen !== gen || !isOpen()) return;    // a re-open superseded this / dialog closed
         var b = res.body || {};
         if (res.status !== 200) { renderError(b.error, true, repo); return; }
-        if (b.requested === true) { renderDone(); return; }
+        // The execute answers with its own `how` too; prefer it — it was read a moment later than
+        // the preflight's, so a config edited in between can never leave the done line stale.
+        if (b.requested === true) { renderDone(b.how || listedHow); return; }
         // The runner died between the preflight and the confirm → honest no-runner, never an error.
         if (b.running === false) { renderNoRunner(b.manual); return; }
         renderError(b.error, true, repo);
@@ -136,11 +151,15 @@
   }
 
   // A live runner is there: state EXACTLY what will happen, in plain words, then the confirm gate.
+  // The FIRST consequence is the engine's own `how` (home-correct — a tab re-exec or a supervised
+  // restart), never a phrase this file chose. Its fallback says only what is true in BOTH homes: a
+  // restart happens. Better a vaguer sentence than a confidently wrong one.
   function renderConfirm() {
     setBody(
       '<div class="cc-restart-lead">A loop is running for <b>' + esc(slug) + '</b>. Restarting will:</div>' +
       '<ul class="cc-restart-consequence">' +
-        '<li>let it <b>finish the current tick</b>, then restart the loop in its own cmux tab;</li>' +
+        '<li>let it <b>finish the current tick</b>, then <b>' +
+          esc(listedHow || "restart the loop") + '</b>;</li>' +
         '<li>reload the currently-installed engine and <b>clear in-memory state</b> ' +
           '(e.g. a stuck launch hold);</li>' +
         '<li>leave <b>in-flight worker sessions untouched</b> — nothing merges while it restarts.</li>' +
@@ -152,20 +171,22 @@
   }
 
   // No live runner: the button cannot (and must not) resurrect one. Say so plainly and show the
-  // one-line manual start — never a confirm button, because there is nothing to ask.
+  // engine's one-line manual remedy — which is home-correct (a `superlooper run` for the pane home,
+  // a `launchctl kickstart` for a login-item job), so this file neither writes nor guesses it.
+  // Never a confirm button, because there is nothing to ask.
   function renderNoRunner(manual) {
-    var line = manual || "open a cmux tab and run: superlooper run --repo <path>";
+    var line = manual || "superlooper request-restart --repo <path>   (run it for the exact remedy)";
     setBody(
       '<div class="cc-restart-notice">No loop is running for <b>' + esc(slug) + '</b> — ' +
-        'there is nothing to restart. Start it by hand in a visible cmux tab:</div>' +
+        'there is nothing to restart. Start it by hand:</div>' +
       '<div class="cc-restart-manual"><code>' + esc(line) + '</code></div>' +
       '<div class="cc-restart-actions"><button class="btn ghost" data-restart-close>Done</button></div>');
   }
 
-  function renderDone() {
+  function renderDone(how) {
     setBody(
       '<div class="cc-restart-result ok">✓ Restart requested — the loop will finish its ' +
-        'current tick and restart itself in its own tab.</div>' +
+        'current tick and ' + esc(how || "restart") + '.</div>' +
       '<div class="cc-restart-actions"><button class="btn ghost" data-restart-close>Done</button></div>');
   }
 

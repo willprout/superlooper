@@ -17,6 +17,7 @@ and the tower log can never drift.
 import json
 
 import flights
+import session_window
 import tower
 
 _GH = "https://github.com"
@@ -505,6 +506,29 @@ def _cargo(flight):
     return {"present": present, "added": added, "removed": removed, "files": files, "chip": chip}
 
 
+def _session(flight):
+    """The Open-session-window button's whole decision (issue #310): may the drawer offer to open
+    THIS flight's window on the session host, and under what host name?
+
+    Two facts, both already settled elsewhere, joined here so the JS derives nothing:
+
+    * ``present`` — the flight's own ``session_window`` (the loop recorded a window for this lane,
+      the same marker ``superlooper tidy`` selects on). A queued lane has none, and a tidied one no
+      longer does; a button that could only ever fail would be a lie about what the surface can do.
+      Missing/falsy reads as absent: fail closed, never a hopeful button.
+    * ``name`` — the host's agent name, taken from :func:`session_window.name_for`, the SAME
+      function the verb itself uses to build its argument. One spelling of the address means a
+      drawer that says ``i310`` can never be a button that focuses something else. A flight with no
+      usable number yields ``None`` (and therefore no button) rather than a name built from junk.
+
+    The host is not consulted here — this layer is pure, and "is that window still open?" is a
+    question only the host can answer. It is asked at TAP time, and its answer is shown honestly.
+    """
+    host_name = session_window.name_for(flight.get("num"))
+    return {"present": bool(flight.get("session_window")) and host_name is not None,
+            "name": host_name}
+
+
 def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, operator="the owner"):
     """The whole flight-card drawer (design record §4) — pure over the flight + its journal slice.
 
@@ -570,6 +594,9 @@ def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, oper
         "cargo": _cargo(flight),
         "journal": journal,
         "decision": decision,
+        # The Open-session-window button (issue #310) — offered only for a flight that HAS a
+        # session, addressed by the same host name the verb will send.
+        "session": _session(flight),
         "attempt": _attempt(flight),
         "go_arounds": _attempt(flight) - 1,
     }

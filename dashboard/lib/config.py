@@ -74,7 +74,14 @@ _REPO_THRESHOLD_DEFAULTS = {"idle_seconds": 480, "freeze_seconds": 2700}
 # absolute path (a relative override stays relative, resolved against cwd like gh's bare ``gh``).
 _DEFAULT_SUPERLOOPER_CLI = "~/.claude/skills/superlooper/bin/superlooper"
 
-_ALLOWED_TOP = set(_TOP_DEFAULTS) | {"repos", "notify", "fun", "superlooper_cli", "operator"}
+# The session-host CLI the Open-session-window button drives (issue #310). Bare by default —
+# resolved against PATH exactly like ``gh`` — because herdr's install prefix is per-machine
+# (/opt/homebrew/bin on Apple silicon, /usr/local/bin on Intel, a cargo target dir for a patched
+# build), so there is no path a shared config could name that would be right for the next user.
+_DEFAULT_HERDR_CLI = "herdr"
+
+_ALLOWED_TOP = set(_TOP_DEFAULTS) | {"repos", "notify", "fun", "superlooper_cli", "herdr_cli",
+                                     "operator"}
 _ALLOWED_REPO_ENTRY = {"path", "airline"}
 
 # Every fun mechanic except the master switch — the snapshot resolves each against master so the
@@ -147,6 +154,15 @@ def _validate_and_fill(raw):
     if not isinstance(raw_cli, str) or not raw_cli.strip():
         _err(f"'superlooper_cli' must be a non-empty string path, got {raw_cli!r}")
     out["superlooper_cli"] = os.path.expanduser(raw_cli.strip())
+
+    # The Open-session-window button's host CLI (issue #310). Same shape and same fail-loud rule as
+    # superlooper_cli, but a BARE default: herdr's install prefix differs per machine
+    # (/opt/homebrew, /usr/local, a cargo build), so "whatever is on PATH" is the only default that
+    # is honest for a shareable install — the same contract `gh` already has here.
+    raw_host = raw.get("herdr_cli", _DEFAULT_HERDR_CLI)
+    if not isinstance(raw_host, str) or not raw_host.strip():
+        _err(f"'herdr_cli' must be a non-empty string path, got {raw_host!r}")
+    out["herdr_cli"] = os.path.expanduser(raw_host.strip())
 
     out["notify"] = _fill_and_check_map("notify", raw.get("notify", {}), _NOTIFY_DEFAULTS,
                                         _check_str_or_null)

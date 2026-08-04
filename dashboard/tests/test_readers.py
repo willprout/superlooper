@@ -93,7 +93,7 @@ def test_state_home_returns_every_contract_key():
     assert set(facts) == {
         "issues_state", "activity", "blocked", "exited", "awaiting",
         "heartbeat_epoch", "heartbeat_age", "merges_frozen", "alert", "reports",
-        "state_format", "published_view"}
+        "state_format", "published_view", "session_windows"}
 
 
 def test_state_home_issues_json_content():
@@ -297,3 +297,26 @@ def test_published_view_corrupt_fails_closed_to_empty_dict(tmp_path):
 def test_published_view_non_dict_body_fails_closed_to_empty_dict(tmp_path):
     (_state(tmp_path) / "gh_view.json").write_text("[1, 2, 3]")
     assert readers.read_state_home(tmp_path, now=1300)["published_view"] == {}
+
+
+# --------------------------- session windows (issue #310) ---------------------------
+
+def test_recorded_session_windows_are_read_from_the_engines_pane_markers(tmp_path):
+    # The engine writes state/panes/<id> when it launches a session and removes it when tidy closes
+    # that window; the `.ws` sidecar names the workspace. Reading the SAME marker is what keeps the
+    # dashboard's Open-session-window button and `superlooper tidy` agreeing about which lanes have
+    # a window — neither derives it from a status.
+    panes = tmp_path / "state" / "panes"
+    panes.mkdir(parents=True)
+    (panes / "i23").write_text("host:surface-23\n")
+    (panes / "i23.ws").write_text("sandbox\n")       # the sidecar is NOT a window of its own
+    (panes / "i7").write_text("")                    # a window whose surface could not be read
+    (panes / "notanid").write_text("x")              # anything that is not a lane id is ignored
+    facts = readers.read_state_home(tmp_path)
+    assert facts["session_windows"] == {"i23", "i7"}
+
+
+def test_a_missing_or_unreadable_panes_dir_reads_as_no_windows(tmp_path):
+    # Fail closed: no marker dir ⇒ no lane claims a window ⇒ no button offered anywhere. A reader
+    # that guessed the other way would put a button on every card on a machine it knows nothing about.
+    assert readers.read_state_home(tmp_path)["session_windows"] == set()

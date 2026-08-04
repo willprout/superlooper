@@ -127,3 +127,50 @@ def test_garbage_output_is_a_plain_failure_never_a_false_success(restart_fix, mo
     monkeypatch.setenv("SL_RESTART_GARBAGE", "1")         # CLI ran but printed no parseable JSON
     res = verb.execute(SLUG)
     assert res["ok"] is False and res["error"]
+
+
+# --------------------------- the runner's home (issues #306 / #310) ---------------------------
+# The runner now has TWO homes and a restart means a different thing in each: in the `pane` home it
+# re-execs in its own visible tab; as a `login-item` it exits cleanly and its supervisor brings it
+# back. `request-restart --json` answers with a home-correct `how` (what a restart DOES) and a
+# home-correct `manual` (the remedy when nothing is live) precisely so the dashboard never has to
+# know which home it is looking at. These pin that the adapter carries BOTH through untouched — a
+# dialog that dropped `how` would fall back to a vaguer sentence, and one that rewrote it would
+# reintroduce the wrong-mechanism defect the engine fixed.
+
+@pytest.mark.parametrize("home,how_fragment,manual_fragment", [
+    ("pane", "own cmux tab", "superlooper run --repo"),
+    ("login-item", "supervisor", "kickstart -k gui/"),
+])
+def test_preflight_carries_the_engines_home_correct_how_and_manual(
+        restart_fix, monkeypatch, home, how_fragment, manual_fragment):
+    verb, _ = restart_fix
+    monkeypatch.setenv("SL_RESTART_HOME", home)
+    res = verb.preflight(SLUG)
+    assert how_fragment in res["how"]
+    assert manual_fragment in res["manual"]
+
+
+@pytest.mark.parametrize("home,how_fragment", [
+    ("pane", "own cmux tab"),
+    ("login-item", "supervisor"),
+])
+def test_execute_carries_the_engines_home_correct_how(restart_fix, monkeypatch, home, how_fragment):
+    verb, _ = restart_fix
+    monkeypatch.setenv("SL_RESTART_HOME", home)
+    res = verb.execute(SLUG)
+    assert res["requested"] is True
+    assert how_fragment in res["how"]
+
+
+def test_the_dead_runner_refusal_carries_the_home_correct_remedy(restart_fix, monkeypatch):
+    # The one the owner reads at 3am. Under a login-item home "open a cmux tab and run
+    # superlooper run" is not merely unhelpful — following it starts a SECOND runner outside its
+    # own home, so the remedy must be the job's own.
+    verb, _ = restart_fix
+    monkeypatch.setenv("SL_RESTART_RUNNING", "0")
+    monkeypatch.setenv("SL_RESTART_HOME", "login-item")
+    res = verb.execute(SLUG)
+    assert res["running"] is False
+    assert "kickstart -k gui/" in res["manual"]      # the job's own restart, not a tab to open
+    assert "cmux" not in res["manual"]

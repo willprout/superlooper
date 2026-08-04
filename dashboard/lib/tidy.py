@@ -2,10 +2,10 @@
 design record §2 verb amendment, owner-approved 2026-07-07).
 
 Every other button the dashboard shows writes a GitHub label/comment/issue (``lib/actions.py``).
-Tidy is deliberately different: it runs the local ``superlooper tidy`` CLI to close the cmux windows
-of FINISHED sessions. This creates a new capability class — executing a machine on this box, not
-writing to GitHub — so it is fenced with the same discipline the GitHub egress carries, and one
-more besides (the CLI is external and it CLOSES things):
+Tidy is deliberately different: it runs the local ``superlooper tidy`` CLI to close the session
+windows of FINISHED sessions. This creates a new capability class — executing a machine on this
+box, not writing to GitHub — so it is fenced with the same discipline the GitHub egress carries,
+and one more besides (the CLI is external and it CLOSES things):
 
 * **This adapter never raises into a caller.** A missing binary, a timeout, a killed process — all
   become a nonzero rc + empty stdout (mirrors ``lib/gh._run``), so a tap can only ever fail closed.
@@ -65,16 +65,22 @@ def _run(binary, args, timeout=None):
 # =============================== the pure parser (semantics — design B.1) ===============================
 # `superlooper tidy` prints (bin/superlooper cmd_tidy), for the default merged scope:
 #     tidy will close N finished (merged) session window(s):
-#       i23   merged        cmux:surface-23           <- f"  {id:5} {status:13} {surface or '(no surface)'}"
+#       i23   merged        <surface>                 <- f"  {id:5} {status:13} {surface or '(no surface)'}"
 #       i16   merged        (no surface)
-#       a1    finished      cmux:answerer-1           <- a FINISHED answerer session window (#132)
+#       a1    finished      <surface>                 <- a FINISHED answerer session window (#132)
 #     dry-run: nothing closed.                         (--dry-run)   /   closed N window(s).   (--yes)
 # or, when nothing is finished:
 #     tidy: no finished (merged) session windows to close.
+#
+# The SURFACE column is whatever the session HOST calls that window, and it is opaque here on
+# purpose (issue #310): today it reads `<host>:surface-23`, under herdr it is a workspace-qualified
+# id or a bare agent name, and the parser below must not care. That column is the dashboard's whole
+# coupling to the host on this path — the close itself is the engine's — which is why a host swap
+# changes the strings this dialog shows and no code in this file.
 
 # An indented window row: two leading spaces, the id, the single-token status, then the surface
-# (which may itself contain non-space punctuation like `cmux:...`). The id is `iN` (a tracked issue
-# session) OR `aN` (a finished answerer session — issue #132; the CLI folds these into the same
+# (which may itself carry non-space punctuation, e.g. a `host:id` form). The id is `iN` (a tracked
+# issue session) OR `aN` (a finished answerer session — #132; the CLI folds these into the same
 # list with a synthetic "finished" status). Header/footer prose never matches (it does not start
 # with two-spaces-then-an-id), so it is ignored — an empty list is the honest "nothing finished
 # to close" read.

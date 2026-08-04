@@ -50,14 +50,34 @@ def test_nothing_executes_without_an_in_ui_confirm():
 
 
 def test_confirm_states_the_consequence_in_plain_words():
-    # The DoD: the dialog states the consequence plainly — finishes the current tick, restarts the
-    # loop in its own tab, in-flight worker sessions untouched.
+    # The DoD: the dialog states the consequence plainly — finishes the current tick, then how the
+    # loop actually comes back, in-flight worker sessions untouched.
     assert re.search(r"finish the current tick", _RESTART_JS, re.I), (
         "the confirm must say it finishes the current tick")
-    assert re.search(r"own (cmux )?tab", _RESTART_JS, re.I), (
-        "the confirm must say it restarts the loop in its own tab")
     assert re.search(r"in-flight worker sessions untouched", _RESTART_JS, re.I), (
         "the confirm must say in-flight worker sessions are untouched")
+
+
+def test_how_the_loop_comes_back_is_the_servers_word_not_a_hardcoded_tab(monkeypatch=None):
+    # Issue #310 / #306: the runner now has TWO homes. In the `pane` home it re-execs in its own
+    # visible tab; as a `login-item` it exits cleanly and launchd brings it back — and a dialog
+    # that says "its own cmux tab" to an owner whose runner is a launchd job is the D12 defect
+    # class this project has already paid for. `superlooper request-restart --json` answers with a
+    # home-correct `how`, so the dialog must RENDER that rather than assert a tab of its own.
+    assert re.search(r"\.how\b", _RESTART_JS), (
+        "the confirm must render the server's home-correct `how` phrase")
+    assert not re.search(r"cmux", _RESTART_JS, re.I), (
+        "restart.js must name no host: which tab (or job) the loop comes back in is the engine's "
+        "word, carried in `how`/`manual`")
+
+
+def test_the_shell_button_makes_no_claim_about_where_the_loop_comes_back():
+    # The top-bar button's tooltip is read before any dialog opens, so it cannot know the home
+    # either — and a tooltip that names a cmux tab is just as wrong as a dialog that does.
+    m = re.search(r'data-act="restart-open"[\s\S]{0,600}?</button>', _SHELL_JS)
+    assert m, "shell.js must render the restart-open button"
+    assert not re.search(r"cmux", m.group(0), re.I), (
+        "the Restart button's own copy must not claim the runner comes back in a cmux tab")
 
 
 def test_dead_runner_is_honest_and_offers_no_restart():

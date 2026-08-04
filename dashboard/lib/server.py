@@ -157,7 +157,8 @@ _ACTION_PATHS = set(_LABEL_VERBS) | {"/api/flag", "/api/discuss", "/api/answer"}
 _TIDY_PATHS = {"/api/tidy/dry-run": "dry_run", "/api/tidy": "execute"}
 # The Restart endpoints (issue #116) — the dashboard's second local-command verb, a sibling of Tidy:
 # ``/api/restart/check`` is the confirm dialog's preflight (is a live runner there to ask?);
-# ``/api/restart`` drops the request the runner honors by re-exec'ing itself in its own cmux tab.
+# ``/api/restart`` drops the request the live runner honors between ticks (how it comes back is the
+# engine's word, carried in the CLI's home-correct ``how`` — issues #306/#310).
 _RESTART_PATHS = {"/api/restart/check": "preflight", "/api/restart": "execute"}
 
 # The Janitor endpoints (issue #121) — the dashboard's THIRD button in the local-command class:
@@ -172,6 +173,13 @@ _JANITOR_PATHS = {"/api/janitor/propose": "propose", "/api/janitor": "execute"}
 # #144). Both are POST-only and same-origin gated: this is the most consequential endpoint in the
 # product — it starts an agent on the owner's machine.
 _FIXER_PATHS = {"/api/fixer/check": "preflight", "/api/fixer": "execute"}
+
+# The Open-session-window endpoint (issue #310) — the newest member of the local-command class and
+# the only ONE-STEP one. It asks the session host to bring a flight's own window to the front
+# (owner ruling 2026-07-30: a button on the card that opens that session's herdr window — attach,
+# which is proven — instead of observe-stream plumbing). There is no preflight and no confirm gate
+# because the verb changes nothing about the loop: it opens a window the owner already owns.
+_SESSION_WINDOW_PATH = "/api/session-window"
 
 
 def _is_allowed_origin(origin, host):
@@ -284,6 +292,32 @@ def _route_restart(clean, body_bytes, restart):
     if not isinstance(repo, str) or not repo.strip():
         return _json_resp(400, {"ok": False, "error": "missing 'repo'"})
     return _json_resp(200, getattr(restart, _RESTART_PATHS[clean])(repo))
+
+
+def _route_session_window(body_bytes, session_window):
+    """The Open-session-window endpoint (issue #310) — a local-command verb. Same-origin is already
+    enforced by the caller (a foreign page must not be able to yank the focus of the owner's
+    terminal any more than it could drive the label writer). ``session_window=None`` (a read-only
+    embedder, or writes disabled) → 405.
+
+    The target is a NUMBER, parsed with the same :func:`_num_of` the label verbs use. That is the
+    bright line of this endpoint: the client names a FLIGHT, and ``lib.session_window.name_for``
+    turns that into the host's agent name — so no string from a request body can ever be handed to
+    the session host as a target. A host that has no window for this flight (a session that never
+    launched, or one already closed) is the verb's own honest ``ok: false`` body at 200 — the
+    request itself was fine — never an HTTP error and never a silent success."""
+    if session_window is None:
+        return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
+    payload, err = _parse_json_body(body_bytes)
+    if err is not None:
+        return err
+    repo = payload.get("repo")
+    if not isinstance(repo, str) or not repo.strip():
+        return _json_resp(400, {"ok": False, "error": "missing 'repo'"})
+    num = _num_of(payload)
+    if num is None:
+        return _json_resp(400, {"ok": False, "error": "missing or bad 'num'"})
+    return _json_resp(200, session_window.open(repo, num))
 
 
 def _route_janitor(clean, body_bytes, janitor):
@@ -400,7 +434,7 @@ def _route_fixer(clean, body_bytes, fixer, snapshot_provider):
 
 
 def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, desk=None, tidy=None,
-                restart=None, janitor=None, version=None, fixer=None):
+                restart=None, janitor=None, version=None, fixer=None, session_window=None):
     """The pure POST router. Order is deliberate: cross-origin → 403 (before any parsing, for every
     POST); the Tidy local-command endpoints (need only ``tidy``); the dashboard-local tower-seen
     write (needs only ``desk``); then the gh verbs — writes-disabled → 405; unknown action path →
@@ -417,6 +451,8 @@ def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, des
         return _route_janitor(clean, body_bytes, janitor)
     if clean in _FIXER_PATHS:
         return _route_fixer(clean, body_bytes, fixer, snapshot_provider)
+    if clean == _SESSION_WINDOW_PATH:
+        return _route_session_window(body_bytes, session_window)
     if clean == "/api/tower-seen":
         return _route_tower_seen(body_bytes, desk)
     if actions is None:                  # gh writes not wired → method not allowed (Task 5 contract)
@@ -489,7 +525,7 @@ def _provider_get(provider, params):
 
 def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"", origin=None,
           host=None, desk=None, tidy=None, restart=None, janitor=None, replay_provider=None,
-          digest_provider=None, version=None, fixer=None):
+          digest_provider=None, version=None, fixer=None, session_window=None):
     """Map one request to a :class:`Response`, with no socket in sight (unit-testable with an
     injected ``snapshot_provider`` and ``actions``). ``POST`` drives the six mechanical verbs
     (Task 6) plus the dashboard-local tower-seen write (Task 9) via :func:`_route_post`;
@@ -506,11 +542,13 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
     checkout has moved on under a running process (issue #136); ``None`` keeps the plain old 404.
     ``fixer`` (a ``lib.fixer.Fixer``) backs the Deploy Fixer endpoints (issue #141), which compose a
     readout from the CURRENT snapshot and shell ``superlooper debug`` to launch one interactive
-    sl-debugger session (issue #144)."""
+    sl-debugger session (issue #144). ``session_window`` (a ``lib.session_window.SessionWindow``)
+    backs the Open-session-window endpoint (issue #310), which asks the session host to bring one
+    flight's own window to the front."""
     clean = path.split("?", 1)[0]
     if method == "POST":
         return _route_post(clean, body, origin, host, actions, snapshot_provider, desk, tidy,
-                           restart, janitor, version, fixer)
+                           restart, janitor, version, fixer, session_window)
     if method not in ("GET", "HEAD"):
         return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
 
@@ -536,7 +574,7 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
 
 def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=None, restart=None,
                  janitor=None, replay_provider=None, digest_provider=None, version=None,
-                 fixer=None):
+                 fixer=None, session_window=None):
     """A ``BaseHTTPRequestHandler`` subclass that delegates to :func:`route`. Kept thin: the socket
     machinery lives here (reading the POST body + Origin), every decision lives in the pure router
     above. ``actions`` (an ``lib.actions.Actions``) enables the POST verbs; ``desk`` (a
@@ -544,8 +582,9 @@ def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=N
     enables the Tidy local-command endpoints (issue #41); ``restart`` (a ``lib.restart.Restart``)
     enables the Restart endpoints (issue #116); ``janitor`` (a ``lib.janitor.Janitor``) enables the
     Janitor GitHub-sweep endpoints (issue #121); ``replay_provider`` / ``digest_provider``
-    (``fn(params)->dict``) enable the on-demand Task-11 GETs. ``None`` for any of them leaves that
-    surface off (POST → 405; replay/digest GET → 404)."""
+    (``fn(params)->dict``) enable the on-demand Task-11 GETs; ``session_window`` (a
+    ``lib.session_window.SessionWindow``) enables the Open-session-window endpoint (issue #310).
+    ``None`` for any of them leaves that surface off (POST → 405; replay/digest GET → 404)."""
 
     class _Handler(BaseHTTPRequestHandler):
         # Quiet by default — a 2-second poll would otherwise spam stderr with one line per request.
@@ -585,21 +624,22 @@ def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=N
                               actions=actions, body=self._read_body(),
                               origin=self.headers.get("Origin"), host=self.headers.get("Host"),
                               desk=desk, tidy=tidy, restart=restart, janitor=janitor,
-                              version=version, fixer=fixer))
+                              version=version, fixer=fixer, session_window=session_window))
 
     return _Handler
 
 
 def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, actions=None, desk=None,
                  tidy=None, restart=None, janitor=None, replay_provider=None, digest_provider=None,
-                 version=None, fixer=None):
+                 version=None, fixer=None, session_window=None):
     """Construct (do NOT start) the loopback HTTP server. Refuses any non-loopback ``host`` with a
     ``ValueError`` — binding ``0.0.0.0`` or a LAN interface would expose a label-writing (and now
     local-command-running, issue #41) server off the machine, a bright line (decision B.3).
     ``actions`` wires the POST verbs (Task 6); ``desk`` wires the tower-seen watermark write (Task
     9); ``tidy`` wires the Tidy local-command endpoints (issue #41); ``restart`` wires the Restart
     local-command endpoints (issue #116); ``janitor`` wires the Janitor GitHub-sweep endpoints (issue
-    #121); ``fixer`` wires the Deploy Fixer session-launch endpoints (issue #141); ``replay_provider``
+    #121); ``fixer`` wires the Deploy Fixer session-launch endpoints (issue #141);
+    ``session_window`` wires the Open-session-window endpoint (issue #310); ``replay_provider``
     / ``digest_provider`` wire the on-demand replay + digest GETs (Task 11); ``version`` (a
     ``lib.version.Version``) wires the boot-identity/skew honesty (issue #136); omit any for a
     surface that stays off. ``port=0`` binds an ephemeral port (tests). Call ``.serve_forever()`` to
@@ -611,7 +651,7 @@ def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, acti
     return ThreadingHTTPServer((host, port),
                                make_handler(snapshot_provider, static_root, actions, desk, tidy,
                                             restart, janitor, replay_provider, digest_provider,
-                                            version, fixer))
+                                            version, fixer, session_window))
 
 
 # =============================== CachedGh — the gh slow clock (decision B.2) ===============================
@@ -1465,6 +1505,11 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
             "is_investigation": is_investigation,
             "activity_mtime": facts["activity"].get(iid), "blocked": facts["blocked"].get(iid),
             "awaiting_marker": iid in facts["awaiting"], "report_present": iid in facts["reports"],
+            # Does this lane have a recorded session window (state/panes/<id>)? The flight card's
+            # Open-session-window button is gated on it, and it is the same marker `superlooper
+            # tidy` selects on — so the button that opens a window and the verb that closes one can
+            # never disagree about which lanes have one (issue #310).
+            "session_window": iid in facts["session_windows"],
             # The three-way review state (issue #176), judged against the PR's CURRENT head so a
             # verdict pinned to a superseded diff reads 'stale', not a false green. ``review_present``
             # is the field's historical name; it now carries that state string (gate_checklist and
