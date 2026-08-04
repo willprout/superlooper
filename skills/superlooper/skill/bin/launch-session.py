@@ -81,14 +81,35 @@ def _spec(argv):
         codex={"dangerous_bypass": env.get("SL_CODEX_DANGEROUS_BYPASS", ""),
                "bypass_hook_trust": env.get("SL_CODEX_BYPASS_HOOK_TRUST", ""),
                "no_alt_screen": env.get("SL_CODEX_NO_ALT_SCREEN", "")},
-        # The pane's shell inherits the HOST's environment, not ours, so this is not how a variable
-        # reaches a session — it is what the launcher OFFERS, already scrubbed by pane_environment.
-        # PATH rides so a pinned engine layout survives; nothing else is assumed.
-        forwarded_env={k: v for k, v in env.items() if k in ("PATH", "TMPDIR", "LANG")},
+        # NOTHING is forwarded, which is what the cmux launcher did too. A pane's shell is spawned
+        # by the host and sources the operator's own rc files, so this was never how a variable
+        # reaches a session — and PATH in particular is the one variable most able to change which
+        # binaries a session resolves, including the third rung of the #303 claude ladder. The
+        # parameter stays because `pane_environment` is what scrubs it, and a caller that has a
+        # reason to offer something should have to say so.
     )
 
 
 def main(argv):
+    # ---- ONE variable of the launch-floor scrub belongs on THIS side too (issue #301) ----------
+    # The floor itself lives in start-session.sh — it is the only code that runs in the session's
+    # own environment, and the pane's shell sources the operator's rc files AFTER this process has
+    # finished, so a scrub here would prove nothing about the worker's env.
+    #
+    # XDG_CONFIG_HOME is the exception, for two mechanical reasons rather than tidiness:
+    #
+    #   * `gh` resolves its config dir from it, and the worker's floor removes it. If this side
+    #     kept an inherited value while the worker dropped it, the two `gh api user` reads would
+    #     consult DIFFERENT config dirs — and #299 COMPARES their answers, so every launch would
+    #     refuse with a mismatch that names no real fault (a held queue, or a park per issue).
+    #   * the session host's own CLI resolves its socket from it too — observed while driving this
+    #     launcher against a live server (reports/i308.md): with it set, `workspace create` fails
+    #     with a bare NotFound and the launch reads as a delivery-channel fault.
+    #
+    # Process-wide, exactly as the cmux launcher had it, so every child this launcher spawns — the
+    # gh probe, git, pretrust, the host — agrees about where config lives. `identity_probe_env` is
+    # the belt to this braces: it keeps the guarantee for an in-process caller too.
+    os.environ.pop("XDG_CONFIG_HOME", None)
     spec = _spec(argv)
     if spec is None:
         return 1

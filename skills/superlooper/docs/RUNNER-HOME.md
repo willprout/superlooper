@@ -136,8 +136,8 @@ will "restart itself in its own cmux tab". Same follow-up.
 
 Stated plainly because a half-migrated home that *looks* complete is worse than one that announces
 its gap. This issue moves the **supervisor's own process**. The launch path it drives —
-`launch-session.sh`, which still resolves a pane and births a tab — belongs to the wrapper migration
-and has not landed. So on a machine set to `login-item` today the runner boots, preflights, ticks,
+the launcher, which under cmux resolved a pane and birthed a tab — belonged to the wrapper
+migration, and landed in #308 as `launch-session.py` on the session host. So on a machine set to `login-item` today the runner boots, preflights, ticks,
 restarts and is doctored correctly, and its *worker launches* still expect the old launcher. The
 parallel-run plan sequences it that way on purpose: the pieces land first, the cutover is one
 deliberate event, and production stays on `pane` throughout.

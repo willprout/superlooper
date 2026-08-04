@@ -133,16 +133,21 @@ def test_noop_in_a_nested_shell_inside_a_live_session(tmp_path):
     assert not marker.exists()
 
 
-def test_start_session_disarms_the_handoff_for_its_own_children(tmp_path):
-    """The other half of the pair, asserted against the real start-session.sh: whatever the pane
-    handed it, its children must not carry the arming variable."""
-    engine = os.path.join(REPO_ROOT, "skill", "bin", "start-session.sh")
-    with open(engine) as f:
-        source = f.read()
-    assert "unset SL_START_SESSION" in source, \
-        "start-session.sh must disarm the handoff before it launches the agent"
-    assert source.index("unset SL_START_SESSION") < source.index("acquire_worker"), \
-        "the disarm runs before anything that can exit early"
+def test_the_handoff_target_disarms_its_own_children(tmp_path):
+    """The other half of the pair: whatever the pane handed start-session.sh, nothing it spawns may
+    carry the arming variable — or a subshell the agent starts re-arms and launches a second worker
+    into the lane. Asserted through the handoff for real (a source grep would pass on an `unset`
+    that sat inside a subshell or was re-exported afterwards); the REAL start-session.sh proves the
+    same thing end to end in test_launch_delivery's `test_the_pane_ran_our_floor_and_not_a_bare_agent`."""
+    seen = tmp_path / "child_env"
+    start = tmp_path / "start-session.sh"
+    start.write_text("#!/bin/sh\n"
+                     "sh -c 'printf \"%s\" \"${SL_START_SESSION:-gone}\"' > '" + str(seen) + "'\n")
+    start.chmod(0o755)
+    r, _ = _run(f"source '{SHIM}'; claude", env=_pane_env(tmp_path, start))
+    assert r.returncode == 0, r.stderr
+    assert seen.read_text() == "gone", \
+        "a grandchild of the handoff must not be able to re-arm it"
 
 
 def test_noop_for_an_agent_this_stack_cannot_launch(tmp_path):
@@ -249,3 +254,21 @@ def test_the_two_halves_are_independent(tmp_path):
     assert r.returncode == 0, r.stderr
     assert marker.read_text() == "i308"
     assert not ran.exists(), "the session pane must not claim a resurrection command"
+
+
+def test_the_handoff_disarms_the_pane_shell_itself(tmp_path):
+    """P2 from the fresh review, and a real one: `start-session.sh`'s own unset runs in a CHILD, so
+    the pane's LOGIN shell kept the variable exported. A shell started from that prompt afterwards
+    — the operator poking at a finished session — re-armed and launched a whole second flight for
+    the lane: it takes the freed worker lock, re-reads the brief, and asks for a `--session-id`
+    that has already been used. The function disarms its own shell before handing over."""
+    marker = tmp_path / "handed"
+    start = _start_session(tmp_path, marker)
+    r, _ = _run(f"source '{SHIM}'; claude; "
+                f"echo \"AFTER=${{SL_START_SESSION:-gone}}\"; "
+                f"source '{SHIM}'; whence -w claude || echo none",
+                env=_pane_env(tmp_path, start))
+    assert r.returncode == 0, r.stderr
+    assert marker.read_text() == "i308", "the handoff still fired"
+    assert "AFTER=gone" in r.stdout, "the pane's own shell no longer carries the arming variable"
+    assert "claude: function" not in r.stdout, "so re-sourcing cannot re-arm it"

@@ -56,6 +56,13 @@ _THE_DOOR = "skills/superlooper/skill/lib/session_host.py"
 # Every script allowed to reach the session host, and why. There is one, and adding a second is a
 # decision a human has to make in review — which is the whole mechanism.
 _ALLOWED = {
+    "skills/superlooper/tests/fakes/fake-sessionhost":
+        "A STAND-IN FOR the host, not a second caller of it. The offline simulation needs something "
+        "on the other end of the doorway that speaks the real envelope, and a fake that spoke a "
+        "friendlier dialect would prove nothing about the wrapper. It is exempt for the same reason "
+        "the wrapper's own tests are — it must spell the verbs it answers — and it is listed here "
+        "rather than pattern-exempted so that adding a SECOND such fake is still a decision a human "
+        "makes in review.",
     _THE_DOOR:
         "THE DOORWAY. The five-verb wrapper (spawn/send/state/exit/kill) where every distrust rule "
         "is enforced once: --wait always, transcript-side delivery proof, process-fact liveness, "

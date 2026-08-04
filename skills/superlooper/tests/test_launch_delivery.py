@@ -579,3 +579,18 @@ def test_the_claude_pin_rides_across_the_spawn_only_when_it_is_set(rig):
     r = _launch(rig, extra_env={"SL_CLAUDE": str(pin)})
     assert r.returncode == 0, r.stderr
     assert _pane_env(rig)["SL_CLAUDE"] == str(pin)
+
+
+def test_an_inherited_config_dir_redirect_never_reaches_the_launch(rig):
+    """#299's asymmetry, and the reason the cmux launcher unset this one variable.
+
+    `gh` resolves its config dir from XDG_CONFIG_HOME and the session's own floor REMOVES it. If
+    the launcher kept an inherited value while the worker dropped it, the two `gh api user` reads
+    would consult different config dirs — and #299 compares their answers, so every launch would
+    refuse with a mismatch that names no real fault. The session host's CLI resolves its socket
+    from it too, so a launch under it cannot even reach the host."""
+    r = _launch(rig, extra_env={"XDG_CONFIG_HOME": "/nonexistent/poisoned-config"})
+    assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
+    assert "XDG_CONFIG_HOME" not in _pane_env(rig)
+    assert _wait_for(rig["stub"] / "claude_env"), (rig["stub"] / "pane.log").read_text()
+    assert "XDG_CONFIG_HOME" not in (rig["stub"] / "claude_env").read_text()

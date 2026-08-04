@@ -46,7 +46,7 @@ PRE_HOOK = os.path.join(REPO_ROOT, "skill", "bin", "pretooluse-hook.sh")
 WORKER_ENV = {"SL_ISSUE_ID": "i7", "SL_RUN_ROOT": "/runs/willprout"}
 DEBUGGER_ENV = {"SL_ISSUE_ID": "d3", "SL_RUN_ROOT": "/runs/willprout"}
 # The owner tap (`superlooper debug`, issue #144): the SAME d<N> shape, but a person is at the
-# keyboard — launch-session.sh carries SL_ATTENDED=1 into the session for exactly this distinction.
+# keyboard — the launcher carries SL_ATTENDED=1 into the session for exactly this distinction.
 ATTENDED_DEBUGGER_ENV = {**DEBUGGER_ENV, "SL_ATTENDED": "1"}
 
 
@@ -92,7 +92,7 @@ def test_worker_deny_requires_committing_and_pushing_the_wip():
     checkout holding the only copy of its work — the i153/i163 loss #190 now fences.
 
     The REASON given for the push must stay honest (fresh-agent review P0). The resume does not
-    depend on it: _exec_post_question tears down with remove_worktree=False and launch-session.sh
+    depend on it: _exec_post_question tears down with remove_worktree=False and the launcher
     creates a worktree only when none exists, so the relaunch reuses the PRESERVED WIP. Claiming
     unpushed work is unrecoverable would be a new falsehood of the very class this issue removes,
     and a worker whose push failed would then refuse to end its session — the i280 stall, re-entered
@@ -279,7 +279,7 @@ def test_noop_outside_a_worker_session():
 
 def test_noop_for_an_unrecognized_session_id():
     # Only the ids the loop's own launchers can produce (`i<N>` and `d<N>` — the exact shapes
-    # launch-session.sh enforces) name a session whose escalation protocol we know. Anything else is
+    # lib/launch.py enforces) name a session whose escalation protocol we know. Anything else is
     # a session we cannot hand a correct fallback to, so we deny nothing. `a5` is in this list on
     # purpose: #194 retired the answerer seat, so an a<N> is now an unrecognized id like any other.
     for bad_id in ("", "i", "iabc", "7", "worker", "x9", "i7x", "d", "a5", "a-1", "I7"):
@@ -469,7 +469,7 @@ REPO_CFG = {"repo": "willprout/superlooper", "touches_required": True,
 
 def _worktree(tmp_path, cfg=REPO_CFG, issue_id="i7"):
     """A worker's real on-disk shape: <run root>/worktrees/<id>/.superlooper/config.json — the
-    path launch-session.sh actually creates, so the hook can find the repo's contract from the
+    path the launcher actually creates, so the hook can find the repo's contract from the
     environment alone."""
     wt = tmp_path / "worktrees" / issue_id
     (wt / ".superlooper").mkdir(parents=True)

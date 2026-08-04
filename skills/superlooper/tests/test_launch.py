@@ -208,8 +208,15 @@ def test_worktree_creation_holds_a_lock_for_the_whole_critical_section(tmp_path)
         with pytest.raises(BlockingIOError):
             fcntl.flock(second._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         second._close()
-    assert not any("worktree add" in " ".join(c) for c in edges.calls[-1:]), \
-        "the lock is released again — a launch never leaves it held"
+    # ...and it is RELEASED: a second holder acquires it without blocking once the launch is over.
+    # (Asserted non-blockingly — a launch that leaked the lock would otherwise hang this test
+    # rather than fail it.)
+    after = open(lock, "a+")
+    try:
+        fcntl.flock(after.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises if still held
+        fcntl.flock(after.fileno(), fcntl.LOCK_UN)
+    finally:
+        after.close()
 
 
 def test_an_existing_worktree_is_reused_never_destroyed(tmp_path):

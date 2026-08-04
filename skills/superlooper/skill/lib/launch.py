@@ -161,6 +161,7 @@ class Spec:
     start_timeout_ms: int = _START_TIMEOUT_MS
     codex: dict = field(default_factory=dict)
     forwarded_env: dict = None           # what the caller's own environment offers (scrubbed here)
+    probe_env: dict = None               # the environment the identity read runs in (None = ours)
 
 
 class Edges:
@@ -273,7 +274,7 @@ def _launch(spec, host, edges):
     expect_login = spec.expect_gh_login
     if not expect_login:
         probe = edges.run([spec.gh_bin or "gh", "api", "user", "--jq", ".login"],
-                          timeout=_GH_PROBE_SECONDS)
+                          timeout=_GH_PROBE_SECONDS, env=identity_probe_env(spec.probe_env))
         # gh's OWN WORDS, whatever the rc: an error path prints the only account of WHY, and
         # discarding it would flatten not-logged-in, rate-limited, network-down and
         # gh-not-installed into one indistinguishable memo. The SHAPE CHECK below, never the rc,
@@ -286,6 +287,22 @@ def _launch(spec, host, edges):
             % (iid, expect_login or "<no answer>"),
             "[%s] Run `gh auth login --hostname github.com` as the account that owns the loop "
             "repo. NOT launching; no session was created." % iid]))
+
+    # ---- the brief, BEFORE anything is created ---------------------------------------------
+    # Ordered here for the same reason the identity read is: a refusal must cost no leftover
+    # checkout, no new branch and no trust entry. (The cmux launcher checked it here too; moving it
+    # after worktree creation would leave all three behind on a brief the runner failed to write.)
+    #
+    # A revive opens on its OWN brief and leaves the lane's original untouched beside it: the
+    # crash-recovery relaunch re-runs this without rebuilding the brief, so a preamble written over
+    # briefs/<id>.md would later be delivered verbatim to a brand-new, empty session. FAIL CLOSED,
+    # never fall back — substituting the original would deliver the whole issue brief as a NEW
+    # instruction into a conversation that already built it.
+    resume = bool(spec.resume_session_id)
+    brief = os.path.join(spec.run_root, "briefs",
+                         "%s.resume.md" % iid if resume else "%s.md" % iid)
+    if not os.path.isfile(brief):
+        return Result(ABORTED, "[%s] missing brief %s" % (iid, brief))
 
     # ---- where the session lives ----------------------------------------------------------
     branch = ""
@@ -334,20 +351,9 @@ def _launch(spec, host, edges):
     # minting on a revive would strand the very transcript the operator asked to re-enter.
     # CLAUDE ONLY: `--session-id`/`--resume` are Claude Code's spelling, and minting for a codex
     # repo would write a UUID into lane state that names no conversation anywhere.
-    resume = bool(spec.resume_session_id)
     session_id = ""
     if spec.agent == "claude":
         session_id = spec.resume_session_id or str(uuid.uuid4())
-
-    # A revive opens on its OWN brief and leaves the lane's original untouched beside it: the
-    # crash-recovery relaunch re-runs this without rebuilding the brief, so a preamble written
-    # over briefs/<id>.md would later be delivered verbatim to a brand-new, empty session. FAIL
-    # CLOSED, never fall back — substituting the original would deliver the whole issue brief as a
-    # NEW instruction into a conversation that already built it.
-    brief = os.path.join(spec.run_root, "briefs",
-                         "%s.resume.md" % iid if resume else "%s.md" % iid)
-    if not os.path.isfile(brief):
-        return Result(ABORTED, "[%s] missing brief %s" % (iid, brief))
 
     # ---- run-state hygiene ----------------------------------------------------------------
     token = edges.token()
@@ -356,7 +362,8 @@ def _launch(spec, host, edges):
     # ---- the doorway ----------------------------------------------------------------------
     host = host if host is not None else session_host.SessionHost()
     name = spec.session_name or ("superlooper %s%s" % (iid, " (%s)" % branch if branch else ""))
-    pane_env = pane_environment(spec, iid, session_id, resume, expect_login, token)
+    pane_env = pane_environment(spec, iid, session_id, resume, expect_login, token,
+                                session_name=name)
     try:
         session = host.spawn(name=iid, cwd=worktree, env=pane_env, kind=spec.agent,
                              label=spec.label or name,
@@ -438,7 +445,8 @@ def _make_worktree(spec, edges, iid, worktree, branch, base):
                                        (attach.stderr or fresh.stderr or "").strip()))
 
 
-def pane_environment(spec, iid, session_id, resume, expect_login, token):
+def pane_environment(spec, iid, session_id, resume, expect_login, token,
+                     session_name=None):
     """Everything the in-pane floor is handed, and nothing else.
 
     A pane inherits NOTHING useful from this launcher — its shell is spawned by the host and
@@ -463,7 +471,10 @@ def pane_environment(spec, iid, session_id, resume, expect_login, token):
     env.update({
         "SL_ISSUE_ID": iid,
         "SL_RUN_ROOT": spec.run_root,
-        "SL_SESSION_NAME": spec.session_name or "superlooper %s" % iid,
+        # ONE string for the workspace label, the terminal title and the remote-control label —
+        # as the cmux launcher had it. Split, the phone's Remote Control list silently loses the
+        # branch, which is the one thing that tells two lanes apart at a glance.
+        "SL_SESSION_NAME": session_name or spec.session_name or "superlooper %s" % iid,
         "SL_MODEL": str(spec.model or ""),
         "SL_EFFORT": str(spec.effort or ""),
         "SL_AGENT": spec.agent,
@@ -488,6 +499,27 @@ def pane_environment(spec, iid, session_id, resume, expect_login, token):
     # sets, silently converting a configured launch back into PATH luck).
     if spec.claude_bin:
         env["SL_CLAUDE"] = spec.claude_bin
+    return env
+
+
+def identity_probe_env(base=None):
+    """The environment the launcher's own `gh api user` read runs in — ONE variable different from
+    ours, and that variable is the whole point (issue #299).
+
+    `XDG_CONFIG_HOME` is where `gh` resolves its config dir from, and the session's floor REMOVES
+    it (start-session.sh, issue #301). If this side kept an inherited value while the worker
+    dropped it, the two `gh api user` reads would consult DIFFERENT config dirs — and #299 compares
+    their answers. Every launch would then refuse with a mismatch that names no real fault: either
+    the launcher's probe finds no `hosts.yml` and the whole queue is HELD as a runner-env auth
+    death, or it answers as a SECOND account and every issue parks on an assert against an identity
+    the worker was never going to have. Dropping it here makes both sides read the same config dir
+    by construction, which is exactly what the cmux launcher did and why.
+
+    Nothing else is touched: PATH, HOME and the keychain context a `gh` read legitimately needs
+    must survive (the c25 landmine — overriding HOME breaks macOS keychain OAuth outright).
+    """
+    env = dict(os.environ if base is None else base)
+    env.pop("XDG_CONFIG_HOME", None)
     return env
 
 

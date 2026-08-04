@@ -63,7 +63,7 @@ def _clear_worker_launch_env(monkeypatch):
         # dogfooding this repo is exactly who would have it exported.
         "SL_PLUGIN_ID",
         # The gh-auth assert's own vars (issue #299). These matter MORE than the rest, because
-        # launch-session.sh now NAMES SL_GH and SL_EXPECT_GH_LOGIN in the dropped worker command —
+        # the launcher now NAMES SL_GH and SL_EXPECT_GH_LOGIN in every pane's environment —
         # so once this ships, every worker session (including one running this suite) carries them
         # ambiently. Left inherited, SL_GH would be set for every test, which would make
         # _never_reach_real_gh below no-op and quietly re-open the path to the owner's real,
@@ -129,11 +129,11 @@ def _never_reach_real_cmux(monkeypatch):
 @pytest.fixture(autouse=True)
 def _never_reach_real_gh(monkeypatch, _clear_worker_launch_env):
     # The `_clear_worker_launch_env` parameter is an ORDERING DEPENDENCY, not a value: this guard
-    # only fires when SL_GH is unset, and inside a worker pane SL_GH is ambient (launch-session.sh
+    # only fires when SL_GH is unset, and inside a worker pane SL_GH is ambient (the launcher
     # names it in the dropped command). Declaring the scrub as a dependency makes "scrub first, then
     # neutralize" explicit rather than an accident of definition order.
     # Same ratchet as _never_reach_real_cmux, for the GitHub CLI. lib/gh.py, stack_doctor and — since
-    # the positive auth assert (issue #299) — launch-session.sh + start-session.sh ALL resolve their
+    # the positive auth assert (issue #299) — lib/launch.py + start-session.sh ALL resolve their
     # gh through SL_GH, falling back to whatever `gh` is on PATH. On a dogfooding machine that is a
     # real, logged-in gh: a test that forgot to stub would quietly make live GitHub calls as the
     # owner's account. Point the default at a guaranteed-absent path so a missed stub fails loudly

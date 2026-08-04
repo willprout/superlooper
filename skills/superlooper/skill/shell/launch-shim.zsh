@@ -52,9 +52,14 @@ _superlooper_launch_shim() {
   # no gain, and the one-doorway fence (tests/test_one_session_host_door.py) is right to refuse
   # that: swapping the host must stay a rewrite of the wrapper alone.
   [[ -n "${SL_ISSUE_ID:-}" && -n "${SL_RUN_ROOT:-}" && -n "${SL_START_SESSION:-}" ]] || return 0
-  # SL_START_SESSION is the one of the three that start-session.sh UNSETS before it launches the
-  # agent, which is what stops a nested shell inside a live session (a worker typing `zsh`) from
-  # re-arming the handoff and launching a second worker into its own lane.
+  # SL_START_SESSION is the one of the three that gets DISARMED once the handoff has fired: the
+  # function below unsets it in the pane's own login shell before handing over, and
+  # start-session.sh unsets it again in its own process. Both are needed and they cover different
+  # shells. Without the first, a shell started FROM THE PANE PROMPT — the operator poking at a
+  # finished session, or an `exec zsh` — still inherits it from the login shell, re-arms, and its
+  # next `claude` starts a whole second flight for the lane: it takes the now-free worker lock,
+  # re-reads the lane brief, and asks for a `--session-id` that has already been used. Without the
+  # second, the same is true of anything the agent itself spawns.
 
   local agent="${SL_AGENT:-claude}"
   case "$agent" in
@@ -76,14 +81,16 @@ _superlooper_launch_shim() {
   # is one quoted string with no parsing surprises, and the two values are ${(q)}-quoted so a state
   # home or engine path containing a space or a quote can neither break nor inject it.
   #
-  # `unfunction` runs FIRST, before anything that can fail: a body that errored while still defined
-  # would be re-entered by the next `claude` and try to launch a second worker into the same lane.
+  # `unfunction` and the disarm run FIRST, before anything that can fail: a body that errored while
+  # still armed would be re-entered by the next `claude` and try to launch a second worker into the
+  # same lane. The path itself is expanded at DEFINITION time, so unsetting the variable at run
+  # time disarms the shell without taking the handoff's own target with it.
   #
   # NOT `exec`: running start-session.sh as a child and returning afterwards is what leaves the
   # pane at an interactive shell when the session ends, so its transcript can be scrolled and the
   # printed `claude --resume <id>` pasted. The cmux path made the same choice for the same reason,
   # and #168 ("a live session is the owner's to inspect") rests on it.
-  functions[$agent]="unfunction $agent; command ${(q)SL_START_SESSION} ${(q)SL_ISSUE_ID}"
+  functions[$agent]="unfunction $agent; unset SL_START_SESSION; command ${(q)SL_START_SESSION} ${(q)SL_ISSUE_ID}"
 }
 
 

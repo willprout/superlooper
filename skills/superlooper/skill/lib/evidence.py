@@ -73,12 +73,13 @@ def bound(text, limit=STDERR_TAIL_MAX):
 
 _LAUNCH_RC = {
     1: ("launch_failed_before_delivery",
-        "the launch aborted before any tab could host a worker — no worker was ever started, so "
+        "the launch aborted before any pane could host a worker — no worker was ever started, so "
         "nothing about the session itself is at fault; the captured stderr names the step that "
         "failed"),
     2: ("shim_not_fired",
-        "a tab WAS created but no worker ever started in it within the verify window: the launch "
-        "shim did not run the dropped command — is it installed? (bin/install-launch-shim.sh)"),
+        "no worker started for this launch: either the session host would not give it a pane, or "
+        "a pane was created and the launch shim never handed the agent verb to start-session.sh "
+        "— is the shim installed? (bin/install-launch-shim.sh). The captured stderr says which"),
     3: ("base_missing",
         "the worktree base branch does not exist on origin, so every worktree creation fails "
         "before the agent starts — a repo/config fault (dev_branch), not a launch-delivery problem"),
@@ -90,7 +91,7 @@ _LAUNCH_RC = {
         "--hostname github.com` with the account that owns the loop repo, then re-approve"),
     5: ("gh_auth_dead_runner",
         "the RUNNER's own `gh` could not say who it is, so there was no identity to launch any "
-        "session against and no tab was ever opened — a machine-level GitHub auth fault that no "
+        "session against and no pane was ever opened — a machine-level GitHub auth fault that no "
         "queued issue caused and none can fix. Every launch will fail until it is repaired: "
         "`gh auth login --hostname github.com` with the account that owns the loop repo"),
     6: ("env_poisoned",

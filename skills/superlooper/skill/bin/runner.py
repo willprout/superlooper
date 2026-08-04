@@ -164,7 +164,6 @@ class Outcome(str):
         o.evidence = evidence_rec
         return o
 RECHECK_TIMEOUT = 600
-CLOSE_TIMEOUT = 15             # bound the best-effort close of a stale session's pane (D4)
 # (#149) After the pane close, how long teardown waits to OBSERVE the worker CLI actually go before
 # it will prune the worktree. A closed surface does not mean a dead process: the CLI unwinds on its
 # own clock, and its start-session.sh holds worker.<id>.lock until it truly exits. Bounded because a
@@ -471,10 +470,10 @@ def display_asleep(run=None):
     None = unreadable (issue #124). Read-only, bounded, injectable for tests. Fail-open lives in the
     CALLER: decide holds launches only on an explicit True, so None/False both launch normally.
 
-    WHY this exists: macOS does NOT schedule a fresh cmux tab's shell to boot while the display
-    sleeps (the live 2026-07-13 launch killer). The launcher hands the pane its command through
-    the tab's ~/.zshrc shim runs (keystroke-free, RC6), but that shim never runs because the shell
-    itself is not scheduled — so the 30s delivery sentinel expires and the tab is closed as an orphan
+    WHY this exists: macOS does NOT schedule a fresh tab's shell to boot while the display sleeps
+    (the live 2026-07-13 launch killer). The launch reaches the session through that shell — under
+    cmux a dropped command it picked up, and now the ~/.zshrc shim's agent-verb handoff — but the
+    shell itself is never scheduled, so the delivery sentinel expires and the pane is torn down
     (exit 2): a burned launch attempt, a systemic-streak entry (#24), and an alert, every sleeping
     episode. #115's canary makes THAT self-recover, but the cleaner fix is to not ATTEMPT delivery
     into a sleeping display at all. The runner calls this once per tick (only when there is launch
@@ -1920,8 +1919,8 @@ class Runner:
             # D14 prune-under-a-live-CLI shape. It also clears the lane's stale pane markers, which
             # a bare worktree_remove left behind to outlive their session (D9).
             # exit_timeout=0: this loop is unbounded in N and runs every tick, so it does not add a
-            # per-lane WAIT on top of the close it already pays (that close is bounded by
-            # CLOSE_TIMEOUT and is a fast no-op on an already-dead surface). Disk hygiene has no
+            # per-lane WAIT on top of the close it already pays (the doorway bounds its own calls,
+            # and a session that is already gone is a fast no-op). Disk hygiene has no
             # deadline — a lane whose CLI is still unwinding is reclaimed on the next sweep, by
             # which time the pane close issued here has landed.
             # guard_worktree=True (#190): these park-family lanes are NOT merged, so their worktree

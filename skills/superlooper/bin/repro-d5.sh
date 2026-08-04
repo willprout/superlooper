@@ -11,7 +11,7 @@
 #   cycle k:  [k>1: replicate runner._close_stale_session verbatim —
 #              cmux close-surface on the recorded pane, rm pane markers + worker lock]
 #             re-point issues.json at a fresh -r<k> branch (regenerate's branch move)
-#             bash -x launch-session.sh i1   (the REAL script, full trace captured)
+#             bash -x the launcher, i1   (the REAL script, full trace captured) [RETIRED]
 #             rc==0 -> delivered; rc==2 -> D5 REPRODUCED
 #             then VERIFY THE PREMISE: the worker lock names a LIVE pid and no exited
 #             marker appeared — a claude that died at boot (bad model/auth) would make
@@ -19,7 +19,7 @@
 #             premise aborts the run loudly instead of reporting hollow PASSes.
 #
 # Instrumentation (the live failure path rm's its own evidence, so we watch it happen):
-#   xtrace-<k>.log    every step of launch-session.sh, incl. raw new-surface output
+#   xtrace-<k>.log    every step of the launcher, incl. raw new-surface output [RETIRED]
 #   samples-<k>.log   4x/s: launch-dir listing, started/ sentinels, worker lock, pgrep
 #
 # Fidelity notes: the launch dir must be the REAL ~/.superlooper/launch (the new tab's
@@ -37,8 +37,17 @@ set -euo pipefail
 CYCLES="${1:-5}"
 SL_PANE="${SL_PANE:?SL_PANE (cmux pane uuid hosting the repro tabs) required}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-LAUNCH_SH="$HERE/skill/bin/launch-session.sh"
-[ -f "$LAUNCH_SH" ] || { echo "no $LAUNCH_SH — run from the repo"; exit 1; }
+# RETIRED WITH THE CMUX LAUNCHER (issue #308). This harness drove `skill/bin/launch-session.sh`,
+# which no longer exists: the spawn path is `launch-session.py` through the session-host wrapper,
+# and its D5 shape would have to be re-derived against the host rather than against cmux tabs.
+# Refuses up front rather than failing three steps in on a missing file.
+LAUNCH_SH="$HERE/skill/bin/launch-session.py"
+cat >&2 <<'RETIRED'
+repro-d5.sh is retired: it reproduces a cmux tab-delivery fault against a launcher that was
+replaced by the session-host wrapper (issue #308). Re-derive the repro against the host before
+using it again — the D5 shape does not translate line-for-line.
+RETIRED
+exit 64
 CMUX="${SL_CMUX:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
 LAUNCH_DIR="$HOME/.superlooper/launch"       # the real well-known path — NEVER overridden
 LAUNCH_DEADLINE=120                          # outer watchdog, mirrors the runner's LAUNCH_TIMEOUT
