@@ -33,7 +33,10 @@ import json
 import os
 import re
 import time
-import tomllib
+try:                                    # 3.11+; the fleet machine has it, the CI floor does not
+    import tomllib
+except ImportError:                     # pragma: no cover - exercised by the CI interpreter
+    tomllib = None
 import plistlib
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
@@ -237,13 +240,18 @@ def host_config_problem(text):
     """
     if text is None:
         return "no config file"
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as e:
-        return ("it is not valid TOML (%s) — the host refuses to start on a config it cannot "
-                "parse, so this is not a state to report as merely incomplete" % e)
-    except (TypeError, ValueError) as e:
-        return "it could not be parsed (%s)" % e
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as e:
+            return ("it is not valid TOML (%s) — the host refuses to start on a config it cannot "
+                    "parse, so this is not a state to report as merely incomplete" % e)
+        except (TypeError, ValueError) as e:
+            return "it could not be parsed (%s)" % e
+    else:
+        data, problem = _read_toml_ish(text)
+        if problem:
+            return problem
     session = data.get("session")
     if not isinstance(session, dict):
         return "no [session] table"
@@ -255,6 +263,51 @@ def host_config_problem(text):
                 "a newer build is a fleet that can quietly stop being the build you fenced (nested "
                 "under a table it would parse and be ignored)")
     return None
+
+
+# The two literals this check ever needs to recognise. Deliberately not a value parser: the
+# questions are "is it exactly true" and "is it exactly false", and anything else — an int, a
+# string, a nested array — is neither, which is the answer the caller wants anyway.
+_BOOLS = {"true": True, "false": False}
+
+
+def _read_toml_ish(text):
+    """`(mapping, problem)` for the two settings this check asks about, without a TOML parser.
+
+    Only reached on an interpreter older than 3.11 (`tomllib` is the reader everywhere else, and it
+    is the one the fleet machine uses). It is a LINE WALKER, not a parser, and it is written to be
+    honest about that: it tracks which table each key belongs to — the thing a flat regex sweep gets
+    wrong in both directions — and refuses a duplicate table header, which real TOML rejects and a
+    naive reader would call healthy. Anything it cannot classify is ignored rather than guessed at,
+    so its answer is only ever "these two keys are set like this", which is all the caller uses.
+    """
+    data, table, seen = {}, None, set()
+    for raw in text.splitlines():
+        line = re.sub(r"\s+#.*$", "", raw).strip()
+        line = "" if line.startswith("#") else line
+        if not line:
+            continue
+        header = re.match(r"^\[([^\[\]]+)\]$", line)
+        if header:
+            table = header.group(1).strip()
+            if table in seen:
+                return None, ("it declares the table [%s] twice, which TOML rejects — the host "
+                              "refuses to start on a config it cannot parse" % table)
+            seen.add(table)
+            data.setdefault(table, {})
+            continue
+        if line.startswith("[["):                    # an array of tables: not a table we read
+            table = None
+            continue
+        pair = re.match(r"^([A-Za-z0-9_-]+)\s*=\s*(\S+)\s*$", line)
+        if not pair:
+            continue
+        value = _BOOLS.get(pair.group(2).lower(), pair.group(2))
+        if table is None:
+            data[pair.group(1)] = value
+        elif isinstance(data.get(table), dict):
+            data[table][pair.group(1)] = value
+    return data, None
 
 
 # --------------------------------------------------------------- the screen-state override

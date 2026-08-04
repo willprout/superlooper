@@ -137,6 +137,32 @@ def test_the_host_config_check_names_each_missing_setting():
     assert "not valid TOML" in fleet.host_config_problem("this is = = not toml\n")
 
 
+def test_both_config_readers_give_the_same_verdicts(monkeypatch):
+    # `tomllib` is 3.11+. The fleet machine has it; the CI floor does not, so there is a fallback
+    # line walker — and a check whose strictness depends on the interpreter is exactly the kind of
+    # thing that passes here and misses there. Both readers answer every case identically or this
+    # goes red.
+    cases = [
+        fleet.render_host_config(),
+        fleet.host_config_settings(),
+        "version_check = false\n[session]\nresume_agents_on_restore = true\n[session]\n",
+        "version_check = false\n[session]\n[ui]\nresume_agents_on_restore = true\n",
+        "[session]\nresume_agents_on_restore = true\nversion_check = false\n",
+        "version_check = false\n",
+        "version_check = false\n[session]\nresume_agents_on_restore = false\n",
+        "# version_check = false\n[session]\nresume_agents_on_restore = true\n",
+    ]
+    real = [fleet.host_config_problem(c) for c in cases]
+    monkeypatch.setattr(fleet, "tomllib", None)
+    fallback = [fleet.host_config_problem(c) for c in cases]
+    for case, a, b in zip(cases, real, fallback):
+        assert (a is None) == (b is None), (case, a, b)
+    assert (real[0], fallback[0]) == (None, None)
+    # Both must catch the duplicate table — the case a flat text sweep calls healthy and the host
+    # refuses to start on.
+    assert "twice" in fallback[2] and "not valid TOML" in real[2]
+
+
 def test_the_merge_instructions_carry_no_ownership_marker():
     # A refusal tells an operator to paste these into a file they maintain. If they carried the
     # marker, the NEXT install would read it as ownership and replace the whole file.
