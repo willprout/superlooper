@@ -564,22 +564,30 @@ class Runner:
         # the repo from the process cwd, and the runner may be started from anywhere.
         gh.set_repo(config.get("repo") if isinstance(config, dict) else None)
         self.home = os.fspath(state_home) if state_home else str(config_lib.state_home(config))
+        # Which PROCESS HOME this runner lives in (issue #306) — the pane home (a visible tab whose
+        # pane is the launch anchor) or the login-item home (a plain gui/$UID LaunchAgent). Read
+        # from config through runner_home.kind, which fails closed to the pane home, so a runner
+        # handed a half-read config keeps the behaviour that refuses to launch without an anchor.
+        # Resolved FIRST because the pane resolution just below depends on it. Four things branch on
+        # it and nothing else does: the pane, the anchor record, the per-tick anchor probe, and how
+        # a #116 Restart request is executed.
+        self.runner_home = runner_home.kind(config)
         # Explicit override only; the CLI resolves the self-pane default (detect_self_pane) before
         # constructing the Runner. CMUX_PANE_ID is deliberately NOT read — cmux never exports it
         # (only CMUX_SURFACE_ID / CMUX_WORKSPACE_ID), so that old fallback silently never fired.
-        self.pane = pane or os.environ.get("SL_PANE") or ""
+        #
+        # ...and in the login-item home there is NO pane, so none is kept — not the argument, not
+        # the environment. The environment of a shell that starts a runner very often DOES carry a
+        # pane (every session this loop launches exports one), and a stray pane in a home that has
+        # none is worse than an empty one: empty fails loudly at the launch path, stray succeeds
+        # silently and births a worker session into somebody else's window.
+        self.pane = ("" if self.runner_home == runner_home.LOGIN_ITEM
+                     else pane or os.environ.get("SL_PANE") or "")
         # Anchor identity of the runner's own tab (issue #33): the workspace/window the pane lives
         # in. Display + doctor use them to make a misplaced runner visible; they never gate launches
         # (the pane is the only thing new-surface needs). "" when cmux couldn't resolve them.
         self.workspace = workspace if isinstance(workspace, str) else ""
         self.window = window if isinstance(window, str) else ""
-        # Which PROCESS HOME this runner lives in (issue #306) — the pane home (a visible tab whose
-        # pane is the launch anchor) or the login-item home (a plain gui/$UID LaunchAgent). Read
-        # from config through runner_home.kind, which fails closed to the pane home, so a runner
-        # handed a half-read config keeps the behaviour that refuses to launch without an anchor.
-        # Three things branch on it and nothing else does: the anchor record, the per-tick anchor
-        # probe, and how a #116 Restart request is executed.
-        self.runner_home = runner_home.kind(config)
         if run_script is not None:
             self._run_script = run_script
         if fetch_usage is not None:
@@ -739,10 +747,17 @@ class Runner:
     def _spend_restart_baton(self):
         """Journal the LANDING of a restart this runner is the successor of, exactly once.
 
+        Only in the home that leaves batons. A repo flipped back to the pane home with one still on
+        disk would otherwise journal a landing for a restart that never happened in that home — a
+        diagnostic that tells a small lie is worse than no diagnostic. It is left in place rather
+        than cleaned up, because a home that does not own a file should not delete it.
+
         Consumed (removed) whether or not the journal write succeeds — a baton left behind would
-        make the next ordinary boot claim to be a restart landing, which is a worse lie than a
-        missing row. Never raises: this is a diagnostic, not a gate.
+        make the next ordinary boot claim to be a restart landing, which is the same lie in the
+        other direction. Never raises: this is a diagnostic, not a gate.
         """
+        if self.runner_home != runner_home.LOGIN_ITEM:
+            return
         rec = _read_json(self._restart_baton_path())
         if not isinstance(rec, dict):
             return

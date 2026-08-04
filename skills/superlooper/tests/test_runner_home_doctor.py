@@ -156,3 +156,16 @@ def test_an_unreadable_plist_is_a_failure_not_a_pass():
 def test_a_repo_with_no_config_is_skipped_rather_than_judged():
     r = stack_doctor.check_runner_home(_probe(), None)
     assert r.ok
+
+
+def test_the_mismatch_fix_does_not_name_either_pid_as_the_stray_one():
+    # Fresh-agent review (medium): the earlier text said "Stop the stray: launchctl bootout …",
+    # but bootout stops the LAUNCHD-supervised process — which in a mismatch may well be the
+    # legitimate one. The doctor cannot know which is authoritative, so it must not tell the
+    # operator to act as though it does.
+    r = stack_doctor.check_runner_home(
+        _probe(plist=_plist(), printed=_printed(4242), lock=9999, alive=[4242, 9999]), _cfg())
+    assert not r.ok
+    assert "stray" not in r.fix.lower()
+    # It still has to be actionable: name the verb, and say what to establish before restarting.
+    assert "bootout" in r.fix and "one runner" in r.fix

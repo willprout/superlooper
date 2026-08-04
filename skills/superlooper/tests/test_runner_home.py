@@ -614,3 +614,76 @@ def test_a_missing_template_breaks_only_the_installer_not_every_import(monkeypat
         runner_home.render_plist(label="l", superlooper_bin="/b", repo_path="/r", state_home="/s",
                                  path="/usr/bin")
     assert "install.sh" in str(e.value)
+
+
+# --------------------------------------------------------------- fresh-agent review findings
+
+def test_a_path_containing_xml_metacharacters_still_renders_a_valid_job():
+    # Fresh-agent review (medium): substitution is a plain textual replace into XML text nodes, so
+    # a directory named `R&D` — or anything carrying & < > — produced a plist launchd could not
+    # parse, with the failure surfacing as a job that silently never starts. Same defect family as
+    # the `--` comment bug found by installing it, one layer down.
+    d = plistlib.loads(runner_home.render_plist(
+        label="com.superlooper.runner.o__r", superlooper_bin="/opt/R&D/bin/superlooper",
+        repo_path="/opt/R&D/<repo>", state_home="/opt/R&D/home",
+        path="/opt/R&D/bin:" + runner_home.LAUNCHD_PATH,
+        state_base="/opt/R&D & more").encode())
+    assert d["ProgramArguments"][0] == "/opt/R&D/bin/superlooper"
+    assert d["ProgramArguments"][3] == "/opt/R&D/<repo>"
+    assert d["WorkingDirectory"] == "/opt/R&D/<repo>"
+    assert d["EnvironmentVariables"]["PATH"].startswith("/opt/R&D/bin:")
+    assert d["EnvironmentVariables"]["SL_HOME"] == "/opt/R&D & more"
+    assert d["StandardOutPath"] == "/opt/R&D/home/logs/runner.log"
+
+
+def test_a_missing_gh_is_named_once_not_twice():
+    # Fresh-agent review (nit): with gh absent from PATH the preflight said both "PATH does not
+    # resolve gh" and "gh could not be asked at all" — the same fact, told twice, in the message an
+    # operator reads once. The PATH problem is the actionable one and already names it.
+    ok, why = runner_home.preflight(manager="Aqua", missing=["gh"], gh_ok=None, host_answered=True)
+    assert ok is False
+    assert why.count("gh") >= 1
+    assert "could not be asked" not in why
+
+
+def test_gh_that_resolves_but_cannot_be_asked_is_still_refused():
+    # The other half of that: when gh IS on PATH, an unanswerable probe is UNKNOWN, and UNKNOWN is
+    # never a pass — that distinction must survive the de-duplication above.
+    ok, why = runner_home.preflight(manager="Aqua", missing=[], gh_ok=None, host_answered=True)
+    assert ok is False
+    assert "could not be asked" in why
+
+
+def test_a_pane_runner_never_spends_a_restart_baton(tmp_path):
+    # Fresh-agent review (nit): the baton is a login-item artefact. A repo flipped back to `pane`
+    # with one left on disk would journal a `runner_restart/up` for a restart that never happened
+    # in that home — a diagnostic telling a small lie is worse than no diagnostic.
+    (tmp_path / "repo").mkdir()
+    r = _runner(tmp_path, "pane")
+    r.acquire_singleton()
+    (tmp_path / "home" / "state" / "runner.restarted").write_text(json.dumps({"old_pid": 4242}))
+    r.release_singleton()
+    r2 = _runner(tmp_path, "pane")
+    r2.run(max_ticks=1, sleep=lambda s: None)
+    text = tmp_path / "home" / "journal.jsonl"
+    rows = [json.loads(x) for x in text.read_text().splitlines() if x.strip()] \
+        if text.exists() else []
+    assert not [x for x in rows if x.get("act") == "runner_restart"]
+    # And it is left alone rather than silently deleted by a home that does not own it.
+    assert (tmp_path / "home" / "state" / "runner.restarted").exists()
+
+
+def test_a_login_item_runner_carries_no_pane_even_when_one_is_ambient(monkeypatch, tmp_path):
+    # A runner started from a shell that HAS a pane in its environment (every session this loop
+    # launches exports one) would otherwise carry that stray pane into a home where it means
+    # nothing — and the launch path, which still reads it, would birth a worker session into an
+    # unrelated window. An empty pane fails loudly downstream; a stray one fails silently and in
+    # someone else's tab.
+    (tmp_path / "repo").mkdir()
+    monkeypatch.setenv("SL_PANE", "SOMEONE-ELSES-PANE")
+    assert _runner(tmp_path, "pane").pane == "pane-1"          # explicit argument still wins
+    assert _runner(tmp_path, "login-item").pane == ""
+
+    r = runner_mod.Runner(repo=str(tmp_path / "repo"), config=_config(runner_home="login-item"),
+                          state_home=str(tmp_path / "home2"))
+    assert r.pane == "", "an ambient pane leaked into a home that has none"

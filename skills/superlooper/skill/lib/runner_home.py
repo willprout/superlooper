@@ -51,6 +51,12 @@ the whole ruling is that they live on opposite sides of the host boundary.
 import os
 import re
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
+
+
+def _xml(value):
+    """One value, safe to drop into an XML text node. Stdlib only, like everything else here."""
+    return _xml_escape(str(value))
 
 # ---------------------------------------------------------------------------- the two homes
 PANE = "pane"
@@ -275,7 +281,10 @@ def preflight(*, manager, missing, gh_ok, host_answered):
             "— so the plist must set PATH explicitly (see `superlooper runner-home --install`, "
             "which records where these actually resolved)"
             % (", ".join(missing), LAUNCHD_PATH))
-    if gh_ok is not True:
+    # Skipped entirely when gh is one of the MISSING commands: the PATH problem above already names
+    # it, and it is the actionable one. Saying the same fact twice in a message an operator reads
+    # once is how a refusal starts getting skimmed (fresh-agent review).
+    if gh_ok is not True and "gh" not in (missing or []):
         problems.append(
             "the keychain-backed gh login did not read from here (%s) — a runner that cannot prove "
             "its GitHub identity fails every read while looking perfectly alive"
@@ -318,11 +327,16 @@ def render_plist(*, label, superlooper_bin, repo_path, state_home, path, state_b
         if not str(state_base).startswith("/"):
             raise ValueError("state_base must be absolute — launchd runs the job from '/', so %r "
                              "would resolve to nothing" % (state_base,))
-        extra = "\n        <key>SL_HOME</key>\n        <string>%s</string>" % state_base
+        extra = "\n        <key>SL_HOME</key>\n        <string>%s</string>" % _xml(state_base)
+    # Every substituted value lands in an XML TEXT NODE, so it is escaped (fresh-agent review). A
+    # directory named `R&D` is enough to produce a plist launchd cannot parse, and that failure
+    # surfaces as a job that silently never starts — the same defect family as the `--` in a comment
+    # that installing this for real turned up, one layer down. `extra` is assembled above from
+    # already-escaped parts and so is inserted as markup, not text.
     return (_template()
-            .replace("{label}", str(label))
-            .replace("{superlooper_bin}", str(superlooper_bin))
-            .replace("{repo_path}", str(repo_path))
-            .replace("{state_home}", str(state_home))
-            .replace("{path}", str(path))
+            .replace("{label}", _xml(label))
+            .replace("{superlooper_bin}", _xml(superlooper_bin))
+            .replace("{repo_path}", _xml(repo_path))
+            .replace("{state_home}", _xml(state_home))
+            .replace("{path}", _xml(path))
             .replace("{extra_env}", extra))

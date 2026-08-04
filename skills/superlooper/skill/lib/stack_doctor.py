@@ -811,8 +811,15 @@ def check_runner_home(probe, config):
             "launchd is supervising pid %s for %s, but the loop's own pidfile names a live pid %s "
             "— two runners, and one is about to be restarted out from under the other"
             % (job_pid, job, runner_pid),
-            "Stop the stray: `launchctl bootout %s` then check `superlooper status`, and restart "
-            "the job once only one remains." % runner_home.service_target(uid, job))
+            # Deliberately does NOT name either pid as the stray one: `bootout` stops the
+            # LAUNCHD-supervised process, which in a mismatch may well be the legitimate runner.
+            # This block cannot tell which is authoritative, so it must not tell the operator to
+            # act as though it can (fresh-agent review).
+            "Establish which process is the real runner before ending either — `superlooper "
+            "status` and the journal in the state home say which one is ticking. `launchctl "
+            "bootout %s` stops the supervised one; the other must be ended by hand. Then restart "
+            "the job so exactly one runner is live."
+            % runner_home.service_target(uid, job))
     if path_problem:
         return CheckResult(name, False, "job %s is running (pid %s) but %s" % (job, job_pid,
                                                                                path_problem), fix)
