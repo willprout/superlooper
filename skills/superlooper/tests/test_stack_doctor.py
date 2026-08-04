@@ -1258,7 +1258,8 @@ def test_a_pin_naming_a_directory_is_not_runnable(tmp_path):
     probe = stack_doctor.Probe(env={"SL_CLAUDE": str(d), "HOME": str(tmp_path)})
 
     assert probe.executable(str(d)) is False
-    assert stack_doctor.resolve_claude(probe) == {"path": str(d), "source": "pin", "ok": False}
+    assert stack_doctor.resolve_claude(probe) == {
+        "path": str(d), "source": "pin", "ok": False, "reason": "unrunnable"}
 
 
 def test_a_real_probe_searches_its_own_path_not_the_processs(tmp_path):
@@ -1274,4 +1275,29 @@ def test_a_real_probe_searches_its_own_path_not_the_processs(tmp_path):
 
     r = stack_doctor.resolve_claude(probe)
 
-    assert r == {"path": str(stub), "source": "PATH", "ok": True}
+    assert r == {"path": str(stub), "source": "PATH", "ok": True, "reason": None}
+
+
+def test_a_relative_pin_is_refused_by_both_ladders():
+    # `SL_CLAUDE=./claude` resolves against the CWD, and this process's cwd is not the worker's —
+    # the worker has already cd-ed into its worktree. The doctor would validate one file while a
+    # launch ran a different one, which is the exact class of lie the pin exists to end.
+    probe = _bin_probe(pin="./claude", standalone=True)
+    probe.files["./claude"] = "#!/bin/sh\n"          # it EXISTS here; that is the trap
+
+    r = stack_doctor.resolve_claude(probe)
+    assert r["ok"] is False and r["reason"] == "relative"
+
+    block = stack_doctor.check_claude_binary(probe)
+    assert block.ok is False
+    assert "relative" in block.detail.lower()
+    assert "absolute" in block.fix.lower()
+
+
+def test_resolve_claude_always_reports_why_it_is_not_ok():
+    # `reason` is what lets the block tell a relative pin from an unrunnable one; a missing reason
+    # would collapse two different operator mistakes into one message with the wrong cure.
+    assert stack_doctor.resolve_claude(_bin_probe())["reason"] == "absent"
+    assert stack_doctor.resolve_claude(
+        _bin_probe(pin="/nowhere/claude", pin_exists=False))["reason"] == "unrunnable"
+    assert stack_doctor.resolve_claude(_bin_probe(standalone=True))["reason"] is None

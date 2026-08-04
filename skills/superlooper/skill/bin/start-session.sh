@@ -389,17 +389,39 @@ case "$AGENT" in
     # blaming the agent. This is also exactly what the Python twin tests (os.path.isfile + os.access),
     # so the two ladders agree on what "runnable" means (fresh-agent review, P1).
     sl_runnable() { [ -f "$1" ] && [ -x "$1" ]; }
-    CLAUDE_STANDALONE="${HOME:-}/.local/bin/claude"
+    # UNQUOTED tilde, not "${HOME:-}": bash expands `~` from the passwd entry when HOME is UNSET,
+    # which is exactly what Python's os.path.expanduser (and so probe.home) does — and with HOME set
+    # to the empty string both produce the same "/.local/bin/claude". Spelling it "${HOME:-}" made
+    # the two ladders disagree in precisely the HOME-unset case, where the doctor would green-light
+    # the standalone install while the launcher fell through to PATH and ran cmux's shim (second
+    # review round). Tilde expansion in an assignment is not word-split, so a HOME with spaces is
+    # safe unquoted; quoting it would stop the expansion entirely.
+    CLAUDE_STANDALONE=~/.local/bin/claude
     if [ -n "${SL_CLAUDE:-}" ]; then
       CLAUDE_BIN="$SL_CLAUDE"
+      # ABSOLUTE ONLY. A relative pin is resolved against the CWD, and the doctor's cwd is not the
+      # worker's — the worker has already `cd`-ed into its worktree. `SL_CLAUDE=./claude` would let
+      # the doctor validate one file and the launcher run (or fail to find) a different one, which
+      # is the whole class of lie this pin exists to end (second review round).
+      case "$CLAUDE_BIN" in
+        /*) ;;
+        *) refuse_claude_bin \
+             "SL_CLAUDE pins '$CLAUDE_BIN', which is a RELATIVE path — it would resolve against whatever directory each process happens to be in, so the binary the doctor checks and the one a worker runs need not be the same file. Give SL_CLAUDE an absolute path" ;;
+      esac
       sl_runnable "$CLAUDE_BIN" || refuse_claude_bin \
         "SL_CLAUDE pins '$CLAUDE_BIN', which is not an executable file — refusing to fall back to whatever \`claude\` this session's PATH happens to offer. Point SL_CLAUDE at a real claude binary, or unset it to take the standalone install at $CLAUDE_STANDALONE"
     elif sl_runnable "$CLAUDE_STANDALONE"; then
       CLAUDE_BIN="$CLAUDE_STANDALONE"
     else
-      CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
-      [ -n "$CLAUDE_BIN" ] || refuse_claude_bin \
-        "no claude binary to launch: SL_CLAUDE is unset, $CLAUDE_STANDALONE does not exist, and no \`claude\` is on this session's PATH. Install Claude Code's standalone native build (\`claude install stable\`), then re-run \`superlooper doctor --stack\`"
+      # `type -P`, NOT `command -v`: command -v answers with the NAME for a shell function or alias,
+      # so a `claude()` function reaching this shell (a non-interactive bash sources $BASH_ENV)
+      # would be stamped as the binary in use and run in place of Claude Code, while the doctor —
+      # which can only ever find files — reported something else entirely. type -P searches PATH for
+      # an executable FILE and nothing else, which is what shutil.which does on the other side.
+      # sl_runnable then re-checks the answer, so this rung accepts exactly what the other two do.
+      CLAUDE_BIN="$(type -P claude 2>/dev/null || true)"
+      { [ -n "$CLAUDE_BIN" ] && sl_runnable "$CLAUDE_BIN"; } || refuse_claude_bin \
+        "no claude binary to launch: SL_CLAUDE is unset, $CLAUDE_STANDALONE does not exist, and no executable \`claude\` file is on this session's PATH. Install Claude Code's standalone native build (\`claude install stable\`), then re-run \`superlooper doctor --stack\`"
     fi
     # Stamp what THIS launch resolved, machine-wide. The doctor re-walks the ladder in the
     # OPERATOR's environment, and a worker tab's is not the same one — the same gap #299/#301 were

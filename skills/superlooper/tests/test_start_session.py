@@ -878,3 +878,28 @@ def test_a_pin_naming_a_directory_refuses_rather_than_execing_it(tmp_path):
     assert r.returncode != 0 and "SL_CLAUDE" in r.stderr
     assert not (tmp_path / "claude_argv0").exists()                    # nothing was executed
     assert not (tmp_path / "home" / ".superlooper" / "claude-bin.last").exists()   # nothing stamped
+
+
+def test_a_relative_pin_is_refused_even_when_it_resolves_here(tmp_path):
+    # The launcher runs after `cd $WT`, so a relative pin names a different file for it than for
+    # whoever set it. Refuse rather than run the wrong binary (second review round).
+    rel = tmp_path / "run" / "relative-claude"          # cwd of the launch IS run_root
+    r, _run_root, _args = _start(tmp_path, standalone=True, extra_env={"SL_CLAUDE": "./x"})
+    assert r.returncode != 0
+    assert "relative" in r.stderr.lower() and "SL_CLAUDE" in r.stderr
+    assert not (tmp_path / "claude_argv0").exists()
+    assert not rel.exists()
+
+
+def test_the_path_rung_ignores_a_shell_function_named_claude(tmp_path):
+    # `command -v` answers with the bare NAME for a shell function, so a `claude()` reaching this
+    # non-interactive bash (via $BASH_ENV) would have been stamped as the binary in use and run in
+    # place of Claude Code — while the doctor, which can only ever find files, reported something
+    # else. `type -P` searches PATH for an executable FILE, matching shutil.which on the other side.
+    benv = tmp_path / "benv.sh"
+    benv.write_text("claude() { echo 'I am a function, not Claude Code'; exit 0; }\n")
+
+    r, _run_root, _args = _start(tmp_path, extra_env={"BASH_ENV": str(benv)})
+
+    assert r.returncode == 0, r.stderr
+    assert _argv0(tmp_path) == str(tmp_path / "stub" / "claude")     # the FILE, not the function

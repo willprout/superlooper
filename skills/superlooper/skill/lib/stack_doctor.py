@@ -271,9 +271,10 @@ CLAUDE_BIN_RECORD_REL = os.path.join(".superlooper", "claude-bin.last")
 def resolve_claude(probe):
     """Which `claude` the launch stack will run, and why — the twin of start-session.sh's ladder.
 
-    Returns {"path": str|None, "source": "pin"|"standalone"|"PATH"|None, "ok": bool}. `ok` is False
-    only for a pin that names nothing runnable (the fail-closed case) or for a machine with no
-    claude at all; the caller decides severity."""
+    Returns {"path": str|None, "source": "pin"|"standalone"|"PATH"|None, "ok": bool,
+    "reason": "relative"|"unrunnable"|"absent"|None}. `ok` is False only for a pin the launcher
+    would refuse (relative, or naming nothing runnable) or for a machine with no claude at all;
+    `reason` says which, and the caller decides severity."""
     env = getattr(probe, "env", {}) or {}
     pin = env.get("SL_CLAUDE")
     # `pin != ""`, NOT _nonempty_string: the shell twin tests `[ -n "$SL_CLAUDE" ]`, which is true
@@ -281,20 +282,30 @@ def resolve_claude(probe):
     # REFUSE the launch while the doctor quietly reported on the standalone install instead — a
     # divergence in the one direction that matters, since it hides a launcher that cannot start.
     if isinstance(pin, str) and pin != "":
-        return {"path": pin, "source": "pin", "ok": bool(probe.executable(pin))}
-    # probe.home, like every other block here, is $HOME with a passwd-entry fallback; the shell twin
-    # can only read $HOME. They differ ONLY when HOME is unset — where the shell simply misses this
-    # rung and falls through to PATH, which is safe in the one direction that matters (it never
-    # launches a binary the doctor did not consider).
+        # A RELATIVE pin resolves against the CWD, and this process's cwd is not the worker's (it
+        # has already cd-ed into its worktree), so `SL_CLAUDE=./claude` would have this block
+        # validate one file while a launch ran — or failed to find — a different one. The launcher
+        # refuses it outright; so does this.
+        if not os.path.isabs(pin):
+            return {"path": pin, "source": "pin", "ok": False, "reason": "relative"}
+        ok = bool(probe.executable(pin))
+        return {"path": pin, "source": "pin", "ok": ok,
+                "reason": None if ok else "unrunnable"}
+    # probe.home is $HOME with a passwd-entry fallback — and the shell twin now spells this rung as
+    # an UNQUOTED `~`, which bash expands from the passwd entry on an unset HOME and to "" on an
+    # empty one, matching os.path.expanduser in both. So the two agree on all three states rather
+    # than only on the ordinary one.
     standalone = os.path.join(probe.home, CLAUDE_STANDALONE_REL)
     if probe.executable(standalone):
-        return {"path": standalone, "source": "standalone", "ok": True}
+        return {"path": standalone, "source": "standalone", "ok": True, "reason": None}
     # No envvar here: the pin was already consulted above, and passing it again would let a broken
-    # pin fall through to PATH — the fallback this ladder exists to refuse.
+    # pin fall through to PATH — the fallback this ladder exists to refuse. shutil.which finds an
+    # executable FILE only, which is why the shell rung is `type -P` and not `command -v` (the
+    # latter answers with the bare name for a shell function, which no doctor could ever see).
     found = probe.command("claude")
     if found:
-        return {"path": found, "source": "PATH", "ok": True}
-    return {"path": None, "source": None, "ok": False}
+        return {"path": found, "source": "PATH", "ok": True, "reason": None}
+    return {"path": None, "source": None, "ok": False, "reason": "absent"}
 
 
 def classify_claude(probe, path):
@@ -344,12 +355,15 @@ def check_claude_binary(probe):
     path, source = r["path"], r["source"]
 
     if source == "pin" and not r["ok"]:
+        why = ("is a RELATIVE path, so it names a different file depending on which directory the "
+               "reader happens to be in — and a worker's is its worktree, never this one"
+               if r.get("reason") == "relative" else "is not an executable file")
         return CheckResult(
             name, False,
-            "SL_CLAUDE pins %s, which is not an executable file — start-session.sh refuses the "
-            "launch rather than falling back to PATH, so every worker launch fails here." % path,
-            "Point SL_CLAUDE at a real claude binary, or unset it to take the standalone install "
-            "at ~/%s." % CLAUDE_STANDALONE_REL)
+            "SL_CLAUDE pins %s, which %s — start-session.sh refuses the launch rather than falling "
+            "back to PATH, so every worker launch fails here." % (path, why),
+            "Give SL_CLAUDE an absolute path to a real claude binary, or unset it to take the "
+            "standalone install at ~/%s." % CLAUDE_STANDALONE_REL)
     if path is None:
         return CheckResult(
             name, False,
