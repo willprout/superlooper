@@ -849,3 +849,32 @@ def test_the_shell_ladder_and_the_doctors_ladder_resolve_the_same_binary(tmp_pat
         doctor_said = stack_doctor.resolve_claude(stack_doctor.Probe())["path"]
         assert doctor_said == shell_said, (
             f"{label}: the doctor would report on {doctor_said} while a launch runs {shell_said}")
+
+
+def test_an_empty_pin_is_no_pin_and_a_blank_one_still_refuses(tmp_path):
+    # The shell's `[ -n "$SL_CLAUDE" ]` is FALSE for "" and TRUE for "   ", and the doctor's twin
+    # must draw the line in the same place (test_stack_doctor pins the other half). Empty falls
+    # through to the standalone install; whitespace is a pin that names nothing runnable.
+    r, _run_root, _args = _start(tmp_path, standalone=True, extra_env={"SL_CLAUDE": ""})
+    assert r.returncode == 0, r.stderr
+    assert _argv0(tmp_path) == str(tmp_path / "home" / ".local" / "bin" / "claude")
+
+    blank = tmp_path / "blank"
+    blank.mkdir()
+    r2, _rr, _a = _start(blank, standalone=True, extra_env={"SL_CLAUDE": "   "})
+    assert r2.returncode != 0 and "SL_CLAUDE" in r2.stderr
+
+
+def test_a_pin_naming_a_directory_refuses_rather_than_execing_it(tmp_path):
+    # A directory is executable — that is traversal permission — so a bare `-x` test would accept
+    # `SL_CLAUDE=$HOME/.local/bin`, stamp it as the binary in use, and only fail when bash tried to
+    # exec it: past the refusal, past the stamp, with a park memo blaming the agent. (Fresh-agent
+    # review, P1; the Python twin already tested isfile + access, so this is where they diverged.)
+    adir = tmp_path / "a-directory"
+    adir.mkdir()
+
+    r, _run_root, _args = _start(tmp_path, standalone=True, extra_env={"SL_CLAUDE": str(adir)})
+
+    assert r.returncode != 0 and "SL_CLAUDE" in r.stderr
+    assert not (tmp_path / "claude_argv0").exists()                    # nothing was executed
+    assert not (tmp_path / "home" / ".superlooper" / "claude-bin.last").exists()   # nothing stamped

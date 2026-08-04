@@ -383,12 +383,18 @@ case "$AGENT" in
       write_exited 127                   # 127 = "command not found", which is exactly what this is
       exit 127
     }
+    # `-f AND -x`, never `-x` alone: a DIRECTORY is executable (that is traversal permission), so a
+    # bare `-x` would accept `SL_CLAUDE=$HOME/.local/bin`, stamp it as the binary in use, and only
+    # fail when bash tried to exec a directory — past the refusal, past the stamp, with a park memo
+    # blaming the agent. This is also exactly what the Python twin tests (os.path.isfile + os.access),
+    # so the two ladders agree on what "runnable" means (fresh-agent review, P1).
+    sl_runnable() { [ -f "$1" ] && [ -x "$1" ]; }
     CLAUDE_STANDALONE="${HOME:-}/.local/bin/claude"
     if [ -n "${SL_CLAUDE:-}" ]; then
       CLAUDE_BIN="$SL_CLAUDE"
-      [ -x "$CLAUDE_BIN" ] || refuse_claude_bin \
+      sl_runnable "$CLAUDE_BIN" || refuse_claude_bin \
         "SL_CLAUDE pins '$CLAUDE_BIN', which is not an executable file — refusing to fall back to whatever \`claude\` this session's PATH happens to offer. Point SL_CLAUDE at a real claude binary, or unset it to take the standalone install at $CLAUDE_STANDALONE"
-    elif [ -x "$CLAUDE_STANDALONE" ]; then
+    elif sl_runnable "$CLAUDE_STANDALONE"; then
       CLAUDE_BIN="$CLAUDE_STANDALONE"
     else
       CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"

@@ -1221,3 +1221,57 @@ def test_claude_login_defers_to_the_binary_block_instead_of_raising_a_second_ala
     assert r.ok is False
     assert "claude binary" in r.fix
     assert probe.calls == []                  # and it never ran the thing it knows cannot run
+
+
+def test_the_shim_stamp_verdict_names_the_launch_that_clears_it():
+    # The stamp is never expired by age — the claim is "a worker has been SEEN running a
+    # cmux-independent binary", which only a launch can establish. So the fix line has to name the
+    # launch, or an operator who already installed the standalone build reads a red line with no
+    # exit and starts deleting state files to make it go away.
+    r = stack_doctor.check_claude_binary(_bin_probe(standalone=True, record=_SHIM))
+
+    assert r.ok is False
+    assert "next worker launch" in r.fix.lower()
+    assert stack_doctor.CLAUDE_BIN_RECORD_REL in r.fix
+
+
+def test_an_empty_pin_is_no_pin_but_a_blank_one_is_still_a_pin():
+    # The two ladders must agree on the edges of "is SL_CLAUDE set". Shell `[ -n "$SL_CLAUDE" ]` is
+    # FALSE for "" and TRUE for "   " — so an empty pin falls through to the standalone install and
+    # a whitespace one refuses. A strip-based test here would have made the doctor report happily on
+    # the standalone install while every launch refused.
+    empty = _bin_probe(standalone=True)
+    empty.env["SL_CLAUDE"] = ""
+    assert stack_doctor.resolve_claude(empty)["source"] == "standalone"
+
+    blank = _bin_probe(standalone=True)
+    blank.env["SL_CLAUDE"] = "   "
+    r = stack_doctor.resolve_claude(blank)
+    assert r["source"] == "pin" and r["ok"] is False
+
+
+def test_a_pin_naming_a_directory_is_not_runnable(tmp_path):
+    # The Python half of the same P1: os.access(dir, X_OK) is True, so `executable` has to demand a
+    # regular file or the doctor would green-light a pin the launcher refuses.
+    d = tmp_path / "a-directory"
+    d.mkdir()
+    probe = stack_doctor.Probe(env={"SL_CLAUDE": str(d), "HOME": str(tmp_path)})
+
+    assert probe.executable(str(d)) is False
+    assert stack_doctor.resolve_claude(probe) == {"path": str(d), "source": "pin", "ok": False}
+
+
+def test_a_real_probe_searches_its_own_path_not_the_processs(tmp_path):
+    # `Probe(env=...)` used to resolve against the host's real PATH regardless of the env it was
+    # handed — which contradicts the isolation the caller asked for and is a hole in the
+    # no-test-reaches-a-real-binary ratchet (fresh-agent review, P1).
+    binned = tmp_path / "bin"
+    binned.mkdir()
+    stub = binned / "claude"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    probe = stack_doctor.Probe(env={"PATH": str(binned), "HOME": str(tmp_path / "nowhere")})
+
+    r = stack_doctor.resolve_claude(probe)
+
+    assert r == {"path": str(stub), "source": "PATH", "ok": True}

@@ -122,6 +122,19 @@ def _x(path, body):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_claude_pin(monkeypatch, _never_reach_real_claude):
+    """The cases here spawn REAL launches through to start-session.sh, whose binary ladder (issue
+    #303) fails closed on a pin that names nothing runnable — which is exactly what conftest's
+    never-reach-a-real-claude default is. Left in place it would make every launch in this file
+    refuse a pin the file never set, turning delivery cases into pin cases.
+
+    Safe to drop here for the same reason as in test_start_session.py: every case owns both HOME
+    (a tmp dir with no standalone install) and the front of PATH (a stub `claude`), so the ladder
+    can only ever land on a stub."""
+    monkeypatch.delenv("SL_CLAUDE", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _stub_gh(tmp_path_factory, monkeypatch):
     """Every launch in this file now runs the positive gh-auth assert (#299) on BOTH sides of the
     spawn, so EVERY case needs a `gh` that answers — and none may reach the real one (CLAUDE.md's

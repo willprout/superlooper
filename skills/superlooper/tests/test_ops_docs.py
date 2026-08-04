@@ -392,6 +392,15 @@ class FakeProbe:
     def exists(self, path):
         return path in self.files or any(k.startswith(path.rstrip("/") + "/") for k in self.files)
 
+    # The two edges the claude-binary block needs (issue #303). This probe reaches check_stack, so
+    # it has to answer them — and it answers "no claude here at all", which is the honest reading of
+    # a filesystem that is a dict of ops docs.
+    def executable(self, path):
+        return False
+
+    def read_head(self, path, limit=4096):
+        return None
+
     def read_text(self, path):
         return self.files.get(path)
 

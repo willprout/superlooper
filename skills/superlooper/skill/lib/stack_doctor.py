@@ -76,7 +76,13 @@ class Probe:
         override = self.env.get(envvar) if envvar else None
         if override:
             return override
-        found = shutil.which(name)
+        # Search THIS probe's PATH, not the process's. They are the same object in production
+        # (env defaults to os.environ), so nothing changes there — but a caller that hands the probe
+        # an isolated env used to have its lookups quietly resolve against the host's real PATH,
+        # which both contradicts the env it passed and is a hole in the "no test reaches a real
+        # external binary" ratchet (fresh-agent review, P1). A None here keeps shutil's own
+        # os.environ default, so an env without PATH behaves exactly as before.
+        found = shutil.which(name, path=self.env.get("PATH"))
         if found:
             return found
         if default and os.path.exists(default):
@@ -270,7 +276,11 @@ def resolve_claude(probe):
     claude at all; the caller decides severity."""
     env = getattr(probe, "env", {}) or {}
     pin = env.get("SL_CLAUDE")
-    if _nonempty_string(pin):
+    # `pin != ""`, NOT _nonempty_string: the shell twin tests `[ -n "$SL_CLAUDE" ]`, which is true
+    # for a whitespace-only value. Using the strip-based helper here would make a pin of "   "
+    # REFUSE the launch while the doctor quietly reported on the standalone install instead — a
+    # divergence in the one direction that matters, since it hides a launcher that cannot start.
+    if isinstance(pin, str) and pin != "":
         return {"path": pin, "source": "pin", "ok": bool(probe.executable(pin))}
     # probe.home, like every other block here, is $HOME with a passwd-entry fallback; the shell twin
     # can only read $HOME. They differ ONLY when HOME is unset — where the shell simply misses this
@@ -362,12 +372,19 @@ def check_claude_binary(probe):
         launched = "no worker launch has recorded a binary yet"
 
     if last_kind == "cmux-shim":
+        # Deliberately a FAIL even when the resolution above is healthy, and deliberately NOT
+        # expired by age: the claim this block makes is "a worker has been observed running a
+        # cmux-independent binary", and until one has, that claim is simply unproven. The cure is
+        # therefore a real launch, not the passage of time — and the fix line has to SAY so, or an
+        # operator who has already installed the standalone build reads a red line with no exit.
         return CheckResult(
             name, False,
             "%s, but %s — a worker tab resolves in its OWN environment, and that one ran cmux's "
             "bundled wrapper, which contains no Claude Code (it execs another claude off PATH). "
             "Retiring cmux takes that launch path with it." % (resolved, launched),
-            _CLAUDE_INSTALL_FIX)
+            _CLAUDE_INSTALL_FIX + " This line then clears on the NEXT worker launch, which "
+            "re-stamps ~/%s from inside the session — a launch is what proves it, not a re-run of "
+            "this doctor." % CLAUDE_BIN_RECORD_REL)
     if kind == "cmux-shim":
         return CheckResult(
             name, False,
