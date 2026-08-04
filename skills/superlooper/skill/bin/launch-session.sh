@@ -215,12 +215,14 @@ gh_login_bounded() {                 # stdout = gh's answer (or its error text);
   # `set -e` — a bare failing `wait` aborts inside the command substitution before `cat` runs,
   # silently returning an EMPTY capture and leaking the temp file: P1-1 through a second door.
   local out_file pid ticks=0 limit rc
+  case "$GH_PROBE_SECONDS" in ""|*[!0-9]*) GH_PROBE_SECONDS=10 ;; esac   # a typo must not mean "refuse"
   limit=$((GH_PROBE_SECONDS * 10))
   out_file="$(mktemp "${TMPDIR:-/tmp}/sl-ghwho.XXXXXX")" || return 1
   "$GH" api user --jq .login > "$out_file" 2>&1 &
   pid=$!
   while [ "$ticks" -lt "$limit" ] && kill -0 "$pid" 2>/dev/null; do
-    sleep 0.1; ticks=$((ticks + 1))
+    sleep 0.1 2>/dev/null || sleep 1   # a sleep without fractions must cost
+    ticks=$((ticks + 1))                # granularity, never a refused launch
   done
   if kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true             # OUR pid, captured from $! — nothing else can match

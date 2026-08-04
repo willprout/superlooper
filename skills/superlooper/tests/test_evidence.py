@@ -390,3 +390,17 @@ def test_a_real_github_rate_limit_still_reads_as_unreachable():
                  "[i5] GH AUTH DEAD: API rate limit exceeded for user",
                  "[i5] GH AUTH DEAD: HTTP 503: Service Unavailable"):
         assert evidence.build("launch", rc=4, captured=text)["reason"] == "gh_probe_unreachable", text
+
+
+def test_a_dead_cmux_socket_is_not_reported_as_an_unreachable_github():
+    """`connection refused` reads as a network fault, but cmux's OWN socket error carries it too —
+    and the gh needles are ordered ahead of anchor_socket_lost, so including it flipped a dead cmux
+    socket to "wait for GitHub to come back": a remedy for a fault that never self-recovers. gh's Go
+    error always spells the whole `dial tcp <ip>:443: connect: connection refused`, so dropping the
+    bare phrase costs nothing."""
+    dead_socket = ("[i7] new-surface failed (rc=1) targeting pane 'pane:1': "
+                   "could not connect to cmux: connect: connection refused")
+    assert evidence.build("launch", rc=1, captured=dead_socket)["reason"] == "anchor_socket_lost"
+    # ...while gh's own refused connection is still caught, via `dial tcp`:
+    gh_refused = "[i5] GH AUTH DEAD: dial tcp 140.82.113.6:443: connect: connection refused"
+    assert evidence.build("launch", rc=4, captured=gh_refused)["reason"] == "gh_probe_unreachable"

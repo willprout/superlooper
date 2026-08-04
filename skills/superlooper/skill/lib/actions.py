@@ -280,7 +280,7 @@ NUDGE_MESSAGES = {
 
 # Human-readable ALERT notify bodies. The reason CODES (stable, sorted) are what the ALERT file
 # stores and what decide dedups on; these strings are only the push text. A reason not listed here
-# (gh_unreachable, launch_runaway:<id>, update_errors:<id>) falls back to its own code.
+# (launch_runaway:<id>, update_errors:<id>) falls back to its own code.
 ALERT_MESSAGES = {
     "usage_stale": "usage meter unreadable past the grace — FAILING OPEN: launching normally so "
                    "work continues; real usage may be low, and sessions hit the wall themselves if "
@@ -306,6 +306,14 @@ ALERT_MESSAGES = {
                                "(or re-run bin/install-launch-shim.sh), then FULLY QUIT and "
                                "relaunch cmux in a visible tab and restart the runner — the flag is "
                                "read only at app launch. If it persists, check the cmux anchor.",
+    "gh_unreachable": "GitHub is not answering — the runner's issue/PR polling is failing, or "
+                      "the launch-time identity probe could not complete (rate limit, outage, "
+                      "DNS/network). Nothing is wrong with any issue and NOTHING NEEDS "
+                      "RE-AUTHENTICATING: the credential is fine, GitHub is simply "
+                      "unreachable. Launches are HELD (the queue is intact, nothing parked, "
+                      "no issue charged) and resume on their own once GitHub answers again. "
+                      "If it persists past a normal outage, check the network and `gh api "
+                      "rate_limit` for a burned hourly quota.",
     "gh_auth_dead_runner": "the RUNNER's own GitHub CLI cannot say who it is — `gh api user` "
                            "returns no usable login, so the launcher has no identity to start any "
                            "session against and refuses BEFORE opening a tab (issue #299). This is "
@@ -1481,7 +1489,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             reasons.append("launch_systemic_failure")
     if auth_invalid and (has_pending_launch or has_relaunch_demand):   # dead auth only matters with a
         reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
-    reasons.sort()
+    # DEDUPE, not just sort (#299). Two independent detectors can now name the SAME reason:
+    # an unreachable GitHub breaks the POLL and the launch-time identity probe together, and
+    # the launch streak persists until a verified delivery, so the overlap is the normal case
+    # rather than a corner. Duplicates were structurally impossible before that second
+    # detector existed, which is why plain sort() was enough until now.
+    reasons = sorted(set(reasons))
     if reasons:
         existing = alert_on_disk.get("reasons") if alert_on_disk else None
         if existing != reasons:

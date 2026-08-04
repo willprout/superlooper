@@ -5179,3 +5179,30 @@ def test_an_unreadable_evidence_stamp_falls_back_to_the_generic_alert():
                    issues_state={"version": 1, "issues": {"i5": ist("ready", launch_evidence=ev)}})
         assert only(decide(parsed_issues=[parsed(5)], dsk=dsk), "alert")[0]["reasons"] == \
             ["launch_systemic_failure"], ev
+
+
+def test_one_condition_is_never_alerted_twice():
+    # Two independent detectors now name the SAME reason: an unreachable GitHub breaks the POLL and
+    # the launch-time identity probe together, and the launch streak persists until a verified
+    # delivery — so the overlap is the DEFINITIONAL case, not a corner. Before the launch probe
+    # existed no two detectors could collide, so a plain sort() was enough; without deduping the
+    # owner's push read "gh_unreachable; gh_unreachable".
+    dsk = disk(launch_anchor=_anchor_ok(), launch_fail_ids=["i5"],
+               issues_state={"version": 1, "issues": {
+                   "i5": ist("ready", launch_evidence={"reason": "gh_probe_unreachable", "rc": 4,
+                                                       "captured": "x", "kind": "launch"})}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk,
+                 gh_view={"ok": True, "consecutive_failures": 99})
+    reasons = only(out, "alert")[0]["reasons"]
+    assert reasons == sorted(set(reasons)), reasons
+    assert reasons.count("gh_unreachable") == 1, reasons
+
+
+def test_every_gh_alert_reason_carries_a_real_body():
+    # A channel fault HOLDS, and a held queue writes no park memo — so the alert body is the only
+    # thing the owner is ever told. A reason falling back to its own bare code says nothing at all.
+    for reason in ("gh_unreachable", "gh_auth_dead_runner"):
+        msg = actions._alert_message(reason)
+        assert msg != reason and len(msg) > 80, (reason, msg)
+    # ...and the transient one must NOT send the owner to re-authenticate something that works.
+    assert "gh auth login" not in actions._alert_message("gh_unreachable")

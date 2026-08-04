@@ -158,9 +158,15 @@ _LAUNCH_TEXT = (
     # that — every launcher line is prefixed `[$ID]`, so on issue i429 a missing brief, a failed
     # worktree and a dead cmux workspace all read as "GitHub is rate-limited" and froze the queue.
     # Hence `http 429` / `api rate limit` over `429`, and the enumerated 5xx over `http 5`.
+    #
+    # `connection refused` is DELIBERATELY ABSENT for the same reason one rung up: cmux's own
+    # socket error carries it too, and this tuple is ordered ahead of `anchor_socket_lost`, so
+    # including it turned a dead cmux socket into "wait for GitHub to come back" — a remedy for
+    # a fault that never self-recovers. gh's Go error always spells the whole
+    # `dial tcp <ip>:443: connect: connection refused`, which `dial tcp` already catches.
     (("api rate limit", "secondary rate limit", "http 429",
       "http 500", "http 502", "http 503", "http 504",
-      "could not resolve", "dial tcp", "connection refused",
+      "could not resolve", "dial tcp",
       "no answer within", "i/o timeout", "network is unreachable", "temporary failure"),
      ("gh_probe_unreachable",
       "the gh-auth assert could not get an answer OUT of GitHub — a rate limit, an outage, or a "
