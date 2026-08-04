@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- superlooper FLEET SESSION HOST, the mini build-up's server (issue #309). Load it as a user
+     LaunchAgent in the gui/$UID domain ONLY — never a background daemon. That is the keychain
+     rule: a gui agent is in the Aqua session, which is the only session with an unlocked login
+     keychain, and the host's panes inherit the server's session. A daemon-hosted server spawns
+     panes whose gh and claude logins cannot read their own credentials, and the failure is
+     intermittent rather than loud (docs/SPIKES-2026-07-29-results.md test 3).
+
+     RunAtLoad + KeepAlive are the login-item half: the fleet's host comes up with the owner's GUI
+     login and is restarted if it exits. That is safe to do here in a way it would not be for an
+     attended multiplexer, because the pinned release restores its hosted agents with no client
+     ever attached (measured, issue #302) — so a restart brings the fleet back rather than parking
+     it until somebody opens a window.
+
+     The session is NAMED. It is what lets the owner's own window and the fleet's server share one
+     machine without sharing one server, and it decides the control socket's path
+     (<config dir>/sessions/<name>/, read out of the pinned release's own src/session.rs).
+
+     PATH is EXPLICIT and load-bearing: launchd hands a job only /usr/bin:/bin:/usr/sbin:/sbin, so
+     a server started this way finds no Homebrew and no ~/.local/bin, and every pane it spawns
+     inherits that impoverished PATH.
+
+     THE FENCE TOKEN IS NOT IN THIS FILE, and must never be put in it. `launchctl print
+     gui/$UID/<label>` echoes a job's EnvironmentVariables verbatim — measured on the fleet
+     machine while writing this — so a token spelled here is one command away from any same-uid
+     process, which is precisely the worker the fence exists to keep out. What is here is the PATH
+     of the 0600 file the server reads it from; see skills/superlooper/docs/FLEET.md for what that
+     does and does not buy.
+
+     The placeholders are named in this comment WITHOUT their braces, deliberately: substitution is
+     a plain textual replace over the whole file, so a braced name here would be substituted into
+     the comment too — and a value containing a double hyphen then makes the whole plist invalid
+     XML. The slots are label, binary, session, token_file_var, token_file, log_dir and path, and
+     lib/fleet.py's render_server_plist is what fills them. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{binary}</string>
+        <string>--session</string>
+        <string>{session}</string>
+        <string>server</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{path}</string>
+        <key>{token_file_var}</key>
+        <string>{token_file}</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{log_dir}/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/server.log</string>
+</dict>
+</plist>

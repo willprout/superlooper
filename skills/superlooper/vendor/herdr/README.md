@@ -131,12 +131,32 @@ Rotating the token means restarting the server — a deliberate event, by design
 
 ## Build
 
+`build.sh` in this directory is the executable form of the steps below, and is what the fleet
+build-up (issue #309) actually runs:
+
+```sh
+skills/superlooper/vendor/herdr/build.sh          # --prefix / --work / --force
+```
+
+It reads the pinned version from `skill/lib/herdr_hook.py` (one machine-readable pin, so a bump
+cannot leave two disagreeing versions on disk), clones that tag, applies this patch, asserts the
+two load-bearing invariants below, builds, and installs the result into `<state base>/fleet/bin/`.
+It is idempotent: an already-installed binary reporting the pinned version is left alone.
+
+By hand, it is:
+
 ```sh
 git clone --depth 1 --branch v0.8.0 https://github.com/ogulcancelik/herdr herdr-src
 cd herdr-src
 git apply --3way ../0001-fence-token-auth-on-the-control-socket.patch
 cargo build --release          # rustup honours rust-toolchain.toml (1.96.1)
 ```
+
+One gotcha the script encodes: **do not use `rustup run`** on a machine whose rustup came from
+Homebrew. That formula installs no `~/.cargo/bin` shims, and `rustup run` puts that empty directory
+on PATH — so cargo starts and then dies with ``could not execute process `rustc -vV` ``, which
+reads like a broken toolchain rather than a missing shim. Resolve the toolchain's own bin directory
+(`rustup which --toolchain <channel> cargo`) and put that on PATH.
 
 `zig@0.15` must be on `PATH` if the link step needs it (`brew install zig@0.15`; Homebrew's own
 formula prepends it).

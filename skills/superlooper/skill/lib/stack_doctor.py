@@ -93,9 +93,28 @@ class Probe:
             return default
         return None
 
-    def run(self, argv, timeout=10):
+    def run(self, argv, timeout=10, env=None):
+        """Run `argv`. `env`, when given, is an OVERLAY on this probe's environment, and a value of
+        None REMOVES that variable.
+
+        It exists for one measurement and is shaped for it: reading `claude auth status` twice, once
+        per credential config dir, where the answer is a function of the environment and of nothing
+        else (issue #300 — the credential namespace is keyed by the config-dir string). An overlay
+        rather than a replacement because the command still needs a PATH and a HOME to run at all;
+        an explicit None rather than a sentinel because the case that matters is REMOVING the fleet's
+        config dir to ask the same question about the owner's default one.
+        """
+        run_env = None
+        if env is not None:
+            run_env = dict(self.env)
+            for key, value in env.items():
+                if value is None:
+                    run_env.pop(key, None)
+                else:
+                    run_env[key] = value
         try:
-            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                                  env=run_env)
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(argv, 124, "", "")
         except (OSError, ValueError):

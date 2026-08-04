@@ -520,6 +520,73 @@ def _speak(socket_path, payload, timeout):
         client.close()
 
 
+# --------------------------------------------------------------------------- where the host lives
+# The build-up (issue #309) has to CREATE the things this module elsewhere only talks to: install
+# the binary, write the config the server reads, put the socket somewhere short enough to bind. It
+# needs the host's own path derivations to do that — and every one of them is host machinery, so
+# they live here, behind the same door as the verbs. `lib/fleet.py` reads them from this module and
+# spells none of them itself, which is what keeps the swap bounded: a tmux host replaces these
+# three functions along with the five verbs, and the build-up's logic is untouched.
+#
+# Read out of the pinned release's own source (`src/session.rs`: `data_dir_for` /
+# `api_socket_path_for`, `src/config.rs`: `config_dir`), not guessed — a wrong path here produces a
+# server nobody can reach while everything reports success.
+
+BINARY_NAME = _DEFAULT_BINARY
+# The host's config directory NAME under the XDG config home. Not a full path: the home itself is
+# the caller's environment, and baking one in would freeze a location the operator may have moved.
+CONFIG_DIR_NAME = "herdr"
+SOCKET_FILE = "herdr.sock"
+
+
+def config_dir(env=None):
+    """The host's config directory — ``$XDG_CONFIG_HOME/<name>``, else ``~/.config/<name>``.
+
+    The build-up deliberately does NOT set ``XDG_CONFIG_HOME`` for the server: a pane inherits the
+    server's environment, and an inherited XDG config home was measured de-authenticating ``gh``
+    while it kept answering (docs/SPIKES-2026-07-29-results.md). Isolation comes from the named
+    session below, which costs a pane nothing.
+    """
+    env = os.environ if env is None else env
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(
+        env.get("HOME") or os.path.expanduser("~"), ".config")
+    return os.path.join(base, CONFIG_DIR_NAME)
+
+
+def state_dir(env=None):
+    """The host's state directory — ``$XDG_STATE_HOME/<name>``, else ``~/.local/state/<name>``.
+
+    Separate from the config dir because the host keeps them separate: config is what an operator
+    writes, state is what the host caches for itself — including the agent-detection manifests it
+    fetches in the background, which the build-up snapshots.
+    """
+    env = os.environ if env is None else env
+    base = env.get("XDG_STATE_HOME") or os.path.join(
+        env.get("HOME") or os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, CONFIG_DIR_NAME)
+
+
+def remote_manifest_path(host_state_dir, agent):
+    """The host's cached copy of an agent's REMOTE screen-detection manifest.
+
+    This is the file the build-up snapshots into a local override: it is what the host is actually
+    using today, so a snapshot of it freezes nothing the machine did not already have.
+    """
+    return os.path.join(host_state_dir, "agent-detection", "remote", "%s.toml" % agent)
+
+
+def session_socket_path(host_config_dir, session=None):
+    """The control socket for a named session — ``<config dir>/sessions/<name>/<socket>``.
+
+    ``session=None`` is the host's DEFAULT session, whose socket sits directly in the config dir.
+    The fleet always names its session: a dedicated name is what lets the owner's own window and
+    the fleet's server share one machine without sharing one server (plan §2).
+    """
+    if session is None:
+        return os.path.join(host_config_dir, SOCKET_FILE)
+    return os.path.join(host_config_dir, "sessions", session, SOCKET_FILE)
+
+
 # --------------------------------------------------------------------------- the doorway
 
 class SessionHost:
