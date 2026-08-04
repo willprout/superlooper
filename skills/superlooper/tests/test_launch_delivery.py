@@ -79,7 +79,11 @@ STUB_CMUX = textwrap.dedent("""\
 STUB_CLAUDE = ("#!/usr/bin/env bash\n"
                # Record the fact of the agent ever running, so a test can prove a REFUSED launch
                # never reached it (issue #299: dead auth must stop before the flight, not after).
-               "printf \"%s\\n\" \"$@\" >> \"$STUB_DIR/claude_args\"\nexit 0\n")
+               "printf \"%s\\n\" \"$@\" >> \"$STUB_DIR/claude_args\"\n"
+               # …and the environment it was actually HANDED, three processes down the spawn chain
+               # (issue #301). What the launcher unset in its own shell is unobservable from here;
+               # what the agent's process received is what would have been billed.
+               "env > \"$STUB_DIR/claude_env\"\nexit 0\n")
 STUB_CODEX = "#!/usr/bin/env bash\nprintf \"%s\\n\" \"$@\" > \"$STUB_DIR/codex_args\"\nexit 0\n"
 
 # Stub `gh` for the POSITIVE auth assert (issue #299). It answers exactly one call —
@@ -882,3 +886,165 @@ def test_the_debugger_spawn_path_asserts_gh_auth_too(tmp_path):
     assert not (run_root / "state" / "activity" / "d1").exists()
     assert not (run_root / "state" / "panes" / "d1").exists()
     assert (stubdir / "closed").exists(), "the refused debugger's tab must be torn down"
+
+
+# ---- launch-floor env scrub + spawn assert (issue #301, tool-dive claim c1) ---------------------
+# Sessions inherit the full parent env, and the fresh tab's shell SOURCES ~/.zshrc on the way up —
+# which is precisely where a LIVE ANTHROPIC_API_KEY was found on the owner's own machine on
+# 2026-07-30 (docs/SPIKES-2026-07-30-supervised.md §0.3). One exported key silently flips every
+# worker from Max-subscription to API billing; inherited CLAUDE_CODE_* silently turns transcript
+# saving off (voiding #298's --resume floor); XDG_CONFIG_HOME silently de-authenticates gh.
+#
+# These cases drive the WHOLE spawn chain — launcher -> stub cmux -> the real launch shim -> the
+# dropped bash command -> start-session.sh -> the agent — because that chain is the only place the
+# claim is true or false. The oracle is the env the stub agent recorded, three processes down.
+ENV_RC = 6   # a session whose own environment is poisoned -> parks THIS issue with a naming memo
+
+ENV_POISON = {
+    "ANTHROPIC_API_KEY": "sk-ant-api03-MUST-NEVER-REACH-A-SESSION",
+    "ANTHROPIC_BASE_URL": "https://not-anthropic.invalid/v1",
+    "CLAUDECODE": "1",
+    "CLAUDE_CODE_SESSION_ID": "00000000-0000-4000-8000-000000000000",
+    "CLAUDE_CODE_CHILD_SESSION": "1",
+    "CLAUDE_PID": "424242",
+    "CLAUDE_EFFORT": "xhigh",
+}
+
+# A poison the scrub CANNOT remove, so the ASSERT is what is under test rather than the scrub —
+# and driven without a test-only backdoor in the floor itself. BASH_ENV is sourced by every
+# non-interactive bash (a real injection vector: the launcher, the shim's `bash -c`, and
+# start-session.sh all pick it up), and `declare -rx` makes the variable exported AND readonly, so
+# `unset` genuinely fails and the poison genuinely survives into the spawn.
+UNSCRUBBABLE = "declare -rx ANTHROPIC_API_KEY=sk-ant-api03-UNSCRUBBABLE\n"
+
+_ENV_NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+
+
+def _agent_env_names(stubdir):
+    text = (stubdir / "claude_env").read_text()
+    return [m.group(1) for m in (_ENV_NAME_RE.match(ln) for ln in text.splitlines()) if m]
+
+
+def _bash_env(tmp_path, body):
+    p = tmp_path / "bashenv.sh"
+    p.write_text(body)
+    return {"BASH_ENV": str(p)}
+
+
+def test_a_poisoned_launch_env_never_reaches_the_spawned_agent(tmp_path):
+    """THE claim (c1), end to end. The poison rides the launcher's own environment all the way to
+    the tab exactly as an ~/.zshrc export would, and must be gone by the time the agent process
+    exists — because that process is what gets billed."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver", extra_env=dict(ENV_POISON))
+    assert r.returncode == 0, f"a scrubbable env must launch normally: rc={r.returncode}\n{r.stderr}"
+    assert (stubdir / "claude_env").exists(), "the agent must actually have started"
+    handed = _agent_env_names(stubdir)
+    leaked = sorted(n for n in handed
+                    if n.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))
+                    or n in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "XDG_CONFIG_HOME"))
+    assert leaked == [], f"these survived the whole spawn chain into the agent: {leaked}"
+    # the scrub is a denylist, not an allowlist: c25's landmine is that overriding HOME breaks
+    # macOS keychain OAuth, so what a session legitimately needs must arrive intact.
+    assert "HOME" in handed and "PATH" in handed and "SL_RUN_ROOT" in handed
+
+
+def test_an_unscrubbable_env_refuses_the_launch_and_tears_the_tab_down(tmp_path):
+    """A scrub that rotted must not fail OPEN. The launcher must learn WHY from the session's own
+    marker and act at once — not time out 30s later and blame the launch shim, which is the
+    mis-blame the marker discipline exists to end."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env=_bash_env(tmp_path, UNSCRUBBABLE))
+    assert r.returncode == ENV_RC, \
+        f"a poisoned session env must exit {ENV_RC}, got rc={r.returncode}\nSTDERR:\n{r.stderr}"
+    assert not (stubdir / "claude_args").exists(), \
+        "the agent must NEVER start in an env that could be API-billed"
+    assert "ANTHROPIC_API_KEY" in r.stderr, \
+        f"the launcher's stderr is the park memo's evidence — name the variable: {r.stderr!r}"
+    assert "shim" not in r.stderr.lower(), \
+        f"an env fault must not be reported as a launch-delivery one: {r.stderr!r}"
+    assert not (run_root / "state" / "envfail" / "i1.11111111-1111-1111-1111-111111111111").exists(), \
+        "the launcher must consume its env marker, not leave it in the state tree"
+    assert not (run_root / "state" / "activity" / "i1").exists(), "must NOT fabricate liveness"
+    assert not (run_root / "state" / "panes" / "i1").exists(), "must NOT record a pane"
+    assert (stubdir / "closed").exists(), "the refused session's tab must be torn down"
+    st = json.load(open(run_root / "state" / "issues.json"))
+    assert st["issues"]["i1"].get("launches", 0) == 0, "a refused launch is not a launch"
+
+
+def test_a_refused_env_is_not_read_as_a_shim_that_never_fired(tmp_path):
+    """Without its own marker + code, a session that refuses itself looks identical to a launch the
+    shim never delivered: the launcher would wait out the full verify window and report
+    `shim_not_fired`, sending the owner to debug the launch machinery over an exported API key.
+    The refusal must therefore be PROMPT as well as distinct."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver",
+                    extra_env={**_bash_env(tmp_path, UNSCRUBBABLE),
+                               "SL_LAUNCH_VERIFY_SECONDS": "25"})
+    assert r.returncode == ENV_RC, r.stderr
+    assert "LAUNCH NOT DELIVERED" not in r.stderr, \
+        f"the env refusal must pre-empt the delivery timeout, not wait it out: {r.stderr!r}"
+
+
+def test_a_stale_env_marker_from_an_abandoned_launch_is_swept(tmp_path):
+    """Nothing else prunes these: the launcher only removes the marker it actually OBSERVED inside
+    its verify window, so one written just after a timeout would sit in the state tree forever. The
+    sweep is AGE-BOUNDED for the same reason `started` is per-token — an id-wide `rm` would delete
+    an OVERLAPPING launch's live marker and make that launch report `shim_not_fired`."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    envfail = run_root / "state" / "envfail"
+    envfail.mkdir(parents=True)
+    stale = envfail / "i1.ABANDONED-LAUNCH-UUID"
+    stale.write_text("a marker nobody consumed")
+    os.utime(stale, (0, 0))                      # far older than the 5-minute bound
+    fresh = envfail / "i1.OVERLAPPING-LIVE-UUID"
+    fresh.write_text("another launch's LIVE marker")
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="deliver")
+    assert r.returncode == 0, r.stderr
+    assert not stale.exists(), "an abandoned marker must be swept"
+    assert fresh.exists(), "an overlapping launch's fresh marker must NOT be collateral damage"
+
+
+def test_the_debugger_spawn_path_scrubs_and_asserts_too(tmp_path):
+    """DoD: BOTH spawn paths. A d<N> debugger has no worktree and no issue counter, but it is a
+    full Claude session — API-billed just the same, and just as dependent on a transcript to be
+    resumable. It shares this launcher and start-session.sh, so it is covered by construction; this
+    pins that rather than trusting it."""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    (run_root / "briefs" / "d1.md").write_text("diagnose the instance")
+    base = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{stubdir}:{os.environ['PATH']}",
+        "SL_RUN_ROOT": str(run_root),
+        "SL_PANE": "pane:1",
+        "SL_CMUX": str(cmux),
+        "STUB_DIR": str(stubdir),
+        "SHIM_PATH": SHIM_PATH,
+        "STUB_MODE": "deliver",
+        "SL_LAUNCH_VERIFY_SECONDS": "5",
+    }
+    # scrubbable poison -> the debugger launches, and its agent is handed a clean env
+    ok = subprocess.run(
+        [LAUNCH, "--cwd", str(repo), "d1"],
+        env={**base, **ENV_POISON,
+             "SL_LAUNCH_DIR": os.path.join(os.path.dirname(str(run_root)), "launchdir_env_ok")},
+        capture_output=True, text=True, timeout=60)
+    assert ok.returncode == 0, f"a scrubbable env must launch a debugger: {ok.stderr}"
+    assert [n for n in _agent_env_names(stubdir)
+            if n.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))] == [], \
+        "the debugger's agent was handed poison"
+
+    # unscrubbable poison -> refused with the same distinct code, tab torn down, no liveness
+    (stubdir / "claude_args").unlink()
+    (stubdir / "claude_env").unlink()
+    bad = subprocess.run(
+        [LAUNCH, "--cwd", str(repo), "d1"],
+        env={**base, **_bash_env(tmp_path, UNSCRUBBABLE),
+             "SL_LAUNCH_DIR": os.path.join(os.path.dirname(str(run_root)), "launchdir_env_bad")},
+        capture_output=True, text=True, timeout=60)
+    assert bad.returncode == ENV_RC, \
+        f"a poisoned debugger env must exit {ENV_RC}, got rc={bad.returncode}\n{bad.stderr}"
+    assert not (stubdir / "claude_args").exists(), "the debugger must NEVER start in a poisoned env"
+    assert "ANTHROPIC_API_KEY" in bad.stderr

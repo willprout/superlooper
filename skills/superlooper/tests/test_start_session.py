@@ -8,6 +8,7 @@ kickoff rule), pinning exactly which flags reach the CLI:
   * a bracketed model (opus[1m]) survives verbatim through the launch stack.
 """
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -18,16 +19,29 @@ HERE = os.path.dirname(__file__)
 REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 START = os.path.join(REPO_ROOT, "skill", "bin", "start-session.sh")
 
-# records every argv element on its own line, then exits (a real worker would idle at the prompt).
-STUB_AGENT = '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$SL_TEST_ARGS"\nexit 0\n'
+# Records every argv element on its own line, then exits (a real worker would idle at the prompt).
+# It ALSO dumps the environment it was actually handed when SL_TEST_ENV names a file (issue #301):
+# what the launcher `unset` in its own shell is unobservable from outside, but what the spawned
+# agent RECEIVES is exactly what would have been billed to an API key or stripped of its transcript.
+# That file is the only honest oracle for a scrub.
+STUB_AGENT = ('#!/usr/bin/env bash\n'
+              'printf "%s\\n" "$@" > "$SL_TEST_ARGS"\n'
+              '[ -n "${SL_TEST_ENV:-}" ] && env > "$SL_TEST_ENV"\n'
+              'exit 0\n')
 
 # Stub `gh` for the positive auth assert (issue #299): answers `api user --jq .login` with
 # $STUB_GH_LOGIN, or refuses like a logged-out CLI when that is "DEAD". No test may reach the real
 # gh (CLAUDE.md ratchet), and start-session.sh runs the probe on EVERY launch, so every case here
 # needs one.
+#
+# It also reproduces the 2026-07-29 spike's XDG_CONFIG_HOME landmine faithfully (issue #301): the
+# real `gh` honours XDG_CONFIG_HOME for its config dir, so pointed anywhere else it finds no
+# hosts.yml and answers, confidently, as nobody. That makes the scrub's ORDERING testable — the env
+# floor must run BEFORE the auth probe, or the loop diagnoses a poisoned env as dead credentials.
 STUB_GH = ('#!/usr/bin/env bash\n'
            'set -u\n'
            'login="${STUB_GH_LOGIN:-loopbot}"\n'
+           'if [ -n "${XDG_CONFIG_HOME:-}" ]; then login="DEAD"; fi\n'
            'if [ "$login" = "DEAD" ]; then\n'
            '  echo "gh: To get started with GitHub CLI, please run:  gh auth login" >&2\n'
            '  exit 4\n'
@@ -40,6 +54,56 @@ STUB_GH = ('#!/usr/bin/env bash\n'
 # reads it from exactly there), so without this the "no id was minted" cases would inherit the
 # test-runner session's id and quietly assert nothing.
 _SESSION_ENV = ("SL_SESSION_ID", "SL_RESUME")
+
+# ---- the launch-floor env denylist (issue #301) -------------------------------------------------
+# Every name here is a REALIZED silent-lie vector, not a hypothetical:
+#   * ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL flip a session from Max-subscription to API billing
+#     with no error and no signal (tool-dive claim c1, two codebases) — and a LIVE key was found in
+#     the owner's own ~/.zshrc:5 on 2026-07-30 (docs/SPIKES-2026-07-30-supervised.md §0.3);
+#   * inherited CLAUDE_CODE_* / CLAUDECODE turn transcript saving OFF, which silently breaks
+#     `--resume` and so silently voids the whole resurrection floor (#298 depends on this);
+#   * XDG_CONFIG_HOME de-authenticates `gh` while it keeps answering confidently.
+# (All from docs/SPIKES-2026-07-29-results.md.) Values are recognisable so a leak is unmistakable
+# in a failure message.
+POISON_ENV = {
+    "ANTHROPIC_API_KEY": "sk-ant-api03-MUST-NEVER-REACH-A-SESSION",
+    "ANTHROPIC_BASE_URL": "https://not-anthropic.invalid/v1",
+    "ANTHROPIC_AUTH_TOKEN": "tok-MUST-NEVER-REACH-A-SESSION",
+    "CLAUDECODE": "1",
+    "CLAUDE_CODE_SESSION_ID": "00000000-0000-4000-8000-000000000000",
+    "CLAUDE_CODE_CHILD_SESSION": "1",
+    "CLAUDE_CODE_ENTRYPOINT": "cli",
+    "CLAUDE_PID": "424242",
+    "CLAUDE_EFFORT": "xhigh",
+    "XDG_CONFIG_HOME": "/nowhere/xdg",
+}
+
+_POISON_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_")
+_POISON_EXACT = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "XDG_CONFIG_HOME")
+
+
+def _is_poison(name):
+    return name.startswith(_POISON_PREFIXES) or name in _POISON_EXACT
+
+
+_NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+
+
+def _recorded_env_names(path):
+    """The variable NAMES the stub agent was actually handed. Names only: a value can contain
+    newlines and `=`, so only a line that OPENS with a valid identifier followed by `=` names a
+    variable."""
+    return [m.group(1) for m in (_NAME_RE.match(ln) for ln in path.read_text().splitlines()) if m]
+
+
+def _recorded_env(path):
+    out = {}
+    for line in path.read_text().splitlines():
+        m = _NAME_RE.match(line)
+        if m:
+            out[m.group(1)] = line[len(m.group(1)) + 1:]
+    return out
+
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 
@@ -62,6 +126,9 @@ def _stub_gh(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("SL_GH", str(gh))
     monkeypatch.setenv("STUB_GH_LOGIN", "loopbot")
     monkeypatch.setenv("SL_EXPECT_GH_LOGIN", "loopbot")
+    # An ambient XDG_CONFIG_HOME would de-auth the stub gh in EVERY case above (it reproduces the
+    # spike's landmine), so pin it absent here and let the one ordering case set it in-body.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     return gh
 
 
@@ -82,16 +149,22 @@ def _start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
     _x(str(stubdir / "claude"), STUB_AGENT)
     _x(str(stubdir / "codex"), STUB_AGENT)
     args_file = tmp_path / f"{agent}_args"
-    # start from a copy that never leaks the parent's SL_MODEL/SL_EFFORT into the child.
+    # start from a copy that never leaks the parent's SL_MODEL/SL_EFFORT into the child, and never
+    # its POISON either (#301): this suite very often runs inside a real Claude Code session, whose
+    # CLAUDE_CODE_*/CLAUDECODE/CLAUDE_PID/CLAUDE_EFFORT are ambient in os.environ. Left in, the
+    # baseline "a clean env launches normally" case would silently be a scrub case instead, and the
+    # scrub cases could not tell their own injected poison from the harness's.
     env = {k: v for k, v in os.environ.items()
            if k not in ("SL_MODEL", "SL_EFFORT", "SL_CODEX_DANGEROUS_BYPASS",
                         "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN",
-                        _SESSION_ENV[0], _SESSION_ENV[1])}
+                        _SESSION_ENV[0], _SESSION_ENV[1])
+           and not _is_poison(k)}
     env.update({
         "PATH": f"{stubdir}:{os.environ['PATH']}",
         "HOME": str(tmp_path / "home"),
         "SL_RUN_ROOT": str(run_root),
         "SL_TEST_ARGS": str(args_file),
+        "SL_TEST_ENV": str(tmp_path / f"{agent}_env"),
         "SL_AGENT": agent,
     })
     if model is not None:
@@ -505,3 +578,129 @@ def test_the_assert_also_gates_the_codex_agent(tmp_path):
                                      extra_env={"STUB_GH_LOGIN": "DEAD"})
     assert r.returncode == AUTH_RC, f"expected rc={AUTH_RC}, got {r.returncode}\n{r.stderr}"
     assert not args_file.exists()
+
+
+# ---- the env scrub + post-scrub assert, in the worker's OWN env (issue #301) --------------------
+# Sessions inherit the full parent env. One exported ANTHROPIC_API_KEY silently flips every worker
+# from Max-subscription to API billing — no error, no signal, just a bill — and a LIVE key sat in
+# the owner's ~/.zshrc:5 until 2026-07-30. The same inheritance turns transcript saving off
+# (CLAUDE_CODE_*, which silently voids `--resume` and so #298's whole resurrection floor) and
+# de-authenticates `gh` (XDG_CONFIG_HOME).
+#
+# The tab's shell SOURCES ~/.zshrc, so the poison is injected AFTER the launcher has run and before
+# start-session.sh starts: this file is the only place the fix can live, and the only place it can
+# be tested honestly. SCRUB AND ASSERT, per docs/HERDR-ADOPTION-PLAN.md §6 — the scrub removes the
+# poison, the assert catches a scrub that rotted.
+ENV_RC = 6
+
+# A poison the scrub CANNOT remove — how a rotted scrub is driven without a test-only backdoor in
+# the floor itself. BASH_ENV is sourced by every non-interactive bash (a real injection vector), and
+# `declare -rx` makes the variable exported AND readonly, so `unset` fails and the poison survives
+# into the spawned agent's environment. Nothing here is stubbed: the scrub really runs, really
+# fails, and the assert is the only thing standing between that and an API-billed session.
+UNSCRUBBABLE = 'declare -rx ANTHROPIC_API_KEY=sk-ant-api03-UNSCRUBBABLE\n'
+
+
+def _envfail_markers(run_root):
+    d = run_root / "state" / "envfail"
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def _bash_env(tmp_path, body):
+    p = tmp_path / "bashenv.sh"
+    p.write_text(body)
+    return {"BASH_ENV": str(p)}
+
+
+def test_a_poisoned_parent_env_never_reaches_the_agent(tmp_path):
+    """THE claim (c1). The oracle is the environment the AGENT was handed, not the launcher's own
+    bookkeeping — a session is billed by what its process received."""
+    r, _run_root, args_file = _start(tmp_path, extra_env=dict(POISON_ENV))
+    assert r.returncode == 0, f"a scrubbable env must launch normally: rc={r.returncode}\n{r.stderr}"
+    assert args_file.exists(), "the agent must have started"
+    handed = _recorded_env_names(tmp_path / "claude_env")
+    leaked = sorted(n for n in handed if _is_poison(n))
+    assert leaked == [], f"these reached the spawned agent: {leaked}"
+
+
+def test_the_scrub_keeps_what_a_session_legitimately_needs(tmp_path):
+    """The boundary, and it is not a nicety: c25's documented landmine is that overriding HOME
+    breaks macOS keychain OAuth. A denylist scrub, never an aggressive allowlist — PATH, HOME and
+    the loop's own SL_* handoff must survive it intact."""
+    r, run_root, _args = _start(tmp_path, extra_env=dict(POISON_ENV))
+    assert r.returncode == 0, r.stderr
+    handed = _recorded_env(tmp_path / "claude_env")
+    assert handed.get("HOME") == str(tmp_path / "home"), "HOME must survive the scrub untouched"
+    assert str(tmp_path / "stub") in handed.get("PATH", ""), "PATH must survive the scrub"
+    assert handed.get("SL_RUN_ROOT") == str(run_root), "the loop's own handoff must survive"
+    assert handed.get("SL_ISSUE_ID") == "i1"
+
+
+def test_an_unscrubbable_poison_refuses_the_flight_and_leaves_a_named_marker(tmp_path):
+    """A scrub that rotted must not fail OPEN. The refusal is loud, per-launch, and NAMES the
+    variable — the launcher is meanwhile counting down its delivery-verify window, and without this
+    marker a refused flight is indistinguishable from a launch shim that never fired."""
+    extra = _bash_env(tmp_path, UNSCRUBBABLE)
+    extra["SL_START_TOKEN"] = "TOK"
+    r, run_root, args_file = _start(tmp_path, extra_env=extra)
+    assert r.returncode == ENV_RC, f"expected rc={ENV_RC}, got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists(), "the agent must NEVER start in an env that could be API-billed"
+    assert "ANTHROPIC_API_KEY" in r.stderr, f"the refusal must NAME the variable: {r.stderr!r}"
+    assert _envfail_markers(run_root) == ["i1.TOK"], "a per-launch env marker must be left"
+    assert "ANTHROPIC_API_KEY" in (run_root / "state" / "envfail" / "i1.TOK").read_text()
+    assert not (run_root / "state" / "started" / "i1.TOK").exists(), \
+        "a refused session must NOT stamp the delivery sentinel — it never became a worker"
+
+
+def test_a_refused_env_writes_no_exited_marker(tmp_path):
+    # Same discipline as the auth refusal: the exited marker means "a worker WAS running and its
+    # process is gone", and the runner recovers from it by RELAUNCHING — straight back into the same
+    # poisoned environment. No worker ever ran here; the launcher's rc is the whole signal.
+    r, run_root, _args = _start(tmp_path, extra_env=_bash_env(tmp_path, UNSCRUBBABLE))
+    assert r.returncode == ENV_RC, r.stderr
+    assert not (run_root / "state" / "exited" / "i1").exists()
+
+
+def test_the_env_floor_also_gates_the_codex_agent(tmp_path):
+    # The floor sits ABOVE the agent branch, so both spawn agents are covered by construction rather
+    # than by a second copy that could drift. (A codex session inheriting XDG_CONFIG_HOME loses its
+    # gh just the same, and an inherited base-url redirect is nobody's friend.)
+    r, _run_root, args_file = _start(tmp_path, agent="codex",
+                                     extra_env=_bash_env(tmp_path, UNSCRUBBABLE))
+    assert r.returncode == ENV_RC, f"expected rc={ENV_RC}, got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists()
+
+
+def test_a_clean_env_launches_normally(tmp_path):
+    """The other half of the contract: the floor must be invisible when there is nothing to scrub.
+    A floor that refused a healthy env would be worse than none at all."""
+    r, _run_root, args_file = _start(tmp_path, model="fable")
+    assert r.returncode == 0, f"a clean env must launch: rc={r.returncode}\n{r.stderr}"
+    assert args_file.read_text().splitlines()[-1] == "do the thing"
+    assert [n for n in _recorded_env_names(tmp_path / "claude_env") if _is_poison(n)] == []
+
+
+def test_the_scrub_runs_before_the_gh_auth_assert(tmp_path):
+    """ORDERING, and it is load-bearing. The stub gh reproduces the 2026-07-29 landmine: it honours
+    XDG_CONFIG_HOME, so pointed anywhere else it answers as nobody. Scrub first and the probe sees a
+    healthy config and the launch proceeds; probe first and the loop parks the issue under a memo
+    telling the owner to re-login — a confidently WRONG remedy for a poisoned environment."""
+    r, _run_root, args_file = _start(tmp_path, extra_env={"XDG_CONFIG_HOME": "/nowhere/xdg"})
+    assert r.returncode == 0, \
+        f"the env floor must repair gh's config dir before the auth probe: {r.stderr!r}"
+    assert args_file.exists()
+
+
+def test_the_assert_reads_the_env_the_agent_will_inherit_not_the_shells_own_bookkeeping(tmp_path):
+    """Why the assert is not a tautology of the scrub. It re-reads the environment from a CHILD
+    process — exactly what the agent gets — so a variable the shell believes it removed but did not
+    is still caught. Drive it with the readonly poison alongside a scrubbable one: the scrubbable
+    one must be gone from the memo, the unscrubbable one named."""
+    poisoned = dict(POISON_ENV)
+    poisoned.update(_bash_env(tmp_path, UNSCRUBBABLE))
+    r, _run_root, _args = _start(tmp_path, extra_env=poisoned)
+    assert r.returncode == ENV_RC, r.stderr
+    assert "ANTHROPIC_API_KEY" in r.stderr
+    assert "ANTHROPIC_BASE_URL" not in r.stderr, \
+        f"a variable the scrub DID remove must not be reported as still present: {r.stderr!r}"
+    assert "XDG_CONFIG_HOME" not in r.stderr
