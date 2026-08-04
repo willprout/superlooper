@@ -619,7 +619,11 @@ def test_a_session_id_that_could_not_be_recorded_refuses_the_launch(tmp_path):
     finally:
         os.chmod(sessions, 0o700)
     assert result.rc == launch.ABORTED
-    assert "refusing" in result.stderr, \
+    # The SUBJECT has to be the crash rendering, not the refusal's own words: `launch`'s catch-all
+    # interpolates the exception verbatim, so every word of a _Refused message also appears when it
+    # is rendered as a crash. Asserting on those words guards nothing — proven by reverting
+    # _Refused to a bare OSError, which the previous spelling of this test still passed.
+    assert "failed unexpectedly" not in result.stderr, \
         "a deliberate refusal must not render as 'the launcher failed unexpectedly'"
     assert "could not record the session id" in result.stderr
     assert host.spawned == []
