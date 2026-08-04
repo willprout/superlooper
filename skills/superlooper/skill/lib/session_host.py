@@ -127,6 +127,35 @@ _HOST_ENV_PREFIX = "HERDR"
 # one, because an unfenced socket does not look broken from the runner's seat — it answers.
 FENCED, OPEN, UNREACHABLE = "fenced", "open", "unreachable"
 
+# --------------------------------------------------------------------- the allowance (#331)
+# The fence refuses every unauthenticated connection before dispatch, with exactly ONE exception,
+# ruled by the owner on 2026-08-04: the agent's own state report. That call is what tells the host
+# which session id to `--resume` after a crash, it is made by the host's own hook script carried
+# byte-for-byte (#307), and that script presents no token because upstream herdr has no token
+# concept — nor do `i<N>` worker panes, by the same 2026-07-31 distribution ruling. Without the
+# allowance a fenced host captures no id at all and `persist.restore` brings a crashed pane back as
+# a bare shell, SILENTLY: the session launches, runs and works.
+#
+# The allowance lives in the carried patch, host-side and method-scoped (`auth::admit`). Nothing
+# here grants it and nothing here can: what this module owns is the ability to ASK a live socket
+# which of the two states a machine is in, because "the fence is up and the capture works" and "the
+# fence is up and the capture is silent" look identical from the runner's seat.
+STATE_REPORT_METHOD = "pane.report_agent_session"
+
+# What a tokenless state report was answered with. ADMITTED is the ruled behaviour; REFUSED is a
+# host built before the allowance (or from a patch that lost it at a version bump).
+ADMITTED, REFUSED = "admitted", "refused"
+
+# The pane the capture probe names, and the agent label it reports — BOTH deliberately unusable.
+#
+# The probe has to reach the method body to learn that the fence let it in, and a doctor command
+# must not write anything while it does. The host's own handler checks the pane id first and the
+# agent label second, so an unresolvable pane refuses it before any state is touched, and an empty
+# label refuses it again in the impossible case that the id resolved anyway. Two independent stops,
+# because "the doctor corrupted a live pane's resume record" is not a bug anybody would enjoy.
+_PROBE_PANE = "superlooper-capture-probe-not-a-pane"
+_PROBE_AGENT = ""
+
 _DEFAULT_BINARY = "herdr"
 _CALL_SECONDS = 20                 # a control call that hangs is a dead host, not a slow one
 _PROMPT_TIMEOUT_MS = 120000        # the host's own documented prompt wait
@@ -494,6 +523,88 @@ def fence_probe(socket_path, env=None, timeout=5.0, connect=None):
     # Some other error: the host spoke but not about auth. That is not a fence, and it is not a
     # served request either — refuse to call it either one.
     return UNREACHABLE
+
+
+def state_report_probe(socket_path, env=None, timeout=5.0, connect=None):
+    """Does this socket admit the vendor's state report from a TOKENLESS caller? (issue #331)
+
+    The second half of the fence's question, and the one nothing else can answer by looking at a
+    file: `fence_probe` says whether the fence is up, this says whether the ruled hole is in it.
+    A machine can be fenced with the capture working and fenced with the capture silent, and from
+    the runner's seat those two are the same machine — sessions launch, run and work in both.
+
+    Presents NO token, for the same reason `fence_probe` does not: it must ask exactly what the
+    hook in a worker pane asks, and a probe that authenticated itself would report an allowance
+    that no worker actually enjoys.
+
+    Returns ADMITTED (the call reached the method body), REFUSED (`unauthorized` — the fence turned
+    it away, so this host captures no session ids), or UNREACHABLE.
+
+    ADMITTED means "past the fence", NOT "the report was accepted" — the probe's own arguments are
+    deliberately unusable (see `_PROBE_PANE`), so the host's own refusal of them is the evidence.
+    Any error code OTHER than `unauthorized` is therefore a pass: the fence's vocabulary is the
+    discriminator, and a code that MOVES in a later release degrades to ADMITTED rather than
+    silently reading a live allowance as absent.
+
+    On an UNFENCED host every method is admitted, so this returns ADMITTED there too. That is not a
+    flaw to fix here — it is why the doctor asks BOTH probes and reads them together.
+    """
+    line = (connect or _speak)(socket_path, json.dumps({
+        "id": "superlooper-capture-probe",
+        "method": STATE_REPORT_METHOD,
+        "params": {"pane_id": _PROBE_PANE, "source": "herdr:claude", "agent": _PROBE_AGENT},
+    }) + "\n", timeout)
+    if not line:
+        return UNREACHABLE
+    try:
+        reply = json.loads(line)
+    except (TypeError, ValueError):
+        return UNREACHABLE
+    if not isinstance(reply, dict):
+        return UNREACHABLE
+    error = reply.get("error")
+    if isinstance(error, dict):
+        return REFUSED if error.get("code") == "unauthorized" else ADMITTED
+    if reply.get("result"):
+        return ADMITTED
+    # The host spoke, but said neither. Refuse to call that either answer (c2).
+    return UNREACHABLE
+
+
+def control_socket_path(env=None):
+    """Where this machine's host keeps its control socket, resolved the way the host resolves it.
+
+    Read from the environment rather than by asking the binary, so a caller that only wants to
+    PROBE never has to run anything. The order is the host's own (`session::active_api_socket_path`
+    at the pinned release), minus the `--session` CLI flag, which is a thing only its CLI has:
+
+    1. ``HERDR_SOCKET_PATH`` — the explicit override, and what the adoption plan's short-socket-path
+       deployment (§2, the 104-char ``sun_path`` limit) actually sets;
+    2. otherwise a named session's own directory, if ``HERDR_SESSION`` names one that is not the
+       default;
+    3. otherwise the config directory itself.
+
+    Returns None when there is nothing to resolve against (no HOME and no XDG override), because a
+    guessed path would make a probe answer UNREACHABLE about a machine it never looked at.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get("HERDR_SOCKET_PATH")
+    if explicit:
+        return explicit
+    config_home = env.get("XDG_CONFIG_HOME")
+    if config_home:
+        # `herdr-dev` is the DEBUG build's directory name; a release build is plain `herdr`, and a
+        # release build is the only thing #302's pin ships.
+        base = os.path.join(config_home, "herdr")
+    else:
+        home = env.get("HOME")
+        if not home:
+            return None
+        base = os.path.join(home, ".config", "herdr")
+    session = (env.get("HERDR_SESSION") or "").strip()
+    if session and session != "default":
+        return os.path.join(base, "sessions", session, "herdr.sock")
+    return os.path.join(base, "herdr.sock")
 
 
 def _speak(socket_path, payload, timeout):

@@ -33,6 +33,51 @@ sessions receive it at spawn** (repair has to be able to drive herdr — revive,
 **`i<N>` workers never see it.** The token grants the *how*; the D13 supervised/unattended rails
 still govern the *whether*.
 
+## The one hole: the state report (issue #331, ruled 2026-08-04)
+
+herdr learns which session id to `--resume` after a crash from ONE call — `pane.report_agent_session`,
+fired by herdr's own hook script, carried byte-for-byte in the publishable payload (#307). That
+script presents no token (upstream herdr has no token concept) and `i<N>` workers hold none, so the
+fence as first built refused it: a fenced host captured no session ids at all and `persist.restore`
+returned a bare shell. Silently — the sessions launch, run and work.
+
+**The ruling: a method allowance.** A fenced host **admits that one method** from a tokenless
+caller and refuses every other one before dispatch, unchanged. Chosen over a runner-side re-report
+and over no hole at all, on the owner's stated grounds: keep herdr's built-in crash revive as the
+working second layer, at the least owned code and surface.
+
+Where it lives and what it is not:
+
+| | |
+|---|---|
+| The decision | `auth::admit` — token **or** the one open method, one function, unit-tested |
+| The method | `auth::STATE_REPORT_METHOD`, matched **exactly**: no trim, no case fold, no prefix |
+| What it is NOT | a credential taught to the vendor hook. That script is untouched — the carry-verbatim rule from #307 stands, so any credential the host accepts is one the HOST resolves |
+| Its width | one method. The report's own neighbours (`pane.report_agent`, `pane.report_metadata`) stay refused, and `tests/test_fence_token_auth.py` asserts that against a real server |
+
+**Two properties worth not breaking if you rework this.**
+
+1. **The allowance does not vary with `Expectation`.** A `Misconfigured` server admits the state
+   report exactly as a `Token` one does, because the allowance is a statement about that method's
+   blast radius rather than about the credential. It does not soften the fail-closed rule below:
+   every verb an operator or the runner actually drives is still refused, so a typo is still loud.
+2. **The envelope and the dispatcher must agree about which method a line names.** The line is
+   parsed twice — once as `auth::Envelope` to judge it, once as `Request` to run it — and if those
+   could ever disagree, the allowance would be a way to smuggle a different verb past the fence
+   (judged as the harmless report, dispatched as something else). `the_admitted_method_is_the_one_
+   that_would_actually_dispatch` in `auth.rs` is that check, over duplicate keys and hidden
+   spellings; keep it.
+
+**The accepted exposure, recorded rather than implied.** A tokenless caller can set the recorded
+session ref of ANY pane, not only its own. What that buys is bounded by what the method does: it
+writes in-memory bookkeeping that herdr later turns into `claude --resume <value>`. It is not a
+shell string (`shell_quote` in `app/agent_resume.rs` escapes every argument) and control characters
+are refused by `valid_session_id`, so the reach is "choose a revived pane's resume argument" — a
+value beginning with `-` would be read by the agent as a flag — and not "run a command". Superlooper
+bounds the rest by doctrine, not by more carried code: the host's bookkeeping is advisory (muscle,
+never truth), the runner's minted-id ledger (#298) is the loop's identity truth, and a revived pane
+passes the same state/liveness verification as any other before the loop trusts it.
+
 ## The pin
 
 | | |
@@ -51,19 +96,21 @@ conflict; the four edits to existing files are small and sit in stable places.
 
 | File | Size | What |
 |---|---|---|
-| `src/api/auth.rs` | +221 | **New file.** Token resolution (env or file), the `Expectation` states, constant-time compare, the pure `authorize()` decision + its unit tests. |
-| `src/api/server.rs` | +43 | The gate in `handle_connection`, before dispatch, plus the tiny `AuthEnvelope`. |
-| `src/api/client.rs` | +26 | `serialize_request` attaches the token so every CLI path presents it transparently. |
+| `src/api/auth.rs` | +452 | **New file.** Token resolution (env or file), the `Expectation` states, constant-time compare, the request `Envelope`, the `authorize()` / `admit()` decisions (#331's allowance included) + their unit tests. |
+| `src/api/server.rs` | +33 | The gate in `handle_connection`, before dispatch. Four lines of decision, all of it delegated to `auth`. |
+| `src/api/client.rs` | +25 | `serialize_request` attaches the token so every CLI path presents it transparently. |
 | `src/pane.rs` | +25 | Scrub the token from inherited pane env; substitute the real token for the grant sentinel. |
 | `src/api/mod.rs` | +1 | `pub mod auth;` |
 
 Two design choices exist purely to keep the re-apply cheap, and should be preserved if you rework
 this:
 
-- **The check reads a minimal `AuthEnvelope`, not the `Request` struct.** `Request` is built at
+- **The check reads a minimal `auth::Envelope`, not the `Request` struct.** `Request` is built at
   ~260 literal sites upstream; adding a field there would make this patch enormous and would
-  conflict on every release. `AuthEnvelope` ignores unknown members, so it parses any valid
-  request and the hunk stays a few lines wide.
+  conflict on every release. `Envelope` ignores unknown members, so it parses any valid request and
+  the hunk stays a few lines wide. It lives in `auth.rs` rather than `server.rs` for the same
+  reason everything else does — a new file is a hunk that can never conflict, and its decisions can
+  be unit-tested without standing up a socket.
 - **The client attaches `auth` to the serialized JSON object**, for the same reason.
 
 ### The `pane.rs` hunk is load-bearing — do not "tidy" it
@@ -150,15 +197,17 @@ it answers.
 1. **Re-apply.** `git apply --3way` the patch against the new tag. If a hunk conflicts, read
    upstream to resolve it — that is explicitly allowed. (What is *not* allowed, per the ruling, is
    an upstream PR, issue or ask about auth.)
-2. **Re-read the two invariants above** — the `pane.rs` ordering, and that the gate still sits
-   before `match request.method`. A refactor upstream can move dispatch without conflicting.
+2. **Re-read the three invariants above** — the `pane.rs` ordering, that the gate still sits before
+   `match request.method`, and that the `envelope`/`Request` agreement test still exists. A
+   refactor upstream can move dispatch, or rename a method, without conflicting.
 3. **Build**, then run upstream's own api tests as a smoke signal:
    ```sh
    cargo test --bin herdr api:: -- --test-threads=1
    ```
    Serial matters: several upstream plugin/graphics tests are timing-flaky — measured failing on
    an **unpatched** v0.8.0 tree too (`inactive_owner_cancels_idle_stream_and_dispatches_close`
-   failed 1 run in 6 on pristine v0.8.0, while the patched tree ran 284/284 green on 3 consecutive serial runs). A red there is not evidence
+   failed 1 run in 6 on pristine v0.8.0, and again 1 run in 4 while building #331, while the patched
+   tree ran 292/292 green on 3 consecutive serial runs). A red there is not evidence
    against the patch; re-run it before investigating.
 4. **Run the negative test against the built binary** — the check that actually matters:
    ```sh
@@ -167,21 +216,34 @@ it answers.
    ```
    That file is the fence's contract. Its opt-in test stands up a real patched server on an
    isolated socket and asserts all of it: a **tokenless** connection (the worker's position) is
-   refused; a **tokened** one is served; a **worker pane** does not inherit the token even though
-   the server holds it; a **debugger pane** does receive it via the sentinel; and a caller-supplied
-   literal token is ignored. Each half is needed — a socket that refused everyone would pass the
-   first assertion and be a broken host, not a fence.
+   refused; a **tokened** one is served; the **state report** is admitted tokenless while **eleven
+   other methods** — including the report's own neighbours — are not; near-miss spellings of the
+   open method are refused; a **worker pane** does not inherit the token even though the server
+   holds it; a **debugger pane** does receive it via the sentinel; and a caller-supplied literal
+   token is ignored. Each half is needed — a socket that refused everyone would pass the first
+   assertion and be a broken host, not a fence, and a socket that admitted everyone would pass the
+   allowance assertion and be no fence at all.
 
-   The pane assertions were verified to BITE by mutation: deleting the `pane.rs` hunk and
-   rebuilding turns that test red with "a worker pane inherited the server's token". They read the
-   environment by having the pane **report its own env**, never via `ps -Eww` — which returns
-   nothing on macOS and so makes such a check silently vacuous. That mistake was made once here
-   already; don't re-introduce it.
+   Both load-bearing halves were verified to BITE by mutation rather than assumed. Deleting the
+   `pane.rs` hunk and rebuilding turns the pane assertions red with "a worker pane inherited the
+   server's token". Reverting `admit` to `authorize` and rebuilding turns the allowance assertion
+   red with `assert 'refused' == 'admitted'` (#331). The pane assertions read the environment by
+   having the pane **report its own env**, never via `ps -Eww` — which returns nothing on macOS and
+   so makes such a check silently vacuous. That mistake was made once here already; don't
+   re-introduce it.
 5. **Record the new pin** in the table above.
 
-`session_host.fence_probe(socket_path)` is the same question in one call, for the runner's own
-pre-flight: it returns `FENCED`, `OPEN` or `UNREACHABLE`, presents no token (it must ask what a
-*worker* would ask), and treats silence as `UNREACHABLE` rather than as safety.
+Two probes ask these questions in one call each, presenting no token (both must ask what a *worker*
+would ask), and both treat silence as `UNREACHABLE` rather than as safety:
+
+- `session_host.fence_probe(socket_path)` → `FENCED` / `OPEN` / `UNREACHABLE` — is anything refused?
+- `session_host.state_report_probe(socket_path)` → `ADMITTED` / `REFUSED` / `UNREACHABLE` — is the
+  ruled hole there? It writes nothing: it names a pane that cannot resolve and an empty agent label,
+  so the host's own handler refuses it before touching state, and being refused *by the handler* is
+  precisely the evidence that it got past the fence.
+
+`doctor --stack`'s `host state capture` block reads the two together, which is the only way to tell
+a fenced host with a working capture from one that admits the report because it admits everything.
 
 ## Not done here — the pre-flight is not yet wired
 

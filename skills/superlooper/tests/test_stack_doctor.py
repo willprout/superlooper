@@ -167,6 +167,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("installed engine current", True),  # no VERSION stamp injected -> cleanly skipped, passes
         ("installed ops docs", True),        # no installed engine home injected -> clean skip (#199)
         ("host state hook", True),           # clean global settings, no engine home yet (#307)
+        ("host state capture", True),        # no control socket injected -> nothing to ask (#331)
         ("superlooper plugin", True),        # installed + enabled in the healthy probe
     ]
 
@@ -1428,3 +1429,124 @@ def test_host_state_hook_follows_the_config_dir_override():
                       env={"HOME": "/home/will", "CLAUDE_CONFIG_DIR": "/fleet/cfg"})
     r = stack_doctor.check_host_state_hook(probe)
     assert not r.ok and "/fleet/cfg/settings.json" in r.detail
+
+
+# --- `host state capture`: which of the two fenced states this machine is in (issue #331) -------
+# The block above reads FILES. This one asks the live control socket, because the two states it
+# distinguishes are invisible on disk and identical from the runner's seat: a fenced host that
+# admits the vendor's state report captures every worker's session id, and a fenced host that
+# refuses it captures none — while both launch, run and report exactly the same.
+#
+# Every case below drives the REAL probes in session_host through a scripted socket (`connect`),
+# never a stand-in for the probes themselves: what is under test is the pair of answers being read
+# together, and a mock of the probes would assert nothing about that reading.
+
+_SOCK = "/home/will/.config/herdr/herdr.sock"
+
+
+def _socket_saying(**by_method):
+    """A fake control socket: one canned reply line per method asked for."""
+    def connect(socket_path, payload, timeout):
+        method = json.loads(payload)["method"]
+        reply = by_method.get(method)
+        return "" if reply is None else json.dumps(reply)
+    return connect
+
+
+def _unauthorized(request_id="x"):
+    return {"id": request_id, "error": {"code": "unauthorized",
+                                        "message": "unauthorized: this socket requires a token"}}
+
+
+def _capture_probe(files=None, env=None):
+    return FakeProbe(files={_SOCK: ""} if files is None else files, home="/home/will",
+                     env={"HOME": "/home/will"} if env is None else env)
+
+
+def test_host_state_capture_ok_when_the_host_is_fenced_and_admits_the_state_report():
+    """The ruled state (owner, 2026-08-04): refused everywhere, admitted for that one method."""
+    r = stack_doctor.check_host_state_capture(_capture_probe(), connect=_socket_saying(
+        ping=_unauthorized(),
+        **{"pane.report_agent_session": {"id": "x", "error": {"code": "pane_not_found",
+                                                              "message": "no such pane"}}}))
+    assert r.ok and not r.warn, r.detail
+    assert "admits the state report" in r.detail and _SOCK in r.detail
+
+
+def test_host_state_capture_fails_when_a_fenced_host_refuses_the_state_report():
+    """The whole reason this block exists: nothing else on the machine can tell you this, and the
+    machine does not look broken — it looks like everything working."""
+    r = stack_doctor.check_host_state_capture(_capture_probe(), connect=_socket_saying(
+        ping=_unauthorized(), **{"pane.report_agent_session": _unauthorized()}))
+    assert not r.ok
+    assert "REFUSES the state report" in r.detail
+    assert "bare shell" in r.detail
+    assert "vendor/herdr" in r.fix
+
+
+def test_host_state_capture_fails_when_the_host_has_no_fence_at_all():
+    """A socket that admits the state report BECAUSE it admits everything is not a healthy machine,
+    and must never be rendered as one — which is exactly why this block asks both questions."""
+    r = stack_doctor.check_host_state_capture(_capture_probe(), connect=_socket_saying(
+        ping={"id": "x", "result": {"type": "pong", "version": "0.8.0"}},
+        **{"pane.report_agent_session": {"id": "x", "result": {"type": "ok"}}}))
+    assert not r.ok
+    assert "no fence at all" in r.detail
+    assert "HERDR_API_TOKEN" in r.fix
+
+
+def test_host_state_capture_passes_quietly_when_no_host_is_running():
+    r = stack_doctor.check_host_state_capture(_capture_probe(files={}))
+    assert r.ok and not r.warn
+    assert "nothing is listening" in r.detail
+
+
+def test_host_state_capture_warns_when_the_socket_is_there_but_silent():
+    """Absence of signal is unknown, never fine (c2) — and never 'fenced'."""
+    r = stack_doctor.check_host_state_capture(_capture_probe(), connect=_socket_saying())
+    assert r.ok and r.warn
+    assert "did not answer" in r.detail
+
+
+def test_host_state_capture_warns_when_only_the_capture_question_goes_unanswered():
+    r = stack_doctor.check_host_state_capture(_capture_probe(),
+                                              connect=_socket_saying(ping=_unauthorized()))
+    assert r.ok and r.warn
+    assert "cannot say whether the capture works" in r.detail
+
+
+def test_host_state_capture_cannot_work_out_where_to_look_without_a_home():
+    probe = FakeProbe(files={}, home="", env={})
+    r = stack_doctor.check_host_state_capture(probe)
+    assert r.ok and r.warn
+    assert "could not work out where" in r.detail
+
+
+def test_host_state_capture_reads_the_socket_path_from_the_probe_not_this_process():
+    """A block that fell through to the real environment would open the OPERATOR's live socket in
+    the middle of a test run — the same rule the hook block above keeps for HOME."""
+    seen = {}
+
+    def connect(socket_path, payload, timeout):
+        seen["path"] = socket_path
+        return json.dumps(_unauthorized())
+
+    probe = FakeProbe(files={"/lab/h.sock": ""}, home="/home/will",
+                      env={"HOME": "/home/will", "HERDR_SOCKET_PATH": "/lab/h.sock"})
+    stack_doctor.check_host_state_capture(probe, connect=connect)
+    assert seen["path"] == "/lab/h.sock"
+
+
+def test_host_state_capture_is_wired_into_the_stack_run():
+    names = [r.name for r in stack_doctor.check_stack({}, probe=_capture_probe(files={}))]
+    assert "host state capture" in names
+
+
+def test_the_suite_can_never_probe_the_real_control_socket():
+    """The conftest ratchet, asserted rather than assumed (the toast-spam rule).
+
+    `cmd_stack_doctor` builds a REAL Probe, and on the fleet machine the resolved path is the
+    owner's live server. If this neutralization is ever dropped, this test is what says so.
+    """
+    assert os.environ.get("HERDR_SOCKET_PATH") == "/nonexistent/superlooper-test-herdr.sock"
+    assert not os.path.exists(os.environ["HERDR_SOCKET_PATH"])

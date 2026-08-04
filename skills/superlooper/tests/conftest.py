@@ -174,6 +174,23 @@ def _never_reach_real_session_host(monkeypatch, _clear_worker_launch_env):
 
 
 @pytest.fixture(autouse=True)
+def _never_probe_the_real_control_socket(monkeypatch):
+    # The same ratchet as the four above, one step sideways: the thing at risk is not a BINARY but
+    # the host's control SOCKET (issue #331). `doctor --stack`'s `host state capture` block opens
+    # it — cmd_stack_doctor builds a REAL Probe, and session_host.control_socket_path resolves the
+    # path the host's own way, which on a machine that runs the fleet is the owner's live server.
+    # SL_HERDR does not help here: no binary is involved, which is the whole point of the fence.
+    #
+    # Two ways a test could reach the real one, and this closes both: the default fallback under a
+    # real HOME, and an AMBIENT HERDR_SOCKET_PATH — the host injects that variable into every pane,
+    # so a suite run inside a worker pane carries it already. Setting it (it wins the resolution
+    # order) points every probe at a path that cannot exist, so a missed injection reads UNREACHABLE
+    # instead of quietly interrogating the owner's fleet. Tests that exercise a socket pass their
+    # own `connect` or their own path in-body.
+    monkeypatch.setenv("HERDR_SOCKET_PATH", "/nonexistent/superlooper-test-herdr.sock")
+
+
+@pytest.fixture(autouse=True)
 def _never_reach_real_launchctl(monkeypatch, _clear_worker_launch_env):
     # Same ratchet as the four above, for macOS's service manager (issue #306). The runner's
     # login-item home is a launchd job, so the CLI and the doctor shell `launchctl` to bootstrap,

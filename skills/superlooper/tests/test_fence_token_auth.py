@@ -336,6 +336,160 @@ def test_the_probe_presents_no_token_because_that_is_the_position_it_is_testing(
     assert TOKEN not in seen["line"]
 
 
+# ------------------------------------------- the one hole in the fence: the state report (#331)
+# Owner ruling, 2026-08-04: a fenced host ADMITS the vendor's `SessionStart` state report from a
+# tokenless caller — the call the carried hook script (#307) makes to tell the host which session id
+# to `--resume` after a crash — and refuses every other method before dispatch exactly as #305 built
+# it. Without the hole a fenced host captures nothing and `persist.restore` returns a bare shell,
+# silently. The allowance is host-side and method-scoped, inside the carried patch; the vendor hook
+# is never taught a credential.
+#
+# The tests below are the OUR-CODE half: that the probe asks the worker's question, that it reads
+# both answers, and — in the opt-in acceptance check further down — that a real patched host really
+# does draw the line exactly one method wide.
+
+def test_the_capture_probe_reports_an_admitted_state_report(sock_dir):
+    path = os.path.join(sock_dir, "h.sock")
+    # What a fenced host with the allowance actually answers: the call reached the method body and
+    # the method refused the probe's deliberately unusable arguments.
+    _serve_one(path, json.dumps(
+        {"id": "superlooper-capture-probe",
+         "error": {"code": "pane_not_found", "message": "pane … not found"}}) + "\n")
+
+    assert session_host.state_report_probe(path) == session_host.ADMITTED
+
+
+def test_the_capture_probe_reports_a_refused_state_report(sock_dir):
+    # The state this issue exists for, and the one that is invisible from the runner's seat: the
+    # fence is up, every worker launches and works, and no session id is ever captured.
+    path = os.path.join(sock_dir, "h.sock")
+    _serve_one(path, json.dumps(
+        {"id": "superlooper-capture-probe",
+         "error": {"code": "unauthorized", "message": "unauthorized"}}) + "\n")
+
+    assert session_host.state_report_probe(path) == session_host.REFUSED
+
+
+def test_the_capture_probe_reads_a_served_report_as_admitted(sock_dir):
+    # An unfenced host serves it outright. Still ADMITTED — this probe answers "did the fence turn
+    # it away", and the doctor pairs it with fence_probe to tell the two apart.
+    path = os.path.join(sock_dir, "h.sock")
+    _serve_one(path, json.dumps({"id": "superlooper-capture-probe", "result": {"type": "ok"}}) + "\n")
+
+    assert session_host.state_report_probe(path) == session_host.ADMITTED
+
+
+def test_an_unknown_error_code_is_read_as_admitted_not_as_refused(sock_dir):
+    # `unauthorized` is the fence's own word and the only discriminator. Anything else came out of
+    # the method body, which means the connection got past the check. A code that MOVES in a later
+    # release must degrade to "the hole is there" rather than quietly reporting a working capture as
+    # silent — the direction that would send an operator chasing a healthy machine.
+    path = os.path.join(sock_dir, "h.sock")
+    _serve_one(path, json.dumps(
+        {"id": "x", "error": {"code": "invalid_agent", "message": "…"}}) + "\n")
+
+    assert session_host.state_report_probe(path) == session_host.ADMITTED
+
+
+def test_the_capture_probe_reports_unreachable_when_nothing_is_listening(tmp_path):
+    assert session_host.state_report_probe(str(tmp_path / "absent.sock")) \
+        == session_host.UNREACHABLE
+
+
+def test_the_capture_probe_reports_unreachable_on_silence(sock_dir):
+    path = os.path.join(sock_dir, "h.sock")
+    _serve_one(path, None)
+
+    assert session_host.state_report_probe(path, timeout=1.0) == session_host.UNREACHABLE
+
+
+def test_the_capture_probe_presents_no_token_and_asks_for_exactly_one_method(sock_dir):
+    """It has to ask what a WORKER would ask — and it must not be able to ask for anything else."""
+    path = os.path.join(sock_dir, "h.sock")
+    seen = {}
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+
+    def run():
+        conn, _ = srv.accept()
+        seen["line"] = conn.recv(65536).decode()
+        conn.sendall(json.dumps({"id": "x", "error": {"code": "pane_not_found",
+                                                      "message": "no"}}).encode() + b"\n")
+        conn.close()
+        srv.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    session_host.state_report_probe(path, env={session_host.API_TOKEN_ENV_VAR: TOKEN})
+
+    sent = json.loads(seen["line"])
+    assert "auth" not in sent, sent
+    assert TOKEN not in seen["line"]
+    assert sent["method"] == session_host.STATE_REPORT_METHOD == "pane.report_agent_session"
+
+
+def test_the_capture_probe_cannot_write_over_a_real_pane_s_record(sock_dir):
+    """A doctor command must not mutate the fleet it is describing.
+
+    The probe has to reach the method BODY to learn that the fence let it in, and that body's whole
+    job is writing a pane's resume record. So its arguments are unusable twice over: the pane id
+    cannot resolve, and the agent label is empty — the host's handler checks the pane first and the
+    label second, so even a pane id that somehow resolved is refused before anything is written.
+    """
+    path = os.path.join(sock_dir, "h.sock")
+    seen = {}
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+
+    def run():
+        conn, _ = srv.accept()
+        seen["line"] = conn.recv(65536).decode()
+        conn.sendall(b'{"id":"x","error":{"code":"pane_not_found","message":"no"}}\n')
+        conn.close()
+        srv.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    session_host.state_report_probe(path)
+
+    params = json.loads(seen["line"])["params"]
+    assert not params["agent"].strip(), params
+    assert ":" not in params["pane_id"] and not params["pane_id"].startswith("p_"), params
+    # And it never carries a session id, so there is nothing for a host to record even if it did.
+    assert "agent_session_id" not in params, params
+
+
+# --------------------------------------------------------------- where the socket is, unasked
+
+def test_the_socket_path_prefers_the_explicit_override():
+    assert session_host.control_socket_path({"HERDR_SOCKET_PATH": "/tmp/h.sock",
+                                             "HOME": "/Users/x"}) == "/tmp/h.sock"
+
+
+def test_the_socket_path_falls_back_to_the_host_s_own_config_directory():
+    assert session_host.control_socket_path({"HOME": "/Users/x"}) \
+        == "/Users/x/.config/herdr/herdr.sock"
+    assert session_host.control_socket_path({"XDG_CONFIG_HOME": "/cfg", "HOME": "/Users/x"}) \
+        == "/cfg/herdr/herdr.sock"
+
+
+def test_a_named_session_keeps_its_own_socket():
+    # The adoption plan's deployment shape (§2: a dedicated named session), spelled the way the
+    # host spells it.
+    assert session_host.control_socket_path({"HOME": "/Users/x", "HERDR_SESSION": "loop"}) \
+        == "/Users/x/.config/herdr/sessions/loop/herdr.sock"
+    # "default" is not a named session — the host filters it out, and so does this.
+    assert session_host.control_socket_path({"HOME": "/Users/x", "HERDR_SESSION": "default"}) \
+        == "/Users/x/.config/herdr/herdr.sock"
+
+
+def test_no_home_and_no_override_resolves_to_nothing_rather_than_a_guess():
+    # A guessed path would let a probe answer UNREACHABLE about a machine it never looked at.
+    assert session_host.control_socket_path({}) is None
+
+
 # --------------------------------------------------- the deliberate-event check (opt-in, real)
 
 _REAL = os.environ.get("SL_FENCE_HERDR")
@@ -378,14 +532,58 @@ def test_a_tokenless_connection_to_a_real_patched_server_is_refused(sock_dir):
 
         # The runner's position: served. Both halves matter — a socket that refused EVERYONE
         # would also pass the first assertion, and would be a broken host, not a fence.
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(5.0)
-        client.connect(sock)
-        client.sendall((json.dumps({"id": "probe", "method": "ping", "params": {},
-                                    "auth": token}) + "\n").encode())
-        reply = client.recv(65536).decode()
-        client.close()
-        assert "pong" in reply, reply
+        def speak(request, timeout=5.0):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(timeout)
+            client.connect(sock)
+            client.sendall((json.dumps(request) + "\n").encode())
+            reply = client.recv(65536).decode()
+            client.close()
+            return reply
+
+        assert "pong" in speak({"id": "probe", "method": "ping", "params": {}, "auth": token})
+
+        # ---- the ruled allowance, and its exact width (#331) -----------------------------------
+        # POSITIVE: the vendor's own state report, presented by a caller with no credential at all,
+        # reaches the method body. `pane_not_found` IS the admission — it is the handler talking.
+        assert session_host.state_report_probe(sock, timeout=5.0) == session_host.ADMITTED
+
+        # NEGATIVE, and this is the half the DoD leans on: a tokenless caller can do NOTHING else.
+        # A socket that admitted everything would sail through the assertion above, so without this
+        # loop the acceptance check would pass on a host with no fence at all. The list deliberately
+        # includes the report's two NEIGHBOURS — `pane.report_agent` and `pane.report_metadata` are
+        # the same hook family, same shape, same pane argument — because "one method wide" is the
+        # claim, not "the reporting methods are open".
+        for method, params in (
+                ("ping", {}),
+                ("server.stop", {}),
+                ("workspace.create", {"cwd": str(root)}),
+                ("workspace.list", {}),
+                ("agent.start", {"name": "x", "kind": "claude"}),
+                ("agent.list", {}),
+                ("pane.run", {"pane_id": "w1:p1", "command": ["true"]}),
+                ("pane.read", {"pane_id": "w1:p1"}),
+                ("pane.report_agent", {"pane_id": "w1:p1", "source": "herdr:claude",
+                                       "agent": "claude", "state": "working"}),
+                ("pane.report_metadata", {"pane_id": "w1:p1", "source": "herdr:claude"}),
+                ("pane.release_agent", {"pane_id": "w1:p1", "source": "herdr:claude"}),
+        ):
+            reply = json.loads(speak({"id": "n", "method": method, "params": params}))
+            assert reply.get("error", {}).get("code") == "unauthorized", (method, reply)
+
+        # And the allowance is the exact spelling, not a family of them. Every one of these would
+        # be a way in if the check ever trimmed, folded case, or matched a prefix.
+        for near_miss in (" pane.report_agent_session", "pane.report_agent_session ",
+                          "PANE.REPORT_AGENT_SESSION", "pane.report_agent_session2",
+                          "pane.report_agent_sessio"):
+            reply = json.loads(speak({"id": "m", "method": near_miss, "params": {}}))
+            assert reply.get("error", {}).get("code") == "unauthorized", (near_miss, reply)
+
+        # The allowance is not a credential: naming the open method does not open the others. This
+        # is the shape a "smuggle a second verb in on the same line" attempt would take.
+        smuggled = json.loads(speak({"id": "s", "method": "server.stop", "params": {},
+                                     "auth": session_host.STATE_REPORT_METHOD}))
+        assert smuggled.get("error", {}).get("code") == "unauthorized", smuggled
 
         # ---- the pane grant, which is the other load-bearing half of the patch ----------------
         # Without this, a re-apply could silently drop or move the `pane.rs` hunk and everything
