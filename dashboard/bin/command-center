@@ -172,8 +172,9 @@ def main(argv):
     # the operator chose to watch. Merged-only scope is enforced in lib/tidy (never passes `--all`).
     tidy = tidy_mod.Tidy(cfg["superlooper_cli"], {r["slug"]: r["path"] for r in cfg["repos"]})
     # The Restart button (issue #116) — a local-command verb: it shells `superlooper
-    # request-restart` to ask the LIVE runner to restart itself in its own cmux tab (never a launch
-    # or a tab placement — that bright line stays). Bound to the same configured CLI path and the
+    # request-restart` to ask the LIVE runner to restart itself where it already lives (never a
+    # launch or a window placement — that bright line stays; how it comes back is the engine's word,
+    # carried in the CLI's home-correct `how`, issues #306/#310). Bound to the same configured CLI path and the
     # same watched-repo allow-list as Tidy, and signed with the operator so the runner journals who
     # asked; the marker-writing + dead-runner refusal live in the engine (request-restart).
     restart = restart_mod.Restart(cfg["superlooper_cli"],

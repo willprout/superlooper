@@ -1,6 +1,10 @@
 /* The Deploy Fixer button's note box (issue #141) — the dashboard's FOURTH ops-verb button and the
-   most consequential: tapping it starts ONE fresh interactive sl-debugger session in its own cmux
-   tab, pointed at whatever the board is currently showing stuck.
+   most consequential: tapping it starts ONE fresh interactive sl-debugger session in its own
+   session window, pointed at whatever the board is currently showing stuck.
+
+   The copy deliberately names no HOST (issue #310). Which multiplexer that window belongs to is the
+   engine's business and is mid-migration; "its own session window" is true whichever one answers,
+   and a dashboard that guessed would be wrong on one side of the switchover.
 
    The button lives IN the trouble banner (tap-where-you-read, design §0.3): the one surface that
    appears for every condition it answers — runner down, ALERT, a park pile-up, a frozen session, a
@@ -65,7 +69,7 @@
         '<div class="cc-fixer-head">' +
           '<span class="cc-fixer-title">\u{1F527} DEPLOY FIXER <b id="cc-fixer-target"></b></span>' +
           '<span class="cc-fixer-sub">launches one interactive <code>sl-debugger</code> session in ' +
-            'its own cmux tab, pointed at what the board is showing. the AI runs in THAT session — ' +
+            'its own session window, pointed at what the board is showing. the AI runs in THAT session — ' +
             'never in this dashboard.</span>' +
           '<button class="cc-fixer-x" data-fixer-close title="close (Esc)">✕</button>' +
         '</div>' +
@@ -196,7 +200,7 @@
   function renderLive(liveId) {
     setBody(
       '<div class="cc-fixer-notice">A fixer session' + (liveId ? ' (<b>' + esc(liveId) + '</b>)' : "") +
-        ' is <b>already running</b> for ' + esc(slug) + ' — it has its own cmux tab. Two debuggers ' +
+        ' is <b>already running</b> for ' + esc(slug) + ' — it has its own session window. Two debuggers ' +
         'on one patient would race each other’s repairs, so this deploys nothing. Go talk to ' +
         'the one that’s already there.</div>' +
       '<div class="cc-fixer-actions"><button class="btn ghost" data-fixer-close>Done</button></div>');
@@ -205,7 +209,7 @@
   function renderDone(id) {
     setBody(
       '<div class="cc-fixer-result ok">✓ Fixer ' + (id ? esc(id) + " " : "") + 'deployed — it’s ' +
-        'in its own cmux tab with your note. Go say hello; it can answer you.</div>' +
+        'in its own session window with your note. Go say hello; it can answer you.</div>' +
       '<div class="cc-fixer-actions"><button class="btn ghost" data-fixer-close>Done</button></div>');
   }
 

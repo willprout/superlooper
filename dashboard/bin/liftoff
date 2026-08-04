@@ -2,11 +2,20 @@
 """liftoff — the ONE command that brings up the pair (issue #45).
 
 Today the operator starts the runner and the dashboard separately. ``liftoff`` starts — or verifies
-already-running — BOTH: this dashboard and one watched repo's runner. Run it BY HAND inside a cmux
-tab, exactly like ``superlooper run``: it starts the dashboard in the BACKGROUND (a localhost server
-needs no tab) and then FOREGROUNDS the runner in the current tab, so the runner lands in a visible
-cmux tab — the one proven restart procedure (the engine's runner-ops.md). No automated tab placement;
-your real tab is the anchor.
+already-running — BOTH: this dashboard and one watched repo's runner. The dashboard always goes up
+in the BACKGROUND (a localhost server needs no tab). What happens to the RUNNER depends on where
+that repo's runner lives (``runner_home``, issue #306, wired here by #310), which liftoff asks the
+engine for with the read-only ``superlooper runner-home --repo <path>``:
+
+  * ``pane`` (the default) — run liftoff BY HAND in a session tab, exactly like ``superlooper run``:
+    it FOREGROUNDS the runner in the current tab, so the runner lands in a visible tab — the one
+    proven restart procedure (the engine's runner-ops.md). No automated tab placement; your real tab
+    is the anchor.
+  * ``login-item`` — launchd owns the runner's process, so there is no tab to claim: liftoff runs
+    the engine's own ``runner-home --install --load`` bootstrap and hands the terminal back.
+
+An engine too old to answer (or one that cannot run) leaves the home unknown, and liftoff keeps the
+pane behaviour — the same thing it did before either home existed.
 
 Two boundaries (see lib/liftoff.py):
   * the engine stays dashboard-agnostic — liftoff shells the engine's OWN ``superlooper run`` through
@@ -56,8 +65,8 @@ import server                 # noqa: E402
 
 _COMMAND_CENTER = str(_ROOT / "bin" / "command-center")
 _USAGE = ("usage: liftoff [config.json] [--repo <slug|name|path>] [--restart-dashboard]\n"
-          "  Brings up (or verifies) the dashboard + one watched repo's runner. Run inside a cmux "
-          "tab.\n"
+          "  Brings up (or verifies) the dashboard + one watched repo's runner. With a `pane`\n"
+          "  runner home, run it inside a session tab (it claims that tab for the runner).\n"
           "  --restart-dashboard  Stop the running dashboard and start it again on the current\n"
           "                       build, then exit. Use when the dashboard reports a stale tower:\n"
           "                       a running server keeps the Python it loaded at boot, so a merge\n"
@@ -70,6 +79,12 @@ _USAGE = ("usage: liftoff [config.json] [--repo <slug|name|path>] [--restart-das
 # owner's patience — whereas giving up too early would be a double start, the one outcome barred.
 _STOP_TIMEOUT = 10.0
 _STOP_POLL = 0.2
+
+# How long the read-only runner-home report may take before liftoff stops waiting on it. It is one
+# config read plus (for a login-item repo) one `launchctl print`, so this is generous; the ceiling
+# exists only so a wedged engine binary cannot hold up the launch forever. A timeout reads as
+# "unknown home", which keeps today's pane behaviour.
+_HOME_PROBE_TIMEOUT = 20.0
 
 
 class _Usage(Exception):
@@ -222,12 +237,66 @@ def _spawn_dashboard(argv, log_path):
 
 
 def _exec_runner(argv):
-    """Replace THIS process with ``superlooper run`` — so the current cmux tab becomes the runner's
-    tab (the proven procedure; the engine's own preflight then confirms it can see this tab). Uses
-    ``execvp`` (not ``execv``) so a bare or relative ``superlooper_cli`` — which the config contract
-    explicitly allows, "resolved against PATH like gh's bare gh" — is found on PATH; an absolute path
-    (the default) is used as-is. Never returns on success."""
+    """Replace THIS process with ``superlooper run`` — so the current tab becomes the runner's
+    tab (the proven procedure for the PANE home; the engine's own preflight then confirms it can see
+    this tab). Uses ``execvp`` (not ``execv``) so a bare or relative ``superlooper_cli`` — which the
+    config contract explicitly allows, "resolved against PATH like gh's bare gh" — is found on PATH;
+    an absolute path (the default) is used as-is. Never returns on success."""
     os.execvp(argv[0], argv)
+
+
+def _engine(superlooper_cli):
+    """The engine CLI every subprocess in this file runs: the ``SL_SUPERLOOPER`` env override wins
+    over the configured path (config's ``superlooper_cli``).
+
+    ONE resolution point, deliberately. ``lib/tidy``, ``lib/restart``, ``lib/janitor`` and
+    ``lib/fixer`` each honour this override so ``tests/conftest.py`` can point the whole suite at an
+    absent binary; liftoff shells the engine too, and one of its calls —
+    ``runner-home --install --load`` — is the most destructive subprocess in this repo: it renders a
+    LaunchAgent into ``~/Library/LaunchAgents`` and bootstraps a launchd job. A path that skipped
+    the override would put exactly that call outside the fail-closed ratchet, one forgotten test
+    injection away from bootstrapping a real job against a pytest tmpdir on the owner's Mac.
+
+    It is also the honest thing in production: probing engine A and then bootstrapping engine B,
+    because only one of the two consulted the override, is a bug nobody would find quickly.
+    """
+    return os.environ.get("SL_SUPERLOOPER") or superlooper_cli
+
+
+def _runner_home(engine_bin, repo_path):
+    """Which home this repo's runner lives in — ``pane``, ``login-item``, or ``None`` when the
+    engine could not say (issue #306, wired by #310).
+
+    READ-ONLY: it runs the engine's documented report and nothing else, so merely asking the
+    question can never place a plist or bootstrap a job. NEVER raises — a missing, hanging or
+    ancient engine binary degrades to ``None``, and the caller then keeps today's pane behaviour.
+    A probe that could take liftoff down before it started anything would be worse than no probe.
+
+    Why shell the engine rather than read the repo's ``.superlooper/config.json`` directly: the
+    boundary this file is built on. liftoff shells the engine's OWN documented commands and never
+    parses its files, so the engine stays a black box whose config format is free to move.
+
+    ``engine_bin`` is already resolved by :func:`_engine` — every subprocess in this file goes
+    through that one point, so the binary this probes is provably the binary the launch then runs.
+    """
+    try:
+        proc = subprocess.run(liftoff_mod.runner_home_argv(engine_bin, repo_path),
+                              capture_output=True, text=True, timeout=_HOME_PROBE_TIMEOUT)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    # rc is deliberately NOT gated on: the pane branch prints its line and exits 0, but a future
+    # nonzero path that still names the home should be read, and a run that named nothing already
+    # parses to None. The output is the answer; the exit code adds nothing here.
+    return liftoff_mod.parse_runner_home(proc.stdout)
+
+
+def _start_job(argv):
+    """Run the engine's login-item bootstrap (``runner-home --install --load``) to completion and
+    return its exit code, with its own output going straight to the operator's terminal — this is
+    the one command in liftoff whose refusals (a PATH it cannot honestly record, a launchctl that
+    would not bootstrap) are the operator's to read and act on. Unlike ``_exec_runner`` it RETURNS:
+    launchd owns the runner's process in this home, so liftoff has nothing to become."""
+    return subprocess.run(argv).returncode
 
 
 def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, stop_process,
@@ -289,7 +358,7 @@ def _restart_dashboard(cfg, config_path, url, out, *, dashboard_snapshot, stop_p
 def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pid,
          spawn_dashboard=_spawn_dashboard, exec_runner=_exec_runner, out=None,
          dashboard_snapshot=_dashboard_snapshot, stop_process=_stop_process, sleep=time.sleep,
-         port_busy=_port_busy):
+         port_busy=_port_busy, runner_home=_runner_home, start_job=_start_job):
     out = out if out is not None else sys.stderr
     try:
         config_path, repo_arg, restart_dashboard = _parse_args(argv)
@@ -340,11 +409,24 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
 
     url = "http://%s:%d" % (server.BIND_HOST, cfg["port"])
     dash_argv = liftoff_mod.dashboard_argv(sys.executable, _COMMAND_CENTER, config_path)
-    run_argv = liftoff_mod.runner_argv(cfg["superlooper_cli"], repo["path"])
+    # WHERE this repo's runner lives decides what starting it even means (issue #306, wired here by
+    # #310). Asked before the plan is built, read-only, and fail-soft: an engine that cannot answer
+    # leaves `home` None, which make_plan treats as the pane home — exactly liftoff's behaviour
+    # before this existed.
+    engine = _engine(cfg["superlooper_cli"])
+    pid = live_runner_pid(repo["state_home"])
+    # Probed ONLY when something is actually being started. The probe shells the engine — and, for a
+    # login-item repo, a `launchctl print` behind it — so a routine "confirm the pair is up" run
+    # must not pay for it, and a wedged engine binary must not delay the dashboard by the probe
+    # timeout for a run whose whole outcome is "leaving it".
+    home = (runner_home(engine, repo["path"]) or liftoff_mod.PANE) if pid is None else liftoff_mod.PANE
+    run_argv = (liftoff_mod.runner_job_argv(engine, repo["path"])
+                if home == liftoff_mod.LOGIN_ITEM
+                else liftoff_mod.runner_argv(engine, repo["path"]))
     plan = liftoff_mod.make_plan(
         repo, url, dash_argv, run_argv,
         dashboard_up=is_dashboard_up(server.BIND_HOST, cfg["port"]),
-        runner_pid=live_runner_pid(repo["state_home"]))
+        runner_pid=pid, runner_home=home)
 
     # 1) Dashboard first — it must be up (and stay up) before liftoff hands the tab to the runner.
     dash = plan["dashboard"]
@@ -359,18 +441,40 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
     else:
         out.write("liftoff: %s\n" % dash["message"])
 
-    # 2) Runner — foreground in THIS cmux tab (the proven procedure), unless one is already live.
+    # 2) Runner — in the PANE home, foreground in THIS tab (the proven procedure); in the
+    #    LOGIN_ITEM home, run the engine's bootstrap step and hand the terminal back. Either way,
+    #    a runner that is already live is left exactly alone.
     run = plan["runner"]
-    out.write("liftoff: %s\n" % run["message"])
     if not run["start"]:
+        out.write("liftoff: %s\n" % run["message"])
         return 0
+    out.write("liftoff: %s\n" % run["message"])
     out.flush()
+    if not run["foreground"]:
+        # launchd owns the runner's process here, so there is nothing for liftoff to become. The
+        # bootstrap's own refusals are the operator's to read (it prints them itself); a nonzero
+        # exit must fail the launch rather than read as a started loop.
+        try:
+            rc = start_job(run["argv"])
+        except OSError as e:
+            out.write("liftoff: could not run the login-item setup via %r (%s)\n"
+                      "  Check 'superlooper_cli' in your config.json.\n" % (run["argv"][0], e))
+            return EXIT_LAUNCH_FAILED
+        if rc != 0:
+            out.write("liftoff: the login-item setup for %s exited %d — the runner was NOT "
+                      "started.\n"
+                      "  Run it by hand to see what it refused: %s\n"
+                      % (repo["slug"], rc, " ".join(run["argv"])))
+            return EXIT_LAUNCH_FAILED
+        out.write("liftoff: the runner for %s is running as its login item — this terminal is "
+                  "yours.\n" % repo["slug"])
+        return 0
     try:
         exec_runner(run["argv"])   # replaces this process on success — nothing below runs
     except OSError as e:
         out.write("liftoff: could not start the runner via %r (%s)\n"
-                  "  Check 'superlooper_cli' in your config.json, and run liftoff inside a cmux tab.\n"
-                  % (run["argv"][0], e))
+                  "  Check 'superlooper_cli' in your config.json, and run liftoff inside a session "
+                  "tab.\n" % (run["argv"][0], e))
         return EXIT_LAUNCH_FAILED
     return 0   # only reached under an injected exec_runner (tests); a real execv never returns
 

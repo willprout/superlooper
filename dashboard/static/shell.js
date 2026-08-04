@@ -282,12 +282,15 @@
         (r ? "" : " disabled") +
         ' title="Tidy — close the terminal windows of finished sessions (runs superlooper tidy locally; no GitHub)">\u{1F9F9} Tidy</button>' +
       // The Restart button (issue #116) — an OPS-verb button: asks the LIVE runner to restart
-      // itself in its own cmux tab (runs `superlooper request-restart` locally; a confirm dialog states
-      // exactly what will happen first, and reports honestly when no loop is running). Never launches
-      // or places a tab. Carries the camera repo, like Tidy/Flag, so a tap targets the repo on screen.
+      // itself (runs `superlooper request-restart` locally; a confirm dialog states exactly what
+      // will happen first, and reports honestly when no loop is running). Never launches or places
+      // a session window. The tooltip deliberately does NOT say where the loop comes back (issue
+      // #310): the runner has two homes and only the engine knows which one this repo uses — the
+      // dialog gets that from `request-restart --json`'s `how`, and a tooltip cannot ask.
+      // Carries the camera repo, like Tidy/Flag, so a tap targets the repo on screen.
       '<button class="restart-btn" data-act="restart-open" data-repo="' + esc(r ? r.slug : "") + '"' +
         (r ? "" : " disabled") +
-        ' title="Restart the loop — asks the running runner to restart itself in its own cmux tab (runs superlooper request-restart locally; no GitHub)">\u{1F504} Restart</button>' +
+        ' title="Restart the loop — asks the running runner to restart itself (runs superlooper request-restart locally; no GitHub)">\u{1F504} Restart</button>' +
       // The Janitor button (issue #121) — an ops-verb button: clears GitHub-side debris
       // (stale merged/superseded loop branches, superseded PRs, aged parked issues) by running
       // `superlooper janitor` locally; a sweep dialog groups every proposal and executes only the
@@ -314,8 +317,8 @@
     // the currently-viewed repo, so the fixer always lands on the patient being reported.
     var fix = t.offender
       ? '<button class="trouble-fix" data-act="fixer-open" data-repo="' + esc(t.offender) + '"' +
-          ' title="Deploy a fixer — launches one interactive sl-debugger session in its own cmux' +
-          ' tab, pointed at this trouble (no AI runs in this dashboard)">\u{1F527} Deploy Fixer</button>'
+          ' title="Deploy a fixer — launches one interactive sl-debugger session in its own' +
+          ' session window, pointed at this trouble (no AI runs in this dashboard)">\u{1F527} Deploy Fixer</button>'
       : "";
     return '<div class="' + cls + '"><span class="dot"></span>' +
              '<span class="trouble-text">' + esc(t.text) + '</span>' + fix + '</div>';

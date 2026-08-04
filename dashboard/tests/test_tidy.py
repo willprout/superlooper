@@ -1,7 +1,7 @@
 """Issue #41 — the Tidy verb: a LOCAL COMMAND execution, the dashboard's second button class.
 
 Every other verb writes a GitHub label/comment/issue (``lib/actions.py``). Tidy is different: it
-runs the local ``superlooper tidy`` CLI to close finished cmux session windows. So its adapter
+runs the local ``superlooper tidy`` CLI to close finished session windows. So its adapter
 (``lib/tidy.py``) mirrors ``lib/gh.py``'s discipline — a subprocess wrapper that NEVER raises into
 the caller, a hard timeout, and fail-closed on any nonzero exit — but keeps the SEMANTICS (turning
 the CLI's human list into structured window rows) as pure, unit-tested functions (design B.1).
@@ -9,7 +9,7 @@ the CLI's human list into structured window rows) as pure, unit-tested functions
 Two properties are load-bearing bright lines:
 
 * **No real binary in tests.** The CLI CLOSES windows; a stray real call would touch William's live
-  cmux. The conftest points ``SL_SUPERLOOPER`` at an absent path by default; these tests override it
+  windows. The conftest points ``SL_SUPERLOOPER`` at an absent path by default; these tests override it
   in-body to ``tests/fakes/fake-superlooper``, which records every invocation.
 * **Merged-only scope.** ``--all`` is NEVER passed (issue #41 — the dashboard does not expose the
   wider scope). The fake logs argv, so a test proves ``--all`` never appears.
@@ -215,3 +215,30 @@ def test_all_scope_is_never_passed_on_either_verb(tidy_fix):
     verb.execute(SLUG)
     for call in _calls(fixtures):
         assert "--all" not in call["argv"], "the dashboard must never widen tidy's scope to --all"
+
+
+# --------------------------- host-agnostic surfaces (issue #310) ---------------------------
+# Tidy reaches the session host through the ENGINE (`superlooper tidy` owns the close), so the
+# dashboard's whole coupling to the host is one thing: the SURFACE column in the CLI's listing.
+# These pin that the parser treats it as opaque text, so the herdr migration (#308) changes the
+# strings the dialog shows and nothing else here — no parser edit, no adapter edit, no new key.
+
+def test_the_surface_column_is_opaque_so_a_host_swap_changes_no_code_here():
+    for surface in ("cmux:surface-23",                    # today
+                    "herdr:sandbox/i23",                  # a workspace-qualified host id
+                    "i23",                                # a bare agent name (herdr addresses by name)
+                    "tmux:%17",                           # some later host entirely
+                    "ws 1 / pane 3"):                     # even one carrying spaces
+        out = "tidy will close 1 finished (merged) session window(s):\n" \
+              "  i23   merged        %s\n" % surface
+        assert tidy_mod.parse_windows(out) == [
+            {"id": "i23", "status": "merged", "surface": surface}]
+
+
+def test_a_window_the_host_could_not_name_still_lists_and_still_closes():
+    # `(no surface)` is the CLI's own placeholder for a window whose surface it could not read. It
+    # must survive as an honest empty string — the row still appears in the dialog, because the
+    # session is still finished and the owner is still entitled to see it in the list.
+    out = ("tidy will close 1 finished (merged) session window(s):\n"
+           "  i23   merged        (no surface)\n")
+    assert tidy_mod.parse_windows(out) == [{"id": "i23", "status": "merged", "surface": ""}]

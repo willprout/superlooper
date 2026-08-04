@@ -3,15 +3,20 @@ a sibling of Tidy (``lib/tidy.py``).
 
 Every GitHub-write button lives in ``lib/actions.py``. Restart, like Tidy, is deliberately
 different: it shells the local ``superlooper`` CLI — here ``superlooper request-restart`` — to ask
-the LIVE runner to restart ITSELF in its own cmux tab. The runner honors the request between ticks
-by re-exec'ing in place: a fresh process image that reloads the currently-installed engine and
-clears in-memory episode state (e.g. a tripped systemic-launch hold). This is "turn the loop off
-and on again" as one tap instead of finding the runner's tab, Ctrl-C, and retyping ``superlooper
-run``.
+the LIVE runner to restart ITSELF. The runner honors the request between ticks: it reloads the
+currently-installed engine and clears in-memory episode state (e.g. a tripped systemic-launch
+hold). This is "turn the loop off and on again" as one tap instead of finding the runner, Ctrl-C,
+and retyping ``superlooper run``.
 
-The bright line that shapes the whole design: **the button never spawns or places a cmux tab**
-(owner ruling, 2026-07-09 — automated tab placement is out). It only asks a runner that is ALREADY
-running in its own tab to re-exec there. So:
+HOW it comes back depends on where the runner lives (issue #306): in the ``pane`` home it re-execs
+in place, in the ``login-item`` home it exits cleanly and its supervisor restarts it. This adapter
+never has to know which — ``request-restart --json`` answers with a home-correct ``how`` and
+``manual``, and the adapter relays the CLI's body verbatim (see :meth:`Restart._invoke`), which is
+exactly what lets the dialog tell the truth in both homes without a branch of its own.
+
+The bright line that shapes the whole design: **the button never spawns or places a session
+window** (owner ruling, 2026-07-09 — automated tab placement is out). It only asks a runner that is
+ALREADY running to restart where it already lives. So:
 
 * **This adapter never raises into a caller.** A missing binary, a timeout, a killed process — all
   become a nonzero rc + empty stdout (mirrors ``lib/tidy._run`` / ``lib/gh._run``), so a tap can
