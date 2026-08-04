@@ -175,9 +175,17 @@ class Sent:
 
 @dataclass(frozen=True)
 class Teardown:
-    """The outcome of a verified teardown. ``signalled`` names how far the escalation had to go."""
+    """The outcome of a verified teardown. ``signalled`` names how far the escalation had to go.
+
+    ``orphan_pid`` is the one honest loose end this module can be left holding: a pid recorded at
+    spawn that is still alive after the host has positively let go of the workspace. It may not be
+    signalled (nothing can still attribute it to this session, and the OS reuses pid numbers) and it
+    may not veto the teardown either (that would make a legitimately-ended session unverifiable
+    forever). So it is REPORTED — a named doubt the caller can log or park on, never a silence.
+    """
     closed: bool
     signalled: list = field(default_factory=list)
+    orphan_pid: int = None
     detail: str = ""
 
 
@@ -571,14 +579,18 @@ class SessionHost:
             if attempt:
                 self._probe.sleep(self._teardown_pause)
             after = self.state(session)
-            # `is False`, not `is not True`: the host SAYING the name is gone is evidence; the host
-            # having stopped answering is silence. Accepting silence here reports a workspace as
-            # reaped while it is still sitting on the machine.
-            if after.name_resolves is False and after.liveness != ALIVE:
+            # Ask about the WORKSPACE, not just the agent. "The name no longer resolves" is nearly
+            # free here — exit only ever runs on a session whose agent has already exited, and the
+            # host clears names on exit — so verifying with it would confirm something that was
+            # true before the close and leak an empty workspace per lane. `close.ok` is not the
+            # test either: a `workspace_not_found` refusal means the window was ALREADY gone, which
+            # is a teardown, while a cheerful rc=0 that changed nothing is not.
+            if self._workspace_gone(session.workspace) is True and after.liveness != ALIVE:
                 return Teardown(closed=True, signalled=[],
-                                detail="workspace %s closed and verified gone" % session.workspace)
+                                detail="workspace %s is gone (the host no longer has it)"
+                                       % session.workspace)
         raise TeardownUnverified(
-            "[%s] the close was issued but nothing confirmed the session went (workspace %s)%s"
+            "[%s] the close was issued but nothing confirmed the workspace went (%s)%s"
             % (before.name, session.workspace,
                "; the host answered: " + close.error if not close.ok else ""))
 
@@ -615,12 +627,18 @@ class SessionHost:
             for attempt in range(max(1, self._teardown_reads)):
                 if attempt:
                     self._probe.sleep(self._teardown_pause)
-                if self._ended(session, pid, recorded):
-                    return Teardown(closed=True, signalled=signalled,
-                                    detail="workspace %s closed; %s" % (
+                if self._ended(session, pid):
+                    orphan = (recorded if pid is None and recorded is not None
+                              and self._probe.pid_alive(recorded) else None)
+                    return Teardown(closed=True, signalled=signalled, orphan_pid=orphan,
+                                    detail="workspace %s is gone; %s%s" % (
                                         session.workspace,
                                         "no signal needed" if not signalled
-                                        else "escalated to " + "+".join(signalled)))
+                                        else "escalated to " + "+".join(signalled),
+                                        "" if orphan is None else
+                                        "; the pid recorded at spawn (%s) is still alive and could "
+                                        "not be attributed to this session, so it was neither "
+                                        "signalled nor counted as evidence" % orphan))
         unattributed = (pid is None and recorded is not None
                         and self._probe.pid_alive(recorded))
         raise TeardownUnverified(
@@ -629,8 +647,8 @@ class SessionHost:
                " (escalated to %s against pid %s)" % ("+".join(signalled), pid) if signalled
                else "",
                "; the host answered: " + close.error if not close.ok else "",
-               "; the pid recorded at spawn (%s) is still alive and this read could not attribute "
-               "it to this session, so it was deliberately NOT signalled — %s"
+               "; the pid recorded at spawn (%s) is also still alive and this read could not "
+               "attribute it to this session, so it was deliberately NOT signalled — %s"
                % (recorded, before.detail) if unattributed else ""))
 
     # ---- private -----------------------------------------------------------------------
@@ -670,21 +688,42 @@ class SessionHost:
                                      "shell, whatever the host reports" % shell_pid)
         return shell_pid, ALIVE, "pane shell pid %s has live child %s" % (shell_pid, children[0])
 
-    def _ended(self, session, pid, recorded):
+    def _ended(self, session, pid):
         """Is this session verifiably over? Every branch needs POSITIVE evidence.
 
-        * An attributed pid that is gone is the strongest answer there is.
-        * With no pid to watch, the host SAYING the name no longer resolves is the evidence — and
-          `is False` matters: a host that stopped answering has told us nothing.
-        * ...but if a pid we recorded at spawn is still alive, we may neither signal it (we could
-          not attribute it) nor call the session ended over it. That combination is exactly the
-          case the caller must be told about rather than reassured about.
+        * An attributed pid that is gone is the strongest answer there is — but only the workspace
+          being gone says the WINDOW went with it, so both are required.
+        * With no pid to watch, the host positively letting go of the workspace is the evidence. A
+          host that stopped answering has told us nothing, and `_workspace_gone` returns None there.
+
+        A recorded pid that is still alive is deliberately NOT part of this predicate. It cannot be
+        signalled (nothing attributes it to this session, and pid numbers are reused), and letting
+        it veto would leave a legitimately-ended session unverifiable forever. It is reported as
+        ``Teardown.orphan_pid`` instead — a named doubt rather than a silent one.
         """
         if pid is not None:
-            return not self._probe.pid_alive(pid)
-        if self.state(session).name_resolves is not False:
+            # Cheapest evidence first: while the pid is alive nothing else can make this true, and
+            # asking the host on every poll of the escalation ladder is pure chatter.
+            if self._probe.pid_alive(pid):
+                return False
+            return self._workspace_gone(session.workspace) is True
+        if self._workspace_gone(session.workspace) is not True:
             return False
-        return not (recorded is not None and self._probe.pid_alive(recorded))
+        return self.state(session).name_resolves is False
+
+    def _workspace_gone(self, workspace):
+        """True / False / None — does the host still have this workspace?
+
+        A structured error (``workspace_not_found`` and friends) is the host saying it does not,
+        which is what a teardown needs to hear; a result means it still does. No answer at all is
+        None, and every caller reads None as "not verified".
+        """
+        if not workspace:
+            return None
+        reply = self._call(["workspace", "get", workspace])
+        if reply.ok:
+            return False
+        return True if reply.spoke else None
 
     def _rollback(self, workspace):
         """Undo a spawn that could not be confirmed. Best effort by design: the raise that follows
