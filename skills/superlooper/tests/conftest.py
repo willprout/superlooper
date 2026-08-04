@@ -72,6 +72,11 @@ def _clear_worker_launch_env(monkeypatch):
         # here, BEFORE that fixture runs, so the ratchet actually fires.
         "SL_GH",
         "SL_EXPECT_GH_LOGIN",
+        # The claude binary pin (issue #303). Same shape as SL_GH one line up: it steers which
+        # binary start-session.sh actually launches and which one the doctor judges, so an ambient
+        # value from a dogfooding shell would silently change every launcher and doctor test under
+        # it. Scrubbed here so _never_reach_real_claude below can then set the fail-closed default.
+        "SL_CLAUDE",
         # Same shape: the per-launch delivery token is ambient in a worker pane, and a launcher
         # test that inherited it would stamp its sentinel under a token it did not mint.
         "SL_START_TOKEN",
@@ -119,6 +124,23 @@ def _never_reach_real_gh(monkeypatch, _clear_worker_launch_env):
     # (rc 127) instead of succeeding for real. Tests that exercise gh set their own SL_GH in-body.
     if not os.environ.get("SL_GH"):
         monkeypatch.setenv("SL_GH", "/nonexistent/superlooper-test-gh")
+
+
+@pytest.fixture(autouse=True)
+def _never_reach_real_claude(monkeypatch, _clear_worker_launch_env):
+    # Same ratchet as _never_reach_real_cmux / _never_reach_real_gh, for the coding agent itself —
+    # `claude` is named in CLAUDE.md's rule but had no neutralizer, and issue #303 made the gap
+    # matter: the doctor's claude blocks now resolve through one ladder (SL_CLAUDE -> the standalone
+    # install at ~/.local/bin/claude -> PATH), and cmd_stack_doctor builds a REAL Probe. On a
+    # dogfooding machine both of the lower rungs hit a real, logged-in Claude Code, so a test that
+    # forgot to stub would run `claude auth status` / `claude plugin list` for real. Pointing the pin
+    # at a guaranteed-absent path makes the ladder stop at rung 1 and fail LOUDLY (the same
+    # fail-closed refusal start-session.sh gives a broken pin) instead of succeeding for real. Tests
+    # that exercise a claude set their own SL_CLAUDE in-body, and subprocess-driven tests build
+    # explicit env dicts. The ordering dependency on _clear_worker_launch_env is the same as
+    # _never_reach_real_gh's: scrub an ambient value first, then neutralize.
+    if not os.environ.get("SL_CLAUDE"):
+        monkeypatch.setenv("SL_CLAUDE", "/nonexistent/superlooper-test-claude")
 
 
 @pytest.fixture(autouse=True)

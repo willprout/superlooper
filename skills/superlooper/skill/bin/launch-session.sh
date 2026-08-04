@@ -436,8 +436,26 @@ WS_ARGS=()
 # tab's PATH happens to find. Omitting either would not weaken the assert — start-session.sh fails
 # closed on a missing expectation — it would refuse every launch, which is the loud failure a
 # silently-disabled floor deserves.
-printf -v CMD 'cd %q && SL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_ATTENDED=%q SL_SESSION_ID=%q SL_RESUME=%q SL_EXPECT_GH_LOGIN=%q SL_GH=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
-  "$WT" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$ATTENDED" "$SESSION_ID" "$RESUME" "$EXPECT_GH_LOGIN" "$GH" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
+# The claude binary pin (issue #303) rides ONLY when this launcher's own environment actually sets
+# it, which is why it is a built prefix rather than another %q slot. The distinction is load-bearing
+# in both directions:
+#   * NAMED when set, because otherwise a pin an operator verified with `doctor --stack` would
+#     simply not reach the worker, and the doctor's whole claim — "this is the binary a launch will
+#     run" — would be false for the one machine state where someone went to the trouble of pinning.
+#   * ABSENT when unset, never `SL_CLAUDE=''`. The dropped command's assignments override the tab
+#     shell's own environment, and the documented place to set the pin is a shell rc file the fresh
+#     tab sources. Passing an empty value unconditionally (as the codex knobs do, where empty just
+#     means "default") would BLANK that pin for every worker on a machine whose runner happens not
+#     to export it — silently converting a configured launch back into PATH luck.
+# Agent-specific by name, in the agent-agnostic launcher, exactly like the SL_CODEX_* knobs beside
+# it: the boundary rule is about the agent's COMMAND LINE, which still lives only in
+# start-session.sh — this only carries a value across a spawn that inherits nothing.
+CLAUDE_PIN_ASSIGN=""
+if [ -n "${SL_CLAUDE:-}" ]; then
+  printf -v CLAUDE_PIN_ASSIGN 'SL_CLAUDE=%q ' "$SL_CLAUDE"
+fi
+printf -v CMD 'cd %q && %sSL_ISSUE_ID=%q SL_RUN_ROOT=%q SL_SESSION_NAME=%q SL_MODEL=%q SL_EFFORT=%q SL_AGENT=%q SL_ATTENDED=%q SL_SESSION_ID=%q SL_RESUME=%q SL_EXPECT_GH_LOGIN=%q SL_GH=%q SL_CODEX_DANGEROUS_BYPASS=%q SL_CODEX_BYPASS_HOOK_TRUST=%q SL_CODEX_NO_ALT_SCREEN=%q SL_START_TOKEN=%q %q %q' \
+  "$WT" "$CLAUDE_PIN_ASSIGN" "$ID" "$SL_RUN_ROOT" "$NAME" "$MODEL" "$EFFORT" "$AGENT" "$ATTENDED" "$SESSION_ID" "$RESUME" "$EXPECT_GH_LOGIN" "$GH" "$CODEX_DANGEROUS_BYPASS" "$CODEX_BYPASS_HOOK_TRUST" "$CODEX_NO_ALT_SCREEN" "$SURF" "$HERE/start-session.sh" "$ID"
 # Drop the command FIRST — before any further cmux RPC — so the new tab's shell finds it immediately
 # and the shim's bounded wait can't be eaten by an unrelated slow RPC (e.g. rename-tab; review B6).
 # Atomic write (tmp + mv) so the shim never reads a half-written command; refresh .active so its

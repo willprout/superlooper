@@ -187,6 +187,14 @@ class Sim:
             "SL_LAUNCH_VERIFY_SECONDS": "15",
         }.items():
             monkeypatch.setenv(k, v)
+        # The claude binary PIN (issue #303) must be absent here, so start-session.sh's ladder falls
+        # through HOME (a tmp dir with no standalone install) to PATH and finds the fake-claude
+        # placed above — the resolution this harness has always modelled. conftest sets a
+        # guaranteed-absent SL_CLAUDE as its never-reach-a-real-claude ratchet, and left in place it
+        # would make every simulated launch refuse a pin the simulation never set. Safe to drop for
+        # the same reason it is safe in test_start_session.py: this harness owns both HOME and the
+        # front of PATH, so no rung can reach the machine's real Claude Code.
+        monkeypatch.delenv("SL_CLAUDE", raising=False)
 
         self.config = config_lib.load(str(self.repo))
         self.home = str(config_lib.state_home(self.config))

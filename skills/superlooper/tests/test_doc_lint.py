@@ -237,6 +237,12 @@ def test_the_static_and_dynamic_block_readings_agree_on_what_ships():
         def exists(self, path):
             return False
 
+        def executable(self, path):
+            return False
+
+        def read_head(self, path, limit=4096):
+            return None
+
         def read_text(self, path):
             return None
 

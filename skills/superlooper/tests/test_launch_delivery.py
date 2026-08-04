@@ -122,6 +122,19 @@ def _x(path, body):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_claude_pin(monkeypatch, _never_reach_real_claude):
+    """The cases here spawn REAL launches through to start-session.sh, whose binary ladder (issue
+    #303) fails closed on a pin that names nothing runnable — which is exactly what conftest's
+    never-reach-a-real-claude default is. Left in place it would make every launch in this file
+    refuse a pin the file never set, turning delivery cases into pin cases.
+
+    Safe to drop here for the same reason as in test_start_session.py: every case owns both HOME
+    (a tmp dir with no standalone install) and the front of PATH (a stub `claude`), so the ladder
+    can only ever land on a stub."""
+    monkeypatch.delenv("SL_CLAUDE", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _stub_gh(tmp_path_factory, monkeypatch):
     """Every launch in this file now runs the positive gh-auth assert (#299) on BOTH sides of the
     spawn, so EVERY case needs a `gh` that answers — and none may reach the real one (CLAUDE.md's
@@ -1048,3 +1061,30 @@ def test_the_debugger_spawn_path_scrubs_and_asserts_too(tmp_path):
         f"a poisoned debugger env must exit {ENV_RC}, got rc={bad.returncode}\n{bad.stderr}"
     assert not (stubdir / "claude_args").exists(), "the debugger must NEVER start in a poisoned env"
     assert "ANTHROPIC_API_KEY" in bad.stderr
+
+
+def test_the_claude_binary_pin_rides_across_the_spawn_only_when_it_is_set(tmp_path):
+    """The fresh tab inherits NOTHING, so a pin the operator verified with `doctor --stack` reaches
+    a worker only if the dropped command names it (issue #303).
+
+    Both halves matter. NAMED when set, or the doctor's central claim — "this is the binary a launch
+    will run" — is false on the one machine where somebody bothered to pin it. ABSENT when unset,
+    never `SL_CLAUDE=''`: the dropped assignments override the tab shell's own environment, and the
+    documented home for the pin is a shell rc file that shell sources — so an unconditional empty
+    value would BLANK a configured pin for every worker whose runner happens not to export it,
+    silently turning a pinned launch back into PATH luck. (The SL_CODEX_* knobs beside it ARE passed
+    unconditionally because empty there just means "use the default"; here it means "unpin".)"""
+    run_root, repo, home, stubdir, cmux = _setup(tmp_path)
+    capture = tmp_path / "pinned.cmd"
+    r = _run_launch(run_root, repo, home, stubdir, cmux, mode="drop",
+                    extra_env={"SL_CLAUDE": "/opt/claude/bin/claude",
+                               "STUB_CMD_CAPTURE": str(capture)})
+    assert r.returncode == 2
+    assert "SL_CLAUDE=/opt/claude/bin/claude" in capture.read_text()
+
+    run_root2, repo2, home2, stubdir2, cmux2 = _setup(tmp_path / "unpinned")
+    capture2 = tmp_path / "unpinned.cmd"
+    r2 = _run_launch(run_root2, repo2, home2, stubdir2, cmux2, mode="drop",
+                     extra_env={"STUB_CMD_CAPTURE": str(capture2)})
+    assert r2.returncode == 2
+    assert "SL_CLAUDE" not in capture2.read_text()

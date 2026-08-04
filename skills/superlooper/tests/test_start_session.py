@@ -24,8 +24,11 @@ START = os.path.join(REPO_ROOT, "skill", "bin", "start-session.sh")
 # what the launcher `unset` in its own shell is unobservable from outside, but what the spawned
 # agent RECEIVES is exactly what would have been billed to an API key or stripped of its transcript.
 # That file is the only honest oracle for a scrub.
+# It also records its own $0 when SL_TEST_ARGV0 names a file (issue #303): WHICH claude binary the
+# launcher resolved is invisible in argv, and it is the whole subject of the binary-pin ladder.
 STUB_AGENT = ('#!/usr/bin/env bash\n'
               'printf "%s\\n" "$@" > "$SL_TEST_ARGS"\n'
+              '[ -n "${SL_TEST_ARGV0:-}" ] && printf "%s\\n" "$0" > "$SL_TEST_ARGV0"\n'
               '[ -n "${SL_TEST_ENV:-}" ] && env > "$SL_TEST_ENV"\n'
               'exit 0\n')
 
@@ -115,6 +118,19 @@ def _x(path, body):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_claude_pin(monkeypatch, _never_reach_real_claude):
+    """This file's subject is the binary LADDER (issue #303), so it must run with no pin unless a
+    case sets one — including conftest's guaranteed-absent `_never_reach_real_claude` default, which
+    would otherwise make every launch here refuse a pin it never asked for (rung 1 fails closed by
+    design). Declared AFTER that fixture so it undoes it rather than racing it.
+
+    Safe to drop here, unlike anywhere else in the suite: every helper below launches with
+    HOME under a tmp dir and a stub `claude` first on PATH, so both remaining rungs land on a stub
+    and no case can reach the machine's real Claude Code."""
+    monkeypatch.delenv("SL_CLAUDE", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _stub_gh(tmp_path_factory, monkeypatch):
     """start-session.sh now gates EVERY launch on the positive gh-auth assert (#299), so every case
     in this file needs a `gh` that answers and a login to answer as — and none may reach the real
@@ -133,11 +149,14 @@ def _stub_gh(tmp_path_factory, monkeypatch):
 
 
 def _start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
-           resume_brief=None):
+           resume_brief=None, standalone=False):
     """Run start-session.sh i1 with a stub agent; return (CompletedProcess, run_root, args_file).
     model/effort default to unset (env var absent); pass "" to exercise the empty-string path.
     `resume_brief` seeds briefs/i1.resume.md — a resume launch REQUIRES it (the selection fails
-    closed rather than substituting the lane's own brief)."""
+    closed rather than substituting the lane's own brief).
+    `standalone` puts a stub at $HOME/.local/bin/claude — the native install the binary ladder pins
+    ahead of PATH (issue #303); without it the ladder falls through to the PATH stub, which is what
+    every pre-#303 case in this file relies on."""
     run_root = tmp_path / "run"
     (run_root / "briefs").mkdir(parents=True)
     (run_root / "state").mkdir()
@@ -148,12 +167,19 @@ def _start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
     stubdir.mkdir()
     _x(str(stubdir / "claude"), STUB_AGENT)
     _x(str(stubdir / "codex"), STUB_AGENT)
+    if standalone:
+        native = tmp_path / "home" / ".local" / "bin"
+        native.mkdir(parents=True, exist_ok=True)
+        _x(str(native / "claude"), STUB_AGENT)
     args_file = tmp_path / f"{agent}_args"
     # start from a copy that never leaks the parent's SL_MODEL/SL_EFFORT into the child, and never
     # its POISON either (#301): this suite very often runs inside a real Claude Code session, whose
     # CLAUDE_CODE_*/CLAUDECODE/CLAUDE_PID/CLAUDE_EFFORT are ambient in os.environ. Left in, the
     # baseline "a clean env launches normally" case would silently be a scrub case instead, and the
     # scrub cases could not tell their own injected poison from the harness's.
+    # (SL_CLAUDE, the #303 binary pin, is cleared for the whole file by _no_ambient_claude_pin
+    # above — every helper here builds from os.environ, so one fixture covers them all. The pin
+    # cases below set it in extra_env.)
     env = {k: v for k, v in os.environ.items()
            if k not in ("SL_MODEL", "SL_EFFORT", "SL_CODEX_DANGEROUS_BYPASS",
                         "SL_CODEX_BYPASS_HOOK_TRUST", "SL_CODEX_NO_ALT_SCREEN",
@@ -164,6 +190,7 @@ def _start(tmp_path, *, agent="claude", model=None, effort=None, extra_env=None,
         "HOME": str(tmp_path / "home"),
         "SL_RUN_ROOT": str(run_root),
         "SL_TEST_ARGS": str(args_file),
+        "SL_TEST_ARGV0": str(tmp_path / f"{agent}_argv0"),
         "SL_TEST_ENV": str(tmp_path / f"{agent}_env"),
         "SL_AGENT": agent,
     })
@@ -704,3 +731,194 @@ def test_the_assert_reads_the_env_the_agent_will_inherit_not_the_shells_own_book
     assert "ANTHROPIC_BASE_URL" not in r.stderr, \
         f"a variable the scrub DID remove must not be reported as still present: {r.stderr!r}"
     assert "XDG_CONFIG_HOME" not in r.stderr
+
+
+# ------------------- the claude binary, resolved explicitly (issue #303) -------------------------
+# Before this, the launcher ran a BARE `claude` and PATH order decided which binary a worker got.
+# On the tool-dive machine the only `claude` was cmux's bundled wrapper — a script that contains no
+# Claude Code, walks PATH for another claude and execs it — so retiring cmux would have taken the
+# launcher's binary with it. The ladder below replaces that luck: SL_CLAUDE, else the standalone
+# native install at ~/.local/bin/claude, else PATH. These cases drive start-session.sh for real and
+# read back the $0 the stub was invoked as, which is the only honest oracle for "which binary ran".
+
+def _argv0(tmp_path, agent="claude"):
+    return (tmp_path / f"{agent}_argv0").read_text().strip()
+
+
+def test_launch_runs_the_standalone_install_ahead_of_whatever_path_offers(tmp_path):
+    # The core guarantee: with the standalone build present, no PATH entry participates in the
+    # decision — so cmux's shim (or its removal) cannot change which binary a worker runs.
+    r, _run_root, _args = _start(tmp_path, standalone=True)
+
+    assert r.returncode == 0, r.stderr
+    assert _argv0(tmp_path) == str(tmp_path / "home" / ".local" / "bin" / "claude")
+
+
+def test_launch_honours_an_explicit_sl_claude_pin_over_the_standalone_install(tmp_path):
+    pinned = tmp_path / "pinned-claude"
+    _x(str(pinned), STUB_AGENT)
+
+    r, _run_root, _args = _start(tmp_path, standalone=True,
+                                 extra_env={"SL_CLAUDE": str(pinned)})
+
+    assert r.returncode == 0, r.stderr
+    assert _argv0(tmp_path) == str(pinned)
+
+
+def test_launch_falls_back_to_path_when_no_standalone_install_exists(tmp_path):
+    # A machine that installed Claude Code some other way still launches — the ladder's last rung.
+    r, _run_root, _args = _start(tmp_path)
+
+    assert r.returncode == 0, r.stderr
+    assert _argv0(tmp_path) == str(tmp_path / "stub" / "claude")
+
+
+def test_launch_refuses_a_pin_that_names_no_executable_instead_of_falling_back(tmp_path):
+    # FAIL CLOSED. Falling back to PATH here would restore the exact luck the pin removes, at the
+    # moment the operator most believes the binary is pinned — and it would do it silently.
+    r, run_root, _args = _start(tmp_path, standalone=True,
+                                extra_env={"SL_CLAUDE": str(tmp_path / "nowhere" / "claude")})
+
+    assert r.returncode != 0
+    assert "SL_CLAUDE" in r.stderr
+    assert not (tmp_path / "claude_argv0").exists()          # no binary ran at all
+    # the runner's relaunch-cap park memo reads this file (issue #40), so the reason must be there
+    assert "SL_CLAUDE" in (run_root / "state" / "launch_stderr" / "i1").read_text()
+    assert (run_root / "state" / "exited" / "i1").exists()
+
+
+def test_launch_refuses_when_no_claude_exists_anywhere(tmp_path):
+    # A PATH with the ordinary system utilities the script itself needs (mktemp, env, sed, date) but
+    # no claude anywhere on it — the machine-has-no-Claude-Code state, not a broken shell.
+    r, run_root, _args = _start(tmp_path, extra_env={"PATH": "/usr/bin:/bin"})
+
+    assert r.returncode != 0
+    assert "claude" in r.stderr.lower()
+    assert (run_root / "state" / "exited" / "i1").exists()
+
+
+def test_launch_records_the_binary_it_actually_ran(tmp_path):
+    # A worker tab resolves in ITS OWN environment, so the doctor re-resolving in the operator's
+    # shell proves nothing about the worker's (the #299/#301 lesson). This stamp is what does.
+    _r, _run_root, _args = _start(tmp_path, standalone=True)
+
+    record = tmp_path / "home" / ".superlooper" / "claude-bin.last"
+    assert record.read_text().strip() == str(tmp_path / "home" / ".local" / "bin" / "claude")
+
+
+def test_a_codex_launch_leaves_the_claude_binary_record_alone(tmp_path):
+    # The record answers "which claude did a worker run"; a codex flight must not overwrite it with
+    # something that is not a claude at all.
+    _r, _run_root, _args = _start(tmp_path, agent="codex", standalone=True)
+
+    assert not (tmp_path / "home" / ".superlooper" / "claude-bin.last").exists()
+
+
+def test_the_shell_ladder_and_the_doctors_ladder_resolve_the_same_binary(tmp_path, monkeypatch):
+    """start-session.sh and stack_doctor.resolve_claude are TWINS, duplicated on purpose (the fresh
+    tab shell inherits nothing and knows no engine paths, so the launcher cannot import the doctor).
+    Duplication only stays honest if something drives BOTH and compares — otherwise the doctor
+    eventually reports on a binary the launcher stopped running, which is precisely the confident
+    lie this whole block exists to prevent. Each rung of the ladder is checked, not just one."""
+    import stack_doctor
+
+    home = tmp_path / "home"
+    stub = tmp_path / "stub"
+    pinned = tmp_path / "pinned-claude"
+    _x(str(pinned), STUB_AGENT)
+
+    for label, kw, pin in (
+        ("PATH fallback", {}, None),
+        ("standalone install", {"standalone": True}, None),
+        ("explicit pin", {"standalone": True}, str(pinned)),
+    ):
+        case = tmp_path / label.replace(" ", "_")
+        case.mkdir()
+        env = {"SL_CLAUDE": pin} if pin else None
+        r, _run_root, _args = _start(case, extra_env=env, **kw)
+        assert r.returncode == 0, f"{label}: {r.stderr}"
+        shell_said = _argv0(case)
+
+        monkeypatch.setenv("HOME", str(case / "home"))
+        monkeypatch.setenv("PATH", f"{case / 'stub'}:{os.environ['PATH']}")
+        if pin:
+            monkeypatch.setenv("SL_CLAUDE", pin)
+        else:
+            monkeypatch.delenv("SL_CLAUDE", raising=False)
+
+        doctor_said = stack_doctor.resolve_claude(stack_doctor.Probe())["path"]
+        assert doctor_said == shell_said, (
+            f"{label}: the doctor would report on {doctor_said} while a launch runs {shell_said}")
+
+
+def test_an_empty_pin_is_no_pin_and_a_blank_one_still_refuses(tmp_path):
+    # The shell's `[ -n "$SL_CLAUDE" ]` is FALSE for "" and TRUE for "   ", and the doctor's twin
+    # must draw the line in the same place (test_stack_doctor pins the other half). Empty falls
+    # through to the standalone install; whitespace is a pin that names nothing runnable.
+    r, _run_root, _args = _start(tmp_path, standalone=True, extra_env={"SL_CLAUDE": ""})
+    assert r.returncode == 0, r.stderr
+    assert _argv0(tmp_path) == str(tmp_path / "home" / ".local" / "bin" / "claude")
+
+    blank = tmp_path / "blank"
+    blank.mkdir()
+    r2, _rr, _a = _start(blank, standalone=True, extra_env={"SL_CLAUDE": "   "})
+    assert r2.returncode != 0 and "SL_CLAUDE" in r2.stderr
+
+
+def test_a_pin_naming_a_directory_refuses_rather_than_execing_it(tmp_path):
+    # A directory is executable — that is traversal permission — so a bare `-x` test would accept
+    # `SL_CLAUDE=$HOME/.local/bin`, stamp it as the binary in use, and only fail when bash tried to
+    # exec it: past the refusal, past the stamp, with a park memo blaming the agent. (Fresh-agent
+    # review, P1; the Python twin already tested isfile + access, so this is where they diverged.)
+    adir = tmp_path / "a-directory"
+    adir.mkdir()
+
+    r, _run_root, _args = _start(tmp_path, standalone=True, extra_env={"SL_CLAUDE": str(adir)})
+
+    assert r.returncode != 0 and "SL_CLAUDE" in r.stderr
+    assert not (tmp_path / "claude_argv0").exists()                    # nothing was executed
+    assert not (tmp_path / "home" / ".superlooper" / "claude-bin.last").exists()   # nothing stamped
+
+
+def test_a_relative_pin_is_refused_even_when_it_resolves_here(tmp_path):
+    # The launcher runs after `cd $WT`, so a relative pin names a different file for it than for
+    # whoever set it. Refuse rather than run the wrong binary (second review round).
+    rel = tmp_path / "run" / "relative-claude"          # cwd of the launch IS run_root
+    r, _run_root, _args = _start(tmp_path, standalone=True, extra_env={"SL_CLAUDE": "./x"})
+    assert r.returncode != 0
+    assert "relative" in r.stderr.lower() and "SL_CLAUDE" in r.stderr
+    assert not (tmp_path / "claude_argv0").exists()
+    assert not rel.exists()
+
+
+def test_the_path_rung_ignores_a_shell_function_named_claude(tmp_path):
+    # `command -v` answers with the bare NAME for a shell function, so a `claude()` reaching this
+    # non-interactive bash (via $BASH_ENV) would have been stamped as the binary in use and run in
+    # place of Claude Code — while the doctor, which can only ever find files, reported something
+    # else. `type -P` searches PATH for an executable FILE, matching shutil.which on the other side.
+    benv = tmp_path / "benv.sh"
+    benv.write_text("claude() { echo 'I am a function, not Claude Code'; exit 0; }\n")
+
+    r, _run_root, _args = _start(tmp_path, extra_env={"BASH_ENV": str(benv)})
+
+    assert r.returncode == 0, r.stderr
+    assert _argv0(tmp_path) == str(tmp_path / "stub" / "claude")     # the FILE, not the function
+
+
+def test_a_relative_path_hit_is_refused_rather_than_run_from_the_worktree(tmp_path):
+    # `PATH=":..."` (an empty element) means the CURRENT DIRECTORY, which for a worker is its own
+    # worktree — so a `claude` file checked into a repo would be launched as the coding agent.
+    # bash's `type -P` answers `./claude` there, which is also a different string than the doctor's
+    # shutil.which returns, so the ladder refuses anything non-absolute on this rung too.
+    run_root = tmp_path / "run"
+    run_root.mkdir(parents=True, exist_ok=True)
+    planted = run_root / "claude"                       # the launch's cwd IS run_root
+    planted.write_text("#!/bin/sh\necho PLANTED; exit 0\n")
+    planted.chmod(0o755)
+
+    r, _run_root, _args = _start(tmp_path, extra_env={"PATH": ":/usr/bin:/bin"})
+
+    assert r.returncode != 0
+    assert "relative" in r.stderr.lower()
+    assert "PLANTED" not in r.stdout
+    assert not (tmp_path / "home" / ".superlooper" / "claude-bin.last").exists()
