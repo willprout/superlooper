@@ -687,3 +687,49 @@ def test_a_login_item_runner_carries_no_pane_even_when_one_is_ambient(monkeypatc
     r = runner_mod.Runner(repo=str(tmp_path / "repo"), config=_config(runner_home="login-item"),
                           state_home=str(tmp_path / "home2"))
     assert r.pane == "", "an ambient pane leaked into a home that has none"
+
+
+def test_no_environment_variable_can_choose_which_uid_a_job_is_addressed_in():
+    # Fresh-agent review round 2 (BLOCKING): an `SL_UID` test seam in production code made the
+    # gui/$UID rule optional at runtime — an ambient or mistaken value would point bootstrap,
+    # bootout, kickstart and print at ANOTHER user's login domain, and those verbs start and stop
+    # jobs. The seam is gone; the uid is the process's own, always. Tests that need a uid read the
+    # same one this code does.
+    from pathlib import Path
+    root = Path(runner_home.__file__).resolve().parents[2]   # .../skills/superlooper
+    # `os.environ`-shaped reads only: the CLI's own docstring explains the removal by name, and
+    # that prose must stay readable, so this looks for the variable being READ, not mentioned.
+    for rel in ("skill/bin/superlooper", "skill/lib/stack_doctor.py", "skill/lib/runner_home.py",
+                "skill/bin/runner.py", "tests/conftest.py"):
+        text = (root / rel).read_text()
+        for shape in ('"SL_UID"', "'SL_UID'"):
+            assert shape not in text, "%s still reads an SL_UID seam" % rel
+
+
+# --------------------------------------------------------------- round-2 review: the state read
+
+@pytest.mark.parametrize("state,expected", [
+    ("not running", True),
+    ("waiting", True),
+    ("running", False),
+    ("spawn scheduled", False),
+])
+def test_a_services_own_state_word_is_read_from_a_closed_vocabulary(state, expected):
+    assert runner_home.service_is_idle("com.x = {\n\tstate = %s\n}" % state) is expected
+
+
+@pytest.mark.parametrize("text", [
+    "", None, "com.x = {\n}", "com.x = {\n\tstate = some-future-word\n}",
+    "Could not find service \"com.x\" in domain for uid: 501",
+])
+def test_an_unrecognised_state_is_unknown_never_folded_into_idle(text):
+    # The point of splitting this out of service_pid: "no pid" and "the service says it is not
+    # running" are different facts, and a caller that must fail closed needs to tell them apart.
+    # An unrecognised word is UNKNOWN — the doctor FAILS on it rather than reporting a benign idle.
+    assert runner_home.service_is_idle(text) is None
+
+
+def test_a_running_service_is_not_idle_even_when_it_also_reports_a_pid():
+    out = "com.x = {\n\tstate = running\n\tpid = 41231\n}"
+    assert runner_home.service_is_idle(out) is False
+    assert runner_home.service_pid(out) == 41231

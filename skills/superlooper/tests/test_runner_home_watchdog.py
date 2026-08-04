@@ -53,7 +53,7 @@ def rig(tmp_path):
            "HOME": str(tmp_path / "userhome"), "SL_HOME": str(tmp_path / "slhome"),
            "SL_GH": str(_FAKE_GH), "GH_FIXTURES": str(fixdir),
            "SL_CMUX": "/nonexistent/superlooper-test-cmux",
-           "SL_LAUNCHCTL": str(launchctl), "SL_UID": "501",
+           "SL_LAUNCHCTL": str(launchctl),
            "SL_RESURRECT_RUNNER": str(resurrect),
            "LAUNCHCTL_LOG": str(tmp_path / "launchctl.log"),
            "RESURRECT_LOG": str(tmp_path / "resurrect.log"),
@@ -108,7 +108,7 @@ def test_the_login_item_home_restarts_a_dead_runner_by_kickstarting_its_job(rig)
     # The pane launcher — which needs an anchor that does not exist in this home — is never called.
     assert not _lines(rig.resurrect_log)
     calls = _lines(rig.launchctl_log)
-    assert "kickstart -k gui/501/com.superlooper.runner.o__r" in calls, calls
+    assert "kickstart -k gui/%d/com.superlooper.runner.o__r" % os.getuid() in calls, calls
     assert "resurrected the runner" in r.stdout
 
 

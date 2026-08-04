@@ -57,7 +57,7 @@ def rig(tmp_path):
            "HOME": str(home), "SL_HOME": str(tmp_path / "slhome"),
            "SL_GH": str(_FAKE_GH), "GH_FIXTURES": str(fixdir),
            "SL_LAUNCHCTL": str(launchctl), "SL_LAUNCHD_DIR": str(launchagents),
-           "SL_UID": "501", "SL_HERDR": str(host),
+           "SL_HERDR": str(host),
            "SL_CMUX": "/bin/ls",
            "PATH": f"{bindir}:{os.environ.get('PATH', '')}"}
     env.pop("GH_FAIL", None)
@@ -103,7 +103,7 @@ def test_runner_home_reports_the_login_item_job(rig):
     r = cli(rig, "runner-home", "--repo", str(rig.repo))
     assert r.returncode == 0, r.stdout + r.stderr
     assert "com.superlooper.runner.o__r" in r.stdout
-    assert "gui/501" in r.stdout
+    assert "gui/%d" % os.getuid() in r.stdout
 
 
 # --------------------------------------------------------------- --install
@@ -122,7 +122,7 @@ def test_install_writes_a_gui_launchagent_with_an_explicit_path(rig):
     assert str(_FAKE_GH.parent) in d["EnvironmentVariables"]["PATH"].split(":")
     assert d["RunAtLoad"] is True and d["KeepAlive"] is True
     # It prints the command that activates it rather than activating it silently.
-    assert "bootstrap gui/501" in r.stdout
+    assert "bootstrap gui/%d" % os.getuid() in r.stdout
 
 
 def test_install_does_not_load_the_job_unless_asked(rig):
@@ -142,7 +142,7 @@ def test_install_load_bootstraps_into_the_gui_domain_and_nowhere_else(rig):
     r = cli(rig, "runner-home", "--repo", str(rig.repo), "--install", "--load")
     assert r.returncode == 0, r.stdout + r.stderr
     lines = log.read_text().splitlines()
-    assert any(line.startswith("bootstrap gui/501 ") for line in lines), lines
+    assert any(line.startswith("bootstrap gui/%d " % os.getuid()) for line in lines), lines
     assert not any("system/" in line for line in lines), lines
 
 
@@ -232,7 +232,7 @@ def test_request_restart_names_the_right_manual_start_for_the_login_item_home(ri
     write_config(rig.repo, runner_home="login-item")
     r = cli(rig, "request-restart", "--repo", str(rig.repo))
     out = r.stdout + r.stderr
-    assert "kickstart" in out and "gui/501" in out
+    assert "kickstart" in out and "gui/%d" % os.getuid() in out
     assert "tab" not in out.lower()
 
 
@@ -266,3 +266,16 @@ def test_install_omits_the_state_home_variable_when_it_is_not_relocated(rig):
     assert r.returncode == 0, r.stdout + r.stderr
     d = plistlib.loads((rig.launchagents / "com.superlooper.runner.o__r.plist").read_bytes())
     assert "SL_HOME" not in d["EnvironmentVariables"]
+
+
+def test_an_unreachable_session_host_is_reported_as_no_answer_not_as_a_refusal(rig):
+    # Fresh-agent review round 2 (nit, but it points the operator at the wrong end of the wire):
+    # everything the probe can observe — a timeout, a missing binary, the wrapper raising — is
+    # "we got no answer", never "something answered and said no".
+    write_config(rig.repo, runner_home="login-item")
+    r = cli(rig, "runner-home", "--repo", str(rig.repo), "--verify",
+            env_over={"SL_HERDR": "/nonexistent/session-host"})
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "no answer" in out
+    assert "reachable but not answering" not in out

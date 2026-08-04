@@ -168,11 +168,16 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   processes (two runners, one about to be restarted out from under the other); or the job's
   recorded PATH no longer resolves `gh`/`git` — launchd hands a job only
   `/usr/bin:/bin:/usr/sbin:/sbin`, so a job without an explicit PATH comes up, looks perfectly
-  alive, and fails every GitHub read. A job that is loaded but not currently running is a WARN, not
-  a FAIL: that is simply true between a restart and the next boot. Fix all of them with
-  `superlooper runner-home --repo <path> --install --load`, which records where `gh` and `git`
-  actually resolve on this machine. `SL_LAUNCHCTL` overrides the service-manager binary and
-  `SL_LAUNCHD_DIR` the directory the job is installed into.
+  alive, and fails every GitHub read — and that one FAILs whether or not the job is running right
+  now, because it is a static property of the installed home that will bite again on its next
+  start. A job that reports itself loaded and **not running** is a WARN, not a FAIL: that is simply
+  true between a restart and the next boot. A job that reports neither a pid nor a state this
+  build recognises is a FAIL, deliberately — nothing can then say whether a runner is supervised at
+  all, and guessing is how a dark job reads green. Fix the rest with `superlooper runner-home
+  --repo <path> --install --load`, which records where `gh` and `git` actually resolve on this
+  machine. `SL_LAUNCHCTL` overrides the service-manager binary and `SL_LAUNCHD_DIR` the directory
+  the job is installed into; there is deliberately no override for the uid — the job is always
+  addressed in this process's own `gui/$UID` domain.
 - `installed engine current`: a visibility line that never fails the stack — being behind is by
   design, since a merged engine change is inert until someone republishes through the gated
   `bin/install.sh` (issue #39). It compares the installed copy's VERSION stamp

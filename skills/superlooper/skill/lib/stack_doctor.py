@@ -797,14 +797,31 @@ def check_runner_home(probe, config):
     job_pid = runner_home.service_pid(_out(proc))
     runner_pid = _live_runner_pid(probe, state)
     path_problem = _job_path_problem(probe, plist)
+    # A broken recorded PATH is judged BEFORE liveness, and fails whatever the job is doing right
+    # now (fresh-agent review). It is a static property of the installed home: the job will fail
+    # every GitHub read on its NEXT start too, so downgrading it to a warning because the job
+    # happens to be between runs would hide the one condition this check exists to catch.
+    if path_problem:
+        return CheckResult(name, False, "job %s %s but %s"
+                           % (job, "is running (pid %s)" % job_pid if job_pid else "is installed",
+                              path_problem), fix)
     if job_pid is None:
-        # Loaded but not up. Between a restart and the next boot this is simply true, so it is a
-        # WARN — a doctor that FAILED here would cry wolf every time the owner taps Restart.
-        return CheckResult(name, True,
-                           "job %s is loaded in %s but not running (no pid)%s"
-                           % (job, runner_home.domain(uid),
-                              "; also: " + path_problem if path_problem else ""),
-                           warn=True)
+        # No pid. "The service SAYS it is not running" and "we could not tell" are different facts
+        # and are answered differently — folding the second into the first would turn a changed
+        # `launchctl print` shape, or any unreadable answer, into a benign-looking idle job.
+        if runner_home.service_is_idle(_out(proc)) is True:
+            # Genuinely loaded and idle. Between a restart and the next boot this is simply true,
+            # so it is a WARN — failing here would cry wolf every time the owner taps Restart.
+            return CheckResult(name, True, "job %s is loaded in %s and not running"
+                               % (job, runner_home.domain(uid)), warn=True)
+        return CheckResult(
+            name, False,
+            "the job %s is loaded in %s but neither a pid nor a recognisable state could be read "
+            "from it — so nothing here can say whether a runner is supervised at all"
+            % (job, runner_home.domain(uid)),
+            "Read it yourself: `launchctl print %s`. If the output looks unfamiliar, this check's "
+            "reader is out of date with the service manager and lib/runner_home.py needs updating "
+            "— it deliberately refuses to guess." % runner_home.service_target(uid, job))
     if runner_pid is not None and runner_pid != job_pid:
         return CheckResult(
             name, False,
@@ -820,9 +837,6 @@ def check_runner_home(probe, config):
             "bootout %s` stops the supervised one; the other must be ended by hand. Then restart "
             "the job so exactly one runner is live."
             % runner_home.service_target(uid, job))
-    if path_problem:
-        return CheckResult(name, False, "job %s is running (pid %s) but %s" % (job, job_pid,
-                                                                               path_problem), fix)
     return CheckResult(name, True, "job %s is running in %s (pid %s)%s"
                        % (job, runner_home.domain(uid), job_pid,
                           "" if runner_pid else "; no live runner pidfile yet"))
@@ -839,11 +853,11 @@ def _launchagents_dir(probe):
 
 
 def _launchd_uid(probe):
-    env = getattr(probe, "env", {}) or {}
-    try:
-        return int(env["SL_UID"])          # TEST seam only — production reads the real uid
-    except (KeyError, TypeError, ValueError):
-        return os.getuid()
+    """This process's own uid, and nothing else can say otherwise — see the CLI's `_home_uid` for
+    why the override that used to live here was removed (a fresh-agent review called it blocking:
+    a rule with a runtime escape hatch is not a rule, and the remedy this block PRINTS names a
+    launchd domain the operator will type)."""
+    return os.getuid()
 
 
 def _job_path_problem(probe, plist):

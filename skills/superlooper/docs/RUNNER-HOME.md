@@ -46,8 +46,10 @@ Each is refused at boot rather than explained in a document, and each was measur
    keychain is its default keychain, and `gh` read its keyring token in one second with no prompt. A
    `system/` domain daemon is a *different* session and was never tested — the "intermittent gh
    auth-death under launchd" reports live there. So the gui domain is spelled once, in
-   `runner_home.domain`, and **no function in that module takes a domain parameter**: a rule that
-   can be passed as an argument is a rule that will one day be passed the wrong argument.
+   `runner_home.domain`, and **no function in that module takes a domain parameter, and no
+   environment variable can choose the uid**: a rule that can be passed as an argument — or
+   exported for debugging — is a rule that will one day point `bootstrap`, `bootout` and
+   `kickstart` at another user's login session.
 2. **PATH.** launchd hands a job `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else — no Homebrew, no
    `~/.local/bin`. A launchd-hosted runner that shells `gh` by bare name simply does not find it,
    and fails every GitHub read while looking perfectly alive. So `superlooper runner-home --install`

@@ -9,6 +9,7 @@ shells. Every one of those is a way the runner can be running and wrong while lo
 Uses the FakeProbe shape from tests/test_stack_doctor.py: nothing here resolves a real launchctl.
 """
 import json
+import os
 
 import pytest
 
@@ -28,6 +29,9 @@ LABEL = "com.superlooper.runner.o__r"
 PLIST = "/home/will/Library/LaunchAgents/%s.plist" % LABEL
 STATE = "/home/will/.superlooper/o__r/state"
 _LAUNCHCTL = "/stub/launchctl"
+# The uid this process actually runs as — there is no override, by design (the gui/$UID
+# rule stopped being negotiable at runtime after the round-2 review).
+_UID = os.getuid()
 
 
 def _plist(path="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"):
@@ -36,8 +40,13 @@ def _plist(path="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"):
                                     path=path)
 
 
-def _printed(pid=None):
-    body = "%s = {\n\tstate = running\n" % LABEL
+def _printed(pid=None, state=None):
+    """One `launchctl print` block. The default state matches the pid: a service reporting
+    `running` with no pid is a CONTRADICTION, and the doctor is right to refuse it — so fixtures
+    that mean "loaded and idle" have to say so."""
+    if state is None:
+        state = "running" if pid is not None else "not running"
+    body = "%s = {\n\tstate = %s\n" % (LABEL, state)
     if pid is not None:
         body += "\tpid = %d\n" % pid
     return body + "}"
@@ -59,8 +68,8 @@ def _probe(*, lock=None, plist=None, printed=None, print_rc=0, alive=(), home_re
     if home_rec is not None:
         files[STATE + "/runner.home.json"] = json.dumps(home_rec)
     commands = {"launchctl": {"path": _LAUNCHCTL,
-                              ("print", "gui/501/" + LABEL): (print_rc, printed or "", "")}}
-    p = FakeProbe(commands=commands, files=files, env={"SL_LAUNCHCTL": _LAUNCHCTL, "SL_UID": "501"},
+                              ("print", "gui/%d/" % _UID + LABEL): (print_rc, printed or "", "")}}
+    p = FakeProbe(commands=commands, files=files, env={"SL_LAUNCHCTL": _LAUNCHCTL},
                   alive_pids=alive)
     return p
 
@@ -109,7 +118,7 @@ def test_an_uninstalled_job_fails_and_names_the_installer():
 def test_a_job_that_is_not_bootstrapped_fails_and_names_the_domain():
     r = stack_doctor.check_runner_home(_probe(plist=_plist(), print_rc=1), _cfg())
     assert not r.ok
-    assert "gui/501" in (r.detail + r.fix)
+    assert "gui/%d" % _UID in (r.detail + r.fix)
 
 
 def test_a_healthy_installed_running_job_whose_pid_matches_the_runner_passes():
@@ -129,12 +138,33 @@ def test_a_job_supervising_a_different_process_than_the_pidfile_names_is_a_failu
     assert "4242" in r.detail and "9999" in r.detail
 
 
-def test_a_loaded_job_with_no_live_runner_is_reported_but_not_failed():
+def test_a_loaded_job_that_says_it_is_not_running_is_reported_but_not_failed():
     # Between a restart and the next boot this is simply true, and a doctor that failed on it would
     # cry wolf every time the owner taps Restart.
     r = stack_doctor.check_runner_home(_probe(plist=_plist(), printed=_printed()), _cfg())
     assert r.ok and r.warn
     assert "not running" in r.detail
+
+
+def test_a_job_that_reports_neither_a_pid_nor_a_readable_state_fails_closed():
+    # Fresh-agent review round 2: "no pid" was being read as "loaded and idle", so a changed
+    # `launchctl print` shape — or any truncated/unreadable answer — became a benign-looking warn.
+    # Nothing here can then say whether a runner is supervised at all, and that is a FAIL.
+    r = stack_doctor.check_runner_home(
+        _probe(plist=_plist(), printed=_printed(state="some-future-word")), _cfg())
+    assert not r.ok
+    assert "neither a pid nor a recognisable state" in r.detail
+    assert "refuses to guess" in r.fix
+
+
+def test_a_broken_job_path_fails_even_while_the_job_is_not_running():
+    # Also round 2: a bad recorded PATH is a STATIC property of the installed home — the job will
+    # fail every GitHub read on its next start too — so it cannot be downgraded to a warning just
+    # because the job happens to be between runs.
+    r = stack_doctor.check_runner_home(
+        _probe(plist=_plist(path=runner_home.LAUNCHD_PATH), printed=_printed()), _cfg())
+    assert not r.ok
+    assert "PATH" in r.detail and "gh" in r.detail
 
 
 def test_a_job_whose_path_lost_gh_fails_even_while_it_runs():

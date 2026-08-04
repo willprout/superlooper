@@ -239,13 +239,16 @@ def _launchd_dir():
 
 
 def _home_uid():
-    """The uid whose gui domain the job lives in. SL_UID is a TEST seam only — production reads the
-    real uid, because a job installed for another uid is a job in someone else's login session."""
-    raw = os.environ.get("SL_UID")
-    try:
-        return int(raw) if raw else os.getuid()
-    except ValueError:
-        return os.getuid()
+    """The uid whose gui domain the job lives in: THIS process's own, and there is no way to say
+    otherwise.
+
+    There was briefly an ``SL_UID`` override here so tests could pin a uid. A fresh-agent review
+    called it blocking and was right: these verbs bootstrap, bootout and kickstart launchd JOBS, so
+    an override — ambient, exported for debugging, or simply wrong — points them at another user's
+    login session. The keychain rule that says gui/$UID is the whole reason this home exists, and a
+    rule with a runtime escape hatch is not a rule. Tests read the same uid this does.
+    """
+    return os.getuid()
 
 
 def _resolve_command(name):
@@ -283,14 +286,20 @@ def _host_answered():
     when the host SPOKE (a structured "no such agent" for our reserved name) and ``None`` when the
     call never got through at all. That distinction is exactly the question, and asking it this way
     means the runner's boot needs no second door to the host.
+
+    True or None, never False. Both non-True answers refuse the boot, but they refuse it with
+    different words, and only one of them is honest here: everything this function can observe —
+    a timeout, a missing binary, the wrapper itself raising — is "we got no answer", never
+    "something answered and said no". Reporting the wrong one sends the operator looking at the
+    wrong end of the connection (fresh-agent review).
     """
     try:
         import session_host
-        return session_host.SessionHost().state(_HOST_PROBE_NAME).name_resolves is not None
+        spoke = session_host.SessionHost().state(_HOST_PROBE_NAME).name_resolves is not None
     except Exception:
-        # The wrapper raising here would take the boot down with the host it was asking about, and
-        # "we could not ask" is the same answer as "it did not answer" for a preflight.
-        return False
+        # The wrapper raising here would take the boot down with the host it was asking about.
+        return None
+    return True if spoke else None
 
 
 def _login_item_facts():

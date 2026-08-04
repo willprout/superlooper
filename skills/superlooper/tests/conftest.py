@@ -87,15 +87,15 @@ def _clear_worker_launch_env(monkeypatch):
         # default.
         "SL_HERDR",
         # The runner's process home (issue #306). SL_LAUNCHCTL steers the service manager the CLI
-        # and doctor talk to, SL_LAUNCHD_DIR steers where a LaunchAgent is PLACED, and SL_UID
-        # steers whose gui domain a job is addressed in. All three are ambient on a machine that
-        # has installed a login-item runner, and all three change what an install/verify under test
-        # actually touches — an inherited SL_LAUNCHD_DIR would let a test write into the owner's
-        # real ~/Library/LaunchAgents. Scrubbed here so _never_reach_real_launchctl below can then
-        # set the fail-closed default.
+        # and doctor talk to; SL_LAUNCHD_DIR steers where a LaunchAgent is PLACED. Both are ambient
+        # on a machine that has installed a login-item runner, and both change what an
+        # install/verify under test actually touches — an inherited SL_LAUNCHD_DIR would let a test
+        # write into the owner's real ~/Library/LaunchAgents. Scrubbed here so
+        # _never_reach_real_launchctl below can then set the fail-closed default. (There is
+        # deliberately NO variable for the UID: the gui/$UID domain is not overridable at runtime,
+        # so tests read the same uid the code does.)
         "SL_LAUNCHCTL",
         "SL_LAUNCHD_DIR",
-        "SL_UID",
     ):
         monkeypatch.delenv(name, raising=False)
 

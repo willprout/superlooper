@@ -92,6 +92,12 @@ REQUIRED_COMMANDS = ("gh", "git")
 # be mistaken for the service's own.
 _PID_LINE = re.compile(r"^\s*pid\s*=\s*(\d+)\s*$", re.M)
 
+# The `state = <words>` line from the same block. A CLOSED vocabulary on both sides on purpose: an
+# unrecognised word is UNKNOWN, never quietly folded into whichever answer is convenient.
+_STATE_LINE = re.compile(r"^\s*state\s*=\s*(.+?)\s*$", re.M)
+_IDLE_STATES = frozenset({"not running", "waiting"})
+_RUNNING_STATES = frozenset({"running", "spawn scheduled"})
+
 # The shipped launchd label shape, matching the nightly and watchdog jobs already installed
 # (com.superlooper.<job>.<owner>__<name>) so one glance at `launchctl list` groups a repo's jobs.
 _LABEL_FMT = "com.superlooper.runner.%s__%s"
@@ -204,6 +210,25 @@ def kickstart_argv(launchctl, uid, job_label):
 
 def print_argv(launchctl, uid, job_label):
     return [launchctl, "print", service_target(uid, job_label)]
+
+
+def service_is_idle(text):
+    """Did the service EXPLICITLY report a not-running state? True / False / None (unreadable).
+
+    Split out from ``service_pid`` after a fresh-agent review: "no pid" and "the service says it is
+    not running" are different facts, and treating the first as the second turns a changed output
+    shape, a truncated read, or any other unreadable answer into a benign-looking "loaded but idle".
+    A caller that must fail closed needs to tell them apart, so it gets a positive read or nothing.
+    """
+    match = _STATE_LINE.search(text or "")
+    if not match:
+        return None
+    state = " ".join(match.group(1).split()).lower()
+    if state in _IDLE_STATES:
+        return True
+    if state in _RUNNING_STATES:
+        return False
+    return None
 
 
 def service_pid(text):
