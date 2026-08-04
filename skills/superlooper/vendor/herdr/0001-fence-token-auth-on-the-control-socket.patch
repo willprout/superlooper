@@ -1,9 +1,9 @@
 diff --git a/src/api/auth.rs b/src/api/auth.rs
 new file mode 100644
-index 0000000..80c8cf1
+index 0000000..49c6d47
 --- /dev/null
 +++ b/src/api/auth.rs
-@@ -0,0 +1,452 @@
+@@ -0,0 +1,504 @@
 +//! Token auth for the control socket — superlooper's carried fence (issue #305).
 +//!
 +//! Upstream herdr deliberately exposes every capability twice (CLI + newline-JSON socket) so that
@@ -219,7 +219,27 @@ index 0000000..80c8cf1
 +/// Read the envelope out of a request line. A line that is not a well-formed request object at all
 +/// yields the DEFAULT envelope — no token, no method — which `admit` refuses. Fail closed: garbage
 +/// must never be a way past the check.
++///
++/// **A REQUEST IS AN OBJECT, and this has to say so.** serde's derived impl for a struct also
++/// accepts a positional SEQUENCE, so without the shape test below `["1","<token>","server.stop"]`
++/// fills `(id, auth, method)` by position and `["1",null,"pane.report_agent_session"]` walks
++/// straight through the allowance. Measured against the real patched server before this line
++/// existed: both reached the `Request` parse, where the array died as `invalid_request` — which is
++/// already one failure of this patch's stated contract (a refused caller must learn only that it
++/// was refused; that error code is an oracle for which methods are open, readable with no token at
++/// all) and one upstream schema change away from being a real bypass. `Request` refuses a sequence
++/// TODAY only because its `#[serde(flatten)]` suppresses the seq visitor, and this check is not
++/// allowed to rest on an accident of somebody else's struct.
++///
++/// The test is on the TEXT rather than a re-parse into `serde_json::Value`, deliberately: a
++/// `Value` round-trip collapses duplicate keys (last wins) while the derived struct below REFUSES
++/// them outright, and swapping one rule for the other is precisely how the envelope and the
++/// dispatcher would start disagreeing about which method a line names. Fail closed, and change
++/// nothing else.
 +pub fn envelope(line: &str) -> Envelope {
++    if !line.trim_start().starts_with('{') {
++        return Envelope::default();
++    }
 +    serde_json::from_str::<Envelope>(line).unwrap_or_default()
 +}
 +
@@ -396,6 +416,38 @@ index 0000000..80c8cf1
 +        for line in ["", "   ", "not json", "[]", "\"pane.report_agent_session\"", "null", "7",
 +                     "{\"method\":7}", "{\"method\":null}", "{"] {
 +            assert_eq!(envelope(line), Envelope::default(), "{line:?} parsed as something");
++            assert!(!admit(&token("secret"), &envelope(line)), "{line:?} was admitted");
++        }
++    }
++
++    #[test]
++    fn a_positional_array_is_not_an_envelope() {
++        // The finding this shape test exists for. A derived struct impl accepts a SEQUENCE as well
++        // as a map, filling fields in declaration order — so without the object check an array is
++        // an envelope with `id`, `auth` and `method` supplied positionally. `[]` in the case above
++        // passes for the wrong reason (zero elements, so every field defaults); these do not.
++        for line in [
++            "[\"1\",null,\"pane.report_agent_session\"]",   // the allowance, positionally
++            "[\"1\",\"secret\",\"server.stop\"]",           // the TOKEN, positionally
++            "[\"1\",\"secret\"]",
++            "  [\"1\",null,\"pane.report_agent_session\"]",
++        ] {
++            assert_eq!(envelope(line), Envelope::default(), "{line:?} parsed as an envelope");
++            assert!(!admit(&token("secret"), &envelope(line)), "{line:?} was admitted");
++        }
++    }
++
++    #[test]
++    fn a_method_named_twice_is_refused_outright() {
++        // Fail closed where the two parsers are most likely to part company. The derived impl
++        // REFUSES a duplicate field, so such a line never reaches the agreement question below —
++        // asserted here rather than left as an untested branch of that test.
++        for line in [
++            "{\"id\":\"1\",\"method\":\"pane.report_agent_session\",\"method\":\"server.stop\"}",
++            "{\"id\":\"1\",\"method\":\"server.stop\",\"method\":\"pane.report_agent_session\"}",
++            "{\"id\":\"1\",\"auth\":\"secret\",\"auth\":\"guess\"}",
++        ] {
++            assert_eq!(envelope(line), Envelope::default(), "{line:?} parsed as an envelope");
 +            assert!(!admit(&token("secret"), &envelope(line)), "{line:?} was admitted");
 +        }
 +    }

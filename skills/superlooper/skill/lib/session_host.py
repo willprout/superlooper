@@ -156,6 +156,22 @@ ADMITTED, REFUSED = "admitted", "refused"
 _PROBE_PANE = "superlooper-capture-probe-not-a-pane"
 _PROBE_AGENT = ""
 
+# The host's own session-name rule, transcribed from the pinned release (`session::validate_name`:
+# ASCII alphanumerics plus `.`, `_` and `-`, at most 64 bytes, and never `.` or `..`). A name that
+# fails it is IGNORED by the host, which then serves on the plain config-dir socket — so a resolver
+# that did not check would point at a directory nothing ever creates. No trimming: the host does
+# none, so a name with a leading space is invalid rather than tidied into a valid one.
+#
+# `\Z`, not `$`: Python's `$` also matches just before a TRAILING NEWLINE, so `"loop\n"` — a name
+# the host rejects outright — would pass a `$`-anchored version of this and send the probe to a
+# directory that cannot exist. The test parametrises that exact value.
+_SESSION_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+
+# The most a single control-socket reply may be before `_speak` gives up on it. A real one is a
+# JSON line; nothing legitimate is near this, and the number exists so a hostile or wedged peer
+# cannot grow a probe's buffer without limit.
+_MAX_REPLY_BYTES = 4 * 1024 * 1024
+
 _DEFAULT_BINARY = "herdr"
 _CALL_SECONDS = 20                 # a control call that hangs is a dead host, not a slow one
 _PROMPT_TIMEOUT_MS = 120000        # the host's own documented prompt wait
@@ -580,9 +596,15 @@ def control_socket_path(env=None):
 
     1. ``HERDR_SOCKET_PATH`` — the explicit override, and what the adoption plan's short-socket-path
        deployment (§2, the 104-char ``sun_path`` limit) actually sets;
-    2. otherwise a named session's own directory, if ``HERDR_SESSION`` names one that is not the
-       default;
+    2. otherwise a named session's own directory, if ``HERDR_SESSION`` names one the host would
+       actually honour — not the default, and passing the host's own name validation;
     3. otherwise the config directory itself.
+
+    Step 2's validation is not decoration. The host IGNORES a name it considers invalid and serves
+    on the plain config-dir socket; a resolver that accepted any string would send the probe to a
+    ``sessions/<junk>/`` path that cannot exist, and the doctor would then report "nothing is
+    listening" about a machine with a live host. Deferring to what the host does is the only way
+    that answer stays true.
 
     Returns None when there is nothing to resolve against (no HOME and no XDG override), because a
     guessed path would make a probe answer UNREACHABLE about a machine it never looked at.
@@ -601,8 +623,8 @@ def control_socket_path(env=None):
         if not home:
             return None
         base = os.path.join(home, ".config", "herdr")
-    session = (env.get("HERDR_SESSION") or "").strip()
-    if session and session != "default":
+    session = env.get("HERDR_SESSION") or ""
+    if session != "default" and _SESSION_NAME_RE.match(session) and session not in (".", ".."):
         return os.path.join(base, "sessions", session, "herdr.sock")
     return os.path.join(base, "herdr.sock")
 
@@ -615,11 +637,22 @@ def _speak(socket_path, payload, timeout):
     """
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(timeout)
+    # `timeout` is per-recv, and the two bounds below are what turn that into a bound on the CALL.
+    # Without them a peer that emits one byte every `timeout - 1` seconds is never timed out and
+    # never ends its line, so this loop runs forever and `buf` grows forever — and the callers are
+    # a doctor block and a launch pre-flight, i.e. exactly the places where hanging quietly is the
+    # worst available outcome. Whatever is at the other end of this socket is precisely the thing
+    # the fence exists because we do not trust.
+    deadline = time.monotonic() + max(float(timeout), 0.0) * 2
     try:
         client.connect(socket_path)
         client.sendall(payload.encode())
         buf = b""
         while not buf.endswith(b"\n"):
+            if time.monotonic() > deadline or len(buf) > _MAX_REPLY_BYTES:
+                # A truncated read is not a reply. Say nothing rather than hand a caller half a
+                # line to make a verdict out of — every probe here reads "" as UNREACHABLE.
+                return ""
             chunk = client.recv(65536)
             if not chunk:
                 break

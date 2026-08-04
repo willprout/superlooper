@@ -1345,17 +1345,23 @@ def check_host_state_capture(probe, connect=None):
     if fence != session_host.FENCED:
         return CheckResult(
             name, True,
-            "the control socket at %s did not answer, so this check cannot say whether a worker's "
-            "session id would be captured. Absence of signal is unknown, not fine." % socket_path,
-            warn=True)
+            "the control socket at %s did not answer the fence probe, or answered something that "
+            "is neither a refusal nor a served request, so this check cannot say whether a "
+            "worker's session id would be captured. Absence of signal is unknown, not fine."
+            % socket_path, warn=True)
 
     capture = session_host.state_report_probe(socket_path, timeout=_SOCKET_PROBE_SECONDS,
                                               connect=connect)
     if capture == session_host.ADMITTED:
+        # Says what was PROVEN and not a word more. The probe establishes that the report can cross
+        # the fence; whether the hook that fires it is published and registered is the `host state
+        # hook` block's question, and a green line here that claimed "ids are being captured" would
+        # be answering it without having asked.
         return CheckResult(
             name, True,
             "the host at %s is fenced, and admits the state report (%s) from a tokenless caller — "
-            "so a worker's session id is captured and the host can revive a crashed pane."
+            "so a worker's session-id report can cross the fence on this machine (whether the hook "
+            "that fires it is installed is the `host state hook` block's question)."
             % (socket_path, session_host.STATE_REPORT_METHOD))
     if capture == session_host.REFUSED:
         return CheckResult(

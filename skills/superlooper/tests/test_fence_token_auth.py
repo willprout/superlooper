@@ -436,6 +436,11 @@ def test_the_capture_probe_cannot_write_over_a_real_pane_s_record(sock_dir):
     job is writing a pane's resume record. So its arguments are unusable twice over: the pane id
     cannot resolve, and the agent label is empty — the host's handler checks the pane first and the
     label second, so even a pane id that somehow resolved is refused before anything is written.
+
+    The EMPTY LABEL is the unconditional stop, and the one to keep. The pane id is checked against
+    all three forms the host's ``parse_pane_id`` accepts at the pinned release, but that list is a
+    thing upstream can extend at a version bump, and an id that stopped being unresolvable would
+    fail silently — whereas ``normalize_reported_agent_label("")`` is refused on its own terms.
     """
     path = os.path.join(sock_dir, "h.sock")
     seen = {}
@@ -455,8 +460,14 @@ def test_the_capture_probe_cannot_write_over_a_real_pane_s_record(sock_dir):
     session_host.state_report_probe(path)
 
     params = json.loads(seen["line"])["params"]
-    assert not params["agent"].strip(), params
-    assert ":" not in params["pane_id"] and not params["pane_id"].startswith("p_"), params
+    # The stop that holds whatever upstream does to pane ids.
+    assert params["agent"] == "" and not params["agent"].strip(), params
+    # And the id itself, against every shape the pinned host would try to resolve:
+    # `<ws>:<pane>`, `p_<ws>_<n>` / `p_<n>`, and `<ws>-<n>` (a trailing `rsplit_once('-')`).
+    pane_id = params["pane_id"]
+    assert ":" not in pane_id, pane_id
+    assert not pane_id.startswith("p_"), pane_id
+    assert not pane_id.rsplit("-", 1)[-1].isdigit(), pane_id
     # And it never carries a session id, so there is nothing for a host to record even if it did.
     assert "agent_session_id" not in params, params
 
@@ -485,9 +496,70 @@ def test_a_named_session_keeps_its_own_socket():
         == "/Users/x/.config/herdr/herdr.sock"
 
 
+@pytest.mark.parametrize("name", ["my loop", "a/b", "café", "", " loop", "loop ", ".", "..",
+                                  "x" * 65, "loop\n"])
+def test_a_session_name_the_host_would_refuse_resolves_to_the_plain_socket(name):
+    """Deferring to the host's own rule, because the alternative answer is a confident lie.
+
+    The host IGNORES a name that fails `session::validate_name` and serves on the config-dir
+    socket. A resolver that accepted any string would point at `sessions/<junk>/herdr.sock`, find
+    nothing there, and let the doctor report "nothing is listening" about a machine with a live —
+    possibly capture-broken — host. That is the one wrong answer this whole block exists to avoid.
+    """
+    assert session_host.control_socket_path({"HOME": "/Users/x", "HERDR_SESSION": name}) \
+        == "/Users/x/.config/herdr/herdr.sock"
+
+
+@pytest.mark.parametrize("name", ["loop", "loop-2", "loop_2", "loop.2", "L", "x" * 64])
+def test_a_session_name_the_host_would_honour_gets_its_own_directory(name):
+    assert session_host.control_socket_path({"HOME": "/Users/x", "HERDR_SESSION": name}) \
+        == "/Users/x/.config/herdr/sessions/%s/herdr.sock" % name
+
+
 def test_no_home_and_no_override_resolves_to_nothing_rather_than_a_guess():
     # A guessed path would let a probe answer UNREACHABLE about a machine it never looked at.
     assert session_host.control_socket_path({}) is None
+
+
+# --------------------------------------------------- a probe cannot be held open by its peer
+
+def test_a_peer_that_dribbles_bytes_forever_does_not_hang_the_probe(sock_dir):
+    """The per-recv timeout is not a bound on the CALL, and both callers here are places where
+    hanging quietly is the worst outcome (a doctor block, and the launch pre-flight #326 will add).
+
+    A peer that sends something just often enough resets `settimeout` every time and never ends its
+    line. This asserts the probe gives up anyway — and reports UNREACHABLE, never a verdict built
+    out of half a line.
+    """
+    path = os.path.join(sock_dir, "h.sock")
+    stop = threading.Event()
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+
+    def run():
+        try:
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            while not stop.is_set():          # never a newline, never a close
+                conn.sendall(b'{"id":"x","er')
+                stop.wait(0.05)
+            conn.close()
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        started = __import__("time").monotonic()
+        assert session_host.state_report_probe(path, timeout=0.5) == session_host.UNREACHABLE
+        assert __import__("time").monotonic() - started < 20, "the probe was held open"
+    finally:
+        stop.set()
+        thread.join(timeout=5)
 
 
 # --------------------------------------------------- the deliberate-event check (opt-in, real)
@@ -584,6 +656,26 @@ def test_a_tokenless_connection_to_a_real_patched_server_is_refused(sock_dir):
         smuggled = json.loads(speak({"id": "s", "method": "server.stop", "params": {},
                                      "auth": session_host.STATE_REPORT_METHOD}))
         assert smuggled.get("error", {}).get("code") == "unauthorized", smuggled
+
+        # A REQUEST IS AN OBJECT (fresh-agent review, P1). A struct's derived deserializer also
+        # accepts a positional SEQUENCE, so before the shape check was added an array filled
+        # (id, auth, method) by position and walked through the allowance — measured against this
+        # very binary, where it reached the request parse and came back `invalid_request` instead
+        # of `unauthorized`. That difference is itself the leak: it tells a caller holding no token
+        # which method is open. Every one of these must be refused in the SAME words as everything
+        # else, and the assertion is on the code for exactly that reason.
+        for line in ('["1",null,"%s"]' % session_host.STATE_REPORT_METHOD,
+                     '["1","%s","server.stop"]' % token,
+                     '["1","%s"]' % token,
+                     '"%s"' % session_host.STATE_REPORT_METHOD,
+                     'null', '7'):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(5.0)
+            client.connect(sock)
+            client.sendall(line.encode() + b"\n")
+            reply = json.loads(client.recv(65536).decode())
+            client.close()
+            assert reply.get("error", {}).get("code") == "unauthorized", (line, reply)
 
         # ---- the pane grant, which is the other load-bearing half of the patch ----------------
         # Without this, a re-apply could silently drop or move the `pane.rs` hunk and everything
