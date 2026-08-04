@@ -1,7 +1,7 @@
 """runner.py — the deterministic ~15s tick shell. Everything decision-shaped lives in
 actions.decide (tested in test_actions.py); these tests pin what the SHELL must guarantee:
 
-  * the env contract launch-session.sh depends on (SL_RUN_ROOT/SL_REPO/SL_PANE/SL_DEV_BRANCH/
+  * the env contract launch-session.py depends on (SL_RUN_ROOT/SL_REPO/SL_PANE/SL_DEV_BRANCH/
     SL_MODEL/SL_EFFORT/SL_AGENT) on every worker launch, plus the per-issue model/effort
     override (label > config > default; durable across a cold restart);
   * executor mechanics: ordered gh mutations, loopstate stamps, marker hygiene, fail-and-retry
@@ -528,7 +528,7 @@ def test_launch_env_contract_and_registration(rig):
     out = rig.r._execute(_launch_action(), NOW)
     assert out == "ok"
     call = rig.calls[-1]
-    assert call["args"][0].endswith("launch-session.sh") and call["args"][1] == "i101"
+    assert call["args"][0].endswith("launch-session.py") and call["args"][1] == "i101"
     env = call["env"]
     assert env["SL_RUN_ROOT"] == str(rig.home)
     assert env["SL_REPO"] == str(rig.repo)
@@ -584,7 +584,7 @@ def test_launch_env_carries_explicit_codex_agent_without_changing_protocol(rig):
     out = rig.r._execute(_launch_action(), NOW)
     assert out == "ok"
     call = rig.calls[-1]
-    assert call["args"][0].endswith("launch-session.sh") and call["args"][1] == "i101"
+    assert call["args"][0].endswith("launch-session.py") and call["args"][1] == "i101"
     assert call["env"]["SL_AGENT"] == "codex"
     assert call["env"]["SL_MODEL"] == ""
     assert call["env"]["SL_EFFORT"] == ""
@@ -601,7 +601,7 @@ def test_codex_usage_is_deferred_and_does_not_call_claude_usage(rig):
 
     rig.r.tick(now=NOW)
 
-    assert any(c["args"][0].endswith("launch-session.sh") and c["args"][1] == "i101"
+    assert any(c["args"][0].endswith("launch-session.py") and c["args"][1] == "i101"
                for c in rig.calls)
     usage = rig.r.usage_view()
     assert usage["auth_status"] == "ok"
@@ -843,12 +843,12 @@ def test_channel_fault_launch_charges_no_per_issue_cap(rig):
 # --------------------------- launch anchor liveness (#24) ---------------------------
 
 def test_missing_base_branch_launch_records_the_cause_and_skips_the_streak(rig):
-    # issue #28: launch-session.sh exits 3 when the worktree base branch is missing. The runner must
+    # issue #28: launch-session.py exits 3 when the worktree base branch is missing. The runner must
     # stamp launch_error="base_missing" (so the park memo names the branch) and must NOT feed this to
     # the systemic-anchor streak — a missing base is a per-repo config fault, not a dead cmux anchor.
     rig.r.tick(now=NOW)
     rig.calls.clear()
-    rig.rc_queue.append(3)                             # launch-session.sh: worktree base missing
+    rig.rc_queue.append(3)                             # launch-session.py: worktree base missing
     out = rig.r._execute(_launch_action(), NOW)
     assert out != "ok"
     ist = issue_state(rig, "i101")
@@ -993,8 +993,8 @@ def test_tick_holds_launches_and_alerts_when_the_anchor_is_gone(rig):
     assert alert["reasons"] == ["launch_anchor_down"]
     assert issue_state(rig, "i101") is None            # never launched -> no loopstate stamp
     assert len(mutations(rig)) == before               # agent-ready never moved to in-progress
-    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
-    assert launches == []                              # launch-session.sh never even invoked
+    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.py")]
+    assert launches == []                              # launch-session.py never even invoked
 
 
 def test_tick_launches_normally_when_the_anchor_is_healthy(rig):
@@ -1105,7 +1105,7 @@ def test_a_failed_canary_via_base_missing_charges_no_cap_and_re_spaces_the_clock
     rig.r._launch_fail_ids = {"i101", "i102"}
     rig.r._launch_fail_at = NOW - 500
     rig.calls.clear()
-    rig.rc_queue.append(3)                             # launch-session.sh: worktree base missing
+    rig.rc_queue.append(3)                             # launch-session.py: worktree base missing
     out = rig.r._execute(dict(_launch_action(), canary=True), NOW)
     assert out != "ok"
     assert issue_state(rig, "i101")["launch_failures"] == 1     # NO per-issue cap charged to a probe
@@ -1126,8 +1126,8 @@ def test_a_canary_whose_brief_fails_still_re_spaces_the_retry_clock(rig, monkeyp
     out = rig.r._execute(dict(_launch_action(), canary=True), NOW)
     assert out.startswith("brief failed")
     assert rig.r._launch_fail_at == NOW                         # clock re-spaced despite the brief error
-    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
-    assert launches == []                                       # never even reached launch-session.sh
+    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.py")]
+    assert launches == []                                       # never even reached launch-session.py
 
 
 def test_launch_recovered_executor_is_wired_and_returns_its_reason(rig):
@@ -1143,7 +1143,7 @@ def test_systemic_hold_re_arms_via_canary_end_to_end(rig):
     # launching in priority order.
     # Soft affinity so the resume is a clean parallel launch, not an affinity-serialized dribble.
     rig.r.config["affinity"] = "soft"
-    launches = lambda: [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
+    launches = lambda: [c for c in rig.calls if c["args"][0].endswith("launch-session.py")]
 
     # ---- trip: two DISTINCT issues fail delivery back-to-back (the breaker's own signal) ----
     rig.r._poll_github(NOW)                            # populate the queue WITHOUT auto-launching
@@ -1158,7 +1158,7 @@ def test_systemic_hold_re_arms_via_canary_end_to_end(rig):
     # ---- hold: a tick sees the streak, alerts once, holds every launch, parks nothing ----
     rig.calls.clear()
     rig.r.tick(now=NOW + 15)                           # interval (300s) not elapsed -> no canary
-    assert launches() == []                            # held: launch-session.sh not invoked
+    assert launches() == []                            # held: launch-session.py not invoked
     alert = json.loads((rig.home / "state" / "ALERT").read_text())
     assert alert["reasons"] == ["launch_systemic_failure"]
     assert [i for i in _all_issue_states(rig).values() if i.get("status") == "parked"] == []
@@ -1765,7 +1765,7 @@ def test_recover_exited_relaunches(rig):
     seed_issue(rig, "i5", status="running", branch="sl/i5-x")
     out = rig.r._execute({"act": "recover", "id": "i5", "tier": "exited"}, NOW)
     assert out == "ok"
-    assert rig.calls[-1]["args"][0].endswith("launch-session.sh")
+    assert rig.calls[-1]["args"][0].endswith("launch-session.py")
     assert rig.calls[-1]["args"][1] == "i5"
     assert issue_state(rig, "i5")["status"] == "running"
 
@@ -2394,7 +2394,7 @@ def test_resolve_conflict_launches_in_the_prs_own_branch(rig):
     assert "force" not in [w for w in b.lower().split() if w == "force"] or "never force" in b.lower()
     close_idx = next((i for i, c in enumerate(rig.calls) if "close-surface" in c["args"]), None)
     launch_idx = next((i for i, c in enumerate(rig.calls)
-                       if c["args"][0].endswith("launch-session.sh") and c["args"][1] == "i123"), None)
+                       if c["args"][0].endswith("launch-session.py") and c["args"][1] == "i123"), None)
     assert close_idx is not None and launch_idx is not None and close_idx < launch_idx
     assert not (rig.home / "state" / "worker.i123.lock").exists()     # singleton freed for the relaunch
     ist = issue_state(rig, "i123")
@@ -2582,7 +2582,7 @@ def test_reapprove_clears_stale_interview_mail_and_ack_but_keeps_receipts(rig):
     # episode-1 marker still on the thread, the re-run would close without EVER getting its own
     # interview: the exact #215 incident, one episode removed. Reapprove must clear pending mail
     # (and the stale ack, cheap symmetry) while receipts — the history of what WAS delivered —
-    # stay, mirroring launch-session.sh's own rule.
+    # stay, mirroring launch-session.py's own rule.
     seed_issue(rig, "i7", status="parked", type="investigate", branch="sl/i7-x",
                exit_asks=2, exit_nonce="exit-9")
     mail_dir = rig.home / "state" / "mail"
@@ -2814,7 +2814,7 @@ def test_unknown_action_is_journaled_not_fatal(rig):
 
 def test_reapprove_executor_zeroes_counters_rereleases_and_journals_the_old_ones(rig):
     """A fresh agent-ready on a parked issue is a fresh cap: every attempt counter zeroes (INCLUDING
-    launches — launch-session.sh derives retries from it, so a non-zero launches would restore the
+    launches — launch-session.py derives retries from it, so a non-zero launches would restore the
     retry count on the next launch and re-park at cap), status returns to ready, and the OLD
     counters are journaled so the issue's real prior cost is never lost."""
     seed_issue(rig, "i5", status="parked", launches=3, retries=2, conflicts=1,
@@ -2869,7 +2869,7 @@ def test_reapprove_executor_wipes_stale_markers_and_fields_for_a_clean_launch(ri
 # ---------------- re-approval rebuilds on a genuinely FRESH branch (issue #177) -------------------
 # The reclaim/tidy docstrings justified pruning a parked lane's worktree with "re-approval rebuilds
 # from the issue on a fresh branch". It was FALSE: the reset never touched `branch`, _launch_branch
-# prefers the stamp, and launch-session.sh's fallback re-ATTACHES the existing branch — so the
+# prefers the stamp, and launch-session.py's fallback re-ATTACHES the existing branch — so the
 # "clean slate" resumed on the parked episode's commits, its still-open PR was rediscovered by
 # pr_for_branch, and `gh pr create` would refuse a second PR on the same head.
 
@@ -3364,7 +3364,7 @@ def test_display_probe_is_read_only_pmset_systemstate():
 
 def test_tick_holds_launches_while_the_display_sleeps(rig):
     # End to end at the shell (mirror of the dead-anchor tick test): a tick with launch demand whose
-    # per-tick display probe reads ASLEEP holds every launch — launch-session.sh is never even
+    # per-tick display probe reads ASLEEP holds every launch — launch-session.py is never even
     # invoked, no tab is created, agent-ready is never moved, and NO alert is raised (a sleeping
     # display is normal, not a fault). The held queue resumes automatically when the probe reads awake.
     rig.r._display_asleep = lambda: True
@@ -3373,8 +3373,8 @@ def test_tick_holds_launches_while_the_display_sleeps(rig):
     assert not (rig.home / "state" / "ALERT").exists()     # a sleeping display raises no alert
     assert issue_state(rig, "i101") is None                # never launched -> no loopstate stamp
     assert len(mutations(rig)) == before                   # agent-ready never moved to in-progress
-    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.sh")]
-    assert launches == []                                  # launch-session.sh never even invoked
+    launches = [c for c in rig.calls if c["args"][0].endswith("launch-session.py")]
+    assert launches == []                                  # launch-session.py never even invoked
 
 
 # --------------------------- self-pane auto-detection (owner request 2026-07-06) -----------------
@@ -4763,7 +4763,7 @@ def test_the_drain_keeps_waiting_on_an_unknown_lane(rig, monkeypatch):
 
 
 def test_regenerate_aborts_untouched_rather_than_rebuild_on_a_stale_worktree(rig, monkeypatch):
-    """P0: launch-session.sh only creates the worktree `if [ ! -d "$WT" ]`, so a surviving stale
+    """P0: launch-session.py only creates the worktree `if [ ! -d "$WT" ]`, so a surviving stale
     worktree is not a failed relaunch — it is a SILENT reuse. If regenerate advanced its state
     after a declined prune, the rebuild would run on the OLD conflicted branch while its brief
     named the new one, pushing commits onto a superseded PR. So: touch nothing, retry next tick."""
@@ -4826,7 +4826,7 @@ def test_reclaim_never_stalls_the_tick_waiting_on_a_live_worker(rig, monkeypatch
 
 
 def test_launch_closes_a_stale_session_before_relaunching(rig):
-    """End-to-end: _exec_launch closes the id's stale pane BEFORE invoking launch-session.sh, and
+    """End-to-end: _exec_launch closes the id's stale pane BEFORE invoking launch-session.py, and
     clears the stale singleton lock — so a conflict-regenerate / retry of an id whose old session is
     still alive can actually deliver."""
     rig.r.tick(now=NOW)                                  # i101 lands in the parsed view
@@ -4838,7 +4838,7 @@ def test_launch_closes_a_stale_session_before_relaunching(rig):
     assert out == "ok"
     close_idx = next((i for i, c in enumerate(rig.calls) if "close-surface" in c["args"]), None)
     launch_idx = next((i for i, c in enumerate(rig.calls)
-                       if c["args"][0].endswith("launch-session.sh")), None)
+                       if c["args"][0].endswith("launch-session.py")), None)
     assert close_idx is not None and launch_idx is not None
     assert close_idx < launch_idx                        # close the old session BEFORE relaunching
     assert "OLD-SURFACE" in rig.calls[close_idx]["args"]
@@ -5641,7 +5641,7 @@ def test_drain_guards_a_parked_lane_but_still_reclaims_a_merged_one(rig):
 # ============ the one launch-eligibility gate, end to end (issue #150 / D8) ============
 # Fixture i103 declares `blocked-by: #101, #102` in its Loop metadata and neither is closed, so no
 # session may start for it BY ANY PATH. These drive the real Runner (real decide, real executors,
-# recording run_script) and assert on launch-session.sh itself — the thing that starts a session —
+# recording run_script) and assert on launch-session.py itself — the thing that starts a session —
 # rather than on decide's action list.
 
 def _blocked_and_exited(rig, now):
@@ -5654,7 +5654,7 @@ def _blocked_and_exited(rig, now):
 
 def _launches_of(rig, iid):
     return [c for c in rig.calls
-            if c["args"][0].endswith("launch-session.sh") and iid in c["args"]]
+            if c["args"][0].endswith("launch-session.py") and iid in c["args"]]
 
 
 def test_crash_recovery_never_launches_a_session_past_an_open_blocker(rig):
@@ -6190,7 +6190,7 @@ def test_a_failed_launch_journals_the_dead_anchor_not_a_bare_code(rig):
 
 
 def test_rc1_and_rc2_launch_failures_journal_different_reasons(rig):
-    """The distinction launch-session.sh draws and the journal used to flatten to
+    """The distinction launch-session.py draws and the journal used to flatten to
     'delivery not verified'."""
     rig.r.tick(now=NOW)
     seen = {}
@@ -6521,7 +6521,7 @@ def test_an_approved_issue_with_no_type_label_is_journaled_with_its_fix(rig):
     assert "type:build" in recs[0]["outcome"] and "type:investigate" in recs[0]["outcome"]
     # ...and it is genuinely not launched
     assert [c for c in rig.calls
-            if c["args"][0].endswith("launch-session.sh") and "i104" in c["args"]] == []
+            if c["args"][0].endswith("launch-session.py") and "i104" in c["args"]] == []
 
 
 def test_the_refusal_is_stamped_in_loopstate_and_not_re_journaled_every_tick(rig):
@@ -6594,7 +6594,7 @@ def test_github_being_unreachable_holds_rather_than_parking_with_a_relogin_memo(
 
 
 def test_the_worker_env_never_inherits_a_second_hand_gh_identity(rig):
-    # #299: launch-session.sh NAMES SL_EXPECT_GH_LOGIN in every worker command, so a runner started
+    # #299: launch-session.py NAMES SL_EXPECT_GH_LOGIN in every worker command, so a runner started
     # from inside a worker or debugger pane would inherit that session's value. Pinned EMPTY here so
     # the launcher always resolves the loop's identity itself rather than trusting a stale answer.
     assert rig.r._worker_env("i101")["SL_EXPECT_GH_LOGIN"] == ""

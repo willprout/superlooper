@@ -264,16 +264,23 @@ def test_failed_launch_journals_and_does_not_mark_launched(tmp_path):
     assert st["episode"]["launch_attempts"] == 1
 
 
-def test_no_resolvable_pane_is_a_loud_launch_failure_not_a_crash(tmp_path):
+def test_an_unattended_repair_no_longer_needs_a_pane_to_launch_into(tmp_path):
+    """Issue #308 removed the pane gate, and this is the case it was removed FOR.
+
+    The old launcher had to be told which cmux pane to open a tab in, so a watchdog check that
+    could not resolve one refused up front with `no_pane`. Under a login-item runner (issue #306)
+    none resolves — which would have turned every unattended repair into a refusal at exactly the
+    moment repair is needed. The session host creates a workspace against its own server; there is
+    no anchor to find, so the launch simply proceeds."""
     rig = _Rig(tmp_path)
     rig.heartbeat(3600)
     rig.episode(age_seconds=3600)                    # no anchor file, no SL_PANE
     r = rig.run()
     assert r.returncode == 0, r.stderr
-    assert rig.launch_calls() == []                  # nothing to launch INTO — script never ran
+    calls = rig.launch_calls()
+    assert calls, "the repair must launch with no pane to launch into"
     recs = rig.wjournal()
-    assert [x["outcome"] for x in recs] == ["launch_failed"]
-    assert recs[0]["rc"] == "no_pane"
+    assert [x["outcome"] for x in recs] == ["launched"]
 
 
 def test_kill_switch_observes_journals_and_launches_nothing(tmp_path):

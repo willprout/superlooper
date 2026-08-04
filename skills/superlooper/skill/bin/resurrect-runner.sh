@@ -23,13 +23,13 @@
 # state it writes is the transient launch-shim command file; everything else is the runner's own.
 set -euo pipefail
 
-# ---- Parse (mirrors launch-session.sh --cwd) ----------------------------------------------------
+# ---- Parse (mirrors the session launcher's --cwd) ------------------------------------------------
 [ "${1:-}" = "--cwd" ] || { echo "usage: resurrect-runner.sh --cwd <repo> <r-id>" >&2; exit 64; }
 CWD="${2:?usage: resurrect-runner.sh --cwd <repo> <r-id>}"
 ID_IN="${3:?usage: resurrect-runner.sh --cwd <repo> <r-id>}"
-# Runner-resurrection ids are r<N> ONLY — the symmetric contract to launch-session.sh's d<N>
+# Runner-resurrection ids are r<N> ONLY — the symmetric contract to the launcher's d<N>
 # --cwd ids, so a stray issue/debugger id can never route a session launch through the runner path.
-# ANCHORED (^r[0-9]+$), matching launch-session.sh: a `case` glob of `r[0-9]*` accepts everything
+# ANCHORED (^r[0-9]+$), matching the launcher: a `case` glob of `r[0-9]*` accepts everything
 # trailing the first digit ("r1; touch ..."), which today is harmless only because $ID reaches
 # nothing but quoted argv. Refuse at the door rather than rest on that downstream accident.
 if [[ "$ID_IN" =~ ^r[0-9]+$ ]]; then
@@ -64,7 +64,7 @@ UUID_RE='[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]
 LAUNCH_DIR="${SL_LAUNCH_DIR:-$HOME/.superlooper/launch}"
 mkdir -p "$LAUNCH_DIR"; chmod 700 "$LAUNCH_DIR" 2>/dev/null || true
 # Mark a launch IN-FLIGHT *before* creating the surface so the fast-booting new shell sees a fresh
-# .active marker and WAITS for its command file (closes the shell-boot race — launch-session.sh's
+# .active marker and WAITS for its command file (closes the shell-boot race — the cmux launcher's
 # lesson). The per-tab command file is written just after new-surface returns.
 : > "$LAUNCH_DIR/.active"
 

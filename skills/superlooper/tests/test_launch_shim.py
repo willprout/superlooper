@@ -9,9 +9,11 @@ In every OTHER shell it must be an instant no-op: a hand-opened terminal, an unr
 the operator's own herdr window are untouched. These run the real shim under zsh with a controlled
 environment and then ask the shell what it is actually holding.
 
-(This file replaced the cmux command-file suite wholesale. That mechanism existed because cmux had
-no keystroke-free "run a command in a surface" API; the host's `agent start` types the verb itself,
-so there is no command to drop, no marker directory, and no boot race to lose.)
+The shim has a SECOND, independent half, covered at the bottom of this file: the cmux command-file
+mechanism, which now has exactly one writer left — bin/resurrect-runner.sh, the watchdog's restart
+of a provably-gone runner. Sessions no longer need it (the host starts the agent itself, so there
+is no command to drop and no boot race to lose), but the runner's own home is issue #306's and the
+cmux retirement is #311's, so that half stays and is tested as what it now is.
 """
 import os
 import shutil
@@ -175,3 +177,75 @@ def test_re_sourcing_is_idempotent(tmp_path):
                 env=_pane_env(tmp_path, start))
     assert r.returncode == 0, r.stderr
     assert count.read_text() == "x", "the handoff runs exactly once, however often it is armed"
+
+
+# --------------------------------------------------------------------------- the runner's own half
+
+def test_the_command_file_half_still_serves_the_runner_resurrection(tmp_path):
+    """bin/resurrect-runner.sh is the ONE remaining writer of a dropped command file (issue #208):
+    it restarts a provably-gone runner in its recorded cmux pane, which is not a session launch and
+    not this issue's to retire. It goes when cmux does."""
+    d = tmp_path / "launch"
+    d.mkdir()
+    marker = tmp_path / "ran.S1"
+    (d / "S1.cmd").write_text(f"touch '{marker}'")
+    r, _ = _run(f"source '{SHIM}'",
+                env={"SL_LAUNCH_DIR": str(d), "CMUX_SURFACE_ID": "S1"})
+    assert r.returncode == 0, r.stderr
+    assert marker.exists(), "the shim must run the command file for its own surface"
+    assert not (d / "S1.cmd").exists(), "the command file is claimed, not left behind"
+
+
+def test_the_command_half_ignores_another_surfaces_command(tmp_path):
+    d = tmp_path / "launch"
+    d.mkdir()
+    marker = tmp_path / "ran.other"
+    (d / "OTHER.cmd").write_text(f"touch '{marker}'")
+    r, elapsed = _run(f"source '{SHIM}'",
+                      env={"SL_LAUNCH_DIR": str(d), "CMUX_SURFACE_ID": "S6"})
+    assert r.returncode == 0
+    assert not marker.exists()
+    assert (d / "OTHER.cmd").exists(), "another surface's command is left untouched"
+    assert elapsed < 3
+
+
+def test_the_command_half_claims_exactly_once_across_a_double_source(tmp_path):
+    d = tmp_path / "launch"
+    d.mkdir()
+    count = tmp_path / "count"
+    (d / "S7.cmd").write_text(f"printf x >> '{count}'")
+    r, _ = _run(f"source '{SHIM}'; source '{SHIM}'",
+                env={"SL_LAUNCH_DIR": str(d), "CMUX_SURFACE_ID": "S7"})
+    assert r.returncode == 0, r.stderr
+    assert count.read_text() == "x"
+
+
+def test_a_stale_active_marker_never_delays_a_hand_opened_terminal(tmp_path):
+    d = tmp_path / "launch"
+    d.mkdir()
+    active = d / ".active"
+    active.write_text("")
+    old = time.time() - 600
+    os.utime(active, (old, old))
+    r, elapsed = _run(f"source '{SHIM}'",
+                      env={"SL_LAUNCH_DIR": str(d), "CMUX_SURFACE_ID": "S3",
+                           "SL_SHIM_WAIT_TICKS": "50"})
+    assert r.returncode == 0
+    assert elapsed < 3, "a stale active marker must be ignored"
+
+
+def test_the_two_halves_are_independent(tmp_path):
+    """A session pane carries no CMUX_SURFACE_ID and a resurrection tab carries none of the SL_*
+    triple, so neither half can ever fire on the other's case."""
+    marker = tmp_path / "handed"
+    start = _start_session(tmp_path, marker)
+    d = tmp_path / "launch"
+    d.mkdir()
+    ran = tmp_path / "ran"
+    (d / "S1.cmd").write_text(f"touch '{ran}'")
+    env = _pane_env(tmp_path, start)
+    env["SL_LAUNCH_DIR"] = str(d)
+    r, _ = _run(f"source '{SHIM}'; claude", env=env)          # a session pane: no surface id
+    assert r.returncode == 0, r.stderr
+    assert marker.read_text() == "i308"
+    assert not ran.exists(), "the session pane must not claim a resurrection command"

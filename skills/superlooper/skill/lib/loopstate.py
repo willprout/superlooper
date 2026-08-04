@@ -46,7 +46,7 @@ LOCK_STALE_SECONDS = 120
 VALID = ["ready", "running", "awaiting_answer", "frozen", "exited",
          "gating", "holding", "merged", "parked", "needs_william", "bounced"]
 
-# One issue's initial state TEMPLATE. `launches` is stamped mechanically by launch-session.sh at
+# One issue's initial state TEMPLATE. `launches` is stamped mechanically by the launcher at
 # the moment a worker's delivery is VERIFIED (the only honest point); retries = launches - 1.
 # `pr` caches the discovered PR number; `declared_touches` is the areas the issue claims (for
 # anti-affinity vs in-flight lanes); `requeue_front` re-front-queues a conflict-regenerated issue.

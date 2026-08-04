@@ -2359,7 +2359,7 @@ def _debugger_shim_run(cfg, repo, home, pane, sid, attended=False):
     ``pane`` is accepted and IGNORED. The host has no launch anchor: a session is created by the
     wrapper against the server, not born inside some tab whose id the caller had to find first. The
     parameter stays so the watchdog's own "can I launch at all?" reporting keeps its shape until
-    the dashboard/cmux retirement (#310) settles what replaces it.
+    the cmux retirement settles what replaces it.
 
     ``attended`` is the ONE thing the two callers genuinely disagree about: the owner tap has a
     person at the keyboard and its brief invites them to ask, the watchdog's does not. It rides in

@@ -818,3 +818,52 @@ def test_kill_reads_the_live_pane_before_closing_it():
     fake.kill = kill
     _host(fake).kill(_session(shell_pid=4242))
     assert ("term", 999) in fake.signals, "the FRESH pid is the one we signal"
+
+
+# --------------------------------------------------------------------------- a pane still booting
+
+def test_a_pane_that_is_still_booting_is_waited_for_not_failed():
+    """Measured against a live host while wiring the spawners onto this doorway (#308).
+
+    `workspace create` returns as soon as the workspace exists, but the host will only start an
+    agent in "an available shell" — and the pane's login shell (which sources the operator's rc
+    files) is still coming up. Without this wait a perfectly healthy machine produces a flaky
+    launch, which is exactly the class this module exists to remove."""
+    busy = (1, "", _err("agent_pane_busy", "agent target pane w1:p1 is not an available shell"))
+    fake = FakeHerdr(
+        script={("workspace", "create"): (0, _ws_created(), ""),
+                ("agent", "start"): [busy, busy, (0, _agent(kind="agent_started"), "")],
+                ("agent", "get"): (0, _agent(), ""),
+                ("pane", "process-info"): (0, _process_info(), "")},
+        alive={4242, 4243}, children={4242: [4243]})
+    session = _host(fake).spawn("i304", cwd="/tmp/wt")
+    assert session.pane == "w1:p1"
+    starts = [c for c in fake.calls if c[1:3] == ["agent", "start"]]
+    assert len(starts) == 3, "it retried the SAME pane, and only as often as it had to"
+    assert all("--pane" in c for c in starts)
+    assert not [c for c in fake.calls if c[1:3] == ["workspace", "close"]], \
+        "a still-booting pane is not rolled back — re-creating it would just make another"
+
+
+def test_a_pane_that_never_becomes_ready_is_a_refused_spawn():
+    busy = (1, "", _err("agent_pane_busy", "not an available shell"))
+    fake = FakeHerdr(
+        script={("workspace", "create"): (0, _ws_created(), ""),
+                ("agent", "start"): [busy] * 30,
+                ("workspace", "close"): (0, _ok({"type": "ok"}), "")})
+    with pytest.raises(session_host.SpawnRefused):
+        _host(fake).spawn("i304", cwd="/tmp/wt")
+    starts = [c for c in fake.calls if c[1:3] == ["agent", "start"]]
+    assert len(starts) == session_host._START_RETRIES, "bounded — it does not retry forever"
+    assert [c for c in fake.calls if c[1:3] == ["workspace", "close"]], "and it rolls back"
+
+
+def test_only_a_busy_pane_is_waited_for():
+    """Retrying a real failure would turn a diagnosable fault into a slow one."""
+    fake = FakeHerdr(
+        script={("workspace", "create"): (0, _ws_created(), ""),
+                ("agent", "start"): (1, "", _err("agent_start_failed", "no such kind")),
+                ("workspace", "close"): (0, _ok({"type": "ok"}), "")})
+    with pytest.raises(session_host.SpawnRefused):
+        _host(fake).spawn("i304", cwd="/tmp/wt")
+    assert len([c for c in fake.calls if c[1:3] == ["agent", "start"]]) == 1

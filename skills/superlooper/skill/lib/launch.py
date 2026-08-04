@@ -104,6 +104,7 @@ _HOST_ENV_PREFIX = "HERDR"
 
 _GH_PROBE_SECONDS = 10          # a black-holed network must not eat the caller's whole timeout
 _START_TIMEOUT_MS = 45000       # the pane's floor (a bounded gh read) runs before the agent does
+
 _VERIFY_SECONDS = 30            # the floor stamps its sentinel BEFORE the agent starts, so this
 _VERIFY_PAUSE = 0.25            # window is nearly always already satisfied when spawn returns
 _MARKER_STALE_MINUTES = 5       # only genuinely abandoned self-refusal markers are swept

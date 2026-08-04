@@ -31,6 +31,17 @@
 # operator types in that pane afterwards is the real binary and not a second worker. The worker
 # singleton inside start-session.sh is the backstop underneath it.
 
+# ------------------------------------------------------------------------------------------------
+# The shim has TWO independent halves, and each is a strict no-op for the other's case.
+#
+#   1. `_superlooper_launch_shim`  — the SESSION handoff above (issue #308), used by every worker
+#      and every sl-debugger, on the session host.
+#   2. `_superlooper_command_shim` — the cmux command-file mechanism below, which now has exactly
+#      ONE remaining writer: bin/resurrect-runner.sh, the watchdog's restart of a provably-gone
+#      runner in its recorded cmux pane. It is not a session launch and it is not this issue's to
+#      retire; it goes when cmux does (the runner's own home is issue #306, the cutover #311).
+# ------------------------------------------------------------------------------------------------
+
 _superlooper_launch_shim() {
   emulate -L zsh                                        # local options; don't disturb the user shell
 
@@ -75,4 +86,48 @@ _superlooper_launch_shim() {
   functions[$agent]="unfunction $agent; command ${(q)SL_START_SESSION} ${(q)SL_ISSUE_ID}"
 }
 
+
+_superlooper_command_shim() {
+  # THE RUNNER'S OWN RESURRECTION, and nothing else (issue #208). A dropped command file keyed by
+  # this tab's surface uuid, run by the fresh shell cmux spawns at surface creation.
+  #
+  # WHY A DROPPED FILE (run-20260626-1656 post-mortem, RC6): cmux exposes NO keystroke-free "run a
+  # command in a surface" API — only send_text / send_key — and macOS GATES that keystroke delivery
+  # to a fresh or background tab while the display sleeps, which is exactly the 1am scenario a
+  # runner resurrection exists for. The shell cmux spawns, however, runs as a normal child process
+  # regardless of display state. Sessions no longer need any of this (the host runs the agent
+  # itself), so this half survives for one caller and retires with cmux.
+  emulate -L zsh
+  [[ -n "${CMUX_SURFACE_ID:-}" ]] || return 0           # only inside a cmux terminal
+  local dir="${SL_LAUNCH_DIR:-$HOME/.superlooper/launch}"
+  local cmd="$dir/${CMUX_SURFACE_ID}.cmd"
+
+  if [[ ! -f "$cmd" ]]; then
+    # No command for this tab. Return INSTANTLY unless a launch is actively in flight, so a
+    # hand-opened terminal is never delayed. A fresh `.active` marker signals one; the command file
+    # is written within milliseconds of the surface, but this shell can win the race to here.
+    local active="$dir/.active"
+    [[ -f "$active" ]] || return 0
+    local now mt
+    now=$(command date +%s 2>/dev/null) || return 0
+    mt=$(command stat -f %m "$active" 2>/dev/null) || return 0
+    (( now - mt <= 60 )) || return 0                    # stale marker => no launch really running
+    local i=0 max="${SL_SHIM_WAIT_TICKS:-25}"           # 25 * 0.2s = 5s ceiling
+    while [[ ! -f "$cmd" && i -lt max ]]; do command sleep 0.2; (( i++ )); done
+    [[ -f "$cmd" ]] || return 0
+  fi
+
+  # Claim atomically (so a re-source can never double-launch), read, then run. NOT `exec`, for the
+  # same reason as the handoff above: the tab drops back to an interactive shell afterwards. The
+  # command was built with bash %q quoting, so it runs under bash.
+  local claimed="$cmd.claimed.$$"
+  command mv -f -- "$cmd" "$claimed" 2>/dev/null || return 0   # lost the race to another claimer
+  local script
+  script="$(command cat -- "$claimed" 2>/dev/null)"
+  command rm -f -- "$claimed" 2>/dev/null
+  [[ -n "$script" ]] || return 0
+  command bash -c "$script"
+}
+
 _superlooper_launch_shim
+_superlooper_command_shim

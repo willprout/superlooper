@@ -96,7 +96,7 @@ def _history_lines(rig):
 
 
 def _launch_calls(rig):
-    return [c for c in rig.calls if c["args"] and c["args"][0].endswith("launch-session.sh")]
+    return [c for c in rig.calls if c["args"] and c["args"][0].endswith("launch-session.py")]
 
 
 # --------------------------- the cached probe ---------------------------

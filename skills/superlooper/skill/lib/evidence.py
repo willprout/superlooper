@@ -24,7 +24,7 @@ Three rules hold it together:
     the size and strips control bytes; every entry point runs through it, and the park memo bounds
     a second time (the same belt-and-suspenders `_launch_stderr_memo` uses for issue #40).
   * READ THE TEXT, NOT JUST THE CODE. An rc is a category; the captured text is the cause.
-    launch-session.sh exits 1 for five different faults, so rc alone can never name one. The
+    the launcher exits 1 for five different faults, so rc alone can never name one. The
     stderr patterns below refine an ALREADY-FAILED outcome — they never manufacture a failure, so
     a stray substring costs a mis-worded reason, never a false park.
 """
@@ -135,7 +135,7 @@ _NUDGE_RC = {
 _RC_TABLES = {"launch": _LAUNCH_RC, "nudge": _NUDGE_RC}
 
 # ---- what the captured TEXT means --------------------------------------------------------------
-# Checked BEFORE the rc-only reading, because launch-session.sh exits 1 for five distinct faults
+# Checked BEFORE the rc-only reading, because the launcher exits 1 for five distinct faults
 # and only its stderr says which. Matched case-insensitively against the real strings the tools
 # emit (cmux's own error text, and the scripts' own `echo ... >&2` diagnostics). Order is
 # significant: first match wins, so the most specific patterns lead.
@@ -202,7 +202,7 @@ _LAUNCH_TEXT = (
       "the positive gh-auth assert refused the flight: `gh` did not answer as the login this loop "
       "runs as from inside the session's own environment, so the session could not have read its "
       "issue or posted any evidence. Re-login with `gh auth login --hostname github.com`")),
-    # THE storm (2026-07-09). cmux exits 0 while printing this to stdout, so launch-session.sh's
+    # THE storm (2026-07-09). cmux exited 0 while printing this to stdout, so the cmux launcher's
     # surface-parse guard echoes the whole output to stderr — which is how the cause reaches us.
     (("not_found", "pane or workspace not found", "workspace not found", "pane not found"),
      ("anchor_workspace_missing",
@@ -279,7 +279,7 @@ def is_channel_fault(rec):
     per-issue fault), so a genuinely novel exit code can never silently freeze the whole loop. This is
     NOT a blanket 'only these reasons ever hold' guarantee, though: `launch_failed_before_delivery` is
     the reason `_classify` returns for ANY rc=1 whose stderr matches no per-issue pattern, and it IS a
-    channel reason — because launch-session.sh defines rc=1 as 'aborted before any tab could host a
+    channel reason — because the launcher defines rc=1 as 'aborted before any pane could host a
     worker; nothing about the session itself is at fault', and its per-issue rc=1 causes
     (worktree_create_failed, identity_invalid, brief_missing) each echo a distinguishing stderr line.
     So the contract the classifier relies on is the launcher's: a per-issue fault must carry either its

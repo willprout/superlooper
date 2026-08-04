@@ -198,7 +198,7 @@ CANARY_RETRY_SECONDS = 300
 QUESTION_CAP = 2
 MERGE_REFUSAL_CAP = 2              # gate-green PR's merge refused this many ticks -> park (#27)
 # A rebuild (reapprove / conflict-regenerate) that cannot clear its worktree ABORTS, because
-# launch-session.sh only creates a worktree `if [ ! -d "$WT" ]` and would otherwise silently reuse
+# the launcher only creates a worktree when none exists, and would otherwise silently reuse
 # the stale one on the old branch (#149 P0-3). That refusal is right, and #149 deliberately left it
 # uncounted — so a stale worker.<id>.lock naming a REUSED pid (a SIGKILLed start-session.sh never
 # runs its EXIT trap; pids recycle) made the rebuild abort every tick FOREVER: parked, uncounted,
@@ -2424,7 +2424,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # memo below name the component actually at fault instead of guessing one.
             launch_ev = ist.get("launch_evidence")
             if ist.get("launch_error") == "base_missing":
-                # issue #28: launch-session.sh could not create the worktree because its base ref
+                # issue #28: the launcher could not create the worktree because its base ref
                 # origin/<dev_branch> does not exist. Name the REAL cause — the missing base branch
                 # — instead of sending the newcomer to debug the launch shim (the wrong component).
                 # The captured stderr rides along (#152) so the operator can check this reading

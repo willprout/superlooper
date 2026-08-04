@@ -472,7 +472,7 @@ grace) on recovery.
 **The flow.** First trip → one text (naming the signal, the grace, the authority tier) → the
 grace window (`watchdog.grace_minutes`, default 30) → if the signal still stands, ONE fresh
 sl-debugger session launches through the same interactive launch shim workers use
-(`launch-session.sh --cwd <repo> d<N>` — never a headless `claude -p`), its brief carrying the
+(`launch-session.py --cwd <repo> d<N>` — never a headless `claude -p`), its brief carrying the
 tripped signal and the standing `watchdog.authority` tier; the session follows the sl-debugger
 skill's `references/unattended-contract.md`. If the signal cleared meanwhile, it stands down
 SILENTLY (journal only). The launch tab targets the runner's recorded anchor pane

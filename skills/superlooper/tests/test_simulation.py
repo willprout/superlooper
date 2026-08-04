@@ -1,13 +1,16 @@
 """Task 15 — the offline end-to-end simulation (the acceptance harness).
 
 REAL runner ticks (the actual Runner class, its actual executors, the actual launch stack:
-launch-session.sh -> fake-cmux's tab-shell/shim -> start-session.sh -> fake-claude) against a
+launch-session.py -> the five-verb wrapper -> fake-sessionhost's pane + the real launch shim
+-> start-session.sh -> fake-claude) against a
 REAL local git repo pair (a bare origin + a working clone in tmp) and three fakes:
 
   fake-gh      a stateful little GitHub (tests/fakes/fake-gh, state.json mode): label moves,
                comments, PR creation and REAL squash-merges into the bare origin's dev branch.
-  fake-cmux    tabs/screens/sends against tmp state; deliver mode executes the dropped .cmd
-               (the launch-shim contract); drop mode loses the keystrokes (the overnight bug).
+  fake-sessionhost  the session host's five verbs against tmp state; deliver mode really starts
+               the pane shell (which sources the real shim and hands off to start-session.sh),
+               hollow mode reports a started agent with nothing behind it (the phantom).
+  fake-cmux    screens/sends/close against tmp state — the verbs that have not moved off cmux yet.
   fake-claude  plays each session per a SCENARIO spec — invoked exactly like the real binary
                (brief contents as final argv, SL_ISSUE_ID/SL_RUN_ROOT from env) and reads its
                contract paths out of the brief text itself, so a broken brief template fails
@@ -25,6 +28,7 @@ paid-for pokes from waves 3-4 are asserted here against the real tick loop.
 import contextlib
 import json
 import os
+import pathlib
 import shutil
 import stat
 import subprocess
@@ -180,6 +184,15 @@ class Sim:
             "SL_CMUX": os.path.join(FAKES, "fake-cmux"),
             "FAKE_CMUX_DIR": str(self.cmux_dir),
             "CMUX_MODE": "deliver",
+            # The SPAWN path is the session host now (issue #308); cmux above survives only for
+            # the verbs that have not moved yet (nudge/close). fake-sessionhost's deliver mode
+            # starts the pane for real, so the simulation still drives the whole chain:
+            # launcher -> wrapper -> pane shell -> shim handoff -> start-session.sh -> fake-claude.
+            "SL_HERDR": os.path.join(FAKES, "fake-sessionhost"),
+            "FAKE_HOST_DIR": str(self.cmux_dir / "host"),
+            "FAKE_HOST_SHIM": str(pathlib.Path(__file__).resolve().parent.parent
+                                  / "skill" / "shell" / "launch-shim.zsh"),
+            "HOST_MODE": "deliver",
             "SL_LAUNCH_DIR": str(self.launch_dir),
             "SIM_SCENARIO_DIR": str(self.scenario_dir),
             "SIM_STOP": str(self.stop_file),
@@ -429,7 +442,10 @@ class Sim:
         return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
     def surfaces(self):
-        path = self.cmux_dir / "surfaces.jsonl"
+        """Every session this simulation SPAWNED. The record moved with the spawn path (issue
+        #308): it used to be a cmux surface per tab, and it is now an agent the session host was
+        asked to start — one per launch, named by the lane id, either way."""
+        path = self.cmux_dir / "host" / "agents.jsonl"
         if not path.exists():
             return []
         return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
@@ -2344,9 +2360,12 @@ def test_wrong_typed_usage_stops_launches_but_gates_proceed(sim_factory):
 # (issue #153, superseding the old per-issue "is the shim installed?" park — #152/#24).
 # =====================================================================================
 
-def test_shim_not_firing_holds_the_queue_and_never_parks_the_issue(sim_factory, monkeypatch):
+def test_a_hollow_launch_holds_the_queue_and_never_parks_the_issue(sim_factory, monkeypatch):
     sim = sim_factory()
-    monkeypatch.setenv("CMUX_MODE", "drop")            # the shim drops the launch command
+    # The phantom (issue #308): the host reports the agent started and ready with nothing behind
+    # it. Same shape as the cmux keystroke drop this case was written for, new cause — and the same
+    # rule applies, because no queued issue caused either one.
+    monkeypatch.setenv("HOST_MODE", "hollow")
     monkeypatch.setenv("SL_LAUNCH_VERIFY_SECONDS", "2")
     num = sim.add_issue(title="Keystrokes lost", scenario={"scenario": "happy"})
     sid = "i%d" % num
@@ -2367,7 +2386,7 @@ def test_shim_not_firing_holds_the_queue_and_never_parks_the_issue(sim_factory, 
         "a shim fault must not post a per-issue park memo — the systemic alert carries the guidance"
     # Orphan tabs are still CLOSED (no buffered-keystroke time bomb), no liveness was ever fabricated
     # for a worker that never started, and agent-ready was never moved (the queue is intact).
-    closed = (sim.cmux_dir / "closed.jsonl")
+    closed = (sim.cmux_dir / "host" / "closed.jsonl")
     assert closed.exists() and len(closed.read_text().splitlines()) >= 1
     assert not os.path.exists(os.path.join(sim.home, "state", "activity", sid))
     assert "in-progress" not in sim.issue(num)["labels"]

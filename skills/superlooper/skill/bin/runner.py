@@ -3,7 +3,7 @@
 disk markers, events.py), DECIDES (actions.decide — one pure function, the only brain), and
 ACTS (this file's executors, all thin I/O over the Task-6/9 machinery). No model call exists
 anywhere in this process — LLM judgment is hired per-event as VISIBLE interactive sessions
-through launch-session.sh, and the runner never waits on judgment to act safely.
+through lib/launch.py, and the runner never waits on judgment to act safely.
 
 Failure posture (the nobody-responds-for-8-hours standard, EVENT-MODEL.md):
   * a tick NEVER raises: every helper fails closed to an empty/error shape, every executor is
@@ -471,7 +471,7 @@ def display_asleep(run=None):
     CALLER: decide holds launches only on an explicit True, so None/False both launch normally.
 
     WHY this exists: macOS does NOT schedule a fresh cmux tab's shell to boot while the display
-    sleeps (the live 2026-07-13 launch killer). launch-session.sh drops the worker command in a file
+    sleeps (the live 2026-07-13 launch killer). The launcher hands the pane its command through
     the tab's ~/.zshrc shim runs (keystroke-free, RC6), but that shim never runs because the shell
     itself is not scheduled — so the 30s delivery sentinel expires and the tab is closed as an orphan
     (exit 2): a burned launch attempt, a systemic-streak entry (#24), and an alert, every sleeping
@@ -2147,7 +2147,7 @@ class Runner:
                 # something a launch inherits from the shell the runner happens to live in.
                 "SL_RESUME_SESSION_ID": "",
                 # PINNED EMPTY for the same inheritance reason (#299), and it matters because this
-                # env is merged over os.environ: launch-session.sh NAMES SL_EXPECT_GH_LOGIN in every
+                # env is merged over os.environ: the launcher NAMES SL_EXPECT_GH_LOGIN in every
                 # worker command, so a runner started from inside a worker or debugger pane would
                 # inherit that session's value and SKIP its own identity read — accepting a stale,
                 # second-hand answer as proof of who this machine is. The launcher must resolve the
@@ -3122,7 +3122,7 @@ class Runner:
         return "ok"
 
     # Per-issue attempt counters a fresh approval zeroes. `launches` MUST be reset alongside
-    # `retries`: launch-session.sh recomputes `retries = launches - 1` on every verified delivery,
+    # `retries`: the launcher recomputes `retries = launches - 1` on every verified delivery,
     # so leaving `launches` at its old value would silently restore `retries` on the next launch
     # and re-park the issue at the retry cap. `conflicts` is reset too so re-approval is a clean
     # slate on every ladder, not just the launch one. `merge_refusals`
@@ -3145,13 +3145,13 @@ class Runner:
         artifact FIRST (a leftover report would re-gate, an `exited` marker would `recover` and
         double-launch, a `blocked` marker would re-enter the question flow, a `recheck_failed`
         field would re-park immediately). Then zero the attempt counters (`launches` MUST reset —
-        launch-session.sh derives `retries = launches - 1`, so a non-zero launches would restore
+        the launcher derives `retries = launches - 1`, so a non-zero launches would restore
         the retry count and re-park at cap) and re-release to `ready`. The old counters are
         JOURNALED (never lost — the honest record of what the issue already cost). actions.decide
         holds the launch back one tick so it fires against the reset state.
 
         (#177) And the rebuild gets a genuinely FRESH BRANCH. This reset used to clear everything
-        EXCEPT `branch` — so _launch_branch preferred the stale stamp and launch-session.sh's
+        EXCEPT `branch` — so _launch_branch preferred the stale stamp and the launcher's
         fallback re-ATTACHED the existing branch: the "clean slate" resumed on the parked episode's
         commits, pr_for_branch rediscovered its still-open PR, and `gh pr create` would refuse a
         second PR on the same head (no force path exists anywhere by design). That made the
@@ -3165,13 +3165,13 @@ class Runner:
         meta = {}                                  # pre-reset facts the gh bookkeeping below needs
         # 1. local hygiene FIRST (mirrors _exec_regenerate): stale artifacts must be unable to
         #    drive decide() before the fresh launch. Best-effort — no-ops when nothing is there;
-        #    launch-session.sh recreates the worktree.
+        #    the launcher recreates the worktree.
         #    (#149) This USED to prune the worktree outright and leave the pane/lock for the launch
         #    to clean up later — i.e. it unlinked the cwd of a session that was, by this function's
         #    own D4 reasoning, quite possibly still alive: the D14 sequence verbatim. The ordered
         #    teardown closes that session and sees it go first.
         #    A declined prune ABORTS the re-approval, touching no state (same reason as
-        #    _exec_regenerate): launch-session.sh reuses a surviving worktree rather than failing,
+        #    _exec_regenerate): the launcher reuses a surviving worktree rather than failing,
         #    so a fresh start would silently inherit the parked run's stale checkout — the opposite
         #    of the clean slate this executor promises. decide re-emits while `agent-ready` stands.
         #    (#169) The deferral is COUNTED. It is right to abort, but a stale lock naming a reused
@@ -3188,7 +3188,7 @@ class Runner:
         # episode's fresh session would consume the stale ask at its first rest and could post
         # NO-FINDINGS before re-investigating anything, closing the re-run without its own
         # interview. Pending mail only: the .consumed/.claimed/.discarded receipts are the
-        # history of what was actually delivered and stay (launch-session.sh's own rule).
+        # history of what was actually delivered and stay (the launcher's own rule).
         for sub in ("blocked", "exited", "awaiting", "started", "mail", "ack"):
             _rm(os.path.join(self.state, sub, iid))
         # 2. durable state: zero the attempt counters and clear the stale run/gate fields that
@@ -3201,7 +3201,7 @@ class Runner:
             # _launch_branch mint the clean base name.
             #
             # A stamp does NOT prove the branch exists (_exec_launch stamps it BEFORE invoking
-            # launch-session.sh, so a lane parked on the launch-delivery ladder carries a name that
+            # the launcher, so a lane parked on the launch-delivery ladder carries a name that
             # was never created). Rotating anyway is the fail-safe direction: the alternative —
             # probing whether the branch exists — answers "no" for a branch that survives only on the
             # REMOTE, which is precisely the case whose push this issue exists to stop refusing. The
@@ -4018,7 +4018,7 @@ class Runner:
         #    (#149) Ordered: the superseded session is closed and observed gone before its worktree
         #    is pruned — this path used to unlink the cwd of a session it knew might still be live
         #    (D4), which is the D14 stamp-killer.
-        #    A declined prune must ABORT the regenerate, touching no state: launch-session.sh only
+        #    A declined prune must ABORT the regenerate, touching no state: the launcher only
         #    creates the worktree `if [ ! -d "$WT" ]`, so relaunching over a surviving stale
         #    worktree does not fail — it SILENTLY reuses it, and the rebuild would run on the OLD
         #    conflicted branch while its brief names the new one, pushing commits onto a superseded

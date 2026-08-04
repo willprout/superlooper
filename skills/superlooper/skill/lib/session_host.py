@@ -112,7 +112,7 @@ API_TOKEN_FILE_ENV_VAR = "HERDR_API_TOKEN_FILE"
 # fence exists to keep out. So the request travels in argv and the secret never does.
 GRANT_SENTINEL = "@superlooper-fence-grant"
 
-# The launcher's own mode guard, spelled the same way here on purpose (launch-session.sh refuses
+# The launcher's own mode guard, spelled the same way here on purpose (lib/launch.py refuses
 # `--cwd` for anything but `^d[0-9]+$`). Repair sessions must be able to drive herdr — revive, kill
 # and read panes — so they RECEIVE the token; workers never do.
 _DEBUGGER_RE = re.compile(r"^d[0-9]+$")
@@ -131,6 +131,11 @@ _DEFAULT_BINARY = "herdr"
 _CALL_SECONDS = 20                 # a control call that hangs is a dead host, not a slow one
 _PROMPT_TIMEOUT_MS = 120000        # the host's own documented prompt wait
 _START_TIMEOUT_MS = 30000          # its documented agent-start default, named rather than implied
+_START_RETRIES = 6                 # a pane's login shell has to reach its prompt before an agent
+_START_RETRY_PAUSE = 1.0           # can be started in it — bounded, ~6s, and only for that refusal
+# The host's way of saying "that pane is not at a shell prompt yet". Asserted here like _GONE_CODES
+# is: if a later release renames it, spawns fail LOUDLY on a cold pane rather than silently.
+_PANE_BUSY = re.compile(r"pane[_ ]busy|not an available shell|no[_ ]available[_ ]shell")
 _CONFIRM_READS = 5                 # post-spawn confirmation attempts...
 _CONFIRM_PAUSE = 1.0               # ...one second apart: `agent start` can return a beat before
                                    # the pane's own child is visible to the OS
@@ -572,7 +577,23 @@ class SessionHost:
                  "--timeout", str(int(start_timeout_ms))]
         if agent_args:
             start += ["--"] + [str(a) for a in agent_args]     # native agent args, after the sep
-        reply = self._call(start, timeout=int(start_timeout_ms) / 1000.0 + _CALL_SECONDS)
+        # A pane that is still BOOTING is a wait, not a failure — measured against a live host
+        # while wiring the spawners onto this doorway (#308, reports/i308.md). `workspace create`
+        # returns as soon as the workspace exists, but the host will only start an agent in "an
+        # available shell", and the pane's login shell (which sources the operator's rc files) is
+        # still coming up. It refuses with `agent_pane_busy`, and without this the launch dies on a
+        # perfectly healthy machine — a flaky launch, which is the whole class this module exists
+        # to remove. Retried against THE SAME pane, because that is what has to settle; re-creating
+        # the workspace would just produce another shell at exactly the same stage.
+        #
+        # ONLY that refusal waits. Every other one is a real failure to report at once, because a
+        # retried diagnosis is a slow diagnosis.
+        for attempt in range(max(1, _START_RETRIES)):
+            if attempt:
+                self._probe.sleep(_START_RETRY_PAUSE)
+            reply = self._call(start, timeout=int(start_timeout_ms) / 1000.0 + _CALL_SECONDS)
+            if reply.ok or not _PANE_BUSY.search((reply.error or "").lower()):
+                break
         if not reply.ok:
             self._rollback(workspace)
             raise SpawnRefused("[%s] the agent did not start: %s" % (name, reply.error))
