@@ -234,6 +234,9 @@ def test_login_item_home_bootstraps_the_job_instead_of_claiming_this_tab():
     assert p["runner"]["argv"] == job
     assert "cmux tab" not in p["runner"]["message"]
     assert "login item" in p["runner"]["message"]
+    # It states the ATTEMPT, never the outcome: the bootstrap can refuse, and a promise followed by
+    # its own retraction is exactly the 3am-readability failure this migration exists to end.
+    assert "launchd keeps it running" not in p["runner"]["message"]
 
 
 def test_a_live_runner_is_left_alone_in_either_home():

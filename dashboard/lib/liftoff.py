@@ -295,7 +295,11 @@ def make_plan(repo, url, dashboard_argv_, runner_argv_, *, dashboard_up, runner_
         runner = {"start": True, "foreground": True, "argv": list(runner_argv_), "pid": None,
                   "message": "starting the runner for %s in this tab" % repo["slug"]}
     else:
+        # Says what is being ATTEMPTED, not what will be true afterwards: the bootstrap can refuse
+        # (a PATH it cannot honestly record, a launchctl that would not bootstrap), and a line that
+        # promised "launchd keeps it running" followed by its own retraction is the 3am-readability
+        # failure this migration exists to end. The composition root prints the outcome after.
         runner = {"start": True, "foreground": False, "argv": list(runner_argv_), "pid": None,
-                  "message": "starting the runner for %s as its login item — launchd keeps it "
-                             "running, so this terminal stays yours" % repo["slug"]}
+                  "message": "setting up the runner for %s as its login item — launchd will own "
+                             "the process, so this terminal stays yours" % repo["slug"]}
     return {"dashboard": dashboard, "runner": runner}

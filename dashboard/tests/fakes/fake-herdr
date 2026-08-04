@@ -13,10 +13,15 @@ It models exactly the one verb the dashboard's host doorway spells:
 
 Behaviour, chosen so the adapter's honest-failure paths are all reachable:
 
-- ``agent focus i999`` exits 1 with ``error: agent_not_found: i999`` on stderr — exactly the
-  shape herdr answers with for a name that no longer resolves (an agent that exited, or a
-  session that was never launched). This is the case the button hits most often, so it is the
-  one the fake makes easy to drive.
+- ``agent focus i999`` exits 1 and writes herdr's real refusal ENVELOPE to stderr — measured
+  against the installed binary while building #310, not guessed:
+
+      {"error":{"code":"agent_not_found","message":"agent target i999 not found"},"id":"cli:agent:focus"}
+
+  That is the shape for a name that no longer resolves (an agent that exited, or a session that
+  was never launched). It is the case the button hits most often, so it is the one the fake makes
+  easy to drive — and pinning the envelope here is what keeps the adapter's message extraction
+  honest instead of toasting a wall of JSON.
 - ``agent focus i1`` sleeps for ``SL_HERDR_SLEEP`` seconds (default 5) so a short adapter
   timeout trips its rc-124 path.
 - anything else exits 0 and echoes its own argv on stdout, so a test can pin the exact verb
@@ -25,6 +30,7 @@ Behaviour, chosen so the adapter's honest-failure paths are all reachable:
 Every invocation's full argv is echoed, never logged to a file: this fake has no fixture
 directory because the verb has no output to fixture — the argv IS the contract.
 """
+import json
 import os
 import sys
 import time
@@ -37,7 +43,10 @@ def main(argv):
         if name == "i1":
             time.sleep(float(os.environ.get("SL_HERDR_SLEEP", "5")))
         if name == "i999":
-            sys.stderr.write("error: agent_not_found: %s\n" % name)
+            sys.stderr.write(json.dumps({
+                "error": {"code": "agent_not_found",
+                          "message": "agent target %s not found" % name},
+                "id": "cli:agent:focus"}) + "\n")
             return 1
     sys.stdout.write(" ".join(args) + "\n")
     return 0

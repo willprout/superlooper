@@ -58,7 +58,7 @@ def test_confirm_states_the_consequence_in_plain_words():
         "the confirm must say in-flight worker sessions are untouched")
 
 
-def test_how_the_loop_comes_back_is_the_servers_word_not_a_hardcoded_tab(monkeypatch=None):
+def test_how_the_loop_comes_back_is_the_servers_word_not_a_hardcoded_tab():
     # Issue #310 / #306: the runner now has TWO homes. In the `pane` home it re-execs in its own
     # visible tab; as a `login-item` it exits cleanly and launchd brings it back — and a dialog
     # that says "its own cmux tab" to an owner whose runner is a launchd job is the D12 defect

@@ -320,3 +320,14 @@ def test_a_missing_or_unreadable_panes_dir_reads_as_no_windows(tmp_path):
     # Fail closed: no marker dir ⇒ no lane claims a window ⇒ no button offered anywhere. A reader
     # that guessed the other way would put a button on every card on a machine it knows nothing about.
     assert readers.read_state_home(tmp_path)["session_windows"] == set()
+
+
+def test_a_pane_marker_named_with_an_unparseable_digit_does_not_take_the_poll_down(tmp_path):
+    # `"i²"` passes `str.isdigit()` but `int("²")` raises, and this reader runs inside the 2-second
+    # snapshot poll — one such filename must be ignored, never propagate an exception that blanks
+    # the whole board for every repo (the #139 defect class).
+    panes = tmp_path / "state" / "panes"
+    panes.mkdir(parents=True)
+    (panes / "i23").write_text("x")
+    (panes / "i²").write_text("x")
+    assert readers.read_state_home(tmp_path)["session_windows"] == {"i23"}

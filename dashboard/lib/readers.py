@@ -159,8 +159,13 @@ def _scan_mtimes(dir_path):
 
 def _iid_num(name):
     """``i<N>`` -> ``N``, else ``None`` — the skill's rule for "is this an issue id" (used to keep
-    per-issue reports and drop the ``morning-<date>.md`` digest)."""
-    if isinstance(name, str) and name.startswith("i") and name[1:].isdigit():
+    per-issue reports and drop the ``morning-<date>.md`` digest).
+
+    ``isdecimal``, not ``isdigit``: ``"²".isdigit()`` is True but ``int("²")`` RAISES, so a file
+    called ``i²`` in a scanned directory would throw out of a reader — inside the 2-second snapshot
+    poll, blanking the whole board for every repo rather than being ignored as the junk filename it
+    is. Same fail-closed-per-entry direction as every other reader here (the #139 defect class)."""
+    if isinstance(name, str) and name.startswith("i") and name[1:].isdecimal():
         return int(name[1:])
     return None
 
@@ -169,11 +174,17 @@ def _session_window_ids(panes_dir):
     """The lane ids that have a RECORDED session window — the engine writes ``state/panes/<id>``
     when it launches a session and removes it when ``tidy`` closes that window (issue #310).
 
-    Exactly the engine's own rule, deliberately: an entry named ``i<N>`` counts, the ``<id>.ws``
+    The engine's own selection rule, deliberately: an entry named ``i<N>`` counts, the ``<id>.ws``
     workspace sidecar does not, and anything else in the directory is ignored. Matching it is what
     keeps the dashboard's Open-session-window button and ``superlooper tidy`` agreeing about which
     lanes have a window — the alternative, deriving it from a status, gets both ends wrong (a parked
     lane's window is kept alive on purpose; a merged-and-tidied one's is gone).
+
+    The marker is not a *guarantee* the window is still open, and the gap is real: the engine only
+    removes markers for a status that can never relaunch, so a hand-run ``superlooper tidy --all``
+    closes a re-approvable lane's window and LEAVES its marker behind. The button is then offered
+    for a window that is gone — which is fine, because the host is the authority and answers
+    honestly at tap time. This decides only whether there is anything worth asking about.
 
     Missing/unreadable dir ⇒ an empty set. Fail closed: no marker ⇒ no lane claims a window ⇒ no
     button offered, which is the safe direction for a reader that cannot see the markers at all.

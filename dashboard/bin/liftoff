@@ -245,7 +245,25 @@ def _exec_runner(argv):
     os.execvp(argv[0], argv)
 
 
-def _runner_home(superlooper_cli, repo_path):
+def _engine(superlooper_cli):
+    """The engine CLI every subprocess in this file runs: the ``SL_SUPERLOOPER`` env override wins
+    over the configured path (config's ``superlooper_cli``).
+
+    ONE resolution point, deliberately. ``lib/tidy``, ``lib/restart``, ``lib/janitor`` and
+    ``lib/fixer`` each honour this override so ``tests/conftest.py`` can point the whole suite at an
+    absent binary; liftoff shells the engine too, and one of its calls —
+    ``runner-home --install --load`` — is the most destructive subprocess in this repo: it renders a
+    LaunchAgent into ``~/Library/LaunchAgents`` and bootstraps a launchd job. A path that skipped
+    the override would put exactly that call outside the fail-closed ratchet, one forgotten test
+    injection away from bootstrapping a real job against a pytest tmpdir on the owner's Mac.
+
+    It is also the honest thing in production: probing engine A and then bootstrapping engine B,
+    because only one of the two consulted the override, is a bug nobody would find quickly.
+    """
+    return os.environ.get("SL_SUPERLOOPER") or superlooper_cli
+
+
+def _runner_home(engine_bin, repo_path):
     """Which home this repo's runner lives in — ``pane``, ``login-item``, or ``None`` when the
     engine could not say (issue #306, wired by #310).
 
@@ -258,15 +276,11 @@ def _runner_home(superlooper_cli, repo_path):
     boundary this file is built on. liftoff shells the engine's OWN documented commands and never
     parses its files, so the engine stays a black box whose config format is free to move.
 
-    The binary resolves through ``SL_SUPERLOOPER`` first, exactly like ``lib/tidy``, ``lib/restart``,
-    ``lib/janitor`` and ``lib/fixer``. That is not decoration: this is the ONE subprocess liftoff
-    runs on its default path, so without the override a test that injected everything else would
-    still shell the operator's real installed engine (tests/conftest.py points the var at an absent
-    path for the whole suite).
+    ``engine_bin`` is already resolved by :func:`_engine` — every subprocess in this file goes
+    through that one point, so the binary this probes is provably the binary the launch then runs.
     """
-    binary = os.environ.get("SL_SUPERLOOPER") or superlooper_cli
     try:
-        proc = subprocess.run(liftoff_mod.runner_home_argv(binary, repo_path),
+        proc = subprocess.run(liftoff_mod.runner_home_argv(engine_bin, repo_path),
                               capture_output=True, text=True, timeout=_HOME_PROBE_TIMEOUT)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
@@ -399,14 +413,20 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
     # #310). Asked before the plan is built, read-only, and fail-soft: an engine that cannot answer
     # leaves `home` None, which make_plan treats as the pane home — exactly liftoff's behaviour
     # before this existed.
-    home = runner_home(cfg["superlooper_cli"], repo["path"]) or liftoff_mod.PANE
-    run_argv = (liftoff_mod.runner_job_argv(cfg["superlooper_cli"], repo["path"])
+    engine = _engine(cfg["superlooper_cli"])
+    pid = live_runner_pid(repo["state_home"])
+    # Probed ONLY when something is actually being started. The probe shells the engine — and, for a
+    # login-item repo, a `launchctl print` behind it — so a routine "confirm the pair is up" run
+    # must not pay for it, and a wedged engine binary must not delay the dashboard by the probe
+    # timeout for a run whose whole outcome is "leaving it".
+    home = (runner_home(engine, repo["path"]) or liftoff_mod.PANE) if pid is None else liftoff_mod.PANE
+    run_argv = (liftoff_mod.runner_job_argv(engine, repo["path"])
                 if home == liftoff_mod.LOGIN_ITEM
-                else liftoff_mod.runner_argv(cfg["superlooper_cli"], repo["path"]))
+                else liftoff_mod.runner_argv(engine, repo["path"]))
     plan = liftoff_mod.make_plan(
         repo, url, dash_argv, run_argv,
         dashboard_up=is_dashboard_up(server.BIND_HOST, cfg["port"]),
-        runner_pid=live_runner_pid(repo["state_home"]), runner_home=home)
+        runner_pid=pid, runner_home=home)
 
     # 1) Dashboard first — it must be up (and stay up) before liftoff hands the tab to the runner.
     dash = plan["dashboard"]
@@ -425,9 +445,10 @@ def main(argv, *, is_dashboard_up=_dashboard_up, live_runner_pid=_live_runner_pi
     #    LOGIN_ITEM home, run the engine's bootstrap step and hand the terminal back. Either way,
     #    a runner that is already live is left exactly alone.
     run = plan["runner"]
-    out.write("liftoff: %s\n" % run["message"])
     if not run["start"]:
+        out.write("liftoff: %s\n" % run["message"])
         return 0
+    out.write("liftoff: %s\n" % run["message"])
     out.flush()
     if not run["foreground"]:
         # launchd owns the runner's process here, so there is nothing for liftoff to become. The

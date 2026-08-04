@@ -13,7 +13,6 @@ shells a local binary, so it inherits their whole discipline and these tests pin
 No test here reaches a real ``herdr``: ``tests/conftest.py`` points ``SL_HERDR`` at an absent path
 by default and these tests inject ``tests/fakes/fake-herdr`` in-body (mirrors test_tidy.py).
 """
-import os
 from pathlib import Path
 
 import pytest
@@ -88,8 +87,8 @@ def test_a_host_that_has_no_window_for_this_flight_is_an_honest_failure(fake_her
     assert res["name"] == "i999"
     # The host's own words are kept AND framed: this string lands alone in a toast seconds after a
     # tap, so it has to say which button produced it, not just echo a log line.
-    assert "agent_not_found" in res["error"]
-    assert "i999" in res["error"] and "session host" in res["error"]
+    assert "agent target i999 not found" in res["error"]        # herdr's own sentence, verbatim
+    assert "session host" in res["error"] and "i999's window" in res["error"]
 
 
 def test_a_missing_host_binary_fails_closed_and_names_what_to_fix(monkeypatch):
@@ -131,3 +130,37 @@ def test_no_token_is_ever_placed_on_the_hosts_command_line(fake_herdr, monkeypat
     res = sw.open("willprout/superlooper", 310)
     assert "s3cret" not in res["raw"]
     assert "s3cret" not in res["manual"]
+
+
+def test_name_for_is_total_even_for_characters_python_calls_digits(monkeypatch):
+    # `"²".isdigit()` is True but `int("²")` RAISES — Python's isdigit accepts superscripts and
+    # other numeric characters that int() will not parse. This module bills name_for as pure and
+    # total ("or None"), and it is the fence between a request body and a subprocess, so it must
+    # answer None here rather than throw out of a request handler.
+    for weird in ("²", "½", "¹²", " ³ "):
+        assert session_window.name_for(weird) is None, weird
+    # ...while a real non-ASCII DECIMAL digit is still just a number, and is accepted as one.
+    assert session_window.name_for("٣١٠") == "i310"      # Arabic-Indic 310
+
+
+def test_the_hosts_json_refusal_envelope_becomes_plain_words_not_a_wall_of_json(fake_herdr):
+    # Measured against the installed herdr while building this, not guessed: a refusal is a JSON
+    # ENVELOPE on stderr —
+    #     {"error":{"code":"agent_not_found","message":"agent target i999 not found"},"id":"..."}
+    # — and that whole blob landing in a toast would be the opposite of "surfaces plainly". The
+    # host's own message is extracted; the machine-readable envelope is not the owner's problem.
+    sw = session_window.SessionWindow("herdr", _PATHS)
+    err = sw.open("willprout/superlooper", 999)["error"]
+    assert "agent target i999 not found" in err
+    assert "{" not in err and "cli:agent:focus" not in err, "the raw envelope must not reach the UI"
+
+
+def test_a_refusal_this_build_cannot_parse_still_reaches_the_owner_verbatim(monkeypatch, tmp_path):
+    # If a later herdr changes the envelope, the message must DEGRADE to the raw text — never to
+    # silence. A failure the owner cannot see is worse than an ugly one.
+    stub = tmp_path / "herdr"
+    stub.write_text("#!/bin/sh\necho 'something entirely new went wrong' >&2\nexit 1\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("SL_HERDR", str(stub))
+    sw = session_window.SessionWindow("herdr", _PATHS)
+    assert "something entirely new went wrong" in sw.open("willprout/superlooper", 310)["error"]

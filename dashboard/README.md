@@ -209,6 +209,15 @@ that one line to `~/Library/Logs/command-center.log` at most once every 30s — 
 leaves you time to free the port or change it, never a runaway. Free the port (or edit `port`) and
 the next relaunch comes up clean; no `unload`/`load` needed.
 
+> **Note (Open session window):** launchd also runs with a minimal *environment*, and the plist
+> sets no `EnvironmentVariables`. Two consequences for the **Open session window** button. First,
+> `herdr_cli` must be an absolute path if `herdr` isn't on launchd's `PATH` (it usually isn't —
+> `/opt/homebrew/bin` is not there). Second, once the session host's control socket is fenced with
+> token auth, the keep-alive job inherits no `HERDR_API_TOKEN`, so the host will refuse and the
+> button will say so honestly on every tap. Whether the dashboard should hold that token is the
+> owner's call and is filed as a follow-up; until it is answered, run `bin/command-center` from a
+> terminal (or via `liftoff`) if you want that button to work.
+
 > **Note:** launchd runs with a minimal `PATH`, so the job uses your system `python3`
 > (`/usr/bin/python3` — the stdlib-only runtime this is built for). If your only Python 3 is a
 > Homebrew install not on that path, the job won't find it; run `bin/command-center` in a terminal

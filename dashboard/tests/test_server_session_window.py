@@ -161,3 +161,13 @@ def test_an_unwatched_repo_is_refused_over_the_socket(monkeypatch):
     resp = _post("/api/session-window", {"repo": "someone/else", "num": 310}, real)
     assert resp.status == 200
     assert json.loads(resp.body) == {"ok": False, "verb": "session-window", "error": "unknown repo"}
+
+
+@pytest.mark.parametrize("weird", ["²", "½", " ³ "])
+def test_a_numeric_looking_character_int_cannot_parse_is_a_400_not_a_crash(weird):
+    # `"²".isdigit()` is True but `int("²")` raises. The router's own num parse must answer 400
+    # rather than throw out of the request handler and drop the connection — a client can send this.
+    s = _RecordingSessionWindow()
+    resp = _post("/api/session-window", {"repo": REPO, "num": weird}, s)
+    assert resp.status == 400
+    assert s.calls == []

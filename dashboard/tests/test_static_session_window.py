@@ -61,20 +61,42 @@ def test_no_observe_stream_plumbing_was_added():
         "no observe/frame/pane stream endpoint may be added — the ruling is attach only")
 
 
+def _handler_body(js, name):
+    """The source of `function <name>(...) { ... }`, brace-matched. The guards below assert on THIS
+    rather than on a character window after a keyword: a distance-based regex passes or fails on how
+    many unrelated lines happen to sit in between, so reordering two `if` statements elsewhere could
+    flip it either way. Anchoring on the function's real extent makes the guard mean what it says."""
+    i = js.index("function %s(" % name)
+    depth, start = 0, js.index("{", i)
+    for j in range(start, len(js)):
+        if js[j] == "{":
+            depth += 1
+        elif js[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start:j + 1]
+    raise AssertionError("unbalanced braces in %s" % name)
+
+
 def test_a_failed_open_is_shown_honestly_never_swallowed():
     # The host may have no window for this flight (a session that exited, or one already tidied).
     # That is the COMMON answer and it must reach the owner in the host's own words.
-    assert re.search(r"session-window[\s\S]{0,900}?toast\(", _SHELL_JS), (
-        "the session-window handler must report its outcome to the owner")
-    assert re.search(r"doSessionWindow[\s\S]{0,900}?\berr\b", _SHELL_JS), (
-        "a failure must be toasted as an error, never as a success")
+    body = _handler_body(_SHELL_JS, "doSessionWindow")
+    assert "/api/session-window" in body, "the handler must POST the verb"
+    assert "toast(" in body, "the handler must report its outcome to the owner"
+    assert re.search(r"b\.error[\s\S]{0,120}\"err\"", body), (
+        "a failure must toast the SERVER's error string, as an error — never a silent success")
+    assert re.search(r"b\.ok[\s\S]{0,200}\"ok\"", body), (
+        "only an ok:true result may toast success")
 
 
 def test_the_button_never_writes_to_github():
     # It is a local-command verb like Tidy/Restart: it must not ride the GitHub verb helper, whose
-    # toast claims a label landed.
-    assert not re.search(r"session-window[\s\S]{0,120}postVerb", _SHELL_JS), (
+    # toast claims a label landed and whose refresh re-polls for a GitHub state that never changed.
+    body = _handler_body(_SHELL_JS, "doSessionWindow")
+    assert "postVerb" not in body, (
         "session-window is a LOCAL command, not a GitHub write — it must not go through postVerb")
+    assert "refresh(" not in body, "nothing about the loop changed, so nothing needs re-polling"
 
 
 def test_the_button_has_a_style_of_its_own():
@@ -99,8 +121,10 @@ def test_the_dashboard_names_no_host_of_its_own():
     # this test removes. "Session window" is true in both hosts, which is exactly the point of
     # putting the host behind one door.
     root = _STATIC.parent
-    surfaces = sorted(root.glob("static/*.js")) + [_STATIC / "index.html"] + \
-        sorted(root.glob("lib/*.py")) + [root / "bin" / "liftoff", root / "bin" / "command-center"]
+    surfaces = (sorted(root.glob("static/*")) + sorted(root.glob("lib/*.py"))
+                + sorted(p for p in root.glob("bin/*") if p.is_file())
+                + sorted(root.glob("templates/*")) + [root / "config.example.json"])
+    assert len(surfaces) > 30, "the ratchet must actually be sweeping the product"
     for path in surfaces:
         text = path.read_text(encoding="utf-8")
         assert "cmux" not in text.lower(), (

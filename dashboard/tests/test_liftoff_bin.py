@@ -321,7 +321,8 @@ def test_a_failed_job_bootstrap_is_reported_and_fails_the_launch(one_repo):
                                   runner_home=lambda cli, path: lo.liftoff_mod.LOGIN_ITEM,
                                   start_job=_Recorder(ret=2))
     assert rc == lo.EXIT_LAUNCH_FAILED
-    assert "liftoff:" in text
+    assert "was NOT started" in text, "a refused bootstrap must never read as a started loop"
+    assert "exited 2" in text and "Run it by hand" in text
 
 
 def test_a_job_bootstrap_that_cannot_run_at_all_fails_friendly(one_repo):
@@ -331,12 +332,14 @@ def test_a_job_bootstrap_that_cannot_run_at_all_fails_friendly(one_repo):
                                   runner_home=lambda cli, path: lo.liftoff_mod.LOGIN_ITEM,
                                   start_job=boom)
     assert rc == lo.EXIT_LAUNCH_FAILED
-    assert "liftoff:" in text            # a friendly line, never a traceback
+    assert "could not run the login-item setup" in text   # a friendly line, never a traceback
+    assert "Traceback" not in text
 
 
 def test_the_home_probe_is_read_only_and_shells_the_engines_own_command(monkeypatch):
     # The probe must be the documented read-only report — no --install, no --load, nothing that
-    # writes a plist as a side effect of merely asking a question.
+    # writes a plist as a side effect of merely asking a question. It takes an ALREADY-resolved
+    # binary: main() resolves once through _engine, so probe and launch provably agree.
     seen = {}
 
     class _Proc:
@@ -347,9 +350,8 @@ def test_the_home_probe_is_read_only_and_shells_the_engines_own_command(monkeypa
         seen["argv"] = argv
         return _Proc()
 
-    monkeypatch.setenv("SL_SUPERLOOPER", "/cli/superlooper")   # the fixture's own lever, set explicitly
     monkeypatch.setattr(lo.subprocess, "run", fake_run)
-    assert lo._runner_home("/configured/superlooper", "/co/a") == lo.liftoff_mod.LOGIN_ITEM
+    assert lo._runner_home("/cli/superlooper", "/co/a") == lo.liftoff_mod.LOGIN_ITEM
     assert seen["argv"] == ["/cli/superlooper", "runner-home", "--repo", "/co/a"]
 
 
@@ -363,24 +365,16 @@ def test_the_home_probe_never_raises_into_the_launch(monkeypatch):
     assert lo._runner_home("/nonexistent/superlooper", "/co/a") is None
 
 
-def test_the_home_probe_resolves_the_engine_through_the_neutralizable_override(monkeypatch):
-    # THE fail-closed lever. Every other path to the engine (lib/tidy, lib/restart, lib/janitor,
-    # lib/fixer) resolves SL_SUPERLOOPER before the configured path exactly so tests/conftest.py can
-    # point the whole suite at an absent binary. This probe is a subprocess like the rest, and it
-    # runs on the DEFAULT path of every liftoff test that doesn't inject it — so if it ignored the
-    # override it would shell the operator's REAL installed engine from the test suite.
-    seen = {}
-
-    class _Proc:
-        returncode = 0
-        stdout = "runner_home: pane — ...\n"
-
+def test_the_engine_binary_resolves_through_the_neutralizable_override(monkeypatch):
+    # THE fail-closed lever, and now a SINGLE resolution point. Every other path to the engine
+    # (lib/tidy, lib/restart, lib/janitor, lib/fixer) resolves SL_SUPERLOOPER before the configured
+    # path exactly so tests/conftest.py can point the whole suite at an absent binary. liftoff
+    # shells the engine too — including the destructive `runner-home --install --load` — so it goes
+    # through the same lever, once, and every argv it builds inherits that.
     monkeypatch.setenv("SL_SUPERLOOPER", "/nonexistent/neutralized-superlooper")
-    monkeypatch.setattr(lo.subprocess, "run",
-                        lambda argv, **kw: (seen.update(argv=argv), _Proc())[1])
-    lo._runner_home("/real/installed/superlooper", "/co/a")
-    assert seen["argv"][0] == "/nonexistent/neutralized-superlooper", (
-        "the home probe must honour SL_SUPERLOOPER, or the test suite reaches the real engine")
+    assert lo._engine("/real/installed/superlooper") == "/nonexistent/neutralized-superlooper"
+    monkeypatch.delenv("SL_SUPERLOOPER")
+    assert lo._engine("/real/installed/superlooper") == "/real/installed/superlooper"
 
 
 def test_the_default_liftoff_run_never_reaches_a_real_engine_binary(one_repo):
@@ -389,3 +383,37 @@ def test_the_default_liftoff_run_never_reaches_a_real_engine_binary(one_repo):
     assert os.environ["SL_SUPERLOOPER"].startswith("/nonexistent/")
     rc, text, spawn, execr = _run(one_repo, up=True, pid=None)   # no runner_home injected
     assert len(execr.calls) == 1, "an unanswerable probe keeps the pane behaviour"
+
+
+def test_every_engine_subprocess_resolves_through_the_neutralizable_override(one_repo, monkeypatch):
+    # The P1 from the #310 fresh review. `runner-home --install --load` is the most destructive
+    # subprocess in this repo — it renders a LaunchAgent into ~/Library/LaunchAgents and bootstraps
+    # a launchd job — so it, and not merely the read-only probe, must resolve through the same
+    # SL_SUPERLOOPER lever the conftest pulls. Otherwise a future test that sets `runner_home:
+    # "login-item"` in its fixture and forgets to inject `start_job` bootstraps a real job on
+    # William's Mac pointing at a pytest tmpdir.
+    monkeypatch.setenv("SL_SUPERLOOPER", "/nonexistent/neutralized-superlooper")
+    started = _Recorder(ret=0)
+    _run(one_repo, up=True, pid=None,
+         runner_home=lambda cli, path: lo.liftoff_mod.LOGIN_ITEM, start_job=started)
+    assert started.calls[0][0][0][0] == "/nonexistent/neutralized-superlooper", (
+        "the login-item bootstrap must honour SL_SUPERLOOPER, or a test can reach the real engine")
+
+
+def test_the_pane_exec_resolves_through_the_override_too(one_repo, monkeypatch):
+    # Same lever on the other branch: `superlooper run` REPLACES this process, so a test that ran it
+    # for real would become a runner rather than finish.
+    monkeypatch.setenv("SL_SUPERLOOPER", "/nonexistent/neutralized-superlooper")
+    rc, text, spawn, execr = _run(one_repo, up=True, pid=None,
+                                  runner_home=lambda cli, path: lo.liftoff_mod.PANE)
+    assert execr.calls[0][0][0][0] == "/nonexistent/neutralized-superlooper"
+
+
+def test_the_home_is_not_probed_when_a_live_runner_already_answers(one_repo):
+    # The probe shells the engine (and, for a login-item repo, a `launchctl print` behind it), so a
+    # routine "confirm the pair is up" run must not pay for it — and must not let a wedged engine
+    # binary delay the dashboard by the probe timeout for a run whose whole outcome is "leaving it".
+    probes = []
+    _run(one_repo, up=False, pid=4321,
+         runner_home=lambda cli, path: probes.append(path) or lo.liftoff_mod.PANE)
+    assert probes == [], "a live runner needs no home probe — nothing is being started"

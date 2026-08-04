@@ -32,7 +32,11 @@ The discipline this verb inherits from its siblings, each pinned by a test:
 * **A WATCHED repo only.** Gated on the allow-list mapping each configured repo slug to its
   checkout path; a stray/forged request for an unwatched repo is refused BEFORE any subprocess.
   The path is not passed to the host (agents are host-global, not per-repo) — the allow-list is
-  here purely as the bright line every button in this class draws.
+  here purely as the bright line every button in this class draws. **Consequence, stated rather
+  than buried:** on a multi-repo install two watched repos can both reach issue #310, both record a
+  marker in their own state home, and both offer this button — but ``i310`` names ONE agent on the
+  host, so the second tap focuses the first repo's session. The name is the engine's (a lane id
+  carries no repo), so a repo-scoped name is an engine change; filed as a follow-up, not fixed here.
 * **The target is DERIVED, never received.** :func:`name_for` turns a flight NUMBER into the host
   name, and refuses anything that is not a positive integer. No string from a request body can
   reach the host's argv, so the endpoint cannot be steered into addressing something else.
@@ -51,6 +55,7 @@ binary by default (a real call would reach across into William's own live herd) 
 session-window test can inject the fake in-body. This mirrors ``lib/tidy``'s ``SL_SUPERLOOPER``
 precedence, so the entry point and the tests agree on binary resolution.
 """
+import json
 import os
 import subprocess
 
@@ -94,36 +99,71 @@ def name_for(num):
     address nothing. The second is the fence between the network and a subprocess — only a positive
     integer ever becomes a name, so no string a client sends can be handed to the host as a target.
     ``bool`` is screened out explicitly because ``True`` is an ``int`` in Python and would otherwise
-    become the perfectly plausible ``i1``.
+    become the perfectly plausible ``i1``. The string test is ``isdecimal``, not ``isdigit``:
+    ``"²".isdigit()`` is True but ``int("²")`` RAISES, so the obvious spelling would turn this
+    "returns ``None``" contract into an exception thrown out of a request handler — from the one
+    function standing between a request body and a subprocess. (``isdecimal`` still accepts a real
+    non-ASCII decimal digit like ``"٣١٠"``, which ``int`` parses fine; that is a number, and it is
+    treated as one.)
     """
     if isinstance(num, bool):
         return None
     if isinstance(num, int):
         n = num
-    elif isinstance(num, str) and num.strip().isdigit():   # isdigit() excludes signs and spaces
+    elif isinstance(num, str) and num.strip().isdecimal():   # excludes signs, spaces and "²"
         n = int(num.strip())
     else:
         return None
     return "i%d" % n if n > 0 else None
 
 
+def _host_message(stderr):
+    """The plain sentence inside a host refusal, or the raw text when this build can't find one.
+
+    Measured, not assumed: the installed herdr answers a refusal with a JSON ENVELOPE on stderr —
+    ``{"error": {"code": "agent_not_found", "message": "agent target i310 not found"}, "id": ...}``
+    — which is right for a machine and wrong for the toast this ends up in. The message is pulled
+    out; the code and the request id are not the owner's problem.
+
+    Parsed defensively, the same way the engine's doorway reads this host's replies: an envelope
+    that MOVES in a later release degrades to the raw text rather than raising or, worse, going
+    quiet. A failure the owner cannot see is worse than an ugly one.
+    """
+    text = (stderr or "").strip()
+    if not text:
+        return ""
+    try:
+        body = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        for key in ("message", "code"):
+            v = err.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    elif isinstance(err, str) and err.strip():
+        return err.strip()
+    return text
+
+
 def _error(rc, stderr, binary, name):
     """A plain, honest failure message — what the UI shows instead of a fake success.
 
-    The host's own words are always KEPT (``agent_not_found: i310`` is the real answer and the
+    The host's own words are always KEPT (``agent target i310 not found`` is the real answer and the
     operator may need to recognise it), but they are FRAMED: this string lands in a toast, on its
-    own, seconds after a tap, and a bare ``agent_not_found: i310`` there says nothing about which
-    button produced it or what it means. Naming what was asked is the difference between a log line
-    and an answer. A missing binary names the binary instead, so the operator knows what to fix.
+    own, seconds after a tap, and the host's bare sentence there says nothing about which button
+    produced it. Naming what was asked is the difference between a log line and an answer. A missing
+    binary names the binary instead, so the operator knows what to fix.
     """
-    stderr = (stderr or "").strip()
     if rc == 127:
         return ("could not run the session host at %s — is herdr installed? "
                 "(set 'herdr_cli' in config.json)" % binary)
     if rc == 124:
         return "the session host timed out opening the window for %s" % name
-    if stderr:
-        return "the session host would not open %s's window — %s" % (name, stderr)
+    said = _host_message(stderr)
+    if said:
+        return "the session host would not open %s's window — %s" % (name, said)
     return "the session host would not open the window for %s (exit %d)" % (name, rc)
 
 

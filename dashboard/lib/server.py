@@ -215,11 +215,16 @@ def _num_of(payload):
     """The issue number from a POST body — a POSITIVE int, or a digit-string coerced to one (a JSON
     client may send either). ``None`` for anything else (a bool, a float, ``"abc"``, or a
     non-positive value like ``0``/``-5``) → the caller 400s, so invalid input never reaches the
-    label writer."""
+    label writer.
+
+    The string test is ``isdecimal``, not ``isdigit``: ``"²".isdigit()`` is True but ``int("²")``
+    RAISES, so the obvious spelling turns this "``None`` for anything else" contract into an
+    exception thrown out of the request handler — a dropped connection instead of a 400, on every
+    verb that takes a number, from a body any client can send."""
     n = payload.get("num")
     if isinstance(n, bool):
         return None
-    if isinstance(n, str) and n.strip().lstrip("-").isdigit():
+    if isinstance(n, str) and n.strip().lstrip("-").isdecimal():
         n = int(n)
     if isinstance(n, int) and not isinstance(n, bool) and n > 0:
         return n
