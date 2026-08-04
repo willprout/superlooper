@@ -19,6 +19,7 @@ import herdr_hook
 import notify
 import ops_docs
 import runner_home
+import session_host
 
 
 _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"
@@ -29,6 +30,11 @@ _CMUX_BUNDLE_ID = "com.cmuxterm.app"
 _APP_NAP_TRUE = {"1", "yes", "true", "on"}
 _APP_NAP_FALSE = {"0", "no", "false", "off"}
 GH_MIN_REMAINING = 500
+
+# How long a control-socket probe waits (issue #331). A doctor that hangs on a wedged socket is a
+# doctor nobody runs, and a host that needs longer than this to refuse a one-line request has
+# already told us something.
+_SOCKET_PROBE_SECONDS = 5.0
 
 # The one message the doctor actually sends to prove the channel. Static (no clock) so the check
 # is deterministic and the owner learns to recognize it. Reads as an explanation on arrival.
@@ -1333,6 +1339,108 @@ def check_host_state_hook(probe):
         "every worker gets it from its own per-lane settings file." % (settings, asset))
 
 
+# --- the state report the fence lets through (issue #331) ---------------------------------------
+# The block above asks about FILES: is the hook published, and is the operator's global settings
+# document still clean. Both can be perfect on a machine where the capture never happens, because
+# the hook's report has to cross the fence (#305) and it carries no token — so the owner's ruling
+# (2026-08-04) punched one method-scoped hole for it, host-side, inside the carried patch.
+#
+# That hole is in a BINARY somebody built. Nothing on this machine's filesystem says whether the
+# running host has it, and both states behave identically from the runner's seat: workers launch,
+# work and report, and one of the two silently cannot be revived by the host after a crash. So this
+# block asks the socket itself, exactly as a worker pane would — no token, one question each way.
+_CAPTURE_REBUILD_FIX = (
+    "rebuild the host from the pinned release with the CURRENT carried patch "
+    "(skills/superlooper/vendor/herdr/, procedure in its README) and restart the server — the "
+    "allowance lives in `auth::admit` and a build from before it, or a version bump that dropped "
+    "the hunk, produces exactly this.")
+# The variable is NAMED through the doorway's own constant rather than spelled here. Not a style
+# choice: `tests/test_one_session_host_door.py` treats a host environment variable written out in
+# any scanned script as reaching the host, and it is right to — a fix hint and a command look the
+# same to a reader of string literals. One module spells it; everyone else asks that module.
+_CAPTURE_UNFENCED_FIX = (
+    "start the host from a build carrying the fence patch, with %s set in the SERVER's environment "
+    "(skills/superlooper/vendor/herdr/README.md). Until then every worker pane can drive the whole "
+    "fleet — issue #305 is the fence, #326 wires it into launch." % session_host.API_TOKEN_ENV_VAR)
+
+
+def check_host_state_capture(probe, connect=None):
+    """doctor --stack's `host state capture` line.
+
+    Two probes, read together, because neither answers alone: `fence_probe` says whether an
+    unauthenticated caller is refused at all, and `state_report_probe` says whether the ONE method
+    the ruling opened is reachable. A socket that admits the state report because it admits
+    everything is not a healthy machine, and this block must never render it as one.
+
+    ``connect`` is the probes' own injection point — a ``(socket_path, payload, timeout) -> line``
+    callable. Passing one exercises the real probe logic against a scripted socket; leaving it None
+    opens the real one. It is the only external edge here, which is why this block does not take a
+    second kind of fake.
+
+    Nothing is written by either probe. The capture probe reaches the method BODY (that is how it
+    learns it got past the fence) and the host's own handler refuses its deliberately unusable
+    arguments before touching any state — see ``session_host._PROBE_PANE``.
+    """
+    name = "host state capture"
+    # HOME from the PROBE, never this process's: same rule as the block above, and here it decides
+    # which machine's socket gets opened.
+    env = dict(probe.env)
+    env.setdefault("HOME", probe.home)
+    socket_path = session_host.control_socket_path(env)
+    if not socket_path:
+        return CheckResult(
+            name, True,
+            "no HOME and no explicit socket override, so this check could not work out where the "
+            "session host would keep its control socket.", warn=True)
+    if not probe.exists(socket_path):
+        return CheckResult(
+            name, True,
+            "no session host control socket at %s — nothing is listening to ask." % socket_path)
+
+    fence = session_host.fence_probe(socket_path, timeout=_SOCKET_PROBE_SECONDS, connect=connect)
+    if fence == session_host.OPEN:
+        return CheckResult(
+            name, False,
+            "a caller presenting NO token was served at %s — this host has no fence at all. The "
+            "state report gets through because everything does, including every verb that drives "
+            "the fleet." % socket_path,
+            _CAPTURE_UNFENCED_FIX)
+    if fence != session_host.FENCED:
+        return CheckResult(
+            name, True,
+            "the control socket at %s did not answer the fence probe, or answered something that "
+            "is neither a refusal nor a served request, so this check cannot say whether a "
+            "worker's session id would be captured. Absence of signal is unknown, not fine."
+            % socket_path, warn=True)
+
+    capture = session_host.state_report_probe(socket_path, timeout=_SOCKET_PROBE_SECONDS,
+                                              connect=connect)
+    if capture == session_host.ADMITTED:
+        # Says what was PROVEN and not a word more. The probe establishes that the report can cross
+        # the fence; whether the hook that fires it is published and registered is the `host state
+        # hook` block's question, and a green line here that claimed "ids are being captured" would
+        # be answering it without having asked.
+        return CheckResult(
+            name, True,
+            "the host at %s is fenced, and admits the state report (%s) from a tokenless caller — "
+            "so a worker's session-id report can cross the fence on this machine (whether the hook "
+            "that fires it is installed is the `host state hook` block's question)."
+            % (socket_path, session_host.STATE_REPORT_METHOD))
+    if capture == session_host.REFUSED:
+        return CheckResult(
+            name, False,
+            "the host at %s is fenced but REFUSES the state report (%s), so no worker's session id "
+            "is ever captured and a crashed pane comes back as a bare shell. Nothing about this "
+            "looks broken from the runner's seat — the sessions launch, run and work. The loop's "
+            "own --session-id/--resume floor is unaffected; what is missing is the host-side second "
+            "layer." % (socket_path, session_host.STATE_REPORT_METHOD),
+            _CAPTURE_REBUILD_FIX)
+    return CheckResult(
+        name, True,
+        "the host at %s refused a tokenless caller but did not answer the state-report probe, so "
+        "this check cannot say whether the capture works." % socket_path, warn=True)
+
+
 # --- superlooper plugin presence (issue #90) ---------------------------------------------------
 # After the plugin restructure (design D10), the loop's SKILL CONTENT ships as a plugin, not inside
 # the gated engine payload. A machine without it silently loses the ops / write-issue / debugger
@@ -1485,6 +1593,10 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_engine_drift(probe, repo_path=repo_path, dev_branch=dev),
         check_ops_docs(probe),
         check_host_state_hook(probe),
+        # After the hook block, deliberately: that one asks whether the asset is published and the
+        # operator's settings file is clean, and this one asks whether the report it fires can
+        # actually cross the fence on THIS machine (issue #331).
+        check_host_state_capture(probe),
         check_superlooper_plugin(probe),
     ]
 

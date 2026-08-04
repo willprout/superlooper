@@ -72,6 +72,15 @@ A loop user needs enough local stack for a worker session to launch, work, repor
   pointed at the debugger playbook's `unattended-contract.md` for the rules it is held to, and a
   machine where that file does not exist is the 2026-07-12 incident (defect class D12) waiting to
   repeat. A machine with no installed engine at all is a clean pass here — another block names that.
+- `host state capture` - on a machine whose session host is running, an agent's session-id report
+  must be able to reach it. The host's control socket is fenced (a carried token-auth patch, issue
+  #305) and the report is fired by the host's own hook, which carries no token — so the owner ruled
+  (2026-08-04) one method-scoped hole for exactly that call. This block asks the live socket both
+  questions a worker could ask, with no token: is anything refused at all, and is the state report
+  admitted. A **FAIL** means either the host has no fence at all, or it is fenced without the
+  allowance — in which case no worker's session id is ever captured and a crashed pane returns as a
+  bare shell, invisibly (the loop's own `--session-id`/`--resume` floor still applies, so this costs
+  the second revive layer, not the first). A machine with no host running passes cleanly.
 - `superlooper plugin` - the `superlooper@superlooper` plugin should be installed and enabled, so
   planning and worker sessions on this machine load the superlooper ops, write-issue and debugger
   skills. This is a **WARN**, never a FAIL: the runner does not depend on the skills being
@@ -211,6 +220,18 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   FAILs when the vendored hook asset is absent from the installed engine or does not match the
   pinned checksum: republish with the repo-root `bin/install.sh`. Until it lands, workers launch
   without host-side revive — the loop's own `--session-id`/`--resume` floor still applies.
+- `host state capture`: asks the session host's live control socket, tokenless, the two questions a
+  worker pane could ask. FAILs when a tokenless caller is SERVED — that host carries no fence, so
+  every worker can drive the whole fleet; start it from a build carrying the patch in
+  `skills/superlooper/vendor/herdr/` with `HERDR_API_TOKEN` set in the server's environment. Also
+  FAILs when the host is fenced but refuses the state report (`pane.report_agent_session`): the
+  capture is silent, so no session id is recorded and the host cannot revive a crashed pane —
+  rebuild from the pinned release with the CURRENT carried patch, which is where the owner's ruled
+  allowance lives, and restart the server. WARNs when the socket is there but does not answer
+  (silence is unknown, never fine) and passes quietly when no host is running at all. The probes
+  write nothing: the capture question names a pane that cannot resolve and an empty agent label, so
+  the host refuses it before touching any state. `HERDR_SOCKET_PATH` overrides where it looks, the
+  same variable the host itself reads first.
 - `superlooper plugin`: install it with `claude plugin marketplace add willprout/superlooper` then
   `claude plugin install superlooper@superlooper --scope user`; if it is installed but disabled, run
   `claude plugin enable superlooper@superlooper`. Always a WARN — the loop runs correctly without

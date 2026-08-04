@@ -336,6 +336,232 @@ def test_the_probe_presents_no_token_because_that_is_the_position_it_is_testing(
     assert TOKEN not in seen["line"]
 
 
+# ------------------------------------------- the one hole in the fence: the state report (#331)
+# Owner ruling, 2026-08-04: a fenced host ADMITS the vendor's `SessionStart` state report from a
+# tokenless caller — the call the carried hook script (#307) makes to tell the host which session id
+# to `--resume` after a crash — and refuses every other method before dispatch exactly as #305 built
+# it. Without the hole a fenced host captures nothing and `persist.restore` returns a bare shell,
+# silently. The allowance is host-side and method-scoped, inside the carried patch; the vendor hook
+# is never taught a credential.
+#
+# The tests below are the OUR-CODE half: that the probe asks the worker's question, that it reads
+# both answers, and — in the opt-in acceptance check further down — that a real patched host really
+# does draw the line exactly one method wide.
+
+def test_the_capture_probe_reports_an_admitted_state_report(sock_dir):
+    path = os.path.join(sock_dir, "h.sock")
+    # What a fenced host with the allowance actually answers: the call reached the method body and
+    # the method refused the probe's deliberately unusable arguments.
+    _serve_one(path, json.dumps(
+        {"id": "superlooper-capture-probe",
+         "error": {"code": "pane_not_found", "message": "pane … not found"}}) + "\n")
+
+    assert session_host.state_report_probe(path) == session_host.ADMITTED
+
+
+def test_the_capture_probe_reports_a_refused_state_report(sock_dir):
+    # The state this issue exists for, and the one that is invisible from the runner's seat: the
+    # fence is up, every worker launches and works, and no session id is ever captured.
+    path = os.path.join(sock_dir, "h.sock")
+    _serve_one(path, json.dumps(
+        {"id": "superlooper-capture-probe",
+         "error": {"code": "unauthorized", "message": "unauthorized"}}) + "\n")
+
+    assert session_host.state_report_probe(path) == session_host.REFUSED
+
+
+def test_the_capture_probe_reads_a_served_report_as_admitted(sock_dir):
+    # An unfenced host serves it outright. Still ADMITTED — this probe answers "did the fence turn
+    # it away", and the doctor pairs it with fence_probe to tell the two apart.
+    path = os.path.join(sock_dir, "h.sock")
+    _serve_one(path, json.dumps({"id": "superlooper-capture-probe", "result": {"type": "ok"}}) + "\n")
+
+    assert session_host.state_report_probe(path) == session_host.ADMITTED
+
+
+def test_an_unknown_error_code_is_read_as_admitted_not_as_refused(sock_dir):
+    # `unauthorized` is the fence's own word and the only discriminator. Anything else came out of
+    # the method body, which means the connection got past the check. A code that MOVES in a later
+    # release must degrade to "the hole is there" rather than quietly reporting a working capture as
+    # silent — the direction that would send an operator chasing a healthy machine.
+    path = os.path.join(sock_dir, "h.sock")
+    _serve_one(path, json.dumps(
+        {"id": "x", "error": {"code": "invalid_agent", "message": "…"}}) + "\n")
+
+    assert session_host.state_report_probe(path) == session_host.ADMITTED
+
+
+def test_the_capture_probe_reports_unreachable_when_nothing_is_listening(tmp_path):
+    assert session_host.state_report_probe(str(tmp_path / "absent.sock")) \
+        == session_host.UNREACHABLE
+
+
+def test_the_capture_probe_reports_unreachable_on_silence(sock_dir):
+    path = os.path.join(sock_dir, "h.sock")
+    _serve_one(path, None)
+
+    assert session_host.state_report_probe(path, timeout=1.0) == session_host.UNREACHABLE
+
+
+def test_the_capture_probe_presents_no_token_and_asks_for_exactly_one_method(sock_dir):
+    """It has to ask what a WORKER would ask — and it must not be able to ask for anything else."""
+    path = os.path.join(sock_dir, "h.sock")
+    seen = {}
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+
+    def run():
+        conn, _ = srv.accept()
+        seen["line"] = conn.recv(65536).decode()
+        conn.sendall(json.dumps({"id": "x", "error": {"code": "pane_not_found",
+                                                      "message": "no"}}).encode() + b"\n")
+        conn.close()
+        srv.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    session_host.state_report_probe(path, env={session_host.API_TOKEN_ENV_VAR: TOKEN})
+
+    sent = json.loads(seen["line"])
+    assert "auth" not in sent, sent
+    assert TOKEN not in seen["line"]
+    assert sent["method"] == session_host.STATE_REPORT_METHOD == "pane.report_agent_session"
+
+
+def test_the_capture_probe_cannot_write_over_a_real_pane_s_record(sock_dir):
+    """A doctor command must not mutate the fleet it is describing.
+
+    The probe has to reach the method BODY to learn that the fence let it in, and that body's whole
+    job is writing a pane's resume record. So its arguments are unusable twice over: the pane id
+    cannot resolve, and the agent label is empty — the host's handler checks the pane first and the
+    label second, so even a pane id that somehow resolved is refused before anything is written.
+
+    The EMPTY LABEL is the unconditional stop, and the one to keep. The pane id is checked against
+    all three forms the host's ``parse_pane_id`` accepts at the pinned release, but that list is a
+    thing upstream can extend at a version bump, and an id that stopped being unresolvable would
+    fail silently — whereas ``normalize_reported_agent_label("")`` is refused on its own terms.
+    """
+    path = os.path.join(sock_dir, "h.sock")
+    seen = {}
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+
+    def run():
+        conn, _ = srv.accept()
+        seen["line"] = conn.recv(65536).decode()
+        conn.sendall(b'{"id":"x","error":{"code":"pane_not_found","message":"no"}}\n')
+        conn.close()
+        srv.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    session_host.state_report_probe(path)
+
+    params = json.loads(seen["line"])["params"]
+    # The stop that holds whatever upstream does to pane ids.
+    assert params["agent"] == "" and not params["agent"].strip(), params
+    # And the id itself, against every shape the pinned host would try to resolve:
+    # `<ws>:<pane>`, `p_<ws>_<n>` / `p_<n>`, and `<ws>-<n>` (a trailing `rsplit_once('-')`).
+    pane_id = params["pane_id"]
+    assert ":" not in pane_id, pane_id
+    assert not pane_id.startswith("p_"), pane_id
+    assert not pane_id.rsplit("-", 1)[-1].isdigit(), pane_id
+    # And it never carries a session id, so there is nothing for a host to record even if it did.
+    assert "agent_session_id" not in params, params
+
+
+# --------------------------------------------------------------- where the socket is, unasked
+
+def test_the_socket_path_prefers_the_explicit_override():
+    assert session_host.control_socket_path({"HERDR_SOCKET_PATH": "/tmp/h.sock",
+                                             "HOME": "/Users/x"}) == "/tmp/h.sock"
+
+
+def test_the_socket_path_falls_back_to_the_host_s_own_config_directory():
+    assert session_host.control_socket_path({"HOME": "/Users/x"}) \
+        == "/Users/x/.config/herdr/herdr.sock"
+    assert session_host.control_socket_path({"XDG_CONFIG_HOME": "/cfg", "HOME": "/Users/x"}) \
+        == "/cfg/herdr/herdr.sock"
+
+
+def test_a_named_session_keeps_its_own_socket():
+    # The adoption plan's deployment shape (§2: a dedicated named session), spelled the way the
+    # host spells it.
+    assert session_host.control_socket_path({"HOME": "/Users/x", "HERDR_SESSION": "loop"}) \
+        == "/Users/x/.config/herdr/sessions/loop/herdr.sock"
+    # "default" is not a named session — the host filters it out, and so does this.
+    assert session_host.control_socket_path({"HOME": "/Users/x", "HERDR_SESSION": "default"}) \
+        == "/Users/x/.config/herdr/herdr.sock"
+
+
+@pytest.mark.parametrize("name", ["my loop", "a/b", "café", "", " loop", "loop ", ".", "..",
+                                  "x" * 65, "loop\n"])
+def test_a_session_name_the_host_would_refuse_resolves_to_the_plain_socket(name):
+    """Deferring to the host's own rule, because the alternative answer is a confident lie.
+
+    The host IGNORES a name that fails `session::validate_name` and serves on the config-dir
+    socket. A resolver that accepted any string would point at `sessions/<junk>/herdr.sock`, find
+    nothing there, and let the doctor report "nothing is listening" about a machine with a live —
+    possibly capture-broken — host. That is the one wrong answer this whole block exists to avoid.
+    """
+    assert session_host.control_socket_path({"HOME": "/Users/x", "HERDR_SESSION": name}) \
+        == "/Users/x/.config/herdr/herdr.sock"
+
+
+@pytest.mark.parametrize("name", ["loop", "loop-2", "loop_2", "loop.2", "L", "x" * 64])
+def test_a_session_name_the_host_would_honour_gets_its_own_directory(name):
+    assert session_host.control_socket_path({"HOME": "/Users/x", "HERDR_SESSION": name}) \
+        == "/Users/x/.config/herdr/sessions/%s/herdr.sock" % name
+
+
+def test_no_home_and_no_override_resolves_to_nothing_rather_than_a_guess():
+    # A guessed path would let a probe answer UNREACHABLE about a machine it never looked at.
+    assert session_host.control_socket_path({}) is None
+
+
+# --------------------------------------------------- a probe cannot be held open by its peer
+
+def test_a_peer_that_dribbles_bytes_forever_does_not_hang_the_probe(sock_dir):
+    """The per-recv timeout is not a bound on the CALL, and both callers here are places where
+    hanging quietly is the worst outcome (a doctor block, and the launch pre-flight #326 will add).
+
+    A peer that sends something just often enough resets `settimeout` every time and never ends its
+    line. This asserts the probe gives up anyway — and reports UNREACHABLE, never a verdict built
+    out of half a line.
+    """
+    path = os.path.join(sock_dir, "h.sock")
+    stop = threading.Event()
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+
+    def run():
+        try:
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            while not stop.is_set():          # never a newline, never a close
+                conn.sendall(b'{"id":"x","er')
+                stop.wait(0.05)
+            conn.close()
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        started = __import__("time").monotonic()
+        assert session_host.state_report_probe(path, timeout=0.5) == session_host.UNREACHABLE
+        assert __import__("time").monotonic() - started < 20, "the probe was held open"
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+
 # --------------------------------------------------- the deliberate-event check (opt-in, real)
 
 _REAL = os.environ.get("SL_FENCE_HERDR")
@@ -378,14 +604,78 @@ def test_a_tokenless_connection_to_a_real_patched_server_is_refused(sock_dir):
 
         # The runner's position: served. Both halves matter — a socket that refused EVERYONE
         # would also pass the first assertion, and would be a broken host, not a fence.
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(5.0)
-        client.connect(sock)
-        client.sendall((json.dumps({"id": "probe", "method": "ping", "params": {},
-                                    "auth": token}) + "\n").encode())
-        reply = client.recv(65536).decode()
-        client.close()
-        assert "pong" in reply, reply
+        def speak(request, timeout=5.0):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(timeout)
+            client.connect(sock)
+            client.sendall((json.dumps(request) + "\n").encode())
+            reply = client.recv(65536).decode()
+            client.close()
+            return reply
+
+        assert "pong" in speak({"id": "probe", "method": "ping", "params": {}, "auth": token})
+
+        # ---- the ruled allowance, and its exact width (#331) -----------------------------------
+        # POSITIVE: the vendor's own state report, presented by a caller with no credential at all,
+        # reaches the method body. `pane_not_found` IS the admission — it is the handler talking.
+        assert session_host.state_report_probe(sock, timeout=5.0) == session_host.ADMITTED
+
+        # NEGATIVE, and this is the half the DoD leans on: a tokenless caller can do NOTHING else.
+        # A socket that admitted everything would sail through the assertion above, so without this
+        # loop the acceptance check would pass on a host with no fence at all. The list deliberately
+        # includes the report's two NEIGHBOURS — `pane.report_agent` and `pane.report_metadata` are
+        # the same hook family, same shape, same pane argument — because "one method wide" is the
+        # claim, not "the reporting methods are open".
+        for method, params in (
+                ("ping", {}),
+                ("server.stop", {}),
+                ("workspace.create", {"cwd": str(root)}),
+                ("workspace.list", {}),
+                ("agent.start", {"name": "x", "kind": "claude"}),
+                ("agent.list", {}),
+                ("pane.run", {"pane_id": "w1:p1", "command": ["true"]}),
+                ("pane.read", {"pane_id": "w1:p1"}),
+                ("pane.report_agent", {"pane_id": "w1:p1", "source": "herdr:claude",
+                                       "agent": "claude", "state": "working"}),
+                ("pane.report_metadata", {"pane_id": "w1:p1", "source": "herdr:claude"}),
+                ("pane.release_agent", {"pane_id": "w1:p1", "source": "herdr:claude"}),
+        ):
+            reply = json.loads(speak({"id": "n", "method": method, "params": params}))
+            assert reply.get("error", {}).get("code") == "unauthorized", (method, reply)
+
+        # And the allowance is the exact spelling, not a family of them. Every one of these would
+        # be a way in if the check ever trimmed, folded case, or matched a prefix.
+        for near_miss in (" pane.report_agent_session", "pane.report_agent_session ",
+                          "PANE.REPORT_AGENT_SESSION", "pane.report_agent_session2",
+                          "pane.report_agent_sessio"):
+            reply = json.loads(speak({"id": "m", "method": near_miss, "params": {}}))
+            assert reply.get("error", {}).get("code") == "unauthorized", (near_miss, reply)
+
+        # The allowance is not a credential: naming the open method does not open the others. This
+        # is the shape a "smuggle a second verb in on the same line" attempt would take.
+        smuggled = json.loads(speak({"id": "s", "method": "server.stop", "params": {},
+                                     "auth": session_host.STATE_REPORT_METHOD}))
+        assert smuggled.get("error", {}).get("code") == "unauthorized", smuggled
+
+        # A REQUEST IS AN OBJECT (fresh-agent review, P1). A struct's derived deserializer also
+        # accepts a positional SEQUENCE, so before the shape check was added an array filled
+        # (id, auth, method) by position and walked through the allowance — measured against this
+        # very binary, where it reached the request parse and came back `invalid_request` instead
+        # of `unauthorized`. That difference is itself the leak: it tells a caller holding no token
+        # which method is open. Every one of these must be refused in the SAME words as everything
+        # else, and the assertion is on the code for exactly that reason.
+        for line in ('["1",null,"%s"]' % session_host.STATE_REPORT_METHOD,
+                     '["1","%s","server.stop"]' % token,
+                     '["1","%s"]' % token,
+                     '"%s"' % session_host.STATE_REPORT_METHOD,
+                     'null', '7'):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(5.0)
+            client.connect(sock)
+            client.sendall(line.encode() + b"\n")
+            reply = json.loads(client.recv(65536).decode())
+            client.close()
+            assert reply.get("error", {}).get("code") == "unauthorized", (line, reply)
 
         # ---- the pane grant, which is the other load-bearing half of the patch ----------------
         # Without this, a re-apply could silently drop or move the `pane.rs` hunk and everything

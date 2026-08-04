@@ -1,9 +1,9 @@
 diff --git a/src/api/auth.rs b/src/api/auth.rs
 new file mode 100644
-index 0000000..dab9af8
+index 0000000..49c6d47
 --- /dev/null
 +++ b/src/api/auth.rs
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,504 @@
 +//! Token auth for the control socket — superlooper's carried fence (issue #305).
 +//!
 +//! Upstream herdr deliberately exposes every capability twice (CLI + newline-JSON socket) so that
@@ -64,6 +64,31 @@ index 0000000..dab9af8
 +/// client passing the real token would publish it to precisely the workers being fenced out. See
 +/// `apply_pane_launch_env` in `pane.rs`, which is where the substitution happens.
 +pub const GRANT_SENTINEL: &str = "@superlooper-fence-grant";
++
++/// The ONE method a caller may reach with no credential at all (superlooper issue #331).
++///
++/// This is the agent's own `SessionStart` state report — the call the vendor's carried hook script
++/// makes, over this same socket, to tell the server which session id to `--resume` after a crash.
++/// The hook is herdr's asset carried byte-for-byte and it presents no token, because upstream herdr
++/// has no token concept; `i<N>` worker panes deliberately hold none either. Without this allowance
++/// a fenced host captures no session id and `persist.restore` brings a crashed pane back as a bare
++/// shell — silently, because a session that cannot report its id still runs perfectly.
++///
++/// **Owner ruling, 2026-08-04:** admit this method, refuse every other one before dispatch exactly
++/// as before. Chosen over a runner-side re-report and over leaving the seam open, at the least
++/// owned code and surface.
++///
++/// **The accepted exposure, stated plainly.** A tokenless caller — any worker pane — can set the
++/// recorded session ref of ANY pane, not only its own. What that buys it is bounded by what the
++/// method does: `handle_pane_report_agent_session` writes in-memory bookkeeping that herdr later
++/// turns into `claude --resume <value>` on restore. It is not a shell string (`shell_quote` in
++/// `app/agent_resume.rs` escapes every argument) and control characters are already refused by
++/// `valid_session_id`, so the reach is "choose a revived pane's resume argument", not "run a
++/// command". Superlooper bounds the rest by doctrine rather than by more code: the host's
++/// bookkeeping is advisory (muscle, never truth), the runner's own minted-id ledger (#298) is the
++/// loop's identity truth, and a revived pane passes the same state/liveness verification as any
++/// other before the loop trusts it.
++pub const STATE_REPORT_METHOD: &str = "pane.report_agent_session";
 +
 +/// The error code an unauthenticated caller gets back. Callers match on this exact string.
 +pub const UNAUTHORIZED_CODE: &str = "unauthorized";
@@ -172,6 +197,72 @@ index 0000000..dab9af8
 +    }
 +}
 +
++/// The smallest thing that can be read out of a request line in order to judge it: who is asking
++/// (`id`, echoed back so a refused caller can still correlate), what they presented (`auth`), and
++/// what they are asking for (`method`, for the one allowance below).
++///
++/// Unknown members are ignored BY DESIGN — this must parse every valid request without knowing the
++/// method surface, and must never become a second place where method spellings are maintained. It
++/// lives here rather than in `server.rs` for the same reason the rest of this file does: everything
++/// in a new file is a hunk that can never conflict at a version bump, and its decisions can be
++/// unit-tested without standing up a socket.
++#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize)]
++pub struct Envelope {
++    #[serde(default)]
++    pub id: Option<String>,
++    #[serde(default)]
++    pub auth: Option<String>,
++    #[serde(default)]
++    pub method: Option<String>,
++}
++
++/// Read the envelope out of a request line. A line that is not a well-formed request object at all
++/// yields the DEFAULT envelope — no token, no method — which `admit` refuses. Fail closed: garbage
++/// must never be a way past the check.
++///
++/// **A REQUEST IS AN OBJECT, and this has to say so.** serde's derived impl for a struct also
++/// accepts a positional SEQUENCE, so without the shape test below `["1","<token>","server.stop"]`
++/// fills `(id, auth, method)` by position and `["1",null,"pane.report_agent_session"]` walks
++/// straight through the allowance. Measured against the real patched server before this line
++/// existed: both reached the `Request` parse, where the array died as `invalid_request` — which is
++/// already one failure of this patch's stated contract (a refused caller must learn only that it
++/// was refused; that error code is an oracle for which methods are open, readable with no token at
++/// all) and one upstream schema change away from being a real bypass. `Request` refuses a sequence
++/// TODAY only because its `#[serde(flatten)]` suppresses the seq visitor, and this check is not
++/// allowed to rest on an accident of somebody else's struct.
++///
++/// The test is on the TEXT rather than a re-parse into `serde_json::Value`, deliberately: a
++/// `Value` round-trip collapses duplicate keys (last wins) while the derived struct below REFUSES
++/// them outright, and swapping one rule for the other is precisely how the envelope and the
++/// dispatcher would start disagreeing about which method a line names. Fail closed, and change
++/// nothing else.
++pub fn envelope(line: &str) -> Envelope {
++    if !line.trim_start().starts_with('{') {
++        return Envelope::default();
++    }
++    serde_json::from_str::<Envelope>(line).unwrap_or_default()
++}
++
++/// May this request run at all? The whole fence decision, in one place.
++///
++/// Two ways in, and only two: present the token, or ask for the one method that is open to
++/// everybody (`STATE_REPORT_METHOD` — see its note for the ruling and the accepted exposure).
++///
++/// The allowance does NOT vary with `Expectation`, deliberately. It is a statement about that one
++/// method's blast radius, not about the credential, so a `Misconfigured` server admits the state
++/// report exactly as a `Token` one does. That does not soften the fail-closed rule the
++/// `Misconfigured` state exists for: every verb an operator or the runner actually drives is still
++/// refused, so a typo in the token configuration is still loud.
++pub fn admit(expected: &Expectation, envelope: &Envelope) -> bool {
++    authorize(expected, envelope.auth.as_deref()) || is_state_report(envelope.method.as_deref())
++}
++
++/// Exact match, and nothing clever. No trimming, no case folding, no prefix: the vendor's hook
++/// sends this one spelling, and every variation a caller invents is somebody probing.
++fn is_state_report(method: Option<&str>) -> bool {
++    method == Some(STATE_REPORT_METHOD)
++}
++
 +/// Does this server require a token at all? Used to decide whether to run the check.
 +pub fn is_enforcing() -> bool {
 +    !matches!(expectation(), Expectation::Unconfigured)
@@ -260,6 +351,155 @@ index 0000000..dab9af8
 +        assert_eq!(vet("s3cret"), Expectation::Token("s3cret".to_string()));
 +    }
 +
++    // ---- the one method a tokenless caller may reach (issue #331) ---------------------------
++
++    fn asking(method: &str) -> Envelope {
++        Envelope { id: None, auth: None, method: Some(method.to_string()) }
++    }
++
++    #[test]
++    fn a_tokenless_state_report_is_admitted() {
++        // The ruling. The vendor's SessionStart hook has no token to present and never will.
++        assert!(admit(&token("secret"), &asking(STATE_REPORT_METHOD)));
++    }
++
++    #[test]
++    fn a_tokenless_caller_can_reach_nothing_else() {
++        // The other half, and the half that matters more: the allowance is one method wide.
++        for method in [
++            "ping", "server.stop", "workspace.create", "agent.start", "agent.prompt",
++            "pane.run", "pane.read", "events.subscribe", "pane.report_agent",
++            "pane.report_metadata", "pane.release_agent",
++        ] {
++            assert!(!admit(&token("secret"), &asking(method)), "{method} was admitted");
++        }
++        // …including asking for nothing at all.
++        assert!(!admit(&token("secret"), &Envelope::default()));
++    }
++
++    #[test]
++    fn only_the_exact_spelling_is_admitted() {
++        // Nothing is trimmed, folded or prefix-matched, so none of these is a way in.
++        for near_miss in [
++            " pane.report_agent_session",
++            "pane.report_agent_session ",
++            "PANE.REPORT_AGENT_SESSION",
++            "Pane.Report_Agent_Session",
++            "pane.report_agent_session2",
++            "pane.report_agent_sessio",
++            "pane.report_agent",
++            "\tpane.report_agent_session",
++        ] {
++            assert!(!admit(&token("secret"), &asking(near_miss)), "{near_miss:?} was admitted");
++        }
++    }
++
++    #[test]
++    fn the_allowance_does_not_depend_on_how_the_token_was_configured() {
++        // It is a statement about the METHOD, not about the credential. A server whose token file
++        // is broken still lets an agent report its session id — and still refuses every verb its
++        // operator drives, which is what makes the misconfiguration loud.
++        assert!(admit(&Expectation::Misconfigured, &asking(STATE_REPORT_METHOD)));
++        assert!(!admit(&Expectation::Misconfigured, &asking("ping")));
++    }
++
++    #[test]
++    fn a_presented_token_still_opens_everything() {
++        assert!(admit(&token("secret"), &Envelope {
++            id: None, auth: Some("secret".into()), method: Some("server.stop".into()),
++        }));
++    }
++
++    #[test]
++    fn a_line_that_is_not_a_request_object_is_refused() {
++        // Fail closed on garbage: no envelope, no method, no way past.
++        for line in ["", "   ", "not json", "[]", "\"pane.report_agent_session\"", "null", "7",
++                     "{\"method\":7}", "{\"method\":null}", "{"] {
++            assert_eq!(envelope(line), Envelope::default(), "{line:?} parsed as something");
++            assert!(!admit(&token("secret"), &envelope(line)), "{line:?} was admitted");
++        }
++    }
++
++    #[test]
++    fn a_positional_array_is_not_an_envelope() {
++        // The finding this shape test exists for. A derived struct impl accepts a SEQUENCE as well
++        // as a map, filling fields in declaration order — so without the object check an array is
++        // an envelope with `id`, `auth` and `method` supplied positionally. `[]` in the case above
++        // passes for the wrong reason (zero elements, so every field defaults); these do not.
++        for line in [
++            "[\"1\",null,\"pane.report_agent_session\"]",   // the allowance, positionally
++            "[\"1\",\"secret\",\"server.stop\"]",           // the TOKEN, positionally
++            "[\"1\",\"secret\"]",
++            "  [\"1\",null,\"pane.report_agent_session\"]",
++        ] {
++            assert_eq!(envelope(line), Envelope::default(), "{line:?} parsed as an envelope");
++            assert!(!admit(&token("secret"), &envelope(line)), "{line:?} was admitted");
++        }
++    }
++
++    #[test]
++    fn a_method_named_twice_is_refused_outright() {
++        // Fail closed where the two parsers are most likely to part company. The derived impl
++        // REFUSES a duplicate field, so such a line never reaches the agreement question below —
++        // asserted here rather than left as an untested branch of that test.
++        for line in [
++            "{\"id\":\"1\",\"method\":\"pane.report_agent_session\",\"method\":\"server.stop\"}",
++            "{\"id\":\"1\",\"method\":\"server.stop\",\"method\":\"pane.report_agent_session\"}",
++            "{\"id\":\"1\",\"auth\":\"secret\",\"auth\":\"guess\"}",
++        ] {
++            assert_eq!(envelope(line), Envelope::default(), "{line:?} parsed as an envelope");
++            assert!(!admit(&token("secret"), &envelope(line)), "{line:?} was admitted");
++        }
++    }
++
++    #[test]
++    fn the_envelope_ignores_everything_it_does_not_need() {
++        let parsed = envelope(
++            "{\"id\":\"7\",\"method\":\"pane.report_agent_session\",\"params\":{\"pane_id\":\"w1:p1\"},\
++             \"auth\":\"secret\",\"unknown\":{\"nested\":[1,2,3]}}");
++        assert_eq!(parsed.id.as_deref(), Some("7"));
++        assert_eq!(parsed.auth.as_deref(), Some("secret"));
++        assert_eq!(parsed.method.as_deref(), Some(STATE_REPORT_METHOD));
++    }
++
++    #[test]
++    fn the_admitted_method_is_the_one_that_would_actually_dispatch() {
++        // THE test this allowance rests on. The line is parsed TWICE — once here to judge it, and
++        // once by `server.rs` as a `Request` to run it. If those two could ever disagree about
++        // which method a line names, the allowance would be a way to smuggle a different verb past
++        // the fence: judged as the harmless report, dispatched as something else.
++        //
++        // So: for every line below that gets admitted WITHOUT a token, whatever the dispatcher
++        // makes of it must be the state report or nothing at all.
++        let report = "\"method\":\"pane.report_agent_session\"";
++        let params = "\"params\":{\"pane_id\":\"w1:p1\",\"source\":\"herdr:claude\",\
++                      \"agent\":\"claude\",\"agent_session_id\":\"x\"}";
++        let lines = [
++            // the honest one
++            format!("{{\"id\":\"1\",{report},{params}}}"),
++            // the method named twice, both orders — a duplicate key is where two parsers most
++            // easily part company
++            format!("{{\"id\":\"1\",{report},\"method\":\"server.stop\",{params}}}"),
++            format!("{{\"id\":\"1\",\"method\":\"server.stop\",{report},{params}}}"),
++            // the allowed spelling hidden somewhere the dispatcher will not look
++            format!("{{\"id\":\"1\",\"method\":\"server.stop\",\"params\":{{{report}}}}}"),
++            format!("{{\"id\":\"1\",\"method\":\"server.stop\",\"auth\":{report}}}"),
++        ];
++        for line in &lines {
++            if !admit(&token("secret"), &envelope(line)) {
++                continue;                       // refused: there is nothing to disagree about
++            }
++            let Ok(request) = serde_json::from_str::<crate::api::schema::Request>(line) else {
++                continue;                       // the dispatcher will refuse it as invalid_request
++            };
++            let rendered = serde_json::to_value(&request).expect("a Request re-serializes");
++            assert_eq!(
++                rendered.get("method").and_then(|m| m.as_str()),
++                Some(STATE_REPORT_METHOD),
++                "admitted as the state report but dispatches as something else: {line}");
++        }
++    }
++
 +    #[test]
 +    fn constant_time_eq_agrees_with_equality() {
 +        assert!(constant_time_eq(b"", b""));
@@ -320,34 +560,14 @@ index 7520d83..2a3bfed 100644
  mod event_hub;
  pub mod schema;
 diff --git a/src/api/server.rs b/src/api/server.rs
-index 0598fae..fb09121 100644
+index 0598fae..24b8906 100644
 --- a/src/api/server.rs
 +++ b/src/api/server.rs
-@@ -136,6 +136,19 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
-     crate::ipc::restrict_socket_permissions(path, SOCKET_PERMISSION_MODE)
- }
- 
-+/// superlooper fence (#305). The smallest thing that can be read out of a request line in order to
-+/// judge it: who is asking (`id`, echoed back so a refused caller can still correlate) and what
-+/// they presented (`auth`). Unknown members are ignored by design — this must parse EVERY valid
-+/// request without knowing the method surface, and must never be a second place that method
-+/// spellings have to be maintained.
-+#[derive(Default, serde::Deserialize)]
-+struct AuthEnvelope {
-+    #[serde(default)]
-+    id: Option<String>,
-+    #[serde(default)]
-+    auth: Option<String>,
-+}
-+
- fn handle_connection(
-     mut stream: LocalStream,
-     api_tx: &ApiRequestSender,
-@@ -156,6 +169,36 @@ fn handle_connection(
+@@ -156,6 +156,39 @@ fn handle_connection(
          return Ok(());
      }
  
-+    // ---- superlooper fence (#305): token auth, BEFORE dispatch. -------------------------------
++    // ---- superlooper fence (#305, #331): token auth, BEFORE dispatch. -------------------------
 +    // Deliberately ahead of the `Request` parse below. An unauthenticated caller must not be able
 +    // to use this server's parse errors as an oracle for the method surface, and no method body may
 +    // run for it — so the only thing it can learn from this socket is that it was refused.
@@ -355,12 +575,15 @@ index 0598fae..fb09121 100644
 +    // The check reads a MINIMAL envelope rather than adding a field to `Request`, for a reason that
 +    // is about maintenance rather than taste: `Request` is constructed at ~260 literal sites, so a
 +    // new field there would make this carried patch enormous and conflict-prone at every version
-+    // bump. `AuthEnvelope` ignores unknown members, so it parses any well-formed request object and
-+    // this hunk stays four lines wide.
++    // bump. `auth::Envelope` ignores unknown members, so it parses any well-formed request object
++    // and this hunk stays a few lines wide.
++    //
++    // The DECISION itself — token, or the one method open to everybody (#331's ruled allowance for
++    // the vendor's own state-report hook) — lives entirely in `auth::admit`, where it is unit
++    // tested. Nothing about the method surface is spelled here.
 +    if crate::api::auth::is_enforcing() {
-+        let envelope = serde_json::from_str::<AuthEnvelope>(line).unwrap_or_default();
-+        if !crate::api::auth::authorize(crate::api::auth::expectation(),
-+                                        envelope.auth.as_deref()) {
++        let envelope = crate::api::auth::envelope(line);
++        if !crate::api::auth::admit(crate::api::auth::expectation(), &envelope) {
 +            // No token material in the log line, and no request body either — just the fact.
 +            warn!("api connection refused: unauthenticated");
 +            write_json_line_allow_disconnect(

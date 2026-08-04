@@ -87,15 +87,35 @@ work, and simply never come back after a crash.
 5. **Confirm the global settings file is untouched** (sha256 before and after), and that
    `doctor --stack`'s `host state hook` block still passes.
 
-## A known interaction — the fence (#305) refuses this hook
+## How this hook crosses the fence (#305) — the ruled allowance (#331)
 
 The carried fence patch rejects **every unauthenticated connection** to the control socket before
-dispatch. This hook opens the socket directly and presents no token (it is stock herdr, and herdr
-has no token concept), and `i<N>` workers deliberately never hold one. So **on a fenced host this
-capture goes silent** and herdr-side revive stops working — quietly, because a session that cannot
-report its id still runs perfectly.
+dispatch. This hook opens that socket directly and presents **no token** — it is stock herdr, and
+herdr has no token concept — and `i<N>` workers deliberately never hold one either. So on a fenced
+host the capture went silent, and quietly: a session that cannot report its id still runs perfectly.
 
-That is not a defect in either piece; it is a seam between two accepted decisions, and closing it
-is a security-posture call the owner makes, not something to work around here. Filed as **#331** (`needs-owner`) rather than patched in this lane. Until it is decided, the loop's own
-resurrection floor (#298 — the runner mints `--session-id` and relaunches with `--resume`) is
-unaffected, because it never asks herdr anything.
+**Owner ruling, 2026-08-04 — a method allowance.** The fenced host now **admits this one call**
+(`pane.report_agent_session`) from a tokenless caller, and refuses every other method before
+dispatch exactly as #305 built it. Chosen over a runner-side re-report and over leaving the seam
+open, at the least owned code and surface: herdr's built-in crash revive stays the working second
+layer, and nothing here duplicates a feature the vendor already ships.
+
+Three things about the shape of that hole, because each is load-bearing:
+
+- **It is host-side, in the carried patch** (`auth::admit` / `auth::STATE_REPORT_METHOD` in
+  `../../../vendor/herdr/`). This script is untouched. The carry-verbatim rule stands: any
+  credential a host accepts is something the host resolves for itself, never something taught to a
+  vendor asset.
+- **It is one method wide, spelled exactly.** No trimming, no case folding, no prefix. The report's
+  own neighbours — `pane.report_agent`, `pane.report_metadata` — stay refused, and so does
+  everything else.
+- **The accepted exposure, stated:** a worker pane can write session-id bookkeeping without a
+  credential, including for a pane that is not its own. That is bounded by doctrine rather than by
+  new machinery — the host's bookkeeping is advisory (muscle, never truth), the runner's minted-id
+  ledger (#298) remains the loop's identity truth, and a revived pane passes the same
+  state/liveness verification as any other before the loop trusts it. What the method actually
+  reaches is in the patch's own note next to the constant.
+
+**Which state a machine is in is not visible on disk**, and both states launch and work identically.
+`doctor --stack`'s `host state capture` block asks the live socket, tokenless, and says which —
+run it after any host rebuild.

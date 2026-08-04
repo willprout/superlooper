@@ -127,6 +127,51 @@ _HOST_ENV_PREFIX = "HERDR"
 # one, because an unfenced socket does not look broken from the runner's seat — it answers.
 FENCED, OPEN, UNREACHABLE = "fenced", "open", "unreachable"
 
+# --------------------------------------------------------------------- the allowance (#331)
+# The fence refuses every unauthenticated connection before dispatch, with exactly ONE exception,
+# ruled by the owner on 2026-08-04: the agent's own state report. That call is what tells the host
+# which session id to `--resume` after a crash, it is made by the host's own hook script carried
+# byte-for-byte (#307), and that script presents no token because upstream herdr has no token
+# concept — nor do `i<N>` worker panes, by the same 2026-07-31 distribution ruling. Without the
+# allowance a fenced host captures no id at all and `persist.restore` brings a crashed pane back as
+# a bare shell, SILENTLY: the session launches, runs and works.
+#
+# The allowance lives in the carried patch, host-side and method-scoped (`auth::admit`). Nothing
+# here grants it and nothing here can: what this module owns is the ability to ASK a live socket
+# which of the two states a machine is in, because "the fence is up and the capture works" and "the
+# fence is up and the capture is silent" look identical from the runner's seat.
+STATE_REPORT_METHOD = "pane.report_agent_session"
+
+# What a tokenless state report was answered with. ADMITTED is the ruled behaviour; REFUSED is a
+# host built before the allowance (or from a patch that lost it at a version bump).
+ADMITTED, REFUSED = "admitted", "refused"
+
+# The pane the capture probe names, and the agent label it reports — BOTH deliberately unusable.
+#
+# The probe has to reach the method body to learn that the fence let it in, and a doctor command
+# must not write anything while it does. The host's own handler checks the pane id first and the
+# agent label second, so an unresolvable pane refuses it before any state is touched, and an empty
+# label refuses it again in the impossible case that the id resolved anyway. Two independent stops,
+# because "the doctor corrupted a live pane's resume record" is not a bug anybody would enjoy.
+_PROBE_PANE = "superlooper-capture-probe-not-a-pane"
+_PROBE_AGENT = ""
+
+# The host's own session-name rule, transcribed from the pinned release (`session::validate_name`:
+# ASCII alphanumerics plus `.`, `_` and `-`, at most 64 bytes, and never `.` or `..`). A name that
+# fails it is IGNORED by the host, which then serves on the plain config-dir socket — so a resolver
+# that did not check would point at a directory nothing ever creates. No trimming: the host does
+# none, so a name with a leading space is invalid rather than tidied into a valid one.
+#
+# `\Z`, not `$`: Python's `$` also matches just before a TRAILING NEWLINE, so `"loop\n"` — a name
+# the host rejects outright — would pass a `$`-anchored version of this and send the probe to a
+# directory that cannot exist. The test parametrises that exact value.
+_SESSION_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+
+# The most a single control-socket reply may be before `_speak` gives up on it. A real one is a
+# JSON line; nothing legitimate is near this, and the number exists so a hostile or wedged peer
+# cannot grow a probe's buffer without limit.
+_MAX_REPLY_BYTES = 4 * 1024 * 1024
+
 _DEFAULT_BINARY = "herdr"
 _CALL_SECONDS = 20                 # a control call that hangs is a dead host, not a slow one
 _PROMPT_TIMEOUT_MS = 120000        # the host's own documented prompt wait
@@ -477,6 +522,12 @@ def fence_probe(socket_path, env=None, timeout=5.0, connect=None):
     Returns FENCED (refused — the good answer), OPEN (a tokenless caller was SERVED, i.e. there is
     no fence), or UNREACHABLE. Silence is UNREACHABLE, never FENCED: absence of signal is UNKNOWN
     (c2), and a socket that accepts and then says nothing has proven nothing.
+
+    ``env`` is accepted for signature symmetry with the rest of this module and is DELIBERATELY
+    NOT READ. Both probes here present no credential by construction, so passing one an environment
+    holding the token does not authenticate it — and must not be read as doing so. (Not a raise:
+    the runner's own environment legitimately holds the token, and the launch pre-flight #326 will
+    call these from exactly there.)
     """
     line = (connect or _speak)(socket_path, json.dumps(
         {"id": "superlooper-fence-probe", "method": "ping", "params": {}}) + "\n", timeout)
@@ -496,6 +547,95 @@ def fence_probe(socket_path, env=None, timeout=5.0, connect=None):
     return UNREACHABLE
 
 
+def state_report_probe(socket_path, env=None, timeout=5.0, connect=None):
+    """Does this socket admit the vendor's state report from a TOKENLESS caller? (issue #331)
+
+    The second half of the fence's question, and the one nothing else can answer by looking at a
+    file: `fence_probe` says whether the fence is up, this says whether the ruled hole is in it.
+    A machine can be fenced with the capture working and fenced with the capture silent, and from
+    the runner's seat those two are the same machine — sessions launch, run and work in both.
+
+    Presents NO token, for the same reason `fence_probe` does not: it must ask exactly what the
+    hook in a worker pane asks, and a probe that authenticated itself would report an allowance
+    that no worker actually enjoys. ``env`` is accepted for signature symmetry and deliberately
+    unread — see `fence_probe`.
+
+    Returns ADMITTED (the call reached the method body), REFUSED (`unauthorized` — the fence turned
+    it away, so this host captures no session ids), or UNREACHABLE.
+
+    ADMITTED means "past the fence", NOT "the report was accepted" — the probe's own arguments are
+    deliberately unusable (see `_PROBE_PANE`), so the host's own refusal of them is the evidence.
+    Any error code OTHER than `unauthorized` is therefore a pass: the fence's vocabulary is the
+    discriminator, and a code that MOVES in a later release degrades to ADMITTED rather than
+    silently reading a live allowance as absent.
+
+    On an UNFENCED host every method is admitted, so this returns ADMITTED there too. That is not a
+    flaw to fix here — it is why the doctor asks BOTH probes and reads them together.
+    """
+    line = (connect or _speak)(socket_path, json.dumps({
+        "id": "superlooper-capture-probe",
+        "method": STATE_REPORT_METHOD,
+        "params": {"pane_id": _PROBE_PANE, "source": "herdr:claude", "agent": _PROBE_AGENT},
+    }) + "\n", timeout)
+    if not line:
+        return UNREACHABLE
+    try:
+        reply = json.loads(line)
+    except (TypeError, ValueError):
+        return UNREACHABLE
+    if not isinstance(reply, dict):
+        return UNREACHABLE
+    error = reply.get("error")
+    if isinstance(error, dict):
+        return REFUSED if error.get("code") == "unauthorized" else ADMITTED
+    if reply.get("result"):
+        return ADMITTED
+    # The host spoke, but said neither. Refuse to call that either answer (c2).
+    return UNREACHABLE
+
+
+def control_socket_path(env=None):
+    """Where this machine's host keeps its control socket, resolved the way the host resolves it.
+
+    Read from the environment rather than by asking the binary, so a caller that only wants to
+    PROBE never has to run anything. The order is the host's own (`session::active_api_socket_path`
+    at the pinned release), minus the `--session` CLI flag, which is a thing only its CLI has:
+
+    1. ``HERDR_SOCKET_PATH`` — the explicit override, and what the adoption plan's short-socket-path
+       deployment (§2, the 104-char ``sun_path`` limit) actually sets;
+    2. otherwise a named session's own directory, if ``HERDR_SESSION`` names one the host would
+       actually honour — not the default, and passing the host's own name validation;
+    3. otherwise the config directory itself.
+
+    Step 2's validation is not decoration. The host IGNORES a name it considers invalid and serves
+    on the plain config-dir socket; a resolver that accepted any string would send the probe to a
+    ``sessions/<junk>/`` path that cannot exist, and the doctor would then report "nothing is
+    listening" about a machine with a live host. Deferring to what the host does is the only way
+    that answer stays true.
+
+    Returns None when there is nothing to resolve against (no HOME and no XDG override), because a
+    guessed path would make a probe answer UNREACHABLE about a machine it never looked at.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get("HERDR_SOCKET_PATH")
+    if explicit:
+        return explicit
+    config_home = env.get("XDG_CONFIG_HOME")
+    if config_home:
+        # `herdr-dev` is the DEBUG build's directory name; a release build is plain `herdr`, and a
+        # release build is the only thing #302's pin ships.
+        base = os.path.join(config_home, "herdr")
+    else:
+        home = env.get("HOME")
+        if not home:
+            return None
+        base = os.path.join(home, ".config", "herdr")
+    session = env.get("HERDR_SESSION") or ""
+    if session != "default" and _SESSION_NAME_RE.match(session) and session not in (".", ".."):
+        return os.path.join(base, "sessions", session, "herdr.sock")
+    return os.path.join(base, "herdr.sock")
+
+
 def _speak(socket_path, payload, timeout):
     """One newline-JSON exchange over the control socket. The only place this module opens it.
 
@@ -504,11 +644,22 @@ def _speak(socket_path, payload, timeout):
     """
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(timeout)
+    # `timeout` is per-recv, and the two bounds below are what turn that into a bound on the CALL.
+    # Without them a peer that emits one byte every `timeout - 1` seconds is never timed out and
+    # never ends its line, so this loop runs forever and `buf` grows forever — and the callers are
+    # a doctor block and a launch pre-flight, i.e. exactly the places where hanging quietly is the
+    # worst available outcome. Whatever is at the other end of this socket is precisely the thing
+    # the fence exists because we do not trust.
+    deadline = time.monotonic() + max(float(timeout), 0.0) * 2
     try:
         client.connect(socket_path)
         client.sendall(payload.encode())
         buf = b""
         while not buf.endswith(b"\n"):
+            if time.monotonic() > deadline or len(buf) > _MAX_REPLY_BYTES:
+                # A truncated read is not a reply. Say nothing rather than hand a caller half a
+                # line to make a verdict out of — every probe here reads "" as UNREACHABLE.
+                return ""
             chunk = client.recv(65536)
             if not chunk:
                 break
