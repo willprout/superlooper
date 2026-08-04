@@ -63,6 +63,10 @@ NAMED = (
     # doctor blocks, and an operator standing up (or debugging) a login-item runner reads it as
     # instructions. That is exactly the surface D12 is about.
     "skills/superlooper/docs/RUNNER-HOME.md",
+    # The fleet machine build-up (issue #309). Operational for the same reason RUNNER-HOME.md is,
+    # and more so: it is the runbook somebody follows with a terminal open, naming a live verb, a
+    # live script and live paths. A stale line here is read as an instruction mid-build-up.
+    "skills/superlooper/docs/FLEET.md",
     "skills/superlooper/skill/docs/ADOPTING.md",  # the adoption walkthrough, published with the engine
     "README.md",                                  # a stranger's first contact with the verbs
 )
