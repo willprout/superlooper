@@ -42,6 +42,7 @@ import journal
 import loopstate
 import published_view
 import runner_home
+import session_host
 import tidy
 import usage as usage_mod
 import worker_hook
@@ -2439,15 +2440,47 @@ class Runner:
         journal.append(self.home, {"act": "merged_close_declined", "id": iid, "pid": pid})
 
     def _close_pane(self, iid):
-        """Close the id's recorded surface. Best-effort; rc ignored (a dead surface = a no-op)."""
-        surface = self._surface(iid)
-        if not surface:
+        """End the id's recorded session, through the doorway. Best-effort: a session that is
+        already gone is a no-op, exactly as it was when this closed a cmux surface.
+
+        It had to move with the spawn (issue #308), and the simulation is what proved it: the
+        handles this reads — ``state/panes/<id>`` and its ``.ws`` — are written by the launcher, so
+        after the spawn moved they name the session HOST's workspace and pane. Left on cmux, this
+        asked cmux about identifiers cmux never issued: it no-opped silently, the finished-but-alive
+        prior session kept ``worker.<id>.lock``, and the D4 relaunch could not take the singleton —
+        its start-session exits 0 without stamping a sentinel, so the launch reads as never
+        delivered and the lane false-parks. That is the same landmine this issue exists for, one
+        verb along.
+
+        ``exit`` first, then ``kill``: the doorway's ``exit`` is a positive allowlist that closes
+        only a session it can NAME as finished, and the case this is most often called for — a
+        worker that wrote its report and is idling at the prompt — reads ALIVE. Escalating is what
+        `close-surface` did unconditionally, so this preserves the behaviour rather than quietly
+        becoming gentler; the callers that must NOT end a live session gate on that themselves
+        (#168), before they ever reach here.
+        """
+        pane = self._surface(iid)
+        workspace = (_read(os.path.join(self.state, "panes", f"{iid}.ws")) or "").strip()
+        if not workspace:
+            # Without a workspace the doorway has nothing to close, and it refuses rather than
+            # guess — which is right: closing "whatever is at that pane" is how a stale handle
+            # ends someone else's window.
             return
-        ws = (_read(os.path.join(self.state, "panes", f"{iid}.ws")) or "").strip()
-        args = [os.environ.get("SL_CMUX", _CMUX_DEFAULT), "close-surface", "--surface", surface]
-        if ws:
-            args += ["--workspace", ws]
-        self._run_script(args, timeout=CLOSE_TIMEOUT)
+        session = session_host.Session(name=iid, workspace=workspace, pane=pane or None,
+                                       owned=True)
+        host = self._session_host()
+        try:
+            host.exit(session)
+        except session_host.TeardownRefused:
+            try:
+                host.kill(session)
+            except session_host.HostError as e:
+                self._log(f"[{iid}] could not end the recorded session: {e}")
+        except session_host.HostError as e:
+            self._log(f"[{iid}] could not end the recorded session: {e}")
+
+    def _session_host(self):                                         # injectable, like _run_script
+        return session_host.SessionHost()
 
     def _teardown_session(self, iid, remove_worktree=False, exit_timeout=None, guard_worktree=False,
                           await_exit=None):

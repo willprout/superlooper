@@ -296,6 +296,12 @@ def _launch(spec, host, edges):
         # would name nothing there.
         worktree = os.path.realpath(spec.cwd)
     else:
+        if not spec.repo:
+            # Named rather than left to git. Without it `git -C ''` fails, the base-ref probe
+            # fails with it, and the launch would exit 3 telling the owner to fix a dev_branch
+            # that is not what went wrong — the mis-blame the whole evidence table exists to end.
+            return Result(ABORTED, "[%s] no target repo was given for a worker launch (SL_REPO) — "
+                                   "not launching" % iid)
         state_path = os.path.join(spec.run_root, "state", "issues.json")
         try:
             issue = loopstate.load(state_path)["issues"][iid]
@@ -315,9 +321,12 @@ def _launch(spec, host, edges):
     # classified that blocked pane `idle`. So S9 pre-trust stays load-bearing, and runs for the
     # debugger's in-place directory too (an owner-tap repair on an unvisited repo is exactly the
     # case that would hang).
-    pretrust = os.path.join(spec.engine_bin, "pretrust-codex.sh" if spec.agent == "codex"
-                            else "pretrust.sh")
-    edges.run([pretrust, worktree], timeout=60)
+    #
+    # `pretrust.sh` on BOTH agent paths, which is a FAITHFUL port and not an oversight: the cmux
+    # launcher called exactly this one whatever the configured agent was, and `pretrust-codex.sh`
+    # has no caller anywhere. Wiring it here would be a real fix and an unrequested behaviour
+    # change inside a migration, so it is filed rather than smuggled in (see the follow-up issue).
+    edges.run([os.path.join(spec.engine_bin, "pretrust.sh"), worktree], timeout=60)
 
     # ---- session identity (issue #298) ----------------------------------------------------
     # Identity handed down, never self-asserted. A RELAUNCH always mints anew (`--session-id` on

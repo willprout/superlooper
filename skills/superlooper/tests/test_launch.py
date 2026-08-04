@@ -524,3 +524,13 @@ def test_a_relaunch_clears_this_ids_stale_run_markers_only(tmp_path):
     assert not any(os.path.exists(p) for p in stale)
     assert all(os.path.exists(p) for p in keep), \
         "delivery receipts and other lanes' reports are history, and history survives a restart"
+
+
+def test_a_worker_launch_without_a_repo_names_that_rather_than_the_branch(tmp_path):
+    """Left to git it would fail the base-ref probe too, and exit 3 would send the owner to fix a
+    dev_branch that is not what went wrong."""
+    spec = _spec(tmp_path, repo="")
+    result, _edges, host = _run(spec, started=False)
+    assert result.rc == launch.ABORTED
+    assert "SL_REPO" in result.stderr
+    assert host.spawned == []

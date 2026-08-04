@@ -76,10 +76,44 @@ def rig(tmp_path, monkeypatch):
 
     calls = []
     rc_queue = []
+    teardowns = []
 
     def run_script(args, env=None, timeout=None):
         calls.append({"args": [str(x) for x in args], "env": dict(env or {})})
         return rc_queue.pop(0) if rc_queue else 0
+
+    class _FakeSessionHost:
+        """The five-verb doorway, as the runner uses it (issue #308): ending a lane's session.
+
+        Recorded into the SAME `calls` list as the scripts, because half of what these tests pin
+        is ORDER — the session must end before the worktree is pruned, and before a relaunch. It
+        also lands in `teardowns` so a test can assert WHICH verb ran: `exit` closes a session it
+        can name as finished, `kill` is the escalation for one that is still live, and the runner
+        has always ended a recorded session whichever it was.
+        """
+
+        def __init__(self):
+            self.on_close = None            # a test hook: what the close DOES to the world
+            self.live = True                # a finished-but-alive session refuses `exit`
+
+        def _record(self, verb, session):
+            calls.append({"args": ["session-host", "end-session", verb,
+                                   session.workspace or "", session.pane or ""], "env": {}})
+            teardowns.append((verb, session.workspace, session.pane))
+            if self.on_close is not None:
+                self.on_close(session)
+
+        def exit(self, session):
+            if self.live:
+                raise runner_mod.session_host.TeardownRefused("still live")
+            self._record("exit", session)
+            return runner_mod.session_host.Teardown(closed=True)
+
+        def kill(self, session):
+            self._record("kill", session)
+            return runner_mod.session_host.Teardown(closed=True, signalled=["term"])
+
+    host = _FakeSessionHost()
 
     r = runner_mod.Runner(
         repo=str(repo), config=make_config(), state_home=str(home), pane="pane-1",
@@ -88,8 +122,12 @@ def rig(tmp_path, monkeypatch):
     # Healthy launch anchor by default (mirrors the healthy stub usage/run_script above): the real
     # probe would shell out to cmux, which the suite neutralizes — anchor tests override this.
     r._anchor_status = lambda: {"ok": True, "reason": ""}
-    return type("Rig", (), {"r": r, "calls": calls, "rc_queue": rc_queue,
-                            "home": home, "repo": repo, "fixdir": fixdir})
+    # The doorway is injected for the same reason run_script is: no test may reach a real session
+    # host, whose verbs CREATE and CLOSE windows (conftest's fail-closed default would make every
+    # teardown a silent no-op instead).
+    r._session_host = lambda: host
+    return type("Rig", (), {"r": r, "calls": calls, "rc_queue": rc_queue, "teardowns": teardowns,
+                            "host": host, "home": home, "repo": repo, "fixdir": fixdir})
 
 
 def mutations(rig):
@@ -2380,7 +2418,8 @@ def test_resolve_conflict_launches_in_the_prs_own_branch(rig):
     # D4: the preserve-path resolver also relaunches into the id's own worktree while the finished-
     # but-alive prior session holds worker.<id>.lock — it must close/free it first (else infinite
     # retry). Seed a stale session + lock to assert the close happens before the relaunch.
-    (rig.home / "state" / "panes" / "i123").write_text("PRESERVE-OLD-SURFACE")
+    (rig.home / "state" / "panes" / "i123").write_text("PRESERVE-OLD-PANE")
+    (rig.home / "state" / "panes" / "i123.ws").write_text("PRESERVE-OLD-WS")
     (rig.home / "state" / "worker.i123.lock").write_text("7777")
     rig.calls.clear()
     out = rig.r._execute({"act": "resolve_conflict", "id": "i123", "num": 123, "pr": 555}, NOW)
@@ -2392,7 +2431,7 @@ def test_resolve_conflict_launches_in_the_prs_own_branch(rig):
     assert runner_mod.gate.pinned_review_marker() in b
     assert "$(" not in b, "the conflict brief tells the worker to post a substitution"
     assert "force" not in [w for w in b.lower().split() if w == "force"] or "never force" in b.lower()
-    close_idx = next((i for i, c in enumerate(rig.calls) if "close-surface" in c["args"]), None)
+    close_idx = next((i for i, c in enumerate(rig.calls) if "end-session" in c["args"]), None)
     launch_idx = next((i for i, c in enumerate(rig.calls)
                        if c["args"][0].endswith("launch-session.py") and c["args"][1] == "i123"), None)
     assert close_idx is not None and launch_idx is not None and close_idx < launch_idx
@@ -3823,10 +3862,10 @@ def test_close_stale_session_frees_the_singleton_lock(rig):
 
     rig.r._close_stale_session("i3")
 
-    closes = [c for c in rig.calls if "close-surface" in c["args"]]
-    assert closes, "expected a cmux close-surface call for the stale pane"
+    closes = [c for c in rig.calls if "end-session" in c["args"]]
+    assert closes, "expected the stale session to be ended through the doorway"
     assert "SURFACE-UUID-3" in closes[0]["args"]
-    assert "--workspace" in closes[0]["args"] and "WS-UUID-3" in closes[0]["args"]
+    assert "WS-UUID-3" in closes[0]["args"], "the workspace is what a teardown closes"
     assert not (rig.home / "state" / "panes" / "i3").exists()
     assert not (rig.home / "state" / "panes" / "i3.ws").exists()
     assert not (rig.home / "state" / "worker.i3.lock").exists()       # lock freed for the relaunch
@@ -3835,7 +3874,7 @@ def test_close_stale_session_frees_the_singleton_lock(rig):
 def test_close_stale_session_is_a_noop_without_a_recorded_pane(rig):
     """A first launch (no prior pane) must neither attempt a close nor error."""
     rig.r._close_stale_session("i9")
-    assert not [c for c in rig.calls if "close-surface" in c["args"]]
+    assert not [c for c in rig.calls if "end-session" in c["args"]]
 
 
 # ------------------- issue #149: ONE ORDERED TEARDOWN (the D14 family) -------------------
@@ -3970,13 +4009,9 @@ def test_a_failed_removal_is_not_reported_as_a_live_worker(rig, monkeypatch):
 
 
 def test_teardown_closes_the_pane_before_it_prunes(rig, monkeypatch):
-    """The ORDER is the fix, not the individual steps: close-surface must precede the prune."""
+    """The ORDER is the fix, not the individual steps: the session must END before the prune."""
     order = []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            order.append("close")
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: order.append("close")
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: order.append("prune") or True)
     _teardown_rig(rig, "i3")
@@ -4023,7 +4058,7 @@ def test_teardown_ignores_an_unreadable_lock_pid(rig, monkeypatch):
 
 
 def test_teardown_waits_for_a_worker_that_dies_after_the_close(rig, monkeypatch):
-    """The realistic shape: close-surface returns, and the CLI takes a moment to actually go. The
+    """The realistic shape: the teardown returns, and the CLI takes a moment to actually go. The
     bounded wait must OBSERVE that exit rather than race it."""
     monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 5)
     monkeypatch.setattr(runner_mod, "WORKER_EXIT_POLL", 0.01)
@@ -4056,11 +4091,7 @@ def test_merge_closes_the_pane_before_reclaiming_the_worktree(rig, monkeypatch):
     """The lane that just merged is the D14 hot path: its worker is finished-but-alive at the
     prompt when the runner reclaims the worktree."""
     order = []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            order.append("close")
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: order.append("close")
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: order.append("prune") or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
@@ -4319,11 +4350,7 @@ def test_resume_at_the_gate_clears_the_deferral_ladder_it_did_not_charge(rig, mo
 
 def test_absorb_merged_closes_the_pane_before_reclaiming(rig, monkeypatch):
     order = []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            order.append("close")
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: order.append("close")
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: order.append("prune") or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
@@ -4343,11 +4370,7 @@ def test_absorb_merged_closes_the_pane_before_reclaiming(rig, monkeypatch):
 
 def _no_close_no_prune(rig, monkeypatch):
     closed, pruned = [], []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            closed.append(1)
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: closed.append(1)
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: pruned.append(str(path)) or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
@@ -4394,11 +4417,7 @@ def test_merge_auto_closes_by_default(rig, monkeypatch):
     """The shipped default (auto_close_merged_windows absent -> True) still closes then prunes a
     landed lane — point 1 of the ruling ALLOWS auto-close for merged-and-landed."""
     order = []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            order.append("close")
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: order.append("close")
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: order.append("prune") or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
@@ -4417,16 +4436,12 @@ def test_merge_auto_closes_by_default(rig, monkeypatch):
 # whether the session ends; the worktree knob decides only whether the checkout is pruned.
 
 def _close_but_keep_checkout(rig, monkeypatch, close_kills=True):
-    """Prune gated off, window knob at its default. The worker is ALIVE until close-surface kills
-    its tab — the #178 case is a builder still BUILDING, and the teardown must OBSERVE it go rather
-    than assume it. `close_kills=False` models the close that did not: cmux returned but the process
-    lived (a stale surface id, a vanished workspace)."""
+    """Prune gated off, window knob at its default. The worker is ALIVE until the teardown ends
+    its session — the #178 case is a builder still BUILDING, and the teardown must OBSERVE it go
+    rather than assume it. `close_kills=False` models the close that did not: the host answered but
+    the process lived (a stale handle, a workspace that had already gone)."""
     closed, pruned = [], []
-    def run_script(args, env=None, timeout=None):
-        if "close-surface" in [str(a) for a in args]:
-            closed.append(1)
-        return 0
-    monkeypatch.setattr(rig.r, "_run_script", run_script)
+    rig.host.on_close = lambda session: closed.append(1)
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
                         lambda repo, path: pruned.append(str(path)) or True)
     monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: not (closed and close_kills))
@@ -4698,7 +4713,7 @@ def test_reclaim_terminal_worktrees_routes_through_the_one_teardown(rig, monkeyp
     _teardown_rig(rig, "i7")
 
     rig.r._reclaim_terminal_worktrees(loopstate.load(str(rig.home / "state" / "issues.json")))
-    assert [c for c in rig.calls if "close-surface" in c["args"]], "expected the pane to be closed"
+    assert [c for c in rig.calls if "end-session" in c["args"]], "expected the session to be ended"
     assert not (rig.home / "state" / "panes" / "i7").exists()
     assert not (rig.home / "state" / "worker.i7.lock").exists()
 
@@ -4830,18 +4845,19 @@ def test_launch_closes_a_stale_session_before_relaunching(rig):
     clears the stale singleton lock — so a conflict-regenerate / retry of an id whose old session is
     still alive can actually deliver."""
     rig.r.tick(now=NOW)                                  # i101 lands in the parsed view
-    (rig.home / "state" / "panes" / "i101").write_text("OLD-SURFACE")
+    (rig.home / "state" / "panes" / "i101").write_text("OLD-PANE")
+    (rig.home / "state" / "panes" / "i101.ws").write_text("OLD-WS")
     (rig.home / "state" / "worker.i101.lock").write_text("9999")
     rig.calls.clear()
 
     out = rig.r._execute(_launch_action(), NOW)
     assert out == "ok"
-    close_idx = next((i for i, c in enumerate(rig.calls) if "close-surface" in c["args"]), None)
+    close_idx = next((i for i, c in enumerate(rig.calls) if "end-session" in c["args"]), None)
     launch_idx = next((i for i, c in enumerate(rig.calls)
                        if c["args"][0].endswith("launch-session.py")), None)
     assert close_idx is not None and launch_idx is not None
     assert close_idx < launch_idx                        # close the old session BEFORE relaunching
-    assert "OLD-SURFACE" in rig.calls[close_idx]["args"]
+    assert "OLD-WS" in rig.calls[close_idx]["args"]
     assert not (rig.home / "state" / "worker.i101.lock").exists()     # freed before the new start-session
 
 

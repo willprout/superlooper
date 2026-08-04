@@ -34,9 +34,37 @@ DIR = os.environ.get("FAKE_HOST_DIR", "")
 MODE = os.environ.get("HOST_MODE", "deliver")
 SHIM = os.environ.get("FAKE_HOST_SHIM", "")
 
-WORKSPACE = "w1"
-PANE = "w1:p1"
-TAB = "w1:t1"
+def opt(args, flag):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+# One workspace per launch, allocated from a counter — NEVER a fixed id. The simulation runs
+# several lanes at once, and a shared id makes every per-workspace fact (its pane environment, its
+# pid, whether it is still open) collide across lanes: closing one lane's window would kill
+# another's worker. The cmux fake this replaces minted a fresh surface uuid per tab for exactly
+# this reason.
+def allocate():
+    path = state("counter")
+    try:
+        with open(path) as f:
+            n = int(f.read().strip()) + 1
+    except (OSError, ValueError):
+        n = 1
+    with open(path, "w") as f:
+        f.write(str(n))
+    return "w%d" % n
+
+
+def pane_of(ws):
+    return "%s:p1" % ws
+
+
+def ws_of(pane):
+    return str(pane).split(":", 1)[0]
 
 
 def emit(result):
@@ -58,19 +86,11 @@ def state(name):
     return os.path.join(DIR, name)
 
 
-def opt(args, flag):
-    if flag in args:
-        i = args.index(flag)
-        if i + 1 < len(args):
-            return args[i + 1]
-    return None
-
-
-def start_pane(name, agent):
+def start_pane(ws, name, agent):
     """Start the pane for real, detached, in the environment `workspace create` was given."""
     env = {}
     try:
-        with open(state("pane.env")) as f:
+        with open(state("pane.env.%s" % ws)) as f:
             for line in f:
                 key, _, value = line.rstrip("\n").partition("=")
                 if key:
@@ -78,7 +98,7 @@ def start_pane(name, agent):
     except OSError:
         pass
     try:
-        with open(state("cwd")) as f:
+        with open(state("cwd.%s" % ws)) as f:
             cwd = f.read().strip()
     except OSError:
         cwd = os.getcwd()
@@ -110,9 +130,10 @@ def main():
     rest = args[2:]
 
     if (group, verb) == ("workspace", "create"):
+        ws = allocate()
         # Record the pane environment EXACTLY as argv carried it — this is where the fence's token
         # wiring is decided, and where a simulation can see what a pane was (and was not) handed.
-        with open(state("pane.env"), "w") as f:
+        with open(state("pane.env.%s" % ws), "w") as f:
             i = 0
             while i < len(rest):
                 if rest[i] == "--env" and i + 1 < len(rest):
@@ -120,20 +141,21 @@ def main():
                     i += 2
                     continue
                 i += 1
-        with open(state("cwd"), "w") as f:
+        with open(state("cwd.%s" % ws), "w") as f:
             f.write(opt(rest, "--cwd") or "")
-        open(state("workspace_live"), "w").close()
+        open(state("live.%s" % ws), "w").close()
         emit({"type": "workspace_created",
-              "workspace": {"workspace_id": WORKSPACE},
-              "tab": {"tab_id": TAB},
-              "root_pane": {"pane_id": PANE}})
+              "workspace": {"workspace_id": ws},
+              "tab": {"tab_id": "%s:t1" % ws},
+              "root_pane": {"pane_id": pane_of(ws)}})
 
     if (group, verb) == ("agent", "start"):
         name = rest[0] if rest else "?"
         kind = opt(rest, "--kind") or "claude"
-        log("agents.jsonl", {"name": name, "kind": kind, "mode": MODE})
+        ws = ws_of(opt(rest, "--pane") or "w1:p1")
+        log("agents.jsonl", {"name": name, "kind": kind, "mode": MODE, "workspace": ws})
         if MODE == "deliver":
-            pid = start_pane(name, kind)
+            pid = start_pane(ws, name, kind)
         else:
             # A pid that is ALIVE and CHILDLESS: the pane is a bare shell. The phantom.
             # EVERY standard stream is detached. A child that inherits this process's stdout keeps
@@ -144,45 +166,53 @@ def main():
             pid = subprocess.Popen(["sleep", "120"], stdin=subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    start_new_session=True).pid
-        with open(state("pane.pid"), "w") as f:
+        with open(state("pid.%s" % ws), "w") as f:
             f.write(str(pid))
-        open(state("agent_live"), "w").close()
+        with open(state("agent.%s" % name), "w") as f:
+            f.write(ws)
         emit({"type": "agent_started",
-              "agent": {"name": name, "pane_id": PANE, "agent_status": "idle"}})
+              "agent": {"name": name, "pane_id": pane_of(ws), "agent_status": "idle"}})
 
     if (group, verb) == ("agent", "get"):
-        if not os.path.exists(state("agent_live")):
+        try:
+            with open(state("agent.%s" % (rest[0] if rest else ""))) as f:
+                ws = f.read().strip()
+        except OSError:
             fail("agent_not_found", "no such agent")
-        emit({"type": "agent", "agent": {"pane_id": PANE, "agent_status": "idle"}})
+        if not os.path.exists(state("live.%s" % ws)):
+            fail("agent_not_found", "no such agent")     # names clear when the agent goes
+        emit({"type": "agent", "agent": {"pane_id": pane_of(ws), "agent_status": "idle"}})
 
     if (group, verb) == ("pane", "process-info"):
+        ws = ws_of(opt(rest, "--pane") or "")
         try:
-            with open(state("pane.pid")) as f:
+            with open(state("pid.%s" % ws)) as f:
                 pid = int(f.read().strip())
         except (OSError, ValueError):
             fail("pane_not_found", "no pane")
         emit({"type": "process_info", "process_info": {"shell_pid": pid}})
 
     if (group, verb) == ("workspace", "close"):
-        log("closed.jsonl", {"workspace": rest[0] if rest else ""})
-        for marker in ("agent_live", "workspace_live"):
-            try:
-                os.remove(state(marker))
-            except OSError:
-                pass
-        # Kill the pane's own process GROUP — by the pid THIS fake recorded when it started it,
-        # never by name or pattern (the house rule). The real host owns its panes the same way.
+        ws = rest[0] if rest else ""
+        log("closed.jsonl", {"workspace": ws})
         try:
-            with open(state("pane.pid")) as f:
+            os.remove(state("live.%s" % ws))
+        except OSError:
+            pass
+        # Kill THIS workspace's own pane process GROUP — by the pid this fake recorded when it
+        # started it, never by name or pattern (the house rule), and never another workspace's.
+        try:
+            with open(state("pid.%s" % ws)) as f:
                 os.killpg(int(f.read().strip()), 9)
         except (OSError, ValueError):
             pass
         emit({"type": "workspace_closed"})
 
     if (group, verb) == ("workspace", "get"):
-        if not os.path.exists(state("workspace_live")):
+        ws = rest[0] if rest else ""
+        if not os.path.exists(state("live.%s" % ws)):
             fail("workspace_not_found", "no such workspace")
-        emit({"type": "workspace", "workspace": {"workspace_id": WORKSPACE}})
+        emit({"type": "workspace", "workspace": {"workspace_id": ws}})
 
     fail("unsupported", "fake-sessionhost: %s %s" % (group, verb))
 

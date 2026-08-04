@@ -441,6 +441,15 @@ class Sim:
             return []
         return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
+    def closed_workspaces(self):
+        """Every session this simulation ENDED. Like `surfaces`, the record moved with the spawn
+        path (issue #308): a teardown closes the session host's WORKSPACE now, not a cmux surface.
+        Read defensively — when this regresses NOTHING is ever closed, and a bare read would die
+        with FileNotFoundError instead of naming the property that broke."""
+        log = self.cmux_dir / "host" / "closed.jsonl"
+        return [json.loads(l)["workspace"]
+                for l in (log.read_text() if log.exists() else "").splitlines() if l.strip()]
+
     def surfaces(self):
         """Every session this simulation SPAWNED. The record moved with the spawn path (issue
         #308): it used to be a cmux surface per tab, and it is now an agent the session host was
@@ -1589,8 +1598,8 @@ def test_out_of_band_merge_kills_the_builder_even_when_the_worktree_is_kept(sim_
     pr = sim.prs_for()[0]
     assert pr["state"] == "OPEN"
     assert sim.loop_issue(sid).get("status") == "running"          # still building behind it
-    with open(os.path.join(sim.home, "state", "panes", sid)) as f:
-        surf0 = f.read().strip()
+    with open(os.path.join(sim.home, "state", "panes", "%s.ws" % sid)) as f:
+        ws0 = f.read().strip()                        # the workspace a teardown must close
     lock = os.path.join(sim.home, "state", "worker.%s.lock" % sid)
     pid0, alive0 = sim._lock_holder(lock)
     assert pid0 and alive0, "the builder must be a LIVE process — the whole premise"
@@ -1600,12 +1609,8 @@ def test_out_of_band_merge_kills_the_builder_even_when_the_worktree_is_kept(sim_
         "never absorbed the out-of-band merge: %s" % [
             (r.get("act"), r.get("outcome")) for r in sim.journal()]
 
-    # read defensively: when this regresses NOTHING is ever closed, and a bare read_text would die
-    # with FileNotFoundError instead of naming the property that broke
-    log = sim.cmux_dir / "closed.jsonl"
-    closed = [json.loads(l)["surface"]
-              for l in (log.read_text() if log.exists() else "").splitlines() if l.strip()]
-    assert surf0 in closed, "the builder's window was never closed: %s" % closed
+    closed = sim.closed_workspaces()
+    assert ws0 in closed, "the builder's window was never closed: %s" % closed
     assert _wait_dead(pid0), "the builder must be GONE — a merged branch must not keep a live " \
         "worker able to push to it and open a fresh PR"
     assert not os.path.exists(lock)
@@ -1689,8 +1694,8 @@ def test_regenerate_relaunch_survives_finished_but_alive_worker(sim_factory):
     sim.tick()
     assert sim.loop_issue(s1).get("status") == "running"
     assert sim.loop_issue(s2).get("status") == "running"
-    with open(os.path.join(sim.home, "state", "panes", s2)) as f:
-        surf0 = f.read().strip()                      # gen0's tab — must be the one closed
+    with open(os.path.join(sim.home, "state", "panes", "%s.ws" % s2)) as f:
+        ws0 = f.read().strip()                        # gen0's workspace — the one closed
     assert sim.tick_until(lambda: sim.loop_issue(s1).get("status") == "merged")
 
     sync1.write_text("go")
@@ -1710,10 +1715,9 @@ def test_regenerate_relaunch_survives_finished_but_alive_worker(sim_factory):
     assert sim.loop_issue(s2).get("launch_failures") in (None, 0)
     # the stale pane was really closed (fake-cmux records it), and the rebuild — which also
     # lingers — owns a FRESH lock
-    closed = [json.loads(l)["surface"]
-              for l in (sim.cmux_dir / "closed.jsonl").read_text().splitlines() if l.strip()]
-    assert surf0 in closed, closed
-    assert _wait_dead(pid0), "close-surface must KILL the old tab's process tree, " \
+    closed = sim.closed_workspaces()
+    assert ws0 in closed, closed
+    assert _wait_dead(pid0), "the teardown must END the old session's process tree, " \
         "not merely record a close (the lingering gen0 session must be gone)"
     pid1, alive1 = sim._lock_holder(lock)
     assert alive1 and pid1 != pid0, "the rebuild must own a fresh singleton, not the corpse's"
@@ -1745,8 +1749,8 @@ def test_preserve_resolution_survives_finished_but_alive_worker(sim_factory):
 
     sim.tick()
     assert sim.loop_issue(s2).get("status") == "running"
-    with open(os.path.join(sim.home, "state", "panes", s2)) as f:
-        surf0 = f.read().strip()
+    with open(os.path.join(sim.home, "state", "panes", "%s.ws" % s2)) as f:
+        ws0 = f.read().strip()                        # gen0's workspace — the one closed
     assert sim.tick_until(lambda: sim.loop_issue(s1).get("status") == "merged")
     b_branch = sim.loop_issue(s2).get("branch")
 
@@ -1769,10 +1773,9 @@ def test_preserve_resolution_survives_finished_but_alive_worker(sim_factory):
     assert resolves and all(r.get("outcome") == "ok" for r in resolves), resolves
     assert len(resolves) == 1, "one resolve launch — never a retry loop against a stale lock"
     # ...after the stale pane was really closed; and it resolved IN PLACE, never regenerated
-    closed = [json.loads(l)["surface"]
-              for l in (sim.cmux_dir / "closed.jsonl").read_text().splitlines() if l.strip()]
-    assert surf0 in closed, closed
-    assert _wait_dead(pid0), "the lingering gen0 session must be gone after close-surface"
+    closed = sim.closed_workspaces()
+    assert ws0 in closed, closed
+    assert _wait_dead(pid0), "the lingering gen0 session must be gone after the teardown"
     assert not sim.journal("regenerate"), "preserve replaces regenerate — never both"
     assert sim.origin_file("src/shared.txt").splitlines()[2] == "A and B merged"
 
