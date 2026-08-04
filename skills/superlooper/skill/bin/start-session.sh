@@ -422,6 +422,18 @@ case "$AGENT" in
       CLAUDE_BIN="$(type -P claude 2>/dev/null || true)"
       { [ -n "$CLAUDE_BIN" ] && sl_runnable "$CLAUDE_BIN"; } || refuse_claude_bin \
         "no claude binary to launch: SL_CLAUDE is unset, $CLAUDE_STANDALONE does not exist, and no executable \`claude\` file is on this session's PATH. Install Claude Code's standalone native build (\`claude install stable\`), then re-run \`superlooper doctor --stack\`"
+      # ABSOLUTE ONLY on this rung too. A PATH containing an EMPTY element (`PATH=":/usr/bin"`, a
+      # common misconfiguration) or a literal `.` means the CURRENT DIRECTORY — and the worker's is
+      # its worktree. A `claude` file checked into a repo would then be launched as the coding agent
+      # itself. Worse, the two ladders do not even agree on the string: for `PATH=":..."` bash's
+      # `type -P` answers `./claude` while Python's shutil.which answers a bare `claude`. So the
+      # whole ladder holds ONE invariant — it only ever accepts an absolute path — and the doctor's
+      # twin enforces the same on the same rung (third review round).
+      case "$CLAUDE_BIN" in
+        /*) ;;
+        *) refuse_claude_bin \
+             "PATH resolved \`claude\` to '$CLAUDE_BIN', a RELATIVE path — this session's PATH contains an empty or relative element, so that names a file in whatever directory the reader happens to be in (for a worker, its own worktree) rather than an installed binary. Fix this session's PATH, or set SL_CLAUDE to an absolute path" ;;
+      esac
     fi
     # Stamp what THIS launch resolved, machine-wide. The doctor re-walks the ladder in the
     # OPERATOR's environment, and a worker tab's is not the same one — the same gap #299/#301 were

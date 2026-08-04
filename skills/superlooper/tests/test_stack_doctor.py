@@ -1301,3 +1301,30 @@ def test_resolve_claude_always_reports_why_it_is_not_ok():
     assert stack_doctor.resolve_claude(
         _bin_probe(pin="/nowhere/claude", pin_exists=False))["reason"] == "unrunnable"
     assert stack_doctor.resolve_claude(_bin_probe(standalone=True))["reason"] is None
+
+
+def test_a_relative_path_hit_is_refused_like_a_relative_pin():
+    # A PATH with an empty element (`PATH=":/usr/bin"`) or a literal `.` means the CURRENT
+    # DIRECTORY, and a worker's is its own worktree — so a `claude` file checked into a repo could
+    # be launched as the coding agent. The two ladders do not even agree on the string there (bash
+    # `type -P` answers `./claude`, shutil.which answers a bare `claude`), so neither may accept one.
+    probe = _bin_probe(path_claude="./claude")
+
+    r = stack_doctor.resolve_claude(probe)
+    assert r["ok"] is False and r["reason"] == "relative" and r["source"] == "PATH"
+
+    block = stack_doctor.check_claude_binary(probe)
+    assert block.ok is False
+    assert "relative" in block.detail.lower()
+    assert "PATH" in block.fix                       # the cure here is PATH, not the pin
+
+
+def test_the_standalone_install_is_recognised_through_a_trailing_slash_home():
+    # The shell builds its path by concatenation, so a HOME ending in "/" stamps a doubled slash.
+    # Same file — but unnormalised it classified as `standalone` live and `other` from the stamp,
+    # printing "resolved standalone; last launch ran other" about one binary.
+    probe = _bin_probe(standalone=True, record="/home/will//.local/bin/claude")
+
+    assert stack_doctor.classify_claude(probe, "/home/will//.local/bin/claude") == "standalone"
+    r = stack_doctor.check_claude_binary(probe)
+    assert r.ok is True and "other" not in r.detail

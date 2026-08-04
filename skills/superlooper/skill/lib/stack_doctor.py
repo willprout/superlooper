@@ -304,7 +304,14 @@ def resolve_claude(probe):
     # latter answers with the bare name for a shell function, which no doctor could ever see).
     found = probe.command("claude")
     if found:
-        return {"path": found, "source": "PATH", "ok": True, "reason": None}
+        # Absolute only, the ladder's ONE invariant. A PATH with an empty element (`PATH=":/usr/bin"`)
+        # or a literal `.` means the CURRENT DIRECTORY, and the worker's is its worktree — so a
+        # `claude` file checked into a repo could be launched as the agent. The two ladders do not
+        # even agree on the string there (bash `type -P` says `./claude`, shutil.which says
+        # `claude`), which is why neither is allowed to accept one.
+        ok = os.path.isabs(found)
+        return {"path": found, "source": "PATH", "ok": ok,
+                "reason": None if ok else "relative"}
     return {"path": None, "source": None, "ok": False, "reason": "absent"}
 
 
@@ -316,8 +323,15 @@ def classify_claude(probe, path):
     that is neither the standalone install nor inside a cmux bundle, i.e. a small wrapper script."""
     if not _nonempty_string(path):
         return "other"
-    if (path == os.path.join(probe.home, CLAUDE_STANDALONE_REL)
-            or os.path.join(probe.home, _CLAUDE_STANDALONE_PAYLOAD) in path):
+    # NORMALIZED before comparing. The shell builds its path by concatenation, so a HOME with a
+    # trailing slash stamps `/home//​.local/bin/claude` while os.path.join here yields the
+    # single-slash form — the same file, which would otherwise classify as `standalone` live and
+    # `other` from the stamp, printing "resolved standalone; last launch ran other" about one
+    # binary (third review round).
+    norm = os.path.normpath(path)
+    home = os.path.normpath(probe.home)
+    if (norm == os.path.normpath(os.path.join(home, CLAUDE_STANDALONE_REL))
+            or os.path.normpath(os.path.join(home, _CLAUDE_STANDALONE_PAYLOAD)) in norm):
         return "standalone"
     if _CMUX_BUNDLE_MARK in path:
         return "cmux-shim"
@@ -354,22 +368,37 @@ def check_claude_binary(probe):
     r = resolve_claude(probe)
     path, source = r["path"], r["source"]
 
-    if source == "pin" and not r["ok"]:
-        why = ("is a RELATIVE path, so it names a different file depending on which directory the "
-               "reader happens to be in — and a worker's is its worktree, never this one"
-               if r.get("reason") == "relative" else "is not an executable file")
-        return CheckResult(
-            name, False,
-            "SL_CLAUDE pins %s, which %s — start-session.sh refuses the launch rather than falling "
-            "back to PATH, so every worker launch fails here." % (path, why),
-            "Give SL_CLAUDE an absolute path to a real claude binary, or unset it to take the "
-            "standalone install at ~/%s." % CLAUDE_STANDALONE_REL)
     if path is None:
         return CheckResult(
             name, False,
             "no claude binary found: SL_CLAUDE is unset, ~/%s does not exist, and no `claude` is on "
             "PATH — no worker session can start." % CLAUDE_STANDALONE_REL,
             _CLAUDE_INSTALL_FIX)
+    if not r["ok"]:
+        # Every not-ok state the launcher REFUSES, spoken in the operator's terms. A relative path
+        # gets its own wording on both rungs, because "not an executable file" would send someone
+        # hunting for a missing binary when the actual fault is that the name means a different file
+        # in every directory — and the two rungs have different cures (fix the pin vs fix PATH).
+        if r.get("reason") == "relative":
+            whose = ("SL_CLAUDE pins" if source == "pin"
+                     else "this shell's PATH resolves `claude` to")
+            cure = ("Give SL_CLAUDE an absolute path to a real claude binary."
+                    if source == "pin" else
+                    "Remove the empty or relative element from PATH (an empty element — a leading, "
+                    "trailing or doubled `:` — means the current directory), or set SL_CLAUDE to an "
+                    "absolute path.")
+            return CheckResult(
+                name, False,
+                "%s %s, a RELATIVE path — it names a different file depending on which directory "
+                "the reader happens to be in, and a worker's is its own worktree, never this one. "
+                "start-session.sh refuses the launch." % (whose, path),
+                cure)
+        return CheckResult(
+            name, False,
+            "SL_CLAUDE pins %s, which is not an executable file — start-session.sh refuses the "
+            "launch rather than falling back to PATH, so every worker launch fails here." % path,
+            "Give SL_CLAUDE an absolute path to a real claude binary, or unset it to take the "
+            "standalone install at ~/%s." % CLAUDE_STANDALONE_REL)
 
     kind = classify_claude(probe, path)
     where = {"pin": "pinned by SL_CLAUDE", "standalone": "the standalone native install",

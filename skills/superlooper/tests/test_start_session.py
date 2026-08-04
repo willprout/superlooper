@@ -903,3 +903,22 @@ def test_the_path_rung_ignores_a_shell_function_named_claude(tmp_path):
 
     assert r.returncode == 0, r.stderr
     assert _argv0(tmp_path) == str(tmp_path / "stub" / "claude")     # the FILE, not the function
+
+
+def test_a_relative_path_hit_is_refused_rather_than_run_from_the_worktree(tmp_path):
+    # `PATH=":..."` (an empty element) means the CURRENT DIRECTORY, which for a worker is its own
+    # worktree — so a `claude` file checked into a repo would be launched as the coding agent.
+    # bash's `type -P` answers `./claude` there, which is also a different string than the doctor's
+    # shutil.which returns, so the ladder refuses anything non-absolute on this rung too.
+    run_root = tmp_path / "run"
+    run_root.mkdir(parents=True, exist_ok=True)
+    planted = run_root / "claude"                       # the launch's cwd IS run_root
+    planted.write_text("#!/bin/sh\necho PLANTED; exit 0\n")
+    planted.chmod(0o755)
+
+    r, _run_root, _args = _start(tmp_path, extra_env={"PATH": ":/usr/bin:/bin"})
+
+    assert r.returncode != 0
+    assert "relative" in r.stderr.lower()
+    assert "PLANTED" not in r.stdout
+    assert not (tmp_path / "home" / ".superlooper" / "claude-bin.last").exists()
