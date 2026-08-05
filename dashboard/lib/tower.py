@@ -16,8 +16,15 @@ the design record's costume rule (§3, rule 2) plus its honesty law (§7):
 Everything here is a PURE function of a record — no clock, no I/O — so the gloss is unit-tested to
 the line and the JS downstream binds strings it never derives (design record B.1). Flight number =
 issue number everywhere, so every line stays journal-greppable (§3).
+
+Some engine acts are about the LOOP ITSELF, not about a flight — the unattended debugger episode,
+the runner restarting its own corpse, the Restart button's landing. They carry no issue number, so
+they must never borrow the flight vocabulary: costume rule 1 ("inexact mappings get plain words").
+Their sentences name the mechanism instead, and the runner keeps the tower it already owns in §7
+("Tower unmanned" for a stale heartbeat).
 """
 import math
+import re
 
 
 # =============================== the comms/routine tier (issue #36) ===============================
@@ -72,6 +79,44 @@ def _first_line(text, limit=76):
     return ""
 
 
+def _plain(v):
+    """A machine token (an ``outcome``, a ``phase``) in plain words: its first line with the
+    underscores opened out. ``""`` when the record says nothing — the caller supplies the honest
+    "unrecorded" wording rather than printing a bare ``None`` at the owner."""
+    return _first_line(str(v).replace("_", " ")) if v not in (None, "") else ""
+
+
+def _paren(*bits):
+    """The trailing "(a; b)" clause built from whichever bits are non-empty, or ``""``. Keeps the
+    sentence readable when a record carries only some of its optional fields."""
+    kept = [b for b in bits if b]
+    return " (%s)" % "; ".join(kept) if kept else ""
+
+
+def _pid(v):
+    """A pid from a journal record, or ``None`` — a wrong-typed one is dropped rather than printed
+    (bool is an int subclass, so it is excluded explicitly)."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+# The watchdog's signal codes are machine tokens (`skills/…/lib/watchdog.py`). The owner reads WHY
+# the loop hired itself a repair session, not the enum — an unknown code still renders, opened out.
+_SIGNAL_WORDS = {
+    "heartbeat_stale": "the runner stopped completing ticks",
+    "alert": "an ALERT is standing",
+    "no_progress": "approved work is waiting with nothing launching",
+}
+
+
+def _signals(rec):
+    """A record's ``signals`` list in plain words, joined; ``""`` when there are none or the field
+    is wrong-typed."""
+    raw = rec.get("signals")
+    raw = raw if isinstance(raw, list) else []
+    words = [_SIGNAL_WORDS.get(s, _plain(s)) for s in raw if isinstance(s, str) and s.strip()]
+    return "; ".join(w for w in words if w)
+
+
 def _merge_row(rec, num):
     """A ``merge`` record → its comms sentence. Only a SUCCESSFUL, non-wandered merge is a
     celebrated touchdown; a wandered one is a neutral landing with "see report" (§7); a failed
@@ -86,6 +131,176 @@ def _merge_row(rec, num):
                 "text": "%s down%s, but it wandered outside its lane — see report." % (_who(num), pr_bit)}
     return {"radio": "Nice landing.", "kind": "merge",
             "text": "%s touchdown%s." % (_who(num), pr_bit)}
+
+
+def _watchdog_row(rec):
+    """A ``watchdog`` record → its comms sentence (issue #66 / #253): the loop hiring an agent to
+    repair ITSELF, with nobody watching.
+
+    The owner-tap fixer (#144) already reads as a fixer someone chose to deploy; the one fact that
+    separates this act from it is that no human decided it and no human is in the session, so every
+    launched line says so outright. A failed hire is the WORSE event — the loop needed repair
+    overnight and could not get any — so it reads as a failure and never as a session on the field
+    (§7: no flourish for a dishonest state). The quiet outcomes (episode opened, stood down, held
+    off, kill switch) are journaled too and render in plain words the day they exist (costume rule
+    4), each carefully not claiming a session that never started."""
+    sid = rec.get("id")
+    sid = sid.strip() if isinstance(sid, str) and sid.strip() else "the fixer"
+    sigs = _signals(rec)
+    outcome = rec.get("outcome")
+    if outcome == "launched":
+        auth = rec.get("authority")
+        auth = "authority: %s" % auth if isinstance(auth, str) and auth.strip() else ""
+        return {"radio": "Engineering to the field — unmanned.", "kind": "launch",
+                "text": "Unattended fixer %s is on the field — NOBODY is in it: the loop hired a "
+                        "debugger to repair itself%s." % (sid, _paren(sigs, auth))}
+    if outcome == "launch_failed":
+        rc = rec.get("rc")
+        rc = "rc=%s" % rc if rc not in (None, "") else ""
+        return {"radio": "", "kind": "alert",
+                "text": "Unattended fixer %s did not launch — the loop needed repair and could not "
+                        "hire anyone%s." % (sid, _paren(rc, sigs))}
+    if outcome == "notified":
+        grace = rec.get("grace_seconds")
+        when = ("in %d min" % (int(grace) // 60)
+                if isinstance(grace, (int, float)) and not isinstance(grace, bool) and grace >= 0
+                else "shortly")
+        return {"radio": "", "kind": "alert",
+                "text": "The loop flagged itself for repair%s — an unattended fixer launches %s "
+                        "unless it clears." % (_paren(sigs), when)}
+    if outcome == "stand_down":
+        return {"radio": "", "kind": "event",
+                "text": "The loop's repair flag cleared on its own — no session was hired."}
+    if outcome == "skipped_live_session":
+        return {"radio": "", "kind": "event",
+                "text": "Unattended repair held off — a debug session is already on the field."}
+    if outcome == "disabled":
+        return {"radio": "", "kind": "alert",
+                "text": "Unattended self-repair is OFF — the kill switch is set, so nothing is "
+                        "hired%s." % _paren(sigs)}
+    return {"radio": "", "kind": "event",         # costume rule 4: a future outcome still speaks
+            "text": "Unattended self-repair — %s%s."
+                    % (_plain(outcome) or "an unrecorded outcome", _paren(sigs))}
+
+
+def _resurrect_row(rec):
+    """A ``runner_resurrect`` record → its comms sentence (issue #208 / #253): the loop restarting
+    its own provably-dead runner.
+
+    Three outcomes, three sentences — flattening a corpse into a success is exactly the lie this
+    channel exists to prevent. The capped line claims ATTEMPTS, never restarts that happened: an
+    undeliverable attempt (no pane) burns a cap slot without restarting anything, and the morning
+    report already paid for that distinction. A cap of zero is auto-restart switched OFF in config,
+    not a crash loop hitting a ceiling, so it gets its own sentence."""
+    rid = rec.get("id")
+    rid = rid.strip() if isinstance(rid, str) and rid.strip() else ""
+    sigs = _signals(rec)
+    outcome = rec.get("outcome")
+    if outcome == "resurrected":
+        return {"radio": "Tower back on the air.", "kind": "launch",
+                "text": "The runner was dead and restarted itself%s — its pidfile came back live, "
+                        "and it rebuilds from GitHub and disk like a manual restart."
+                        % _paren(rid, sigs)}
+    if outcome == "resurrect_failed":
+        rc = rec.get("rc")
+        rc = "rc=%s" % rc if rc not in (None, "") else ""
+        return {"radio": "Mayday, mayday.", "kind": "alert",
+                "text": "The runner is dead and could NOT restart itself%s — the loop is not "
+                        "running." % _paren(rid, rc, sigs)}
+    if outcome == "resurrect_capped":
+        cap = rec.get("max_per_hour")
+        if isinstance(cap, int) and not isinstance(cap, bool) and cap == 0:
+            return {"radio": "Mayday, mayday.", "kind": "alert",
+                    "text": "The runner is dead and automatic restart is DISABLED in config — it "
+                            "stays down until you restart it."}
+        n = rec.get("attempts")
+        n = n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+        tried = ("a restart was attempted %d time%s in the last hour" % (n, "" if n == 1 else "s")
+                 if n is not None else "repeated restarts were attempted")
+        return {"radio": "Mayday, mayday.", "kind": "alert",
+                "text": "Automatic restart is PAUSED — %s and the runner is still going down; that "
+                        "is a real incident, not a flap." % tried}
+    return {"radio": "", "kind": "event",
+            "text": "The runner's automatic restart — %s%s."
+                    % (_plain(outcome) or "an unrecorded outcome", _paren(sigs))}
+
+
+def _runner_restart_row(rec, operator):
+    """A ``runner_restart`` record → its comms sentence (issue #116 / #253): the Restart button.
+
+    The act is journaled in phases, and the one the owner is waiting for is the LANDING (``up``) —
+    old pid → new pid, the proof a different process is now running. The two in-flight phases name
+    WHO asked, taken from the restart marker on the RECORD rather than the dashboard's configured
+    operator (the #144 rule: a restart requested from a terminal by someone else is not the owner's).
+    ``reexec_failed`` is the one phase the button itself cannot report — it already answered "ok" to
+    the request — so this line is the only place the old image still running ever surfaces."""
+    phase = rec.get("phase")
+    old, new = _pid(rec.get("old_pid")), _pid(rec.get("new_pid"))
+    req = rec.get("request") if isinstance(rec.get("request"), dict) else {}
+    by = req.get("operator")
+    by = " by %s" % by.strip() if isinstance(by, str) and by.strip() else ""
+    if phase == "up":
+        if old is not None and new is not None:
+            pids = " (pid %d → %d)" % (old, new)
+        else:
+            pids = " (pid %d)" % new if new is not None else ""
+        return {"radio": "Tower back on the air.", "kind": "launch",
+                "text": "The Restart landed — the runner is back up%s." % pids}
+    if phase in ("reexec", "exit_to_supervisor"):
+        how = ("is replacing itself now" if phase == "reexec"
+               else "is exiting for its supervisor to bring it back")
+        return {"radio": "", "kind": "event",
+                "text": "Restart requested%s — the runner%s %s."
+                        % (by, " (pid %d)" % old if old is not None else "", how)}
+    if phase == "reexec_failed":
+        return {"radio": "", "kind": "alert",
+                "text": "The Restart did NOT land — the runner stayed on its old image (%s)."
+                        % (_first_line(rec.get("error")) or "the exec failed")}
+    if phase == "stale":
+        target, ours = _pid(rec.get("target_pid")), _pid(rec.get("our_pid"))
+        return {"radio": "", "kind": "event",
+                "text": "A leftover Restart request was dropped%s — this runner%s is not the one it "
+                        "named, so nothing is restarting."
+                        % (" (it named pid %d)" % target if target is not None else "",
+                           " (pid %d)" % ours if ours is not None else "")}
+    return {"radio": "", "kind": "event",
+            "text": "Runner restart — %s." % (_plain(phase) or "an unrecorded phase")}
+
+
+# The re-approval outcome line the engine composes ends with "superseded PR #<n>" when — and only
+# when — the `superseded` label actually LANDED on a PR still open on the retired branch. Nothing
+# else on the record carries that number (a finding reported on issue #253, not an engine edit): it
+# is read from here so the owner learns which PR was retired out from under them. Deliberately
+# narrow, and silent when it does not match — an engine reword loses the PR number, never invents one.
+_SUPERSEDED_PR = re.compile(r"superseded PR #(\d+)")
+_GENERATION = re.compile(r"-r(\d+)$")
+
+
+def _reapprove_row(rec, num, operator):
+    """A ``reapprove`` / ``approve`` record → its comms sentence (issue #177 / #253).
+
+    Re-approval no longer resumes on the parked episode's branch: it RETIRES that branch and
+    rebuilds on the next unburned generation, handing any PR still open on the retired branch to the
+    janitor's `superseded` lane. The old gloss described the world before that, and `regenerate`
+    already gets the design record's honest retire-and-rebuild treatment (§3, the conflict row) —
+    this is the same mechanic reached by the other door, so it says the same true things.
+
+    The retirement clause appears only when the record carries both branch names. A lane never
+    handed to the launcher has nothing to retire, and the dashboard's own Approve verb carries no
+    branches at all — both keep the calm, unadorned human-gate sentence (§7 fun-free zone)."""
+    old_b, new_b = rec.get("old_branch"), rec.get("new_branch")
+    parts = []
+    if isinstance(old_b, str) and old_b.strip() and isinstance(new_b, str) and new_b.strip():
+        gen = _GENERATION.search(new_b.strip())
+        parts.append("%s retired, rebuilding from scratch on %s%s"
+                     % (old_b.strip(), new_b.strip(),
+                        " (generation %s)" % gen.group(1) if gen else ""))
+    pr = _SUPERSEDED_PR.search(rec["outcome"]) if isinstance(rec.get("outcome"), str) else None
+    if pr:
+        parts.append("PR #%s on the retired branch is superseded" % pr.group(1))
+    return {"radio": "", "kind": "approve",
+            "text": "%s re-approved by %s%s." % (_who(num), operator,
+                                                 " — " + "; ".join(parts) if parts else "")}
 
 
 def _event_row(rec, num):
@@ -164,8 +379,7 @@ def comms_row(rec, operator="the owner"):
     elif act == "notify":
         row = {"radio": "", "kind": "notify", "text": "note — %s" % (rec.get("title") or "(memo)")}
     elif act in ("reapprove", "approve"):
-        row = {"radio": "", "kind": "approve",   # a human gate is a fun-free zone (§7) — stays calm
-               "text": "%s re-approved by %s." % (who, operator)}
+        row = _reapprove_row(rec, num, operator)
     elif act == "relabel":
         row = {"radio": "", "kind": "relabel", "text": "%s relabelled." % who}
     elif act == "update":
@@ -185,6 +399,15 @@ def comms_row(rec, operator="the owner"):
             why = _first_line(rec.get("error")) or "no session was confirmed"
             row = {"radio": "", "kind": "alert",
                    "text": "Fixer %s did not launch — %s." % (sid, why)}
+    # The three engine-level acts that name no flight (issue #253). Each fell through to the generic
+    # fallback below and reached the owner as a sentence about a flight that does not exist — the
+    # same defect #144 fixed for the owner-tap fixer, three more times over.
+    elif act == "watchdog":
+        row = _watchdog_row(rec)
+    elif act == "runner_resurrect":
+        row = _resurrect_row(rec)
+    elif act == "runner_restart":
+        row = _runner_restart_row(rec, operator)
     elif act == "alert":
         row = {"radio": "Mayday, mayday.", "kind": "alert", "text": "ALERT raised — a factory-stop."}
     elif act == "freeze":
