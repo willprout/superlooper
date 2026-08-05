@@ -304,6 +304,24 @@ if [ "$AGENT" = "claude" ]; then
   # existed — and the assert below still refuses an inherited CLAUDE_CONFIG_DIR, because a namespace
   # picked up from a shell rc file is one nobody chose.
   if [ -n "${SL_CLAUDE_CONFIG_DIR:-}" ]; then
+    # ATTEMPTED IN A SUBSHELL FIRST (cross-review round 2), because this assignment can FAIL. A
+    # pane rc file that made the variable READONLY — the same `declare -rx` vector the #301 floor
+    # is already tested with — makes `export` print an error and return 1, leaving the INHERITED
+    # value in place.
+    #
+    # MEASURED, because the two spellings differ and the difference decides how bad this is: a BARE
+    # `X=v` on a readonly variable is FATAL in a non-interactive bash (the script would die here,
+    # before any marker existed, and the launcher would time out into rc=2 `shim_not_fired` — a
+    # CHANNEL fault that holds the whole queue and blames the launch shim). `export X=v` is not: it
+    # returns 1 and execution continues, so the assert below still refuses with its own marker. Do
+    # not "simplify" this line to a bare assignment.
+    #
+    # So what the guard buys is the MEMO, not the refusal. Without it the assert refuses over a
+    # spelling mismatch the operator cannot act on ("these two strings differ"); with it the memo
+    # names the thing they can actually fix — a variable somebody froze.
+    if ! ( export CLAUDE_CONFIG_DIR="$SL_CLAUDE_CONFIG_DIR" ) 2>/dev/null; then
+      refuse_identity "this session's CLAUDE_CONFIG_DIR could not be set to the assigned '$SL_CLAUDE_CONFIG_DIR' — something this pane's shell sourced has made that variable READONLY (it currently reads '${CLAUDE_CONFIG_DIR:-<unset>}'). The credential namespace is a hash of that string, so this session would run as whatever account the frozen value names. Find where it is declared readonly (a shell rc file, a LaunchAgent, a wrapper) and remove it"
+    fi
     export CLAUDE_CONFIG_DIR="$SL_CLAUDE_CONFIG_DIR"
   fi
   SL_IDENTITY_LIB="$(cd "$(dirname "$0")" && pwd)/../lib/identity.py"

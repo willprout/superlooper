@@ -720,6 +720,22 @@ def test_an_inherited_credential_redirect_is_refused_with_a_memo(tmp_path):
     assert r.returncode == IDENTITY_RC
 
 
+def test_a_readonly_config_dir_refuses_as_identity_and_not_as_a_dead_launch_shim(tmp_path):
+    """Cross-review round 2, corrected by measurement. A pane rc file that declared this variable
+    READONLY makes `export` return 1 and leave the INHERITED value in place — it does NOT kill the
+    script the way a bare assignment would, so the assert still refuses with its own marker. What
+    the guard buys is the MEMO: without it this refuses over a spelling mismatch the operator
+    cannot act on, and with it the memo names the variable somebody froze. Same `declare -rx`
+    injection vector the #301 floor is tested with, one variable over."""
+    r, run_root, args_file = _start(tmp_path, extra_env=dict(
+        _fleet_env(SL_START_TOKEN="TOK"),
+        **_bash_env(tmp_path, "declare -rx CLAUDE_CONFIG_DIR=/somebody/elses\n")))
+    assert r.returncode == IDENTITY_RC, f"got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists()
+    memo = (run_root / "state" / "identityfail" / "i1.TOK").read_text()
+    assert "READONLY" in memo and _FLEET_DIR in memo, memo
+
+
 def test_a_logged_out_config_dir_is_refused_rather_than_parked_at_a_login_screen(tmp_path):
     r, _run_root, args_file = _start(tmp_path, extra_env=_fleet_env(
         STUB_CLAUDE_LOGGED_IN_DIR="/some/other/dir"))
