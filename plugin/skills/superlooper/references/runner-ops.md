@@ -54,16 +54,16 @@ the code wins and both are wrong.
 
 ## The verbs, at a glance
 
-Every one takes `--repo <path>` (default: cwd). The two that change anything on GitHub — `tidy` and
-`janitor` — propose first and execute only what you approve; the rest either read, or refuse rather
-than guess.
+Every one takes `--repo <path>` (default: cwd). `tidy` and `janitor` are the two that clean up
+after the loop — each proposes first and executes only what you approve. The rest either read, act
+only on their own schedule, or refuse rather than guess.
 
 | Verb | What it does | Writes anything? |
 |---|---|---|
 | `superlooper run` | the tick loop itself — the `pane` home's foreground start | drives the loop |
 | `superlooper runner-home` | which home this repo's runner lives in, the job, whether it is live; `--install` sets up the `login-item` LaunchAgent | only with `--install` |
 | `superlooper request-restart` | ask the **live** runner to restart itself between ticks | drops a marker |
-| `superlooper status` | heartbeat, ALERT, freeze state, lanes and queue | no |
+| `superlooper status` | heartbeat, ALERT, freeze state, lanes, gate and a journal tail — no GitHub read | no |
 | `superlooper doctor` | the preflight checklist; `--stack` judges the machine and this repo's runner home | no |
 | `superlooper upkeep` | the weekly once-over, read-only by construction | no |
 | `superlooper tidy` | close FINISHED sessions' windows, on your y/N | on your word |
@@ -82,7 +82,7 @@ than guess.
 ## Start, watch, stop
 
 ```bash
-superlooper status --repo /path/to/repo      # lanes / queue / freeze state, from journal + disk
+superlooper status --repo /path/to/repo      # lanes / gate / freeze state, from journal + disk
 ```
 
 (The bare `superlooper` command comes from publishing: `bin/install.sh` links it onto your PATH,
@@ -97,10 +97,16 @@ runner-home section below. To check it is actually up, `superlooper runner-home`
 own answer (a pid, "not running", or "not loaded") rather than a guess.
 
 **Under `pane`** — `superlooper run` in a session tab you can watch. **That's it, no pane id to
-set:** the runner detects the pane of the tab it is running in and opens every worker as a sibling
-tab there, grouped and watchable. This survives a machine restart that reassigns pane UUIDs — you
-never hardcode a pane. It takes a pidfile singleton, so a second `run` on the same repo refuses to
-start rather than double-drive it.
+set:** the runner detects the pane of the tab it is running in and records it as its **anchor**.
+This survives a machine restart that reassigns pane UUIDs — you never hardcode a pane. It takes a
+pidfile singleton, so a second `run` on the same repo refuses to start rather than double-drive it.
+
+What the anchor is *for* has shrunk. Worker sessions are no longer born as sibling tabs in it:
+every spawn now goes through the session host, which creates each session its own unfocused
+workspace and needs no anchor at all. What still rides on it in this home is the runner's own boot
+preflight, the `runner anchor (live)` doctor block, and the watchdog's resurrection path — which
+births a replacement runner tab there. So a `pane`-home runner whose tab is closed or dragged
+elsewhere is still a real fault, just a narrower one than it used to be.
 
 ```bash
 superlooper run --repo /path/to/repo      # the pane home's tick loop (foreground; Ctrl-C to stop)
@@ -115,9 +121,10 @@ start instead.
 
 ### Watching
 
-`superlooper status` renders the heartbeat age, any ALERT, whether merges are frozen, and the
-current lanes and queue — read from the journal and disk, so it works whether or not the runner is
-up. The morning report (below) is the batched version of the same truth.
+`superlooper status` renders the heartbeat age, any ALERT, whether merges are frozen, the occupied
+lanes and what is at the gate, the merged count, and a tail of the journal — read from the journal
+and disk, so it works whether or not the runner is up. It does **not** read GitHub, so it shows no
+queue; the morning report (below) is where queue depth and what's next up live.
 
 ### Stopping
 
@@ -128,8 +135,8 @@ automatically and no launch is duplicated.
 
 - **Under `pane`:** Ctrl-C (SIGTERM) in the runner's tab.
 - **Under `login-item`:** bootout the job, or launchd will simply restart it —
-  `launchctl bootout gui/$UID/<job label>`. `superlooper runner-home` prints the exact label and
-  the bootout command for this repo; `superlooper runner-home --install` prints it too. A plain
+  `launchctl bootout gui/$UID/<job label>`. `superlooper runner-home` prints this repo's exact job
+  label and domain; `superlooper runner-home --install` prints the ready-made bootout line. A plain
   `kill` is **not** a stop here: `KeepAlive` is doing its job and brings the runner straight back.
 
 There is no single `stop` verb yet — a deliberate off switch that the runner's own guardians
@@ -186,12 +193,15 @@ the tab *is* the caller, and its shell boots and sources the shim like any other
 ### Which agent runs the sessions
 
 Claude is the default and, by the owner's 2026-08-05 ruling (issue #352), **the only live target**:
-Codex is not a lane the fleet runs today, so no Codex-specific readiness work is owed. The config
-still carries a `codex` block and `superlooper run` still accepts `--agent codex` for a repo that
-deliberately opts in; the queue, labels, merge gate, issue protocol and command-center surfaces are
-unchanged by that choice. If you ever do opt a repo in, `dangerous_bypass` is the explicit switch
-for Codex's approval/sandbox bypass — leave it `false` unless you are supervising that repo and
-accept the same risk profile as Claude's permission-bypassed worker sessions.
+Codex is not a lane the fleet runs today, so no Codex-specific readiness work is owed.
+
+**Do not opt a repo into Codex expecting it to work.** The config still carries a `codex` block and
+`superlooper run` still accepts `--agent codex`, but the delivery oracle — the thing that proves a
+prompt actually arrived, because an exit code carries no delivery information — exists for Claude
+only. A Codex lane therefore launches and can never be **nudged**: every send refuses with
+`no_oracle` rather than pressing a prompt nobody could confirm arrived. That is the fail-closed
+direction, but it means the session sits there with nothing in the queue explaining why. Treat
+`--agent codex` as unbuilt until #352's posture changes.
 
 ---
 
@@ -309,8 +319,7 @@ closed by `closedAt`, and the remainder is **reported, never dropped** — the s
 naming exactly what it withheld:
 
 ```
-(3 more keyword-closed issue(s) were found and NOT proposed this sweep — at most 10 reopens per
-sweep; `superlooper doctor` lists them all and a later sweep proposes the rest)
+(3 more keyword-closed issue(s) were found and NOT proposed this sweep — at most 10 reopens per sweep; `superlooper doctor` lists them all and a later sweep proposes the rest)
 ```
 
 A cap that is not *said* reads as "there was nothing else" — the same over-claim the
@@ -444,7 +453,11 @@ answer is never reused.
 
 **At most two questions per issue.** A worker that would ask a third is no longer scoping — the
 runner hands the issue back as `needs-owner` with the question quoted, rather than opening a third
-round-trip. The count spans the issue's whole life and re-approval does not reset it.
+round-trip. Answering does **not** reset the count: the cap spans a whole answer-and-relaunch cycle,
+so a second question still costs the second slot. Re-approving a **parked** issue is a different
+act and *is* a fresh cap — `agent-ready` on a park-family issue zeroes `questions_asked` along with
+the retry and conflict counters, which is what lets a question-capped issue be re-scoped and tried
+again.
 
 ### Answering a bounce
 
@@ -558,22 +571,25 @@ repo, and — only in the `login-item` home — the runner as well.
 
 ### `launchd.nightly.plist` (both homes)
 
-`StartCalendarInterval` at `qa.nightly_time` (02:00 Mac-local), invoking `superlooper nightly
---repo <path>`. It needs no session anchor — it builds a fresh worktree and runs the browser suite,
+`StartCalendarInterval` at `qa.nightly_time` (02:00 Mac-local), invoking
+`superlooper nightly --repo <path>`. It needs no session anchor — it builds a fresh worktree and runs the browser suite,
 and never opens worker windows. A nonzero exit is journaled + pushed, never restart-looped: it is a
 scheduled one-shot, not a keep-alive.
 
 ### The runner: no launchd job under `pane`, a LaunchAgent under `login-item`
 
 **Under `pane` there is deliberately no launchd runner, and that prohibition stands (issue #33).**
-A launchd-started process is detached with no session tab of its own. In that home the runner
-launches every worker into its own tab's pane, so it *needs* a pane — and a paneless process cannot
-self-detect one. Its startup preflight correctly fails hard, and a `KeepAlive=true` would just
-relaunch it into the identical failure forever, filling the log while nothing ever launches. There
-is no way to make launchd start a `pane`-home runner *correctly*, because the only correct start is
-inside a tab a human opened and automated tab-placement is owner-ruled out (above). Keep-alive of a
-`pane`-home runner is that visible tab, which you can arrange to reopen on login. Nothing under
-`templates/` may keep a paneless runner alive, and a test enforces that.
+A launchd-started process is detached with no session tab of its own, so it can never self-detect
+the anchor pane that home is built around — the pane its boot preflight demands, the one the
+watchdog births a replacement tab into, and the one `runner anchor (live)` judges. Its startup
+preflight correctly fails hard, and a `KeepAlive=true` would just relaunch it into the identical
+failure forever, filling the log while nothing ever launches. There is no way to make launchd start
+a `pane`-home runner *correctly*, because the only correct start is inside a tab a human opened and
+automated tab-placement is owner-ruled out (above). Keep-alive of a `pane`-home runner is that
+visible tab, which you can arrange to reopen on login. The shipped guard is narrower than "no plist
+may keep a runner alive" — the runner template below *is* a keep-alive — it is that **the runner
+template is the only plist allowed to invoke `run` at all**, so no second, undeclared launchd runner
+can appear.
 
 **Under `login-item` that reasoning does not apply, and there IS a runner job.** #33's argument was
 a fact about *a host whose spawn needs an anchor*, not about launchd. The runner now talks to the
@@ -618,8 +634,8 @@ process is up), so a runner that is alive-but-wedged reads as stale, not healthy
 
 ## The unattended-debugger watchdog (`superlooper watchdog`, issue #66)
 
-The shipped implementation of that contract, plus a third detector. `superlooper watchdog --repo
-<path>` is ONE mechanical check — no LLM anywhere on the path, no repair decisions: it detects,
+The shipped implementation of that contract, plus a third detector.
+`superlooper watchdog --repo <path>` is ONE mechanical check — no LLM anywhere on the path, no repair decisions: it detects,
 notifies, waits, launches, journals. Its attended sibling — the one **you** tap — is the
 `superlooper debug` section directly below; the two share a lock, an id namespace and a singleton,
 so read both.
@@ -688,8 +704,8 @@ morning report's "Runner resurrection" section.
 yield on `state/watchdog.lock`); once-per-incident (a continuing episode never relaunches — a
 genuinely new episode after recovery may); failed launches retry at most 3× with ONE failure
 text; every transition is journaled (`act: "watchdog"`) and every launch — verified or failed —
-appears in the morning report's "Unattended debugger" section. **Kill-switch:** `touch
-<state-home>/state/WATCHDOG_OFF` — the check keeps observing and journaling but notifies and
+appears in the morning report's "Unattended debugger" section. **Kill-switch:**
+`touch <state-home>/state/WATCHDOG_OFF` — the check keeps observing and journaling but notifies and
 launches nothing; delete it to re-arm. Episode state lives in `state/watchdog.json`; deleting it
 resets the clocks (safe — the bounds simply restart).
 
