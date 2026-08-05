@@ -32,7 +32,7 @@ stage. That becomes a ninth issue, `priority:high`.
 
 Then you start the runner (`superlooper run`) and go to bed.
 
-Overnight, terminal windows open and close on your Mac. The import bug goes first. Each
+Overnight, coding sessions open and close on your Mac. The import bug goes first. Each
 issue gets a fresh Claude Code session in its own worktree, and each finished piece has to
 prove itself before it ships. In a real browser, the agent clicks through the screens it
 changed, and GPT (via Codex) picks over the code and sends back problems to fix. Then the
@@ -66,25 +66,27 @@ Step by step:
    <img src="docs/assets/hiw/hiw-1-issue.png" width="700" alt="a real loop issue in the queue: title, the owner-decision label needs-owner (this screenshot predates its rename from needs-william), opened by the owner">
 
 2. You approve and steer with labels. Saying yes puts the `agent-ready` label on an
-   issue. That label is your word: no agent is allowed to apply it, ever. It's also your
+   issue. That label is your word: no agent may apply it on its own judgment, ever. It's also your
    safety filter, so never approve an issue you haven't read. The rest of the label set is
    how you steer without writing code:
 
    <img src="docs/assets/hiw/hiw-2-labels.png" alt="the label set in four columns: type, status, model, and effort or priority">
 
-3. A terminal window opens. The runner starts a fresh Claude Code session for the issue in
-   a new terminal tab on your Mac (via cmux, a tiling terminal), on your subscription. The
-   session works in its own git worktree, an isolated copy of your repo. Fresh session
-   means no leftover context from three tasks ago; a window on your machine means you can
-   watch any build, any time, or ignore them all.
+3. A session starts. The runner asks the session host — herdr, a background terminal
+   server — to open an isolated workspace, and starts a fresh Claude Code session in it,
+   on your subscription. The session works in its own git worktree, an isolated copy of
+   your repo. Fresh session means no leftover context from three tasks ago; a host on your
+   machine means you can open its window and watch any build, any time, or never look at
+   all.
 
-   <img src="docs/assets/hiw/hiw-3-cmux.png" width="420" alt="a fresh Claude Code session in a cmux tab: Opus, 1M context, on a Max subscription, permissions bypassed">
+   <img src="docs/assets/hiw/hiw-3-herdr.png" width="420" alt="a fresh Claude Code session inside a herdr workspace: on a Max subscription, permissions bypassed, mid-build — with the agents panel tracking every session's state at a glance">
 
 4. The work has to prove itself. The worker builds test-first: a failing test, then the
    code that passes it, then regression tests over what changed (the order is instructed;
    what the gate enforces is the evidence). Before shipping, it must drive the changed
-   behavior end-to-end and record what it saw, in a real browser (Playwright) for a web UI
-   or against the actual CLI or API surface otherwise. Then cross-review: the diff goes to a reviewer
+   behavior end-to-end and record what it saw, in a real browser for a web UI or against
+   the actual CLI or API surface otherwise (a repo can make that record a gated report
+   section). Then cross-review: the diff goes to a reviewer
    that wrote none of it (by default GPT via the Codex CLI, a different model family
    entirely) and its findings get fixed and re-reviewed. The verdict is posted on the pull
    request, where the merge gate requires it mechanically: no review verdict, no merge. CI
@@ -112,7 +114,7 @@ Step by step:
 
 If you wire up the optional nightly test run, a browser suite drives your running dev site
 overnight. Anything still broken on retry gets filed as a fix issue, and landings pause
-until the dev branch is green again.
+until the nightly is green again.
 
 Two things to know before you run it unattended. Worker sessions run Claude Code with
 permissions bypassed (a session that stops to ask at 3am would just hang), each confined
@@ -129,10 +131,10 @@ be fun.
 
 The two boards carry the state you'll actually check. Departures is the queue: what's
 approved and waiting, in real launch order. Arrivals is what's landed: merged work, newest
-first, in plain sentences. Between them, the field shows every running session at its true
+first, in plain words. Between them, the field shows every running session at its true
 stage, from taxiing out (launching) through mid-circuit (building) to final approach. On
-final, the clearance checklist fills in (report ✓ review ✓ CI ✓ mergeable ✓, the literal
-merge gate). Every stage of a flight is a real state of the work rather than decoration.
+final, the clearance checklist fills in (report ✓ review ✓ CI ✓ mergeable ✓, mirroring
+the merge gate). Every stage of a flight is a real state of the work rather than decoration.
 
 There is no AI anywhere inside the dashboard, and its server binds to localhost only. It
 can write labels on your repos, so it is never reachable off your machine. It's a separate
@@ -158,27 +160,32 @@ One CLI, installed through the gated installer. The main verbs:
 superlooper adopt      # wire a repo into the loop
 superlooper doctor     # check everything, name every fix
 superlooper run        # start the loop
+superlooper fleet      # stand up + judge the session host on an always-on machine
 superlooper janitor    # propose cleanup; execute only what you approve
-superlooper tidy       # close the terminal windows of finished sessions
+superlooper tidy       # close the session windows of finished builds
 superlooper watchdog   # optional: texts you if the loop wedges, then sends a repair session
 ```
 
 And the dashboard, a separate clone-and-run app. The airport.
 
+Day-to-day operation — starting it, watching it, answering it, stopping it — is one page:
+[docs/OPERATING.md](docs/OPERATING.md).
+
 ## Requirements
 
 The hard ones:
 
-- A Mac. The loop runs on your machine, in real terminal tabs, with real notifications.
+- A Mac. The loop runs on your machine, in real sessions you can watch, with real
+  notifications.
 - Claude Code, signed into your subscription. That's the agent that builds. Codex (a newer
   addition) works too, and the best setup is both: Claude Code builds, Codex gives the
   second-opinion review. Codex is optional, though; without it, the review comes from a
   fresh agent that wrote none of the code.
-- A GitHub repo you own, with a test suite. The loop refuses to merge anything without at
-  least one required CI check. No tests, no gate, no loop. (No tests yet? Ask Claude Code
+- A GitHub repo you own, with a test suite. The loop won't run without a test suite. No
+  tests, no gate, no loop. (No tests yet? Ask Claude Code
   for a starter suite before you adopt; `doctor` will tell you when the wiring is right.)
 
-Everything else (cmux, `gh`, `jq`) installs in minutes, and the doctor walks you to green.
+Everything else (Herdr, `gh`, `jq`) installs in minutes, and the doctor walks you to green.
 
 ## Install
 
@@ -212,7 +219,7 @@ saying yes.
 superlooper doctor --stack
 ```
 
-It names every missing machine block with its exact fix: cmux (the terminal the loop opens
+It names every missing machine block with its exact fix: Herdr (the terminal the loop opens
 its sessions in), `gh` login, a notification channel. Safe to re-run until everything is
 green.
 
@@ -239,7 +246,8 @@ much rigor it wants:
   `{"build": 1, "investigate": 1}` keeps merge-producing work strictly sequential while
   investigations still run alongside.
 - `areas` and `affinity`: what "touching the same thing" means. Map path globs to named
-  areas, and two issues run together only when their declared areas don't overlap.
+  areas, and under `affinity: hard` (the default) two merge-producing issues run together
+  only when their declared areas don't overlap.
 - `required_checks`: the CI checks that must be green before a merge. At least one is
   mandatory; the loop refuses to run a repo with no mechanical gate.
 - `ship_cmd`: hand shipping to your own pipeline. When set, workers ship exclusively
@@ -247,6 +255,9 @@ much rigor it wants:
   fresh-agent review verdict on every PR.
 - `models.worker` and `models.worker_effort`: repo-wide defaults for worker model and
   effort. Per-issue `model:` / `effort:` labels override them.
+- `runner_home`: where the runner itself lives. `pane` (the default) is a terminal tab
+  you open and watch; `login-item` runs it in the background from login, restarted
+  automatically — the home for an always-on machine.
 - `report_required_sections`: the evidence every worker report must contain. The default
   asks only for what any repo can show (Tests, Review); a web repo adds a browser-evidence
   section and the gate enforces it like the rest.
@@ -269,13 +280,15 @@ different contracts. Every field is documented in
 - Nothing executable rides an update. Plugin updates carry markdown only. Engine changes
   sit inert on main until you re-run the gated installer and OK the diff; a bad merge
   cannot reach your machine on its own.
-- No AI inside the dashboard. It's a renderer over GitHub and the loop's own journal.
+- No AI inside the dashboard. It renders the loop's own published state and journal.
   Localhost only.
 - It never nags. The loop pushes a notification for the handful of things that stop work
   outright, plus one morning report, and otherwise waits for you to look.
 
 ## Going deeper
 
+- [OPERATING.md](docs/OPERATING.md): the owner's day-to-day guide — start it, watch it,
+  answer it, stop it, recover it.
 - [ADOPTING.md](skills/superlooper/skill/docs/ADOPTING.md): the full adoption contract
   (every config field, the label set, branch protection).
 - [STACK.md](skills/superlooper/docs/STACK.md): the machine stack, block by block.
