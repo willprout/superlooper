@@ -1425,24 +1425,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         errs, corrupt = _counter(ist_of(iid), "update_errors")
         if corrupt or errs >= UPDATE_ERROR_ALERT:
             reasons.append(f"update_errors:{iid}")     # a corrupt counter is alert-worthy too
-        # A hand-back (park #61, OR bounce #108 — both reuse this marker) whose label move keeps
-        # failing past the bound: the marker is stamped but status never settled terminal, so the
-        # silent retries have run long enough to be ALERT-worthy (one text via the standard dedup —
-        # never twenty). A terminal status means the move landed (episode over); the marker clearing
-        # (recovery / reapprove / absorb_close) drops the reason, which auto-clears the ALERT. Skip an
-        # issue the owner has CLOSED on GitHub (fresh proof): its stuck label is moot — absorb_close
-        # settles it this same tick — so a "label stuck" text as the owner drops it is pure noise (#108
-        # review P2). gh_stale keeps this fail-SAFE: an unproven close never suppresses a real alert.
         # A session whose auth died IN-PROCESS (issue #151 / i336). The runner senses this from the
         # pane and records it; only the owner can fix it, so it is alert-worthy the moment it is
         # seen. It rides the same durable-marker discipline as every reason here: it stands while
         # the state is on disk and auto-clears when the lane reads healthy again.
         #
-        # TERMINAL statuses are excluded for the same reason park_label_stuck excludes them
-        # (fresh-review P1): a merged/parked lane's last reading is history, not a live problem —
-        # nothing will ever re-sense it to clear the field — and an un-clearable reason would pin
-        # the ALERT open forever AND poison the dedup for every other reason (the `existing !=
-        # reasons` compare below is what decides whether anything at all gets said).
+        # TERMINAL statuses are excluded (fresh-review P1): a merged/parked lane's last reading is
+        # history, not a live problem — nothing will ever re-sense it to clear the field — and an
+        # un-clearable reason would pin the ALERT open forever AND poison the dedup for every other
+        # reason (the `existing != reasons` compare below is what decides whether anything at all
+        # gets said). Here the status proxy is exact, which is why this veto is flat where
+        # park_label_stuck's (below) now carries a positive-proof escape: `sensed_state` is written
+        # by the pane sensor, and a terminal lane HAS no pane to re-sense. Nothing can make the
+        # reading true again, so there is no live-evidence conjunct to write. (#256)
         #
         # The sensed VARIANT (issue #174) is appended to the reason, not carried beside it, for one
         # reason: this list IS the dedup key. When the banner changes mid-episode — the owner fixes
@@ -1465,10 +1460,53 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 and _since_ok(ist_of(iid).get("sensed_since"), now)
                 and now - ist_of(iid)["sensed_since"] >= AT_DIALOG_ALERT_SECONDS):
             reasons.append(f"session_at_dialog:{iid}")
+        # A hand-back (park #61, OR bounce #108 — both reuse this marker) whose label move keeps
+        # failing past the bound: the marker is stamped and the silent retries have run long enough
+        # to be ALERT-worthy (one text via the standard dedup — never twenty). The marker clearing
+        # (recovery / reapprove / absorb_close) drops the reason, which auto-clears the ALERT. Skip
+        # an issue the owner has CLOSED on GitHub: its stuck label is moot — absorb_close settles it
+        # this same tick — so a "label stuck" text as the owner drops it is pure noise (#108 P2).
         stamped = ist_of(iid).get("park_notify_at")
         being_absorbed = not gh_stale and _iid_num(iid) in closed_nums
-        if (not being_absorbed
-                and _status_of(ist_of(iid)) not in TERMINAL_STATUSES
+        # The terminal veto is scoped by POSITIVE PROOF, not by status alone (issue #256, half 1).
+        # "Terminal means the move landed" held only while every park decide emitted came from a
+        # NON-terminal lane. #169's re-approval hand-back is the first park emitted from a lane that
+        # is ALREADY park-family, so on that site the proxy inverted: the hand-back derives from
+        # inside the excluded set, and one whose label move keeps failing sat exactly where the
+        # alert could not reach it — the park re-derives every tick, `agent-ready` is never stripped
+        # (the failing set_labels is the write that would strip it), #61 silences every later text,
+        # and nothing ever escalated. One text, one comment, then permanent silence with
+        # `agent-ready` still on the board and nothing running it — a quieter #169 livelock.
+        #
+        # `park_landed_cause` (#169) is the discriminator that keeps the exclusion's INTENT: the
+        # executor writes it ONLY past a successful set_labels, so a cause recorded there IS the
+        # proof the labels moved. Settled history stays silent; a stuck park escalates.
+        #
+        # BOTH other conjuncts are load-bearing. `agent-ready` on a FRESH read is the live evidence
+        # that the removal never happened — without it, a bare cause mismatch would alert on every
+        # lane parked before #169 shipped the field at all (no `park_landed_cause` anywhere in its
+        # state file), lanes where nothing is stuck precisely because the labels did move. And the
+        # read must be fresh: a stale view's labels are last poll's, while the claim being made is
+        # about what is standing on the issue right now.
+        p_now = parsed_by_id.get(iid)
+        labels_now = p_now.get("labels") if isinstance(p_now, dict) else None
+        park_unlanded = (not gh_stale and isinstance(labels_now, list)
+                         and "agent-ready" in labels_now
+                         and ist_of(iid).get("park_landed_cause")
+                         != ist_of(iid).get("park_notify_cause"))
+        # ...and the absorption suppression takes the #172 VOUCH, not bare membership (#256, half
+        # 2). `gh api rate_limit` is exempt from rate limiting, so during a throttle the probe
+        # answers, the poll completes, the view is stamped FRESH, and the closed set is empty for a
+        # reason nobody observed — the staleness check overhead never fires. Reading that emptiness
+        # as "the issue is still open" pages the owner about a park they resolved seconds ago (the
+        # dashboard's Drop, or a close by hand). Holding instead costs a DELAYED true page, never a
+        # lost one: this reason re-derives every tick, so the first vouched read that still shows
+        # the issue open escalates. `closed_read_ok` folds gh_stale in deliberately (see its
+        # definition): when the WHOLE view is doubted, #108's rule stands unchanged — an unproven
+        # close must never suppress a real alert. The `absorb_close` sibling needs no such conjunct:
+        # it requires POSITIVE membership, so an unvouched read only delays absorption.
+        if (not being_absorbed and closed_read_ok
+                and (_status_of(ist_of(iid)) not in TERMINAL_STATUSES or park_unlanded)
                 and isinstance(ist_of(iid).get("park_notify_cause"), str)
                 and _real(stamped) and now - stamped >= PARK_LABEL_STUCK_ALERT_SECONDS):
             reasons.append(f"park_label_stuck:{iid}")
