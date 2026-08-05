@@ -893,6 +893,116 @@ def test_build_flight_unhashable_status_with_a_launch_event_still_reads_launched
     assert f["circuit_stage"] == flights.TAKEOFF   # launched, no session/report yet
 
 
+# =============================== corruption guard — a wrong-typed journal act never dies into the poll (issue #218) ===============================
+# The same class as #139, one field over: the APPEND-ONLY JOURNAL rather than issues.json. Three
+# reads routed a record's `act` — and, for an `event` envelope, its nested `event.type` — straight
+# into a SET membership test, so a well-formed JSON record whose value there is UNHASHABLE (a list,
+# a dict) parsed fine and then raised TypeError:
+#   * progress()      — the variety count builds a set from _event_kind, which returns the bare act;
+#   * _is_incident()  — `act in _INCIDENT_ACTS`;
+#   * _is_incident()  — `event.type in _INCIDENT_EVENT_TYPES` (the nested type).
+# progress runs inside build_flight and incident_stats inside the snapshot assembler, so ONE corrupt
+# record took down the WHOLE board — every repo, every flight, not merely its own row. corner_stats
+# is the shape to preserve: it reads `act` only through `==`, which never hashes.
+
+_UNHASHABLE_ACTS = ([], {}, ["park"], {"act": "park"})
+
+
+def test_act_of_folds_a_wrong_typed_act_to_a_no_set_sentinel():
+    # Mirror of _status_of (#139) / the engine's _status_of (#95): None and str pass through
+    # unchanged, everything else folds to a sentinel that is itself hashable and belongs to no act
+    # set — so both act sets can be tested against it without raising.
+    assert flights._act_of(None) is None
+    assert flights._act_of("park") == "park"
+    for bad in _UNHASHABLE_ACTS:
+        assert flights._act_of(bad) is flights._CORRUPT_ACT
+    assert flights._act_of(5) is flights._CORRUPT_ACT
+    assert (flights._act_of([]) in flights._INCIDENT_ACTS) is False
+    assert (flights._act_of([]) in flights._INCIDENT_EVENT_TYPES) is False
+
+
+def test_progress_survives_an_unhashable_act_without_dying_into_the_poll():
+    # The variety count builds a SET of kinds; a bare unhashable act reached it and raised. It must
+    # fold instead — every corrupt record keys as ONE unknown kind, and the well-formed records
+    # around it still count normally.
+    for bad in _UNHASHABLE_ACTS:
+        prog = flights.progress([{"act": bad, "ts": 1}], diff_delta=0)   # must not raise
+        assert prog["events"] == 1
+        assert prog["variety"] == 1
+    mixed = flights.progress([{"act": "gate"}, {"act": []}, {"act": {}}, {"act": "merge"}],
+                             diff_delta=0)
+    assert mixed["events"] == 4
+    assert mixed["variety"] == 3          # gate, merge, and one collapsed corrupt kind
+    assert mixed["flat"] is False
+
+
+def test_incident_stats_survives_an_unhashable_act_without_dying_into_the_poll():
+    # `act in _INCIDENT_ACTS` raised on the corrupt record. Folded, it fails CLOSED: a record whose
+    # act can't be read is NOT a machine stumble, so it never repaints the sign — and the real
+    # landings and the real park on either side of it are still counted exactly as before.
+    for bad in _UNHASHABLE_ACTS:
+        stats = flights.incident_stats([_merge("i1", 10), {"act": bad, "ts": 15},
+                                        _merge("i2", 20)])                # must not raise
+        assert stats["total_landings"] == 2
+        assert stats["landings_since_incident"] == 2      # the corrupt record is not an incident
+        assert stats["last_incident_ts"] is None
+    real = flights.incident_stats([{"act": []}, _merge("i1", 10),
+                                   {"act": "park", "ts": 15}, _merge("i2", 20)])
+    assert real["last_incident_ts"] == 15
+    assert real["landings_since_incident"] == 1
+
+
+def test_incident_stats_survives_an_unhashable_nested_event_type():
+    # The THIRD unguarded site: an `event` envelope whose nested type is unhashable reached
+    # `event.type in _INCIDENT_EVENT_TYPES` and raised there exactly as the two above did — note
+    # this fires even for an EMPTY list/dict, which no truthiness gate stops.
+    for bad in _UNHASHABLE_ACTS:
+        stats = flights.incident_stats([_merge("i1", 10),
+                                        {"act": "event", "event": {"type": bad}, "ts": 15}])
+        assert stats["total_landings"] == 1
+        assert stats["last_incident_ts"] is None          # unreadable type ⇒ not an incident
+    # A well-formed envelope still counts — the fold changes nothing for readable records.
+    good = flights.incident_stats([_merge("i1", 10),
+                                   {"act": "event", "event": {"type": "runner_down"}, "ts": 15},
+                                   _merge("i2", 20)])
+    assert good["last_incident_ts"] == 15
+    assert good["landings_since_incident"] == 1
+
+
+def test_build_flight_survives_an_unhashable_act_in_its_journal():
+    # End-to-end through the composer: progress() runs inside build_flight, so one corrupt journal
+    # record used to raise out of the snapshot poll here too. The flight must still compose.
+    # All three records sit INSIDE the 900 s progress window (_REPO now = 1783190000), so the
+    # corrupt one actually reaches the variety set rather than being filtered out by age.
+    issue = {"id": "i9", "num": 9, "status": "running", "activity_mtime": 1783189900,
+             "journal": [{"act": "launch", "id": "i9", "ts": 1783189800},
+                         {"act": [], "id": "i9", "ts": 1783189900},
+                         {"act": "event", "event": {"type": {}}, "id": "i9", "ts": 1783189950}]}
+    f = flights.build_flight(issue, _REPO)               # must not raise
+    assert f["label"] == "SL-9"
+    assert f["progress"]["events"] == 3
+    assert f["attempt"] == 1
+
+
+def test_corner_stats_already_survives_an_unhashable_act():
+    # The shape this fold preserves: corner_stats reads `act` only through `==`, which never
+    # hashes, so it was never part of this defect. Pinned so a later refactor to a set membership
+    # test reintroduces the crash as a RED test rather than silently.
+    stats = flights.corner_stats([{"act": []}, {"act": {}}, _merge("i1", 10),
+                                  {"act": "park", "ts": 15}], now=1000)
+    assert stats["landings_total"] == 1
+    assert stats["parks"] == 1
+    assert stats["go_arounds"] == 0
+
+
+def test_flight_memo_already_survives_an_unhashable_act():
+    # The sweep's other journal reader with an `in` test: HANDBACK_ACTS is a TUPLE, so `in` compares
+    # with == and never hashes. Pinned for the same reason — turning it into a set would crash.
+    assert isinstance(flights.HANDBACK_ACTS, tuple)
+    journal = [{"act": [], "memo": "junk"}, {"act": "park", "memo": "gave up", "ts": 10}]
+    assert flights._flight_memo(journal, blocked_txt=None, bounced=False) == "gave up"
+
+
 # =============================== round-1 review fixes (Codex cross-review) ===============================
 
 def test_landed_clean_requires_a_successful_unwandered_merge():
