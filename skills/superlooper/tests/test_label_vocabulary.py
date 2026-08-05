@@ -46,12 +46,30 @@ Two layers, because a label literal can hide two ways:
    a sentence justifying a DIFFERENT function, and its own action dicts would go unscanned. Pinning
    the number forces that copy to be read by a human before the ratchet excuses it.
 
-   The other half of "cannot resolve" is *cannot be guessed at*: a name that is mutated in place
-   (``add = []`` then ``add.append(…)``), rebound by anything other than a plain assignment, or
-   declared ``global``/``nonlocal`` is marked unreadable rather than read as the value it was last
-   assigned. Without that, the most idiomatic way in Python to build a conditional label list would
-   resolve to ``[]`` — "this call applies no labels" — which is a silent all-clear, the one verdict
-   a fence must never give.
+   The other half of "cannot resolve" is *cannot be guessed at*. Two rules, both aimed at the same
+   verdict a fence must never give — the silent "this call applies no labels":
+
+     * A name mutated in place *in the scope that reads it* (``add = []`` then ``add.append(…)``),
+       rebound by anything other than a plain assignment, or declared ``global``/``nonlocal`` is
+       unreadable rather than read as the value it was last assigned. At module scope the mutation
+       scan goes deep, because a module name is visible from every function — one ``.append``
+       anywhere invalidates the constant. Function scopes stay shallow, so a mutated local in one
+       helper cannot blind an unrelated same-named local next door: that cry-wolf failure is what
+       gets a fence muted rather than fixed.
+     * An INDIRECT expression (a name, a dotted constant) that resolves to *no* labels is
+       unreadable. This is the general form, and it is what catches the mutation the rule above
+       cannot see — a closure that appends to the list, or a helper the list was handed to, leaves
+       the binding at ``[]`` while gh still applies whatever went in. A literal ``add=[]`` written
+       at the call site keeps resolving to "nothing", because that one really does apply nothing.
+
+**Known limits, stated rather than implied.** A list SEEDED non-empty and then filled out of sight
+(``add = ["parked"]``, handed to a helper that appends) still resolves — to the seed alone. So does
+a payload dict whose ``labels`` key is written after the literal (``p["labels"] = […]``). And a raw
+``subprocess.run(["gh", "issue", "edit", …, "--add-label", …])`` that bypasses ``lib/gh.py``
+entirely is outside the call table by construction; ``test_every_gh_helper_that_names_a_label_flag_
+is_classified`` guards the helper surface, not the shell. None of these is how the engine writes
+labels today, and each would be visible in review — but a fence is only as honest as its stated
+reach, and a reader who assumes more than this list is the next person to be surprised.
 
 **Scanned surface: the engine only** (``skills/superlooper/skill/**``, by extension and by shebang,
 because the CLI ``skill/bin/superlooper`` carries none). This is deliberate and worth stating,
@@ -406,8 +424,7 @@ def _is_label_payload(items):
     as a write. `test_every_unreadable_label_argument_is_accounted_for`'s message names that case,
     because the right fix there is to tighten this predicate, not to add an allow-list entry.
     """
-    if "act" in items and any(k in items for k in _ACT_APPLY_KEYS + _ACT_REMOVE_KEYS
-                              if k != "labels"):
+    if "act" in items and any(k in items for k in _ACT_APPLY_KEYS + _ACT_REMOVE_KEYS):
         return True
     return "labels" in items and "title" in items and "body" in items
 
@@ -440,7 +457,17 @@ def _walk_scope(scope, inherited, across, sites, module=False):
     def record(kind, node):
         if node is None:
             return
-        sites.append((kind, ast.unparse(node), _resolve(node, own, across)))
+        names = _resolve(node, own, across)
+        # An INDIRECT expression that resolves to nothing is not "this call applies no labels" —
+        # it is a name whose list was filled somewhere the fence cannot see. A closure that appends
+        # to it, a helper it was handed to, a build loop: all leave the binding at `[]` and all end
+        # with gh applying whatever went in. The engine has dozens of nested defs, so this is one
+        # ordinary refactor away, and reading it as an empty add is the silent all-clear the whole
+        # fence exists to prevent. A literal `add=[]` written at the call site is untouched — that
+        # one really does apply nothing, and it is the only zero-name shape in the engine today.
+        if names == [] and isinstance(node, (ast.Name, ast.Attribute)):
+            names = None
+        sites.append((kind, ast.unparse(node), names))
 
     for node in _own_scope_nodes(scope):
         if isinstance(node, ast.Call):
@@ -761,14 +788,17 @@ def test_fence_reads_the_action_dicts_that_feed_the_executor():
     assert _UNKNOWN in _flagged(_VIA_ACTION_DICT)
 
 
-def test_fence_reads_an_action_dict_under_any_verb_name():
+def test_fence_reads_an_action_dict_under_any_verb_name_and_any_label_key():
     # `_is_label_payload` deliberately does not pin the act NAME. A sibling verb — the obvious way
     # to add a PR-side relabel — would otherwise build its add-list outside the fence's sight while
     # its forwarder borrowed the existing executor's `_UNREADABLE` excuse: two holes that line up.
-    src = """def plan(iid, num):
-    return [{"act": "relabel_pr", "id": iid, "num": num, "add": [%(x)r], "remove": []}]
-""" % {"x": _UNKNOWN}
-    assert _UNKNOWN in _flagged(src)
+    # The label KEY is not pinned either: an act dict carrying `labels` is as much a write payload
+    # as one carrying `add`, and requiring `add`/`remove` specifically was a coverage regression.
+    for key in ("add", "remove", "labels"):
+        src = """def plan(iid, num):
+    return [{"act": "relabel_pr", "id": iid, "num": num, %(k)r: [%(x)r]}]
+""" % {"k": key, "x": _UNKNOWN}
+        assert _UNKNOWN in _flagged(src), "an act dict's %r key must be checked" % key
 
 
 def test_fence_reads_an_issue_creation_payload():
@@ -875,6 +905,46 @@ def park(num):
     assert not unregistered and not unreadable, (
         "a mutated local in one function must not blind the fence in another: %s %s"
         % (unregistered, unreadable))
+
+
+def test_fence_does_not_read_a_list_filled_out_of_sight_as_no_labels():
+    # The general form of the mutation hole, and the one the scope-local mutation scan CANNOT see:
+    # the append happens in a closure, or in a helper the list was handed to. Both leave the
+    # binding at `[]` while gh still applies whatever went in. The engine has dozens of nested
+    # defs, so this is one ordinary refactor away from being real.
+    closure = """import gh
+def hand_back(num, urgent):
+    add = []
+    def fill():
+        add.append(%(x)r)
+    if urgent:
+        fill()
+    gh.set_labels(num, add=add, remove=["in-progress"])
+""" % {"x": _UNKNOWN}
+    callee = """import gh
+def fill(out, urgent):
+    if urgent:
+        out.append(%(x)r)
+def hand_back(num, urgent):
+    add = []
+    fill(add, urgent)
+    gh.set_labels(num, add=add, remove=["in-progress"])
+""" % {"x": _UNKNOWN}
+    for name, src in (("closure", closure), ("callee", callee)):
+        _unregistered, unreadable = _scan1(src)
+        assert unreadable, "%s-filled list must be unreadable, not read as []" % name
+
+
+def test_fence_still_reads_a_literal_empty_add_as_applying_nothing():
+    # The other side of that rule: `add=[]` spelled AT the call site really does apply nothing, and
+    # the engine writes it (a relabel that only removes). Treating it as unreadable would put an
+    # honest no-op on the ratchet and buy an _UNREADABLE entry that excuses nothing.
+    src = """import gh
+def absorb(num):
+    gh.set_labels(num, add=[], remove=["in-progress"])
+"""
+    unregistered, unreadable = _scan1(src)
+    assert not unregistered and not unreadable
 
 
 def test_fence_does_not_read_a_kwargs_splat_as_no_labels():
