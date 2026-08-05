@@ -1344,7 +1344,15 @@ def _pick_source(facts, config, now, gh_mod):
         now=now, silent_after=config.get("runner_silent_seconds", config_mod.RUNNER_SILENT_SECONDS),
         fetched_at=_newest_direct_fetch(gh_mod), hhmm=_hhmm, fmt=format_duration)
     if mode["mode"] == flights.SOURCE_LIVE:
-        return runner_source.RunnerSource(facts["published_view"]), mode
+        source = runner_source.RunnerSource(facts["published_view"])
+        # The runner's own vouch for the closed-issue read behind this view (issues #172/#268). It
+        # rides the mode dict because that is the block the truth strip already binds — the ONE
+        # place the freshness of what's on screen is stated, which is where the operator will be
+        # looking when his queue stops moving. LIVE only: in FALLBACK the runner's document isn't
+        # what's on screen, so its vouch says nothing about the picture, and `truth` renders the
+        # louder "GitHub direct — not the runner's view" there instead.
+        mode["closed_read_ok"] = source.closed_read_ok()
+        return source, mode
     return gh_mod, mode
 
 
@@ -1572,7 +1580,9 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         # so we polled GitHub ourselves). `data_age`/`tick_age` are shown in BOTH modes so the owner
         # can always see how old this picture is and when the runner last completed a tick; `banner`
         # is the fallback's two-fact shout and is None in LIVE. Nothing latches — a recovered runner
-        # returns the next poll to LIVE and the banner clears itself.
+        # returns the next poll to LIVE and the banner clears itself. In LIVE it also carries
+        # `closed_read_ok` (issues #172/#268): the runner's vouch that the closed-issue read behind
+        # this view actually landed, which the truth strip states beside the freshness.
         "source": source_mode,
     }
     return repo_snap, flight_records, journal, state

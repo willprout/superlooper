@@ -115,6 +115,57 @@ def test_an_unknown_issue_reads_as_an_empty_answer():
     assert src().issue("o/r", 999) == {}
 
 
+# --------------------------- the closed-read VOUCH (issues #172 / #268) ---------------------------
+# An empty `closed_nums` is ambiguous on its own: GitHub answered "nothing is closed", or it REFUSED
+# the read and the fail-closed parser produced the same empty. The probe (`gh api rate_limit`) is
+# EXEMPT from throttling, so `stale` stays False right through a throttle and the two render
+# identically — the queue quietly stops moving under a board showing nothing wrong. #172 made the
+# runner publish a positive vouch for that read; this is the dashboard reading it.
+#
+# The vouch changes NOTHING about closure (pinned below): it is a marker, not a second oracle.
+
+def test_a_vouched_closed_read_reports_ok():
+    assert src(closed_read_ok=True).closed_read_ok() is True
+
+
+def test_an_unvouched_closed_read_reports_not_ok():
+    # The throttle case, exactly: not stale, an empty closed set, and the runner saying so.
+    assert src(closed_read_ok=False, closed_nums=[]).closed_read_ok() is False
+
+
+def test_a_view_that_never_claimed_the_read_landed_is_UNVOUCHED_not_vouched():
+    # THE asymmetry. The field is trusted ONLY in the direction it explicitly asserts — an engine
+    # too old to publish it, or a half-written document, must not buy a confident all-clear by
+    # SAYING NOTHING. That is the same fail-closed direction the engine publishes in
+    # (published_view.build: `view.get("closed_read_ok") is True`).
+    v = _view()
+    assert "closed_read_ok" not in v, "the pre-#172 view shape, explicitly"
+    assert runner_source.RunnerSource(v).closed_read_ok() is False
+
+
+@pytest.mark.parametrize("junk", [None, 1, "true", "yes", [], {}, "False"])
+def test_only_a_real_True_vouches(junk):
+    # A truthy string ("true") or a 1 from a hand-edited document must not vouch: everything except
+    # an actual boolean True is "not vouched", the same strictness the engine publishes with.
+    assert src(closed_read_ok=junk).closed_read_ok() is False
+
+
+def test_the_vouch_never_touches_closure():
+    # The DoD's guard rail. An unvouched poll must not make a closed issue read open, and a vouched
+    # one must not make an absent issue read closed — closure stays the runner's POSITIVE set alone.
+    assert src(closed_read_ok=False, closed_nums=[7]).is_closed("o/r", 7) is True
+    assert src(closed_read_ok=False, closed_nums=[7]).issue("o/r", 7)["state"] == "CLOSED"
+    assert src(closed_read_ok=True, closed_nums=[]).is_closed("o/r", 7) is False
+    assert src(closed_read_ok=True, closed_nums=[]).issue("o/r", 7) == {}
+
+
+def test_the_vouch_is_still_no_egress():
+    # It is a read of the published document, like every other answer here — nothing new goes out.
+    s = src(closed_read_ok=False)
+    s.closed_read_ok()
+    assert not any("gh" in a.lower() for a in vars(s)), vars(s)
+
+
 # --------------------------- PRs ---------------------------
 
 def test_pr_for_branch_returns_the_runners_pr_view():

@@ -22,10 +22,15 @@ import flights
 import truth
 
 
-def _live(tick="4s ago", data="12s ago"):
-    """A source_mode verdict shaped exactly as lib/flights.source_mode returns it."""
+def _live(tick="4s ago", data="12s ago", closed_read_ok=True):
+    """A source_mode verdict shaped exactly as the server hands one to the strip in LIVE.
+
+    ``closed_read_ok`` is the runner's own vouch for the closed-issue read behind this view
+    (issues #172/#268) — the server attaches it in ``_pick_source`` from the RunnerSource.
+    """
     return {"mode": flights.SOURCE_LIVE, "reason": None, "tick_age": 4.0, "data_age": 12.0,
-            "tick_age_text": tick, "data_age_text": data, "silent_since": None, "banner": None}
+            "tick_age_text": tick, "data_age_text": data, "silent_since": None, "banner": None,
+            "closed_read_ok": closed_read_ok}
 
 
 def _silent(tick_age=900.0, tick="15m ago"):
@@ -149,6 +154,76 @@ def test_an_unknown_age_is_a_question_mark_never_a_confident_zero():
     t = truth.banner(_never_ticked())
     assert "?" in t["data"]["text"]
     assert "0s" not in t["data"]["text"]
+
+
+# ------------- the closed-read vouch: is the freshness stamp even covering the closed set? -------------
+# The gap this closes (issue #268). During a GitHub throttle the runner's closed-issue read is
+# REFUSED — but the reachability probe (`gh api rate_limit`) is exempt, so the view still stamps
+# itself fresh and the closed set comes back empty. Every blocked-by issue then holds (correctly,
+# engine-side, since #172) while this strip said "data 12s ago" and nothing else: the queue quietly
+# stops moving under a board showing nothing wrong. The runner already VOUCHES for that read; the
+# strip's job is to stop swallowing the vouch.
+
+def test_a_vouched_live_poll_says_nothing_extra():
+    # §0.2 — no nagging. The healthy poll keeps the calm one-clause line it always had, or the
+    # marker becomes wallpaper and is invisible the one time it fires.
+    t = truth.banner(_live(closed_read_ok=True))
+    assert t["data"]["state"] == "ok"
+    assert t["data"]["text"] == "data 12s ago"
+    assert t["level"] == "ok"
+
+
+def test_an_unvouched_closed_read_is_marked_beside_the_freshness():
+    # THE case. The age still rides — the view IS fresh, that part is true — but it no longer stands
+    # alone claiming the whole picture landed.
+    t = truth.banner(_live(closed_read_ok=False))
+    assert t["data"]["state"] == "unvouched"
+    assert t["data"]["text"].startswith("data 12s ago · "), (
+        "the marker sits BESIDE the existing staleness indicator, it does not replace it")
+    assert "closed-issue read did not land this poll" in t["data"]["text"]
+    assert "blocked-by issues" in t["data"]["text"] and "holding" in t["data"]["text"]
+
+
+def test_the_unvouched_marker_never_diagnoses_github():
+    # The field is published FAIL-CLOSED: false means "not vouched", never "GitHub is definitely
+    # throttled". A strip that named a cause it cannot know would send the owner to wait out a
+    # throttle that may not exist — and the honest reading (the read didn't land) is the one that
+    # explains the stopped queue either way.
+    text = truth.banner(_live(closed_read_ok=False))["data"]["text"].lower()
+    for invented in ("throttl", "rate limit", "rate-limit", "429", "quota"):
+        assert invented not in text, "the marker must not diagnose a cause it cannot know: %r" % invented
+
+
+def test_an_unvouched_read_is_a_notice_not_an_alarm():
+    # Nothing is broken: the loop is holding correctly and journalling its reason. It is a thing the
+    # owner should KNOW (his queue has stopped), not a dead loop — so amber, never the red pulse.
+    assert truth.banner(_live(closed_read_ok=False))["level"] == "notice"
+
+
+def test_a_live_verdict_that_never_claimed_the_vouch_is_unvouched_never_ok():
+    # Unknown is never an all-clear — the one direction this module may not fail in. A verdict with
+    # no vouch on it (a pre-#268 recording, a hand-built block) must degrade to the marker, exactly
+    # as a published view that omits the field does.
+    src = _live()
+    del src["closed_read_ok"]
+    assert truth.banner(src)["data"]["state"] == "unvouched"
+
+
+def test_a_dead_loop_outranks_an_unvouched_read():
+    # In FALLBACK the runner's view is not what is on screen at all, so its vouch says nothing about
+    # the picture — and "GitHub direct — not the runner's view" is already the stronger sentence.
+    # Marking it unvouched there would attribute a runner fact to a source that isn't the runner.
+    t = truth.banner(_silent())
+    assert t["data"]["state"] == "blind"
+    assert "closed-issue read" not in t["data"]["text"]
+
+
+def test_a_dark_tower_outranks_an_unvouched_read():
+    # The runner can't reach GitHub AT ALL: no read landed, not just the closed one. Naming one
+    # sub-read under "the tower is blind" is noise on top of the bigger, truer sentence.
+    t = truth.banner(_live(closed_read_ok=False), github={"unreachable": True})
+    assert t["data"]["state"] == "dark"
+    assert "closed-issue read" not in t["data"]["text"]
 
 
 # --------------------------- the engine line: is the merged fix live? ---------------------------
