@@ -170,7 +170,11 @@ def records(run_root, iid, agent="claude", env=None, tail_bytes=TAIL_BYTES):
     path = oracle._path()
     if not path:
         return []
-    window = max(int(tail_bytes), 0)
+    # At least 1, never 0. A zero window reads nothing, finds no complete line, and multiplies
+    # back to zero — an infinite loop. Unreachable from any caller today (nothing passes
+    # `tail_bytes`), which is exactly why it is worth closing here rather than trusting that to
+    # stay true.
+    window = max(int(tail_bytes), 1)
     while True:
         out, size = _tail(path, window)
         # An EMPTY answer from a NON-empty file means the window landed inside a single oversized

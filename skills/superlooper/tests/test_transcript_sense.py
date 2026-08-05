@@ -127,7 +127,7 @@ def test_another_tools_result_does_not_answer_the_dialog():
     assert pane_state.classify_transcript([DIALOG, _answer("toolu_99")]) == "at_dialog"
 
 
-def test_a_dialog_answered_by_typing_something_else_stops_refusing(tmp_path=None):
+def test_a_dialog_answered_by_typing_something_else_stops_refusing():
     """A dialog can be left unanswered forever: the owner ignores it and types something else, so
     the tool_use sits in the file with no matching result. A resting worker writes no new bytes, so
     that record never scrolls out of the bounded tail — without this rule the lane would read

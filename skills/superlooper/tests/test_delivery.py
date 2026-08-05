@@ -332,6 +332,15 @@ def test_records_widens_its_window_rather_than_reporting_a_false_emptiness(tmp_p
     assert got[-1]["message"]["content"] == "last"
 
 
+def test_the_widening_read_terminates_for_any_window(tmp_path):
+    # The widening loop grows by multiplication, so a zero window would multiply back to zero and
+    # spin forever against a non-empty file. Nothing passes `tail_bytes` today; this pins that a
+    # future caller cannot wedge a tick by doing so.
+    env = _lane(tmp_path, [_entry("user", "one"), _entry("user", "two")])
+    assert delivery.records(str(tmp_path), "i7", env=env, tail_bytes=0)
+    assert delivery.records(str(tmp_path), "i7", env=env, tail_bytes=-5)
+
+
 def test_records_is_empty_when_there_is_no_transcript(tmp_path):
     # Not an error. The classifier reads it as UNKNOWN, which lib/nudge.py turns into a deferral —
     # so this emptiness has to be genuine, which is what the widening read below is about.
