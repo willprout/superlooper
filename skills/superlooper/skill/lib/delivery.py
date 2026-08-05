@@ -62,6 +62,13 @@ POLL_SECONDS = 0.2
 # entry decides", so a bounded tail loses nothing and keeps a per-nudge read cheap.
 TAIL_BYTES = 256 * 1024
 
+# The ceiling for the widened re-read below. A single transcript record can be larger than the
+# ordinary window — a 300KB tool result is unremarkable for these agents — and a window that lands
+# entirely inside one record yields NO complete line, which reads as "this session has written
+# nothing" and now REFUSES the nudge. So an empty bounded read widens once rather than answering a
+# question it did not actually look at.
+MAX_TAIL_BYTES = 8 * 1024 * 1024
+
 # Where Claude keeps its per-project transcripts under whichever config dir is in force.
 PROJECTS_DIRNAME = "projects"
 CONFIG_DIR_DEFAULT = ".claude"
@@ -152,8 +159,10 @@ def records(run_root, iid, agent="claude", env=None, tail_bytes=TAIL_BYTES):
     decides": a window that starts mid-history must never change a verdict.
 
     An empty list is the honest answer for every failure here — no session id, no config dir,
-    transcript saving off, an unreadable file. The classifier reads that as UNKNOWN, which refuses
-    nothing; the dangerous case (a bare shell) is covered by the host's process facts instead.
+    transcript saving off, an unreadable file. The classifier reads that as UNKNOWN, and the NUDGE
+    path treats UNKNOWN as "this session has taken no turn, so it may be sitting at a first-run
+    dialog" and refuses. That is why the window widens rather than reporting an emptiness it never
+    looked hard enough to establish.
     """
     if agent not in AGENTS:
         return []
@@ -161,15 +170,30 @@ def records(run_root, iid, agent="claude", env=None, tail_bytes=TAIL_BYTES):
     path = oracle._path()
     if not path:
         return []
+    window = max(int(tail_bytes), 0)
+    while True:
+        out, size = _tail(path, window)
+        # An EMPTY answer from a NON-empty file means the window landed inside a single oversized
+        # record and every line in it was a fragment. Widening is not optional politeness: the
+        # caller reads an empty list as "this session has written nothing", and that now refuses the
+        # nudge — so answering it off a window we never saw a whole record in would defer a healthy
+        # busy worker, unboundedly, for having read a large file.
+        if out or size <= window or window >= MAX_TAIL_BYTES:
+            return out
+        window = min(window * 8, MAX_TAIL_BYTES)
+
+
+def _tail(path, window):
+    """``(parsed records, file size)`` for the last ``window`` bytes, or ``([], 0)``."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
-            f.seek(max(size - max(int(tail_bytes), 0), 0))
+            f.seek(max(size - window, 0))
             raw = f.read()
     except OSError:
-        return []
+        return [], 0
     lines = raw.decode("utf-8", "replace").splitlines()
-    if size > tail_bytes and lines:
+    if size > window and lines:
         lines = lines[1:]                 # the seek almost certainly landed mid-line; drop it
     out = []
     for line in lines:
@@ -181,7 +205,7 @@ def records(run_root, iid, agent="claude", env=None, tail_bytes=TAIL_BYTES):
         except ValueError:
             continue                      # a half-flushed tail line is not a record
         out.append(parsed)
-    return out
+    return out, size
 
 
 class Transcript:

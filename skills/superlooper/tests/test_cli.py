@@ -1771,10 +1771,10 @@ def test_tidy_leaves_a_lane_that_relaunched_during_the_y_N_wait_completely_alone
     assert "closed 0 window(s)" in out
 
 
-def test_tidy_snapshots_the_handle_so_a_relaunch_cannot_redirect_the_close(rig):
-    # tidy closes the SNAPSHOTTED handle (captured at list time), never a fresh re-read. Even if
-    # the markers are rewritten to a new (live) session during the run, the close targets the OLD,
-    # already-finished workspace — so a concurrent relaunch can't get its live window closed.
+def test_tidy_closes_the_snapshotted_workspace_not_one_the_host_reports_later(rig):
+    # The close targets the workspace captured at LIST time. (A relaunch that rewrote the markers
+    # is refused outright by the guard above; this pins the other half — that nothing the host says
+    # mid-teardown can redirect which workspace gets closed.)
     home = _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("old:p1", "old")})
     log = rig.tmp / "host-close.log"
     marker = home / "state" / "panes" / "i1.ws"

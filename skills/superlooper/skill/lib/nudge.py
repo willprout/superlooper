@@ -2,7 +2,7 @@
 
 Every message the loop ever puts in front of a worker comes through here: the gate's handback, the
 progress probe, the frozen recover's wake, the idle status peek and the exit-interview ping. The
-runner branches on the exit code, so the six codes below are a contract, not a convention.
+runner branches on the exit code, so the seven codes below are a contract, not a convention.
 
 WHAT #334 CHANGED. Issue #308 moved every session SPAWN onto the five-verb wrapper, so
 `state/panes/<id>` and its `.ws` began holding the SESSION HOST's pane and workspace instead of

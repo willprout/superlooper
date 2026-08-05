@@ -319,9 +319,22 @@ def test_a_tail_that_lands_mid_line_drops_the_fragment(tmp_path):
     assert [r["message"]["content"] for r in got] == ["the whole one"]
 
 
+def test_records_widens_its_window_rather_than_reporting_a_false_emptiness(tmp_path):
+    """A single record can be larger than the ordinary window — a 300KB tool result is unremarkable
+    — and a window landing entirely inside one yields NO complete line. Reported as empty that reads
+    as "this session has written nothing", which the nudge path now REFUSES on: a busy, healthy
+    worker would be deferred, unboundedly, for having read a large file."""
+    env = _lane(tmp_path, [_entry("user", "first"),
+                           _entry("user", "z" * 40000),          # bigger than the window below
+                           _entry("assistant", "last")])
+    got = delivery.records(str(tmp_path), "i7", env=env, tail_bytes=1000)
+    assert got, "an oversized record must not be reported as no record at all"
+    assert got[-1]["message"]["content"] == "last"
+
+
 def test_records_is_empty_when_there_is_no_transcript(tmp_path):
-    # Not an error and not a refusal — the classifier reads it as UNKNOWN and the host's process
-    # facts carry the dangerous case.
+    # Not an error. The classifier reads it as UNKNOWN, which lib/nudge.py turns into a deferral —
+    # so this emptiness has to be genuine, which is what the widening read below is about.
     assert delivery.records(str(tmp_path), "i7", env={"HOME": str(tmp_path)}) == []
 
 

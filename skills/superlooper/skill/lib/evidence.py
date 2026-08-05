@@ -132,9 +132,10 @@ _NUDGE_RC = {
         "address an agent, or this agent has no delivery oracle — a channel fault, not the "
         "session's, so nothing was delivered and the session never saw the message"),
     3: ("pane_deferred",
-        "nothing was typed and the session may be perfectly healthy: the host could not vouch for "
-        "the pane, it reports the agent waiting on a person, or the send could not be PROVEN "
-        "delivered (rc is never proof) — the runner refused to claim it and will retry"),
+        "NOTHING WAS TYPED and the session may be perfectly healthy: the host could not vouch for "
+        "the pane, it reports the agent waiting on a person, or the session has written no record "
+        "to judge it by (so it may be sitting at a first-run dialog) — the runner refused to type "
+        "and will retry"),
     4: ("pane_dead",
         "the agent process is gone and the pane is a bare shell — typing here would run the "
         "message as a permission-bypassed shell command, so the caller must relaunch instead"),

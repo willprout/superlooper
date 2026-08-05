@@ -1719,15 +1719,23 @@ def _recorded_windows(home):
 
 
 def _snapshot(home, iid):
-    """The recorded handle read from disk NOW. Captured at LIST time — the close then targets
-    exactly the window shown to William, never a re-read that a relaunch during the y/N wait could
-    have redirected to a fresh, LIVE session (Codex cross-review round 1: the never-close-in-flight
-    property must survive a concurrent re-approval)."""
+    """The recorded handle read from disk NOW, at LIST time — so the close targets exactly the
+    window shown to William (Codex cross-review round 1: the never-close-in-flight property must
+    survive a concurrent re-approval).
+
+    The snapshot is no longer the whole guarantee. `_close_window` re-reads this immediately before
+    the teardown and refuses on a mismatch, because the doorway's `kill` resolves the pid it signals
+    from the lane NAME rather than from anything recorded here — see that function."""
     return panes.read(os.path.join(home, "state"), iid)
 
 
 def _close_window(home, iid, handle, *, cleanup):
     """Best-effort close of the SNAPSHOTTED session, THROUGH THE DOORWAY (issue #334).
+
+    Returns whether the teardown was VERIFIED — which is what the caller counts. A close the host
+    could not confirm is not a closed window, and saying otherwise would be the very shape this
+    verb was fixed for: reporting N closed while closing none.
+
 
     It used to be `cmux close-surface --surface <recorded>`. After #308 moved the spawn onto the
     five-verb wrapper, that recorded value is the session HOST's workspace and pane — identifiers
@@ -1775,26 +1783,32 @@ def _close_window(home, iid, handle, *, cleanup):
         print(f"  {iid}: relaunched while you were deciding — leaving the new session alone.")
         return False
     session = handle.as_session(iid) if handle else None
+    verified = False
     if session is not None:
         host = session_host.SessionHost(call_seconds=_CLOSE_TIMEOUT, teardown_reads=2,
                                         teardown_pause=0.5)
         try:
             host.exit(session)
+            verified = True
         except session_host.TeardownRefused:
             try:
                 host.kill(session)
-            except session_host.HostError:
-                pass
-        except session_host.HostError:
-            pass                                  # best-effort; a close failure never wedges tidy
-    if not cleanup:
-        return True
-    panes.forget(os.path.join(home, "state"), iid)
-    try:
-        os.remove(os.path.join(home, "state", f"worker.{iid}.lock"))
-    except OSError:
-        pass
-    return True
+                verified = True
+            except session_host.HostError as e:
+                print(f"  {iid}: could not be closed ({e}).")
+        except session_host.HostError as e:
+            print(f"  {iid}: could not be closed ({e}).")
+    if cleanup:
+        # Cleared even on an UNVERIFIED close, and deliberately: `cleanup` is set only for a status
+        # that can never relaunch, so nothing will ever write these again and leaving them behind
+        # would strand markers for a session nobody will look at. What must not happen is claiming
+        # the WINDOW went — that is what `verified` carries out to the count.
+        panes.forget(os.path.join(home, "state"), iid)
+        try:
+            os.remove(os.path.join(home, "state", f"worker.{iid}.lock"))
+        except OSError:
+            pass
+    return verified
 
 
 def cmd_tidy(args):
@@ -1834,7 +1848,7 @@ def cmd_tidy(args):
             return 0
 
     reconciled, closed = [], 0
-    for s in snaps:
+    for s in snaps:                                # noqa: PLW2901 — `s` shadows nothing here
         # cleanup (remove markers+lock) ONLY for a status that can never relaunch — merged. A
         # re-approvable session's markers/lock stay the runner's to reconcile (race-free by
         # construction; see _close_window).
@@ -1844,8 +1858,9 @@ def cmd_tidy(args):
         closed += 1
         if not cleanup:
             reconciled.append(s["id"])
-    # The COUNT is what was really closed, not what was listed. Reporting the listed number would
-    # tell the owner a relaunched lane's window went when it deliberately did not — the same
+    # The COUNT is what a teardown actually VERIFIED, not what was listed. Two things it must
+    # therefore exclude: a lane that relaunched while the owner was deciding (skipped on purpose),
+    # and a close the host would not confirm. Reporting the listed number instead would be the same
     # "reported N, closed none" shape this verb was fixed for in the first place.
     print(f"closed {closed} window(s)." + (
         f" {len(reconciled)} re-approvable session(s) left for the runner to reconcile "

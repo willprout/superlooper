@@ -20,8 +20,9 @@
 # stub binary, which is precisely the blindness #334 exists to close.
 #
 # EXIT CODES are the runner's contract and are documented in full in lib/nudge.py:
-#   0 sent (and PROVEN delivered)   1 failed   3 deferred
+#   0 sent (and PROVEN delivered)   1 failed   3 deferred (nothing was typed)
 #   4 dead   5 auth dead in-session   6 at its own dialog
+#   7 submitted, delivery unproven — the one code that does NOT mean "nothing was typed"
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 exec python3 "$HERE/../lib/nudge.py" "$@"

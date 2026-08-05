@@ -127,6 +127,37 @@ def test_another_tools_result_does_not_answer_the_dialog():
     assert pane_state.classify_transcript([DIALOG, _answer("toolu_99")]) == "at_dialog"
 
 
+def test_a_dialog_answered_by_typing_something_else_stops_refusing(tmp_path=None):
+    """A dialog can be left unanswered forever: the owner ignores it and types something else, so
+    the tool_use sits in the file with no matching result. A resting worker writes no new bytes, so
+    that record never scrolls out of the bounded tail — without this rule the lane would read
+    at_dialog for the rest of its life and no nudge could ever reach it. Real transcripts on this
+    machine carry exactly that shape."""
+    assert pane_state.classify_transcript([DIALOG, _user("never mind, do this instead")]) == "idle"
+
+
+def test_only_a_TYPED_prompt_clears_a_dialog():
+    """Narrow on purpose: this is the verdict whose loss presses Enter at a selection. An assistant
+    turn is the session talking to itself, a tool result is a different call answering, and a
+    COMPACTION is prose ABOUT the earlier conversation written back into the file — the delivery
+    oracle excludes that one for the same reason a module over. None of them is somebody answering.
+    """
+    assert pane_state.classify_transcript([DIALOG, _assistant()]) == "at_dialog"
+    assert pane_state.classify_transcript(
+        [DIALOG, dict(_user("summary of the conversation so far"), isCompactSummary=True)]
+    ) == "at_dialog"
+    assert pane_state.classify_transcript(
+        [DIALOG, dict(_user("<system note>"), isMeta=True)]) == "at_dialog"
+    assert pane_state.classify_transcript(
+        [DIALOG, dict(_user("a subagent said this"), isSidechain=True)]) == "at_dialog"
+
+
+def test_a_dialog_raised_AFTER_a_typed_prompt_still_refuses():
+    # The clear is positional, so the ordering has to be right: a prompt, then a dialog, is a
+    # session that asked something in response — which is i280 exactly.
+    assert pane_state.classify_transcript([_user("go"), DIALOG]) == "at_dialog"
+
+
 def test_an_ordinary_tool_use_is_not_a_dialog():
     other = {"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": "toolu_02", "name": "Bash", "input": {"command": "ls"}}]}}
@@ -143,9 +174,10 @@ def test_auth_death_outranks_an_open_dialog():
 # ------------------------------------------------------------------ the honest unknowns
 
 def test_no_record_at_all_is_unknown_never_a_verdict():
-    # A freshly-spawned session has no transcript until its first turn. Reading that as a refusal
-    # would wedge every first nudge; reading it as 'idle' would claim a safety check that never
-    # ran. The caller leans on the host's process facts, which is the stronger signal anyway.
+    # Not 'idle' (which would claim a safety check that never ran) and not 'dead'. UNKNOWN says
+    # only that this record cannot judge the session; what to DO about it is the caller's, and
+    # lib/nudge.py defers on it because a session with no record has not taken its first turn — and
+    # what a session sits in before its first turn is the first-run dialog.
     assert pane_state.classify_transcript([]) == "unknown"
     assert pane_state.classify_transcript(None) == "unknown"
 

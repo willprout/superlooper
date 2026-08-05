@@ -3972,7 +3972,8 @@ class Runner:
             loopstate.update(self.issues_path, m)
             if rc == 0:
                 return "ok"
-            why = "logged out in-window" if rc == 5 else "dead pane"
+            why = {5: "logged out in-window",
+                   7: "submitted but delivery unproven"}.get(int(rc), "dead pane")
             return f"{why} — nudge spent, gate parks next pass"
         return f"nudge rc={rc} (retrying next tick)"
 

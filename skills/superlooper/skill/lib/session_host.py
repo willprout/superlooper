@@ -19,6 +19,10 @@ each is named where it is enforced so a later reader can tell doctrine from para
   prompts typed their text, dropped the submission, and returned ``agent_prompted`` rc=0 in under a
   second. And rc is not evidence in either direction — even a settled ``--wait`` rc=0 means
   "queued" — so delivery is proven transcript-side, through an injected oracle, or the send raises.
+  WHICH failure it raises matters as much as that it raises: a host that REFUSED the call is a
+  channel fault (``HostError``, retry it), while a call the host accepted and the oracle could not
+  confirm is ``DeliveryUnproven`` (something was typed). Conflating them makes a caller spend a
+  one-shot nudge on a message the host never carried.
   A post-revive first prompt stalls even with ``--wait`` (5/5), so a REVIVED send chases
   ``send-keys enter``; that chaser stays until the pinned-build retest (#302) says otherwise.
   A revived send must also carry the re-orientation preamble (#298) — a revived session remembers
@@ -866,6 +870,20 @@ class SessionHost:
         reply = self._call(["agent", "prompt", name, text, "--wait", "--timeout", str(ms)],
                            timeout=ms / 1000.0 + _CALL_SECONDS)
         landed = delivery.landed(mark)
+        if landed is not True and not reply.ok:
+            # THE HOST REFUSED THE CALL — an unresolvable name, a timeout, a missing binary, or its
+            # own `agent_prompt_stalled`. That is a CHANNEL fault and it must not wear the delivery
+            # oracle's costume: `DeliveryUnproven` says "we typed and could not confirm it", and a
+            # caller with a one-shot key (the gate's single handback) spends that key and then parks
+            # the lane with a memo blaming a worker for ignoring a message the host never carried.
+            # A refused call is exactly what a caller should RETRY, so it raises the base error.
+            #
+            # Ordered before the revive chaser deliberately: chasing Enter into a pane whose prompt
+            # call was refused presses Enter for no reason, and a stray Enter SELECTS.
+            raise HostError("[%s] the host refused the prompt (rc=%s%s) — nothing was carried to "
+                            "the session, so this is a channel fault rather than an unproven "
+                            "delivery" % (name, reply.rc,
+                                          "; " + reply.error if reply.error else ""))
         chased = False
         if landed is not True and revived:
             # 5/5 in the spikes: a post-revive first prompt lands in the composer unsubmitted even

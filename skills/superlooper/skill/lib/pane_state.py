@@ -542,30 +542,45 @@ def transcript_at_dialog(records):
     for record in records or []:
         if not isinstance(record, dict) or record.get("isSidechain"):
             continue
-        typed_prompt = False
         for block in _blocks(record):
             if block.get("type") == "tool_use" and block.get("name") == _QUESTION_TOOL:
                 open_ids.add(block.get("id"))
             elif block.get("type") == "tool_result":
                 open_ids.discard(block.get("tool_use_id"))
-            elif (block.get("type") == "text" and record.get("type") == "user"
-                  and not record.get("isMeta")):
-                typed_prompt = True
-        if typed_prompt:
+        if _is_typed_prompt(record):
             # Somebody answered by talking instead. Whatever the session was waiting on, it is not
             # waiting on it now.
             open_ids.clear()
     return bool(open_ids)
 
 
+def _is_typed_prompt(record):
+    """Is this record a person (or the loop) TYPING something into the session?
+
+    Deliberately narrow, because it is what clears a dialog verdict and a wrong clear presses Enter
+    at a selection. It must be a `user` record whose content is a plain STRING — a list is a tool
+    result or an attachment, i.e. the session talking to itself — and it must carry none of the
+    flags that mark a `user` record as something other than somebody typing. `isCompactSummary` is
+    the one worth naming: a compaction writes PROSE ABOUT the earlier conversation back into the
+    file, which is emphatically not an answer, and the delivery oracle excludes it for the same
+    reason one module over.
+    """
+    if not isinstance(record, dict) or record.get("type") != "user":
+        return False
+    if any(record.get(flag) for flag in ("isSidechain", "isMeta", "isCompactSummary")):
+        return False
+    message = record.get("message")
+    return isinstance(message, dict) and isinstance(message.get("content"), str)
+
+
 def classify_transcript(records, exited_marker=False, agent="claude"):
     """The send-safety verdict from a session's own record. Same vocabulary as classify_screen.
 
-    'unknown' is a REAL answer here and is not a refusal: a freshly spawned session has written no
-    transcript yet, and treating that as "unsafe" would wedge every first nudge. The caller pairs
-    this with the host's process facts, which are the stronger signal for the dangerous case
-    anyway — a bare shell is a pane whose shell pid has no live child, read from the OS, where the
-    screen classifier could only infer it from a prompt glyph.
+    'unknown' is a REAL answer here and is not itself a verdict — it says only that this record
+    cannot judge the session. What the CALLER does with it is the caller's decision and it differs
+    by surface: `lib/nudge.py` treats it as "no turn taken yet, so this may be a first-run dialog"
+    and defers, because a session's brief IS its first turn and a session with no record has not
+    reached one. This module states the fact; it does not decide the send.
 
     Order mirrors classify_screen: DEAD first, then auth death, then the dialog. Auth death outranks
     an open dialog because both refuse the send and only one carries a remedy for the owner.
