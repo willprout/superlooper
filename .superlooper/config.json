@@ -10,6 +10,12 @@
     ],
     "dashboard": [
       "dashboard/**"
+    ],
+    "plugin": [
+      "plugin/**"
+    ],
+    "docs": [
+      "docs/**"
     ]
   },
   "required_checks": [
