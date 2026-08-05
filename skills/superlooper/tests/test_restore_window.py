@@ -95,6 +95,7 @@ class FakeHerdr:
         self.alive = set(alive)
         self.children = dict(children or {})
         self.calls = []
+        self.timeouts = []          # the per-call bound each one was handed
         self.slept = 0.0
         self.clock = 0.0
         # What the REAL delivery oracle costs per check: `delivery.PATIENCE_SECONDS` is 6.0 and it
@@ -109,6 +110,7 @@ class FakeHerdr:
 
     def run(self, argv, timeout=None):
         self.calls.append(list(argv))
+        self.timeouts.append(timeout)
         self.clock += self.call_seconds
         entry = self.script.get(tuple(argv[1:3]), (1, "", _err("unscripted", " ".join(argv[1:3]))))
         if isinstance(entry, list):
@@ -398,6 +400,56 @@ def test_the_bound_is_wall_clock_and_the_oracle_is_not_polled_while_the_host_ref
     assert elapsed <= 60.0, (
         "the bound is wall clock: %.1fs elapsed against a 10s bound (a poll-counting "
         "implementation measures ~241s here)" % elapsed)
+
+
+class _StoppedClock(FakeHerdr):
+    """A probe whose clock never advances — the failure mode an injected clock invites."""
+
+    def now(self):
+        return 0.0
+
+
+def test_a_clock_that_never_advances_cannot_spin_the_wait_forever():
+    # The wall clock is primary, but it is INJECTED, and three fakes already in this suite have a
+    # `sleep` and no `now`. A deadline is only a bound if something else also counts (measured at
+    # ~340k host calls in three seconds without this). The poll count cannot be lied to.
+    fake = _StoppedClock(script={
+        ("agent", "prompt"): [_REFUSED],
+        ("agent", "get"): (0, _agent(), ""),
+        ("pane", "process-info"): (1, "", PANE_GONE),
+    })
+    with pytest.raises(session_host.RestoreWindowExpired):
+        _host(fake, restore_wait_seconds=5.0, restore_poll_seconds=1.0).send(
+            _session(), "carry on", delivery=FakeDelivery(False))
+    assert len(fake.verbs("agent", "prompt")) <= 8, (
+        "the poll count is the backstop: %s prompts" % len(fake.verbs("agent", "prompt")))
+
+
+def test_a_poll_longer_than_the_bound_does_not_overshoot_it():
+    # Caller-supplied, so nothing stops a poll longer than the whole wait. Unclamped, a 1s bound
+    # slept 600s before noticing it had expired.
+    fake = _window(prompts=[_REFUSED])
+    with pytest.raises(session_host.RestoreWindowExpired):
+        _host(fake, restore_wait_seconds=1.0, restore_poll_seconds=600.0).send(
+            _session(), "carry on", delivery=FakeDelivery(False))
+    assert fake.slept <= 1.0, "slept %.1fs against a 1.0s bound" % fake.slept
+
+
+def test_the_wait_re_issues_the_prompt_on_the_callers_own_call_budget():
+    # `nudge` halves the module's default call seconds because its whole script is killed at the
+    # runner's NUDGE_TIMEOUT. A wait that used the module constant instead would size its calls
+    # against a budget nobody chose — and the bound's arithmetic is only honest if the two agree.
+    fake = _window(prompts=[_REFUSED, _PROMPTED],
+                   panes=[(1, "", PANE_GONE), (0, _process_info(), "")])
+    fake.alive.add(4242)
+    fake.children[4242] = [4243]
+    _host(fake, call_seconds=3.0, prompt_timeout_ms=1000).send(
+        _session(), "carry on", delivery=FakeDelivery(False, True))
+
+    prompt_timeouts = [t for c, t in zip(fake.calls, fake.timeouts)
+                       if tuple(c[1:3]) == ("agent", "prompt")]
+    assert prompt_timeouts[-1] == pytest.approx(1.0 + 3.0), (
+        "the re-issued prompt must use the caller's call budget, got %s" % prompt_timeouts)
 
 
 def test_the_bound_is_configurable_by_the_caller_and_by_the_operators_environment():

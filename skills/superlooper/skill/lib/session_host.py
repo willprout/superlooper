@@ -1146,6 +1146,14 @@ class SessionHost:
         # back. So the verdict has to HOLD across a pause longer than that gap. A genuinely
         # finished session reads DEAD both times and pays two seconds; a restoring one does not
         # read DEAD twice, and keeps its window.
+        #
+        # WHAT THIS DOES NOT DO, measured rather than assumed (third verification pass): it does
+        # not save the session from its CALLERS. Both production call sites answer a
+        # `TeardownRefused` with `kill`, which closes the workspace unconditionally and by design —
+        # so the refusal below is a signal, not a save. Teaching a caller to tell a restore-shaped
+        # refusal from a still-alive one is caller policy and issue #356; the margin here is also a
+        # stability heuristic rather than a guarantee, since only the SIZE of that gap was measured
+        # and not its frequency.
         self._probe.sleep(_EXIT_CONFIRM_PAUSE)
         again = self.state(session)
         if again.liveness != DEAD:
