@@ -6362,6 +6362,21 @@ def test_boot_heals_a_repo_adopted_before_awaiting_answer_was_registered(rig):
     assert _alert(rig) is None
 
 
+def test_boot_holds_when_the_awaiting_answer_heal_cannot_apply(rig):
+    # The other side of #337's blast radius on OTHER adopted repos, stated rather than assumed:
+    # adding a runner-managed label gives every pre-#337 repo one new boot-time GitHub WRITE, and a
+    # write that fails takes the #160 contract's hold path — refuse the tick loop, raise one legible
+    # systemic ALERT naming the migration. That is the intended behaviour (a repo whose vocabulary
+    # cannot be repaired would otherwise storm), and it is worth pinning for THIS label because it
+    # is the first new runner-managed label since the contract was written.
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked"])
+    _fail_gh(rig, "label create")
+    assert rig.r._apply_boot_migrations(now=NOW) is False       # boot HELD, not stormed
+    alert = _alert(rig)
+    assert alert and any("migration_hold" in x and "awaiting-answer" in x
+                         for x in alert["reasons"])
+
+
 def test_boot_migration_applies_the_needs_william_rename(rig):
     # the 2026-07-13 storm's exact repo shape: still carries the OLD needs-william and lacks the NEW
     # needs-owner. Boot renames IN PLACE (preserving every issue that carries it) and does NOT then

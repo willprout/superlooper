@@ -975,7 +975,8 @@ class Runner:
         Two boot migrations, both idempotent:
           * state-format stamp — _stamp_state_format(), run just above in run(); always re-applied.
           * runner-managed LABEL migrations — this method: the #58 rename + creating any missing
-            runner-managed label (in-progress / needs-owner / parked). This EXTENDS #108's boot
+            runner-managed label (whatever labels.runner_managed_labels() names — in-progress /
+            needs-owner / parked / awaiting-answer). This EXTENDS #108's boot
             preflight from a fail-loud refusal to a self-heal (owner ruling, issue #160), keeping
             #108's read-health discipline: a REFUSED label read SKIPS every migration and proceeds,
             so a transient boot-time gh blip can never wedge a restart (the #92 refused-vs-answered-
