@@ -218,14 +218,38 @@ _TEARDOWN_PAUSE = 1.0
 # caller reading it as "the session is gone" tears down a flight that was about to come back on its
 # own, which turns a survivable host restart into lost work.
 #
-# 120 seconds because the window was RE-MEASURED on the pinned v0.8.0 and came back an order of
-# magnitude wider than the numbers #302 recorded on the same build one day earlier (2026-08-05,
-# reports/i317.md): 8.2s in the shipped drill, and 19.6s / 28.9s from the host's own
-# `persist.restore`→`pane.spawned` log lines while a probe grid was running. Against #302's
-# 0.78–4.06s. A quantity whose spread is that wide is not one to trust to a decimal place, so the
-# bound is roughly four times the worst reading — and `tests/test_restore_window.py` re-measures it
-# against a real server rather than believing this comment.
-RESTORE_WAIT_SECONDS = 120.0
+# TWO KNOWN FALSE POSITIVES, recorded rather than implied (fresh-agent review). Neither is unsafe —
+# both cost a bounded wait and then the ordinary refusal — but neither is "only a restore produces
+# this", which is what the conjunction below is tempting to claim:
+#   * a pane the OWNER closed under a live agent record (`pane close`) presents the same "name
+#     resolves, pane refused" pair, and pays the full bound on every send until the record clears;
+#   * a host that resolves a name and reports NO pane for it is read as unreadable rather than as
+#     restoring, so a restore that rebuilds a record before assigning a pane would be missed. That
+#     one fails toward the retryable channel fault, never toward "gone".
+#
+# The window was RE-MEASURED on the pinned v0.8.0 and came back an order of magnitude wider than
+# the numbers #302 recorded on the same build one day earlier (2026-08-05, reports/i317.md):
+# 3.9–8.2s across six runs of the shipped drill, and 19.6s / 28.9s from the host's own
+# `persist.restore`→`pane.spawned` log lines while a probe grid was running — load moves it, which
+# is exactly why it is re-measured rather than trusted. Against #302's 0.78–4.06s.
+#
+# 45 seconds is that worst reading with half again on top, and it is capped from ABOVE by the
+# caller rather than chosen freely: the only production caller is `lib/nudge.py`, whose whole
+# budget the runner kills at `NUDGE_TIMEOUT` (120s). A bound that does not fit inside it does not
+# produce a loud expiry at all — it produces rc=124, which that module's own comment says "reads as
+# a channel fault and holds the queue". An operator whose machine is slower raises both, through
+# the variable below. (Fresh-agent review, P0: the first draft's 120s default could not have
+# reached a caller.)
+#
+# WHAT THE WAIT ACTUALLY COVERS IN PRODUCTION, measured by driving `nudge-pane.sh` through a real
+# restore window (reports/i317.md): almost never the whole window. `nudge` asks `state` FIRST, and
+# a RESTORING verdict is not ALIVE, so it defers in 0.1s with nothing typed and the runner simply
+# tries again next tick — which is the cheaper shape of "wait, not dead" and the one that carries
+# most of this issue's weight. The send-path wait is the SECOND net: it covers the residual race
+# where the window opens in the few hundred milliseconds between that state read and the prompt.
+# Sizing it against the whole window is still right, because the race can open at the window's very
+# start.
+RESTORE_WAIT_SECONDS = 45.0
 RESTORE_POLL_SECONDS = 1.0
 # The operator's override, same convention as SL_HERDR one screen up. It exists because the right
 # bound is a property of the MACHINE (how long its disk takes to respawn a fleet of panes), not of
@@ -322,8 +346,15 @@ class Sent:
     ``restored`` is True when this delivery only landed after the wrapper waited out a host restore
     window (#317). It is reported rather than smoothed over because the session on the other end is
     now a REVIVED one — herdr brought it back with ``--resume``, so it remembers the conversation
-    and nothing about what happened to the world (#298). What to do about that is the caller's
-    policy and deliberately not decided here; being told is what makes deciding possible.
+    and nothing about what happened to the world (#298).
+
+    **This is a KNOWN HOLE in the #298 rule, not a delegation of it** (fresh-agent review). A send
+    that opens with ``revived=True`` is refused without the re-orientation preamble; a send that
+    BECOMES revived under the wrapper's feet, mid-call, is not — the text was already chosen by a
+    caller who believed the session was live, and refusing it here would throw away the flight this
+    whole path exists to save. So the prompt goes and the flag says what happened. Closing it means
+    deciding what a caller should do with an instruction it can no longer re-word, which is that
+    caller's policy and a separate issue.
     """
     delivered: bool
     chased: bool = False
@@ -448,6 +479,18 @@ class Probe:
     def sleep(self, seconds):
         time.sleep(seconds)
 
+    def now(self):
+        """A monotonic clock, injected for the same reason `sleep` is.
+
+        The restore wait (#317) is the one loop here whose bound has to be WALL CLOCK rather than a
+        count of pauses. Counting pauses was the first draft and it was not a bound at all: the
+        delivery oracle polls for six seconds of its own on every check, so a "120 second" wait ran
+        about fourteen minutes — past the caller's own kill timeout, which turned the loud expiry
+        this issue asked for into an rc=124 that reads as a channel fault (fresh-agent review, P0).
+        Monotonic, so a clock step cannot extend or collapse the wait.
+        """
+        return time.monotonic()
+
 
 class _Reply:
     """A parsed host answer. ``ok`` means the host returned a result — never that it told truth."""
@@ -533,17 +576,23 @@ def _find(payload, key, depth=6):
 
 
 def _seconds(value, fallback):
-    """A positive number of seconds, or ``fallback``. Never raises, never returns 0.
+    """A positive FINITE number of seconds, or ``fallback``. Never raises, never returns 0.
 
     Used for the restore bound, whose override arrives from an operator's environment. A junk
     value must not take a runner down at construction, and must not degrade to 0 either: 0 means
     "never wait out a restore", which is the exact behaviour issue #317 exists to remove.
+
+    ``isfinite`` is not decoration (fresh-agent review, P1). ``float()`` happily accepts ``inf``,
+    ``"Infinity"`` and ``"1e400"``, and an infinite bound escaped this guard to raise
+    ``OverflowError`` from the wait's arithmetic — out through `nudge.nudge`, which catches
+    ``HostError`` and documents itself as never raising. A guard that admits the one value able to
+    break its own caller is not a guard.
     """
     try:
         number = float(value)
     except (TypeError, ValueError):
         return fallback
-    return number if number > 0 else fallback
+    return number if math.isfinite(number) and number > 0 else fallback
 
 
 def _pid(value):
@@ -980,7 +1029,8 @@ class SessionHost:
             # be reported as anything the wrapper asks whether the host is mid-restore — and if it
             # is, waits it out instead of handing the caller a verdict that reads "gone".
             reply, landed, restored, waited = self._wait_out_restore(
-                name, argv, ms, delivery, mark, reply, landed)
+                name, argv, ms, delivery, mark, reply, landed,
+                recorded=session.shell_pid if isinstance(session, Session) else None)
         if landed is not True and not reply.ok:
             # THE HOST REFUSED THE CALL — an unresolvable name, a timeout, a missing binary, or its
             # own `agent_prompt_stalled`. That is a CHANNEL fault and it must not wear the delivery
@@ -996,10 +1046,17 @@ class SessionHost:
                             "delivery" % (name, reply.rc,
                                           "; " + reply.error if reply.error else ""))
         chased = False
-        if landed is not True and revived:
+        if landed is not True and (revived or restored):
             # 5/5 in the spikes: a post-revive first prompt lands in the composer unsubmitted even
             # with `--wait`, and `send-keys enter` submits it. Scoped to the revive path on
             # purpose — a stray Enter into a pane showing a selection dialog SELECTS an item.
+            #
+            # `restored` counts as revived, and missing that was the review's first P0. A prompt
+            # that waited out a restore window IS a post-`--resume` first prompt — herdr did the
+            # reviving instead of us, which changes who typed `--resume` and nothing about the pane
+            # it produced. Without this the feature's own success path lands in the composer
+            # unsubmitted, raises DeliveryUnproven, and spends the caller's one-shot nudge on a
+            # session that was working: the exact harm RestoreWindowExpired was written to avoid.
             self._call(["agent", "send-keys", name, "enter"])
             chased = True
             landed = delivery.landed(mark)
@@ -1194,7 +1251,7 @@ class SessionHost:
         argv = [self.binary] + [str(a) for a in args]
         return _parse(self._probe.run(argv, timeout=timeout or self._call_seconds))
 
-    def _restoring(self, name):
+    def _restoring(self, name, recorded=None):
         """Is the host mid-restore for this agent? ``(bool, detail)`` — issue #317.
 
         Two reads, in this order, and neither is ``agent list``'s status field. The host said
@@ -1207,6 +1264,18 @@ class SessionHost:
            action surface refused it is the record `persist.restore` put back.
         2. **Is there a runtime behind the pane that record names?** Asked through the same process
            facts every liveness read here uses, so RESTORING can only be reached the one way.
+
+        A restore has TWO halves and the second one is not pane-absent (fresh-agent review, P0).
+        The host respawns the pane's shell first and attaches the agent to it after — that gap is
+        the same one `_PANE_BUSY` exists for, and while it is open `pane process-info` ANSWERS with
+        a bare shell, which reads DEAD. Waiting only through the first half would abandon the wait
+        at the moment the restore was furthest along.
+
+        ``recorded`` is what tells the two bare shells apart, and it is a genuine PROCESS fact
+        rather than another of the host's opinions: a session that simply finished still sits in
+        the shell we recorded at spawn, while a restored pane's shell is a NEW pid because the
+        whole tree died with the server. Without a recorded pid there is nothing to compare, and
+        the answer stays the conservative one.
         """
         got = self._call(["agent", "get", name])
         if not got.ok:
@@ -1216,10 +1285,18 @@ class SessionHost:
                           "the host did not answer at all (%s), and silence is not evidence of a "
                           "restore" % got.error)
         pane = _dig(got.payload, "agent", "pane_id") or _find(got.payload, "pane_id")
-        _, liveness, detail = self._process_facts(pane)
-        return liveness == RESTORING, detail
+        shell_pid, liveness, detail = self._process_facts(pane)
+        if liveness == RESTORING:
+            return True, detail
+        if (liveness == DEAD and recorded is not None and shell_pid is not None
+                and int(shell_pid) != int(recorded)):
+            return True, ("pane %s is a bare shell under a NEW pid (%s, not the %s recorded at "
+                          "spawn) while the host still resolves the name — the restore's second "
+                          "half, where the pane is back and its agent has not attached yet"
+                          % (pane, shell_pid, recorded))
+        return False, detail
 
-    def _wait_out_restore(self, name, argv, ms, delivery, mark, reply, landed):
+    def _wait_out_restore(self, name, argv, ms, delivery, mark, reply, landed, recorded=None):
         """Wait out a host restore window, then re-offer the prompt. ``(reply, landed, restored,
         waited)``, or ``RestoreWindowExpired`` — issue #317.
 
@@ -1230,38 +1307,44 @@ class SessionHost:
         somebody's composer. That is the property ``test_a_prompt_the_host_accepted_is_never_
         re_issued_by_the_wait`` exists to keep.
 
-        The bound is counted in POLLS rather than off a wall clock on purpose: the wrapper's only
-        clock is the injected probe's ``sleep``, which is what lets the tests drive a 120-second
-        wait deterministically. The refusals themselves return in milliseconds (measured), so polls
-        times pause is a fair account of the wait — and it is the number the raise reports.
+        **The bound is WALL CLOCK, and the oracle is not asked while the host is refusing.** Both
+        of those are the same lesson, learned at review (P0). Counting pauses is not a bound when
+        something inside the loop can block: `delivery.landed` polls for six seconds of its own, so
+        a pause-counted "120 second" wait ran about fourteen minutes of real time — past the
+        caller's kill timeout, which replaced this verb's loud expiry with an rc=124 that reads as
+        a channel fault. Asking the oracle at all was the waste: while the host is REFUSING,
+        nothing was carried, so there is nothing for a transcript to have recorded. It is asked
+        once, on the way out, about the answer that actually matters.
         """
-        restoring, detail = self._restoring(name)
+        restoring, detail = self._restoring(name, recorded)
         if not restoring:
             # Not a restore. The caller's refusal stands exactly as the host gave it, and `send`
             # reports it as the channel fault it already knew how to report.
             return reply, landed, False, 0.0
 
-        polls = max(1, int(math.ceil(self.restore_wait_seconds / self.restore_poll_seconds)))
-        waited = 0.0
-        for _ in range(polls):
+        started = self._probe.now()
+        deadline = started + self.restore_wait_seconds
+        while True:
             self._probe.sleep(self.restore_poll_seconds)
-            waited += self.restore_poll_seconds
             reply = self._call(argv, timeout=ms / 1000.0 + _CALL_SECONDS)
-            landed = delivery.landed(mark)
-            if landed is True or not _is_gone(reply):
-                # The host stopped refusing. Whatever it said now is the honest answer — including
-                # a refusal in different words, which the caller's own error path will report.
-                return reply, landed, True, waited
-            restoring, detail = self._restoring(name)
+            if not _is_gone(reply):
+                # The host stopped refusing. NOW the oracle is worth asking: this is the first
+                # answer that could have carried anything. Whatever the host said stands, including
+                # a refusal in different words, which the caller's own error path reports.
+                return reply, delivery.landed(mark), True, self._probe.now() - started
+            restoring, detail = self._restoring(name, recorded)
             if not restoring:
                 # The window closed the other way: the agent is genuinely gone. Hand back the
                 # refusal so `send` raises its ordinary channel fault rather than inventing one.
-                return reply, landed, False, waited
+                return reply, landed, False, self._probe.now() - started
+            if self._probe.now() >= deadline:
+                break
         raise RestoreWindowExpired(
-            "[%s] the host was STILL mid-restore after %.1fs (bound %.1fs, %s): its record for "
-            "this agent is back and nothing is running behind its pane. Nothing was typed — this "
-            "is a park, not a dead session, and not a delivery to doubt. %s"
-            % (name, waited, self.restore_wait_seconds, RESTORE_WAIT_ENV_VAR, detail))
+            "[%s] the host was STILL mid-restore after %.1fs (bound %.1fs, raise it with %s): its "
+            "record for this agent is back and no agent is running behind its pane. Nothing was "
+            "typed — this is a park, not a dead session, and not a delivery to doubt. %s"
+            % (name, self._probe.now() - started, self.restore_wait_seconds,
+               RESTORE_WAIT_ENV_VAR, detail))
 
     def _process_facts(self, pane):
         """``(shell_pid, liveness, detail)`` for a pane — the OS's answer, not the host's.

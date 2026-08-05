@@ -90,12 +90,18 @@ class FakeHerdr:
     answers `not_found` while the window is open and normally once it has closed.
     """
 
-    def __init__(self, script=None, alive=(), children=None):
+    def __init__(self, script=None, alive=(), children=None, oracle_seconds=0.0):
         self.script = {k: list(v) if isinstance(v, list) else v for k, v in (script or {}).items()}
         self.alive = set(alive)
         self.children = dict(children or {})
         self.calls = []
         self.slept = 0.0
+        self.clock = 0.0
+        # What the REAL delivery oracle costs per check: `delivery.PATIENCE_SECONDS` is 6.0 and it
+        # polls for all of it. Staged here because a wait that counted its own pauses and ignored
+        # this ran ~7x its stated bound (fresh-agent review, P0), and only a clock that the oracle
+        # also advances can hold that regression down.
+        self.oracle_seconds = oracle_seconds
 
     def run(self, argv, timeout=None):
         self.calls.append(list(argv))
@@ -116,20 +122,31 @@ class FakeHerdr:
 
     def sleep(self, seconds):
         self.slept += seconds
+        self.clock += seconds
+
+    def now(self):
+        return self.clock
 
 
 class FakeDelivery:
-    """The transcript-side oracle: ``answers`` are consumed in order, the last one repeats."""
+    """The transcript-side oracle: ``answers`` are consumed in order, the last one repeats.
 
-    def __init__(self, *answers):
+    Charges the probe's clock for every check, the way the real one does — see
+    ``FakeHerdr.oracle_seconds``.
+    """
+
+    def __init__(self, *answers, probe=None):
         self.answers = list(answers) or [True]
         self.checks = 0
+        self.probe = probe
 
     def mark(self):
         return "mark"
 
     def landed(self, mark):
         self.checks += 1
+        if self.probe is not None:
+            self.probe.clock += self.probe.oracle_seconds
         return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
 
 
@@ -145,13 +162,13 @@ def _session(**over):
     return session_host.Session(**kwargs)
 
 
-def _window(prompts, gets=None, panes=None):
+def _window(prompts, gets=None, panes=None, **kw):
     """A host staged in the restore window: the name resolves, the pane has no runtime."""
     return FakeHerdr(script={
         ("agent", "prompt"): prompts,
         ("agent", "get"): gets or (0, _agent(), ""),
         ("pane", "process-info"): panes or (1, "", PANE_GONE),
-    })
+    }, **kw)
 
 
 _REFUSED = (1, "", AGENT_GONE)
@@ -183,6 +200,26 @@ def test_a_prompt_refused_during_the_restore_window_is_waited_out_rather_than_re
     assert sent.delivered is True
     assert sent.restored is True, "the caller has to learn its session came back through a restore"
     assert fake.slept > 0, "the wrapper must actually wait out the window"
+
+
+def test_a_prompt_that_waited_out_a_restore_gets_the_enter_chaser():
+    """The feature's own SUCCESS path is a post-`--resume` first prompt (fresh-agent review, P0).
+
+    herdr did the reviving instead of us, which changes who typed `--resume` and nothing about the
+    pane it produced — and that pane leaves the first prompt in the composer unsubmitted, 5/5 in
+    the spikes. Without the chaser this path ends in `DeliveryUnproven`, which the runner counts as
+    a spent one-shot nudge and parks the lane: the session was working the whole time.
+    """
+    fake = _window(prompts=[_REFUSED, _PROMPTED],
+                   panes=[(1, "", PANE_GONE), (0, _process_info(), "")])
+    fake.alive.add(4242)
+    fake.children[4242] = [4243]
+    # False until the Enter lands — exactly the measured composer stall.
+    sent = _host(fake).send(_session(), "carry on", delivery=FakeDelivery(False, False, True))
+
+    assert sent.chased is True, "a restore-revived first prompt needs the same chaser a revive does"
+    assert sent.delivered is True
+    assert fake.verbs("agent", "send-keys"), "the chaser is an `agent send-keys … enter`"
 
 
 def test_the_wait_ends_loudly_with_its_own_error_rather_than_a_silent_retry_loop():
@@ -257,6 +294,71 @@ def test_a_prompt_the_host_accepted_is_never_re_issued_by_the_wait():
         "one refused call, one accepted, and then no more: %s" % fake.verbs("agent", "prompt"))
 
 
+def test_the_wait_keeps_waiting_through_the_restores_second_half():
+    """A restore does not go pane-absent → agent-attached in one step (fresh-agent review, P0).
+
+    The host respawns the pane's SHELL first and attaches the agent to it after — the same gap
+    `_PANE_BUSY` exists for. While it is open the pane ANSWERS with a bare shell, which reads DEAD,
+    and a wait that gave up there would abandon the session at the moment the restore was furthest
+    along. The recorded pid is what separates that shell from a finished session's: a restored
+    pane's shell is a NEW pid, because the whole tree died with the server.
+    """
+    fake = _window(
+        prompts=[_REFUSED, _REFUSED, _REFUSED, _PROMPTED],
+        panes=[(1, "", PANE_GONE),                    # first half: no pane at all
+               (0, _process_info(shell_pid=9191), ""),  # second half: a bare shell, NEW pid
+               (0, _process_info(shell_pid=9191), ""),
+               (0, _process_info(shell_pid=9191), "")])
+    fake.alive.update({4242, 9191})
+    fake.children[9191] = []                          # bare — the agent has not attached yet
+
+    sent = _host(fake).send(_session(shell_pid=4242), "carry on",
+                            delivery=FakeDelivery(False, True))
+
+    assert sent.restored is True
+    assert sent.delivered is True
+
+
+def test_a_bare_shell_on_the_pid_we_recorded_is_a_finished_session_not_a_restore():
+    # The other side of the same read, and the one that keeps the wait from swallowing a real
+    # ending: a session that simply finished still sits in the shell recorded at spawn.
+    fake = _window(prompts=[_REFUSED], panes=(0, _process_info(shell_pid=4242), ""))
+    fake.alive.add(4242)
+    fake.children[4242] = []
+
+    with pytest.raises(session_host.HostError) as caught:
+        _host(fake).send(_session(shell_pid=4242), "carry on", delivery=FakeDelivery(False))
+    assert not isinstance(caught.value, session_host.RestoreWindowExpired)
+    assert fake.slept == 0
+
+
+def test_the_bound_is_wall_clock_and_the_oracle_is_not_polled_while_the_host_refuses():
+    """Both halves of the review's P0 on the bound, in one test.
+
+    `delivery.landed` polls for `PATIENCE_SECONDS` (6.0) of real time per check. A wait that
+    counted its own pauses and called the oracle every round ran ~7x its stated bound — past the
+    runner's NUDGE_TIMEOUT, which turns this verb's loud expiry into an rc=124 that reads as a
+    channel fault and holds the queue. The oracle has nothing to say while the host is REFUSING
+    (nothing was carried), so it is asked once, on the way out.
+    """
+    fake = _window(prompts=[_REFUSED], oracle_seconds=6.0)
+    oracle = FakeDelivery(False, probe=fake)
+
+    with pytest.raises(session_host.RestoreWindowExpired):
+        _host(fake, restore_wait_seconds=10.0, restore_poll_seconds=1.0).send(
+            _session(), "carry on", delivery=oracle)
+
+    assert oracle.checks == 1, (
+        "the oracle is asked once — before the wait — not on every refused poll (%s checks)"
+        % oracle.checks)
+    # The wait's own span, with the one pre-wait oracle check taken back off the clock. The
+    # pause-counted first draft spent 10 x (1s pause + 6s oracle) = 70s here and still called it
+    # "10 seconds"; anything near that is the regression coming back.
+    span = fake.clock - oracle.checks * fake.oracle_seconds
+    assert span <= 10.0 + fake.slept / 10.0 + 1.0, (
+        "the bound is wall clock: the wait itself ran %.1fs against a 10s bound" % span)
+
+
 def test_the_bound_is_configurable_by_the_caller_and_by_the_operators_environment():
     default = session_host.SessionHost(probe=FakeHerdr(), binary="/nonexistent/x")
     assert default.restore_wait_seconds == session_host.RESTORE_WAIT_SECONDS
@@ -270,9 +372,34 @@ def test_the_bound_is_configurable_by_the_caller_and_by_the_operators_environmen
 
     # A junk override must not take the wrapper down at construction, and must not silently become
     # zero either — zero is "never wait", i.e. the exact behaviour this issue exists to remove.
-    junk = session_host.SessionHost(probe=FakeHerdr(), binary="/nonexistent/x",
-                                    env={session_host.RESTORE_WAIT_ENV_VAR: "soon"})
-    assert junk.restore_wait_seconds == session_host.RESTORE_WAIT_SECONDS
+    # `inf` is on this list because it is the one junk value `float()` ACCEPTS: it escaped the
+    # first draft's guard and raised OverflowError out of `send`, past `nudge.nudge`, which catches
+    # HostError and documents itself as never raising (fresh-agent review, P1).
+    for junk in ("soon", "", None, "0", "-5", "nan", "inf", "Infinity", "1e400"):
+        host = session_host.SessionHost(probe=FakeHerdr(), binary="/nonexistent/x",
+                                        env={session_host.RESTORE_WAIT_ENV_VAR: junk})
+        assert host.restore_wait_seconds == session_host.RESTORE_WAIT_SECONDS, junk
+        # …and the value it settled on has to survive the arithmetic the wait does with it.
+        with pytest.raises(session_host.HostError):
+            host.send(_session(), "x", delivery=FakeDelivery(False))
+
+
+def test_the_default_bound_fits_inside_the_budget_of_the_caller_that_exists():
+    """A bound the caller's own timeout cannot contain produces no loud expiry at all.
+
+    `bin/runner.py` kills `nudge-pane.sh` at NUDGE_TIMEOUT (120s) and reads the rc=124 as a channel
+    fault that holds the queue — `lib/nudge.py` says so in as many words where it sizes its own
+    call timeouts. The first draft defaulted to exactly 120s, so DoD 3's park-worthy outcome could
+    never have reached anybody (fresh-agent review, P0). Asserted against the real constants so a
+    later change to either side has to come back here.
+    """
+    import runner
+    import nudge
+
+    budget = runner.NUDGE_TIMEOUT - (nudge.PROMPT_TIMEOUT_MS / 1000.0) - nudge.CALL_SECONDS
+    assert session_host.RESTORE_WAIT_SECONDS < budget, (
+        "a %.0fs restore bound does not fit inside the caller's %.0fs budget"
+        % (session_host.RESTORE_WAIT_SECONDS, budget))
 
 
 def test_the_default_bound_clears_the_window_measured_on_the_pinned_build():
@@ -282,7 +409,10 @@ def test_the_default_bound_clears_the_window_measured_on_the_pinned_build():
     # day earlier, which is exactly why the number is asserted rather than trusted. A build whose
     # window outgrows the default fails the real drill; this is the paired reminder in the fast
     # suite of what the default was chosen against.
-    assert session_host.RESTORE_WAIT_SECONDS >= 4 * 28.9
+    #
+    # The margin is 1.5x rather than anything more comfortable because the bound is squeezed from
+    # the other side too — see the caller-budget test below. When those two meet, the pin moves.
+    assert session_host.RESTORE_WAIT_SECONDS >= 1.5 * 28.9
 
 
 # --------------------------------------------------------------------- state
@@ -382,10 +512,17 @@ def test_the_wrapper_survives_a_real_server_restart(sock_dir):
     when the lab is cleaned up. Both learned the hard way while building this (reports/i317.md).
 
     **The measured window on the pinned build** (v0.8.0, tag `v0.8.0`, commit `346411f`; Mac mini,
-    2026-08-05): **8.2s** here, and **19.6s** / **28.9s** read off the host's own
-    `persist.restore`→`pane.spawned` log lines while a probe grid was hammering it. Against the
-    0.78–4.06s #302 recorded on the same build one day earlier. That spread is why the default
-    bound is generous, and the assertion below is what makes a build that moves it fail visibly.
+    2026-08-05): **3.9–8.2s** across six runs of this drill, and **19.6s** / **28.9s** read off the
+    host's own `persist.restore`→`pane.spawned` log lines while a probe grid was hammering it —
+    load moves this number, which is the point. Against the 0.78–4.06s #302 recorded on the same
+    build one day earlier. That spread is why the default bound has margin, and the assertion below
+    is what makes a build that moves it fail visibly.
+
+    All six runs went `restoring -> alive` with no DEAD reading in between. That is evidence,
+    not proof: the bare-shell phase between `pane.spawned` and the agent attaching was ~0.7s in the
+    log readings and this loop samples at 0.5s, so the `DEAD not in seen` assertion below is a trap
+    laid for a phase it may simply not have caught yet. The send path does not rely on catching it
+    — `_restoring` treats a bare shell under a new pid as the restore's second half either way.
     """
     repo = pathlib.Path(__file__).resolve().parents[1]
     root = pathlib.Path(sock_dir)
@@ -503,7 +640,10 @@ def test_the_wrapper_survives_a_real_server_restart(sock_dir):
         # `wait()`, not a `kill(pid, 0)` spin: a SIGKILLed CHILD becomes a zombie, a zombie keeps
         # its pid entry, and signal 0 answers happily for one — so the obvious spin never ends. It
         # cost half an hour of drills that looked like a dying host and were a hung test.
-        server.wait(timeout=30)
+        try:
+            server.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pytest.fail(evidence("the lab server would not die within 30s of SIGKILL"))
         killed = time.monotonic()
         server = serve()
 
@@ -519,37 +659,72 @@ def test_the_wrapper_survives_a_real_server_restart(sock_dir):
         with pytest.raises(session_host.TeardownRefused):
             host.exit(session)
 
+        # A deliberately tiny bound so the expiry lands well inside even the fastest window seen
+        # (7.6s). A bound near the window's own length would false-red on a quick machine, where
+        # the host starts accepting mid-wait and the send ends in DeliveryUnproven instead.
         started = time.monotonic()
         with pytest.raises(session_host.RestoreWindowExpired):
-            host.send(session, "carry on", delivery=_NeverLanded())
-        assert time.monotonic() - started >= 4.0, "the send has to actually WAIT out its bound"
+            build(restore_wait_seconds=2.0, restore_poll_seconds=0.5).send(
+                session, "carry on", delivery=_NeverLanded())
+        assert time.monotonic() - started >= 2.0, "the send has to actually WAIT out its bound"
 
         # ---- and the window closing, which is the whole reason for waiting ---------------------
+        # ALIVE, not merely "stopped saying RESTORING" (fresh-agent review, P2 — and it is the one
+        # change that would have caught the P0 above). A restore ends in a live agent; a loop that
+        # broke on anything-but-RESTORING would also break on DEAD, go green while the wrapper was
+        # authorising a teardown, and record that moment as "the measured window".
+        seen = []
         while time.monotonic() - killed < 180:
-            if host.state(session).liveness != session_host.RESTORING:
+            now = host.state(session).liveness
+            if not seen or seen[-1] != now:
+                seen.append(now)
+            if now == session_host.ALIVE:
                 break
             time.sleep(0.5)
         window = time.monotonic() - killed
-        print("\nmeasured restore window on %s: %.2fs" % (_REAL, window))
-        assert host.state(session).liveness != session_host.RESTORING, (
-            "the window never closed in 180s — the host is not restoring, it is broken")
+        print("\nmeasured restore window on %s: %.2fs (liveness went %s)"
+              % (_REAL, window, " -> ".join(seen)))
+        assert host.state(session).liveness == session_host.ALIVE, (
+            "the window never closed into a LIVE agent in 180s; liveness went %s"
+            % " -> ".join(seen))
+        assert session_host.DEAD not in seen, (
+            "the wrapper called this session DEAD mid-restore (%s) — that verdict authorises a "
+            "teardown of a session the host was bringing back" % " -> ".join(seen))
         assert window < session_host.RESTORE_WAIT_SECONDS, (
             "the measured window (%.2fs) has outgrown the wrapper's default bound (%.1fs) — the "
             "pinned build moved and the default must be re-decided, not quietly outrun"
             % (window, session_host.RESTORE_WAIT_SECONDS))
+
+        # The premise the whole retry rests on: a REFUSED prompt carries nothing. The drill sent
+        # "carry on" repeatedly during the window, so the restored session must show it zero times.
+        read = host._call(["agent", "read", name, "--lines", "200"])
+        if read.ok:
+            text = json.dumps(read.payload)
+            assert text.count("carry on") == 0, (
+                "a prompt the host refused reached the pane anyway — the retry is not safe")
     finally:
-        info = host._call(["pane", "process-info", "--pane", "%s:p1" % "w1"])
-        pids = [p.get("pid") for p in _dig_procs(info.payload)] if info.ok else []
+        # Pane pids FIRST, while the host can still attribute them: killing the server takes its
+        # tree with it, and signalling a reaped pid afterwards is the pid-reuse hazard the
+        # never-kill-by-pattern rule exists for. BY PID, never a name (house rule).
+        pids = []
         try:
-            os.kill(server.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        # BY RECORDED PID ONLY — never a name or a pattern (house rule).
+            info = host._call(["pane", "process-info", "--pane", session.pane])
+            pids = [p.get("pid") for p in _dig_procs(info.payload)] if info.ok else []
+        except Exception:                                    # a dead host owes us no answer
+            pids = []
         for pid in pids:
             try:
                 os.kill(int(pid), signal.SIGKILL)
             except (OSError, TypeError, ValueError):
                 pass
+        try:
+            os.kill(server.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            server.wait(timeout=30)
+        except Exception:
+            pass
 
 
 class _NeverLanded:
