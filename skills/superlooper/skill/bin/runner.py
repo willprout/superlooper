@@ -650,6 +650,7 @@ class Runner:
         self.issues_path = os.path.join(self.state, "issues.json")
         for sub in ("state/activity", "state/blocked", "state/exited", "state/awaiting",
                     "state/panes", "state/started", "state/authfail",   # (#299) refused-on-auth marks
+                    "state/identityfail",               # (#314) refused-on-wrong-account marks
                     "state/launch_stderr", "state/events/processed",
                     "state/pending_teardown",           # (#149) prunes declined under a live CLI
                     "briefs", "reports", "worktrees", "logs"):

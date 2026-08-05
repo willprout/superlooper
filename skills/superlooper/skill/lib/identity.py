@@ -66,7 +66,13 @@ SUGGESTED_FLEET_DIR = "~/.claude-fleet"
 # a network blip is not this read's failure mode, and every second spent here comes out of the
 # launcher's 30s delivery-verify window, which the gh probe is already spending from.
 PROBE_SECONDS_VAR = "SL_CLAUDE_PROBE_SECONDS"
-DEFAULT_PROBE_SECONDS = 8
+# 5s, with ONE retry only on a non-answer (see `_assert`). The bound matters because it comes out
+# of the launcher's 30s delivery-verify window, which the #299 gh probe already spends up to 17s
+# of: overrun it and the launch reads as rc=2 `shim_not_fired`, a CHANNEL fault that holds the
+# whole queue and blames the launch shim — the exact mis-blame these floors exist to prevent. The
+# read itself is local (it consults the keychain item) and was measured at 0.17s, so this is ~30x
+# headroom.
+DEFAULT_PROBE_SECONDS = 5
 
 REFUSED = 3                    # identity.py's own exit code for a refusal; 0 = the account is right
 
@@ -328,29 +334,43 @@ def read_status(runner, claude, config_dir=None, env=None, timeout=None):
 
 
 def resolve_claude(env=None):
-    """``(path, None)`` for the binary this stack would launch, or ``(None, why-not)``.
+    """``(path, None, True)`` for the binary this stack would launch, else ``(None, why, deferrable)``.
 
     Delegates to ``stack_doctor.resolve_claude`` — the existing Python twin of start-session.sh's
     own #303 ladder, which ``tests/test_start_session.py`` drives against the shell side so the two
     cannot drift. There is deliberately no third ladder here: the identity read must ask the SAME
     binary the session is about to run, or it is a measurement of a different process.
+
+    ``deferrable`` is the difference between "this ladder says there is no runnable claude" and
+    "this ladder could not be consulted", and it is not a nicety. The in-session caller DEFERS the
+    first case to start-session.sh's own #303 rung, which refuses the launch a few lines later with
+    the accurate memo. Deferring the second would be a fail-open hole: an engine published without
+    `lib/` still has a perfectly runnable claude on PATH, so the shell ladder would find one, start
+    the agent, and the identity assert would have quietly not happened.
     """
     try:
         import stack_doctor
     except ImportError as e:                                 # an engine published without lib/
         return None, ("the ladder that decides which claude this stack runs could not be loaded "
-                      "(%s) — republish the engine through bin/install.sh" % e)
+                      "(%s) — republish the engine through bin/install.sh" % e), False
     found = stack_doctor.resolve_claude(stack_doctor.Probe(os.environ if env is None else env))
     if found.get("ok") and found.get("path"):
-        return found["path"], None
+        return found["path"], None, True
     reason = {
         "relative": "the SL_CLAUDE pin %r is a relative path, which resolves against whatever "
                     "directory each process happens to be in" % found.get("path"),
         "unrunnable": "the SL_CLAUDE pin %r is not an executable file" % found.get("path"),
-        "absent": "no claude binary could be resolved at all (SL_CLAUDE unset, no standalone "
+        # Worded to avoid the substring `could not resolve`, which lib/evidence.py matches as a
+        # CHANNEL fault (a network needle). A stray match there converts one issue's park into a
+        # HELD QUEUE — the class that file's own comments were written about.
+        "absent": "this environment has no claude binary at all (SL_CLAUDE unset, no standalone "
                   "install at ~/.local/bin/claude, none on PATH)",
-    }.get(found.get("reason"), "the claude binary could not be resolved")
-    return None, reason
+    }.get(found.get("reason"))
+    # An unrecognised reason is NOT deferrable: the deferral rests on start-session.sh's ladder
+    # refusing the same case, and a case this function does not recognise is one nobody has checked
+    # that against.
+    return (None, reason, True) if reason else (
+        None, "the claude binary could not be established (%r)" % found.get("reason"), False)
 
 
 # ---------------------------------------------------------------------------- the session verdict
@@ -409,26 +429,46 @@ def _assert(env, runner=None):
     problem = env_problem(env)
     if problem:
         return REFUSED, problem
-    claude, why = resolve_claude(env)
+    claude, why, deferrable = resolve_claude(env)
+    if claude is None and deferrable:
+        # DEFERRED — the one branch that does not refuse. It hands this case to start-session.sh's
+        # own #303 rung, which walks the SAME ladder and refuses outright when it names nothing
+        # runnable: `refuse_claude_bin` writes the stderr tail, stamps the exited marker and exits
+        # 127 without ever reaching the agent. So no session flies unverified; what differs is
+        # which memo the owner reads, and "SL_CLAUDE pins a file that is not executable" is the
+        # accurate one. Refusing here instead would relabel every binary-pin fault on the machine
+        # as an identity fault — the mis-blame the rc table exists to prevent.
+        #
+        # BE EXACT ABOUT WHERE, because it is later than "the next step" (cross-review, round 1):
+        # #303's rung sits AFTER the delivery sentinel, so this refusal is a park via the exited
+        # marker and the relaunch cap, not a pre-delivery teardown like every other refusal in this
+        # file. That is #303's own pre-existing contract for its own fault and is deliberately left
+        # alone — the deferral changes nothing about it, which is the point of deferring.
+        #
+        # What this may never become is a general "could not ask, so proceed": every OTHER
+        # unreadable state — including a ladder that could not be CONSULTED, one branch down — is a
+        # refusal, before the sentinel, in this file.
+        return 0, ("identity NOT asserted: %s. The binary pin (#303) refuses this launch when it "
+                   "walks the same ladder, which is where that fault is named" % why)
     if claude is None:
-        # DEFERRED, and this is the one branch that does not refuse — deliberately, and it is not
-        # a hole. The very next thing start-session.sh does with a claude agent is walk that same
-        # #303 ladder itself, and it REFUSES the launch outright when the ladder names nothing
-        # runnable (exit 127, no agent, ever). So no session flies unverified either way; what
-        # differs is only which memo the owner reads, and "SL_CLAUDE pins a file that is not
-        # executable" is the accurate one. Refusing here instead would relabel every binary-pin
-        # fault on the machine as an identity fault — a mis-blame of exactly the kind the rc table
-        # exists to prevent. What this may never become is a general "could not ask, so proceed":
-        # every OTHER unreadable state below is a refusal.
-        return 0, ("identity NOT asserted: %s. The binary pin (#303) refuses this launch on the "
-                   "next step, which is where that fault is named" % why)
+        return REFUSED, ("which Anthropic account this session holds could not be established: %s"
+                         % why)
     try:
         seconds = int(str(env.get(PROBE_SECONDS_VAR) or DEFAULT_PROBE_SECONDS).strip())
     except (TypeError, ValueError):
         seconds = DEFAULT_PROBE_SECONDS          # a typo must not mean "refuse"
     config_dir = env.get(CONFIG_DIR_VAR) or None
-    status = read_status(runner or _Subprocess(), claude, config_dir=config_dir, env=env,
-                         timeout=max(1, seconds))
+    runner = runner or _Subprocess()
+    status = read_status(runner, claude, config_dir=config_dir, env=env, timeout=max(1, seconds))
+    if status is None:
+        # ONE retry, and ONLY on a NON-ANSWER. A logged-out dir answers with a body and is a
+        # definite reading, so it is never retried — retrying a definite refusal would just cost
+        # every genuinely dead launch a second timeout inside the launcher's 30s verify window,
+        # which the gh probe above is already spending from. This retry exists for the same reason
+        # that one has it: with LAUNCH_FAILURE_CAP=2, two consecutive launches lost to a single
+        # hiccup park the issue.
+        status = read_status(runner, claude, config_dir=config_dir, env=env,
+                             timeout=max(1, seconds))
     problem = account_problem(status, expected_account(env))
     if problem:
         return REFUSED, problem

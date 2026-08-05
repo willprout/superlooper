@@ -251,6 +251,42 @@ def test_the_session_refuses_the_redirect_before_it_reads_any_account():
     assert problem and identity.REDIRECT_VAR in problem
 
 
+def test_a_ladder_that_cannot_be_consulted_refuses_while_one_with_no_binary_defers(monkeypatch):
+    """The one branch of `_assert` that does not refuse is the deferral to start-session.sh's own
+    #303 rung, which refuses a launch whose binary ladder names nothing runnable. That deferral is
+    only sound for THAT case. A ladder that could not be LOADED must refuse here, because an engine
+    published without `lib/` still has a runnable claude on PATH — the shell ladder would find one,
+    start the agent, and the assert would simply not have happened."""
+    env = _session_env()
+    monkeypatch.setattr(identity, "resolve_claude",
+                        lambda e=None: (None, "no claude anywhere", True))
+    code, message = identity._assert(env)
+    assert code == 0 and "NOT asserted" in message and "#303" in message
+
+    monkeypatch.setattr(identity, "resolve_claude",
+                        lambda e=None: (None, "the ladder could not be loaded", False))
+    code, message = identity._assert(env)
+    assert code == identity.REFUSED and "could not be established" in message
+
+
+def test_a_non_answer_is_retried_once_and_a_definite_refusal_is_not():
+    """The retry exists for the same reason the gh probe's does — one hiccup must not park an issue
+    — but a logged-out dir ANSWERS, and retrying a definite reading would only spend a second
+    timeout out of the launcher's 30s verify window on a launch that is already refused."""
+    # `/bin/sh` only because the #303 ladder demands a real executable FILE for its pin — the fake
+    # runner intercepts the call, so nothing is ever run.
+    silent = FakeRun(answers={"*": ""}, rc=124)
+    code, _message = identity._assert(_session_env(SL_CLAUDE="/bin/sh"), runner=silent)
+    assert code == identity.REFUSED
+    reads = [c for c in silent.calls if c[0][1:3] == ["auth", "status"]]
+    assert len(reads) == 2, "a non-answer is worth one retry"
+
+    definite = FakeRun(answers={"*": '{"loggedIn": false, "authMethod": "none"}'}, rc=1)
+    code, _message = identity._assert(_session_env(SL_CLAUDE="/bin/sh"), runner=definite)
+    assert code == identity.REFUSED
+    assert len([c for c in definite.calls if c[0][1:3] == ["auth", "status"]]) == 1
+
+
 def test_the_session_refuses_the_wrong_account_and_names_both_sides():
     env = _session_env(**{identity.EXPECT_VAR: _FLEET_ORG})
     problem = identity.session_problem(env, status=_status(org=_OWNER_ORG))

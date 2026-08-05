@@ -351,7 +351,7 @@ def _launch(spec, host, edges):
     if config_dir or expect_account:
         claude_bin, why = spec.claude_bin, None
         if not claude_bin:
-            claude_bin, why = identity.resolve_claude(probe_base)
+            claude_bin, why, _deferrable = identity.resolve_claude(probe_base)
         if not claude_bin:
             # NAMED, not folded into "the account could not be read": the fault is the binary pin
             # (#303), the remedy is an install, and a memo that said "log in again" would send the

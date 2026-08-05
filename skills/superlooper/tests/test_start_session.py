@@ -966,11 +966,16 @@ def test_launch_refuses_a_pin_that_names_no_executable_instead_of_falling_back(t
 def test_launch_refuses_when_no_claude_exists_anywhere(tmp_path):
     # A PATH with the ordinary system utilities the script itself needs (mktemp, env, sed, date) but
     # no claude anywhere on it — the machine-has-no-Claude-Code state, not a broken shell.
-    r, run_root, _args = _start(tmp_path, extra_env={"PATH": "/usr/bin:/bin"})
+    r, run_root, args_file = _start(tmp_path, extra_env={"PATH": "/usr/bin:/bin"})
 
     assert r.returncode != 0
     assert "claude" in r.stderr.lower()
     assert (run_root / "state" / "exited" / "i1").exists()
+    # #314's identity assert DEFERS this case to the rung above rather than relabelling a binary-pin
+    # fault as an identity one — so this rc, this memo and this marker are #303's, unchanged. What
+    # the deferral must never cost is an agent that runs unasserted, and there is none here.
+    assert r.returncode == 127, "the binary pin's own code, not the identity assert's"
+    assert not args_file.exists(), "no agent may run when the assert could not ask which one"
 
 
 def test_launch_records_the_binary_it_actually_ran(tmp_path):
@@ -988,6 +993,31 @@ def test_a_codex_launch_leaves_the_claude_binary_record_alone(tmp_path):
     _r, _run_root, _args = _start(tmp_path, agent="codex", standalone=True)
 
     assert not (tmp_path / "home" / ".superlooper" / "claude-bin.last").exists()
+
+
+def test_the_two_ladders_agree_on_the_standalone_rung_when_home_is_empty_or_unset():
+    """The one rung whose two spellings could diverge, pinned by MEASUREMENT rather than by the
+    comment that asserts it (a cross-review round on #314 read the Python side as falling back to
+    the passwd home on an empty HOME, which would have the identity assert measure one binary while
+    the session ran another).
+
+    bash expands an unquoted `~` from the passwd entry when HOME is UNSET and to the empty string
+    when HOME is EMPTY; `os.path.expanduser` does the same on both. This runs both and compares,
+    so a platform where that stops being true fails here rather than in a pane at 3am."""
+    twin = ("import sys, os; sys.path.insert(0, %r); import stack_doctor; "
+            "print(os.path.join(stack_doctor.Probe().home, stack_doctor.CLAUDE_STANDALONE_REL))"
+            % os.path.join(REPO_ROOT, "skill", "lib"))
+    shell = 'CLAUDE_STANDALONE=~/.local/bin/claude; printf "%s" "$CLAUDE_STANDALONE"'
+    for label, env in (("HOME empty", {**os.environ, "HOME": ""}),
+                       ("HOME unset", {k: v for k, v in os.environ.items() if k != "HOME"})):
+        from_shell = subprocess.run(["bash", "-c", shell], env=env, capture_output=True,
+                                    text=True).stdout.strip()
+        from_python = subprocess.run(["python3", "-c", twin], env=env, capture_output=True,
+                                     text=True).stdout.strip()
+        assert from_shell == from_python, (
+            "%s: the launcher would run %r while the identity assert measured %r"
+            % (label, from_shell, from_python))
+        assert from_shell.startswith("/"), "%s: the rung must never be a relative path" % label
 
 
 def test_the_shell_ladder_and_the_doctors_ladder_resolve_the_same_binary(tmp_path, monkeypatch):
