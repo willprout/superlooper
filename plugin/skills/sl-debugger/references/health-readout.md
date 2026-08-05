@@ -95,14 +95,18 @@ not an emergency to escape.
 ## 5. Per-session markers (one issue's session, under `<home>/state/`)
 
 `activity/<id>` (mtime = liveness heartbeat, stamped by the Claude hooks; idle peek at
-~480s stale, recovery ladder at ~2700s), `blocked/<id>` (the worker's plain-text question —
-an answerer session gets hired), `exited/<id>` (process gone, `<epoch> rc=<code>`),
+~480s stale, recovery ladder at ~2700s), `blocked/<id>` (the worker's plain-text question or
+`BOUNCED:` memo — the worker pushes its WIP and EXITS, then the runner posts the question as a
+durable GitHub comment, releases the lane to `awaiting_answer` and consumes this marker; nothing is
+hired to answer it, and the owner's answer plus a fresh `agent-ready` relaunches the lane — #163),
+`exited/<id>` (process gone, `<epoch> rc=<code>`),
 `awaiting/<id>` (suppresses the idle peek during long background work), `panes/<id>` +
 `panes/<id>.ws` (the SESSION HOST's pane and workspace for that lane — host identifiers since
 issue #308, not cmux surfaces; `lib/panes.py` is the one place that reads or writes them), `worker.<id>.lock` (per-worker
 pid singleton), `started/<id>.*` (launch delivery proof). Siblings at the home root:
-`briefs/<id>.md`, `reports/<id>.md` (existence = session finished), `answers/<id>.md`,
-`worktrees/<id>/`, `logs/runner.log`.
+`briefs/<id>.md`, `reports/<id>.md` (existence = session finished), `worktrees/<id>/`,
+`logs/runner.log`. (There is no `answers/` directory — a question's Q&A lives in the issue's
+`qa_log` in `state/issues.json` and on GitHub, never on disk beside the briefs.)
 
 ## 6. The usage meter
 
