@@ -49,6 +49,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -73,6 +74,85 @@ def activity():
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write(str(int(time.time())))
+
+
+# --------------------------- the transcript, and the prompts that reach it (issue #334) --------
+# The runner's nudge path proves delivery from the session's OWN TRANSCRIPT — Claude Code writes
+# one per conversation, and `lib/delivery.py` reads it, because rc carries no delivery information
+# (6/6 measured prompts typed their text, dropped the submission and returned rc=0).
+#
+# So a fake worker that wrote no transcript would make every simulated nudge unprovable, and the
+# simulation would go green on "the runner correctly refused to claim a delivery" — technically
+# true and useless. This plays the agent's half honestly instead: the session host hands a prompt
+# to the pane, and the AGENT records having taken it. Nothing forges the proof from the host side,
+# which is the whole point — if the runner addresses the wrong name, no prompt reaches this inbox,
+# nothing lands in the transcript, and the nudge is refused exactly as it would be in production.
+
+def session_id():
+    """The conversation id this session owns — `--session-id <uuid>` on a fresh launch, `--resume
+    <uuid>` on a revive. Both are start-session.sh's own spelling (the agent boundary)."""
+    argv = sys.argv[1:]
+    for flag in ("--session-id", "--resume"):
+        if flag in argv:
+            i = argv.index(flag)
+            if i + 1 < len(argv):
+                return argv[i + 1]
+    return ""
+
+
+def transcript_path():
+    """Where Claude Code would keep it: `<config dir>/projects/<slug>/<session id>.jsonl`. The slug
+    is the cwd with separators rewritten; the reader finds the file by session id, so the exact
+    slug does not matter — only that it is per-project, as the real layout is."""
+    sid = session_id()
+    if not sid:
+        return ""
+    base = env("CLAUDE_CONFIG_DIR") or os.path.join(env("HOME", ""), ".claude")
+    slug = os.getcwd().replace("/", "-")
+    return os.path.join(base, "projects", slug, "%s.jsonl" % sid)
+
+
+def record_prompt(text):
+    """Append the `user` entry a submitted prompt produces. The oracle looks for exactly this."""
+    path = transcript_path()
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps({"type": "user", "isSidechain": False,
+                            "message": {"role": "user", "content": text}}) + "\n")
+
+
+def _inbox():
+    d = env("FAKE_HOST_DIR")
+    return os.path.join(d, "inbox.%s" % ID) if d else ""
+
+
+def watch_for_prompts():
+    """Take whatever the host hands this pane, and record it — the fake's stand-in for the pane
+    accepting typed input. Runs as a daemon so it never outlives the session."""
+    path = _inbox()
+    if not path:
+        return
+    seen = 0
+
+    def loop():
+        nonlocal seen
+        while not stopped():
+            try:
+                with open(path) as f:
+                    lines = f.readlines()
+            except OSError:
+                lines = []
+            for line in lines[seen:]:
+                try:
+                    record_prompt(json.loads(line)["text"])
+                except (ValueError, KeyError):
+                    pass
+            seen = max(seen, len(lines))
+            time.sleep(0.05)
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def stopped():
@@ -243,17 +323,15 @@ def do_review_comment(spec, pr):
 # --------------------------- scenarios ---------------------------
 
 def nudged():
-    """Has a gate nudge landed in THIS worker's pane? The runner's nudges go through
-    nudge-pane.sh -> fake-cmux, which logs sends — the only 'screen' a fake session can
-    watch. Filtered to our own surface (state/panes/<id>, recorded by launch-session.sh):
-    in a multi-worker scenario, issue A's nudge must never trigger issue B's compliance
-    (Codex round-1 M2)."""
-    try:
-        with open(os.path.join(RUN_ROOT, "state", "panes", ID)) as f:
-            surf = f.read().strip()
-    except OSError:
+    """Has a gate nudge landed in THIS worker's pane?
+
+    Read from our OWN inbox — the file the session host hands this pane's prompts to (issue #334).
+    Per-agent by construction, so issue A's nudge can never trigger issue B's compliance (Codex
+    round-1 M2), where the old cmux-era version had to filter a shared send log by surface.
+    """
+    path = _inbox()
+    if not path:
         return False
-    path = os.path.join(env("FAKE_CMUX_DIR"), "sends.jsonl")
     try:
         with open(path) as f:
             lines = f.readlines()
@@ -261,10 +339,10 @@ def nudged():
         return False
     for line in lines:
         try:
-            rec = json.loads(line)
+            text = json.loads(line).get("text") or ""
         except ValueError:
             continue
-        if rec.get("surface") == surf and "[superlooper gate]" in (rec.get("text") or ""):
+        if "[superlooper gate]" in text:
             return True
     return False
 
@@ -467,7 +545,14 @@ def main():
     if not ID or not RUN_ROOT:
         log("SL_ISSUE_ID / SL_RUN_ROOT missing — not launched through the real stack?")
         sys.exit(1)
+    watch_for_prompts()          # the pane starts taking input the moment the agent is up
     brief = sys.argv[-1] if len(sys.argv) > 1 else ""
+    # The brief IS this session's first prompt — the launcher hands it as argv and the real agent
+    # records it as a user turn. Recording it here is not decoration: the nudge path defers a
+    # session that has written NO record (it cannot tell a fresh pane from one sitting at a
+    # first-run dialog), so a fake that skipped its own first turn would make every simulated lane
+    # permanently un-nudgeable for a reason no production worker has.
+    record_prompt(brief)
     spec = load_spec()
     name = spec["scenario"]
     log("playing scenario %r (branch %r)" % (name, spec.get("branch")))

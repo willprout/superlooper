@@ -417,6 +417,34 @@ def test_a_zero_rc_is_not_delivery():
     assert "rc is not evidence" in str(exc.value), "the memo must say WHY rc=0 proved nothing"
 
 
+def test_a_host_that_REFUSED_the_prompt_is_a_channel_fault_not_an_unproven_delivery():
+    """The two failures must not wear each other's costume (issue #334).
+
+    `DeliveryUnproven` means "we typed and nothing confirmed it". A caller with a ONE-SHOT key —
+    the gate's single handback — reasonably spends that key on it, because the worker has the
+    message. If a refused call raised the same thing, the key would be spent on a message the host
+    never carried and the lane would park with a memo blaming the worker for ignoring it. A refusal
+    is the thing a caller should retry, so it raises the base error and nothing more specific.
+    """
+    fake = _healthy({("agent", "prompt"):
+                     (1, "", _err("agent_not_found", "the name does not resolve"))})
+    with pytest.raises(session_host.HostError) as e:
+        _host(fake).send(_session(), "do the thing", delivery=FakeDelivery(False))
+    assert not isinstance(e.value, session_host.DeliveryUnproven)
+    assert "refused" in str(e.value)
+
+
+def test_a_refused_prompt_is_never_chased_with_enter():
+    # The chaser exists for a prompt that landed in the composer unsubmitted. Pressing Enter into a
+    # pane whose prompt call the host REFUSED presses Enter for no reason — and a stray Enter into
+    # a pane showing a selection dialog SELECTS an item.
+    fake = _healthy({("agent", "prompt"):
+                     (1, "", _err("agent_prompt_stalled", "no lifecycle change in five seconds"))})
+    with pytest.raises(session_host.HostError):
+        _host(fake).send(_session(), _preamble(), delivery=FakeDelivery(False), revived=True)
+    assert ("agent", "send-keys") not in fake.verbs(), fake.verbs()
+
+
 def test_an_oracle_that_cannot_answer_is_not_a_delivery():
     fake = _healthy()
     with pytest.raises(session_host.DeliveryUnproven):

@@ -1,12 +1,29 @@
-"""Pure classification of a cmux pane's screen into a send-safety state. No I/O.
+"""Pure classification of what a session shows about itself, into a send-safety state. No I/O.
+
+TWO SURFACES, ONE VOCABULARY AND ONE PATTERN TABLE (issue #334). The verdicts, the auth-death
+table and the refusal semantics are shared; only the evidence differs.
 
 classify_screen(text, exited_marker=False, orchestrator=False, agent='claude')
+  a rendered PANE — what cmux's `read-screen` gave us.
   Claude -> 'dead' | 'logged_out' | 'menu' | 'at_dialog' | 'busy' | 'idle'
   Codex  -> 'dead' | 'busy' | 'idle' | 'trust_blocked' | 'permission_blocked' |
             'quota_blocked' | 'unknown'
+classify_transcript(records, exited_marker=False, agent='claude')
+  the session's OWN RECORD — the transcript entries Claude Code writes.
+  Claude -> 'dead' | 'logged_out' | 'at_dialog' | 'idle' | 'unknown'
 auth_death_variant(text) -> which auth-death banner is showing, or None (issue #174). Not a
-  send-safety verdict — classify_screen already refuses on all of them — but the only thing the
+  send-safety verdict — both classifiers already refuse on all of them — but the only thing the
   OWNER can act on, so it is what the alert body is written from.
+
+WHY A SECOND SURFACE EXISTS. The session host exposes no screen read and must not grow one: rows
+that scroll off Claude's alternate screen never enter the host's scrollback, so the adoption plan
+(§7.3) rules screen reads out as an evidence path entirely and the wrapper builds no `agent read`
+call at all. What the plan blesses is the file shape — the agent writes a file, the supervisor
+reads it — and Claude Code already writes exactly the file we need: every auth-death banner in the
+table below is ALSO recorded as an `isApiErrorMessage` entry carrying the identical string, and an
+open AskUserQuestion is a `tool_use` nothing has answered. So the two states that cost the most to
+learn survive the move off cmux, on better evidence than the render they were learned from. The
+screen classifier stays whole for whatever surface a later host offers.
 
 The single decision behind every write into a pane (the doorbell AND the orchestrator's
 resume/answer/nudge), via bin/nudge-pane.sh:
@@ -420,4 +437,164 @@ def classify_screen(text, exited_marker=False, orchestrator=False, agent="claude
     for pat in patterns:
         if pat.search(flat) or pat.search(raw):
             return "menu"
+    return "idle"
+
+
+# ============================ the session's own record (issue #334) ============================
+# The same two refusals, read off what Claude Code WROTE rather than off what a pane rendered. Both
+# shapes below were verified against the real transcripts on this machine (2026-08-04), not
+# inferred: `isApiErrorMessage` entries carrying the exact #174 banners, and AskUserQuestion as an
+# assistant `tool_use` answered by a later `tool_result` bearing its id.
+#
+# Two properties this surface has that a screen never did, and they are why the move is an upgrade:
+#
+#   * A record cannot SCROLL AWAY. The 40-line window was the whole reason the screen classifier
+#     had to fight clipped and wrapped banners (see `_clipped` above) — a banner pushed off the top
+#     was simply invisible, and invisible read as 'idle' = safe to send.
+#   * A session cannot TALK its way into a verdict. #151's fresh-review P1 had to fence the screen
+#     path with whole-line fullmatching because a worker rendering this very file read as a broken
+#     session. Here the fence is on the SHAPE, not the words: only the agent's own refused turn is
+#     written as an `isApiErrorMessage` record, and no amount of quoting produces one. (Not a
+#     security boundary — the transcript is a file the session's own uid owns, so a worker that set
+#     out to forge one could. That is a different threat with far better targets available to it;
+#     what this buys is immunity to the ACCIDENT, which is what actually happened in #151.)
+
+# The tool whose open call means "this session raised its OWN question and is waiting" (i280). A
+# live, working lane — the caller must surface it, never escalate it.
+_QUESTION_TOOL = "AskUserQuestion"
+
+# The agents whose own record this module knows how to read. Asked by the caller so that "this
+# session has written nothing yet" can be told apart from "this agent keeps no record we can read"
+# — two very different silences, and only the first is a reason to wait.
+_TRANSCRIPT_AGENTS = ("claude",)
+
+
+def reads_transcript(agent):
+    return agent in _TRANSCRIPT_AGENTS
+
+
+def _blocks(record):
+    """The content blocks of one transcript record, or []. Never raises on a shape we don't know:
+    this reads somebody else's file format, and a release that moves a field must degrade to "no
+    signal" rather than take a tick down."""
+    if not isinstance(record, dict):
+        return []
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if isinstance(content, list):
+        return [b for b in content if isinstance(b, dict)]
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return []
+
+
+def _record_text(record):
+    return "\n".join(str(b.get("text") or "") for b in _blocks(record) if b.get("type") == "text")
+
+
+def transcript_auth_death(records):
+    """The auth-death variant this session is CURRENTLY refused with, or None.
+
+    "Currently" is the whole rule and it is what makes this self-clearing: the scan walks the
+    records in order and the LAST substantive entry decides. An owner who fixes the credential and
+    lets the session take one more turn has a nudgeable lane again, with nothing to restart — where
+    a "has it ever happened" test would refuse the lane forever off an hour-old banner.
+
+    Only the agent's OWN refused turn counts (`isApiErrorMessage` on a non-sidechain assistant
+    entry). `isApiErrorMessage` also covers 529s, mid-response disconnects and usage limits; none
+    of those is auth death, and the shared table below is what tells them apart — a 529 matches no
+    banner, so it clears the verdict exactly like an ordinary reply does.
+    """
+    variant = None
+    for record in records or []:
+        if not isinstance(record, dict) or record.get("isSidechain"):
+            continue
+        if record.get("type") not in ("user", "assistant"):
+            continue
+        if record.get("type") == "assistant" and record.get("isApiErrorMessage"):
+            variant = auth_death_variant(_record_text(record))
+            continue
+        variant = None                    # any ordinary turn means the session is answering again
+    return variant
+
+
+def transcript_at_dialog(records):
+    """Is an AskUserQuestion still open RIGHT NOW? Paired by tool_use id, and self-clearing.
+
+    Two rules, and both were paid for:
+
+    * The id matters. A worker sitting at its own dialog is otherwise idle, and a rule that cleared
+      on "some tool_result arrived later" would be cleared by any unrelated call — while typing into
+      an open dialog SELECTS an option, the one thing this must never allow.
+    * A LATER TYPED PROMPT clears it, exactly as it clears an auth-death verdict. A dialog can be
+      left unanswered forever: the owner ignores it and types something else, and the tool_use sits
+      in the file with no matching result. A resting worker writes no new bytes, so that record
+      never scrolls out of the bounded tail — and without this rule the lane would read `at_dialog`
+      for the rest of its life, unreachable by any nudge. Real transcripts on this machine carry
+      exactly that shape (an unanswered call followed by thirteen further records).
+
+    "The most recent state decides" is the same rule `transcript_auth_death` follows, and it is what
+    makes reading a bounded TAIL sound for both.
+    """
+    open_ids = set()
+    for record in records or []:
+        if not isinstance(record, dict) or record.get("isSidechain"):
+            continue
+        for block in _blocks(record):
+            if block.get("type") == "tool_use" and block.get("name") == _QUESTION_TOOL:
+                open_ids.add(block.get("id"))
+            elif block.get("type") == "tool_result":
+                open_ids.discard(block.get("tool_use_id"))
+        if _is_typed_prompt(record):
+            # Somebody answered by talking instead. Whatever the session was waiting on, it is not
+            # waiting on it now.
+            open_ids.clear()
+    return bool(open_ids)
+
+
+def _is_typed_prompt(record):
+    """Is this record a person (or the loop) TYPING something into the session?
+
+    Deliberately narrow, because it is what clears a dialog verdict and a wrong clear presses Enter
+    at a selection. It must be a `user` record whose content is a plain STRING — a list is a tool
+    result or an attachment, i.e. the session talking to itself — and it must carry none of the
+    flags that mark a `user` record as something other than somebody typing. `isCompactSummary` is
+    the one worth naming: a compaction writes PROSE ABOUT the earlier conversation back into the
+    file, which is emphatically not an answer, and the delivery oracle excludes it for the same
+    reason one module over.
+    """
+    if not isinstance(record, dict) or record.get("type") != "user":
+        return False
+    if any(record.get(flag) for flag in ("isSidechain", "isMeta", "isCompactSummary")):
+        return False
+    message = record.get("message")
+    return isinstance(message, dict) and isinstance(message.get("content"), str)
+
+
+def classify_transcript(records, exited_marker=False, agent="claude"):
+    """The send-safety verdict from a session's own record. Same vocabulary as classify_screen.
+
+    'unknown' is a REAL answer here and is not itself a verdict — it says only that this record
+    cannot judge the session. What the CALLER does with it is the caller's decision and it differs
+    by surface: `lib/nudge.py` treats it as "no turn taken yet, so this may be a first-run dialog"
+    and defers, because a session's brief IS its first turn and a session with no record has not
+    reached one. This module states the fact; it does not decide the send.
+
+    Order mirrors classify_screen: DEAD first, then auth death, then the dialog. Auth death outranks
+    an open dialog because both refuse the send and only one carries a remedy for the owner.
+    """
+    if exited_marker:
+        return "dead"
+    if agent != "claude":
+        # This reads Claude Code's record format and nothing else. Applying its table to a file
+        # another agent wrote would be a guess wearing a verdict's clothes.
+        return "unknown"
+    if not records:
+        return "unknown"
+    if transcript_auth_death(records):
+        return "logged_out"
+    if transcript_at_dialog(records):
+        return "at_dialog"
     return "idle"

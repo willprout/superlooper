@@ -70,6 +70,7 @@ from dataclasses import dataclass, field
 
 import identity
 import loopstate
+import panes
 import sanitize
 import session_host
 
@@ -818,8 +819,11 @@ def _record_delivery(spec, iid, session, debugger, resume):
     started."""
     state = os.path.join(spec.run_root, "state")
     _write_atomic(os.path.join(state, "activity", iid), str(int(time.time())))
-    _write_atomic(os.path.join(state, "panes", iid), session.pane or "")
-    _write_atomic(os.path.join(state, "panes", "%s.ws" % iid), session.workspace or "")
+    # THE one writer of the recorded handle, and it writes through `lib/panes` so that what a
+    # spawn records and what the nudge/teardown paths read back is one vocabulary rather than four
+    # hand-rolled path joins (issue #334 — the #308 format change was invisible precisely because
+    # there was no such place).
+    panes.record(state, iid, session)
     if debugger or resume:
         # A debugger is not a tracked issue, so it has no counter; and a REVIVE is deliberately
         # not counted (#298) — `retries` is mechanical telemetry about how many times a lane had

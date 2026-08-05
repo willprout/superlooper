@@ -1302,7 +1302,7 @@ def _activity(rig, iid, mtime):
 
 def _frozen_nudges(rig):
     return [c for c in rig.calls if c["args"][0].endswith("nudge-pane.sh")
-            and "inactive for a long time" in c["args"][3]]
+            and "inactive for a long time" in c["args"][2]]
 
 
 def test_a_wake_gap_opens_the_grace_window_and_journals_it(rig):
@@ -1373,7 +1373,7 @@ def test_wake_gap_holds_the_usage_stale_alert_then_rearms_if_still_dark(rig):
 
 def _probe_calls(rig):
     return [c for c in rig.calls if c["args"][0].endswith("nudge-pane.sh")
-            and "PROGRESS PROBE" in c["args"][3]]
+            and "PROGRESS PROBE" in c["args"][2]]
 
 
 def test_exec_probe_delivers_a_machine_readable_ask_and_stamps_bookkeeping(rig):
@@ -1381,7 +1381,7 @@ def test_exec_probe_delivers_a_machine_readable_ask_and_stamps_bookkeeping(rig):
     (rig.home / "state" / "panes" / "i5").write_text("surf-uuid")
     out = rig.r._execute({"act": "probe", "id": "i5", "num": 5, "attempt": 1}, NOW)
     assert out == "ok"
-    msg = _probe_calls(rig)[-1]["args"][3]
+    msg = _probe_calls(rig)[-1]["args"][2]
     assert "PROGRESS PROBE" in msg and "state/ack/i5" in msg               # names the ack FILE path
     for state in ("DONE", "WORKING", "WAITING", "STUCK"):
         assert state in msg                                                # the four machine states
@@ -1561,7 +1561,7 @@ def test_progress_stall_ladder_probes_then_parks_end_to_end(rig):
     assert parked, "the ladder never parked — it looped (the i328 bug)"
     calls = _probe_calls(rig)
     assert 1 <= len(calls) <= 3               # bounded probes, never an infinite nudge loop
-    msg = calls[0]["args"][3]
+    msg = calls[0]["args"][2]
     assert "state/ack/i5" in msg and "nonce" in msg.lower()      # machine-readable, not prose-only
     # the dossier reached GitHub as a park comment
     assert any(m["kind"] == "comment" and "progress" in m["body"].lower() for m in mutations(rig))
@@ -2476,8 +2476,9 @@ def test_exec_exit_interview_claude_arms_the_mailbox_and_wake_pings(rig):
     assert "FINDINGS-FILED:" in mail and "NO-FINDINGS" in mail
     assert "#7" in mail and "needs-owner" in mail and "parent: #7" in mail
     pings = _pane_calls(rig)
-    assert len(pings) == 1 and pings[0]["args"][1] == "surf-7"
-    assert "FINDINGS-FILED" not in pings[0]["args"][3]      # payload rides the mailbox only
+    # addressed by NAME, never by the recorded handle (#334): the lane id IS the agent name.
+    assert len(pings) == 1 and pings[0]["args"][1] == "i7"
+    assert "FINDINGS-FILED" not in pings[0]["args"][2]      # payload rides the mailbox only
     st = issue_state(rig, "i7")
     assert st["exit_asks"] == 1 and st["exit_asked_at"] == NOW and st["exit_nonce"]
     # the outcome never claims delivery off a send rc — the receipt is the only proof
@@ -2516,7 +2517,7 @@ def test_exec_exit_interview_no_pane_still_arms_the_mail(rig):
     assert (rig.home / "state" / "mail" / "i7").exists()
     assert _pane_calls(rig) == []
     assert issue_state(rig, "i7")["exit_asks"] == 1
-    assert "no pane" in out
+    assert "no session" in out
 
 
 def test_exec_exit_interview_codex_types_the_ask_demanding_the_ack_file(rig):
@@ -2533,7 +2534,7 @@ def test_exec_exit_interview_codex_types_the_ask_demanding_the_ack_file(rig):
     r2._execute({"act": "exit_interview", "id": "i7", "num": 7}, NOW)
     typed = [c for c in calls if c["args"][0].endswith("nudge-pane.sh")]
     assert len(typed) == 1
-    msg = typed[0]["args"][3]
+    msg = typed[0]["args"][2]
     st = issue_state(rig, "i7")
     assert "FINDINGS-FILED:" in msg and "NO-FINDINGS" in msg
     assert str(rig.home / "state" / "ack" / "i7") in msg    # names the ack FILE

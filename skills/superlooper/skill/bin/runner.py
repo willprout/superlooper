@@ -40,6 +40,7 @@ import gh
 import gitops
 import journal
 import loopstate
+import panes as panes_lib
 import published_view
 import runner_home
 import session_host
@@ -124,7 +125,13 @@ LAUNCH_TIMEOUT = 120           # the launcher verifies delivery within ~30s; be 
 # exist" (issue #28) — a per-repo config fault, kept out of the systemic-anchor streak so the park
 # memo can name the branch instead of the launch machinery. Must match lib/launch.BASE_MISSING.
 LAUNCH_BASE_MISSING_RC = 3
-NUDGE_TIMEOUT = 60
+# How long the nudge script gets. Raised from 60 with #334: a nudge now asks the session host to
+# vouch for the pane, reads the session's own record and then PROVES the delivery, where it used to
+# make three cmux calls and trust an rc. The failure mode of sizing this too tightly is not a slow
+# nudge — it is the runner killing the script mid-send and recording rc=124 ("it hung") for a host
+# that was merely slow, which reads as a CHANNEL fault and holds the whole queue. lib/nudge.py
+# bounds its own host calls to sit comfortably inside this.
+NUDGE_TIMEOUT = 120
 # The exit interview's wake ping (issue #215). On Claude the interview PAYLOAD rides the mailbox
 # (verified, zero-keystroke — #148), but a finished worker is RESTING and the Stop hook fires only
 # at a turn end, so armed mail would sit unread forever. This ping is the sanctioned idle-wake
@@ -2256,8 +2263,17 @@ class Runner:
         ist = st.get("issues", {}).get(iid)
         return ist.get(key, default) if isinstance(ist, dict) else default
 
-    def _surface(self, iid):
-        return (_read(os.path.join(self.state, "panes", iid)) or "").strip()
+    def _has_session(self, iid):
+        """Does this lane have a session window recorded at all? (issue #334)
+
+        Was `_surface`, and the rename is the fix rather than tidiness. It returned a HANDLE that
+        four call sites then passed to nudge-pane.sh, which handed it to cmux — and after #308 moved
+        the spawn onto the wrapper, that handle named something cmux never issued. The nudge path
+        addresses the session by NAME now, so nothing needs the handle; what the callers were
+        really asking is this yes/no, and asking it directly is what makes it impossible to pass
+        the wrong thing along. `lib/panes` owns the file format.
+        """
+        return bool(panes_lib.read(self.state, iid))
 
     def _worktree(self, iid):
         return os.path.join(self.home, "worktrees", iid)
@@ -2457,6 +2473,12 @@ class Runner:
         """End the id's recorded session, through the doorway. Best-effort: a session that is
         already gone is a no-op, exactly as it was when this closed a cmux surface.
 
+        NOTE for a future caller: the doorway's `kill` derives the pid it signals FRESH from the
+        lane NAME, so this ends whatever session that name resolves to NOW — not necessarily the
+        one whose handle was read a moment ago. Every caller here already gates on the lane being
+        settled before it arrives, but a caller that pauses in between (as `superlooper tidy` does,
+        for a y/N) has to re-check; see the guard in its own `_close_window`.
+
         It had to move with the spawn (issue #308), and the simulation is what proved it: the
         handles this reads — ``state/panes/<id>`` and its ``.ws`` — are written by the launcher, so
         after the spawn moved they name the session HOST's workspace and pane. Left on cmux, this
@@ -2473,15 +2495,14 @@ class Runner:
         becoming gentler; the callers that must NOT end a live session gate on that themselves
         (#168), before they ever reach here.
         """
-        pane = self._surface(iid)
-        workspace = (_read(os.path.join(self.state, "panes", f"{iid}.ws")) or "").strip()
-        if not workspace:
+        # `lib/panes` owns the format both halves of this file are written and read in (#334), so
+        # a later change to what a handle MEANS lands on one reader instead of four.
+        session = panes_lib.read(self.state, iid).as_session(iid)
+        if session is None:
             # Without a workspace the doorway has nothing to close, and it refuses rather than
             # guess — which is right: closing "whatever is at that pane" is how a stale handle
             # ends someone else's window.
             return
-        session = session_host.Session(name=iid, workspace=workspace, pane=pane or None,
-                                       owned=True)
         host = self._session_host()
         try:
             host.exit(session)
@@ -2589,9 +2610,8 @@ class Runner:
             if remove_worktree:                            # only a declined PRUNE has a retry here
                 self._defer_teardown(iid, pid)
             return False                                   # the ONE meaning: still held
-        for p in (os.path.join(self.state, "panes", iid),
-                  os.path.join(self.state, "panes", f"{iid}.ws"),
-                  # (#298) The session record dies with the lane it identified. Left behind, it
+        panes_lib.forget(self.state, iid)                  # both halves together (D9, #334)
+        for p in (# (#298) The session record dies with the lane it identified. Left behind, it
                   # would let `superlooper resume` revive a RETIRED episode's conversation into
                   # whatever lane later takes this id — a re-approval rebuilds on a fresh branch
                   # with a wiped report, and the old transcript's memory of the world would be
@@ -3531,26 +3551,24 @@ class Runner:
                     if events_mod.usable_baseline(sig):   # only a readable-head sig; never poison None
                         i["progress_sig"] = sig
             self._update_issue(iid, fn=_anchor_frozen_baseline)
-            surface = self._surface(iid)
-            if not surface:
-                self._mark_exited(iid, "frozen with no pane recorded", now)
-                return "no pane — marked exited for relaunch"
+            if not self._has_session(iid):
+                self._mark_exited(iid, "frozen with no session recorded", now)
+                return "no session — marked exited for relaunch"
             msg = ("[superlooper] You have been inactive for a long time. Continue with your "
                    "issue; if you are blocked, write your blocked-question file; if you are "
                    "waiting on long background work, touch your awaiting marker.")
-            rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
+            rc = self._run_script([self._script("nudge-pane.sh"), iid, msg],
                                   env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
             if rc == 4:
                 self._mark_exited(iid, "dead pane found by frozen recovery", now)
                 return self._failed("nudge", rc, "dead pane — marked exited for relaunch", tier=tier)
             return self._record_sensed(iid, rc, now, tier=tier)
         # idle: the safe peek — a gentle status ask, never a blind action
-        surface = self._surface(iid)
-        if not surface:
-            return "no pane recorded"
+        if not self._has_session(iid):
+            return "no session recorded"
         msg = ("[superlooper] Status check: are you progressing? If you are waiting on long "
                "background work, touch your awaiting marker (see your brief).")
-        rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
+        rc = self._run_script([self._script("nudge-pane.sh"), iid, msg],
                               env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
         return self._record_sensed(iid, rc, now, tier="idle")
 
@@ -3572,8 +3590,9 @@ class Runner:
         """Turn a nudge-pane rc into the lane's honest sensed state (issue #151). Shared by BOTH
         liveness tiers so their reading of the same rc can never drift apart.
 
-        nudge-pane refuses to TYPE into these panes — that enforcement lives in pane_state, at the
-        only place that can actually see the screen. What lands here is the caller's half: naming
+        nudge-pane refuses to TYPE into these sessions — that enforcement lives in pane_state,
+        which reads the session's own record now rather than a scraped screen (#334) but answers the
+        same question with the same vocabulary. What lands here is the caller's half: naming
         what was seen so decide can act on it (alert the owner; never park a lane that is alive)
         instead of re-firing a nudge every 10 minutes at a pane that cannot answer (i336) or
         marching a live one to a park (i280).
@@ -3593,8 +3612,8 @@ class Runner:
         member of the family and every guard downstream keys off `logged_out`, so splitting the
         state would only multiply the places that can silently forget a member. It rides on
         nudge-pane's stderr — the channel ScriptRC already carries — and fails OPEN to None. The
-        pane itself never produces a variant-less logged_out (classify_screen and auth_death_variant
-        read the same table), so None means the CHANNEL lost it: a stubbed plain-int rc that
+        session itself never produces a variant-less logged_out (the classifiers and
+        auth_death_variant read the same table), so None means the CHANNEL lost it: a stubbed plain-int rc that
         captured nothing, or a stderr tail that did not survive. Either way the lane is still
         auth-dead and still held; only the wording degrades."""
         sensed = {5: "logged_out", 6: "at_dialog"}.get(rc)
@@ -3740,15 +3759,14 @@ class Runner:
         The attempt is counted BEFORE the send, so a probe that fails to deliver still walks the cap
         toward escalation rather than looping."""
         iid, num = a["id"], a.get("num")
-        surface = self._surface(iid)
-        if not surface:
-            # No pane to probe. The idle peek could return inertly here (a peek that no-ops costs
+        if not self._has_session(iid):
+            # No session to probe. The idle peek could return inertly here (a peek that no-ops costs
             # nothing), but the PROBE tier is a bounded escalation ladder: returning without
             # advancing probe_attempts / probe_sent_at would leave decide re-emitting a probe every
             # tick forever (never escalating — the exact i328 pathology this issue kills). Mirror the
             # frozen tier: a running lane with no pane is a relaunch case, not a nudge case.
-            self._mark_exited(iid, "progress-stall probe found no pane recorded", now)
-            return "no pane — marked exited for relaunch"
+            self._mark_exited(iid, "progress-stall probe found no session recorded", now)
+            return "no session — marked exited for relaunch"
         # Ground truth first (issue #151): a gone worker process can't answer a probe — mark it
         # exited for relaunch instead of typing at a dead pane. Only a DEFINITE 'dead' short-circuits.
         if self._worker_liveness(iid) == "dead":
@@ -3767,7 +3785,7 @@ class Runner:
                f"Writing this ack does not reset the progress clock, so keep making real progress.")
         # Count the attempt + rotate the nonce BEFORE the send (fail toward the cap, never a loop).
         self._update_issue(iid, fn=lambda st, i: self._probe_bump(i, nonce, now))
-        rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
+        rc = self._run_script([self._script("nudge-pane.sh"), iid, msg],
                               env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
         if rc == 4:
             self._mark_exited(iid, "dead pane found by progress-stall probe", now)
@@ -3905,21 +3923,27 @@ class Runner:
 
     def _exec_nudge(self, a, now):
         iid, key = a["id"], a.get("nudge_key")
-        surface = self._surface(iid)
-        if not surface:
-            rc = 4                                     # no pane = nowhere to nudge: spend the key
+        if not self._has_session(iid):
+            rc = 4                                  # no session = nowhere to nudge: spend the key
         else:
-            rc = self._run_script([self._script("nudge-pane.sh"), surface, iid,
+            rc = self._run_script([self._script("nudge-pane.sh"), iid,
                                    f"[superlooper gate] {a.get('message', '')}"],
                                   env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
-        if rc in (0, 4, 5):
-            # sent, or unsendable-FOREVER (4 = dead pane; 5 = logged out in-window, issue #151):
+        if rc in (0, 4, 5, 7):
+            # sent (0), SUBMITTED-BUT-UNPROVEN (7, issue #334), or unsendable-FOREVER (4 = dead
+            # pane; 5 = logged out in-window, issue #151):
             # either way the one nudge is spent — gate.nudge_or_park parks on the next pass (never
             # an unbounded nudge loop). rc=5 belongs here and not with the defers: a session whose
             # auth is dead can never answer, and before #151 taught the classifier to see it, this
             # screen read as 'idle' and was typed into for rc=0 — which spent the key and reached
             # the owner. Leaving 5 out would have made a logged-out lane re-nudge every tick and
             # never park: strictly worse than the bug being fixed.
+            # rc=7 belongs here for a different reason than any of the others: the prompt really
+            # WAS submitted (the wrapper types first and consults its delivery oracle afterwards),
+            # so the worker has it — only our proof is missing. Leaving it out would put a real
+            # send inside an unbounded every-tick retry, re-delivering the same handback into a
+            # live worker forever and never parking. That the old rc=3 retry was unbounded was
+            # harmless while rc=3 meant "nothing was typed"; it is a different proposition now.
             # rc=6 (at_dialog) is NOT here on purpose: the pane is LIVE, and a dialog that gets
             # answered leaves the next pass free to deliver, so spending the lane's one nudge on a
             # refusal would burn it for nothing. It defers exactly like rc=3 — and inherits rc=3's
@@ -3948,7 +3972,8 @@ class Runner:
             loopstate.update(self.issues_path, m)
             if rc == 0:
                 return "ok"
-            why = "logged out in-window" if rc == 5 else "dead pane"
+            why = {5: "logged out in-window",
+                   7: "submitted but delivery unproven"}.get(int(rc), "dead pane")
             return f"{why} — nudge spent, gate parks next pass"
         return f"nudge rc={rc} (retrying next tick)"
 
@@ -4235,17 +4260,17 @@ class Runner:
             i.update({"exit_asked_at": now, "exit_asked_key": a.get("reply_key"),
                       "exit_nonce": nonce})
         self._update_issue(iid, fn=stamp)
-        surface = self._surface(iid)
+        has_session = self._has_session(iid)
         if self.agent == "codex":
             # degraded path: Codex's Stop hook cannot block a stop, so no mailbox — the ask is
             # TYPED and the reply comes back through the ack file (stop-hook.sh's agent split).
             ack_path = os.path.join(self.state, "ack", iid)
             os.makedirs(os.path.join(self.state, "ack"), exist_ok=True)
             msg = self._exit_interview_text(num, defect=defect, ack_path=ack_path, nonce=nonce)
-            if not surface:
-                return ("no pane recorded — ask spent; the bounded ladder parks if no reply "
+            if not has_session:
+                return ("no session recorded — ask spent; the bounded ladder parks if no reply "
                         "ever lands")
-            rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, msg],
+            rc = self._run_script([self._script("nudge-pane.sh"), iid, msg],
                                   env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
             return (f"exit interview typed (rc={rc}) — the reply is judged by the ack file, "
                     "never this rc")
@@ -4265,10 +4290,10 @@ class Runner:
         except OSError as e:
             return (f"mail write failed ({e.__class__.__name__}) — ask spent; the bounded "
                     "ladder re-asks once, then parks")
-        if not surface:
-            return ("interview mailed; no pane recorded for a wake ping — a live session "
+        if not has_session:
+            return ("interview mailed; no session recorded for a wake ping — a live session "
                     "consumes it at its next rest; delivery pends the consumption receipt")
-        rc = self._run_script([self._script("nudge-pane.sh"), surface, iid, EXIT_WAKE_PING],
+        rc = self._run_script([self._script("nudge-pane.sh"), iid, EXIT_WAKE_PING],
                               env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
         return (f"interview mailed + wake ping (rc={rc}) — delivery is judged by the "
                 "consumption receipt, never this rc")

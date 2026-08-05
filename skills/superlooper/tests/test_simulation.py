@@ -10,7 +10,7 @@ REAL local git repo pair (a bare origin + a working clone in tmp) and three fake
   fake-sessionhost  the session host's five verbs against tmp state; deliver mode really starts
                the pane shell (which sources the real shim and hands off to start-session.sh),
                hollow mode reports a started agent with nothing behind it (the phantom).
-  fake-cmux    screens/sends/close against tmp state — the verbs that have not moved off cmux yet.
+  fake-cmux    notify against tmp state — the last verb that has not moved off cmux.
   fake-claude  plays each session per a SCENARIO spec — invoked exactly like the real binary
                (brief contents as final argv, SL_ISSUE_ID/SL_RUN_ROOT from env) and reads its
                contract paths out of the brief text itself, so a broken brief template fails
@@ -436,7 +436,14 @@ class Sim:
         return [l for l in self.notify_log.read_text().splitlines() if l.strip()]
 
     def sends(self):
-        path = self.cmux_dir / "sends.jsonl"
+        """Every message the loop actually put in front of a worker.
+
+        The record moved with the send path (issue #334): a nudge is `agent prompt <name> <text>`
+        at the session host now, not a cmux `send` at a recorded surface. Each entry carries the
+        AGENT it was addressed to, which is the lane id — so a test asserting "issue A got exactly
+        one nudge" is asserting it against the address the runner really used.
+        """
+        path = self.cmux_dir / "host" / "prompts.jsonl"
         if not path.exists():
             return []
         return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]

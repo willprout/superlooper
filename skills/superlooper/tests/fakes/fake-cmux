@@ -22,6 +22,19 @@ that a full runner (launch-session.sh, nudge-pane.sh, notify.py) can drive for m
 
 Every invocation's argv also lands in calls.jsonl (the fake-gh discipline): a dropped
 --workspace or a wrong subcommand is caught by a test, never masked by a permissive router.
+
+**IT REFUSES A HANDLE IT NEVER ISSUED (issue #334).** This fake used to validate nothing:
+`read-screen` fell back to a default screen for any surface at all, and `send`/`send-key` just
+appended to a log. So when #308 moved every session spawn onto the session host — making
+`state/panes/<id>` hold the HOST's pane and workspace instead of a cmux surface UUID — the nudge
+path went on handing those identifiers to cmux and `test_simulation.py` stayed green on a
+configuration that could not have worked against a real binary. A fake that answers anything
+cannot tell you that you addressed the wrong thing, and a handle-format change is exactly the
+mistake nobody catches by reading.
+
+So every verb that takes a recorded handle now checks it against what this fake actually minted,
+and refuses an unknown one the way the real binary does: `Error: not_found` on stderr, nonzero rc,
+and nothing logged. `tests/test_fakes_refuse_unissued_handles.py` fails if the refusal is removed.
 """
 import json
 import os
@@ -87,6 +100,50 @@ def fixed_uuid(name):
         with open(path, "w") as f:
             f.write(val)
         return val
+
+
+def issued_surfaces():
+    """Every surface THIS fake minted, read back from its own log."""
+    out = set()
+    try:
+        with open(os.path.join(DIR, "surfaces.jsonl")) as f:
+            for line in f:
+                try:
+                    out.add(json.loads(line).get("surface"))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def issued(kind):
+    """The pane / workspace uuid this fake has minted, or None if it never has.
+
+    Read WITHOUT minting: a validity check that created the thing it was checking for would
+    accept every id it was ever asked about, which is the permissiveness this exists to end.
+    """
+    try:
+        with open(os.path.join(DIR, "%s.uuid" % kind)) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def refuse_unknown(surface=None, workspace=None):
+    """Refuse a handle this fake never issued, the way the real binary does.
+
+    Real cmux answers `Error: not_found: Pane or workspace not found` — the same text the 2026-07-09
+    launch storm produced, and the same text lib/evidence keys `anchor_workspace_missing` on. This
+    is deliberately the ONE place the check lives, so a new verb that forgets to call it is a
+    visible omission rather than a silent hole.
+    """
+    if surface is not None and surface not in issued_surfaces():
+        die("Error: not_found: Pane or workspace not found (no surface %r was ever created here)"
+            % surface)
+    if workspace and workspace != issued("ws"):
+        die("Error: not_found: Pane or workspace not found (no workspace %r was ever created here)"
+            % workspace)
 
 
 def main():
@@ -155,6 +212,7 @@ def main():
 
     if sub == "read-screen":
         surf = opt(rest, "--surface") or ""
+        refuse_unknown(surface=surf)
         for cand in (os.path.join(DIR, "screens", "%s.txt" % surf),
                      os.path.join(DIR, "screens", "default.txt")):
             if os.path.isfile(cand):
@@ -165,6 +223,7 @@ def main():
         sys.exit(0)
 
     if sub == "send":
+        refuse_unknown(surface=opt(rest, "--surface") or "", workspace=opt(rest, "--workspace"))
         # text = the last positional (after --surface/--workspace pairs)
         positionals = [a for i, a in enumerate(rest)
                        if not a.startswith("--") and (i == 0 or not rest[i - 1].startswith("--"))]
@@ -174,6 +233,7 @@ def main():
         sys.exit(0)
 
     if sub == "send-key":
+        refuse_unknown(surface=opt(rest, "--surface") or "", workspace=opt(rest, "--workspace"))
         positionals = [a for i, a in enumerate(rest)
                        if not a.startswith("--") and (i == 0 or not rest[i - 1].startswith("--"))]
         log("sends.jsonl", {"surface": opt(rest, "--surface"),
@@ -183,6 +243,7 @@ def main():
 
     if sub == "close-surface":
         surf = opt(rest, "--surface") or ""
+        refuse_unknown(surface=surf, workspace=opt(rest, "--workspace"))
         log("closed.jsonl", {"surface": surf})
         # Real cmux kills the closed tab's whole process tree (the pane's shell session gets
         # SIGHUP); the fake mirrors it so the D4-class tests prove the OLD session actually
@@ -197,6 +258,7 @@ def main():
         sys.exit(0)
 
     if sub == "rename-tab":
+        refuse_unknown(surface=opt(rest, "--surface") or "", workspace=opt(rest, "--workspace"))
         sys.exit(0)
 
     if sub == "notify":

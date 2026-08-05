@@ -128,11 +128,14 @@ _LAUNCH_RC = {
 
 _NUDGE_RC = {
     1: ("send_failed",
-        "cmux refused the write into the pane: the send itself failed, so nothing was delivered "
-        "and the session never saw the message"),
+        "the message could not be sent at all: the session host refused it, the lane id cannot "
+        "address an agent, or this agent has no delivery oracle — a channel fault, not the "
+        "session's, so nothing was delivered and the session never saw the message"),
     3: ("pane_deferred",
-        "the pane could not be safely typed into (a menu, an ambiguous or unreadable screen) so "
-        "the runner refused to type and will retry — the session may be perfectly healthy"),
+        "NOTHING WAS TYPED and the session may be perfectly healthy: the host could not vouch for "
+        "the pane, it reports the agent waiting on a person, or the session has written no record "
+        "to judge it by (so it may be sitting at a first-run dialog) — the runner refused to type "
+        "and will retry"),
     4: ("pane_dead",
         "the agent process is gone and the pane is a bare shell — typing here would run the "
         "message as a permission-bypassed shell command, so the caller must relaunch instead"),
@@ -142,6 +145,11 @@ _NUDGE_RC = {
     6: ("pane_at_dialog",
         "the session is ALIVE and asking its own question in-window, waiting on an answer — going "
         "quiet to wait is not a fault, and parking it would kill a working lane"),
+    7: ("send_unproven",
+        "the prompt WAS submitted to the session host and nothing could confirm it arrived — rc is "
+        "never delivery evidence, so the runner refuses to claim one. Distinct from a deferral "
+        "because something really was typed: a caller with a one-shot key must spend it rather "
+        "than re-submit into a live worker every tick"),
     124: ("nudge_timeout", "the nudge script never returned within the runner's timeout"),
     127: ("nudge_script_unrunnable",
           "the nudge script could not be executed at all (missing, or not executable)"),
