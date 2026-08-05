@@ -342,12 +342,15 @@ def test_the_quiet_watchdog_outcomes_still_read_plainly():
     assert "waiting" in opened["text"].lower()
     stood_down = tower.comms_row({"act": "watchdog", "outcome": "stand_down",
                                   "signals": ["heartbeat_stale"]})
-    assert "no session" in stood_down["text"].lower()
-    # The engine stands the episode down on "self-recovery OR OWNER INTERVENTION" — the record
-    # proves only that the tripped signal is gone. Crediting the loop with fixing itself is agency
-    # nothing journaled (fresh review, Codex).
+    assert "cleared" in stood_down["text"].lower()
+    assert "runner" in stood_down["text"].lower(), "name the signal that cleared, not the enum"
+    # The engine stands the episode down on "self-recovery OR OWNER INTERVENTION", and it emits the
+    # SAME record for an episode that already launched a session (after_launch keeps the episode
+    # alive). So the record proves exactly one thing — the tripped signal is gone — and the line may
+    # claim neither agency nor an empty field (fresh review, Codex, rounds 1 and 2).
     assert "on its own" not in stood_down["text"].lower()
     assert "itself" not in stood_down["text"].lower()
+    assert "session" not in stood_down["text"].lower()
     held = tower.comms_row({"act": "watchdog", "outcome": "skipped_live_session",
                             "signals": ["alert"]})
     assert "already" in held["text"].lower()
@@ -489,6 +492,23 @@ def test_a_reapprove_that_did_not_complete_never_reads_as_one_that_did():
                           "outcome": "reapproved (reset nothing)"}, operator="Ada")
     assert ok["text"] == "SL-5 re-approved by Ada."
     assert ok["kind"] == "approve"
+
+
+def test_a_reapprove_whose_github_bookkeeping_failed_says_what_did_not_land():
+    # The rebuild can succeed while its owner-facing GitHub bookkeeping does not: the `superseded`
+    # label, the supersede note, the retirement comment. NOTHING retries those — the engine names
+    # them in the outcome for exactly that reason — so a row that swallowed the clause would leave a
+    # retired PR orphaned behind a line that read as fully handled (fresh review, Codex).
+    row = tower.comms_row({"act": "reapprove", "id": "i5", "num": 5,
+                           "outcome": "reapproved (reset nothing; rebuilding on sl/i5-x-r2; "
+                                      "gh bookkeeping incomplete: the `superseded` label on PR "
+                                      "#42, the retirement comment on issue #5)"}, operator="Ada")
+    assert "SL-5 re-approved by Ada" in row["text"]
+    assert "did not all land" in row["text"].lower()
+    assert "the `superseded` label on PR #42" in row["text"]
+    assert "the retirement comment on issue #5" in row["text"]
+    assert not row["text"].endswith(")."), "the engine's own closing paren is not content"
+    assert row["kind"] == "alert", "nothing retries this bookkeeping — it needs the owner's eye"
 
 
 def test_a_reapprove_that_retired_nothing_still_reads_as_the_calm_human_gate():

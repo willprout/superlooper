@@ -169,12 +169,14 @@ def _watchdog_row(rec):
                 "text": "The loop flagged itself for repair%s — an unattended fixer launches %s "
                         "unless it clears." % (_paren(sigs), when)}
     if outcome == "stand_down":
-        # NOT "cleared on its own": the engine stands an episode down on self-recovery OR owner
-        # intervention, and the record cannot tell them apart. It proves the tripped signal is gone
-        # and that nothing was hired — so that, and only that, is what the line says.
+        # Two claims this record does NOT support, both cut after review. It is not "cleared on its
+        # own": the engine stands an episode down on self-recovery OR owner intervention and cannot
+        # tell them apart. And it is not "no session was hired": a LAUNCHED episode stays open, so
+        # the same record is written when the signal clears under a session already on the field.
+        # What it proves is one thing — the signal that tripped the episode is gone.
         return {"radio": "", "kind": "event",
-                "text": "The loop's repair flag cleared — the tripped signal is gone; no session "
-                        "was hired."}
+                "text": "The loop's repair flag cleared — the signal that tripped it%s is gone."
+                        % _paren(sigs)}
     if outcome == "skipped_live_session":
         return {"radio": "", "kind": "event",
                 "text": "Unattended repair held off — a debug session is already on the field."}
@@ -283,6 +285,23 @@ def _runner_restart_row(rec, operator):
 _SUPERSEDED_PR = re.compile(r"superseded PR #(\d+)")
 _GENERATION = re.compile(r"-r(\d+)$")
 
+# A re-approval can rebuild successfully while its owner-facing GitHub bookkeeping does not land —
+# the `superseded` label, the supersede note, the retirement comment. NOTHING retries those (the
+# state reset has already left the re-emitting statuses), which is why the engine names them in the
+# outcome. Swallowing the clause would leave a retired PR orphaned behind a line that read as fully
+# handled, so it is carried through verbatim and the row is raised to the alert kind.
+_BOOKKEEPING_GAP = "gh bookkeeping incomplete:"
+
+
+def _reapprove_gap(outcome):
+    """What a successful re-approval says did NOT land, or ``""``. The engine's own
+    ``reapproved (…)`` envelope is unwrapped first so its closing paren is not read as content."""
+    body = outcome.strip()
+    if body.startswith("reapproved (") and body.endswith(")"):
+        body = body[len("reapproved ("):-1]
+    i = body.find(_BOOKKEEPING_GAP)
+    return body[i + len(_BOOKKEEPING_GAP):].strip() if i >= 0 else ""
+
 
 def _reapprove_row(rec, num, operator):
     """A ``reapprove`` / ``approve`` record → its comms sentence (issue #177 / #253).
@@ -313,12 +332,15 @@ def _reapprove_row(rec, num, operator):
         parts.append("%s retired, rebuilding from scratch on %s%s"
                      % (old_b.strip(), new_b.strip(),
                         " (generation %s)" % gen.group(1) if gen else ""))
-    pr = _SUPERSEDED_PR.search(rec["outcome"]) if isinstance(rec.get("outcome"), str) else None
+    pr = _SUPERSEDED_PR.search(out) if isinstance(out, str) else None
     if pr:
         parts.append("PR #%s on the retired branch is superseded" % pr.group(1))
-    return {"radio": "", "kind": "approve",
-            "text": "%s re-approved by %s%s." % (_who(num), operator,
-                                                 " — " + "; ".join(parts) if parts else "")}
+    text = "%s re-approved by %s%s." % (_who(num), operator,
+                                        " — " + "; ".join(parts) if parts else "")
+    gap = _reapprove_gap(out) if isinstance(out, str) else ""
+    if gap:
+        text += " GitHub bookkeeping did not all land: %s." % gap
+    return {"radio": "", "kind": "alert" if gap else "approve", "text": text}
 
 
 def _event_row(rec, num):
