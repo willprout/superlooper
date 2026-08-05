@@ -5,24 +5,35 @@
   "lanes": 2,
   "touches_required": true,
   "areas": {
-    "engine": ["skills/**"],
-    "dashboard": ["dashboard/**"]
+    "engine": [
+      "skills/**"
+    ],
+    "dashboard": [
+      "dashboard/**"
+    ]
   },
-  "required_checks": ["tests"],
-  "report_required_sections": ["Tests", "Screenshot evidence", "Review"],
+  "required_checks": [
+    "tests"
+  ],
+  "report_required_sections": [
+    "Tests",
+    "Screenshot evidence",
+    "Review"
+  ],
   "models": {
     "worker_effort": "xhigh"
   },
+  "runner_home": "login-item",
   "notify": {
     "imessage_to": null,
     "cmd": "\"$HOME/.claude/skills/superlooper/bin/imessage-notify.sh\" \"$(cat \"$HOME/.superlooper/notify_to\")\" {title} {body}"
   },
   "bright_lines": [
-    "The engine under `skills/**` is owner-gated, not loop-forbidden (owner ruling 2026-07-09; issues #2/#6 are the precedent): touch it ONLY when your approved issue explicitly declares `touches: engine` — William's approval of such an issue IS the authorization, so do not park over this line when your issue declares engine. An issue that does not declare `engine` stays out of `skills/**` entirely; any diff reaching an undeclared area is flagged at the gate as an out-of-lane wander. The engine's real backstop is publishing: a merged engine change is inert until someone republishes through the gated `bin/install.sh`, which shows the diff and requires an explicit OK.",
-    "Never modify anything under `.superlooper/**` — it is the loop's executable config (the referee's own rulebook: gates, required checks, notify commands). A PR that edits it reprograms the loop; such changes come only through a supervised session, never a loop worker.",
-    "Never modify anything under `.github/workflows/**` — CI is the mechanical gate that judges your PR, and a worker must not edit its own referee. Workflow changes come only through a supervised session.",
+    "The engine under `skills/**` is owner-gated, not loop-forbidden (owner ruling 2026-07-09; issues #2/#6 are the precedent): touch it ONLY when your approved issue explicitly declares `touches: engine` \u2014 William's approval of such an issue IS the authorization, so do not park over this line when your issue declares engine. An issue that does not declare `engine` stays out of `skills/**` entirely; any diff reaching an undeclared area is flagged at the gate as an out-of-lane wander. The engine's real backstop is publishing: a merged engine change is inert until someone republishes through the gated `bin/install.sh`, which shows the diff and requires an explicit OK.",
+    "Never modify anything under `.superlooper/**` \u2014 it is the loop's executable config (the referee's own rulebook: gates, required checks, notify commands). A PR that edits it reprograms the loop; such changes come only through a supervised session, never a loop worker.",
+    "Never modify anything under `.github/workflows/**` \u2014 CI is the mechanical gate that judges your PR, and a worker must not edit its own referee. Workflow changes come only through a supervised session.",
     "No AI or LLM call anywhere inside the dashboard or its server: every button is an existing mechanical verb (label change, comment, issue create). No model calls, no standing seat.",
-    "The server binds 127.0.0.1 only — it can write GitHub labels (William's word), so it must never be reachable off the machine. Never bind 0.0.0.0 or a public interface.",
+    "The server binds 127.0.0.1 only \u2014 it can write GitHub labels (William's word), so it must never be reachable off the machine. Never bind 0.0.0.0 or a public interface.",
     "No force-push, ever."
   ]
 }
