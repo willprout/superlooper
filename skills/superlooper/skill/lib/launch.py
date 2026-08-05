@@ -205,14 +205,14 @@ class Spec:
     codex: dict = field(default_factory=dict)
     forwarded_env: dict = None           # what the caller's own environment offers (scrubbed here)
     probe_env: dict = None               # the environment the identity read runs in (None = ours)
-    # #326. The environment the MACHINE's own host facts are read from: whether this fleet declares
-    # itself fenced, and where the control socket is. None means ours — which is the honest default
-    # and not merely a convenient one, because ours is exactly what the host CLI child inherits, so
-    # the socket the pre-flight probes and the socket the spawn drives are the same by construction.
-    # A field rather than a bool: there is deliberately NO parameter here that can turn the fence
-    # gate off, for the reason `session_host.receives_token` takes no grant parameter — a flag that
+    # There is deliberately NO field here for the fence pre-flight (#326) — not for the switch and
+    # not for the socket. It reads `os.environ` and nothing else, because `os.environ` is exactly
+    # what the `herdr` child inherits: the doorway's `_call` runs the CLI without an explicit env,
+    # so a caller-supplied environment could make the pre-flight probe one socket while the spawn
+    # drove another, and a FENCED verdict about a socket nothing launches onto is worse than no
+    # verdict at all. An earlier draft of this had such a field and the cross-review caught it. The
+    # same reasoning as `session_host.receives_token`, which takes no grant parameter: a flag that
     # can be passed is a flag that will one day be passed by the wrong call site.
-    host_env: dict = None
 
 
 class Edges:
@@ -608,12 +608,13 @@ def _fence_preflight(spec, iid, edges):
     fleet has been fenced all week". The journal is a RECORD of the decision and never an input to
     it — an unwritable one cannot refuse a launch, and far more importantly cannot permit one.
     """
-    env = spec.host_env if spec.host_env is not None else os.environ
-    required, unrecognised = session_host.fence_required(env)
-    # Resolved through the doorway's own resolver, from the environment the host CLI child
-    # inherits — so the socket this probes and the socket the spawn drives are the same by
-    # construction rather than by two copies of a resolution rule that can drift apart.
-    socket_path = session_host.control_socket_path(env)
+    required, unrecognised = session_host.fence_required(os.environ)
+    # `os.environ`, with no override anywhere in the signature — see the note on `Spec`. The doorway
+    # runs the host CLI with no explicit environment, so the child inherits exactly this; resolving
+    # the socket from it through the doorway's OWN resolver is what makes "the socket probed" and
+    # "the socket driven" the same address by construction, rather than by two copies of a
+    # resolution rule that can drift apart or be pointed at different places by a caller.
+    socket_path = session_host.control_socket_path(os.environ)
     verdict = edges.fence(socket_path) if socket_path else FENCE_UNRESOLVED
 
     refusal = None
