@@ -124,8 +124,24 @@ STUB_HOST = textwrap.dedent("""\
 
 # The agent LINGERS, because the wrapper's liveness is a process fact: the pane shell must have a
 # live child or the launch is (correctly) refused as hollow.
+# `auth status` is answered on the SAME asymmetry the gh stub uses below, keyed on SL_ISSUE_ID —
+# only a PANE carries that — so the launcher's own account read and the worker's can be made to
+# disagree (issue #314). That is the whole failure this contract exists for: an identity that is
+# perfectly healthy where the launcher stands and something else inside the session, because the
+# credential namespace is a hash of the CLAUDE_CONFIG_DIR string the pane ended up with.
 STUB_CLAUDE = textwrap.dedent("""\
     #!/usr/bin/env bash
+    if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then
+      printf '%s=%s\\n' "${SL_ISSUE_ID:-launcher}" "${CLAUDE_CONFIG_DIR:-<none>}" \\
+        >> "$STUB_DIR/claude_auth_reads"
+      if [ -n "${SL_ISSUE_ID:-}" ]; then org="${STUB_CLAUDE_WORKER_ORG:-fleet-org}"
+      else                               org="${STUB_CLAUDE_ORG:-fleet-org}"; fi
+      if [ "${CLAUDE_CONFIG_DIR:-}" != "${STUB_CLAUDE_LOGGED_IN_DIR:-}" ]; then
+        printf '{"loggedIn": false, "authMethod": "none"}\\n'; exit 0
+      fi
+      printf '{"loggedIn":true,"authMethod":"claude.ai","email":"l@x.com","orgId":"%s","subscriptionType":"max"}\\n' "$org"
+      exit 0
+    fi
     printf "%s\\n" "$@" >> "$STUB_DIR/claude_args"
     env > "$STUB_DIR/claude_env"
     sleep "${STUB_AGENT_SECONDS:-20}"
@@ -594,3 +610,88 @@ def test_an_inherited_config_dir_redirect_never_reaches_the_launch(rig):
     assert "XDG_CONFIG_HOME" not in _pane_env(rig)
     assert _wait_for(rig["stub"] / "claude_env"), (rig["stub"] / "pane.log").read_text()
     assert "XDG_CONFIG_HOME" not in (rig["stub"] / "claude_env").read_text()
+
+
+# ---- the identity env contract, across the whole spawn (issue #314) ----------------------------
+# Only an end-to-end drive can show this one, because the whole subject is a string surviving three
+# processes: the launcher derives it, the wrapper carries it in the pane's environment, the pane's
+# own shell (which sources the operator's rc files) hands it to start-session.sh, and the floor
+# turns it into the agent's own CLAUDE_CONFIG_DIR. Every hop is a place a spelling could change,
+# and a changed spelling is a different credential namespace that reports LOGGED OUT (#300).
+_E2E_FLEET_DIR = "/tmp/sl-i314-e2e-fleet"
+
+
+def _auth_reads(rig):
+    """Who asked `claude auth status`, and under which config dir, in order."""
+    path = rig["stub"] / "claude_auth_reads"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def test_the_assigned_config_dir_survives_the_whole_spawn_unchanged(rig):
+    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR,
+                                "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR})
+    assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
+    # The launcher NAMES it as SL_*; CLAUDE_CONFIG_DIR itself is the agent's variable and is set by
+    # the floor, one process later, inside the session's own shell.
+    assert _pane_env(rig)["SL_CLAUDE_CONFIG_DIR"] == _E2E_FLEET_DIR
+    assert "CLAUDE_CONFIG_DIR=" + _E2E_FLEET_DIR not in _pane_env(rig)
+    assert _wait_for(rig["stub"] / "claude_env"), (rig["stub"] / "pane.log").read_text()
+    agent_env = dict(line.partition("=")[::2]
+                     for line in (rig["stub"] / "claude_env").read_text().splitlines() if "=" in line)
+    assert agent_env["CLAUDE_CONFIG_DIR"] == _E2E_FLEET_DIR
+    # Both reads consulted the SAME namespace — the launcher's, and the session's own. Two spellings
+    # here would be two identities, and the session's would simply report logged out.
+    reads = _auth_reads(rig)
+    assert ("launcher=" + _E2E_FLEET_DIR) in reads
+    assert ("i1=" + _E2E_FLEET_DIR) in reads
+
+
+def test_a_non_canonical_assignment_is_canonicalised_before_anything_downstream_sees_it(rig):
+    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR + "/",
+                                "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR})
+    assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
+    assert _pane_env(rig)["SL_CLAUDE_CONFIG_DIR"] == _E2E_FLEET_DIR
+    assert _wait_for(rig["stub"] / "claude_env"), (rig["stub"] / "pane.log").read_text()
+    assert ("CLAUDE_CONFIG_DIR=" + _E2E_FLEET_DIR + "\n") in (rig["stub"] / "claude_env").read_text()
+
+
+def test_an_account_that_is_right_here_and_wrong_in_the_session_refuses_the_flight(rig):
+    """The asymmetry only an end-to-end drive can produce, and the exact shape the contract exists
+    for: the launcher's own read is healthy, and the SESSION's is a different account. A launcher
+    that checked only itself would have flown this."""
+    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR,
+                                "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR,
+                                "STUB_CLAUDE_WORKER_ORG": "somebody-elses-org"})
+    assert r.returncode == 7, f"rc={r.returncode}\n{r.stderr}"
+    assert "CLAUDE IDENTITY REFUSED" in r.stderr
+    assert "somebody-elses-org" in r.stderr and "fleet-org" in r.stderr
+    assert not (rig["stub"] / "claude_env").exists(), "the agent must never have started"
+
+
+def test_a_credential_redirect_the_pane_shell_injects_refuses_the_flight(rig):
+    """#300 landmine 2 entering exactly where the realized API key entered — the pane's own shell
+    startup, after the launcher is gone. Set-but-EMPTY collapses the credential namespace back to
+    the owner's unsuffixed default, so this session would have spent the owner's subscription with
+    nothing anywhere erroring."""
+    zdot = rig["stub"] / "zdot"
+    zdot.mkdir()
+    (zdot / ".zshenv").write_text("export CLAUDE_SECURESTORAGE_CONFIG_DIR=\n")
+    r = _launch(rig, extra_env={"ZDOTDIR": str(zdot),
+                                "SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR,
+                                "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR})
+    assert r.returncode == 7, f"rc={r.returncode}\n{r.stderr}"
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in r.stderr
+    assert not (rig["stub"] / "claude_env").exists(), "the agent must never have started"
+
+
+def test_a_config_dir_the_pane_shell_injects_is_refused_not_adopted(rig):
+    """An unassigned machine plus a shell rc that exports one is identity picked up rather than
+    assigned (claim c3) — and it is silently a different credential namespace from the one the
+    launcher measured."""
+    zdot = rig["stub"] / "zdot"
+    zdot.mkdir()
+    (zdot / ".zshenv").write_text("export CLAUDE_CONFIG_DIR=%s\n" % _E2E_FLEET_DIR)
+    r = _launch(rig, extra_env={"ZDOTDIR": str(zdot)})
+    assert r.returncode == 7, f"rc={r.returncode}\n{r.stderr}"
+    assert "was not assigned" in r.stderr
+    assert not (rig["stub"] / "claude_env").exists()

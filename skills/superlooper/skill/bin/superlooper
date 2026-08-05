@@ -523,8 +523,17 @@ def cmd_fleet(args):
     prefix = fleet.prefix(state_base)
     host_config_dir = session_host.config_dir()
     host_state_dir = session_host.state_dir()
-    fleet_config_dir = os.environ.get("SL_FLEET_CLAUDE_CONFIG_DIR") or os.path.join(
-        os.path.expanduser("~"), ".claude-fleet")
+    # The dir a LAUNCH would actually assign, read through the same function the spawn seam uses
+    # (#314) — never a default invented here. A judge that fell back to `~/.claude-fleet` when the
+    # machine names nothing would report a green identity for a directory no worker will ever be
+    # pointed at, which is the same confident lie in reverse. Unconfigured is a RED line with the
+    # variable named in its fix, because the fleet machine is supposed to name it.
+    fleet_config_dir, _dir_problem = fleet.identity.worker_config_dir(os.environ)
+    if _dir_problem:
+        # Judge the RAW value, not the None a refused canonicalisation returns: "no fleet config
+        # dir is configured" for a variable that IS configured — just not canonically — would send
+        # the operator to set something they already set.
+        fleet_config_dir = os.environ.get(fleet.identity.FLEET_DIR_VAR)
     uid = _home_uid()
     home = os.path.expanduser("~")
 

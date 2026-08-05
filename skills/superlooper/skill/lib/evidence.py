@@ -102,6 +102,20 @@ _LAUNCH_RC = {
         "inherited CLAUDE_CODE_* turns transcript saving off, which silently breaks `--resume`. "
         "The captured stderr names the exact variables: find where they are exported (a shell rc "
         "file, a LaunchAgent, a wrapper) and remove them, then re-approve"),
+    7: ("claude_identity_wrong",
+        "the positive Anthropic-account assert refused the flight (#314): from inside the SESSION's "
+        "own environment, `claude auth status` did not report the account this launch assigned — "
+        "not logged in, on an API key, or on a different org. The two subscriptions are separate "
+        "rate-limit pools, so a session on the wrong one is a lane whose capacity nobody can "
+        "predict; and an API-key session bills per token while still answering `loggedIn: true`. "
+        "The captured stderr names which of those it was: repair it in a supervised `claude` "
+        "window under that config dir, then re-approve"),
+    8: ("claude_identity_wrong_runner",
+        "the RUNNER's own environment could not produce the Anthropic account every session would "
+        "be launched against, so no pane was ever opened — a machine-level identity fault that no "
+        "queued issue caused and none can fix by re-approving. Every launch will fail until it is "
+        "repaired: log the fleet's config dir into its own account in a supervised window, or "
+        "correct SL_FLEET_CLAUDE_CONFIG_DIR"),
     64: ("agent_unsupported",
          "the configured agent is not one this launcher can start (expected: claude or codex)"),
     124: ("launch_timeout",
@@ -193,6 +207,21 @@ _LAUNCH_TEXT = (
       "the gh-auth assert could not get an answer OUT of GitHub — a rate limit, an outage, or a "
       "network fault, not a credential that has died. Re-authenticating would fix nothing; the "
       "queue is held until GitHub answers again, and resumes on its own when it does")),
+    # The Anthropic half (#314), ahead of the gh needles for the same ordering reason they are
+    # ahead of the cmux ones: these are the loop's OWN words, and the memo they select talks about
+    # a subscription rather than about `gh auth login`. The runner-env spelling leads its own
+    # session-env sibling, because "CLAUDE IDENTITY REFUSED" and "CLAUDE IDENTITY (runner env)" are
+    # different faults with different blast radii and the first match wins.
+    (("claude identity (runner env)",),
+     ("claude_identity_wrong_runner",
+      "the RUNNER's own environment could not produce the Anthropic account to launch sessions "
+      "against, so no pane was opened — a machine-level identity fault no queued issue caused. "
+      "Repair the fleet config dir's login in a supervised window")),
+    (("claude identity refused",),
+     ("claude_identity_wrong",
+      "the positive Anthropic-account assert refused the flight from inside the session's own "
+      "environment: not logged in, on an API key, or on an org this launch did not assign. The "
+      "captured stderr names which")),
     (("gh auth dead (runner env)",),
      ("gh_auth_dead_runner",
       "the RUNNER's own `gh` could not say who it is, so no session could be launched against any "
@@ -271,6 +300,15 @@ CHANNEL_FAULT_REASONS = frozenset({
     # (#299) GitHub itself did not answer (rate limit / outage / network). Nothing is wrong with any
     # issue OR with the credential, and it repairs itself — hold, never park, never say "re-login".
     "gh_probe_unreachable",
+    # (#314) The RUNNER's own environment cannot produce the Anthropic account sessions launch
+    # against — its fleet config dir is logged out, on an API key, or on the wrong org. Every launch
+    # reads the same answer, so this is the gh_auth_dead_runner shape one credential over: charged
+    # per-issue it would walk the whole approved queue into parks over one machine-level fault.
+    # Its SESSION-side sibling (`claude_identity_wrong`, rc=7) is deliberately absent for the same
+    # reason gh_auth_dead is: it is an environment fault whose memo the owner must actually READ,
+    # and held as a channel fault it would surface under the systemic-launch alert, whose body
+    # names App Nap and the cmux anchor.
+    "claude_identity_wrong_runner",
 })
 
 

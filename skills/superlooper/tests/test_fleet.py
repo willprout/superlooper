@@ -555,12 +555,27 @@ def test_an_override_the_host_would_refuse_or_never_apply_is_not_installed(monke
         assert not fleet.has_catchall_rule('# id = "%s"' % fleet.CATCHALL_RULE_ID), reader
 
 
-def test_the_identity_block_says_what_it_does_not_prove():
-    # A green line here must not be read as "workers bill the fleet's subscription". Putting
-    # CLAUDE_CONFIG_DIR on the spawn seam is #314; until then a worker starts on whatever its
-    # environment carries, and that gap is the c1 silent-billing-flip in a new costume.
+def test_the_identity_block_names_the_seam_that_makes_it_load_bearing():
+    # This line used to have to say what it did NOT prove: that a launch actually points a session
+    # at this dir. #314 closed that gap — the launch path reads the same variable, derives the same
+    # canonical string, and each session refuses itself unless the account under it is the expected
+    # one — so the line now names the seam instead of apologising for its absence.
     r = fleet.check_identity(_green_probe(), _FLEET_CLAUDE_DIR, claude=_CLAUDE)
-    assert r.ok and "#314" in r.detail and "not that a launch uses it" in r.detail
+    assert r.ok and "#314" in r.detail
+    assert fleet.identity.FLEET_DIR_VAR in r.detail
+    assert "not that a launch uses it" not in r.detail
+
+
+def test_the_build_up_judge_and_the_launch_seam_share_one_account_verdict():
+    # The judge used to accept any `loggedIn: true` — and the real binary answers exactly that for
+    # a session running on an API KEY, with null org and subscription. A build-up that green-lit
+    # such a dir would be reporting a healthy identity for one that bills per token.
+    on_key = {"loggedIn": True, "authMethod": "claude.ai", "apiKeySource": "ANTHROPIC_API_KEY",
+              "email": None, "orgId": None, "subscriptionType": None}
+    assert "API key" in fleet.identity_problem(on_key, {"orgId": "org-owner"})
+    assert fleet.identity_problem(on_key, None)
+    # One definition, not two copies: the seam's own canonicalisation rule IS this module's.
+    assert fleet.config_dir_problem is fleet.identity.config_dir_problem
 
 
 def test_a_token_this_build_up_cannot_vouch_for_is_not_adopted():

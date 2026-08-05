@@ -96,6 +96,19 @@ def _clear_worker_launch_env(monkeypatch):
         # so tests read the same uid the code does.)
         "SL_LAUNCHCTL",
         "SL_LAUNCHD_DIR",
+        # The identity env contract (issue #314), and this one matters as much as SL_GH does. Once
+        # it ships, the launcher NAMES SL_CLAUDE_CONFIG_DIR and SL_EXPECT_CLAUDE_ACCOUNT in every
+        # pane — so a suite running inside a worker carries both ambiently, and a floor test would
+        # inherit an assignment it never made (or, worse, an expectation that made its assert pass
+        # for the wrong reason). CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR are the
+        # agent's OWN variables and are scrubbed for a sharper reason still: they steer which
+        # credential namespace any `claude` a test resolves would read, and the contract's whole
+        # subject is that a session's config dir is assigned rather than inherited.
+        "SL_CLAUDE_CONFIG_DIR",
+        "SL_EXPECT_CLAUDE_ACCOUNT",
+        "SL_FLEET_CLAUDE_CONFIG_DIR",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     ):
         monkeypatch.delenv(name, raising=False)
 

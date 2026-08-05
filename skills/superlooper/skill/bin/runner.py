@@ -650,6 +650,7 @@ class Runner:
         self.issues_path = os.path.join(self.state, "issues.json")
         for sub in ("state/activity", "state/blocked", "state/exited", "state/awaiting",
                     "state/panes", "state/started", "state/authfail",   # (#299) refused-on-auth marks
+                    "state/identityfail",               # (#314) refused-on-wrong-account marks
                     "state/launch_stderr", "state/events/processed",
                     "state/pending_teardown",           # (#149) prunes declined under a live CLI
                     "briefs", "reports", "worktrees", "logs"):
@@ -2157,6 +2158,16 @@ class Runner:
                 # second-hand answer as proof of who this machine is. The launcher must resolve the
                 # loop's identity itself, every launch.
                 "SL_EXPECT_GH_LOGIN": "",
+                # PINNED EMPTY for exactly that reason, one credential over (#314). The launcher
+                # NAMES SL_EXPECT_CLAUDE_ACCOUNT in every pane, so a runner started from inside a
+                # worker or debugger pane would inherit THAT session's expected org and assert every
+                # later launch against a second-hand answer — including after the machine's config
+                # dir was repointed. Empty means "resolve it from the assigned config dir, this
+                # launch", which is the only answer that is about this machine right now.
+                # (SL_FLEET_CLAUDE_CONFIG_DIR is deliberately NOT pinned, exactly as SL_CLAUDE is
+                # not: it is a MACHINE fact the operator sets on the runner's own process, and
+                # blanking it here would silently un-assign the fleet's identity.)
+                "SL_EXPECT_CLAUDE_ACCOUNT": "",
                 "SL_CODEX_DANGEROUS_BYPASS": env_bool(
                     "SL_CODEX_DANGEROUS_BYPASS", bool(codex.get("dangerous_bypass", False))),
                 "SL_CODEX_BYPASS_HOOK_TRUST": env_bool(
