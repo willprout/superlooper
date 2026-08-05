@@ -24,9 +24,9 @@ lands in the owner's interactive PATH, not necessarily yours), invoke the instal
 directly: `~/.claude/skills/superlooper/bin/superlooper` — that is the copy the live runner
 itself runs from, so it always exists on a machine with a loop. `superlooper doctor --stack --repo <repo>` adds machine-level checks — claude/gh
 auth, gh API headroom, launch shim, and — for a `pane`-home repo — the **live runner anchor
-probe** (catches a runner whose own tab was closed or moved, so its boot preflight and the
-watchdog's resurrection tab have nowhere to land; a `login-item` repo is judged by the `runner
-home` block instead) — but note its one
+probe** (catches a live runner whose own tab was closed or moved, which leaves the watchdog's
+resurrection tab nowhere to land; a `login-item` repo has no anchor and is judged by the
+`runner home` block instead) — but note its one
 deliberate side effect: it sends a single real test message through the notify channel.
 Fine when notify is the patient; skip it when the owner is asleep.
 
