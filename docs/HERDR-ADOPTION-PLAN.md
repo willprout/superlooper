@@ -2,8 +2,8 @@
 
 **Status: RULED 2026-07-30 — owner adopted herdr as the host** (direct word to the orchestrator:
 "I'm good with Herdr"). This document is now the plan of record. Posture per the same ruling:
-**attended-preferred, headless-capable** — the owner keeps a viewer window (nice UX, and it covers
-the §5.4 revive gap until the #2064 fix ships), but nothing load-bearing may depend on a client
+**attended-preferred, headless-capable** — the owner keeps a viewer window (nice UX only now —
+the pinned v0.8.0 carries the #2064 fix), but nothing load-bearing may depend on a client
 being attached, and acceptance tests run clientless. Evidence basis: docs/TOOL-DIVE-2026-07-28.md,
 docs/SPIKES-2026-07-29/30-*.md, ARCHITECTURE-PROPOSALS.md §4, and HERDR-UPSTREAM-ISSUES.md (a
 local working file, deliberately not committed — the filed issues live on the herdrdev/herdr
@@ -16,8 +16,8 @@ Operating principle throughout: **herdr is muscle, never truth.**
 - **Workspace/worktree topology** — `workspace create --cwd --env`, worktrees first-class.
 - **`agent start`** — the spawn verb (wrapped with our post-spawn confirmation).
 - **`agent prompt --wait`** — the ONLY prompt form we ever use, + `agent wait`.
-- **Crash-restore + auto-`claude --resume`** — the revive machinery (see §5.2 for the
-  clientless gap until the #2064 fix ships in a release).
+- **Crash-restore + auto-`claude --resume`** — the revive machinery; clientless since the pinned
+  v0.8.0 (§8.1), measured by #302 and #311.
 - **Attach / observe** — the owner's window, SSH thin client, read-only frame streams for the
   dashboard live view. Watching costs nothing and load-bears nothing.
 - **Screen manifests for hook-blind states** (auth-death, crash-at-startup) with their
@@ -44,7 +44,14 @@ Operating principle throughout: **herdr is muscle, never truth.**
    panes); **workers `i<N>` never see it.** The token grants the how; the D13 supervised/
    unattended rails still govern the whether. REQUIRED before unattended fleet use. Also strip
    HERDR_* from worker pane env as defense-in-depth (the socket path is guessable, so the token
-   is the real fence).
+   is the real fence). **The token is readable by the processes it fences, and that is ACCEPTED
+   (owner ruling 2026-08-05, #342)** — on a machine where fleet and workers share one UNIX
+   account no file-based scheme keeps a secret from them, but the token bounds the CONTROL
+   SURFACE, not the operating system: what a worker that reached it could then do is already
+   bounded by the standing rails (the kill-by-pattern deny, the D13 supervised/unattended
+   split), and a second UNIX account is not worth upending the keychain, login-item and
+   worktree-ownership arrangements. #342's closing comment is the ruling of record; it covers
+   the `token.provenance` sidecar (#309) on the same grounds.
 2. **Session-id capture without the global settings rewrite** (#2066) — carry herdr's
    state-report hook line inside superlooper's OWN per-worker hook config at launch, instead of
    `herdr integration install claude` touching global ~/.claude/settings.json.
@@ -57,9 +64,14 @@ rewrite behind an unchanged interface.
 
 - **spawn**: workspace+agent start, then confirm the process actually exists (post-spawn check).
 - **send**: `--wait` always + transcript-side delivery verification (rc alone is never proof;
-  even fixed-preview rc=0 means "queued"). Enter-chaser after post-revive first prompts (until
-  retested on a fixed build). Resume re-orientation preamble (a revived session remembers the
-  conversation, not the world).
+  even fixed-preview rc=0 means "queued"). **Enter-chaser — settled on the pinned v0.8.0:** a
+  post-revive first prompt now submits on its own (5/5 unchased, #302), so `send-keys enter` is
+  not an unconditional step; the wrapper fires it only when the delivery oracle has NOT confirmed
+  a revived send, and #317 extended that fallback to a send that waited out a host restore window
+  (a restored send IS a post-`--resume` first prompt — herdr did the reviving instead of us).
+  Scoped to the revive path on purpose: a stray Enter into a pane showing a selection dialog
+  SELECTS. Resume re-orientation preamble (a revived session remembers the conversation, not the
+  world).
 - **state**: superlooper's own Claude hooks are PRIMARY truth; herdr surfaces are advisory;
   liveness = process facts (pgrep pane child), never `agent list`.
 - **exit/kill**: keep our ordered-teardown discipline; herdr verbs as mechanism only.
@@ -92,9 +104,11 @@ rewrite behind an unchanged interface.
    `worktree.created` AND pulls the owner toward per-diff review — against the batching model),
    worktrunk (duplicates the runner's own worktree logic). Check herdr's FIRST-PARTY
    `[ui.toast]` / `[ui.sound]` before any notification plugin — ~25 of them re-implement it.
-4. TEMPORARY: reliance on clientless auto-revive — the #2064 fix is on master, not yet in a
-   release; until a build ≥ ac47b9e ships, a login-item viewer (or robot client) covers
-   nobody-home restarts. Delete this item when the fix ships and the retest passes.
+4. ~~TEMPORARY: reliance on clientless auto-revive (login-item viewer / robot client)~~ —
+   **item deleted 2026-08-05 as its own text instructed**: the #2064 fix shipped in the pinned
+   v0.8.0 (§8.1) and clientless restore across `kill -9` with no client ever attached is now
+   measured twice — #302's lab (3 drills, 6/6) and #311's unfenced acceptance control on the
+   mini. Nothing here may be given a viewer or robot client again on this reasoning.
 
 ## 6. Sequencing gates (unchanged from §4 rulings)
 
@@ -162,20 +176,34 @@ never moves. Two consequences worth stating plainly:
    Sub-decisions, ruled 2026-07-31: **runner lives OUTSIDE herdr** (plain login-item process
    talking to the server — the supervisor never lives inside what it supervises); **version
    policy = pin an exact release containing the #2063-class prompt fix + the #2064 restore fix**,
-   upgrades are deliberate events that re-run the acceptance spikes (if no such release exists at
-   wrapper time, re-decide between preview-pin and stable+workarounds then); **fence = carried
-   patch only, no upstream ask, d<N> sessions get the token** (ruled 2026-07-31, see §3.1);
+   upgrades are deliberate events that re-run the acceptance spikes. **The pin is herdr `v0.8.0`**
+   — stable (`prerelease=false`), published 2026-08-03, commit
+   `346411fa21afd297f5ed3b3fa56f9e3fbf7654b7`, retested asset `herdr-macos-aarch64` sha256
+   `d53a9f93fccfdfcc55632927bf51002f5add0aa7990bcdf508ffbd84ac658178` (#302 proved by ancestry
+   that it contains `ac47b9e`, the #2064 restore fix; the release notes name the #1878
+   submission fix, fix #2066, and relicense herdr AGPL-3.0 → **Apache-2.0**, which makes §3.1's
+   carried fence patch a plainly permitted act). The fallback re-decision (preview-pin vs
+   stable+workarounds) never triggered. The pin's machine-readable home is
+   `skills/superlooper/skill/lib/herdr_hook.py`'s `PINNED_VERSION`, which
+   `skills/superlooper/vendor/herdr/build.sh` reads so a bump cannot leave two disagreeing pins
+   on disk; **fence = carried patch only, no upstream ask, d<N> sessions get the token**
+   (ruled 2026-07-31, see §3.1);
    **fleet machine = MAC MINI as a fresh build-up (ruled 2026-08-03)** — the herdr fleet stands
    up on the always-on mini from day one while cmux production keeps running untouched on the
    work laptop; cutover only when the acceptance suite passes ON the mini. Identity plan: the
    fleet rides its own Claude subscription + the loop's GitHub login via per-worker
    `CLAUDE_CONFIG_DIR`/`GH_CONFIG_DIR` (c25), keeping the owner's personal mini sessions on his
    other subscription — includes a cheap floor spike proving two subscriptions coexist in two
-   config dirs on one Mac (designed mechanism, not yet proven in our lab). No sub-decisions
-   remain open on the host.
-2. #2064 fix shipping + retest (deletes §5.4's workaround).
+   config dirs on one Mac (designed mechanism, not yet proven in our lab). Agent posture, **owner
+   ruling 2026-08-05 (#352): Claude Code only for now — Codex is not a live target**, so no
+   delivery-oracle or pre-trust work is owed for Codex lanes. No sub-decisions remain open on the
+   host.
+2. ~~#2064 fix shipping + retest~~ — **RESOLVED: shipped in the pinned v0.8.0 (§8.1) and retested
+   clientless (#302, 3 drills 6/6; re-demonstrated by #311's unfenced acceptance control on the
+   mini). §5.4's workaround is deleted.**
 3. Fence: upstream PR accepted vs carried patch.
-4. Enter-chaser necessity on fixed builds (post-revive path not retested on preview).
+4. ~~Enter-chaser necessity on fixed builds~~ — **RESOLVED: retested on the pinned v0.8.0 (#302,
+   5/5 unchased); §4's send rule now states the settled behaviour.**
 5. Proposal 1b (pre-flight triage) — unruled, orthogonal.
 6. Sleep soak (one agent-free night) — acquitted for a short nap, full night unproven.
 

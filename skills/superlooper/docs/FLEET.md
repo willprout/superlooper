@@ -81,14 +81,24 @@ while `launchctl print` requires knowing nothing. Closing the gap properly means
 somewhere genuinely outside a worker's reach — a second UNIX account — which is an architecture
 decision, not a detail of this build-up.
 
+**Ruled 2026-08-05 (#342): the same-uid exposure is ACCEPTED.** The token bounds the control
+surface, not the operating system — a worker reaching the token requires it to act far outside its
+brief, and what it could then do is already bounded by the standing rails (the kill-by-pattern
+deny, the D13 supervised/unattended split); a second UNIX account is not worth upending the
+keychain, login-item and worktree-ownership arrangements. The ruling of record is #342's closing
+comment, and it covers the `token.provenance` sidecar on the same grounds — a process that can
+write the token can equally write its integrity record, so the sidecar is an integrity record,
+never authentication.
+
 ### The viewer is an artefact, not a login item
 
 Plan §2 asks for the server *and* viewer as login items. A viewer is a TUI: it needs a terminal, so
 it cannot be a LaunchAgent the way the server is. More to the point, **it is no longer
 load-bearing** — issue #302 measured the pinned build restoring hosted agents with no client ever
-attached, which retired plan §5.4's "keep a viewer attached" workaround (#316 deletes the text). So
-`viewer.command` is written into the prefix and left there; register it as a Login Item yourself if
-you want the window. Nothing in the build-up depends on it, and the judge never asks about it.
+attached, which retired plan §5.4's "keep a viewer attached" workaround (deleted from the plan
+2026-08-05). So `viewer.command` is written into the prefix and left there; register it as a Login
+Item yourself if you want the window. Nothing in the build-up depends on it, and the judge never
+asks about it.
 
 ---
 
