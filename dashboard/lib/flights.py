@@ -302,13 +302,39 @@ _SPIN_MIN_EVENTS = 3    # fewer events than this is "quiet", never "flat" — do
 _SPIN_MAX_VARIETY = 1   # one repeating kind of event = the worker is stuck on a single operation
 
 
+# A wrong-typed journal ``act`` folds to a sentinel that belongs to no act set — the same guard the
+# loopstate ``status`` gets below (``_status_of`` / ``_CORRUPT_STATUS``, issue #139, itself mirroring
+# the engine's ``actions._status_of``, issue #95), one field over: the APPEND-ONLY JOURNAL rather
+# than ``issues.json`` (issue #218). Three reads routed a record's ``act`` — and, for an ``event``
+# envelope, its nested ``event.type`` — straight into a SET membership test, and a well-formed JSON
+# record whose value there is UNHASHABLE (a list, a dict) parsed fine and then raised ``TypeError``:
+# ``progress``'s variety set (via ``_event_kind``) and both membership tests inside ``_is_incident``.
+# ``progress`` runs inside ``build_flight`` and ``incident_stats`` inside the snapshot assembler, so
+# ONE corrupt record took down the WHOLE board — every repo and every flight, not merely its own row.
+# Folding at the read boundary keeps every act test hash-safe and fails CLOSED: an act that cannot be
+# read is no known act, so it is never mistaken for an incident. ``None`` is preserved — an absent
+# act is a legitimately unknown record, not a corrupt one. ``corner_stats`` is the shape this
+# preserves: it reads ``act`` only through ``==``, which never hashes.
+_CORRUPT_ACT = object()
+
+
+def _act_of(act):
+    """A journal ``act`` — or an ``event`` envelope's nested ``type``, which is drawn from the same
+    act vocabulary — folded hash-safe: itself when ``None`` or a ``str``, else :data:`_CORRUPT_ACT`,
+    a sentinel that is a member of no act set, so an ``act in <SET>`` test on it never raises. Mirror
+    of :func:`_status_of` (issue #139); see the note above."""
+    return act if (act is None or isinstance(act, str)) else _CORRUPT_ACT
+
+
 def _event_kind(rec):
     """The record's KIND for variety counting. A journal ``event`` envelope carries its real fact in
     ``event.type`` (``session_blocked`` / ``idle`` / ``frozen`` / ``session_finished`` …), so it is
     keyed as ``event:<type>`` — otherwise every distinct event would collapse to one kind and a
     lively mixed window could masquerade as flat (a false ``spinning`` alarm). Any other record is
-    keyed by its bare ``act``."""
-    act = rec.get("act")
+    keyed by its bare ``act`` — folded hash-safe, because that bare act is what lands in
+    ``progress``'s variety SET (issue #218). Every unreadable act keys as the one same sentinel, so
+    corrupt records collapse to a single unknown kind rather than each inventing a distinct one."""
+    act = _act_of(rec.get("act"))
     if act == "event":
         ev = rec.get("event")
         if isinstance(ev, dict) and ev.get("type"):
@@ -428,12 +454,16 @@ def _is_landing(rec):
 
 
 def _is_incident(rec):
-    act = rec.get("act")
+    # Both membership tests read a raw journal value against a SET, so both fold hash-safe first
+    # (issue #218) — the nested event type included, since an `event` record whose type is
+    # unhashable raises here exactly as a wrong-typed top-level act does. Fails closed: an
+    # unreadable act or type is no known incident, so a corrupt record never repaints the sign.
+    act = _act_of(rec.get("act"))
     if act in _INCIDENT_ACTS:
         return True
     if act == "event":
         ev = rec.get("event")
-        if isinstance(ev, dict) and ev.get("type") in _INCIDENT_EVENT_TYPES:
+        if isinstance(ev, dict) and _act_of(ev.get("type")) in _INCIDENT_EVENT_TYPES:
             return True
     return False
 
