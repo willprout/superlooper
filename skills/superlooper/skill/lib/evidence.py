@@ -116,6 +116,16 @@ _LAUNCH_RC = {
         "queued issue caused and none can fix by re-approving. Every launch will fail until it is "
         "repaired: log the fleet's config dir into its own account in a supervised window, or "
         "correct SL_FLEET_CLAUDE_CONFIG_DIR"),
+    9: ("fence_down",
+        "the pre-flight fence check refused the flight (#326): this machine declares its fleet "
+        "fenced, and a TOKENLESS connection to the session host's control socket was either SERVED "
+        "or unanswerable. A served one means there is no fence at all — every worker pane already "
+        "carries the socket path, so any session launched onto it could drive the whole fleet with "
+        "ten lines of python and no host binary. An unanswerable one proves nothing either way, "
+        "and silence is never read as a fence here. NO issue caused this and re-approving fixes "
+        "nothing: rebuild the patched host (vendor/herdr/build.sh) and re-run `superlooper fleet "
+        "--install`, or set SL_FLEET_FENCE=off on a machine that is deliberately unfenced. The "
+        "captured stderr says which of the two verdicts it was"),
     64: ("agent_unsupported",
          "the configured agent is not one this launcher can start (expected: claude or codex)"),
     124: ("launch_timeout",
@@ -183,6 +193,23 @@ _LAUNCH_TEXT = (
       "silently change how a session runs — API-key billing, a redirected base URL, transcript "
       "saving switched off — survived into it, so the flight was refused before it started. The "
       "captured stderr names them; find where they are exported and remove them")),
+    # THEN the fence pre-flight (issue #326), ahead of the gh and cmux patterns for the same reason
+    # the env-poison needle leads them: "FENCE DOWN" is the loop's OWN phrase from lib/launch.py,
+    # which no third-party tool can emit, and the memo it selects talks about the session host's
+    # control socket rather than about GitHub or a cmux anchor. Ordering matters here in one
+    # concrete direction: the UNREACHABLE refusal is about a socket that did not answer, and every
+    # phrase in that neighbourhood ("could not connect", "connection refused") belongs to a needle
+    # further down — so an unfenced fleet would otherwise be reported as "wait for GitHub to come
+    # back", a remedy for a fault that never self-recovers and that leaves the socket wide open
+    # while the owner waits. The launcher's own text is written to contain none of those phrases;
+    # this ordering is the belt to that braces.
+    (("fence down",),
+     ("fence_down",
+      "this machine declares its fleet fenced and the pre-flight found the session host's control "
+      "socket unfenced (a tokenless caller was SERVED) or unanswerable — so no session was "
+      "launched onto it. A machine-level fault no queued issue caused and none can fix by "
+      "re-approving: rebuild the patched host and reinstall the fleet server, or declare the "
+      "machine unfenced deliberately")),
     # THEN, ahead of every cmux pattern below (issue #299). The auth refusals relay `gh`'s OWN
     # error text into the launcher's stderr, and gh's wording is not ours to control — a message
     # containing "could not connect" or "not_found" would otherwise be read as a dead cmux anchor
@@ -317,6 +344,17 @@ CHANNEL_FAULT_REASONS = frozenset({
     # and held as a channel fault it would surface under the systemic-launch alert, whose body
     # names App Nap and the cmux anchor.
     "claude_identity_wrong_runner",
+    # (#326) The session host's control socket is unfenced (or unanswerable) on a machine that
+    # declares its fleet fenced. Every launch here reads the SAME socket and gets the same verdict,
+    # so this is the gh_auth_dead_runner shape one layer down: charged per-issue it would walk the
+    # whole approved queue into parks over one machine-level fault, and each of those parks would
+    # carry a memo asking the owner to re-approve an issue that was never the problem.
+    #
+    # Unlike its two siblings there is no per-issue variant to hold apart from: a fence is a
+    # property of the host server, and no session can be launched in a way that fixes it. Held as a
+    # channel fault the queue simply waits — which is the correct posture, because the alternative
+    # to waiting is flying workers onto an open socket.
+    "fence_down",
 })
 
 

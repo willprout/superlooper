@@ -521,6 +521,50 @@ def test_no_home_and_no_override_resolves_to_nothing_rather_than_a_guess():
     assert session_host.control_socket_path({}) is None
 
 
+# ------------------------------------------------ does this MACHINE declare its fleet fenced (#326)
+
+def test_a_machine_that_says_nothing_declares_no_fence():
+    """The default every dev checkout gets. `fence_probe` answering OPEN there is the normal state
+    of an unfenced workstation, not a fault — the switch is what turns a verdict into a refusal."""
+    assert session_host.fence_required({}) == (False, None)
+    assert session_host.fence_required({session_host.FENCE_REQUIRED_VAR: ""}) == (False, None)
+    assert session_host.fence_required({session_host.FENCE_REQUIRED_VAR: "   "}) == (False, None)
+
+
+def test_off_is_a_spelling_an_operator_can_actually_write():
+    """`off` exists so a fleet machine can be taken out of the fenced set DELIBERATELY, leaving a
+    value on disk that says so — rather than by deleting the variable, which is indistinguishable
+    from never having set it."""
+    for spelling in ("off", "OFF", " Off "):
+        assert session_host.fence_required({session_host.FENCE_REQUIRED_VAR: spelling}) \
+            == (False, None)
+
+
+def test_required_arms_the_gate():
+    for spelling in ("required", "REQUIRED", " Required "):
+        assert session_host.fence_required({session_host.FENCE_REQUIRED_VAR: spelling}) \
+            == (True, None)
+
+
+@pytest.mark.parametrize("value", ["requried", "1", "true", "yes", "on", "no", "0", "false"])
+def test_a_value_this_engine_does_not_know_arms_the_gate_and_is_reported(value):
+    """Fails CLOSED, and LOUDLY. A typo on the fleet machine must not read as `off` — that is a
+    silently disarmed fence, which is the whole failure this pre-flight exists to end. Truthy
+    spellings are refused too rather than guessed at: `SL_FLEET_FENCE=0` reads to a human as
+    "disarmed" and to a truthy parser as nothing, and a switch whose two readers disagree is worse
+    than one that is simply strict. The value comes back so the refusal can name it."""
+    required, unrecognised = session_host.fence_required({session_host.FENCE_REQUIRED_VAR: value})
+    assert required is True
+    assert unrecognised == value
+
+
+def test_the_switch_is_read_from_the_process_environment_by_default(monkeypatch):
+    monkeypatch.setenv(session_host.FENCE_REQUIRED_VAR, "required")
+    assert session_host.fence_required() == (True, None)
+    monkeypatch.delenv(session_host.FENCE_REQUIRED_VAR)
+    assert session_host.fence_required() == (False, None)
+
+
 # --------------------------------------------------- a probe cannot be held open by its peer
 
 def test_a_peer_that_dribbles_bytes_forever_does_not_hang_the_probe(sock_dir):

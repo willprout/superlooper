@@ -107,6 +107,12 @@ def _clear_worker_launch_env(monkeypatch):
         "SL_CLAUDE_CONFIG_DIR",
         "SL_EXPECT_CLAUDE_ACCOUNT",
         "SL_FLEET_CLAUDE_CONFIG_DIR",
+        # The fence pre-flight's machine switch (issue #326). Ambient on the fleet mini, where the
+        # suite also runs — and it decides whether a launch is REFUSED, so a test inheriting it
+        # would pass or fail on a fact about the machine rather than about the code. Scrubbed in
+        # both directions: absent, the gate is disarmed by default, which is the state every
+        # not-about-the-fence launch test assumes.
+        "SL_FLEET_FENCE",
         "CLAUDE_CONFIG_DIR",
         "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     ):

@@ -462,3 +462,38 @@ def test_a_dead_cmux_socket_is_not_reported_as_an_unreachable_github():
     # ...while gh's own refused connection is still caught, via `dial tcp`:
     gh_refused = "[i5] GH AUTH DEAD: dial tcp 140.82.113.6:443: connect: connection refused"
     assert evidence.build("launch", rc=4, captured=gh_refused)["reason"] == "gh_probe_unreachable"
+
+
+# ---- the fence pre-flight (issue #326) ---------------------------------------------------------
+
+def test_a_fence_refusal_is_a_channel_fault_that_holds_the_queue():
+    """Machine-level, exactly like `gh_auth_dead_runner` and `claude_identity_wrong_runner`: every
+    launch on this host reads the SAME control socket and gets the same verdict, so charging one
+    issue a park for it would walk the whole approved queue into parks over a single machine fault
+    — the 2026-07-09 storm's shape with a new cause. No re-approval can fix it; the fleet's server
+    has to be rebuilt or restarted."""
+    rec = evidence.build("launch", rc=9, captured=None)
+    assert rec["reason"] == "fence_down"
+    assert evidence.is_channel_fault(rec) is True
+
+
+@pytest.mark.parametrize("captured", [
+    "[i5] FENCE DOWN: a tokenless connection to /tmp/h.sock was SERVED",
+    "[i5] FENCE DOWN: /tmp/h.sock did not answer, and silence is never proof of a fence",
+])
+def test_the_launchers_own_fence_words_classify_as_the_fence(captured):
+    rec = evidence.build("launch", rc=9, captured=captured)
+    assert rec["reason"] == "fence_down", rec
+
+
+def test_a_fence_refusal_never_reads_as_a_github_outage_or_a_dead_anchor():
+    """`_LAUNCH_TEXT` is consulted before the rc table and the first match wins, so the fence's own
+    refusal text must contain none of the earlier needles — otherwise an unfenced fleet would be
+    reported to the owner as "wait for GitHub to come back", a remedy for a fault that never
+    self-recovers and that leaves the socket wide open in the meantime."""
+    for captured in ("[i5] FENCE DOWN: a tokenless connection to /tmp/h.sock was SERVED",
+                     "[i5] FENCE DOWN: /tmp/h.sock did not answer, and silence is never proof of "
+                     "a fence"):
+        rec = evidence.build("launch", rc=9, captured=captured)
+        assert rec["reason"] not in ("gh_probe_unreachable", "anchor_socket_lost",
+                                     "anchor_workspace_missing", "env_poisoned"), rec

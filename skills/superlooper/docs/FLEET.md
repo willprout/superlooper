@@ -113,6 +113,35 @@ dangerous answer, not the mild one: an unfenced socket does not look broken from
 and every worker pane already carries the path to it. Silence is `UNREACHABLE`, never a fence.
 REQUIRED before unattended fleet use (plan §3.1).
 
+This block is a doctor reading, and a doctor is something a person runs. The **launch pre-flight**
+(issue #326) is the same question asked mechanically, on every worker launch, by the one thing that
+would otherwise fly a session onto an open socket:
+
+* it runs for `i<N>` **worker** launches only. A `d<N>` repair session is handed the token by
+  design, so an open socket grants it nothing it does not already hold — and refusing repair
+  *because* the fence is down would mean no unattended repair at the moment repair is needed.
+* `OPEN` and `UNREACHABLE` are both **fatal** (exit 9, a channel fault that holds the queue rather
+  than parking an issue that caused nothing). Silence refuses for the same reason the doctor will
+  not call it a fence, plus two of its own: the spawn was about to be driven through that same
+  socket, and a pre-flight that proceeded on `UNREACHABLE` could be disarmed by anything that
+  breaks the probe.
+* it probes the socket **the spawn itself would use**, resolved through the doorway's own resolver
+  from the launcher's environment — the same environment the host CLI child inherits.
+
+**`SL_FLEET_FENCE`** is the switch, and it is an environment variable on the runner's own process
+rather than a key in a repo's `.superlooper/config.json`. That file travels with the repo through
+git, so the fleet mini and a dev laptop would read one answer — and those two machines must differ,
+because a dev workstation runs a stock host whose socket is `OPEN` by construction. `required` arms
+the gate; `off` or unset disarms it; **any other value arms it and says so**, because a typo that
+read as `off` would be a silently disarmed fence. Set `SL_FLEET_FENCE=required` on the fleet
+machine's runner; leave it unset everywhere else.
+
+Every worker launch journals its verdict (`act: fence_preflight`, with `verdict`, `required` and
+`refused`), permitted launches included. That is what keeps a default-off switch from being a
+silent no-op: a machine nobody ever armed writes down its `OPEN` socket every launch, so the
+morning report can show the fence state over time instead of leaving "unfenced all week" and
+"fenced all week" indistinguishable.
+
 **`host config`** — `session.resume_agents_on_restore = true` and `version_check = false`, plus the
 socket path the named session will actually bind, measured in bytes against the kernel's
 `sun_path` limit of 104 (a long username plus a long session name is enough to make a server that
