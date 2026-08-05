@@ -1411,6 +1411,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # not systemic_launch) is the recovery the canary probe (or a restart) produces: the streak
     # cleared on a verified delivery while the alert still names it. Journaled once below (#115).
     prev_systemic = bool(alert_on_disk) and "launch_systemic_failure" in _dget(alert_on_disk, "reasons", list)
+    # The reasons the durable ALERT already names — the same on-disk episode marker prev_systemic
+    # reads, kept as a list so any reason can ask "am I already standing?" (issue #256 uses it to
+    # keep per-poll view health from RETRACTING a page it already sent; see park_label_stuck).
+    prev_alert_reasons = _dget(alert_on_disk, "reasons", list) if alert_on_disk else []
 
     # ================= A. alerts (safety first, before any work) =================
     reasons = []
@@ -1482,18 +1486,41 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # executor writes it ONLY past a successful set_labels, so a cause recorded there IS the
         # proof the labels moved. Settled history stays silent; a stuck park escalates.
         #
-        # BOTH other conjuncts are load-bearing. `agent-ready` on a FRESH read is the live evidence
-        # that the removal never happened — without it, a bare cause mismatch would alert on every
-        # lane parked before #169 shipped the field at all (no `park_landed_cause` anywhere in its
-        # state file), lanes where nothing is stuck precisely because the labels did move. And the
-        # read must be fresh: a stale view's labels are last poll's, while the claim being made is
-        # about what is standing on the issue right now.
+        # Every other conjunct is load-bearing, and each was found by a fresh review paying for the
+        # cheaper version first:
+        #
+        # * `agent-ready` on the issue is the live evidence that the removal never happened. The
+        #   park's set_labels is what strips it, so a park that is genuinely stuck is a park whose
+        #   `agent-ready` is still standing.
+        # * `park_landed_cause` must be a STRING, not merely different (P1-1). A bare `!=` reads
+        #   ABSENCE as "the move failed", and absence means the opposite here — no park ever landed
+        #   on this lane, so there is no unlanded park to be stuck. Two whole populations sit there:
+        #   `_exec_bounce` settles `bounced` past its own successful label move and never writes the
+        #   field (it borrows only the notify marker), and every lane parked before #169 shipped the
+        #   field has no such key at all. Both are terminal, both carry a live `park_notify_cause`
+        #   forever, and both get `agent-ready` back the moment the owner does the designed next
+        #   thing — amend and re-approve. On `!=` alone THAT is what pages them, at 3am, about a
+        #   GitHub that is working perfectly. A recorded landed cause says a park DID move labels
+        #   here; differing from the cause now stamped says the one now stamped has not.
+        # * the read must be FRESH: a stale view's labels are last poll's, while the claim being
+        #   made is about what is standing on the issue right now.
+        #
+        # `standing` is what keeps that freshness requirement from turning into a storm (P1-2).
+        # `gh_stale` and `closed_read_ok` flip with each poll's luck, and the ALERT's dedup key is
+        # the reasons LIST — so a reason that drops out on a doubted poll and returns on the next is
+        # a NEW alert and a NEW text, once per flip, which is the 41-text defect class #61 exists to
+        # bound. The correlation is adverse, not incidental: a flaky GitHub is exactly what makes a
+        # label move stick in the first place. So per-poll doubt gates only the RAISE — a page
+        # already sent stands until EVIDENCE retracts it (the marker clears, the park lands, or a
+        # vouched read says the owner closed the issue), never until the weather improves.
+        standing = f"park_label_stuck:{iid}" in prev_alert_reasons
         p_now = parsed_by_id.get(iid)
         labels_now = p_now.get("labels") if isinstance(p_now, dict) else None
-        park_unlanded = (not gh_stale and isinstance(labels_now, list)
-                         and "agent-ready" in labels_now
-                         and ist_of(iid).get("park_landed_cause")
-                         != ist_of(iid).get("park_notify_cause"))
+        landed_cause = ist_of(iid).get("park_landed_cause")
+        park_unlanded = (isinstance(labels_now, list) and "agent-ready" in labels_now
+                         and (not gh_stale or standing)
+                         and isinstance(landed_cause, str)
+                         and landed_cause != ist_of(iid).get("park_notify_cause"))
         # ...and the absorption suppression takes the #172 VOUCH, not bare membership (#256, half
         # 2). `gh api rate_limit` is exempt from rate limiting, so during a throttle the probe
         # answers, the poll completes, the view is stamped FRESH, and the closed set is empty for a
@@ -1504,8 +1531,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # the issue open escalates. `closed_read_ok` folds gh_stale in deliberately (see its
         # definition): when the WHOLE view is doubted, #108's rule stands unchanged — an unproven
         # close must never suppress a real alert. The `absorb_close` sibling needs no such conjunct:
-        # it requires POSITIVE membership, so an unvouched read only delays absorption.
-        if (not being_absorbed and closed_read_ok
+        # it requires POSITIVE membership, so an unvouched read only delays absorption. `standing`
+        # again bounds this to the RAISE: an unvouched read must not retract a page already sent
+        # (that is the same per-poll flap as above, and the same one text per flip).
+        if (not being_absorbed and (closed_read_ok or standing)
                 and (_status_of(ist_of(iid)) not in TERMINAL_STATUSES or park_unlanded)
                 and isinstance(ist_of(iid).get("park_notify_cause"), str)
                 and _real(stamped) and now - stamped >= PARK_LABEL_STUCK_ALERT_SECONDS):

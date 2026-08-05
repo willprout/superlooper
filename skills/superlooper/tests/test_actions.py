@@ -3655,6 +3655,32 @@ def test_a_landed_park_stays_silent_in_that_same_terminal_status():
     assert only(out2, "alert") == [] and not has_notify(out2)
 
 
+def test_a_re_approved_bounce_is_never_mistaken_for_a_stuck_park():
+    """FRESH-REVIEW P1-1. `_exec_bounce` settles `bounced` PAST its own successful label move and
+    never writes `park_landed_cause` — it borrows only the notify marker. So every bounced lane
+    carries a live `park_notify_cause` against an absent landed cause, forever, and gets
+    `agent-ready` back the moment the owner does the designed next thing: amend the issue and
+    re-approve. A bare cause mismatch pages THAT — at 3am (an ALERT is never quiet-hour batched),
+    about a GitHub that is working perfectly, telling the owner writes are not landing."""
+    d = disk(issues_state={"version": 1, "issues": {
+        "i7": ist("bounced", park_notify_cause="bounce",
+                  park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)}})
+    out = decide(parsed_issues=[parsed(7)], dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+    assert len(only(out, "reapprove")) == 1, "...and the re-approval itself is untouched"
+
+
+def test_a_pre_169_parked_lane_never_alerts_when_it_is_re_approved():
+    # The other absent-field population: a lane parked before #169 shipped `park_landed_cause` has
+    # no such key in its state file at all. Its labels DID move (that is why it is parked and why
+    # `agent-ready` was gone until the owner put it back), so nothing here is stuck.
+    d = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("needs_william", park_notify_cause="checks",
+                  park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)}})
+    out = decide(parsed_issues=[parsed(5)], dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
 def test_a_terminal_lane_with_no_fresh_agent_ready_never_alerts():
     # The `agent-ready` conjunct is load-bearing: a mismatched pair alone would alert on every lane
     # parked before #169 shipped `park_landed_cause`, whose state file simply has no such field.
@@ -3740,19 +3766,52 @@ def test_a_stale_view_still_escalates_rather_than_suppressing_on_an_unproven_clo
     assert len(a) == 1 and "park_label_stuck:i7" in a[0]["reasons"]
 
 
-def test_a_long_stuck_hand_back_alerts_once_across_a_whole_outage():
-    # The storm bound: the ALERT's own reasons-diff dedup. A GitHub write outage lasting hours must
-    # cost ONE text, not one per 15s tick — the same discipline #61 gave the park itself.
-    d = _stuck_reapproved_park()
-    alerts = texts = 0
-    for k in range(60):
-        out = decide(now=NOW + k * 15, parsed_issues=[parsed(5)], dsk=d)
+def _ticks(d, views, n=60):
+    """Run n consecutive ticks, carrying the durable ALERT forward exactly as the runner does (it
+    writes state/ALERT on `alert` and removes it on `clear_alert`). `views` picks the gh_view per
+    tick, so a poll whose health CHANGES is a first-class case."""
+    alerts = texts = clears = 0
+    for k in range(n):
+        out = decide(now=NOW + k * 15, parsed_issues=[parsed(5)], dsk=d, gh_view=views(k))
         a = only(out, "alert")
         alerts += len(a)
         texts += len(only(out, "notify"))
         if a:
             d = dict(d, alert={"reasons": a[0]["reasons"], "since": NOW + k * 15})
-    assert (alerts, texts) == (1, 1)
+        elif only(out, "clear_alert"):
+            clears += 1
+            d = dict(d, alert=None)
+    return alerts, texts, clears
+
+
+def test_a_long_stuck_hand_back_alerts_once_across_a_whole_outage():
+    # The storm bound: the ALERT's own reasons-diff dedup. A GitHub write outage lasting hours must
+    # cost ONE text, not one per 15s tick — the same discipline #61 gave the park itself.
+    assert _ticks(_stuck_reapproved_park(), lambda k: ghv()) == (1, 1, 0)
+
+
+def test_per_poll_view_health_can_delay_the_page_but_never_re_sends_it():
+    """FRESH-REVIEW P1-2. `closed_read_ok` and `gh_stale` flip with each poll's luck, and the ALERT
+    dedup key is the reasons LIST — so a conjunct that drops the reason on a doubted poll and
+    restores it on the next bills a fresh alert AND a fresh text every flip. The correlation is
+    adverse, not incidental: a flaky GitHub is exactly what makes the label move stick. Doubt gates
+    the RAISE only; a page already sent stands until evidence retracts it."""
+    for view in (lambda k: ghv(closed_read_ok=k % 2 == 0),      # the #172 vouch flapping
+                 lambda k: ghv(stale=k % 2 == 0),               # ...and the whole view flapping
+                 lambda k: ghv(stale=k % 3 == 0, closed_read_ok=k % 2 == 0)):
+        assert _ticks(_stuck_reapproved_park(), view) == (1, 1, 0), "one text per outage, not per flip"
+
+
+def test_a_page_already_sent_is_still_retracted_by_evidence():
+    # The other half of `standing`: holding through DOUBT must not become holding through PROOF.
+    # A vouched read naming the issue closed clears the alert on the very next tick.
+    d = dict(_stuck_reapproved_park(), alert={"reasons": ["park_label_stuck:i5"], "since": NOW})
+    out = decide(parsed_issues=[parsed(5)], dsk=d, gh_view=ghv(closed_nums={5}, closed_read_ok=True))
+    assert only(out, "clear_alert") == [{"act": "clear_alert"}]
+    # ...and so does the park's own landing (the marker pair agrees again)
+    d2 = dict(_stuck_reapproved_park(park_landed_cause=actions.TEARDOWN_CAUSE_REAPPROVED),
+              alert={"reasons": ["park_label_stuck:i5"], "since": NOW})
+    assert only(decide(parsed_issues=[parsed(5)], dsk=d2), "clear_alert") == [{"act": "clear_alert"}]
 
 
 # ---------------- absorb external closes for bounced/parked issues (issue #108) ----------------
