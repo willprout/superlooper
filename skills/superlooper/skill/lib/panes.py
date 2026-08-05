@@ -83,12 +83,22 @@ def _paths(state, iid):
 def record(state, iid, session):
     """THE writer. Both halves, atomically each, from the handle `spawn` returned.
 
-    Returns True only when BOTH landed: a recorded pane whose workspace write failed is the
-    un-closable handle `as_session` refuses on, and the caller (the launcher) would rather know.
+    THE WORKSPACE GOES FIRST, and the order is the whole of the error handling. These are two
+    writes and the process can die between them, so one of the two half-states is going to happen
+    eventually — the order decides WHICH:
+
+    * workspace-then-pane leaves a closable handle with no cached pane, which every reader here
+      already tolerates (`as_session` allows ``pane=None``, and the doorway re-resolves the pane
+      from the name on every read anyway). Harmless.
+    * pane-then-workspace leaves the opposite, and it is not harmless at all: `as_session` returns
+      None for it, so `_close_pane` silently no-ops AND every nudge reads "no session recorded" →
+      rc=4 → mark-exited → relaunch, in a loop, on a lane whose worker is alive.
+
+    Returns True only when both landed, so a caller that has somewhere to put the news can use it.
     """
     pane_path, ws_path = _paths(state, iid)
-    ok = write_atomic(pane_path, getattr(session, "pane", "") or "")
-    return write_atomic(ws_path, getattr(session, "workspace", "") or "") and ok
+    ok = write_atomic(ws_path, getattr(session, "workspace", "") or "")
+    return write_atomic(pane_path, getattr(session, "pane", "") or "") and ok
 
 
 def read(state, iid):

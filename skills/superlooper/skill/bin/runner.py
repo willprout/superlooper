@@ -2473,6 +2473,12 @@ class Runner:
         """End the id's recorded session, through the doorway. Best-effort: a session that is
         already gone is a no-op, exactly as it was when this closed a cmux surface.
 
+        NOTE for a future caller: the doorway's `kill` derives the pid it signals FRESH from the
+        lane NAME, so this ends whatever session that name resolves to NOW — not necessarily the
+        one whose handle was read a moment ago. Every caller here already gates on the lane being
+        settled before it arrives, but a caller that pauses in between (as `superlooper tidy` does,
+        for a y/N) has to re-check; see the guard in its own `_close_window`.
+
         It had to move with the spawn (issue #308), and the simulation is what proved it: the
         handles this reads — ``state/panes/<id>`` and its ``.ws`` — are written by the launcher, so
         after the spawn moved they name the session HOST's workspace and pane. Left on cmux, this
@@ -3923,14 +3929,21 @@ class Runner:
             rc = self._run_script([self._script("nudge-pane.sh"), iid,
                                    f"[superlooper gate] {a.get('message', '')}"],
                                   env=self._script_env("", ""), timeout=NUDGE_TIMEOUT)
-        if rc in (0, 4, 5):
-            # sent, or unsendable-FOREVER (4 = dead pane; 5 = logged out in-window, issue #151):
+        if rc in (0, 4, 5, 7):
+            # sent (0), SUBMITTED-BUT-UNPROVEN (7, issue #334), or unsendable-FOREVER (4 = dead
+            # pane; 5 = logged out in-window, issue #151):
             # either way the one nudge is spent — gate.nudge_or_park parks on the next pass (never
             # an unbounded nudge loop). rc=5 belongs here and not with the defers: a session whose
             # auth is dead can never answer, and before #151 taught the classifier to see it, this
             # screen read as 'idle' and was typed into for rc=0 — which spent the key and reached
             # the owner. Leaving 5 out would have made a logged-out lane re-nudge every tick and
             # never park: strictly worse than the bug being fixed.
+            # rc=7 belongs here for a different reason than any of the others: the prompt really
+            # WAS submitted (the wrapper types first and consults its delivery oracle afterwards),
+            # so the worker has it — only our proof is missing. Leaving it out would put a real
+            # send inside an unbounded every-tick retry, re-delivering the same handback into a
+            # live worker forever and never parking. That the old rc=3 retry was unbounded was
+            # harmless while rc=3 meant "nothing was typed"; it is a different proposition now.
             # rc=6 (at_dialog) is NOT here on purpose: the pane is LIVE, and a dialog that gets
             # answered leaves the next pass free to deliver, so spending the lane's one nudge on a
             # refusal would burn it for nothing. It defers exactly like rc=3 — and inherits rc=3's

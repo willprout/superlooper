@@ -19,7 +19,10 @@ because a model that flubs the answer would otherwise read as a delivery failure
 import json
 import os
 
+import pytest
+
 import delivery
+import identity
 
 SESSION = "39c26db1-edc1-4f6b-a5a2-1e020e737657"
 
@@ -142,6 +145,21 @@ def test_a_sidechain_entry_is_not_this_session_being_prompted(tmp_path):
     assert oracle.landed(mark) is False
 
 
+@pytest.mark.parametrize("flag", ["isMeta", "isCompactSummary"])
+def test_a_meta_or_compaction_entry_is_not_a_prompt(tmp_path, flag):
+    """Both are real `type: user`, non-sidechain, STRING-content records — 2 of them in this
+    machine's own transcripts. A compact summary is prose ABOUT the earlier conversation and can
+    quote a previous nudge verbatim; landing inside the mark→landed window it would prove a
+    delivery that never happened, which is the one direction this must never fail."""
+    root, path = _root(tmp_path)
+    path.write_text("")
+    oracle = _oracle(root, "ring the doorbell")
+    mark = oracle.mark()
+    with open(path, "a") as f:
+        f.write(_entry("user", "ring the doorbell", **{flag: True}))
+    assert oracle.landed(mark) is False
+
+
 def test_a_tool_result_entry_is_not_a_prompt(tmp_path):
     # Claude records tool results as `type: user` with a LIST content. A tool result whose text
     # happens to contain the nudge (a worker `cat`ing the runner log would produce exactly that)
@@ -211,7 +229,7 @@ def test_patience_is_bounded(tmp_path):
 
 # --------------------------------------------------------------- resolution
 
-def test_the_root_follows_the_worker_config_dir_assignment(tmp_path):
+def test_the_root_follows_the_machines_worker_config_dir_assignment(tmp_path):
     # #314 gives each worker its own CLAUDE_CONFIG_DIR, and Claude keeps its transcripts under it.
     # A resolver that hardcoded ~/.claude would look in the operator's own namespace and find
     # nothing — an oracle that answers "cannot tell" about every fleet worker.
@@ -220,10 +238,34 @@ def test_the_root_follows_the_worker_config_dir_assignment(tmp_path):
                                      "HOME": str(tmp_path)}) == os.path.join(assigned, "projects")
 
 
-def test_an_explicit_config_dir_in_the_environment_wins(tmp_path):
-    env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "explicit"),
+def test_the_root_is_canonicalised_the_way_the_launcher_canonicalises_it(tmp_path):
+    """The engine's OWN suggested fleet value is `~/.claude-fleet`, and every spawn path expands it
+    through `identity.canonical`. A second derivation that joined the raw string would hand
+    os.listdir a literal `~`, find nothing, and answer "cannot tell" about every nudge on the
+    machine — while the workers themselves ran perfectly under the expanded path. Silent, and it
+    reads as a healthy-session defer."""
+    env = {"SL_FLEET_CLAUDE_CONFIG_DIR": identity.SUGGESTED_FLEET_DIR, "HOME": str(tmp_path)}
+    assert delivery.transcript_root(env) == os.path.join(
+        str(tmp_path), ".claude-fleet", "projects")
+
+
+def test_an_inherited_session_config_dir_does_not_steer_the_oracle(tmp_path):
+    """A runner started from inside a worker or debugger pane carries THAT session's
+    CLAUDE_CONFIG_DIR. The launch floor refuses to forward one, `identity_probe_env` scrubs it and
+    `_script_env` pins its sibling empty, all for the same reason: it is a second-hand answer about
+    somebody else's credential namespace. Ranking it here would point the oracle at one namespace
+    while every worker ran in another."""
+    env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "somebody-elses"),
+           "SL_CLAUDE_CONFIG_DIR": str(tmp_path / "also-not-ours"),
            "SL_FLEET_CLAUDE_CONFIG_DIR": str(tmp_path / "fleet"), "HOME": str(tmp_path)}
-    assert delivery.transcript_root(env) == os.path.join(str(tmp_path / "explicit"), "projects")
+    assert delivery.transcript_root(env) == os.path.join(str(tmp_path / "fleet"), "projects")
+
+
+def test_a_configured_but_unusable_assignment_resolves_to_nothing(tmp_path):
+    # NOT quietly downgraded to the default namespace — that substitution is the one thing #314
+    # exists to prevent, and here it would make the oracle answer about the operator's own sessions.
+    assert delivery.transcript_root({"SL_FLEET_CLAUDE_CONFIG_DIR": "relative/dir",
+                                     "HOME": str(tmp_path)}) is None
 
 
 def test_the_root_falls_back_to_the_default_claude_home(tmp_path):

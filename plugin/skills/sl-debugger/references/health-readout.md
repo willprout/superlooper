@@ -98,7 +98,8 @@ not an emergency to escape.
 ~480s stale, recovery ladder at ~2700s), `blocked/<id>` (the worker's plain-text question —
 an answerer session gets hired), `exited/<id>` (process gone, `<epoch> rc=<code>`),
 `awaiting/<id>` (suppresses the idle peek during long background work), `panes/<id>` +
-`panes/<id>.ws` (which cmux surface the session lives in), `worker.<id>.lock` (per-worker
+`panes/<id>.ws` (the SESSION HOST's pane and workspace for that lane — host identifiers since
+issue #308, not cmux surfaces; `lib/panes.py` is the one place that reads or writes them), `worker.<id>.lock` (per-worker
 pid singleton), `started/<id>.*` (launch delivery proof). Siblings at the home root:
 `briefs/<id>.md`, `reports/<id>.md` (existence = session finished), `answers/<id>.md`,
 `worktrees/<id>/`, `logs/runner.log`.

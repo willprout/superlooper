@@ -12,7 +12,9 @@ import json
 import os
 import re
 import shutil
+import select
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -1553,6 +1555,22 @@ def _recording_host(rig, *, gone=True):
     return log, str(stub)
 
 
+def _read_until(stream, marker, timeout=30.0):
+    """Read from a live process's stdout until `marker` appears, and return what was read.
+
+    A plain readline() cannot be used: the y/N prompt has no trailing newline, so the only reason
+    the bytes are visible at all is that `input()` flushes stdout before it blocks — which is
+    exactly the moment this test needs to catch.
+    """
+    got, deadline = "", time.monotonic() + timeout
+    while marker not in got:
+        assert time.monotonic() < deadline, f"never saw {marker!r}; got {got!r}"
+        ready, _, _ = select.select([stream], [], [], 0.1)
+        if ready:
+            got += os.read(stream.fileno(), 4096).decode("utf-8", "replace")
+    return got
+
+
 def _closed_workspaces(log):
     """The workspaces tidy actually asked the host to close, in order."""
     if not log.exists():
@@ -1653,6 +1671,7 @@ def test_tidy_all_scope_closes_every_terminal_status_but_never_inflight(rig):
     assert not (home / "state" / "worker.i1.lock").exists()
     for n in (2, 3, 4):
         assert (home / "state" / "panes" / f"i{n}").exists()
+        assert (home / "state" / f"worker.i{n}.lock").exists()
 
 
 def test_tidy_confirm_yes_closes(rig):
@@ -1720,6 +1739,36 @@ def test_tidy_never_touches_a_reapprovable_sessions_markers_or_lock(rig):
     assert (home / "state" / "panes" / "i2.ws").exists()
     assert (home / "state" / "worker.i2.lock").exists()
     assert "reconcile" in r.stdout.lower()
+
+
+def test_tidy_leaves_a_lane_that_relaunched_during_the_y_N_wait_completely_alone(rig):
+    """Under cmux the snapshot was a structural guarantee: `close-surface --surface <snapshot>`
+    could not touch anything but that surface. The doorway is not shaped that way — its `kill`
+    derives the pid it SIGNALS fresh from the lane NAME, so a re-approval that relaunched this lane
+    while the owner read the prompt would have had its brand-new worker SIGTERMed. The handle is
+    re-read immediately before the teardown and a mismatch stops everything."""
+    home = _seed_tidy_state(rig, {"i2": "parked"}, {"i2": ("old:p1", "old")})
+    log, host = _recording_host(rig)
+    # Driven through the REAL y/N wait, because that wait IS the window: the snapshot is taken when
+    # the list is printed and the close happens after the answer. Popen (not `cli`) so the relaunch
+    # can land while the process is genuinely blocked on stdin.
+    proc = subprocess.Popen([sys.executable, str(CLI), "tidy", "--all", "--repo", str(rig.repo)],
+                            env={**rig.env, "SL_HERDR": host}, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    seen = _read_until(proc.stdout, "close these windows")     # the list is out; we are at the wait
+    # the relaunch: a fresh spawn rewrites BOTH halves, because every spawn makes a new workspace
+    (home / "state" / "panes" / "i2").write_text("new:p1")
+    (home / "state" / "panes" / "i2.ws").write_text("new")
+    proc.stdin.write("y\n")
+    proc.stdin.flush()
+    rest = proc.stdout.read()
+    proc.wait(timeout=60)
+    out = seen + rest
+    assert proc.returncode == 0, out + proc.stderr.read()
+    assert not log.exists(), f"nothing may be asked of the host: {log.read_text()}"
+    assert "relaunched" in out
+    # and the count is honest — reporting the LISTED number would tell the owner a window went
+    assert "closed 0 window(s)" in out
 
 
 def test_tidy_snapshots_the_handle_so_a_relaunch_cannot_redirect_the_close(rig):

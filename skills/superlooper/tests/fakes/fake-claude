@@ -547,6 +547,12 @@ def main():
         sys.exit(1)
     watch_for_prompts()          # the pane starts taking input the moment the agent is up
     brief = sys.argv[-1] if len(sys.argv) > 1 else ""
+    # The brief IS this session's first prompt — the launcher hands it as argv and the real agent
+    # records it as a user turn. Recording it here is not decoration: the nudge path defers a
+    # session that has written NO record (it cannot tell a fresh pane from one sitting at a
+    # first-run dialog), so a fake that skipped its own first turn would make every simulated lane
+    # permanently un-nudgeable for a reason no production worker has.
+    record_prompt(brief)
     spec = load_spec()
     name = spec["scenario"]
     log("playing scenario %r (branch %r)" % (name, spec.get("branch")))

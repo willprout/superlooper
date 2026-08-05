@@ -264,7 +264,18 @@ def main():
         emit({"type": "agent_prompted", "agent": {"name": name, "agent_status": "idle"}})
 
     if (group, verb) == ("agent", "send-keys"):
-        log("keys.jsonl", {"agent": rest[0] if rest else "", "key": rest[1] if len(rest) > 1 else ""})
+        # Validated like every other verb, and it matters MORE here than most: this is the revive
+        # path's Enter chaser, i.e. the one verb whose whole job is to press Enter. A fake that
+        # accepted any name would let a chaser aimed at the wrong session look like it worked.
+        name = rest[0] if rest else ""
+        try:
+            with open(state("agent.%s" % name)) as f:
+                ws = f.read().strip()
+        except OSError:
+            fail("agent_not_found", "no agent named %r" % name)
+        if not os.path.exists(state("live.%s" % ws)):
+            fail("agent_not_found", "no agent named %r" % name)
+        log("keys.jsonl", {"agent": name, "key": rest[1] if len(rest) > 1 else ""})
         emit({"type": "keys_sent"})
 
     if (group, verb) == ("workspace", "close"):

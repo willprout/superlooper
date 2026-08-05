@@ -38,9 +38,9 @@ EXIT CODES (load-bearing — the runner branches on these):
       input is queued, and the runner confirms real progress through activity/report, as before.
   1 = FAILED. The host refused the send, the id cannot address an agent, or this agent has no
       delivery oracle at all — a channel fault, not the session's.
-  3 = DEFERRED. Nothing was typed and the session may be perfectly healthy: the host could not
-      vouch for the pane, its advisory says the agent is waiting on a person, or the send could not
-      be PROVEN. Caller retries later.
+  3 = DEFERRED. NOTHING WAS TYPED and the session may be perfectly healthy: the host could not
+      vouch for the pane, its advisory says the agent is waiting on a person, or the session has
+      written no record this can judge it from. Caller retries later.
   4 = DEAD. The agent process is gone. Caller RESTARTS — it must NEVER type, or the message would
       run as a permission-bypassed shell command (RC-DEADPANE).
   5 = AUTH DEAD IN-SESSION (#151, widened by #174). Every turn is refused. Nothing was typed.
@@ -51,9 +51,24 @@ EXIT CODES (load-bearing — the runner branches on these):
   6 = AT DIALOG (#151). The session raised its OWN question and is waiting on an answer. Nothing
       was typed. This is a LIVE, working session — surface it, never escalate it.
 
+  7 = SUBMITTED BUT UNPROVEN. The prompt WAS handed to the host — the wrapper submits and only then
+      consults the oracle — and nothing could confirm it arrived. Distinct from 3 for one concrete
+      reason: 3 promises nothing was typed, and a caller whose retry is unbounded (the gate's one
+      nudge per cause) would otherwise re-SUBMIT a real prompt into a live worker every tick,
+      forever. A caller that spends a one-shot key must spend it here.
+
 5 and 6 are refusals exactly like 3; they differ only in telling the caller WHY, which is the whole
 point. The old single "deferred" made a dead-auth session, a session asking a question and a
 genuine menu indistinguishable, and the runner treated all three as "stuck".
+
+WHAT THIS PATH CANNOT SEE, stated plainly because it is a real reduction. The cmux classifier also
+refused on a MENU — a trust prompt, a permission dialog, any ambiguous selection UI — because a
+stray Enter there SELECTS an item. The session host exposes no screen read and #334's boundary
+forbids adding one, and a modal that is not `AskUserQuestion` leaves no trace in the transcript. Two
+things narrow the gap and neither closes it: a session that has written NO record yet is deferred
+outright (below), which covers the pre-first-turn trust dialog — the realistic case, since a worker
+runs with permission prompts bypassed; and the host's advisory `blocked` takes a send away when the
+host happens to notice. The residue is issue #353.
 """
 import os
 import sys
@@ -64,7 +79,7 @@ import pane_state
 import panes
 import session_host
 
-SENT, FAILED, DEFERRED, DEAD, LOGGED_OUT, AT_DIALOG = 0, 1, 3, 4, 5, 6
+SENT, FAILED, DEFERRED, DEAD, LOGGED_OUT, AT_DIALOG, UNPROVEN = 0, 1, 3, 4, 5, 6, 7
 
 # How long ONE control call to the host may hang, and how long the prompt itself may take.
 #
@@ -140,7 +155,7 @@ def nudge(run_root, iid, message, agent="claude", env=None, edges=None):
     #    caller that hands this an unaddressable id has a bug and every later answer would be about
     #    the wrong question. The doorway validates it again; this is where the caller hears it.
     try:
-        session_host.name_for(iid)
+        name = session_host.name_for(iid)
     except session_host.NameRefused as e:
         return Outcome(FAILED, "unaddressable", detail=_bound(str(e)))
 
@@ -153,7 +168,11 @@ def nudge(run_root, iid, message, agent="claude", env=None, edges=None):
     # 2. Is there a recorded session at all? This is the ONLY thing the recorded handle is read for
     #    here — never to address anything (see the module's rule 1).
     handle = panes.read(state_dir, iid)
-    session = handle.as_session(iid)
+    # The VALIDATED name, not the raw id. `name_for` repairs case (ids are ours and their case
+    # carries no meaning) and the doorway validates again at every verb — so building the Session
+    # from the raw id would make the check above decorative, and a `D12` would surface as a send
+    # failure at the host instead of as the unaddressable-id refusal it is.
+    session = handle.as_session(name)
     if session is None:
         return Outcome(DEAD, "no_session",
                        detail="no session window is recorded for this lane (state/panes/%s)" % iid)
@@ -173,10 +192,14 @@ def nudge(run_root, iid, message, agent="claude", env=None, edges=None):
                        detail="the host reports this agent %r — waiting on a person, so nothing "
                               "was typed" % live.advisory)
 
-    # 4. The two refusals that came off the screen and onto the session's own record.
-    sensed = pane_state.classify_transcript(edges.records(run_root, iid, agent, env), agent=agent)
+    # 4. The two refusals that came off the screen and onto the session's own record. ONE read,
+    #    shared by the verdict and the variant: two reads could straddle a write and disagree, and
+    #    a variant-less `logged_out` is precisely what the runner's own alert treats as impossible
+    #    ("the session itself never produces one, so None means the CHANNEL lost it").
+    records = edges.records(run_root, iid, agent, env)
+    sensed = pane_state.classify_transcript(records, agent=agent)
     if sensed == "logged_out":
-        variant = pane_state.transcript_auth_death(edges.records(run_root, iid, agent, env))
+        variant = pane_state.transcript_auth_death(records)
         return Outcome(LOGGED_OUT, "logged_out", auth=variant,
                        detail="this session's own record shows its auth is dead in-session (%s): "
                               "every turn is refused, so a nudge cannot be answered"
@@ -185,6 +208,18 @@ def nudge(run_root, iid, message, agent="claude", env=None, edges=None):
         return Outcome(AT_DIALOG, "at_dialog",
                        detail="this session raised its own question and is waiting on an answer — "
                               "live, not stuck; nothing was typed")
+    if sensed == "unknown" and pane_state.reads_transcript(agent):
+        # This agent keeps a record and this session has not written one — so it has taken no turn
+        # yet, and the thing a session sits in before its first turn is a DIALOG (the first-run
+        # directory-trust prompt, which pretrust does not always reach — #345). Typing there presses
+        # Enter on a selection. The host's process facts say the pane is alive, which is exactly
+        # what made the old screen classifier's `menu` refusal load-bearing; with no screen to read,
+        # "it has said nothing at all" is the honest stand-in, and it costs a healthy worker nothing
+        # because a real one records its brief as its first turn.
+        return Outcome(DEFERRED, "no_record",
+                       detail="this session has written no record yet, so nothing can say whether "
+                              "it is at a first-run dialog — deferring rather than pressing Enter "
+                              "into one")
 
     # 5. The send. `delivery` has no default at the doorway on purpose: a send nobody can check is
     #    the exact operation that returned rc=0 on 6/6 non-deliveries.
@@ -197,7 +232,10 @@ def nudge(run_root, iid, message, agent="claude", env=None, edges=None):
     try:
         host.send(session, message, delivery=oracle)
     except session_host.DeliveryUnproven as e:
-        return Outcome(DEFERRED, "unproven", detail=_bound(str(e)))
+        # NOT a plain defer: `send` submits the prompt and consults the oracle afterwards, so this
+        # branch means "it was typed and nothing confirmed it". Telling a caller otherwise is how an
+        # unbounded retry turns into re-submitting a real prompt into a live worker every tick.
+        return Outcome(UNPROVEN, "unproven", detail=_bound(str(e)))
     except session_host.HostError as e:
         return Outcome(FAILED, "send_failed", detail=_bound(str(e)))
     return Outcome(SENT, "idle")
@@ -220,6 +258,8 @@ def evidence_line(iid, outcome):
 _WHY = {
     FAILED: "the message could not be sent",
     DEFERRED: "deferring — nothing was typed",
+    UNPROVEN: "the prompt was submitted and nothing confirmed it arrived — caller must not re-send "
+              "blindly",
     DEAD: "the session is DEAD (the agent process is gone) — not typing; caller must restart",
     LOGGED_OUT: "session auth is DEAD in-session — not typing; caller must alert the owner",
     AT_DIALOG: "session is asking a question in-window — not typing; live, not stuck",

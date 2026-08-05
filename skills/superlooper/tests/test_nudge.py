@@ -16,8 +16,11 @@ What changed, and what deliberately did not:
   process facts: the pane shell has no live child. Same verdict, read from the OS.
 * DELIVERY. Was `rc=0` from cmux. Is now the wrapper's proven send: rc is never evidence, so an
   unproven prompt is a REFUSAL, not a silent success.
-* THE EXIT-CODE CONTRACT. Unchanged, all six codes, because the runner's branching is built on it
-  and every one of them was paid for by an incident.
+* THE EXIT-CODE CONTRACT. Every one of the six survives, because each was paid for by an incident
+  and collapsing any two is how the loop forgets which it is looking at. ONE is added: rc=7,
+  "submitted but unproven", because the wrapper types first and consults its oracle afterwards —
+  so that outcome is emphatically not rc=3's "nothing was typed", and a caller with an unbounded
+  retry must not treat it as such.
 """
 import nudge
 import session_host
@@ -54,7 +57,12 @@ class FakeOracle:
         return True
 
 
-def _edges(host=None, oracle=FakeOracle(), records=()):
+# What a session that has taken at least one turn has written. Every test that expects a SEND needs
+# one, because a session with no record at all is deferred (see the no_record test below).
+FIRST_TURN = [{"type": "user", "message": {"role": "user", "content": "your brief"}}]
+
+
+def _edges(host=None, oracle=FakeOracle(), records=FIRST_TURN):
     return nudge.Edges(host=lambda: host if host is not None else FakeHost(),
                        oracle=lambda *a, **k: oracle,
                        records=lambda *a, **k: list(records))
@@ -192,12 +200,25 @@ def test_an_advisory_never_grants_a_send_on_its_own(tmp_path):
 
 def test_an_unproven_delivery_is_a_refusal_not_a_send(tmp_path):
     # The heart of it: cmux's rc=0 was accepted as delivery and lied 6/6 times. Now the wrapper
-    # raises unless the oracle confirms, and a nudge that cannot be proven is deferred and retried.
+    # raises unless the oracle confirms, and a nudge that cannot be proven is never called a send.
     _lane(tmp_path)
     host = FakeHost(send=session_host.DeliveryUnproven("nothing proved this prompt was delivered"))
     out = _nudge(tmp_path, _edges(host))
-    assert out.code == nudge.DEFERRED and out.state == "unproven"
+    assert out.code == nudge.UNPROVEN and out.state == "unproven"
     assert "deliver" in out.detail.lower()
+
+
+def test_an_unproven_delivery_is_not_reported_as_nothing_typed(tmp_path):
+    """UNPROVEN must not collapse into DEFERRED, and the reason is concrete rather than pedantic.
+    `send` submits the prompt and consults the oracle AFTERWARDS, so this branch means "it was
+    typed and we cannot prove it arrived" — while rc=3 promises the opposite. A caller whose retry
+    is unbounded (the gate's one nudge per cause) reads rc=3 as "nothing happened, try again", and
+    would re-submit a real handback into a live worker every tick, forever."""
+    _lane(tmp_path)
+    host = FakeHost(send=session_host.DeliveryUnproven("nope"))
+    out = _nudge(tmp_path, _edges(host))
+    assert out.code != nudge.DEFERRED
+    assert host.sends, "the prompt really was handed to the host before the oracle refused it"
 
 
 def test_a_host_refusal_of_the_send_is_a_failure(tmp_path):
@@ -217,6 +238,28 @@ def test_an_agent_with_no_delivery_oracle_refuses_rather_than_sending_blind(tmp_
     out = _nudge(tmp_path, edges, agent="codex")
     assert out.code == nudge.FAILED and out.state == "no_oracle"
     assert not host.sends and "oracle" in out.detail.lower()
+
+
+def test_a_session_that_has_written_no_record_is_not_typed_into(tmp_path):
+    """The screen classifier refused on a MENU because Enter at a selection SELECTS. The host
+    exposes no screen, so the one case that still has a signal is this one: a session that has
+    written nothing has taken no turn, and what a session sits in before its first turn is the
+    first-run trust dialog. Costs a healthy worker nothing — a real one records its brief as its
+    first turn."""
+    _lane(tmp_path)
+    host = FakeHost()
+    out = _nudge(tmp_path, _edges(host, records=[]))
+    assert out.code == nudge.DEFERRED and out.state == "no_record"
+    assert not host.sends
+
+
+def test_an_agent_that_keeps_no_readable_record_is_not_deferred_for_it(tmp_path):
+    # "This session has written nothing yet" and "this agent keeps nothing we can read" are two
+    # different silences. Only the first is a reason to wait; the second is the oracle's refusal.
+    _lane(tmp_path)
+    host = FakeHost()
+    edges = nudge.Edges(host=lambda: host, oracle=lambda *a, **k: None, records=lambda *a, **k: [])
+    assert _nudge(tmp_path, edges, agent="codex").state == "no_oracle"
 
 
 # ------------------------------------------------------------------ the evidence line (#152/#174)

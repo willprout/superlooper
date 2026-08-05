@@ -453,12 +453,24 @@ def classify_screen(text, exited_marker=False, orchestrator=False, agent="claude
 #     was simply invisible, and invisible read as 'idle' = safe to send.
 #   * A session cannot TALK its way into a verdict. #151's fresh-review P1 had to fence the screen
 #     path with whole-line fullmatching because a worker rendering this very file read as a broken
-#     session. Here the fence is structural: only the agent's own refused turn carries
-#     `isApiErrorMessage`, and no amount of quoting produces one.
+#     session. Here the fence is on the SHAPE, not the words: only the agent's own refused turn is
+#     written as an `isApiErrorMessage` record, and no amount of quoting produces one. (Not a
+#     security boundary — the transcript is a file the session's own uid owns, so a worker that set
+#     out to forge one could. That is a different threat with far better targets available to it;
+#     what this buys is immunity to the ACCIDENT, which is what actually happened in #151.)
 
 # The tool whose open call means "this session raised its OWN question and is waiting" (i280). A
 # live, working lane — the caller must surface it, never escalate it.
 _QUESTION_TOOL = "AskUserQuestion"
+
+# The agents whose own record this module knows how to read. Asked by the caller so that "this
+# session has written nothing yet" can be told apart from "this agent keeps no record we can read"
+# — two very different silences, and only the first is a reason to wait.
+_TRANSCRIPT_AGENTS = ("claude",)
+
+
+def reads_transcript(agent):
+    return agent in _TRANSCRIPT_AGENTS
 
 
 def _blocks(record):
@@ -509,22 +521,41 @@ def transcript_auth_death(records):
 
 
 def transcript_at_dialog(records):
-    """Is an AskUserQuestion still unanswered? Paired by tool_use id, never by ordering.
+    """Is an AskUserQuestion still open RIGHT NOW? Paired by tool_use id, and self-clearing.
 
-    The id matters: a worker sitting at its own dialog is otherwise idle, but a rule that cleared
-    on "some tool_result arrived later" would be cleared by any unrelated call — and typing into an
-    open dialog SELECTS an option, which is the one thing this must never allow.
+    Two rules, and both were paid for:
+
+    * The id matters. A worker sitting at its own dialog is otherwise idle, and a rule that cleared
+      on "some tool_result arrived later" would be cleared by any unrelated call — while typing into
+      an open dialog SELECTS an option, the one thing this must never allow.
+    * A LATER TYPED PROMPT clears it, exactly as it clears an auth-death verdict. A dialog can be
+      left unanswered forever: the owner ignores it and types something else, and the tool_use sits
+      in the file with no matching result. A resting worker writes no new bytes, so that record
+      never scrolls out of the bounded tail — and without this rule the lane would read `at_dialog`
+      for the rest of its life, unreachable by any nudge. Real transcripts on this machine carry
+      exactly that shape (an unanswered call followed by thirteen further records).
+
+    "The most recent state decides" is the same rule `transcript_auth_death` follows, and it is what
+    makes reading a bounded TAIL sound for both.
     """
-    asked, answered = [], set()
+    open_ids = set()
     for record in records or []:
         if not isinstance(record, dict) or record.get("isSidechain"):
             continue
+        typed_prompt = False
         for block in _blocks(record):
             if block.get("type") == "tool_use" and block.get("name") == _QUESTION_TOOL:
-                asked.append(block.get("id"))
+                open_ids.add(block.get("id"))
             elif block.get("type") == "tool_result":
-                answered.add(block.get("tool_use_id"))
-    return any(tid not in answered for tid in asked)
+                open_ids.discard(block.get("tool_use_id"))
+            elif (block.get("type") == "text" and record.get("type") == "user"
+                  and not record.get("isMeta")):
+                typed_prompt = True
+        if typed_prompt:
+            # Somebody answered by talking instead. Whatever the session was waiting on, it is not
+            # waiting on it now.
+            open_ids.clear()
+    return bool(open_ids)
 
 
 def classify_transcript(records, exited_marker=False, agent="claude"):

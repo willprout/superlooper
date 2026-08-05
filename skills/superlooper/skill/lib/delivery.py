@@ -31,9 +31,11 @@ text we sent. Three deliberate exclusions:
 * NEVER the content of any reply. The spikes' methodological finding: two trivial-arithmetic
   answers were wrong that night, so an oracle that graded the answer would have reported a delivery
   failure for a prompt that was delivered perfectly.
-* NOT a `type: user` entry that is a tool RESULT or a SIDECHAIN. Both are recorded under the same
-  role, and a worker whose session `cat`s the runner log — or a subagent handed the same text —
-  would otherwise manufacture proof that the pane accepted a prompt nobody submitted.
+* NOT a `type: user` entry that is a tool RESULT, a SIDECHAIN, a META entry or a COMPACT SUMMARY.
+  All four are recorded under the same role and none of them is the pane accepting a prompt: a
+  worker whose session `cat`s the runner log, a subagent handed the same text, or a compaction
+  summarising an earlier turn back into the file would each otherwise manufacture proof that a
+  prompt nobody submitted had arrived.
 
 **What it must never do is guess.** Three answers, and the third is load-bearing: True (proven),
 False (we could read the transcript throughout and our prompt is not in it — the composer-drop
@@ -45,6 +47,8 @@ import json
 import os
 import re
 import time
+
+import identity
 
 # How long `landed` will wait for a transcript line that is still being flushed. `--wait` returning
 # "settled" is the host observing a lifecycle change, not the agent's JSONL hitting disk, and the
@@ -80,24 +84,37 @@ _WS = re.compile(r"\s+")
 def transcript_root(env=None):
     """Where THIS machine's worker transcripts live, or None when nothing resolves.
 
-    The ladder mirrors how the config dir actually reaches a session (issue #314):
+    Resolved through ``identity.worker_config_dir`` — the SAME derivation every spawn path uses,
+    not a second one. That is #314's own rule ("one canonical config-dir string per worker") and it
+    is load-bearing twice over:
 
-    1. ``CLAUDE_CONFIG_DIR`` — the agent's own variable, if this process is already inside a
-       session that has one;
-    2. ``SL_CLAUDE_CONFIG_DIR`` — what the LAUNCHER named for the pane;
-    3. ``SL_FLEET_CLAUDE_CONFIG_DIR`` — what the MACHINE assigns its workers, which is what the
-       runner's own environment carries;
-    4. ``$HOME/.claude`` — the default namespace, i.e. every machine that is not the fleet.
+    * It CANONICALISES. The engine's own suggested fleet value is ``~/.claude-fleet``; a resolver
+      that joined the raw string would hand ``os.listdir`` a literal ``~`` and find nothing, while
+      every worker ran happily under the expanded path. The oracle would then answer "cannot tell"
+      about a directory it never looked at — and "cannot tell" is a refusal, so the whole machine's
+      nudges would defer forever after really delivering their prompts. Silent, and it reads as a
+      healthy-session defer.
+    * It reads the MACHINE's assignment (``SL_FLEET_CLAUDE_CONFIG_DIR``) and nothing else. An
+      inherited ``CLAUDE_CONFIG_DIR`` / ``SL_CLAUDE_CONFIG_DIR` is exactly what the rest of the
+      engine refuses to trust in the runner's environment — the launch floor will not forward one,
+      `identity_probe_env` scrubs it, and `_script_env` pins its sibling empty — because a runner
+      started from inside a worker or debugger pane carries THAT session's namespace. Ranking them
+      first here would point the oracle at one credential namespace while every worker ran in
+      another.
 
-    None (rather than a guess) when there is no HOME and no assignment: a guessed root would make
-    the oracle answer "cannot tell" about a directory it never looked at, and "cannot tell" is a
-    refusal — so the guess would cost real nudges.
+    Falls back to ``$HOME/.claude``, which is the namespace of every machine that is not the fleet.
+    None (rather than a guess) when there is no HOME and no assignment, for the same reason the
+    canonicalisation matters: a guessed root costs real nudges.
     """
     env = os.environ if env is None else env
-    for name in ("CLAUDE_CONFIG_DIR", "SL_CLAUDE_CONFIG_DIR", "SL_FLEET_CLAUDE_CONFIG_DIR"):
-        value = env.get(name)
-        if isinstance(value, str) and value.strip():
-            return os.path.join(value.strip(), PROJECTS_DIRNAME)
+    assigned, problem = identity.worker_config_dir(env)
+    if assigned and not problem:
+        return os.path.join(assigned, PROJECTS_DIRNAME)
+    # A configured-but-unusable assignment is NOT quietly downgraded to "the default namespace":
+    # that is the one thing #314 says must never happen, and reading the operator's own transcripts
+    # instead of the fleet's would make the oracle answer about the wrong sessions entirely.
+    if problem:
+        return None
     home = env.get("HOME")
     if not isinstance(home, str) or not home.strip():
         return None
@@ -280,7 +297,14 @@ def _is_our_prompt(line, needle):
         rec = json.loads(line)
     except ValueError:
         return False                      # a half-flushed line is not evidence; the poll retries
-    if not isinstance(rec, dict) or rec.get("type") != "user" or rec.get("isSidechain"):
+    if not isinstance(rec, dict) or rec.get("type") != "user":
+        return False
+    # Every flag here marks a `type: user` entry that is NOT the pane accepting a typed prompt.
+    # `isSidechain` is a subagent's conversation inside the same file; `isMeta` is the harness
+    # talking to itself; `isCompactSummary` is a PROSE SUMMARY of the earlier conversation, which
+    # can quote a previous prompt of ours verbatim — and landing inside the mark→landed window it
+    # would prove a delivery that never happened, which is the one direction this must never fail.
+    if any(rec.get(flag) for flag in ("isSidechain", "isMeta", "isCompactSummary")):
         return False
     message = rec.get("message")
     if not isinstance(message, dict) or message.get("role") != "user":

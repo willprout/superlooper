@@ -67,7 +67,13 @@ def _x(path, body):
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _setup(tmp_path, iid="i1", records=()):
+# What every session that has taken a turn has written. Tests that expect a SEND need one: a
+# session with no record at all is deferred, because the thing a session sits in before its first
+# turn is a first-run dialog and pressing Enter at one SELECTS.
+FIRST_TURN = {"type": "user", "message": {"role": "user", "content": "your brief"}}
+
+
+def _setup(tmp_path, iid="i1", records=(FIRST_TURN,)):
     """A lane with a recorded session, a live pane process, and a transcript to prove against."""
     run_root = tmp_path / "run"
     for d in ("state/panes", "state/exited", "state/sessions"):
@@ -176,11 +182,23 @@ def test_a_dropped_submission_is_refused_however_cheerful_the_rc(tmp_path):
     cannot confirm it — and an unproven prompt is a REFUSAL, not a delivered nudge."""
     rig = _setup(tmp_path)
     r = _run(*rig, over={"STUB_DROP_SUBMISSION": "1"})
-    assert r.returncode == 3, f"an unproven send must defer, got {r.returncode}: {r.stderr}"
+    # rc=7, NOT rc=3: the prompt really was submitted, so a caller that reads this as "nothing was
+    # typed" would re-submit into a live worker on every tick of an unbounded retry.
+    assert r.returncode == 7, f"an unproven send must be rc=7, got {r.returncode}: {r.stderr}"
     assert "state=unproven" in r.stderr
 
 
 # ------------------------------------------------------------------ the refusals
+
+def test_a_session_that_has_written_no_record_is_not_typed_into(tmp_path):
+    # The pre-first-turn dialog. Nothing on either surface says a fresh pane is at the trust prompt
+    # rather than at an empty composer, and pressing Enter at a selection SELECTS — so the honest
+    # stand-in for the retired `menu` refusal is "it has said nothing at all yet".
+    rig = _setup(tmp_path, records=())
+    r = _run(*rig)
+    assert r.returncode == 3 and "state=no_record" in r.stderr
+    assert not any(c.startswith("agent prompt") for c in _calls(rig[2]))
+
 
 def test_the_exited_marker_refuses_to_type(tmp_path):
     # The load-bearing safety: typing into a pane whose agent is gone would run the message as a
