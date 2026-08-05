@@ -51,6 +51,8 @@ agent args at all.
 4    THIS session's own environment cannot authenticate to GitHub
 5    the RUNNER's environment cannot authenticate — a channel fault, the queue holds
 6    THIS session's own environment is poisoned and the floor could not clean it
+7    THIS session holds the wrong Anthropic account (or none, or an API key)
+8    the RUNNER's environment holds the wrong Anthropic account — a channel fault
 64   the configured agent is not one this stack can launch (repo-wide, not one issue's)
 ===  ==================================================================================
 
@@ -66,6 +68,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+import identity
 import loopstate
 import sanitize
 import session_host
@@ -85,6 +88,12 @@ BASE_MISSING = 3
 AUTH_DEAD = 4
 AUTH_DEAD_RUNNER = 5
 ENV_POISONED = 6
+# The Anthropic half of the same pair (#314). Split from 4/5 for exactly the reason those two are
+# split from each other: the remedies are different sentences to different people (`gh auth login`
+# versus "this session is on the wrong subscription"), and a memo that names the wrong one sends
+# the owner to repair something that is not broken.
+CLAUDE_IDENTITY = 7
+CLAUDE_IDENTITY_RUNNER = 8
 UNSUPPORTED_AGENT = 64
 
 AGENTS = ("claude", "codex")
@@ -96,6 +105,12 @@ AGENTS = ("claude", "codex")
 # release is poison the day it appears, and a list would learn about it from a bill.
 _POISON_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_")
 _POISON_NAMES = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "XDG_CONFIG_HOME")
+
+# The identity contract's two agent-owned variables (#314). NOT poison — the fleet ASSIGNS the
+# config dir, deliberately — but never forwarded either: an inherited one is a credential namespace
+# nobody chose, and the whole contract is that identity is assigned rather than picked up. The
+# session's own floor is what refuses them; this only keeps the launcher from being the source.
+_IDENTITY_VARS = (identity.CONFIG_DIR_VAR, identity.REDIRECT_VAR)
 
 # Defense in depth beside the fence (#305). The wrapper strips these too, and the host injects its
 # own pane-identity vars whatever anyone passes — which is precisely why the token, and not this,
@@ -165,6 +180,11 @@ class Spec:
     expect_gh_login: str = None          # None -> resolve it here, in the runner's own environment
     gh_bin: str = ""
     claude_bin: str = ""                 # #303: named ONLY when this launcher actually has a pin
+    # #314. None -> read the machine's own assignment (SL_FLEET_CLAUDE_CONFIG_DIR); "" -> none.
+    # A canonical absolute string is derived from it ONCE, here, and every spawn path is handed
+    # that same string byte for byte — the credential namespace is a hash of it as written.
+    claude_config_dir: str = None
+    expect_claude_account: str = ""      # an operator PIN (an orgId); else read from the dir above
     session_name: str = ""
     label: str = ""
     verify_seconds: int = _VERIFY_SECONDS
@@ -300,6 +320,64 @@ def _launch(spec, host, edges):
             "[%s] Run `gh auth login --hostname github.com` as the account that owns the loop "
             "repo. NOT launching; no session was created." % iid]))
 
+    # ---- the identity env contract (issue #314) --------------------------------------------
+    # ONE derivation, here, for every spawn path — because the credential namespace `claude` uses
+    # is `sha256` of the CLAUDE_CONFIG_DIR string AS WRITTEN, so two spellings of one directory are
+    # two identities and the wrong one presents as a LOGGED-OUT session rather than as an error
+    # (#300 landmine 1). Deriving it per caller is how that drift would arrive.
+    #
+    # Ordered beside the gh read and before the worktree for the same reason: a refusal here must
+    # cost no orphan pane and no leftover checkout.
+    probe_base = spec.probe_env if spec.probe_env is not None else os.environ
+    config_dir, problem = identity.resolve_config_dir(spec.claude_config_dir, probe_base)
+    if problem:
+        return Result(CLAUDE_IDENTITY_RUNNER, "\n".join([
+            "[%s] CLAUDE IDENTITY (runner env): this machine's fleet config dir cannot be used — "
+            "%s" % (iid, problem),
+            "[%s] Set %s to one canonical absolute path (suggested: %s), or unset it to run "
+            "workers on the machine's default Claude login. NOT launching; no session was created."
+            % (iid, identity.FLEET_DIR_VAR, identity.SUGGESTED_FLEET_DIR)]))
+    # The expected ACCOUNT, resolved once here and handed down, exactly as the gh login is: the
+    # session's own assert needs something to assert against, and a second-hand answer proves
+    # nothing about this launch.
+    #
+    # ONLY when this machine has actually assigned an identity (a config dir, or an operator's
+    # pinned orgId). With neither, "the intended account" is by definition whatever login the
+    # machine's default config dir holds — the launcher and the session would be reading the same
+    # namespace by construction, so the comparison would cost every launch a subprocess to
+    # discover something it already knew. The session's own assert stays POSITIVE either way: it
+    # still requires logged-in, on a subscription, never on an API key.
+    expect_account = str(spec.expect_claude_account or "").strip()
+    if config_dir or expect_account:
+        claude_bin, why = spec.claude_bin, None
+        if not claude_bin:
+            claude_bin, why = identity.resolve_claude(probe_base)
+        if not claude_bin:
+            # NAMED, not folded into "the account could not be read": the fault is the binary pin
+            # (#303), the remedy is an install, and a memo that said "log in again" would send the
+            # owner to repair a credential that is fine. Unlike the session-side assert this one
+            # cannot defer to the pin's own refusal — that refusal happens in a pane, and this
+            # launch has not created one.
+            return Result(CLAUDE_IDENTITY_RUNNER, "\n".join([
+                "[%s] CLAUDE IDENTITY (runner env): which Anthropic account a session would hold "
+                "cannot be established because %s" % (iid, why),
+                "[%s] Install Claude Code's standalone native build (`claude install stable`) or "
+                "point SL_CLAUDE at a real binary. NOT launching; no session was created." % iid]))
+        status = identity.read_status(
+            edges, claude_bin, config_dir=config_dir,
+            env=identity_probe_env(spec.probe_env, config_dir=config_dir))
+        problem = identity.account_problem(status, expect_account or None)
+        if problem:
+            # A CHANNEL fault (rc=8): every launch on this machine will read the same account, so
+            # charging one issue a park for it would walk the whole approved queue into parks over
+            # a single machine-level fault — the 2026-07-09 storm's shape with a new cause.
+            return Result(CLAUDE_IDENTITY_RUNNER, "\n".join([
+                "[%s] CLAUDE IDENTITY (runner env): %s" % (iid, problem),
+                "[%s] Repair it in a supervised window (`claude` under %s), then re-approve. NOT "
+                "launching; no session was created."
+                % (iid, config_dir or "the machine's default config dir")]))
+        expect_account = status.get("orgId")
+
     # ---- the brief, BEFORE anything is created ---------------------------------------------
     # Ordered here for the same reason the identity read is: a refusal must cost no leftover
     # checkout, no new branch and no trust entry. (The cmux launcher checked it here too; moving it
@@ -393,7 +471,8 @@ def _launch(spec, host, edges):
     host = host if host is not None else session_host.SessionHost()
     name = spec.session_name or ("superlooper %s%s" % (iid, " (%s)" % branch if branch else ""))
     pane_env = pane_environment(spec, iid, session_id, resume, expect_login, token,
-                                session_name=name)
+                                session_name=name, config_dir=config_dir,
+                                expect_account=expect_account)
     try:
         session = host.spawn(name=iid, cwd=worktree, env=pane_env, kind=spec.agent,
                              label=spec.label or name,
@@ -488,7 +567,7 @@ def _make_worktree(spec, edges, iid, worktree, branch, base):
 
 
 def pane_environment(spec, iid, session_id, resume, expect_login, token,
-                     session_name=None):
+                     session_name=None, config_dir=None, expect_account=None):
     """Everything the in-pane floor is handed, and nothing else.
 
     A pane inherits NOTHING useful from this launcher — its shell is spawned by the host and
@@ -507,7 +586,7 @@ def pane_environment(spec, iid, session_id, resume, expect_login, token,
     env = {}
     for key, value in (spec.forwarded_env or {}).items():
         key = str(key)
-        if key.startswith(_HOST_ENV_PREFIX) or is_poison(key):
+        if key.startswith(_HOST_ENV_PREFIX) or is_poison(key) or key in _IDENTITY_VARS:
             continue
         env[key] = str(value)
     env.update({
@@ -527,6 +606,15 @@ def pane_environment(spec, iid, session_id, resume, expect_login, token,
         "SL_SESSION_ID": session_id,
         "SL_RESUME": "1" if resume else "",
         "SL_EXPECT_GH_LOGIN": expect_login,
+        # The identity contract (#314), NAMED on every launch INCLUDING the empty case — the same
+        # discipline SL_EXPECT_GH_LOGIN follows. "This machine assigns no config dir" is then
+        # something the launcher SAID, sitting in the pane environment a test or an operator can
+        # read, rather than something the floor inferred from a variable that was not there.
+        # `CLAUDE_CONFIG_DIR` itself is deliberately NOT set here: it is the AGENT's own variable,
+        # so the pane's floor is what exports it (the agent-boundary rule), one step later and
+        # inside the session's own shell.
+        identity.ASSIGN_VAR: str(config_dir or ""),
+        identity.EXPECT_VAR: str(expect_account or ""),
         "SL_GH": spec.gh_bin or "gh",
         "SL_START_TOKEN": token,
         # The pane knows no engine paths, and its shim must hand the typed agent verb to a real
@@ -544,9 +632,9 @@ def pane_environment(spec, iid, session_id, resume, expect_login, token,
     return env
 
 
-def identity_probe_env(base=None):
-    """The environment the launcher's own `gh api user` read runs in — ONE variable different from
-    ours, and that variable is the whole point (issue #299).
+def identity_probe_env(base=None, config_dir=None):
+    """The environment the launcher's own identity reads run in — the differences from ours ARE the
+    point (issues #299 and #314).
 
     `XDG_CONFIG_HOME` is where `gh` resolves its config dir from, and the session's floor REMOVES
     it (start-session.sh, issue #301). If this side kept an inherited value while the worker
@@ -557,12 +645,22 @@ def identity_probe_env(base=None):
     the worker was never going to have. Dropping it here makes both sides read the same config dir
     by construction, which is exactly what the cmux launcher did and why.
 
-    Nothing else is touched: PATH, HOME and the keychain context a `gh` read legitimately needs
-    must survive (the c25 landmine — overriding HOME breaks macOS keychain OAuth outright).
+    The `claude` half is the same argument one variable over (#314). The session's floor SCRUBS the
+    poison and REFUSES an inherited credential redirect, so a probe that kept either would measure
+    a namespace the worker will never use: an inherited ANTHROPIC_API_KEY makes this read answer
+    `loggedIn: true` on an API key (measured), and the launch would be refused for a fault that
+    exists only on this side of the spawn. The config dir is then set — or removed outright, never
+    emptied, because an empty CLAUDE_CONFIG_DIR is its own credential namespace rather than "the
+    default one".
+
+    Nothing else is touched: PATH, HOME and the keychain context these reads legitimately need must
+    survive (the c25 landmine — overriding HOME breaks macOS keychain OAuth outright).
     """
     env = dict(os.environ if base is None else base)
-    env.pop("XDG_CONFIG_HOME", None)
-    return env
+    for name in list(env):
+        if is_poison(name):                 # includes XDG_CONFIG_HOME, the #299 gh half
+            env.pop(name, None)
+    return identity.probe_env(env, config_dir)
 
 
 def is_poison(name):
@@ -575,7 +673,7 @@ def _prepare_state(spec, iid, session_id, token):
     """Everything that must exist (or must NOT survive) before a session starts."""
     state = os.path.join(spec.run_root, "state")
     for sub in ("activity", "panes", "started", "blocked", "exited", "awaiting", "sessions",
-                "authfail", "envfail", "mail", "status", "launch_stderr"):
+                "authfail", "envfail", "identityfail", "mail", "status", "launch_stderr"):
         os.makedirs(os.path.join(state, sub), exist_ok=True)
     os.makedirs(os.path.join(spec.run_root, "reports"), exist_ok=True)
 
@@ -608,7 +706,7 @@ def _prepare_state(spec, iid, session_id, token):
     # take an OVERLAPPING launch's live marker with it, and that launch would then report a
     # delivery fault for an auth one.
     cutoff = time.time() - _MARKER_STALE_MINUTES * 60
-    for sub in ("authfail", "envfail", "started"):
+    for sub in ("authfail", "envfail", "identityfail", "started"):
         directory = os.path.join(state, sub)
         for entry in os.listdir(directory) if os.path.isdir(directory) else []:
             if not entry.startswith("%s." % iid):
@@ -647,9 +745,11 @@ def _refusal_marker(spec, iid, token):
     The environment is read BEFORE auth on purpose: a poisoned environment is causally UPSTREAM of
     the auth death it can produce (an inherited XDG_CONFIG_HOME is exactly how `gh` dies), so if
     both were ever stamped the environment is the honest reading — and "re-login" would be a
-    confidently wrong remedy for it.
+    confidently wrong remedy for it. Identity is read LAST for the same reason from the other end:
+    the floor runs it last, after the environment it depends on has been proven clean, so a marker
+    here is a real account fault rather than an environment one wearing its costume.
     """
-    for kind in ("envfail", "authfail"):
+    for kind in ("envfail", "authfail", "identityfail"):
         path = os.path.join(spec.run_root, "state", kind, "%s.%s" % (iid, token))
         if os.path.exists(path):
             try:
@@ -687,6 +787,13 @@ def _self_refusal(spec, iid, token, edges=None, seconds=0.0):
             "[%s] %s" % (iid, why or "the session reported no detail"),
             "[%s] Nothing is running; this is an environment fault, not a launch-delivery one."
             % iid]))
+    if kind == "identityfail":
+        return Result(CLAUDE_IDENTITY, "\n".join([
+            "[%s] CLAUDE IDENTITY REFUSED in the session's own environment — the flight was "
+            "refused before it started." % iid,
+            "[%s] %s" % (iid, why or "the session reported no detail"),
+            "[%s] Nothing is running; this session would have worked on somebody else's "
+            "subscription, or on none." % iid]))
     return Result(AUTH_DEAD, "\n".join([
         "[%s] GH AUTH DEAD in the session's own environment — the flight was refused before it "
         "started." % iid,

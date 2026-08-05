@@ -27,7 +27,29 @@ START = os.path.join(REPO_ROOT, "skill", "bin", "start-session.sh")
 # That file is the only honest oracle for a scrub.
 # It also records its own $0 when SL_TEST_ARGV0 names a file (issue #303): WHICH claude binary the
 # launcher resolved is invisible in argv, and it is the whole subject of the binary-pin ladder.
+#
+# It also answers `auth status` (issue #314), because the floor now asks the SAME binary which
+# Anthropic account this session holds before it starts the agent. The answer REPRODUCES the real
+# credential-namespace rule rather than paraphrasing it: `claude` keys its keychain item on
+# `sha256(CLAUDE_CONFIG_DIR)`, so a config dir that is not the provisioned one — including the same
+# directory spelled with a trailing slash — reports LOGGED OUT rather than erroring (#300). That is
+# what STUB_CLAUDE_LOGGED_IN_DIR models. With neither variable set, both sides are "" and the stub
+# is a healthy default-config-dir login, which is what every pre-#314 case in this file needs.
+STUB_AUTH_PRELUDE = (
+    'if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then\n'
+    '  if [ -n "${STUB_CLAUDE_STATUS:-}" ]; then\n'
+    '    printf "%s\\n" "$STUB_CLAUDE_STATUS"; exit 0\n'
+    '  fi\n'
+    '  if [ "${CLAUDE_CONFIG_DIR:-}" != "${STUB_CLAUDE_LOGGED_IN_DIR:-}" ]; then\n'
+    '    printf \'{"loggedIn": false, "authMethod": "none"}\\n\'; exit 0\n'
+    '  fi\n'
+    '  printf \'{"loggedIn": true, "authMethod": "claude.ai", "email": "loop@example.com",'
+    ' "orgId": "%s", "subscriptionType": "max"}\\n\' "${STUB_CLAUDE_ORG:-fleet-org}"\n'
+    '  exit 0\n'
+    'fi\n')
+
 STUB_AGENT = ('#!/usr/bin/env bash\n'
+              + STUB_AUTH_PRELUDE +
               'printf "%s\\n" "$@" > "$SL_TEST_ARGS"\n'
               '[ -n "${SL_TEST_ARGV0:-}" ] && printf "%s\\n" "$0" > "$SL_TEST_ARGV0"\n'
               '[ -n "${SL_TEST_ENV:-}" ] && env > "$SL_TEST_ENV"\n'
@@ -325,7 +347,11 @@ def _run_start_capture(tmp_path, stub_body, *, agent="claude", model=None, extra
     return run_root / "state" / "launch_stderr" / "i1", args_file
 
 
+# The auth prelude rides on EVERY custom stub below, not as boilerplate but because the floor now
+# asks THIS binary which account the session holds before it starts the agent (#314) — a stub that
+# answered nothing would refuse the launch, and these cases are about what happens after it starts.
 DYING_STUB = ('#!/usr/bin/env bash\n'
+              + STUB_AUTH_PRELUDE +
               'echo "error: unknown option \'--effort\'" >&2\n'
               'echo "run claude --help for usage" >&2\n'
               'exit 3\n')
@@ -343,6 +369,7 @@ def test_launch_stderr_tail_is_bounded(tmp_path):
     # A chatty/looping launch must not grow the captured tail without bound; the MOST RECENT lines
     # (which carry the actual error) are what survive.
     noisy = ('#!/usr/bin/env bash\n'
+             + STUB_AUTH_PRELUDE +
              'for i in $(seq 1 5000); do echo "noise line $i" >&2; done\n'
              'echo "FINAL: the real error is here at the tail" >&2\n'
              'exit 3\n')
@@ -417,7 +444,9 @@ def test_a_stale_tail_does_not_bleed_into_a_later_healthy_launch(tmp_path):
 _HOOK = os.path.join(REPO_ROOT, "skill", "bin", "pretooluse-hook.sh")
 
 HOOK_PROBE_AGENT = """#!/usr/bin/env bash
-# stands in for `claude`: runs the real PreToolUse hook and records what it decided.
+# stands in for `claude`: answers the #314 identity assert, then runs the real PreToolUse hook and
+# records what it decided.
+""" + STUB_AUTH_PRELUDE + """
 payload='{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{}}'
 out="$(printf '%s' "$payload" | bash "$SL_TEST_HOOK")"
 { printf 'SL_ATTENDED=[%s]\\n' "${SL_ATTENDED-<unset>}"
@@ -606,6 +635,152 @@ def test_the_assert_also_gates_the_codex_agent(tmp_path):
                                      extra_env={"STUB_GH_LOGIN": "DEAD"})
     assert r.returncode == AUTH_RC, f"expected rc={AUTH_RC}, got {r.returncode}\n{r.stderr}"
     assert not args_file.exists()
+
+
+# ---- the identity env contract, in the worker's OWN env (issue #314) ---------------------------
+# The credential namespace a `claude` session uses is `sha256` of CLAUDE_CONFIG_DIR AS WRITTEN, so
+# the isolation is only as good as the string — and the failure presents as a LOGGED-OUT session
+# rather than as an error (#300). These drive the real floor with a stub `claude` that reproduces
+# that rule: a config dir other than the provisioned one answers logged-out, exactly as the real
+# binary does when it looks in a different keychain item.
+IDENTITY_RC = 7
+_FLEET_DIR = "/tmp/sl-i314-fleet"
+_FLEET_ORG = "fleet-org"
+
+
+def _identityfail_markers(run_root):
+    d = run_root / "state" / "identityfail"
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def _fleet_env(**over):
+    """A pane environment on a machine that HAS assigned a fleet config dir."""
+    env = {"SL_CLAUDE_CONFIG_DIR": _FLEET_DIR, "SL_EXPECT_CLAUDE_ACCOUNT": _FLEET_ORG,
+           "STUB_CLAUDE_LOGGED_IN_DIR": _FLEET_DIR, "STUB_CLAUDE_ORG": _FLEET_ORG}
+    env.update(over)
+    return env
+
+
+def test_the_assigned_config_dir_becomes_the_agents_own_environment(tmp_path):
+    """The launcher NAMES it as SL_*; the floor is what turns it into the agent's own variable
+    (the agent-boundary rule), and only the agent's recorded env can prove it got there."""
+    r, _run_root, args_file = _start(tmp_path, extra_env=_fleet_env())
+    assert r.returncode == 0, r.stderr
+    assert args_file.exists(), "an assigned, logged-in identity must reach the agent"
+    env = _recorded_env(tmp_path / "claude_env")
+    assert env["CLAUDE_CONFIG_DIR"] == _FLEET_DIR
+
+
+def test_no_spelling_of_one_directory_ever_produces_a_second_identity(tmp_path):
+    """The DoD's own test. #300 measured five spellings of one dir producing five credential
+    namespaces; the contract is that at most ONE of them can ever reach a session — the canonical
+    one — and every other spelling is refused rather than quietly becoming its own identity."""
+    reached = set()
+    for i, spelling in enumerate([_FLEET_DIR, _FLEET_DIR + "/", _FLEET_DIR + "//",
+                                  "/tmp/./sl-i314-fleet", "/tmp//sl-i314-fleet",
+                                  "sl-i314-fleet"]):
+        case = tmp_path / ("spell%d" % i)
+        case.mkdir()
+        r, _run_root, args_file = _start(case, extra_env=_fleet_env(
+            SL_CLAUDE_CONFIG_DIR=spelling))
+        if r.returncode == 0 and args_file.exists():
+            reached.add(_recorded_env(case / "claude_env").get("CLAUDE_CONFIG_DIR"))
+        else:
+            assert r.returncode == IDENTITY_RC, (spelling, r.returncode, r.stderr)
+    assert reached == {_FLEET_DIR}, \
+        "exactly one spelling may reach a session, and it is the canonical one: %r" % (reached,)
+
+
+def test_a_config_dir_this_session_was_never_assigned_is_refused(tmp_path):
+    """Identity ASSIGNED, never inherited (claim c3). The pane's shell sources the operator's rc
+    files, so a CLAUDE_CONFIG_DIR from there is a credential namespace nobody chose."""
+    r, run_root, args_file = _start(tmp_path, extra_env={"CLAUDE_CONFIG_DIR": _FLEET_DIR,
+                                                         "SL_START_TOKEN": "TOK"})
+    assert r.returncode == IDENTITY_RC, f"got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists()
+    assert _identityfail_markers(run_root) == ["i1.TOK"]
+    assert "CLAUDE_CONFIG_DIR" in (run_root / "state" / "identityfail" / "i1.TOK").read_text()
+
+
+def test_an_inherited_credential_redirect_is_refused_with_a_memo(tmp_path):
+    """#300 landmine 2, the sharpest one: set-but-EMPTY collapses the namespace back to the
+    owner's unsuffixed default, so the fleet silently spends the owner's subscription. Refused,
+    never passed through and never quietly scrubbed — somebody's environment is exporting it, and
+    only a memo gets that found."""
+    r, run_root, args_file = _start(tmp_path, extra_env=_fleet_env(
+        CLAUDE_SECURESTORAGE_CONFIG_DIR="", SL_START_TOKEN="TOK"))
+    assert r.returncode == IDENTITY_RC, f"got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists(), "a redirected session must never reach the agent"
+    memo = (run_root / "state" / "identityfail" / "i1.TOK").read_text()
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in memo and "EMPTY" in memo
+    # A non-empty inherited value is the same refusal with a different sentence — #300's third row
+    # is a deliberate escape hatch, and one nobody assigned is one nobody chose.
+    r, _run_root, args_file = _start(tmp_path / "b", extra_env=_fleet_env(
+        CLAUDE_SECURESTORAGE_CONFIG_DIR="/somewhere/else"))
+    assert r.returncode == IDENTITY_RC
+
+
+def test_a_logged_out_config_dir_is_refused_rather_than_parked_at_a_login_screen(tmp_path):
+    r, _run_root, args_file = _start(tmp_path, extra_env=_fleet_env(
+        STUB_CLAUDE_LOGGED_IN_DIR="/some/other/dir"))
+    assert r.returncode == IDENTITY_RC, f"got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists()
+    assert "not logged in" in r.stderr
+
+
+def test_an_api_key_environment_is_refused_although_it_reports_logged_in(tmp_path):
+    """MEASURED against the real binary (2.1.222, 2026-08-04): with ANTHROPIC_API_KEY exported,
+    `claude auth status` answers `loggedIn: true` with null org and subscription. A floor that
+    stopped at `loggedIn` would green-light the exact billing flip #301 exists to prevent."""
+    on_key = ('{"loggedIn": true, "authMethod": "claude.ai", "apiKeySource": "ANTHROPIC_API_KEY",'
+              ' "email": null, "orgId": null, "subscriptionType": null}')
+    r, _run_root, args_file = _start(tmp_path, extra_env=_fleet_env(STUB_CLAUDE_STATUS=on_key))
+    assert r.returncode == IDENTITY_RC, f"got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists()
+    assert "API key" in r.stderr
+
+
+def test_a_stranger_account_is_refused_even_though_the_cli_answers_happily(tmp_path):
+    """POSITIVE: absence of an error is not identity. This CLI is logged in, on a subscription,
+    and answering — just not as the account this lane's capacity was planned against."""
+    r, _run_root, args_file = _start(tmp_path, extra_env=_fleet_env(STUB_CLAUDE_ORG="other-org"))
+    assert r.returncode == IDENTITY_RC, f"got {r.returncode}\n{r.stderr}"
+    assert not args_file.exists()
+    assert "other-org" in r.stderr and _FLEET_ORG in r.stderr
+
+
+def test_an_identity_refusal_stamps_no_sentinel_and_no_exited_marker(tmp_path):
+    """The sentinel means "a worker started here" and the exited marker means "a worker WAS running
+    and its process is gone" — the runner recovers from the second by RELAUNCHING, straight back
+    onto the same wrong account. A refused session was never a worker."""
+    r, run_root, _args = _start(tmp_path, extra_env=_fleet_env(STUB_CLAUDE_ORG="other-org",
+                                                               SL_START_TOKEN="TOK"))
+    assert r.returncode == IDENTITY_RC
+    assert not (run_root / "state" / "started" / "i1.TOK").exists()
+    assert not (run_root / "state" / "exited" / "i1").exists()
+
+
+def test_a_machine_that_assigns_nothing_still_asserts_the_account_positively(tmp_path):
+    """Production's path: no config dir anywhere, the session runs on the machine's default Claude
+    login exactly as before — and the assert still requires a real subscription seat."""
+    r, _run_root, args_file = _start(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert args_file.exists()
+    assert "CLAUDE_CONFIG_DIR" not in _recorded_env(tmp_path / "claude_env"), \
+        "an unassigned machine must hand the agent no config dir at all — an empty one is its own " \
+        "credential namespace, not 'the default'"
+    r, _run_root, args_file = _start(tmp_path / "b", extra_env={
+        "STUB_CLAUDE_STATUS": '{"loggedIn": false, "authMethod": "none"}'})
+    assert r.returncode == IDENTITY_RC, "a logged-out default dir is still a refused launch"
+
+
+def test_the_codex_branch_is_not_gated_on_a_claude_account(tmp_path):
+    """CLAUDE_CONFIG_DIR is Claude Code's own spelling and codex has no equivalent, so the assert
+    sits BELOW the two agent-independent floors rather than beside them (agent-boundary rule)."""
+    r, _run_root, args_file = _start(tmp_path, agent="codex", extra_env={
+        "STUB_CLAUDE_STATUS": '{"loggedIn": false, "authMethod": "none"}'})
+    assert r.returncode == 0, r.stderr
+    assert args_file.exists(), "a codex launch must not be refused over a claude account"
 
 
 # ---- the env scrub + post-scrub assert, in the worker's OWN env (issue #301) --------------------

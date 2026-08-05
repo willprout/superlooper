@@ -148,6 +148,42 @@ paid for by a measured failure:
    default — reports **different `orgId`s**. `orgId` is the billing entity, so that is the
    measurement; a matching email with different orgs is not the separation the ruling asked for
    either. The owner's dir being unreadable is not the fleet's failure and is not reported as one.
+   The single-account half of that verdict is `identity.account_problem`, shared with the launch
+   seam below — so it also refuses a reading that is `loggedIn: true` **on an API key**, which is
+   what the real binary answers when `ANTHROPIC_API_KEY` is exported (measured 2026-08-04).
+
+The dir this block judges is the one a **launch would actually assign**: it is read from
+`SL_FLEET_CLAUDE_CONFIG_DIR` through the same function the spawn seam uses, and an unset variable
+is a RED line rather than a default. A green identity for a directory no worker is pointed at would
+be the same confident lie in reverse.
+
+## The identity env contract at the spawn seam (issue #314)
+
+Setting the fleet's config dir on the machine is what makes the block above load-bearing, and the
+launch path is where it is enforced:
+
+* **one canonical string, derived once.** `lib/launch.py` reads `SL_FLEET_CLAUDE_CONFIG_DIR`,
+  canonicalises it (`~` expanded, trailing slash / `//` / `/./` collapsed, relative refused) and
+  names it in every pane as `SL_CLAUDE_CONFIG_DIR`. Both spawn paths — `i<N>` and `d<N>` — share
+  that one derivation, so they cannot drift into two spellings of one directory.
+* **the pane's floor is what assigns it.** `bin/start-session.sh` exports `CLAUDE_CONFIG_DIR` from
+  that value inside the session's own shell (the agent's variable belongs on the agent side of the
+  boundary), then runs `python3 lib/identity.py --assert` in that same environment.
+* **the assert is positive and strict** (owner ruling, 2026-08-04): logged in, on a subscription,
+  never on an API key, and on the expected `orgId`. Anything else refuses the launch before the
+  delivery sentinel — `state/identityfail/<id>.<token>`, exit 7 — so the launcher tears the pane
+  down at once with a memo naming the account, rather than the runner reading the lane as live.
+* **nothing is inherited.** A `CLAUDE_CONFIG_DIR` this session was not assigned, or any
+  `CLAUDE_SECURESTORAGE_CONFIG_DIR` at all, refuses the launch with a memo instead of being
+  silently scrubbed: somebody's environment is exporting it, and only a memo gets that found.
+* **a machine that assigns nothing keeps today's behaviour** — no config dir is handed to a
+  session, which runs on the machine's default Claude login. There is deliberately no default: an
+  unprovisioned config dir parks a worker at the first-run theme picker, a screen no auth manifest
+  covers and the host reports as idle. The account assert still runs.
+
+The rationale for the strictness is capacity, not secrecy: the two Max accounts are separate
+rate-limit pools and the runner's usage machinery reasons about one pool per lane, so a session on
+the wrong pool makes lane assignment non-deterministic even though both accounts are the owner's.
 
 **`fleet isolation`** — the fleet's named session, socket and prefix are its own, separate from the
 host's default session. This block is explicit about its reach: **production on the other machine

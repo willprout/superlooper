@@ -386,6 +386,152 @@ def test_the_pane_env_names_everything_the_in_pane_floor_needs(tmp_path):
         "the pane's shim handoff needs the absolute path — a pane knows no engine paths"
 
 
+# ------------------------------------------------------- the identity env contract (issue #314)
+# The credential namespace a `claude` session uses is `sha256` of the CLAUDE_CONFIG_DIR string AS
+# WRITTEN (#300), so isolation holds only while every spawn emits the SAME string — and the wrong
+# one presents as a logged-out session rather than as an error. The launcher derives it ONCE.
+
+_FLEET_DIR = "/Users/loop/.claude-fleet"
+_FLEET_ORG = "512c95fc-0638-4911-a131-32f411f70afc"
+_FLEET_STATUS = json.dumps({"loggedIn": True, "authMethod": "claude.ai",
+                            "apiProvider": "firstParty", "email": "loop@example.com",
+                            "orgId": _FLEET_ORG, "subscriptionType": "max"})
+
+
+def _fleet_spec(tmp_path, iid="i308", **over):
+    """A launch on a machine that HAS assigned a fleet config dir."""
+    kw = {"claude_config_dir": _FLEET_DIR, "claude_bin": "/opt/claude"}
+    kw.update(over)
+    return _spec(tmp_path, iid=iid, **kw)
+
+
+def test_both_spawn_paths_are_handed_the_same_byte_identical_config_dir(tmp_path):
+    """DoD: one canonical string, and `i<N>` and `d<N>` pass the SAME one. They share
+    `pane_environment`, so this is by construction — asserted because the construction is the
+    guarantee, and a later split of the two paths is exactly how it would be lost."""
+    edges = FakeEdges({"auth status": (0, _FLEET_STATUS, "")})
+    worker = _fleet_spec(tmp_path)
+    _r, _e, host = _run(worker, edges=edges)
+    cwd = tmp_path / "patient"
+    cwd.mkdir()
+    debugger = _fleet_spec(tmp_path, iid="d12", home=_home(tmp_path, "d12"), cwd=str(cwd))
+    result, _e, host2 = _run(debugger, edges=FakeEdges({"auth status": (0, _FLEET_STATUS, "")}))
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned[0]["env"]["SL_CLAUDE_CONFIG_DIR"] == _FLEET_DIR
+    assert host2.spawned[0]["env"]["SL_CLAUDE_CONFIG_DIR"] == _FLEET_DIR
+    # ...and both were told which ACCOUNT that dir must turn out to hold.
+    assert host.spawned[0]["env"]["SL_EXPECT_CLAUDE_ACCOUNT"] == _FLEET_ORG
+    assert host2.spawned[0]["env"]["SL_EXPECT_CLAUDE_ACCOUNT"] == _FLEET_ORG
+
+
+def test_a_non_canonical_assignment_is_normalised_once_and_never_reaches_a_pane_twice(tmp_path):
+    """#300 landmine 1: five spellings of one directory produced five credential namespaces. The
+    launcher normalises at the seam, so the pane can only ever see the canonical one."""
+    for spelling in (_FLEET_DIR + "/", _FLEET_DIR + "//", "/Users/loop/./.claude-fleet"):
+        spec = _fleet_spec(tmp_path, claude_config_dir=spelling)
+        result, _e, host = _run(spec, edges=FakeEdges({"auth status": (0, _FLEET_STATUS, "")}))
+        assert result.rc == launch.OK, result.stderr
+        assert host.spawned[0]["env"]["SL_CLAUDE_CONFIG_DIR"] == _FLEET_DIR, spelling
+
+
+def test_a_config_dir_that_cannot_be_canonicalised_refuses_before_any_pane_exists(tmp_path):
+    spec = _fleet_spec(tmp_path, claude_config_dir="claude-fleet")
+    result, _e, host = _run(spec, edges=FakeEdges({"auth status": (0, _FLEET_STATUS, "")}))
+    assert result.rc == launch.CLAUDE_IDENTITY_RUNNER
+    assert "absolute" in result.stderr and host.spawned == []
+
+
+def test_the_launcher_reads_the_account_under_the_assigned_dir_and_hands_it_down(tmp_path):
+    spec = _fleet_spec(tmp_path)
+    edges = FakeEdges({"auth status": (0, _FLEET_STATUS, "")})
+    result, _e, host = _run(spec, edges=edges)
+    assert result.rc == launch.OK, result.stderr
+    probes = [c for c in edges.calls if c[1:3] == ["auth", "status"]]
+    assert probes and probes[0][0] == "/opt/claude"
+    assert host.spawned[0]["env"]["SL_EXPECT_CLAUDE_ACCOUNT"] == _FLEET_ORG
+
+
+def test_a_runner_environment_on_an_api_key_holds_the_queue_instead_of_launching(tmp_path):
+    """MEASURED shape (2026-08-04): with ANTHROPIC_API_KEY exported the real binary answers
+    `loggedIn: true` with null org and subscription. rc=8 is the CHANNEL half — no queued issue
+    caused it and re-approving fixes nothing."""
+    on_key = json.dumps({"loggedIn": True, "apiKeySource": "ANTHROPIC_API_KEY", "email": None,
+                         "orgId": None, "subscriptionType": None})
+    spec = _fleet_spec(tmp_path)
+    result, _e, host = _run(spec, edges=FakeEdges({"auth status": (0, on_key, "")}))
+    assert result.rc == launch.CLAUDE_IDENTITY_RUNNER
+    assert "api key" in result.stderr.lower() and host.spawned == []
+
+
+def test_a_pinned_account_the_runner_does_not_hold_refuses_the_launch(tmp_path):
+    """The operator's own expectation, when they name one: the fleet dir being logged in is not
+    the same fact as it being logged in to the account the capacity plan assigned it."""
+    spec = _fleet_spec(tmp_path, expect_claude_account="9f0d1a22-dead-4b33-9999-abcdefabcdef")
+    result, _e, host = _run(spec, edges=FakeEdges({"auth status": (0, _FLEET_STATUS, "")}))
+    assert result.rc == launch.CLAUDE_IDENTITY_RUNNER
+    assert _FLEET_ORG in result.stderr and host.spawned == []
+
+
+def test_a_machine_that_assigns_no_config_dir_launches_exactly_as_before(tmp_path):
+    """Production's path, and the reason there is no default: a config dir applied by the launcher
+    on every machine would move every worker onto a dir nobody provisioned, and an unprovisioned
+    dir parks a session at the first-run theme picker. The pane is still TOLD there is no
+    assignment, so the floor can tell "none assigned" from "an old launcher"."""
+    spec = _spec(tmp_path)
+    edges = FakeEdges()
+    result, _e, host = _run(spec, edges=edges)
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned[0]["env"]["SL_CLAUDE_CONFIG_DIR"] == ""
+    assert host.spawned[0]["env"]["SL_EXPECT_CLAUDE_ACCOUNT"] == ""
+    assert not [c for c in edges.calls if c[1:3] == ["auth", "status"]], \
+        "an unassigned machine must not pay for a status read it has nothing to compare"
+
+
+def test_an_inherited_identity_variable_is_never_forwarded_into_a_pane(tmp_path):
+    """The launcher must not be the one handing over either half of the contract. (The floor
+    inside the pane is what PROVES it — the pane's shell sources the operator's rc files after
+    this launcher is gone.)"""
+    spec = _spec(tmp_path, forwarded_env={"CLAUDE_CONFIG_DIR": "/somebody/elses",
+                                          "CLAUDE_SECURESTORAGE_CONFIG_DIR": "",
+                                          "PATH": "/usr/bin"})
+    result, _e, host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    env = host.spawned[0]["env"]
+    assert "CLAUDE_CONFIG_DIR" not in env
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
+
+
+def test_the_launchers_own_probe_env_reads_the_assigned_namespace_and_no_other(tmp_path):
+    """The two reads — the launcher's and the session's — must consult the same credential
+    namespace, or the comparison between them names a fault that is not there. Same reason
+    `identity_probe_env` drops XDG_CONFIG_HOME for the gh probe (#299)."""
+    env = launch.identity_probe_env({"HOME": "/h", "XDG_CONFIG_HOME": "/x",
+                                     "ANTHROPIC_API_KEY": "sk-live",
+                                     "CLAUDE_SECURESTORAGE_CONFIG_DIR": ""},
+                                    config_dir=_FLEET_DIR)
+    assert env["CLAUDE_CONFIG_DIR"] == _FLEET_DIR
+    assert env["HOME"] == "/h", "HOME must survive — overriding it breaks macOS keychain OAuth"
+    for gone in ("XDG_CONFIG_HOME", "ANTHROPIC_API_KEY", "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        assert gone not in env, gone
+    # No assignment -> ABSENT, never empty: an empty value is its own namespace, not "the default".
+    assert "CLAUDE_CONFIG_DIR" not in launch.identity_probe_env({"HOME": "/h"})
+
+
+def test_a_session_that_refuses_its_own_identity_is_read_as_identity_not_as_delivery(tmp_path):
+    """The floor refuses from inside the pane, so no agent ever starts. rc=7 is per-issue: the
+    memo names the account, and the owner is the only one who can repair it."""
+    spec = _spec(tmp_path)
+    marker = os.path.join(spec.run_root, "state", "identityfail")
+    os.makedirs(marker)
+    with open(os.path.join(marker, f"{spec.id}.tok-1"), "w") as f:
+        f.write("this environment is running on an API key")
+    host = FakeHost(raises=session_host.SpawnRefused("no process is behind it"))
+    result, _edges, _host = _run(spec, host=host, started=False)
+    assert result.rc == launch.CLAUDE_IDENTITY
+    assert "claude identity refused" in result.stderr.lower()
+    assert "running on an API key" in result.stderr
+
+
 def test_the_claude_pin_rides_only_when_this_launcher_actually_has_one(tmp_path):
     """#303: naming it unconditionally would BLANK an operator's pin on every machine whose
     runner happens not to export it, silently restoring PATH luck."""

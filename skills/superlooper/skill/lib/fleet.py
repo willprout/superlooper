@@ -43,6 +43,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
 
 import herdr_hook
+import identity
 import runner_home
 import session_host
 import stack_doctor
@@ -511,31 +512,12 @@ def _sh_quote(value):
 
 # --------------------------------------------------------------------------------- identity (c25)
 
-# #300's landmine 2. Present-but-EMPTY collapses the credential namespace back to the unsuffixed
-# default — the owner's — and nothing anywhere errors. Named as a string because it is Claude
-# Code's variable, not the host's.
-_REDIRECT_VAR = "CLAUDE_SECURESTORAGE_CONFIG_DIR"
-
-
-def config_dir_problem(value):
-    """None, or why this spelling of the fleet config dir cannot be trusted.
-
-    #300's landmine 1: the credential namespace is `sha256` of the string **as written**, with no
-    canonicalisation of any kind. Five spellings of one directory produced five namespaces, and the
-    wrong one presents as auth-death rather than as an error — the refused-read-as-empty family,
-    arriving down a path nobody is watching.
-    """
-    if not isinstance(value, str) or not value:
-        return "no fleet config dir is configured"
-    if not value.startswith("/"):
-        return ("%r is not an absolute path — the credential namespace is a hash of this string as "
-                "written, so a relative or ~-spelled dir is a DIFFERENT identity that reports "
-                "logged-out" % value)
-    if value != os.path.normpath(value):
-        return ("%r is not the canonical spelling of %r — a trailing slash, a `//` or a `/./` each "
-                "hash to their own credential namespace, and a worker launched with the wrong one "
-                "presents as auth-death" % (value, os.path.normpath(value)))
-    return None
+# ONE definition of the contract, and it is not here (#314). `lib/identity.py` owns the canonical
+# spelling, the credential-redirect rule and the account verdict, because the LAUNCH SEAM enforces
+# exactly those three and a build-up report that judged them by its own second copy would tell an
+# operator the machine is ready for launches its launcher will refuse.
+_REDIRECT_VAR = identity.REDIRECT_VAR
+config_dir_problem = identity.config_dir_problem
 
 
 def identity_problem(fleet_status, owner_status):
@@ -543,14 +525,17 @@ def identity_problem(fleet_status, owner_status):
 
     `owner_status` may be None — the owner's default config dir being unreadable is not the fleet's
     fault and must not be reported as the fleet's failure. Everything else fails closed.
+
+    The single-account half is `identity.account_problem`, which is the verdict the LAUNCH SEAM
+    applies (#314). Sharing it is not tidiness: this block used to accept any `loggedIn: true`,
+    and the real binary answers exactly that for a session running on an API KEY — so the build-up
+    could report a healthy fleet identity for a dir that bills per token. What remains here is the
+    part only a build-up can ask: whether the fleet's account is a DIFFERENT one from the owner's.
     """
-    if not isinstance(fleet_status, dict):
-        return "the fleet config dir's login could not be read at all"
-    if fleet_status.get("loggedIn") is not True:
-        return ("the fleet config dir is not logged in — a worker launched here lands on a login "
-                "screen, and the identity plan's OAuth is an owner action (#313)")
-    if not fleet_status.get("orgId"):
-        return "the fleet login reports no orgId, so its billing entity cannot be established"
+    problem = identity.account_problem(fleet_status)
+    if problem:
+        return ("the fleet config dir's own login is not one a worker may fly on: %s (the identity "
+                "plan's OAuth is an owner action — #313)" % problem)
     if not isinstance(owner_status, dict) or not owner_status.get("orgId"):
         return None
     if fleet_status.get("orgId") == owner_status.get("orgId"):
@@ -571,18 +556,19 @@ def _auth_status(probe, claude, config_dir):
 
     The measurement instrument #300 identified: it prints `email` / `orgId` / `subscriptionType`
     as JSON, per config dir, non-interactively and without spending a token.
+
+    The OVERLAY (rather than `identity.probe_env`'s whole-environment build) is what this reader
+    needs and the launch seam's does not: `config_dir=None` must REMOVE the variable so the same
+    command can be asked about the owner's default dir, which is the second half of the
+    two-different-orgIds measurement. What it does share is `identity.status_from` — the body,
+    never the exit code, because `claude auth status` EXITS 1 when logged out while printing a
+    perfectly readable answer, and this block used to report that as unreadable (found by driving
+    the real CLI against a real unprovisioned dir).
     """
     if not claude:
         return None
-    proc = probe.run([claude, "auth", "status"], timeout=20,
-                     env={"CLAUDE_CONFIG_DIR": config_dir})
-    if getattr(proc, "returncode", 1) != 0:
-        return None
-    try:
-        data = json.loads(getattr(proc, "stdout", "") or "")
-    except (TypeError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    return identity.status_from(probe.run([claude, "auth", "status"], timeout=20,
+                                          env={identity.CONFIG_DIR_VAR: config_dir}))
 
 
 def check_host_binary(probe, fleet_prefix):
@@ -862,9 +848,12 @@ def check_identity(probe, fleet_config_dir, claude=None):
     name = "fleet identity"
     problem = config_dir_problem(fleet_config_dir)
     if problem:
-        return CheckResult(name, False, problem,
-                           "set the canonical absolute spelling once and use it everywhere; #300 "
-                           "measured five spellings of one directory producing five identities")
+        return CheckResult(
+            name, False, problem,
+            "set %s to one canonical absolute path (suggested: %s) — the launch path reads that "
+            "variable and assigns the SAME string to every session, and #300 measured five "
+            "spellings of one directory producing five identities"
+            % (identity.FLEET_DIR_VAR, identity.SUGGESTED_FLEET_DIR))
     if _REDIRECT_VAR in (getattr(probe, "env", {}) or {}):
         return CheckResult(
             name, False,
@@ -897,19 +886,22 @@ def check_identity(probe, fleet_config_dir, claude=None):
             % (fleet_config_dir, fleet_status.get("email"), fleet_status.get("orgId")),
             "open one interactive `claude` under that config dir and finish first-run (#313)")
     other = (owner_status or {}).get("orgId")
-    # What this block proves, stated exactly, because the gap is one a green line would otherwise
-    # paper over (fresh-agent review): the fleet's config DIR holds its own login, separate from the
-    # owner's. It does NOT prove any launch points a session at that dir — putting CLAUDE_CONFIG_DIR
-    # on the spawn seam is #314's job, and until that lands a worker still starts on whatever the
-    # environment gives it. Reading this line as "the fleet bills its own subscription" is exactly
-    # the c1 silent-billing-flip in a new costume, so the line says so itself.
+    # What this block proves, stated exactly. The gap it used to name — "this proves the config
+    # DIR's identity, not that a launch uses it" — is closed by #314: the launch path derives this
+    # same string once and every spawn is handed it byte for byte, and the session refuses itself
+    # if the account under it is not the expected one. The remaining honest limit is narrower and
+    # is stated instead: a launch only assigns this dir when the MACHINE says so, so a green line
+    # here plus an unset SL_FLEET_CLAUDE_CONFIG_DIR still means workers ride the default login.
+    # That case never reaches this line — `config_dir_problem(None)` fails the block above.
     return CheckResult(
         name, True,
-        "%s rides its own subscription (%s, org %s%s). This proves the CONFIG DIR's identity, not "
-        "that a launch uses it — the spawn-seam contract is #314; until it lands, a worker starts "
-        "on whatever CLAUDE_CONFIG_DIR its environment carries"
+        "%s rides its own subscription (%s, org %s%s), and %s assigns it to every launch — the "
+        "spawn seam derives this one canonical string and each session refuses itself unless "
+        "`claude auth status` reports that account (#314)"
         % (fleet_config_dir, fleet_status.get("subscriptionType") or "?",
-           fleet_status.get("orgId"), "; the owner's default dir is org %s" % other if other else ""))
+           fleet_status.get("orgId"),
+           "; the owner's default dir is org %s" % other if other else "",
+           identity.FLEET_DIR_VAR))
 
 
 def _onboarded(text):

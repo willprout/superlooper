@@ -77,6 +77,12 @@ def _spec(argv):
         expect_gh_login=env.get("SL_EXPECT_GH_LOGIN") or None,
         gh_bin=env.get("SL_GH", ""),
         claude_bin=env.get("SL_CLAUDE", ""),
+        # #314. None means "read this machine's own assignment (SL_FLEET_CLAUDE_CONFIG_DIR) in
+        # lib/launch, where the canonical string is derived ONCE for every spawn path" — the same
+        # shape as expect_gh_login above, and for the same reason: one derivation, or two spellings
+        # of one directory become two credential namespaces.
+        claude_config_dir=None,
+        expect_claude_account=env.get("SL_EXPECT_CLAUDE_ACCOUNT", ""),
         verify_seconds=_int(env.get("SL_LAUNCH_VERIFY_SECONDS"), launch._VERIFY_SECONDS),
         codex={"dangerous_bypass": env.get("SL_CODEX_DANGEROUS_BYPASS", ""),
                "bypass_hook_trust": env.get("SL_CODEX_BYPASS_HOOK_TRUST", ""),

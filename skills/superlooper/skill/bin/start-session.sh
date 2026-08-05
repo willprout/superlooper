@@ -255,6 +255,74 @@ if [ "$ACTUAL_LOGIN" != "$EXPECT_LOGIN" ]; then
   refuse_auth "\`$GH api user\` did not answer as '$EXPECT_LOGIN' from inside this session's own environment (got: ${ACTUAL_LOGIN:-<no answer>}). Run \`gh auth login --hostname github.com\` as the account that owns the loop repo"
 fi
 
+# ---- THE IDENTITY ENV CONTRACT + POSITIVE ACCOUNT ASSERT (issue #314) --------------------------
+# The same doctrine as the gh assert above, one credential over — and with a sharper mechanism
+# underneath it, because the isolation here is a STRING (#300):
+#
+#   * `claude` derives its keychain service name as `Claude Code-credentials-<sha256(CLAUDE_CONFIG_
+#     DIR)[0:8]>`, taken over the value AS WRITTEN. So a trailing slash on a perfectly provisioned,
+#     logged-in config dir is a DIFFERENT credential namespace — and the session it produces reports
+#     LOGGED OUT rather than erroring. The launcher derives one canonical string and names it in
+#     SL_CLAUDE_CONFIG_DIR; this is where it becomes the agent's own variable.
+#   * CLAUDE_SECURESTORAGE_CONFIG_DIR overrides that derivation, and set-but-EMPTY collapses it
+#     back to the owner's unsuffixed namespace — the c1 silent-billing-flip in a new costume.
+#   * and `claude auth status` answers `loggedIn: true` for a session running on an API KEY, with
+#     null email/orgId/subscriptionType (measured 2026-08-04 against 2.1.222). So "no error" is not
+#     "on the subscription", and only a POSITIVE read of the account can tell them apart.
+#
+# The owner's ruling on #314 is strict and this is where it is enforced: a worker must provably be
+# logged in, on the intended account, never on an API key, else the launch is refused. The stated
+# reason is capacity — the two Max accounts are separate rate-limit pools and the runner's usage
+# machinery reasons about one pool per lane, so a session on the wrong pool makes lane assignment
+# non-deterministic.
+#
+# CLAUDE ONLY, and so it sits BELOW the two agent-independent floors above rather than beside them:
+# CLAUDE_CONFIG_DIR is Claude Code's own spelling and codex neither reads it nor has an equivalent
+# (agent-boundary rule). It still runs BEFORE the delivery sentinel, so a refusal is a launch the
+# launcher tears down at once with a memo naming the account — not a lane the runner reads as live
+# and then recovers by relaunching into the same wrong subscription.
+#
+# The VERDICT lives in lib/identity.py rather than here, unlike the gh probe above: it has to parse
+# JSON and derive a sha256, which bash cannot do honestly, and the launcher-side half of the same
+# contract already reads those functions — one implementation, so the two sides cannot drift about
+# what a canonical dir or a healthy account is.
+AGENT="${SL_AGENT:-claude}"
+IDENTITY_RC=7                                # lib/launch.py + evidence.py read this same code
+refuse_identity() {                          # loud, torn down, and NAMED — never a wrong-account session
+  local why="$1"
+  mkdir -p "$SL_RUN_ROOT/state/identityfail"
+  printf '%s\n' "$why" > "$SL_RUN_ROOT/state/identityfail/$ID.$TOKEN"
+  echo "[$ID] CLAUDE IDENTITY REFUSED: $why" >&2
+  # No exited marker, for the reason the env and auth refusals write none: that marker means "a
+  # worker WAS running and its process is gone", and the runner recovers from it by RELAUNCHING —
+  # straight back onto the same wrong account.
+  exit "$IDENTITY_RC"
+}
+if [ "$AGENT" = "claude" ]; then
+  # ASSIGNED, never inherited (claim c3). An EMPTY value means this machine assigns no config dir —
+  # a worker then runs on the machine's default Claude login, exactly as it did before this contract
+  # existed — and the assert below still refuses an inherited CLAUDE_CONFIG_DIR, because a namespace
+  # picked up from a shell rc file is one nobody chose.
+  if [ -n "${SL_CLAUDE_CONFIG_DIR:-}" ]; then
+    export CLAUDE_CONFIG_DIR="$SL_CLAUDE_CONFIG_DIR"
+  fi
+  SL_IDENTITY_LIB="$(cd "$(dirname "$0")" && pwd)/../lib/identity.py"
+  if [ ! -f "$SL_IDENTITY_LIB" ]; then
+    refuse_identity "the engine on this machine has no lib/identity.py, so which Anthropic account this session holds cannot be established — republish it with bin/install.sh. Refusing rather than flying an unverified identity"
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    refuse_identity "no python3 on this session's PATH, so the identity assert could not run at all — and not being able to look is not proof. Put python3 on PATH (the runner itself needs it) and re-approve"
+  fi
+  # `2>&1` merges the refusal reason (stderr) and the success line (stdout) into one capture; the
+  # exit code, never the text, is what decides. EXPORTED first, so what this reads is exactly the
+  # environment the agent process below will be handed — the same honest-oracle rule the env floor
+  # above follows by re-reading from a fresh child.
+  if ! IDENTITY_LINE="$(python3 "$SL_IDENTITY_LIB" --assert 2>&1)"; then
+    refuse_identity "${IDENTITY_LINE:-the identity assert failed and reported nothing}"
+  fi
+  echo "[$ID] identity: $IDENTITY_LINE" >&2   # the POSITIVE line, on the record in the pane
+fi
+
 # DELIVERY PROOF (RC-LAUNCHVERIFY — the run-20260625-1857 overnight killer). Now that we hold the
 # worker lock and are about to start Claude, stamp the PER-LAUNCH start marker. Its NAME carries the
 # launch token (minted per launch by lib/launch.py), so it is unique to THIS launch
@@ -309,7 +377,8 @@ MODEL="${SL_MODEL:-}"
 # runner resolves precedence and sends SL_EFFORT="" when neither is set). Pass --effort ONLY when
 # non-empty — no forced default when it's empty. Same %q-quoted stack as --model.
 EFFORT="${SL_EFFORT:-}"
-AGENT="${SL_AGENT:-claude}"
+# AGENT was resolved by the identity block above, which needs it to decide whether the Claude-only
+# account assert applies — one read, so the two can never disagree about which agent this is.
 # ---- SESSION IDENTITY (issue #298) ----
 # The per-flight conversation id, MINTED BY THE RUNNER at spawn (lib/launch.py) and handed down
 # here — identity ASSIGNED, never self-asserted (claim c3). Two spellings, one id:
