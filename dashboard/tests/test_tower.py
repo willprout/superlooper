@@ -343,6 +343,11 @@ def test_the_quiet_watchdog_outcomes_still_read_plainly():
     stood_down = tower.comms_row({"act": "watchdog", "outcome": "stand_down",
                                   "signals": ["heartbeat_stale"]})
     assert "no session" in stood_down["text"].lower()
+    # The engine stands the episode down on "self-recovery OR OWNER INTERVENTION" — the record
+    # proves only that the tripped signal is gone. Crediting the loop with fixing itself is agency
+    # nothing journaled (fresh review, Codex).
+    assert "on its own" not in stood_down["text"].lower()
+    assert "itself" not in stood_down["text"].lower()
     held = tower.comms_row({"act": "watchdog", "outcome": "skipped_live_session",
                             "signals": ["alert"]})
     assert "already" in held["text"].lower()
@@ -460,6 +465,30 @@ def test_reapprove_names_the_superseded_pr_when_the_record_carries_one():
                                       "sl/i5-fix-the-board-r2; superseded PR #42)"})
     assert "#42" in row["text"]
     assert "supersede" in row["text"].lower()
+
+
+def test_a_reapprove_that_did_not_complete_never_reads_as_one_that_did():
+    # The engine journals the ACTION and its outcome too, and that outcome is not always a
+    # re-approval that happened: `_exec_reapprove` aborts when a worker is still live in the
+    # worktree, and the tick loop turns an executor crash into an `executor error: …` outcome.
+    # Rendering either as the calm "SL-5 re-approved by the owner." hides a lane that did not
+    # actually restart (fresh review, Codex).
+    deferred = tower.comms_row({"act": "reapprove", "id": "i5", "num": 5, "had_rebuild": False,
+                                "outcome": "worker still live in the worktree (pid 8123) — "
+                                           "deferring the fresh start (deferral 1 of 3; retries "
+                                           "next tick)"})
+    assert "SL-5" in deferred["text"]
+    assert "did not complete" in deferred["text"].lower()
+    assert "worker still live" in deferred["text"]
+    assert deferred["kind"] == "alert", "a re-approval that did not take is not a cleared gate"
+    crashed = tower.comms_row({"act": "reapprove", "id": "i5", "num": 5,
+                               "outcome": "executor error: OSError()"})
+    assert "did not complete" in crashed["text"].lower()
+    # The successful outcome record — the engine's own "reapproved (…)" form — stays the calm gate.
+    ok = tower.comms_row({"act": "reapprove", "id": "i5", "num": 5,
+                          "outcome": "reapproved (reset nothing)"}, operator="Ada")
+    assert ok["text"] == "SL-5 re-approved by Ada."
+    assert ok["kind"] == "approve"
 
 
 def test_a_reapprove_that_retired_nothing_still_reads_as_the_calm_human_gate():

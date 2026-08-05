@@ -169,8 +169,12 @@ def _watchdog_row(rec):
                 "text": "The loop flagged itself for repair%s — an unattended fixer launches %s "
                         "unless it clears." % (_paren(sigs), when)}
     if outcome == "stand_down":
+        # NOT "cleared on its own": the engine stands an episode down on self-recovery OR owner
+        # intervention, and the record cannot tell them apart. It proves the tripped signal is gone
+        # and that nothing was hired — so that, and only that, is what the line says.
         return {"radio": "", "kind": "event",
-                "text": "The loop's repair flag cleared on its own — no session was hired."}
+                "text": "The loop's repair flag cleared — the tripped signal is gone; no session "
+                        "was hired."}
     if outcome == "skipped_live_session":
         return {"radio": "", "kind": "event",
                 "text": "Unattended repair held off — a debug session is already on the field."}
@@ -228,8 +232,12 @@ def _resurrect_row(rec):
 def _runner_restart_row(rec, operator):
     """A ``runner_restart`` record → its comms sentence (issue #116 / #253): the Restart button.
 
-    The act is journaled in phases, and the one the owner is waiting for is the LANDING (``up``) —
-    old pid → new pid, the proof a different process is now running. The two in-flight phases name
+    The act is journaled in phases, and the one the owner is waiting for is the LANDING (``up``).
+    Two mechanisms reach it: a re-exec replaces the image IN PLACE, so the pid is unchanged and only
+    ``new_pid`` is recorded; a login-item home exits and is restarted by its supervisor, a real
+    process death whose baton carries the old pid too, so that landing reads ``old → new``. Both are
+    the same fact for the owner — it came back — so both render as a landing. The two in-flight
+    phases name
     WHO asked, taken from the restart marker on the RECORD rather than the dashboard's configured
     operator (the #144 rule: a restart requested from a terminal by someone else is not the owner's).
     ``reexec_failed`` is the one phase the button itself cannot report — it already answered "ok" to
@@ -287,7 +295,17 @@ def _reapprove_row(rec, num, operator):
 
     The retirement clause appears only when the record carries both branch names. A lane never
     handed to the launcher has nothing to retire, and the dashboard's own Approve verb carries no
-    branches at all — both keep the calm, unadorned human-gate sentence (§7 fun-free zone)."""
+    branches at all — both keep the calm, unadorned human-gate sentence (§7 fun-free zone).
+
+    The engine journals the ACTION and its outcome as well as the detail record, and that outcome is
+    not always a re-approval that happened: the executor ABORTS while a worker is still live in the
+    worktree (it must not rebuild over a checkout it cannot clear), and the tick loop turns a crash
+    into an ``executor error: …``. Either rendered as the calm gate sentence would report a lane
+    restarted that is still sitting exactly where it was (§7)."""
+    out = rec.get("outcome")
+    if isinstance(out, str) and out.strip() and not out.strip().startswith("reapproved"):
+        return {"radio": "", "kind": "alert",
+                "text": "%s re-approval did not complete: %s." % (_who(num), _first_line(out))}
     old_b, new_b = rec.get("old_branch"), rec.get("new_branch")
     parts = []
     if isinstance(old_b, str) and old_b.strip() and isinstance(new_b, str) and new_b.strip():
