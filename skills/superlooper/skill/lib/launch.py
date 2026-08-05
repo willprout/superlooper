@@ -53,6 +53,7 @@ agent args at all.
 6    THIS session's own environment is poisoned and the floor could not clean it
 7    THIS session holds the wrong Anthropic account (or none, or an API key)
 8    the RUNNER's environment holds the wrong Anthropic account — a channel fault
+9    this machine's fleet is fenced and the host's control socket is not — a channel fault
 64   the configured agent is not one this stack can launch (repo-wide, not one issue's)
 ===  ==================================================================================
 
@@ -69,6 +70,7 @@ import uuid
 from dataclasses import dataclass, field
 
 import identity
+import journal
 import loopstate
 import panes
 import sanitize
@@ -95,6 +97,12 @@ ENV_POISONED = 6
 # the owner to repair something that is not broken.
 CLAUDE_IDENTITY = 7
 CLAUDE_IDENTITY_RUNNER = 8
+# The fence pre-flight (#326). ONE code for both fatal verdicts (OPEN and UNREACHABLE) rather than
+# the split rc 4/5 and 7/8 use, because those splits exist where the runner BRANCHES — session-side
+# faults park one issue, runner-side ones hold the queue. Both fence verdicts are machine-level and
+# both hold, so a second code would divide the evidence table on something nothing reads. What
+# differs between them is one sentence of remedy, and the stderr carries that verbatim into the memo.
+FENCE_DOWN = 9
 UNSUPPORTED_AGENT = 64
 
 AGENTS = ("claude", "codex")
@@ -119,6 +127,10 @@ _IDENTITY_VARS = (identity.CONFIG_DIR_VAR, identity.REDIRECT_VAR)
 _HOST_ENV_PREFIX = "HERDR"
 
 _GH_PROBE_SECONDS = 10          # a black-holed network must not eat the caller's whole timeout
+# The fence pre-flight's own bound (#326), named for the same reason the gh one is: a wedged or
+# hostile peer on the control socket must not be able to grow a launch into a hang. `fence_probe`
+# turns this into a bound on the whole exchange, not merely on one recv.
+_FENCE_SECONDS = 5
 _START_TIMEOUT_MS = 45000       # the pane's floor (a bounded gh read) runs before the agent does
 
 _VERIFY_SECONDS = 30            # the floor stamps its sentinel BEFORE the agent starts, so this
@@ -193,6 +205,14 @@ class Spec:
     codex: dict = field(default_factory=dict)
     forwarded_env: dict = None           # what the caller's own environment offers (scrubbed here)
     probe_env: dict = None               # the environment the identity read runs in (None = ours)
+    # There is deliberately NO field here for the fence pre-flight (#326) — not for the switch and
+    # not for the socket. It reads `os.environ` and nothing else, because `os.environ` is exactly
+    # what the `herdr` child inherits: the doorway's `_call` runs the CLI without an explicit env,
+    # so a caller-supplied environment could make the pre-flight probe one socket while the spawn
+    # drove another, and a FENCED verdict about a socket nothing launches onto is worse than no
+    # verdict at all. An earlier draft of this had such a field and the cross-review caught it. The
+    # same reasoning as `session_host.receives_token`, which takes no grant parameter: a flag that
+    # can be passed is a flag that will one day be passed by the wrong call site.
 
 
 class Edges:
@@ -214,6 +234,15 @@ class Edges:
 
     def sleep(self, seconds):
         time.sleep(seconds)
+
+    def fence(self, socket_path, timeout=_FENCE_SECONDS):
+        """What a TOKENLESS caller finds at the control socket (#326) — FENCED / OPEN / UNREACHABLE.
+
+        An edge like the others: it opens a socket, so it is injected rather than called inline, and
+        no test reaches a real one. The question itself belongs to the doorway and is asked there —
+        this only decides when it gets asked.
+        """
+        return session_host.fence_probe(socket_path, timeout=timeout)
 
     def token(self):
         """This launch's own key. Under cmux it was the new tab's surface UUID; the host's pane id
@@ -298,6 +327,18 @@ def _launch(spec, host, edges):
         return Result(UNSUPPORTED_AGENT,
                       "[%s] unsupported agent '%s' (expected: %s)"
                       % (iid, spec.agent, " or ".join(AGENTS)))
+
+    # ---- the fence (issue #326) ------------------------------------------------------------
+    # FIRST of the machine-level asserts, and cheapest: one unix-socket exchange, no subprocess.
+    # Ordered ahead of the two identity reads because it is the refusal that says this machine may
+    # not run an unattended worker AT ALL — spending a `gh api user` and a `claude auth status`
+    # first would be resolving whose account a launch runs under when the launch was never going to
+    # be permitted. Like them, it is ordered before the worktree and before any host RPC so a
+    # refusal costs no orphan pane and no leftover checkout (the base-missing discipline, #28).
+    if not debugger:
+        refused = _fence_preflight(spec, iid, edges)
+        if refused is not None:
+            return refused
 
     # ---- the expected gh login (issue #299) -----------------------------------------------
     # Read ONCE here, in the runner's own environment, and handed down: the session's own assert
@@ -513,6 +554,127 @@ def _launch(spec, host, edges):
     return Result(OK, "", "[launch] %s  branch=%s pane=%s ws=%s name='%s' (delivery verified)"
                   % (iid, branch or "<none>", session.pane, session.workspace, name),
                   session=session)
+
+
+# --------------------------------------------------------------------------- the fence pre-flight
+
+# What the journal calls this check, and what a report reads back.
+FENCE_ACT = "fence_preflight"
+# The verdict when there was no socket to ask about. Deliberately NOT spelled `unreachable`: that
+# word means "we asked and got nothing", and this means "we never had an address to ask". Reporting
+# the second as the first would send an operator to restart a server that may be running fine.
+FENCE_UNRESOLVED = "unresolved"
+
+
+def _fence_preflight(spec, iid, edges):
+    """Refuse a worker launch onto an unfenced control socket, or return None (#326).
+
+    #305 shipped the fence and ``fence_probe``; nothing called the probe on a launch path, so the
+    only thing establishing that a fleet was actually fenced was a human running the acceptance
+    check by hand. The carried patch is deliberately INERT when no token is configured — that is
+    what lets upstream's own test suite pass unmodified — so a stock, unpatched or misconfigured
+    host serves any tokenless worker. And that host does not look broken from the runner's seat,
+    because it answers. This is the check that turns "the fence is up" from an assumption a machine
+    inherited at build time into an observation made on every launch.
+
+    **WORKER launches only.** The MODE decides and nothing else does, exactly as
+    ``session_host.receives_token`` lets the NAME decide who gets the token:
+
+    * an ``i<N>`` is the thing the fence exists to contain. It is handed no token, so on a fenced
+      socket it is refused and on an open one it can drive every pane on the machine.
+    * a ``d<N>`` RECEIVES the token by design, so an open socket grants a repair session nothing it
+      does not already hold — and refusing repair BECAUSE the fence is down would mean no
+      unattended repair at exactly the moment repair is needed, which is the landmine the whole
+      spawn port was built around.
+
+    There is deliberately no ``attended`` bypass, and that omission is load-bearing rather than an
+    oversight: ``SL_ATTENDED`` is read from the environment, so an ambient ``export SL_ATTENDED=1``
+    in the shell or LaunchAgent that started the runner would silently disarm the fence for every
+    worker on the machine. The runner already pins it empty for that exact reason; a gate that
+    honoured it would be trusting the variable that pin exists because nobody can trust.
+
+    **UNREACHABLE refuses** — the ruled behaviour, decided rather than defaulted. Three reasons,
+    and any one of them is sufficient. Silence is not a fence: ``fence_probe`` refuses to call it
+    one (c2) and neither may this. The spawn is about to be driven through that same socket, so a
+    socket that is genuinely down fails the launch one step later anyway — refusing costs a healthy
+    machine nothing. And a pre-flight that PROCEEDED on UNREACHABLE would be silently disarmed by
+    anything that breaks the probe, which is a fail-OPEN on the one check whose whole job is to
+    fail closed.
+
+    The verdict is journaled on EVERY worker launch, permitted ones included. That line is what
+    keeps a default-off switch from being a silent no-op: a machine that was quietly never armed
+    writes down its OPEN socket every launch, so the morning report can show the fence state over
+    time instead of leaving "this fleet has been unfenced all week" indistinguishable from "this
+    fleet has been fenced all week". The journal is a RECORD of the decision and never an input to
+    it — an unwritable one cannot refuse a launch, and far more importantly cannot permit one.
+    """
+    required, unrecognised = session_host.fence_required(os.environ)
+    # `os.environ`, with no override anywhere in the signature — see the note on `Spec`. The doorway
+    # runs the host CLI with no explicit environment, so the child inherits exactly this; resolving
+    # the socket from it through the doorway's OWN resolver is what makes "the socket probed" and
+    # "the socket driven" the same address by construction, rather than by two copies of a
+    # resolution rule that can drift apart or be pointed at different places by a caller.
+    socket_path = session_host.control_socket_path(os.environ)
+    verdict = edges.fence(socket_path) if socket_path else FENCE_UNRESOLVED
+
+    refusal = None
+    if required and verdict != session_host.FENCED:
+        refusal = Result(FENCE_DOWN, "\n".join(
+            [_fence_memo(iid, verdict, socket_path)]
+            + ([("[%s] (%s is set to %r, which this engine does not recognise — it reads as "
+                 "'required', because a switch typo that read as 'off' would be a silently "
+                 "disarmed fence.)" % (iid, session_host.FENCE_REQUIRED_VAR, unrecognised))]
+               if unrecognised else [])
+            + ["[%s] NOT launching; no session was created." % iid]))
+
+    record = {"act": FENCE_ACT, "id": iid, "verdict": verdict, "required": required,
+              "socket": socket_path, "refused": refusal is not None}
+    if unrecognised:
+        record["switch"] = unrecognised
+    try:
+        journal.append(spec.run_root, record)
+    except (OSError, ValueError):
+        # Telemetry may never fail a launch — and, far more important, may never pass one. The
+        # refusal above is already built; this only writes it down.
+        pass
+    return refusal
+
+
+def _fence_memo(iid, verdict, socket_path):
+    """The operator-facing first line, per verdict. Each names a DIFFERENT repair.
+
+    ``evidence.py`` classifies on this text before it reads the rc, so two rules bind it. It must
+    lead with the loop's own "FENCE DOWN" phrase, which no third-party tool can emit. And it must
+    contain none of the needles that map to an earlier reason — in particular none of the phrases a
+    socket failure invites (``could not connect``, ``connection refused``, ``no answer within``),
+    every one of which belongs to the gh-transient or cmux-anchor needle further down the table. An
+    unfenced fleet reported as "wait for GitHub to come back" would be a remedy for a fault that
+    never self-recovers, offered while the socket stays wide open.
+    """
+    if verdict == session_host.OPEN:
+        return "\n".join([
+            "[%s] FENCE DOWN: a tokenless connection to %s was SERVED — the session host's control "
+            "socket has no fence at all. Its path is injected into every pane whatever a launcher "
+            "passes, and the protocol is plain newline-JSON, so a worker started here could drive "
+            "the whole fleet with ten lines of python and no host binary." % (iid, socket_path),
+            "[%s] This machine declares its fleet fenced (%s). Rebuild the patched host with "
+            "vendor/herdr/build.sh and re-run `superlooper fleet --install`, or set %s=off if this "
+            "machine is deliberately unfenced."
+            % (iid, session_host.FENCE_REQUIRED_VAR, session_host.FENCE_REQUIRED_VAR)])
+    if verdict == FENCE_UNRESOLVED:
+        return "\n".join([
+            "[%s] FENCE DOWN: this machine declares its fleet fenced, but where the host keeps its "
+            "control socket could not be resolved from this launcher's own environment — so the "
+            "fence was never measured. A guessed path would be a verdict about a machine nothing "
+            "looked at." % iid,
+            "[%s] Give the launcher's process a HOME (or the explicit socket override the fleet's "
+            "own deployment sets), then re-run `superlooper doctor`." % iid])
+    return "\n".join([
+        "[%s] FENCE DOWN: %s did not answer, so nothing proved this fleet is fenced — and silence "
+        "is never read as one here (absence of signal is UNKNOWN, never health). The spawn would "
+        "have been driven through that same socket." % (iid, socket_path),
+        "[%s] The host's server is not running, or it is bound somewhere else: run `superlooper "
+        "fleet --install` and read the server log under the fleet prefix." % iid])
 
 
 # --------------------------------------------------------------------------- pre-flight pieces
@@ -863,4 +1025,5 @@ def _rm_quiet(path):
 
 __all__ = ["Spec", "Result", "Ran", "Edges", "WorktreeLock", "launch", "pane_environment",
            "is_poison", "WORKER_RE", "DEBUGGER_RE", "OK", "ABORTED", "NOT_DELIVERED",
-           "BASE_MISSING", "AUTH_DEAD", "AUTH_DEAD_RUNNER", "ENV_POISONED", "UNSUPPORTED_AGENT"]
+           "BASE_MISSING", "AUTH_DEAD", "AUTH_DEAD_RUNNER", "ENV_POISONED", "FENCE_DOWN",
+           "UNSUPPORTED_AGENT"]

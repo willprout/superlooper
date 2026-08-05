@@ -462,3 +462,94 @@ def test_a_dead_cmux_socket_is_not_reported_as_an_unreachable_github():
     # ...while gh's own refused connection is still caught, via `dial tcp`:
     gh_refused = "[i5] GH AUTH DEAD: dial tcp 140.82.113.6:443: connect: connection refused"
     assert evidence.build("launch", rc=4, captured=gh_refused)["reason"] == "gh_probe_unreachable"
+
+
+# ---- the fence pre-flight (issue #326) ---------------------------------------------------------
+
+def test_a_fence_refusal_is_a_channel_fault_that_holds_the_queue():
+    """Machine-level, exactly like `gh_auth_dead_runner` and `claude_identity_wrong_runner`: every
+    launch on this host reads the SAME control socket and gets the same verdict, so charging one
+    issue a park for it would walk the whole approved queue into parks over a single machine fault
+    — the 2026-07-09 storm's shape with a new cause. No re-approval can fix it; the fleet's server
+    has to be rebuilt or restarted."""
+    rec = evidence.build("launch", rc=9, captured=None)
+    assert rec["reason"] == "fence_down"
+    assert evidence.is_channel_fault(rec) is True
+
+
+@pytest.mark.parametrize("captured", [
+    "[i5] FENCE DOWN: a tokenless connection to /tmp/h.sock was SERVED",
+    "[i5] FENCE DOWN: /tmp/h.sock did not answer, and silence is never proof of a fence",
+])
+def test_the_launchers_own_fence_words_classify_as_the_fence(captured):
+    rec = evidence.build("launch", rc=9, captured=captured)
+    assert rec["reason"] == "fence_down", rec
+
+
+def test_a_fence_refusal_never_reads_as_a_github_outage_or_a_dead_anchor():
+    """`_LAUNCH_TEXT` is consulted before the rc table and the first match wins, so the fence's own
+    refusal text must contain none of the earlier needles — otherwise an unfenced fleet would be
+    reported to the owner as "wait for GitHub to come back", a remedy for a fault that never
+    self-recovers and that leaves the socket wide open in the meantime."""
+    for captured in ("[i5] FENCE DOWN: a tokenless connection to /tmp/h.sock was SERVED",
+                     "[i5] FENCE DOWN: /tmp/h.sock did not answer, and silence is never proof of "
+                     "a fence"):
+        rec = evidence.build("launch", rc=9, captured=captured)
+        assert rec["reason"] not in ("gh_probe_unreachable", "anchor_socket_lost",
+                                     "anchor_workspace_missing", "env_poisoned"), rec
+
+
+@pytest.mark.parametrize("hostile", [
+    "/tmp/env poisoned.sock",                  # the needle that leads the whole table
+    "/tmp/dial tcp/h.sock",                    # a gh-transient needle -> would HOLD for GitHub
+    "/tmp/gh auth dead/h.sock",                # -> would tell the owner to re-login
+    "/tmp/not_found/h.sock",                   # -> would raise a cmux anchor alert
+    "/tmp/could not connect/h.sock",           # -> anchor_socket_lost
+    "/tmp/http 429/h.sock",                    # -> "wait for GitHub to come back"
+])
+def test_an_environment_chosen_socket_path_cannot_change_what_a_fence_refusal_MEANS(hostile):
+    """The `[i429]` lesson, one interpolation over.
+
+    The fence memo NAMES the socket it probed and the switch value it could not read — and both are
+    strings this engine does not choose: an operator picks the path, and the switch may hold
+    anything at all. `_LAUNCH_TEXT` is consulted BEFORE the rc table and the first match wins, so a
+    socket path containing another reason's needle would relabel a machine-level fence failure as
+    that other reason. Half of those are PER-ISSUE, which is the 2026-07-09 shape exactly: the
+    queue walks into parks over one machine-level fault, each memo naming something the issue did
+    not do.
+    """
+    captured = ("[i5] FENCE DOWN: a tokenless connection to %s was SERVED — the session host's "
+                "control socket has no fence at all." % hostile)
+    rec = evidence.build("launch", rc=9, captured=captured)
+    assert rec["reason"] == "fence_down", rec
+    assert evidence.is_channel_fault(rec) is True
+
+
+def test_an_unreadable_switch_value_cannot_change_what_a_fence_refusal_means():
+    captured = ("[i5] FENCE DOWN: a tokenless connection to /tmp/h.sock was SERVED.\n"
+                "[i5] (SL_FLEET_FENCE is set to 'env poisoned', which this engine does not "
+                "recognise — it reads as 'required'.)")
+    rec = evidence.build("launch", rc=9, captured=captured)
+    assert rec["reason"] == "fence_down", rec
+    assert evidence.is_channel_fault(rec) is True
+
+
+def test_the_fence_text_needle_still_covers_an_rc_this_engine_has_no_entry_for():
+    """The needle's ONE remaining job, and the only window it fires in.
+
+    rc=9 is classified by rc (`_RC_AUTHORITATIVE`), so this needle is not the fence's normal path.
+    It covers publish drift: a merged launcher emits rc=9 while the INSTALLED engine judging it
+    predates the rc table entry. Without the needle that reads as `launch_rc_<n>` — per-issue, with
+    a memo that names no cause. With it the reason is right even though the rc means nothing here.
+    """
+    captured = "[i5] FENCE DOWN: a tokenless connection to /tmp/h.sock was SERVED"
+    rec = evidence.build("launch", rc=97, captured=captured)
+    assert rec["reason"] == "fence_down", rec
+    assert evidence.is_channel_fault(rec) is True
+
+
+def test_the_fence_needle_leads_the_table_so_a_later_needle_cannot_be_inserted_above_it():
+    """Structural, not behavioural: the fallback above is only sound while nothing precedes it,
+    because an interpolated socket path can contain any needle in this table."""
+    first_needles = evidence._LAUNCH_TEXT[0][0]
+    assert "fence down" in first_needles, evidence._LAUNCH_TEXT[0]

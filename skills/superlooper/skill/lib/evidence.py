@@ -116,6 +116,16 @@ _LAUNCH_RC = {
         "queued issue caused and none can fix by re-approving. Every launch will fail until it is "
         "repaired: log the fleet's config dir into its own account in a supervised window, or "
         "correct SL_FLEET_CLAUDE_CONFIG_DIR"),
+    9: ("fence_down",
+        "the pre-flight fence check refused the flight (#326): this machine declares its fleet "
+        "fenced, and a TOKENLESS connection to the session host's control socket was either SERVED "
+        "or unanswerable. A served one means there is no fence at all — every worker pane already "
+        "carries the socket path, so any session launched onto it could drive the whole fleet with "
+        "ten lines of python and no host binary. An unanswerable one proves nothing either way, "
+        "and silence is never read as a fence here. NO issue caused this and re-approving fixes "
+        "nothing: rebuild the patched host (vendor/herdr/build.sh) and re-run `superlooper fleet "
+        "--install`, or set SL_FLEET_FENCE=off on a machine that is deliberately unfenced. The "
+        "captured stderr says which of the two verdicts it was"),
     64: ("agent_unsupported",
          "the configured agent is not one this launcher can start (expected: claude or codex)"),
     124: ("launch_timeout",
@@ -171,7 +181,27 @@ _RC_TABLES = {"launch": _LAUNCH_RC, "nudge": _NUDGE_RC}
 # see the note on the gh needles below, which a bare "429" violated by matching the `[i429]` id
 # prefix that every single launcher line carries.
 _LAUNCH_TEXT = (
-    # FIRST OF ALL (issue #301), ahead of even the gh needles. A poisoned environment is causally
+    # FIRST OF ALL (issue #326) — and note this needle is NOT the fence's classification path. rc=9
+    # is authoritative (see `_RC_AUTHORITATIVE`), precisely because this refusal's text interpolates
+    # a socket path and a switch value the engine did not choose. What remains here is the FALLBACK
+    # for the one window where the rc carries no meaning: a newly-merged launcher emitting rc=9 read
+    # by an engine published BEFORE this change, whose rc table has no entry for it. That degrades
+    # to a per-issue park rather than a held queue — loud and bounded, and it clears the moment the
+    # engine is republished.
+    #
+    # It leads the table for the same reason the rc rule exists: an interpolated socket path can
+    # contain any other needle here, so any position but the first is a position some later needle
+    # can be inserted above. Costs the readings below nothing — "FENCE DOWN" is the loop's OWN
+    # phrase from lib/launch.py, which gh, git and cmux can never emit, and which no variable name
+    # in an env-poison refusal can contain (it has a space in it).
+    (("fence down",),
+     ("fence_down",
+      "this machine declares its fleet fenced and the pre-flight found the session host's control "
+      "socket unfenced (a tokenless caller was SERVED) or unanswerable — so no session was "
+      "launched onto it. A machine-level fault no queued issue caused and none can fix by "
+      "re-approving: rebuild the patched host and reinstall the fleet server, or declare the "
+      "machine unfenced deliberately")),
+    # THEN (issue #301), ahead of the gh needles. A poisoned environment is causally
     # UPSTREAM of the auth death it can produce — an inherited XDG_CONFIG_HOME is exactly how `gh`
     # dies — so when the session's refusal names the environment, the environment is the honest
     # reading and "run `gh auth login`" is a confidently wrong remedy. Ordering it here costs the
@@ -317,6 +347,17 @@ CHANNEL_FAULT_REASONS = frozenset({
     # and held as a channel fault it would surface under the systemic-launch alert, whose body
     # names App Nap and the cmux anchor.
     "claude_identity_wrong_runner",
+    # (#326) The session host's control socket is unfenced (or unanswerable) on a machine that
+    # declares its fleet fenced. Every launch here reads the SAME socket and gets the same verdict,
+    # so this is the gh_auth_dead_runner shape one layer down: charged per-issue it would walk the
+    # whole approved queue into parks over one machine-level fault, and each of those parks would
+    # carry a memo asking the owner to re-approve an issue that was never the problem.
+    #
+    # Unlike its two siblings there is no per-issue variant to hold apart from: a fence is a
+    # property of the host server, and no session can be launched in a way that fixes it. Held as a
+    # channel fault the queue simply waits — which is the correct posture, because the alternative
+    # to waiting is flying workers onto an open socket.
+    "fence_down",
 })
 
 
@@ -338,9 +379,30 @@ def is_channel_fault(rec):
     return isinstance(rec, dict) and rec.get("reason") in CHANNEL_FAULT_REASONS
 
 
+# Exit codes whose rc DECIDES, with the text pass skipped entirely (issue #326).
+#
+# The text pass exists to disambiguate — the launcher exits 1 for five distinct faults and only its
+# stderr says which. It costs nothing where an rc is already unambiguous, and it costs everything
+# where that rc's memo INTERPOLATES a value this engine did not choose. `fence_down` does exactly
+# that: it names the control socket it probed (a path the operator picked) and, when the switch is
+# unreadable, the switch's value (which may be any string at all). Run through the needle table,
+# a socket at `/tmp/env poisoned.sock` classifies a machine-level fence failure as `env_poisoned` —
+# a PER-ISSUE reason. That is the 2026-07-09 shape exactly, and the same mistake `[i429]` already
+# taught once: the whole approved queue walks into parks over one machine fault, each memo naming
+# something the issue did not do.
+#
+# The rule this generalizes: an rc whose stderr carries text from outside this engine may not be
+# classified BY that text. Adding an entry here is how a future such reason opts out — and it is
+# strictly safer than ordering its needle first, which the next needle added above it would undo.
+_RC_AUTHORITATIVE = {"launch": frozenset({9})}
+
+
 def _classify(kind, rc, captured):
     """(reason, detail) for a non-success outcome. Text first, then the rc table, then an honest
-    fallback that names the rc rather than inventing a cause."""
+    fallback that names the rc rather than inventing a cause — except for the rcs above, which
+    skip the text pass because their own text is partly not ours."""
+    if rc in _RC_AUTHORITATIVE.get(kind, ()) and rc in _RC_TABLES.get(kind, {}):
+        return _RC_TABLES[kind][rc]
     if kind == "launch" and captured:
         low = captured.lower()
         for needles, verdict in _LAUNCH_TEXT:

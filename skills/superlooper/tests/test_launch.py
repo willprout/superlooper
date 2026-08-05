@@ -22,6 +22,7 @@ import os
 
 import pytest
 
+import journal
 import launch
 import session_host
 
@@ -35,10 +36,14 @@ class FakeEdges:
     succeeds silently — a test names only the edge it is about.
     """
 
-    def __init__(self, answers=None):
+    def __init__(self, answers=None, fence=None):
         self.answers = answers or {}
         self.calls = []
         self.slept = 0.0
+        # What a tokenless probe of the control socket would find (#326). FENCED by default so a
+        # test that is not about the fence never has to say so.
+        self.fence_verdict = fence if fence is not None else session_host.FENCED
+        self.fence_asked = []
 
     def run(self, argv, timeout=None, cwd=None, env=None):
         argv = [str(a) for a in argv]
@@ -55,6 +60,10 @@ class FakeEdges:
 
     def token(self):
         return "tok-1"
+
+    def fence(self, socket_path, timeout=None):
+        self.fence_asked.append(socket_path)
+        return self.fence_verdict
 
 
 class FakeHost:
@@ -564,6 +573,245 @@ def test_the_launcher_passes_no_token_of_its_own(tmp_path):
     env = host.spawned[0]["env"]
     assert session_host.API_TOKEN_ENV_VAR not in env
     assert session_host.API_TOKEN_FILE_ENV_VAR not in env
+
+
+# ------------------------------------------------------------ the fence pre-flight (#326)
+# #305 shipped the fence and the probe that measures it; nothing called the probe on a launch
+# path, so the only thing establishing that a fleet was fenced was a human running the acceptance
+# check by hand. The carried patch is deliberately INERT with no token configured (that is what
+# lets upstream's own suite pass unmodified), so a stock or misconfigured host serves any tokenless
+# worker — and from the runner's seat that host does not look broken, because it answers.
+
+_SOCK = "/tmp/superlooper-test-fence.sock"
+
+
+def _fleet(monkeypatch, switch="required", socket=_SOCK):
+    """Declare what this MACHINE says about its fence, where the launcher actually reads it.
+
+    The PROCESS environment, not a Spec field. That is not a test-rig detail — it is the property
+    under test: the doorway runs the host CLI with no explicit env, so `os.environ` is what the
+    child inherits, and a launcher that read the switch or the socket from anywhere else could
+    probe one socket and spawn onto another. (conftest neutralizes both variables autouse, so a
+    test that does not call this gets a disarmed gate and an absent socket.)
+    """
+    if switch is None:
+        monkeypatch.delenv("SL_FLEET_FENCE", raising=False)
+    else:
+        monkeypatch.setenv("SL_FLEET_FENCE", switch)
+    if socket is None:
+        monkeypatch.delenv("HERDR_SOCKET_PATH", raising=False)
+    else:
+        monkeypatch.setenv("HERDR_SOCKET_PATH", socket)
+
+
+def test_an_open_socket_refuses_a_worker_launch(tmp_path, monkeypatch):
+    """THE point of the issue. OPEN means a tokenless caller was SERVED: every worker pane already
+    carries the socket path, so the session about to be started could drive the whole fleet with
+    ten lines of python. Refused, never warned about."""
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch)
+    spec = _spec(tmp_path)
+    result, edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.FENCE_DOWN
+    assert "FENCE DOWN" in result.stderr
+    assert "served" in result.stderr.lower()
+    assert host.spawned == [], "an unfenced fleet costs no pane"
+
+
+def test_a_fenced_socket_permits_a_worker_launch(tmp_path, monkeypatch):
+    """The other half, and the one that keeps this from being a gate that refuses everything."""
+    edges = FakeEdges(fence=session_host.FENCED)
+    _fleet(monkeypatch)
+    spec = _spec(tmp_path)
+    result, edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.OK, result.stderr
+    assert [s["name"] for s in host.spawned] == ["i308"]
+
+
+def test_an_unreachable_socket_refuses_a_worker_launch(tmp_path, monkeypatch):
+    """The RULED behaviour (#326 DoD), decided rather than defaulted: UNREACHABLE refuses.
+
+    Silence is not a fence — `fence_probe` will not call it one (c2), and neither may this. Two
+    further reasons it is a refusal rather than a proceed: the spawn is about to go through that
+    same socket, so a socket that is genuinely down fails the launch a step later anyway; and a
+    pre-flight that PROCEEDED on UNREACHABLE would be silently disarmed by anything that breaks the
+    probe — a fail-open on the one check whose whole job is to fail closed.
+    """
+    edges = FakeEdges(fence=session_host.UNREACHABLE)
+    _fleet(monkeypatch)
+    spec = _spec(tmp_path)
+    result, edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.FENCE_DOWN
+    assert "FENCE DOWN" in result.stderr
+    assert "did not answer" in result.stderr
+    assert host.spawned == []
+
+
+def test_an_unfenced_dev_host_stays_usable(tmp_path, monkeypatch):
+    """The switch is what makes this shippable. A dev workstation runs a stock host, so its socket
+    is OPEN by construction — and a hardcoded assumption here would break every dev spawn."""
+    edges = FakeEdges(fence=session_host.OPEN)
+    # A machine that declares no fence — every checkout that is not the fleet's.
+    _fleet(monkeypatch, switch=None)
+    spec = _spec(tmp_path)
+    result, edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.OK, result.stderr
+    assert [s["name"] for s in host.spawned] == ["i308"]
+    assert edges.fence_asked == [_SOCK], \
+        "a disarmed gate still MEASURES: an unfenced machine's state has to be journalable"
+
+
+def test_an_explicit_off_is_the_same_as_saying_nothing(tmp_path, monkeypatch):
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch, switch="off")
+    spec = _spec(tmp_path)
+    result, _edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned != []
+
+
+def test_a_switch_value_this_engine_cannot_read_arms_the_gate_and_names_itself(tmp_path, monkeypatch):
+    """Fails closed, and says why. A typo'd switch on the fleet machine reading as `off` is a
+    silently disarmed fence — the exact class of silence this pre-flight exists to end."""
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch, switch="requried")
+    spec = _spec(tmp_path)
+    result, _edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.FENCE_DOWN
+    assert "requried" in result.stderr
+    assert host.spawned == []
+
+
+def test_the_gate_cannot_be_disarmed_by_the_attended_flag(tmp_path, monkeypatch):
+    """There is deliberately no attended bypass, for the reason `receives_token` has no grant
+    parameter: `SL_ATTENDED` is read from the environment, so an ambient `export SL_ATTENDED=1` in
+    the shell or LaunchAgent that started the runner would otherwise disarm the fence for every
+    worker on the machine. The MODE decides, and nothing else does."""
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch)
+    spec = _spec(tmp_path, attended=True)
+    result, _edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.FENCE_DOWN
+    assert host.spawned == []
+
+
+def test_a_debugger_launch_is_never_gated_by_the_fence(tmp_path, monkeypatch):
+    """A `d<N>` RECEIVES the token by design (#305), so an open socket grants it nothing it does
+    not already hold — and refusing repair because the fence is down would mean no unattended
+    repair at exactly the moment repair is needed, which is the landmine the whole spawn port was
+    built around."""
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch)
+    spec = _spec(tmp_path, iid="d12", home=_home(tmp_path, "d12"), cwd=str(tmp_path))
+    result, edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned != []
+    assert edges.fence_asked == [], "the repair path is not gated, so it does not probe either"
+
+
+def test_the_refusal_costs_no_worktree_no_pretrust_and_no_pane(tmp_path, monkeypatch):
+    """Ordered with the other machine-level asserts, ahead of anything that CREATES: a refusal must
+    leave no orphan pane and no leftover checkout (the base-missing discipline, #28)."""
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch)
+    spec = _spec(tmp_path)
+    result, edges, host = _run(spec, edges=edges, started=False)
+    assert result.rc == launch.FENCE_DOWN
+    assert not any("worktree" in " ".join(c) for c in edges.calls), edges.calls
+    assert not any("pretrust" in " ".join(c) for c in edges.calls), edges.calls
+    assert host.spawned == []
+
+
+def test_the_probe_asks_the_socket_the_spawn_itself_would_use(tmp_path, monkeypatch):
+    """Not theatre: the verdict has to be about the socket this launch is about to drive. The
+    launcher resolves it through the doorway's own resolver, from the same environment the host
+    CLI child inherits — so the two agree by construction rather than by two copies of a rule."""
+    edges = FakeEdges(fence=session_host.FENCED)
+    _fleet(monkeypatch, socket=None)
+    monkeypatch.setenv("HOME", "/Users/x")
+    monkeypatch.setenv("HERDR_SESSION", "fleet")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    spec = _spec(tmp_path)
+    result, edges, _host = _run(spec, edges=edges)
+    assert result.rc == launch.OK, result.stderr
+    assert edges.fence_asked == [session_host.control_socket_path(os.environ)]
+    assert edges.fence_asked == ["/Users/x/.config/herdr/sessions/fleet/herdr.sock"]
+
+
+def test_a_machine_whose_socket_cannot_be_resolved_refuses_rather_than_guessing(tmp_path, monkeypatch):
+    """`control_socket_path` returns None when there is nothing to resolve against. An armed gate
+    that shrugged there would be a fence nobody measured; a guessed path would be a verdict about
+    a machine the probe never looked at."""
+    edges = FakeEdges(fence=session_host.FENCED)
+    _fleet(monkeypatch, socket=None)                      # and no HOME to fall back on either
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    spec = _spec(tmp_path)
+    result, edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.FENCE_DOWN
+    assert edges.fence_asked == [], "there was no socket to ask"
+    assert host.spawned == []
+
+
+def test_the_probe_verdict_is_journaled_on_every_worker_launch(tmp_path, monkeypatch):
+    """So a morning report can show the fence state OVER TIME. Journaled on the permitted path too
+    — an armed gate that only ever wrote a line when it refused would leave 'this fleet has been
+    fenced all week' unprovable, and the disarmed case unrecorded entirely."""
+    edges = FakeEdges(fence=session_host.FENCED)
+    _fleet(monkeypatch)
+    spec = _spec(tmp_path)
+    result, _edges, _host = _run(spec, edges=edges)
+    assert result.rc == launch.OK, result.stderr
+    records = [r for r in journal.read(spec.run_root) if r.get("act") == "fence_preflight"]
+    assert len(records) == 1, records
+    assert records[0]["id"] == "i308"
+    assert records[0]["verdict"] == session_host.FENCED
+    assert records[0]["required"] is True
+    assert records[0]["socket"] == _SOCK
+    assert records[0]["refused"] is False
+    assert records[0]["ts"] > 0
+
+
+def test_an_unfenced_machine_that_launches_anyway_still_leaves_a_record(tmp_path, monkeypatch):
+    """The line that keeps 'default off' from being a silent no-op: a dev host's OPEN socket is
+    written down every launch, so a machine that was quietly never armed is visible in the report
+    rather than indistinguishable from a fenced one."""
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch, switch=None)
+    spec = _spec(tmp_path)
+    result, _edges, _host = _run(spec, edges=edges)
+    assert result.rc == launch.OK, result.stderr
+    record = [r for r in journal.read(spec.run_root) if r.get("act") == "fence_preflight"][0]
+    assert record["verdict"] == session_host.OPEN
+    assert record["required"] is False
+    assert record["refused"] is False
+
+
+def test_a_refusal_is_journaled_as_a_refusal(tmp_path, monkeypatch):
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch)
+    spec = _spec(tmp_path)
+    result, _edges, _host = _run(spec, edges=edges, started=False)
+    assert result.rc == launch.FENCE_DOWN
+    record = [r for r in journal.read(spec.run_root) if r.get("act") == "fence_preflight"][0]
+    assert record["verdict"] == session_host.OPEN
+    assert record["required"] is True
+    assert record["refused"] is True
+
+
+def test_an_unjournalable_verdict_never_decides_the_launch(tmp_path, monkeypatch):
+    """Telemetry may not fail a launch, and — far more important — it may not PASS one. The
+    refusal is the Result; the journal line is a record of it."""
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch)
+    spec = _spec(tmp_path)
+    # A journal that cannot be written: the state home is a FILE where the directory must be.
+    unwritable = tmp_path / "nowhere"
+    unwritable.write_text("not a directory")
+    spec.run_root = str(unwritable / "home")
+    result, _edges, host = _run(spec, edges=edges, started=False)
+    assert result.rc == launch.FENCE_DOWN, result.stderr
+    assert host.spawned == []
 
 
 # --------------------------------------------------------------------------- the handoff

@@ -131,6 +131,11 @@ _HOST_ENV_PREFIX = "HERDR"
 # one, because an unfenced socket does not look broken from the runner's seat — it answers.
 FENCED, OPEN, UNREACHABLE = "fenced", "open", "unreachable"
 
+# The MACHINE's own declaration that its fleet is fenced (#326) — see `fence_required` below for
+# why this is an environment variable and not a key in the repo's config file.
+FENCE_REQUIRED_VAR = "SL_FLEET_FENCE"
+FENCE_REQUIRED, FENCE_OFF = "required", "off"
+
 # --------------------------------------------------------------------- the allowance (#331)
 # The fence refuses every unauthenticated connection before dispatch, with exactly ONE exception,
 # ruled by the owner on 2026-08-04: the agent's own state report. That call is what tells the host
@@ -513,6 +518,46 @@ def receives_token(name):
     govern what a ``d<N>`` session may actually do with it.
     """
     return bool(isinstance(name, str) and _DEBUGGER_RE.match(name))
+
+
+def fence_required(env=None):
+    """Does THIS MACHINE declare its fleet fenced? ``(required, unrecognised value or None)``.
+
+    The switch the launch pre-flight reads (#326). A verdict on its own decides nothing — an OPEN
+    socket is the normal, correct state of a dev workstation running a stock host, and a pre-flight
+    that refused there would break every dev spawn on the day it shipped. This is what says which
+    machines an OPEN answer is fatal on.
+
+    **An ENVIRONMENT variable rather than a key in the repo's own config**, which is the one design
+    decision here worth defending. ``.superlooper/config.json`` travels with the repo through git,
+    so the fleet mini and the owner's laptop read the SAME file — and the whole point of the switch
+    is that those two machines must answer differently. The fence is a property of the host server
+    running on a machine, not of a checkout. ``SL_FLEET_*`` is already the spelling for exactly that
+    claim (``identity.FLEET_DIR_VAR``: "what the MACHINE sets").
+
+    Three answers, and the third is the one that matters:
+
+    * unset, empty, or ``off`` — no fence is claimed. ``off`` exists so a machine can be taken out
+      of the fenced set DELIBERATELY, leaving a value on disk that says so; deleting the variable is
+      indistinguishable from never having set it.
+    * ``required`` — the fence is claimed, and the pre-flight enforces it.
+    * **anything else — the fence is claimed anyway, and the value comes back so the refusal can
+      name it.** Fails CLOSED because the alternative is the failure this whole issue exists to
+      end: a typo on the fleet machine reading as "off" is a silently disarmed fence, and an
+      unfenced socket does not look broken from the runner's seat. Truthy spellings (``1``,
+      ``true``, ``yes``) are deliberately NOT accepted as synonyms rather than being quietly
+      welcomed — ``SL_FLEET_FENCE=0`` reads to a human as "disarmed" and to a truthy parser as
+      nothing at all, and a switch whose two readers disagree about a security posture is worse
+      than one that is simply strict about its two words.
+    """
+    env = os.environ if env is None else env
+    raw = env.get(FENCE_REQUIRED_VAR)
+    value = raw.strip() if isinstance(raw, str) else ""
+    if not value or value.lower() == FENCE_OFF:
+        return False, None
+    if value.lower() == FENCE_REQUIRED:
+        return True, None
+    return True, value
 
 
 def fence_probe(socket_path, env=None, timeout=5.0, connect=None):
