@@ -86,6 +86,11 @@ def _clear_worker_launch_env(monkeypatch):
         # drive it. Scrubbed here so _never_reach_real_session_host below can set the fail-closed
         # default.
         "SL_HERDR",
+        # The restore-wait override (issue #317). The engine's own docs invite an operator to
+        # export this when their machine's restore window is wider than the default, and a
+        # dogfooding shell that has is exactly the shell this suite runs in — inherited, it
+        # false-reds every test that asserts what the default bound is.
+        "SL_HERDR_RESTORE_WAIT",
         # The runner's process home (issue #306). SL_LAUNCHCTL steers the service manager the CLI
         # and doctor talk to; SL_LAUNCHD_DIR steers where a LaunchAgent is PLACED. Both are ambient
         # on a machine that has installed a login-item runner, and both change what an
