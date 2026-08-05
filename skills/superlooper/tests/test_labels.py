@@ -51,10 +51,37 @@ def test_rebuild_label_exists_but_is_never_runner_managed():
     assert all(step.get("name") != "rebuild" for step in labels.label_migration_plan(set()))
 
 
+def test_awaiting_answer_is_registered_and_runner_managed():
+    """Issue #337, the #165 defect class's second occurrence. The #163 question hand-back writes
+    `awaiting-answer` in the runner; nothing ever put it in LABELS, so adopt never created it, the
+    #160 boot migration never healed it, and gh refused the label move on every repo. Because that
+    move retries silently, #310 froze for ~9 hours (2026-08-04) with the owner's answer
+    un-ingestable — the settle that leaves awaiting_answer runs only after the label lands.
+
+    It must be registered AND '(runner-managed)': unlike the owner's own verbs (expedite, rebuild,
+    pre-authorized:referee) the RUNNER applies this one as machinery, so the boot migration has to
+    self-heal it on every repo adopted before this shipped — otherwise the next question hand-back
+    on such a repo freezes exactly the same way.
+    """
+    spec = labels.label_spec("awaiting-answer")
+    assert spec is not None, "the label the question hand-back writes must be in the §C.2 set, or " \
+                             "adopt never creates it and gh refuses every hand-back"
+    color, desc = spec
+    assert color and desc
+    assert "(runner-managed)" in desc
+    assert "awaiting-answer" in labels.runner_managed_labels()
+    # a repo adopted before #337 lacks it -> boot plans the create, so the heal is automatic
+    assert "awaiting-answer" in labels.missing_runner_labels(
+        {n for n, _c, _d in labels.LABELS} - {"awaiting-answer"})
+    assert {"kind": "create", "name": "awaiting-answer"} in labels.label_migration_plan(
+        [n for n, _c, _d in labels.LABELS if n != "awaiting-answer"])
+
+
 def test_runner_managed_subset_is_the_tagged_set():
     # exactly the labels the RUNNER writes as machinery — derived from the description tag, so the
     # LABELS list is the one place the vocabulary is defined.
-    assert set(labels.runner_managed_labels()) == {"in-progress", "needs-owner", "parked"}
+    assert set(labels.runner_managed_labels()) == {"in-progress", "needs-owner", "parked",
+                                                   "awaiting-answer"}
     for name in labels.runner_managed_labels():
         color, desc = labels.label_spec(name)
         assert "(runner-managed)" in desc and color   # every runner-managed label has a real spec
@@ -62,18 +89,22 @@ def test_runner_managed_subset_is_the_tagged_set():
 
 def test_missing_runner_labels_fails_closed_on_garbage():
     assert labels.missing_runner_labels(set(n for n, _c, _d in labels.LABELS)) == []
-    assert labels.missing_runner_labels({"agent-ready", "in-progress", "parked"}) == ["needs-owner"]
+    assert labels.missing_runner_labels(
+        {"agent-ready", "in-progress", "parked", "awaiting-answer"}) == ["needs-owner"]
     # a wrong-typed / garbage read is treated as EMPTY -> every runner-managed label reads missing,
     # never as "all present" (the repo's fail-open-on-wrong-typed defect class).
-    assert set(labels.missing_runner_labels("garbage")) == {"in-progress", "needs-owner", "parked"}
-    assert set(labels.missing_runner_labels(None)) == {"in-progress", "needs-owner", "parked"}
+    assert set(labels.missing_runner_labels("garbage")) == {"in-progress", "needs-owner", "parked",
+                                                            "awaiting-answer"}
+    assert set(labels.missing_runner_labels(None)) == {"in-progress", "needs-owner", "parked",
+                                                       "awaiting-answer"}
 
 
 def test_plan_is_empty_when_already_applied():
     have = [n for n, _c, _d in labels.LABELS]              # a fully-adopted repo
     assert labels.label_migration_plan(have) == []
     # needs-william already renamed away AND needs-owner present -> still a no-op (idempotent).
-    assert labels.label_migration_plan(["needs-owner", "in-progress", "parked"]) == []
+    assert labels.label_migration_plan(
+        ["needs-owner", "in-progress", "parked", "awaiting-answer"]) == []
 
 
 def test_plan_creates_a_missing_runner_managed_label():
@@ -86,26 +117,36 @@ def test_plan_renames_needs_william_first_and_does_not_recreate_it():
     # the 2026-07-13 storm's exact shape: the repo still carries the OLD needs-william and lacks the
     # NEW needs-owner. The plan renames in place (preserving every issue that carries it) and must
     # NOT then also try to create needs-owner (the rename already produced it).
-    have = ["needs-william", "in-progress", "parked", "agent-ready"]
+    have = ["needs-william", "in-progress", "parked", "awaiting-answer", "agent-ready"]
     plan = labels.label_migration_plan(have)
     assert plan == [{"kind": "rename", "old": "needs-william", "new": "needs-owner"}]
 
 
+def test_plan_heals_a_repo_adopted_before_awaiting_answer_was_registered():
+    # EVERY repo adopted before issue #337 is in this state: the whole pre-#337 set present, the
+    # question hand-back's label absent. Boot creates exactly it — one step, nothing else disturbed
+    # — which is what makes the fix reach other adopted repos without anyone re-running adopt.
+    have = [n for n, _c, _d in labels.LABELS if n != "awaiting-answer"]
+    assert labels.label_migration_plan(have) == [{"kind": "create", "name": "awaiting-answer"}]
+
+
 def test_plan_renames_and_still_creates_other_missing_labels():
-    have = ["needs-william", "agent-ready"]                # in-progress + parked also missing
+    have = ["needs-william", "agent-ready"]                # in-progress + parked + awaiting also missing
     plan = labels.label_migration_plan(have)
     assert plan[0] == {"kind": "rename", "old": "needs-william", "new": "needs-owner"}
     created = [s["name"] for s in plan if s["kind"] == "create"]
-    assert created == ["in-progress", "parked"]           # NOT needs-owner (rename produced it)
+    # NOT needs-owner (the rename produced it); LABELS order, so awaiting-answer comes after parked
+    assert created == ["in-progress", "parked", "awaiting-answer"]
 
 
 def test_plan_does_not_rename_when_needs_owner_already_exists():
     # both old and new present (a mid-migration repo): renaming would collide, so the rename is
     # skipped and only genuinely-missing labels are created.
-    have = ["needs-william", "needs-owner", "in-progress", "parked"]
+    have = ["needs-william", "needs-owner", "in-progress", "parked", "awaiting-answer"]
     assert labels.label_migration_plan(have) == []
 
 
 def test_plan_creates_every_runner_managed_label_from_scratch():
     plan = labels.label_migration_plan([])
-    assert plan == [{"kind": "create", "name": n} for n in ("in-progress", "needs-owner", "parked")]
+    assert plan == [{"kind": "create", "name": n}
+                    for n in ("in-progress", "needs-owner", "parked", "awaiting-answer")]

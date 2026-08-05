@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import labels as labels_lib
 import loopstate
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -27,7 +28,13 @@ CLI = _ROOT / "skill" / "bin" / "superlooper"
 _FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gh"
 _FAKE_GH = Path(__file__).resolve().parent / "fakes" / "fake-gh"
 
-ALL_LABELS = ["agent-ready", "in-progress", "needs-owner", "parked", "expedite",
+ALL_LABELS = ["agent-ready", "in-progress", "needs-owner", "parked",
+              # the #163 question hand-back's control label (#337). adopt must CREATE it — gh
+              # refuses to apply a label that does not exist, which is exactly how #310 froze for
+              # ~9h on 2026-08-04 — and unlike the owner verbs below, the RUNNER applies this one,
+              # so it is also boot-healed (that runner-managed split is pinned in test_labels.py).
+              "awaiting-answer",
+              "expedite",
               "preserve", "auto-approved:nightly-red", "superseded",
               # the owner's explicit rebuild-from-scratch verb (#161). adopt must CREATE it — gh
               # refuses to apply a label that does not exist — but the runner never APPLIES it (that
@@ -707,6 +714,24 @@ def test_adopt_creates_the_model_and_effort_starter_labels(rig):
     assert {"effort:low", "effort:medium", "effort:high", "effort:xhigh", "effort:max"} <= created
 
 
+def test_readopt_reconciles_a_hand_created_awaiting_answer_label(rig):
+    # Issue #337's other half. On 2026-08-04 the only way to unfreeze #310 was a supervised
+    # `gh label create awaiting-answer` — so this repo (and any repo that hit the same freeze) now
+    # carries a label nobody registered, with whatever colour and description the hand fix chose.
+    # Re-adopting must RECONCILE it to the registered spec rather than skip it as "already there"
+    # or error on the collision: gh's `--force` makes create-or-update one idempotent call, which
+    # is what lets adopt be re-run safely on a repo that self-medicated.
+    r = cli(rig, "adopt", "--repo", str(rig.repo))          # the rig's repo already HAS the label
+    assert r.returncode == 0, r.stdout + r.stderr
+    created = [m for m in mutations(rig)
+               if m["kind"] == "create_label" and m["name"] == "awaiting-answer"]
+    assert len(created) == 1, "adopt must reconcile the existing label exactly once: %s" % created
+    color, desc = labels_lib.label_spec("awaiting-answer")
+    assert created[0]["color"] == color
+    assert created[0]["description"] == desc.replace("{operator}", "o")   # the rig's owner login
+    assert created[0]["force"] is True, "without --force this is an error on an existing label"
+
+
 def test_readopt_adds_a_new_starter_label_without_disturbing_the_others(rig):
     # issue #134: a NEW seeded knob (model:sonnet) has to reach repos that were adopted before it
     # existed, and migrations ride adopt — not install (the 2026-07-13 needs-owner storm lesson).
@@ -1138,16 +1163,19 @@ def test_runner_managed_labels_is_the_tagged_subset():
     # the runner-managed subset is derived from the '(runner-managed)' tag in the LABELS
     # descriptions, so the LABELS list stays the single source of truth.
     sl = _cli_module()
-    assert set(sl.runner_managed_labels()) == {"in-progress", "needs-owner", "parked"}
+    assert set(sl.runner_managed_labels()) == {"in-progress", "needs-owner", "parked",
+                                               "awaiting-answer"}
 
 
 def test_missing_runner_labels_pure():
     sl = _cli_module()
+    _MANAGED = {"in-progress", "needs-owner", "parked", "awaiting-answer"}
     assert sl.missing_runner_labels(set(ALL_LABELS)) == []
-    assert sl.missing_runner_labels({"agent-ready", "in-progress", "parked"}) == ["needs-owner"]
-    assert set(sl.missing_runner_labels(set())) == {"in-progress", "needs-owner", "parked"}
-    assert set(sl.missing_runner_labels([])) == {"in-progress", "needs-owner", "parked"}  # list ok
-    assert set(sl.missing_runner_labels("garbage")) == {"in-progress", "needs-owner", "parked"}
+    assert sl.missing_runner_labels(
+        {"agent-ready", "in-progress", "parked", "awaiting-answer"}) == ["needs-owner"]
+    assert set(sl.missing_runner_labels(set())) == _MANAGED
+    assert set(sl.missing_runner_labels([])) == _MANAGED                       # list ok
+    assert set(sl.missing_runner_labels("garbage")) == _MANAGED
 
 
 def test_run_creates_a_missing_runner_managed_label_at_boot(rig):

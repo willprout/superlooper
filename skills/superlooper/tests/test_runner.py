@@ -6335,12 +6335,46 @@ def _alert(rig):
 def test_boot_creates_a_missing_runner_managed_label(rig):
     # a repo missing a runner-managed label has it CREATED at boot (issue #160), not #108's
     # fail-loud refusal — an already-installed migration step, applied idempotently (--force).
-    _set_repo_labels(rig, ["agent-ready", "in-progress", "parked"])       # needs-owner MISSING
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "parked",        # needs-owner MISSING
+                           "awaiting-answer"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     created = [m for m in mutations(rig) if m["kind"] == "create_label"]
     assert [m["name"] for m in created] == ["needs-owner"]
     assert created[0]["force"] is True                                    # idempotent create-or-update
     assert _alert(rig) is None                                            # success -> no hold
+
+
+def test_boot_heals_a_repo_adopted_before_awaiting_answer_was_registered(rig):
+    # Issue #337, and the reason the label is tagged '(runner-managed)' rather than merely added to
+    # LABELS. EVERY repo adopted before this shipped is missing `awaiting-answer` — including this
+    # one, which only has it because a supervised `gh label create` unfroze #310 by hand on
+    # 2026-08-04. Registering it is not enough on its own: without the boot heal, such a repo keeps
+    # refusing the #163 question hand-back until somebody re-runs adopt, and the failure mode is a
+    # SILENT retry loop, so nobody would know to. Boot creates it, with the registered spec, and
+    # then boots normally.
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked"])
+    assert rig.r._apply_boot_migrations(now=NOW) is True
+    created = [m for m in mutations(rig) if m["kind"] == "create_label"]
+    assert [m["name"] for m in created] == ["awaiting-answer"]
+    assert created[0]["color"] and created[0]["force"] is True
+    assert "(runner-managed)" in created[0]["description"]
+    assert "{operator}" not in created[0]["description"]       # signed, never a raw placeholder
+    assert _alert(rig) is None
+
+
+def test_boot_holds_when_the_awaiting_answer_heal_cannot_apply(rig):
+    # The other side of #337's blast radius on OTHER adopted repos, stated rather than assumed:
+    # adding a runner-managed label gives every pre-#337 repo one new boot-time GitHub WRITE, and a
+    # write that fails takes the #160 contract's hold path — refuse the tick loop, raise one legible
+    # systemic ALERT naming the migration. That is the intended behaviour (a repo whose vocabulary
+    # cannot be repaired would otherwise storm), and it is worth pinning for THIS label because it
+    # is the first new runner-managed label since the contract was written.
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked"])
+    _fail_gh(rig, "label create")
+    assert rig.r._apply_boot_migrations(now=NOW) is False       # boot HELD, not stormed
+    alert = _alert(rig)
+    assert alert and any("migration_hold" in x and "awaiting-answer" in x
+                         for x in alert["reasons"])
 
 
 def test_boot_migration_applies_the_needs_william_rename(rig):

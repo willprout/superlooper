@@ -23,6 +23,17 @@ LABELS = [
     ("in-progress", "fbca04", "claimed by a loop session (runner-managed)"),
     ("needs-owner", "d93f0b", "parked for an owner decision (runner-managed)"),
     ("parked", "c2e0c6", "handed back to {operator} with a memo (runner-managed)"),
+    # The #163 durable-question hand-back: a worker exited on an owner decision, the question is a
+    # comment, and this label is what says the issue is WAITING rather than building. Registered by
+    # issue #337, after it was born in code and never in the vocabulary — the runner wrote it, gh
+    # refused it (no repo had it), and because every label move retries silently, #310 froze for ~9
+    # hours on 2026-08-04 with the owner's answer un-ingestable. '(runner-managed)' is load-bearing
+    # here, not decoration: the runner APPLIES this one as machinery (unlike expedite/rebuild/
+    # pre-authorized:referee, which are the owner's own verbs), so the #160 boot migration must
+    # self-heal it on every repo adopted before this shipped — otherwise the next question hand-back
+    # on such a repo freezes exactly the same way.
+    ("awaiting-answer", "c5def5",
+     "a posted worker question awaits {operator}'s answer (runner-managed)"),
     ("expedite", "b60205", "queue-bypass lane: the next free lane takes this first"),
     ("preserve", "5319e7", "on a PR: resolve conflicts in-branch instead of regenerating"),
     ("auto-approved:nightly-red", "e99695",

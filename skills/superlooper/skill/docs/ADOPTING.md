@@ -269,6 +269,12 @@ rest are workflow state the runner and William drive.
   place — preserving it on every issue — and the runner recognizes both, so an already-adopted repo
   keeps working. Re-run `adopt` to migrate.)
 - `parked` — handed back with a memo after a retry/conflict cap.
+- `awaiting-answer` — a worker hit a decision only you can make, exited, and posted its question as
+  a comment; the issue is waiting on your reply, not building. Answer it (the dashboard's Answer
+  button, or a comment plus re-approval) and a fresh session resumes with the Q&A in its brief.
+  Registered late (issue #337): before that, the runner wrote a label no repo had, and because
+  label moves retry silently rather than failing loudly, one issue sat frozen for ~9 hours. If you
+  adopted before that fix, the runner creates the label for you at its next boot.
 - `preserve` — on a PR: resolve conflicts in the PR's own branch instead of regenerating.
 - `superseded` — on a PR the loop replaced by a rebuild (branch kept, PR left open).
 - `auto-approved:nightly-red` — the one standing-rule auto-approval: a fix issue the nightly (or
