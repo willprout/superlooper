@@ -304,7 +304,8 @@ superlooper janitor --repo /path/to/repo --retry-refused  # re-propose previousl
    kind an issue is and which territory it touches are judgment calls, and there is no standing LLM
    seat to make them. It offers the closed set of values the repo itself declares as
    mutually-exclusive alternatives and **your tap picks one**. A bulk `y/N` never executes a grouped
-   alternative (it would apply all three `type:` labels at once); only an explicit per-key tap does.
+   alternative (it would apply all three `type:` labels at once); only an explicit per-key tap does — the command
+   center's, not a CLI gesture, so a terminal sweep leaves the grouped choices for that surface.
    The one ungrouped fix is the case where nothing is being chosen — the author already wrote the
    `touches:` value and only the heading above it is missing.
 
@@ -454,8 +455,9 @@ answer is never reused.
 **At most two questions per issue.** A worker that would ask a third is no longer scoping — the
 runner hands the issue back as `needs-owner` with the question quoted, rather than opening a third
 round-trip. Answering does **not** reset the count: the cap spans a whole answer-and-relaunch cycle,
-so a second question still costs the second slot. Re-approving a **parked** issue is a different
-act and *is* a fresh cap — `agent-ready` on a park-family issue zeroes `questions_asked` along with
+so a second question still costs the second slot. Re-approving a **parked / needs-owner /
+bounced** issue is a different act and *is* a fresh cap — `agent-ready` on any of those zeroes
+`questions_asked` along with
 the retry and conflict counters, which is what lets a question-capped issue be re-scoped and tried
 again.
 

@@ -23,8 +23,10 @@ disk). If `superlooper` isn't on the current PATH (observed live 2026-07-11 — 
 lands in the owner's interactive PATH, not necessarily yours), invoke the installed copy
 directly: `~/.claude/skills/superlooper/bin/superlooper` — that is the copy the live runner
 itself runs from, so it always exists on a machine with a loop. `superlooper doctor --stack --repo <repo>` adds machine-level checks — claude/gh
-auth, gh API headroom, launch shim, and the **live runner anchor probe** (catches a runner
-whose cmux tab was closed/moved, which otherwise parks the whole queue) — but note its one
+auth, gh API headroom, launch shim, and — for a `pane`-home repo — the **live runner anchor
+probe** (catches a runner whose own tab was closed or moved, so its boot preflight and the
+watchdog's resurrection tab have nowhere to land; a `login-item` repo is judged by the `runner
+home` block instead) — but note its one
 deliberate side effect: it sends a single real test message through the notify channel.
 Fine when notify is the patient; skip it when the owner is asleep.
 
