@@ -663,7 +663,8 @@ def test_exit_refuses_when_liveness_is_unknown():
 
 
 def test_exit_closes_the_workspace_of_a_finished_session_and_verifies_it_went():
-    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (1, "", _NOT_FOUND)]})
+    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (0, _agent(), ""),
+                                       (1, "", _NOT_FOUND)]})
     fake.children[4242] = []                       # the agent has exited; the pane shell remains
     result = _host(fake).exit(_session())
     close = [c for c in fake.calls if c[1:3] == ["workspace", "close"]][0]
@@ -686,7 +687,8 @@ def test_exit_raises_when_the_close_did_not_take():
 def test_exit_will_not_call_a_close_verified_while_the_host_is_silent():
     # Silence is not evidence. Reporting `closed` when the host stopped answering is how a
     # workspace leaks while the runner believes it was reaped (fresh-agent review, P0).
-    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (1, "", "connection refused")],
+    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (0, _agent(), ""),
+                                       (1, "", "connection refused")],
                      ("workspace", "get"): (1, "", "connection refused")})
     fake.children[4242] = []
     with pytest.raises(session_host.TeardownUnverified):
@@ -698,7 +700,8 @@ def test_the_agent_being_gone_is_not_proof_the_workspace_went():
     # has ALREADY exited, and the host clears names on exit — so "the name no longer resolves" was
     # true before the close and confirms nothing about it. A close that quietly did nothing would
     # leak one empty workspace per lane, forever, while every teardown reported success.
-    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (1, "", _NOT_FOUND)],
+    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (0, _agent(), ""),
+                                       (1, "", _NOT_FOUND)],
                      ("workspace", "close"): (1, "", _err("close_failed", "workspace is busy")),
                      ("workspace", "get"): (0, _ok({"type": "workspace_info",
                                                     "workspace": {"workspace_id": "w1"}}), "")})
@@ -711,7 +714,8 @@ def test_the_agent_being_gone_is_not_proof_the_workspace_went():
 def test_only_a_not_found_answer_means_the_workspace_went():
     # A "busy" or "refused" reply is the host saying it could not tell us — reading any structured
     # error as gone would be the same false success in a new costume (review verification pass).
-    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (1, "", _NOT_FOUND)],
+    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (0, _agent(), ""),
+                                       (1, "", _NOT_FOUND)],
                      ("workspace", "get"): (1, "", _err("workspace_busy", "try again"))})
     fake.children[4242] = []
     with pytest.raises(session_host.TeardownUnverified):
@@ -722,7 +726,8 @@ def test_a_close_that_errored_but_left_nothing_behind_is_still_a_teardown():
     # The other direction, so the fix above does not trade a false success for a false failure: a
     # `workspace_not_found` refusal means the window was ALREADY gone. Refusing THAT would park a
     # lane over a window the owner had simply closed himself.
-    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (1, "", _NOT_FOUND)],
+    fake = _healthy({("agent", "get"): [(0, _agent(), ""), (0, _agent(), ""),
+                                       (1, "", _NOT_FOUND)],
                      ("workspace", "close"): (1, "", _err("workspace_not_found", "no such w1"))})
     fake.children[4242] = []
     assert _host(fake).exit(_session()).closed is True

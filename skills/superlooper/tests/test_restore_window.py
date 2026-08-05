@@ -28,7 +28,7 @@ So the evidence this wrapper acts on is a PROCESS FACT (no runtime behind the pa
 own restore bookkeeping (the name still resolves) — never `agent list`'s status field, which is the
 one surface proven to lie here.
 
-**The measured window on the pinned build** is recorded in `test_the_measured_window_is_recorded`
+**The measured window on the pinned build** is recorded in `test_the_default_bound_clears_the_window_measured_on_the_pinned_build`
 and in the opt-in real drill at the bottom of this file; a version bump that moves it fails there
 visibly rather than silently eating the default bound.
 """
@@ -90,7 +90,7 @@ class FakeHerdr:
     answers `not_found` while the window is open and normally once it has closed.
     """
 
-    def __init__(self, script=None, alive=(), children=None, oracle_seconds=0.0):
+    def __init__(self, script=None, alive=(), children=None, oracle_seconds=0.0, call_seconds=0.0):
         self.script = {k: list(v) if isinstance(v, list) else v for k, v in (script or {}).items()}
         self.alive = set(alive)
         self.children = dict(children or {})
@@ -102,9 +102,14 @@ class FakeHerdr:
         # this ran ~7x its stated bound (fresh-agent review, P0), and only a clock that the oracle
         # also advances can hold that regression down.
         self.oracle_seconds = oracle_seconds
+        # And what a HOST call costs. Without this the fake simulates no in-loop blocking at all,
+        # which is what made the wall-clock assertion vacuous the first time: a poll-counting
+        # regression that kept the oracle out of the loop passed it (second fresh-agent review).
+        self.call_seconds = call_seconds
 
     def run(self, argv, timeout=None):
         self.calls.append(list(argv))
+        self.clock += self.call_seconds
         entry = self.script.get(tuple(argv[1:3]), (1, "", _err("unscripted", " ".join(argv[1:3]))))
         if isinstance(entry, list):
             entry = entry.pop(0) if len(entry) > 1 else entry[0]
@@ -118,7 +123,12 @@ class FakeHerdr:
         return int(pid) in self.alive
 
     def child_pids(self, pid):
-        return self.children.get(int(pid))
+        # A LIST OF LISTS is consumed in order, like `script`: it is how a pane that is a bare
+        # shell on one read and has its agent attached on the next gets staged.
+        answer = self.children.get(int(pid))
+        if isinstance(answer, list) and answer and isinstance(answer[0], list):
+            return answer.pop(0) if len(answer) > 1 else answer[0]
+        return answer
 
     def sleep(self, seconds):
         self.slept += seconds
@@ -294,14 +304,21 @@ def test_a_prompt_the_host_accepted_is_never_re_issued_by_the_wait():
         "one refused call, one accepted, and then no more: %s" % fake.verbs("agent", "prompt"))
 
 
-def test_the_wait_keeps_waiting_through_the_restores_second_half():
+@pytest.mark.parametrize("recorded", [4242, None])
+def test_the_wait_keeps_waiting_through_the_restores_second_half(recorded):
     """A restore does not go pane-absent → agent-attached in one step (fresh-agent review, P0).
 
     The host respawns the pane's SHELL first and attaches the agent to it after — the same gap
     `_PANE_BUSY` exists for. While it is open the pane ANSWERS with a bare shell, which reads DEAD,
     and a wait that gave up there would abandon the session at the moment the restore was furthest
-    along. The recorded pid is what separates that shell from a finished session's: a restored
-    pane's shell is a NEW pid, because the whole tree died with the server.
+    along.
+
+    ``recorded=None`` is the case that matters and the reason this is parametrised: `Session
+    .shell_pid` is never persisted (`panes.Handle.as_session` does not carry it), so EVERY
+    production send arrives without one. A discriminator that needed the recorded pid was dead
+    code on the only path that exists — which is what the second review found. What carries it is
+    that this wait already watched the host refuse this very pane, and a finished session cannot
+    have produced that.
     """
     fake = _window(
         prompts=[_REFUSED, _REFUSED, _REFUSED, _PROMPTED],
@@ -312,11 +329,25 @@ def test_the_wait_keeps_waiting_through_the_restores_second_half():
     fake.alive.update({4242, 9191})
     fake.children[9191] = []                          # bare — the agent has not attached yet
 
-    sent = _host(fake).send(_session(shell_pid=4242), "carry on",
+    sent = _host(fake).send(_session(shell_pid=recorded), "carry on",
                             delivery=FakeDelivery(False, True))
 
     assert sent.restored is True
     assert sent.delivered is True
+
+
+def test_a_session_the_production_caller_builds_carries_no_recorded_pid():
+    """The fact the parametrisation above rests on, pinned where it will be seen.
+
+    `panes.Handle.as_session` is what every production `send` is handed. If it ever starts carrying
+    a shell pid, the second-half discriminator gains a second signal — but until then, a fix that
+    needs one is inert, and this is the assertion that says so out loud.
+    """
+    import panes
+
+    built = panes.Handle(pane="w1:p1", workspace="w1").as_session("i317")
+    assert built is not None
+    assert built.shell_pid is None
 
 
 def test_a_bare_shell_on_the_pid_we_recorded_is_a_finished_session_not_a_restore():
@@ -341,8 +372,13 @@ def test_the_bound_is_wall_clock_and_the_oracle_is_not_polled_while_the_host_ref
     channel fault and holds the queue. The oracle has nothing to say while the host is REFUSING
     (nothing was carried), so it is asked once, on the way out.
     """
-    fake = _window(prompts=[_REFUSED], oracle_seconds=6.0)
+    # BOTH costs are staged, and that is the whole point (second fresh-agent review): the first
+    # version of this test subtracted the oracle's time back out, so it was invariant under exactly
+    # the regression it named, and the fake charged nothing for a host call so no in-loop blocking
+    # was simulated at all. A poll-counting version passed it.
+    fake = _window(prompts=[_REFUSED], oracle_seconds=6.0, call_seconds=5.0)
     oracle = FakeDelivery(False, probe=fake)
+    before = fake.clock
 
     with pytest.raises(session_host.RestoreWindowExpired):
         _host(fake, restore_wait_seconds=10.0, restore_poll_seconds=1.0).send(
@@ -351,12 +387,17 @@ def test_the_bound_is_wall_clock_and_the_oracle_is_not_polled_while_the_host_ref
     assert oracle.checks == 1, (
         "the oracle is asked once — before the wait — not on every refused poll (%s checks)"
         % oracle.checks)
-    # The wait's own span, with the one pre-wait oracle check taken back off the clock. The
-    # pause-counted first draft spent 10 x (1s pause + 6s oracle) = 70s here and still called it
-    # "10 seconds"; anything near that is the regression coming back.
-    span = fake.clock - oracle.checks * fake.oracle_seconds
-    assert span <= 10.0 + fake.slept / 10.0 + 1.0, (
-        "the bound is wall clock: the wait itself ran %.1fs against a 10s bound" % span)
+    # No subtraction of the thing the regression adds — total simulated wall clock, against an
+    # allowance spelled out from the fake's own costs:
+    #   before the wait  : prompt 5 + oracle 6 + the entry `_restoring`'s two calls 10 = 21
+    #   one iteration    : sleep 1 + prompt 5 + `_restoring` 10                        = 16
+    #   the bound itself                                                               = 10
+    # Current code measures 37. A poll-counting version runs all ten polls and measures ~241, so
+    # the ceiling separates them by a wide margin without being loose enough to admit one.
+    elapsed = fake.clock - before
+    assert elapsed <= 60.0, (
+        "the bound is wall clock: %.1fs elapsed against a 10s bound (a poll-counting "
+        "implementation measures ~241s here)" % elapsed)
 
 
 def test_the_bound_is_configurable_by_the_caller_and_by_the_operators_environment():
@@ -376,11 +417,14 @@ def test_the_bound_is_configurable_by_the_caller_and_by_the_operators_environmen
     # first draft's guard and raised OverflowError out of `send`, past `nudge.nudge`, which catches
     # HostError and documents itself as never raising (fresh-agent review, P1).
     for junk in ("soon", "", None, "0", "-5", "nan", "inf", "Infinity", "1e400"):
-        host = session_host.SessionHost(probe=FakeHerdr(), binary="/nonexistent/x",
-                                        env={session_host.RESTORE_WAIT_ENV_VAR: junk})
+        fake = _window(prompts=[_REFUSED])          # STAGED, so the wait is actually entered:
+        fake.clock = 0.0                            # the first version used a bare FakeHerdr and
+        host = session_host.SessionHost(            # never reached the loop at all, so the junk
+            probe=fake, binary="/nonexistent/x", restore_poll_seconds=1.0,
+            env={session_host.RESTORE_WAIT_ENV_VAR: junk})   # never met the arithmetic it breaks.
         assert host.restore_wait_seconds == session_host.RESTORE_WAIT_SECONDS, junk
-        # …and the value it settled on has to survive the arithmetic the wait does with it.
-        with pytest.raises(session_host.HostError):
+        # An infinite bound does not raise here any more — it SPINS, which is worse and quieter.
+        with pytest.raises(session_host.RestoreWindowExpired):
             host.send(_session(), "x", delivery=FakeDelivery(False))
 
 
@@ -445,6 +489,44 @@ def test_exit_refuses_a_session_that_is_still_restoring():
     assert session_host.RESTORING in str(caught.value)
     assert fake.verbs("workspace", "close") == [], (
         "a restoring session must not have its window closed — that is the lost-work failure")
+
+
+def test_exit_refuses_a_dead_reading_that_does_not_hold():
+    """The restore's second half reads DEAD, and DEAD is what authorises destruction.
+
+    Traced by the second fresh-agent review all the way through: a bare shell reads DEAD, nudge
+    turns DEAD into rc=4, and the runner turns rc=4 into mark-exited → relaunch → `_close_pane` →
+    `host.exit`, which closed the workspace herdr was mid-way through restoring. One reading is
+    not enough to destroy a window, so exit re-reads after a pause longer than the measured ~0.7s
+    attach gap and refuses anything that cannot say DEAD twice.
+    """
+    fake = _window(prompts=[_REFUSED],
+                   panes=[(0, _process_info(shell_pid=9191), ""),   # bare shell: reads DEAD…
+                          (0, _process_info(shell_pid=9191), ""),
+                          (0, _process_info(shell_pid=9191), "")])
+    fake.alive.add(9191)
+    fake.children[9191] = [[], [4243]]  # bare on the first read, agent attached on the re-read
+
+    with pytest.raises(session_host.TeardownRefused) as caught:
+        _host(fake).exit(_session())
+    assert "did not hold" in str(caught.value)
+    assert fake.verbs("workspace", "close") == [], "nothing may be closed on a verdict that moved"
+
+
+def test_exit_still_closes_a_session_that_reads_dead_twice():
+    # The other half: the confirm must not make a finished session un-tidyable. It costs one pause.
+    fake = FakeHerdr(script={
+        ("agent", "get"): (0, _agent(), ""),
+        ("pane", "process-info"): (0, _process_info(shell_pid=9191), ""),
+        ("workspace", "close"): (0, _ok({"type": "workspace_closed"}), ""),
+        ("workspace", "get"): (1, "", _err("workspace_not_found", "no workspace w1")),
+    })
+    fake.alive.add(9191)
+    fake.children[9191] = []            # a bare shell that stays bare — genuinely finished
+
+    torn = _host(fake).exit(_session())
+    assert torn.closed is True
+    assert fake.verbs("workspace", "close"), "a session that reads DEAD twice is still closable"
 
 
 # --------------------------------------------------------------- the real drill (opt-in)
