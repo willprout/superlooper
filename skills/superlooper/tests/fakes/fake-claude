@@ -430,7 +430,40 @@ def scenario_resolve_conflict(spec, brief):
     finish(spec, contract)
 
 
+def auth_status():
+    """`claude auth status`, as the launch floor's identity assert (#314) asks it.
+
+    Invoked EXACTLY like the real binary, which is the point of this fake: the floor resolves a
+    claude through the #303 ladder and asks THAT binary which Anthropic account this session holds
+    before it starts the agent. A fake that answered nothing would have every simulated launch
+    refuse with rc=7 — correctly, which is how this gap was found — and the simulation would be
+    testing the refusal instead of the loop.
+
+    It reproduces the credential-namespace rule rather than paraphrasing it: `claude` keys its
+    keychain item on `sha256(CLAUDE_CONFIG_DIR)`, so any dir other than the provisioned one — the
+    same directory spelled with a trailing slash included — reports LOGGED OUT rather than erroring
+    (#300). With neither variable set, both sides are "" and this is a healthy default-config-dir
+    login, which is what every scenario in the simulation needs.
+
+    Exits 1 when logged out, 0 when logged in — the real binary's own codes, measured 2026-08-04.
+    The floor reads the BODY and not the code, and a fake that got this backwards would let a
+    body-ignoring regression pass here.
+    """
+    if env("CLAUDE_CONFIG_DIR") != env("SIM_CLAUDE_LOGGED_IN_DIR"):
+        print(json.dumps({"loggedIn": False, "authMethod": "none"}))
+        return 1
+    print(json.dumps({"loggedIn": True, "authMethod": "claude.ai",
+                      "email": "loop@example.invalid",
+                      "orgId": env("SIM_CLAUDE_ORG", "sim-org"),
+                      "subscriptionType": "max"}))
+    return 0
+
+
 def main():
+    if sys.argv[1:3] == ["auth", "status"]:
+        # BEFORE the SL_* check below: the identity assert runs in the session's own environment,
+        # not as a launched worker, so it legitimately carries no issue id.
+        sys.exit(auth_status())
     if not ID or not RUN_ROOT:
         log("SL_ISSUE_ID / SL_RUN_ROOT missing — not launched through the real stack?")
         sys.exit(1)
