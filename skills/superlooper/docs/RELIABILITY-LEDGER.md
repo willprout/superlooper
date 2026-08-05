@@ -256,6 +256,19 @@ first-prompt audit (see `AUDIT-2026-07-16-worker-first-prompt.md`); #189 reopene
 same evening with its approval labels intact; a mechanical detector for the class (closed-as-
 completed with no merged PR behind it) filed as #229.
 
+**2026-08-04 — a label born in code but never in the vocabulary freezes an issue for ~9h** ·
+*Classes 1, 3* · The #163 question hand-back moves a paused issue to `awaiting-answer`, but that
+name was never added to `lib/labels.py`'s LABELS — so `adopt` never created it, the #160 boot
+migration never healed it, and `gh` (which refuses to apply a label a repo does not have) rejected
+the move. Because every label move in the runner retries rather than fails loudly, i310 sat for
+about nine hours emitting `label move failed (will retry silently next tick)`, with the owner's
+answer un-ingestable the whole time — the settle that leaves `awaiting_answer` runs only *after*
+the label lands. Unfrozen by a supervised `gh label create`. Second occurrence of the #165 class:
+the suite sets labels in Python, so a label gh would refuse looks identical to one it would accept
+and a green suite proves nothing. Fixed by #337 — the label is registered and runner-managed (so
+boot heals every repo adopted before it), and `tests/test_label_vocabulary.py` now reads the engine
+source and reddens CI whenever a label the engine applies is absent from LABELS.
+
 ---
 
 ## The owner's documented frustrations (recorded 2026-07-15, in his words where quoted)
