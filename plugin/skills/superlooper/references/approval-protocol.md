@@ -27,7 +27,12 @@ Read that literally:
 
 When William approves issues in conversation (e.g. "yes, those three are approved"):
 
-1. **Apply `agent-ready`** to each issue he named — and only those.
+1. **Apply `agent-ready` AND remove `needs-owner`** (plus the legacy `needs-william`, and
+   `parked` if present) on each issue he named — and only those. The removal is not optional
+   housekeeping: `needs-owner` says "waiting for the owner's decision," which the approval just
+   ended, and leaving it on confuses humans and agents reading raw labels (owner instruction
+   2026-08-05). This matches what the dashboard's Approve verb has always done in one move
+   (`dashboard/lib/actions.py`, `approve`).
 2. **Append an audit comment** to each, recording the human decision behind the label:
 
    ```
