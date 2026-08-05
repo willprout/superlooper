@@ -40,6 +40,13 @@
 #      ONE remaining writer: bin/resurrect-runner.sh, the watchdog's restart of a provably-gone
 #      runner in its recorded cmux pane. It is not a session launch and it is not this issue's to
 #      retire; it goes when cmux does (the runner's own home is issue #306, the cutover #311).
+#
+#      RE-EXAMINED AND KEPT (issue #334, whose DoD asked whether the resurrection moves). #306 has
+#      since landed the login-item home, whose resurrection is `launchctl kickstart` and touches
+#      none of this. But `runner_home.kind` still fails closed to `pane`, so the pane home is live
+#      and is the untouched-cmux side of the parallel run — and it is the only thing that ever
+#      writes a command file. So this half is exactly as scoped as its writer, and the two retire
+#      together. Nothing in it addresses a session handle, which is why #334 left it alone.
 # ------------------------------------------------------------------------------------------------
 
 _superlooper_launch_shim() {

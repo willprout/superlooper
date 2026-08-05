@@ -7,6 +7,25 @@
 #
 # Usage: resurrect-runner.sh --cwd <repo> <r-id>       (r-id is r<N>, minted by the watchdog)
 #
+# THIS SCRIPT STAYS ON CMUX, DELIBERATELY (issue #334's DoD item 5 — the decision, recorded).
+#
+# Everything else that addressed a recorded handle moved onto the session-host wrapper, because
+# #308 made those handles the HOST's. This did not, and the reason is that it never held one. Its
+# target is `$SL_PANE`, the RUNNER's own anchor pane — a fact about where the runner lives, not
+# about any session the loop spawned — and it is reached only through the `pane` branch of
+# `_watchdog_resurrect` (bin/superlooper), i.e. only on a repo whose `runner_home` is `pane`.
+#
+# #306 has since landed the login-item home, and its resurrection is `launchctl kickstart -k` on
+# the runner's own job: no tab to place, no keystroke delivery to work around, nothing to poll. The
+# pane home remains the DEFAULT (runner_home.kind fails closed to PANE, so a config written before
+# #306 keeps today's behaviour) and is the side the cross-machine parallel run rests on — so this
+# path is live, on cmux, until the cutover retires cmux itself. Porting it now would mean building
+# a herdr-shaped resurrection for a home that exists to be the untouched cmux control.
+#
+# It is therefore also the LAST writer of the launch shim's command-file half
+# (`_superlooper_command_shim` in shell/launch-shim.zsh), and that half's own comment says the same
+# thing from the other end: it survives for this one caller and retires with cmux.
+#
 # PLACEMENT (the DoD asks the implementer to state this): a NEW tab in the runner's OWN recorded
 # pane group — NOT a worker tab, NOT the dead runner's stale shell. Two reasons it must be a fresh
 # surface rather than the dead runner's own tab:

@@ -21,7 +21,24 @@ Two modes, via ``$HOST_MODE``:
 
 Liveness is a PROCESS FACT to the wrapper, so ``pane process-info`` answers with the real pid of
 the pane shell this fake started. In hollow mode it answers with a pid that is alive and CHILDLESS
-— a bare shell — which is precisely what the wrapper's post-spawn confirmation must catch.
+— a bare shell, which is precisely what the wrapper's post-spawn confirmation must catch.
+
+``agent prompt`` (issue #334) does what the real verb does and nothing more: it validates the
+agent NAME, records the prompt, and hands it to the pane. It does NOT write the transcript — the
+AGENT does (tests/fakes/fake-claude), because the transcript is the agent's record and the wrapper
+proves delivery from it. That split is the simulation's whole value here: if the runner addresses
+the wrong name, this refuses; if the prompt never reaches the pane, the oracle finds nothing and
+the send is refused as unproven. Neither failure can pass quietly.
+
+``$HOST_DROP_SUBMISSION`` stages the measured false green — the verb returns ``agent_prompted``
+rc=0 with the text left sitting in the composer, which is what 6/6 plain-verb prompts did in the
+spikes. Nothing reaches the pane, so the delivery oracle refuses it.
+
+**IT REFUSES A HANDLE IT NEVER ISSUED.** Every id this fake hands out is minted here, and every
+verb checks the one it is given against what exists. A fake that answers anything cannot tell you
+that you addressed the wrong thing — which is exactly how #308's handle-format change stayed
+invisible to the acceptance harness while the nudge path went on addressing cmux.
+``tests/test_fakes_refuse_unissued_handles.py`` fails if a refusal is removed.
 
 State lives under ``$FAKE_HOST_DIR``, one directory per simulation.
 """
@@ -108,7 +125,9 @@ def start_pane(ws, name, agent):
     env.setdefault("PATH", os.environ.get("PATH", ""))
     env.setdefault("HOME", os.environ.get("HOME", ""))
     for carry in ("SIM_SCENARIO_DIR", "SIM_STOP", "GH_FIXTURES", "GH_GIT_REPO",
-                  "FAKE_CMUX_DIR", "SL_CMUX", "TMPDIR"):
+                  # FAKE_HOST_DIR is how the pane's agent finds the prompts addressed to it —
+                  # the stand-in for "typed input arrived in this pane" (#334).
+                  "FAKE_CMUX_DIR", "SL_CMUX", "FAKE_HOST_DIR", "TMPDIR"):
         if carry in os.environ:
             env.setdefault(carry, os.environ[carry])
     logfile = open(state("pane-%s.log" % name), "ab")
@@ -172,7 +191,12 @@ def main():
     if (group, verb) == ("agent", "start"):
         name = rest[0] if rest else "?"
         kind = opt(rest, "--kind") or "claude"
-        ws = ws_of(opt(rest, "--pane") or "w1:p1")
+        pane = opt(rest, "--pane") or ""
+        ws = ws_of(pane)
+        # The pane must be one THIS fake created. A permissive router here is what let a spawn
+        # aimed at an id from another host's vocabulary look like a successful launch (#334).
+        if not os.path.exists(state("live.%s" % ws)) or pane != pane_of(ws):
+            fail("pane_not_found", "no pane %r exists on this host" % pane)
         log("agents.jsonl", {"name": name, "kind": kind, "mode": MODE, "workspace": ws})
         if MODE == "deliver":
             pid = start_pane(ws, name, kind)
@@ -204,7 +228,10 @@ def main():
         emit({"type": "agent", "agent": {"pane_id": pane_of(ws), "agent_status": "idle"}})
 
     if (group, verb) == ("pane", "process-info"):
-        ws = ws_of(opt(rest, "--pane") or "")
+        pane = opt(rest, "--pane") or ""
+        ws = ws_of(pane)
+        if pane != pane_of(ws):
+            fail("pane_not_found", "no pane %r exists on this host" % pane)
         try:
             with open(state("pid.%s" % ws)) as f:
                 pid = int(f.read().strip())
@@ -212,8 +239,41 @@ def main():
             fail("pane_not_found", "no pane")
         emit({"type": "process_info", "process_info": {"shell_pid": pid}})
 
+    if (group, verb) == ("agent", "prompt"):
+        # `herdr agent prompt <name> <text> --wait --timeout <ms>`. The wrapper builds exactly one
+        # prompt argv in this codebase and `--wait` is not a parameter — refuse without it, so a
+        # regression that reintroduced the plain verb (banned outright, plan §5.1) fails here
+        # rather than in production six weeks later.
+        name = rest[0] if rest else ""
+        text = rest[1] if len(rest) > 1 else ""
+        if "--wait" not in rest:
+            fail("bad_request", "agent prompt without --wait is banned (plan 5.1)")
+        try:
+            with open(state("agent.%s" % name)) as f:
+                ws = f.read().strip()
+        except OSError:
+            fail("agent_not_found", "no agent named %r" % name)
+        if not os.path.exists(state("live.%s" % ws)):
+            fail("agent_not_found", "no agent named %r" % name)   # names clear when the agent goes
+        log("prompts.jsonl", {"agent": name, "text": text})
+        if not os.environ.get("HOST_DROP_SUBMISSION"):
+            # Hand it to the PANE. The agent picks it up and writes its own transcript, which is
+            # what the wrapper's delivery oracle reads — nothing here forges that proof.
+            with open(state("inbox.%s" % name), "a") as f:
+                f.write(json.dumps({"text": text}) + "\n")
+        emit({"type": "agent_prompted", "agent": {"name": name, "agent_status": "idle"}})
+
+    if (group, verb) == ("agent", "send-keys"):
+        log("keys.jsonl", {"agent": rest[0] if rest else "", "key": rest[1] if len(rest) > 1 else ""})
+        emit({"type": "keys_sent"})
+
     if (group, verb) == ("workspace", "close"):
         ws = rest[0] if rest else ""
+        if not os.path.exists(state("live.%s" % ws)) and not os.path.exists(state("cwd.%s" % ws)):
+            # Never created here at all. The real host answers `workspace_not_found`, and the
+            # wrapper reads exactly that as "the window is already gone" — so a fake that shrugged
+            # would let a teardown aimed at a foreign id VERIFY (#334).
+            fail("workspace_not_found", "no workspace %r exists on this host" % ws)
         log("closed.jsonl", {"workspace": ws})
         try:
             os.remove(state("live.%s" % ws))

@@ -20,7 +20,7 @@
                   request marker the runner honors between ticks by re-exec'ing in place (fresh
                   engine, cleared in-memory state). Never launches/places a tab; with no live runner
                   it refuses and names the manual start. A local ops UI over the loop shells this
-  tidy            close the cmux windows of FINISHED sessions (merged by default; --all extends
+  tidy            close the session windows of FINISHED sessions (merged by default; --all extends
                   to parked/needs-william/bounced) — manual, never automatic; never touches an
                   in-flight or mid-gate lane, so it is safe to run while the runner is live
   janitor         propose GitHub-side cleanup (stale merged/superseded sl/* branches, open
@@ -86,6 +86,7 @@ from labels import LABELS, missing_runner_labels, runner_managed_labels
 import journal
 import ledger as ledger_lib
 import loopstate
+import panes
 import nightly as nightly_lib
 import notify
 import queue_lint
@@ -98,11 +99,11 @@ import upkeep as upkeep_lib
 
 _TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
 
-# cmux close settings, kept in step with runner.py (the agent boundary: cmux specifics stay in
-# the launch/close machinery — this CLI's `tidy` copies the runner's proven _close_stale_session
-# close, it does not invent a second one).
-_CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"   # SL_CMUX overrides (tests)
-_CLOSE_TIMEOUT = 15            # bound the best-effort close of a finished session's pane
+# Session-close settings, kept in step with runner.py: `tidy` goes through the same doorway and the
+# same exit->kill ladder as the runner's own `_close_pane`, it does not invent a second one (#334).
+# The bound is per CONTROL CALL, and it is the tick-latency argument one seat over — a wedged host
+# must not hold the owner at a prompt he asked one question at.
+_CLOSE_TIMEOUT = 15
 
 # The §C.2 label set (LABELS) and the runner-managed subset (runner_managed_labels /
 # missing_runner_labels) now live in lib/labels.py and are imported above. They moved there for
@@ -1701,76 +1702,80 @@ def cmd_accept_failure(args):
 
 
 # ------------------------------- tidy -------------------------------
-# `superlooper tidy` closes the cmux windows of FINISHED sessions. It is William's explicit word,
+# `superlooper tidy` closes the session windows of FINISHED sessions. It is William's explicit word,
 # never automatic (V1 'nothing auto-closed' — DRYRUN 2026-07-03): a real claude worker idles at
 # its prompt forever after finishing (D4) and never self-closes, so windows pile up. Safe to run
 # while the runner is live — the pure selector (tidy.closable) never picks an in-flight or
 # in-between-gate lane, so a close can only ever land on a finished, idle session.
 
-def _panes_dir(home):
-    return os.path.join(home, "state", "panes")
-
-
 def _recorded_windows(home):
-    """The iids that have a recorded cmux window: a pane marker file state/panes/<iid> (an exact
-    `i<N>` name — the `.ws` sidecar is skipped). Missing dir / unreadable -> empty set."""
-    out = set()
-    try:
-        for name in os.listdir(_panes_dir(home)):
-            if re.fullmatch(r"i\d+", name):
-                out.add(name)
-    except OSError:
-        pass
-    return out
+    """The iids that have a recorded session window (state/panes/<iid>), narrowed to worker lanes.
+
+    `lib/panes` owns the file format; the `i<N>` narrowing is tidy's own — a debugger seat is
+    William's to close himself. Missing dir / unreadable -> empty set."""
+    return {iid for iid in panes.recorded_ids(os.path.join(home, "state"))
+            if re.fullmatch(r"i\d+", iid)}
 
 
 def _snapshot(home, iid):
-    """(surface, ws) read from disk NOW. Captured at LIST time — the close then targets exactly
-    the window shown to William, never a re-read that a relaunch during the y/N wait could have
-    redirected to a fresh, LIVE surface (Codex cross-review round 1: the never-close-in-flight
+    """The recorded handle read from disk NOW. Captured at LIST time — the close then targets
+    exactly the window shown to William, never a re-read that a relaunch during the y/N wait could
+    have redirected to a fresh, LIVE session (Codex cross-review round 1: the never-close-in-flight
     property must survive a concurrent re-approval)."""
-    panes = _panes_dir(home)
-    return ((_read(os.path.join(panes, iid)) or "").strip(),
-            (_read(os.path.join(panes, f"{iid}.ws")) or "").strip())
+    return panes.read(os.path.join(home, "state"), iid)
 
 
-def _close_window(cmux, home, iid, surface, ws, *, cleanup):
-    """Best-effort close of the SNAPSHOTTED surface (rc IGNORED — a dead surface is a silent
-    no-op). Then, ONLY when `cleanup` is set, clear iid's pane markers + singleton lock — the
-    runner's _close_stale_session close (runner.py), copied deliberately (runner.py is read-only
-    here; a parallel session owns it — dedup noted as a follow-up).
+def _close_window(home, iid, handle, *, cleanup):
+    """Best-effort close of the SNAPSHOTTED session, THROUGH THE DOORWAY (issue #334).
 
-    Why the close targets the SNAPSHOT surface and not a fresh re-read: the snapshot was taken
-    when the window was listed, so if a relaunch replaced this session while tidy ran, we close
-    the OLD (now-dead) surface — a harmless no-op — and NEVER the new, LIVE one. tidy can't close
-    an in-flight window.
+    It used to be `cmux close-surface --surface <recorded>`. After #308 moved the spawn onto the
+    five-verb wrapper, that recorded value is the session HOST's workspace and pane — identifiers
+    cmux never issued — so the close silently no-opped: `superlooper tidy` would report closing N
+    windows and close none, leaving every finished session standing. (#310 re-homed the DASHBOARD's
+    Tidy button onto this verb and deliberately left the verb itself alone; its host coupling is
+    here, and this is where it had to move.)
+
+    `exit` then `kill`, the same ladder and the same reasoning as the runner's `_close_pane`: the
+    doorway's `exit` is a positive allowlist that closes only a session it can NAME as finished,
+    and the case tidy exists for — a worker that wrote its report and idles at its prompt — reads
+    ALIVE. `close-surface` escalated unconditionally, so escalating preserves the behaviour rather
+    than quietly becoming gentler. Every failure is swallowed: a close that cannot be verified must
+    never wedge tidy, and the pure selector has already proved the lane is finished.
+
+    Why the close targets the SNAPSHOT and not a fresh re-read: the snapshot was taken when the
+    window was listed, so if a relaunch replaced this session while tidy ran, we close the OLD
+    (now-gone) workspace — a harmless no-op — and NEVER the new, LIVE one.
 
     Why cleanup is gated (Codex cross-review rounds 1-2): pane markers/lock are NOT under any lock
-    tidy can take (the runner writes them from the shell launch stack), so a read-then-remove can
-    never be made atomic against a concurrent relaunch. The airtight fix is structural — `cleanup`
-    is set ONLY for a status that can NEVER relaunch (merged; see tidy.REAPPROVABLE), so there is
-    no concurrent writer and the removal is race-free. For a re-approvable status tidy closes the
+    tidy can take (the runner writes them from the launch stack), so a read-then-remove can never
+    be made atomic against a concurrent relaunch. The airtight fix is structural — `cleanup` is set
+    ONLY for a status that can NEVER relaunch (merged; see tidy.REAPPROVABLE), so there is no
+    concurrent writer and the removal is race-free. For a re-approvable status tidy closes the
     window but leaves the markers/lock to the runner, whose _close_stale_session frees them on the
     next relaunch (and _live_lock_ids ignores a dead-PID lock meanwhile) — so tidy never frees a
     live worker's singleton lock. Freeing a merged session's stale lock mirrors _close_stale_session
     (the finished-but-alive session held it — D4)."""
-    if surface:
-        args = [cmux, "close-surface", "--surface", surface]
-        if ws:
-            args += ["--workspace", ws]
+    import session_host                   # lazy, like the other two host reads in this file
+    session = handle.as_session(iid) if handle else None
+    if session is not None:
+        host = session_host.SessionHost(call_seconds=_CLOSE_TIMEOUT, teardown_reads=2,
+                                        teardown_pause=0.5)
         try:
-            subprocess.run(args, capture_output=True, text=True, timeout=_CLOSE_TIMEOUT)
-        except (OSError, subprocess.TimeoutExpired):
+            host.exit(session)
+        except session_host.TeardownRefused:
+            try:
+                host.kill(session)
+            except session_host.HostError:
+                pass
+        except session_host.HostError:
             pass                                  # best-effort; a close failure never wedges tidy
     if not cleanup:
         return
-    panes = _panes_dir(home)
-    for p in (os.path.join(panes, iid), os.path.join(panes, f"{iid}.ws"),
-              os.path.join(home, "state", f"worker.{iid}.lock")):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
+    panes.forget(os.path.join(home, "state"), iid)
+    try:
+        os.remove(os.path.join(home, "state", f"worker.{iid}.lock"))
+    except OSError:
+        pass
 
 
 def cmd_tidy(args):
@@ -1792,11 +1797,11 @@ def cmd_tidy(args):
 
     # Snapshot each target's surface/ws NOW, before the y/N wait, so the close targets exactly the
     # windows listed here — a relaunch during the wait can't redirect a close onto a live window.
-    snaps = [{"id": t["id"], "status": t["status"], **dict(zip(("surface", "ws"),
-              _snapshot(home, t["id"])))} for t in targets]
+    snaps = [{"id": t["id"], "status": t["status"], "handle": _snapshot(home, t["id"])}
+             for t in targets]
     print(f"tidy will close {len(snaps)} finished ({scope}) session window(s):")
     for s in snaps:
-        print(f"  {s['id']:5} {s['status']:13} {s['surface'] or '(no surface)'}")
+        print(f"  {s['id']:5} {s['status']:13} {s['handle'].workspace or '(no window)'}")
     if args.dry_run:
         print("dry-run: nothing closed.")
         return 0
@@ -1809,14 +1814,13 @@ def cmd_tidy(args):
             print("aborted — nothing closed.")
             return 0
 
-    cmux = os.environ.get("SL_CMUX", _CMUX_DEFAULT)
     reconciled = []
     for s in snaps:
         # cleanup (remove markers+lock) ONLY for a status that can never relaunch — merged. A
         # re-approvable session's markers/lock stay the runner's to reconcile (race-free by
         # construction; see _close_window).
         cleanup = s["status"] not in tidy_lib.REAPPROVABLE
-        _close_window(cmux, home, s["id"], s["surface"], s["ws"], cleanup=cleanup)
+        _close_window(home, s["id"], s["handle"], cleanup=cleanup)
         if not cleanup:
             reconciled.append(s["id"])
     print(f"closed {len(snaps)} window(s)." + (

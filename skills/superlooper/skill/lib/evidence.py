@@ -128,11 +128,13 @@ _LAUNCH_RC = {
 
 _NUDGE_RC = {
     1: ("send_failed",
-        "cmux refused the write into the pane: the send itself failed, so nothing was delivered "
-        "and the session never saw the message"),
+        "the message could not be sent at all: the session host refused it, the lane id cannot "
+        "address an agent, or this agent has no delivery oracle — a channel fault, not the "
+        "session's, so nothing was delivered and the session never saw the message"),
     3: ("pane_deferred",
-        "the pane could not be safely typed into (a menu, an ambiguous or unreadable screen) so "
-        "the runner refused to type and will retry — the session may be perfectly healthy"),
+        "nothing was typed and the session may be perfectly healthy: the host could not vouch for "
+        "the pane, it reports the agent waiting on a person, or the send could not be PROVEN "
+        "delivered (rc is never proof) — the runner refused to claim it and will retry"),
     4: ("pane_dead",
         "the agent process is gone and the pane is a bare shell — typing here would run the "
         "message as a permission-bypassed shell command, so the caller must relaunch instead"),

@@ -1495,53 +1495,90 @@ def _tidy_home(rig):
 
 
 def _seed_tidy_state(rig, issues, panes):
-    """issues: {iid: status}. panes: {iid: (surface, ws_or_None)} — also drops a worker lock per
-    pane so a test can assert tidy frees the singleton lock like _close_stale_session does."""
+    """issues: {iid: status}. panes: {iid: (pane, workspace)} — the recorded handle, in the shape
+    lib/panes writes it. Also drops a worker lock per lane so a test can assert tidy frees the
+    singleton lock like _close_stale_session does.
+
+    Both halves are seeded now (issue #334): the doorway closes a WORKSPACE, so a handle with no
+    workspace names nothing it may act on — which is the point, since "close whatever is at that
+    pane" is how a stale handle ends someone else's window."""
     home = _tidy_home(rig)
     (home / "state" / "panes").mkdir(parents=True, exist_ok=True)
     st = loopstate.new_state()
     for iid, status in issues.items():
         st["issues"][iid] = dict(loopstate.new_issue(), status=status, branch=f"sl/{iid}")
     loopstate.save(str(home / "state" / "issues.json"), st)
-    for iid, (surf, ws) in panes.items():
-        (home / "state" / "panes" / iid).write_text(surf)
+    for iid, (pane, ws) in panes.items():
+        (home / "state" / "panes" / iid).write_text(pane)
         if ws:
             (home / "state" / "panes" / f"{iid}.ws").write_text(ws)
         (home / "state" / f"worker.{iid}.lock").write_text("held")
     return home
 
 
-def _recording_cmux(rig, *, rc=0):
-    """A cmux stub that records every invocation's argv to a log and exits `rc` — the surface to
-    assert both the exact close argv and that a nonzero rc is ignored (best-effort close)."""
-    log = rig.tmp / "cmux-close.log"
-    stub = rig.tmp / "cmux-rec"
-    stub.write_text("#!/bin/sh\n"
-                    'printf "%s\\n" "$*" >> "' + str(log) + '"\n'
-                    f"exit {rc}\n")
+def _recording_host(rig, *, gone=True):
+    """A SESSION HOST stub that records every invocation's argv and plays a FINISHED, gone session.
+
+    tidy used to drive `cmux close-surface` with a recorded surface UUID; after #308 that recorded
+    value is the host's own workspace, so #334 moved the close onto the doorway. The stub answers
+    the three calls the teardown ladder makes:
+
+      agent get       -> `agent_not_found` (the host clears a name when the agent exits), which
+                         makes the doorway's `state` read UNKNOWN — so `exit` refuses and the
+                         ladder escalates to `kill`, exactly as it does against a real finished
+                         session that has not been closed yet;
+      workspace close -> ok;
+      workspace get   -> `workspace_not_found`, the ONE answer a teardown may read as proof the
+                         window went. `gone=False` instead keeps answering, which is how a close
+                         that did not take is staged.
+    """
+    log = rig.tmp / "host-close.log"
+    stub = rig.tmp / "host-rec"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "open(%r, 'a').write(' '.join(args) + chr(10))\n"
+        "pair = (args[0], args[1])\n"
+        "def emit(r):\n"
+        "    print(json.dumps({'id': 's', 'result': r})); sys.exit(0)\n"
+        "def fail(c, m):\n"
+        "    print(json.dumps({'id': 's', 'error': {'code': c, 'message': m}})); sys.exit(1)\n"
+        "if pair == ('agent', 'get'): fail('agent_not_found', 'the name no longer resolves')\n"
+        "if pair == ('workspace', 'close'): emit({'type': 'workspace_closed'})\n"
+        "if pair == ('workspace', 'get'):\n"
+        "    fail('workspace_not_found', 'gone') if %r else emit({'workspace': {}})\n"
+        "fail('unsupported', ' '.join(args))\n" % (str(log), bool(gone)))
     stub.chmod(0o755)
     return log, str(stub)
 
 
+def _closed_workspaces(log):
+    """The workspaces tidy actually asked the host to close, in order."""
+    if not log.exists():
+        return []
+    return [ln.split()[-1] for ln in log.read_text().splitlines()
+            if ln.startswith("workspace close ")]
+
+
 def test_tidy_dry_run_lists_merged_windows_and_closes_nothing(rig):
     _seed_tidy_state(rig, {"i1": "merged", "i2": "merged", "i5": "running"},
-                     {"i1": ("surf1", None), "i2": ("surf2", None), "i5": ("surf5", None)})
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--dry-run", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux})
+                     {"i1": ("w1:p1", "w1"), "i2": ("w2:p1", "w2"), "i5": ("w5:p1", "w5")})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--dry-run", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
     assert r.returncode == 0, r.stdout + r.stderr
     assert "i1" in r.stdout and "i2" in r.stdout
     assert "i5" not in r.stdout                       # the in-flight lane is never listed
     assert not log.exists()                           # dry-run closed nothing
 
 
-def test_tidy_yes_closes_merged_windows_with_the_close_stale_session_argv(rig):
+def test_tidy_yes_closes_merged_windows_through_the_doorway(rig):
     home = _seed_tidy_state(rig, {"i1": "merged", "i5": "running"},
-                            {"i1": ("surf1", None), "i5": ("surf5", None)})
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux})
+                            {"i1": ("w1:p1", "w1"), "i5": ("w5:p1", "w5")})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
     assert r.returncode == 0, r.stdout + r.stderr
-    calls = log.read_text().splitlines()
-    assert calls == ["close-surface --surface surf1"]     # exactly the merged window, that argv
+    assert _closed_workspaces(log) == ["w1"]          # exactly the merged window
     # markers + lock cleared for the closed session; the in-flight lane untouched
     assert not (home / "state" / "panes" / "i1").exists()
     assert not (home / "state" / "worker.i1.lock").exists()
@@ -1549,31 +1586,53 @@ def test_tidy_yes_closes_merged_windows_with_the_close_stale_session_argv(rig):
     assert (home / "state" / "worker.i5.lock").exists()
 
 
-def test_tidy_passes_the_workspace_when_one_is_recorded(rig):
-    _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("surf1", "ws7")})
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux})
+def test_tidy_never_hands_a_recorded_handle_to_cmux(rig):
+    """Issue #334's own regression. `state/panes/<id>` holds the session HOST's identifiers now, so
+    a close that shelled cmux with them asked a multiplexer about ids it never issued — it exited
+    cheerfully, closed nothing, and tidy reported N windows closed."""
+    _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("w1:p1", "w1")})
+    log, host = _recording_host(rig)
+    cmux_log = rig.tmp / "cmux-must-not-run.log"
+    cmux = rig.tmp / "cmux-tripwire"
+    cmux.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + str(cmux_log) + "\"\nexit 0\n")
+    cmux.chmod(0o755)
+    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo),
+            env_over={"SL_HERDR": host, "SL_CMUX": str(cmux)})
     assert r.returncode == 0, r.stdout + r.stderr
-    assert log.read_text().splitlines() == ["close-surface --surface surf1 --workspace ws7"]
+    assert _closed_workspaces(log) == ["w1"]
+    assert not cmux_log.exists(), cmux_log.read_text()
 
 
-def test_tidy_ignores_a_nonzero_close_rc(rig):
-    # best-effort: a dead surface makes cmux exit nonzero; tidy still succeeds and still clears.
-    home = _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("surf1", None)})
-    log, cmux = _recording_cmux(rig, rc=3)
-    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux})
+def test_tidy_ignores_a_close_the_host_refuses(rig):
+    # best-effort: a host that will not confirm the teardown must not wedge tidy, and the lane's
+    # markers are still cleared so nothing outlives the session it identified.
+    home = _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("w1:p1", "w1")})
+    log, host = _recording_host(rig, gone=False)       # the workspace keeps answering: unverified
+    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
     assert r.returncode == 0, r.stdout + r.stderr
-    assert log.read_text().splitlines() == ["close-surface --surface surf1"]
+    assert _closed_workspaces(log) == ["w1"]
+    assert not (home / "state" / "panes" / "i1").exists()
+
+
+def test_tidy_closes_nothing_for_a_handle_with_no_workspace(rig):
+    # The doorway closes a WINDOW, and a pane id alone cannot name one. Refusing is right —
+    # "close whatever is at that pane" is how a stale handle ends someone else's session — and the
+    # markers are still swept, so a half-written record does not become permanent.
+    home = _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("w1:p1", None)})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _closed_workspaces(log) == []
     assert not (home / "state" / "panes" / "i1").exists()
 
 
 def test_tidy_default_scope_leaves_parked_windows_alone(rig):
     home = _seed_tidy_state(rig, {"i1": "merged", "i2": "parked"},
-                            {"i1": ("surf1", None), "i2": ("surf2", None)})
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux})
+                            {"i1": ("w1:p1", "w1"), "i2": ("w2:p1", "w2")})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
     assert r.returncode == 0, r.stdout + r.stderr
-    assert log.read_text().splitlines() == ["close-surface --surface surf1"]
+    assert _closed_workspaces(log) == ["w1"]
     assert (home / "state" / "panes" / "i2").exists()     # parked left for possible re-approval
 
 
@@ -1581,12 +1640,11 @@ def test_tidy_all_scope_closes_every_terminal_status_but_never_inflight(rig):
     home = _seed_tidy_state(
         rig, {"i1": "merged", "i2": "parked", "i3": "needs_william", "i4": "bounced",
               "i5": "running", "i6": "gating"},
-        {f"i{n}": (f"surf{n}", None) for n in range(1, 7)})
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux})
+        {f"i{n}": (f"w{n}:p1", f"w{n}") for n in range(1, 7)})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
     assert r.returncode == 0, r.stdout + r.stderr
-    closed = set(log.read_text().splitlines())
-    assert closed == {f"close-surface --surface surf{n}" for n in (1, 2, 3, 4)}
+    assert set(_closed_workspaces(log)) == {f"w{n}" for n in (1, 2, 3, 4)}
     assert (home / "state" / "panes" / "i5").exists()     # running: never closed
     assert (home / "state" / "panes" / "i6").exists()     # gating: never closed
     # merged is fully cleaned (never relaunches -> race-free); re-approvable sessions keep their
@@ -1595,21 +1653,20 @@ def test_tidy_all_scope_closes_every_terminal_status_but_never_inflight(rig):
     assert not (home / "state" / "worker.i1.lock").exists()
     for n in (2, 3, 4):
         assert (home / "state" / "panes" / f"i{n}").exists()
-        assert (home / "state" / f"worker.i{n}.lock").exists()
 
 
 def test_tidy_confirm_yes_closes(rig):
-    _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("surf1", None)})
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux}, inp="y\n")
+    _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("w1:p1", "w1")})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--repo", str(rig.repo), env_over={"SL_HERDR": host}, inp="y\n")
     assert r.returncode == 0, r.stdout + r.stderr
-    assert log.read_text().splitlines() == ["close-surface --surface surf1"]
+    assert _closed_workspaces(log) == ["w1"]
 
 
 def test_tidy_confirm_default_no_aborts_and_closes_nothing(rig):
-    home = _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("surf1", None)})
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux}, inp="\n")
+    home = _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("w1:p1", "w1")})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--repo", str(rig.repo), env_over={"SL_HERDR": host}, inp="\n")
     assert r.returncode == 0, r.stdout + r.stderr
     assert not log.exists()                               # empty answer = No = nothing closed
     assert (home / "state" / "panes" / "i1").exists()
@@ -1618,9 +1675,9 @@ def test_tidy_confirm_default_no_aborts_and_closes_nothing(rig):
 
 def test_tidy_with_only_inflight_sessions_closes_nothing(rig):
     home = _seed_tidy_state(rig, {"i5": "running", "i6": "blocked", "i7": "exited"},
-                            {"i5": ("surf5", None), "i6": ("surf6", None), "i7": ("surf7", None)})
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux})
+                            {f"i{n}": (f"w{n}:p1", f"w{n}") for n in (5, 6, 7)})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
     assert r.returncode == 0, r.stdout + r.stderr
     assert not log.exists()
     for n in (5, 6, 7):
@@ -1639,9 +1696,9 @@ def test_tidy_survives_a_corrupt_issues_json(rig):
     home = _tidy_home(rig)
     (home / "state" / "panes").mkdir(parents=True, exist_ok=True)
     (home / "state" / "issues.json").write_text('["not", "a", "state", "dict"]')
-    (home / "state" / "panes" / "i1").write_text("surf1")
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux})
+    (home / "state" / "panes" / "i1").write_text("w1:p1")
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
     assert r.returncode == 0, r.stdout + r.stderr
     assert not log.exists()
     assert "no" in r.stdout.lower()
@@ -1653,11 +1710,11 @@ def test_tidy_never_touches_a_reapprovable_sessions_markers_or_lock(rig):
     # under any lock tidy can take, so a read-then-remove can never be made atomic. The airtight
     # fix is STRUCTURAL: tidy closes such a window but NEVER removes its markers/lock (that stays
     # the runner's _close_stale_session lifecycle), so tidy can never free a live worker's lock.
-    home = _seed_tidy_state(rig, {"i2": "parked"}, {"i2": ("surf2", "ws2")})
-    log, cmux = _recording_cmux(rig)
-    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": cmux})
+    home = _seed_tidy_state(rig, {"i2": "parked"}, {"i2": ("w2:p1", "w2")})
+    log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--all", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": host})
     assert r.returncode == 0, r.stdout + r.stderr
-    assert log.read_text().splitlines() == ["close-surface --surface surf2 --workspace ws2"]
+    assert _closed_workspaces(log) == ["w2"]
     # the window is closed, but the session's markers + singleton lock are LEFT for the runner
     assert (home / "state" / "panes" / "i2").exists()
     assert (home / "state" / "panes" / "i2.ws").exists()
@@ -1665,22 +1722,30 @@ def test_tidy_never_touches_a_reapprovable_sessions_markers_or_lock(rig):
     assert "reconcile" in r.stdout.lower()
 
 
-def test_tidy_snapshots_the_surface_so_a_relaunch_cannot_redirect_the_close(rig):
-    # tidy closes the SNAPSHOTTED surface (captured at list time), never a fresh re-read. Even if
-    # the pane marker is rewritten to a new (live) surface during the run, the close targets the
-    # OLD, already-dead surface — so a concurrent relaunch can't get its live window closed.
-    home = _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("surf-old", None)})
-    log = rig.tmp / "cmux-close.log"
-    marker = home / "state" / "panes" / "i1"
-    stub = rig.tmp / "cmux-relaunch"
-    stub.write_text("#!/bin/sh\n"
-                    'printf "%s\\n" "$*" >> "' + str(log) + '"\n'
-                    'printf "surf-new" > "' + str(marker) + '"\n'      # simulate a relaunch mid-close
-                    "exit 0\n")
+def test_tidy_snapshots_the_handle_so_a_relaunch_cannot_redirect_the_close(rig):
+    # tidy closes the SNAPSHOTTED handle (captured at list time), never a fresh re-read. Even if
+    # the markers are rewritten to a new (live) session during the run, the close targets the OLD,
+    # already-finished workspace — so a concurrent relaunch can't get its live window closed.
+    home = _seed_tidy_state(rig, {"i1": "merged"}, {"i1": ("old:p1", "old")})
+    log = rig.tmp / "host-close.log"
+    marker = home / "state" / "panes" / "i1.ws"
+    stub = rig.tmp / "host-relaunch"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "open(%r, 'a').write(' '.join(args) + chr(10))\n"
+        "open(%r, 'w').write('new')\n"                   # simulate a relaunch mid-close
+        "pair = (args[0], args[1])\n"
+        "def fail(c, m):\n"
+        "    print(json.dumps({'id': 's', 'error': {'code': c, 'message': m}})); sys.exit(1)\n"
+        "if pair == ('workspace', 'close'):\n"
+        "    print(json.dumps({'id': 's', 'result': {'type': 'workspace_closed'}})); sys.exit(0)\n"
+        "fail('workspace_not_found', 'gone')\n" % (str(log), str(marker)))
     stub.chmod(0o755)
-    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_CMUX": str(stub)})
+    r = cli(rig, "tidy", "--yes", "--repo", str(rig.repo), env_over={"SL_HERDR": str(stub)})
     assert r.returncode == 0, r.stdout + r.stderr
-    assert log.read_text().splitlines() == ["close-surface --surface surf-old"]   # snapshot, not re-read
+    assert _closed_workspaces(log) == ["old"]         # the snapshot, not the re-read
 
 
 # --------------------------- janitor (propose-and-approve GitHub debris sweep) ---------------------------
@@ -2326,7 +2391,8 @@ def test_tidy_ignores_a_leftover_answerer_pane_marker(rig):
     assert re.findall(r"^  (\w+)\s", r.stdout, re.M) == ["i7"], r.stdout
     assert "a1" not in r.stdout
 
-    r = cli(rig, "tidy", "--repo", str(rig.repo), "--yes")
+    _log, host = _recording_host(rig)
+    r = cli(rig, "tidy", "--repo", str(rig.repo), "--yes", env_over={"SL_HERDR": host})
     assert r.returncode == 0, r.stderr
     assert "closed 1 window(s)." in r.stdout, r.stdout
     # the merged issue's markers are cleaned; the orphaned a<N> pair is left exactly as found
