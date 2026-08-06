@@ -3715,6 +3715,15 @@ def test_a_wrong_typed_labels_field_is_never_read_as_carrying_agent_ready():
         assert only(out, "alert") == [], f"{bad!r} must not read as the label standing"
 
 
+@pytest.mark.parametrize("bad", [7, [], {}, True, 0.0, ""])
+def test_a_wrong_typed_landed_cause_never_escalates(bad):
+    # The landed cause must be a real recorded STRING. Every wrong type is unreadable bookkeeping
+    # and must fail CLOSED to silence, exactly as an absent one does — never be read as "different
+    # from the stamped cause, so the move failed" (the wrong-typed fail-OPEN class _counter names).
+    d = _stuck_reapproved_park(park_landed_cause=bad)
+    assert only(decide(parsed_issues=[parsed(5)], dsk=d), "alert") == []
+
+
 def test_a_stale_view_never_escalates_a_terminal_lane_off_old_labels():
     # The `agent-ready` reading must be FRESH. A stale view's labels are last poll's, and the whole
     # point of the conjunct is that the label is still standing RIGHT NOW.
@@ -3788,13 +3797,14 @@ def test_a_stale_view_still_escalates_rather_than_suppressing_on_an_unproven_clo
     assert len(a) == 1 and "park_label_stuck:i7" in a[0]["reasons"]
 
 
-def _ticks(d, views, n=60):
+def _ticks(d, views, n=60, issues=lambda k: [parsed(5)]):
     """Run n consecutive ticks, carrying the durable ALERT forward exactly as the runner does (it
     writes state/ALERT on `alert` and removes it on `clear_alert`). `views` picks the gh_view per
-    tick, so a poll whose health CHANGES is a first-class case."""
+    tick and `issues` the parsed list, so a poll whose health CHANGES — in EITHER read — is a
+    first-class case."""
     alerts = texts = clears = 0
     for k in range(n):
-        out = decide(now=NOW + k * 15, parsed_issues=[parsed(5)], dsk=d, gh_view=views(k))
+        out = decide(now=NOW + k * 15, parsed_issues=issues(k), dsk=d, gh_view=views(k))
         a = only(out, "alert")
         alerts += len(a)
         texts += len(only(out, "notify"))
@@ -3839,6 +3849,34 @@ def test_the_non_terminal_population_is_flap_proof_too():
         elif only(out, "clear_alert"):
             clears += 1
             d = dict(d, alert=None)
+    assert (alerts, texts, clears) == (1, 1, 0)
+
+
+def test_a_refused_issue_list_read_holds_the_page_instead_of_re_sending_it():
+    """FRESH-REVIEW P1. The issue-list read fails closed to [] exactly as the closed-list read
+    does, and the poll stamps the view FRESH either way — so a refused `gh issue list` empties the
+    whole parsed view while `stale` still reads False. Reading "not observed" as "the label is
+    gone" drops the reason on that poll and restores it on the next: one alert and one text per
+    flip, the same storm `standing` exists to stop, arriving through a different input."""
+    assert _ticks(_stuck_reapproved_park(), lambda k: ghv(),
+                  issues=lambda k: [] if k % 2 else [parsed(5)]) == (1, 1, 0)
+
+
+def test_that_hold_does_not_swallow_the_owner_taking_the_label_off():
+    """The other side of it: an issue we DID see, wearing no `agent-ready`, is evidence — the owner
+    really took the label off — and must still retract the page. Only an UNOBSERVED issue holds."""
+    d = dict(_stuck_reapproved_park(), alert={"reasons": ["park_label_stuck:i5"], "since": NOW})
+    out = decide(parsed_issues=[parsed(5, labels=("type:build",))], dsk=d)
+    assert only(out, "clear_alert") == [{"act": "clear_alert"}]
+
+
+def test_a_refused_issue_list_read_re_pages_no_other_standing_reason():
+    # The dedup key is the whole reasons LIST, so a reason that flaps re-sends every OTHER standing
+    # reason with it. Pin the neighbour: an unrelated alert must not be re-texted by this flap.
+    d = _stuck_reapproved_park()
+    d["issues_state"]["issues"]["i9"] = ist("running", update_errors=actions.UPDATE_ERROR_ALERT)
+    alerts, texts, clears = _ticks(d, lambda k: ghv(),
+                                   issues=lambda k: [] if k % 2 else [parsed(5)])
     assert (alerts, texts, clears) == (1, 1, 0)
 
 

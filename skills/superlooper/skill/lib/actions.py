@@ -1441,9 +1441,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # un-clearable reason would pin the ALERT open forever AND poison the dedup for every other
         # reason (the `existing != reasons` compare below is what decides whether anything at all
         # gets said). Here the status proxy is exact, which is why this veto is flat where
-        # park_label_stuck's (below) now carries a positive-proof escape: `sensed_state` is written
-        # by the pane sensor, and a terminal lane HAS no pane to re-sense. Nothing can make the
-        # reading true again, so there is no live-evidence conjunct to write. (#256)
+        # park_label_stuck's (below) now carries a positive-proof escape: `sensed_state` is only
+        # ever written by the liveness/recovery paths, and `decide` emits none of them for a
+        # terminal lane — so whatever the field says, nothing will write it again. (A terminal lane
+        # can still HAVE a live pane; that is exactly what #169's teardown-deferral ladder is about.
+        # What it cannot have is another reading.) With no way to make the reading true again there
+        # is no live-evidence conjunct to write, which is what park_label_stuck has and this does
+        # not. (#256)
         #
         # The sensed VARIANT (issue #174) is appended to the reason, not carried beside it, for one
         # reason: this list IS the dedup key. When the banner changes mid-episode — the owner fixes
@@ -1505,17 +1509,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         #   thing — amend and re-approve. On `!=` alone THAT is what pages them, at 3am, about a
         #   GitHub that is working perfectly. A recorded landed cause says a park DID move labels
         #   here; differing from the cause now stamped says the one now stamped has not.
-        # * the read must be FRESH: a stale view's labels are last poll's, while the claim being
-        #   made is about what is standing on the issue right now.
+        # * the read must be FRESH to RAISE: a stale view's labels are last poll's, while the claim
+        #   being made is about what is standing on the issue right now (`standing` relaxes this
+        #   for a page already sent — see below).
         #
-        # `standing` is what keeps that freshness requirement from turning into a storm (P1-2).
-        # `gh_stale` and `closed_read_ok` flip with each poll's luck, and the ALERT's dedup key is
-        # the reasons LIST — so a reason that drops out on a doubted poll and returns on the next is
-        # a NEW alert and a NEW text, once per flip, which is the 41-text defect class #61 exists to
-        # bound. The correlation is adverse, not incidental: a flaky GitHub is exactly what makes a
-        # label move stick in the first place. So per-poll doubt gates only the RAISE — a page
-        # already sent stands until EVIDENCE retracts it (the marker clears, the park lands, or a
-        # vouched read says the owner closed the issue), never until the weather improves.
+        # `standing` is what keeps those view-health requirements from turning into a storm (P1-2).
+        # `gh_stale`, `closed_read_ok` and the issue-list read itself flip with each poll's luck,
+        # and the ALERT's dedup key is the reasons LIST — so a reason that drops out on a doubted
+        # poll and returns on the next is a NEW alert and a NEW text, once per flip, which is the
+        # 41-text defect class #61 exists to bound. The correlation is adverse, not incidental: a
+        # flaky GitHub is exactly what makes a label move stick in the first place. So per-poll
+        # doubt gates only the RAISE — a page already sent stands until EVIDENCE retracts it (the
+        # marker clears, the park lands, the owner takes `agent-ready` off, or a vouched read says
+        # they closed the issue), never until the weather improves.
         #
         # Scoped to REAPPROVAL_STATUSES — the hand-back statuses — rather than to every terminal
         # one, because `merged` is the single terminal status `decide` has no path to clear a
@@ -1529,17 +1535,31 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # invariant that should not be load-bearing at a distance.
         standing = f"park_label_stuck:{iid}" in prev_alert_reasons
         p_now = parsed_by_id.get(iid)
-        labels_now = p_now.get("labels") if isinstance(p_now, dict) else None
+        # "Not OBSERVED this poll" and "observed WITHOUT the label" are different facts, and only
+        # the second is evidence (third fresh review, P1). The issue-list read fails closed to []
+        # exactly as the closed-list read does, and the poll stamps the view fresh either way — so
+        # a refused `gh issue list` empties the whole parsed view while `stale` still reads False.
+        # Collapsing the two would drop this reason on such a poll and restore it on the next,
+        # which is the same one-text-per-flip storm `standing` exists to stop, arriving through a
+        # different input — and because the dedup key is the whole reasons LIST, each flap re-pages
+        # every OTHER standing reason with it. So: an unobserved issue HOLDS what was already said,
+        # while an issue we did see, wearing no `agent-ready`, retracts it — the owner really did
+        # take the label off, which is real evidence and must still clear the page.
+        seen_now = isinstance(p_now, dict)
+        labels_now = p_now.get("labels") if seen_now else None
+        ready_now = isinstance(labels_now, list) and "agent-ready" in labels_now
         landed_cause = ist_of(iid).get("park_landed_cause")
         park_unlanded = (_status_of(ist_of(iid)) in REAPPROVAL_STATUSES
-                         and isinstance(labels_now, list) and "agent-ready" in labels_now
+                         and (ready_now or (standing and not seen_now))
                          and (not gh_stale or standing)
-                         and isinstance(landed_cause, str)
+                         # a RECORDED cause: every writer stamps a real name, so a blank is
+                         # corruption and fails closed to silence like any other wrong type
+                         and isinstance(landed_cause, str) and landed_cause.strip()
                          and landed_cause != ist_of(iid).get("park_notify_cause"))
         # ...and the absorption suppression takes the #172 VOUCH, not bare membership (#256, half
         # 2). `gh api rate_limit` is exempt from rate limiting, so during a throttle the probe
         # answers, the poll completes, the view is stamped FRESH, and the closed set is empty for a
-        # reason nobody observed — the staleness check overhead never fires. Reading that emptiness
+        # reason nobody observed — the staleness check above never fires. Reading that emptiness
         # as "the issue is still open" pages the owner about a park they resolved seconds ago (the
         # dashboard's Drop, or a close by hand). Holding instead costs a delay: this reason
         # re-derives every tick, so the first vouched read that still shows the issue open
