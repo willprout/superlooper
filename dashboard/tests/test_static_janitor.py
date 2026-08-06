@@ -2,7 +2,8 @@
 
 Janitor is the dashboard's SECOND ops-verb button (same LOCAL COMMAND class as Tidy): tapping it
 runs ``superlooper janitor`` (via the server) to sweep GitHub-side debris — stale merged/superseded
-``sl/*`` branches, open ``superseded`` PRs, aged parked/needs-owner issues. Owner ruling 2026-07-13:
+``sl/*`` branches, open ``superseded`` PRs, aged parked/needs-owner issues, and (issue #229) issues
+closed as COMPLETED by a bare commit keyword, proposed for REOPEN. Owner ruling 2026-07-13:
 full CLI parity without leaving the dashboard. The flow is a bright line of this issue:
 
     button → server runs `janitor --json` → dialog GROUPS the proposals by kind → the owner selects
@@ -91,6 +92,176 @@ def test_held_back_actions_are_surfaced():
     # A refused/failed action from a prior sweep is held back by the CLI and reported in `held`; the
     # dialog must surface it (not silently drop it, not auto-retry it).
     assert re.search(r"\.held", _JAN_JS), "janitor.js must surface the server's held-back keys"
+
+
+# =============================== the reopen tile + the never-drop rule (issue #289) ===============================
+
+def test_the_all_clear_is_gated_on_more_than_the_groups_it_drew():
+    # Issue #289's headline defect: the dialog rendered "Apron's clear" whenever it had no GROUPS to
+    # show — so a proposal class it could not draw (the accidental-close reopen) read as no debris
+    # at all, on the owner's primary surface. Pinned on the SEMANTIC tokens the guard must consult,
+    # not on the syntax of the condition (the condition may wrap across lines), so a correct
+    # refactor is free to move.
+    assert "Apron’s clear" in _JAN_JS, (
+        "the all-clear message must still exist for a genuinely empty apron")
+    guard = re.search(r"if \(([\s\S]{0,240}?)\)\s*\{\s*\n[\s\S]{0,300}?Apron’s clear", _JAN_JS)
+    assert guard, "the all-clear must live behind an explicit guard condition"
+    cond = guard.group(1)
+    assert "groups.length" not in cond, (
+        "the all-clear must not be decided by whether this file found a tile to draw — that is the "
+        "bug (an unrenderable kind read as 'nothing to sweep')")
+    for token in ("total", "missing", "capped"):
+        assert token in cond, (
+            "the all-clear must consult `%s` — every count of debris the sweep FOUND, not just the "
+            "rows this file managed to draw" % token)
+
+
+def test_the_dialog_reconciles_the_rows_it_drew_against_the_servers_count():
+    # Honesty must be self-enforcing rather than contingent on the server's `unreadable` being
+    # exact: an OLDER server (the 2026-07-14 skew shape) drops a kind and sends no `unreadable` at
+    # all, and a group can arrive with an empty items list. Counting what is really about to be
+    # drawn catches both.
+    assert re.search(r"\bshown\b[\s\S]{0,200}?groups\.reduce", _JAN_JS), (
+        "renderProposals must count the rows it is about to draw, from the groups themselves")
+    assert re.search(r"\bmissing\b\s*=\s*Math\.max\(", _JAN_JS), (
+        "the shortfall must be max(server's unreadable, count - shown) — never just one of them")
+
+
+def test_the_dialog_binds_every_honesty_field_the_server_sends():
+    for field in ("b.count", "b.unreadable", "b.reopen_withheld"):
+        assert field in _JAN_JS, (
+            "loadPropose must hand the server's `%s` to renderProposals (design B.1: the JS derives "
+            "no janitor semantics of its own)" % field)
+    assert re.search(r"renderProposals\([\s\S]{0,200}?b\.count", _JAN_JS), (
+        "the proposal count must reach renderProposals, which decides the all-clear")
+
+
+def test_the_reopen_caps_withheld_remainder_is_said_out_loud():
+    # The reopen class is the one class the engine caps per sweep. A cap that is not said reads as
+    # "there was nothing else" — the same over-claim this dialog is being fixed for.
+    assert re.search(r"capped[\s\S]{0,400}?keyword-closed", _JAN_JS), (
+        "the dialog must name the reopens the sweep's cap left out, not just the ones it drew")
+
+
+def test_a_group_the_server_marks_untappable_is_shown_but_never_armed():
+    # An unknown kind is SURFACED, never dropped — but it is not a tap target either: the dashboard
+    # must not offer a consent it cannot state the consequence of. The server decides, via
+    # `tappable`. This is the PR's most safety-relevant JS invariant, so it is bound TEXTUALLY to
+    # the assignment as well as to the branch: a round-2 mutation proved that checking only for the
+    # presence of `g.tappable` somewhere in the file lets `var arm = true` — which arms every row,
+    # including the choose_group alternatives a bulk approval must never touch — ship green.
+    assert re.search(r"var arm = g\.tappable !== false", _JAN_JS), (
+        "`arm` must be assigned FROM the server's tappable flag — not from a kind list here, and "
+        "not from a constant")
+    flat = re.search(r"if \(!arm\) \{([\s\S]{0,600}?)\n\s*\}", _JAN_JS)
+    assert flat, "renderProposals must build a separate row template for an untappable group"
+    for marker in ("data-jan-key", 'role="checkbox"', "cc-jan-check", "tabindex"):
+        assert marker not in flat.group(1), (
+            "an untappable row must carry no %s — it is shown, never armed" % marker)
+
+
+def test_a_sweep_with_nothing_armable_offers_no_sweep_button():
+    # A permanently-disabled "Sweep 0 selected" under a lead reading "tap the debris to clear"
+    # describes a dialog the owner is not looking at. Bound to the BRANCH, not to proximity: a
+    # round-2 mutation proved a loose `anyArmable[\s\S]{0,900}?data-jan-confirm` was already
+    # satisfied by an unrelated earlier `anyArmable` and passed with the gating reverted.
+    assert re.search(r"anyArmable\s*=\s*groups\.some", _JAN_JS), (
+        "renderProposals must ask whether ANY group is armable before offering the confirm row")
+    branch = re.search(r"\(anyArmable\s*\n?\s*\?([\s\S]{0,700}?)\s*:([\s\S]{0,400}?)\)\);", _JAN_JS)
+    assert branch, "the footer must be a two-way branch on anyArmable"
+    assert "data-jan-confirm" in branch.group(1), (
+        "the armable footer is the one that carries the sweep confirm")
+    assert "data-jan-confirm" not in branch.group(2), (
+        "a sweep with nothing armable must offer NO confirm — a permanently disabled Sweep button "
+        "describes a dialog that is not on screen")
+    assert "data-jan-close" in branch.group(2), (
+        "...it offers Done instead, the only honest control left")
+
+
+def test_the_honesty_notes_are_actually_rendered_not_merely_computed():
+    # Round-2 mutation: suppressing either note (`var lostNote = false`) left the suite green,
+    # because the guards matched the surrounding source rather than the interpolation.
+    assert re.search(r"lostNote\s*\+\s*capNote", _JAN_JS), (
+        "both honesty notes must reach the body on the path that draws tiles")
+    assert re.search(r"setBody\(lostNote \+ capNote", _JAN_JS), (
+        "...and on the path where the sweep found debris but drew no tile at all")
+    assert re.search(r"var lostNote = missing", _JAN_JS) and re.search(r"var capNote = capped",
+                                                                      _JAN_JS), (
+        "each note must be conditioned on its own count, so it disappears only when that count is 0")
+
+
+def test_every_server_string_reaching_the_dom_is_escaped():
+    # `_what()` interpolates the GitHub ISSUE TITLE, and this is a public repo — anyone who can open
+    # an issue can write that string. The PR adds three new innerHTML sinks (the flat row, the raw
+    # key, the unnamed-held caveat), so pin the escaping rather than trusting review to catch it.
+    for field in ("esc(it.what)", "esc(it.why)", "esc(it.key)", "esc(g.label)", "esc(g.kind)"):
+        assert field in _JAN_JS, (
+            "%s must go through esc() before it reaches innerHTML" % field)
+    assert not re.search(r"\+ it\.(what|why|key)\b", _JAN_JS), (
+        "no row field may be concatenated into HTML raw")
+
+
+def test_a_wrong_typed_items_list_can_never_count_as_a_drawn_row():
+    # If `shown` goes NaN on a garbled group, the all-clear guard's arithmetic silently passes and
+    # the dialog renders an empty body. Every count and every template reads through one
+    # fail-closed accessor instead.
+    assert re.search(r"function itemsOf\(g\)[\s\S]{0,200}?Array\.isArray", _JAN_JS), (
+        "one fail-closed accessor must decide what a group's rows are")
+    assert "(g.items || [])" not in _JAN_JS, (
+        "no caller may read g.items directly — a wrong-typed items would count as shown-but-blank")
+    assert re.search(r"groups = Array\.isArray\(groups\)", _JAN_JS), (
+        "a wrong-typed `groups` must degrade into the honest 'more than we can show' path, never "
+        "throw out of the render (the upstream catch would then blame the network)")
+
+
+def test_a_held_row_the_server_could_not_name_says_so():
+    # The held/retry path keeps its Retry for an unnamed kind — it re-runs a write the owner already
+    # chose in the terminal, and withdrawing it would take a working verb off the primary surface —
+    # but the row must not pass a raw key off as a plain-language consequence.
+    assert re.search(r"it\.named\s*===\s*false", _JAN_JS), (
+        "the held row must read the server's `named` flag rather than re-deriving the verb")
+    assert "cc-jan-held-unnamed" in _JAN_JS, (
+        "an unnamed held row must carry its caveat in its own element — heldWhat() reads "
+        ".cc-jan-held-what back verbatim for the confirm label, so a caveat folded in there would "
+        "end up inside \"Yes — …\"")
+    assert re.search(r'cc-jan-held-what">[^<]*\+ esc\(it\.what\) \+ .</span>', _JAN_JS), (
+        "the .cc-jan-held-what element must hold the verb ALONE")
+
+
+def test_the_untappable_row_shows_the_raw_key_so_the_terminal_can_act_on_it():
+    assert "cc-jan-rawkey" in _JAN_JS, (
+        "an unrenderable proposal must show its raw key — that is what --execute-keys takes")
+
+
+def test_the_sweep_breakdown_counts_reopens():
+    # The confirm button states the consequence: "Sweep 3 — 1 branch, 2 reopens". The breakdown reads
+    # the KEY prefixes the server minted, and `reopen:` was missing from that map.
+    bd = re.search(r"function breakdown\(keys\)[\s\S]{0,900}?\n  \}", _JAN_JS)
+    assert bd, "breakdown() must exist"
+    assert re.search(r"reopen:\s*0", bd.group(0)), (
+        "the per-kind tally must count the reopen: key prefix, or a reopen sweeps unnamed")
+    assert "reopen" in bd.group(0) and "reopens" in bd.group(0), (
+        "the breakdown must name reopens in singular and plural")
+
+
+def test_the_static_subtitle_names_every_debris_class():
+    # Issue #290 (absorbed): the dialog's own standing prose enumerated three classes and never grew
+    # the fourth. Stale prose on a trusted surface is the same lie as a missing tile.
+    sub = re.search(r'cc-jan-sub">([\s\S]{0,600}?)</span>', _JAN_JS)
+    assert sub, "the dialog must keep its static subtitle"
+    text = sub.group(1).lower()
+    for word in ("branch", "pr", "parked", "closed"):
+        assert word in text, "the subtitle must name the %s class of debris" % word
+    assert "reopen" in text, (
+        "the subtitle must name the accidental-close class it now renders (issue #229/#289)")
+
+
+def test_the_reopen_tile_and_the_catch_all_are_styled():
+    assert ".cc-jan-issue-reopen" in _CSS, (
+        "shell.css must style the reopen tile — `.cc-jan-issue` does not match `cc-jan-issue-reopen`,"
+        " so without this the fourth tile renders as an unglyphed grey box")
+    assert ".cc-jan-other" in _CSS, "shell.css must style the catch-all group for unknown kinds"
+    assert ".cc-jan-rawkey" in _CSS, "shell.css must style the raw-key line on an untappable row"
 
 
 # =============================== the held-back retry (issue #131) ===============================

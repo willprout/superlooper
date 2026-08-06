@@ -292,9 +292,10 @@
         (r ? "" : " disabled") +
         ' title="Restart the loop — asks the running runner to restart itself (runs superlooper request-restart locally; no GitHub)">\u{1F504} Restart</button>' +
       // The Janitor button (issue #121) — an ops-verb button: clears GitHub-side debris
-      // (stale merged/superseded loop branches, superseded PRs, aged parked issues) by running
-      // `superlooper janitor` locally; a sweep dialog groups every proposal and executes only the
-      // ones tapped. Carries the camera repo, like Flag/Tidy, so a tap sweeps the repo on screen.
+      // (stale merged/superseded loop branches, superseded PRs, aged parked issues) and reopens
+      // issues closed by a bare commit keyword (issue #229) by running `superlooper janitor`
+      // locally; a sweep dialog groups every proposal and executes only the ones tapped. Carries
+      // the camera repo, like Flag/Tidy, so a tap sweeps the repo on screen.
       '<button class="janitor-btn" data-act="janitor-open" data-repo="' + esc(r ? r.slug : "") + '"' +
         (r ? "" : " disabled") +
         ' title="Sweep — clear GitHub-side debris (runs superlooper janitor locally; you tap exactly what to clear)">\u{1F5D1}️ Sweep</button>' +
