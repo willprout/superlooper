@@ -1986,6 +1986,22 @@ def test_preauthorized_referee_merge_comment_names_the_paths_and_the_word(rig, m
     assert "pre-authorized:referee" in body
 
 
+def test_preauthorized_merge_comment_renders_the_label_from_the_gate(rig, monkeypatch):
+    """Issue #238: the audit comment must NAME the label the gate actually consumes. A hardcoded
+    copy can drift from gate.PREAUTHORIZED_REFEREE_LABEL, leaving the loop's one bright-line-
+    crossing merge citing an authorization nobody can look up. Proved by RENAMING the constant —
+    pinning the same literal on both sides of the assertion would prove nothing."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod.gate, "PREAUTHORIZED_REFEREE_LABEL", "renamed:preauth-label")
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash",
+                    "wander": False, "referee_preauthorized": True,
+                    "referee_paths": [".superlooper/config.json"]}, NOW)
+    body = [m for m in mutations(rig) if m["kind"] == "comment"][0]["body"]
+    assert "renamed:preauth-label" in body
+    assert "pre-authorized:referee" not in body
+
+
 def test_ordinary_merge_comment_says_nothing_about_referee(rig, monkeypatch):
     # the un-authorized/ordinary path is untouched — no referee prose on a merge that crossed no
     # bright line (the pre-authorization line must stay a signal, never boilerplate).

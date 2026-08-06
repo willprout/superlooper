@@ -21,6 +21,8 @@ tests pin the DoD facts so they cannot silently regress:
 import re
 from pathlib import Path
 
+import gate
+
 # tests/test_write_issue_promotion.py -> tests -> superlooper -> skills -> <repo root>
 _REPO = Path(__file__).resolve().parents[3]
 _WRITE_ISSUE = _REPO / "plugin" / "skills" / "write-issue" / "SKILL.md"
@@ -28,11 +30,20 @@ _OLD_REFERENCE = _REPO / "skills" / "superlooper" / "skill" / "references" / "is
 _APPROVAL_PROTOCOL = (_REPO / "plugin" / "skills" / "superlooper"
                       / "references" / "approval-protocol.md")
 
-# The distinct label that records the owner's referee-path pre-authorization (issue #165). Pinned
-# as a string here because lib/gate.py (PREAUTHORIZED_REFEREE_LABEL) and the two skills MUST agree
-# on it verbatim — the launch/merge gates key off exactly this label, so a doc that taught a
-# different spelling would send William to apply a label the machinery never reads.
+# The distinct label that records the owner's referee-path pre-authorization (issue #165). Spelled
+# out here because these are DOC tests — what the skills must teach verbatim — but pinned to
+# lib/gate.py below, because the launch/merge gates key off exactly this label and a doc teaching a
+# different spelling would send William to apply a label the machinery never reads. (Issue #238:
+# before the pin, the literal was free-floating and this file never imported gate, so the agreement
+# this comment claimed was enforced by nothing — a rename would leave these tests green against a
+# stale spelling.)
 _PREAUTH_LABEL = "pre-authorized:referee"
+
+
+def test_preauth_label_literal_is_pinned_to_the_gate():
+    assert _PREAUTH_LABEL == gate.PREAUTHORIZED_REFEREE_LABEL, (
+        "the label these doc tests demand the skills teach must be the one lib/gate.py keys on; "
+        "rename it in gate.py and the skills' text must move with it")
 
 # The corrected cross-reference form: approval-protocol.md is now the sibling superlooper skill's
 # reference, so write-issue names it by that skill rather than as a bare local filename.

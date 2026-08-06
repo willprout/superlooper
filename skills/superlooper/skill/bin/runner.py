@@ -4033,7 +4033,8 @@ class Runner:
             gh.comment(num, f"Merged as PR #{pr} by superlooper (gate green: report + review "
                             "evidence + required checks + mergeable) — including referee path(s) "
                             f"{named or '(unnamed)'}, merged under {self._operator()}'s "
-                            "`pre-authorized:referee` pre-authorization rather than parked.")
+                            f"`{gate.PREAUTHORIZED_REFEREE_LABEL}` pre-authorization rather "
+                            "than parked.")
         else:
             gh.comment(num, f"Merged as PR #{pr} by superlooper (gate green: report + review "
                             "evidence + required checks + mergeable).")
