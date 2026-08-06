@@ -46,6 +46,12 @@ INVESTIGATION_MARKER = "<!-- superlooper-investigation -->"
 # hyphen too, so `<!-- superlooper-review-notes sha=<head> -->` — a sibling in the `<!-- superlooper-`
 # marker family — parsed as a full verdict: fail-OPEN on the one property this module exists to
 # protect. (Second fresh review, P2-a.)
+#
+# MIRRORED (issues #176/#238): `dashboard/lib/review_marker.py` re-implements this marker's parsing
+# so the dashboard can read a verdict without importing the engine, and
+# `dashboard/tests/test_review_marker.py` pins its regexes to THESE. Change the marker format here
+# and that mirror's tests go red — which is the point; the pointer is here so an editor of the
+# original can see the mirror exists before wondering why.
 _REVIEW_MARKER_RE = re.compile(r"<!--\s*superlooper-review(\s[^\n]*?)?-->", re.IGNORECASE)
 _REVIEW_PIN_RE = re.compile(r"\bsha\s*=\s*(\S+)", re.IGNORECASE)
 # A readable git oid. Abbreviations are honored (a worker reaches for `git rev-parse --short

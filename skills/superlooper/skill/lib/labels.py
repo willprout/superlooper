@@ -40,8 +40,11 @@ LABELS = [
      "standing rule: auto-filed fix for a red nightly/dev (scoped to restoring green)"),
     # {operator}'s word, granted at approval, for a foreseeable referee-path owner-stop (issue
     # #165). A DISTINCT label, never folded into `agent-ready` — the same discipline as
-    # `auto-approved:nightly-red` above (and coloured as its sibling): the audit trail must always
-    # show HOW a referee touch was cleared. Deliberately NOT '(runner-managed)': the runner must
+    # `auto-approved:nightly-red` above: the audit trail must always show HOW a referee touch was
+    # cleared. It carries its OWN colour (`f9d0c4`, a pale peach — not that sibling's deeper
+    # salmon `e99695`), so the two
+    # owner-word grants are told apart at a glance in the issue list — the discipline they share is
+    # the distinct label, not a shared colour. Deliberately NOT '(runner-managed)': the runner must
     # never create, apply, or heal this one — it is only ever applied by hand, by {operator}.
     ("pre-authorized:referee", "f9d0c4",
      "{operator}'s pre-authorization: the gate may merge this issue's referee-path touches"),
