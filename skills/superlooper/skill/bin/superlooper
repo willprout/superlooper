@@ -468,8 +468,8 @@ def _arm_machine_env(announce=True):
 
     Silent on a machine that never ran the build-up: no file, no switch, no gate, and no new line
     explaining a fence that workstation does not have. ``announce=False`` silences the stdout line
-    for a caller whose stdout is a MACHINE-readable answer (`superlooper resume --json`, which the
-    dashboard parses) — warnings still go to stderr, where they belong either way.
+    for a caller whose stdout is a MACHINE-readable answer (`superlooper resume --json`) — warnings
+    still go to stderr, where they belong either way.
 
     **It never raises.** This runs before `_load_config` on a process whose whole job is to keep
     running, and the thing it reads is a text file the docs invite an operator to hand-edit — so

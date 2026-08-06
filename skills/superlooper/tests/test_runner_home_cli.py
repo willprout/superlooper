@@ -379,7 +379,7 @@ def test_resume_arms_the_gate_too_and_keeps_its_json_parseable(rig):
     # `superlooper resume i<N>` is the FOURTH spawner and the only one besides the runner that can
     # put a WORKER on the host — so on a built fleet machine it must not fly the one launch class
     # the fence exists to contain past a gate the machine already armed. Its stdout is a
-    # machine-readable answer the dashboard parses, so the arming says nothing there.
+    # machine-readable answer (`--json`), so the arming says nothing there.
     _arm(rig)
     home = Path(rig.env["SL_HOME"]) / "o__r"
     (home / "state" / "sessions").mkdir(parents=True, exist_ok=True)
@@ -393,7 +393,7 @@ def test_resume_arms_the_gate_too_and_keeps_its_json_parseable(rig):
             env_over={"SL_LAUNCH_SESSION": str(launcher)})
     assert seen.exists(), r.stdout + r.stderr
     assert seen.read_text() == "required", "a revived WORKER must meet the same gate"
-    # stdout stays a single machine-readable object: the dashboard parses it.
+    # stdout stays a single machine-readable object for whatever drives the verb.
     assert "fleet machine" not in r.stdout
     assert json.loads(r.stdout.strip())["id"] == "i101"
 

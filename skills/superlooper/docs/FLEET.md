@@ -175,7 +175,7 @@ runner's. Three properties are deliberate:
 
 `superlooper resume i<N>` arms itself the same way, and it is the only other command that can put a
 **worker** on the host (`debug` and the watchdog's relaunch are `d<N>`, which the pre-flight exempts
-by design). Its stdout is a machine-readable answer the dashboard parses, so it says nothing there —
+by design). Its stdout is a machine-readable answer (`--json`), so it says nothing there —
 the launcher's own refusal is where an operator meets the gate.
 
 The file is read **at boot**, so a runner that was already up when you ran `--install` keeps the
