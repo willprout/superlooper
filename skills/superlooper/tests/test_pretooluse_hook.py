@@ -675,6 +675,38 @@ def test_the_config_is_also_found_from_the_sessions_own_cwd(tmp_path):
     assert reason and "plugin" in reason
 
 
+# --- the provenance advisory rides along, and never denies (issue #400) ---
+
+def test_a_missing_source_label_never_denies_an_otherwise_valid_issue(tmp_path):
+    # The whole family is display-only (owner ruling 2026-08-06): nothing may EVER block on it, and
+    # this hook is the only surface that even asks. A valid issue with no `source:` label is created,
+    # full stop — otherwise every worker filing a follow-up would be refused for provenance, which
+    # is the definition of blocking on it.
+    _worktree(tmp_path)
+    assert _create("gh issue create --title x --label type:build --body %s"
+                   % shlex.quote(VALID_BODY), tmp_path) is None
+
+
+def test_a_deny_the_issue_has_already_earned_also_teaches_the_source_label(tmp_path):
+    # When the command is being refused anyway, the session is about to retype it — so this is the
+    # cheapest possible moment to say the whole contract at once, including the part that is only
+    # ever advice. It rides ALONG with a real defect; it never creates one.
+    _worktree(tmp_path)
+    reason = _create("gh issue create --title x --body %s" % shlex.quote(VALID_BODY), tmp_path)
+    assert reason and "type:" in reason
+    assert "no `source:` label" in reason
+
+
+def test_an_issue_that_names_its_source_is_told_nothing_about_provenance(tmp_path):
+    # The type: complaint still stands (it is a real defect); the provenance line is gone, because
+    # the issue answered it. Any value answers it — the family is open.
+    _worktree(tmp_path)
+    reason = _create("gh issue create --title x --label source:slackbot --body %s"
+                     % shlex.quote(VALID_BODY), tmp_path)
+    assert reason and "type:" in reason
+    assert "no `source:` label" not in reason
+
+
 @pytest.mark.parametrize("command", [
     "gh issue create --title 'unbalanced --body x",          # shlex cannot split it
     "echo gh issue create",                                  # not at a command position

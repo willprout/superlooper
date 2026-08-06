@@ -10,6 +10,8 @@ rendering, the three type variants, bright-line injection, absolute state paths,
 classes Session 1 kept catching — shared mutable defaults / input mutation, and fail-OPEN on a
 wrong-typed (not just missing) field.
 """
+import re
+
 import pytest
 
 import brief
@@ -667,6 +669,46 @@ def test_the_pointer_is_ONE_line_not_a_teaching_block(_sl_home):
     clause = _filing_clause(brief.build(_issue(), _cfg(_sl_home)))
     added = [ln for ln in clause.splitlines() if "type:" in ln or "## Loop metadata" in ln]
     assert len(added) == 1, added
+
+
+# --------------------------------------------------------------------------- provenance (#400)
+# Every issue a session files says WHICH KIND OF SESSION filed it, so the owner can filter the pile
+# by where it came from. The brief carries the value because only the brief knows the session kind —
+# the session itself is a fresh Claude that has never heard of `source:`.
+
+def test_the_filing_clause_names_the_source_label_for_this_session_kind(_sl_home):
+    for itype, expected in (("build", "source:build"),
+                            ("diagnose-and-fix", "source:build"),
+                            ("investigate", "source:investigation")):
+        clause = _filing_clause(brief.build(_issue(type=itype), _cfg(_sl_home)))
+        assert expected in clause, itype
+        # ...and never a value belonging to a different session kind
+        for other in ("source:qa", "source:debugger", "source:dashboard-flag",
+                      "source:orchestration"):
+            assert other not in clause, (itype, other)
+
+
+def test_a_diagnose_and_fix_split_labels_its_children_with_its_own_provenance(_sl_home):
+    out = brief.build(_issue(type="diagnose-and-fix"), _cfg(_sl_home))
+    split = next(p for p in out.split("\n\n") if "SPLIT" in p)
+    assert "needs-owner" in split and "source:build" in split
+
+
+def test_an_investigations_children_are_labeled_with_its_own_provenance(_sl_home):
+    out = brief.build(_issue(type="investigate"), _cfg(_sl_home))
+    children = next(p for p in out.split("\n\n") if "File scoped child issues" in p)
+    assert "needs-owner" in children and "source:investigation" in children
+
+
+def test_the_source_label_is_registered_vocabulary_every_time(_sl_home):
+    # gh refuses a label the repo does not have, so a value the brief invents is an instruction the
+    # worker cannot follow. Every value any brief can print must be in the engine's own registry.
+    import labels as labels_mod
+    registered = set(labels_mod.source_labels())
+    for itype in ("build", "diagnose-and-fix", "investigate"):
+        out = brief.build(_issue(type=itype), _cfg(_sl_home))
+        printed = set(re.findall(r"source:[a-z0-9-]+", out))
+        assert printed and printed <= registered, (itype, printed - registered)
 
 
 def test_the_pointer_says_the_deny_will_catch_it(_sl_home):

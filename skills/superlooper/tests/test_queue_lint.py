@@ -248,6 +248,90 @@ def test_blocking_says_whether_the_runner_would_refuse():
     assert queue_lint.blocking([]) is False
 
 
+# =============================== the provenance advisory (issue #400) ===============================
+# `source:` names WHO FILED an issue. It is display-and-filter only: no scheduling, gating or
+# approval decision may ever read it, and NOTHING may ever block on it (owner ruling 2026-08-06).
+# So it is not part of the mechanical contract at all — it is an OPT-IN advisory the create-time
+# surface asks for, and every existing issue is grandfathered by the opt-in being off everywhere
+# else.
+
+def test_the_contract_is_unchanged_when_advisories_are_not_asked_for():
+    # The default posture, and the one that grandfathers the standing pile: an issue with no
+    # `source:` label is exactly as valid as it was before #400, on every surface that does not
+    # ask. Nothing retro-complains about the issues that were filed before the family existed.
+    assert queue_lint.lint(["type:build"], METADATA, areas=AREAS) == []
+    assert queue_lint.lint_parsed(parsed(), areas=AREAS) == []
+
+
+def test_a_missing_source_label_is_reported_when_advisories_are_asked_for():
+    found = queue_lint.lint(["type:build"], METADATA, areas=AREAS, advisories=True)
+    assert [d["code"] for d in found] == ["source_missing"]
+    d = found[0]
+    assert d["blocks_launch"] is False        # never the runner's verdict...
+    assert d["advisory"] is True              # ...and never ANY gate's verdict
+    assert d["choices"] == []                 # nothing may guess which session kind filed it
+    assert "source:" in queue_lint.describe(d)
+
+
+def test_any_source_value_satisfies_the_advisory_because_the_family_is_open():
+    # Adopters add their own values (a future `source:slackbot`) with no engine change, so the
+    # advisory asks whether the family is present — never whether the VALUE is one the engine knows.
+    for value in ("source:build", "source:qa", "source:slackbot"):
+        assert queue_lint.lint(["type:build", value], METADATA, areas=AREAS,
+                               advisories=True) == [], value
+
+
+def test_the_advisory_never_blocks_and_never_reads_as_a_refusal():
+    found = queue_lint.lint(["type:build"], METADATA, areas=AREAS, advisories=True)
+    assert queue_lint.blocking(found) is False
+    assert queue_lint.refusals(found) == []
+
+
+def test_refusals_keeps_every_defect_that_is_not_an_advisory():
+    # The two halves of the same list: a real contract defect stays a refusal even when an advisory
+    # rides beside it, so a surface that filters advisories out never filters a real defect out too.
+    found = queue_lint.lint([], METADATA, areas=AREAS, advisories=True)
+    assert sorted(d["code"] for d in found) == ["source_missing", "type_missing"]
+    assert [d["code"] for d in queue_lint.refusals(found)] == ["type_missing"]
+    assert queue_lint.blocking(found) is True
+
+
+def test_the_advisory_is_reported_last_so_real_defects_lead():
+    found = queue_lint.lint([], "## Goal\nx\n", areas=AREAS, advisories=True)
+    assert found[-1]["code"] == "source_missing"
+    assert [d["code"] for d in found[:-1]] == ["type_missing", "touches_missing"]
+
+
+def test_every_contract_defect_is_a_refusal_not_an_advisory():
+    # The other direction, so a future defect cannot be quietly born advisory: everything the
+    # mechanical contract reports is refusable, and only the #400 provenance notice is not.
+    for labels_in, body in ([], METADATA), (["type:build"], "## Goal\nx\n"), \
+                           (["type:build"], "## Loop metadata\ntouches: plugin\n"), \
+                           (["type:build", "model:a", "model:b"], METADATA):
+        for d in queue_lint.lint(labels_in, body, areas=AREAS):
+            assert d["advisory"] is False, d
+        assert queue_lint.refusals(queue_lint.lint(labels_in, body, areas=AREAS))
+
+
+@pytest.mark.parametrize("bad", [None, "x", 5, [1, 2], {"a": 1}, [{"no": "name"}]])
+def test_the_advisory_never_raises_on_wrong_typed_labels(bad):
+    # Same fail-open-per-dimension discipline the rest of the module has: a garbage gh read reports
+    # the advisory (it genuinely names no source), and NEVER raises out of a hook that would then
+    # deny nothing at all.
+    found = queue_lint.lint(bad, METADATA, areas=AREAS, advisories=True)
+    assert "source_missing" in [d["code"] for d in found]
+    assert queue_lint.lint_parsed(bad, areas=AREAS, advisories=True)
+
+
+def test_lint_parsed_and_lint_issue_carry_the_advisory_through_too():
+    assert [d["code"] for d in queue_lint.lint_parsed(parsed(), areas=AREAS, advisories=True)] \
+        == ["source_missing"]
+    assert queue_lint.lint_issue({"labels": [{"name": "type:build"}], "body": METADATA},
+                                 areas=AREAS, advisories=True)[0]["code"] == "source_missing"
+    assert queue_lint.lint_parsed(parsed(labels=("type:build", "source:build")),
+                                 areas=AREAS, advisories=True) == []
+
+
 def test_signature_is_a_stable_defect_set_identity():
     # The runner journals a refusal ONCE per defect SET: the signature is what makes "the same
     # complaint" recognizable across ticks, and a CHANGED complaint speak up again.

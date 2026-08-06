@@ -4408,7 +4408,8 @@ def test_red_dev_freezes_files_once_and_notifies():
     fix = only(out, "file_fix_issue")
     assert len(fix) == 1
     assert fix[0]["labels"] == ["type:diagnose-and-fix", "agent-ready",
-                                "auto-approved:nightly-red", "expedite"]   # EXACTLY these
+                                "auto-approved:nightly-red", "expedite",
+                                "source:qa"]                               # EXACTLY these
     assert "green" in fix[0]["title"].lower() or "green" in fix[0]["body"].lower()
     assert "ci" in fix[0]["title"] or "ci" in fix[0]["body"]
     assert has_notify(out)

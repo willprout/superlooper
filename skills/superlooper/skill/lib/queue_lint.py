@@ -34,9 +34,27 @@ reach" — the hook's degraded mode when it cannot find a config to read. The ar
 judged at all, while the type and metadata dimensions still answer. Never a blanket stand-down, and
 never a confident verdict on evidence we do not have.
 
+**ADVISORIES are opt-in, and never anybody's verdict.** The provenance family (`source:`, issue
+#400) is display-and-filter only: no scheduling, gating or approval decision may ever read it, and
+NOTHING may ever block on it (owner ruling 2026-08-06). So a missing `source:` is not a contract
+defect at all — it is an ADVISORY, off by default and asked for by name. Two consequences, both
+deliberate:
+
+  * every issue filed before the family existed is GRANDFATHERED, because every standing surface
+    (the runner's refusal journal, `doctor --repo`, the janitor, the departures board) simply does
+    not ask. Nothing sweeps the pile, nothing retro-labels it, and nothing complains about it;
+  * the ONE surface that does ask is the create-time PreToolUse deny — the moment an issue is being
+    WRITTEN, which is the only moment the advisory can be acted on. Even there it can never be the
+    reason for a refusal: that surface filters on `refusals()`, so an otherwise-valid issue with no
+    `source:` label is created, not denied.
+
 A defect is a dict:
   code           discrete reason (the pixels and the journal never parse prose)
   blocks_launch  would the RUNNER refuse/park over this, right now?
+  advisory       is this a notice rather than a defect? An advisory is never a refusal at ANY gate
+                 (`refusals()` drops it) and never `blocks_launch`. Structural, not conventional:
+                 "nothing ever blocks on `source:`" is a property of the data, not of each caller
+                 remembering to special-case a code.
   what           one sentence naming what is wrong, quoting the offending value in its REAL casing
   fix            one sentence naming the exact repair
   choices        the closed set of values a MECHANICAL fix could set, or [] when there is none.
@@ -45,6 +63,7 @@ A defect is a dict:
 import re
 
 import issues as issues_mod
+import labels as labels_mod
 
 # The three issue kinds, from the engine's own single source. Imported, never re-listed: a fourth
 # kind must not need editing in two places.
@@ -73,9 +92,33 @@ _KINDS_PHRASE = ", ".join(_TYPE_PREFIX + k for k in VALID_TYPES[:-1]) + \
 METADATA_SHAPE = "## Loop metadata\ntouches: <area>[, <area>...]"
 
 
-def _defect(code, blocks_launch, what, fix, choices=()):
-    return {"code": code, "blocks_launch": bool(blocks_launch), "what": what, "fix": fix,
-            "choices": list(choices)}
+def _defect(code, blocks_launch, what, fix, choices=(), advisory=False):
+    return {"code": code, "blocks_launch": bool(blocks_launch), "advisory": bool(advisory),
+            "what": what, "fix": fix, "choices": list(choices)}
+
+
+def _source_advisory(names):
+    """The provenance notice (#400): this issue does not say who filed it.
+
+    Deliberately asks only whether the FAMILY is present, never whether the value is one the engine
+    knows — the value set is open (``labels.OPEN_LABEL_FAMILIES``), so an adopter's own
+    `source:slackbot` is a correct answer and judging it would redden a repo for doing exactly what
+    the family is for.
+
+    `choices` is empty on purpose, so the janitor can never propose a value here. The right label is
+    the SESSION KIND that filed the issue, which is knowable only to that session — a machine
+    guessing it would write a provenance record that lies, and a provenance record nobody can trust
+    is worse than none.
+    """
+    if any(n.startswith(labels_mod.SOURCE_PREFIX) for n in names):
+        return []
+    return [_defect(
+        "source_missing", False,
+        "no `source:` label — nothing blocks on it, but the queue cannot then be filtered by who "
+        "filed this issue",
+        "Add exactly one `source:` label naming the session kind that filed it (e.g. "
+        "`source:build` from a build session, `source:orchestration` from a planning session).",
+        advisory=True)]
 
 
 def _area_names(areas):
@@ -209,26 +252,37 @@ def _lint_touches(declared, blocks, areas, section_present=False, bare=None, no_
         choices=choices)]
 
 
-def lint(labels, body, areas=None, touches_required=True):
+def _advisories(labels, wanted):
+    """The opt-in notices for these labels, or [] when the caller did not ask. Appended LAST by
+    every entry point, so the mechanical contract's defects always lead a report and a surface that
+    truncates or reads only the first line never trades a real defect for a notice."""
+    if not wanted:
+        return []
+    return _source_advisory(issues_mod._label_names({"labels": labels}))
+
+
+def lint(labels, body, areas=None, touches_required=True, advisories=False):
     """Every way this issue fails the mechanical contract, in the order the RUNNER hits them.
 
     `areas` is the repo's `areas` config block (name -> globs), or None when it is out of reach.
     `touches_required` is the repo's own knob; a wrong-typed value ENFORCES, the same fail-safe
     direction as actions._touches_required (never silently launch a no-touches issue on a garbled
-    config). Returns [] for a valid issue."""
+    config). `advisories` adds the opt-in notices (the #400 provenance one) — off by default, so
+    the contract this returns is byte-for-byte what it was before advisories existed. Returns []
+    for a valid issue."""
     body = body if isinstance(body, str) else ""
     found, itype = _lint_labels(labels)
-    if not _territory_applies(itype, touches_required):
-        return found
-    sections = issues_mod.parse_sections(body)
-    declared = issues_mod.parse_loop_metadata(body)["touches"]
-    return found + _lint_touches(
-        declared, _territory_blocks(found, itype), areas,
-        section_present=any(h.strip().lower() == "loop metadata" for h in sections),
-        bare=None if declared else _bare_touches_value(body))
+    if _territory_applies(itype, touches_required):
+        sections = issues_mod.parse_sections(body)
+        declared = issues_mod.parse_loop_metadata(body)["touches"]
+        found = found + _lint_touches(
+            declared, _territory_blocks(found, itype), areas,
+            section_present=any(h.strip().lower() == "loop metadata" for h in sections),
+            bare=None if declared else _bare_touches_value(body))
+    return found + _advisories(labels, advisories)
 
 
-def lint_parsed(parsed, areas=None, touches_required=True):
+def lint_parsed(parsed, areas=None, touches_required=True, advisories=False):
     """lint() from an ALREADY-parsed issue (issues.parse_issue's shape) — what the runner holds on
     a tick. It has the labels and the parsed `touches`, but no body, so the one thing it cannot
     tell apart is WHY a declaration is absent (never written, or written where the parser does not
@@ -237,13 +291,13 @@ def lint_parsed(parsed, areas=None, touches_required=True):
     if not isinstance(parsed, dict):
         parsed = {}
     found, itype = _lint_labels(parsed.get("labels"))
-    if not _territory_applies(itype, touches_required):
-        return found
-    declared = parsed.get("touches")
-    declared = [t for t in declared if isinstance(t, str) and t.strip()] \
-        if isinstance(declared, list) else []
-    return found + _lint_touches(declared, _territory_blocks(found, itype), areas,
-                                 no_section_hint=False)
+    if _territory_applies(itype, touches_required):
+        declared = parsed.get("touches")
+        declared = [t for t in declared if isinstance(t, str) and t.strip()] \
+            if isinstance(declared, list) else []
+        found = found + _lint_touches(declared, _territory_blocks(found, itype), areas,
+                                      no_section_hint=False)
+    return found + _advisories(parsed.get("labels"), advisories)
 
 
 def _territory_applies(itype, touches_required):
@@ -264,13 +318,13 @@ def _territory_blocks(label_defects, itype):
     return itype in MERGE_PRODUCING_TYPES and not blocking(label_defects)
 
 
-def lint_issue(gh_issue, areas=None, touches_required=True):
+def lint_issue(gh_issue, areas=None, touches_required=True, advisories=False):
     """lint() over a raw gh issue dict. A non-dict (None, a list, a string from a broken gh call)
     degrades to an empty issue — which lints as invalid, never as valid, and never raises."""
     if not isinstance(gh_issue, dict):
         gh_issue = {}
     return lint(gh_issue.get("labels"), gh_issue.get("body"),
-                areas=areas, touches_required=touches_required)
+                areas=areas, touches_required=touches_required, advisories=advisories)
 
 
 _METADATA_HEADING = "## Loop metadata"
@@ -381,6 +435,17 @@ def describe(defect):
 def blocking(defects):
     """Would the RUNNER refuse to launch over any of these? (An empty list is not blocking.)"""
     return any(d.get("blocks_launch") for d in defects)
+
+
+def refusals(defects):
+    """The defects a gate may REFUSE over — everything that is not an advisory.
+
+    What makes "nothing ever blocks on `source:`" structural rather than a convention each caller
+    remembers. A surface that turns a defect list into a refusal (the create-time deny) filters
+    here, so a future advisory is born non-blocking at every such surface at once instead of
+    needing a new special case in each — the shape of miss that lets a display-only label quietly
+    become a gate."""
+    return [d for d in defects if not d.get("advisory")]
 
 
 def signature(defects):

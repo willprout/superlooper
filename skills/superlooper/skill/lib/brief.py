@@ -25,6 +25,26 @@ from config import state_home, operator as _operator
 
 _TYPES = ("build", "investigate", "diagnose-and-fix")
 
+# WHO FILED IT, per session kind (issue #400). Only the brief knows what kind of session this is —
+# the worker is a fresh Claude that has never heard of the family — so the brief is where the value
+# is chosen and the session is simply told which label to apply. Every value here must be one
+# `labels.LABELS` registers, because gh refuses a label the repo does not have: a value invented
+# here would be an instruction the worker cannot follow. Pinned by
+# test_brief.test_the_source_label_is_registered_vocabulary_every_time rather than by importing
+# `labels` — this module's whole job is rendering PROSE, and a printed label is a string in a
+# sentence, not a constant it dereferences.
+#
+# A diagnose-and-fix session shares `source:build` with a build session on purpose: both are `i<N>`
+# build sessions, and the distinction the owner asked to see is who FILED an issue, not which of the
+# two code-producing types was running at the time (the child's own `type:` already says that).
+# `source:debugger` belongs to a `d<N>` repair session, which never gets a brief from here; the
+# write-issue doctrine is what carries it.
+_SOURCE_BY_TYPE = {
+    "build": "source:build",
+    "diagnose-and-fix": "source:build",
+    "investigate": "source:investigation",
+}
+
 # A comment whose body BEGINS with this prefix is one of the runner's own mechanical protocol
 # markers (the review verdict — gate.pinned_review_marker() — and gate.INVESTIGATION_MARKER),
 # never a human amendment. On these repos every comment shares one gh identity (workers, runner,
@@ -53,8 +73,9 @@ _BUILD_WORK_BLOCK = """\
 _DNF_SCOPE_CLAUSE = """\
 **Scope check FIRST (diagnose-and-fix).** If the root cause exceeds the issue's Boundaries — or
 touches any bright-line area below — do NOT fix it here: SPLIT. File scoped child issues (each with
-`parent: #{issue_num}` in its `## Loop metadata`, labeled `needs-owner`), comment the diagnosis on
-#{issue_num}, and open no PR. Only fix root causes that sit fully in scope."""
+`parent: #{issue_num}` in its `## Loop metadata`, labeled `needs-owner` and `{source_label}`),
+comment the diagnosis on #{issue_num}, and open no PR. Only fix root causes that sit fully in
+scope."""
 
 # investigate REPLACES the ship gate entirely: the deliverable is a marker comment + child issues,
 # never a PR (§C.4 investigate gate keys on the `<!-- superlooper-investigation -->` marker comment).
@@ -64,7 +85,8 @@ _INVESTIGATE_WORK_BLOCK = """\
    `<!-- superlooper-investigation -->`. Zero children is a valid finding — "nothing to do" is a
    legitimate root cause.
 2. File scoped child issues for the work the root cause implies, each carrying `parent: #{issue_num}`
-   in its `## Loop metadata` and labeled `needs-owner` ({operator} approves every child before it runs).
+   in its `## Loop metadata` and labeled `needs-owner` ({operator} approves every child before it runs)
+   and `{source_label}` (it says this investigation filed them).
 3. Open ZERO pull requests and change no files outside your own scratch notes.
 4. After you finish, the runner delivers an EXIT INTERVIEW asking you to account for your findings.
    Answer it when it arrives (it carries its own instructions) — the parent closes only after that
@@ -201,6 +223,18 @@ def _work_and_finish(itype):
     if itype == "investigate":
         return _INVESTIGATE_WORK_BLOCK, "", _ASSUME_INVESTIGATE   # no PR anywhere in an investigation
     raise ValueError(f"cannot build a brief for issue type {itype!r} (expected one of {_TYPES})")
+
+
+def _source_label(itype):
+    """The `source:` value a session of this kind stamps on every issue it files (#400).
+
+    Raises on an unknown type for the same reason _work_and_finish does — but note it can only ever
+    be reached AFTER that call has already validated the type, so this is a belt-and-braces guard
+    against a future type added to one table and not the other, not a second front door."""
+    try:
+        return _SOURCE_BY_TYPE[itype]
+    except KeyError:
+        raise ValueError(f"no source: label registered for issue type {itype!r}") from None
 
 
 def _amend_header(operator):
@@ -417,6 +451,7 @@ def build(parsed_issue, config, comments=None, qa=None):
     })
     footer = _sub(footer, {"ship_instructions": ship_instructions})
     footer = _sub(footer, {
+        "source_label": _source_label(itype),
         "issue_num": issue_num,
         "dev_branch": dev,
         "branch": branch,

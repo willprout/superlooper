@@ -271,4 +271,4 @@ def test_post_flag_writes_through_the_socket_to_fake_gh(tmp_path, monkeypatch):
     muts = [json.loads(ln) for ln in (tmp_path / "mutations.jsonl").read_text().splitlines() if ln.strip()]
     created = [m for m in muts if m["kind"] == "create_issue"][-1]
     assert created["body"] == "socket path works"
-    assert created["labels"] == "flag"
+    assert created["labels"] == "flag,source:dashboard-flag"     # the verb's own provenance (#400)

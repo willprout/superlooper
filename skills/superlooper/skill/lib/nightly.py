@@ -22,6 +22,7 @@ import re
 from xml.etree import ElementTree as ET
 
 import gate
+import labels
 
 # Must equal actions.FIX_ISSUE_LABELS — a nightly-filed and a runner-filed fix issue are the same
 # standing-rule auto-approval and must be indistinguishable in the audit trail (§4.4). The SET is
@@ -29,7 +30,14 @@ import gate
 # heavy actions->brief/gate/scheduler import chain; the standing-rule marker itself comes from gate
 # (already imported), because since #294 the scheduler READS that label — a drifting literal here
 # would silently cost a nightly-filed fix its territory-claim exemption.
-NIGHTLY_FIX_LABELS = ["type:diagnose-and-fix", "agent-ready", gate.RESTORE_GREEN_LABEL, "expedite"]
+#
+# `source:qa` (issue #400) comes from `labels` for the same reason, one notch stronger: it is a
+# label this filer APPLIES at issue-creation time, and `gh issue create` refuses OUTRIGHT for a
+# label the repo lacks — a drifting literal here would not mis-schedule the fix, it would mean no
+# fix issue gets filed at all. `labels` is a pure leaf module (it imports nothing), so this costs
+# the core no import chain.
+NIGHTLY_FIX_LABELS = ["type:diagnose-and-fix", "agent-ready", gate.RESTORE_GREEN_LABEL, "expedite",
+                      labels.SOURCE_QA]
 
 _BODY_EXCERPT = 1200      # cap the observed-failure block so a giant traceback can't bloat the issue
 
