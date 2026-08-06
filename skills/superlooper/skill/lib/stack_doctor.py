@@ -16,6 +16,9 @@ from dataclasses import dataclass
 
 import config as config_lib
 import herdr_hook
+# `identity` imports THIS module, but lazily and from inside a function (`identity.resolve_claude`),
+# precisely so the module-level direction can run one way. Keep it that way.
+import identity
 import notify
 import ops_docs
 import runner_home
@@ -540,16 +543,81 @@ def check_claude(probe):
             "claude login", False,
             "cannot read the login: %s is not a runnable claude" % claude,
             "The `claude binary` block above names the real problem; fix that first.")
-    proc = probe.run([claude, "auth", "status", "--json"], timeout=10)
+    # ...and under the CONFIG DIR the launch stack would assign (issues #314, #345), for the same
+    # reason it is the binary above and not some other one: a login read under a different config
+    # dir is a confident statement about a different account. `claude` keys its credentials on the
+    # config-dir string, so on a fleet machine this block used to answer for the OWNER's dir while
+    # every worker flew on another — a green line about a file nobody launches with.
+    #
+    # The REDIRECT first, because it decides which namespace any read would consult at all — the
+    # ordering `identity.env_problem` uses, and for the same reason: a status taken under a
+    # redirected namespace is a confident measurement of the wrong thing, and this block now NAMES
+    # the dir it measured, so an inherited redirect would make that sentence false (it would also
+    # pair an account from one namespace with an onboarding read from another). REFUSED rather than
+    # scrubbed for our own read: the session floor refuses an inherited redirect outright, so on a
+    # machine that has one every worker refuses itself — a doctor that quietly dropped it for its
+    # own convenience would go green over exactly that. Machine-wide, not fleet-only, because the
+    # floor's refusal is.
+    problem = identity.redirect_problem(probe.env)
+    if problem:
+        # The memo carries the mechanism and the remedy already (it is the same sentence the
+        # session floor refuses with). The fix line adds only what it cannot know from in there:
+        # no account was read at all, and this is not one block's opinion — every worker this
+        # machine launches refuses itself on the same variable.
+        return CheckResult("claude login", False, problem,
+                           "No account was read under it. Every worker launched from this machine "
+                           "refuses itself on the same variable, so remove it and re-run.")
+    config_dir, problem = identity.worker_config_dir(probe.env)
+    if problem:
+        # Every launch on this machine already refuses with rc=8 for this. Saying "auth active"
+        # beside that would send the operator to look at the wrong thing.
+        return CheckResult(
+            "claude login", False,
+            "this machine assigns workers a config dir it cannot use — %s" % problem,
+            "Set %s to one canonical absolute path (suggested: %s), or unset it to run workers on "
+            "the machine's default Claude login."
+            % (identity.FLEET_DIR_VAR, identity.SUGGESTED_FLEET_DIR))
+    # REMOVED when there is no assignment, never emptied: an empty CLAUDE_CONFIG_DIR is its own
+    # credential namespace rather than "the default one" (#300 landmine 2). None is Probe.run's
+    # overlay spelling of "unset this variable".
+    where = ("under %s" % config_dir) if config_dir else "under the default Claude config dir"
+    proc = probe.run([claude, "auth", "status", "--json"], timeout=10,
+                     env={identity.CONFIG_DIR_VAR: config_dir})
     data = _json(proc)
     logged_in = data.get("loggedIn") is True
     auth_method = data.get("authMethod")
     if getattr(proc, "returncode", 1) == 0 and logged_in and auth_method == "claude.ai":
-        return CheckResult("claude login", True, "claude.ai subscription auth active")
-    detail = _out(proc) or ("authMethod=%r loggedIn=%r" % (auth_method, data.get("loggedIn")))
+        # THE FIRST-RUN FLOW, and only for a dir this machine actually assigns (issue #345). Being
+        # logged in is not being provisioned: a config dir that has never finished first-run opens
+        # a worker on the theme picker, which pre-trust cannot close (it closes the folder gate and
+        # the bypass warning behind it, and nothing else) and which the host reports as `idle`.
+        #
+        # Not asked of the DEFAULT dir on purpose — the operator is running this doctor under it,
+        # so it is provisioned by demonstration, and a new red line there would be a false alarm on
+        # every machine that has no fleet at all.
+        first_run = (identity.onboarded(probe.read_text(identity.config_file(config_dir)))
+                     if config_dir else None)
+        if config_dir and first_run is not True:
+            return CheckResult(
+                "claude login", False,
+                "%s is logged in, but nothing says its first-run flow was ever accepted (%s) — an "
+                "un-onboarded config dir parks a worker at the theme picker, a screen pre-trust "
+                "does not close and the host reports as idle"
+                % (config_dir, "the flag reads false" if first_run is False
+                   else "no readable hasCompletedOnboarding in %s"
+                        % identity.config_file(config_dir)),
+                "Open one interactive `claude` under that config dir and finish first-run (#313), "
+                "then re-run this check.")
+        return CheckResult("claude login", True,
+                           "claude.ai subscription auth active %s%s"
+                           % (where, ", first-run accepted" if config_dir else ""))
+    detail = "%s (%s)" % (
+        _out(proc) or ("authMethod=%r loggedIn=%r" % (auth_method, data.get("loggedIn"))), where)
     return CheckResult(
         "claude login", False, detail,
-        "Run `claude auth login` with the subscription account the loop uses.",
+        "Run `claude auth login` with the subscription account the loop uses%s."
+        % (" — with %s=%s exported, so it lands in the namespace workers fly on"
+           % (identity.CONFIG_DIR_VAR, config_dir) if config_dir else ""),
     )
 
 

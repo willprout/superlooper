@@ -166,6 +166,59 @@ def resolve_config_dir(explicit, env=None, home=None):
     return canonical(explicit, home=(env or {}).get("HOME") if home is None else home)
 
 
+# ------------------------------------------------ where a config dir keeps its state (issue #345)
+
+def config_file(config_dir=None, home=None):
+    """The `.claude.json` this config dir's sessions actually read — project trust, first-run flag.
+
+    The layout is ASYMMETRIC and the asymmetry is the whole trap #345 was filed for. MEASURED on
+    the fleet machine (2026-08-06):
+
+      * ``CLAUDE_CONFIG_DIR`` assigned -> the file lives INSIDE it. ``~/.claude-fleet/.claude.json``
+        exists and carries ``projects[<folder>].hasTrustDialogAccepted``.
+      * nothing assigned -> ``$HOME/.claude.json``, a SIBLING of ``~/.claude`` rather than a child
+        of it. ``~/.claude/.claude.json`` does not exist at all.
+
+    So "the config dir" and "the config file's directory" are the same place in one case and not in
+    the other — which is exactly how a step can write to one file while the session it wrote for
+    reads another. Three callers depend on this answer (``pretrust.sh``'s write, ``doctor --stack``
+    and the fleet judge's first-run reads), and this is the one place that gives it.
+
+    Agent-specific by nature, and therefore confined to this module by the agent-boundary rule.
+    """
+    if config_dir and str(config_dir).strip():
+        return os.path.join(config_dir, ".claude.json")
+    return os.path.join(home if home else os.path.expanduser("~"), ".claude.json")
+
+
+def onboarded(text):
+    """True / False / None(unknown) for whether a config dir has ever accepted the first-run flow.
+
+    PARSED, never substring-matched: `"hasCompletedOnboarding":true` and the spaced spelling are
+    the same fact, and a check that recognised only one would red-line a perfectly provisioned dir
+    — the kind of false alarm that teaches an operator to skim the block.
+
+    None is UNKNOWN, and it covers both "the file could not be read" and "the flag is not there at
+    all" (a fresh dir has neither). Neither is a state a flight may be certified in, so both answer
+    the same way and the caller decides once.
+
+    Why this matters to #345's fix rather than being trivia beside it: pre-trust closes the FOLDER
+    gate, and #311 measured that closing it also closes the bypass-permissions warning behind it.
+    What it cannot close is the first-run flow an unprovisioned config dir opens on — so once the
+    trust record lands in the right file, the remaining way a fresh fleet identity stalls a worker
+    is this flag, and something has to be able to say so before the flight.
+    """
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or "hasCompletedOnboarding" not in data:
+        return None
+    return data.get("hasCompletedOnboarding") is True
+
+
 # ------------------------------------------------------------------- the redirect variable (#300)
 
 def redirect_problem(env):

@@ -483,7 +483,20 @@ def _launch(spec, host, edges):
     # queue and blames the launch shim. pretrust.sh exits nonzero on a missing `jq`, an
     # unsupported agent and an unwritable trust store, all of which are real and none of which the
     # launch machinery caused.
-    trusted = edges.run([os.path.join(spec.engine_bin, "pretrust.sh"), worktree], timeout=60)
+    #
+    # AND IT IS AIMED, not merely run (issue #345). Trust is keyed per config dir, so the record has
+    # to land in the file the session this launch is about to start will actually read — the SAME
+    # canonical string derived above and named in the pane below, handed over byte for byte. #311
+    # measured the alternative: the entry in the operator's default config while the worker read a
+    # per-worker one, which is a pre-trust that exists and does nothing, on every launch, because
+    # every issue gets a fresh worktree.
+    #
+    # NAMED even when it is empty, rather than left off: this is a child process and it inherits the
+    # runner's own shell, so an unnamed assignment would let a stray CLAUDE_CONFIG_DIR there aim the
+    # write at a dir this launch is not using — the same fault one directory over. Empty is a
+    # statement ("this machine assigns none"), which is why pretrust.sh distinguishes it from absent.
+    trusted = edges.run([os.path.join(spec.engine_bin, "pretrust.sh"), worktree, config_dir or ""],
+                        timeout=60)
     if trusted.rc != 0:
         # rc ONLY — no third-party text, for the reason the worktree refusal below spells out:
         # evidence.py classifies this line, and its CHANNEL needles ("no answer within", which is

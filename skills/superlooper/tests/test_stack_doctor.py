@@ -20,6 +20,7 @@ class FakeProbe:
         self.home = home
         self.alive_pids = set(alive_pids or [])
         self.calls = []
+        self.overlays = []
 
     def pid_alive(self, pid):
         return pid in self.alive_pids
@@ -40,8 +41,11 @@ class FakeProbe:
         text = self.read_text(path)
         return None if text is None else text[:limit]
 
-    def run(self, argv, timeout=10):
+    def run(self, argv, timeout=10, env=None):
         self.calls.append(list(argv))
+        # The OVERLAY, recorded (issue #345): which credential config dir a read was taken under is
+        # invisible in argv and is the entire subject of the login block's aim.
+        self.overlays.append(dict(env) if env is not None else None)
         spec = self.commands.get(argv[0])
         if spec is None:
             spec = next((v for v in self.commands.values() if v.get("path") == argv[0]), None)
@@ -1215,6 +1219,143 @@ def test_claude_login_probes_the_binary_the_launch_stack_resolved():
     stack_doctor.check_claude(probe)
 
     assert [_STANDALONE, "auth", "status", "--json"] in probe.calls
+
+
+# ------------------------------------------- the login block reads the dir a launch uses (#345)
+# #345's defect one layer up: a check that measures a different file than the one in use is a
+# confident statement about the wrong thing. The launch path assigns workers this machine's
+# SL_FLEET_CLAUDE_CONFIG_DIR (#314), so the block that says "you are logged in" has to be looking
+# at that dir — and has to say whether its first-run flow was ever accepted, because pre-trust
+# closes the folder gate and NOT the theme picker an unprovisioned dir opens on.
+
+_DOCTOR_FLEET_DIR = "/home/will/.claude-fleet"
+
+
+def _fleet_probe(fleet_dir=_DOCTOR_FLEET_DIR, onboarded=True, logged_in=True):
+    probe = _healthy_probe()
+    probe.env["SL_FLEET_CLAUDE_CONFIG_DIR"] = fleet_dir
+    probe.env["HOME"] = probe.home
+    if not logged_in:
+        probe.commands["claude"][("auth", "status", "--json")] = (
+            1, json.dumps({"loggedIn": False, "authMethod": "none"}), "")
+    if onboarded is not None:
+        body = {"hasCompletedOnboarding": True} if onboarded else {"numStartups": 1}
+        probe.files[os.path.join(fleet_dir, ".claude.json")] = json.dumps(body)
+    return probe
+
+
+def test_the_login_block_reads_the_config_dir_a_launch_would_assign():
+    probe = _fleet_probe()
+
+    stack_doctor.check_claude(probe)
+
+    assert probe.overlays[-1] == {"CLAUDE_CONFIG_DIR": _DOCTOR_FLEET_DIR}
+
+
+def test_the_login_block_removes_the_variable_when_this_machine_assigns_no_dir():
+    # REMOVED, never emptied: an empty CLAUDE_CONFIG_DIR is its own credential namespace rather
+    # than "the default one" (#300 landmine 2), so a doctor that emptied it would read a third
+    # account nobody has. The overlay's None is Probe.run's spelling of "unset this".
+    probe = _healthy_probe()
+
+    stack_doctor.check_claude(probe)
+
+    assert probe.overlays[-1] == {"CLAUDE_CONFIG_DIR": None}
+
+
+def test_a_fleet_dir_that_has_never_accepted_the_first_run_flow_is_visible_before_a_flight():
+    """The DoD's last line. An un-onboarded config dir parks the first worker at the theme picker
+    — a screen pre-trust cannot close and the host reports as idle — so it must be a red line on
+    the machine's doctor, not a discovery made during an unattended flight."""
+    probe = _fleet_probe(onboarded=False)
+
+    r = stack_doctor.check_claude(probe)
+
+    assert r.ok is False
+    assert "first-run" in r.detail and _DOCTOR_FLEET_DIR in r.detail
+    assert "interactive" in r.fix.lower()
+
+
+def test_a_fleet_dir_whose_config_file_cannot_be_read_is_not_certified_either():
+    # None is UNKNOWN, and "we could not look" is not "it is fine" — the same doctrine the account
+    # read applies to an unreadable `auth status`.
+    probe = _fleet_probe(onboarded=None)
+
+    assert stack_doctor.check_claude(probe).ok is False
+
+
+def test_a_provisioned_fleet_dir_passes_and_the_line_names_the_dir_it_measured():
+    probe = _fleet_probe()
+
+    r = stack_doctor.check_claude(probe)
+
+    assert r.ok is True
+    assert _DOCTOR_FLEET_DIR in r.detail
+
+
+def test_a_machine_that_assigns_no_config_dir_is_judged_exactly_as_before():
+    """The unchanged path: no new failure mode arrives on the machines that have no fleet dir, and
+    the operator's own default dir is not second-guessed about onboarding — they are running the
+    doctor under it."""
+    r = stack_doctor.check_claude(_healthy_probe())
+
+    assert r.ok is True and r.warn is False
+
+
+def test_a_fleet_dir_this_machine_cannot_use_is_named_by_the_login_block_too():
+    # Every launch on this machine already refuses with rc=8 for this (#314). A login block that
+    # answered "auth active" beside that would send the operator to look at the wrong thing.
+    probe = _fleet_probe(fleet_dir="claude-fleet")
+
+    r = stack_doctor.check_claude(probe)
+
+    assert r.ok is False and "absolute" in r.detail
+    assert "SL_FLEET_CLAUDE_CONFIG_DIR" in r.fix
+
+
+def test_a_credential_redirect_refuses_the_block_before_it_measures_anything():
+    """#300 landmine 2, and the reason it belongs to THIS block now (cross-review, second pass).
+
+    `CLAUDE_SECURESTORAGE_CONFIG_DIR` OVERRIDES the namespace `CLAUDE_CONFIG_DIR` names — and the
+    binary reads a set-but-EMPTY value as "no config dir", collapsing back to the owner's unsuffixed
+    namespace. Once this block NAMES the dir it measured, an inherited redirect makes that sentence
+    false: the account comes from namespace A while the line (and the onboarding read one step
+    later) says namespace B.
+
+    REFUSED rather than scrubbed. The launch floor refuses an inherited redirect outright, so on a
+    machine that has one every worker refuses itself — a doctor that quietly dropped it for its own
+    read would go green over exactly that.
+    """
+    # BOTH values: the empty one is the classic `export X=$SOMETHING_UNSET` accident and the more
+    # dangerous of the two, and a deliberate value is #300's own escape hatch.
+    for value in ("", "/somebody/elses-dir"):
+        probe = _fleet_probe()
+        probe.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = value
+
+        r = stack_doctor.check_claude(probe)
+
+        assert r.ok is False, value
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in r.detail, value
+        assert not [c for c in probe.calls if c[1:3] == ["auth", "status"]], \
+            "it measured an account under a namespace it could not name (%r)" % value
+
+
+def test_the_redirect_refusal_is_machine_wide_not_fleet_only():
+    # The floor refuses it whether or not a config dir was assigned, so the doctor must too.
+    probe = _healthy_probe()
+    probe.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = ""
+
+    assert stack_doctor.check_claude(probe).ok is False
+
+
+def test_a_logged_out_fleet_dir_still_fails_on_the_login_and_not_on_onboarding():
+    # Ordering: which account the dir holds is upstream of whether it finished first-run, and one
+    # cause deserves one alarm.
+    probe = _fleet_probe(logged_in=False, onboarded=False)
+
+    r = stack_doctor.check_claude(probe)
+
+    assert r.ok is False and "first-run" not in r.detail
 
 
 def test_claude_login_defers_to_the_binary_block_instead_of_raising_a_second_alarm():

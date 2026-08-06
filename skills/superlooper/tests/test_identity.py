@@ -291,3 +291,38 @@ def test_the_session_refuses_the_wrong_account_and_names_both_sides():
     env = _session_env(**{identity.EXPECT_VAR: _FLEET_ORG})
     problem = identity.session_problem(env, status=_status(org=_OWNER_ORG))
     assert problem and _OWNER_ORG in problem and _FLEET_ORG in problem
+
+
+# ------------------------------------------- where a config dir keeps its file, and its first run
+# Issue #345. `claude` splits its own storage asymmetrically and the split is the trap: with a
+# config dir assigned the file lives INSIDE it, and with none it is a SIBLING of `~/.claude`.
+# MEASURED on the fleet machine, 2026-08-06:
+#   ~/.claude-fleet/.claude.json   exists, and carries projects[...].hasTrustDialogAccepted
+#   ~/.claude/.claude.json         does not exist at all — the default file is ~/.claude.json
+# Three readers depend on this one answer (pretrust's write, the doctor's onboarding read, the
+# fleet judge's), so it is stated once here rather than three times in three spellings.
+
+def test_an_assigned_config_dir_keeps_its_file_inside_itself():
+    assert identity.config_file("/Users/loop/.claude-fleet") == \
+        "/Users/loop/.claude-fleet/.claude.json"
+
+
+def test_the_default_file_is_a_sibling_of_the_default_dir_not_a_child_of_it():
+    assert identity.config_file(None, home="/Users/loop") == "/Users/loop/.claude.json"
+    assert identity.config_file("", home="/Users/loop") == "/Users/loop/.claude.json"
+
+
+def test_the_first_run_flag_is_parsed_never_substring_matched():
+    assert identity.onboarded('{"hasCompletedOnboarding": true}') is True
+    assert identity.onboarded('{"hasCompletedOnboarding":true}') is True
+    assert identity.onboarded('{"hasCompletedOnboarding": false}') is False
+
+
+def test_an_absent_flag_or_an_unreadable_file_is_unknown_and_never_a_yes():
+    """None is UNKNOWN. A fresh config dir has no flag at all, and reading that as 'not onboarded'
+    and as 'could not look' the same way is what lets a caller decide once, in one place, that
+    neither is a state a flight may be certified in."""
+    assert identity.onboarded('{"numStartups": 1}') is None
+    assert identity.onboarded(None) is None
+    assert identity.onboarded("not json") is None
+    assert identity.onboarded("[]") is None

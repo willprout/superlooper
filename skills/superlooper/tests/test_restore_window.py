@@ -672,7 +672,11 @@ def test_the_wrapper_survives_a_real_server_restart(sock_dir):
     # never ran, herdr captured no id, and the window it exists to measure did not exist.
     herdr_hook.write_settings(str(work / ".claude" / "settings.json"),
                               herdr_hook.vendored_script())
-    subprocess.run(["bash", str(repo / "skill" / "bin" / "pretrust.sh"), str(work)], check=True)
+    # The empty config dir is NAMED (issue #345): this drill's claude runs on the operator's own
+    # default login (see the docstring on HOME), and a suite running inside a fleet worker carries
+    # a CLAUDE_CONFIG_DIR that pretrust would otherwise honour — putting the trust entry in a file
+    # this drill's claude never reads, which is the stall this line exists to prevent.
+    subprocess.run(["bash", str(repo / "skill" / "bin" / "pretrust.sh"), str(work), ""], check=True)
 
     # An ALLOWLIST, not the ambient environment: this suite runs inside a claude pane of its own,
     # and an inherited CLAUDE_CODE_CHILD_SESSION made the lab's claude write no transcript at all,
