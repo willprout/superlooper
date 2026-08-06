@@ -1000,8 +1000,17 @@ def _issue_create_deny(tool_input, contract):
     defects = queue_lint.lint(parsed["labels"], body if body is not None else "",
                               areas=areas,
                               # An unreadable body must never be reported as a missing section.
-                              touches_required=bool(got.get("touches_required")) and body is not None)
-    return _issue_create_reason(defects, areas) if defects else None
+                              touches_required=bool(got.get("touches_required")) and body is not None,
+                              # This is the ONE surface that asks for the opt-in notices (issue
+                              # #400): an issue's provenance can only be recorded while it is being
+                              # written, so a create-time deny is the only moment saying so helps.
+                              advisories=True)
+    # ...but a notice is never a REFUSAL. `refusals()` is what decides whether to deny, so an
+    # otherwise-valid issue with no `source:` label is created rather than bounced — nothing may
+    # ever block on that family (owner ruling 2026-08-06). When the command has ALREADY earned a
+    # deny, the notice still rides along in the text: the session is about to retype the command,
+    # so it is the cheapest possible moment to say the whole contract at once.
+    return _issue_create_reason(defects, areas) if queue_lint.refusals(defects) else None
 
 
 # --------------------------- attendance ---------------------------

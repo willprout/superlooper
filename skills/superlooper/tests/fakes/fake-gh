@@ -35,6 +35,12 @@ the real service. Extra realism, all of it load-bearing for the simulated failur
 Fail injection (both modes):
 - GH_SLEEP=<secs>  makes every call sleep (to exercise gh.py's hard-timeout path).
 - GH_FAIL=1        makes every call exit nonzero (to exercise the fail-closed parsers).
+- GH_LABEL_NOT_IN_REPO=a,b  makes `issue create` HARD-FAIL — exactly as real gh does — when any
+  --label names a label the repo does not define. This is the ONE failure the label-vocabulary
+  fence exists for, and until now the fakes could not express it: a Python list of strings accepts
+  any name, so a label gh would refuse looked identical to one it would accept (the #165/#337
+  "the suite cannot see it" defect class). `issue create` is all-or-nothing, so NO issue is
+  created and no mutation is recorded — the filer's whole work item silently never exists.
 - $GH_FIXTURES/fail_rules.json: [{"match": "<substring of the joined argv>", "times": N}] — the
   first matching rule with times>0 fails THIS call and decrements. This is how a simulation makes
   exactly one `issue edit` blip mid-park (the duplicate-comment-but-never-duplicate-label poke)
@@ -502,6 +508,7 @@ def main_stateful():
         sys.exit(0)
 
     elif sub == ["issue", "create"]:
+        refuse_unknown_labels(opt("--label"))
         labels = [n for n in (opt("--label") or "").split(",") if n]
         record("create_issue", title=opt("--title"), body=opt("--body"), labels=opt("--label"))
         with _Lock(STATE_PATH):
@@ -796,6 +803,7 @@ def main_fixture():
         sys.exit(0)
 
     elif sub == ["issue", "create"]:
+        refuse_unknown_labels(opt("--label"))
         new_num = os.environ.get("GH_NEW_ISSUE_NUM", "9001")
         record("create_issue", title=opt("--title"), body=opt("--body"), labels=opt("--label"))
         sys.stdout.write("https://github.com/fake/repo/issues/%s\n" % new_num)
@@ -876,6 +884,38 @@ def check_fail_rules():
                 msg = rule["stderr"] if isinstance(rule.get("stderr"), str) \
                     else "forced failure (fail rule %r)" % rule["match"]
                 die(msg)
+
+
+
+def refuse_unknown_labels(label_arg):
+    """Real gh refuses `issue create` outright when any --label names a label the repo lacks.
+
+    Armed by GH_LABEL_NOT_IN_REPO (comma-separated). All-or-nothing, like the real thing: it dies
+    before the mutation is recorded, so a test sees exactly what the field would see — no issue,
+    no record, and a filer that must decide what to do about it.
+
+    A name STOPS being missing once this run has created it (`gh label create` is recorded in
+    mutations.jsonl). That is what makes the arming useful rather than merely fatal: a filer that
+    seeds its own label first must be able to succeed, and one that does not must fail — which is
+    exactly the difference the test wants to see.
+    """
+    missing = {n.strip() for n in os.environ.get("GH_LABEL_NOT_IN_REPO", "").split(",") if n.strip()}
+    if not missing:
+        return
+    path = os.path.join(FIX, "mutations.jsonl") if FIX else ""
+    if path and os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("kind") == "create_label":
+                    missing.discard(rec.get("name"))
+    named = [n.strip() for n in (label_arg or "").split(",") if n.strip()]
+    hit = [n for n in named if n in missing]
+    if hit:
+        die("could not add label: '%s' not found" % hit[0])
 
 
 def main():

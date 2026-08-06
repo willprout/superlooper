@@ -220,3 +220,49 @@ def test_approval_protocol_documents_the_preauthorization_ceremony():
     assert "still his word" in text or "still His word" in text or "still William's word" in text \
         or "still his say-so" in text.lower()
     assert "referee" in text.lower()
+
+
+# ---- issue #400: the provenance doctrine — one `source:` label per issue, blocking on none ----
+
+def test_write_issue_teaches_one_source_label_per_session_kind():
+    """The doctrine half of #400. The engine's registry is the truth for the SET; this skill is the
+    only place that says WHEN each value applies — and a session that is never told to apply one
+    files an issue with no provenance, which is the whole feature not happening."""
+    text = _read()
+    assert re.search(r"^## One `source:` label", text, re.MULTILINE), (
+        "write-issue must carry a `source:` section, or no session is ever told to apply one")
+    for value, when in (("source:orchestration", "planning session"),
+                        ("source:build", "build session"),
+                        ("source:investigation", "investigate"),
+                        ("source:debugger", "debugger"),
+                        ("source:qa", "restore-green"),
+                        ("source:dashboard-flag", "Flag button")):
+        assert value in text, "the doctrine must name %s" % value
+        assert when.lower() in text.lower(), (
+            "%s must say WHEN it applies (%r), not just that it exists" % (value, when))
+    # exactly ONE, and the family it belongs to is open — both are the doctrine, not decoration
+    assert "exactly one" in text.lower()
+    assert "open" in text.lower()
+
+
+def test_write_issue_says_the_source_family_never_blocks():
+    # The owner ruling (2026-08-06) in the doc a drafting session actually reads. Without it, the
+    # next agent to find an issue with no `source:` label treats it as broken and "fixes" the pile —
+    # the retro-labeling sweep that was explicitly ruled out.
+    text = _read()
+    section = text.split("## One `source:` label", 1)[1].split("\n## ", 1)[0]
+    assert "block" in section.lower(), "the section must say nothing blocks on the family"
+    assert "grandfather" in section.lower(), (
+        "the section must say existing issues are grandfathered, or an agent will sweep them")
+
+
+def test_the_filing_example_carries_a_source_label_but_never_agent_ready():
+    text = _read()
+    example = text.split("## Filing the issue", 1)[1].split("```bash", 1)[1].split("```", 1)[0]
+    assert re.search(r"--label\s+\"source:[a-z0-9-]+\"", example), (
+        "the one copy-pasteable command in this skill must model the source: label")
+    # ...and the new label must not have blurred the one line that keeps William's word his: the
+    # only place `agent-ready` may appear in this command is inside the NEVER comment.
+    for line in example.splitlines():
+        if "agent-ready" in line:
+            assert "NEVER" in line, line

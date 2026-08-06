@@ -60,12 +60,47 @@ refuses it.
 - **`type:build`** — a pre-scoped change. One issue → one PR. Must carry a real Definition of done.
 - **`type:investigate`** — an undiagnosed problem. Output = a root-cause report **as an issue
   comment** + scoped child issues. **Zero PRs.** Children each carry `parent: #N` and are labeled
-  `needs-owner` (William approves every child before it runs — one label releases a series).
+  `needs-owner` (William approves every child before it runs — one label releases a series) and
+  `source:investigation`.
   Zero children is a legitimate finding: "nothing to do" is a valid root cause.
 - **`type:diagnose-and-fix`** — a small bug: one session diagnoses **and** fixes, *if* the fix
   stays inside the issue's Boundaries. If the root cause is bigger than the boundaries — or (on
   the eApp) touches any bright-line area — it **splits** into approval-needing children instead of
   fixing, comments the diagnosis, and opens no PR.
+
+---
+
+## One `source:` label, exactly one — who filed this issue
+
+Every issue you file says where it came from, so William can filter the pile by provenance at a
+glance: what he worked to shape versus what the agents added, and a quick check that the QA filer is
+doing its job. Apply the ONE value that names **your own session kind**:
+
+- **`source:orchestration`** — shaped in a planning session with William (the issues you draft in
+  conversation with him: this is the default when you are reading this skill).
+- **`source:build`** — filed by an `i<N>` build session: a follow-up, a cross-PR promise, or a
+  scope split. Diagnose-and-fix sessions use this too — both are `i<N>` build sessions.
+- **`source:investigation`** — a child of a `type:investigate` issue.
+- **`source:debugger`** — filed by a `d<N>` repair session.
+- **`source:qa`** — the auto-filed restore-green fixes. The engine's own filers stamp this; never
+  apply it by hand.
+- **`source:dashboard-flag`** — the command center's Flag button. Applied by the dashboard; never
+  by hand.
+
+The engine's label registry (`skills/superlooper/skill/lib/labels.py`) is the truth for the set, and
+`superlooper adopt` creates it on a repo. The family is **open**, like `model:`: an adopter registers
+and applies their own `source:<their-own-filer>` value with no engine change. Do not invent one here
+— every value this file names is a label the engine actually registers, because `gh issue create`
+refuses the whole call for a label the repo does not have.
+
+**Nothing ever blocks on it** (owner ruling 2026-08-06). It is provenance display and filtering only:
+no launch, gate, approval or scheduling decision reads it, a missing one is at most an advisory in
+the create-time deny, and issues filed before the family existed are grandfathered — nothing
+retro-labels them.
+
+**Why:** the pile grew faster than any one memory of where each item came from. Without a filing
+record, "which of these did I ask for?" is a question only re-reading every issue can answer — and
+an auto-filer that quietly stopped working looks exactly like a quiet week.
 
 ---
 
@@ -152,8 +187,13 @@ Create it through `gh`, with every label the issue needs **except `agent-ready`*
 gh issue create \
   --title "<concise imperative title>" \
   --body-file <path-to-the-body-above> \
-  --label "type:build" --label "priority:high"     # NEVER --label "agent-ready"
+  --label "type:build" --label "source:orchestration" \
+  --label "priority:high"                          # NEVER --label "agent-ready"
 ```
+
+(Swap `source:orchestration` for the value that names your own session kind — see the `source:`
+section above. If `gh` refuses the label, the repo has not run `superlooper adopt` since the family
+shipped: file without it rather than blocking, and say so.)
 
 Then bring the drafted issues to William for approval in conversation. When he approves, the
 approval step (the superlooper skill's `references/approval-protocol.md`) applies `agent-ready`

@@ -101,6 +101,7 @@ import janitor as janitor_lib
 # The §C.2 label set + the runner-managed subset live in a shared lib module (issue #160) so the
 # CLI's adopt/doctor and the runner's boot migration build on ONE source of truth. Re-exported here
 # by name so existing callers (and the unit tests that import them off this module) keep resolving.
+import labels as labels_lib          # the vocabulary itself, for the specs adopt writes
 from labels import LABELS, missing_runner_labels, runner_managed_labels
 import journal
 import ledger as ledger_lib
@@ -2412,6 +2413,31 @@ def _run_suite(cmd, worktree, results_glob):
     return rc, nightly_lib.parse_junit(texts)
 
 
+def _seed_nightly_provenance_label(operator, already):
+    """Create-or-force `source:qa` once per nightly run, returning True so the caller does it once.
+
+    Why the nightly needs its own seeding when the runner does not (issue #400, fresh-agent review
+    2026-08-06): the runner heals its runner-managed labels in the #160 BOOT migration, and this
+    command never boots the runner — it runs on its own schedule, against whatever vocabulary the
+    repo happens to have. `gh issue create` is ALL-OR-NOTHING for labels, so on a repo adopted
+    before this shipped the entire call would be refused and the red mainline would freeze with the
+    fix issue that is meant to lift it never filed.
+
+    Only the label this change INTRODUCED is seeded. The other four in the standing-rule set are
+    §4.4 vocabulary that predates the loop's current shape and that every adopted repo already has;
+    seeding those too would be a different (and much larger) claim about what this command may write.
+    A failure is deliberately not fatal — the create below then fails honestly and the next nightly
+    re-files (idempotent by fingerprint), which is the same posture this filer already takes on any
+    gh failure."""
+    if already:
+        return True
+    spec = labels_lib.label_spec(labels_lib.SOURCE_QA)
+    if spec:
+        color, desc = spec
+        gh.create_label(labels_lib.SOURCE_QA, color, desc.replace("{operator}", operator))
+    return True
+
+
 def _file_fix_issues(home, failures, dev, operator):
     """File one standing-rule fix issue per DISTINCT persistent failure, deduped by fingerprint:
     skip a fp already tracked in state/fix_issues.json, and reconcile against an open
@@ -2424,7 +2450,7 @@ def _file_fix_issues(home, failures, dev, operator):
     open_bodies = [(it["number"], it["body"]) for it in gh.open_issues(gate.RESTORE_GREEN_LABEL)
                    if isinstance(it, dict) and isinstance(it.get("body"), str)
                    and type(it.get("number")) is int]
-    tracking, seen = [], set()
+    tracking, seen, seeded = [], set(), False
     for f in failures:
         fp = f.get("fp")
         if not fp or fp in seen:
@@ -2440,6 +2466,7 @@ def _file_fix_issues(home, failures, dev, operator):
             tracking.append(hit)
             continue
         issue = nightly_lib.fix_issue(f, dev, operator)
+        seeded = _seed_nightly_provenance_label(operator, seeded)
         num = gh.create_issue(issue["title"], issue["body"], labels=issue["labels"])
         if num is None:
             continue                     # gh failed; the next nightly re-files (idempotent by fp)

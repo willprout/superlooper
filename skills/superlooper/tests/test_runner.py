@@ -2788,6 +2788,54 @@ def _file_fix(rig, fp="fp1"):
                            "labels": list(FIX_LABELS)}, NOW)
 
 
+def test_file_fix_issue_seeds_its_provenance_label_before_creating(rig):
+    """Issue #400, fresh-agent review round 2 (Codex).
+
+    The #160 boot migration normally heals `source:qa` on a repo adopted before the family existed
+    — but a REFUSED label read makes that migration SKIP for the life of the process, and the runner
+    boots anyway (deliberately: a read blip must never wedge a restart). This path then runs with an
+    unhealed vocabulary, and `gh issue create` is ALL-OR-NOTHING on labels: the whole call is
+    refused, every tick, and the red mainline stays frozen with the fix issue meant to lift it never
+    filed. So the executor seeds the one label its payload introduces, immediately before the create.
+    """
+    (rig.fixdir / "label_list.json").write_text("not json at all")   # the refused-read boot shape
+    assert rig.r._apply_boot_migrations(now=NOW) is True             # ...skipped, runner boots on
+    assert not [m for m in mutations(rig) if m["kind"] == "create_label"]
+
+    out = rig.r._execute({"act": "file_fix_issue", "fingerprint": "fpseed",
+                          "title": "Restore green", "body": "## Goal\nfix",
+                          "labels": list(FIX_LABELS) + ["source:qa"]}, NOW)
+    assert out == "ok"
+    muts = mutations(rig)
+    lab = [m for m in muts if m["kind"] == "create_label"]
+    assert [m["name"] for m in lab] == ["source:qa"]        # exactly the label it introduced
+    assert lab[0]["force"] is True
+    assert "{operator}" not in lab[0]["description"]        # signed, never a raw placeholder
+    iss = next(m for m in muts if m["kind"] == "create_issue")
+    assert muts.index(lab[0]) < muts.index(iss)             # BEFORE the create, not after
+
+
+def test_file_fix_issue_still_files_when_gh_refuses_the_unseeded_label(rig, monkeypatch):
+    # The proof the seeding above is load-bearing, driven through a gh that behaves like the real
+    # one: GH_LABEL_NOT_IN_REPO makes `issue create` refuse outright for a label the repo lacks
+    # (until this run creates it). Without the seed there is NO fix issue at all — which is the one
+    # outcome a frozen mainline cannot survive.
+    monkeypatch.setenv("GH_LABEL_NOT_IN_REPO", "source:qa")
+    out = rig.r._execute({"act": "file_fix_issue", "fingerprint": "fpseed",
+                          "title": "Restore green", "body": "## Goal\nfix",
+                          "labels": list(FIX_LABELS) + ["source:qa"]}, NOW)
+    assert out == "ok"
+    assert [m for m in mutations(rig) if m["kind"] == "create_issue"]
+
+
+def test_file_fix_issue_seeds_nothing_for_a_payload_without_the_family(rig):
+    # The other side: the seeding is scoped to the label THIS change introduced. A payload that does
+    # not carry it makes no label write at all — the executor must not grow into a general
+    # vocabulary repairer on the filing path.
+    assert _file_fix(rig) == "ok"
+    assert not [m for m in mutations(rig) if m["kind"] == "create_label"]
+
+
 def test_file_fix_issue_replaces_a_retired_fingerprint_record(rig):
     # Issue #294: decide re-arms a fingerprint whose fix issue is gone. The executor must OVERWRITE
     # the stale number with the new one — otherwise the map stays poisoned and decide re-emits on
@@ -6486,7 +6534,7 @@ def test_boot_creates_a_missing_runner_managed_label(rig):
     # a repo missing a runner-managed label has it CREATED at boot (issue #160), not #108's
     # fail-loud refusal — an already-installed migration step, applied idempotently (--force).
     _set_repo_labels(rig, ["agent-ready", "in-progress", "parked",        # needs-owner MISSING
-                           "awaiting-answer"])
+                           "awaiting-answer", "source:qa"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     created = [m for m in mutations(rig) if m["kind"] == "create_label"]
     assert [m["name"] for m in created] == ["needs-owner"]
@@ -6502,13 +6550,34 @@ def test_boot_heals_a_repo_adopted_before_awaiting_answer_was_registered(rig):
     # refusing the #163 question hand-back until somebody re-runs adopt, and the failure mode is a
     # SILENT retry loop, so nobody would know to. Boot creates it, with the registered spec, and
     # then boots normally.
-    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked"])
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked", "source:qa"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     created = [m for m in mutations(rig) if m["kind"] == "create_label"]
     assert [m["name"] for m in created] == ["awaiting-answer"]
     assert created[0]["color"] and created[0]["force"] is True
     assert "(runner-managed)" in created[0]["description"]
     assert "{operator}" not in created[0]["description"]       # signed, never a raw placeholder
+    assert _alert(rig) is None
+
+
+def test_boot_heals_a_repo_adopted_before_the_source_family_was_registered(rig):
+    """Issue #400, and the reason `source:qa` alone of the six is '(runner-managed)'.
+
+    The restore-green filer CREATES an issue carrying that label, and `gh issue create` refuses the
+    whole call when a named label is missing — so on a repo adopted before this shipped, a red
+    nightly would file NO fix issue at all. That is worse than #337's silent label-move retry: the
+    work item itself never exists. The five session/dashboard values are deliberately NOT healed
+    here (the runner never applies them; adopt and the dashboard's own create-or-force cover them),
+    so the boot write stays exactly one.
+    """
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked",
+                           "awaiting-answer"])
+    assert rig.r._apply_boot_migrations(now=NOW) is True
+    created = [m for m in mutations(rig) if m["kind"] == "create_label"]
+    assert [m["name"] for m in created] == ["source:qa"]
+    assert created[0]["color"] and created[0]["force"] is True
+    assert "(runner-managed)" in created[0]["description"]
+    assert "{operator}" not in created[0]["description"]
     assert _alert(rig) is None
 
 
@@ -6519,7 +6588,7 @@ def test_boot_holds_when_the_awaiting_answer_heal_cannot_apply(rig):
     # systemic ALERT naming the migration. That is the intended behaviour (a repo whose vocabulary
     # cannot be repaired would otherwise storm), and it is worth pinning for THIS label because it
     # is the first new runner-managed label since the contract was written.
-    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked"])
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked", "source:qa"])
     _fail_gh(rig, "label create")
     assert rig.r._apply_boot_migrations(now=NOW) is False       # boot HELD, not stormed
     alert = _alert(rig)
@@ -6531,7 +6600,7 @@ def test_boot_migration_applies_the_needs_william_rename(rig):
     # the 2026-07-13 storm's exact repo shape: still carries the OLD needs-william and lacks the NEW
     # needs-owner. Boot renames IN PLACE (preserving every issue that carries it) and does NOT then
     # also create needs-owner (the rename already produced it).
-    _set_repo_labels(rig, ["agent-ready", "needs-william", "in-progress", "parked"])
+    _set_repo_labels(rig, ["agent-ready", "needs-william", "in-progress", "parked", "source:qa"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     muts = mutations(rig)
     assert [m for m in muts if m["kind"] == "rename_label"] == \

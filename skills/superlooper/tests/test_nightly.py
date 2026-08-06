@@ -125,7 +125,7 @@ def test_fix_issue_carries_standing_rule_labels_and_the_dedup_marker():
     f = _f("tests/test_login.py::test_redirect", "AssertionError: redirect loop at line 88")
     issue = nightly.fix_issue(f, dev_branch="main")
     assert issue["labels"] == ["type:diagnose-and-fix", "agent-ready",
-                               "auto-approved:nightly-red", "expedite"]
+                               "auto-approved:nightly-red", "expedite", "source:qa"]
     fp = nightly.fingerprint(f)
     assert issue["fingerprint"] == fp
     assert f"Failure fingerprint: `{fp}`" in issue["body"]       # runner's _exec_file_fix_issue marker
@@ -148,3 +148,21 @@ def test_nightly_fix_labels_match_the_runner_standing_rule():
     # §4.4 audit-trail regression: nightly-filed and runner-filed fix issues carry identical labels
     assert nightly.NIGHTLY_FIX_LABELS == actions.FIX_ISSUE_LABELS
     assert "auto-approved:nightly-red" in nightly.NIGHTLY_FIX_LABELS
+
+
+def test_both_auto_filers_stamp_their_own_provenance():
+    """Issue #400: the QA filer says it filed the issue, so the owner can check at a glance that it
+    is doing its job — and can tell an auto-filed fix from one he shaped himself.
+
+    `source:qa` rides ALONGSIDE `auto-approved:nightly-red` and replaces nothing: that label records
+    how the issue was APPROVED (the standing rule), this one records who FILED it. Both filers stamp
+    the same value from the ONE constant, because a nightly-filed and a runner-filed fix issue must
+    stay indistinguishable in the audit trail (§4.4)."""
+    import labels as labels_mod
+    for name, spelled in (("nightly", nightly.NIGHTLY_FIX_LABELS),
+                          ("runner", actions.FIX_ISSUE_LABELS)):
+        source = [x for x in spelled if x.startswith(labels_mod.SOURCE_PREFIX)]
+        assert source == [labels_mod.SOURCE_QA], name        # exactly one, and it is the QA value
+        assert "auto-approved:nightly-red" in spelled, name  # the approval label is UNCHANGED
+    fix = nightly.fix_issue(_f("tests/x.py::test_a", "boom"), dev_branch="main")
+    assert labels_mod.SOURCE_QA in fix["labels"]             # ...and it reaches the real payload

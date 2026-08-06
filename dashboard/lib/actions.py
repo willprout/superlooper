@@ -56,9 +56,24 @@ _REBUILD_LABEL_COLOR = "d73a4a"              # the destructive red — this verb
 # has the label).
 _FLAG_LABEL_COLOR = "d73a4a"                 # GitHub's default red — a flag is a call for attention
 
+# WHO FILED IT (issue #400). Every filer in the loop stamps its own provenance so the pile can be
+# filtered by where an issue came from; this button is the command center's one filer, so this is
+# the command center's one value. Mirrors the engine's `source:dashboard-flag` registration (the
+# engine's label registry is the truth for the family), but is created here on first use exactly
+# like FLAG above and for the same reason: `gh issue create` refuses OUTRIGHT for a label the repo
+# lacks, so a repo that never ran `superlooper adopt` — or adopted before #400 — would otherwise
+# watch its Flag button start failing. Display only: nothing in the dashboard or the engine reads
+# it, and nothing may ever block on it.
+SOURCE_DASHBOARD_FLAG = "source:dashboard-flag"
+_SOURCE_LABEL_COLOR = "5a32a3"               # the engine's provenance band — one colour, one meaning
+
 
 def flag_label_desc(operator):
     return "Flagged by %s from the command center — a planning session sweeps these later" % operator
+
+
+def source_label_desc(operator):
+    return "provenance: filed by %s's command center Flag button" % operator
 
 
 _FLAG_TITLE_MAX = 72                          # a flag title is the first line, trimmed — the body carries all
@@ -253,18 +268,23 @@ class Actions:
                 "commented": bool(commented), "labeled": bool(labeled)}
 
     def flag(self, repo, text):
-        """Flag: file the raw text VERBATIM as a new issue labeled ``flag`` (no AI, no summarizing),
-        creating the ``flag`` label on first use. Returns the new issue number in ``num``. Empty
-        text is refused with no gh call."""
+        """Flag: file the raw text VERBATIM as a new issue labeled ``flag`` (no AI, no summarizing)
+        and ``source:dashboard-flag`` (issue #400 — who filed it), creating BOTH labels on first
+        use. Returns the new issue number in ``num``. Empty text is refused with no gh call."""
         if repo not in self._allowed:
             return self._refuse("flag")
         text = (text or "").strip()
         if not text:
             return {"ok": False, "verb": "flag", "error": "empty flag"}
-        # Create-or-update the label first (idempotent via --force) so the labeled create can't fail
-        # for want of the label on a repo seeing its first flag.
+        # Create-or-update BOTH labels first (idempotent via --force) so the labeled create can't
+        # fail for want of a label on a repo seeing its first flag. Both, not just FLAG: gh refuses
+        # the whole `issue create` when ANY named label is missing, so an unseeded provenance label
+        # would take the working half of the verb down with it.
         self._gh.create_label(repo, FLAG, _FLAG_LABEL_COLOR, flag_label_desc(self._operator))
-        num = self._gh.create_issue(repo, flag_title(text), text, labels=[FLAG])
+        self._gh.create_label(repo, SOURCE_DASHBOARD_FLAG, _SOURCE_LABEL_COLOR,
+                              source_label_desc(self._operator))
+        num = self._gh.create_issue(repo, flag_title(text), text,
+                                    labels=[FLAG, SOURCE_DASHBOARD_FLAG])
         return {"ok": num is not None, "verb": "flag", "num": num}
 
 

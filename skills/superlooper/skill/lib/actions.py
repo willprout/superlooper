@@ -105,6 +105,7 @@ import events as events_mod
 import evidence
 import gate
 import issues as issues_mod
+import labels                 # pure leaf: the label vocabulary, so a filer never spells one itself
 import queue_lint
 import scheduler
 
@@ -231,7 +232,13 @@ PARK_LABEL_STUCK_ALERT_SECONDS = 600
 # The red-nightly standing rule's EXACT label set (spec §4.4, owner-defined 2026-07-02). The
 # distinct `auto-approved:nightly-red` label is what makes this auto-approval auditable as
 # standing-rule work, not an agent applying William's word. Do not add, drop, or reorder.
-FIX_ISSUE_LABELS = ["type:diagnose-and-fix", "agent-ready", gate.RESTORE_GREEN_LABEL, "expedite"]
+#
+# `source:qa` (issue #400) is the one later addition, and it changes NOTHING about the four above:
+# they say how this issue was APPROVED, it says who FILED it — provenance the owner can filter on to
+# see the QA filer working. Nothing reads it; it is display only. It is last so the owner-defined
+# four keep their order exactly as spec §4.4 wrote them.
+FIX_ISSUE_LABELS = ["type:diagnose-and-fix", "agent-ready", gate.RESTORE_GREEN_LABEL, "expedite",
+                    labels.SOURCE_QA]
 
 # Statuses that occupy a lane (a running/frozen/exited session still owns its worktree+branch)
 # vs statuses from which a (re)launch is legitimate. gating/holding hold NO lane: the build is

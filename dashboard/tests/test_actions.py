@@ -395,7 +395,36 @@ def test_flag_creates_the_flag_label_first_then_the_issue(tmp_path, monkeypatch)
     assert lab["name"] == "flag" and lab["force"] is True
     iss = next(m for m in muts if m["kind"] == "create_issue")
     assert muts.index(lab) < muts.index(iss)
-    assert iss["labels"] == "flag"
+    assert iss["labels"] == "flag,source:dashboard-flag"
+
+
+def test_flag_stamps_its_own_provenance_and_creates_that_label_first_too(tmp_path, monkeypatch):
+    """Issue #400: every filer says who filed it, this one included — so William can tell a flag he
+    tapped from the command center apart from an issue an agent added.
+
+    The label is create-or-forced exactly like `flag` itself, and for the same reason: `gh issue
+    create` refuses OUTRIGHT for a label the repo does not have, so a repo that has never run
+    `superlooper adopt` (or adopted before #400) would see its Flag button start failing. The
+    dashboard's own first-use creation is what keeps every verb working on any watched repo.
+    """
+    a = _acts(monkeypatch, tmp_path)
+    a.flag(REPO, "the arrivals board flickers on merge")
+    muts = _mutations(tmp_path)
+    created = [m for m in muts if m["kind"] == "create_label"]
+    assert [m["name"] for m in created] == ["flag", "source:dashboard-flag"]
+    assert all(m["force"] is True for m in created)
+    iss = next(m for m in muts if m["kind"] == "create_issue")
+    assert max(muts.index(m) for m in created) < muts.index(iss)   # BOTH exist before the create
+    assert "source:dashboard-flag" in iss["labels"].split(",")
+
+
+def test_flag_never_applies_agent_ready_alongside_its_provenance(tmp_path, monkeypatch):
+    # The constitutional line, re-pinned where a new label was added: a flag is raw input, never
+    # approved work. `agent-ready` is William's word and no dashboard code path applies it here.
+    a = _acts(monkeypatch, tmp_path)
+    a.flag(REPO, "something odd")
+    iss = next(m for m in _mutations(tmp_path) if m["kind"] == "create_issue")
+    assert "agent-ready" not in iss["labels"]
 
 
 def test_flag_files_the_raw_text_verbatim_as_the_body_no_ai(tmp_path, monkeypatch):

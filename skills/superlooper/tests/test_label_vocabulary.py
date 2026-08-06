@@ -91,6 +91,7 @@ only proof that matters: on the day of the incident, this would have been red.
 import ast
 import collections
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -656,6 +657,240 @@ def test_every_type_label_the_janitor_can_compute_is_registered():
     assert not missing, (
         "the janitor's add-label repair can compute these labels, but labels.LABELS does not carry "
         "them: %s — the owner would tap a repair gh refuses" % (missing,))
+
+
+# --------------------------------------------------------------- the provenance family (issue #400)
+
+_WRITE_ISSUE_SKILL = "plugin/skills/write-issue/SKILL.md"
+
+
+def test_the_source_family_is_registered_and_documented_in_both_directions():
+    """The registry is the truth for the SET; the write-issue skill is the doctrine for WHEN.
+
+    Two files, one fact, and a drift in either direction is a real failure with a different shape:
+
+      * a value in the REGISTRY that the doctrine never mentions is a label adopt creates and
+        nobody is ever told to apply — provenance that silently never gets recorded;
+      * a value in the DOCTRINE that the registry does not carry is worse, and is the #165/#337
+        defect class exactly: a session told to apply it runs `gh issue create`, gh refuses the
+        whole call for a label the repo does not have, and the issue is simply never filed.
+
+    Checked over THIS repo's own starter set, not over the family in general — the value set is
+    open (``labels.OPEN_LABEL_FAMILIES``), so an adopter's `source:slackbot` lives in that
+    adopter's repo and doctrine, never here.
+    """
+    registered = set(labels_mod.source_labels())
+    assert registered, "the provenance family must have a starter set, or adopt seeds nothing"
+    doctrine = (_REPO / _WRITE_ISSUE_SKILL).read_text(encoding="utf-8")
+    named = set(re.findall(r"source:[a-z0-9-]+", doctrine))
+    assert registered - named == set(), (
+        "labels.LABELS registers these `source:` values but %s never tells a session when to apply "
+        "them: %s — adopt would create a label nobody is instructed to use"
+        % (_WRITE_ISSUE_SKILL, sorted(registered - named)))
+    assert named - registered == set(), (
+        "%s tells sessions to apply these `source:` values but labels.LABELS does not carry them: "
+        "%s — gh refuses `issue create` outright for an unknown label, so the issue is never filed "
+        "at all" % (_WRITE_ISSUE_SKILL, sorted(named - registered)))
+
+
+def test_every_source_label_the_engine_itself_applies_is_registered():
+    """The engine's own filers, checked by name rather than only by the general fence above.
+
+    Layer 1 already reads FIX_ISSUE_LABELS / NIGHTLY_FIX_LABELS, so an unregistered value would be
+    caught there too. This says the second half out loud: those filers must each stamp EXACTLY ONE
+    `source:` value, and it must be the registered QA one. A filer that stamps none records no
+    provenance (the owner's check that the QA filer is working goes blind), and one that stamps two
+    makes the family unfilterable.
+    """
+    import actions as actions_mod
+    import nightly as nightly_mod
+
+    registered = set(labels_mod.source_labels())
+    for name, spelled in (("actions.FIX_ISSUE_LABELS", actions_mod.FIX_ISSUE_LABELS),
+                          ("nightly.NIGHTLY_FIX_LABELS", nightly_mod.NIGHTLY_FIX_LABELS)):
+        found = [x for x in spelled if x.startswith(labels_mod.SOURCE_PREFIX)]
+        assert found == [labels_mod.SOURCE_QA], (name, found)
+        assert labels_mod.SOURCE_QA in registered
+
+
+# The modules that DECIDE things — what launches, in what order, what merges, and what the runner
+# does about it. `lib/actions.py` is on the list because it holds `decide()`, the pure planner that
+# every tick's action list comes out of: leaving the loop's brain unscanned would have been the
+# largest hole in a guard whose whole claim is that nothing schedules on provenance (fresh-agent
+# review round 2, Codex 2026-08-06). The family is display-only by owner ruling (2026-08-06), and
+# "display-only" is exactly the kind of promise that erodes one convenient read at a time.
+_DECIDING_MODULES = ("lib/scheduler.py", "lib/gate.py", "lib/issues.py", "lib/actions.py",
+                     "bin/runner.py")
+
+# The APPLY-side sites in those modules, which are legitimate and must stay countable.
+#
+# The boundary is not "never name the family" — the DoD REQUIRES the engine's own filers to stamp
+# `source:qa` on the issue they create, and both of those sites live in scanned modules. It is
+# "never DECIDE on it". A blanket ban would therefore be unsatisfiable, and the tempting fix (move
+# the write behind a differently-named helper) would buy a green guard over code that still touches
+# the family — evasion by rename.
+#
+# So: a ratchet, keyed on the unparsed expression WITH A COUNT, exactly like `_UNREADABLE` above and
+# for the same reason. A new site cannot inherit an existing site's justification; the number has to
+# be bumped by hand, which puts a human in front of the question "is this an apply, or a decision?"
+# at review time.
+_APPLY_SIDE_FAMILY_SITES = {
+    ("lib/actions.py", "labels.SOURCE_QA"): (1,
+        "FIX_ISSUE_LABELS — the restore-green filer's payload. This is the label being APPLIED to "
+        "an issue the engine creates; the list is data handed to the executor, never read back to "
+        "decide anything. Pinned by test_every_source_label_the_engine_itself_applies_is_registered."),
+    ("bin/runner.py", "labels_lib.SOURCE_QA"): (3,
+        "_seed_payload_provenance — create-or-forces that same label immediately before "
+        "`gh issue create`, because a REFUSED boot label read makes the #160 migration skip and gh "
+        "refuses the whole create for a label the repo lacks. Three reads in one function: the "
+        "payload membership test, the spec lookup, and the create_label call. Apply-side only — "
+        "nothing branches on it."),
+}
+
+# A `source:` label TOKEN, and the bare prefix on its own. `runner.py` documents an unrelated
+# freeze-marker field spelled `source: "nightly"`, so the guard must not read prose about a
+# different `source` as a label read — but `x.startswith("source:")` IS a family read, and a
+# token-only pattern would miss exactly the shape a scheduling filter would be written in
+# (review round 2). The bare prefix is matched only when the string ENDS there, so the
+# freeze-marker sentence (which continues `source: "nightly"`) still does not trip it.
+# The value grammar is deliberately WIDER than the starter set's kebab-case: the family is OPEN, so
+# an adopter's `source:QA` or `source:foo_bar` is a real label, and a narrower class would let a
+# hardcoded one of those through as a false negative (fresh-agent verification pass, Codex).
+_SOURCE_TOKEN = re.compile(re.escape(labels_mod.SOURCE_PREFIX) + r"[A-Za-z0-9_.-]*(?![ \w])")
+
+
+# Every public name in `labels` that exposes the family. A read through the helper is as much a
+# read as one through the constant — `labels.source_labels()` in a sort key would schedule on
+# provenance just as surely as `labels.SOURCE_PREFIX` would.
+_FAMILY_CONSTANTS = ("SOURCE_PREFIX", "SOURCE_QA", "source_labels")
+
+
+def _labels_bindings(tree):
+    """(module aliases for ``labels``, local names bound to its family constants).
+
+    The engine imports this module under several names — ``bin/runner.py`` really does
+    ``import labels as labels_lib``, inside a function — so keying the scan on the literal name
+    ``labels`` would leave the module MOST likely to grow a scheduling read as the one the guard
+    cannot see (fresh-agent review, Codex 2026-08-06). Aliases and ``from labels import …`` are
+    both collected, so a read is caught however it was spelled.
+    """
+    aliases, direct = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "labels":
+                    aliases.add(a.asname or "labels")
+        elif isinstance(node, ast.ImportFrom) and node.module == "labels":
+            for a in node.names:
+                if a.name in _FAMILY_CONSTANTS:
+                    direct.add(a.asname or a.name)
+    return aliases, direct
+
+
+def _emitted_strings_and_attributes(tree):
+    """Every `source:<value>` an emitted STRING carries, plus every read of the family's constants.
+
+    Docstrings are excluded (module, class and function): they are documentation, exactly like the
+    comments this AST walk cannot see, and the same distinction ``test_no_hardcoded_operator.py``
+    makes for the same reason. A docstring that EXPLAINS why the family is not read here should not
+    be the thing that fails the test enforcing it.
+    """
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", None)
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                docstrings.add(id(body[0].value))
+    aliases, direct = _labels_bindings(tree)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and id(node) not in docstrings:
+            found.extend(_SOURCE_TOKEN.findall(node.value))
+        elif isinstance(node, ast.Attribute) and node.attr in _FAMILY_CONSTANTS \
+                and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            found.append("%s.%s" % (node.value.id, node.attr))
+        elif isinstance(node, ast.Name) and node.id in direct:
+            found.append("labels.%s (imported directly)" % node.id)
+    return found
+
+
+def test_no_launch_gate_or_scheduling_path_reads_the_source_family():
+    """`source:` is provenance. Nothing may ever schedule, gate or approve on it.
+
+    Enforced by ABSENCE, the way this repo enforces its other bright lines: the code for the
+    forbidden thing must not exist. A read is cheap to add and invisible in review — "skip
+    `source:qa` issues when the queue is busy" is one plausible line — and the moment one lands the
+    label stops being a label the owner can apply freely and becomes a control knob with
+    consequences he was never told about.
+
+    Scanned as SOURCE rather than behaviour because there is no behaviour to test: the guarantee is
+    that no such branch exists, and a test that exercised the branches would only ever cover the
+    ones somebody remembered to write.
+    """
+    found = collections.Counter()
+    for rel in _DECIDING_MODULES:
+        text = (_REPO / _ENGINE / rel).read_text(encoding="utf-8")
+        tree = _parse(text)
+        assert tree is not None, "%s must parse" % rel
+        for site in _emitted_strings_and_attributes(tree):
+            found[(rel, site)] += 1
+    declared = {site: count for site, (count, _why) in _APPLY_SIDE_FAMILY_SITES.items()}
+    mismatched = sorted((site, declared.get(site, 0), found.get(site, 0))
+                        for site in set(declared) | set(found)
+                        if declared.get(site, 0) != found.get(site, 0))
+    assert not mismatched, (
+        "a launch/gate/scheduling module's use of the `source:` family no longer matches the "
+        "apply-side ratchet (site, declared, found): %s.\n"
+        "The family is provenance display and filtering ONLY (owner ruling 2026-08-06): nothing may "
+        "schedule, gate or approve on it. A count that GREW means a new site — read it and decide "
+        "whether it APPLIES the label (add its own entry with a reason and a count) or DECIDES on "
+        "it (then it must not exist at all, and no entry here can make it acceptable). A count that "
+        "SHRANK means a stale entry — delete it." % (mismatched,))
+    reasonless = [site for site, (_count, why) in _APPLY_SIDE_FAMILY_SITES.items()
+                  if len(why.strip()) < 40]
+    assert not reasonless, "every apply-side entry needs a real reason: %s" % (reasonless,)
+
+
+def test_the_absence_guard_would_notice_a_read_being_added():
+    """The meta-test the guard above needs to not be vacuous — and to not cry wolf.
+
+    Both halves matter. A guard that catches nothing is decoration; a guard that reddens over an
+    unrelated `source` in prose gets muted, which is the same outcome one step later.
+    """
+    for src in ('def pick(labels):\n    return "source:qa" in labels\n',
+                'import labels\ndef pick(x):\n    return x.startswith(labels.SOURCE_PREFIX)\n',
+                'def sort_key(p):\n    return 0 if "source:orchestration" in p["labels"] else 1\n',
+                # ALIASED, and imported inside a function — the exact spelling bin/runner.py
+                # already uses for this module, so keying on the bare name `labels` would leave
+                # the likeliest offender invisible (Codex review, 2026-08-06).
+                'def pick(x):\n    import labels as labels_lib\n'
+                '    return x.startswith(labels_lib.SOURCE_PREFIX)\n',
+                'from labels import SOURCE_QA\ndef pick(x):\n    return SOURCE_QA in x\n',
+                'from labels import SOURCE_PREFIX as P\ndef pick(x):\n    return x.startswith(P)\n',
+                # the BARE prefix, which a token-only pattern would miss — and it is the exact
+                # shape a scheduling filter would be written in (review round 2).
+                'def pick(x):\n    return x.startswith("source:")\n',
+                'def pick(xs):\n    return [x for x in xs if not x.startswith("source:")]\n',
+                # an ADOPTER's own value, outside the starter set's kebab-case — the family is open,
+                # so the guard's grammar must be at least as wide as the label's.
+                'def pick(x):\n    return "source:foo_bar" in x\n',
+                'def pick(x):\n    return "source:QA" in x\n',
+                # ...and the family through its HELPER rather than its constants.
+                'import labels\ndef rank(p):\n    return set(p) & set(labels.source_labels())\n',
+                'from labels import source_labels\ndef rank(p):\n    return source_labels()\n'):
+        assert _emitted_strings_and_attributes(ast.parse(src)), src
+    # ...and the shapes it must stay quiet about: the runner's unrelated freeze-marker field, in a
+    # docstring and in an emitted string, plus a docstring that names the family to explain itself.
+    for src in ('"""a nightly-owned freeze (`source: "nightly"`) is cleared by a green nightly."""\n',
+                'def f():\n    """never reads source:qa — provenance only."""\n    return 1\n',
+                'def f(m):\n    return m.get("source") == "nightly"\n',
+                # the freeze marker's own field, in an EMITTED string — a different `source`
+                # entirely. A guard that reddened here would be muted within the week.
+                'def freeze(now):\n    return {"source": "nightly", "since": now}\n',
+                'def msg(x):\n    return "source: %s" % x\n'):
+        assert _emitted_strings_and_attributes(ast.parse(src)) == [], src
 
 
 def test_the_scanned_surface_covers_the_extensionless_cli():

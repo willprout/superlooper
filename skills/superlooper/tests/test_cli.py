@@ -49,7 +49,14 @@ ALL_LABELS = ["agent-ready", "in-progress", "needs-owner", "parked",
               # per-issue model/effort control knobs — gh refuses to apply a label that does not
               # exist, so adopt must seed the starter set (owner ruling 2026-07-07).
               "model:opus", "model:opus[1m]", "model:fable", "model:sonnet",
-              "effort:low", "effort:medium", "effort:high", "effort:xhigh", "effort:max"]
+              "effort:low", "effort:medium", "effort:high", "effort:xhigh", "effort:max",
+              # the provenance family (#400): WHO FILED an issue, display-and-filter only. adopt
+              # seeds all six — gh refuses the whole `issue create` for a label the repo lacks, so
+              # an unseeded value is an instruction no session can follow — and `source:qa` alone is
+              # also boot-healed, because the ENGINE applies that one (split pinned in
+              # test_labels.py).
+              "source:orchestration", "source:build", "source:investigation", "source:debugger",
+              "source:qa", "source:dashboard-flag"]
 
 RULE_START = "<!-- loop-standing-rules:start -->"
 RULE_END = "<!-- loop-standing-rules:end -->"
@@ -1164,15 +1171,15 @@ def test_runner_managed_labels_is_the_tagged_subset():
     # descriptions, so the LABELS list stays the single source of truth.
     sl = _cli_module()
     assert set(sl.runner_managed_labels()) == {"in-progress", "needs-owner", "parked",
-                                               "awaiting-answer"}
+                                               "awaiting-answer", "source:qa"}
 
 
 def test_missing_runner_labels_pure():
     sl = _cli_module()
-    _MANAGED = {"in-progress", "needs-owner", "parked", "awaiting-answer"}
+    _MANAGED = {"in-progress", "needs-owner", "parked", "awaiting-answer", "source:qa"}
     assert sl.missing_runner_labels(set(ALL_LABELS)) == []
     assert sl.missing_runner_labels(
-        {"agent-ready", "in-progress", "parked", "awaiting-answer"}) == ["needs-owner"]
+        {"agent-ready", "in-progress", "parked", "awaiting-answer", "source:qa"}) == ["needs-owner"]
     assert set(sl.missing_runner_labels(set())) == _MANAGED
     assert set(sl.missing_runner_labels([])) == _MANAGED                       # list ok
     assert set(sl.missing_runner_labels("garbage")) == _MANAGED
@@ -1352,14 +1359,68 @@ def test_nightly_persistent_failure_freezes_and_files_a_standing_rule_issue(rig,
     assert r.returncode == 0, r.stdout + r.stderr
     created = [m for m in mutations(rig) if m["kind"] == "create_issue"]
     assert len(created) == 1
-    # the exact standing-rule label set (§4.4 audit trail) + the runner's fingerprint dedup marker
+    # the exact standing-rule label set (§4.4 audit trail) + the filer's own provenance (#400) +
+    # the runner's fingerprint dedup marker
     assert created[0]["labels"] == \
-        "type:diagnose-and-fix,agent-ready,auto-approved:nightly-red,expedite"
+        "type:diagnose-and-fix,agent-ready,auto-approved:nightly-red,expedite,source:qa"
     assert "Failure fingerprint:" in created[0]["body"]
     home, recs = _nightly_records(rig)
     fm = json.loads((home / "state" / "merges_frozen.json").read_text())
     assert fm["source"] == "nightly"                                 # nightly claims freeze ownership
     assert recs and recs[-1]["persistent"] == 1 and recs[-1]["green"] is False
+
+
+def test_nightly_seeds_its_own_provenance_label_before_filing(rig, tmp_path):
+    """Issue #400 + fresh-agent review (Codex, 2026-08-06), P0.
+
+    The standalone `superlooper nightly` runs on its own schedule and NEVER runs the runner's boot
+    migration — so on a repo adopted before #400, `source:qa` simply would not exist there. `gh
+    issue create` is ALL-OR-NOTHING for labels, so the whole call is refused: the merges freeze, and
+    the fix issue that is supposed to lift it is never filed. The nightly self-heals the one label
+    it adds, create-or-forced immediately before the create (the same defense the dashboard's Flag
+    verb already uses), so the filer cannot be taken down by its own new label.
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fx = tmp_path / "junit.xml"
+    _write_junit(fx, failing=True)
+    _write_qa(rig, {"nightly_cmd": f"mkdir -p results && cp {fx} results/junit.xml",
+                    "results_glob": "results/*.xml", "retry_once": True})
+    r = cli(rig, "nightly", "--repo", str(rig.repo), env_over={"SL_NIGHTLY_WORKTREE": str(wt)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    muts = mutations(rig)
+    lab = [m for m in muts if m["kind"] == "create_label"]
+    assert [m["name"] for m in lab] == ["source:qa"]        # exactly the one label it introduced
+    assert lab[0]["force"] is True                          # idempotent on a repo that has it
+    assert "{operator}" not in lab[0]["description"]        # signed, never a raw placeholder
+    iss = next(m for m in muts if m["kind"] == "create_issue")
+    assert muts.index(lab[0]) < muts.index(iss)             # seeded BEFORE the create, not after
+
+
+def test_nightly_still_files_on_a_repo_whose_gh_refuses_the_unseeded_label(rig, tmp_path):
+    """The proof the seeding above is load-bearing, driven through a gh that behaves like the real
+    one: `GH_LABEL_NOT_IN_REPO` makes `issue create` refuse outright for a label the repo lacks.
+
+    This is the #165/#337 defect class the suite could never see — every test set labels as Python
+    strings, so a label gh would REFUSE looked exactly like one it would accept, and a green suite
+    proved nothing twice. With the fake refusing, the create-or-force is what keeps the red-nightly
+    fix issue getting filed at all.
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fx = tmp_path / "junit.xml"
+    _write_junit(fx, failing=True)
+    _write_qa(rig, {"nightly_cmd": f"mkdir -p results && cp {fx} results/junit.xml",
+                    "results_glob": "results/*.xml", "retry_once": True})
+    r = cli(rig, "nightly", "--repo", str(rig.repo),
+            env_over={"SL_NIGHTLY_WORKTREE": str(wt),
+                      # the label exists only once the nightly creates it; the fake refuses any
+                      # `issue create` naming it BEFORE that, exactly as gh does on an unadopted repo.
+                      "GH_LABEL_NOT_IN_REPO": "source:qa"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    created = [m for m in mutations(rig) if m["kind"] == "create_issue"]
+    assert len(created) == 1, "the fix issue must still be filed — a red mainline with no fix " \
+                              "issue is a freeze nothing can lift"
 
 
 def test_green_nightly_clears_its_own_freeze(rig, tmp_path):

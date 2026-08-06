@@ -75,6 +75,35 @@ LABELS = [
     ("effort:high", "8256d0", "per-issue worker effort: high"),
     ("effort:xhigh", "8256d0", "per-issue worker effort: xhigh"),
     ("effort:max", "8256d0", "per-issue worker effort: max"),
+    # WHO FILED THIS (issue #400). Provenance only: one label per issue naming the session kind that
+    # created it, so {operator} can filter the pile at a glance — issues he worked to shape in a
+    # planning session versus ones the agents added, and a quick check that the QA filer is doing its
+    # job. NOTHING in the engine reads these: no scheduling, gating or approval decision may ever
+    # turn on provenance (owner ruling 2026-08-06), and `test_no_launch_path_reads_the_source_family`
+    # in test_label_vocabulary.py is what keeps that true. They share ONE colour on purpose — this is
+    # a metadata band, not a set of distinctions the eye has to tell apart mid-queue.
+    #
+    # The VALUE set is OPEN, like model:/effort: (see OPEN_LABEL_FAMILIES below): an adopter adds
+    # `source:slackbot` by creating and applying it, with no engine change. What is here is the
+    # starter set the engine's own filers and the write-issue doctrine name.
+    ("source:orchestration", "5a32a3", "provenance: shaped in a planning session with {operator}"),
+    ("source:build", "5a32a3",
+     "provenance: filed by an `i<N>` build session (a follow-up, a promise, or a split)"),
+    ("source:investigation", "5a32a3",
+     "provenance: a child of a `type:investigate` issue"),
+    ("source:debugger", "5a32a3", "provenance: filed by a `d<N>` repair session"),
+    # The one the ENGINE applies, and so the one that must self-heal. The restore-green filer stamps
+    # it on the issue it CREATES (actions.FIX_ISSUE_LABELS / nightly.NIGHTLY_FIX_LABELS), and
+    # `gh issue create` refuses OUTRIGHT for a label the repo lacks — so on a repo adopted before
+    # this shipped the auto-file would fail entirely and a red nightly would sit with no fix issue.
+    # That is the #165/#337 defect class a third time; '(runner-managed)' is what makes the #160 boot
+    # migration create it without anyone re-running adopt. It rides ALONGSIDE
+    # `auto-approved:nightly-red` and replaces nothing: that one records how the issue was APPROVED,
+    # this one records who FILED it.
+    ("source:qa", "5a32a3",
+     "provenance: auto-filed by the restore-green QA filer (runner-managed)"),
+    ("source:dashboard-flag", "5a32a3",
+     "provenance: filed by the command center's Flag button"),
 ]
 
 # name -> (color, description-template). Built once; label_spec resolves a create step's color/desc.
@@ -101,7 +130,29 @@ RETIRED_LABELS = {
 # — the doc-lint has to know that `model:haiku` in an ops doc is a legitimate example and not a typo
 # for a label that does not exist. Without this the lint would redden CI over an instruction that
 # genuinely works, which is how a guard gets deleted rather than fixed.
-OPEN_LABEL_FAMILIES = ("model", "effort")
+#
+# `source` joins them by the same ruling, for a stronger reason (issue #400): the family exists so an
+# ADOPTER can name their own filers, and a `source:slackbot` written into that adopter's own docs must
+# not be read here as a typo for a label that does not exist.
+OPEN_LABEL_FAMILIES = ("model", "effort", "source")
+
+# The provenance family's prefix, spelled ONCE. Every surface that has to RECOGNIZE the family —
+# the lint's advisory, the structural guards — derives its spelling from here rather than retyping
+# it, so a rename is one edit and no guard is left scanning for the old spelling while passing.
+SOURCE_PREFIX = "source:"
+
+# The one value the ENGINE itself applies (the restore-green filer). Named here rather than spelled
+# at the two filers so the label-vocabulary fence resolves it across modules and the two filers
+# cannot drift into stamping different provenance for the same auto-file.
+SOURCE_QA = "source:qa"
+
+
+def source_labels():
+    """The registered `source:` values, in LABELS order. The engine's own starter set — NOT a closed
+    allowlist (nothing validates a `source:` value; see OPEN_LABEL_FAMILIES), so this is what adopt
+    seeds and what the write-issue doctrine is checked against, never a gate on what a repo may
+    apply."""
+    return [name for name, _color, _desc in LABELS if name.startswith(SOURCE_PREFIX)]
 
 
 def runner_managed_labels():
