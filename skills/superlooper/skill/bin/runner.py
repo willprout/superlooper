@@ -291,12 +291,14 @@ If the conflict is not mechanically resolvable without a product decision, STOP 
 durable question protocol: write your single specific question to {blocked_path} as three parts
 — `QUESTION:` the one decision, `OPTIONS:` the choices you see, `RECOMMENDATION:` the one you
 would take if forced — then COMMIT AND PUSH your work-in-progress on `{branch}`
-(`git push -u origin HEAD` — the plain push step 1 allows; never a force-push) and END the
-session. The runner posts your question as a durable comment on issue #{issue_num}, closes this
-window, and releases the lane; when the owner answers, a FRESH session resumes the issue with the
-answer in its brief, reusing this worktree's work-in-progress. Push before you end anyway: the
-runner is what closes this window, so the push is your last chance to put the work anywhere but
-this machine.
+(`git push -u origin HEAD` — the plain push step 1 allows; never a force-push),
+and END the session.
+
+The runner posts your question as a durable comment on issue #{issue_num}, closes this window,
+and releases the lane; when the owner answers, a FRESH session resumes the issue with the answer
+in its brief, reusing this worktree's work-in-progress. Push before you end anyway: the runner is
+what closes this window, so the push is your last chance to put the work anywhere but this
+machine.
 """
 
 
