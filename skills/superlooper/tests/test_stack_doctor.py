@@ -1691,3 +1691,21 @@ def test_the_suite_can_never_probe_the_real_control_socket():
     """
     assert os.environ.get("HERDR_SOCKET_PATH") == "/nonexistent/superlooper-test-herdr.sock"
     assert not os.path.exists(os.environ["HERDR_SOCKET_PATH"])
+
+
+def test_the_suite_can_never_reach_the_real_host_config_dir():
+    """The other half of that ratchet, asserted for the same reason (issue #355).
+
+    `session_host.config_dir()` / `state_dir()` resolve from XDG FIRST and fall back to HOME. Every
+    rig here overrides HOME and none overrides XDG — so on a machine that exports these, a test
+    driving `superlooper fleet --install` rewrites the OWNER'S OWN `herdr/config.toml` and its
+    screen manifest, and the fence block opens a tokenless connection to the live server (the line
+    above cannot stop that one: `fleet.socket_path()` derives its path from the config dir, not
+    from `HERDR_SOCKET_PATH`).
+
+    The scrub is a NO-OP on a machine that does not export them, which is why it needs a guard:
+    drop it and the hole re-opens with the whole suite still green — on somebody else's machine.
+    """
+    for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME"):
+        assert name not in os.environ, (
+            "%s is how `fleet --install` would reach the owner's real herdr config dir" % name)

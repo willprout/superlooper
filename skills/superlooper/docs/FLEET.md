@@ -39,6 +39,7 @@ apart, and it does it by asking the socket what a *worker* would ask.
 | Path | What | Notes |
 |---|---|---|
 | `<prefix>/token` | the fence token | minted `0600` on first install, then left alone |
+| `<prefix>/environment` | what this machine's runners enforce | `SL_FLEET_FENCE=required` — arms the launch gate; read, never sourced |
 | `<host config dir>/config.toml` | the host's settings (plan §2) | **shared** with any session already on this machine — see below |
 | `<host config dir>/agent-detection/<agent>.toml` | the screen-state override | a snapshot of the host's own manifest plus one rule |
 | `~/Library/LaunchAgents/com.superlooper.session-host.plist` | the server login item | `gui/$UID` only |
@@ -138,13 +139,54 @@ would otherwise fly a session onto an open socket:
 * it probes the socket **the spawn itself would use**, resolved through the doorway's own resolver
   from the launcher's environment — the same environment the host CLI child inherits.
 
+**`launch gate`** — a runner booting on this machine **arms** that pre-flight. A separate block from
+`host fence` on purpose: the two are different facts and a machine can have either without the
+other. `host fence` asks the socket whether a tokenless caller is refused; this asks whether the
+launcher will bother to ask before it flies a worker. #326 shipped exactly the machine where the
+first was green and the second was inert.
+
 **`SL_FLEET_FENCE`** is the switch, and it is an environment variable on the runner's own process
 rather than a key in a repo's `.superlooper/config.json`. That file travels with the repo through
 git, so the fleet mini and a dev laptop would read one answer — and those two machines must differ,
 because a dev workstation runs a stock host whose socket is `OPEN` by construction. `required` arms
 the gate; `off` or unset disarms it; **any other value arms it and says so**, because a typo that
-read as `off` would be a silently disarmed fence. Set `SL_FLEET_FENCE=required` on the fleet
-machine's runner; leave it unset everywhere else.
+read as `off` would be a silently disarmed fence.
+
+**The build-up sets it; an operator does not** (issue #355). `--install` writes `<prefix>/environment`
+with `SL_FLEET_FENCE=required`, and `superlooper run` reads that file at boot into its own process —
+so every launch this runner makes inherits it, because the launcher's environment is merged over the
+runner's. Three properties are deliberate:
+
+* **one mechanism, both homes.** Which home a runner lives in (`runner_home`: a visible pane today,
+  a login item optionally) is a per-repo decision. Baking the switch into a LaunchAgent would arm
+  exactly one of them and leave today's default silently unarmed.
+* **the machine's file beats an ambient variable.** An `export SL_FLEET_FENCE=off` left in a shell
+  rc file, a wrapper or a LaunchAgent would otherwise disarm the fleet machine silently — the same
+  inheritance hazard the runner pins `SL_ATTENDED` empty for. The boot line says when it overrode
+  one, so a variable that lost is never a variable that vanished.
+* **fail closed on a broken file, and never crash on one.** The file exists only because the
+  build-up ran here, so a hand-edit that lost the line — or an empty value, an embedded NUL, a byte
+  the runner cannot decode, or a file that cannot be read at all — arms the gate anyway and warns.
+  It never stops the runner from starting: a boot that died on this would die again on every
+  resurrect. To take a machine OUT of the fenced set, change the value to `off` rather than
+  deleting the file: a deleted file disarms too, and leaves nothing on disk that says so, and
+  **re-running `--install` keeps a value you have already set** rather than stamping `required`
+  back over it.
+
+`superlooper resume i<N>` arms itself the same way, and it is the only other command that can put a
+**worker** on the host (`debug` and the watchdog's relaunch are `d<N>`, which the pre-flight exempts
+by design). Its stdout is a machine-readable answer (`--json`), so it says nothing there —
+the launcher's own refusal is where an operator meets the gate.
+
+The file is read **at boot**, so a runner that was already up when you ran `--install` keeps the
+posture it started with. The `launch gate` block says so in its own green line: writing the file
+arms the *next* runner, and restarting the current one is what arms this machine now.
+
+It is **read, never sourced**, and only `SL_FLEET_FENCE` is ever applied from it. A machine-level
+file that could set anything would put the launcher's whole contract on disk — `SL_ATTENDED`,
+`SL_RESUME_SESSION_ID`, `SL_EXPECT_GH_LOGIN` — every one of which the runner pins empty precisely so
+that an ambient value cannot ride into a worker session. Anything else the file names is reported
+and ignored.
 
 Every worker launch journals its verdict (`act: fence_preflight`, with `verdict`, `required` and
 `refused`), permitted launches included. That is what keeps a default-off switch from being a

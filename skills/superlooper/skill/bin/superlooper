@@ -451,6 +451,123 @@ def _state_base():
     return os.environ.get("SL_HOME") or os.path.expanduser("~/.superlooper")
 
 
+def _arm_machine_env(announce=True):
+    """Give THIS process the environment the machine's own build-up declares (issue #355).
+
+    The launch pre-flight (#326) reads `SL_FLEET_FENCE` off the runner's process, and until this
+    existed nothing in the engine set it — so the gate shipped correct and INERT on the fleet
+    machine it was built for, and arming it was a step someone had to remember. This is the seam
+    that removes the remembering: the build-up writes `<prefix>/environment`, and a runner booting
+    on that machine picks it up. `_run_script` merges the launcher's env OVER `os.environ`, so
+    every launch this runner makes inherits it.
+
+    **Both homes, one mechanism.** Which home a runner lives in (`runner_home`: a visible pane
+    today, a login item optionally) is a per-repo decision and explicitly not this seam's to make.
+    Baking the switch into a LaunchAgent would arm exactly one of them and leave today's default
+    silently unarmed — which is this issue's own failure mode wearing a different hat.
+
+    Silent on a machine that never ran the build-up: no file, no switch, no gate, and no new line
+    explaining a fence that workstation does not have. ``announce=False`` silences the stdout line
+    for a caller whose stdout is a MACHINE-readable answer (`superlooper resume --json`) — warnings
+    still go to stderr, where they belong either way.
+
+    **It never raises.** This runs before `_load_config` on a process whose whole job is to keep
+    running, and the thing it reads is a text file the docs invite an operator to hand-edit — so
+    an undecodable byte or any other surprise must become a warned, fail-CLOSED arming rather than
+    a traceback that stops the runner from starting at all and then repeats on every resurrect
+    (fresh-agent review, P0).
+    """
+    try:
+        _apply_machine_env(announce)
+    except _MachineEnvApplied:
+        # The declaration ALREADY landed and something after it — a print onto a closed stdout, say
+        # — blew up. Stamping the fail-closed default here would overwrite a machine that had just
+        # successfully declared `off` (fresh-agent review round 2), so this path stops at the
+        # warning below and changes nothing.
+        print("WARNING: this machine's fleet environment was applied, but reporting it failed.",
+              file=sys.stderr)
+    except Exception as e:                                                   # noqa: BLE001
+        # Fail CLOSED, but only for a machine that actually declared something. The existence of
+        # the file is the declaration, so a dev workstation stays exactly as unarmed as it was even
+        # when this path is reached for a reason that has nothing to do with the file — arming one
+        # would refuse every launch on a machine that never opted in.
+        #
+        # LITERALS, not `session_host.FENCE_REQUIRED_VAR` (same review): a handler whose own first
+        # act is an import cannot be the handler for an import that failed, and "it never raises"
+        # has to hold without conditions on the way a runner's boot goes wrong.
+        path = os.path.join(_state_base(), "fleet", "environment")
+        if not os.path.exists(path):
+            print("WARNING: could not read this machine's fleet environment (%s); nothing declared "
+                  "one, so nothing was armed." % e, file=sys.stderr)
+            return
+        os.environ["SL_FLEET_FENCE"] = "required"
+        print("WARNING: %s could not be applied (%s) — arming the launch gate anyway "
+              "(SL_FLEET_FENCE=required) rather than starting a runner whose posture is unknown."
+              % (path, e), file=sys.stderr)
+
+
+class _MachineEnvApplied(Exception):
+    """Raised when the machine's declaration is already in `os.environ` and the failure came after.
+
+    Not a control-flow flourish: the difference decides whether the fail-closed stamp above
+    overwrites a machine that deliberately, and successfully, declared itself `off`.
+    """
+
+
+def _apply_machine_env(announce=True):
+    import fleet
+    import session_host
+
+    prefix = fleet.prefix(_state_base())
+    assignments, problem, ignored = fleet.load_machine_env(stack_doctor.Probe(), prefix)
+    if not assignments:
+        return
+    applied = {}
+    try:
+        # INSIDE the guard, so a PARTIAL apply is already "the declaration landed" (fresh-agent
+        # review). With one variable in ENV_VARS this cannot happen — the single assignment either
+        # lands or it does not — but the day a second one is added, a half-applied file taking the
+        # generic handler's path would stamp `required` over a machine that had just declared off.
+        applied, replaced = fleet.apply_machine_env(os.environ, assignments)
+        path = fleet.env_file(prefix)
+        # Read BACK out of this process's environment, through the PRE-FLIGHT's own parser rather
+        # than from the file we just read. The line is then evidence about what a launch will
+        # actually see — which is the question — instead of a restatement of what a file says.
+        required, unrecognised = session_host.fence_required(os.environ)
+        value = os.environ.get(session_host.FENCE_REQUIRED_VAR)
+        if announce:
+            print("fleet machine: %s=%s (from %s) — %s"
+                  % (session_host.FENCE_REQUIRED_VAR, value, path,
+                     "an i<N> launch probes the session host's control socket first and refuses an "
+                     "unfenced one" if required else
+                     "the launch pre-flight is DISARMED on this machine, deliberately and in "
+                     "writing"))
+        if problem:
+            print("  WARNING: %s %s" % (path, problem), file=sys.stderr)
+        if unrecognised:
+            print("  WARNING: %r is not a value this engine recognises — it reads as %r, because a "
+                  "switch typo that read as 'off' would be a silently disarmed fence."
+                  % (unrecognised, session_host.FENCE_REQUIRED), file=sys.stderr)
+        for key, was in sorted(replaced.items()):
+            # The machine's own declaration beats an ambient variable (see apply_machine_env), and
+            # it says so: an operator who exported that value has to be able to see it lose. On a
+            # caller whose stdout is a machine-readable answer this goes to STDERR rather than
+            # being dropped (fresh-agent review) — "a variable that lost is never a variable that
+            # vanished" has to hold on every path, not only the one with a human reading it.
+            print("  note: this process arrived carrying %s=%r; the machine's own file wins."
+                  % (key, was), file=sys.stdout if announce else sys.stderr)
+        if ignored and announce:
+            print("  note: %s also names %s, which a runner never applies (it may set only %s)."
+                  % (path, ", ".join(sorted(set(ignored))), ", ".join(fleet.ENV_VARS)))
+    except Exception:                                                        # noqa: BLE001
+        # The declaration is already applied (or partly so); everything else in the block is
+        # REPORTING. Say which side of that boundary the failure fell on, so the caller does not
+        # undo a good apply — and re-raise untouched when nothing landed at all.
+        if applied:
+            raise _MachineEnvApplied()
+        raise
+
+
 def _write_once(path, text, marker, what, merge_text=None):
     """Write `text` to `path` unless somebody else's file is already there.
 
@@ -468,10 +585,13 @@ def _write_once(path, text, marker, what, merge_text=None):
             existing = f.read()
     except FileNotFoundError:
         pass
-    except OSError as e:
+    except (OSError, ValueError) as e:
         # NOT absence (fresh-agent review). A file we could not READ is a file we could not prove
         # we own, and treating the failure as "nothing is there" turns a permissions problem, an
         # ACL or a broken symlink into permission to overwrite somebody else's file.
+        # `ValueError` covers the undecodable one: every file this writes is text an operator may
+        # edit, and one editor round-trip through a non-UTF-8 encoding used to take the whole
+        # command down with a traceback instead of refusing the one file (#355 review).
         print("  REFUSED %s: %s exists but could not be read (%s), so it cannot be shown to be "
               "ours to rewrite." % (what, path, e))
         return "refused"
@@ -611,6 +731,36 @@ def cmd_fleet(args):
                   % token, file=sys.stderr)
             return 2
 
+        # The machine's own declaration that its runners enforce the fence (issue #355). Written
+        # before the host config because it is the one artefact here that changes what a LAUNCH
+        # does rather than what the server is, and an operator reading this output top to bottom
+        # should meet it beside the token it is the other half of.
+        env_path = fleet.env_file(prefix)
+        # KEEPING a value the machine already declared, rather than stamping `required` back over
+        # it (fresh-agent review): the file and docs offer exactly one supported edit — change it
+        # to `off` — and a re-install is a build-up step after a version bump, not a decision about
+        # this machine's posture. An install that silently reverted the edit would make the
+        # instruction false the first time anybody followed it.
+        held = None
+        try:
+            with open(env_path) as f:
+                held = f.read()
+        except (OSError, ValueError):
+            pass
+        wrote = _write_once(env_path,
+                            fleet.render_env_file(fleet.keep_declared_fence(held)),
+                            fleet.ENV_MARKER, "runner environment",
+                            # SETTINGS only in a refusal, exactly as the host config does: the
+                            # rendered file's first line IS the ownership marker, and inviting an
+                            # operator to paste it into a file they maintain would have the NEXT
+                            # install read it as ownership and replace the whole thing.
+                            merge_text="%s=%s\n" % (session_host.FENCE_REQUIRED_VAR,
+                                                    fleet.keep_declared_fence(held)))
+        if wrote != "refused":
+            print("  %s %s (%s the launch pre-flight for every runner on this machine)"
+                  % (wrote, env_path,
+                     "arms" if fleet.keep_declared_fence(held) == "required" else "DISARMS"))
+
         cfg_path = fleet.host_config_path(host_config_dir)
         wrote = _write_once(cfg_path, fleet.render_host_config(), fleet.CONFIG_MARKER, "config",
                             merge_text=fleet.host_config_settings())
@@ -708,6 +858,15 @@ def cmd_fleet(args):
 
 def cmd_run(args):
     from runner import Runner, preflight_pane, detect_self_anchor
+    # BEFORE anything else this process does (issue #355): the machine's own declaration is part of
+    # this runner's environment, and every launch it makes inherits that environment. A dev
+    # workstation that never ran the fleet build-up is untouched by this call.
+    #
+    # HERE, at the LIVE runner's process entrypoint — not in `Runner.__init__` — for exactly the
+    # reason `gh.set_telemetry` sits on the next lines rather than in the constructor: this mutates
+    # process-global state, and only the long-lived runner should carry it. A Runner built inside a
+    # unit test or a one-shot CLI command must not silently acquire a machine's launch posture.
+    _arm_machine_env()
     cfg = _load_config(args.repo)
     fetch_usage = None
     fake = os.environ.get("SL_FAKE_USAGE")
@@ -3419,6 +3578,12 @@ def cmd_resume(args):
     refuse on "no cmux pane resolves" too; issue #308 moved the launch onto the session host, which
     is asked for a workspace rather than told which pane to open a tab in. ``--check`` is the
     read-only preflight."""
+    # The FOURTH spawner, and the only one besides the runner that can put an `i<N>` worker on the
+    # host (issue #355; `debug` and the watchdog's relaunch are `d<N>`, which `_fence_preflight`
+    # exempts by design). It builds its launcher env from `os.environ` — an operator's shell, or
+    # the dashboard's — so without this a hand-typed revive on a built fleet machine would fly the
+    # one launch class the fence exists to contain, past a gate the machine had already armed.
+    _arm_machine_env(announce=False)
     cfg = _load_config(args.repo)
     home = str(config_lib.state_home(cfg))
     state_dir = os.path.join(home, "state")
@@ -3672,7 +3837,8 @@ def main(argv=None):
                                  "runner will actually get")})
     add("fleet", cmd_fleet,
         **{"--install": dict(action="store_true",
-                             help="write the fleet's token, host config, screen-state override, "
+                             help="write the fleet's token, runner environment (the file that arms "
+                                  "the launch pre-flight), host config, screen-state override, "
                                   "server LaunchAgent and viewer script, then judge the result"),
            "--load": dict(action="store_true",
                           help="with --install, also bootstrap the server job into gui/$UID now"),

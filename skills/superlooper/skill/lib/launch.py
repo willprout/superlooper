@@ -671,8 +671,10 @@ def _fence_memo(iid, verdict, socket_path):
             "passes, and the protocol is plain newline-JSON, so a worker started here could drive "
             "the whole fleet with ten lines of python and no host binary." % (iid, socket_path),
             "[%s] This machine declares its fleet fenced (%s). Rebuild the patched host with "
-            "vendor/herdr/build.sh and re-run `superlooper fleet --install`, or set %s=off if this "
-            "machine is deliberately unfenced."
+            "vendor/herdr/build.sh and re-run `superlooper fleet --install`, or write %s=off into "
+            "the fleet prefix's `environment` file if this machine is deliberately unfenced — on a "
+            "machine the build-up armed (#355) that FILE is the declaration and an exported "
+            "variable no longer wins."
             % (iid, session_host.FENCE_REQUIRED_VAR, session_host.FENCE_REQUIRED_VAR)])
     if verdict == FENCE_UNRESOLVED:
         return "\n".join([
