@@ -124,8 +124,10 @@ _LAUNCH_RC = {
         "ten lines of python and no host binary. An unanswerable one proves nothing either way, "
         "and silence is never read as a fence here. NO issue caused this and re-approving fixes "
         "nothing: rebuild the patched host (vendor/herdr/build.sh) and re-run `superlooper fleet "
-        "--install`, or set SL_FLEET_FENCE=off on a machine that is deliberately unfenced. The "
-        "captured stderr says which of the two verdicts it was"),
+        "--install`, or write SL_FLEET_FENCE=off into the fleet prefix's `environment` file on a "
+        "machine that is deliberately unfenced — since #355 that file is the machine's declaration "
+        "and an exported variable no longer overrides it. The captured stderr says which of the "
+        "two verdicts it was"),
     64: ("agent_unsupported",
          "the configured agent is not one this launcher can start (expected: claude or codex)"),
     124: ("launch_timeout",

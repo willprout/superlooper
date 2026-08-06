@@ -240,6 +240,50 @@ def _arm(rig, body="SL_FLEET_FENCE=required\n"):
     return path
 
 
+def _built_host(rig):
+    """A stand-in for the PATCHED host binary the build-up refuses to configure without.
+
+    `check_host_binary` asks two things of it and nothing else: that `--version` reports the pin,
+    and that the file CONTAINS the carried patch's own refusal message (the fence at rest — a
+    stock build reports the same version). A shell script satisfies both honestly.
+    """
+    import fleet
+    prefix = Path(rig.env["SL_HOME"]) / "fleet"
+    (prefix / "bin").mkdir(parents=True, exist_ok=True)
+    return _script(prefix / "bin" / "herdr",
+                   "# %s\ncase \"$1\" in --version) echo 'herdr %s';; esac\nexit 0\n"
+                   % (fleet.FENCE_SIGNATURE, fleet.PINNED_VERSION))
+
+
+def test_the_build_up_is_what_writes_the_arming_file(rig):
+    # The DoD's first bullet, driven through the verb that claims it: without this, deleting the
+    # write from `fleet --install` leaves every other test here green (they plant the file by hand)
+    # and the machine the build-up produces is one nobody armed — this issue's own failure mode.
+    import fleet
+    _built_host(rig)
+    env_path = Path(rig.env["SL_HOME"]) / "fleet" / "environment"
+    r = cli(rig, "fleet", "--install")
+    assert env_path.exists(), r.stdout + r.stderr
+    assert fleet.machine_env(env_path.read_text())[0] == {"SL_FLEET_FENCE": "required"}
+    # ...and the block that reports it is green, distinctly from `host fence` (no server here).
+    assert "ok   launch gate" in r.stdout, r.stdout
+
+
+def test_a_reinstall_does_not_revert_the_one_edit_the_file_advertises(rig):
+    # The file and the docs offer exactly one supported edit — change the value to `off`. An
+    # install that stamped `required` back over it would make that instruction false the first
+    # time anybody followed it, and a re-install is a build-up step, not a posture decision.
+    _built_host(rig)
+    cli(rig, "fleet", "--install")
+    env_path = Path(rig.env["SL_HOME"]) / "fleet" / "environment"
+    env_path.write_text(env_path.read_text().replace("SL_FLEET_FENCE=required",
+                                                     "SL_FLEET_FENCE=off"))
+    r = cli(rig, "fleet", "--install")
+    assert "SL_FLEET_FENCE=off" in env_path.read_text(), r.stdout + r.stderr
+    # and the judge calls that machine NOT ready, because a fleet build-up is not complete in it
+    assert "FAIL launch gate" in r.stdout
+
+
 def _in_a_pane(rig):
     """env for a runner booting in the PANE home — today's default and the one a plist misses."""
     cmux = _script(rig.tmp / "cmux-ok", 'echo "surface:1  a tab"\nexit 0\n')

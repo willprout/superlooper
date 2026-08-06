@@ -479,22 +479,39 @@ def _arm_machine_env(announce=True):
     """
     try:
         _apply_machine_env(announce)
+    except _MachineEnvApplied:
+        # The declaration ALREADY landed and something after it — a print onto a closed stdout, say
+        # — blew up. Stamping the fail-closed default here would overwrite a machine that had just
+        # successfully declared `off` (fresh-agent review round 2), so this path stops at the
+        # warning below and changes nothing.
+        print("WARNING: this machine's fleet environment was applied, but reporting it failed.",
+              file=sys.stderr)
     except Exception as e:                                                   # noqa: BLE001
         # Fail CLOSED, but only for a machine that actually declared something. The existence of
         # the file is the declaration, so a dev workstation stays exactly as unarmed as it was even
         # when this path is reached for a reason that has nothing to do with the file — arming one
         # would refuse every launch on a machine that never opted in.
+        #
+        # LITERALS, not `session_host.FENCE_REQUIRED_VAR` (same review): a handler whose own first
+        # act is an import cannot be the handler for an import that failed, and "it never raises"
+        # has to hold without conditions on the way a runner's boot goes wrong.
         path = os.path.join(_state_base(), "fleet", "environment")
         if not os.path.exists(path):
             print("WARNING: could not read this machine's fleet environment (%s); nothing declared "
                   "one, so nothing was armed." % e, file=sys.stderr)
             return
-        import session_host
-        os.environ[session_host.FENCE_REQUIRED_VAR] = session_host.FENCE_REQUIRED
-        print("WARNING: %s could not be applied (%s) — arming the launch gate anyway (%s=%s) "
-              "rather than starting a runner whose posture is unknown."
-              % (path, e, session_host.FENCE_REQUIRED_VAR, session_host.FENCE_REQUIRED),
-              file=sys.stderr)
+        os.environ["SL_FLEET_FENCE"] = "required"
+        print("WARNING: %s could not be applied (%s) — arming the launch gate anyway "
+              "(SL_FLEET_FENCE=required) rather than starting a runner whose posture is unknown."
+              % (path, e), file=sys.stderr)
+
+
+class _MachineEnvApplied(Exception):
+    """Raised when the machine's declaration is already in `os.environ` and the failure came after.
+
+    Not a control-flow flourish: the difference decides whether the fail-closed stamp above
+    overwrites a machine that deliberately, and successfully, declared itself `off`.
+    """
 
 
 def _apply_machine_env(announce=True):
@@ -506,33 +523,39 @@ def _apply_machine_env(announce=True):
     if not assignments:
         return
     _applied, replaced = fleet.apply_machine_env(os.environ, assignments)
-    path = fleet.env_file(prefix)
-    # Read BACK out of this process's environment, through the PRE-FLIGHT's own parser rather than
-    # from the file we just read. The line is then evidence about what a launch will actually see —
-    # which is the question — instead of a restatement of what a file says.
-    required, unrecognised = session_host.fence_required(os.environ)
-    value = os.environ.get(session_host.FENCE_REQUIRED_VAR)
-    if announce:
-        print("fleet machine: %s=%s (from %s) — %s"
-              % (session_host.FENCE_REQUIRED_VAR, value, path,
-                 "an i<N> launch probes the session host's control socket first and refuses an "
-                 "unfenced one" if required else
-                 "the launch pre-flight is DISARMED on this machine, deliberately and in writing"))
-    if problem:
-        print("  WARNING: %s %s" % (path, problem), file=sys.stderr)
-    if unrecognised:
-        print("  WARNING: %r is not a value this engine recognises — it reads as %r, because a "
-              "switch typo that read as 'off' would be a silently disarmed fence."
-              % (unrecognised, session_host.FENCE_REQUIRED), file=sys.stderr)
-    for key, was in sorted(replaced.items()):
-        # The machine's own declaration beats an ambient variable (see fleet.apply_machine_env),
-        # and it says so: an operator who exported that value has to be able to see it lose.
+    try:
+        path = fleet.env_file(prefix)
+        # Read BACK out of this process's environment, through the PRE-FLIGHT's own parser rather
+        # than from the file we just read. The line is then evidence about what a launch will
+        # actually see — which is the question — instead of a restatement of what a file says.
+        required, unrecognised = session_host.fence_required(os.environ)
+        value = os.environ.get(session_host.FENCE_REQUIRED_VAR)
         if announce:
-            print("  note: this process arrived carrying %s=%r; the machine's own file wins."
-                  % (key, was))
-    if ignored and announce:
-        print("  note: %s also names %s, which a runner never applies (it may set only %s)."
-              % (path, ", ".join(sorted(set(ignored))), ", ".join(fleet.ENV_VARS)))
+            print("fleet machine: %s=%s (from %s) — %s"
+                  % (session_host.FENCE_REQUIRED_VAR, value, path,
+                     "an i<N> launch probes the session host's control socket first and refuses an "
+                     "unfenced one" if required else
+                     "the launch pre-flight is DISARMED on this machine, deliberately and in "
+                     "writing"))
+        if problem:
+            print("  WARNING: %s %s" % (path, problem), file=sys.stderr)
+        if unrecognised:
+            print("  WARNING: %r is not a value this engine recognises — it reads as %r, because a "
+                  "switch typo that read as 'off' would be a silently disarmed fence."
+                  % (unrecognised, session_host.FENCE_REQUIRED), file=sys.stderr)
+        for key, was in sorted(replaced.items()):
+            # The machine's own declaration beats an ambient variable (see apply_machine_env), and
+            # it says so: an operator who exported that value has to be able to see it lose.
+            if announce:
+                print("  note: this process arrived carrying %s=%r; the machine's own file wins."
+                      % (key, was))
+        if ignored and announce:
+            print("  note: %s also names %s, which a runner never applies (it may set only %s)."
+                  % (path, ", ".join(sorted(set(ignored))), ", ".join(fleet.ENV_VARS)))
+    except Exception:                                                        # noqa: BLE001
+        # Everything above this line is REPORTING; the declaration is already applied. Say which
+        # side of that boundary the failure fell on, so the caller does not undo a good apply.
+        raise _MachineEnvApplied()
 
 
 def _write_once(path, text, marker, what, merge_text=None):
@@ -716,7 +739,13 @@ def cmd_fleet(args):
             pass
         wrote = _write_once(env_path,
                             fleet.render_env_file(fleet.keep_declared_fence(held)),
-                            fleet.ENV_MARKER, "runner environment")
+                            fleet.ENV_MARKER, "runner environment",
+                            # SETTINGS only in a refusal, exactly as the host config does: the
+                            # rendered file's first line IS the ownership marker, and inviting an
+                            # operator to paste it into a file they maintain would have the NEXT
+                            # install read it as ownership and replace the whole thing.
+                            merge_text="%s=%s\n" % (session_host.FENCE_REQUIRED_VAR,
+                                                    fleet.keep_declared_fence(held)))
         if wrote != "refused":
             print("  %s %s (%s the launch pre-flight for every runner on this machine)"
                   % (wrote, env_path,

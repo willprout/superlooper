@@ -178,6 +178,10 @@ runner's. Three properties are deliberate:
 by design). Its stdout is a machine-readable answer the dashboard parses, so it says nothing there —
 the launcher's own refusal is where an operator meets the gate.
 
+The file is read **at boot**, so a runner that was already up when you ran `--install` keeps the
+posture it started with. The `launch gate` block says so in its own green line: writing the file
+arms the *next* runner, and restarting the current one is what arms this machine now.
+
 It is **read, never sourced**, and only `SL_FLEET_FENCE` is ever applied from it. A machine-level
 file that could set anything would put the launcher's whole contract on disk — `SL_ATTENDED`,
 `SL_RESUME_SESSION_ID`, `SL_EXPECT_GH_LOGIN` — every one of which the runner pins empty precisely so

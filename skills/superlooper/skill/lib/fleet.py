@@ -1060,9 +1060,11 @@ def check_launch_gate(probe, fleet_prefix, env=None):
     return CheckResult(
         name, True,
         "%s sets %s=%s, so a runner booting here refuses an `i<N>` launch onto a control socket "
-        "that is not fenced (exit 9)%s"
+        "that is not fenced (exit 9). A runner ALREADY RUNNING keeps the posture it booted with — "
+        "this block reads the file, not another process's environment — so restart one that was "
+        "started before this file was written%s"
         % (path, session_host.FENCE_REQUIRED_VAR, declared,
-           " — " + "; ".join(notes) if notes else ""),
+           "; " + "; ".join(notes) if notes else ""),
         "; ".join(fixes), warn=bool(notes))
 
 
