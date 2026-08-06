@@ -125,6 +125,29 @@ def test_regenerate_increments_attempt_and_relaunches():
     assert last["stage"] == flights.TAKEOFF                # go-around: back to a fresh takeoff
 
 
+def test_a_reapproval_that_rotated_the_branch_is_a_new_attempt_here_too():
+    # Issue #272: re-approval is now a retire-and-rebuild exactly like a conflict regeneration — it
+    # prunes the worktree, DELETES the filed report and relaunches on a fresh generation. The replay
+    # and the live board read the same journal, so a lane the board calls SL-4·A2 must not be SL-4
+    # in the time-lapse, still parked at the report it no longer has.
+    j = [_rec(100, "launch", num=4),
+         _rec(200, "event", event={"type": "session_finished", "id": "i4"}),
+         _rec(300, "park", num=4, needs_william=True, memo="your call"),
+         _rec(400, "reapprove", num=4, old_branch="sl/i4-x", new_branch="sl/i4-x-r1")]
+    last = replay.build_replay(j, slug="o/r")["frames"][-1]["flights"][0]
+    assert last["label"] == flights.flight_label(4, 2)     # SL-4·A2
+    assert last["stage"] == flights.TAKEOFF                # rebuilding from the start, report gone
+
+
+def test_a_reapproval_with_nothing_to_retire_is_not_a_new_attempt():
+    # A lane parked before it was ever handed to the launcher has no branch to rotate, so the engine
+    # journals no branch pair. Nothing was retired; the relaunch is still attempt 1.
+    j = [_rec(100, "park", num=4, needs_william=True, memo="no touches: line"),
+         _rec(200, "reapprove", num=4)]
+    last = replay.build_replay(j, slug="o/r")["frames"][-1]["flights"][0]
+    assert last["label"] == flights.flight_label(4, 1)     # plain SL-4
+
+
 # --------------------------- click-through payload ---------------------------
 
 def test_each_frame_carries_its_event_for_click_through():

@@ -108,27 +108,62 @@ def test_attempt_number_ignores_a_reapproval_that_rotated_nothing():
     assert flights.attempt_number(journal, None) == 1
 
 
-def test_attempt_number_reads_the_generation_off_the_branch():
-    # The branch the lane is ACTUALLY on is the authority — the `-r<N>` suffix survives every
-    # counter reset. A lane on -r2 is on its third attempt whatever the journal slice carries
-    # (a truncated/rotated journal must not walk the board back to attempt 1).
-    assert flights.attempt_number([], "sl/i7-make-it-formal-r2") == 3
-    assert flights.attempt_number([], "sl/i7-make-it-formal") == 1
+def test_attempt_number_reads_the_generation_off_the_branch_once_a_rotation_is_proven():
+    # Once the journal proves the lane WAS retired at least once, the branch it landed on settles
+    # WHICH generation that is — the `-r<N>` suffix survives every counter reset, so it is the one
+    # reading a re-approval cannot erase.
+    rotated = [{"act": "reapprove", "old_branch": "sl/i7-x", "new_branch": "sl/i7-x-r2"}]
+    assert flights.attempt_number(rotated, "sl/i7-x-r2") == 3
+
+
+def test_attempt_number_never_reads_a_generation_off_a_lane_that_never_rotated():
+    # Fresh-review P1. `-r<N>` is not a reserved namespace: `brief.branch_for` slugs the ISSUE
+    # TITLE into the same string space, so an issue called "bump the API to r10" is launched — once,
+    # never rebuilt — on `sl/i7-bump-the-api-to-r10`. Reading that tail as a generation put SL-7·A11
+    # on the board, told the arrivals board "2nd attempt", and wrote "attempt 11" into the briefing,
+    # for a lane that flew exactly once. The suffix is only believed when the lane's own record
+    # proves SOMETHING was retired; with nothing retired there is no second attempt to name.
+    assert flights.attempt_number([], "sl/i7-bump-the-api-to-r10") == 1
+    assert flights.attempt_number([{"act": "launch"}, {"act": "merge"}], "sl/i7-pin-herdr-to-r2") == 1
+
+
+def test_attempt_number_takes_the_branch_over_a_rebuild_the_engine_re_emitted():
+    # A `regenerate` RECORD is not proof a rebuild landed: the executor aborts while a worker is
+    # still live in the worktree, the tick loop journals the action with its deferral outcome, and
+    # `decide` re-emits it every tick to the deferral cap. Counting records alone put a lane on
+    # attempt 5 over an `-r1` branch — the two-surfaces-disagreeing symptom this issue exists to
+    # kill. Once a rotation is proven, the branch says how many actually happened.
+    journal = [{"act": "regenerate", "outcome": "worker still live in the worktree (pid 41) — "
+                                                "deferring the rebuild (deferral 1 of 5)"},
+               {"act": "regenerate", "outcome": "worker still live in the worktree (pid 41) — "
+                                                "deferring the rebuild (deferral 2 of 5)"},
+               {"act": "regenerate", "outcome": "regenerated on sl/i7-x-r1"}]
+    assert flights.attempt_number(journal, "sl/i7-x-r1") == 2
 
 
 def test_attempt_number_never_falls_below_what_the_journal_proves():
-    # ...and the journal is the floor in the other direction: a missing/unreadable branch stamp
-    # must not erase a regeneration the append-only record proves happened.
+    # ...and the journal is the floor in the other direction: a missing or generation-less branch
+    # stamp must not erase a regeneration the append-only record proves happened.
     journal = [{"act": "regenerate"}, {"act": "regenerate"}]
     assert flights.attempt_number(journal, None) == 3
     assert flights.attempt_number(journal, "sl/i7-x") == 3
 
 
 def test_attempt_number_is_fail_closed_on_an_unreadable_branch():
-    # A wrong-typed or unparseable stamp yields the base generation, never a crash and never an
-    # invented attempt (the derivations-never-raise rule).
+    # A wrong-typed or unparseable stamp falls back to the journal's own count, never a crash and
+    # never an invented attempt (the derivations-never-raise rule).
+    rotated = [{"act": "reapprove", "old_branch": "sl/i7-x", "new_branch": "sl/i7-x-r1"}]
     for bad in (None, 17, True, "", "   ", "sl/i7-x-r", "sl/i7-x-r-1", "sl/i7-r2-x"):
         assert flights.attempt_number([], bad) == 1
+        assert flights.attempt_number(rotated, bad) == 2
+
+
+def test_attempt_number_skips_a_wrong_typed_journal_record():
+    # One corrupt line in journal.jsonl must not raise into the poll (the #139 hash-safe discipline)
+    # nor count as a rebuild.
+    journal = [None, "regenerate", 7, [], {"act": "regenerate"}]
+    assert flights.attempt_number(journal, None) == 2
+    assert flights.go_around_count(journal) == 1
 
 
 def test_go_around_count_is_conflicts_only_never_a_reapproval():

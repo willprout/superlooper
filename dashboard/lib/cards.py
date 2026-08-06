@@ -319,17 +319,37 @@ def decision_dossier(flight, journal_slice):
 #
 # (#272, following the engine's #177) The tap does MORE than empty the lane, and no button may hide
 # what it does. `_exec_reapprove` now ROTATES the branch: the rebuild is launched on the next
-# unburned generation, the branch the parked episode was sitting on is retired with its commits
-# intact on the remote, and a PR still open on it is handed to the janitor's `superseded` lane. Two
-# of those are the owner's business in opposite directions — the retirement is a consequence he is
-# choosing (his committed work moves out of the lane's path and he is the one who decides whether to
-# go get it), and the preservation is the reassurance that keeps the sentence from over-scaring.
-# What the engine does NOT do is close or delete anything, so this must not imply it does.
+# unburned generation, and the branch the parked episode was sitting on is retired — never reused,
+# never touched again. That is the owner's business in both directions: the retirement is a
+# consequence he is choosing (whatever the parked episode committed stops being in this lane's path,
+# and he is the one who decides whether to go get it), and the fact that the engine deletes and
+# closes NOTHING is the reassurance that keeps the sentence from over-scaring.
+#
+# The preservation is phrased the way the engine phrases it — "whatever was committed there stays
+# there" — and deliberately NOT as "preserved on the remote" (fresh review P2). A branch STAMP does
+# not prove a branch was ever pushed: `_exec_launch` stamps the name before the launcher runs, so a
+# lane parked on the launch-delivery ladder carries a name nothing ever created. The engine's own
+# retirement notice reasons this out and makes the vacuous claim rather than the false one; so does
+# this.
 _DISCARDS = ("Any worktree and filed report this issue already has are discarded — nothing is "
              "resumed — its attempt counters are zeroed, and a fresh session starts from the issue. "
-             "Any branch it is already on is retired: the rebuild runs on a fresh generation, the "
-             "retired branch is preserved on the remote with its commits, and a pull request still "
-             "open on it is labeled superseded and left standing for you.")
+             "Any branch it is already on is retired rather than reused: the rebuild runs on a "
+             "fresh generation, and whatever was committed on the retired branch stays there.")
+
+# The other half of the retirement, and the one the engine SKIPS by issue type: a PR still open on
+# the retired branch is handed to the janitor's `superseded` lane (labeled, noted, left open — the
+# janitor's later sweeps are what may close it, and only with the owner's say-so). `_exec_reapprove`
+# does none of that for an INVESTIGATION, which opens no PR by contract, so an investigation's verb
+# must not promise it (fresh review P2 — the same `is_investigation` mirror #161 already needs two
+# lines below, for the same reason: the button says what the runner will really do, or nothing).
+_SUPERSEDES = (" A pull request still open on the retired branch is labeled superseded and left "
+               "standing for you — nothing is auto-closed.")
+
+
+def _discards(flight):
+    """The shared discard warning for this flight's rebuilding verbs, with the supersede clause
+    only where the engine actually performs it."""
+    return _DISCARDS if flight.get("is_investigation") else _DISCARDS + _SUPERSEDES
 
 # The consequence of the DEFAULT re-approval on a FINISHED lane (issue #161 — the D11 fix). The
 # engine now RESUMES AT THE GATE instead of rebuilding: it re-enters the merge gate on the PR this
@@ -367,11 +387,12 @@ def decision_actions(flight, slug=None):
     # deliverable behind a preservation promise. A bounce rejects the premise — always a rebuild.
     finished = (bool((flight.get("gate") or {}).get("report"))
                 and not flight.get("is_investigation") and not bounced)
+    discards = _discards(flight)     # the shared rebuild warning, per-flight (#272)
 
     rebuild = None
     if bounced:
         yes = {"act": "bounce-yes", "label": "Accept the amendment & rebuild",
-               "consequence": "Records that you accepted the worker's proposed amendment. " + _DISCARDS}
+               "consequence": "Records that you accepted the worker's proposed amendment. " + discards}
     elif finished:
         # The D11 default: re-approval resumes at the gate, keeping the finished work.
         yes = {"act": "approve", "label": "Re-approve — resume at the gate",
@@ -387,12 +408,12 @@ def decision_actions(flight, slug=None):
                    "armed_label": "Tap again to discard #%s's PR & review and rebuild" % num,
                    "armed_caption": ("↻ Discards %s #%s's PR and its review — rebuilds from the issue."
                                      % (slug, num) if slug else None),
-                   "consequence": "Throws the finished work away and starts over. " + _DISCARDS,
+                   "consequence": "Throws the finished work away and starts over. " + discards,
                    "tone": "ghost", "destructive": True}
     else:
         yes = {"act": "approve", "label": "Re-approve & rebuild from scratch",
                "consequence": "Re-applies agent-ready in your name — your word, on the record. "
-                              + _DISCARDS}
+                              + discards}
     yes.update({"tone": "ghost" if kind == "conflict-cap" else "primary", "destructive": False})
 
     # The armed caption is a SEMANTIC — it names a destructive consequence — so it lives here beside

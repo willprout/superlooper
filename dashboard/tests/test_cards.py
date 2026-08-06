@@ -677,13 +677,31 @@ def test_the_discard_blurb_names_the_branch_retirement_and_the_superseded_pr():
 
 
 def test_the_discard_blurb_claims_nothing_the_rotation_made_untrue():
-    # The retired branch is PRESERVED on the remote with its commits, and the superseded PR is left
-    # OPEN — the engine auto-closes and deletes nothing (`_retire_old_branch`). A blurb that said the
-    # work was deleted, or the PR closed, would scare the owner off a button that does neither.
+    # `_retire_old_branch` deletes nothing and closes nothing: whatever the retired branch carries
+    # stays on it, and the superseded PR is left OPEN. A blurb saying the work was deleted, or the
+    # PR closed, would scare the owner off a button that does neither.
     a = _rebuild_verbs(_flight(stage=flights.PARKED))[0]
     low = a["consequence"].lower()
-    assert "preserved" in low or "kept" in low, "say the retired branch's commits survive"
-    assert "closed" not in low and "deleted" not in low, "nothing is auto-closed or deleted"
+    assert "stays there" in low, "say the retired branch keeps whatever was committed on it"
+    assert "auto-closed" in low
+    # ...and it must not claim the branch reached the REMOTE (fresh-review P2). A branch STAMP is not
+    # a pushed branch: `_exec_launch` stamps the name before the launcher runs, so a lane parked on
+    # the launch-delivery ladder carries a name nothing ever created. The engine makes the vacuous
+    # claim rather than the false one, and so must this.
+    assert "remote" not in low
+    assert "deleted" not in low
+
+
+def test_an_investigations_rebuild_verb_omits_the_supersede_promise():
+    # Fresh-review P2: `_exec_reapprove` skips the branch-retirement bookkeeping entirely when the
+    # issue type is `investigate` — no `superseded` label, no PR note — because an investigation
+    # opens no PR by contract. The rotation still happens, so the retirement clause stays; the
+    # promise the runner will not keep must go. Same `is_investigation` mirror #161 already needs.
+    f = _flight(stage=flights.PARKED, is_investigation=True)
+    a = _rebuild_verbs(f)[0]
+    low = a["consequence"].lower()
+    assert "superseded" not in low, "never promise bookkeeping the engine skips for this type"
+    assert "retired rather than reused" in low, "the rotation itself still happens — keep naming it"
 
 
 def test_a_reapproval_rotation_is_not_a_conflict_cap():

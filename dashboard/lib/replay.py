@@ -85,12 +85,22 @@ def _apply(facts, rec):
     change anything; flavor acts (nudge, notify, relabel, answers) leave the stage exactly as it
     was — the plane holds its anchor, honest to the journal."""
     act = rec.get("act")
+    # A record that RETIRED this lane and started it over. Since #177 there are two doors to that
+    # one mechanic (issue #272): a conflict `regenerate`, and a `reapprove` that rotated the branch
+    # — the engine's re-approval prunes the worktree, deletes the filed report and relaunches on a
+    # fresh generation, exactly as a regeneration does. A re-approval carrying no branch pair
+    # rotated nothing (there was no branch to retire), so it is a plain relaunch, not a new attempt.
+    rebuilt = act == "regenerate" or (act == "reapprove"
+                                      and rec.get("old_branch") and rec.get("new_branch"))
     if act == "launch":
         facts["launched"] = True
         facts["session_started"] = False       # just off the stand — a brief takeoff before the leg
         facts["status"] = "running"
-    elif act == "regenerate":
-        # A go-around is an honest retire-and-rebuild (§3): a NEW attempt taxis out from the start.
+    elif rebuilt:
+        # An honest retire-and-rebuild (§3): a NEW attempt taxis out from the start, and the report
+        # this lane had is gone — the replay and the live board read the same journal, so a lane the
+        # board calls SL-4·A2 must not be plain SL-4 here, still sitting at a report the engine
+        # already deleted.
         facts["attempt"] += 1
         facts["launched"] = True
         facts["session_started"] = False
@@ -131,7 +141,7 @@ def _apply(facts, rec):
     # Any post-launch record for a live flight proves the session is doing work → on the leg, not
     # merely just-airborne. (Applied after the specific handlers so a session_finished still wins
     # its BASE_TURN via report=True.)
-    if act not in ("launch", "regenerate") and facts["launched"]:
+    if act != "launch" and not rebuilt and facts["launched"]:
         facts["session_started"] = True
 
 

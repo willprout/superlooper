@@ -178,10 +178,16 @@ def branch_generation(branch):
     """The generation encoded in the branch name a lane is on — 0 for a base name and 0 for anything
     unreadable (wrong-typed, blank, a bare ``-r``, ``-r-1``).
 
-    This is the honest record of how many times the lane has been retired and re-minted: the engine
+    This is the honest record of WHICH generation a retired-and-rebuilt lane landed on: the engine
     zeroes its own counters on a re-approval, but the NAME it already burned survives on the remote
     with its superseded PR still open. Fail-closed like every derivation here — an unreadable stamp
-    reads as the base generation, never raises and never invents one."""
+    reads as the base generation, never raises and never invents one.
+
+    It is NOT proof that any rotation happened. ``-r<N>`` is not a reserved namespace: the engine
+    slugs the issue TITLE into the same string space, so an issue called "bump the API to r10" is
+    launched on ``sl/i7-bump-the-api-to-r10`` the very first time. The engine can shrug that off
+    (it only needs the next name not to collide); an owner-facing count cannot. See
+    :func:`attempt_number` for the corroboration that keeps a title from minting attempts."""
     if not isinstance(branch, str):
         return 0
     m = _GENERATION.search(branch.strip())
@@ -207,19 +213,23 @@ def attempt_number(journal, branch=None):
     retire a branch, both mint the next generation, both start a session from scratch — so the board
     counts them the same way, and the ``·A<n>`` marker means what it says.
 
-    Two sources, because neither alone is complete — exactly the pairing the engine's own
-    ``next_generation`` uses:
+    Two sources, each answering the half the other cannot, and in a fixed order — the journal says
+    WHETHER this lane has ever been retired, the branch says HOW MANY TIMES. Neither is trusted
+    alone, because each lies in its own direction (both proven by the fresh review of this change):
 
-    * the ``-r<N>`` suffix on ``branch`` — the generation the lane is ACTUALLY on. Authoritative and
-      reset-proof: a re-approval zeroes every engine counter but cannot un-burn a branch name. This
-      is what makes the attempt on the board agree with the branch under it.
-    * the append-only ``journal`` — the floor. A branch stamp can be missing or unreadable (a lane
-      never handed to the launcher, a corrupt state file), and an absent stamp must not walk a
-      proven rebuild back to attempt 1.
+    * the ``journal`` gates. Its rotation records are the lane's OWN history, so a branch whose
+      ``-r<N>`` tail came from the issue title rather than a rotation ("bump the API to r10") mints
+      no attempts: nothing was retired, so there is no second attempt to name.
+    * the ``-r<N>`` suffix on ``branch`` then settles the count, because a rotation record is not
+      proof a rebuild LANDED — the engine journals a regenerate it deferred (a worker still live in
+      the worktree) and re-emits it every tick to the deferral cap. The branch is where the lane
+      actually IS, and a re-approval zeroes every engine counter but cannot un-burn a branch name.
+    * the journal's own count is the fallback when the stamp carries no generation at all (missing,
+      cleared, wrong-typed) — an absent stamp must not walk a proven rebuild back to attempt 1.
 
-    ``max`` of the two, so neither source can lower what the other proves. A ``reapprove`` record
-    counts only when it carries the branch pair the rotation writes: a lane with nothing stamped had
-    nothing to retire, so its re-approval rotated nothing and is not a fresh attempt.
+    A ``reapprove`` record counts only when it carries the branch pair the rotation writes: a lane
+    with nothing stamped had nothing to retire, so its re-approval rotated nothing and is not a
+    fresh attempt.
 
     ``journal`` is this issue's records (the caller filters by id)."""
     rotations = 0
@@ -231,13 +241,16 @@ def attempt_number(journal, branch=None):
             rotations += 1
         elif act == "reapprove" and r.get("old_branch") and r.get("new_branch"):
             rotations += 1
-    return 1 + max(rotations, branch_generation(branch))
+    if not rotations:
+        return 1
+    return 1 + (branch_generation(branch) or rotations)
 
 
 def flight_label(num, attempt):
     """The flight number shown on every surface: ``SL-<num>`` on the first attempt, ``SL-<num>·A<n>``
-    once a go-around has happened (design record §3; DoD format ``SL-N·A2``). Flight number = issue
-    number so every surface stays journal-greppable."""
+    once the lane has been retired and rebuilt at least once — by a conflict OR by a re-approval
+    (design record §3; DoD format ``SL-N·A2``). Flight number = issue number so every surface stays
+    journal-greppable."""
     base = "SL-%d" % num
     return base if attempt <= 1 else "%s·A%d" % (base, attempt)
 
