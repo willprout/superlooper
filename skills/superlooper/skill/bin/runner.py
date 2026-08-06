@@ -4368,9 +4368,12 @@ class Runner:
     def _exec_freeze(self, a, now):
         # Tag the freeze with its OWNER (Codex R2 C2): the runner freezes only on a red dev
         # required-check, so its marker is source="dev-check". The nightly writes source="nightly".
+        # The literal comes from gate, because since #295 the gate demands an EXACT match on it
+        # before it will let the standing-rule fix merge under this freeze — a drifted spelling here
+        # would silently re-deadlock the mainline instead of failing loudly.
         loopstate.save(os.path.join(self.state, "merges_frozen.json"),
                        {"reason": a.get("reason"), "fingerprint": a.get("fingerprint"),
-                        "since": now, "source": "dev-check"})
+                        "since": now, "source": gate.DEV_CHECK_FREEZE_SOURCE})
         self._end_fix_issue_episode()      # a NEW episode re-checks its fingerprints once (#294)
         return "ok"
 
@@ -4378,13 +4381,20 @@ class Runner:
         # The runner unfreezes on dev-CHECK green, so it may clear only dev-check (or untagged/
         # legacy) freezes. A nightly/browser-suite freeze (source="nightly") is the nightly's to
         # clear (a green nightly does it) — removing it here would let merges flow while the
-        # nightly is still red. Codex R2 C2.
+        # nightly is still red. Codex R2 C2. Ownership is read through gate.nightly_owned_freeze —
+        # the CLEAR predicate, which is deliberately WEAKER than gate.freeze_exempt, the predicate
+        # that decides what may be MERGED under a freeze (#295). Do not collapse them: this one is
+        # asked only while dev reads GREEN, so an unknown-owner marker resolving to "clear it" just
+        # ends a freeze on a healthy mainline, whereas crossing one would merge under a freeze
+        # nobody can vouch for. The set this clears is therefore a strict SUPERSET of the set the
+        # standing-rule fix may cross, which is the safe direction (nothing is crossable-but-never-
+        # clearable).
         path = os.path.join(self.state, "merges_frozen.json")
         marker = _read_json(path)
         # Dev is GREEN, so the runner's own red-mainline episode is over on BOTH branches — even
         # the one where the nightly's marker stays standing (#294).
         self._end_fix_issue_episode()
-        if isinstance(marker, dict) and marker.get("source") == "nightly":
+        if gate.nightly_owned_freeze(marker):
             return "held: nightly-owned freeze (only a green nightly clears it)"
         _rm(path)
         return "ok"

@@ -795,6 +795,106 @@ def test_gate_frozen_holds_merges():                             # step 4
     assert d["action"] == "hold"
 
 
+# --------- step 4's one exemption: the restore-green PR crosses its own freeze (issue #295) ------
+# A dev-check freeze lifts only on a GREEN dev branch, and a genuinely red dev branch only greens
+# when a fix MERGES — so holding every merge held the standing-rule fix's own PR and the freeze
+# could never lift itself. These pin the exemption AND its scope.
+
+DEV_FREEZE = {"reason": "dev checks red: ci (failure)", "source": "dev-check"}
+NIGHTLY_FREEZE = {"reason": "nightly red: 1 persistent failure(s)", "source": "nightly"}
+
+
+def test_restore_green_reads_the_standing_rule_label():
+    assert gate.restore_green([gate.RESTORE_GREEN_LABEL, "expedite"]) is True
+    assert gate.restore_green(["expedite", "agent-ready"]) is False
+
+
+def test_restore_green_fails_closed_on_wrong_typed_labels():
+    # an unreadable label CONTAINER is never the standing-rule issue: the freeze holds by default
+    for bad in (None, "auto-approved:nightly-red", 7, {"name": gate.RESTORE_GREEN_LABEL}):
+        assert gate.restore_green(bad) is False
+    # junk ENTRIES beside a real label are ignored, never a raise: the label is still there
+    assert gate.restore_green([None, 3, gate.RESTORE_GREEN_LABEL]) is True
+
+
+def test_nightly_owned_freeze_only_for_the_nightlys_own_marker():
+    # the CLEAR-direction predicate (what _exec_unfreeze may remove) — unchanged semantics
+    assert gate.nightly_owned_freeze(NIGHTLY_FREEZE) is True
+    assert gate.nightly_owned_freeze(DEV_FREEZE) is False
+    for other in ({"reason": "merges_frozen.json unreadable"}, True, None, "nightly"):
+        assert gate.nightly_owned_freeze(other) is False
+
+
+def test_gate_restore_green_pr_merges_under_its_own_dev_check_freeze():
+    d = _decide(issue=_issue(restore_green=True), frozen=DEV_FREEZE)
+    assert d["action"] == "merge", d
+    assert d.get("freeze_exempt") is True
+    assert "frozen" in d["reason"]      # the journal must say WHY a merge landed under a freeze
+
+
+def test_gate_frozen_still_holds_every_ordinary_pr():
+    # the exemption is per-ISSUE, not per-freeze: ordinary work is unchanged (frozen-on-red)
+    d = _decide(issue=_issue(restore_green=False), frozen=DEV_FREEZE)
+    assert d["action"] == "hold" and d.get("freeze_exempt") is not True
+    assert _decide(frozen=DEV_FREEZE)["action"] == "hold"          # absent flag == not exempt
+
+
+def test_gate_restore_green_never_crosses_a_nightly_owned_freeze():
+    # the nightly owns its freeze (only a green nightly clears it) — the loop never crosses one
+    d = _decide(issue=_issue(restore_green=True), frozen=NIGHTLY_FREEZE)
+    assert d["action"] == "hold" and d.get("freeze_exempt") is not True
+
+
+def test_gate_restore_green_never_crosses_a_freeze_of_unproven_ownership():
+    # (fresh-review P0) Crossing demands POSITIVE proof of dev-check ownership — "not tagged
+    # nightly" is not proof. A marker the runner manufactured for an unreadable file, a marker
+    # predating the source tag, a wrong-typed source, a source this build has never heard of, and a
+    # bare bool from a caller with no marker at all could each be hiding a nightly-owned (or worse,
+    # unknown-owner) freeze — so every one of them HOLDS. Merging on a corrupt input is the exact
+    # fail-open this module exists to refuse.
+    for unproven in (True, {"reason": "merges_frozen.json unreadable"}, {"since": 1},
+                     {"source": 7}, {"source": None}, {"source": "browser-suite"},
+                     {"source": "dev-check "}, {"source": "DEV-CHECK"}):
+        d = _decide(issue=_issue(restore_green=True), frozen=unproven)
+        assert d["action"] == "hold", unproven
+        assert d.get("freeze_exempt") is not True, unproven
+
+
+def test_gate_restore_green_flag_fails_closed_on_wrong_typed_values():
+    # only a real True exempts; a truthy string/int is corruption, and corruption holds
+    for bad in ("yes", 1, ["auto-approved:nightly-red"], {}):
+        d = _decide(issue=_issue(restore_green=bad), frozen=DEV_FREEZE)
+        assert d["action"] == "hold", bad
+
+
+def test_gate_restore_green_exemption_does_not_bypass_any_other_gate():
+    # it consumes ONLY step 4. Every other gate still runs, so the fix merges only when everything
+    # else is green too — the same discipline as the referee pre-authorization above.
+    rg = _issue(restore_green=True)
+    red = _pr(statusCheckRollup=[{"context": "quality-gate", "state": "FAILURE"}])
+    assert _decide(issue=rg, pr=red, frozen=DEV_FREEZE)["action"] == "nudge"
+    unreviewed = _pr(comments=[])
+    assert _decide(issue=rg, pr=unreviewed, frozen=DEV_FREEZE)["action"] == "nudge"
+    conflicting = _pr(mergeable="CONFLICTING")
+    assert _decide(issue=rg, pr=conflicting, frozen=DEV_FREEZE)["action"] == "update"
+    referee = _pr(files=[{"path": ".superlooper/config.json"}])
+    assert _decide(issue=rg, pr=referee, frozen=DEV_FREEZE)["action"] == "park"
+
+
+def test_gate_restore_green_still_holds_behind_an_inflight_lane():
+    # step 3 precedes step 4: an overlapping LIVE lane still holds the fix's merge (that hold
+    # resolves on its own when the lane ends — it is not the self-blocking freeze).
+    d = _decide(issue=_issue(restore_green=True), frozen=DEV_FREEZE,
+                inflight={"i7": ["frontend"]})
+    assert d["action"] == "hold" and d["overlap_lane"] == "i7"
+
+
+def test_gate_restore_green_is_inert_on_a_green_mainline():
+    # nothing frozen -> no exemption to record; an ordinary merge carries no freeze_exempt noise
+    d = _decide(issue=_issue(restore_green=True), frozen=False)
+    assert d["action"] == "merge" and d.get("freeze_exempt") is not True
+
+
 def test_gate_checks_pending_waits():                            # step 5
     d = _decide(pr=_pr(statusCheckRollup=[{"context": "quality-gate", "state": "PENDING"}]))
     assert d["action"] == "wait"

@@ -156,13 +156,11 @@ def _merge_affinity_subject(itype):
 
 
 def _restore_green(parsed):
-    """Is this the standing-rule restore-green fix (spec §4.4) — the auto-filed, auto-approved
-    issue whose whole job is to un-red the mainline? Read from the LIVE labels, so it is exactly
-    the issue the runner (or the nightly) filed under the standing rule and never a look-alike."""
-    labels = parsed.get("labels")
-    if not isinstance(labels, (list, set, tuple)):
-        return False
-    return gate.RESTORE_GREEN_LABEL in labels
+    """Is this the standing-rule restore-green fix (spec §4.4)? Delegates to gate.restore_green so
+    the LAUNCH exemption here (#294) and the gate's FREEZE exemption (#295) read the same fact the
+    same way — two exemptions that disagreed about which issue is the standing-rule fix would put
+    the loop right back in a half-escaped deadlock."""
+    return gate.restore_green(parsed.get("labels"))
 
 
 def _claim_exempt(candidate, blocker_id, finished_claim_ids, frozen):
@@ -172,9 +170,9 @@ def _claim_exempt(candidate, blocker_id, finished_claim_ids, frozen):
     genuinely unknown — whatever broke the check), which overlaps every one of them, so in exactly
     the situation the fix exists to escape it was blocked by the very PRs that were blocked by it.
 
-    This buys the fix a LAUNCH, not the whole escape: gate_decision step 4 still holds its own PR
-    while the freeze stands, so a dev-check freeze does not yet lift itself (issue #295). What
-    changes here is that the fix gets built, reviewed and opened instead of never starting.
+    This buys the fix a LAUNCH — the first half of the escape. Its PR then crosses the freeze at
+    gate_decision step 4, which since issue #295 exempts exactly this issue, so a dev-check freeze
+    now lifts itself: filed -> launched (here) -> built -> merged -> dev greens -> unfreeze.
 
     So a restore-green candidate ignores FINISHED-but-unmerged territory WHILE MERGES ARE FROZEN.
     Both halves are the deadlock's own shape and neither is decoration:
