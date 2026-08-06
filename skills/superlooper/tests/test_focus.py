@@ -136,6 +136,25 @@ def test_every_outcome_has_its_own_exit_code_and_only_focused_is_zero():
     assert all(focus_lib.EXIT_CODES[o] != 0 for o in focus_lib.OUTCOMES if o != focus_lib.FOCUSED)
 
 
+def test_a_recorded_window_that_cannot_address_anything_is_an_answer_not_a_traceback(tmp_path):
+    """The doorway RAISES on a handle it cannot address — right for it, wrong to let out of here.
+    `focus_lane` promises a UI four outcomes, and a traceback with rc=1 and no JSON is the exact
+    failure shape this verb exists to replace (verification pass)."""
+    _record(tmp_path, "i339", "w4:p1", "--help")
+    door = FakeDoor()
+    got = focus_lib.focus_lane(tmp_path, "i339", host=session_host.SessionHost(probe=_NoHost()))
+    assert got.outcome == focus_lib.UNKNOWN_LANE
+    assert got.exit_code in focus_lib.EXIT_CODES.values()
+    assert door.sessions == []
+
+
+class _NoHost:
+    """A probe that fails the test loudly if anything reaches the host edge at all."""
+
+    def run(self, argv, timeout=None):
+        raise AssertionError("no host call may be made for an unaddressable handle: %s" % (argv,))
+
+
 def test_the_json_shape_cannot_be_built_contradicting_itself():
     """`focused` is derived from the outcome so the two can never disagree; a free-form `**extra`
     on the serialiser would have handed that contradiction straight back (fresh-agent review)."""

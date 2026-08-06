@@ -1029,6 +1029,12 @@ def test_a_refusal_in_other_words_is_a_host_fault_not_a_missing_window():
     # workspace while being about a client, so a substring search for "workspace" admitted exactly
     # the answers the check was written to reject — and told the owner a live worker had ended.
     "workspace_client_not_found", "no_such_client_in_workspace",
+    # ...and the ones that pin the ANCHORING itself (verification pass): each of these CONTAINS a
+    # whole workspace-gone code, so they pass a `search` and fail a `fullmatch`. Without them the
+    # match could be loosened back to a substring search and the suite would stay green — the
+    # regex was pinned by its own alternatives but not by the way it is applied.
+    "client_workspace_not_found", "no_such_workspace_client", "agent_workspace_not_found",
+    "workspace_not_found_for_client",
 ])
 def test_a_not_found_about_something_that_is_not_the_workspace_is_not_no_window(code):
     """`_GONE_CODES` is generic, and for `exit`/`kill` that is safe — the only subject of

@@ -138,6 +138,13 @@ def _read(path):
     # since the state home is built from it. Every caller here is a sweep, a nudge or a window verb
     # for which an unreadable marker is an ordinary answer, so a raise escaping this function turns
     # a lane with no window into a traceback in whatever shelled the verb.
+    #
+    # This is BROADER than the NUL case, and deliberately so rather than by oversight:
+    # UnicodeDecodeError is a ValueError, so a marker holding invalid UTF-8 now reads as absent too.
+    # Checked at every consumer (verification pass) — the nudge treats an empty handle as
+    # `no_session`, tidy's re-read fails its equality check and refuses to close, and the runner
+    # branches on empty already. All three fail toward doing nothing, which is the direction an
+    # unreadable marker should push.
     try:
         with open(path) as f:
             return f.read().strip()

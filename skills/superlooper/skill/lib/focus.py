@@ -134,9 +134,10 @@ class Result:
 def focus_lane(home, iid, host=None):
     """Bring lane ``iid``'s session window to the front, for the repo whose state home is ``home``.
 
-    Never raises. Every way this can fail — a malformed id, a lane with no recorded window, a host
-    that will not answer — is one of the four outcomes above, because the caller is a UI rendering
-    the answer rather than a runner deciding on it.
+    Never raises, and that is a promise rather than a happy accident — see the ``except`` below.
+    Every way this can fail — a malformed id, a lane with no recorded window, a recorded window
+    that cannot address anything, a host that will not answer — is one of the four outcomes above,
+    because the caller is a UI rendering the answer rather than a runner deciding on it.
 
     ``host`` is injected for the tests; production builds the doorway here so that no caller has to
     know one exists.
@@ -164,6 +165,17 @@ def focus_lane(home, iid, host=None):
                       detail="no session window is recorded for %s — it has not launched, its "
                              "session ended, or `superlooper tidy` closed the window" % iid)
 
-    got = (host if host is not None
-           else session_host.SessionHost(call_seconds=CALL_SECONDS)).focus(session)
+    door = host if host is not None else session_host.SessionHost(call_seconds=CALL_SECONDS)
+    try:
+        got = door.focus(session)
+    except ValueError as e:
+        # The doorway REFUSES a handle it cannot address — today, one that would read as a
+        # command-line flag. That refusal is right where it lives (it is a caller bug, and the
+        # doorway raises on those exactly as `send` does for a missing oracle), but "never raises"
+        # above is a promise to a UI: a traceback with rc=1 and no JSON is the failure shape this
+        # whole verb exists to replace with an answer. So the raise stops HERE and becomes the
+        # bookkeeping outcome it actually is — what is broken is the marker this repo recorded,
+        # not the host, and not the lane's window.
+        return Result(UNKNOWN_LANE, iid, workspace=handle.workspace,
+                      detail="the window recorded for %s cannot address anything: %s" % (iid, e))
     return Result(got.outcome, iid, workspace=session.workspace, detail=got.detail)
