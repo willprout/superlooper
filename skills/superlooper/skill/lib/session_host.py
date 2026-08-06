@@ -1,4 +1,4 @@
-"""The ONE doorway to the session host: spawn / send / state / exit / kill (issue #304).
+"""The ONE doorway to the session host: spawn / send / state / exit / kill / focus (issue #304).
 
 Nothing else in this engine talks to the host. That is what makes a later host swap a bounded
 rewrite behind an unchanged interface — and it is the only way the distrust rules below get
@@ -38,6 +38,11 @@ each is named where it is enforced so a later reader can tell doctrine from para
   ``agent list``. Absence of signal is UNKNOWN, never idle/done (c2), and a host that names an
   agent's pane and then has no runtime behind it is RESTORING (#317) — a positive reading of a
   transient, not a shade of "we could not tell".
+* **focus** — the one verb that changes NOTHING about the fleet (issue #339). It brings an
+  already-existing window to the front so the owner can watch it with his own eyes and type into
+  it; it never spawns, sends, exits or kills, and it is deliberately not a viewer (owner ruling
+  2026-08-05: attach only, no observation stream, no frame copy). It is also the one verb that
+  REPORTS instead of raising — "that lane has no window" is the COMMON answer, not a failure.
 * **exit/kill** — our ordered teardown; the host's verbs are mechanism only. ``exit`` closes a
   FINISHED session's window and refuses anything else (positive allowlist, like ``tidy.closable``).
   ``kill`` is the forceful path and escalates only against a pid THIS read attributed to the
@@ -55,6 +60,14 @@ Two addressing rules the host's own documentation dictates (plan §7):
    is itself a signal. The constraint is ``[a-z][a-z0-9_-]{0,31}``, validated here before any RPC.
    Where an id is unavoidable (process facts want a pane, close wants a workspace) it is resolved
    FRESH from the name at the moment of use — never read back out of the handle.
+   **The exception is a WINDOW, and it is forced rather than chosen** (issue #339). A name
+   addresses an agent on THIS host; it does not say which repo that agent belongs to, and on a
+   multi-repo install two adopted repos both have an ``i310``. Names are cleared when an agent
+   exits, so repo A's finished lane and repo B's live one legitimately carry the same name minutes
+   apart — a name-addressed window verb would then surface the WRONG repo's session.
+   ``exit``/``kill`` already close the RECORDED workspace for a different reason (after the agent
+   has gone there is nothing left to resolve from); ``focus`` addresses it because the recorded
+   handle is per-repo state and the name is not. What that trades away is stated at ``focus``.
 2. **Screen reads are never the evidence path.** Rows that scroll off the agent's alternate screen
    never enter the host's scrollback, so no line count recovers them. The file-based report
    mechanism stays; this module builds no ``agent read`` / ``pane read`` call at all.
@@ -99,10 +112,27 @@ ALIVE, DEAD, UNKNOWN, RESTORING = "alive", "dead", "unknown", "restoring"
 # Nothing in this module branches on them — that is the point (plan §5.2).
 ADVISORY_STATES = ("idle", "working", "blocked", "done", "unknown")
 
+# What one FOCUS attempt found (issue #339). Three words, and keeping them apart is the whole
+# reason this verb reports instead of raising: a caller renders NO_WINDOW as an ordinary fact about
+# a lane ("that session has exited, or tidy already closed it") and HOST_UNREACHABLE as a fault in
+# the machinery. Collapsing them would tell the owner his session is gone every time the host
+# stopped answering — which is the same absence-of-signal-read-as-a-verdict mistake that ALIVE /
+# DEAD / UNKNOWN exists to prevent one screen up.
+FOCUSED, NO_WINDOW, HOST_UNREACHABLE = "focused", "no_window", "host_unreachable"
+
 # The host error codes that mean "I do not have that" — the ONLY answer a teardown may read as
 # proof the workspace went (see _workspace_gone). Its errors are spelled `<thing>_not_found`; the
 # published schema types the envelope but does not enumerate the codes, so this is the assertion.
 _GONE_CODES = re.compile(r"not[_ ]?found|no[_ ]?such|does[_ ]?not[_ ]?exist")
+
+# ...and WHAT the host says it does not have, for the one caller where the subject matters (#339).
+# `_GONE_CODES` is deliberately generic, and for `exit`/`kill` that is safe: the only subject
+# `workspace get` and `workspace close` have IS the workspace, so any not-found from them is about
+# it. `workspace focus` is a verb that can plausibly touch a client or a terminal as well — and a
+# `client_not_found` read as "that lane's window is closed" would tell the owner a LIVE worker had
+# ended. So the focus path asks the narrower question and treats every other not-found as "the host
+# said something we cannot turn into a verdict about this window".
+_WORKSPACE_SUBJECT = re.compile(r"workspace")
 
 # --------------------------------------------------------------------------- the fence (#305)
 # Token auth on the host's control socket, carried as a patch against the pinned release
@@ -391,6 +421,31 @@ class Teardown:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class Focus:
+    """What one focus attempt found — the only RETURNED failure in this module (issue #339).
+
+    Everything else here raises, and for a good reason: a teardown that could not be verified or a
+    delivery that could not be proven is dangerous precisely when a caller forgets to look at it.
+    This verb inverts that because its failures are not dangerous and its commonest answer is not a
+    failure at all. A lane whose session exited has NO WINDOW to raise the front, and the caller
+    this exists for — a button in a local UI — has to render that as the ordinary fact it is rather
+    than as a red error. Raising would force every caller to spell a try/except whose only job is
+    to turn the exception back into the three-way answer below.
+
+    ``outcome`` is the field a caller branches on. ``focused`` is DERIVED from it rather than
+    stored beside it (fresh-agent review): two independent fields for one fact is two fields that
+    can be constructed disagreeing, and the disagreement that matters here — ``focused=True`` with
+    an outcome that says otherwise — is the one a caller would render as a success.
+    """
+    outcome: str
+    detail: str = ""
+
+    @property
+    def focused(self):
+        return self.outcome == FOCUSED
+
+
 # --------------------------------------------------------------------------- the external edges
 
 class Probe:
@@ -550,6 +605,19 @@ def _is_gone(reply):
         return False
     code = (reply.error or "").split(":", 1)[0].strip().lower()
     return bool(_GONE_CODES.search(code))
+
+
+def _workspace_is_gone(reply):
+    """Did the host answer "I do not have that WORKSPACE"? — the focus path's discriminator (#339).
+
+    Both halves are required. ``_is_gone`` first, so silence and unparseable answers stay UNKNOWN
+    exactly as everywhere else. Then the SUBJECT: the host's codes are ``<thing>_not_found``, and a
+    thing that is not the workspace is not an answer about whether this lane still has a window.
+    """
+    if not _is_gone(reply):
+        return False
+    code = (reply.error or "").split(":", 1)[0].strip().lower()
+    return bool(_WORKSPACE_SUBJECT.search(code))
 
 
 def _dig(payload, *path):
@@ -869,7 +937,7 @@ def _speak(socket_path, payload, timeout):
 # needs the host's own path derivations to do that — and every one of them is host machinery, so
 # they live here, behind the same door as the verbs. `lib/fleet.py` reads them from this module and
 # spells none of them itself, which is what keeps the swap bounded: a tmux host replaces these
-# three functions along with the five verbs, and the build-up's logic is untouched.
+# three functions along with the verbs, and the build-up's logic is untouched.
 #
 # Read out of the pinned release's own source (`src/session.rs`: `data_dir_for` /
 # `api_socket_path_for`, `src/config.rs`: `config_dir`), not guessed — a wrong path here produces a
@@ -933,8 +1001,17 @@ def session_socket_path(host_config_dir, session=None):
 # --------------------------------------------------------------------------- the doorway
 
 class SessionHost:
-    """The five verbs. Everything else in this class is private and stays that way — a sixth public
-    verb is how the interface stops being swappable."""
+    """The six verbs. Everything else in this class is private and stays that way — an extra public
+    verb is how the interface stops being swappable, because every one of them is something the
+    NEXT host has to implement before it can replace this one.
+
+    It was five until issue #339, and the sixth arrived through the only door that should ever open
+    one: an owner ruling that a CALLER must not reach the host itself. The dashboard's
+    open-session-window button needed the host binary, the host's token and the repo→lane map to
+    do its own focusing — the exact three things the fence exists to keep out of a caller — so the
+    capability moved here instead. That is the bar for a seventh: not "this would be convenient
+    here", but "a caller would otherwise have to hold the host".
+    """
 
     def __init__(self, probe=None, binary=None, env=None, prompt_timeout_ms=_PROMPT_TIMEOUT_MS,
                  confirm_reads=_CONFIRM_READS, confirm_pause=_CONFIRM_PAUSE,
@@ -1291,6 +1368,84 @@ class SessionHost:
                "; the pid recorded at spawn (%s) is also still alive and this read could not "
                "attribute it to this session, so it was deliberately NOT signalled — %s"
                % (recorded, before.detail) if unattributed else ""))
+
+    # ---- verb 6: focus -----------------------------------------------------------------
+    def focus(self, session):
+        """Bring an already-existing session window to the front. Nothing else, ever (issue #339).
+
+        Read-only in the sense that matters: it changes nothing about the loop, the repo, or any
+        session's work. It creates no window, sends no keystroke, ends nothing. The whole call is
+        one ``workspace focus`` — and ``test_focus_never_spawns_sends_exits_or_kills`` drives it
+        against a host scripted to answer every OTHER verb happily, so a stray call would succeed
+        rather than raise and could not hide.
+
+        **What the owner gets is the real terminal** (ruling, 2026-08-05). The session comes to the
+        front so he can read it with his own eyes and type into it to interject. This verb must
+        never grow a viewer, an observation stream or a non-interactive copy — "read-only"
+        describes its effect on the fleet, never the window.
+
+        **What FOCUSED actually claims**, because it is easy to read as more: the host accepted the
+        request and moved ITS focus to that workspace. A screen shows that only if a client is
+        attached to this session — which is a fact about the machine (``superlooper fleet`` writes
+        the viewer), not about the lane, and asking would need host surface this door deliberately
+        does not have. So this verb promises the host's focus, and says so in those words.
+
+        **It addresses the RECORDED WORKSPACE, not the lane name**, and that inverts rule 1 of the
+        module docstring on purpose. A lane id is unique inside one repo's state home and nowhere
+        else, so on a multi-repo install `agent focus i310` is a coin toss between two repos'
+        sessions. The recorded workspace is per-repo state, which makes the repo boundary
+        structural rather than a check somebody remembers to write.
+
+        WHAT THAT TRADES AWAY, stated rather than hidden (fresh-agent review). A recorded id can go
+        stale in ways a freshly-resolved name cannot, and neither failure is free:
+
+        * **The owner rearranges his window.** A pane dragged out of this workspace takes the
+          session with it, and what is left behind is a workspace that is empty or gone. So the
+          honest answer becomes "the host no longer has that workspace" — which is why the
+          NO_WINDOW text below names a rearranged window alongside a finished session instead of
+          asserting the session ended. This is the dragged-anchor class arriving through the
+          exception to the rule that exists because of it, and it is admitted rather than denied.
+        * **A marker that outlives its window.** The loop clears these markers when it closes a
+          window, but not on every path (``tidy --all`` deliberately leaves a re-approvable lane's
+          markers for the runner to reconcile). If the host later mints the SAME workspace id for
+          somebody else, a stale marker addresses a stranger's window — and this is the verb whose
+          whole point is that the owner then types into it. The repo boundary is structural; "this
+          workspace is still the one we recorded it for" is NOT checked here, and closing it needs
+          an identity the host can vouch for — issue #389, not a silent assumption.
+
+        ``ValueError`` — never a ``Focus`` — for a handle that cannot address a window (a bare
+        name, ``None``, a ``Session`` with no workspace). That is a caller bug, exactly like
+        ``send``'s missing oracle, and answering it with a tidy-looking NO_WINDOW would report "the
+        owner's session is gone" about a lane nobody actually asked the host about. A lane whose
+        window is genuinely gone never reaches here: ``lib/focus`` reads the recorded handle first
+        and answers NO_WINDOW without a call.
+        """
+        if not isinstance(session, Session) or not session.workspace:
+            raise ValueError(
+                "focus needs the recorded window handle (a Session carrying a workspace id); %r "
+                "cannot address a window. A lane NAME is deliberately not accepted: it is unique "
+                "inside one repo's state home and nowhere else, so on a multi-repo host it names "
+                "no single window." % (session,))
+        reply = self._call(["workspace", "focus", session.workspace])
+        if reply.ok:
+            return Focus(FOCUSED,
+                         "the host moved its focus to workspace %s (an attached viewer follows it)"
+                         % session.workspace)
+        if _workspace_is_gone(reply):
+            # The host SPOKE and said it does not have THIS WORKSPACE. `_workspace_is_gone` is what
+            # keeps this branch honest twice over: a timeout or a missing binary cannot reach it
+            # (c2), and neither can a not-found about some other thing.
+            return Focus(NO_WINDOW,
+                         "the host no longer has workspace %s — that lane has no window to raise "
+                         "(its session's window was closed, or it was rearranged out of the "
+                         "workspace the loop recorded): %s" % (session.workspace, reply.error))
+        # Everything else: a wedged host, a missing binary, garbage, or a refusal in words we
+        # cannot read as a verdict about the window (the fence answers a tokenless caller
+        # `unauthorized`, which says nothing about whether the window exists). Fail toward "we
+        # could not be told", never toward "your session is gone".
+        return Focus(HOST_UNREACHABLE,
+                     "could not ask the host to focus workspace %s (rc=%s%s)"
+                     % (session.workspace, reply.rc, "; " + reply.error if reply.error else ""))
 
     # ---- private -----------------------------------------------------------------------
     def _pane_env(self, name, env):

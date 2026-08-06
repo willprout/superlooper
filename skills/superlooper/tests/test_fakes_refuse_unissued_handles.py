@@ -130,6 +130,16 @@ def test_the_host_refuses_to_close_a_workspace_it_never_created(tmp_path):
     assert not (tmp_path / "closed.jsonl").exists()
 
 
+def test_the_host_refuses_to_focus_a_workspace_it_never_created(tmp_path):
+    """Issue #339's cross-repo guarantee, checked at the harness end. `focus-session` proves a lane
+    id from repo A cannot reach repo B's window; that proof is worth nothing if the stand-in host
+    focuses whatever it is handed."""
+    r = _host(tmp_path, "workspace", "focus", "w404")
+    assert r.returncode != 0
+    assert json.loads(r.stdout)["error"]["code"] == "workspace_not_found"
+    assert not (tmp_path / "focused.jsonl").exists()
+
+
 def test_the_host_still_serves_the_ids_it_did_issue(tmp_path):
     ws = _issue_workspace(tmp_path)
     assert _host(tmp_path, "agent", "start", "i7", "--kind", "claude",

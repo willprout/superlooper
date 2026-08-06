@@ -305,6 +305,18 @@ def main():
             fail("workspace_not_found", "no such workspace")
         emit({"type": "workspace", "workspace": {"workspace_id": ws}})
 
+    if (group, verb) == ("workspace", "focus"):
+        # The read-only window verb (issue #339): bring an existing window to the front and change
+        # nothing. It REFUSES a workspace this fake never issued, for a sharper reason than `close`
+        # does — the whole cross-repo guarantee is that a lane id from one repo can only reach a
+        # window that repo itself recorded, and a fake that focused anything would let a focus
+        # aimed at another repo's id look exactly like one that worked.
+        ws = rest[0] if rest else ""
+        if not os.path.exists(state("live.%s" % ws)):
+            fail("workspace_not_found", "no workspace %r exists on this host" % ws)
+        log("focused.jsonl", {"workspace": ws})
+        emit({"type": "workspace_info", "workspace": {"workspace_id": ws, "focused": True}})
+
     fail("unsupported", "fake-sessionhost: %s %s" % (group, verb))
 
 

@@ -23,6 +23,13 @@
   tidy            close the session windows of FINISHED sessions (merged by default; --all extends
                   to parked/needs-william/bounced) — manual, never automatic; never touches an
                   in-flight or mid-gate lane, so it is safe to run while the runner is live
+  focus-session   bring ONE lane's session window to the front so you can watch it — and type into
+                  it — with your own eyes (issue #339). Read-only about the FLEET: it never spawns,
+                  sends, exits or kills, and it is not a viewer (the window it surfaces is the real
+                  interactive terminal). Four outcomes, all reportable: focused / no_window (the
+                  session ended or tidy closed it — an ordinary answer, not a failure) /
+                  host_unreachable / unknown_lane. A local ops UI shells this instead of reaching
+                  the session host itself
   janitor         propose GitHub-side cleanup (stale merged/superseded sl/* branches, open
                   `superseded` PRs, aged parked/needs-william issues, and issues closed as
                   COMPLETED by a bare commit keyword with no merged PR behind them — issue #229)
@@ -74,6 +81,7 @@ import actions as actions_lib
 import closures
 import config as config_lib
 import doc_lint
+import focus as focus_lib
 import gate
 import gh
 import gitops
@@ -3552,6 +3560,68 @@ def cmd_resume(args):
     return refuse(error, session_id=session_id)
 
 
+# ------------------------------- focus-session -------------------------------
+# `superlooper focus-session --repo <path> --id i<N>` brings that lane's session window to the
+# front. It is the ENGINE's door onto a capability a caller must not hold itself (issue #339, on
+# the owner's #310 ruling): the dashboard's open-session-window button rides this verb, and the
+# dashboard never names the session host. Reaching the host from a caller would take the binary,
+# the control-socket token (#305) and the repo→lane map — the three things
+# tests/test_one_session_host_door.py exists to keep in one place.
+#
+# The decision core is lib/focus (the id→window resolution and the four outcomes); everything here
+# is the command line around it: which repo, and how the answer is printed.
+
+def _emit_focus(args, result, repo=None):
+    """One JSON object for a UI, or one honest line for a person.
+
+    The split between stdout and stderr is the whole rendering contract in miniature: `no_window`
+    prints on STDOUT beside a success, because "that session's window is closed" is an ordinary
+    fact about a lane and not a fault. Only a machinery problem — a host that would not answer, a
+    repo or id we do not know — goes to stderr.
+    """
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(result.as_dict(repo=repo)) + "\n")
+        return
+    if result.outcome == focus_lib.FOCUSED:
+        # "the host moved its focus", not "it is on your screen": a screen shows it only where a
+        # viewer is attached to the session, which is a fact about the machine rather than the lane
+        # (fresh-agent review). Over-claiming here is what would send the owner looking for a
+        # window on a fleet host nobody is watching.
+        sys.stdout.write("%s: the session host moved its focus to that window (%s).\n"
+                         % (result.id, result.workspace))
+    elif result.outcome == focus_lib.NO_WINDOW:
+        sys.stdout.write("%s: nothing to focus — %s\n" % (result.id, result.detail))
+    else:
+        sys.stderr.write("%s\n" % result.detail)
+
+
+def cmd_focus_session(args):
+    """Bring lane <id>'s session window to the front, and change nothing else anywhere.
+
+    The exit code names the outcome (lib/focus.EXIT_CODES): 0 focused, 2 unknown repo/id, 3 no
+    window, 4 the host could not be reached. A caller that can parse JSON should branch on the
+    `outcome` field instead — the codes exist so a shell script does not have to.
+    """
+    try:
+        cfg = _load_config(args.repo)
+        home = str(config_lib.state_home(cfg))
+    except (OSError, ValueError, KeyError) as e:
+        # "That repo is not one we know" — the same class of answer as an unrecognised lane id, and
+        # deliberately NOT a traceback: the caller is a UI, and an unadopted directory is a thing an
+        # owner can point one at by accident. OSError rather than FileNotFoundError because an
+        # unreadable config (a permission bit, a state home on a volume that went away) is the same
+        # answer to a caller as an absent one. Deliberately NOT AttributeError, which here would
+        # only ever be one of THIS engine's own bugs wearing a repo's costume (fresh-agent review).
+        result = focus_lib.Result(focus_lib.UNKNOWN_LANE, (getattr(args, "id", "") or "").strip(),
+                                  detail="no loop state for %s: %s" % (args.repo, e))
+        _emit_focus(args, result)
+        return result.exit_code
+
+    result = focus_lib.focus_lane(home, getattr(args, "id", ""))
+    _emit_focus(args, result, repo=cfg.get("repo"))
+    return result.exit_code
+
+
 # ------------------------------- stubs -------------------------------
 
 def _stub(which, wave):
@@ -3567,8 +3637,12 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    def add(name, fn, **extra):
-        p = sub.add_parser(name)
+    def add(name, fn, description=None, **extra):
+        # `description` is what `superlooper <verb> --help` prints above the flags. Optional and
+        # None by default, so the verbs that carry their paragraph in the module docstring above
+        # are unchanged.
+        p = sub.add_parser(name, description=description,
+                           formatter_class=argparse.RawDescriptionHelpFormatter)
         p.add_argument("--repo", default=os.getcwd(),
                        help="target repo working copy (default: cwd)")
         for flag, kw in extra.items():
@@ -3624,6 +3698,36 @@ def main(argv=None):
            "--yes": dict(action="store_true", help="skip the y/N confirmation"),
            "--dry-run": dict(action="store_true",
                              help="list the windows tidy would close, then close nothing")})
+    add("focus-session", cmd_focus_session,
+        description=(
+            "Bring ONE lane's session window to the front — the real, live, interactive terminal,\n"
+            "so you can watch it and type into it. It is read-only about the FLEET: it never\n"
+            "spawns, sends to, exits or kills a session, and it is not a viewer.\n"
+            "\n"
+            "The lane id selects a window recorded for THIS repo and no other, so an i<N> from one\n"
+            "repo can never focus another repo's session.\n"
+            "\n"
+            "`focused` means the HOST moved its focus to that window; a screen shows it wherever a\n"
+            "viewer is attached to the session (see `superlooper fleet`).\n"
+            "\n"
+            "Outcomes (the `outcome` field with --json; the exit code otherwise):\n"
+            "  focused           0  the host brought that window to the front\n"
+            "  no_window         3  that lane has no window to raise — its window was closed, or\n"
+            "                       it never opened one. An ordinary answer: render it as a fact\n"
+            "                       about the lane, never as a failure\n"
+            "  host_unreachable  4  the session host could not be reached, or answered in words\n"
+            "                       that say nothing about the window (never read as 'the\n"
+            "                       session is gone')\n"
+            "  unknown_lane      5  that repo is not one we know, or that is not a lane id\n"
+            "\n"
+            "2 is left to argparse (a usage error, and what an engine too old for this verb exits\n"
+            "with) so it can never be mistaken for one of the four above."),
+        **{"--id": dict(default=None, metavar="i<N>",
+                        help="the lane whose window to raise: i<N> (an issue worker) or d<N> "
+                             "(a debugger session)"),
+           "--json": dict(action="store_true",
+                          help="emit a single JSON object (for a UI over the loop to parse) — "
+                               "branch on its `outcome` field, which carries all four answers")})
     add("request-restart", cmd_request_restart,
         **{"--check": dict(action="store_true",
                            help="report whether a live runner exists and write nothing "
