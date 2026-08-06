@@ -36,7 +36,7 @@ def _view(now=T0, **over):
     """A HEALTHY instance at `now`: fresh heartbeat, no ALERT, quiet queue."""
     v = {"heartbeat": now - 15, "alert": None, "lanes_busy": False, "gh_ok": True,
          "eligible_nums": [], "usage_exhausted": False, "kill_switch": False,
-         "debugger_live": False}
+         "debugger_live": False, "stopped_by_owner": False, "runner_live": False}
     v.update(over)
     return v
 
@@ -842,3 +842,32 @@ def test_a_stop_drops_the_no_progress_clocks_rather_than_freezing_them():
     st["no_progress_since"] = {"7": T0 - 8 * 60 * MIN}
     r = _run(T0, _dead(T0, stopped_by_owner=True), st)
     assert r["state"]["no_progress_since"] == {}
+
+
+def test_a_stop_stands_an_open_episode_down_instead_of_freezing_its_grace():
+    # A wedge trips at 22:00, the owner stops the loop at 22:05, and starts it again at 08:00. The
+    # reborn runner has not stamped a tick, so the heartbeat still reads stale — and a CARRIED
+    # episode is ten hours past its grace, so the very first check hires an unattended debugger
+    # against a runner twenty seconds old. That is this issue's own failure, moved to the far end
+    # of the stop. Standing the episode down means a surviving signal opens a FRESH one, with a
+    # fresh grace and one honest notify.
+    st = _open_episode(T0)
+    stopped = _run(T0 + 5 * MIN, _dead(T0 + 5 * MIN, stopped_by_owner=True), st)
+    assert stopped["state"]["episode"] is None
+    assert "stand_down" in _outcomes(stopped)
+    back = _run(T0 + 600 * MIN, _view(T0 + 600 * MIN, heartbeat=T0 + 579 * MIN,
+                                      runner_live=True), stopped["state"])
+    assert back["launch"] is None, "no debugger on the first check after a start"
+    assert back["state"]["episode"] is not None                   # a fresh episode, fresh grace
+    assert back["state"]["episode"]["opened_at"] == T0 + 600 * MIN
+
+
+def test_the_two_off_switches_never_swallow_each_others_first_record():
+    # Separate dedup fields exist so a night that flips between them journals both. Each branch has
+    # to RE-ARM the other's, or the second state is recorded once and never again.
+    off = _run(T0, _dead(T0, kill_switch=True))
+    assert _outcomes(off) == ["disabled"]
+    stopped = _run(T0 + 5 * MIN, _dead(T0 + 5 * MIN, stopped_by_owner=True), off["state"])
+    assert _outcomes(stopped) == ["runner_stopped"]
+    off_again = _run(T0 + 10 * MIN, _dead(T0 + 10 * MIN, kill_switch=True), stopped["state"])
+    assert _outcomes(off_again) == ["disabled"], "the kill switch's record was swallowed"

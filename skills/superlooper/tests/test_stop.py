@@ -425,8 +425,13 @@ def test_a_failed_stop_says_the_loop_keeps_going_rather_than_reassuring(rig):
                                    'esac\nexit 0\n')
     r = cli(rig, "stop")
     assert r.returncode != 0
-    assert "will not resurrect" not in r.stdout, "a failed stop must not promise the watchdog is off"
-    assert "still" in r.stdout.lower()
+    out = r.stdout + r.stderr
+    assert "STOP INCOMPLETE" in out, out
+    # It must not promise the guardians are off (they are not, over a live runner) AND it must say
+    # the record outlives the failure — a stop that "failed" still stands the watchdog down the
+    # moment this runner does go away, including by crashing.
+    assert "still watched" in out, out
+    assert "superlooper start` withdraws it" in out, out
 
 
 def test_a_bootout_the_service_confirms_took_is_a_stop_whatever_the_rc_said(rig):
@@ -453,11 +458,13 @@ def test_stop_refuses_to_signal_a_pid_the_runner_does_not_claim(rig):
     pid = rig.spawn()
     (rig.home / "state" / "runner.home.json").unlink()          # a crashed runner's leftovers
     r = cli(rig, "stop", "--json")
-    assert r.returncode == 0, r.stdout + r.stderr
     doc = json.loads(r.stdout)
     assert doc["process_gone"] is False
     assert "does not claim" in (doc.get("signal_refused") or ""), doc
     assert not _dead(pid, deadline=2), "the unverified process must be left alone"
+    # And it is a FAILED stop, not a quiet one: in the pane home the signal is the whole take-down,
+    # so `ok: true` here would tell the button wired to this verb that the loop is off.
+    assert r.returncode != 0 and doc["ok"] is False
 
 
 def test_stop_signals_the_pid_the_runner_does_claim(rig):
@@ -499,3 +506,67 @@ def test_a_start_that_comes_up_with_nothing_running_is_a_failure(rig):
     doc = json.loads(r.stdout)
     assert doc["ok"] is False and doc["pid"] is None
     assert marker(rig) is not None
+
+
+def test_a_bootout_still_in_flight_is_not_called_a_failed_stop(rig):
+    # `bootout` BLOCKS until the service is torn down, and the runner only exits between ticks — so
+    # a stop issued mid-merge, or a second stop while the first is still tearing down, gets
+    # launchd's "operation now in progress". Calling that a failed stop tells the owner launchd can
+    # restart their loop, when launchd is in the middle of removing it.
+    write_config(rig, runner_home="login-item")
+    _script(rig.tmp / "launchctl", '#!/bin/sh\necho "$@" >> "$LAUNCHCTL_LOG"\n'
+                                   'case "$1" in\n'
+                                   '  managername) echo Aqua ;;\n'
+                                   '  bootout) exit 36 ;;\n'
+                                   '  print) printf "\\tpid = 4242\\n\\tstate = running\\n" ;;\n'
+                                   'esac\nexit 0\n')
+    r = cli(rig, "stop", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["ok"] is True and doc["held"] is True
+    assert doc["job_state"] == "tearing_down", doc
+
+
+def test_a_domain_that_cannot_be_read_is_never_reported_as_a_booted_out_job(rig):
+    # `launchctl print` exits 113 both for "no such service" — the fact we want — and for "could not
+    # find domain", which is what a run from outside the Aqua session gets and which says nothing
+    # about the service. Reading the second as the first tells an owner going to bed that their
+    # loop is off because we could not reach launchd.
+    write_config(rig, runner_home="login-item")
+    _script(rig.tmp / "launchctl", '#!/bin/sh\necho "$@" >> "$LAUNCHCTL_LOG"\n'
+                                   'case "$1" in\n'
+                                   '  managername) echo Aqua ;;\n'
+                                   'esac\n'
+                                   'echo "Could not find domain for gui/501" >&2\nexit 113\n')
+    r = cli(rig, "stop", "--json")
+    doc = json.loads(r.stdout)
+    assert doc["job_state"] != "gone", doc
+    assert "booted out" not in r.stdout
+
+
+def test_a_stop_that_attempted_nothing_takes_its_marker_back(rig):
+    # A garbled `repo` means the job cannot even be addressed. Leaving the record on disk would
+    # stand the watchdog down the next time this loop dies for real, over a stop that never
+    # reached it.
+    write_config(rig, runner_home="login-item", repo="not-a-slug")
+    r = cli(rig, "stop")
+    assert r.returncode != 0
+    assert marker(rig) is None, "nothing was attempted, so nothing should be recorded"
+
+
+def test_start_reports_started_separately_from_ok(rig):
+    # The pane home succeeds at everything it can do while starting nothing; a button keyed on `ok`
+    # would claim the loop is back.
+    cli(rig, "stop")
+    doc = json.loads(cli(rig, "start", "--json").stdout)
+    assert doc["ok"] is True and doc["started"] is False, doc
+
+
+def test_a_start_journals_the_landing_once_not_twice(rig):
+    write_config(rig, runner_home="login-item")
+    (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
+    cli(rig, "stop")
+    cli(rig, "start")
+    starts = [json.loads(l) for l in (rig.home / "journal.jsonl").read_text().splitlines()
+              if l.strip() and json.loads(l).get("outcome") == "started"]
+    assert len(starts) == 1, starts

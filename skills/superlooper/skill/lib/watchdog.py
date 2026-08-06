@@ -467,10 +467,14 @@ def evaluate(now, config, view, state):
         # distinct observation, never one per check.
         # runner_down stays False here: the kill switch suppresses the whole resurrection path, so
         # the caller's summary reports DISABLED (what it observed), never a cap it never evaluated.
+        # stopped_observed is re-armed here (and disabled_observed on the stopped branch below):
+        # the two dedups must not inherit each other's "already said that", or a night that flips
+        # between the switches journals the second state only once, ever.
         if sigs == state.get("disabled_observed"):
-            return {"state": state, "notify": [], "launch": None, "journal": [], "resurrect": None,
-                    "runner_down": False}
-        return {"state": dict(state, disabled_observed=sigs), "notify": [], "launch": None,
+            return {"state": dict(state, stopped_observed=None), "notify": [], "launch": None,
+                    "journal": [], "resurrect": None, "runner_down": False}
+        return {"state": dict(state, disabled_observed=sigs, stopped_observed=None),
+                "notify": [], "launch": None,
                 "journal": [_rec("disabled", sigs)], "resurrect": None, "runner_down": False}
 
     if view.get("stopped_by_owner") and not view.get("runner_live"):
@@ -491,16 +495,24 @@ def evaluate(now, config, view, state):
         #
         # runner_down stays False for the same reason it does under the kill switch: the caller's
         # summary reports what it observed ("stopped by owner"), never an incident it did not have.
-        # No episode opens or closes, so a signal that was genuinely open before the stop is still
-        # open when the runner comes back — but the no-progress CLOCKS are dropped. They are frozen
-        # (not advanced) while the heartbeat is stale, so keeping them would hand the first healthy
-        # check after a start a clock reading "waiting since last night" and trip an immediate
-        # no_progress text about work that was waiting because the owner turned the loop off.
+        #
+        # An open EPISODE and the no-progress CLOCKS are both DROPPED, and both for one reason: they
+        # measure elapsed time against a grace that keeps running while the loop is off. Carried
+        # across an overnight stop, an episode opened at 22:00 is ten hours past its grace by the
+        # time the owner starts the loop at 08:00 — so the first check after the start hires an
+        # unattended debugger against a runner that has been alive twenty seconds and has not yet
+        # stamped its first heartbeat. That is this issue's own failure moved to the far end of the
+        # stop. A signal that genuinely survives the stop re-trips on its own and opens a FRESH
+        # episode with a fresh grace and one honest notify, which is the behaviour the grace exists
+        # to produce. The stand-down is journaled, so the record still says the episode ended here.
+        journal = ([_rec("stand_down", state["episode"].get("signals") or [])]
+                   if state.get("episode") is not None else [])
+        rested = dict(state, episode=None, no_progress_since={}, disabled_observed=None)
         if sigs == state.get("stopped_observed"):
-            return {"state": dict(state, no_progress_since={}), "notify": [], "launch": None,
-                    "journal": [], "resurrect": None, "runner_down": False}
-        return {"state": dict(state, stopped_observed=sigs, no_progress_since={}), "notify": [],
-                "launch": None, "journal": [_rec("runner_stopped", sigs)], "resurrect": None,
+            return {"state": rested, "notify": [], "launch": None, "journal": journal,
+                    "resurrect": None, "runner_down": False}
+        return {"state": dict(rested, stopped_observed=sigs), "notify": [], "launch": None,
+                "journal": journal + [_rec("runner_stopped", sigs)], "resurrect": None,
                 "runner_down": False}
 
     new_state = dict(state, no_progress_since=since, disabled_observed=None,
