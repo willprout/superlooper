@@ -627,7 +627,66 @@ def _auth_reads(rig):
     return path.read_text().splitlines() if path.exists() else []
 
 
-def test_the_assigned_config_dir_survives_the_whole_spawn_unchanged(rig):
+@pytest.fixture
+def fleet_dir():
+    """The assigned config dir, PROVISIONED — which is what a real one is (an interactive login
+    creates it, #313).
+
+    It has to exist on disk now (issue #345): pre-trust writes the worktree's trust record into the
+    file the assigned dir holds, and it REFUSES a dir nobody provisioned rather than creating one —
+    a session launched into a config dir that does not exist runs first-run and parks at the theme
+    picker, which no trust key can close, so pretrust cannot deliver its guarantee there and says so
+    instead. An absolute constant rather than a tmp_path because one case asserts this exact string
+    survives three processes byte for byte.
+    """
+    os.makedirs(_E2E_FLEET_DIR, exist_ok=True)
+    yield _E2E_FLEET_DIR
+    shutil.rmtree(_E2E_FLEET_DIR, ignore_errors=True)
+
+
+def _fleet_trusted(fleet_dir):
+    """The folders the ASSIGNED config dir records as trusted — [] if it has no config file."""
+    path = os.path.join(fleet_dir, ".claude.json")
+    if not os.path.exists(path):
+        return []
+    import json as _json
+    with open(path) as f:
+        data = _json.load(f)
+    return sorted(k for k, v in (data.get("projects") or {}).items()
+                  if v.get("hasTrustDialogAccepted") is True)
+
+
+def test_a_fleet_launch_pretrusts_the_worktree_in_the_file_its_own_session_will_read(rig, fleet_dir):
+    """Issue #345, driven through the real launcher process rather than asserted about its argv.
+
+    #311 measured the record going to the operator's DEFAULT config while the worker read a
+    per-worker one — a pre-trust that exists and does nothing, on EVERY launch, because every issue
+    gets a fresh worktree. Only an end-to-end drive shows the two halves at once: which file the
+    pre-flight wrote, and which config dir the agent that started in that worktree was handed.
+    """
+    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": fleet_dir,
+                                "STUB_CLAUDE_LOGGED_IN_DIR": fleet_dir})
+    assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
+    worktree = os.path.realpath(os.path.join(str(rig["run_root"]), "worktrees", "i1"))
+    assert _fleet_trusted(fleet_dir) == [worktree]
+    # ...and the operator's own store was not the one edited. (HOME here is the rig's isolated one,
+    # which is exactly the file the pre-#345 step would have written.)
+    assert not os.path.exists(os.path.join(str(rig["home"]), ".claude.json"))
+    # The two halves meet: the agent really did start under the config dir that now holds the
+    # record. Same dir, same string, one launch.
+    assert _wait_for(rig["stub"] / "claude_env"), (rig["stub"] / "pane.log").read_text()
+    assert ("CLAUDE_CONFIG_DIR=" + fleet_dir + "\n") in (rig["stub"] / "claude_env").read_text()
+
+
+def test_a_machine_with_no_assignment_still_pretrusts_the_operators_own_store(rig):
+    """The unchanged path, end to end: no assignment means the default file, exactly as before."""
+    r = _launch(rig)
+    assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
+    worktree = os.path.realpath(os.path.join(str(rig["run_root"]), "worktrees", "i1"))
+    assert _fleet_trusted(str(rig["home"])) == [worktree]
+
+
+def test_the_assigned_config_dir_survives_the_whole_spawn_unchanged(rig, fleet_dir):
     r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR,
                                 "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR})
     assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
@@ -646,7 +705,8 @@ def test_the_assigned_config_dir_survives_the_whole_spawn_unchanged(rig):
     assert ("i1=" + _E2E_FLEET_DIR) in reads
 
 
-def test_a_non_canonical_assignment_is_canonicalised_before_anything_downstream_sees_it(rig):
+def test_a_non_canonical_assignment_is_canonicalised_before_anything_downstream_sees_it(
+        rig, fleet_dir):
     r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR + "/",
                                 "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR})
     assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
@@ -655,7 +715,7 @@ def test_a_non_canonical_assignment_is_canonicalised_before_anything_downstream_
     assert ("CLAUDE_CONFIG_DIR=" + _E2E_FLEET_DIR + "\n") in (rig["stub"] / "claude_env").read_text()
 
 
-def test_an_account_that_is_right_here_and_wrong_in_the_session_refuses_the_flight(rig):
+def test_an_account_that_is_right_here_and_wrong_in_the_session_refuses_the_flight(rig, fleet_dir):
     """The asymmetry only an end-to-end drive can produce, and the exact shape the contract exists
     for: the launcher's own read is healthy, and the SESSION's is a different account. A launcher
     that checked only itself would have flown this."""
@@ -668,7 +728,7 @@ def test_an_account_that_is_right_here_and_wrong_in_the_session_refuses_the_flig
     assert not (rig["stub"] / "claude_env").exists(), "the agent must never have started"
 
 
-def test_a_credential_redirect_the_pane_shell_injects_refuses_the_flight(rig):
+def test_a_credential_redirect_the_pane_shell_injects_refuses_the_flight(rig, fleet_dir):
     """#300 landmine 2 entering exactly where the realized API key entered — the pane's own shell
     startup, after the launcher is gone. Set-but-EMPTY collapses the credential namespace back to
     the owner's unsuffixed default, so this session would have spent the owner's subscription with

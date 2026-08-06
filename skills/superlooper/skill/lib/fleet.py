@@ -30,7 +30,6 @@ the machine's existing sessions exactly where they were, which is what "fresh bu
 untouched production" means mechanically.
 """
 import hashlib
-import json
 import os
 import re
 import time
@@ -872,7 +871,7 @@ def check_identity(probe, fleet_config_dir, claude=None):
         return CheckResult(name, False, problem,
                            "log the fleet dir into its own account in a supervised window (#313); "
                            "a session cannot drive a browser sign-in")
-    if _onboarded(probe.read_text(os.path.join(fleet_config_dir, ".claude.json"))) is not True:
+    if _onboarded(probe.read_text(identity.config_file(fleet_config_dir))) is not True:
         # A FAIL, not a warn (fresh-agent review). This block is a BUILD-UP gate, and an
         # unprovisioned config dir parks the first worker at the theme picker — a screen no auth
         # manifest covers and the host classifies `idle`. #313's own DoD lists provisioning past
@@ -907,19 +906,11 @@ def check_identity(probe, fleet_config_dir, claude=None):
 def _onboarded(text):
     """True / False / None(unreadable) for a config dir's first-run state.
 
-    PARSED, never substring-matched: `"hasCompletedOnboarding":true` and the spaced spelling are
-    the same fact, and a check that recognised only one would warn about a perfectly provisioned
-    dir — the kind of false red that teaches an operator to skim the block.
+    Delegated to `identity.onboarded` (issue #345), which is now also what `doctor --stack` reads:
+    the build-up judge and the machine doctor must not be able to disagree about whether a config
+    dir has finished first-run, and two copies of one parse is exactly how they would.
     """
-    if text is None:
-        return None
-    try:
-        data = json.loads(text)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(data, dict) or "hasCompletedOnboarding" not in data:
-        return None
-    return data.get("hasCompletedOnboarding") is True
+    return identity.onboarded(text)
 
 
 def check_isolation(probe, fleet_prefix, host_config_dir):

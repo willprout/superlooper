@@ -44,7 +44,14 @@ A loop user needs enough local stack for a worker session to launch, work, repor
 - `claude login` - Claude Code must be logged in through the `claude.ai` subscription account used
   for workers, not only through an API key. The login is read from whatever binary the
   `claude binary` block resolved, never from a different `claude` this shell's PATH happens to
-  offer.
+  offer — and **under the config dir a launch would assign** (`SL_FLEET_CLAUDE_CONFIG_DIR`), never
+  under whichever one this shell happens to carry. `claude` keys its credentials on the config-dir
+  string, so on a machine that assigns one, a login read under the operator's default dir is a
+  green line about an account no worker flies on. The block names the dir it measured. When a dir
+  IS assigned it also reports whether that dir has ever finished the first-run flow: being logged
+  in is not being provisioned, and an un-onboarded config dir opens a worker on the theme picker —
+  a screen the launch pre-flight's folder pre-trust cannot close and the session host reports as
+  `idle`. The machine's own default dir is not asked (you are running the doctor under it).
 - `gh auth` - GitHub CLI must be authenticated to `github.com` as the account that owns the loop
   repo and can read issues, PRs, labels, checks, and rate limits.
 - `gh API headroom` - the active GitHub token needs hourly core API quota left. The stack doctor
@@ -135,7 +142,11 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   than falling back to PATH — point it at a real binary or unset it), when no claude exists
   anywhere, or when either reading lands on cmux's bundled wrapper. WARNs when the resolution fell
   through to PATH: that binary works and survives a cmux retirement, but nothing pinned it.
-- `claude login`: run `claude auth login` with the subscription account.
+- `claude login`: run `claude auth login` with the subscription account — with
+  `CLAUDE_CONFIG_DIR` exported to the assigned dir when this machine assigns one, so the login
+  lands in the credential namespace workers actually fly on. When the block reports the first-run
+  flow was never accepted, open one interactive `claude` under that config dir and finish it; no
+  pre-flight can close that screen for you.
 - `gh auth`: run `gh auth login --hostname github.com`.
 - `gh API headroom`: wait for the hourly quota reset or switch `gh auth` to an account with enough
   core requests remaining.

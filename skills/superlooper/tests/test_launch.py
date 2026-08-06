@@ -496,6 +496,58 @@ def test_a_machine_that_assigns_no_config_dir_launches_exactly_as_before(tmp_pat
         "an unassigned machine must not pay for a status read it has nothing to compare"
 
 
+def test_pretrust_is_aimed_at_the_file_the_session_it_trusts_for_will_read(tmp_path):
+    """Issue #345, and the whole of it. Trust is keyed PER CONFIG DIR, so a pre-trust written to
+    one file while the session reads another is inert — and every issue gets a fresh worktree, so
+    on a fleet machine that is every launch stopping at a first-run dialog with nobody home.
+
+    The assertion is the identity, not a resemblance: the string handed to pretrust is the SAME
+    string named in the pane, byte for byte, because both come off the one derivation at the seam.
+    """
+    spec = _fleet_spec(tmp_path)
+    result, edges, host = _run(spec, edges=FakeEdges({"auth status": (0, _FLEET_STATUS, "")}))
+    assert result.rc == launch.OK, result.stderr
+    pretrust = [c for c in edges.calls if c and c[0].endswith("pretrust.sh")]
+    assert pretrust, "no pretrust ran"
+    assert pretrust[0][2] == host.spawned[0]["env"]["SL_CLAUDE_CONFIG_DIR"] == _FLEET_DIR
+
+
+def test_the_debugger_path_pretrusts_under_the_same_assigned_dir(tmp_path):
+    """An owner-tap repair on an unvisited repo is exactly the case that would hang, and it runs
+    under the same identity — so it gets the same answer, from the same derivation."""
+    cwd = tmp_path / "patient"
+    cwd.mkdir()
+    spec = _fleet_spec(tmp_path, iid="d12", home=_home(tmp_path, "d12"), cwd=str(cwd))
+    result, edges, _host = _run(spec, edges=FakeEdges({"auth status": (0, _FLEET_STATUS, "")}))
+    assert result.rc == launch.OK, result.stderr
+    pretrust = [c for c in edges.calls if c and c[0].endswith("pretrust.sh")]
+    assert pretrust and pretrust[0][2] == _FLEET_DIR
+
+
+def test_a_non_canonical_spelling_reaches_pretrust_canonicalised_too(tmp_path):
+    """The trust store is a FILE PATH, so a trailing slash costs nothing there — but the pane's
+    credential namespace is a hash of the string, and one derivation feeding both is what keeps
+    the two from ever being asked to agree about two different strings."""
+    spec = _fleet_spec(tmp_path, claude_config_dir=_FLEET_DIR + "//")
+    result, edges, _host = _run(spec, edges=FakeEdges({"auth status": (0, _FLEET_STATUS, "")}))
+    assert result.rc == launch.OK, result.stderr
+    pretrust = [c for c in edges.calls if c and c[0].endswith("pretrust.sh")]
+    assert pretrust and pretrust[0][2] == _FLEET_DIR
+
+
+def test_a_machine_that_assigns_no_config_dir_pretrusts_the_default_store(tmp_path):
+    """The unchanged path, and it is NAMED rather than omitted: pretrust inherits the launcher's
+    own environment, so leaving the argument off would let a stray CLAUDE_CONFIG_DIR in the
+    runner's shell aim the record at a dir this launch is not using — the same bug one directory
+    over. An explicit empty string is the launcher saying 'this machine assigns none'."""
+    spec = _spec(tmp_path)
+    result, edges, host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    pretrust = [c for c in edges.calls if c and c[0].endswith("pretrust.sh")]
+    assert pretrust and pretrust[0][2] == ""
+    assert host.spawned[0]["env"]["SL_CLAUDE_CONFIG_DIR"] == ""
+
+
 def test_an_inherited_identity_variable_is_never_forwarded_into_a_pane(tmp_path):
     """The launcher must not be the one handing over either half of the contract. (The floor
     inside the pane is what PROVES it — the pane's shell sources the operator's rc files after
