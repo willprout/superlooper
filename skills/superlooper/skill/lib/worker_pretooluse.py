@@ -442,8 +442,9 @@ def parse_issue_create(command):
 #
 # ACCEPTED MISSES, stated so they stay conscious choices (the same posture as the pattern-kill
 # matcher's, and pinned in test_pretooluse_hook.py):
-#   * a call behind a quote — `sh -c '…'`, `bash -c "…"`, `eval '…'` — or inside a heredoc body,
-#     where the name never sits at a command position this parser can see;
+#   * a call behind a quote — `sh -c '…'`, `bash -c "…"`, `eval '…'` — where the name never sits at
+#     a command position this parser can see;
+#   * `git push --all` (it is not a force, and every ref it would move still has to fast-forward);
 #   * a hand-rolled `curl` to the statuses endpoint (it needs a token the worker has no handy route
 #     to; `gh` is what a session actually reaches for);
 #   * `git push` with no refspec while the checkout happens to sit ON the dev branch — the command
@@ -456,6 +457,11 @@ def parse_issue_create(command):
 # The brief still instructs against all three hazards — brief.py's `_SHIP_NO_CMD` now says so, and
 # the brief-footer line about never hand-posting a commit status is the documented backstop for
 # exactly these misses, not redundant teaching.
+#
+# ...and one ACCEPTED FALSE DENY, the same safe-direction trade duty 2 already makes: an unquoted
+# newline reads as the separator it is, so a line of a HEREDOC BODY reads as a command position.
+# `cat <<EOF` … `gh pr merge is the gate's job` … `EOF` is refused. Erring toward denying costs the
+# session a rephrase; erring the other way costs a rewritten branch. Pinned in tests either way.
 #
 # ONE POSTURE DIFFERENCE FROM DUTY 3, on purpose. There, a deny was the DANGEROUS direction (refusing
 # a legitimate `gh issue create`), so two calls on one line stand the duty down. Here a deny is the
@@ -511,16 +517,42 @@ def _newline_separated(command):
 
 
 def _split_shell(command):
-    """The command's tokens with unquoted newlines as `;` separators, or None when it cannot be read.
+    """The command's tokens, with unquoted newlines as `;` separators and shell punctuation split
+    off its neighbours, or None when the line cannot be read.
 
-    Kept separate from `_split_command` (duty 3's) so this change cannot move duty 3's verdicts: the
-    newline handling is new, and duty 3's fail-open direction makes its own misses harmless."""
+    `punctuation_chars=True` is the load-bearing half (fresh-agent review, 2026-08-06): plain
+    `shlex.split` leaves UNSPACED punctuation glued to the word before it, so `cd /tmp; gh pr merge`
+    tokenizes as [cd, /tmp;, gh, …] and the `gh` no longer follows a separator. The most ordinary
+    compound lines a worker writes — a leading `cd x;` and a trailing `; echo ok` — walked straight
+    past every command-position check. With it, `;`, `&&`, `||`, `|`, `&`, `(`, `)` and the redirect
+    operators each become their own token, spaced or not.
+
+    Kept separate from `_split_command` (duty 3's) so neither of these changes can move duty 3's
+    verdicts: its fail-open direction makes its own misses harmless, and re-tokenizing it would be a
+    behavior change this issue does not need."""
     if not isinstance(command, str) or ("gh" not in command and "git" not in command):
         return None
     try:
-        return shlex.split(_newline_separated(command))
+        lexer = shlex.shlex(_newline_separated(command), posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        return list(lexer)
     except ValueError:
         return None
+
+
+# A redirect ends an argument RUN without starting a new command: what follows `>` is a filename,
+# not a refspec. (`_SEPARATORS`, which duty 3 shares, is left alone.)
+_REDIRECTS = frozenset(("<", ">", ">>", "<<", "<<<", ">&", "<&", "&>", "&>>", ">|"))
+_RUN_END = _SEPARATORS | _REDIRECTS
+
+# `gh`'s OWN global options, which sit BEFORE the subcommand — so `gh --repo x pr merge 42` is still
+# `gh pr merge`. Only these three take a value. NOTE the deliberate difference from duty 3, where
+# `--repo` stands the whole duty DOWN: there the question is what CONTRACT an issue is filed under
+# (another repo has its own areas and its own `touches_required`), and holding this repo's rules
+# over someone else's issue would be a verdict on evidence we do not have. Here the question is
+# this SESSION's own conduct — a loop worker forges no status, approves no issue and merges no PR,
+# in this repo or any other — so a `--repo` never buys permission.
+_GH_GLOBAL_WITH_VALUE = frozenset(("--repo", "-R", "--hostname"))
 
 
 def _at_command_position(tokens, i):
@@ -534,8 +566,8 @@ def _at_command_position(tokens, i):
 
 def _invocations(tokens, binary):
     """[(start, end)] — the ARGUMENT run of every `binary` invoked at a command position. `start` is
-    the index of its first argument, `end` the index of the next separator (or the line's end). An
-    absolute or relative path to the binary is seen through."""
+    the index of its first argument, `end` the index of the next separator or redirect (or the
+    line's end). An absolute or relative path to the binary is seen through."""
     out = []
     for i, tok in enumerate(tokens):
         if not (tok == binary or tok.endswith("/" + binary)):
@@ -544,11 +576,27 @@ def _invocations(tokens, binary):
             continue
         end = len(tokens)
         for j in range(i + 1, len(tokens)):
-            if tokens[j] in _SEPARATORS:
+            if tokens[j] in _RUN_END:
                 end = j
                 break
         out.append((i + 1, end))
     return out
+
+
+def _gh_verb_start(tokens, start, end):
+    """The index of a `gh` call's SUBCOMMAND, stepping over gh's own global options. `gh --repo x pr
+    merge` and `gh --hostname h api …` are the same calls as `gh pr merge` and `gh api …`."""
+    i = start
+    while i < end:
+        tok = tokens[i]
+        if tok in _GH_GLOBAL_WITH_VALUE:
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1                           # `--repo=x`, `-Rowner/repo`, `-h`, valueless flags
+            continue
+        return i
+    return end
 
 
 # --------------------------- matcher A: a forged commit status ---------------------------
@@ -574,9 +622,10 @@ _STATUS_REASON = (
 
 def _forged_status_deny(tokens):
     for start, end in _invocations(tokens, "gh"):
-        if start >= end or tokens[start] != "api":
+        verb = _gh_verb_start(tokens, start, end)
+        if verb >= end or tokens[verb] != "api":
             continue
-        if any(_STATUS_WRITE_RE.search(t) for t in tokens[start + 1:end]):
+        if any(_STATUS_WRITE_RE.search(t) for t in tokens[verb + 1:end]):
             return _STATUS_REASON
     return None
 
@@ -645,9 +694,10 @@ def _api_method(tokens, start, end):
 
 def _approval_label_deny(tokens):
     for start, end in _invocations(tokens, "gh"):
-        args = tokens[start:end]
+        verb = _gh_verb_start(tokens, start, end)
+        args = tokens[verb:end]
         if len(args) >= 2 and args[0] in ("issue", "pr") and args[1] in ("create", "edit"):
-            i = start + 2
+            i = verb + 2
             while i < end:
                 for name in _LABEL_ADD_FLAGS:
                     val, nxt = _flag_value(tokens, i, name)
@@ -659,10 +709,10 @@ def _approval_label_deny(tokens):
                 else:
                     i += 1
         elif args and args[0] == "api":
-            if _api_method(tokens, start, end) == "DELETE":
+            if _api_method(tokens, verb, end) == "DELETE":
                 continue                     # a removal, whatever it names
             on_labels, names_one = False, False
-            for tok in tokens[start:end]:
+            for tok in tokens[verb + 1:end]:
                 if _LABELS_ENDPOINT_RE.search(tok):
                     on_labels = True         # the PATH — never scanned for a label name
                     continue
@@ -676,10 +726,16 @@ def _approval_label_deny(tokens):
 
 # --------------------------- matcher C: out-of-band shipping ---------------------------
 
-_PUSH_FORCE_FLAGS = frozenset(("-f", "--force", "--force-with-lease", "--force-if-includes"))
+# `--mirror` carries no `--force` and no refspec, yet it force-updates EVERY ref and deletes the
+# ones this checkout no longer has — a force-push spelled as a mode (fresh-agent review, 2026-08-06).
+_PUSH_FORCE_FLAGS = frozenset(("-f", "--force", "--force-with-lease", "--force-if-includes",
+                               "--mirror"))
 _PUSH_FORCE_PREFIXES = ("--force-with-lease=", "--force-if-includes=")
 # `git push` options that consume the NEXT token, so their values are never read as refspecs.
 _PUSH_VALUE_FLAGS = frozenset(("--repo", "-o", "--push-option", "--receive-pack", "--exec"))
+# A dry run SHIPS NOTHING: it is a read-shaped call, and read-shaped calls pass. Denying one would
+# take away the only safe way a worker has to check what a refspec would do.
+_PUSH_DRY_RUN_FLAGS = frozenset(("--dry-run", "-n"))
 
 _SANCTIONED_PATH = (
     " The sanctioned path is the whole point of the loop and it is short: push your work to THIS "
@@ -760,12 +816,15 @@ def _refspec_dest(refspec):
 
 def _out_of_band_deny(tokens, contract):
     for start, end in _invocations(tokens, "gh"):
-        if tokens[start:start + 2] == ["pr", "merge"]:
+        verb = _gh_verb_start(tokens, start, end)
+        if tokens[verb:verb + 2] == ["pr", "merge"]:
             return _MERGE_REASON
     for start, end in _invocations(tokens, "git"):
         argv = _push_argv(tokens, start, end)
         if argv is None:
             continue
+        if any(a in _PUSH_DRY_RUN_FLAGS for a in argv):
+            continue                         # ships nothing — a read, not a push
         if any(a in _PUSH_FORCE_FLAGS or a.startswith(_PUSH_FORCE_PREFIXES) for a in argv):
             return _FORCE_REASON
         refspecs = _push_refspecs(argv)

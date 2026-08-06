@@ -1115,6 +1115,62 @@ def test_a_quoted_refspec_is_still_an_ordinary_refspec(tmp_path):
     assert _bash("git push origin 'HEAD:main'", tmp_path)
 
 
+# --- fresh-agent review (Codex, 2026-08-06): four reachable holes in the first cut ---
+
+@pytest.mark.parametrize("command", [
+    # P1-1. `gh`'s OWN global options sit BEFORE the subcommand, so `gh --repo x pr merge 42` hid
+    # the verb from every matcher. Unlike duty 3 — where `--repo` stands the duty DOWN because
+    # another repo has another CONTRACT — these three hazards are about this SESSION's conduct, not
+    # the target repo's rules, so a `--repo` never buys permission.
+    "gh --repo willprout/superlooper pr merge 42",
+    "gh -R willprout/superlooper pr merge 42",
+    "gh --repo willprout/superlooper issue edit 42 --add-label agent-ready",
+    "gh -Rwillprout/superlooper pr edit 42 --add-label pre-authorized:referee",
+    "gh --hostname github.com api repos/o/r/statuses/abc -f state=success",
+])
+def test_gh_global_options_do_not_hide_the_subcommand(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path), "a gh global flag must not hide the verb: %r" % command
+
+
+@pytest.mark.parametrize("command", [
+    # P1-2. `shlex.split` leaves UNSPACED punctuation glued to its neighbour (`/tmp;` is one token),
+    # so the trailing-`; echo ok` and leading-`cd /tmp;` shapes — the most ordinary compound lines
+    # a worker writes — walked straight past the command-position check.
+    "cd /tmp; gh pr merge 42",
+    "gh pr merge 42; echo ok",
+    "true; git push origin main",
+    "git push origin main; echo done",
+    "cd /tmp&&gh pr merge 42",
+    "git fetch||git push --force origin sl/x",
+    "(gh pr merge 42)",
+    "gh issue edit 42 --add-label agent-ready; echo ok",
+])
+def test_unspaced_shell_separators_do_not_hide_the_call(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path), "an unspaced separator must not hide the call: %r" % command
+
+
+@pytest.mark.parametrize("command", [
+    # P1-3. A dry run SHIPS NOTHING — it is a read-shaped call, and the module's whole posture is
+    # that read-shaped calls pass. Denying one costs a worker the only safe way to check a refspec.
+    "git push --dry-run origin main",
+    "git push -n origin main",
+    "git push origin main --dry-run",
+    "git push --dry-run --force origin sl/i226-x",
+])
+def test_a_dry_run_push_ships_nothing_and_is_allowed(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path) is None, "a dry run must not be denied: %r" % command
+
+
+def test_a_mirror_push_is_a_force_push(tmp_path):
+    # P1-4. `--mirror` force-updates every ref and deletes the ones you no longer have — a force
+    # push with no `--force` on the line and no refspec to inspect.
+    _worktree(tmp_path)
+    assert _bash("git push --mirror origin", tmp_path)
+
+
 def test_an_exotic_refspec_is_an_accepted_miss(tmp_path):
     # `git push origin HEAD:refs/for/main` (gerrit-style) and a remote spelled as a URL are not
     # resolved. Pinned so a future tightening is a conscious change.
