@@ -1313,6 +1313,41 @@ def test_a_fleet_dir_this_machine_cannot_use_is_named_by_the_login_block_too():
     assert "SL_FLEET_CLAUDE_CONFIG_DIR" in r.fix
 
 
+def test_a_credential_redirect_refuses_the_block_before_it_measures_anything():
+    """#300 landmine 2, and the reason it belongs to THIS block now (cross-review, second pass).
+
+    `CLAUDE_SECURESTORAGE_CONFIG_DIR` OVERRIDES the namespace `CLAUDE_CONFIG_DIR` names — and the
+    binary reads a set-but-EMPTY value as "no config dir", collapsing back to the owner's unsuffixed
+    namespace. Once this block NAMES the dir it measured, an inherited redirect makes that sentence
+    false: the account comes from namespace A while the line (and the onboarding read one step
+    later) says namespace B.
+
+    REFUSED rather than scrubbed. The launch floor refuses an inherited redirect outright, so on a
+    machine that has one every worker refuses itself — a doctor that quietly dropped it for its own
+    read would go green over exactly that.
+    """
+    # BOTH values: the empty one is the classic `export X=$SOMETHING_UNSET` accident and the more
+    # dangerous of the two, and a deliberate value is #300's own escape hatch.
+    for value in ("", "/somebody/elses-dir"):
+        probe = _fleet_probe()
+        probe.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = value
+
+        r = stack_doctor.check_claude(probe)
+
+        assert r.ok is False, value
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in r.detail, value
+        assert not [c for c in probe.calls if c[1:3] == ["auth", "status"]], \
+            "it measured an account under a namespace it could not name (%r)" % value
+
+
+def test_the_redirect_refusal_is_machine_wide_not_fleet_only():
+    # The floor refuses it whether or not a config dir was assigned, so the doctor must too.
+    probe = _healthy_probe()
+    probe.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = ""
+
+    assert stack_doctor.check_claude(probe).ok is False
+
+
 def test_a_logged_out_fleet_dir_still_fails_on_the_login_and_not_on_onboarding():
     # Ordering: which account the dir holds is upstream of whether it finished first-run, and one
     # cause deserves one alarm.

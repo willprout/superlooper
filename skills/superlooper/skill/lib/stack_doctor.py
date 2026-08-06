@@ -548,6 +548,25 @@ def check_claude(probe):
     # dir is a confident statement about a different account. `claude` keys its credentials on the
     # config-dir string, so on a fleet machine this block used to answer for the OWNER's dir while
     # every worker flew on another — a green line about a file nobody launches with.
+    #
+    # The REDIRECT first, because it decides which namespace any read would consult at all — the
+    # ordering `identity.env_problem` uses, and for the same reason: a status taken under a
+    # redirected namespace is a confident measurement of the wrong thing, and this block now NAMES
+    # the dir it measured, so an inherited redirect would make that sentence false (it would also
+    # pair an account from one namespace with an onboarding read from another). REFUSED rather than
+    # scrubbed for our own read: the session floor refuses an inherited redirect outright, so on a
+    # machine that has one every worker refuses itself — a doctor that quietly dropped it for its
+    # own convenience would go green over exactly that. Machine-wide, not fleet-only, because the
+    # floor's refusal is.
+    problem = identity.redirect_problem(probe.env)
+    if problem:
+        # The memo carries the mechanism and the remedy already (it is the same sentence the
+        # session floor refuses with). The fix line adds only what it cannot know from in there:
+        # no account was read at all, and this is not one block's opinion — every worker this
+        # machine launches refuses itself on the same variable.
+        return CheckResult("claude login", False, problem,
+                           "No account was read under it. Every worker launched from this machine "
+                           "refuses itself on the same variable, so remove it and re-run.")
     config_dir, problem = identity.worker_config_dir(probe.env)
     if problem:
         # Every launch on this machine already refuses with rc=8 for this. Saying "auth active"
