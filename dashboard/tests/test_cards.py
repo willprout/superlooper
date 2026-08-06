@@ -17,7 +17,7 @@ import flights
 
 def _flight(**over):
     """A minimal flight object shaped like ``flights.build_flight`` output, overridable per test."""
-    f = {"num": 7, "label": "SL-7", "attempt": 1, "stage": flights.PARKED,
+    f = {"num": 7, "label": "SL-7", "attempt": 1, "go_arounds": 0, "stage": flights.PARKED,
          "circuit_stage": flights.DOWNWIND, "awaiting_reason": None, "wander": False,
          "gate": {"report": False, "review": False, "ci": False, "mergeable": False, "cleared": False},
          "cargo": {"present": False, "added": 0, "removed": 0, "files": 0},
@@ -41,9 +41,11 @@ def test_bounced_flight_is_a_bounced_card():
 
 
 def test_a_decision_that_went_around_is_a_conflict_cap_card():
-    # A flight that was rebuilt after a merge conflict (attempt >= 2) and still landed on William's
-    # desk is the conflict-cap case — the go-around cap was hit (design record §3).
-    assert cards.card_kind(_flight(stage=flights.PARKED, attempt=2)) == "conflict-cap"
+    # A flight that was rebuilt after a merge CONFLICT and still landed on William's desk is the
+    # conflict-cap case — the go-around cap was hit (design record §3). Keyed on the go-around
+    # count, not the attempt: since #177 a re-approval raises the attempt without any collision
+    # (issue #272).
+    assert cards.card_kind(_flight(stage=flights.PARKED, attempt=2, go_arounds=1)) == "conflict-cap"
 
 
 def test_a_durable_question_is_a_question_card():
@@ -104,7 +106,7 @@ def test_bounced_card_explains_the_bounce_in_plain_words():
 
 def test_conflict_cap_card_names_the_collision_and_defaults_to_discuss():
     # The one plain sentence naming the collision, with Discuss highlighted as the default (§8).
-    f = _flight(stage=flights.PARKED, num=16, label="SL-16·A2", attempt=2)
+    f = _flight(stage=flights.PARKED, num=16, label="SL-16·A2", attempt=2, go_arounds=1)
     card = cards.needs_you_card(f, "will-titan/sandbox")
     assert card["kind"] == "conflict-cap"
     assert card["collision"]                                       # a plain sentence, not a bare badge
@@ -122,7 +124,7 @@ def test_non_conflict_cards_have_no_collision_sentence():
 # =============================== the drawer — ground truth one click away ===============================
 
 def test_drawer_carries_the_title_links_and_go_around_counter():
-    f = _flight(num=16, label="SL-16·A2", attempt=2, pr=19, branch="sl/i16-r1",
+    f = _flight(num=16, label="SL-16·A2", attempt=2, go_arounds=1, pr=19, branch="sl/i16-r1",
                 stage=flights.TOUCHDOWN, circuit_stage=flights.TOUCHDOWN)
     d = cards.flight_drawer(f, [], "will-titan/sandbox", "Sandbox Air", title="Make it formal")
     assert d["num"] == 16
@@ -130,7 +132,7 @@ def test_drawer_carries_the_title_links_and_go_around_counter():
     assert d["links"]["issue"].endswith("/will-titan/sandbox/issues/16")
     assert d["links"]["pr"].endswith("/will-titan/sandbox/pull/19")
     assert d["links"]["branch"] == "sl/i16-r1"
-    assert d["go_arounds"] == 1                                    # attempt 2 → one go-around survived
+    assert d["go_arounds"] == 1                                    # one conflict rebuild survived
 
 
 def test_drawer_circuit_rail_marks_the_current_position():
@@ -322,7 +324,7 @@ def test_drawer_decision_metadata_is_server_computed():
 
 def test_drawer_conflict_cap_defaults_to_discuss_in_the_drawer_too():
     # The §8 guard against a blind Approve must hold in the drawer, not only on the card.
-    d = cards.flight_drawer(_flight(stage=flights.PARKED, attempt=2), [], "r", "Air")
+    d = cards.flight_drawer(_flight(stage=flights.PARKED, attempt=2, go_arounds=1), [], "r", "Air")
     assert d["decision"]["kind"] == "conflict-cap"
     assert d["decision"]["discuss_default"] is True
 
@@ -430,7 +432,7 @@ def test_dossier_names_the_gate_checks_the_machine_saw():
 
 
 def test_dossier_counts_the_go_arounds_on_a_conflict_cap():
-    d = cards.decision_dossier(_flight(attempt=3), [])
+    d = cards.decision_dossier(_flight(attempt=3, go_arounds=2), [])
     pairs = {i["label"]: i["value"] for i in d["items"]}
     assert "2" in pairs["rebuilt after conflicts"]
 
@@ -458,7 +460,7 @@ def test_every_action_names_its_consequence():
     for f in (_flight(stage=flights.PARKED),
               _flight(stage=flights.AWAITING, awaiting_reason="bounced"),
               _flight(stage=flights.AWAITING),
-              _flight(stage=flights.PARKED, attempt=2),
+              _flight(stage=flights.PARKED, attempt=2, go_arounds=1),
               _flight(stage=flights.PARKED, pr=555,        # a FINISHED lane (resume + rebuild, #161)
                       gate={"report": True, "review": True, "ci": False,
                             "mergeable": False, "cleared": False})):
@@ -593,7 +595,7 @@ def test_a_bounce_accepts_the_amendment_and_says_so():
 
 def test_conflict_cap_actions_lead_with_discuss():
     # The §8 guard against a blind Approve on a collision: Discuss is the primary tone there.
-    acts = cards.decision_actions(_flight(stage=flights.PARKED, attempt=2))
+    acts = cards.decision_actions(_flight(stage=flights.PARKED, attempt=2, go_arounds=1))
     assert acts[0]["act"] == "discuss" and acts[0]["tone"] == "primary"
     assert [a for a in acts if a["act"] == "approve"][0]["tone"] != "primary"
 
@@ -648,6 +650,91 @@ def test_the_dossier_does_not_echo_an_episode_key_that_only_names_the_act():
     assert {i["label"]: i["value"] for i in d2["items"]}["recorded cause"] == "answerer_escalated"
 
 
+def _rebuild_verbs(flight):
+    """Every verb on this flight whose consequence appends the shared discard blurb."""
+    return [a for a in cards.decision_actions(flight)
+            if a["act"] in ("approve", "bounce-yes", "rebuild") and "discard" in a["consequence"].lower()]
+
+
+def test_the_discard_blurb_names_the_branch_retirement_and_the_superseded_pr():
+    # Issue #272, following the engine's #177: a re-approval no longer rebuilds on the branch the
+    # parked episode was sitting on. It RETIRES that branch and rebuilds on the next unburned
+    # generation, and a PR still open on the retired branch is labeled `superseded`. cards.py's own
+    # rule is that no button may hide what it does — so the sentence that warns about the discard
+    # must name the retirement and the supersede too, not just the worktree/report/counters.
+    for f in (_flight(stage=flights.PARKED),                                    # approve & rebuild
+              _flight(stage=flights.AWAITING, awaiting_reason="bounced"),       # bounce-yes
+              _finished_flight()):                                              # the rebuild verb
+        verbs = _rebuild_verbs(f)
+        assert verbs, "a rebuilding verb must be on offer here"
+        for a in verbs:
+            low = a["consequence"].lower()
+            assert "branch" in low, "the branch retirement is a consequence of the tap — name it"
+            assert "retire" in low
+            assert "superseded" in low, "the PR handed to the superseded lane must be named"
+            # ...and what it already named stays named (the discard is still real).
+            assert "worktree" in low and "report" in low and "counter" in low
+
+
+def test_the_discard_blurb_claims_nothing_the_rotation_made_untrue():
+    # `_retire_old_branch` deletes nothing and closes nothing: whatever the retired branch carries
+    # stays on it, and the superseded PR is left OPEN. A blurb saying the work was deleted, or the
+    # PR closed, would scare the owner off a button that does neither.
+    a = _rebuild_verbs(_flight(stage=flights.PARKED))[0]
+    low = a["consequence"].lower()
+    assert "stays there" in low, "say the retired branch keeps whatever was committed on it"
+    assert "auto-closed" in low
+    # ...and it must not claim the branch reached the REMOTE (fresh-review P2). A branch STAMP is not
+    # a pushed branch: `_exec_launch` stamps the name before the launcher runs, so a lane parked on
+    # the launch-delivery ladder carries a name nothing ever created. The engine makes the vacuous
+    # claim rather than the false one, and so must this.
+    assert "remote" not in low
+    assert "deleted" not in low
+
+
+def test_an_investigations_rebuild_verb_omits_the_supersede_promise():
+    # Fresh-review P2: `_exec_reapprove` skips the branch-retirement bookkeeping entirely when the
+    # issue type is `investigate` — no `superseded` label, no PR note — because an investigation
+    # opens no PR by contract. The rotation still happens, so the retirement clause stays; the
+    # promise the runner will not keep must go. Same `is_investigation` mirror #161 already needs.
+    f = _flight(stage=flights.PARKED, is_investigation=True)
+    a = _rebuild_verbs(f)[0]
+    low = a["consequence"].lower()
+    assert "superseded" not in low, "never promise bookkeeping the engine skips for this type"
+    assert "retired rather than reused" in low, "the rotation itself still happens — keep naming it"
+
+
+def test_a_reapproval_rotation_is_not_a_conflict_cap():
+    # The conflict-cap card says "this kept colliding with work that landed first". Now that a
+    # re-approval raises the attempt too (issue #272), the kind must key on the CONFLICT go-around
+    # count, not on the attempt — otherwise a lane re-approved once and parked again would be told a
+    # collision story that never happened.
+    f = _flight(stage=flights.PARKED, attempt=2, go_arounds=0)
+    assert cards.card_kind(f) == "parked"
+    assert cards.needs_you_card(f, "r/s")["collision"] is None
+    # A real go-around still reads as the conflict cap, whatever the attempt count around it.
+    assert cards.card_kind(_flight(stage=flights.PARKED, attempt=3, go_arounds=1)) == "conflict-cap"
+
+
+def test_the_dossier_go_around_row_counts_conflicts_not_attempts():
+    # "rebuilt after conflicts" must mean conflicts. A re-approved lane has a higher attempt and no
+    # conflict, so the row is absent rather than claiming a collision.
+    d = cards.decision_dossier(_flight(attempt=2, go_arounds=0, memo="m"), [])
+    assert not any("conflict" in (it["label"] or "") for it in d["items"])
+    d2 = cards.decision_dossier(_flight(attempt=3, go_arounds=1, memo="m"), [])
+    assert {it["label"]: it["value"] for it in d2["items"]}["rebuilt after conflicts"] == "1 time"
+
+
+def test_the_go_around_count_is_fail_closed_on_a_malformed_flight():
+    # Same discipline as `_attempt` (issue #162): this layer is pure over an arbitrary dict, and a
+    # malformed count must never blank the owner's inbox — nor EARN a collision story it cannot
+    # prove. Absent/garbage ⇒ no go-arounds.
+    for bad in (None, "1", 1.5, True, float("nan"), -3):
+        f = _flight(stage=flights.PARKED, attempt=2, go_arounds=bad)
+        assert cards.card_kind(f) == "parked"
+        assert cards.flight_drawer(f, [], "r", "Air")["go_arounds"] == 0
+
+
 def test_the_rebuild_consequence_does_not_claim_work_that_may_not_exist():
     # Codex P0: `needs_william` can be raised BEFORE any launch (e.g. a touches_missing park), where
     # there is no worktree and no filed report. The old sentence asserted both existed and would be
@@ -671,7 +758,7 @@ def test_the_dossier_is_fail_closed_on_a_malformed_flight():
         cards.decision_actions(_flight(attempt=bad))
         cards.card_kind(_flight(attempt=bad))
     # a real int still counts honestly
-    assert {i["label"]: i["value"] for i in cards.decision_dossier(_flight(attempt=3), [])["items"]
+    assert {i["label"]: i["value"] for i in cards.decision_dossier(_flight(go_arounds=2), [])["items"]
             }["rebuilt after conflicts"] == "2 times"
 
 

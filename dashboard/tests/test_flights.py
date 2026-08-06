@@ -84,6 +84,111 @@ def test_attempt_number_two_regenerations_is_attempt_three():
     assert flights.attempt_number(journal) == 3
 
 
+# ---- re-approval mints a generation too (issue #272, following the engine's #177) ----
+# #177 made re-approval ROTATE the lane's branch: the rebuild runs on the next unburned
+# generation, the retired branch keeps its commits, and a PR still open on it is labeled
+# `superseded`. Counting `regenerate` alone showed such a lane as attempt 1 while it was sitting
+# on a later generation's branch — the board and the branch telling two different stories.
+
+def test_attempt_number_counts_a_reapproval_that_rotated_the_branch():
+    # The engine journals the rotation on the `reapprove` record itself (old_branch/new_branch).
+    # That rebuild is a new attempt exactly as a conflict-regeneration is — and it puts the attempt
+    # back in step with the `-r1` branch the lane now sits on.
+    journal = [{"act": "launch", "id": "i7"},
+               {"act": "park", "id": "i7"},
+               {"act": "reapprove", "id": "i7",
+                "old_branch": "sl/i7-x", "new_branch": "sl/i7-x-r1"}]
+    assert flights.attempt_number(journal) == 2
+
+
+def test_attempt_number_ignores_a_reapproval_that_rotated_nothing():
+    # A lane parked BEFORE it was ever handed to the launcher has no branch to retire, so
+    # `_exec_reapprove` leaves the stamp alone and journals no branch pair. Nothing was retired,
+    # so nothing was re-attempted: the rebuild is still attempt 1.
+    journal = [{"act": "park", "id": "i7"}, {"act": "reapprove", "id": "i7"}]
+    assert flights.attempt_number(journal) == 1
+
+
+def test_attempt_number_counts_one_reapproval_once_though_the_engine_journals_it_twice():
+    # The executor journals its own detail record AND the tick loop journals the same action with
+    # its outcome, at the same ts. Only the first carries the branch pair; keying on the pair is
+    # what keeps one rotation from reading as two attempts.
+    journal = [{"act": "reapprove", "id": "i7", "old_counters": {"launches": 1},
+                "old_branch": "sl/i7-x", "new_branch": "sl/i7-x-r1"},
+               {"act": "reapprove", "id": "i7", "num": 7, "had_rebuild": True,
+                "outcome": "reapproved (reset {'launches': 1}; rebuilding on sl/i7-x-r1)"}]
+    assert flights.attempt_number(journal) == 2
+
+
+def test_attempt_number_is_not_read_off_the_branch_name():
+    # Both fresh reviews of this change broke the branch reading, so the count comes from the
+    # lane's own rotation RECORDS instead. `-r<N>` is not a reserved namespace: `brief.branch_for`
+    # slugs the ISSUE TITLE into it, so "bump the API to r10" is launched — once, never rebuilt — on
+    # `sl/i7-bump-the-api-to-r10`, and after ONE rebuild sits on `-r11`. Reading the tail as a count
+    # put SL-7·A11 on a lane that flew once, then SL-7·A12 on one rebuilt once; nothing about the
+    # name alone tells a rotation from a slug.
+    launched_once = [{"act": "launch", "id": "i7"}]
+    assert flights.attempt_number(launched_once) == 1                   # on sl/i7-bump-the-api-to-r10
+    rebuilt_once = launched_once + [{"act": "reapprove", "id": "i7",
+                                     "old_branch": "sl/i7-bump-the-api-to-r10",
+                                     "new_branch": "sl/i7-bump-the-api-to-r11"}]
+    assert flights.attempt_number(rebuilt_once) == 2                    # on sl/i7-bump-the-api-to-r11
+
+
+def test_attempt_number_skips_a_wrong_typed_journal_record():
+    # One corrupt line in journal.jsonl must not raise into the poll (the #139 hash-safe discipline)
+    # nor count as a rebuild.
+    journal = [None, "regenerate", 7, [], {"act": "regenerate"}]
+    assert flights.attempt_number(journal) == 2
+    assert flights.go_around_count(journal) == 1
+
+
+def test_go_around_count_is_conflicts_only_never_a_reapproval():
+    # The go-around count keeps its narrow meaning — a CONFLICT regeneration. A re-approval
+    # rotation raises the attempt but is not a collision, and the conflict-cap story is built on
+    # this number, not on the attempt.
+    journal = [{"act": "regenerate"},
+               {"act": "reapprove", "old_branch": "sl/i7-x-r1", "new_branch": "sl/i7-x-r2"}]
+    assert flights.go_around_count(journal) == 1
+    assert flights.go_around_count([{"act": "launch"}]) == 0
+
+
+def test_build_flight_attempt_agrees_with_the_branch_the_lane_is_on():
+    # THE issue #272 acceptance, end to end and generation by generation: walk the lane through the
+    # rotations the engine really performs — base name, conflict to -r1, re-approval to -r2, another
+    # conflict to -r3 — and at every step the attempt on the board is the generation of the branch
+    # underneath it, plus one. Before this, the re-approval step left the board at attempt 2 on an
+    # -r2 branch, and every later step stayed one behind.
+    journal, branch, seen = [], "sl/i7-x", []
+    steps = [(None, "sl/i7-x"),                                        # first launch, base name
+             ("regenerate", "sl/i7-x-r1"),                             # collision
+             ("reapprove", "sl/i7-x-r2"),                              # the owner re-approves
+             ("regenerate", "sl/i7-x-r3")]                             # collision again
+    for act, nxt in steps:
+        if act == "regenerate":
+            journal.append({"act": "regenerate", "id": "i7", "new_branch": nxt})
+        elif act == "reapprove":
+            journal.append({"act": "reapprove", "id": "i7", "old_branch": branch, "new_branch": nxt})
+        branch = nxt
+        f = flights.build_flight({"id": "i7", "num": 7, "status": "ready", "branch": branch,
+                                  "pr": None, "activity_mtime": None, "journal": list(journal)},
+                                 _REPO)
+        generation = int(branch.rsplit("-r", 1)[1]) if "-r" in branch else 0
+        assert f["attempt"] == generation + 1, "attempt %s on %s" % (f["attempt"], branch)
+        seen.append(f["label"])
+    assert seen == ["SL-7", "SL-7·A2", "SL-7·A3", "SL-7·A4"]
+    # ...and only the collisions are counted as collisions — the re-approval is not one.
+    assert f["go_arounds"] == 2
+
+
+def test_build_flight_go_arounds_counts_the_conflict_rebuilds():
+    issue = {"id": "i16", "num": 16, "status": "ready", "branch": "sl/i16-x-r1", "pr": None,
+             "activity_mtime": None,
+             "journal": [{"act": "regenerate", "id": "i16", "conflicts": 1}]}
+    f = flights.build_flight(issue, _REPO)
+    assert f["attempt"] == 2 and f["go_arounds"] == 1
+
+
 def test_flight_label_hides_attempt_one():
     # Attempt 1 is the plain flight number; the ·A marker only appears once a go-around happened.
     assert flights.flight_label(23, 1) == "SL-23"
