@@ -289,9 +289,11 @@ rest are workflow state the runner and William drive.
   the dev branch greens and only this merge can green it; without the exemption the loop built,
   reviewed and opened a perfect fix PR and then held it forever waiting for you to merge it by hand.
   Everything else the gate checks (review evidence, required checks on the PR, referee paths, lane
-  overlap, mergeability) still applies to it, and every other PR still holds. A **nightly**-owned
-  freeze is not crossed by either the fix or the runner: only a green nightly clears it.
-  On the **runner's** dev-check path,
+  overlap, mergeability) still applies to it, and every other PR still holds. Crossing needs the
+  freeze marker (`state/merges_frozen.json`) to *say* it is dev-check owned: a **nightly**-owned
+  freeze is crossed by nobody (only a green nightly clears it), and a marker the loop cannot read
+  holds everything, the fix included — a corrupt freeze marker is a state-home fault for you to
+  look at, never something to merge through. On the **runner's** dev-check path,
   auto-restore-green is also re-armed once the fix issue it filed has concluded, so a later
   recurrence of the same breakage gets a fresh issue (one re-check per freeze episode — a fix that
   failed its cap still leaves merges frozen for you, it is not re-filed at 3am). The **nightly**
