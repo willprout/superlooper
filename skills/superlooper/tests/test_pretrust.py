@@ -220,6 +220,47 @@ def test_the_lock_sits_beside_the_file_it_writes(tmp_path):
     assert not os.path.exists(str(home / ".claude.json.lock"))
 
 
+def test_the_file_is_seeded_inside_the_critical_section_not_before_it(tmp_path):
+    """A FRESH config dir has no `.claude.json` at all, so the step's first act is to create one —
+    and if that create sits OUTSIDE the lock, two launches can both find it absent, one writes its
+    trust entry under the lock, and the other's `{}` lands on top and erases it. Exactly the
+    lost-update the lock exists to prevent, reachable only on a file that does not exist yet, which
+    is every per-worker config dir on its first launch (cross-review, P1).
+
+    Read from the source rather than raced, because the machine the loop actually runs on ships no
+    `flock(1)` — the ordering is unobservable there, and an invariant that can only be checked
+    where it happens to be observable is one that comes back. The behavioural half is below.
+    """
+    body = open(PRETRUST).read()
+    seed = body.index("""[ -f "$CONF" ] || echo '{}' > "$CONF\"""")
+    assert body.index("flock 9") < seed, \
+        "the config file is seeded before the lock is taken — a concurrent launch can clobber it"
+
+
+@needs_flock
+def test_a_launch_waits_for_the_lock_before_it_touches_the_file_at_all(tmp_path):
+    """The behavioural half of the invariant above: hold the lock, and the whole create-read-write
+    sequence must be on the far side of it — not a `{}` that has already landed."""
+    import fcntl
+    home, cfg, work = _home(tmp_path), _assigned(tmp_path), _folder(tmp_path)
+    conf, lock = cfg / ".claude.json", cfg / ".claude.json.lock"
+    lock.touch()
+    holder = open(str(lock), "a+")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+    p = subprocess.Popen(["bash", PRETRUST, str(work), str(cfg)],
+                         env={"PATH": os.environ.get("PATH", ""), "HOME": str(home)},
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            p.wait(timeout=3)
+        assert not os.path.exists(str(conf)), "it wrote before it held the lock"
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+    assert p.wait(timeout=60) == 0, p.stderr.read()
+    assert _trusted(conf) == [str(work)]
+
+
 @needs_flock
 def test_two_concurrent_launches_never_lose_each_others_records(tmp_path):
     """RC-DEADFEATURES, now against the per-worker file: two launches reading-modifying-writing one

@@ -576,7 +576,8 @@ def check_claude(probe):
         # Not asked of the DEFAULT dir on purpose — the operator is running this doctor under it,
         # so it is provisioned by demonstration, and a new red line there would be a false alarm on
         # every machine that has no fleet at all.
-        first_run = identity.onboarded(probe.read_text(identity.config_file(config_dir)))
+        first_run = (identity.onboarded(probe.read_text(identity.config_file(config_dir)))
+                     if config_dir else None)
         if config_dir and first_run is not True:
             return CheckResult(
                 "claude login", False,

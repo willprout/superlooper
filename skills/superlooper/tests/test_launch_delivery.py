@@ -618,6 +618,10 @@ def test_an_inherited_config_dir_redirect_never_reaches_the_launch(rig):
 # own shell (which sources the operator's rc files) hands it to start-session.sh, and the floor
 # turns it into the agent's own CLAUDE_CONFIG_DIR. Every hop is a place a spelling could change,
 # and a changed spelling is a different credential namespace that reports LOGGED OUT (#300).
+# A config dir a shell rc file INJECTS — never one this suite provisions, and deliberately a path
+# that exists nowhere: the one case still using it proves such a dir is refused rather than adopted,
+# so nothing ever reads or writes it. The cases that need a REAL assigned dir take the `fleet_dir`
+# fixture below instead (issue #345 gave that dir a file to hold, so it has to be per-run).
 _E2E_FLEET_DIR = "/tmp/sl-i314-e2e-fleet"
 
 
@@ -628,7 +632,7 @@ def _auth_reads(rig):
 
 
 @pytest.fixture
-def fleet_dir():
+def fleet_dir(tmp_path):
     """The assigned config dir, PROVISIONED — which is what a real one is (an interactive login
     creates it, #313).
 
@@ -636,12 +640,16 @@ def fleet_dir():
     file the assigned dir holds, and it REFUSES a dir nobody provisioned rather than creating one —
     a session launched into a config dir that does not exist runs first-run and parks at the theme
     picker, which no trust key can close, so pretrust cannot deliver its guarantee there and says so
-    instead. An absolute constant rather than a tmp_path because one case asserts this exact string
-    survives three processes byte for byte.
+    instead.
+
+    Under `tmp_path` rather than the shared `/tmp` constant these cases used while the dir was only
+    ever a STRING (cross-review, P2): now that a real config file is written into it, a fixed path
+    would be state two runs could share. `tmp_path` is absolute and already canonical, which is all
+    the byte-for-byte propagation assertions need.
     """
-    os.makedirs(_E2E_FLEET_DIR, exist_ok=True)
-    yield _E2E_FLEET_DIR
-    shutil.rmtree(_E2E_FLEET_DIR, ignore_errors=True)
+    d = tmp_path / "assigned-claude-config"
+    d.mkdir()
+    return str(d)
 
 
 def _fleet_trusted(fleet_dir):
@@ -687,40 +695,40 @@ def test_a_machine_with_no_assignment_still_pretrusts_the_operators_own_store(ri
 
 
 def test_the_assigned_config_dir_survives_the_whole_spawn_unchanged(rig, fleet_dir):
-    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR,
-                                "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR})
+    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": fleet_dir,
+                                "STUB_CLAUDE_LOGGED_IN_DIR": fleet_dir})
     assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
     # The launcher NAMES it as SL_*; CLAUDE_CONFIG_DIR itself is the agent's variable and is set by
     # the floor, one process later, inside the session's own shell.
-    assert _pane_env(rig)["SL_CLAUDE_CONFIG_DIR"] == _E2E_FLEET_DIR
-    assert "CLAUDE_CONFIG_DIR=" + _E2E_FLEET_DIR not in _pane_env(rig)
+    assert _pane_env(rig)["SL_CLAUDE_CONFIG_DIR"] == fleet_dir
+    assert "CLAUDE_CONFIG_DIR=" + fleet_dir not in _pane_env(rig)
     assert _wait_for(rig["stub"] / "claude_env"), (rig["stub"] / "pane.log").read_text()
     agent_env = dict(line.partition("=")[::2]
                      for line in (rig["stub"] / "claude_env").read_text().splitlines() if "=" in line)
-    assert agent_env["CLAUDE_CONFIG_DIR"] == _E2E_FLEET_DIR
+    assert agent_env["CLAUDE_CONFIG_DIR"] == fleet_dir
     # Both reads consulted the SAME namespace — the launcher's, and the session's own. Two spellings
     # here would be two identities, and the session's would simply report logged out.
     reads = _auth_reads(rig)
-    assert ("launcher=" + _E2E_FLEET_DIR) in reads
-    assert ("i1=" + _E2E_FLEET_DIR) in reads
+    assert ("launcher=" + fleet_dir) in reads
+    assert ("i1=" + fleet_dir) in reads
 
 
 def test_a_non_canonical_assignment_is_canonicalised_before_anything_downstream_sees_it(
         rig, fleet_dir):
-    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR + "/",
-                                "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR})
+    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": fleet_dir + "/",
+                                "STUB_CLAUDE_LOGGED_IN_DIR": fleet_dir})
     assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
-    assert _pane_env(rig)["SL_CLAUDE_CONFIG_DIR"] == _E2E_FLEET_DIR
+    assert _pane_env(rig)["SL_CLAUDE_CONFIG_DIR"] == fleet_dir
     assert _wait_for(rig["stub"] / "claude_env"), (rig["stub"] / "pane.log").read_text()
-    assert ("CLAUDE_CONFIG_DIR=" + _E2E_FLEET_DIR + "\n") in (rig["stub"] / "claude_env").read_text()
+    assert ("CLAUDE_CONFIG_DIR=" + fleet_dir + "\n") in (rig["stub"] / "claude_env").read_text()
 
 
 def test_an_account_that_is_right_here_and_wrong_in_the_session_refuses_the_flight(rig, fleet_dir):
     """The asymmetry only an end-to-end drive can produce, and the exact shape the contract exists
     for: the launcher's own read is healthy, and the SESSION's is a different account. A launcher
     that checked only itself would have flown this."""
-    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR,
-                                "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR,
+    r = _launch(rig, extra_env={"SL_FLEET_CLAUDE_CONFIG_DIR": fleet_dir,
+                                "STUB_CLAUDE_LOGGED_IN_DIR": fleet_dir,
                                 "STUB_CLAUDE_WORKER_ORG": "somebody-elses-org"})
     assert r.returncode == 7, f"rc={r.returncode}\n{r.stderr}"
     assert "CLAUDE IDENTITY REFUSED" in r.stderr
@@ -737,8 +745,8 @@ def test_a_credential_redirect_the_pane_shell_injects_refuses_the_flight(rig, fl
     zdot.mkdir()
     (zdot / ".zshenv").write_text("export CLAUDE_SECURESTORAGE_CONFIG_DIR=\n")
     r = _launch(rig, extra_env={"ZDOTDIR": str(zdot),
-                                "SL_FLEET_CLAUDE_CONFIG_DIR": _E2E_FLEET_DIR,
-                                "STUB_CLAUDE_LOGGED_IN_DIR": _E2E_FLEET_DIR})
+                                "SL_FLEET_CLAUDE_CONFIG_DIR": fleet_dir,
+                                "STUB_CLAUDE_LOGGED_IN_DIR": fleet_dir})
     assert r.returncode == 7, f"rc={r.returncode}\n{r.stderr}"
     assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in r.stderr
     assert not (rig["stub"] / "claude_env").exists(), "the agent must never have started"

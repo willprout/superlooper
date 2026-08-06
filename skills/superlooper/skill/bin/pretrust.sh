@@ -75,7 +75,6 @@ if [ -n "$CFG_DIR" ]; then
 else
   CONF="$HOME/.claude.json"
 fi
-[ -f "$CONF" ] || echo '{}' > "$CONF"
 
 # Serialize the read-modify-write against CONCURRENT superlooper launches (RC-DEADFEATURES): two
 # launches editing one .claude.json at once would lost-update each other's trust
@@ -87,6 +86,13 @@ fi
 LOCK="$CONF.lock"
 exec 9>"$LOCK"
 flock 9 2>/dev/null || true        # if flock is unavailable, fall through (best-effort)
+
+# SEEDING AN ABSENT FILE IS PART OF THE CRITICAL SECTION, not a preamble to it (cross-review, P1).
+# Outside the lock, two launches can both find the file absent, one writes its entry under the
+# lock, and the other's `{}` lands on top and erases it. That race needs a file that does not exist
+# yet — which used to mean almost never (the operator's ~/.claude.json is always there) and now
+# means the FIRST launch under every per-worker config dir.
+[ -f "$CONF" ] || echo '{}' > "$CONF"
 
 already="$(jq -r --arg d "$DIR" '.projects[$d].hasTrustDialogAccepted // false' "$CONF" 2>/dev/null || echo false)"
 if [ "$already" = "true" ]; then
