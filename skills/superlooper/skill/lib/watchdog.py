@@ -402,6 +402,9 @@ def _resurrection(now, view, w, sigs, details, new_state):
                 if isinstance(t, (int, float)) and not isinstance(t, bool)]
 
     if hb_stale and runner_dead:
+        # The runner the booting excuse referred to is a CORPSE, so the excuse dies with it: the
+        # next live runner is genuinely new and gets its own (fresh-agent review).
+        r["booting_since"] = None
         present = sorted(sigs)                              # capture BEFORE filtering, for the memo
         sigs, details = _without(sigs, details, HEARTBEAT_STALE)
         recent = [t for t in attempts if now - t < RESURRECTION_WINDOW_SECONDS]
@@ -539,7 +542,14 @@ def evaluate(now, config, view, state):
         # to produce. The stand-down is journaled, so the record still says the episode ended here.
         journal = ([_rec("stand_down", state["episode"].get("signals") or [])]
                    if state.get("episode") is not None else [])
-        rested = dict(state, episode=None, no_progress_since={}, disabled_observed=None)
+        # `booting_since` is cleared with everything else: it names the start of a runner that is
+        # now gone, and carrying it across the stop would deny the NEXT runner the one excuse it is
+        # entitled to — the very first check after `superlooper start` would then text about the
+        # heartbeat the new runner inherited (fresh-agent review). The excuse is meant to span a
+        # continuous streak of live observations, and a stop ends that streak by definition.
+        rested = dict(state, episode=None, no_progress_since={}, disabled_observed=None,
+                      resurrection=dict(state.get("resurrection") or _new_resurrection(),
+                                        booting_since=None))
         if sigs == state.get("stopped_observed"):
             return {"state": rested, "notify": [], "launch": None, "journal": journal,
                     "resurrect": None, "runner_down": False}

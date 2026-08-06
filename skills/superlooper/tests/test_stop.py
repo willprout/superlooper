@@ -659,14 +659,33 @@ def test_start_in_the_pane_home_withdraws_a_stop_a_live_runner_has_already_dispr
     # clear the marker, so a stop that failed to stop a pane runner leaves a marker nothing on any
     # path can withdraw: `status` reads STOP NOT TAKEN forever, and the watchdog stands down the
     # moment that runner finally dies — over a stop the owner already withdrew.
-    pid = rig.spawn()
-    (rig.home / "state" / "runner.home.json").unlink()   # so `stop` refuses to signal it
-    cli(rig, "stop")
-    assert marker(rig) is not None
+    pid = rig.spawn()                                    # writes the lock AND the runner's record
+    # The marker is seeded directly: a `stop` here would succeed in killing this runner, and the
+    # state under test is precisely "a stop is recorded AND a trustworthy runner is up".
+    (rig.home / "state" / "runner.stopped").write_text(
+        json.dumps({"stopped_at": int(time.time()), "operator": "william"}))
     r = cli(rig, "start", "--json")
     assert r.returncode == 0, r.stdout + r.stderr
     assert marker(rig) is None, "a running runner is exactly what makes the marker false"
     assert json.loads(r.stdout)["pid"] == pid
+
+
+def test_start_will_not_withdraw_a_stop_on_a_pid_stop_itself_refused_to_trust(rig):
+    # The two verbs must not disagree about the same number seconds apart. `stop` declines to signal
+    # a pid the runner's own record does not claim; a `start` that treated it as a live runner would
+    # withdraw the off switch over a loop that is DOWN — guardians re-armed, `started: true` handed
+    # to a UI — which is the worst state this issue can produce.
+    pid = rig.spawn()
+    (rig.home / "state" / "runner.home.json").unlink()   # a crashed runner's leftovers
+    r_stop = cli(rig, "stop", "--json")
+    assert "does not claim" in (json.loads(r_stop.stdout).get("signal_refused") or "")
+    assert marker(rig) is not None
+    r = cli(rig, "start", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert marker(rig) is not None, "the stop stands: nothing trustworthy is running"
+    assert doc["started"] is False and doc["already_running"] is False
+    assert str(pid) in r.stdout and "runner.lock" in r.stdout
 
 
 def test_a_marker_that_will_not_delete_is_a_failed_start_not_a_quiet_one(rig):
@@ -685,3 +704,51 @@ def test_a_marker_that_will_not_delete_is_a_failed_start_not_a_quiet_one(rig):
         assert "could not be removed" in doc["error"]
     finally:
         os.chmod(state, 0o755)
+
+
+def test_start_never_kickstarts_a_job_it_could_not_read_while_a_runner_is_alive(rig):
+    # `kickstart -k` HARD-KILLS the running service. Treating an unreadable job state as "not
+    # loaded" sends `start` down bootstrap -> refused -> kickstart -k, i.e. SIGKILLing a perfectly
+    # healthy runner mid-tick because launchctl took too long to answer. Unknown is not False.
+    write_config(rig, runner_home="login-item")
+    (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
+    pid = rig.spawn()
+    # Seeded directly, not via `stop`: `stop` would take this runner down, and the state under test
+    # is a stop on record with the runner still up and launchd unreadable.
+    (rig.home / "state" / "runner.stopped").write_text(
+        json.dumps({"stopped_at": int(time.time()), "operator": "william"}))
+    _script(rig.tmp / "launchctl", '#!/bin/sh\necho "$@" >> "$LAUNCHCTL_LOG"\n'
+                                   'case "$1" in\n'
+                                   '  managername) echo Aqua ;;\n'
+                                   '  print) echo "Could not print domain: 5: I/O error" >&2;'
+                                   ' exit 5 ;;\n'
+                                   'esac\nexit 0\n')
+    r = cli(rig, "start", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert not any("kickstart" in line for line in calls(rig)), calls(rig)
+    assert not any("bootstrap" in line for line in calls(rig)), calls(rig)
+    assert doc["job_loaded"] is None and doc["started"] is False
+    assert doc["cleared"] is True, "a live runner still falsifies the marker"
+    assert _dead(pid, deadline=2) is False, "the healthy runner must be untouched"
+
+
+def test_status_says_something_true_about_a_garbage_pidfile(rig):
+    (rig.home / "state" / "runner.lock").write_text("not-a-pid")
+    (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time()) - 3600))
+    out = cli(rig, "status").stdout
+    assert "no pidfile" not in out, out                  # there IS one; it just says nothing
+    assert "runner.lock" in out
+
+
+def test_a_failed_stop_reports_launchds_job_pid_without_claiming_it_as_the_runners(rig):
+    write_config(rig, runner_home="login-item")
+    _script(rig.tmp / "launchctl", '#!/bin/sh\necho "$@" >> "$LAUNCHCTL_LOG"\n'
+                                   'case "$1" in\n'
+                                   '  managername) echo Aqua ;;\n'
+                                   '  bootout) exit 1 ;;\n'
+                                   '  print) printf "\\tpid = 4242\\n\\tstate = running\\n" ;;\n'
+                                   'esac\nexit 0\n')
+    doc = json.loads(cli(rig, "stop", "--json").stdout)
+    assert doc["was_running"] is False and doc["pid"] is None   # no runner pidfile in this rig
+    assert doc["job_pid"] == 4242                                # ...and launchd's is its own key

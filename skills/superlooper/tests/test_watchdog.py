@@ -946,3 +946,34 @@ def test_a_ticking_runner_forgets_it_was_ever_booting():
     assert st["resurrection"]["booting_since"] is not None
     healthy = _run(T0 + MIN, _view(T0 + MIN, runner_live=True), st)
     assert healthy["state"]["resurrection"]["booting_since"] is None
+
+
+def test_the_booting_excuse_does_not_outlive_the_runner_it_describes():
+    # The excuse spans a continuous streak of LIVE observations of ONE runner. Carried across a
+    # deliberate stop it would deny the next runner the excuse it is entitled to — and the very
+    # first check after `superlooper start` would text about the heartbeat that runner inherited,
+    # which is the failure the excuse was added to kill.
+    st = _run(T0, _view(T0, heartbeat=T0 - 60 * MIN, runner_live=True,
+                        runner_started_at=T0 - 20))["state"]
+    assert st["resurrection"]["booting_since"] is not None
+    night = T0 + 5 * MIN
+    for _ in range(11):                                    # switched off, checked all night
+        st = _run(night, _dead(night, stale_min=60, stopped_by_owner=True), st)["state"]
+        night += 30 * MIN
+    assert st["resurrection"]["booting_since"] is None, "the stop ended that runner's streak"
+    back = _run(night, _view(night, heartbeat=T0 - 60 * MIN, runner_live=True,
+                             runner_started_at=night - 20), st)
+    assert back["notify"] == [] and back["state"]["episode"] is None
+
+
+def test_a_corpse_takes_the_booting_excuse_with_it():
+    st = _run(T0, _view(T0, heartbeat=T0 - 60 * MIN, runner_live=True,
+                        runner_started_at=T0 - 20))["state"]
+    assert st["resurrection"]["booting_since"] is not None
+    dead = _run(T0 + 5 * MIN, _dead(T0 + 5 * MIN, stale_min=60), st)
+    assert dead["resurrect"] is not None
+    assert dead["state"]["resurrection"]["booting_since"] is None
+    # ...and the runner that comes back from that restart still gets its own excuse.
+    reborn = _run(T0 + 10 * MIN, _view(T0 + 10 * MIN, heartbeat=T0 - 60 * MIN, runner_live=True,
+                                       runner_started_at=T0 + 10 * MIN - 20), dead["state"])
+    assert reborn["state"]["episode"] is None
