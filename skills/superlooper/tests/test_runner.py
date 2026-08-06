@@ -6486,7 +6486,7 @@ def test_boot_creates_a_missing_runner_managed_label(rig):
     # a repo missing a runner-managed label has it CREATED at boot (issue #160), not #108's
     # fail-loud refusal — an already-installed migration step, applied idempotently (--force).
     _set_repo_labels(rig, ["agent-ready", "in-progress", "parked",        # needs-owner MISSING
-                           "awaiting-answer"])
+                           "awaiting-answer", "source:qa"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     created = [m for m in mutations(rig) if m["kind"] == "create_label"]
     assert [m["name"] for m in created] == ["needs-owner"]
@@ -6502,13 +6502,34 @@ def test_boot_heals_a_repo_adopted_before_awaiting_answer_was_registered(rig):
     # refusing the #163 question hand-back until somebody re-runs adopt, and the failure mode is a
     # SILENT retry loop, so nobody would know to. Boot creates it, with the registered spec, and
     # then boots normally.
-    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked"])
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked", "source:qa"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     created = [m for m in mutations(rig) if m["kind"] == "create_label"]
     assert [m["name"] for m in created] == ["awaiting-answer"]
     assert created[0]["color"] and created[0]["force"] is True
     assert "(runner-managed)" in created[0]["description"]
     assert "{operator}" not in created[0]["description"]       # signed, never a raw placeholder
+    assert _alert(rig) is None
+
+
+def test_boot_heals_a_repo_adopted_before_the_source_family_was_registered(rig):
+    """Issue #400, and the reason `source:qa` alone of the six is '(runner-managed)'.
+
+    The restore-green filer CREATES an issue carrying that label, and `gh issue create` refuses the
+    whole call when a named label is missing — so on a repo adopted before this shipped, a red
+    nightly would file NO fix issue at all. That is worse than #337's silent label-move retry: the
+    work item itself never exists. The five session/dashboard values are deliberately NOT healed
+    here (the runner never applies them; adopt and the dashboard's own create-or-force cover them),
+    so the boot write stays exactly one.
+    """
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked",
+                           "awaiting-answer"])
+    assert rig.r._apply_boot_migrations(now=NOW) is True
+    created = [m for m in mutations(rig) if m["kind"] == "create_label"]
+    assert [m["name"] for m in created] == ["source:qa"]
+    assert created[0]["color"] and created[0]["force"] is True
+    assert "(runner-managed)" in created[0]["description"]
+    assert "{operator}" not in created[0]["description"]
     assert _alert(rig) is None
 
 
@@ -6519,7 +6540,7 @@ def test_boot_holds_when_the_awaiting_answer_heal_cannot_apply(rig):
     # systemic ALERT naming the migration. That is the intended behaviour (a repo whose vocabulary
     # cannot be repaired would otherwise storm), and it is worth pinning for THIS label because it
     # is the first new runner-managed label since the contract was written.
-    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked"])
+    _set_repo_labels(rig, ["agent-ready", "in-progress", "needs-owner", "parked", "source:qa"])
     _fail_gh(rig, "label create")
     assert rig.r._apply_boot_migrations(now=NOW) is False       # boot HELD, not stormed
     alert = _alert(rig)
@@ -6531,7 +6552,7 @@ def test_boot_migration_applies_the_needs_william_rename(rig):
     # the 2026-07-13 storm's exact repo shape: still carries the OLD needs-william and lacks the NEW
     # needs-owner. Boot renames IN PLACE (preserving every issue that carries it) and does NOT then
     # also create needs-owner (the rename already produced it).
-    _set_repo_labels(rig, ["agent-ready", "needs-william", "in-progress", "parked"])
+    _set_repo_labels(rig, ["agent-ready", "needs-william", "in-progress", "parked", "source:qa"])
     assert rig.r._apply_boot_migrations(now=NOW) is True
     muts = mutations(rig)
     assert [m for m in muts if m["kind"] == "rename_label"] == \

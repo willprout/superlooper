@@ -724,6 +724,31 @@ _DECIDING_MODULES = ("lib/scheduler.py", "lib/gate.py", "lib/issues.py", "bin/ru
 _SOURCE_TOKEN = re.compile(re.escape(labels_mod.SOURCE_PREFIX) + r"[a-z0-9-]+")
 
 
+_FAMILY_CONSTANTS = ("SOURCE_PREFIX", "SOURCE_QA")
+
+
+def _labels_bindings(tree):
+    """(module aliases for ``labels``, local names bound to its family constants).
+
+    The engine imports this module under several names — ``bin/runner.py`` really does
+    ``import labels as labels_lib``, inside a function — so keying the scan on the literal name
+    ``labels`` would leave the module MOST likely to grow a scheduling read as the one the guard
+    cannot see (fresh-agent review, Codex 2026-08-06). Aliases and ``from labels import …`` are
+    both collected, so a read is caught however it was spelled.
+    """
+    aliases, direct = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "labels":
+                    aliases.add(a.asname or "labels")
+        elif isinstance(node, ast.ImportFrom) and node.module == "labels":
+            for a in node.names:
+                if a.name in _FAMILY_CONSTANTS:
+                    direct.add(a.asname or a.name)
+    return aliases, direct
+
+
 def _emitted_strings_and_attributes(tree):
     """Every `source:<value>` an emitted STRING carries, plus every read of the family's constants.
 
@@ -739,14 +764,17 @@ def _emitted_strings_and_attributes(tree):
             if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
                     and isinstance(body[0].value.value, str):
                 docstrings.add(id(body[0].value))
+    aliases, direct = _labels_bindings(tree)
     found = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str) \
                 and id(node) not in docstrings:
             found.extend(_SOURCE_TOKEN.findall(node.value))
-        elif isinstance(node, ast.Attribute) and node.attr in ("SOURCE_PREFIX", "SOURCE_QA") \
-                and isinstance(node.value, ast.Name) and node.value.id == "labels":
-            found.append("labels." + node.attr)
+        elif isinstance(node, ast.Attribute) and node.attr in _FAMILY_CONSTANTS \
+                and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            found.append("%s.%s" % (node.value.id, node.attr))
+        elif isinstance(node, ast.Name) and node.id in direct:
+            found.append("labels.%s (imported directly)" % node.id)
     return found
 
 
@@ -786,7 +814,14 @@ def test_the_absence_guard_would_notice_a_read_being_added():
     """
     for src in ('def pick(labels):\n    return "source:qa" in labels\n',
                 'import labels\ndef pick(x):\n    return x.startswith(labels.SOURCE_PREFIX)\n',
-                'def sort_key(p):\n    return 0 if "source:orchestration" in p["labels"] else 1\n'):
+                'def sort_key(p):\n    return 0 if "source:orchestration" in p["labels"] else 1\n',
+                # ALIASED, and imported inside a function — the exact spelling bin/runner.py
+                # already uses for this module, so keying on the bare name `labels` would leave
+                # the likeliest offender invisible (Codex review, 2026-08-06).
+                'def pick(x):\n    import labels as labels_lib\n'
+                '    return x.startswith(labels_lib.SOURCE_PREFIX)\n',
+                'from labels import SOURCE_QA\ndef pick(x):\n    return SOURCE_QA in x\n',
+                'from labels import SOURCE_PREFIX as P\ndef pick(x):\n    return x.startswith(P)\n'):
         assert _emitted_strings_and_attributes(ast.parse(src)), src
     # ...and the shapes it must stay quiet about: the runner's unrelated freeze-marker field, in a
     # docstring and in an emitted string, plus a docstring that names the family to explain itself.

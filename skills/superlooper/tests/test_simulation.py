@@ -1810,7 +1810,8 @@ def test_red_dev_freezes_files_once_builds_continue_green_unfreezes(sim_factory)
     # the standing-rule fix issue, with EXACTLY the owner-defined label set
     fixes = sim.mutations("create_issue")
     assert len(fixes) == 1
-    assert fixes[0]["labels"] == "type:diagnose-and-fix,agent-ready,auto-approved:nightly-red,expedite"
+    assert fixes[0]["labels"] == \
+        "type:diagnose-and-fix,agent-ready,auto-approved:nightly-red,expedite,source:qa"
     assert any("frozen" in ln for ln in sim.notify_lines())
 
     # the finished PR HOLDS while frozen (never merges), and the fix issue never re-files.
@@ -2296,7 +2297,8 @@ def test_nightly_red_freezes_with_ownership_dev_green_cannot_unfreeze(sim_factor
     assert marker and marker.get("source") == "nightly", marker
     fixes = sim.mutations("create_issue")
     assert len(fixes) == 1
-    assert fixes[0]["labels"] == "type:diagnose-and-fix,agent-ready,auto-approved:nightly-red,expedite"
+    assert fixes[0]["labels"] == \
+        "type:diagnose-and-fix,agent-ready,auto-approved:nightly-red,expedite,source:qa"
     assert any("nightly RED" in ln for ln in sim.notify_lines())
     ln_path = os.path.join(sim.home, "state", "last_nightly.json")
     assert json.load(open(ln_path))["ok"] is True   # parsed fine; failures recorded
