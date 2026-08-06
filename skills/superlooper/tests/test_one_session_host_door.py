@@ -1,6 +1,6 @@
 """Permanent mechanical fence: exactly ONE module talks to the session host (issue #304).
 
-``skill/lib/session_host.py`` is the five-verb doorway. Its value is not the code inside it — it is
+``skill/lib/session_host.py`` is the doorway. Its value is not the code inside it — it is
 the ABSENCE of any second way to reach the host. Two things rest on that absence:
 
 1. **The host swap stays bounded.** "Replace herdr with tmux" is a rewrite of one module only for
@@ -64,9 +64,10 @@ _ALLOWED = {
         "rather than pattern-exempted so that adding a SECOND such fake is still a decision a human "
         "makes in review.",
     _THE_DOOR:
-        "THE DOORWAY. The five-verb wrapper (spawn/send/state/exit/kill) where every distrust rule "
-        "is enforced once: --wait always, transcript-side delivery proof, process-fact liveness, "
-        "verify-or-teardown, names-not-ids. Swapping the host is a rewrite of this file alone.",
+        "THE DOORWAY. The six-verb wrapper (spawn/send/state/exit/kill/focus) where every distrust "
+        "rule is enforced once: --wait always, transcript-side delivery proof, process-fact "
+        "liveness, verify-or-teardown, names-not-ids. Swapping the host is a rewrite of this file "
+        "alone.",
     "skills/superlooper/skill/vendor/herdr/herdr-agent-state.sh":
         "NOT OURS — the host's own state-report hook asset, carried byte-for-byte from the pinned "
         "release (issue #307; checksum pinned in skill/lib/herdr_hook.py, procedure in that "
@@ -304,19 +305,26 @@ def test_only_the_wrapper_reaches_the_session_host():
             offenders[rel] = hits
     assert not offenders, (
         "these scripts reach the session host directly, but %s is the only doorway: %s\n"
-        "Call the wrapper's five verbs (spawn/send/state/exit/kill) instead. If a new file "
+        "Call the wrapper's verbs (spawn/send/state/exit/kill/focus) instead. If a new file "
         "genuinely has to hold the host itself, it has to be added to _ALLOWED here with a reason "
         "— which is the point: that is a decision a human makes in review."
         % (_THE_DOOR, offenders)
     )
 
 
-def test_the_doorway_still_exists_and_is_still_five_verbs_wide():
+def test_the_doorway_still_exists_and_is_still_six_verbs_wide():
     # A fence whose door has been deleted or widened is worse than no fence: it passes.
+    #
+    # SIX since issue #339, and the widening is the mechanism working rather than failing: the
+    # owner ruled that the dashboard must never name the session host, so `focus` — bring an
+    # existing session's window to the front — had to land HERE, behind the same door, instead of
+    # in a caller that would then need the host binary, the repo→lane map and (on a fenced machine)
+    # a control-socket credential. The exact-set assertion is what makes a SEVENTH verb an argument
+    # somebody has in review.
     import session_host
     public = {n for n in vars(session_host.SessionHost)
               if not n.startswith("_") and callable(getattr(session_host.SessionHost, n))}
-    assert public == {"spawn", "send", "state", "exit", "kill"}
+    assert public == {"spawn", "send", "state", "exit", "kill", "focus"}
     source = (_REPO / _THE_DOOR).read_text(encoding="utf-8")
     assert "--wait" in source, "the doorway must still carry the --wait rule"
 

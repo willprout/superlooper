@@ -148,6 +148,10 @@ no nightly rest.
 - **Revive an interrupted session** instead of restarting the work cold:
   `superlooper resume i<N>` (or `d<N>`) re-enters the same conversation, opening on a
   recap of the current state of the world so it re-reads before it acts.
+- **Watch a session with your own eyes**: `superlooper focus-session --repo <path> --id i<N>`
+  asks the session host to bring that lane's window to the front — the real terminal, so you
+  can read it and type into it to interject. It changes nothing else, and if that lane has no
+  window left to raise it says so rather than pretending it opened something.
 - **Health checks**, after any change to the machine or whenever something looks off:
   `superlooper doctor --repo <path>` checks the repo, `superlooper doctor --stack` checks
   the machine, `superlooper fleet` checks the session host, and `superlooper upkeep` is

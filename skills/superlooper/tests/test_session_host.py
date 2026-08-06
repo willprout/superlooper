@@ -1,4 +1,4 @@
-"""The five-verb wrapper's contract (issue #304): spawn / send / state / exit / kill.
+"""The wrapper's contract: spawn / send / state / exit / kill (issue #304), and focus (issue #339).
 
 Every distrust rule the 2026-07-29/30 spikes paid for is enforced INSIDE the wrapper, so these
 tests are where those rules are pinned. They drive the module through an injected probe — no test
@@ -189,12 +189,14 @@ def _preamble(note=""):
 
 # --------------------------------------------------------------------- the doorway itself
 
-def test_the_module_exposes_exactly_the_five_verbs():
-    # The whole point of a single doorway is that it has a KNOWN width. A sixth public verb is how
-    # the interface stops being swappable — the next host would have to implement it too.
+def test_the_module_exposes_exactly_the_six_verbs():
+    # The whole point of a single doorway is that it has a KNOWN width — every verb here is one the
+    # next host has to implement too. `focus` is the sixth, added on the owner's ruling for issue
+    # #339 (the dashboard must never name the session host, so the ENGINE holds the door). It is
+    # the exact-set assertion that makes a SEVENTH a decision somebody argues for in review.
     public = {n for n in vars(session_host.SessionHost)
               if not n.startswith("_") and callable(getattr(session_host.SessionHost, n))}
-    assert public == {"spawn", "send", "state", "exit", "kill"}
+    assert public == {"spawn", "send", "state", "exit", "kill", "focus"}
 
 
 def test_the_wrapper_resolves_its_binary_from_the_env_override(monkeypatch):
@@ -929,3 +931,166 @@ def test_only_a_busy_pane_is_waited_for():
     with pytest.raises(session_host.SpawnRefused):
         _host(fake).spawn("i304", cwd="/tmp/wt")
     assert len([c for c in fake.calls if c[1:3] == ["agent", "start"]]) == 1
+
+
+# --------------------------------------------------------------------------- focus (issue #339)
+# The sixth verb, and the only one that reports rather than raises. Everything below is either a
+# property the owner's ruling demands (attach only, no viewer, no stream) or a property the
+# multi-repo hazard demands (the WORKSPACE addresses the window; the lane name cannot).
+
+_FOCUS_OK = _ok({"type": "workspace_info", "workspace": {"workspace_id": "w1", "focused": True}})
+
+
+def test_focus_brings_the_recorded_workspace_to_the_front():
+    fake = FakeHerdr(script={("workspace", "focus"): (0, _FOCUS_OK, "")})
+    got = _host(fake).focus(_session())
+    assert (got.focused, got.outcome) == (True, session_host.FOCUSED)
+    assert fake.calls[0][1:] == ["workspace", "focus", "w1"]
+
+
+@pytest.mark.parametrize("payload", [
+    # `api schema --json` types this verb's success as one of the envelope's ResponseResult
+    # variants, and the pinned release carries BOTH a `workspace_info` (variant 2) and a bare `ok`
+    # (variant 56). We could not observe which one the live host picks — the fleet is fenced and a
+    # worker holds no token — so the wrapper must not depend on the choice, and this pins that it
+    # does not (fresh-agent review: the fake's reply shape is the one thing here not measured).
+    {"type": "workspace_info", "workspace": {"workspace_id": "w1", "focused": True}},
+    {"type": "ok"},
+])
+def test_either_success_envelope_the_host_may_return_is_a_focus(payload):
+    fake = FakeHerdr(script={("workspace", "focus"): (0, _ok(payload), "")})
+    assert _host(fake).focus(_session()).outcome == session_host.FOCUSED
+
+
+def test_focus_addresses_the_workspace_and_never_the_lane_name():
+    """THE multi-repo property (#310's worker, #339's DoD).
+
+    A lane id is unique inside ONE repo's state home and nowhere else: two adopted repos both have
+    an `i310`, and the host clears an agent's name when it exits — so repo A's finished lane and
+    repo B's live one can carry the same name minutes apart. A name-addressed focus would then
+    surface the WRONG repo's session. The recorded workspace is the repo-scoped address, so the
+    name must not appear in the argv at all.
+    """
+    fake = FakeHerdr(script={("workspace", "focus"): (0, _FOCUS_OK, "")})
+    _host(fake).focus(_session(name="i310", workspace="w-repo-a"))
+    argv = fake.calls[0]
+    assert "i310" not in argv, "the lane NAME is not repo-unique and must not address a window"
+    assert argv[1:] == ["workspace", "focus", "w-repo-a"]
+
+
+def test_focus_never_spawns_sends_exits_or_kills():
+    """The verb's WHOLE effect is a focus (issue #339 DoD).
+
+    Driven against a host scripted to answer every other verb happily, so a stray call would
+    succeed rather than error — a regression that added one would otherwise hide behind a raise.
+    """
+    fake = _healthy(over={("workspace", "focus"): (0, _FOCUS_OK, "")})
+    got = _host(fake).focus(_session())
+    assert got.focused is True
+    assert fake.verbs() == [("workspace", "focus")], (
+        "focus must make exactly one host call and no other: %s" % (fake.verbs(),))
+    assert fake.signals == [], "focus signals no process, ever"
+    assert fake.slept == 0.0, "focus waits for nothing — it is not a teardown"
+
+
+def test_a_window_the_host_no_longer_has_is_the_ordinary_answer_not_an_error():
+    """A session that exited, or one `tidy` already closed, is the COMMON case. It must arrive as
+    a value a caller can render honestly — never as a raise, and never as a host fault."""
+    fake = FakeHerdr(script={("workspace", "focus"):
+                             (1, "", _err("workspace_not_found", "no workspace w1"))})
+    got = _host(fake).focus(_session())
+    assert (got.focused, got.outcome) == (False, session_host.NO_WINDOW)
+    assert "w1" in got.detail
+
+
+def test_a_host_that_did_not_answer_is_never_read_as_no_window():
+    """Absence of signal is UNKNOWN (c2). Reading a wedged host as "that lane has no window" would
+    tell the owner his session is gone every time the host stops answering."""
+    fake = FakeHerdr(script={("workspace", "focus"): (124, "", "no answer within 20s")})
+    got = _host(fake).focus(_session())
+    assert (got.focused, got.outcome) == (False, session_host.HOST_UNREACHABLE)
+
+
+def test_a_refusal_in_other_words_is_a_host_fault_not_a_missing_window():
+    """The fence refuses a tokenless caller with `unauthorized` — the host SPOKE, and said nothing
+    about whether the window exists. Measured, not imagined: driving this verb from a worker pane
+    against the live fenced fleet returned exactly this code (reports/i339.md)."""
+    fake = FakeHerdr(script={("workspace", "focus"):
+                             (1, "", _err("unauthorized", "token required"))})
+    got = _host(fake).focus(_session())
+    assert (got.focused, got.outcome) == (False, session_host.HOST_UNREACHABLE)
+    assert "unauthorized" in got.detail
+
+
+@pytest.mark.parametrize("code", [
+    "client_not_found", "terminal_not_found", "no_such_client", "pane_not_found",
+    "session_not_found",
+    # The two that defeated the first fix (second fresh-agent review, P1). Both MENTION the
+    # workspace while being about a client, so a substring search for "workspace" admitted exactly
+    # the answers the check was written to reject — and told the owner a live worker had ended.
+    "workspace_client_not_found", "no_such_client_in_workspace",
+    # ...and the ones that pin the ANCHORING itself (verification pass): each of these CONTAINS a
+    # whole workspace-gone code, so they pass a `search` and fail a `fullmatch`. Without them the
+    # match could be loosened back to a substring search and the suite would stay green — the
+    # regex was pinned by its own alternatives but not by the way it is applied.
+    "client_workspace_not_found", "no_such_workspace_client", "agent_workspace_not_found",
+    "workspace_not_found_for_client",
+])
+def test_a_not_found_about_something_that_is_not_the_workspace_is_not_no_window(code):
+    """`_GONE_CODES` is generic, and for `exit`/`kill` that is safe — the only subject of
+    `workspace get`/`workspace close` IS the workspace. A focus can plausibly touch a client or a
+    terminal too, and reading `client_not_found` as "that lane's window is closed" would tell the
+    owner a LIVE worker had ended, at the one outcome he would not think to question."""
+    fake = FakeHerdr(script={("workspace", "focus"): (1, "", _err(code, "nope"))})
+    assert _host(fake).focus(_session()).outcome == session_host.HOST_UNREACHABLE
+
+
+@pytest.mark.parametrize("code", ["workspace_not_found", "no_such_workspace",
+                                  "workspace_does_not_exist"])
+def test_the_workspace_subject_check_still_recognises_the_answer_it_exists_for(code):
+    """The other half: a check narrowed until it recognises nothing would turn every closed window
+    into `host_unreachable`, i.e. quietly delete the outcome this issue was written around."""
+    fake = FakeHerdr(script={("workspace", "focus"): (1, "", _err(code, "gone"))})
+    assert _host(fake).focus(_session()).outcome == session_host.NO_WINDOW
+
+
+def test_focus_refuses_a_recorded_id_that_would_read_as_a_flag():
+    """It comes off disk, and the only writer is the host's own reply — so this is unreachable
+    today rather than a live hazard. It is here because "unreachable today" is a property of the
+    writer rather than of this call (fresh-agent review)."""
+    fake = FakeHerdr(script={("workspace", "focus"): (0, _FOCUS_OK, "")})
+    with pytest.raises(ValueError):
+        _host(fake).focus(_session(workspace="--help"))
+    assert fake.calls == []
+
+
+def test_a_focus_result_can_never_be_built_saying_two_things_at_once():
+    # `focused` is DERIVED from the outcome, not stored beside it: two fields for one fact is two
+    # fields that can be constructed disagreeing, and a caller renders the boolean.
+    for outcome in (session_host.FOCUSED, session_host.NO_WINDOW, session_host.HOST_UNREACHABLE):
+        assert session_host.Focus(outcome).focused == (outcome == session_host.FOCUSED)
+
+
+@pytest.mark.parametrize("handle", ["i304", None, session_host.Session(name="i304", workspace="")])
+def test_focus_refuses_a_handle_that_cannot_address_a_window(handle):
+    """A caller bug, and it raises like `send`'s missing oracle does rather than reporting a
+    tidy-looking "no window": a lane whose window is genuinely gone is answered by the LANE reader
+    (lib/focus), which never builds a handle at all."""
+    fake = FakeHerdr(script={("workspace", "focus"): (0, _FOCUS_OK, "")})
+    with pytest.raises(ValueError):
+        _host(fake).focus(handle)
+    assert fake.calls == [], "nothing may be asked of the host on a handle we cannot trust"
+
+
+def test_focus_is_not_a_viewer():
+    """Owner ruling (#339, 2026-08-05): attach only. No observation stream, no frame copy — the
+    window the owner is shown is the real interactive terminal he can type into."""
+    tree = ast.parse(_MODULE.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        words = [e.value for e in node.elts
+                 if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        assert words[:2] not in (["pane", "read"], ["agent", "read"], ["agent", "attach"],
+                                 ["pane", "wait-output"]), (
+            "focus surfaces the live terminal; it never builds a viewer: %s" % (words,))
