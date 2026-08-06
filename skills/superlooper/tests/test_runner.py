@@ -2482,7 +2482,10 @@ def test_conflict_brief_requires_committing_and_pushing_and_ending_the_session(r
     assert "commit" in low, "the brief must require committing the work-in-progress"
     assert "git push -u origin head" in low, \
         "the brief must give the actual push command, not merely mention pushing"
-    assert "sl/i123-render-the-widget" in b, "the push is on the PR's OWN branch, so name it"
+    # The whole phrase, not a bare branch-name search: the brief's opening paragraph already names
+    # the branch, so a loose `in` would pass even if THIS clause stopped saying where the WIP goes.
+    assert "work-in-progress on `sl/i123-render-the-widget`" in b, \
+        "the push is on the PR's OWN branch — the clause must say so, not just mention it upstream"
     assert "force-push" in low, "the mid-merge seat must be told the push is never a force-push"
 
 
@@ -2495,8 +2498,13 @@ def test_conflict_brief_does_not_claim_the_resume_depends_on_the_push(rig):
     resolver whose push failed would then refuse to end its session at all."""
     b = _conflict_brief(rig)
     low = b.lower()
-    assert "work-in-progress" in low and "worktree" in low, \
-        "the brief must say the resume reuses the PRESERVED worktree's work-in-progress"
+    # The whole sentence, not two loose tokens: "worktree" appears in the brief's opening line and
+    # "work-in-progress" in the commit-and-push clause, so a token search would still pass with the
+    # resume sentence DELETED — the one sentence that carries the fact under test (cross-review).
+    assert "a fresh session resumes the issue" in low, \
+        "the brief must name what actually resumes the issue after the owner answers"
+    assert "reusing this worktree's work-in-progress" in low, \
+        "and must say that resume reuses the PRESERVED worktree's work-in-progress"
     for scare in ("cannot pick up", "only copy", "lost", "unrecoverable"):
         assert scare not in low, \
             "never tell the resolver the resume depends on the push (%r)" % scare
