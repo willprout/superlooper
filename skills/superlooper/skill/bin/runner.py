@@ -193,6 +193,19 @@ _CMUX_DEFAULT = "/Applications/cmux.app/Contents/Resources/bin/cmux"   # SL_CMUX
 # `request-restart` command, exactly as it shells `superlooper tidy`; the engine names no such UI.)
 RESTART_MARKER = "runner.restart"
 
+# The deliberate-STOP marker (issue #239) — the off switch's durable half. `superlooper stop` drops
+# it in the STATE HOME (never .superlooper/**) BEFORE it takes the runner down, and it is what makes
+# the difference between "the loop died" and "the owner turned the loop off" a FACT on disk rather
+# than a guess. Its readers are the loop's two guardians and the owner: the watchdog declines to
+# resurrect while it is present, and `superlooper status` renders "stopped by owner" instead of
+# "crashed". Existence is the signal, like RESTART_MARKER and state/ALERT — a corrupt body must
+# never let a guardian read a deliberate stop as an accident and restart the loop.
+#
+# It is cleared by any runner that BOOTS (below, in run()), which is what keeps the off switch from
+# latching: a marker left behind by a stop the owner later reversed by hand would otherwise disable
+# resurrection for good, and that failure is silent by construction.
+STOP_MARKER = "runner.stopped"
+
 # Durable owner-question protocol markers (#163). Both begin with brief._MARKER_PREFIX
 # ("<!-- superlooper-"), so brief.build's amendments logic SKIPS them: the runner's own question
 # comment is never mistaken for a binding owner amendment, and a marked answer is embedded once via
@@ -438,6 +451,66 @@ def write_restart_request(state_dir, payload):
 
 def clear_restart_request(state_dir):
     _rm(restart_marker_path(state_dir))
+
+
+# ------------------------- deliberate-stop marker (issue #239) -------------------------
+# Shared by `superlooper stop` (which WRITES it), `superlooper start` + the Runner (which CLEAR it),
+# and the watchdog + `status` (which READ it), so every side agrees on the path and the format in
+# one place — the same arrangement the Restart marker above got, for the same reason.
+
+
+def stop_marker_path(state_dir):
+    return os.path.join(os.fspath(state_dir), STOP_MARKER)
+
+
+def read_stop_marker(state_dir):
+    """The deliberate-stop record, or ``None`` when the marker is ABSENT.
+
+    A present-but-unparseable body reads as ``{}`` — EXISTENCE is the signal, exactly as for the
+    restart marker and state/ALERT. The direction is load-bearing here: every reader of this file
+    treats "absent" as permission to restart the runner, so a marker that could be lost to a
+    truncated write or a stray byte would hand the loop back to the guardians the owner just
+    overruled. ``_read`` maps both a missing file and an undecodable one to ``None``, so the
+    ``os.path.exists`` check is what tells those two apart."""
+    path = stop_marker_path(state_dir)
+    txt = _read(path)
+    if txt is None:
+        return {} if os.path.exists(path) else None
+    try:
+        val = json.loads(txt)
+    except (ValueError, TypeError):
+        return {}
+    return val if isinstance(val, dict) else {}
+
+
+def write_stop_marker(state_dir, payload):
+    """Atomically drop the stop marker (tmp + ``os.replace``, per-pid tmp name), so a watchdog check
+    reading it in the same second never sees a half write. Returns the path written."""
+    path = stop_marker_path(state_dir)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+    return path
+
+
+def clear_stop_marker(state_dir):
+    """Remove the marker and report whether one was there — the caller journals the difference
+    between a start that reversed a deliberate stop and an ordinary boot.
+
+    RAISES if the marker survives the removal. `_rm` swallows OSError, which is right for the
+    diagnostics it was written for and wrong here: a marker that cannot be deleted is the off
+    switch LATCHED, and every caller would otherwise report a clean start over a loop the watchdog
+    has quietly stopped guarding — permanently, and with nothing said. The whole feature rests on
+    "the switch can neither miss its own window nor latch", so the one way it could latch is the
+    one thing that must not be silent."""
+    was = read_stop_marker(state_dir)
+    _rm(stop_marker_path(state_dir))
+    if os.path.exists(stop_marker_path(state_dir)):
+        raise OSError("the deliberate-stop marker at %s could not be removed — until it is gone "
+                      "the watchdog will not restart this runner"
+                      % stop_marker_path(state_dir))
+    return was
 
 
 def live_runner_pid(state_dir):
@@ -1153,6 +1226,25 @@ class Runner:
         # this also covers the edge where the lock was externally deleted mid-exec and the reborn
         # image took the normal-acquire path, leaving the token set.
         os.environ.pop("SL_RESTART_ADOPT", None)
+        # The deliberate-stop marker says "no runner is running, ON PURPOSE" (issue #239). This
+        # instance now owns the singleton, so that statement is false — clear it HERE, at the one
+        # point every real start passes through (`superlooper start`, a hand-run `superlooper run`,
+        # a login-time bootstrap, the watchdog's own kickstart), rather than in the start verb alone.
+        # That is what keeps the off switch from latching: a stop the owner later reversed by some
+        # other route would otherwise leave a marker behind that silently disables resurrection for
+        # every crash after it. Journaled only when a marker was actually there, so the journal
+        # carries the "and it came back" half — without it, a night the owner deliberately switched
+        # the loop off reads back as an outage nobody noticed. Guarded: a diagnostic must never
+        # abort run().
+        try:
+            was_stopped = clear_stop_marker(self.state)
+            if was_stopped is not None:
+                journal.append(self.home, {"act": "runner_stop", "outcome": "started",
+                                           "stopped_at": was_stopped.get("stopped_at"),
+                                           "operator": was_stopped.get("operator"),
+                                           "new_pid": os.getpid()})
+        except Exception:
+            pass
         self._stamp_state_format()                     # the live runner declares its state format (#45)
         self._write_anchor()                           # record the live launch anchor for doctor (#33)
         if self._reexec_adopted:

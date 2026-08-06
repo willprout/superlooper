@@ -137,6 +137,83 @@ def test_a_login_item_runner_that_is_merely_wedged_is_not_kickstarted(rig):
     # Kickstarting it would kill a live runner mid-tick — the one thing this path must not do.
     write_config(rig, runner_home="login-item")
     (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time()) - 3600))
-    (rig.home / "state" / "runner.lock").write_text(str(os.getpid()))
-    watchdog(rig)
+    lock = rig.home / "state" / "runner.lock"
+    lock.write_text(str(os.getpid()))
+    # The pidfile is BACK-DATED, because its mtime is the runner's start and a runner younger than
+    # the staleness bound is judged as booting rather than wedged (issue #239). Without this the
+    # test still passes — but for the boot excuse, not for the wedge it is named after.
+    os.utime(lock, (time.time() - 3600, time.time() - 3600))
+    r = watchdog(rig)
     assert not any("kickstart" in line for line in _lines(rig.launchctl_log))
+    assert "episode open (heartbeat_stale)" in r.stdout, r.stdout
+
+
+# --------------------------- the deliberate stop (issue #239) ---------------------------
+
+def stopped_by_owner(rig, **over):
+    """The marker `superlooper stop` leaves: the runner is down BECAUSE THE OWNER SAID SO."""
+    rec = {"stopped_at": int(time.time()), "operator": "william", "source": "cli"}
+    rec.update(over)
+    (rig.home / "state" / "runner.stopped").write_text(json.dumps(rec))
+
+
+def test_a_deliberately_stopped_login_item_runner_is_never_kickstarted(rig):
+    # The DoD's own test: drive the resurrection decision against a present marker and assert no
+    # kickstart. Without it, "off for the night" gets restarted within one watchdog interval — and
+    # the owner is told their loop recovered from an outage they created on purpose.
+    write_config(rig, runner_home="login-item")
+    provably_gone(rig, pane=False)
+    stopped_by_owner(rig)
+    r = watchdog(rig)
+    assert r.returncode == 0, r.stderr
+    assert not any("kickstart" in line for line in _lines(rig.launchctl_log)), _lines(rig.launchctl_log)
+    assert not _lines(rig.resurrect_log)
+    assert "STOPPED BY OWNER" in r.stdout, r.stdout
+    assert "DOWN" not in r.stdout, r.stdout
+
+
+def test_a_deliberately_stopped_pane_runner_is_never_relaunched_in_a_tab(rig):
+    write_config(rig)
+    provably_gone(rig)
+    stopped_by_owner(rig)
+    r = watchdog(rig)
+    assert r.returncode == 0, r.stderr
+    assert not _lines(rig.resurrect_log)
+    assert not _lines(rig.launchctl_log)
+
+
+def test_removing_the_stop_marker_restores_the_resurrection_path(rig):
+    # The off switch must not latch: once the marker is gone the guardian guards again.
+    write_config(rig, runner_home="login-item")
+    provably_gone(rig, pane=False)
+    stopped_by_owner(rig)
+    watchdog(rig)
+    (rig.home / "state" / "runner.stopped").unlink()
+    (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time()) - 3600))
+    r = watchdog(rig)
+    assert any("kickstart" in line for line in _lines(rig.launchctl_log)), _lines(rig.launchctl_log)
+    assert "resurrected the runner" in r.stdout
+
+
+def test_a_stop_that_did_not_take_leaves_the_live_runner_watched(rig):
+    # A marker on disk with the runner STILL RUNNING (a stop that timed out on a long tick, or a
+    # bootout launchd refused). The watchdog must keep watching: the signal it would otherwise
+    # swallow is the one only a live runner can raise.
+    write_config(rig, runner_home="login-item")
+    (rig.home / "state" / "runner.lock").write_text(str(os.getpid()))     # a LIVE pid
+    (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time())))
+    (rig.home / "state" / "ALERT").write_text(json.dumps({"reasons": ["issues_json_corrupt"]}))
+    stopped_by_owner(rig)
+    r = watchdog(rig)
+    assert r.returncode == 0, r.stderr
+    assert "STOPPED BY OWNER" not in r.stdout, r.stdout
+    assert "episode open" in r.stdout, r.stdout
+
+
+def test_a_stop_that_did_not_take_is_named_in_the_summary(rig):
+    write_config(rig, runner_home="login-item")
+    (rig.home / "state" / "runner.lock").write_text(str(os.getpid()))
+    (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time())))
+    stopped_by_owner(rig)
+    r = watchdog(rig)
+    assert "the stop did not take" in r.stdout, r.stdout

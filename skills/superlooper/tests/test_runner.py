@@ -6848,3 +6848,38 @@ def test_the_runners_doorway_is_bounded_for_its_own_sweeps(rig):
     host = runner_mod.Runner._session_host(rig.r)
     assert host._call_seconds <= runner_mod.SESSION_CALL_SECONDS
     assert host._teardown_reads * host._teardown_pause <= 2
+
+
+# --------------------------- the deliberate stop (issue #239) ---------------------------
+
+def _stop_marker(rig):
+    return rig.home / "state" / "runner.stopped"
+
+
+def test_a_booting_runner_clears_the_stop_marker(rig):
+    # The marker means "no runner is running, on purpose". A runner that IS running makes that
+    # false, so it is cleared the moment this instance owns the singleton — which is what keeps one
+    # stop from silently disabling the watchdog's resurrection forever.
+    _stop_marker(rig).write_text(json.dumps({"stopped_at": 1, "operator": "william"}))
+    rig.r.tick = lambda now=None: None
+    rig.r.run(max_ticks=1, sleep=lambda s: None)
+    assert not _stop_marker(rig).exists()
+    assert ("runner_stop", "started") in [(j.get("act"), j.get("outcome")) for j in _journal(rig)]
+
+
+def test_an_ordinary_boot_with_no_stop_marker_journals_nothing_about_stops(rig):
+    rig.r.tick = lambda now=None: None
+    rig.r.run(max_ticks=1, sleep=lambda s: None)
+    assert "runner_stop" not in [j.get("act") for j in _journal(rig)]
+
+
+def test_a_present_but_corrupt_stop_marker_still_reads_as_stopped(rig):
+    # Existence is the signal (state/ALERT's posture, and the restart marker's): a malformed body
+    # must never let a guardian read a deliberate stop as an accident and restart the loop.
+    import runner as runner_mod
+    _stop_marker(rig).write_text("not json {{{")
+    assert runner_mod.read_stop_marker(rig.home / "state") == {}
+    _stop_marker(rig).write_bytes(b"\xff\xfe not utf-8 \x00")
+    assert runner_mod.read_stop_marker(rig.home / "state") == {}
+    _stop_marker(rig).unlink()
+    assert runner_mod.read_stop_marker(rig.home / "state") is None

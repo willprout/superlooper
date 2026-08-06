@@ -56,6 +56,22 @@ the grace stands down SILENTLY (journal only); at most one VERIFIED launch per e
 failed launch retries up to LAUNCH_ATTEMPT_CAP with ONE failure text; a live debugger
 session (any worker.d*.lock with a live pid) blocks a new launch — never two. A kill-switch
 file (state/WATCHDOG_OFF) makes every check observe + journal and change nothing.
+
+TWO off switches reach this module, and they are deliberately not the same one (issue #239):
+  WATCHDOG_OFF     the WATCHDOG is off. Every check observes and changes nothing, whatever the
+                   runner is doing. The broader switch, and it wins when both are present.
+  runner.stopped   the RUNNER is off, because the owner ran `superlooper stop`. Everything a
+                   stopped runner signals — a heartbeat that stops advancing, a pidfile with no
+                   live process behind it — it signals BY DESIGN, so this module's premise ("the
+                   loop broke while the owner was away") does not hold: the loop did not break,
+                   it was switched off. Both actions available here would work against the
+                   instruction the owner just gave — a kickstart restarts what they turned off, a
+                   debugger diagnoses a process that is off on purpose — so the check observes,
+                   journals once per distinct observation, and does nothing. It is honoured ONLY
+                   alongside `runner_live` being false: the marker records a stop that was ASKED
+                   FOR, and a stop can fail to take, so a live runner is watched whatever the
+                   marker says. Cleared by the deliberate start (and by any runner that boots), so
+                   this can never latch.
 """
 import math
 
@@ -103,7 +119,10 @@ def _new_resurrection():
     # issue #208: `attempts` are the restart timestamps in the rolling window (the crash-loop cap
     # counts these); `capped_notified` / `failure_notified` dedup the escalation and failed-restart
     # texts for one down-streak (cleared when the runner is observed healthy again).
-    return {"attempts": [], "capped_notified": False, "failure_notified": False}
+    # `booting_since` (issue #239) is the runner START TIME already excused as "still booting" —
+    # the memory that keeps that excuse from renewing itself forever (see _resurrection).
+    return {"attempts": [], "capped_notified": False, "failure_notified": False,
+            "booting_since": None}
 
 
 def new_state():
@@ -111,9 +130,13 @@ def new_state():
     # kill-switch journals once per DISTINCT observation instead of once per check (an
     # overnight switch at a 5-min interval must not write ~96 identical lines — the
     # 2026-07-08 unbounded-repetition class). None = not currently disabled-deduping.
+    # stopped_observed: the same dedup, for a runner the owner deliberately STOPPED (issue #239).
+    # A separate field from disabled_observed on purpose — the two states journal different words
+    # and must never inherit each other's "already said that", or an overnight stop followed by a
+    # kill switch (or the reverse) would swallow the first record of the second state.
     return {"episode": None, "no_progress_since": {}, "next_debugger": 1,
-            "disabled_observed": None, "resurrection": _new_resurrection(),
-            "next_resurrection": 1}
+            "disabled_observed": None, "stopped_observed": None,
+            "resurrection": _new_resurrection(), "next_resurrection": 1}
 
 
 def coerce_state(raw):
@@ -137,6 +160,9 @@ def coerce_state(raw):
     dob = raw.get("disabled_observed")
     if isinstance(dob, list) and all(isinstance(x, str) for x in dob):
         st["disabled_observed"] = dob
+    sob = raw.get("stopped_observed")
+    if isinstance(sob, list) and all(isinstance(x, str) for x in sob):
+        st["stopped_observed"] = sob
     res = raw.get("resurrection")
     if isinstance(res, dict):
         r = _new_resurrection()
@@ -146,6 +172,9 @@ def coerce_state(raw):
                              if isinstance(t, (int, float)) and not isinstance(t, bool)]
         r["capped_notified"] = res.get("capped_notified") is True
         r["failure_notified"] = res.get("failure_notified") is True
+        bs = res.get("booting_since")
+        if isinstance(bs, (int, float)) and not isinstance(bs, bool):
+            r["booting_since"] = bs
         st["resurrection"] = r
     nr = raw.get("next_resurrection")
     if type(nr) is int and nr >= 1:
@@ -367,11 +396,15 @@ def _resurrection(now, view, w, sigs, details, new_state):
     if not hb_stale and not runner_dead:
         r["capped_notified"] = False
         r["failure_notified"] = False
+        r["booting_since"] = None            # it ticked: whatever it was booting from is finished
 
     attempts = [t for t in r["attempts"]
                 if isinstance(t, (int, float)) and not isinstance(t, bool)]
 
     if hb_stale and runner_dead:
+        # The runner the booting excuse referred to is a CORPSE, so the excuse dies with it: the
+        # next live runner is genuinely new and gets its own (fresh-agent review).
+        r["booting_since"] = None
         present = sorted(sigs)                              # capture BEFORE filtering, for the memo
         sigs, details = _without(sigs, details, HEARTBEAT_STALE)
         recent = [t for t in attempts if now - t < RESURRECTION_WINDOW_SECONDS]
@@ -406,7 +439,32 @@ def _resurrection(now, view, w, sigs, details, new_state):
             r["capped_notified"] = False
     elif hb_stale and not runner_dead:
         last = max(attempts, default=None)
-        if last is not None and now - last < RESURRECTION_SETTLE_SECONDS:
+        started = view.get("runner_started_at")
+        # A runner YOUNGER than the staleness bound cannot yet have proven anything about itself:
+        # nothing stamps the heartbeat at boot (only the END of a successful tick does), so the
+        # stale reading it is being judged on belongs to the PREVIOUS process. The settle window
+        # below already encoded this rule for a runner the watchdog itself restarted; a deliberate
+        # start leaves no attempt behind, so without the general form the first check after every
+        # `superlooper start` texts the owner about the outage they just ended.
+        #
+        # The excuse has MEMORY, and that is what keeps it from renewing itself forever
+        # (fresh-agent review). A login-item runner that exits before completing a tick is respawned
+        # by KeepAlive, so every check sees a live runner younger than the bound — and an excuse
+        # re-derived from the current pidfile would cover a crash loop indefinitely, with
+        # `no_progress` frozen behind the same stale heartbeat and only `alert` left to notice
+        # anything. So we excuse ONE start: a start time that MOVES while the heartbeat is still
+        # stale is a runner being replaced over and over, which is a fault in its own right rather
+        # than a boot in progress. The lower bound on the age is the same rule for the same reason —
+        # a pidfile dated in the future (a clock step, a restored file) is not evidence of youth.
+        age = (now - started) if isinstance(started, (int, float)) \
+            and not isinstance(started, bool) else None
+        fresh = view.get("runner_live") and age is not None \
+            and 0 <= age < w["heartbeat_stale_seconds"]
+        same_runner = r.get("booting_since") is None or r["booting_since"] == started
+        if fresh and same_runner:
+            r["booting_since"] = started
+            sigs, details = _without(sigs, details, HEARTBEAT_STALE)   # this runner is still booting
+        elif last is not None and now - last < RESURRECTION_SETTLE_SECONDS:
             sigs, details = _without(sigs, details, HEARTBEAT_STALE)   # reborn runner still booting
         r["attempts"] = attempts
     else:
@@ -444,13 +502,63 @@ def evaluate(now, config, view, state):
         # distinct observation, never one per check.
         # runner_down stays False here: the kill switch suppresses the whole resurrection path, so
         # the caller's summary reports DISABLED (what it observed), never a cap it never evaluated.
+        # stopped_observed is re-armed here (and disabled_observed on the stopped branch below):
+        # the two dedups must not inherit each other's "already said that", or a night that flips
+        # between the switches journals the second state only once, ever.
         if sigs == state.get("disabled_observed"):
-            return {"state": state, "notify": [], "launch": None, "journal": [], "resurrect": None,
-                    "runner_down": False}
-        return {"state": dict(state, disabled_observed=sigs), "notify": [], "launch": None,
+            return {"state": dict(state, stopped_observed=None), "notify": [], "launch": None,
+                    "journal": [], "resurrect": None, "runner_down": False}
+        return {"state": dict(state, disabled_observed=sigs, stopped_observed=None),
+                "notify": [], "launch": None,
                 "journal": [_rec("disabled", sigs)], "resurrect": None, "runner_down": False}
 
-    new_state = dict(state, no_progress_since=since, disabled_observed=None)
+    if view.get("stopped_by_owner") and not view.get("runner_live"):
+        # The runner is down because `superlooper stop` put it down (issue #239). Same posture as
+        # the kill switch — observe, journal, change nothing — and for a reason that is one step
+        # narrower: the watchdog is watching, there is simply nothing here it would be right to do.
+        # A stopped runner's stale heartbeat and dead pidfile are the STOP's signature, so acting on
+        # them would restart what the owner turned off; a debugger hired to diagnose a process that
+        # is off on purpose has nothing to diagnose either.
+        #
+        # AND NOT runner_live is load-bearing (fresh-agent review). The marker alone says a stop was
+        # REQUESTED, not that it took: a stop can time out on a long tick, and a bootout can fail
+        # outright — both leave a marker on disk with the loop still running. Standing down on the
+        # request would then muzzle the watchdog over a LIVE runner, and the signal it would swallow
+        # is the one only a live runner can raise: `alert`, which the runner writes when its own
+        # ticks are wedging or its state file is corrupt. So the marker buys silence only about a
+        # runner that is actually gone; a runner still up gets watched exactly as before.
+        #
+        # runner_down stays False for the same reason it does under the kill switch: the caller's
+        # summary reports what it observed ("stopped by owner"), never an incident it did not have.
+        #
+        # An open EPISODE and the no-progress CLOCKS are both DROPPED, and both for one reason: they
+        # measure elapsed time against a grace that keeps running while the loop is off. Carried
+        # across an overnight stop, an episode opened at 22:00 is ten hours past its grace by the
+        # time the owner starts the loop at 08:00 — so the first check after the start hires an
+        # unattended debugger against a runner that has been alive twenty seconds and has not yet
+        # stamped its first heartbeat. That is this issue's own failure moved to the far end of the
+        # stop. A signal that genuinely survives the stop re-trips on its own and opens a FRESH
+        # episode with a fresh grace and one honest notify, which is the behaviour the grace exists
+        # to produce. The stand-down is journaled, so the record still says the episode ended here.
+        journal = ([_rec("stand_down", state["episode"].get("signals") or [])]
+                   if state.get("episode") is not None else [])
+        # `booting_since` is cleared with everything else: it names the start of a runner that is
+        # now gone, and carrying it across the stop would deny the NEXT runner the one excuse it is
+        # entitled to — the very first check after `superlooper start` would then text about the
+        # heartbeat the new runner inherited (fresh-agent review). The excuse is meant to span a
+        # continuous streak of live observations, and a stop ends that streak by definition.
+        rested = dict(state, episode=None, no_progress_since={}, disabled_observed=None,
+                      resurrection=dict(state.get("resurrection") or _new_resurrection(),
+                                        booting_since=None))
+        if sigs == state.get("stopped_observed"):
+            return {"state": rested, "notify": [], "launch": None, "journal": journal,
+                    "resurrect": None, "runner_down": False}
+        return {"state": dict(rested, stopped_observed=sigs), "notify": [], "launch": None,
+                "journal": journal + [_rec("runner_stopped", sigs)], "resurrect": None,
+                "runner_down": False}
+
+    new_state = dict(state, no_progress_since=since, disabled_observed=None,
+                     stopped_observed=None)
     journal, notify, launch = [], [], None
 
     # Runner resurrection (issue #208) runs BEFORE the debugger-episode logic: it may reroute a

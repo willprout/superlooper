@@ -36,7 +36,7 @@ def _view(now=T0, **over):
     """A HEALTHY instance at `now`: fresh heartbeat, no ALERT, quiet queue."""
     v = {"heartbeat": now - 15, "alert": None, "lanes_busy": False, "gh_ok": True,
          "eligible_nums": [], "usage_exhausted": False, "kill_switch": False,
-         "debugger_live": False}
+         "debugger_live": False, "stopped_by_owner": False, "runner_live": False}
     v.update(over)
     return v
 
@@ -730,3 +730,250 @@ def test_coerce_state_handles_a_wrong_typed_resurrection_slice():
         assert st["next_resurrection"] >= 1
         r = wd.evaluate(T0, _cfg(), _view(), st)           # never crashes
         assert r["resurrect"] is None
+
+
+# --------------------------- the deliberate stop (issue #239) ---------------------------
+#
+# `superlooper stop` drops state/runner.stopped and takes the runner down. Every signal a stopped
+# runner produces is a signal it produces BY DESIGN, so the watchdog — whose entire premise is "the
+# loop broke while the owner was away" — must observe and do nothing. A loop the owner switched off
+# is not broken, and both actions this module can take (restart the runner, hire a debugger to
+# diagnose it) work directly against the instruction the owner just gave.
+#
+# Deliberately DISTINCT from the kill switch, in state and in the journal: WATCHDOG_OFF turns the
+# whole check off (including for a runner that is up), while this says the RUNNER is off. Blurring
+# them would let a morning report say the watchdog was disabled when it was watching all night.
+
+def test_a_deliberately_stopped_runner_is_never_resurrected():
+    # The DoD's own sentence: the watchdog sees the stop marker and declines to resurrect.
+    r = _run(T0, _dead(T0, stopped_by_owner=True))
+    assert r["resurrect"] is None
+    assert r["launch"] is None
+    assert r["notify"] == []
+    assert r["state"]["episode"] is None
+    # Not "DOWN": the caller's summary must not shout about a loop that is off on purpose.
+    assert r["runner_down"] is False
+    assert r["state"]["resurrection"]["attempts"] == []   # no cap slot burned by a non-attempt
+
+
+def test_a_deliberately_stopped_runner_never_hires_a_debugger():
+    # The stale heartbeat of a stopped runner is the stop's own signature, not a wedge. Without
+    # this, every "off for the night" texts the owner 20 min later and launches an unattended
+    # debugger 30 min after that — against a loop that is off exactly as they asked.
+    st = _run(T0, _view(T0, heartbeat=T0 - 21 * MIN, stopped_by_owner=True))["state"]
+    later = _run(T0 + 60 * MIN, _view(T0 + 60 * MIN, heartbeat=T0 - 21 * MIN,
+                                      stopped_by_owner=True), st)
+    assert later["launch"] is None
+    assert later["notify"] == []
+    assert later["state"]["episode"] is None
+
+
+def test_a_stop_journals_once_per_distinct_observation():
+    # The 2026-07-08 unbounded-repetition class: an overnight stop at a 5-min interval must not
+    # write ~96 identical lines.
+    v = _dead(T0, stopped_by_owner=True)
+    r1 = _run(T0, v)
+    assert _outcomes(r1) == ["runner_stopped"]
+    r2 = _run(T0 + 5 * MIN, _dead(T0 + 5 * MIN, stopped_by_owner=True), r1["state"])
+    assert r2["journal"] == []
+    r3 = _run(T0 + 10 * MIN, _dead(T0 + 10 * MIN, stopped_by_owner=True,
+                                   alert={"reasons": ["x"]}), r2["state"])
+    assert _outcomes(r3) == ["runner_stopped"]            # the observation CHANGED: journal it
+
+
+def test_the_stop_record_is_distinct_from_the_kill_switch_record():
+    stopped = _run(T0, _dead(T0, stopped_by_owner=True))
+    disabled = _run(T0, _dead(T0, kill_switch=True))
+    assert _outcomes(stopped) == ["runner_stopped"]
+    assert _outcomes(disabled) == ["disabled"]
+
+
+def test_the_kill_switch_still_wins_over_a_stop():
+    # Both present: WATCHDOG_OFF is the broader off switch and its record is the honest one — the
+    # check would have changed nothing even if the runner had been up.
+    r = _run(T0, _dead(T0, stopped_by_owner=True, kill_switch=True))
+    assert _outcomes(r) == ["disabled"]
+    assert r["resurrect"] is None
+
+
+def test_starting_the_runner_again_re_arms_the_whole_watchdog():
+    # The stop marker is cleared by the deliberate start, so the very next check watches normally —
+    # including resurrecting a runner that dies after being restarted.
+    st = _run(T0, _dead(T0, stopped_by_owner=True))["state"]
+    back = _run(T0 + 30 * MIN, _dead(T0 + 30 * MIN), st)
+    assert back["resurrect"] is not None
+    assert back["state"]["stopped_observed"] is None      # the dedup marker re-armed
+
+
+def test_wrong_typed_stop_state_degrades_to_a_fresh_one():
+    for garbage in ({"stopped_observed": "yes"}, {"stopped_observed": [1, 2]}):
+        st = wd.coerce_state(garbage)
+        assert st["stopped_observed"] is None
+        r = wd.evaluate(T0, _cfg(), _view(), st)          # never crashes
+        assert r["resurrect"] is None
+
+
+def test_a_stop_that_did_not_take_leaves_a_live_runner_watched():
+    # The marker records a stop that was REQUESTED. A stop can time out on a long tick and a bootout
+    # can fail, so a live runner with a marker on disk is an ordinary state — and standing down over
+    # it would swallow `alert`, the one signal only a RUNNING runner raises (a wedging tick loop, a
+    # corrupt issues.json). That is the loudest thing the watchdog exists to notice.
+    r = _run(T0, _view(T0, alert={"reasons": ["issues_json_corrupt"]},
+                       stopped_by_owner=True, runner_live=True))
+    assert _outcomes(r) == ["notified"]
+    assert r["state"]["episode"]["signals"] == ["alert"]
+    assert len(r["notify"]) == 1
+
+
+def test_a_live_runner_with_a_marker_still_reaches_the_debugger_when_it_wedges():
+    st = _run(T0, _view(T0, heartbeat=T0 - 21 * MIN, stopped_by_owner=True,
+                        runner_live=True))["state"]
+    assert st["episode"] is not None
+    r = _run(T0 + 30 * MIN, _view(T0 + 30 * MIN, heartbeat=T0 - 21 * MIN,
+                                  stopped_by_owner=True, runner_live=True), st)
+    assert r["launch"] is not None
+
+
+def test_a_stop_drops_the_no_progress_clocks_rather_than_freezing_them():
+    # The clocks FREEZE while the heartbeat is stale, so an overnight stop would hand the first
+    # healthy check after the start a clock reading "waiting since last night" — an instant
+    # no_progress text about work that waited because the owner turned the loop off.
+    st = wd.new_state()
+    st["no_progress_since"] = {"7": T0 - 8 * 60 * MIN}
+    r = _run(T0, _dead(T0, stopped_by_owner=True), st)
+    assert r["state"]["no_progress_since"] == {}
+
+
+def test_a_stop_stands_an_open_episode_down_instead_of_freezing_its_grace():
+    # A wedge trips at 22:00, the owner stops the loop at 22:05, and starts it again at 08:00. The
+    # reborn runner has not stamped a tick, so the heartbeat still reads stale — and a CARRIED
+    # episode is ten hours past its grace, so the very first check hires an unattended debugger
+    # against a runner twenty seconds old. That is this issue's own failure, moved to the far end
+    # of the stop. Standing the episode down means a surviving signal opens a FRESH one, with a
+    # fresh grace and one honest notify.
+    st = _open_episode(T0)
+    stopped = _run(T0 + 5 * MIN, _dead(T0 + 5 * MIN, stopped_by_owner=True), st)
+    assert stopped["state"]["episode"] is None
+    assert "stand_down" in _outcomes(stopped)
+    back = _run(T0 + 600 * MIN, _view(T0 + 600 * MIN, heartbeat=T0 + 579 * MIN,
+                                      runner_live=True), stopped["state"])
+    assert back["launch"] is None, "no debugger on the first check after a start"
+    assert back["state"]["episode"] is not None                   # a fresh episode, fresh grace
+    assert back["state"]["episode"]["opened_at"] == T0 + 600 * MIN
+
+
+def test_the_two_off_switches_never_swallow_each_others_first_record():
+    # Separate dedup fields exist so a night that flips between them journals both. Each branch has
+    # to RE-ARM the other's, or the second state is recorded once and never again.
+    off = _run(T0, _dead(T0, kill_switch=True))
+    assert _outcomes(off) == ["disabled"]
+    stopped = _run(T0 + 5 * MIN, _dead(T0 + 5 * MIN, stopped_by_owner=True), off["state"])
+    assert _outcomes(stopped) == ["runner_stopped"]
+    off_again = _run(T0 + 10 * MIN, _dead(T0 + 10 * MIN, kill_switch=True), stopped["state"])
+    assert _outcomes(off_again) == ["disabled"], "the kill switch's record was swallowed"
+
+
+def test_a_runner_that_just_booted_is_not_called_wedged_on_the_heartbeat_it_inherited():
+    # Nothing stamps the heartbeat at BOOT — only the end of a successful tick does. So for the
+    # tens of seconds between winning the singleton and finishing tick one, a freshly started
+    # runner is judged on the previous process's silence. After an overnight stop that reads as
+    # "stale 600 min", and the first check after `superlooper start` texts the owner about the
+    # outage they just ended.
+    now = T0 + 600 * MIN
+    r = _run(now, _view(now, heartbeat=T0, runner_live=True, runner_started_at=now - 20))
+    assert r["notify"] == []
+    assert r["state"]["episode"] is None
+
+
+def test_a_runner_that_has_been_up_past_the_bound_and_still_has_not_ticked_is_wedged():
+    # The other half: the suppression is about evidence, not mercy. Once the runner is older than
+    # the staleness bound, its silence is its OWN.
+    now = T0 + 600 * MIN
+    r = _run(now, _view(now, heartbeat=T0, runner_live=True, runner_started_at=now - 25 * MIN))
+    assert r["state"]["episode"] is not None
+    assert r["state"]["episode"]["signals"] == ["heartbeat_stale"]
+
+
+def test_a_dead_runner_is_never_excused_by_a_start_time():
+    # The suppression rides on runner_live. A corpse with a recent-looking start time must still
+    # be resurrected, or a crash right after a restart would go unnoticed.
+    now = T0 + 600 * MIN
+    r = _run(now, _dead(now, stale_min=600, runner_started_at=now - 20))
+    assert r["resurrect"] is not None
+
+
+def test_a_runner_that_keeps_being_replaced_stops_earning_the_booting_excuse():
+    # A login-item runner that exits before completing a tick is respawned by KeepAlive, so every
+    # check sees a live runner younger than the bound. An excuse re-derived from the current pidfile
+    # would cover that crash loop forever — and no_progress is frozen behind the same stale
+    # heartbeat, leaving only `alert` to notice anything. One start is excused; a start time that
+    # MOVES while the heartbeat is still stale is a runner being replaced, which is its own fault.
+    st = wd.new_state()
+    now = T0
+    seen = []
+    for i in range(6):
+        r = _run(now, _view(now, heartbeat=T0 - 60 * MIN, runner_live=True,
+                            runner_started_at=now - 30), st)
+        st = r["state"]
+        seen.append(st["episode"] is not None)
+        now += 5 * MIN
+    assert seen[0] is False, "the first observation is a boot, and is excused"
+    assert seen[-1] is True, "a runner that keeps being replaced is not booting, it is flapping"
+
+
+def test_the_same_runner_keeps_its_excuse_while_it_boots():
+    st = wd.new_state()
+    started = T0 - 30
+    for step in (0, 60, 120):
+        now = T0 + step
+        r = _run(now, _view(now, heartbeat=T0 - 60 * MIN, runner_live=True,
+                            runner_started_at=started), st)
+        st = r["state"]
+        assert st["episode"] is None, "the SAME runner, still inside the bound, is still booting"
+
+
+def test_a_pidfile_dated_in_the_future_earns_nothing():
+    # A clock step or a restored file must not read as youth — that would suppress heartbeat_stale
+    # indefinitely on evidence that is not evidence.
+    r = _run(T0, _view(T0, heartbeat=T0 - 60 * MIN, runner_live=True,
+                       runner_started_at=T0 + 86400))
+    assert r["state"]["episode"] is not None
+
+
+def test_a_ticking_runner_forgets_it_was_ever_booting():
+    st = _run(T0, _view(T0, heartbeat=T0 - 60 * MIN, runner_live=True,
+                        runner_started_at=T0 - 30))["state"]
+    assert st["resurrection"]["booting_since"] is not None
+    healthy = _run(T0 + MIN, _view(T0 + MIN, runner_live=True), st)
+    assert healthy["state"]["resurrection"]["booting_since"] is None
+
+
+def test_the_booting_excuse_does_not_outlive_the_runner_it_describes():
+    # The excuse spans a continuous streak of LIVE observations of ONE runner. Carried across a
+    # deliberate stop it would deny the next runner the excuse it is entitled to — and the very
+    # first check after `superlooper start` would text about the heartbeat that runner inherited,
+    # which is the failure the excuse was added to kill.
+    st = _run(T0, _view(T0, heartbeat=T0 - 60 * MIN, runner_live=True,
+                        runner_started_at=T0 - 20))["state"]
+    assert st["resurrection"]["booting_since"] is not None
+    night = T0 + 5 * MIN
+    for _ in range(11):                                    # switched off, checked all night
+        st = _run(night, _dead(night, stale_min=60, stopped_by_owner=True), st)["state"]
+        night += 30 * MIN
+    assert st["resurrection"]["booting_since"] is None, "the stop ended that runner's streak"
+    back = _run(night, _view(night, heartbeat=T0 - 60 * MIN, runner_live=True,
+                             runner_started_at=night - 20), st)
+    assert back["notify"] == [] and back["state"]["episode"] is None
+
+
+def test_a_corpse_takes_the_booting_excuse_with_it():
+    st = _run(T0, _view(T0, heartbeat=T0 - 60 * MIN, runner_live=True,
+                        runner_started_at=T0 - 20))["state"]
+    assert st["resurrection"]["booting_since"] is not None
+    dead = _run(T0 + 5 * MIN, _dead(T0 + 5 * MIN, stale_min=60), st)
+    assert dead["resurrect"] is not None
+    assert dead["state"]["resurrection"]["booting_since"] is None
+    # ...and the runner that comes back from that restart still gets its own excuse.
+    reborn = _run(T0 + 10 * MIN, _view(T0 + 10 * MIN, heartbeat=T0 - 60 * MIN, runner_live=True,
+                                       runner_started_at=T0 + 10 * MIN - 20), dead["state"])
+    assert reborn["state"]["episode"] is None

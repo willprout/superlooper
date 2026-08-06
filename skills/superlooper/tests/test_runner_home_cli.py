@@ -477,9 +477,19 @@ def test_the_status_line_never_reports_an_unreadable_job_as_simply_not_running(r
     _script(rig.launchctl, 'echo "com.x = {"\necho "\tstate = not running"\necho "}"\nexit 0\n')
     assert "not running" in cli(rig, "runner-home", "--repo", str(rig.repo)).stdout
 
-    _script(rig.launchctl, 'exit 1\n')                       # the service manager refused
+    # launchd NAMING this service as absent — the only reading that means "not loaded" (issue
+    # #239 brought the same rule to `stop`, and this line had the looser version of it: any
+    # nonzero rc read as "not loaded", including a domain error or an I/O error, which say
+    # nothing about the service at all).
+    _script(rig.launchctl,
+            'echo \'Could not find service "x" in domain for user gui: 501\' >&2\nexit 113\n')
     out = cli(rig, "runner-home", "--repo", str(rig.repo)).stdout
     assert "not running" not in out and "not loaded" in out
+
+    _script(rig.launchctl, 'exit 1\n')                       # refused, and said nothing
+    out = cli(rig, "runner-home", "--repo", str(rig.repo)).stdout
+    assert "not running" not in out and "not loaded" not in out
+    assert "unknown" in out.lower()
 
     _script(rig.launchctl, 'echo "com.x = {"\necho "\tstate = some-future-word"\necho "}"\n')
     out = cli(rig, "runner-home", "--repo", str(rig.repo)).stdout
