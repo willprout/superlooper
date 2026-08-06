@@ -137,9 +137,15 @@ def test_a_login_item_runner_that_is_merely_wedged_is_not_kickstarted(rig):
     # Kickstarting it would kill a live runner mid-tick — the one thing this path must not do.
     write_config(rig, runner_home="login-item")
     (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time()) - 3600))
-    (rig.home / "state" / "runner.lock").write_text(str(os.getpid()))
-    watchdog(rig)
+    lock = rig.home / "state" / "runner.lock"
+    lock.write_text(str(os.getpid()))
+    # The pidfile is BACK-DATED, because its mtime is the runner's start and a runner younger than
+    # the staleness bound is judged as booting rather than wedged (issue #239). Without this the
+    # test still passes — but for the boot excuse, not for the wedge it is named after.
+    os.utime(lock, (time.time() - 3600, time.time() - 3600))
+    r = watchdog(rig)
     assert not any("kickstart" in line for line in _lines(rig.launchctl_log))
+    assert "episode open (heartbeat_stale)" in r.stdout, r.stdout
 
 
 # --------------------------- the deliberate stop (issue #239) ---------------------------

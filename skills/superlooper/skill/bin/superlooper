@@ -1641,9 +1641,35 @@ def cmd_start(args):
     result["already_running"] = pid is not None
 
     rc, out = _launchctl(runner_home.bootstrap_argv(_launchctl_bin(), uid, plist))
+    if rc != 0 and pid is not None:
+        # NEVER kickstart while a runner is ALIVE (fresh-agent review). The fallback below passes
+        # `-k`, which HARD-KILLS the running service — that is what makes it the right remedy for a
+        # job loaded around a dead or wedged process, and the wrong one for anything else. A
+        # bootstrap can be refused for reasons that have nothing to do with the job already being
+        # there (launchd's own I/O errors, a permissions refusal), and `superlooper start` reaching
+        # for a SIGKILL of a healthy runner on the strength of a refused bootstrap is the single
+        # most destructive thing this verb could do. The marker still goes: a live runner is what
+        # makes it false, and that fact came from the runner's own pidfile, not from launchd.
+        result["cleared"] = _clear_stop(result, state_dir)
+        if result["ok"]:
+            # Only when the clear did NOT already fail: a marker that will not delete is the
+            # latched off switch, and overwriting that diagnosis with this one loses the more
+            # important of the two (fresh-agent review).
+            result.update(ok=False, started=False, already_running=True,
+                          error="launchd would not load %s in %s (rc=%d%s) and a runner is already "
+                                "live (pid %d) — this will not kickstart the job, because that "
+                                "would kill it. The loop is running, but launchd is not holding it."
+                                % (job, result["domain"], rc, ": " + out if out else "", pid),
+                          remedy="read the job (%s); once you know why it will not load, restart "
+                                 "the loop with `superlooper stop` then `superlooper start`."
+                                 % " ".join(runner_home.print_argv("launchctl", uid, job)))
+        result.update(started=False, already_running=True)
+        _emit_start(args, result)
+        return 1
     if rc != 0:
         # Already loaded around a dead or wedged process is the ordinary case here (a stop that was
-        # never a bootout, someone else's `launchctl load`), and kickstart is exactly its remedy.
+        # never a bootout, someone else's `launchctl load`), and kickstart is exactly its remedy —
+        # with nothing alive for its `-k` to kill.
         rc, out = _launchctl(runner_home.kickstart_argv(_launchctl_bin(), uid, job))
         if rc != 0:
             result.update(ok=False,
@@ -3450,20 +3476,6 @@ def _watchdog_heartbeat(state_dir):
         return None
 
 
-def _watchdog_runner_dead(state_dir):
-    """True only when state/runner.lock names a DEAD pid — the runner CRASHED (a crash leaves the
-    pidfile behind; a clean stop REMOVES it; a live pid means the loop is up). This is the "recorded
-    pid dead" half of the DoD's provably-gone test (issue #208): a crash we may restart, never a
-    deliberate stop we must respect. A garbage (non-numeric) pidfile reads False — it is not a clean
-    recorded-dead-pid signal, so we fall through to the debugger/notify path rather than auto-restart
-    on a weird state."""
-    txt = _read(os.path.join(state_dir, "runner.lock"))
-    if txt is None:
-        return False
-    pid = txt.strip()
-    return pid.isdigit() and not _pid_alive(int(pid))
-
-
 def _watchdog_stopped(state_dir):
     """True when the owner deliberately stopped this runner (issue #239) — state/runner.stopped is
     present. EXISTENCE is the signal, so a corrupt body still counts: the failure this guards
@@ -3476,10 +3488,11 @@ def _watchdog_stopped(state_dir):
 def _watchdog_runner_view(state_dir):
     """``(live, started_at, dead)`` for the recorded runner — ONE read, three facts.
 
-    `live` is the positive twin of ``_watchdog_runner_dead``, which answers "the recorded pid is
-    DEAD" and leaves the third state (no pidfile at all — a clean exit) as neither. Only a positive
-    read may decide that a stop did not take, because the unsafe direction is believing a runner is
-    gone when it is up.
+    `live` and `dead` are not each other's negation, and that is the point: the third state — no
+    pidfile at all, which is what a CLEAN exit leaves — is neither. Only a positive `live` read may
+    decide that a stop did not take, because the unsafe direction is believing a runner is gone
+    when it is up; and only a positive `dead` read may drive a restart, because the unsafe
+    direction there is restarting a loop somebody stopped.
 
     `started_at` is when that runner took the singleton, from its pidfile's mtime: the file is
     written once, by the process that won the lock, and never refreshed (the re-exec path adopts it
@@ -3495,17 +3508,21 @@ def _watchdog_runner_view(state_dir):
     Answered TOGETHER because they are consumed together: derived from separate reads, a runner
     that booted in the gap yields live=True with started_at=None — which is exactly the spurious
     "wedged" episode the set exists to prevent (fresh-agent review)."""
-    from runner import live_runner_pid
-    if live_runner_pid(state_dir) is not None:
-        try:
-            return True, os.path.getmtime(os.path.join(state_dir, "runner.lock")), False
-        except OSError:
-            return True, None, False
-    # Not live. A garbage (non-numeric) pidfile is NOT a clean recorded-dead-pid signal, so it does
-    # not earn `dead` — the same rule _watchdog_runner_dead has always applied.
-    txt = _read(os.path.join(state_dir, "runner.lock"))
+    lock = os.path.join(state_dir, "runner.lock")
+    txt = _read(lock)
     recorded = (txt or "").strip()
-    return False, None, bool(txt is not None and recorded.isdigit())
+    # A garbage (non-numeric) or non-positive pidfile is NOT a clean recorded-dead-pid signal, so it
+    # earns neither answer: a weird pidfile falls through to the debugger/notify path rather than
+    # auto-restarting on a state nobody can read.
+    pid = int(recorded) if recorded.isdigit() and int(recorded) > 0 else None
+    if pid is None:
+        return False, None, False
+    if not _pid_alive(pid):
+        return False, None, True
+    try:
+        return True, os.path.getmtime(lock), False
+    except OSError:
+        return True, None, False
 
 
 def _watchdog_alert(state_dir):

@@ -752,3 +752,36 @@ def test_a_failed_stop_reports_launchds_job_pid_without_claiming_it_as_the_runne
     doc = json.loads(cli(rig, "stop", "--json").stdout)
     assert doc["was_running"] is False and doc["pid"] is None   # no runner pidfile in this rig
     assert doc["job_pid"] == 4242                                # ...and launchd's is its own key
+
+
+def test_start_leaves_a_live_runner_alone_when_bootstrap_is_refused(rig):
+    # `kickstart -k` HARD-KILLS the running service — which is exactly why it is the right remedy
+    # for a job loaded around a DEAD process, and the wrong one for anything else. A bootstrap can
+    # be refused for reasons that have nothing to do with the job already being there (launchd's own
+    # I/O errors, a permissions refusal), and reaching for a SIGKILL of a healthy runner on the
+    # strength of a refused bootstrap is the most destructive thing this verb could do.
+    write_config(rig, runner_home="login-item")
+    (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
+    pid = rig.spawn()
+    load_job(rig, pid)
+    (rig.home / "state" / "runner.stopped").write_text(
+        json.dumps({"stopped_at": int(time.time()), "operator": "william"}))
+    # A launchd whose `print` answer is stale (the service reads absent) while the job is in fact
+    # loaded, so the bootstrap is refused — the shape that used to reach `kickstart -k`.
+    _script(rig.tmp / "launchctl", '#!/bin/sh\necho "$@" >> "$LAUNCHCTL_LOG"\n'
+                                   'case "$1" in\n'
+                                   '  managername) echo Aqua ;;\n'
+                                   '  print) echo "Could not find service \\"x\\" in domain" >&2;'
+                                   ' exit 113 ;;\n'
+                                   '  bootstrap) echo "Bootstrap failed: 5: I/O error" >&2;'
+                                   ' exit 5 ;;\n'
+                                   'esac\nexit 0\n')
+    r = cli(rig, "start", "--json")
+    doc = json.loads(r.stdout)
+    # By the VERB, not a substring: pytest names its tmpdir after the test, so a path in the
+    # bootstrap line can carry the word this is looking for.
+    assert not any(line.split()[0] == "kickstart" for line in calls(rig) if line.split()), calls(rig)
+    assert not _dead(pid, deadline=2), "the healthy runner must survive a failed start"
+    assert r.returncode != 0 and doc["ok"] is False and doc["started"] is False
+    assert doc["cleared"] is True, "a live runner still falsifies the marker"
+    assert "kill it" in r.stdout or "kill it" in doc["error"]
