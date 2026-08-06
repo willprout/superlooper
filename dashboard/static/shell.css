@@ -697,6 +697,12 @@ html, body {
    dead one must still read as healthy — that is why the words are per-repo in the first place. */
 .btruth .r.down { color: #A3301C; font-weight: 700; }
 .btruth .r.blind, .btruth .r.dark { color: #8A5A12; font-weight: 700; }
+/* An UNVOUCHED closed read (issue #268): the runner's own view, fresh, with one read missing out of
+   it — so blocked-by issues are holding and the queue looks stopped for no visible reason. Same
+   amber register as blind/dark (degraded, nothing broken), but its own rule rather than a third
+   selector on theirs: it is a different fact, and the row-state ratchet in test_static_truth exists
+   precisely so the next state added server-side cannot reach the browser unpainted. */
+.btruth .r.unvouched { color: #8A5A12; font-weight: 700; }
 .btruth .r.eng { color: #8A5A12; }
 /* Level = the worst repo's. One glance at the strip's ground summarises everything under it. */
 .btruth.lvl-notice { background: #FDF6E6; border-color: #D9BE7E; border-left-color: #C08A22; }

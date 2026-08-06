@@ -211,6 +211,40 @@ def test_every_level_the_server_can_emit_has_a_boring_mode_colour():
                 "%s has no rule for level %r — it would render as the healthy state" % (strip, lvl))
 
 
+def test_every_data_state_the_strip_can_emit_has_a_boring_mode_colour():
+    # The row-state ratchet, the sibling of the level one above (issue #268 added `unvouched` and
+    # walked straight into this gap). Boring mode paints ONE class per degraded row state over a base
+    # `.btruth .r` that IS the healthy ink, so a state with no rule renders as the calm reading —
+    # a false all-clear arriving through a CSS gap. `ok` is exempt: the base rule IS the healthy row.
+    #
+    # The vocabulary is DERIVED by driving lib/truth over each situation it can be in, not typed out
+    # here: a hand-listed set is a second copy that goes stale the moment someone adds a fifth state,
+    # which is exactly the failure this guards.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+    import flights
+    import truth
+
+    live = {"mode": flights.SOURCE_LIVE, "reason": None, "tick_age": 4.0, "data_age": 12.0,
+            "tick_age_text": "4s ago", "data_age_text": "12s ago", "silent_since": None,
+            "banner": None, "closed_read_ok": True}
+    unvouched = dict(live, closed_read_ok=False)
+    fallback = {"mode": flights.SOURCE_FALLBACK, "reason": flights.FALLBACK_RUNNER_SILENT,
+                "tick_age": 900.0, "data_age": 30.0, "tick_age_text": "15m ago",
+                "data_age_text": "30s ago", "silent_since": 1000.0, "banner": {"lines": []}}
+    situations = [(live, None), (unvouched, None), (fallback, None),
+                  (live, {"unreachable": True})]
+    states = {truth.banner(src, github=gh)["data"]["state"] for src, gh in situations}
+    assert len(states) >= 4, "the situations must actually produce distinct states, or this is a no-op"
+
+    for state in sorted(states - {"ok"}):
+        rule = re.search(r"\.btruth \.r\.%s\b[^{]*\{([^}]*)\}" % re.escape(state), _CSS)
+        assert rule, (
+            ".btruth has no rule for data state %r — the row would render as the healthy reading"
+            % state)
+        assert re.search(r"color|font-weight", rule.group(1)), (
+            ".btruth .r.%s must paint its own ink/weight — it cannot read as the calm state" % state)
+
+
 def test_boring_modes_levels_are_visually_distinct_without_animation():
     # The field strip pulses to earn the eye. Boring mode may not — "boring mode is fully static, no
     # exceptions" is an owner ruling and `.boring *` kills every animation. So each level must paint

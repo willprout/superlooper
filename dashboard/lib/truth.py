@@ -11,7 +11,11 @@ So this strip states, always and unasked, the three facts that decide how much o
 believe:
 
   * **is the loop alive?** — the runner's last tick, and the word "loop may be down" when it's stale
-  * **whose truth is this?** — the runner's own published view, or a blind/second-hand one
+  * **whose truth is this, and did all of it land?** — the runner's own published view or a
+    blind/second-hand one, and (issue #268) whether the runner VOUCHES for the closed-issue read
+    behind it. A refused closed read is invisible in the result — the poll still stamps itself
+    fresh, because the reachability probe is exempt from throttling, and a refused read and an empty
+    one produce the same empty set — so the vouch is the only thing that can say it
   * **is the merged fix actually running?** — the engine's publish drift (``lib/engine``)
 
 **It DERIVES nothing it could get wrong.** Whether the runner is silent is decided ONCE, in
@@ -51,6 +55,20 @@ _MAY_BE_DOWN = "loop may be down"
 # freshest possible data at the exact moment we have none.
 _UNKNOWN_AGE = "?"
 
+# The unvouched closed-read marker (issue #268). Two clauses, both load-bearing:
+#
+#   * WHAT is missing — the closed-issue read, this poll. Not the view, not the tick: those are
+#     fresh, and saying otherwise would contradict the age sitting beside it.
+#   * WHAT IT COSTS — every blocked-by issue is holding. That is the sentence that explains the
+#     thing the owner is actually looking at: a queue that has quietly stopped moving.
+#
+# It names NO cause. The vouch is published fail-closed (an older or unreadable view publishes a
+# false), so `False` means "not vouched" — never "GitHub is definitely throttled". A throttle is the
+# likeliest reason and the strip still may not claim it: an engine too old to vouch would then be
+# rendered as an outage, and the owner would go wait out a throttle that does not exist. What the
+# dashboard can prove is that the read is not vouched for, and that is what it says.
+_UNVOUCHED_CLOSED_READ = "closed-issue read did not land this poll — blocked-by issues holding"
+
 
 def _age(src, key):
     """The server's own rendered age phrase for ``key``, or a plain "?" — never a fabricated
@@ -83,12 +101,15 @@ def _tick_line(src):
 
 
 def _data_line(src, github):
-    """Whose truth is on screen, and how old. Three honest states, no fourth:
+    """Whose truth is on screen, and how old. Four honest states, no fifth:
 
-      * ``ok``    — the runner's own published view (what the owner always assumed he was reading)
-      * ``dark``  — the tower is blind: no data link to GitHub, so nothing on screen is arriving
-      * ``blind`` — showing GitHub directly: real data, but a SECOND opinion on a stale premise,
-                    which is the exact thing that must never pass for the runner's own view
+      * ``ok``        — the runner's own published view, and it vouches for the whole read (what the
+                        owner always assumed he was reading)
+      * ``unvouched`` — the runner's own view, fresh, but its closed-issue read did NOT land this
+                        poll (issue #268) — see ``_UNVOUCHED_CLOSED_READ``
+      * ``dark``      — the tower is blind: no data link to GitHub, so nothing on screen is arriving
+      * ``blind``     — showing GitHub directly: real data, but a SECOND opinion on a stale premise,
+                        which is the exact thing that must never pass for the runner's own view
     """
     age = _age(src, "data")
 
@@ -112,7 +133,16 @@ def _data_line(src, github):
                 "text": "data %s · can't reach GitHub — the tower is blind" % shown}
 
     if src.get("mode") == flights.SOURCE_LIVE:
-        return {"state": "ok", "text": "data %s" % age}
+        # The view is fresh — but "fresh" is a stamp on the POLL, not a receipt for every read inside
+        # it. The closed-issue read can be refused on its own while the reachability probe (`gh api
+        # rate_limit`, exempt from throttling) keeps the poll looking healthy, and the refusal is
+        # invisible in the result: a refused closed read and a genuinely empty one are the same empty
+        # set. The runner vouches for it explicitly (#172) and the server passes that vouch through
+        # here; anything short of an explicit vouch is UNVOUCHED, because "said nothing" is exactly
+        # what the pre-#172 silence looked like.
+        if src.get("closed_read_ok") is True:
+            return {"state": "ok", "text": "data %s" % age}
+        return {"state": "unvouched", "text": "data %s · %s" % (age, _UNVOUCHED_CLOSED_READ)}
     return {"state": "blind", "text": "data %s · GitHub direct — not the runner's view" % age}
 
 
@@ -152,7 +182,11 @@ def banner(source, engine=None, github=None):
     level = LEVEL_OK
     if tick["state"] == "down":
         level = LEVEL_DOWN                # a dead loop is the headline; everything else can wait
-    elif data["state"] in ("blind", "dark") or eng is not None:
+    # `unvouched` is a NOTICE, not an alarm: nothing is broken — the loop is holding its blocked-by
+    # issues correctly and journalling why (#172). It is a thing the owner should KNOW, because the
+    # visible symptom is his queue standing still, and a strip that stayed green through it would be
+    # the same confident blank this module exists to end.
+    elif data["state"] in ("blind", "dark", "unvouched") or eng is not None:
         level = LEVEL_NOTICE
     return {"level": level, "tick": tick, "data": data, "engine": eng}
 

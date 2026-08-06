@@ -204,6 +204,81 @@ def test_fallback_still_reports_the_tick_timer(home):
     assert src["tick_age"] == SILENT_AFTER + 60
 
 
+# ============ the runner's closed-read vouch reaches the board (issues #172 / #268) ============
+# #172 made the runner publish a positive vouch that its closed-issue read landed; it declared
+# `touches: engine`, so nothing on this side consumed it and a THROTTLED poll rendered exactly like
+# a healthy one — not stale, an empty closed set, no way to tell GitHub refused the read. The
+# operator watching the board during a throttle saw a queue that had quietly stopped moving and a
+# dashboard showing nothing wrong. These pin the vouch travelling view → source → strip.
+
+def test_a_vouched_poll_leaves_the_strip_calm(home):
+    _heartbeat(home, 10)
+    _publish(home, closed_read_ok=True)
+    rs = _repo(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh()))
+    assert rs["source"]["closed_read_ok"] is True
+    assert rs["truth"]["data"]["state"] == "ok"
+    assert "closed-issue read" not in rs["truth"]["data"]["text"]
+    assert rs["truth"]["level"] == "ok", "§0.2 — a healthy poll must not nag"
+
+
+def test_a_refused_closed_read_is_named_on_the_board(home):
+    # THE case, end to end and in the exact shape a throttle produces: the view is FRESH (`stale`
+    # False — the `gh api rate_limit` probe is exempt from throttling, so the poll completes and
+    # stamps itself current), the closed set is EMPTY, and ONLY the vouch tells a refused read apart
+    # from a genuinely empty one.
+    _heartbeat(home, 10)
+    _publish(home, stale=False, closed_nums=[], closed_read_ok=False)
+    rs = _repo(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh()))
+    assert rs["source"]["mode"] == "live", "a throttled poll still looks fresh — that IS the trap"
+    assert rs["source"]["closed_read_ok"] is False
+    assert rs["truth"]["data"]["state"] == "unvouched"
+    assert "closed-issue read did not land this poll" in rs["truth"]["data"]["text"]
+    assert "blocked-by issues" in rs["truth"]["data"]["text"]
+    assert rs["truth"]["level"] == "notice"
+
+
+def test_a_runner_too_old_to_vouch_is_unvouched_never_a_confident_all_clear(home):
+    # A view that never claimed the read landed must not buy silence by saying nothing — the same
+    # fail-closed direction the engine publishes in.
+    _heartbeat(home, 10)
+    doc = _publish(home)
+    assert "closed_read_ok" not in doc, "the pre-#172 view shape, explicitly"
+    rs = _repo(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh()))
+    assert rs["source"]["closed_read_ok"] is False
+    assert rs["truth"]["data"]["state"] == "unvouched"
+
+
+def test_fallback_never_attributes_the_vouch_to_a_source_that_isnt_the_runner(home):
+    # In FALLBACK the runner's document is abandoned — what's on screen is the dashboard's OWN
+    # GitHub read, whose open list is complete and whose closure inference doesn't use the vouch at
+    # all. Carrying it there would attribute a runner fact to a picture the runner didn't paint.
+    _heartbeat(home, SILENT_AFTER + 60)
+    _publish(home, closed_read_ok=False)
+    rs = _repo(server.assemble_snapshot(_config(home), now=NOW, gh_mod=_CountingGh()))
+    assert rs["source"]["mode"] == "fallback"
+    assert "closed_read_ok" not in rs["source"]
+    assert rs["truth"]["data"]["state"] == "blind"
+    assert "closed-issue read" not in rs["truth"]["data"]["text"]
+
+
+def test_the_vouch_re_derives_nothing_it_only_marks(home):
+    # DoD's guard rail, at the assembly end: flip ONLY the vouch and every other fact on the slice —
+    # every flight's state, the arrivals board, the queue — must come out byte-identical. The marker
+    # must never become a second closure oracle.
+    _heartbeat(home, 10)
+    cfg = _config(home)
+    _publish(home, closed_read_ok=True)
+    vouched = _repo(server.assemble_snapshot(cfg, now=NOW, gh_mod=_CountingGh()))
+    _publish(home, closed_read_ok=False)
+    unvouched = _repo(server.assemble_snapshot(cfg, now=NOW, gh_mod=_CountingGh()))
+
+    assert vouched["source"].pop("closed_read_ok") is True
+    assert unvouched["source"].pop("closed_read_ok") is False
+    vouched.pop("truth")                  # the marker itself is the ONLY difference there may be
+    unvouched.pop("truth")
+    assert vouched == unvouched
+
+
 # =============================== the round trip ===============================
 
 def test_fresh_then_stale_then_fresh_returns_to_live_without_a_restart(home):

@@ -52,8 +52,12 @@ def _heartbeat(home, age):
 
 
 def _publish(home, **over):
+    # `closed_read_ok` is the runner's vouch that the closed-issue read behind `closed_nums` landed
+    # (issue #172). A HEALTHY poll publishes True, which is what these fixtures are — an empty
+    # `closed_nums` with no vouch is the throttled shape (issue #268), and the strip is required to
+    # mark it, so leaving it out here would be writing the alarm case and calling it healthy.
     doc = {"published_at": NOW - 5, "polled_at": NOW - 20, "stale": False,
-           "issues": {}, "titles": {}, "closed_nums": [], "prs": {}}
+           "issues": {}, "titles": {}, "closed_nums": [], "prs": {}, "closed_read_ok": True}
     doc.update(over)
     (home / "state" / "gh_view.json").write_text(json.dumps(doc))
 

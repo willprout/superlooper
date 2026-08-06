@@ -109,6 +109,9 @@ class RunnerSource:
         # The runner's OWN reachability verdict. Passing it through (rather than forming a second
         # opinion) is what keeps the dark-tower state and the board from contradicting each other.
         self._stale = bool(v.get("stale", True))
+        # The runner's VOUCH for the closed read behind `closed_nums` (issue #172). Trusted only in
+        # the direction it explicitly asserts — see `closed_read_ok` below.
+        self._closed_read_ok = v.get("closed_read_ok") is True
 
     # --------------------------- issues ---------------------------
 
@@ -139,6 +142,27 @@ class RunnerSource:
         only a source that can answer positively (this one) gets asked. Free — no egress."""
         n = _int(num)
         return n is not None and n in self._closed
+
+    def closed_read_ok(self):
+        """Does the runner VOUCH that the read behind ``closed_nums`` actually landed (issue #172)?
+
+        An empty ``closed_nums`` is ambiguous on its own: GitHub answered "nothing is closed", or it
+        REFUSED the read and the runner's fail-closed parser produced the same empty. The two are
+        indistinguishable from the set alone, and the runner's reachability probe (``gh api
+        rate_limit``) is EXEMPT from throttling — so a throttled poll still stamps the view fresh and
+        renders here exactly like a healthy one. That is the silence #172 closed engine-side (the
+        loop holds blocked-by issues and journals the reason) and #268 closes on this face.
+
+        Trusted ONLY in the direction it explicitly asserts: True demands an actual boolean ``True``,
+        so a view that never claimed the read landed — a pre-#172 engine, a half-written document, a
+        hand-edited ``"true"`` — reads as NOT VOUCHED rather than buying a confident all-clear by
+        saying nothing. Same strictness the engine publishes with (``published_view.build``:
+        ``view.get("closed_read_ok") is True``).
+
+        This is a MARKER, never an oracle. Closure stays the runner's positive ``closed_nums``
+        alone — an unvouched poll does not re-open a closed issue, and a vouched one does not close
+        an absent one (pinned in tests/test_runner_source.py). No egress, like every answer here."""
+        return self._closed_read_ok
 
     def issue(self, repo, num):
         """One issue as the assembler expects it (``state``/``title``), or ``{}`` when the runner
