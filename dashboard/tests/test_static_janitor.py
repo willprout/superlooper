@@ -2,7 +2,8 @@
 
 Janitor is the dashboard's SECOND ops-verb button (same LOCAL COMMAND class as Tidy): tapping it
 runs ``superlooper janitor`` (via the server) to sweep GitHub-side debris — stale merged/superseded
-``sl/*`` branches, open ``superseded`` PRs, aged parked/needs-owner issues. Owner ruling 2026-07-13:
+``sl/*`` branches, open ``superseded`` PRs, aged parked/needs-owner issues, and (issue #229) issues
+closed as COMPLETED by a bare commit keyword, proposed for REOPEN. Owner ruling 2026-07-13:
 full CLI parity without leaving the dashboard. The flow is a bright line of this issue:
 
     button → server runs `janitor --json` → dialog GROUPS the proposals by kind → the owner selects
@@ -95,28 +96,48 @@ def test_held_back_actions_are_surfaced():
 
 # =============================== the reopen tile + the never-drop rule (issue #289) ===============================
 
-def test_the_all_clear_is_gated_on_the_servers_proposal_count():
+def test_the_all_clear_is_gated_on_more_than_the_groups_it_drew():
     # Issue #289's headline defect: the dialog rendered "Apron's clear" whenever it had no GROUPS to
-    # show — so a proposal class it could not draw (the accidental-close reopen) read as no debris at
-    # all, on the owner's primary surface. The all-clear must now be gated on the server's own count.
-    empty = re.search(r"Apron’s clear", _JAN_JS)
-    assert empty, "the all-clear message must still exist for a genuinely empty apron"
-    guard = re.search(r"if \(!groups\.length && [^)]*\)\s*\{[\s\S]{0,400}?Apron’s clear", _JAN_JS)
-    assert guard, ("the all-clear branch must test more than groups.length — an unrenderable kind "
-                   "must never read as 'nothing to sweep'")
-    assert re.search(r"total\s*===\s*0|!total\b", guard.group(0)), (
-        "the all-clear must be gated on the server's proposal count (total), not just the groups")
+    # show — so a proposal class it could not draw (the accidental-close reopen) read as no debris
+    # at all, on the owner's primary surface. Pinned on the SEMANTIC tokens the guard must consult,
+    # not on the syntax of the condition, so a correct refactor is free to move.
+    guard = re.search(r"if \([^\n]*\)\s*\{[\s\S]{0,300}?Apron’s clear", _JAN_JS)
+    assert guard, "the all-clear message must still exist for a genuinely empty apron"
+    cond = guard.group(0).split("{", 1)[0]
+    assert "groups.length" not in cond, (
+        "the all-clear must not be decided by whether this file found a tile to draw — that is the "
+        "bug (an unrenderable kind read as 'nothing to sweep')")
+    for token in ("total", "missing"):
+        assert token in cond, (
+            "the all-clear must consult `%s` — the server's own proposal count, reconciled against "
+            "the rows actually drawn" % token)
 
 
-def test_the_dialog_binds_the_servers_count_and_unreadable_fields():
-    assert re.search(r"renderProposals\([\s\S]{0,160}?\bb\.count\b", _JAN_JS), (
-        "loadPropose must hand the server's proposal count to renderProposals")
-    assert re.search(r"\bb\.unreadable\b", _JAN_JS), (
-        "the dialog must read the server's count of proposals it could not place (design B.1: the "
-        "JS derives no janitor semantics of its own)")
-    assert re.search(r"superlooper janitor</code>[\s\S]{0,200}terminal|terminal[\s\S]{0,200}"
-                     r"superlooper janitor", _JAN_JS), (
-        "a proposal the dialog cannot draw must point the owner at the terminal that can act on it")
+def test_the_dialog_reconciles_the_rows_it_drew_against_the_servers_count():
+    # Honesty must be self-enforcing rather than contingent on the server's `unreadable` being
+    # exact: an OLDER server (the 2026-07-14 skew shape) drops a kind and sends no `unreadable` at
+    # all, and a group can arrive with an empty items list. Counting what is really about to be
+    # drawn catches both.
+    assert re.search(r"\bshown\b[\s\S]{0,200}?groups\.reduce", _JAN_JS), (
+        "renderProposals must count the rows it is about to draw, from the groups themselves")
+    assert re.search(r"\bmissing\b\s*=\s*Math\.max\(", _JAN_JS), (
+        "the shortfall must be max(server's unreadable, count - shown) — never just one of them")
+
+
+def test_the_dialog_binds_every_honesty_field_the_server_sends():
+    for field in ("b.count", "b.unreadable", "b.reopen_withheld"):
+        assert field in _JAN_JS, (
+            "loadPropose must hand the server's `%s` to renderProposals (design B.1: the JS derives "
+            "no janitor semantics of its own)" % field)
+    assert re.search(r"renderProposals\([\s\S]{0,200}?b\.count", _JAN_JS), (
+        "the proposal count must reach renderProposals, which decides the all-clear")
+
+
+def test_the_reopen_caps_withheld_remainder_is_said_out_loud():
+    # The reopen class is the one class the engine caps per sweep. A cap that is not said reads as
+    # "there was nothing else" — the same over-claim this dialog is being fixed for.
+    assert re.search(r"capped[\s\S]{0,400}?keyword-closed", _JAN_JS), (
+        "the dialog must name the reopens the sweep's cap left out, not just the ones it drew")
 
 
 def test_a_group_the_server_marks_untappable_is_shown_but_never_armed():
@@ -124,13 +145,34 @@ def test_a_group_the_server_marks_untappable_is_shown_but_never_armed():
     # must not offer a consent it cannot state the consequence of. The server decides, via `tappable`.
     assert re.search(r"\bg\.tappable\b", _JAN_JS), (
         "the row template must branch on the server's `tappable` flag, not on a kind list here")
-    arm = re.search(r"var arm = g\.tappable !== false;([\s\S]{0,900}?)\}\)\.join\(\"\"\);", _JAN_JS)
-    assert arm, "renderProposals must compute `arm` from g.tappable before building its rows"
-    flat = re.search(r"if \(!arm\) \{([\s\S]{0,500}?)\}\s*return", arm.group(1))
-    assert flat, "the untappable branch must build its own row template"
-    for marker in ("data-jan-key", 'role="checkbox"', "cc-jan-check"):
+    flat = re.search(r"if \(!arm\) \{([\s\S]{0,600}?)\n\s*\}", _JAN_JS)
+    assert flat, "renderProposals must build a separate row template for an untappable group"
+    for marker in ("data-jan-key", 'role="checkbox"', "cc-jan-check", "tabindex"):
         assert marker not in flat.group(1), (
             "an untappable row must carry no %s — it is shown, never armed" % marker)
+
+
+def test_a_sweep_with_nothing_armable_offers_no_sweep_button():
+    # A permanently-disabled "Sweep 0 selected" under a lead reading "tap the debris to clear"
+    # describes a dialog the owner is not looking at.
+    assert re.search(r"anyArmable\s*=\s*groups\.some", _JAN_JS), (
+        "renderProposals must ask whether ANY group is armable before offering the confirm row")
+    assert re.search(r"anyArmable[\s\S]{0,900}?data-jan-confirm", _JAN_JS), (
+        "the confirm control must be gated on there being something to arm")
+
+
+def test_a_held_row_the_server_could_not_name_says_so():
+    # The held/retry path keeps its Retry for an unnamed kind — it re-runs a write the owner already
+    # chose in the terminal, and withdrawing it would take a working verb off the primary surface —
+    # but the row must not pass a raw key off as a plain-language consequence.
+    assert re.search(r"it\.named\s*===\s*false", _JAN_JS), (
+        "the held row must read the server's `named` flag rather than re-deriving the verb")
+    assert "cc-jan-held-unnamed" in _JAN_JS, (
+        "an unnamed held row must carry its caveat in its own element — heldWhat() reads "
+        ".cc-jan-held-what back verbatim for the confirm label, so a caveat folded in there would "
+        "end up inside \"Yes — …\"")
+    assert re.search(r'cc-jan-held-what">[^<]*\+ esc\(it\.what\) \+ .</span>', _JAN_JS), (
+        "the .cc-jan-held-what element must hold the verb ALONE")
 
 
 def test_the_untappable_row_shows_the_raw_key_so_the_terminal_can_act_on_it():

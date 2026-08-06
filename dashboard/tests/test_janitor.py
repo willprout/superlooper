@@ -88,9 +88,12 @@ def test_group_proposals_groups_by_kind_in_a_stable_order():
     assert "flaky retry" in issue["items"][0]["what"]
 
 
-def test_group_proposals_omits_empty_kinds_and_drops_wrong_typed_items():
+def test_group_proposals_omits_empty_kinds_and_ungroups_keyless_items():
+    # An unknown KIND is no longer dropped (see the catch-all below) — only an entry with no string
+    # key, which cannot be tapped and cannot name itself, stays out of the tiles. It is not lost:
+    # unreadable_count carries it (issue #289).
     only_pr = [{"kind": "pr", "key": "pr:5", "action": "close-pr", "target": 5, "why": "w"},
-               "garbage", {"kind": "branch"}, {"no": "key"}]   # last two: no valid key → dropped
+               "garbage", {"kind": "branch"}, {"no": "key"}]   # last three: no valid key
     groups = janitor_mod.group_proposals(only_pr)
     assert [g["kind"] for g in groups] == ["pr"]
     assert [i["key"] for i in groups[0]["items"]] == ["pr:5"]
@@ -163,7 +166,33 @@ def test_held_rows_name_a_held_reopen():
     # A held-back reopen is reported by the CLI as the bare key `reopen:<num>`; the retry row must
     # state the consequence of tapping it, exactly as the other three kinds do.
     assert janitor_mod.held_rows(["reopen:12"]) == \
-        [{"key": "reopen:12", "what": "reopen issue #12"}]
+        [{"key": "reopen:12", "what": "reopen issue #12", "named": True}]
+
+
+def test_held_rows_admit_when_they_cannot_name_the_verb():
+    # `named` lets the dialog word an unnamed row's confirm honestly instead of passing the raw key
+    # off as plain language. It deliberately does NOT withdraw the Retry: unlike a proposal row —
+    # which would ORIGINATE an action in a class this file does not understand — a held row re-runs
+    # a write the owner already chose in the terminal, where the CLI named it in full. Withdrawing
+    # it would take a working verb off the primary surface (owner ruling 2026-07-13: full parity).
+    rows = janitor_mod.held_rows(["reopen:12", "meta:7:type=type:bug", "gremlin:3"])
+    assert [r["named"] for r in rows] == [True, False, False]
+    assert [r["key"] for r in rows] == ["reopen:12", "meta:7:type=type:bug", "gremlin:3"]
+
+
+def test_every_ordered_kind_carries_a_label():
+    # _KIND_LABEL is an unguarded lookup inside the grouping: a kind added to the ordering without a
+    # label would be a KeyError on the propose route (a 500, on the owner's primary surface).
+    for kind in janitor_mod._KIND_ORDER:
+        assert janitor_mod._KIND_LABEL.get(kind), "kind %r has no tile label" % kind
+
+
+def test_a_wrong_typed_why_never_reaches_the_row():
+    # Every other field on a row is coerced; a dict `why` would survive to JSON and render as
+    # "[object Object]" once the JS escapes it.
+    groups = janitor_mod.group_proposals(
+        [dict(_REOPEN_PROPOSAL, why={"not": "a string"})])
+    assert groups[0]["items"][0]["why"] == ""
 
 
 def test_held_rows_name_what_each_held_action_would_do():
@@ -185,7 +214,7 @@ def test_held_rows_fall_back_to_the_raw_key_for_an_unrecognized_kind():
 
 def test_held_rows_drop_wrong_typed_entries():
     assert janitor_mod.held_rows([None, 5, "", {"key": "pr:1"}, "pr:2"]) == \
-        [{"key": "pr:2", "what": "close PR #2"}]
+        [{"key": "pr:2", "what": "close PR #2", "named": True}]
     assert janitor_mod.held_rows("branch:x") == []      # not a list → nothing
     assert janitor_mod.held_rows(None) == []
 
@@ -201,8 +230,8 @@ def test_propose_carries_held_rows_beside_the_raw_held_keys(jan_fix):
     assert res["ok"] is True
     assert res["held"] == ["branch:sl/i7-x", "pr:41"]
     assert res["held_items"] == [
-        {"key": "branch:sl/i7-x", "what": "delete branch sl/i7-x"},
-        {"key": "pr:41", "what": "close PR #41"}]
+        {"key": "branch:sl/i7-x", "what": "delete branch sl/i7-x", "named": True},
+        {"key": "pr:41", "what": "close PR #41", "named": True}]
 
 
 def test_parse_execute_reads_results_and_counts():
@@ -273,6 +302,49 @@ def test_propose_reports_the_proposals_it_could_not_read(jan_fix):
     res = verb.propose(SLUG)
     assert res["ok"] is True and res["count"] == 1
     assert res["groups"] == [] and res["unreadable"] == 1
+
+
+def test_propose_carries_the_reopen_caps_withheld_count(jan_fix):
+    # The accidental-close class is the ONE class the engine caps per sweep, and it reports the
+    # remainder rather than dropping it — because "a cap that is not SAID reads as 'there was
+    # nothing else'". This adapter threw that number away, so a repo with 30 keyword-closed issues
+    # showed a tile reading 10 and nothing to suggest the other 20 existed: the same over-claim
+    # this issue exists to kill, inside the class it just learned to render.
+    verb, fixtures = jan_fix
+    (fixtures / "propose.json").write_text(json.dumps(
+        {"ok": True, "proposals": [_REOPEN_PROPOSAL], "held": [], "aged_park_days": 14,
+         "reopen_withheld": 20}))
+    assert verb.propose(SLUG)["reopen_withheld"] == 20
+
+
+def test_a_wrong_typed_withheld_count_never_invents_a_number(jan_fix):
+    verb, fixtures = jan_fix
+    for bad in ("20", -3, None, {"n": 1}, True):
+        (fixtures / "propose.json").write_text(json.dumps(
+            {"ok": True, "proposals": [], "held": [], "reopen_withheld": bad}))
+        assert verb.propose(SLUG)["reopen_withheld"] == 0, bad
+
+
+def test_an_unreadable_proposal_list_is_a_failed_read_not_a_clean_apron(jan_fix):
+    # The sharpest form of this issue's defect: an `ok: true` envelope whose `proposals` is not a
+    # list. Coercing it to [] renders the all-clear — turning "we could not read the sweep" into
+    # "the sweep found nothing", which is exactly the substitution being fixed. It must fail closed.
+    verb, fixtures = jan_fix
+    (fixtures / "propose.json").write_text(json.dumps(
+        {"ok": True, "proposals": {"a": 1}, "held": [], "aged_park_days": 14}))
+    res = verb.propose(SLUG)
+    assert res["ok"] is False
+    assert "unreadable" in res["error"]
+    assert res["groups"] == [] and res["count"] == 0
+
+
+def test_an_absent_proposal_list_is_still_an_honest_empty_sweep(jan_fix):
+    # ...but ABSENT is not the same as wrong-typed: a CLI that simply reported no proposals ran
+    # fine and found nothing, and must still get the all-clear.
+    verb, fixtures = jan_fix
+    (fixtures / "propose.json").write_text(json.dumps({"ok": True, "held": []}))
+    res = verb.propose(SLUG)
+    assert res["ok"] is True and res["count"] == 0 and res["unreadable"] == 0
 
 
 def test_a_failed_propose_still_carries_the_unreadable_field(jan_fix, monkeypatch):

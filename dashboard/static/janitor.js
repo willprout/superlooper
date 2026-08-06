@@ -149,7 +149,8 @@
         listedRepo = repo;                         // THIS repo's proposals are the ones now on screen
         selected = {};                             // a fresh listing selects nothing
         heldArmed = "";                            // …and arms no held-back retry
-        renderProposals(b.groups || [], b.held || [], b.held_items, b.count, b.unreadable);
+        renderProposals(b.groups || [], b.held || [], b.held_items, b.count, b.unreadable,
+                        b.reopen_withheld);
       })
       .catch(function () {
         if (myGen === gen && isOpen()) renderError("couldn’t reach the command center", false, repo);
@@ -209,22 +210,37 @@
   // a class this dialog cannot draw must never read as a clean apron. Between those two poles sits
   // the honest third case — debris found, none of it drawable here — which says so and names the
   // terminal that can act on it.
-  function renderProposals(groups, held, heldItems, count, unreadable) {
+  function renderProposals(groups, held, heldItems, count, unreadable, withheld) {
     var total = Number(count) || 0;
     var lost = Number(unreadable) || 0;
+    // Count the rows actually about to be DRAWN and reconcile them against the server's own total,
+    // rather than trusting the server's `unreadable` to be exact. Then the dialog's honesty is
+    // self-enforcing: an older server that dropped a kind (the 2026-07-14 skew shape — new bundle
+    // on disk, old Python in the running process) sends no `unreadable` at all, and a group that
+    // arrived with an empty `items` list contributes nothing — both cases still get said out loud.
+    var shown = groups.reduce(function (a, g) { return a + ((g.items || []).length); }, 0);
+    var missing = Math.max(lost, total - shown);
     var closer = heldHTML(held, heldItems) +
       '<div class="cc-jan-actions"><button class="btn ghost" data-jan-close>Done</button></div>';
-    if (!groups.length && total === 0 && lost === 0) {
+    if (!shown && total === 0 && missing === 0) {
       setBody('<div class="cc-jan-empty">Apron’s clear — no GitHub debris to sweep ✓</div>' + closer);
       return;
     }
-    var lostNote = (lost || (!groups.length && total))
-      ? '<div class="cc-jan-lost">⚠ ' + (lost || total) + ' proposal' +
-          ((lost || total) === 1 ? '' : 's') + ' the command center can’t show. Run <code>' +
-          'superlooper janitor</code> in the terminal to see and act on ' +
-          ((lost || total) === 1 ? 'it' : 'them') + '.</div>'
+    var lostNote = missing
+      ? '<div class="cc-jan-lost">⚠ ' + missing + ' proposal' + (missing === 1 ? '' : 's') +
+          ' the command center can’t show. Run <code>superlooper janitor</code> in the terminal ' +
+          'to see and act on ' + (missing === 1 ? 'it' : 'them') + '.</div>'
       : "";
-    if (!groups.length) { setBody(lostNote + closer); return; }
+    // The reopen class is the one class the engine caps per sweep. Say what the cap left out — a
+    // cap that is not said reads as "there was nothing else", which is the over-claim this whole
+    // dialog is being fixed for.
+    var capped = Number(withheld) || 0;
+    var capNote = capped
+      ? '<div class="cc-jan-lost">' + capped + ' more keyword-closed issue' +
+          (capped === 1 ? '' : 's') + ' found and NOT proposed this sweep — the reopen class is ' +
+          'capped. Sweep these, and a later sweep proposes the rest.</div>'
+      : "";
+    if (!shown) { setBody(lostNote + capNote + closer); return; }
     var body = groups.map(function (g) {
       // A group the server marked untappable is a kind this dialog has no verb for. It is SHOWN —
       // with the CLI's own action word and the raw key `--execute-keys` takes — but never armed:
@@ -253,18 +269,32 @@
           'janitor</code> in the terminal to act on them.</div>') +
       '</div>';
     }).join("");
+    // When NOTHING on screen can be tapped, a "Tap the debris to clear" lead and a permanently
+    // disabled Sweep button describe a dialog the owner is not looking at. Say what is true instead
+    // and drop the confirm row — the Done closer is the only honest control there.
+    var anyArmable = groups.some(function (g) {
+      return g.tappable !== false && (g.items || []).length > 0;
+    });
+    var lead = anyArmable
+      ? '<div class="cc-jan-lead">Tap the debris to clear, then sweep. Deleting a branch, closing ' +
+          'a PR/issue or reopening one here does the same GitHub write the terminal would — it ' +
+          'can’t be undone from the dashboard.</div>'
+      : '<div class="cc-jan-lead">Nothing here can be swept from the dashboard yet — these are ' +
+          'kinds it has no verb for. Their keys are listed so <code>superlooper janitor</code> in ' +
+          'the terminal can act on them.</div>';
     setBody(
-      '<div class="cc-jan-lead">Tap the debris to clear, then sweep. Deleting a branch, closing ' +
-        'a PR/issue or reopening one here does the same GitHub write the terminal would — it can’t ' +
-        'be undone from the dashboard.</div>' +
+      lead +
       '<div class="cc-jan-list">' + body + '</div>' +
-      lostNote +
+      lostNote + capNote +
       heldHTML(held, heldItems) +
-      '<div class="cc-jan-actions">' +
-        '<button class="btn ghost" data-jan-cancel>Cancel</button>' +
-        '<button class="btn primary" id="cc-jan-confirm" data-jan-confirm disabled>' +
-          'Sweep 0 selected</button>' +
-      '</div>');
+      (anyArmable
+        ? '<div class="cc-jan-actions">' +
+            '<button class="btn ghost" data-jan-cancel>Cancel</button>' +
+            '<button class="btn primary" id="cc-jan-confirm" data-jan-confirm disabled>' +
+              'Sweep 0 selected</button>' +
+          '</div>'
+        : '<div class="cc-jan-actions">' +
+            '<button class="btn ghost" data-jan-close>Done</button></div>'));
     updateFooter();
   }
 
@@ -285,10 +315,20 @@
     var canRetry = Array.isArray(items) && items.length > 0;
     var rows = canRetry
       ? items.map(function (it) {
+          // `named: false` means the server could not turn this key into a verb — an unrecognized
+          // kind. The Retry STAYS (this re-runs a write the owner already chose in the terminal;
+          // withdrawing it would take a working verb off the primary surface), but the row says so
+          // rather than passing the raw key off as a plain-language consequence.
+          // The caveat is a SIBLING of .cc-jan-held-what, never inside it: heldWhat() reads that
+          // element back verbatim for the confirm button's label, and a caveat folded in would end
+          // up inside "Yes — …".
+          var unnamed = it.named === false;
           return '<div class="cc-jan-held-row" data-jan-held-row="' + esc(it.key) + '">' +
             '<span class="cc-jan-held-what">' + esc(it.what) + '</span>' +
             '<span class="cc-jan-held-act" data-jan-held-act="' + esc(it.key) + '">' +
               retryArmHTML(it.key) + '</span>' +
+            (unnamed ? '<span class="cc-jan-held-unnamed">a kind the dashboard can’t name — ' +
+              'the terminal states what this does in full</span>' : '') +
           '</div>';
         }).join("")
       : keys.map(function (k) {

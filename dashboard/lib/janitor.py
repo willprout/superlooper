@@ -179,13 +179,26 @@ def held_rows(held):
     order. Issue #131 made each held row a RETRY target, so it must state what tapping it would do —
     derived here (pure, tested) so the JS stays logic-free (design B.1). Wrong-typed/empty entries
     are dropped; an unknown kind is still SHOWN under its raw key (a held action the owner cannot
-    see is one he can never clear)."""
+    see is one he can never clear).
+
+    ``named`` says whether the verb above is a real one or the raw key falling back on itself, so
+    the dialog can word an unnamed row's confirm honestly. It deliberately does NOT withdraw the
+    Retry, unlike the untappable proposal rows in :func:`group_proposals`, and the difference is
+    the point: a proposal row would ORIGINATE an action in a class this file does not understand,
+    while a held row re-runs a write the owner already chose once — from the terminal, where the
+    CLI named it in full — and that failed. Refusing to re-offer his own prior choice would take a
+    working verb off the primary surface (owner ruling 2026-07-13: full parity), and it is the CLI,
+    not this file, that re-derives freshly at act time and can still decline."""
     items = held if isinstance(held, list) else []
-    return [{"key": k, "what": _held_what(k)} for k in items if isinstance(k, str) and k]
+    return [{"key": k, "what": _held_what(k), "named": _held_what(k) != k}
+            for k in items if isinstance(k, str) and k]
 
 
 def _row(p):
-    return {"key": p["key"], "what": _what(p), "why": p.get("why") or "",
+    # `why` is coerced, not merely defaulted: a wrong-typed one would survive to JSON and render as
+    # "[object Object]" after the JS escapes it — every other field on the row is already coerced.
+    why = p.get("why")
+    return {"key": p["key"], "what": _what(p), "why": why if isinstance(why, str) else "",
             "target": p.get("target")}
 
 
@@ -272,10 +285,21 @@ class Janitor:
             # the CLI speaks for itself when it can (its fail-closed envelope carries an error);
             # otherwise a missing binary / crash gets the rc-derived message.
             return {"ok": False, "verb": "janitor-propose", "repo": repo, "groups": [],
-                    "count": 0, "unreadable": 0, "held": [], "held_items": [],
+                    "count": 0, "unreadable": 0, "reopen_withheld": 0,
+                    "held": [], "held_items": [],
                     "error": doc.get("error") or _error(rc, err, binary), "raw": out}
         proposals = doc.get("proposals")
-        proposals = proposals if isinstance(proposals, list) else []
+        if proposals is not None and not isinstance(proposals, list):
+            # An `ok: true` envelope whose proposal list is unreadable. Coercing it to [] would
+            # render as "apron's clear ✓" — turning "we could not read the sweep" into "the sweep
+            # found nothing", which is the exact substitution this whole issue exists to stop. An
+            # unreadable answer is a FAILED read, and says so.
+            return {"ok": False, "verb": "janitor-propose", "repo": repo, "groups": [],
+                    "count": 0, "unreadable": 0, "reopen_withheld": 0,
+                    "held": [], "held_items": [],
+                    "error": "the sweep's proposal list came back unreadable — nothing is being "
+                             "shown, and nothing was swept", "raw": out}
+        proposals = proposals or []
         held = doc.get("held") or []
         # `held` (the raw keys) is the ORIGINAL contract and stays byte-for-byte; `held_items` is
         # added beside it (issue #131) so the dialog can name what a retry would do — and so the
@@ -284,9 +308,18 @@ class Janitor:
         # `count` is every proposal the CLI named and `unreadable` is the part of it no row could
         # carry; the dialog's all-clear is gated on `count`, so a proposal that never reaches a tile
         # can no longer read as "nothing to sweep" (issue #289).
+        #
+        # `reopen_withheld` is the reopen class's per-sweep cap speaking. The accidental-close class
+        # is the ONE class the engine caps (REOPEN_SWEEP_CAP), and its own comment gives the reason
+        # this must be carried rather than dropped: a cap that is not SAID reads as "there was
+        # nothing else" — the same over-claim the audit exists to stop. The CLI prints that note;
+        # until now this adapter threw the number away, so a repo with thirty keyword-closed issues
+        # showed a tile reading 10 and nothing to suggest the other twenty existed.
+        withheld = doc.get("reopen_withheld")
         return {"ok": True, "verb": "janitor-propose", "repo": repo,
                 "groups": group_proposals(proposals), "count": len(proposals),
                 "unreadable": unreadable_count(proposals),
+                "reopen_withheld": withheld if (type(withheld) is int and withheld > 0) else 0,
                 "held": held, "held_items": held_rows(held), "raw": out}
 
     def execute(self, repo, keys, retry=False):
