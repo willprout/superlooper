@@ -212,6 +212,21 @@ def _never_probe_the_real_control_socket(monkeypatch):
     # instead of quietly interrogating the owner's fleet. Tests that exercise a socket pass their
     # own `connect` or their own path in-body.
     monkeypatch.setenv("HERDR_SOCKET_PATH", "/nonexistent/superlooper-test-herdr.sock")
+    # The OTHER half of the same resolution, and it is not covered by the line above (found by a
+    # fresh-agent review of #355). `session_host.config_dir()` / `state_dir()` resolve the host's
+    # directories from XDG FIRST and fall back to HOME — and every rig here overrides HOME while
+    # none of them overrides XDG. So on a machine that exports `XDG_CONFIG_HOME`, a test driving
+    # `superlooper fleet --install` rewrites the OWNER'S OWN `herdr/config.toml` and its screen
+    # manifest, and `check_fence` opens a tokenless connection to the live server's socket — which
+    # `HERDR_SOCKET_PATH` cannot prevent, because `fleet.socket_path()` derives its path from the
+    # config dir rather than from that variable.
+    #
+    # SCRUBBED rather than pointed somewhere fake: removing them makes the resolution fall back to
+    # HOME, which every rig already controls, so nothing that passes today changes its answer. This
+    # is the fail-closed-GLOBAL half of the ratchet CLAUDE.md's toast-spam rule is about — the hole
+    # is invisible on a machine that does not export these, which is most of them.
+    for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

@@ -522,8 +522,13 @@ def _apply_machine_env(announce=True):
     assignments, problem, ignored = fleet.load_machine_env(stack_doctor.Probe(), prefix)
     if not assignments:
         return
-    _applied, replaced = fleet.apply_machine_env(os.environ, assignments)
+    applied = {}
     try:
+        # INSIDE the guard, so a PARTIAL apply is already "the declaration landed" (fresh-agent
+        # review). With one variable in ENV_VARS this cannot happen — the single assignment either
+        # lands or it does not — but the day a second one is added, a half-applied file taking the
+        # generic handler's path would stamp `required` over a machine that had just declared off.
+        applied, replaced = fleet.apply_machine_env(os.environ, assignments)
         path = fleet.env_file(prefix)
         # Read BACK out of this process's environment, through the PRE-FLIGHT's own parser rather
         # than from the file we just read. The line is then evidence about what a launch will
@@ -545,17 +550,22 @@ def _apply_machine_env(announce=True):
                   % (unrecognised, session_host.FENCE_REQUIRED), file=sys.stderr)
         for key, was in sorted(replaced.items()):
             # The machine's own declaration beats an ambient variable (see apply_machine_env), and
-            # it says so: an operator who exported that value has to be able to see it lose.
-            if announce:
-                print("  note: this process arrived carrying %s=%r; the machine's own file wins."
-                      % (key, was))
+            # it says so: an operator who exported that value has to be able to see it lose. On a
+            # caller whose stdout is a machine-readable answer this goes to STDERR rather than
+            # being dropped (fresh-agent review) — "a variable that lost is never a variable that
+            # vanished" has to hold on every path, not only the one with a human reading it.
+            print("  note: this process arrived carrying %s=%r; the machine's own file wins."
+                  % (key, was), file=sys.stdout if announce else sys.stderr)
         if ignored and announce:
             print("  note: %s also names %s, which a runner never applies (it may set only %s)."
                   % (path, ", ".join(sorted(set(ignored))), ", ".join(fleet.ENV_VARS)))
     except Exception:                                                        # noqa: BLE001
-        # Everything above this line is REPORTING; the declaration is already applied. Say which
-        # side of that boundary the failure fell on, so the caller does not undo a good apply.
-        raise _MachineEnvApplied()
+        # The declaration is already applied (or partly so); everything else in the block is
+        # REPORTING. Say which side of that boundary the failure fell on, so the caller does not
+        # undo a good apply — and re-raise untouched when nothing landed at all.
+        if applied:
+            raise _MachineEnvApplied()
+        raise
 
 
 def _write_once(path, text, marker, what, merge_text=None):
@@ -3827,7 +3837,8 @@ def main(argv=None):
                                  "runner will actually get")})
     add("fleet", cmd_fleet,
         **{"--install": dict(action="store_true",
-                             help="write the fleet's token, host config, screen-state override, "
+                             help="write the fleet's token, runner environment (the file that arms "
+                                  "the launch pre-flight), host config, screen-state override, "
                                   "server LaunchAgent and viewer script, then judge the result"),
            "--load": dict(action="store_true",
                           help="with --install, also bootstrap the server job into gui/$UID now"),

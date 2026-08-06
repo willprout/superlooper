@@ -596,10 +596,19 @@ def keep_declared_fence(text):
     refusal, where it is named and acted on, not to a file that would quietly carry it forever.
     """
     assignments, problem, _ = machine_env(text)
-    declared = (assignments.get(session_host.FENCE_REQUIRED_VAR) or "").strip().lower()
-    if problem or declared not in (session_host.FENCE_REQUIRED, session_host.FENCE_OFF):
+    # NO FILE is not a declaration of `off`. `fence_required({})` answers "not required", which is
+    # the right reading of an EMPTY ENVIRONMENT and the wrong one here — this function's answer is
+    # what a fresh install writes, and a first install must arm. Checked before the parser is asked.
+    if problem or not assignments:
         return session_host.FENCE_REQUIRED
-    return declared
+    # Through `fence_required`, never against a second copy of its vocabulary (fresh-agent review):
+    # the switch has ONE parser (#326 ruled it), and "is this a value the engine recognises" is a
+    # question only that parser may answer. `unrecognised` is its own word for a spelling it did
+    # not know.
+    required, unrecognised = session_host.fence_required(assignments)
+    if unrecognised:
+        return session_host.FENCE_REQUIRED
+    return session_host.FENCE_REQUIRED if required else session_host.FENCE_OFF
 
 
 def machine_env(text, present=None):
