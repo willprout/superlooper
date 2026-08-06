@@ -267,7 +267,9 @@ _TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
 #     exact falsehood #230 removed — and a resolver whose push failed would then refuse to end.
 # The 2-question cap and the prefer-an-assumption hint are deliberately NOT restated here: this
 # clause fires only on a PRODUCT decision inside someone else's merge, which is the one thing this
-# seat must never assume its way past (the no-LLM-in-merge-mechanics bright line).
+# seat must never assume its way past. The `preserve` escape lets a model resolve the MECHANICS of
+# a conflict; the judgment underneath was never in its grant, and a resolver nudged toward guessing
+# would land a wrong call as a faithful-looking resolution on a branch the gate then re-runs clean.
 _CONFLICT_BRIEF = """\
 # Resolve the merge conflict on PR #{pr} (issue #{issue_num})
 
