@@ -44,7 +44,8 @@ LABELS = [
     # cleared. It carries its OWN colour (`f9d0c4`, a pale peach — not that sibling's deeper salmon
     # `e99695`), so the two owner-word grants are told apart at a glance in the issue list: the
     # discipline they share is the distinct label, not a shared colour. Deliberately NOT
-    # '(runner-managed)': the runner must never create, apply, or heal this one — it is only ever applied by hand, by {operator}.
+    # '(runner-managed)': the runner must never create, apply, or heal this one — it is only ever
+    # applied by hand, by {operator}.
     ("pre-authorized:referee", "f9d0c4",
      "{operator}'s pre-authorization: the gate may merge this issue's referee-path touches"),
     ("superseded", "cccccc", "on a PR: replaced by a rebuild; branch preserved, nothing auto-closed"),
