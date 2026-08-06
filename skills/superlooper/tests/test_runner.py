@@ -2788,6 +2788,54 @@ def _file_fix(rig, fp="fp1"):
                            "labels": list(FIX_LABELS)}, NOW)
 
 
+def test_file_fix_issue_seeds_its_provenance_label_before_creating(rig):
+    """Issue #400, fresh-agent review round 2 (Codex).
+
+    The #160 boot migration normally heals `source:qa` on a repo adopted before the family existed
+    — but a REFUSED label read makes that migration SKIP for the life of the process, and the runner
+    boots anyway (deliberately: a read blip must never wedge a restart). This path then runs with an
+    unhealed vocabulary, and `gh issue create` is ALL-OR-NOTHING on labels: the whole call is
+    refused, every tick, and the red mainline stays frozen with the fix issue meant to lift it never
+    filed. So the executor seeds the one label its payload introduces, immediately before the create.
+    """
+    (rig.fixdir / "label_list.json").write_text("not json at all")   # the refused-read boot shape
+    assert rig.r._apply_boot_migrations(now=NOW) is True             # ...skipped, runner boots on
+    assert not [m for m in mutations(rig) if m["kind"] == "create_label"]
+
+    out = rig.r._execute({"act": "file_fix_issue", "fingerprint": "fpseed",
+                          "title": "Restore green", "body": "## Goal\nfix",
+                          "labels": list(FIX_LABELS) + ["source:qa"]}, NOW)
+    assert out == "ok"
+    muts = mutations(rig)
+    lab = [m for m in muts if m["kind"] == "create_label"]
+    assert [m["name"] for m in lab] == ["source:qa"]        # exactly the label it introduced
+    assert lab[0]["force"] is True
+    assert "{operator}" not in lab[0]["description"]        # signed, never a raw placeholder
+    iss = next(m for m in muts if m["kind"] == "create_issue")
+    assert muts.index(lab[0]) < muts.index(iss)             # BEFORE the create, not after
+
+
+def test_file_fix_issue_still_files_when_gh_refuses_the_unseeded_label(rig, monkeypatch):
+    # The proof the seeding above is load-bearing, driven through a gh that behaves like the real
+    # one: GH_LABEL_NOT_IN_REPO makes `issue create` refuse outright for a label the repo lacks
+    # (until this run creates it). Without the seed there is NO fix issue at all — which is the one
+    # outcome a frozen mainline cannot survive.
+    monkeypatch.setenv("GH_LABEL_NOT_IN_REPO", "source:qa")
+    out = rig.r._execute({"act": "file_fix_issue", "fingerprint": "fpseed",
+                          "title": "Restore green", "body": "## Goal\nfix",
+                          "labels": list(FIX_LABELS) + ["source:qa"]}, NOW)
+    assert out == "ok"
+    assert [m for m in mutations(rig) if m["kind"] == "create_issue"]
+
+
+def test_file_fix_issue_seeds_nothing_for_a_payload_without_the_family(rig):
+    # The other side: the seeding is scoped to the label THIS change introduced. A payload that does
+    # not carry it makes no label write at all — the executor must not grow into a general
+    # vocabulary repairer on the filing path.
+    assert _file_fix(rig) == "ok"
+    assert not [m for m in mutations(rig) if m["kind"] == "create_label"]
+
+
 def test_file_fix_issue_replaces_a_retired_fingerprint_record(rig):
     # Issue #294: decide re-arms a fingerprint whose fix issue is gone. The executor must OVERWRITE
     # the stale number with the new one — otherwise the map stays poisoned and decide re-emits on

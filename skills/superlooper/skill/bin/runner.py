@@ -4463,6 +4463,35 @@ class Runner:
         that asymmetry is precisely what the separate file exists to express."""
         _rm(os.path.join(self.state, "fix_issue_episode.json"))
 
+    def _seed_payload_provenance(self, payload_labels):
+        """Create-or-force the provenance label this fix-issue payload carries, before the create.
+
+        Issue #400, fresh-agent review round 2. The #160 BOOT migration normally heals `source:qa`
+        on a repo adopted before the family existed — but a REFUSED label read makes that migration
+        SKIP for the life of the process (see _apply_boot_migrations: a read anomaly is
+        indistinguishable from a refusal, and it fails open to a skip rather than wedging the
+        restart). This path then runs with an unhealed vocabulary, and `gh issue create` is
+        ALL-OR-NOTHING on labels: the whole call is refused, every tick, and the red mainline stays
+        frozen with the fix issue meant to lift it never filed.
+
+        APPLY-side only. Nothing here reads the family to DECIDE anything — the label is written on
+        an issue the engine files and is never consulted again (owner ruling 2026-08-06); the ratchet
+        in test_label_vocabulary.py is what keeps that true, and this site is on it by name.
+
+        Non-fatal by design, exactly like the nightly's own seeding: a failed create-or-force leaves
+        the create below to fail honestly, and the fingerprint dedup re-files on the next tick."""
+        import labels as labels_lib
+        import config as config_lib
+        names = payload_labels if isinstance(payload_labels, (list, tuple)) else []
+        if labels_lib.SOURCE_QA not in names:
+            return
+        spec = labels_lib.label_spec(labels_lib.SOURCE_QA)
+        if not spec:
+            return
+        color, desc = spec
+        gh.create_label(labels_lib.SOURCE_QA, color,
+                        desc.replace("{operator}", config_lib.operator(self.config)))
+
     def _exec_file_fix_issue(self, a, now):
         fp = a.get("fingerprint")
         # Crash window (Codex round-1 C3): create_issue may have succeeded on a prior tick
@@ -4475,6 +4504,7 @@ class Runner:
             if isinstance(body, str) and fp and marker in body and type(it.get("number")) is int:
                 self._settle_fix_issue(fp, it["number"])
                 return f"already filed as #{it['number']} (reconciled from GitHub)"
+        self._seed_payload_provenance(a.get("labels"))
         num = gh.create_issue(a.get("title"), a.get("body"), labels=a.get("labels"))
         if num is None:
             return "issue create failed (will retry next tick)"
