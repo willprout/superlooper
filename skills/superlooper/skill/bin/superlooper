@@ -441,7 +441,14 @@ def cmd_runner_home(args):
     # status line that prints "not running" about a job it could not READ is how a dark runner
     # comes to look merely idle. Only the service's own word earns that phrase.
     if proc.returncode != 0:
-        live = "not loaded in %s" % runner_home.domain(uid)
+        # Only launchd NAMING this service absent means absent — the same rule (and the same
+        # measured rcs) as _service_view. A domain error, an I/O error or a timeout all exit
+        # nonzero and say nothing about the job, and "not loaded" is the reassuring direction.
+        out = (proc.stdout or "") + (proc.stderr or "")
+        live = ("not loaded in %s" % runner_home.domain(uid) if _NO_SUCH_SERVICE_RE.search(out)
+                else "unknown — launchctl could not be read (%s); ask it yourself: %s"
+                     % (out.strip().splitlines()[-1] if out.strip() else "rc %d" % proc.returncode,
+                        " ".join(runner_home.print_argv("launchctl", uid, job_label))))
     else:
         pid = runner_home.service_pid(proc.stdout)
         if pid:
@@ -1248,6 +1255,7 @@ def _emit_stop(args, result):
             "gone": "%s is booted out of %s — launchd has nothing to restart until your next login",
             "tearing_down": "launchd is still tearing %s out of %s — it is on its way out, and a "
                             "job being removed is not a job that gets restarted",
+            "loaded": "%s is STILL loaded in %s — this stop did not hold it",
             "unconfirmed": "the boot-out of %s from %s was accepted, but launchctl could not be "
                            "read back to confirm the job is gone",
         }[result.get("job_state", "unconfirmed")] % (result["job"], result.get("domain")) + "\n")
@@ -1295,8 +1303,8 @@ def cmd_stop(args):
         # recorded — the marker is never written on this path.
         _emit_stop(args, {"ok": False, "verb": "stop", "home": None, "was_running": None,
                           "pid": None, "job": None, "domain": None, "held": False,
-                          "job_state": None, "process_gone": False, "signal_refused": None,
-                          "marker": None, "start": None,
+                          "job_state": None, "job_pid": None, "process_gone": False,
+                          "signal_refused": None, "marker": None, "start": None,
                           "error": "this repo's .superlooper/config.json could not be read (%s), so "
                                    "nothing was taken down and no stop was recorded" % e,
                           "remedy": "fix the config, then re-run"})
@@ -1311,7 +1319,7 @@ def cmd_stop(args):
     # `held` starts True for the pane home, which has no supervisor to hold and so cannot fail to.
     result = {"ok": True, "verb": "stop", "home": home, "was_running": pid is not None,
               "pid": pid, "job": None, "domain": None, "held": True, "job_state": None,
-              "process_gone": pid is None, "signal_refused": None, "marker": None,
+              "job_pid": None, "process_gone": pid is None, "signal_refused": None, "marker": None,
               "start": "superlooper start --repo %s" % os.path.abspath(args.repo)}
     try:
         result["marker"] = write_stop_marker(state_dir, {
@@ -1365,7 +1373,11 @@ def cmd_stop(args):
         # verb's verdict is about. The only failure is "launchd can restart this", and launchd
         # cannot restart a job it is in the middle of removing.
         in_flight = rc == _BOOTOUT_IN_PROGRESS
-        job_deadline = min(deadline, time.time() + (_STOP_WAIT_SECONDS if in_flight
+        # The long budget goes where the answer can still CHANGE the verdict (fresh-agent review):
+        # an accepted boot-out (rc 0) whose service has not left the domain yet is the only case
+        # where waiting turns a hard failure into the truth. An in-flight teardown is already held
+        # whatever the poll says, and a refused one is not going to un-refuse itself.
+        job_deadline = min(deadline, time.time() + (_STOP_WAIT_SECONDS if rc == 0 or in_flight
                                                     else _JOB_CONFIRM_SECONDS))
         while True:
             loaded, job_pid = _service_view(job)
@@ -1377,7 +1389,8 @@ def cmd_stop(args):
         # job / launchd is in the middle of removing it / the bootout returned ok but launchctl
         # could not be read back to confirm. Only the first has earned "booted out".
         result["job_state"] = ("gone" if loaded is False else
-                               "tearing_down" if in_flight else "unconfirmed")
+                               "tearing_down" if in_flight else
+                               "loaded" if loaded is True else "unconfirmed")
         if not result["held"]:
             result.update(ok=False,
                           error=("the job %s is STILL loaded in %s (bootout rc=%d%s) — launchd can "
@@ -1390,7 +1403,9 @@ def cmd_stop(args):
                           remedy="take it down by hand: %s" % " ".join(
                               runner_home.bootout_argv("launchctl", uid, job)))
             if job_pid:
-                result["pid"] = job_pid
+                # Its OWN key: `pid` is the runner's, read from the pidfile, and overwriting it with
+                # launchd's produced JSON that said `was_running: false, pid: 4242` in one breath.
+                result["job_pid"] = job_pid
             _stop_journal(state_home, {"act": "runner_stop", "outcome": "stop_failed", "home": home,
                                        "job": job, "rc": rc, "operator": args.operator,
                                        "source": args.source or "cli"})
@@ -1440,6 +1455,23 @@ def cmd_stop(args):
     return 0
 
 
+def _clear_stop(result, state_dir):
+    """Withdraw the stop, marking `result` failed if the marker will not go.
+
+    A marker that cannot be deleted is the off switch LATCHED — the watchdog declines to restart
+    this runner from here on, silently and forever — so this is the one bookkeeping failure that
+    must reach the caller rather than being swallowed (fresh-agent review)."""
+    from runner import clear_stop_marker
+    try:
+        return clear_stop_marker(state_dir) is not None
+    except OSError as e:
+        result.update(ok=False, started=False,
+                      error="the runner is up, but the deliberate-stop marker could not be removed "
+                            "(%s) — while it is there the watchdog will not restart this runner" % e,
+                      remedy="delete it by hand: %s" % os.path.join(state_dir, "runner.stopped"))
+        return False
+
+
 def _emit_start(args, result):
     if getattr(args, "json", False):
         sys.stdout.write(json.dumps(result) + "\n")
@@ -1453,12 +1485,14 @@ def _emit_start(args, result):
     if result.get("manual"):
         sys.stdout.write("  %s\n" % result["manual"])
         return
-    if result.get("already_running"):
-        sys.stdout.write("  a runner is already live for this repo (pid %s) — nothing to start.\n"
-                         % result.get("pid"))
+    if result.get("already_running") and result.get("job_loaded"):
+        sys.stdout.write("  a runner is already live for this repo (pid %s) and its job is loaded "
+                         "in %s — nothing to start.\n" % (result.get("pid"), result.get("domain")))
         return
-    sys.stdout.write("  job:      %s bootstrapped into %s\n"
-                     % (result.get("job"), result.get("domain")))
+    sys.stdout.write("  job:      %s bootstrapped into %s%s\n"
+                     % (result.get("job"), result.get("domain"),
+                        " (its runner was already live — launchd had lost the job)"
+                        if result.get("already_running") else ""))
     sys.stdout.write("  process:  %s\n"
                      % ("pid %s" % result["pid"] if result.get("pid") else
                         "the job is loaded; it had not reported a pid yet — check `superlooper "
@@ -1496,7 +1530,8 @@ def cmd_start(args):
     # alone is not enough, because the pane home succeeds at what it can do (clear the way and hand
     # back the one line) while starting nothing at all (fresh-agent review).
     result = {"ok": True, "verb": "start", "home": home, "cleared": False, "started": False,
-              "job": None, "domain": None, "pid": None, "already_running": False, "manual": None}
+              "job": None, "domain": None, "pid": None, "job_loaded": None,
+              "already_running": False, "manual": None}
 
     job = plist = uid = None
     if home == runner_home.LOGIN_ITEM:
@@ -1524,29 +1559,52 @@ def cmd_start(args):
             return 2
 
     if home != runner_home.LOGIN_ITEM:
-        # The pane home gets NO clear here (fresh-agent review). There is nothing this verb can
-        # start — automated tab placement is owner-ruled out — so clearing would swap a respected
+        # The pane home gets no clear here WHEN THERE IS NOTHING RUNNING. This verb cannot start
+        # anything — automated tab placement is owner-ruled out — so clearing would swap a respected
         # stop for a watchdog episode about a loop that is still down, which is exactly the 3am text
         # #239 exists to kill. The marker is still TRUE until a runner boots, and the runner clears
         # it itself the moment one does.
-        result["manual"] = ("now start the runner in a visible cmux tab: superlooper run --repo %s"
-                            " — the stop clears when it boots"
-                            % os.path.abspath(args.repo))
+        #
+        # A LIVE runner is the exception, and it has to be: `superlooper run` refuses the singleton
+        # to a second instance and returns BEFORE it would clear the marker, so a stop that failed
+        # to stop a pane runner leaves a marker that nothing on any path can withdraw — `status`
+        # reads STOP NOT TAKEN forever, and the watchdog stands down the moment that runner finally
+        # dies, over a stop the owner already withdrew (fresh-agent review). A running runner makes
+        # the marker false; that is the same fact `Runner.run` clears on.
+        pid = live_runner_pid(state_dir)
+        if pid is not None:
+            result.update(already_running=True, started=True, pid=pid)
+            result["cleared"] = _clear_stop(result, state_dir)
+            if result["ok"] is False:
+                _emit_start(args, result)
+                return 1
+        result["manual"] = (
+            "a runner is already live in its tab (pid %d) — nothing to start." % pid
+            if pid is not None else
+            "now start the runner in a visible cmux tab: superlooper run --repo %s"
+            " — the stop clears when it boots" % os.path.abspath(args.repo))
         _emit_start(args, result)
         return 0
 
+    # THE JOB is what this verb starts, so the job is what it decides on (fresh-agent review). A
+    # live PROCESS is not enough: `stop` deliberately decouples the two — it boots the job out and
+    # may leave the runner finishing a tick — so short-circuiting on the process alone left the loop
+    # running with launchd holding nothing, the marker withdrawn, and the watchdog re-armed to
+    # kickstart a service that is not there. Only a job that launchd actually has counts as started.
+    loaded, _job_pid = _service_view(job)
     pid = live_runner_pid(state_dir)
-    if pid is not None:
-        result.update(already_running=True, started=True, pid=pid)
-        result["cleared"] = clear_stop_marker(state_dir) is not None
+    if loaded is True and pid is not None:
+        result.update(already_running=True, started=True, pid=pid, job_loaded=True)
+        result["cleared"] = _clear_stop(result, state_dir)
         _emit_start(args, result)
-        return 0
+        return 0 if result["ok"] else 1
 
     # Read the marker BEFORE starting anything, but do not clear it yet: it is the truth until a
     # runner is up, and a start that fails must leave the loop exactly as off — and as respected —
     # as it was. (The booting runner clears it itself, so the clear below is belt-and-braces and
     # must tolerate finding nothing.)
     was = read_stop_marker(state_dir)
+    result["already_running"] = pid is not None
 
     rc, out = _launchctl(runner_home.bootstrap_argv(_launchctl_bin(), uid, plist))
     if rc != 0:
@@ -1597,7 +1655,11 @@ def cmd_start(args):
         return 1
     # Proven up. NOW the stop is over, and only now is `started` an honest journal record.
     result["started"] = True
-    cleared_here = clear_stop_marker(state_dir) is not None
+    result["job_loaded"] = True
+    cleared_here = _clear_stop(result, state_dir)
+    if not result["ok"]:
+        _emit_start(args, result)
+        return 1
     result["cleared"] = cleared_here or was is not None
     if cleared_here:
         # Only when THIS call is the one that cleared it. The booting runner clears the marker and
@@ -1647,9 +1709,13 @@ def _status_runner_line(state_dir, home):
                 "resurrect it; `superlooper start` undoes this" % (who, when, held))
     if pid is not None:
         return "running (pid %d)" % pid
-    recorded = (_read(os.path.join(state_dir, "runner.lock")) or "").strip()
+    lock = os.path.join(state_dir, "runner.lock")
+    recorded = (_read(lock) or "").strip()
     if recorded.isdigit():
         return ("DOWN — CRASHED: the recorded pid %s is gone and no stop was requested" % recorded)
+    if os.path.exists(lock):
+        return ("DOWN — the pidfile %s holds no readable pid, so nothing can be said about how "
+                "this runner ended" % lock)
     return "not running (no pidfile, and no deliberate stop was recorded)"
 
 
@@ -3366,30 +3432,29 @@ def _watchdog_stopped(state_dir):
     return read_stop_marker(state_dir) is not None
 
 
-def _watchdog_runner_started(state_dir):
-    """When the LIVE runner took the singleton, from its pidfile's mtime — or None.
+def _watchdog_runner_view(state_dir):
+    """``(live, started_at)`` for the recorded runner — ONE read, two facts.
 
-    The pidfile is written once, by the process that won the lock, and never refreshed (the re-exec
-    path adopts it in place rather than rewriting it), so its mtime is that runner's start. None
-    whenever there is no live runner, so the fact can never be read about a corpse."""
+    `live` is the positive twin of ``_watchdog_runner_dead``, which answers "the recorded pid is
+    DEAD" and leaves the third state (no pidfile at all — a clean exit) as neither. Only a positive
+    read may decide that a stop did not take, because the unsafe direction is believing a runner is
+    gone when it is up.
+
+    `started_at` is when that runner took the singleton, from its pidfile's mtime: the file is
+    written once, by the process that won the lock, and never refreshed (the re-exec path adopts it
+    in place rather than rewriting it). None whenever the runner is not live, so it is never read
+    about a corpse.
+
+    Answered TOGETHER because they are consumed together: derived from two separate reads, a runner
+    that booted between them yields live=True with started_at=None — which is exactly the spurious
+    "wedged" episode the pair exists to prevent (fresh-agent review)."""
     from runner import live_runner_pid
     if live_runner_pid(state_dir) is None:
-        return None
+        return False, None
     try:
-        return os.path.getmtime(os.path.join(state_dir, "runner.lock"))
+        return True, os.path.getmtime(os.path.join(state_dir, "runner.lock"))
     except OSError:
-        return None
-
-
-def _watchdog_runner_live(state_dir):
-    """True when state/runner.lock names a LIVE pid — the positive twin of ``_watchdog_runner_dead``.
-
-    Deliberately not derivable from that one: it answers "the recorded pid is DEAD", and the third
-    state (no pidfile at all — a clean exit) is neither. Only a positive read may be used to decide
-    that a stop did not take, because the direction that matters is the unsafe one — believing a
-    runner is gone when it is up is what would let this engine restart a live loop mid-tick."""
-    from runner import live_runner_pid
-    return live_runner_pid(state_dir) is not None
+        return True, None
 
 
 def _watchdog_alert(state_dir):
@@ -3707,6 +3772,7 @@ def cmd_watchdog(args):
         return 0
     try:
         st = _watchdog_loopstate(state_dir)
+        runner_live, runner_started_at = _watchdog_runner_view(state_dir)
         heartbeat = _watchdog_heartbeat(state_dir)
         alert = _watchdog_alert(state_dir)
         lanes_busy = _watchdog_lanes_busy(st, state_dir)
@@ -3735,11 +3801,11 @@ def cmd_watchdog(args):
                 "stopped_by_owner": _watchdog_stopped(state_dir),
                 # WHEN this runner started, so a heartbeat it inherited from the previous process
                 # is not read as its own silence. Nothing stamps the heartbeat at boot.
-                "runner_started_at": _watchdog_runner_started(state_dir),
+                "runner_started_at": runner_started_at,
                 # A stop that was REQUESTED is not a stop that TOOK (fresh-agent review): the pure
                 # core honours the marker only when this is False, so a runner still up — because
                 # the stop timed out on a long tick, or the bootout failed — is still watched.
-                "runner_live": _watchdog_runner_live(state_dir),
+                "runner_live": runner_live,
                 "runner_dead": _watchdog_runner_dead(state_dir)}
         state_path = os.path.join(state_dir, watchdog_lib.STATE_FILENAME)
         prior = watchdog_lib.coerce_state(_read_json_file(state_path, None))
@@ -3817,6 +3883,11 @@ def cmd_watchdog(args):
                                if cfg["watchdog"]["resurrection_max_per_hour"] == 0 else
                                "runner is DOWN — auto-restart PAUSED (crash-loop cap hit)") if capped else
                               f"episode open ({', '.join(ep['signals'])})" if ep else
+                              # A runner that has not stamped its first tick is not healthy — it is
+                              # unproven, and saying so is the difference between a summary a
+                              # person can act on and one that reads the same either way.
+                              "runner booting — it has not completed a tick yet"
+                              if final.get("resurrection", {}).get("booting_since") else
                               "healthy — no signal"))
         if view["stopped_by_owner"] and view["runner_live"] and not view["kill_switch"]:
             # Named rather than left to be inferred from the line above: the owner asked for this

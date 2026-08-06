@@ -740,4 +740,6 @@ def test_a_runner_that_only_just_booted_is_not_diagnosed_on_the_old_heartbeat(tm
     assert r.returncode == 0, r.stderr
     assert rig.resurrect_calls() == []
     assert rig.wjournal() == [], rig.wjournal()      # no episode, no text
-    assert "healthy" in r.stdout, r.stdout
+    # And it is not called HEALTHY either: a runner that has not stamped a tick is unproven, not
+    # well. The summary a person reads has to be able to tell those apart.
+    assert "booting" in r.stdout, r.stdout

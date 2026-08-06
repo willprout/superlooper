@@ -552,7 +552,8 @@ def test_only_launchd_naming_the_service_absent_counts_as_a_gone_job(rig, answer
     r = cli(rig, "stop", "--json")
     doc = json.loads(r.stdout)
     assert doc["job_state"] != "gone", doc
-    assert "booted out" not in r.stdout
+    # And the human rendering never claims it either — checked against the renderer, not the JSON.
+    assert "booted out" not in cli(rig, "stop").stdout
 
 
 def test_our_own_timeout_is_never_reported_as_launchds_teardown(rig):
@@ -594,6 +595,7 @@ def test_a_config_that_cannot_be_read_leaves_a_recorded_stop_standing(rig):
     assert r.returncode != 0
     assert "Traceback" not in r.stderr, r.stderr
     assert json.loads(r.stdout)["ok"] is False
+    assert marker(rig) is not None, "a start that could not even read the repo withdrew the stop"
 
 
 def test_start_reports_started_separately_from_ok(rig):
@@ -616,3 +618,70 @@ def test_start_journals_the_landing_only_when_it_is_the_one_that_cleared_the_sto
         rig.home / "journal.jsonl").exists() else []
     starts = [l for l in lines if l.strip() and json.loads(l).get("outcome") == "started"]
     assert starts == [], starts
+
+
+def test_start_reloads_a_job_launchd_has_lost_even_though_a_runner_is_alive(rig):
+    # `stop` decouples the two facts on purpose: it boots the job OUT and may leave the runner
+    # finishing its tick. A `start` that short-circuits on the live process alone leaves the loop
+    # running with launchd holding nothing and the marker withdrawn — so when that process finally
+    # exits, nothing restarts it and the re-armed watchdog kickstarts a service that is not there.
+    # The job is what this verb starts, so the job is what it decides on.
+    write_config(rig, runner_home="login-item")
+    (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
+    pid = rig.spawn()                                  # a runner process, alive
+    assert not (rig.jobs / LABEL).exists()             # ...and launchd has no job for it
+    r = cli(rig, "start", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert (rig.jobs / LABEL).exists(), "the job must be bootstrapped back into the domain"
+    assert doc["job_loaded"] is True and doc["started"] is True
+    # `already_running` records that a runner process was already up when the job was re-loaded.
+    # The reported pid is the JOB's — the two are the same process on a real machine, and here
+    # they cannot be, because this rig's "runner" is not the thing the fake launchd supervises.
+    assert doc["already_running"] is True and doc["pid"] is not None
+    assert pid  # the stand-in runner is what made this the split-brain case in the first place
+
+
+def test_start_over_a_loaded_job_and_a_live_runner_changes_nothing(rig):
+    write_config(rig, runner_home="login-item")
+    (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
+    pid = rig.spawn()
+    load_job(rig, pid)
+    r = cli(rig, "start", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["already_running"] is True and doc["job_loaded"] is True
+    assert not any("bootstrap" in line for line in calls(rig)), calls(rig)
+
+
+def test_start_in_the_pane_home_withdraws_a_stop_a_live_runner_has_already_disproved(rig):
+    # `superlooper run` refuses the singleton to a second instance and returns BEFORE it would
+    # clear the marker, so a stop that failed to stop a pane runner leaves a marker nothing on any
+    # path can withdraw: `status` reads STOP NOT TAKEN forever, and the watchdog stands down the
+    # moment that runner finally dies — over a stop the owner already withdrew.
+    pid = rig.spawn()
+    (rig.home / "state" / "runner.home.json").unlink()   # so `stop` refuses to signal it
+    cli(rig, "stop")
+    assert marker(rig) is not None
+    r = cli(rig, "start", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert marker(rig) is None, "a running runner is exactly what makes the marker false"
+    assert json.loads(r.stdout)["pid"] == pid
+
+
+def test_a_marker_that_will_not_delete_is_a_failed_start_not_a_quiet_one(rig):
+    # The one way the off switch could LATCH. A start that reports success over a marker still on
+    # disk leaves the watchdog declining to restart this runner, silently and forever.
+    write_config(rig, runner_home="login-item")
+    (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
+    cli(rig, "stop")
+    state = rig.home / "state"
+    os.chmod(state, 0o555)                               # the marker cannot be unlinked
+    try:
+        r = cli(rig, "start", "--json")
+        assert r.returncode != 0, r.stdout
+        doc = json.loads(r.stdout)
+        assert doc["ok"] is False and doc["started"] is False
+        assert "could not be removed" in doc["error"]
+    finally:
+        os.chmod(state, 0o755)

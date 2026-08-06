@@ -496,9 +496,20 @@ def write_stop_marker(state_dir, payload):
 
 def clear_stop_marker(state_dir):
     """Remove the marker and report whether one was there — the caller journals the difference
-    between a start that reversed a deliberate stop and an ordinary boot."""
+    between a start that reversed a deliberate stop and an ordinary boot.
+
+    RAISES if the marker survives the removal. `_rm` swallows OSError, which is right for the
+    diagnostics it was written for and wrong here: a marker that cannot be deleted is the off
+    switch LATCHED, and every caller would otherwise report a clean start over a loop the watchdog
+    has quietly stopped guarding — permanently, and with nothing said. The whole feature rests on
+    "the switch can neither miss its own window nor latch", so the one way it could latch is the
+    one thing that must not be silent."""
     was = read_stop_marker(state_dir)
     _rm(stop_marker_path(state_dir))
+    if os.path.exists(stop_marker_path(state_dir)):
+        raise OSError("the deliberate-stop marker at %s could not be removed — until it is gone "
+                      "the watchdog will not restart this runner"
+                      % stop_marker_path(state_dir))
     return was
 
 

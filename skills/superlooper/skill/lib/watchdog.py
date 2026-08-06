@@ -119,7 +119,10 @@ def _new_resurrection():
     # issue #208: `attempts` are the restart timestamps in the rolling window (the crash-loop cap
     # counts these); `capped_notified` / `failure_notified` dedup the escalation and failed-restart
     # texts for one down-streak (cleared when the runner is observed healthy again).
-    return {"attempts": [], "capped_notified": False, "failure_notified": False}
+    # `booting_since` (issue #239) is the runner START TIME already excused as "still booting" —
+    # the memory that keeps that excuse from renewing itself forever (see _resurrection).
+    return {"attempts": [], "capped_notified": False, "failure_notified": False,
+            "booting_since": None}
 
 
 def new_state():
@@ -169,6 +172,9 @@ def coerce_state(raw):
                              if isinstance(t, (int, float)) and not isinstance(t, bool)]
         r["capped_notified"] = res.get("capped_notified") is True
         r["failure_notified"] = res.get("failure_notified") is True
+        bs = res.get("booting_since")
+        if isinstance(bs, (int, float)) and not isinstance(bs, bool):
+            r["booting_since"] = bs
         st["resurrection"] = r
     nr = raw.get("next_resurrection")
     if type(nr) is int and nr >= 1:
@@ -390,6 +396,7 @@ def _resurrection(now, view, w, sigs, details, new_state):
     if not hb_stale and not runner_dead:
         r["capped_notified"] = False
         r["failure_notified"] = False
+        r["booting_since"] = None            # it ticked: whatever it was booting from is finished
 
     attempts = [t for t in r["attempts"]
                 if isinstance(t, (int, float)) and not isinstance(t, bool)]
@@ -435,13 +442,26 @@ def _resurrection(now, view, w, sigs, details, new_state):
         # stale reading it is being judged on belongs to the PREVIOUS process. The settle window
         # below already encoded this rule for a runner the watchdog itself restarted; a deliberate
         # start leaves no attempt behind, so without the general form the first check after every
-        # `superlooper start` texts the owner about the outage they just ended (fresh-agent review).
-        # It costs nothing in detection: a runner that is still not ticking once it is older than
-        # the bound is judged on its OWN silence, which is what the signal was always supposed to mean.
-        booting = (view.get("runner_live") and isinstance(started, (int, float))
-                   and not isinstance(started, bool)
-                   and now - started < w["heartbeat_stale_seconds"])
-        if booting or (last is not None and now - last < RESURRECTION_SETTLE_SECONDS):
+        # `superlooper start` texts the owner about the outage they just ended.
+        #
+        # The excuse has MEMORY, and that is what keeps it from renewing itself forever
+        # (fresh-agent review). A login-item runner that exits before completing a tick is respawned
+        # by KeepAlive, so every check sees a live runner younger than the bound — and an excuse
+        # re-derived from the current pidfile would cover a crash loop indefinitely, with
+        # `no_progress` frozen behind the same stale heartbeat and only `alert` left to notice
+        # anything. So we excuse ONE start: a start time that MOVES while the heartbeat is still
+        # stale is a runner being replaced over and over, which is a fault in its own right rather
+        # than a boot in progress. The lower bound on the age is the same rule for the same reason —
+        # a pidfile dated in the future (a clock step, a restored file) is not evidence of youth.
+        age = (now - started) if isinstance(started, (int, float)) \
+            and not isinstance(started, bool) else None
+        fresh = view.get("runner_live") and age is not None \
+            and 0 <= age < w["heartbeat_stale_seconds"]
+        same_runner = r.get("booting_since") is None or r["booting_since"] == started
+        if fresh and same_runner:
+            r["booting_since"] = started
+            sigs, details = _without(sigs, details, HEARTBEAT_STALE)   # this runner is still booting
+        elif last is not None and now - last < RESURRECTION_SETTLE_SECONDS:
             sigs, details = _without(sigs, details, HEARTBEAT_STALE)   # reborn runner still booting
         r["attempts"] = attempts
     else:

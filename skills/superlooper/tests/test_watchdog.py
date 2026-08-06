@@ -900,3 +900,49 @@ def test_a_dead_runner_is_never_excused_by_a_start_time():
     now = T0 + 600 * MIN
     r = _run(now, _dead(now, stale_min=600, runner_started_at=now - 20))
     assert r["resurrect"] is not None
+
+
+def test_a_runner_that_keeps_being_replaced_stops_earning_the_booting_excuse():
+    # A login-item runner that exits before completing a tick is respawned by KeepAlive, so every
+    # check sees a live runner younger than the bound. An excuse re-derived from the current pidfile
+    # would cover that crash loop forever — and no_progress is frozen behind the same stale
+    # heartbeat, leaving only `alert` to notice anything. One start is excused; a start time that
+    # MOVES while the heartbeat is still stale is a runner being replaced, which is its own fault.
+    st = wd.new_state()
+    now = T0
+    seen = []
+    for i in range(6):
+        r = _run(now, _view(now, heartbeat=T0 - 60 * MIN, runner_live=True,
+                            runner_started_at=now - 30), st)
+        st = r["state"]
+        seen.append(st["episode"] is not None)
+        now += 5 * MIN
+    assert seen[0] is False, "the first observation is a boot, and is excused"
+    assert seen[-1] is True, "a runner that keeps being replaced is not booting, it is flapping"
+
+
+def test_the_same_runner_keeps_its_excuse_while_it_boots():
+    st = wd.new_state()
+    started = T0 - 30
+    for step in (0, 60, 120):
+        now = T0 + step
+        r = _run(now, _view(now, heartbeat=T0 - 60 * MIN, runner_live=True,
+                            runner_started_at=started), st)
+        st = r["state"]
+        assert st["episode"] is None, "the SAME runner, still inside the bound, is still booting"
+
+
+def test_a_pidfile_dated_in_the_future_earns_nothing():
+    # A clock step or a restored file must not read as youth — that would suppress heartbeat_stale
+    # indefinitely on evidence that is not evidence.
+    r = _run(T0, _view(T0, heartbeat=T0 - 60 * MIN, runner_live=True,
+                       runner_started_at=T0 + 86400))
+    assert r["state"]["episode"] is not None
+
+
+def test_a_ticking_runner_forgets_it_was_ever_booting():
+    st = _run(T0, _view(T0, heartbeat=T0 - 60 * MIN, runner_live=True,
+                        runner_started_at=T0 - 30))["state"]
+    assert st["resurrection"]["booting_since"] is not None
+    healthy = _run(T0 + MIN, _view(T0 + MIN, runner_live=True), st)
+    assert healthy["state"]["resurrection"]["booting_since"] is None
