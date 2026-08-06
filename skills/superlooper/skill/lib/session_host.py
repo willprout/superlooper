@@ -38,11 +38,16 @@ each is named where it is enforced so a later reader can tell doctrine from para
   ``agent list``. Absence of signal is UNKNOWN, never idle/done (c2), and a host that names an
   agent's pane and then has no runtime behind it is RESTORING (#317) — a positive reading of a
   transient, not a shade of "we could not tell".
-* **focus** — the one verb that changes NOTHING about the fleet (issue #339). It brings an
-  already-existing window to the front so the owner can watch it with his own eyes and type into
-  it; it never spawns, sends, exits or kills, and it is deliberately not a viewer (owner ruling
-  2026-08-05: attach only, no observation stream, no frame copy). It is also the one verb that
-  REPORTS instead of raising — "that lane has no window" is the COMMON answer, not a failure.
+* **focus** — the one verb that changes no session's WORK (issue #339). It moves the host's focus
+  to an already-existing window so the owner can watch it with his own eyes and type into it; it
+  never spawns, sends, exits or kills, and it is deliberately not a viewer (owner ruling
+  2026-08-05: attach only, no observation stream, no frame copy). It is not a no-op on the host,
+  and saying otherwise would be the kind of claim this module exists to distrust: focus IS host
+  state, and focusing one lane unfocuses whatever was focused before. What that cannot disturb is
+  delivery — the plain prompt verb is banned here and every send is proven transcript-side, which
+  is what makes the pinned release's focus/delivery coupling (SPIKES-2026-07-30-supervised, E10)
+  somebody else's problem rather than this verb's. It is also the one verb that REPORTS instead of
+  raising — "that lane has no window" is the COMMON answer, not a failure.
 * **exit/kill** — our ordered teardown; the host's verbs are mechanism only. ``exit`` closes a
   FINISHED session's window and refuses anything else (positive allowlist, like ``tidy.closable``).
   ``kill`` is the forceful path and escalates only against a pid THIS read attributed to the
@@ -132,7 +137,16 @@ _GONE_CODES = re.compile(r"not[_ ]?found|no[_ ]?such|does[_ ]?not[_ ]?exist")
 # `client_not_found` read as "that lane's window is closed" would tell the owner a LIVE worker had
 # ended. So the focus path asks the narrower question and treats every other not-found as "the host
 # said something we cannot turn into a verdict about this window".
-_WORKSPACE_SUBJECT = re.compile(r"workspace")
+#
+# WHOLE CODES, not a substring search (second fresh-agent review, P1). The first draft was
+# `re.compile("workspace")` against the code, which admits the very answers it was written to
+# reject: `workspace_client_not_found` and `no_such_client_in_workspace` both MENTION the workspace
+# while being about a client, and both came back as "that lane's window is closed" about a live
+# worker. A code this does not recognise degrades to HOST_UNREACHABLE, which is the safe direction:
+# if a later release renames the spelling, focus stops claiming windows are gone rather than
+# starting to claim it about ones that are not.
+_WORKSPACE_GONE_CODES = re.compile(
+    r"workspace[_ ](?:not[_ ]?found|does[_ ]?not[_ ]?exist)|no[_ ]?such[_ ]workspace")
 
 # --------------------------------------------------------------------------- the fence (#305)
 # Token auth on the host's control socket, carried as a patch against the pinned release
@@ -611,13 +625,15 @@ def _workspace_is_gone(reply):
     """Did the host answer "I do not have that WORKSPACE"? — the focus path's discriminator (#339).
 
     Both halves are required. ``_is_gone`` first, so silence and unparseable answers stay UNKNOWN
-    exactly as everywhere else. Then the SUBJECT: the host's codes are ``<thing>_not_found``, and a
-    thing that is not the workspace is not an answer about whether this lane still has a window.
+    exactly as everywhere else. Then the SUBJECT, matched as a WHOLE code: the host's codes are
+    ``<thing>_not_found``, and a thing that is not the workspace — including one merely SCOPED by a
+    workspace, like ``workspace_client_not_found`` — is not an answer about whether this lane still
+    has a window.
     """
     if not _is_gone(reply):
         return False
     code = (reply.error or "").split(":", 1)[0].strip().lower()
-    return bool(_WORKSPACE_SUBJECT.search(code))
+    return bool(_WORKSPACE_GONE_CODES.fullmatch(code))
 
 
 def _dig(payload, *path):
@@ -1413,12 +1429,22 @@ class SessionHost:
           workspace is still the one we recorded it for" is NOT checked here, and closing it needs
           an identity the host can vouch for — issue #389, not a silent assumption.
 
+        WHAT IS OBSERVED AND WHAT IS INFERRED, since the difference is the whole basis of the
+        NO_WINDOW branch (second fresh-agent review). The envelope and the ``workspace_not_found``
+        spelling are production-proven for this verb's SIBLINGS — ``workspace get`` and
+        ``workspace close`` have been read this way since #304/#308, and reports/i317.md records
+        the wrapper parsing a real not-found envelope off the live host. What has NOT been observed
+        is `workspace focus` itself answering that way: this machine's fleet is fenced and a worker
+        pane holds no token, so a real focus could not be completed while building this. Same noun,
+        same host, same envelope — but it is inferred from the siblings, not measured here, and a
+        supervised drive against a closed workspace would settle it.
+
         ``ValueError`` — never a ``Focus`` — for a handle that cannot address a window (a bare
-        name, ``None``, a ``Session`` with no workspace). That is a caller bug, exactly like
-        ``send``'s missing oracle, and answering it with a tidy-looking NO_WINDOW would report "the
-        owner's session is gone" about a lane nobody actually asked the host about. A lane whose
-        window is genuinely gone never reaches here: ``lib/focus`` reads the recorded handle first
-        and answers NO_WINDOW without a call.
+        name, ``None``, a ``Session`` with no workspace, or an id that would read as a FLAG). That
+        is a caller bug, exactly like ``send``'s missing oracle, and answering it with a
+        tidy-looking NO_WINDOW would report "the owner's session is gone" about a lane nobody
+        actually asked the host about. A lane whose window is genuinely gone never reaches here:
+        ``lib/focus`` reads the recorded handle first and answers NO_WINDOW without a call.
         """
         if not isinstance(session, Session) or not session.workspace:
             raise ValueError(
@@ -1426,11 +1452,19 @@ class SessionHost:
                 "cannot address a window. A lane NAME is deliberately not accepted: it is unique "
                 "inside one repo's state home and nowhere else, so on a multi-repo host it names "
                 "no single window." % (session,))
+        if str(session.workspace).startswith("-"):
+            # A recorded id that reads as a FLAG. It comes off disk, and the only writer is the
+            # host's own reply — so this is unreachable today rather than a live hazard, and it is
+            # here because "unreachable today" is a property of the writer, not of this call. The
+            # teardown verbs pass the same value to `workspace close` with no such check; that
+            # shared gap is recorded in reports/i339.md rather than widened here.
+            raise ValueError("[%s] the recorded workspace id %r would read as a command-line flag"
+                             % (session.name, session.workspace))
         reply = self._call(["workspace", "focus", session.workspace])
         if reply.ok:
             return Focus(FOCUSED,
-                         "the host moved its focus to workspace %s (an attached viewer follows it)"
-                         % session.workspace)
+                         "the host moved its focus to workspace %s; a viewer attached to this "
+                         "session follows it" % session.workspace)
         if _workspace_is_gone(reply):
             # The host SPOKE and said it does not have THIS WORKSPACE. `_workspace_is_gone` is what
             # keeps this branch honest twice over: a timeout or a missing binary cannot reach it

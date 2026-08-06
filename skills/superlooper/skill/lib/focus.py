@@ -27,7 +27,10 @@ check standing between the two that somebody has to remember to write.
 What that does NOT promise, because a recorded id can go stale (fresh-agent review): that the
 workspace is still the one this lane opened. If a marker outlives its window and the host later
 mints the same id for somebody else, this addresses a stranger's window — issue #389.
-``SessionHost.focus`` states that exposure where it is paid.
+``SessionHost.focus`` states that exposure where it is paid. It is the SAME staleness ``exit`` and
+``kill`` already act on, through the same file — but the consequence here is worse than theirs, and
+worth saying so plainly: a teardown aimed at a stranger's window closes it, while a focus aimed at
+one brings it up in front of an owner whose next move is to type into it.
 
 **Four outcomes, and none of them is an exception.** The caller RENDERS this, so every answer has
 to be one it can render honestly:
@@ -111,15 +114,18 @@ class Result:
     def exit_code(self):
         return EXIT_CODES.get(self.outcome, 1)
 
-    def as_dict(self, **extra):
+    def as_dict(self, repo=None):
         """The JSON a caller parses. EVERY key is present on every outcome, including the ones a
         given path has nothing to put in them — a UI that has to test for a missing key writes a
-        different branch for each answer, which is how one of the four ends up unhandled."""
-        out = {"ok": self.focused, "verb": "focus-session", "id": self.id,
-               "outcome": self.outcome, "workspace": self.workspace or None,
-               "repo": None, "detail": self.detail}
-        out.update(extra)
-        return out
+        different branch for each answer, which is how one of the four ends up unhandled.
+
+        A NAMED parameter rather than ``**extra`` (second fresh-agent review): a free-form update
+        could overwrite ``ok`` or ``outcome`` and re-open the very contradiction ``focused`` was
+        made a derived property to close — ``{"ok": true, "outcome": "no_window"}``.
+        """
+        return {"ok": self.focused, "verb": "focus-session", "id": self.id,
+                "outcome": self.outcome, "workspace": self.workspace or None,
+                "repo": repo, "detail": self.detail}
 
     def __repr__(self):
         return "Result(outcome=%r, id=%r, workspace=%r)" % (self.outcome, self.id, self.workspace)

@@ -136,6 +136,22 @@ def test_every_outcome_has_its_own_exit_code_and_only_focused_is_zero():
     assert all(focus_lib.EXIT_CODES[o] != 0 for o in focus_lib.OUTCOMES if o != focus_lib.FOCUSED)
 
 
+def test_the_json_shape_cannot_be_built_contradicting_itself():
+    """`focused` is derived from the outcome so the two can never disagree; a free-form `**extra`
+    on the serialiser would have handed that contradiction straight back (fresh-agent review)."""
+    payload = focus_lib.Result(focus_lib.NO_WINDOW, "i339").as_dict(repo="o/r")
+    assert (payload["ok"], payload["outcome"], payload["repo"]) == (False, "no_window", "o/r")
+    assert set(payload) == {"ok", "verb", "id", "outcome", "workspace", "repo", "detail"}
+
+
+def test_a_state_home_with_an_embedded_nul_is_an_answer_rather_than_a_traceback(tmp_path):
+    """`open()` raises ValueError — not OSError — on a NUL in the path, and `lib/panes` caught only
+    OSError. Reachable from a config `repo` carrying one, and `focus_lane` is called OUTSIDE the
+    CLI's own try, so it would have surfaced as a traceback to whatever shelled the verb."""
+    assert focus_lib.focus_lane(str(tmp_path) + "/a\x00b", "i339",
+                                host=FakeDoor()).outcome == focus_lib.NO_WINDOW
+
+
 def test_no_outcome_borrows_argparses_own_exit_code():
     """2 belongs to argparse — a usage error, and what an engine too old to have this verb exits
     with on `invalid choice`. An outcome sharing it would let "this engine has never heard of this

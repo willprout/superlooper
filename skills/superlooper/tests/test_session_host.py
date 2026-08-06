@@ -1022,16 +1022,40 @@ def test_a_refusal_in_other_words_is_a_host_fault_not_a_missing_window():
     assert "unauthorized" in got.detail
 
 
-@pytest.mark.parametrize("code", ["client_not_found", "terminal_not_found", "no_such_client",
-                                  "pane_not_found", "session_not_found"])
+@pytest.mark.parametrize("code", [
+    "client_not_found", "terminal_not_found", "no_such_client", "pane_not_found",
+    "session_not_found",
+    # The two that defeated the first fix (second fresh-agent review, P1). Both MENTION the
+    # workspace while being about a client, so a substring search for "workspace" admitted exactly
+    # the answers the check was written to reject — and told the owner a live worker had ended.
+    "workspace_client_not_found", "no_such_client_in_workspace",
+])
 def test_a_not_found_about_something_that_is_not_the_workspace_is_not_no_window(code):
     """`_GONE_CODES` is generic, and for `exit`/`kill` that is safe — the only subject of
     `workspace get`/`workspace close` IS the workspace. A focus can plausibly touch a client or a
     terminal too, and reading `client_not_found` as "that lane's window is closed" would tell the
-    owner a LIVE worker had ended, at the one outcome he would not think to question
-    (fresh-agent review, P1)."""
+    owner a LIVE worker had ended, at the one outcome he would not think to question."""
     fake = FakeHerdr(script={("workspace", "focus"): (1, "", _err(code, "nope"))})
     assert _host(fake).focus(_session()).outcome == session_host.HOST_UNREACHABLE
+
+
+@pytest.mark.parametrize("code", ["workspace_not_found", "no_such_workspace",
+                                  "workspace_does_not_exist"])
+def test_the_workspace_subject_check_still_recognises_the_answer_it_exists_for(code):
+    """The other half: a check narrowed until it recognises nothing would turn every closed window
+    into `host_unreachable`, i.e. quietly delete the outcome this issue was written around."""
+    fake = FakeHerdr(script={("workspace", "focus"): (1, "", _err(code, "gone"))})
+    assert _host(fake).focus(_session()).outcome == session_host.NO_WINDOW
+
+
+def test_focus_refuses_a_recorded_id_that_would_read_as_a_flag():
+    """It comes off disk, and the only writer is the host's own reply — so this is unreachable
+    today rather than a live hazard. It is here because "unreachable today" is a property of the
+    writer rather than of this call (fresh-agent review)."""
+    fake = FakeHerdr(script={("workspace", "focus"): (0, _FOCUS_OK, "")})
+    with pytest.raises(ValueError):
+        _host(fake).focus(_session(workspace="--help"))
+    assert fake.calls == []
 
 
 def test_a_focus_result_can_never_be_built_saying_two_things_at_once():

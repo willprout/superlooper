@@ -133,10 +133,15 @@ def recorded_ids(state):
 
 
 def _read(path):
+    # ValueError as well as OSError (issue #339, fresh-agent review): `open()` raises ValueError,
+    # not OSError, on a path with an embedded NUL — reachable from a config `repo` that carries one,
+    # since the state home is built from it. Every caller here is a sweep, a nudge or a window verb
+    # for which an unreadable marker is an ordinary answer, so a raise escaping this function turns
+    # a lane with no window into a traceback in whatever shelled the verb.
     try:
         with open(path) as f:
             return f.read().strip()
-    except OSError:
+    except (OSError, ValueError):
         return ""
 
 

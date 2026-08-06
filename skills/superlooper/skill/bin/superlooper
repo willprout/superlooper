@@ -3598,9 +3598,11 @@ def _emit_focus(args, result, repo=None):
 def cmd_focus_session(args):
     """Bring lane <id>'s session window to the front, and change nothing else anywhere.
 
-    The exit code names the outcome (lib/focus.EXIT_CODES): 0 focused, 2 unknown repo/id, 3 no
-    window, 4 the host could not be reached. A caller that can parse JSON should branch on the
-    `outcome` field instead — the codes exist so a shell script does not have to.
+    The exit code names the outcome (lib/focus.EXIT_CODES): 0 focused, 3 no window, 4 the host
+    could not be reached, 5 unknown repo/id. NOT 2, which stays argparse's — it is also what an
+    installed engine too old for this verb exits with on `invalid choice`, and an outcome sharing
+    it would hide exactly that diagnosis. A caller that can parse JSON should branch on the
+    `outcome` field instead; the codes exist so a shell script does not have to.
     """
     try:
         cfg = _load_config(args.repo)
