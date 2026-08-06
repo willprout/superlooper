@@ -249,6 +249,25 @@ _TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
 # The conflict-resolution session's brief (§C.4 6c — the `preserve` escape). Inline: it is
 # runner machinery, not repo-configurable prose. The session works IN the PR's own branch;
 # every gate re-runs afterwards, so it must refresh the report AND the review evidence.
+#
+# This text is DELIVERED to the model, not documentation — and unlike a worker brief, nothing is
+# appended to it: brief-footer.md never reaches this seat, so the closing clause below is the whole
+# blocked protocol the resolver has. It carried the pre-#163 wording ("write your question ... and
+# end your turn") that #230 removed from the PreToolUse deny, and it must stay in step with both
+# (issue #293). Three facts it now states, each for the reason #230 spells out at length in
+# worker_pretooluse._worker_ask_reason:
+#   * the three-part QUESTION/OPTIONS/RECOMMENDATION form — the runner quotes this file STRAIGHT
+#     into a GitHub comment (_render_question), so a bare sentence arrives unanswerable;
+#   * COMMIT AND PUSH, then END the session — "end your turn" leaves the session sitting at the
+#     prompt (the i280 stall) with this checkout holding the only copy (the i153/i163 loss #190
+#     fences). The runner is what closes the window;
+#   * the push is a SECOND copy, never the resume's input. _exec_post_question tears down with
+#     remove_worktree=False and launch._make_worktree returns early when the directory exists, so
+#     the relaunch reuses the PRESERVED work-in-progress. Claiming otherwise would re-import the
+#     exact falsehood #230 removed — and a resolver whose push failed would then refuse to end.
+# The 2-question cap and the prefer-an-assumption hint are deliberately NOT restated here: this
+# clause fires only on a PRODUCT decision inside someone else's merge, which is the one thing this
+# seat must never assume its way past (the no-LLM-in-merge-mechanics bright line).
 _CONFLICT_BRIEF = """\
 # Resolve the merge conflict on PR #{pr} (issue #{issue_num})
 
@@ -268,8 +287,16 @@ its conflict IN PLACE, in this worktree on branch `{branch}`.
 4. Rewrite your report at {report_path} with the required sections ({report_sections}) — the
    full ship gate re-runs on this PR from scratch.
 
-If the conflict is not mechanically resolvable without a product decision, STOP: write your
-single specific question to {blocked_path} and end your turn.
+If the conflict is not mechanically resolvable without a product decision, STOP and use the
+durable question protocol: write your single specific question to {blocked_path} as three parts
+— `QUESTION:` the one decision, `OPTIONS:` the choices you see, `RECOMMENDATION:` the one you
+would take if forced — then COMMIT AND PUSH your work-in-progress on `{branch}`
+(`git push -u origin HEAD` — the plain push step 1 allows; never a force-push) and END the
+session. The runner posts your question as a durable comment on issue #{issue_num}, closes this
+window, and releases the lane; when the owner answers, a FRESH session resumes the issue with the
+answer in its brief, reusing this worktree's work-in-progress. Push before you end anyway: the
+runner is what closes this window, so the push is your last chance to put the work anywhere but
+this machine.
 """
 
 
