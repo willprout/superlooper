@@ -141,15 +141,20 @@ def test_a_recorded_window_that_cannot_address_anything_is_an_answer_not_a_trace
     `focus_lane` promises a UI four outcomes, and a traceback with rc=1 and no JSON is the exact
     failure shape this verb exists to replace (verification pass)."""
     _record(tmp_path, "i339", "w4:p1", "--help")
-    door = FakeDoor()
+    # The REAL doorway over a probe that cannot be touched — a FakeDoor would prove nothing here,
+    # since what is under test is the doorway's own refusal arriving as an outcome.
     got = focus_lib.focus_lane(tmp_path, "i339", host=session_host.SessionHost(probe=_NoHost()))
     assert got.outcome == focus_lib.UNKNOWN_LANE
     assert got.exit_code in focus_lib.EXIT_CODES.values()
-    assert door.sessions == []
+    assert "--help" in got.detail, "the offending marker is what a reader needs to see"
 
 
 class _NoHost:
-    """A probe that fails the test loudly if anything reaches the host edge at all."""
+    """A probe that fails the test loudly if anything reaches the host edge at all.
+
+    This is the live guard in the test above (verification pass): delete the doorway's flag check
+    and this fires, because the unaddressable id would otherwise go straight into argv.
+    """
 
     def run(self, argv, timeout=None):
         raise AssertionError("no host call may be made for an unaddressable handle: %s" % (argv,))
