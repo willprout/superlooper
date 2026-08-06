@@ -2440,6 +2440,77 @@ def test_resolve_conflict_launches_in_the_prs_own_branch(rig):
     assert ist["status"] == "running" and ist["update_result"] is None
 
 
+# --------- #293: the conflict brief's blocked clause must state the LIVE protocol ---------
+# The conflict-resolution seat gets _CONFLICT_BRIEF and NOTHING else — no brief-footer.md is
+# appended to it — so this clause is the whole protocol that seat has when it is blocked, and it
+# acts on it verbatim. It carried the same pre-#163 wording ("write your question ... and end your
+# turn") that #230 removed from the PreToolUse deny; these pin the three facts that wording lost.
+
+
+def _conflict_brief(rig, iid="i123", num=123, pr=555, branch="sl/i123-render-the-widget"):
+    """Render the brief the resolver seat actually receives (substitutions applied, not the raw
+    template): a clause that only reads right BEFORE `{blocked_path}` is filled in is not the text
+    the model gets. Newlines are collapsed to single spaces — the template hard-wraps at ~96 cols,
+    so where a phrase happens to break is a formatting accident, and pinning prose to today's
+    wrapping would fail on the next re-flow while catching nothing real. The WORDS are the contract;
+    the line breaks are not."""
+    rig.r.tick(now=NOW)
+    seed_issue(rig, iid, status="gating", branch=branch, update_result="conflict")
+    assert rig.r._execute({"act": "resolve_conflict", "id": iid, "num": num, "pr": pr}, NOW) == "ok"
+    return " ".join((rig.home / "briefs" / f"{iid}.md").read_text().split())
+
+
+def test_conflict_brief_states_the_three_part_question_form(rig):
+    """The runner quotes the blocked file STRAIGHT into a GitHub comment (_render_question), so the
+    file's shape IS the deliverable the owner acts on. Naming the path without the form invites a
+    bare sentence that cannot be answered."""
+    b = _conflict_brief(rig)
+    for part in ("QUESTION:", "OPTIONS:", "RECOMMENDATION:"):
+        assert part in b, "the conflict brief must name the %s part the protocol requires" % part
+    assert os.path.join("state", "blocked", "i123") in b, "and still name the file to write"
+
+
+def test_conflict_brief_requires_committing_and_pushing_and_ending_the_session(rig):
+    """"end your turn" is not the contract: the runner is what closes this window, and a session
+    that merely ends its turn sits at the prompt (the i280 stall). The protocol is write + COMMIT
+    AND PUSH + END the session — and the push must be the actual command, on this PR's own branch,
+    never a force-push (this seat is mid-merge, where the temptation is highest)."""
+    b = _conflict_brief(rig)
+    low = b.lower()
+    assert "end the session" in low, "the brief must tell the resolver to END, not to end a turn"
+    assert "end your turn" not in low, "the retired pre-#163 wording must not survive anywhere"
+    assert "commit" in low, "the brief must require committing the work-in-progress"
+    assert "git push -u origin head" in low, \
+        "the brief must give the actual push command, not merely mention pushing"
+    # The whole phrase, not a bare branch-name search: the brief's opening paragraph already names
+    # the branch, so a loose `in` would pass even if THIS clause stopped saying where the WIP goes.
+    assert "work-in-progress on `sl/i123-render-the-widget`" in b, \
+        "the push is on the PR's OWN branch — the clause must say so, not just mention it upstream"
+    assert "force-push" in low, "the mid-merge seat must be told the push is never a force-push"
+
+
+def test_conflict_brief_does_not_claim_the_resume_depends_on_the_push(rig):
+    """The #230 P0, which this clause must not re-import: _exec_post_question tears the session down
+    with remove_worktree=False and launch._make_worktree returns early when the directory already
+    exists, so the relaunch reuses the PRESERVED work-in-progress, uncommitted files included. The
+    push is a SECOND copy — off this MACHINE, not off this checkout. Telling a resolver its unpushed
+    resolution is unrecoverable would be a new falsehood of the very class #230 removed, and a
+    resolver whose push failed would then refuse to end its session at all."""
+    b = _conflict_brief(rig)
+    low = b.lower()
+    # The whole sentence, not two loose tokens: "worktree" appears in the brief's opening line and
+    # "work-in-progress" in the commit-and-push clause, so a token search would still pass with the
+    # resume sentence DELETED — the one sentence that carries the fact under test (cross-review).
+    assert "a fresh session resumes the issue" in low, \
+        "the brief must name what actually resumes the issue after the owner answers"
+    assert "reusing this worktree's work-in-progress" in low, \
+        "and must say that resume reuses the PRESERVED worktree's work-in-progress"
+    for scare in ("cannot pick up", "only copy", "lost", "unrecoverable"):
+        assert scare not in low, \
+            "never tell the resolver the resume depends on the push (%r)" % scare
+    assert "answerer" not in low, "the answerer seat is retired (#194) — never teach it"
+
+
 def test_close_investigate_executor(rig):
     seed_issue(rig, "i7", status="gating", type="investigate")
     out = rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW)
