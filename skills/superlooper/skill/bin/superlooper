@@ -1094,6 +1094,76 @@ def _wait_pid_gone(pid, seconds):
         time.sleep(0.25)
 
 
+def _process_age_seconds(pid):
+    """How long that pid has been running, per ``ps -o etime=``, or None when it cannot be read.
+
+    ``[[DD-]HH:]MM:SS`` is the POSIX shape. None is UNKNOWN and every caller here treats it as
+    such — this is corroboration, not a gate, and a `ps` that cannot be read must not turn into a
+    refusal to stop a perfectly real runner."""
+    try:
+        proc = subprocess.run(["/bin/ps", "-o", "etime=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not text:
+        return None
+    days, _, rest = text.rpartition("-")
+    parts = rest.split(":")
+    if not all(p.strip().isdigit() for p in parts) or not 2 <= len(parts) <= 3:
+        return None
+    if days and not days.strip().isdigit():
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + int(p)
+    return secs + (int(days) * 86400 if days else 0)
+
+
+# How much younger than its own pidfile a process may be and still be believed to be the runner
+# that wrote it. The runner writes the lock immediately after start, so the honest gap is under a
+# second; the generous window is only here so a slow boot or a clock nudge cannot refuse a real
+# stop. A RECYCLED pid is typically hours or days younger, which is what this catches.
+_PID_AGE_SLACK = 300
+
+
+def _stop_signalable(state_dir, pid):
+    """``(ok, why)`` — may this verb SIGTERM that recorded pid?
+
+    `stop` is the first path in this engine that SIGNALS the pidfile's number rather than merely
+    reading it, and a pidfile outlives a hard crash: after a SIGKILL or a power cut the lock still
+    names a pid the OS is free to hand to something else. Signalling it then kills whatever the
+    owner happens to be running — the 2026-07-07 collateral kill, arrived at from a different
+    direction. So the number has to be corroborated first, the way this repo corroborates everywhere
+    else (stack_doctor's anchor rule, the dashboard's product claim): a pid alone is a number
+    anything could hold.
+
+    Two independent facts, and both must fail to reach a refusal:
+
+      * the runner's OWN record. ``runner.home.json`` is a positive self-claim ("I am a runner, my
+        pid is N"), written only while the singleton is held and removed on clean exit;
+      * the process's AGE. A runner is never younger than the pidfile naming it. A recycled pid is.
+        Unreadable age is UNKNOWN and does not refuse on its own — corroboration, not a gate.
+    """
+    rec = _read_json_file(os.path.join(state_dir, "runner.home.json"), None)
+    claimed = rec.get("pid") if isinstance(rec, dict) else None
+    if claimed != pid:
+        return False, ("the runner's own record does not claim pid %s (runner.home.json says %s) — "
+                       "that pidfile outlived its runner, and the pid may belong to something else "
+                       "now" % (pid, claimed if claimed is not None else "nothing"))
+    age = _process_age_seconds(pid)
+    if age is not None:
+        try:
+            lock_age = time.time() - os.path.getmtime(os.path.join(state_dir, "runner.lock"))
+        except OSError:
+            lock_age = None
+        if lock_age is not None and age + _PID_AGE_SLACK < lock_age:
+            return False, ("pid %s has only been running %ds but the pidfile naming it is %ds old — "
+                           "the runner died and the OS handed its pid to something else"
+                           % (pid, age, int(lock_age)))
+    return True, None
+
+
 def _stop_journal(home, record):
     """Journal one stop/start record, swallowing a write failure — `_debug_journal`'s posture, for
     the same reason: this call sits AFTER a stop that already happened, and turning it into a
@@ -1110,9 +1180,14 @@ def _emit_stop(args, result):
         return
     if not result.get("ok"):
         sys.stdout.write("STOP INCOMPLETE — %s\n" % result.get("error"))
-        sys.stdout.write("  the deliberate-stop marker stands (%s), so the watchdog will not "
-                         "resurrect the runner.\n  %s\n"
-                         % (result.get("marker"), result.get("remedy", "")))
+        if result.get("marker"):
+            # Deliberately NOT "so the watchdog will not resurrect it": the watchdog honours the
+            # marker only about a runner that is actually gone, and this branch is the case where it
+            # is not. Reassurance here would be the fabrication the failure itself is about.
+            sys.stdout.write("  the stop is recorded (%s), but a runner that is still running is "
+                             "still watched — the loop keeps going until this is fixed.\n"
+                             % result.get("marker"))
+        sys.stdout.write("  %s\n" % result.get("remedy", ""))
         return
     sys.stdout.write("runner stopped.\n")
     sys.stdout.write("  marker:   %s  (deliberate — the watchdog stands down while it is there)\n"
@@ -1125,6 +1200,9 @@ def _emit_stop(args, result):
                          "anyway, which is the half that keeps it down\n")
     elif result.get("process_gone"):
         sys.stdout.write("  process:  pid %s is gone\n" % result.get("pid"))
+    elif result.get("signal_refused"):
+        sys.stdout.write("  process:  pid %s was NOT signalled — %s\n"
+                         % (result.get("pid"), result["signal_refused"]))
     else:
         sys.stdout.write("  process:  pid %s is still finishing its current tick — it stops at the "
                          "end of it, and nothing will start it again\n" % result.get("pid"))
@@ -1160,9 +1238,21 @@ def cmd_stop(args):
               "pid": pid, "job": None, "domain": None, "held": True,
               "process_gone": pid is None, "marker": None,
               "start": "superlooper start --repo %s" % os.path.abspath(args.repo)}
-    result["marker"] = write_stop_marker(state_dir, {
-        "stopped_at": int(time.time()), "operator": args.operator,
-        "source": args.source or "cli", "home": home, "pid": pid})
+    try:
+        result["marker"] = write_stop_marker(state_dir, {
+            "stopped_at": int(time.time()), "operator": args.operator,
+            "source": args.source or "cli", "home": home, "pid": pid})
+    except OSError as e:
+        # Refuse BEFORE taking anything down. A stop whose marker did not land is the shape this
+        # whole verb exists to prevent — the loop goes away and the guardians read it as a crash —
+        # so an unwritable state home stops the verb, not the runner. Reported through the same
+        # result body as every other failure, because a --json caller must never get a traceback.
+        result.update(ok=False, held=False, process_gone=False,
+                      error="the deliberate-stop marker could not be written (%s), so nothing was "
+                            "taken down — a stop the guardians cannot read is a crash to them" % e,
+                      remedy="fix the state home at %s, then re-run" % state_dir)
+        _emit_stop(args, result)
+        return 1
 
     if home == runner_home.LOGIN_ITEM:
         try:
@@ -1177,17 +1267,32 @@ def cmd_stop(args):
         uid = _home_uid()
         result["job"], result["domain"] = job, runner_home.domain(uid)
         rc, out = _launchctl(runner_home.bootout_argv(_launchctl_bin(), uid, job))
-        # rc 3 is launchd's "no such process": the job was already unloaded. Both that and rc 0 mean
-        # the fact this verb is about — launchd has nothing left to restart.
-        loaded, job_pid = _service_view(job)
-        result["held"] = rc in (0, 3) and loaded is not True
+        # The JOB'S OWN STATE is the fact, and the bootout rc is only evidence about it. They come
+        # apart in both directions and the service's word wins either way (fresh-agent review):
+        # rc 36 is "a boot-out is already in progress" — the ordinary answer to running `stop` twice,
+        # or to a job slow to exit — and rc 113 can land on a job that is already gone. Believing the
+        # rc there tells an owner their loop is still running when launchd has just told us it is
+        # not. So the read is POLLED for a moment (an in-progress bootout finishes) and its answer,
+        # when it has one, is the verdict; the rc decides only when launchctl could not be read at
+        # all. rc 3 ("no such process") means the job was already unloaded — the fact we want.
+        end = time.time() + _STOP_BOOTOUT_GRACE
+        while True:
+            loaded, job_pid = _service_view(job)
+            if loaded is False or time.time() >= end:
+                break
+            time.sleep(0.25)
+        result["held"] = (loaded is False) or (loaded is None and rc in (0, 3))
         if not result["held"]:
             result.update(ok=False,
-                          error="the job %s is STILL loaded in %s (bootout rc=%d%s) — launchd can "
-                                "restart it, so this is not a stop"
+                          error=("the job %s is STILL loaded in %s (bootout rc=%d%s) — launchd can "
+                                 "restart it, so this is not a stop"
+                                 if loaded is True else
+                                 "the job %s could not be confirmed gone from %s (bootout rc=%d%s, "
+                                 "and launchctl could not be read back) — launchd may still restart "
+                                 "it, so this cannot be called a stop")
                                 % (job, result["domain"], rc, ": " + out if out else ""),
                           remedy="take it down by hand: %s" % " ".join(
-                              runner_home.bootout_argv("launchctl", uid, job)[1:]))
+                              runner_home.bootout_argv("launchctl", uid, job)))
             if job_pid:
                 result["pid"] = job_pid
             _stop_journal(state_home, {"act": "runner_stop", "outcome": "stop_failed", "home": home,
@@ -1201,13 +1306,17 @@ def cmd_stop(args):
         # supervisor to wait for, so its grace is zero and the signal is this verb's own.
         gone = _wait_pid_gone(pid, _STOP_BOOTOUT_GRACE if home == runner_home.LOGIN_ITEM else 0)
         if not gone:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                # Gone between the poll and the signal, or ours to see but not to signal. Either way
-                # the next poll is the honest answer, so nothing is claimed here.
-                pass
-            gone = _wait_pid_gone(pid, _STOP_WAIT_SECONDS)
+            may, why = _stop_signalable(state_dir, pid)
+            if not may:
+                result["signal_refused"] = why
+            else:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    # Gone between the poll and the signal, or ours to see but not to signal. Either
+                    # way the next poll is the honest answer, so nothing is claimed here.
+                    pass
+                gone = _wait_pid_gone(pid, _STOP_WAIT_SECONDS)
         result["process_gone"] = gone
 
     _stop_journal(state_home, {"act": "runner_stop", "outcome": "stopped", "home": home,
@@ -1246,15 +1355,16 @@ def _emit_start(args, result):
 def cmd_start(args):
     """Clear a deliberate stop and start this repo's runner again (issue #239).
 
-    The other half of `stop`, and the only thing that clears the stop as a GESTURE: everything else
-    clears it as a side effect of a runner actually booting. It refuses BEFORE changing anything when
-    there is no job to start, so a failed start leaves the loop exactly as off as it was.
+    The other half of `stop`. The marker is cleared only once something is PROVABLY RUNNING —
+    never on the way in — because until then the marker is simply true, and a start that failed with
+    a cleared marker is the worst state this issue can produce: a loop that is down, with its
+    guardians re-armed, heading for a 3am text about an outage the owner created on purpose.
 
-    The pane home is deliberately asymmetric: this clears the stop and hands back the one-line manual
-    start, because a runner there must run in a visible tab a human opened and automated tab
-    placement is owner-ruled out (2026-07-09). `stop` works there; `start` can only get out of the way.
+    The pane home is asymmetric because it has to be: a runner there must live in a visible tab a
+    human opened, and automated tab placement is owner-ruled out (2026-07-09). So this hands back the
+    one line to type, and the runner clears the stop itself when it boots.
     """
-    from runner import clear_stop_marker, live_runner_pid
+    from runner import clear_stop_marker, live_runner_pid, read_stop_marker
     cfg = _load_config(args.repo)
     state_home = str(config_lib.state_home(cfg))
     state_dir = os.path.join(state_home, "state")
@@ -1288,15 +1398,14 @@ def cmd_start(args):
             _emit_start(args, result)
             return 2
 
-    was = clear_stop_marker(state_dir)
-    result["cleared"] = was is not None
-    if was is not None:
-        _stop_journal(state_home, {"act": "runner_stop", "outcome": "started", "home": home,
-                                   "operator": args.operator, "source": args.source or "cli",
-                                   "stopped_at": was.get("stopped_at")})
-
     if home != runner_home.LOGIN_ITEM:
+        # The pane home gets NO clear here (fresh-agent review). There is nothing this verb can
+        # start — automated tab placement is owner-ruled out — so clearing would swap a respected
+        # stop for a watchdog episode about a loop that is still down, which is exactly the 3am text
+        # #239 exists to kill. The marker is still TRUE until a runner boots, and the runner clears
+        # it itself the moment one does.
         result["manual"] = ("now start the runner in a visible cmux tab: superlooper run --repo %s"
+                            " — the stop clears when it boots"
                             % os.path.abspath(args.repo))
         _emit_start(args, result)
         return 0
@@ -1304,8 +1413,15 @@ def cmd_start(args):
     pid = live_runner_pid(state_dir)
     if pid is not None:
         result.update(already_running=True, pid=pid)
+        result["cleared"] = clear_stop_marker(state_dir) is not None
         _emit_start(args, result)
         return 0
+
+    # Read the marker BEFORE starting anything, but do not clear it yet: it is the truth until a
+    # runner is up, and a start that fails must leave the loop exactly as off — and as respected —
+    # as it was. (The booting runner clears it itself, so the clear below is belt-and-braces and
+    # must tolerate finding nothing.)
+    was = read_stop_marker(state_dir)
 
     rc, out = _launchctl(runner_home.bootstrap_argv(_launchctl_bin(), uid, plist))
     if rc != 0:
@@ -1317,47 +1433,87 @@ def cmd_start(args):
                           error="launchd refused to start %s in %s (rc=%d%s)"
                                 % (job, result["domain"], rc, ": " + out if out else ""),
                           remedy="read the job: %s" % " ".join(
-                              runner_home.print_argv("launchctl", uid, job)[1:]))
+                              runner_home.print_argv("launchctl", uid, job)))
             _emit_start(args, result)
             return 1
+    # A start is only a start when something is RUNNING. Poll for either proof — the job reporting a
+    # pid, or the runner's own pidfile naming a live one — and treat the window closing as a
+    # FAILURE, not as a slow success (fresh-agent review). Exiting 0 here would tell the button
+    # wired to this verb that the loop is back when nothing came up, and would clear the stop marker
+    # over a loop that is still down.
     end = time.time() + _START_WAIT_SECONDS
     while True:
-        _loaded, job_pid = _service_view(job)
+        loaded, job_pid = _service_view(job)
         if job_pid:
             result["pid"] = job_pid
+            break
+        if live_runner_pid(state_dir) is not None:
+            result["pid"] = live_runner_pid(state_dir)
+            break
+        if loaded is False:
+            # `bootstrap` is synchronous: when it returns success the job IS loaded. A service that
+            # is not there a moment later did not fail to start slowly — it started and died, and
+            # waiting out the window would only delay saying so.
             break
         if time.time() >= end:
             break
         time.sleep(0.5)
+    if result["pid"] is None:
+        result.update(ok=False,
+                      error="%s was accepted by launchd but nothing is running %ss later (the job "
+                            "%s)" % (job, _START_WAIT_SECONDS,
+                                     "is not loaded" if loaded is False else
+                                     "reports no pid" if loaded is True else
+                                     "could not be read"),
+                      remedy="the stop is still recorded, so the loop stays respected-off; read the "
+                             "job's log and %s" % " ".join(
+                                 runner_home.print_argv("launchctl", uid, job)))
+        _emit_start(args, result)
+        return 1
+    # Proven up. NOW the stop is over, and only now is `started` an honest journal record.
+    result["cleared"] = clear_stop_marker(state_dir) is not None or was is not None
+    if was is not None:
+        _stop_journal(state_home, {"act": "runner_stop", "outcome": "started", "home": home,
+                                   "operator": args.operator, "source": args.source or "cli",
+                                   "stopped_at": was.get("stopped_at"), "pid": result["pid"]})
     _emit_start(args, result)
     return 0
 
 
 # ------------------------------- status -------------------------------
 
-def _status_runner_line(state_dir):
+def _status_runner_line(state_dir, home):
     """WHY the runner is or is not running, in words the other states cannot produce (issue #239).
 
-    Four answers, and the point of the verb is that they are four and not two:
+    Five answers, and the point of the verb is that they are five and not two:
 
-      running          a live pid holds the singleton;
-      STOPPED BY OWNER the deliberate-stop marker is there. Checked FIRST, because a stopped runner
-                       has exactly a crash's shape — stale heartbeat, no live process — and reading
-                       the owner's own instruction as a fault is the whole defect this closes;
-      CRASHED          the pidfile names a pid that is gone, and nobody asked for that;
-      not running      no pidfile at all — a clean exit nobody recorded a reason for.
+      running           a live pid holds the singleton, and nobody asked for it to stop;
+      STOP NOT TAKEN    a live pid AND a stop marker. Reported as the contradiction it is: a stop
+                        can time out on a long tick or fail at the bootout, and rendering it as
+                        "stopped" over a loop that is still merging is the fabrication this verb
+                        exists to prevent (fresh-agent review);
+      STOPPED BY OWNER  the marker is there and nothing is running. Checked before CRASHED, because
+                        a stopped runner has exactly a crash's shape — stale heartbeat, no live
+                        process — and reading the owner's own instruction as a fault is the defect
+                        this closes;
+      CRASHED           the pidfile names a pid that is gone, and nobody asked for that;
+      not running       no pidfile at all — a clean exit nobody recorded a reason for.
     """
     from runner import live_runner_pid, read_stop_marker
     stop = read_stop_marker(state_dir)
+    pid = live_runner_pid(state_dir)
     if stop is not None:
         when = stop.get("stopped_at")
         when = (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(when))
                 if isinstance(when, (int, float)) and not isinstance(when, bool) else "(unrecorded)")
         who = stop.get("operator") or stop.get("source") or "the owner"
-        return ("STOPPED BY OWNER — `superlooper stop` by %s at %s. launchd will not restart it "
-                "and the watchdog will not resurrect it; `superlooper start` undoes this"
-                % (who, when))
-    pid = live_runner_pid(state_dir)
+        if pid is not None:
+            return ("STOP NOT TAKEN — `superlooper stop` by %s at %s, but pid %d is STILL RUNNING. "
+                    "It may be finishing a tick; if this persists the stop did not take and the "
+                    "loop is still going (the watchdog still watches it)" % (who, when, pid))
+        held = ("launchd will not restart it and " if home == runner_home.LOGIN_ITEM else "")
+        return ("STOPPED BY OWNER — `superlooper stop` by %s at %s. %sthe watchdog will not "
+                "resurrect it; `superlooper start` undoes this" % (who, when, held))
     if pid is not None:
         return "running (pid %d)" % pid
     recorded = (_read(os.path.join(state_dir, "runner.lock")) or "").strip()
@@ -1370,13 +1526,14 @@ def cmd_status(args):
     cfg = _load_config(args.repo)
     home = str(config_lib.state_home(cfg))
     state_dir = os.path.join(home, "state")
+    import runner as runner_mod
     hb = _read(os.path.join(state_dir, "runner.heartbeat"))
     has_state = os.path.exists(os.path.join(state_dir, "issues.json"))
-    stopped = os.path.exists(os.path.join(state_dir, "runner.stopped"))
+    stopped = os.path.exists(runner_mod.stop_marker_path(state_dir))
     if hb is None and not has_state and not stopped:
         print(f"no runner has ever run for this repo (state home: {home})")
         return 0
-    print(f"runner: {_status_runner_line(state_dir)}")
+    print(f"runner: {_status_runner_line(state_dir, runner_home.kind(cfg))}")
     if hb is None:
         print(f"        no heartbeat yet   state home: {home}")
     else:
@@ -3078,6 +3235,17 @@ def _watchdog_stopped(state_dir):
     return read_stop_marker(state_dir) is not None
 
 
+def _watchdog_runner_live(state_dir):
+    """True when state/runner.lock names a LIVE pid — the positive twin of ``_watchdog_runner_dead``.
+
+    Deliberately not derivable from that one: it answers "the recorded pid is DEAD", and the third
+    state (no pidfile at all — a clean exit) is neither. Only a positive read may be used to decide
+    that a stop did not take, because the direction that matters is the unsafe one — believing a
+    runner is gone when it is up is what would let this engine restart a live loop mid-tick."""
+    from runner import live_runner_pid
+    return live_runner_pid(state_dir) is not None
+
+
 def _watchdog_alert(state_dir):
     """The ALERT dict, {} when present-but-unreadable (existence IS the signal — fail
     closed, runner._read_json's posture), None when absent."""
@@ -3419,6 +3587,10 @@ def cmd_watchdog(args):
                 # late as the view is built and evaluate() is pure, so the window between "the
                 # marker lands" and "we act" is arithmetic, not I/O.
                 "stopped_by_owner": _watchdog_stopped(state_dir),
+                # A stop that was REQUESTED is not a stop that TOOK (fresh-agent review): the pure
+                # core honours the marker only when this is False, so a runner still up — because
+                # the stop timed out on a long tick, or the bootout failed — is still watched.
+                "runner_live": _watchdog_runner_live(state_dir),
                 "runner_dead": _watchdog_runner_dead(state_dir)}
         state_path = os.path.join(state_dir, watchdog_lib.STATE_FILENAME)
         prior = watchdog_lib.coerce_state(_read_json_file(state_path, None))
@@ -3478,10 +3650,15 @@ def cmd_watchdog(args):
                               + (", ".join(disabled_sigs) or "no signal")
                               if view["kill_switch"] else
                               # Never the word DOWN for a loop that is off on purpose: that word is
-                              # what sends someone to a keyboard at 3am (issue #239).
+                              # what sends someone to a keyboard at 3am (issue #239). The liveness
+                              # half is the same conjunction evaluate() uses, and it has to be
+                              # repeated here rather than inferred from the absence of an episode:
+                              # a marker over a LIVE runner is a stop that did not take, and this
+                              # line saying "standing down" over a loop that is still merging is
+                              # the fabrication the verb was built to avoid.
                               "runner STOPPED BY OWNER (state/runner.stopped) — standing down; "
                               "`superlooper start` re-arms this"
-                              if view["stopped_by_owner"] else
+                              if view["stopped_by_owner"] and not view["runner_live"] else
                               "resurrected the runner" if resurrect_rc == 0 else
                               "runner is DOWN — restart FAILED" if resurrect_rc is not None else
                               # cap==0 was never a crash loop — nothing was ever attempted; saying
@@ -3492,6 +3669,12 @@ def cmd_watchdog(args):
                                "runner is DOWN — auto-restart PAUSED (crash-loop cap hit)") if capped else
                               f"episode open ({', '.join(ep['signals'])})" if ep else
                               "healthy — no signal"))
+        if view["stopped_by_owner"] and view["runner_live"] and not view["kill_switch"]:
+            # Named rather than left to be inferred from the line above: the owner asked for this
+            # loop to be off and it is not, and the only place that fact surfaces unprompted is a
+            # check they may not be reading. `superlooper status` says the same thing.
+            print("  NOTE: a stop was requested (state/runner.stopped) but the runner is still "
+                  "running — the stop did not take, so this runner is still watched.")
         return 0
     finally:
         _watchdog_release_lock(lock)

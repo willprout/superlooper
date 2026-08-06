@@ -811,3 +811,34 @@ def test_wrong_typed_stop_state_degrades_to_a_fresh_one():
         assert st["stopped_observed"] is None
         r = wd.evaluate(T0, _cfg(), _view(), st)          # never crashes
         assert r["resurrect"] is None
+
+
+def test_a_stop_that_did_not_take_leaves_a_live_runner_watched():
+    # The marker records a stop that was REQUESTED. A stop can time out on a long tick and a bootout
+    # can fail, so a live runner with a marker on disk is an ordinary state — and standing down over
+    # it would swallow `alert`, the one signal only a RUNNING runner raises (a wedging tick loop, a
+    # corrupt issues.json). That is the loudest thing the watchdog exists to notice.
+    r = _run(T0, _view(T0, alert={"reasons": ["issues_json_corrupt"]},
+                       stopped_by_owner=True, runner_live=True))
+    assert _outcomes(r) == ["notified"]
+    assert r["state"]["episode"]["signals"] == ["alert"]
+    assert len(r["notify"]) == 1
+
+
+def test_a_live_runner_with_a_marker_still_reaches_the_debugger_when_it_wedges():
+    st = _run(T0, _view(T0, heartbeat=T0 - 21 * MIN, stopped_by_owner=True,
+                        runner_live=True))["state"]
+    assert st["episode"] is not None
+    r = _run(T0 + 30 * MIN, _view(T0 + 30 * MIN, heartbeat=T0 - 21 * MIN,
+                                  stopped_by_owner=True, runner_live=True), st)
+    assert r["launch"] is not None
+
+
+def test_a_stop_drops_the_no_progress_clocks_rather_than_freezing_them():
+    # The clocks FREEZE while the heartbeat is stale, so an overnight stop would hand the first
+    # healthy check after the start a clock reading "waiting since last night" — an instant
+    # no_progress text about work that waited because the owner turned the loop off.
+    st = wd.new_state()
+    st["no_progress_since"] = {"7": T0 - 8 * 60 * MIN}
+    r = _run(T0, _dead(T0, stopped_by_owner=True), st)
+    assert r["state"]["no_progress_since"] == {}

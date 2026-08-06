@@ -67,8 +67,11 @@ TWO off switches reach this module, and they are deliberately not the same one (
                    it was switched off. Both actions available here would work against the
                    instruction the owner just gave — a kickstart restarts what they turned off, a
                    debugger diagnoses a process that is off on purpose — so the check observes,
-                   journals once per distinct observation, and does nothing. The marker is cleared
-                   by the deliberate start (and by any runner that boots), so this can never latch.
+                   journals once per distinct observation, and does nothing. It is honoured ONLY
+                   alongside `runner_live` being false: the marker records a stop that was ASKED
+                   FOR, and a stop can fail to take, so a live runner is watched whatever the
+                   marker says. Cleared by the deliberate start (and by any runner that boots), so
+                   this can never latch.
 """
 import math
 
@@ -470,7 +473,7 @@ def evaluate(now, config, view, state):
         return {"state": dict(state, disabled_observed=sigs), "notify": [], "launch": None,
                 "journal": [_rec("disabled", sigs)], "resurrect": None, "runner_down": False}
 
-    if view.get("stopped_by_owner"):
+    if view.get("stopped_by_owner") and not view.get("runner_live"):
         # The runner is down because `superlooper stop` put it down (issue #239). Same posture as
         # the kill switch — observe, journal, change nothing — and for a reason that is one step
         # narrower: the watchdog is watching, there is simply nothing here it would be right to do.
@@ -478,15 +481,27 @@ def evaluate(now, config, view, state):
         # them would restart what the owner turned off; a debugger hired to diagnose a process that
         # is off on purpose has nothing to diagnose either.
         #
+        # AND NOT runner_live is load-bearing (fresh-agent review). The marker alone says a stop was
+        # REQUESTED, not that it took: a stop can time out on a long tick, and a bootout can fail
+        # outright — both leave a marker on disk with the loop still running. Standing down on the
+        # request would then muzzle the watchdog over a LIVE runner, and the signal it would swallow
+        # is the one only a live runner can raise: `alert`, which the runner writes when its own
+        # ticks are wedging or its state file is corrupt. So the marker buys silence only about a
+        # runner that is actually gone; a runner still up gets watched exactly as before.
+        #
         # runner_down stays False for the same reason it does under the kill switch: the caller's
         # summary reports what it observed ("stopped by owner"), never an incident it did not have.
-        # No clock advances and no episode opens or closes, so a signal that was genuinely open
-        # before the stop is still open when the runner comes back.
+        # No episode opens or closes, so a signal that was genuinely open before the stop is still
+        # open when the runner comes back — but the no-progress CLOCKS are dropped. They are frozen
+        # (not advanced) while the heartbeat is stale, so keeping them would hand the first healthy
+        # check after a start a clock reading "waiting since last night" and trip an immediate
+        # no_progress text about work that was waiting because the owner turned the loop off.
         if sigs == state.get("stopped_observed"):
-            return {"state": state, "notify": [], "launch": None, "journal": [], "resurrect": None,
-                    "runner_down": False}
-        return {"state": dict(state, stopped_observed=sigs), "notify": [], "launch": None,
-                "journal": [_rec("runner_stopped", sigs)], "resurrect": None, "runner_down": False}
+            return {"state": dict(state, no_progress_since={}), "notify": [], "launch": None,
+                    "journal": [], "resurrect": None, "runner_down": False}
+        return {"state": dict(state, stopped_observed=sigs, no_progress_since={}), "notify": [],
+                "launch": None, "journal": [_rec("runner_stopped", sigs)], "resurrect": None,
+                "runner_down": False}
 
     new_state = dict(state, no_progress_since=since, disabled_observed=None,
                      stopped_observed=None)

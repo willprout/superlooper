@@ -1221,9 +1221,10 @@ class Runner:
         # a login-time bootstrap, the watchdog's own kickstart), rather than in the start verb alone.
         # That is what keeps the off switch from latching: a stop the owner later reversed by some
         # other route would otherwise leave a marker behind that silently disables resurrection for
-        # every crash after it. Journaled only when a marker was actually there, so the morning
-        # report can say the loop was OFF and is now back — a gap that otherwise looks like an
-        # outage nobody noticed. Guarded: a diagnostic must never abort run().
+        # every crash after it. Journaled only when a marker was actually there, so the journal
+        # carries the "and it came back" half — without it, a night the owner deliberately switched
+        # the loop off reads back as an outage nobody noticed. Guarded: a diagnostic must never
+        # abort run().
         try:
             was_stopped = clear_stop_marker(self.state)
             if was_stopped is not None:

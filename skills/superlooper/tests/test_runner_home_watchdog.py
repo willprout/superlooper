@@ -187,3 +187,27 @@ def test_removing_the_stop_marker_restores_the_resurrection_path(rig):
     r = watchdog(rig)
     assert any("kickstart" in line for line in _lines(rig.launchctl_log)), _lines(rig.launchctl_log)
     assert "resurrected the runner" in r.stdout
+
+
+def test_a_stop_that_did_not_take_leaves_the_live_runner_watched(rig):
+    # A marker on disk with the runner STILL RUNNING (a stop that timed out on a long tick, or a
+    # bootout launchd refused). The watchdog must keep watching: the signal it would otherwise
+    # swallow is the one only a live runner can raise.
+    write_config(rig, runner_home="login-item")
+    (rig.home / "state" / "runner.lock").write_text(str(os.getpid()))     # a LIVE pid
+    (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time())))
+    (rig.home / "state" / "ALERT").write_text(json.dumps({"reasons": ["issues_json_corrupt"]}))
+    stopped_by_owner(rig)
+    r = watchdog(rig)
+    assert r.returncode == 0, r.stderr
+    assert "STOPPED BY OWNER" not in r.stdout, r.stdout
+    assert "episode open" in r.stdout, r.stdout
+
+
+def test_a_stop_that_did_not_take_is_named_in_the_summary(rig):
+    write_config(rig, runner_home="login-item")
+    (rig.home / "state" / "runner.lock").write_text(str(os.getpid()))
+    (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time())))
+    stopped_by_owner(rig)
+    r = watchdog(rig)
+    assert "the stop did not take" in r.stdout, r.stdout

@@ -54,7 +54,12 @@ case "$1" in
       [ -f "$LAUNCHD_JOBS/$lbl" ] || exit 3
       pid=$(cat "$LAUNCHD_JOBS/$lbl")
       rm -f "$LAUNCHD_JOBS/$lbl"
-      if [ "$pid" -gt 0 ] 2>/dev/null; then kill "$pid" 2>/dev/null; fi
+      # It signals ONLY a pid this test file spawned and recorded as killable. A stub that killed
+      # whatever number happened to be in the jobs file would, the first time someone booted out a
+      # job it had bootstrapped itself, SIGTERM a placeholder pid belonging to the developer's own
+      # machine — the ratchet that says no test may reach a real process, arrived at sideways.
+      ok=$(cat "$LAUNCHD_JOBS/.killable" 2>/dev/null)
+      if [ -n "$ok" ] && [ "$pid" = "$ok" ]; then kill "$pid" 2>/dev/null; fi
       ;;
   kickstart)
       t="$2"; [ "$t" = "-k" ] && t="$3"
@@ -137,6 +142,11 @@ def rig(tmp_path):
         pid = int(where.read_text().strip())
         kids.append(pid)
         (home / "state" / "runner.lock").write_text(str(pid))
+        # A live runner writes BOTH the pidfile and its own home record, and `stop` refuses to
+        # signal a pid the second one does not claim. Writing only the lock here would test a
+        # crashed runner's leftovers, not a running one.
+        (home / "state" / "runner.home.json").write_text(
+            json.dumps({"kind": "login-item", "pid": pid, "label": LABEL}))
         return pid
 
     r = type("Rig", (), {"tmp": tmp_path, "repo": repo, "home": home, "env": env,
@@ -173,7 +183,11 @@ def calls(rig):
 
 
 def load_job(rig, pid=0):
+    """Put the job in the stub launchd's loaded set, supervising `pid`. A pid passed here is one
+    this file spawned, so it is also recorded as the ONE pid the stub may signal."""
     (rig.jobs / LABEL).write_text(str(pid))
+    if pid:
+        (rig.jobs / ".killable").write_text(str(pid))
 
 
 def _dead(pid, deadline=20):
@@ -305,11 +319,12 @@ def test_start_clears_the_stop_and_brings_the_job_back(rig):
     load_job(rig, pid)
     assert cli(rig, "stop").returncode == 0
     assert marker(rig) is not None
-    r = cli(rig, "start", env_over={"SL_TEST_JOB_PID": "0"})
+    r = cli(rig, "start")
     assert r.returncode == 0, r.stdout + r.stderr
     assert marker(rig) is None, "an off switch that cannot be switched back on is a broken loop"
     assert any(line.startswith("bootstrap gui/%d " % os.getuid()) for line in calls(rig)), calls(rig)
     assert (rig.jobs / LABEL).exists(), "stop -> start -> the runner's job is loaded again"
+    assert "4242" in r.stdout, "a start reports the pid that proves it: " + r.stdout
 
 
 def test_start_without_an_installed_job_refuses_and_names_the_installer(rig):
@@ -319,13 +334,14 @@ def test_start_without_an_installed_job_refuses_and_names_the_installer(rig):
     assert "runner-home" in (r.stdout + r.stderr)
 
 
-def test_start_in_the_pane_home_clears_the_stop_and_names_the_manual_start(rig):
-    # Automated tab placement is owner-ruled out (2026-07-09), so this clears the stop and hands
-    # the one line back — it never opens a tab.
+def test_start_in_the_pane_home_names_the_manual_start_and_leaves_the_stop_standing(rig):
+    # Automated tab placement is owner-ruled out (2026-07-09), so this verb cannot start anything
+    # here — and therefore must not clear the stop. A cleared marker over a loop that is still down
+    # re-arms the watchdog against it: the 3am text, from the verb meant to be the safe way back.
     cli(rig, "stop")
     r = cli(rig, "start")
     assert r.returncode == 0, r.stdout + r.stderr
-    assert marker(rig) is None
+    assert marker(rig) is not None, "nothing was started, so the stop is still the truth"
     assert "superlooper run" in r.stdout
 
 
@@ -359,11 +375,11 @@ def test_start_emits_one_json_object_for_a_ui_over_the_loop(rig):
     write_config(rig, runner_home="login-item")
     (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
     cli(rig, "stop")
-    r = cli(rig, "start", "--json", env_over={"SL_TEST_JOB_PID": "0"})
+    r = cli(rig, "start", "--json")
     assert r.returncode == 0, r.stdout + r.stderr
     doc = json.loads(r.stdout)
     assert doc["verb"] == "start" and doc["ok"] is True
-    assert doc["cleared"] is True
+    assert doc["cleared"] is True and doc["pid"] == 4242
 
 
 # --------------------------------------------------- the journal keeps the record
@@ -372,9 +388,114 @@ def test_the_stop_and_the_start_are_journaled(rig):
     write_config(rig, runner_home="login-item")
     (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
     cli(rig, "stop", "--operator", "william")
-    cli(rig, "start", env_over={"SL_TEST_JOB_PID": "0"})
+    cli(rig, "start")
     lines = [json.loads(l) for l in
              (rig.home / "journal.jsonl").read_text().splitlines() if l.strip()]
     acts = [(r.get("act"), r.get("outcome")) for r in lines]
     assert ("runner_stop", "stopped") in acts, acts
     assert ("runner_stop", "started") in acts, acts
+
+
+# --------------------------------------------------- a stop that did NOT take
+#
+# The marker records a stop that was ASKED FOR. It can fail to take — a tick that outlives the wait,
+# a bootout launchd refuses — and every reader that treats the request as the outcome then lies
+# about a loop that is still running. These pin the honest answers (fresh-agent review).
+
+def test_status_reports_a_stop_that_did_not_take_as_the_contradiction_it_is(rig):
+    write_config(rig, runner_home="login-item")
+    pid = rig.spawn()
+    (rig.home / "state" / "runner.stopped").write_text(
+        json.dumps({"stopped_at": int(time.time()), "operator": "william"}))
+    (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time())))
+    out = cli(rig, "status").stdout
+    assert "STOP NOT TAKEN" in out, out
+    assert str(pid) in out
+    # The dangerous rendering is the reassuring one: never claim a live runner is stopped.
+    assert "STOPPED BY OWNER" not in out
+
+
+def test_a_failed_stop_says_the_loop_keeps_going_rather_than_reassuring(rig):
+    write_config(rig, runner_home="login-item")
+    _script(rig.tmp / "launchctl", '#!/bin/sh\necho "$@" >> "$LAUNCHCTL_LOG"\n'
+                                   'case "$1" in\n'
+                                   '  managername) echo Aqua ;;\n'
+                                   '  bootout) exit 1 ;;\n'
+                                   '  print) printf "\\tpid = 4242\\n\\tstate = running\\n" ;;\n'
+                                   'esac\nexit 0\n')
+    r = cli(rig, "stop")
+    assert r.returncode != 0
+    assert "will not resurrect" not in r.stdout, "a failed stop must not promise the watchdog is off"
+    assert "still" in r.stdout.lower()
+
+
+def test_a_bootout_the_service_confirms_took_is_a_stop_whatever_the_rc_said(rig):
+    # launchd answers rc 36 ("Operation now in progress") for a bootout already in flight — running
+    # `stop` twice, or a job slow to exit. The SERVICE's own word is the fact; the rc is evidence
+    # about it. Believing the rc tells an owner their loop is running when launchd says it is not.
+    write_config(rig, runner_home="login-item")
+    _script(rig.tmp / "launchctl", '#!/bin/sh\necho "$@" >> "$LAUNCHCTL_LOG"\n'
+                                   'case "$1" in\n'
+                                   '  managername) echo Aqua ;;\n'
+                                   '  bootout) exit 36 ;;\n'
+                                   '  print) exit 113 ;;\n'
+                                   'esac\nexit 0\n')
+    r = cli(rig, "stop")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "runner stopped" in r.stdout
+
+
+# --------------------------------------------------- never signal an unverifiable pid
+
+def test_stop_refuses_to_signal_a_pid_the_runner_does_not_claim(rig):
+    # A pidfile outlives a hard crash, and the OS reuses pids. Signalling that number then kills
+    # whatever the owner happens to be running — the 2026-07-07 collateral kill from another angle.
+    pid = rig.spawn()
+    (rig.home / "state" / "runner.home.json").unlink()          # a crashed runner's leftovers
+    r = cli(rig, "stop", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["process_gone"] is False
+    assert "does not claim" in (doc.get("signal_refused") or ""), doc
+    assert not _dead(pid, deadline=2), "the unverified process must be left alone"
+
+
+def test_stop_signals_the_pid_the_runner_does_claim(rig):
+    pid = rig.spawn()                                            # writes lock AND home record
+    r = cli(rig, "stop")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _dead(pid)
+
+
+# --------------------------------------------------- a start that fails changes nothing
+
+def test_a_start_that_launchd_refuses_leaves_the_stop_standing(rig):
+    # The worst state this issue can produce is a loop that is DOWN with its guardians re-armed: the
+    # heartbeat goes stale, the watchdog opens an episode and texts about an outage the owner
+    # created on purpose. So a failed start must clear nothing and journal no "started".
+    write_config(rig, runner_home="login-item")
+    (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
+    cli(rig, "stop")
+    _script(rig.tmp / "launchctl", '#!/bin/sh\ncase "$1" in managername) echo Aqua ;; esac\nexit 5\n')
+    r = cli(rig, "start")
+    assert r.returncode != 0
+    assert marker(rig) is not None, "the stop is still the truth — nothing came up"
+    acts = [json.loads(l).get("outcome") for l in
+            (rig.home / "journal.jsonl").read_text().splitlines() if l.strip()]
+    assert "started" not in acts, acts
+
+
+def test_a_start_that_comes_up_with_nothing_running_is_a_failure(rig):
+    # bootstrap accepted, job immediately gone. Exiting 0 here would tell a button the loop is back.
+    write_config(rig, runner_home="login-item")
+    (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
+    cli(rig, "stop")
+    _script(rig.tmp / "launchctl", '#!/bin/sh\ncase "$1" in\n'
+                                   '  managername) echo Aqua ;;\n'
+                                   '  print) exit 113 ;;\n'
+                                   'esac\nexit 0\n')
+    r = cli(rig, "start", "--json")
+    assert r.returncode != 0, r.stdout
+    doc = json.loads(r.stdout)
+    assert doc["ok"] is False and doc["pid"] is None
+    assert marker(rig) is not None
