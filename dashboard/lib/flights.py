@@ -169,14 +169,69 @@ def airline_color(slug):
 
 # =============================== attempt counter + wander (§3/§7) ===============================
 
-def attempt_number(journal):
-    """Which attempt this flight is on: 1 by default, +1 for every ``regenerate`` in ``journal``.
+# The generation the engine encodes in a lane's branch name (`sl/i7-slug-r2`). One rotation, one
+# generation — minted by a conflict-regeneration OR, since #177, by a re-approval.
+_GENERATION = re.compile(r"-r([0-9]+)$")
 
-    A conflict-regeneration is an honest retire-and-rebuild (design record §3) — the old attempt is
-    retired and a NEW flight taxis out as attempt 2. ``journal`` is this issue's records (the caller
-    filters by id); counting the append-only ``regenerate`` events is absence-proof — no stored
-    counter to drift."""
-    return 1 + sum(1 for r in journal if isinstance(r, dict) and r.get("act") == "regenerate")
+
+def branch_generation(branch):
+    """The generation encoded in the branch name a lane is on — 0 for a base name and 0 for anything
+    unreadable (wrong-typed, blank, a bare ``-r``, ``-r-1``).
+
+    This is the honest record of how many times the lane has been retired and re-minted: the engine
+    zeroes its own counters on a re-approval, but the NAME it already burned survives on the remote
+    with its superseded PR still open. Fail-closed like every derivation here — an unreadable stamp
+    reads as the base generation, never raises and never invents one."""
+    if not isinstance(branch, str):
+        return 0
+    m = _GENERATION.search(branch.strip())
+    return int(m.group(1)) if m else 0
+
+
+def go_around_count(journal):
+    """How many CONFLICT regenerations this flight has had — the go-around count, narrowly.
+
+    Kept distinct from ``attempt_number`` (issue #272): a go-around is a *collision* story, the one
+    the conflict-cap card tells ("this kept colliding with work that landed first"). A re-approval
+    rebuild raises the attempt without any collision, so it must never be counted here or the card
+    would tell the owner a story that never happened."""
+    return sum(1 for r in journal if isinstance(r, dict) and r.get("act") == "regenerate")
+
+
+def attempt_number(journal, branch=None):
+    """Which attempt this flight is on: 1 by default, +1 for every retire-and-rebuild it has had.
+
+    A rebuild is an honest retire-and-rebuild (design record §3) — the old attempt is retired and a
+    NEW flight taxis out as attempt 2. There are now TWO doors to one (issue #272, following the
+    engine's #177): a conflict ``regenerate``, and a ``reapprove`` that rotated the branch. Both
+    retire a branch, both mint the next generation, both start a session from scratch — so the board
+    counts them the same way, and the ``·A<n>`` marker means what it says.
+
+    Two sources, because neither alone is complete — exactly the pairing the engine's own
+    ``next_generation`` uses:
+
+    * the ``-r<N>`` suffix on ``branch`` — the generation the lane is ACTUALLY on. Authoritative and
+      reset-proof: a re-approval zeroes every engine counter but cannot un-burn a branch name. This
+      is what makes the attempt on the board agree with the branch under it.
+    * the append-only ``journal`` — the floor. A branch stamp can be missing or unreadable (a lane
+      never handed to the launcher, a corrupt state file), and an absent stamp must not walk a
+      proven rebuild back to attempt 1.
+
+    ``max`` of the two, so neither source can lower what the other proves. A ``reapprove`` record
+    counts only when it carries the branch pair the rotation writes: a lane with nothing stamped had
+    nothing to retire, so its re-approval rotated nothing and is not a fresh attempt.
+
+    ``journal`` is this issue's records (the caller filters by id)."""
+    rotations = 0
+    for r in journal:
+        if not isinstance(r, dict):
+            continue
+        act = r.get("act")
+        if act == "regenerate":
+            rotations += 1
+        elif act == "reapprove" and r.get("old_branch") and r.get("new_branch"):
+            rotations += 1
+    return 1 + max(rotations, branch_generation(branch))
 
 
 def flight_label(num, attempt):
@@ -1093,7 +1148,11 @@ def build_flight(issue, repo):
     now = repo.get("now")
     activity_mtime = issue.get("activity_mtime")
 
-    attempt = attempt_number(journal)
+    # The attempt reads the BRANCH as well as the journal (issue #272): re-approval rotates the
+    # lane onto a fresh generation, and a board showing attempt 1 over an `-r1` branch is two
+    # surfaces telling different stories about the same lane.
+    attempt = attempt_number(journal, issue.get("branch"))
+    go_arounds = go_around_count(journal)   # ...of which THESE were collisions (the conflict-cap story)
     live = liveness_tier(activity_mtime, now, repo.get("idle_seconds", 480),
                          repo.get("freeze_seconds", 2700))
 
@@ -1148,6 +1207,10 @@ def build_flight(issue, repo):
         "num": num,
         "label": flight_label(num, attempt),
         "attempt": attempt,
+        # How many of those attempts were forced by a COLLISION. `attempt - 1` stopped being that
+        # number when re-approval started minting generations too (issue #272), so the conflict-cap
+        # card reads this and never infers a collision from the attempt count.
+        "go_arounds": go_arounds,
         "stage": stage,
         "on_circuit": stage in CIRCUIT_STAGES,
         "circuit_stage": stage_on_circuit,

@@ -86,13 +86,19 @@ OFF_PATH_PLAIN = {
 def card_kind(flight):
     """Which decision kind a waiting flight is. A durable owner-decision QUESTION (#163) is its own
     kind and takes precedence — it is answered, not approved/dropped-only, and its story is the
-    question itself, not a go-around count. Otherwise: a flight that went around (``attempt`` >= 2 —
-    a conflict regeneration happened) and STILL landed on William's desk is the ``conflict-cap`` case,
-    whatever its underlying stage (§3); then ``parked`` (the machine gave up), or an amber decision
-    that is a ``bounced`` push-back or a plain ``needs-owner``."""
+    question itself, not a go-around count. Otherwise: a flight that went around (a conflict
+    regeneration happened) and STILL landed on William's desk is the ``conflict-cap`` case, whatever
+    its underlying stage (§3); then ``parked`` (the machine gave up), or an amber decision that is a
+    ``bounced`` push-back or a plain ``needs-owner``.
+
+    Keyed on the go-around count, NOT on ``attempt`` (issue #272). It used to be the same number, so
+    ``attempt >= 2`` was a fair reading of "a conflict happened". It stopped being one when
+    re-approval started rotating the branch too: a lane the owner re-approved once and that parked
+    again is on attempt 2 having collided with nothing, and this card would greet him with "this kept
+    colliding with work that landed first" — a collision story about a lane that never had one."""
     if flight.get("awaiting_reason") == "question":
         return "question"
-    if _attempt(flight) >= 2:
+    if _go_arounds(flight) >= 1:
         return "conflict-cap"
     if flight.get("stage") == flights.PARKED:
         return "parked"
@@ -135,9 +141,13 @@ _CARD_COPY = {
 def _collision_sentence(flight):
     """The one plain sentence naming the collision on a conflict-cap card (§3: "names the collision
     in one plain sentence and offers reasoned choices, never a bare badge"). Built from real facts —
-    the go-around count — so it never overclaims what happened."""
+    the go-around count — so it never overclaims what happened.
+
+    The rebuild count is the CONFLICT go-arounds (issue #272); ``attempt`` is the total, which since
+    #177 also counts a re-approval's rotation. Naming both keeps the sentence honest on a lane that
+    got here by a mix of the two: N collisions, M attempts used."""
     attempt = _attempt(flight)
-    go_arounds = attempt - 1
+    go_arounds = _go_arounds(flight)
     times = "once" if go_arounds == 1 else "%d times" % go_arounds
     return ("%s kept colliding with work that landed first — rebuilt %s, %d attempts used, and it "
             "still couldn't merge cleanly." % (flight.get("label") or ("SL-%s" % flight.get("num")),
@@ -213,6 +223,20 @@ def _attempt(flight):
     return a if a >= 1 else 1
 
 
+def _go_arounds(flight):
+    """This flight's CONFLICT go-arounds, fail-closed to 0 — the number the conflict-cap story is
+    told from (issue #272).
+
+    Fail-closed to ZERO, not to ``attempt - 1``: since re-approval also mints a generation, that
+    subtraction credits a collision to a lane that never had one. A card must EARN its collision
+    sentence with a counted regeneration, the same way a landing must earn its flourish (§7). Same
+    malformed-input discipline as :func:`_attempt` — this layer is pure over an arbitrary dict."""
+    g = flight.get("go_arounds", 0)
+    if isinstance(g, bool) or not isinstance(g, int):
+        return 0
+    return g if g >= 1 else 0
+
+
 def _plain(v):
     """A journal value as one plain string. Bools render as words (``rc: False`` would read as a
     Python literal at a human), everything else through ``str`` — the JS escapes it downstream."""
@@ -266,7 +290,7 @@ def decision_dossier(flight, journal_slice):
     if red and flight.get("awaiting_reason") != "question":
         items.append({"label": "gate at hand-back", "value": "not yet: " + ", ".join(red)})
 
-    go_arounds = _attempt(flight) - 1
+    go_arounds = _go_arounds(flight)
     if go_arounds:
         items.append({"label": "rebuilt after conflicts",
                       "value": "%d time%s" % (go_arounds, "" if go_arounds == 1 else "s")})
@@ -292,8 +316,20 @@ def decision_dossier(flight, journal_slice):
 # report to throw away. `_exec_reapprove` removes them IF PRESENT — so the sentence says "any",
 # never asserting work exists (Codex cross-review, issue #162). What it must never soften is the
 # warning itself: nothing is resumed, and anything already built is not kept.
+#
+# (#272, following the engine's #177) The tap does MORE than empty the lane, and no button may hide
+# what it does. `_exec_reapprove` now ROTATES the branch: the rebuild is launched on the next
+# unburned generation, the branch the parked episode was sitting on is retired with its commits
+# intact on the remote, and a PR still open on it is handed to the janitor's `superseded` lane. Two
+# of those are the owner's business in opposite directions — the retirement is a consequence he is
+# choosing (his committed work moves out of the lane's path and he is the one who decides whether to
+# go get it), and the preservation is the reassurance that keeps the sentence from over-scaring.
+# What the engine does NOT do is close or delete anything, so this must not imply it does.
 _DISCARDS = ("Any worktree and filed report this issue already has are discarded — nothing is "
-             "resumed — its attempt counters are zeroed, and a fresh session starts from the issue.")
+             "resumed — its attempt counters are zeroed, and a fresh session starts from the issue. "
+             "Any branch it is already on is retired: the rebuild runs on a fresh generation, the "
+             "retired branch is preserved on the remote with its commits, and a pull request still "
+             "open on it is labeled superseded and left standing for you.")
 
 # The consequence of the DEFAULT re-approval on a FINISHED lane (issue #161 — the D11 fix). The
 # engine now RESUMES AT THE GATE instead of rebuilding: it re-enters the merge gate on the PR this
@@ -571,5 +607,5 @@ def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, oper
         "journal": journal,
         "decision": decision,
         "attempt": _attempt(flight),
-        "go_arounds": _attempt(flight) - 1,
+        "go_arounds": _go_arounds(flight),   # conflicts only — not every attempt is a collision (#272)
     }
