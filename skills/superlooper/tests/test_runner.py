@@ -5389,6 +5389,49 @@ def test_park_label_stuck_past_bound_raises_one_alert(rig):
     assert (rig.home / "state" / "ALERT").exists()
 
 
+def test_a_stuck_re_approval_hand_back_escalates_end_to_end(rig, monkeypatch):
+    """Issue #256, half 1, driven through the whole runner: the repo has no `needs-owner` label
+    (the #58 rename, or a repo never re-adopted), so `gh issue edit` is refused EVERY time.
+
+    A lane already parked needs-owner (its first park landed — `park_landed_cause`) is re-approved
+    by the owner while its worker lock still names a live pid, so #169 hands it straight back. The
+    executor stamps the marker, posts the memo, then the label move fails: status stays terminal,
+    `agent-ready` is never stripped, and every later tick re-derives the identical park, which #61
+    correctly silences. Before this fix that was the whole story — one text, one comment, then
+    permanent silence with `agent-ready` still on the board and nothing running it. Now the ALERT
+    escalates: once, past the bound, and never again for the same reason."""
+    import actions
+    issue = _build_issue(5)
+    issue["labels"] = ["agent-ready", "type:build"]          # the owner's re-approval, still standing
+    _stateful(rig, {"5": issue})
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: True)
+    _teardown_rig(rig, "i5", pid="4242")                     # the lock #169 refuses to prune over
+    seed_issue(rig, "i5", status="needs_william", num=5, type="build",
+               teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP,
+               teardown_deferral_pid=4242,
+               teardown_deferral_lock=str(rig.home / "state" / "worker.i5.lock"),
+               park_notify_cause=actions.TEARDOWN_CAUSE,
+               park_landed_cause=actions.TEARDOWN_CAUSE)     # the FIRST park's labels really moved
+    _rules(rig, {"match": "issue edit", "times": 999, "stderr": "could not add label: 'needs-owner'"})
+
+    rig.r.tick(now=NOW)                                      # hand-back: one text, label move fails
+    stuck = actions.PARK_LABEL_STUCK_ALERT_SECONDS
+    rig.r.tick(now=NOW + stuck + 5)                          # past the bound -> the escalation
+    rig.r.tick(now=NOW + stuck + 105)                        # same reasons -> deduped, silent
+
+    st = issue_state(rig, "i5")
+    assert st["status"] == "needs_william"                   # terminal the whole time...
+    assert st["park_landed_cause"] == actions.TEARDOWN_CAUSE  # ...and this park never landed
+    assert st["park_notify_cause"] == actions.TEARDOWN_CAUSE_REAPPROVED
+    gh_now = json.loads((rig.fixdir / "state.json").read_text())
+    assert "agent-ready" in gh_now["issues"]["5"]["labels"], "the strip never happened"
+
+    alerts = _journal_acts(rig, "alert")
+    assert len(alerts) == 1 and any("park_label_stuck:i5" in str(r.get("reasons")) for r in alerts)
+    assert len(_journal_acts(rig, "notify")) == 2            # the hand-back's text + one ALERT text
+    assert (rig.home / "state" / "ALERT").exists()
+
+
 def test_park_episode_recovers_and_merges_with_no_further_notify(rig):
     # DoD: the PR becomes visible after k failing ticks (the park label never landed) -> the gate
     # verdict flips to merge, the notify-once marker and hold clock are CLEARED, no further text.

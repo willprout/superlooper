@@ -3599,6 +3599,328 @@ def test_bounce_label_failing_under_bound_stays_quiet():
     assert only(out, "alert") == [] and not has_notify(out)
 
 
+# ---------------- park_label_stuck is TOTAL in both directions (issue #256) ----------------
+# Two conjuncts of the gate above each got one half of totality wrong.
+#
+# HALF 1 — it could never fire from a TERMINAL status, and #169's re-approval hand-back derives
+# from inside that excluded set. A hand-back whose label move keeps failing therefore sat exactly
+# where the alert could not reach it: the park re-derives every tick, `agent-ready` is never
+# stripped (the failing set_labels is what would strip it), #61's notify-once marker silences
+# every later text, and no ALERT ever escalated — one text, one comment, then permanent silence
+# with `agent-ready` still showing on the board. `park_landed_cause` (#169) is the discriminator
+# that keeps the exclusion's INTENT: settled history stays silent, a stuck park escalates.
+#
+# HALF 2 (absorbed #263) — it could fire off an UNOBSERVED closed read. `gh api rate_limit` is
+# exempt from rate limiting, so a throttled poll still answers, stamps the view FRESH, and reports
+# an empty closed set nobody observed (#172). The owner closing a parked issue during a throttle
+# would then be paged about a park they had already resolved. `closed_read_ok` is the vouch.
+
+
+def _stuck_reapproved_park(**over):
+    """#169's reapprove-branch hand-back with its label move failing: the lane is TERMINAL (a park
+    is the only way it got there), the owner's `agent-ready` is still on the issue because the
+    failing set_labels is the very write that would strip it, and the notify marker is older than
+    the bound. `park_landed_cause` records the FIRST park's cause — the one that really landed —
+    so it differs from the cause now stuck."""
+    ist_over = {"teardown_deferrals": actions.TEARDOWN_DEFERRAL_CAP,
+                "teardown_deferral_pid": 4242,
+                "teardown_deferral_lock": "/run/state/worker.i5.lock",
+                "park_notify_cause": actions.TEARDOWN_CAUSE_REAPPROVED,
+                "park_landed_cause": actions.TEARDOWN_CAUSE,
+                "park_notify_at": NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10}
+    ist_over.update(over)
+    return disk(issues_state={"version": 1, "issues": {"i5": ist("needs_william", **ist_over)}},
+                live_lock_ids={"i5"})
+
+
+def test_a_stuck_hand_back_escalates_from_a_terminal_status():
+    # THE hole. Every tick re-derives the identical park, #61 marks it a silent retry, and the
+    # terminal veto used to swallow the one thing left that could speak.
+    out = decide(parsed_issues=[parsed(5)], dsk=_stuck_reapproved_park())
+    a = only(out, "alert")
+    assert len(a) == 1 and "park_label_stuck:i5" in a[0]["reasons"] and has_notify(out)
+    p = only(out, "park")
+    assert len(p) == 1 and p[0].get("retry") is True   # the park stays silent; the ALERT escalates
+
+
+def test_a_landed_park_stays_silent_in_that_same_terminal_status():
+    # The exclusion's INTENT, preserved: `park_landed_cause` is written only past a successful
+    # set_labels, so a cause recorded there IS the proof the labels moved. Settled history — even
+    # with the owner's `agent-ready` back on the issue — says nothing.
+    d = _stuck_reapproved_park(park_landed_cause=actions.TEARDOWN_CAUSE_REAPPROVED)
+    out = decide(parsed_issues=[parsed(5)], dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+    # ...and with the label really gone from the fresh read, likewise (the ordinary parked lane)
+    out2 = decide(parsed_issues=[parsed(5, labels=("type:build",))], dsk=d)
+    assert only(out2, "alert") == [] and not has_notify(out2)
+
+
+def test_a_re_approved_bounce_is_never_mistaken_for_a_stuck_park():
+    """FRESH-REVIEW P1-1. `_exec_bounce` settles `bounced` PAST its own successful label move and
+    never writes `park_landed_cause` — it borrows only the notify marker. So every bounced lane
+    carries a live `park_notify_cause` against an absent landed cause, forever, and gets
+    `agent-ready` back the moment the owner does the designed next thing: amend the issue and
+    re-approve. A bare cause mismatch pages THAT — at 3am (an ALERT is never quiet-hour batched),
+    about a GitHub that is working perfectly, telling the owner writes are not landing."""
+    d = disk(issues_state={"version": 1, "issues": {
+        "i7": ist("bounced", park_notify_cause="bounce",
+                  park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)}})
+    out = decide(parsed_issues=[parsed(7)], dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+    assert len(only(out, "reapprove")) == 1, "...and the re-approval itself is untouched"
+
+
+def test_a_pre_169_parked_lane_never_alerts_when_it_is_re_approved():
+    # The other absent-field population: a lane parked before #169 shipped `park_landed_cause` has
+    # no such key in its state file at all. Its labels DID move (that is why it is parked and why
+    # `agent-ready` was gone until the owner put it back), so nothing here is stuck.
+    d = disk(issues_state={"version": 1, "issues": {
+        "i5": ist("needs_william", park_notify_cause="checks",
+                  park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)}})
+    out = decide(parsed_issues=[parsed(5)], dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_a_terminal_lane_with_no_fresh_agent_ready_never_alerts():
+    # The `agent-ready` conjunct is load-bearing: a mismatched pair alone would alert on every lane
+    # parked before #169 shipped `park_landed_cause`, whose state file simply has no such field.
+    # Nothing is stuck there — the labels moved, which is why nothing is asking for them again.
+    for status in ("merged", "parked", "needs_william", "bounced"):
+        d = disk(issues_state={"version": 1, "issues": {
+            "i5": ist(status, park_notify_cause="checks",
+                      park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)}})
+        out = decide(parsed_issues=[parsed(5, labels=("type:build",))], dsk=d)
+        assert only(out, "alert") == [], f"a {status} lane with no live label must not alert"
+
+
+def test_a_merged_lane_can_never_pin_the_alert_open():
+    """FRESH-REVIEW P3. `merged` is the one terminal status decide has NO path to clear a marker
+    from — not re-approvable, reconciliation wants `parked`, and clear_park_marker sits inside a
+    gate branch the terminal `continue` never reaches. An un-clearable reason does not merely nag:
+    the dedup compares the whole reasons LIST, so it would silence every other alert too. No park
+    is ever emitted for a merged lane, so the escape has nothing to say there."""
+    d = _stuck_reapproved_park()
+    d["issues_state"]["issues"]["i5"]["status"] = "merged"
+    out = decide(parsed_issues=[parsed(5)], dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_a_wrong_typed_labels_field_is_never_read_as_carrying_agent_ready():
+    # The membership test must be a LIST membership. A wrong-typed `labels` (corruption, or a
+    # future shape change) that happens to CONTAIN the substring must not satisfy it.
+    for bad in ("agent-ready,type:build", {"agent-ready": True}, None, 7):
+        # built past `parsed()`'s own list() coercion — the guard under test is decide's, not the
+        # fixture's, and a corrupt view reaches decide uncoerced.
+        out = decide(parsed_issues=[dict(parsed(5), labels=bad)], dsk=_stuck_reapproved_park())
+        assert only(out, "alert") == [], f"{bad!r} must not read as the label standing"
+
+
+@pytest.mark.parametrize("bad", [7, [], {}, True, 0.0, ""])
+def test_a_wrong_typed_landed_cause_never_escalates(bad):
+    # The landed cause must be a real recorded STRING. Every wrong type is unreadable bookkeeping
+    # and must fail CLOSED to silence, exactly as an absent one does — never be read as "different
+    # from the stamped cause, so the move failed" (the wrong-typed fail-OPEN class _counter names).
+    d = _stuck_reapproved_park(park_landed_cause=bad)
+    assert only(decide(parsed_issues=[parsed(5)], dsk=d), "alert") == []
+
+
+def test_a_stale_view_never_escalates_a_terminal_lane_off_old_labels():
+    # The `agent-ready` reading must be FRESH. A stale view's labels are last poll's, and the whole
+    # point of the conjunct is that the label is still standing RIGHT NOW.
+    out = decide(parsed_issues=[parsed(5)], dsk=_stuck_reapproved_park(),
+                 gh_view=ghv(stale=True))
+    assert not any("park_label_stuck" in r for a in only(out, "alert") for r in a["reasons"])
+
+
+def test_the_regenerate_branch_park_still_escalates_from_its_non_terminal_status():
+    # #169's OTHER park fires from a gating lane, which the terminal veto never covered — its
+    # escalation is unchanged, and needs no `agent-ready` (the lane is mid-build, not handed back).
+    d, g = _gating(pv=pr_view(mergeable="CONFLICTING"), live_lock_ids={"i5"})
+    d["issues_state"]["issues"]["i5"].update(
+        update_result="conflict", update_head_oid=HEAD1, conflicts=0,
+        teardown_deferrals=actions.TEARDOWN_DEFERRAL_CAP,
+        teardown_deferral_pid=4242, teardown_deferral_lock="/run/state/worker.i5.lock",
+        park_notify_cause=actions.TEARDOWN_CAUSE,
+        park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=d, gh_view=g)
+    a = only(out, "alert")
+    assert len(a) == 1 and "park_label_stuck:i5" in a[0]["reasons"] and has_notify(out)
+    assert only(out, "park")[0].get("retry") is True
+
+
+def _stuck_bounce():
+    return disk(blocked={"i7": "BOUNCED: x"},
+                issues_state={"version": 1, "issues": {
+                    "i7": ist("running", park_notify_cause="bounce",
+                              park_notify_at=NOW - actions.PARK_LABEL_STUCK_ALERT_SECONDS - 10)}})
+
+
+def test_an_unvouched_closed_read_never_pages_off_an_emptiness_nobody_observed():
+    # HALF 2. The suppression asked "is this issue in the closed set?" — and a throttled poll's
+    # closed set is empty for a reason nobody observed, while the view still reads FRESH. The owner
+    # drops a parked issue mid-throttle and gets paged about the park they just resolved.
+    out = decide(dsk=_stuck_bounce(), gh_view=ghv(closed_nums=set(), closed_read_ok=False))
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_a_clean_closed_read_pages_a_park_that_is_genuinely_still_open():
+    # Holding costs a DELAYED true page, never a lost one: the reason re-derives every tick, so the
+    # first vouched read that still shows the issue open escalates exactly as before.
+    out = decide(dsk=_stuck_bounce(), gh_view=ghv(closed_nums=set(), closed_read_ok=True))
+    a = only(out, "alert")
+    assert len(a) == 1 and "park_label_stuck:i7" in a[0]["reasons"] and has_notify(out)
+
+
+def test_a_clean_closed_read_that_now_names_the_issue_stays_silent():
+    out = decide(dsk=_stuck_bounce(), gh_view=ghv(closed_nums={7}, closed_read_ok=True))
+    assert only(out, "absorb_close") == [{"act": "absorb_close", "id": "i7", "num": 7}]
+    assert not any("park_label_stuck" in r for a in only(out, "alert") for r in a["reasons"])
+
+
+def test_absorb_close_still_takes_positive_membership_only():
+    # The sibling is already correct and must not move: it requires POSITIVE membership, so an
+    # unvouched read only DELAYS absorption — it never invents one, and never blocks a real one.
+    d = _stuck_bounce()
+    assert only(decide(dsk=d, gh_view=ghv(closed_nums=set(), closed_read_ok=False)),
+                "absorb_close") == []
+    assert only(decide(dsk=d, gh_view=ghv(closed_nums={7}, closed_read_ok=False)),
+                "absorb_close") == [{"act": "absorb_close", "id": "i7", "num": 7}]
+    assert only(decide(dsk=d, gh_view=ghv(stale=True, closed_nums={7})), "absorb_close") == []
+
+
+def test_a_stale_view_still_escalates_rather_than_suppressing_on_an_unproven_close():
+    # Unchanged (#108): when the WHOLE view is doubted, an unproven close must not suppress a real
+    # alert. The #172 vouch only speaks about a view that reads fresh.
+    out = decide(dsk=_stuck_bounce(), gh_view=ghv(stale=True, closed_nums=set(),
+                                                  closed_read_ok=False))
+    a = only(out, "alert")
+    assert len(a) == 1 and "park_label_stuck:i7" in a[0]["reasons"]
+
+
+def _ticks(d, views, n=60, issues=lambda k: [parsed(5)]):
+    """Run n consecutive ticks, carrying the durable ALERT forward exactly as the runner does (it
+    writes state/ALERT on `alert` and removes it on `clear_alert`). `views` picks the gh_view per
+    tick and `issues` the parsed list, so a poll whose health CHANGES — in EITHER read — is a
+    first-class case."""
+    alerts = texts = clears = 0
+    for k in range(n):
+        out = decide(now=NOW + k * 15, parsed_issues=issues(k), dsk=d, gh_view=views(k))
+        a = only(out, "alert")
+        alerts += len(a)
+        texts += len(only(out, "notify"))
+        if a:
+            d = dict(d, alert={"reasons": a[0]["reasons"], "since": NOW + k * 15})
+        elif only(out, "clear_alert"):
+            clears += 1
+            d = dict(d, alert=None)
+    return alerts, texts, clears
+
+
+def test_a_long_stuck_hand_back_alerts_once_across_a_whole_outage():
+    # The storm bound: the ALERT's own reasons-diff dedup. A GitHub write outage lasting hours must
+    # cost ONE text, not one per 15s tick — the same discipline #61 gave the park itself.
+    assert _ticks(_stuck_reapproved_park(), lambda k: ghv()) == (1, 1, 0)
+
+
+def test_per_poll_view_health_can_delay_the_page_but_never_re_sends_it():
+    """FRESH-REVIEW P1-2. `closed_read_ok` and `gh_stale` flip with each poll's luck, and the ALERT
+    dedup key is the reasons LIST — so a conjunct that drops the reason on a doubted poll and
+    restores it on the next bills a fresh alert AND a fresh text every flip. The correlation is
+    adverse, not incidental: a flaky GitHub is exactly what makes the label move stick. Doubt gates
+    the RAISE only; a page already sent stands until evidence retracts it."""
+    for view in (lambda k: ghv(closed_read_ok=k % 2 == 0),      # the #172 vouch flapping
+                 lambda k: ghv(stale=k % 2 == 0),               # ...and the whole view flapping
+                 lambda k: ghv(stale=k % 3 == 0, closed_read_ok=k % 2 == 0)):
+        assert _ticks(_stuck_reapproved_park(), view) == (1, 1, 0), "one text per outage, not per flip"
+
+
+def test_the_non_terminal_population_is_flap_proof_too():
+    # `closed_read_ok` is a behaviour CHANGE for the ordinary non-terminal hand-back, so its storm
+    # bound wants its own pin rather than riding the terminal fixture's.
+    alerts = texts = clears = 0
+    d = _stuck_bounce()
+    for k in range(40):
+        out = decide(now=NOW + k * 15, dsk=d, gh_view=ghv(closed_read_ok=k % 2 == 0))
+        a = only(out, "alert")
+        alerts += len(a)
+        texts += len(only(out, "notify"))
+        if a:
+            d = dict(d, alert={"reasons": a[0]["reasons"], "since": NOW + k * 15})
+        elif only(out, "clear_alert"):
+            clears += 1
+            d = dict(d, alert=None)
+    assert (alerts, texts, clears) == (1, 1, 0)
+
+
+def test_a_refused_issue_list_read_holds_the_page_instead_of_re_sending_it():
+    """FRESH-REVIEW P1. The issue-list read fails closed to [] exactly as the closed-list read
+    does, and the poll stamps the view FRESH either way — so a refused `gh issue list` empties the
+    whole parsed view while `stale` still reads False. Reading "not observed" as "the label is
+    gone" drops the reason on that poll and restores it on the next: one alert and one text per
+    flip, the same storm `standing` exists to stop, arriving through a different input."""
+    assert _ticks(_stuck_reapproved_park(), lambda k: ghv(),
+                  issues=lambda k: [] if k % 2 else [parsed(5)]) == (1, 1, 0)
+
+
+def test_that_hold_does_not_swallow_the_owner_taking_the_label_off():
+    """FRESH-REVIEW P2 — the hold must not become a LATCH. The poll's two issue reads are both
+    label-filtered, so the owner hand-stripping `agent-ready` from a parked lane does NOT arrive as
+    "seen without the label": the issue leaves both lists and reads as unobserved, exactly like a
+    refused read. Held on that forever the reason could never clear — no park re-derives without
+    the label, reapprove needs it, absorb_close needs a close — pinning the ALERT open AND
+    silencing this lane's next real escalation. Any OTHER issue in the view proves the read landed,
+    so this one's absence is real."""
+    d = dict(_stuck_reapproved_park(), alert={"reasons": ["park_label_stuck:i5"], "since": NOW})
+    out = decide(parsed_issues=[parsed(9)], dsk=d)       # i5 gone from a read that plainly landed
+    assert only(out, "clear_alert") == [{"act": "clear_alert"}]
+    # ...and the lane is then free to page again if it ever gets stuck anew (no latch)
+    again = decide(parsed_issues=[parsed(5), parsed(9)], dsk=dict(d, alert=None))
+    assert len(only(again, "alert")) == 1 and has_notify(again)
+    # the directly-observed form retracts too, when the poll can produce it (a lane still in flight)
+    seen = decide(parsed_issues=[parsed(5, labels=("type:build",))], dsk=d)
+    assert only(seen, "clear_alert") == [{"act": "clear_alert"}]
+
+
+def test_the_latch_guard_does_not_reopen_the_refused_read_storm():
+    # The one ambiguous shape stays held: a WHOLLY empty parsed view is the refused-read signature
+    # (both label reads fail closed to []), not evidence that every issue lost its label.
+    assert _ticks(_stuck_reapproved_park(), lambda k: ghv(),
+                  issues=lambda k: [] if k % 2 else [parsed(5)]) == (1, 1, 0)
+
+
+def test_a_refused_issue_list_read_re_pages_no_other_standing_reason():
+    # The dedup key is the whole reasons LIST, so a reason that flaps re-sends every OTHER standing
+    # reason with it. Pin the neighbour: an unrelated alert must not be re-texted by this flap.
+    d = _stuck_reapproved_park()
+    d["issues_state"]["issues"]["i9"] = ist("running", update_errors=actions.UPDATE_ERROR_ALERT)
+    alerts, texts, clears = _ticks(d, lambda k: ghv(),
+                                   issues=lambda k: [] if k % 2 else [parsed(5)])
+    assert (alerts, texts, clears) == (1, 1, 0)
+
+
+def test_a_genuinely_new_stuck_episode_texts_again_after_a_retraction():
+    # `standing` must not turn into a latch that eats the NEXT episode's page. Once the reason has
+    # been retracted, a lane that gets stuck again is a new episode and speaks.
+    d = _stuck_reapproved_park(park_landed_cause=actions.TEARDOWN_CAUSE_REAPPROVED)
+    d = dict(d, alert={"reasons": ["park_label_stuck:i5"], "since": NOW})
+    assert only(decide(parsed_issues=[parsed(5)], dsk=d), "clear_alert") == [{"act": "clear_alert"}]
+    again = dict(_stuck_reapproved_park(), alert=None)       # ...stuck once more, marker mismatched
+    out = decide(parsed_issues=[parsed(5)], dsk=again)
+    assert len(only(out, "alert")) == 1 and has_notify(out)
+
+
+def test_a_page_already_sent_is_still_retracted_by_evidence():
+    # The other half of `standing`: holding through DOUBT must not become holding through PROOF.
+    # A vouched read naming the issue closed clears the alert on the very next tick.
+    d = dict(_stuck_reapproved_park(), alert={"reasons": ["park_label_stuck:i5"], "since": NOW})
+    out = decide(parsed_issues=[parsed(5)], dsk=d, gh_view=ghv(closed_nums={5}, closed_read_ok=True))
+    assert only(out, "clear_alert") == [{"act": "clear_alert"}]
+    # ...and so does the park's own landing (the marker pair agrees again)
+    d2 = dict(_stuck_reapproved_park(park_landed_cause=actions.TEARDOWN_CAUSE_REAPPROVED),
+              alert={"reasons": ["park_label_stuck:i5"], "since": NOW})
+    assert only(decide(parsed_issues=[parsed(5)], dsk=d2), "clear_alert") == [{"act": "clear_alert"}]
+
+
 # ---------------- absorb external closes for bounced/parked issues (issue #108) ----------------
 # William closing the issue on GitHub (the dashboard's Drop) while the loop is bouncing/parking it
 # is his answer: absorb the close, settle terminal, stand down. Positive-proof only (a fresh view
