@@ -475,10 +475,18 @@ def parse_issue_create(command):
 _GIT_GLOBAL_WITH_VALUE = frozenset(("-C", "-c", "--git-dir", "--work-tree", "--namespace",
                                     "--exec-path", "--super-prefix"))
 
-# Leading words that wrap a real command without changing what it is — the same list duty 2's regex
-# sees through, so `sudo gh pr merge 42` is still `gh pr merge`.
+# Leading words that wrap a real command without changing what it is — duty 2's list, plus the
+# CONDITION keywords (fresh-agent review round 2, 2026-08-06). Duty 2 documents `if pkill …; then`
+# as an accepted miss because a deny there is the expensive direction; here it is the cheap one, so
+# `if git push origin main; then …` and `until gh pr merge 42; do …` are closed rather than accepted.
 _WRAPPERS = frozenset(("sudo", "env", "nohup", "time", "command", "builtin", "exec", "xargs",
-                       "then", "do", "else"))
+                       "then", "do", "else", "if", "elif", "while", "until", "!"))
+
+# `FOO=bar gh pr merge 42` — an env-assignment PREFIX is the ordinary way to run one command with
+# one variable set, and it left the binary looking like an argument to something else (same review).
+# Matched as a whole token so a `--body 'a=b'` value, which shlex hands over as one token including
+# its spaces, cannot pass for one.
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _newline_separated(command):
@@ -557,9 +565,11 @@ _GH_GLOBAL_WITH_VALUE = frozenset(("--repo", "-R", "--hostname"))
 
 def _at_command_position(tokens, i):
     """Is `tokens[i]` a command being RUN, rather than an argument to something else? True at the
-    line start, right after a separator, or behind a chain of benign wrappers."""
+    line start, right after a separator, or behind a chain of benign wrappers and env-assignment
+    prefixes. The walk-back must REACH a separator or the line start, so `echo if git push` — where
+    it lands on `echo` — is still text, not a call."""
     j = i - 1
-    while j >= 0 and tokens[j] in _WRAPPERS:
+    while j >= 0 and (tokens[j] in _WRAPPERS or _ASSIGNMENT_RE.match(tokens[j])):
         j -= 1
     return j < 0 or tokens[j] in _SEPARATORS
 
@@ -583,6 +593,13 @@ def _invocations(tokens, binary):
     return out
 
 
+# `--help` prints text and calls nothing. Denying it is a deny on no evidence at all (review r2).
+_HELP_FLAGS = frozenset(("--help", "-h"))
+# Methods that cannot write. `gh` sends exactly the method it is told to, so an EXPLICIT one is
+# evidence about this call, not a guess about it — which is why honoring it opens no bypass.
+_READ_METHODS = frozenset(("GET", "HEAD"))
+
+
 def _gh_verb_start(tokens, start, end):
     """The index of a `gh` call's SUBCOMMAND, stepping over gh's own global options. `gh --repo x pr
     merge` and `gh --hostname h api …` are the same calls as `gh pr merge` and `gh api …`."""
@@ -593,10 +610,16 @@ def _gh_verb_start(tokens, start, end):
             i += 2
             continue
         if tok.startswith("-"):
-            i += 1                           # `--repo=x`, `-Rowner/repo`, `-h`, valueless flags
+            i += 1                           # `--repo=x`, `-Rowner/repo`, valueless flags
             continue
         return i
     return end
+
+
+def _is_help(tokens, start, end):
+    """Is this `gh` call asking for HELP rather than doing anything? `gh pr merge --help` prints a
+    page and merges nothing."""
+    return any(t in _HELP_FLAGS for t in tokens[start:end])
 
 
 # --------------------------- matcher A: a forged commit status ---------------------------
@@ -623,8 +646,10 @@ _STATUS_REASON = (
 def _forged_status_deny(tokens):
     for start, end in _invocations(tokens, "gh"):
         verb = _gh_verb_start(tokens, start, end)
-        if verb >= end or tokens[verb] != "api":
+        if verb >= end or tokens[verb] != "api" or _is_help(tokens, start, end):
             continue
+        if _api_method(tokens, verb, end) in _READ_METHODS:
+            continue                         # an explicitly declared read writes nothing
         if any(_STATUS_WRITE_RE.search(t) for t in tokens[verb + 1:end]):
             return _STATUS_REASON
     return None
@@ -695,6 +720,8 @@ def _api_method(tokens, start, end):
 def _approval_label_deny(tokens):
     for start, end in _invocations(tokens, "gh"):
         verb = _gh_verb_start(tokens, start, end)
+        if _is_help(tokens, start, end):
+            continue                         # a help page applies no label
         args = tokens[verb:end]
         if len(args) >= 2 and args[0] in ("issue", "pr") and args[1] in ("create", "edit"):
             i = verb + 2
@@ -817,7 +844,7 @@ def _refspec_dest(refspec):
 def _out_of_band_deny(tokens, contract):
     for start, end in _invocations(tokens, "gh"):
         verb = _gh_verb_start(tokens, start, end)
-        if tokens[verb:verb + 2] == ["pr", "merge"]:
+        if tokens[verb:verb + 2] == ["pr", "merge"] and not _is_help(tokens, start, end):
             return _MERGE_REASON
     for start, end in _invocations(tokens, "git"):
         argv = _push_argv(tokens, start, end)

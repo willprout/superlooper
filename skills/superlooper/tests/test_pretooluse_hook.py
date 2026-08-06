@@ -1164,6 +1164,46 @@ def test_a_dry_run_push_ships_nothing_and_is_allowed(tmp_path, command):
     assert _bash(command, tmp_path) is None, "a dry run must not be denied: %r" % command
 
 
+@pytest.mark.parametrize("command", [
+    # Review round 2 (Codex, 2026-08-06). An ENV-ASSIGNMENT PREFIX is the ordinary way to run one
+    # command with one variable set, and it left `gh`/`git` looking like an argument to it. Same for
+    # a CONDITION position — duty 2 documents `if pkill …; then` as an accepted miss, but here the
+    # deny is the cheap direction, so it is closed rather than accepted.
+    "FOO=bar gh pr merge 42",
+    "GIT_SSH_COMMAND='ssh -i k' git push origin main",
+    "env FOO=bar gh issue edit 42 --add-label agent-ready",
+    "if git push origin main; then echo ok; fi",
+    "while ! git push --force origin sl/x; do sleep 1; done",
+    "until gh pr merge 42; do sleep 1; done",
+])
+def test_assignment_prefixes_and_condition_positions_do_not_hide_the_call(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path), "must not be hidden by its position: %r" % command
+
+
+def test_a_word_before_the_binary_is_still_not_a_command_position(tmp_path):
+    # The walk-back must still END at something that is not a separator: these are TEXT, not calls.
+    _worktree(tmp_path)
+    for command in ("echo if git push --force origin main",
+                    "echo env gh pr merge 42",
+                    "grep -r 'FOO=bar gh pr merge' docs/"):
+        assert _bash(command, tmp_path) is None, "must NOT deny: %r" % command
+
+
+@pytest.mark.parametrize("command", [
+    # Review round 2, P2. Both of these are READS, and reads pass. `--help` prints text; an explicit
+    # `-X GET` is unambiguous evidence that nothing is being written (gh sends exactly the method it
+    # is told to), so honoring it keeps the matcher strictly evidence-based.
+    "gh pr merge --help",
+    "gh issue edit --help",
+    "gh api -X GET repos/o/r/statuses/abc",
+    "gh api --method GET repos/o/r/statuses/abc",
+])
+def test_help_and_explicit_reads_are_not_writes(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path) is None, "a read must not be denied: %r" % command
+
+
 def test_a_mirror_push_is_a_force_push(tmp_path):
     # P1-4. `--mirror` force-updates every ref and deletes the ones you no longer have — a force
     # push with no `--force` on the line and no refspec to inspect.
