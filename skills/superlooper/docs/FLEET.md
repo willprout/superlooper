@@ -164,10 +164,19 @@ runner's. Three properties are deliberate:
   rc file, a wrapper or a LaunchAgent would otherwise disarm the fleet machine silently — the same
   inheritance hazard the runner pins `SL_ATTENDED` empty for. The boot line says when it overrode
   one, so a variable that lost is never a variable that vanished.
-* **fail closed on a broken file.** The file exists only because the build-up ran here, so a
-  hand-edit that lost the line — or an empty value, or a file that cannot be read — arms the gate
-  anyway and warns. To take a machine OUT of the fenced set, change the value to `off` rather than
-  deleting the file: a deleted file disarms too, and leaves nothing on disk that says so.
+* **fail closed on a broken file, and never crash on one.** The file exists only because the
+  build-up ran here, so a hand-edit that lost the line — or an empty value, an embedded NUL, a byte
+  the runner cannot decode, or a file that cannot be read at all — arms the gate anyway and warns.
+  It never stops the runner from starting: a boot that died on this would die again on every
+  resurrect. To take a machine OUT of the fenced set, change the value to `off` rather than
+  deleting the file: a deleted file disarms too, and leaves nothing on disk that says so, and
+  **re-running `--install` keeps a value you have already set** rather than stamping `required`
+  back over it.
+
+`superlooper resume i<N>` arms itself the same way, and it is the only other command that can put a
+**worker** on the host (`debug` and the watchdog's relaunch are `d<N>`, which the pre-flight exempts
+by design). Its stdout is a machine-readable answer the dashboard parses, so it says nothing there —
+the launcher's own refusal is where an operator meets the gate.
 
 It is **read, never sourced**, and only `SL_FLEET_FENCE` is ever applied from it. A machine-level
 file that could set anything would put the launcher's whole contract on disk — `SL_ATTENDED`,

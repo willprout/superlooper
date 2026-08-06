@@ -306,6 +306,54 @@ def test_a_broken_env_file_arms_the_gate_and_says_what_is_wrong(rig):
     assert "WARNING" in out
 
 
+def test_a_file_the_runner_cannot_decode_never_stops_it_from_starting(rig):
+    # The P0 of the fresh-agent review. The file this build-up writes is full of em dashes and the
+    # docs invite a hand edit, so one round-trip through an editor that saves cp1252 is enough —
+    # and `Probe.read_text` catches OSError only. A traceback here is a runner that does not start,
+    # repeated on every resurrect, on the machine whose whole point is being unattended.
+    prefix = Path(rig.env["SL_HOME"]) / "fleet"
+    prefix.mkdir(parents=True, exist_ok=True)
+    (prefix / "environment").write_bytes(b"# superlooper fleet environment \x92\nSL_FLEET_FENCE=required\n")
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0", env_over=_in_a_pane(rig))
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert "Traceback" not in out
+    # ...and it fails CLOSED: an unreadable declaration is not "this machine is unfenced".
+    assert "required" in out
+
+
+def test_a_nul_in_the_value_never_stops_the_runner_from_starting(rig):
+    # os.environ refuses an embedded NUL with a ValueError; a crash-truncated file is that shape.
+    _arm(rig, "SL_FLEET_FENCE=requ\0ired\n")
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0", env_over=_in_a_pane(rig))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Traceback" not in r.stdout + r.stderr
+    assert "required" in r.stdout
+
+
+def test_resume_arms_the_gate_too_and_keeps_its_json_parseable(rig):
+    # `superlooper resume i<N>` is the FOURTH spawner and the only one besides the runner that can
+    # put a WORKER on the host — so on a built fleet machine it must not fly the one launch class
+    # the fence exists to contain past a gate the machine already armed. Its stdout is a
+    # machine-readable answer the dashboard parses, so the arming says nothing there.
+    _arm(rig)
+    home = Path(rig.env["SL_HOME"]) / "o__r"
+    (home / "state" / "sessions").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "sessions" / "i101").write_text(
+        "11111111-2222-3333-4444-555555555555\n")
+    (home / "worktrees" / "i101").mkdir(parents=True, exist_ok=True)
+    seen = rig.tmp / "launcher-env"
+    launcher = _script(rig.tmp / "fake-launcher",
+                       'printf %%s "$SL_FLEET_FENCE" > %s\nexit 0\n' % seen)
+    r = cli(rig, "resume", "i101", "--repo", str(rig.repo), "--json",
+            env_over={"SL_LAUNCH_SESSION": str(launcher)})
+    assert seen.exists(), r.stdout + r.stderr
+    assert seen.read_text() == "required", "a revived WORKER must meet the same gate"
+    # stdout stays a single machine-readable object: the dashboard parses it.
+    assert "fleet machine" not in r.stdout
+    assert json.loads(r.stdout.strip())["id"] == "i101"
+
+
 def test_the_file_may_not_set_the_rest_of_the_launchers_contract(rig):
     # An allow-list, not a general env file: SL_ATTENDED is pinned empty by the runner precisely
     # because an ambient value must never ride into a worker session, and a machine-level file that

@@ -561,22 +561,45 @@ def render_env_file(fence=session_host.FENCE_REQUIRED):
     the supported edit rather than left to "delete the file". Deleting it disarms too, and leaves
     nothing on disk that says so, which is indistinguishable from never having built (the same
     argument `session_host.fence_required` makes for the value existing at all).
+
+    ``fence`` is what the installer passes when the machine has already declared something — see
+    `keep_declared_fence`. Advertising an edit that the next `--install` silently reverts would be
+    a documented lie (fresh-agent review).
     """
     return (
         "# %s — read by `superlooper run` at boot (issue #355).\n"
         "#\n"
-        "# This file is what ARMS the launch pre-flight on this machine: with it, every `i<N>`\n"
+        "# This file is what ARMS the launch pre-flight on this machine: with it, an `i<N>`\n"
         "# worker launch probes the session host's control socket first and REFUSES (exit 9) when\n"
         "# a tokenless caller is served or the socket cannot be reached. Without it the launcher\n"
         "# checks nothing, which is the correct behaviour on a dev workstation running a stock\n"
         "# host — an unfenced socket is that machine's normal state.\n"
         "#\n"
         "# It is READ, never sourced, and only %s is applied. Written by\n"
-        "# `superlooper fleet --install`; re-running it rewrites this file.\n"
+        "# `superlooper fleet --install`, which KEEPS a value you have already set here.\n"
         "#\n"
         "# To take this machine OUT of the fenced set, change the value below to `off` rather than\n"
         "# deleting the file: a deleted file disarms too, and leaves nothing that says so.\n"
         "%s=%s\n" % (ENV_MARKER, ", ".join(ENV_VARS), session_host.FENCE_REQUIRED_VAR, fence))
+
+
+def keep_declared_fence(text):
+    """The switch value an existing file already declares, or the default — what `--install` writes.
+
+    A re-install is a build-up step an operator runs after a version bump, not a decision about
+    this machine's posture. The docs and the file's own header offer exactly one supported edit —
+    change the value to ``off`` — and an install that stamped ``required`` back over it would make
+    that instruction false the first time anybody followed it (fresh-agent review).
+
+    Only a value this engine RECOGNISES is kept. A typo is rewritten to the default rather than
+    preserved: the fail-closed reading of an unrecognised value belongs to the pre-flight's
+    refusal, where it is named and acted on, not to a file that would quietly carry it forever.
+    """
+    assignments, problem, _ = machine_env(text)
+    declared = (assignments.get(session_host.FENCE_REQUIRED_VAR) or "").strip().lower()
+    if problem or declared not in (session_host.FENCE_REQUIRED, session_host.FENCE_OFF):
+        return session_host.FENCE_REQUIRED
+    return declared
 
 
 def machine_env(text, present=None):
@@ -616,7 +639,12 @@ def machine_env(text, present=None):
             % (session_host.FENCE_REQUIRED_VAR, session_host.FENCE_REQUIRED)), []
     assignments, ignored = {}, []
     for raw in text.splitlines():
-        line = raw.strip()
+        # A trailing `# ...` is a COMMENT, stripped the same way `_read_toml_ish` strips one. The
+        # file's own body is full of comment lines and the docs invite a hand edit, so
+        # `SL_FLEET_FENCE=off  # taken out of the fleet` is a natural thing to type — and without
+        # this it parses as the value "off  # taken out of the fleet", which fails closed to armed
+        # and leaves an operator staring at a machine that ignored their edit (fresh-agent review).
+        line = re.sub(r"\s+#.*$", "", raw).strip()
         if not line or line.startswith("#"):
             continue
         # `export K=V` and quoted values are read even though nothing ever sources this file: an
@@ -636,12 +664,18 @@ def machine_env(text, present=None):
             continue
         assignments[key] = value
     problem = None
-    if not (assignments.get(session_host.FENCE_REQUIRED_VAR) or "").strip():
+    declared = assignments.get(session_host.FENCE_REQUIRED_VAR) or ""
+    if not declared.strip() or "\0" in declared:
         # Present-but-empty is the #300 landmine shape: it reads to a human as "set" and to a
         # parser as nothing at all. `off` is the word that disarms; an empty value is a broken file.
+        #
+        # A NUL is refused here rather than carried (fresh-agent review, P0): `os.environ` rejects
+        # an embedded NUL with a ValueError, and the caller of this is a RUNNER'S BOOT — a
+        # crash-truncated or NUL-padded file must produce the fail-closed verdict, not a traceback
+        # from a process whose only job is to keep running.
         assignments.update(fallback)
-        problem = ("it names no %s, so what this machine declares is unknown — a runner booting "
-                   "here fails closed and arms the gate anyway (%s=%s)"
+        problem = ("it names no usable %s, so what this machine declares is unknown — a runner "
+                   "booting here fails closed and arms the gate anyway (%s=%s)"
                    % (session_host.FENCE_REQUIRED_VAR, session_host.FENCE_REQUIRED_VAR,
                       session_host.FENCE_REQUIRED))
     return assignments, problem, ignored
@@ -651,12 +685,24 @@ def load_machine_env(probe, fleet_prefix):
     """`machine_env` for the file on disk — the ONE reader the runner's boot and the judge share.
 
     Two callers that read one file with two readers is two answers, and the pair that matters here
-    is "the report says armed" / "the runner is not". `exists` before `read_text` for the reason
-    `machine_env` takes ``present``: the reader cannot tell absence from an unreadable file, and
-    those are the opposite verdicts.
+    is "the report says armed" / "the runner is not". Presence is read FIRST and never inferred
+    from the content, for the reason `machine_env` takes ``present``: a reader cannot tell absence
+    from an unreadable file, and those are the opposite verdicts. Reading it second also means a
+    file unlinked mid-call still counts as present, which is the fail-CLOSED order (fresh-agent
+    review) — the other way round, a race would hand back "this machine declares nothing".
+
+    A read that RAISES is the same fact as a read that returns None: the file is there and cannot
+    be turned into a declaration. `Probe.read_text` catches OSError only, so an undecodable byte —
+    which the rendered file's own em dashes invite, one editor round-trip away — arrives here as a
+    UnicodeDecodeError, and this is a runner's boot path (fresh-agent review, P0).
     """
     path = env_file(fleet_prefix)
-    return machine_env(probe.read_text(path), present=probe.exists(path))
+    present = probe.exists(path)
+    try:
+        text = probe.read_text(path)
+    except (OSError, ValueError):
+        text = None
+    return machine_env(text, present=present)
 
 
 def apply_machine_env(env, assignments):
@@ -963,19 +1009,26 @@ def check_launch_gate(probe, fleet_prefix, env=None):
         return CheckResult(
             name, False,
             "the launch gate is NOT armed on this machine: there is no %s, so a runner booting here "
-            "carries no %s and every `i<N>` launch flies without probing the control socket first "
-            "— which is the state a fenced-looking machine is silently in%s"
+            "carries no %s and an `i<N>` launch flies without probing the control socket first "
+            "— which is the state a fenced-looking machine is silently in%s. (A machine armed the "
+            "OLD way — the variable set by hand on the runner's own process, which is how #326 "
+            "shipped — is genuinely armed and still reads RED here: this block judges the machine, "
+            "not a shell, and it cannot see another process's environment. Re-run the install.)"
             % (path, session_host.FENCE_REQUIRED_VAR,
-               (". (This command's own environment sets %s=%r, so a runner started from THIS shell "
-                "would be armed — but a login item, or any other shell, would not.)"
+               (". This command's own environment sets %s=%r, so a runner started from THIS shell "
+                "would be armed — but a login item, or any other shell, would not"
                 % (session_host.FENCE_REQUIRED_VAR, ambient)) if ambient else ""),
             fix)
     declared = assignments[session_host.FENCE_REQUIRED_VAR]
     required, unrecognised = session_host.fence_required(assignments)
     if problem:
+        # `--install` will NOT rewrite a file it cannot read — it cannot prove such a file is its
+        # own, which is the rule that protects every other file it touches — so naming the install
+        # alone would be a fix that refuses when followed (found by driving it).
         return CheckResult(
             name, False, "%s: %s" % (path, problem),
-            "re-run `superlooper fleet --install` to rewrite it (or repair the line by hand)")
+            "repair the %s= line by hand, or move the file aside and re-run `superlooper fleet "
+            "--install` to write a fresh one" % session_host.FENCE_REQUIRED_VAR)
     if not required:
         return CheckResult(
             name, False,
@@ -985,24 +1038,32 @@ def check_launch_gate(probe, fleet_prefix, env=None):
             % (path, session_host.FENCE_REQUIRED_VAR, declared),
             "set it back to %r, or accept that this machine is not a fleet machine"
             % session_host.FENCE_REQUIRED)
-    notes = []
+    # Each note carries its OWN remedy (fresh-agent review): the file is correct in every one of
+    # these cases, so "run `fleet --install`" — which would rewrite a file that is already right —
+    # is the wrong instruction for two of the three, and a fix an operator follows and gains
+    # nothing from is how the fix line stops being read.
+    notes, fixes = [], []
     if unrecognised:
         notes.append("the value %r is not one this engine recognises, so the pre-flight reads it as "
                      "'required' and names it in the refusal" % unrecognised)
+        fixes.append("spell the value %r" % session_host.FENCE_REQUIRED)
     if ambient and ambient != declared:
         notes.append("this command's own environment sets %s=%r; the machine's file wins at boot, "
                      "so a runner is armed anyway — but that variable is doing nothing"
                      % (session_host.FENCE_REQUIRED_VAR, ambient))
+        fixes.append("unset %s wherever it is exported — the machine's file is what arms a runner "
+                     "now" % session_host.FENCE_REQUIRED_VAR)
     if ignored:
         notes.append("it also names %s, which a runner never applies: this file may set only %s"
                      % (", ".join(sorted(set(ignored))), ", ".join(ENV_VARS)))
+        fixes.append("remove the other lines from %s" % path)
     return CheckResult(
         name, True,
         "%s sets %s=%s, so a runner booting here refuses an `i<N>` launch onto a control socket "
         "that is not fenced (exit 9)%s"
         % (path, session_host.FENCE_REQUIRED_VAR, declared,
            " — " + "; ".join(notes) if notes else ""),
-        fix if notes else "", warn=bool(notes))
+        "; ".join(fixes), warn=bool(notes))
 
 
 def wait_for_fence(socket, fence=None, sleep=None, attempts=15, pause=1.0):

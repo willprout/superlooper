@@ -6309,6 +6309,26 @@ def test_run_script_stderr_tail_is_bounded(rig):
     assert 0 < len(rc.stderr_tail) <= evidence.STDERR_TAIL_MAX + 1
 
 
+def test_a_worker_launch_inherits_the_machines_fence_switch(rig, tmp_path, monkeypatch):
+    """The runner arms ITSELF at boot (issue #355) and the launcher is a child of that process —
+    so the switch reaches the pre-flight through `_run_script`'s merge over `os.environ` and
+    through nothing else.
+
+    This pins the hop, because the way to break it is invisible: `_script_env` is a list of `SL_*`
+    variables deliberately PINNED EMPTY so an ambient value cannot ride into a worker, and adding
+    `SL_FLEET_FENCE` to that list would look exactly like it belonged. It would disarm the gate on
+    every runner launch on the fleet machine, and every other test here would stay green.
+    """
+    monkeypatch.setenv("SL_FLEET_FENCE", "required")
+    seen = tmp_path / "seen"
+    r = runner_mod.Runner(repo=str(rig.repo), config=make_config(),
+                          state_home=str(rig.home / "x"), pane="p", fetch_usage=lambda: {})
+    rc = r._run_script(["/bin/sh", "-c", 'printf %%s "$SL_FLEET_FENCE" > %s' % seen],
+                       env=r._worker_env("i101"))
+    assert int(rc) == 0
+    assert seen.read_text() == "required", "the launcher child must see the machine's switch"
+
+
 def test_a_failed_launch_journals_the_dead_anchor_not_a_bare_code(rig):
     rig.r.tick(now=NOW)
     rig.calls.clear()

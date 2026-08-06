@@ -470,6 +470,69 @@ def test_a_file_that_cannot_be_read_fails_closed_to_required():
     assert problem and "read" in problem
 
 
+def test_a_reader_that_RAISES_is_the_same_fact_as_one_that_cannot_read():
+    # The caller is a RUNNER'S BOOT (fresh-agent review, P0). `Probe.read_text` catches OSError
+    # only, so an undecodable byte arrives here as a UnicodeDecodeError — and the file this very
+    # build-up writes is full of em dashes, one editor round-trip away from exactly that. A
+    # traceback out of this function is a runner that does not start, on every resurrect.
+    class _Raises(FakeProbe):
+        def read_text(self, path):
+            raise UnicodeDecodeError("utf-8", b"\x92", 0, 1, "invalid start byte")
+    probe = _Raises(files={fleet.env_file(_PREFIX): "unused"}, home=_HOME)
+    assignments, problem, _ = fleet.load_machine_env(probe, _PREFIX)
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+    assert problem
+
+
+def test_a_value_carrying_a_nul_is_refused_rather_than_handed_to_the_environment():
+    # `os.environ` rejects an embedded NUL with a ValueError, and a crash-truncated or NUL-padded
+    # file is exactly the shape that produces one. Fail closed, never raise.
+    assignments, problem, _ = fleet.machine_env(
+        "%s=requ\0ired\n" % session_host.FENCE_REQUIRED_VAR)
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+    assert problem
+    env = {}
+    fleet.apply_machine_env(env, assignments)          # the real environ would raise on a NUL
+    assert "\0" not in env[session_host.FENCE_REQUIRED_VAR]
+
+
+def test_presence_is_read_before_the_content_so_a_race_fails_closed():
+    # Reading presence SECOND would let a file unlinked mid-call come back as "this machine
+    # declares nothing" — a silent disarm out of a race (fresh-agent review).
+    class _Vanishing(FakeProbe):
+        def exists(self, path):
+            return True
+        def read_text(self, path):
+            return None
+    assignments, problem, _ = fleet.load_machine_env(_Vanishing(home=_HOME), _PREFIX)
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+    assert problem
+
+
+def test_a_trailing_comment_on_the_value_line_is_a_comment():
+    # The docs invite exactly this edit, and the file's own body is full of `#` lines — so
+    # `SL_FLEET_FENCE=off  # taken out of the fleet` must disarm rather than parse as an
+    # unrecognised value that fails closed to armed and ignores the operator (fresh-agent review).
+    assignments, problem, _ = fleet.machine_env(
+        "%s=off   # taken out of the fleet 2026-08-06\n" % session_host.FENCE_REQUIRED_VAR)
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: "off"} and problem is None
+
+
+def test_a_reinstall_keeps_a_value_the_machine_already_declared():
+    # `--install` is a build-up step after a version bump, not a decision about this machine's
+    # posture — and the file's own text offers `off` as THE supported edit. Stamping `required`
+    # back over it would make that instruction false the first time anybody followed it.
+    disarmed = fleet.render_env_file(session_host.FENCE_OFF)
+    assert fleet.keep_declared_fence(disarmed) == session_host.FENCE_OFF
+    assert session_host.FENCE_REQUIRED_VAR + "=off" in disarmed
+    # ...but only a value this engine RECOGNISES. A typo is not preserved forever: the fail-closed
+    # reading of one belongs to the refusal that names it, not to a file that carries it silently.
+    assert fleet.keep_declared_fence("%s=requried\n" % session_host.FENCE_REQUIRED_VAR) \
+        == session_host.FENCE_REQUIRED
+    assert fleet.keep_declared_fence(None) == session_host.FENCE_REQUIRED
+    assert fleet.keep_declared_fence("# nothing here\n") == session_host.FENCE_REQUIRED
+
+
 def test_an_unrecognised_spelling_is_carried_verbatim_rather_than_repaired():
     # The switch's parsing belongs to session_host.fence_required (#326) and is not re-implemented
     # here: a typo must reach it intact so the launch refusal can NAME the value it refused on.
