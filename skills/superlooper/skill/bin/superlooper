@@ -1049,15 +1049,33 @@ def cmd_request_restart(args):
 # job that is mid-teardown (fresh-agent review).
 #
 # The runner honours SIGTERM at the safe point BETWEEN ticks, so the budget covers one sleep
-# (TICK_SECONDS) plus the tail of a tick already in flight. Nothing escalates to SIGKILL when it
-# expires: a runner finishing a merge is a runner doing the right thing, and the two durable facts —
-# the marker and the unloaded job — already guarantee nothing brings it back once it does exit.
+# (TICK_SECONDS) plus the tail of a tick already in flight. THIS verb never escalates to SIGKILL —
+# but launchd does (fresh-agent review): the shipped job sets no `ExitTimeOut`, so a login-item
+# runner that has not exited within launchd's own default is hard-killed, well inside a long tick.
+# That is survivable by construction — the runner reconciles from GitHub and disk on every boot,
+# which is the same guarantee a crash already rests on — and it is stated here rather than promised
+# away, because "it stops at the end of its tick" is not something this verb can honestly offer in
+# the home it exists for.
 _STOP_WAIT_SECONDS = 30
-# launchd's rcs for a boot-out that is UNDER WAY rather than refused: 36 is its own EINPROGRESS (the
-# answer to a second `stop` while the first is still tearing down), and 124 is our own wait expiring
-# while launchd carries on. Neither means "launchd will restart this" — which is the only thing this
-# verb's failure verdict is about — so neither is a failed stop.
-_BOOTOUT_IN_FLIGHT = (36, 124)
+# launchd's own EINPROGRESS: a boot-out is UNDER WAY rather than refused — the answer to a second
+# `stop` while the first is still tearing down. It does not mean "launchd will restart this", which
+# is the only thing this verb's failure verdict is about, so it is not a failed stop.
+#
+# Our OWN timeout (124) is deliberately NOT in here (fresh-agent review). It is not something
+# launchd said — it is us giving up on the read — and reading it as "a teardown is under way" would
+# print "runner stopped" over a wedged launchd that never started one, after which KeepAlive
+# restarts the runner and the reborn runner clears the marker. The off switch, silently defeated,
+# behind a success message. 124 is unknown, and unknown is not held.
+_BOOTOUT_IN_PROGRESS = 36
+# How long the JOB's own state is polled for after the boot-out returns. Short, because by then
+# launchd has already done the work — `bootout` blocks through the teardown — so this is a
+# confirmation, not a wait. The exception is an in-progress teardown, which gets the whole budget
+# because that is the case where the answer genuinely changes.
+_JOB_CONFIRM_SECONDS = 5
+
+# launchd naming THIS service as absent — the ONLY reading that means "the job is not loaded". See
+# _service_view for why nothing weaker qualifies.
+_NO_SUCH_SERVICE_RE = re.compile(r"could not find service", re.I)
 # How long `start` waits for the bootstrapped job to report a pid before saying so.
 _START_WAIT_SECONDS = 20
 
@@ -1091,9 +1109,16 @@ def _service_view(job_label):
     if rc in (124, 126):
         return None, None
     if rc != 0:
-        if "could not find domain" in (out or "").lower():
-            return None, None                    # the DOMAIN did not answer — we learned nothing
-        return False, None                       # launchctl answered: no such service in this domain
+        # POSITIVE-ONLY, and the polarity is the whole point (fresh-agent review). Measured on
+        # macOS 25.2: a missing SERVICE is rc 113 with `Could not find service "<label>" in domain
+        # for user gui: <uid>`, while a missing DOMAIN is rc 112 with `Could not find domain for
+        # user gui: <uid>` — and beyond those two there is an open set (an I/O error, a permissions
+        # refusal, a future wording). Treating "not rc 0" as "the job is gone" turns every one of
+        # them into "your runner is stopped", told to an owner going to bed. So only launchd
+        # naming THIS SERVICE as absent counts; everything else is unknown.
+        if _NO_SUCH_SERVICE_RE.search(out or ""):
+            return False, None
+        return None, None
     return True, runner_home.service_pid(out)
 
 
@@ -1207,9 +1232,15 @@ def _emit_stop(args, result):
                              "still watched, but once this one does go down — for any reason — the "
                              "record stands and the watchdog will not restart it. "
                              "`superlooper start` withdraws it.\n" % result.get("marker"))
+        if result.get("job_state") == "gone":
+            # The half that DID work, said out loud: a stop that booted the job out and then
+            # declined to signal a pid is not the same failure as one that changed nothing.
+            sys.stdout.write("  the job %s IS booted out of %s — launchd is not the problem here.\n"
+                             % (result.get("job"), result.get("domain")))
         sys.stdout.write("  %s\n" % result.get("remedy", ""))
         return
-    sys.stdout.write("runner stopped.\n")
+    sys.stdout.write("runner stopped.\n" if result.get("process_gone")
+                     else "stop recorded — the runner has not gone yet.\n")
     sys.stdout.write("  marker:   %s  (deliberate — the watchdog stands down while it is there)\n"
                      % result.get("marker"))
     if result.get("job"):
@@ -1217,8 +1248,8 @@ def _emit_stop(args, result):
             "gone": "%s is booted out of %s — launchd has nothing to restart until your next login",
             "tearing_down": "launchd is still tearing %s out of %s — it is on its way out, and a "
                             "job being removed is not a job that gets restarted",
-            "unconfirmed": "the boot-out of %s from %s returned ok, but launchctl could not be read "
-                           "back to confirm it",
+            "unconfirmed": "the boot-out of %s from %s was accepted, but launchctl could not be "
+                           "read back to confirm the job is gone",
         }[result.get("job_state", "unconfirmed")] % (result["job"], result.get("domain")) + "\n")
     if not result.get("was_running"):
         sys.stdout.write("  process:  no runner was live for this repo — the stop is recorded "
@@ -1256,15 +1287,31 @@ def cmd_stop(args):
     windows put those two facts out of order.
     """
     from runner import live_runner_pid, write_stop_marker
-    cfg = _load_config(args.repo)
+    try:
+        cfg = _load_config(args.repo)
+    except (OSError, ValueError) as e:
+        # A --json caller must never get a traceback (it is a UI's only channel), and a config this
+        # verb cannot read is a repo it cannot address: nothing was attempted, so nothing is
+        # recorded — the marker is never written on this path.
+        _emit_stop(args, {"ok": False, "verb": "stop", "home": None, "was_running": None,
+                          "pid": None, "job": None, "domain": None, "held": False,
+                          "job_state": None, "process_gone": False, "signal_refused": None,
+                          "marker": None, "start": None,
+                          "error": "this repo's .superlooper/config.json could not be read (%s), so "
+                                   "nothing was taken down and no stop was recorded" % e,
+                          "remedy": "fix the config, then re-run"})
+        return 2
     state_home = str(config_lib.state_home(cfg))
     state_dir = os.path.join(state_home, "state")
     os.makedirs(state_dir, exist_ok=True)
     home = runner_home.kind(cfg)
     pid = live_runner_pid(state_dir)
+    # Every field a --json consumer branches on is present from the start, whatever path this takes:
+    # a key that appears only on some outcomes is a key a caller reads as False on the others.
+    # `held` starts True for the pane home, which has no supervisor to hold and so cannot fail to.
     result = {"ok": True, "verb": "stop", "home": home, "was_running": pid is not None,
-              "pid": pid, "job": None, "domain": None, "held": True,
-              "process_gone": pid is None, "marker": None,
+              "pid": pid, "job": None, "domain": None, "held": True, "job_state": None,
+              "process_gone": pid is None, "signal_refused": None, "marker": None,
               "start": "superlooper start --repo %s" % os.path.abspath(args.repo)}
     try:
         result["marker"] = write_stop_marker(state_dir, {
@@ -1291,9 +1338,12 @@ def cmd_stop(args):
         try:
             job = runner_home.label(cfg["repo"])
         except (KeyError, TypeError, ValueError):
-            # NOTHING was attempted, so the marker comes back off: a record of a stop that never
-            # reached the runner would stand on disk and quietly stand the watchdog down the next
-            # time this loop dies for real (fresh-agent review).
+            # Belt-and-braces: `config.load` above already refuses every slug this could fail on, so
+            # today this is unreachable — it is here because `label()` is DOCUMENTED to raise rather
+            # than sanitize, and a future caller that skips that door must not get a traceback. If it
+            # ever does fire, NOTHING was attempted, so the marker comes back off: a record of a stop
+            # that never reached the runner would stand on disk and quietly stand the watchdog down
+            # the next time this loop dies for real.
             from runner import clear_stop_marker
             clear_stop_marker(state_dir)
             result.update(ok=False, held=False, marker=None,
@@ -1314,12 +1364,14 @@ def cmd_stop(args):
         # is already gone, and rc 36/124 mean a teardown UNDER WAY — which is not the failure this
         # verb's verdict is about. The only failure is "launchd can restart this", and launchd
         # cannot restart a job it is in the middle of removing.
+        in_flight = rc == _BOOTOUT_IN_PROGRESS
+        job_deadline = min(deadline, time.time() + (_STOP_WAIT_SECONDS if in_flight
+                                                    else _JOB_CONFIRM_SECONDS))
         while True:
             loaded, job_pid = _service_view(job)
-            if loaded is False or time.time() >= deadline:
+            if loaded is False or time.time() >= job_deadline:
                 break
             time.sleep(0.25)
-        in_flight = rc in _BOOTOUT_IN_FLIGHT
         result["held"] = (loaded is False) or in_flight or (loaded is None and rc in (0, 3))
         # Three different true things, said as three different sentences: launchd no longer has the
         # job / launchd is in the middle of removing it / the bootout returned ok but launchctl
@@ -1426,7 +1478,16 @@ def cmd_start(args):
     one line to type, and the runner clears the stop itself when it boots.
     """
     from runner import clear_stop_marker, live_runner_pid, read_stop_marker
-    cfg = _load_config(args.repo)
+    try:
+        cfg = _load_config(args.repo)
+    except (OSError, ValueError) as e:
+        _emit_start(args, {"ok": False, "verb": "start", "home": None, "cleared": False,
+                           "started": False, "job": None, "domain": None, "pid": None,
+                           "already_running": False, "manual": None,
+                           "error": "this repo's .superlooper/config.json could not be read "
+                                    "(%s), so nothing was started and any recorded stop stands" % e,
+                           "remedy": "fix the config, then re-run"})
+        return 2
     state_home = str(config_lib.state_home(cfg))
     state_dir = os.path.join(state_home, "state")
     os.makedirs(state_dir, exist_ok=True)
@@ -3305,6 +3366,21 @@ def _watchdog_stopped(state_dir):
     return read_stop_marker(state_dir) is not None
 
 
+def _watchdog_runner_started(state_dir):
+    """When the LIVE runner took the singleton, from its pidfile's mtime — or None.
+
+    The pidfile is written once, by the process that won the lock, and never refreshed (the re-exec
+    path adopts it in place rather than rewriting it), so its mtime is that runner's start. None
+    whenever there is no live runner, so the fact can never be read about a corpse."""
+    from runner import live_runner_pid
+    if live_runner_pid(state_dir) is None:
+        return None
+    try:
+        return os.path.getmtime(os.path.join(state_dir, "runner.lock"))
+    except OSError:
+        return None
+
+
 def _watchdog_runner_live(state_dir):
     """True when state/runner.lock names a LIVE pid — the positive twin of ``_watchdog_runner_dead``.
 
@@ -3657,6 +3733,9 @@ def cmd_watchdog(args):
                 # late as the view is built and evaluate() is pure, so the window between "the
                 # marker lands" and "we act" is arithmetic, not I/O.
                 "stopped_by_owner": _watchdog_stopped(state_dir),
+                # WHEN this runner started, so a heartbeat it inherited from the previous process
+                # is not read as its own silence. Nothing stamps the heartbeat at boot.
+                "runner_started_at": _watchdog_runner_started(state_dir),
                 # A stop that was REQUESTED is not a stop that TOOK (fresh-agent review): the pure
                 # core honours the marker only when this is False, so a runner still up — because
                 # the stop timed out on a long tick, or the bootout failed — is still watched.
@@ -4506,8 +4585,11 @@ def main(argv=None):
             "`superlooper stop`.\n"
             "\n"
             "login-item: the job is bootstrapped back into gui/$UID and this waits for it to\n"
-            "report a pid. pane: the stop is cleared and the one-line manual start is handed back,\n"
-            "because a runner there must live in a visible tab a human opened.\n"
+            "report a pid, and only a runner that is provably up clears the stop.\n"
+            "\n"
+            "pane: a runner there must live in a visible tab a human opened, so this can only hand\n"
+            "back the one line to type — and it deliberately leaves the stop STANDING, because it\n"
+            "is still true until a runner boots. That runner clears it itself.\n"
             "\n"
             "It refuses BEFORE changing anything when there is no job installed, so a failed start\n"
             "leaves the loop exactly as off as it was."),

@@ -68,7 +68,13 @@ case "$1" in
       ;;
   print)
       lbl="${2##*/}"
-      [ -f "$LAUNCHD_JOBS/$lbl" ] || exit 113
+      # launchd's REAL words for an absent service, measured on macOS 25.2 — the engine reads them
+      # positively now, so a stub that only exited nonzero would be testing a different launchd.
+      if [ ! -f "$LAUNCHD_JOBS/$lbl" ]; then
+        echo "Bad request." >&2
+        echo "Could not find service \"$lbl\" in domain for user gui: $(id -u)" >&2
+        exit 113
+      fi
       printf '\tpid = %s\n\tstate = running\n' "$(cat "$LAUNCHD_JOBS/$lbl")"
       ;;
 esac
@@ -443,7 +449,7 @@ def test_a_bootout_the_service_confirms_took_is_a_stop_whatever_the_rc_said(rig)
                                    'case "$1" in\n'
                                    '  managername) echo Aqua ;;\n'
                                    '  bootout) exit 36 ;;\n'
-                                   '  print) exit 113 ;;\n'
+                                   '  print) echo "Could not find service \\"x\\" in domain" >&2; exit 113 ;;\n'
                                    'esac\nexit 0\n')
     r = cli(rig, "stop")
     assert r.returncode == 0, r.stdout + r.stderr
@@ -499,7 +505,7 @@ def test_a_start_that_comes_up_with_nothing_running_is_a_failure(rig):
     cli(rig, "stop")
     _script(rig.tmp / "launchctl", '#!/bin/sh\ncase "$1" in\n'
                                    '  managername) echo Aqua ;;\n'
-                                   '  print) exit 113 ;;\n'
+                                   '  print) echo "Could not find service \\"x\\" in domain" >&2; exit 113 ;;\n'
                                    'esac\nexit 0\n')
     r = cli(rig, "start", "--json")
     assert r.returncode != 0, r.stdout
@@ -527,31 +533,67 @@ def test_a_bootout_still_in_flight_is_not_called_a_failed_stop(rig):
     assert doc["job_state"] == "tearing_down", doc
 
 
-def test_a_domain_that_cannot_be_read_is_never_reported_as_a_booted_out_job(rig):
-    # `launchctl print` exits 113 both for "no such service" — the fact we want — and for "could not
-    # find domain", which is what a run from outside the Aqua session gets and which says nothing
-    # about the service. Reading the second as the first tells an owner going to bed that their
-    # loop is off because we could not reach launchd.
+@pytest.mark.parametrize("answer", [
+    'echo "Could not find domain for user gui: 501" >&2; exit 112',   # the domain, not the service
+    'echo "Could not print domain: 5: Input/output error" >&2; exit 5',
+    'exit 113',                                                       # nonzero, and says nothing
+])
+def test_only_launchd_naming_the_service_absent_counts_as_a_gone_job(rig, answer):
+    # Measured on macOS 25.2: an absent SERVICE is rc 113 + `Could not find service "<label>" …`,
+    # an absent DOMAIN is rc 112 + `Could not find domain …`, and past those two there is an open
+    # set. Reading "not rc 0" as "the job is gone" turns every one of them into "your runner is
+    # stopped", told to an owner going to bed.
     write_config(rig, runner_home="login-item")
     _script(rig.tmp / "launchctl", '#!/bin/sh\necho "$@" >> "$LAUNCHCTL_LOG"\n'
                                    'case "$1" in\n'
                                    '  managername) echo Aqua ;;\n'
-                                   'esac\n'
-                                   'echo "Could not find domain for gui/501" >&2\nexit 113\n')
+                                   '  print) %s ;;\n'
+                                   'esac\nexit 0\n' % answer)
     r = cli(rig, "stop", "--json")
     doc = json.loads(r.stdout)
     assert doc["job_state"] != "gone", doc
     assert "booted out" not in r.stdout
 
 
-def test_a_stop_that_attempted_nothing_takes_its_marker_back(rig):
-    # A garbled `repo` means the job cannot even be addressed. Leaving the record on disk would
-    # stand the watchdog down the next time this loop dies for real, over a stop that never
-    # reached it.
-    write_config(rig, runner_home="login-item", repo="not-a-slug")
-    r = cli(rig, "stop")
+def test_our_own_timeout_is_never_reported_as_launchds_teardown(rig):
+    # rc 124 comes from US giving up on the read, not from launchd. Calling it "a teardown is under
+    # way" prints "runner stopped" over a wedged launchd that never started one — after which
+    # KeepAlive restarts the runner and the reborn runner clears the marker. The off switch,
+    # silently defeated, behind a success message.
+    write_config(rig, runner_home="login-item")
+    _script(rig.tmp / "launchctl", '#!/bin/sh\necho "$@" >> "$LAUNCHCTL_LOG"\n'
+                                   'case "$1" in\n'
+                                   '  managername) echo Aqua ;;\n'
+                                   '  bootout) sleep 60 ;;\n'
+                                   '  print) printf "\\tpid = 4242\\n\\tstate = running\\n" ;;\n'
+                                   'esac\nexit 0\n')
+    r = cli(rig, "stop", "--json", timeout=120)
+    doc = json.loads(r.stdout)
+    assert doc["ok"] is False, doc
+    assert doc["job_state"] != "tearing_down", doc
     assert r.returncode != 0
+
+
+def test_a_config_that_cannot_be_read_is_refused_without_recording_a_stop(rig):
+    # A garbled config means the repo cannot be addressed at all. Nothing is attempted, so nothing
+    # is recorded — a marker left behind would stand the watchdog down the next time this loop dies
+    # for real. And it must come back as a RESULT, not a traceback: --json is a UI's only channel.
+    write_config(rig, runner_home="login-item", repo="not-a-slug")
+    r = cli(rig, "stop", "--json")
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr, r.stderr
+    assert json.loads(r.stdout)["ok"] is False
     assert marker(rig) is None, "nothing was attempted, so nothing should be recorded"
+
+
+def test_a_config_that_cannot_be_read_leaves_a_recorded_stop_standing(rig):
+    write_config(rig, runner_home="login-item")
+    cli(rig, "stop")
+    write_config(rig, runner_home="login-item", repo="not-a-slug")
+    r = cli(rig, "start", "--json")
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr, r.stderr
+    assert json.loads(r.stdout)["ok"] is False
 
 
 def test_start_reports_started_separately_from_ok(rig):
@@ -562,11 +604,15 @@ def test_start_reports_started_separately_from_ok(rig):
     assert doc["ok"] is True and doc["started"] is False, doc
 
 
-def test_a_start_journals_the_landing_once_not_twice(rig):
+def test_start_journals_the_landing_only_when_it_is_the_one_that_cleared_the_stop(rig):
+    # The booting runner clears the marker and journals the same landing itself. This verb must
+    # journal only when ITS clear was the one that found something, or a start races the runner it
+    # just launched and the morning journal double-counts it.
     write_config(rig, runner_home="login-item")
     (rig.launchagents / (LABEL + ".plist")).write_text("<plist/>")
-    cli(rig, "stop")
-    cli(rig, "start")
-    starts = [json.loads(l) for l in (rig.home / "journal.jsonl").read_text().splitlines()
-              if l.strip() and json.loads(l).get("outcome") == "started"]
-    assert len(starts) == 1, starts
+    r = cli(rig, "start")                                  # no stop was ever recorded
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = (rig.home / "journal.jsonl").read_text().splitlines() if (
+        rig.home / "journal.jsonl").exists() else []
+    starts = [l for l in lines if l.strip() and json.loads(l).get("outcome") == "started"]
+    assert starts == [], starts

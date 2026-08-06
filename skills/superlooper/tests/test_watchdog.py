@@ -871,3 +871,32 @@ def test_the_two_off_switches_never_swallow_each_others_first_record():
     assert _outcomes(stopped) == ["runner_stopped"]
     off_again = _run(T0 + 10 * MIN, _dead(T0 + 10 * MIN, kill_switch=True), stopped["state"])
     assert _outcomes(off_again) == ["disabled"], "the kill switch's record was swallowed"
+
+
+def test_a_runner_that_just_booted_is_not_called_wedged_on_the_heartbeat_it_inherited():
+    # Nothing stamps the heartbeat at BOOT — only the end of a successful tick does. So for the
+    # tens of seconds between winning the singleton and finishing tick one, a freshly started
+    # runner is judged on the previous process's silence. After an overnight stop that reads as
+    # "stale 600 min", and the first check after `superlooper start` texts the owner about the
+    # outage they just ended.
+    now = T0 + 600 * MIN
+    r = _run(now, _view(now, heartbeat=T0, runner_live=True, runner_started_at=now - 20))
+    assert r["notify"] == []
+    assert r["state"]["episode"] is None
+
+
+def test_a_runner_that_has_been_up_past_the_bound_and_still_has_not_ticked_is_wedged():
+    # The other half: the suppression is about evidence, not mercy. Once the runner is older than
+    # the staleness bound, its silence is its OWN.
+    now = T0 + 600 * MIN
+    r = _run(now, _view(now, heartbeat=T0, runner_live=True, runner_started_at=now - 25 * MIN))
+    assert r["state"]["episode"] is not None
+    assert r["state"]["episode"]["signals"] == ["heartbeat_stale"]
+
+
+def test_a_dead_runner_is_never_excused_by_a_start_time():
+    # The suppression rides on runner_live. A corpse with a recent-looking start time must still
+    # be resurrected, or a crash right after a restart would go unnoticed.
+    now = T0 + 600 * MIN
+    r = _run(now, _dead(now, stale_min=600, runner_started_at=now - 20))
+    assert r["resurrect"] is not None

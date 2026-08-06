@@ -126,9 +126,17 @@ class _Rig:
     def wstate(self):
         return json.loads((self.home / "state" / "watchdog.json").read_text())
 
-    def runner_lock(self, pid):
+    def runner_lock(self, pid, age=None):
         # A pidfile the dead runner left behind (a crash leaves it; a clean stop removes it).
-        (self.home / "state" / "runner.lock").write_text(str(pid))
+        # `age` back-dates its mtime: the pidfile is written once, by the process that won the
+        # singleton, so its mtime is that runner's START — and a runner younger than the staleness
+        # bound is judged as booting, not wedged (issue #239). A test about a WEDGED runner has to
+        # say the runner has been up a while, or it is describing a different situation.
+        path = self.home / "state" / "runner.lock"
+        path.write_text(str(pid))
+        if age is not None:
+            when = time.time() - age
+            os.utime(path, (when, when))
 
     def wjournal(self):
         return [r for r in journal.read(str(self.home)) if r.get("act") == "watchdog"]
@@ -573,11 +581,11 @@ def test_clean_stop_no_pidfile_is_not_resurrected(tmp_path):
 
 
 def test_live_runner_pidfile_is_wedged_not_dead(tmp_path):
-    # heartbeat stale but the recorded pid is ALIVE = a wedged loop (up, not ticking). That is the
-    # debugger's job, not a restart.
+    # heartbeat stale but the recorded pid is ALIVE, and up long enough to be judged on its OWN
+    # silence = a wedged loop (up, not ticking). That is the debugger's job, not a restart.
     rig = _Rig(tmp_path)
     rig.heartbeat(3600)
-    rig.runner_lock(os.getpid())                     # a real, alive pid
+    rig.runner_lock(os.getpid(), age=3600)           # a real, alive pid, up for an hour
     rig.anchor()
     r = rig.run()
     assert r.returncode == 0, r.stderr
@@ -715,3 +723,21 @@ def test_every_disabled_check_names_what_it_observed_not_just_the_first(tmp_path
         assert "no signal" not in r.stdout, (check, r.stdout)
     assert [x["outcome"] for x in rig.wjournal()] == ["disabled"]   # record stays deduped: 1, not 3
     assert rig.resurrect_calls() == []
+
+
+def test_a_runner_that_only_just_booted_is_not_diagnosed_on_the_old_heartbeat(tmp_path):
+    # The sibling of the test above, and the reason it had to say how long the runner had been up
+    # (issue #239). Nothing stamps the heartbeat at BOOT — only the end of a successful tick does —
+    # so between winning the singleton and finishing tick one, a freshly started runner carries the
+    # PREVIOUS process's heartbeat. After a night switched off that reads as "stale 60 min", and
+    # the first check after `superlooper start` would text the owner about the outage they just
+    # ended and then hire a debugger for it.
+    rig = _Rig(tmp_path)
+    rig.heartbeat(3600)
+    rig.runner_lock(os.getpid(), age=5)              # alive, and five seconds old
+    rig.anchor()
+    r = rig.run()
+    assert r.returncode == 0, r.stderr
+    assert rig.resurrect_calls() == []
+    assert rig.wjournal() == [], rig.wjournal()      # no episode, no text
+    assert "healthy" in r.stdout, r.stdout

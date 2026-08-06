@@ -429,7 +429,19 @@ def _resurrection(now, view, w, sigs, details, new_state):
             r["capped_notified"] = False
     elif hb_stale and not runner_dead:
         last = max(attempts, default=None)
-        if last is not None and now - last < RESURRECTION_SETTLE_SECONDS:
+        started = view.get("runner_started_at")
+        # A runner YOUNGER than the staleness bound cannot yet have proven anything about itself:
+        # nothing stamps the heartbeat at boot (only the END of a successful tick does), so the
+        # stale reading it is being judged on belongs to the PREVIOUS process. The settle window
+        # below already encoded this rule for a runner the watchdog itself restarted; a deliberate
+        # start leaves no attempt behind, so without the general form the first check after every
+        # `superlooper start` texts the owner about the outage they just ended (fresh-agent review).
+        # It costs nothing in detection: a runner that is still not ticking once it is older than
+        # the bound is judged on its OWN silence, which is what the signal was always supposed to mean.
+        booting = (view.get("runner_live") and isinstance(started, (int, float))
+                   and not isinstance(started, bool)
+                   and now - started < w["heartbeat_stale_seconds"])
+        if booting or (last is not None and now - last < RESURRECTION_SETTLE_SECONDS):
             sigs, details = _without(sigs, details, HEARTBEAT_STALE)   # reborn runner still booting
         r["attempts"] = attempts
     else:
