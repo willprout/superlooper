@@ -730,3 +730,84 @@ def test_coerce_state_handles_a_wrong_typed_resurrection_slice():
         assert st["next_resurrection"] >= 1
         r = wd.evaluate(T0, _cfg(), _view(), st)           # never crashes
         assert r["resurrect"] is None
+
+
+# --------------------------- the deliberate stop (issue #239) ---------------------------
+#
+# `superlooper stop` drops state/runner.stopped and takes the runner down. Every signal a stopped
+# runner produces is a signal it produces BY DESIGN, so the watchdog — whose entire premise is "the
+# loop broke while the owner was away" — must observe and do nothing. A loop the owner switched off
+# is not broken, and both actions this module can take (restart the runner, hire a debugger to
+# diagnose it) work directly against the instruction the owner just gave.
+#
+# Deliberately DISTINCT from the kill switch, in state and in the journal: WATCHDOG_OFF turns the
+# whole check off (including for a runner that is up), while this says the RUNNER is off. Blurring
+# them would let a morning report say the watchdog was disabled when it was watching all night.
+
+def test_a_deliberately_stopped_runner_is_never_resurrected():
+    # The DoD's own sentence: the watchdog sees the stop marker and declines to resurrect.
+    r = _run(T0, _dead(T0, stopped_by_owner=True))
+    assert r["resurrect"] is None
+    assert r["launch"] is None
+    assert r["notify"] == []
+    assert r["state"]["episode"] is None
+    # Not "DOWN": the caller's summary must not shout about a loop that is off on purpose.
+    assert r["runner_down"] is False
+    assert r["state"]["resurrection"]["attempts"] == []   # no cap slot burned by a non-attempt
+
+
+def test_a_deliberately_stopped_runner_never_hires_a_debugger():
+    # The stale heartbeat of a stopped runner is the stop's own signature, not a wedge. Without
+    # this, every "off for the night" texts the owner 20 min later and launches an unattended
+    # debugger 30 min after that — against a loop that is off exactly as they asked.
+    st = _run(T0, _view(T0, heartbeat=T0 - 21 * MIN, stopped_by_owner=True))["state"]
+    later = _run(T0 + 60 * MIN, _view(T0 + 60 * MIN, heartbeat=T0 - 21 * MIN,
+                                      stopped_by_owner=True), st)
+    assert later["launch"] is None
+    assert later["notify"] == []
+    assert later["state"]["episode"] is None
+
+
+def test_a_stop_journals_once_per_distinct_observation():
+    # The 2026-07-08 unbounded-repetition class: an overnight stop at a 5-min interval must not
+    # write ~96 identical lines.
+    v = _dead(T0, stopped_by_owner=True)
+    r1 = _run(T0, v)
+    assert _outcomes(r1) == ["runner_stopped"]
+    r2 = _run(T0 + 5 * MIN, _dead(T0 + 5 * MIN, stopped_by_owner=True), r1["state"])
+    assert r2["journal"] == []
+    r3 = _run(T0 + 10 * MIN, _dead(T0 + 10 * MIN, stopped_by_owner=True,
+                                   alert={"reasons": ["x"]}), r2["state"])
+    assert _outcomes(r3) == ["runner_stopped"]            # the observation CHANGED: journal it
+
+
+def test_the_stop_record_is_distinct_from_the_kill_switch_record():
+    stopped = _run(T0, _dead(T0, stopped_by_owner=True))
+    disabled = _run(T0, _dead(T0, kill_switch=True))
+    assert _outcomes(stopped) == ["runner_stopped"]
+    assert _outcomes(disabled) == ["disabled"]
+
+
+def test_the_kill_switch_still_wins_over_a_stop():
+    # Both present: WATCHDOG_OFF is the broader off switch and its record is the honest one — the
+    # check would have changed nothing even if the runner had been up.
+    r = _run(T0, _dead(T0, stopped_by_owner=True, kill_switch=True))
+    assert _outcomes(r) == ["disabled"]
+    assert r["resurrect"] is None
+
+
+def test_starting_the_runner_again_re_arms_the_whole_watchdog():
+    # The stop marker is cleared by the deliberate start, so the very next check watches normally —
+    # including resurrecting a runner that dies after being restarted.
+    st = _run(T0, _dead(T0, stopped_by_owner=True))["state"]
+    back = _run(T0 + 30 * MIN, _dead(T0 + 30 * MIN), st)
+    assert back["resurrect"] is not None
+    assert back["state"]["stopped_observed"] is None      # the dedup marker re-armed
+
+
+def test_wrong_typed_stop_state_degrades_to_a_fresh_one():
+    for garbage in ({"stopped_observed": "yes"}, {"stopped_observed": [1, 2]}):
+        st = wd.coerce_state(garbage)
+        assert st["stopped_observed"] is None
+        r = wd.evaluate(T0, _cfg(), _view(), st)          # never crashes
+        assert r["resurrect"] is None

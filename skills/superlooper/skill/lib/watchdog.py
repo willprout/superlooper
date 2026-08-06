@@ -56,6 +56,19 @@ the grace stands down SILENTLY (journal only); at most one VERIFIED launch per e
 failed launch retries up to LAUNCH_ATTEMPT_CAP with ONE failure text; a live debugger
 session (any worker.d*.lock with a live pid) blocks a new launch — never two. A kill-switch
 file (state/WATCHDOG_OFF) makes every check observe + journal and change nothing.
+
+TWO off switches reach this module, and they are deliberately not the same one (issue #239):
+  WATCHDOG_OFF     the WATCHDOG is off. Every check observes and changes nothing, whatever the
+                   runner is doing. The broader switch, and it wins when both are present.
+  runner.stopped   the RUNNER is off, because the owner ran `superlooper stop`. Everything a
+                   stopped runner signals — a heartbeat that stops advancing, a pidfile with no
+                   live process behind it — it signals BY DESIGN, so this module's premise ("the
+                   loop broke while the owner was away") does not hold: the loop did not break,
+                   it was switched off. Both actions available here would work against the
+                   instruction the owner just gave — a kickstart restarts what they turned off, a
+                   debugger diagnoses a process that is off on purpose — so the check observes,
+                   journals once per distinct observation, and does nothing. The marker is cleared
+                   by the deliberate start (and by any runner that boots), so this can never latch.
 """
 import math
 
@@ -111,9 +124,13 @@ def new_state():
     # kill-switch journals once per DISTINCT observation instead of once per check (an
     # overnight switch at a 5-min interval must not write ~96 identical lines — the
     # 2026-07-08 unbounded-repetition class). None = not currently disabled-deduping.
+    # stopped_observed: the same dedup, for a runner the owner deliberately STOPPED (issue #239).
+    # A separate field from disabled_observed on purpose — the two states journal different words
+    # and must never inherit each other's "already said that", or an overnight stop followed by a
+    # kill switch (or the reverse) would swallow the first record of the second state.
     return {"episode": None, "no_progress_since": {}, "next_debugger": 1,
-            "disabled_observed": None, "resurrection": _new_resurrection(),
-            "next_resurrection": 1}
+            "disabled_observed": None, "stopped_observed": None,
+            "resurrection": _new_resurrection(), "next_resurrection": 1}
 
 
 def coerce_state(raw):
@@ -137,6 +154,9 @@ def coerce_state(raw):
     dob = raw.get("disabled_observed")
     if isinstance(dob, list) and all(isinstance(x, str) for x in dob):
         st["disabled_observed"] = dob
+    sob = raw.get("stopped_observed")
+    if isinstance(sob, list) and all(isinstance(x, str) for x in sob):
+        st["stopped_observed"] = sob
     res = raw.get("resurrection")
     if isinstance(res, dict):
         r = _new_resurrection()
@@ -450,7 +470,26 @@ def evaluate(now, config, view, state):
         return {"state": dict(state, disabled_observed=sigs), "notify": [], "launch": None,
                 "journal": [_rec("disabled", sigs)], "resurrect": None, "runner_down": False}
 
-    new_state = dict(state, no_progress_since=since, disabled_observed=None)
+    if view.get("stopped_by_owner"):
+        # The runner is down because `superlooper stop` put it down (issue #239). Same posture as
+        # the kill switch — observe, journal, change nothing — and for a reason that is one step
+        # narrower: the watchdog is watching, there is simply nothing here it would be right to do.
+        # A stopped runner's stale heartbeat and dead pidfile are the STOP's signature, so acting on
+        # them would restart what the owner turned off; a debugger hired to diagnose a process that
+        # is off on purpose has nothing to diagnose either.
+        #
+        # runner_down stays False for the same reason it does under the kill switch: the caller's
+        # summary reports what it observed ("stopped by owner"), never an incident it did not have.
+        # No clock advances and no episode opens or closes, so a signal that was genuinely open
+        # before the stop is still open when the runner comes back.
+        if sigs == state.get("stopped_observed"):
+            return {"state": state, "notify": [], "launch": None, "journal": [], "resurrect": None,
+                    "runner_down": False}
+        return {"state": dict(state, stopped_observed=sigs), "notify": [], "launch": None,
+                "journal": [_rec("runner_stopped", sigs)], "resurrect": None, "runner_down": False}
+
+    new_state = dict(state, no_progress_since=since, disabled_observed=None,
+                     stopped_observed=None)
     journal, notify, launch = [], [], None
 
     # Runner resurrection (issue #208) runs BEFORE the debugger-episode logic: it may reroute a

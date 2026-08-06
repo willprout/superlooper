@@ -140,3 +140,50 @@ def test_a_login_item_runner_that_is_merely_wedged_is_not_kickstarted(rig):
     (rig.home / "state" / "runner.lock").write_text(str(os.getpid()))
     watchdog(rig)
     assert not any("kickstart" in line for line in _lines(rig.launchctl_log))
+
+
+# --------------------------- the deliberate stop (issue #239) ---------------------------
+
+def stopped_by_owner(rig, **over):
+    """The marker `superlooper stop` leaves: the runner is down BECAUSE THE OWNER SAID SO."""
+    rec = {"stopped_at": int(time.time()), "operator": "william", "source": "cli"}
+    rec.update(over)
+    (rig.home / "state" / "runner.stopped").write_text(json.dumps(rec))
+
+
+def test_a_deliberately_stopped_login_item_runner_is_never_kickstarted(rig):
+    # The DoD's own test: drive the resurrection decision against a present marker and assert no
+    # kickstart. Without it, "off for the night" gets restarted within one watchdog interval — and
+    # the owner is told their loop recovered from an outage they created on purpose.
+    write_config(rig, runner_home="login-item")
+    provably_gone(rig, pane=False)
+    stopped_by_owner(rig)
+    r = watchdog(rig)
+    assert r.returncode == 0, r.stderr
+    assert not any("kickstart" in line for line in _lines(rig.launchctl_log)), _lines(rig.launchctl_log)
+    assert not _lines(rig.resurrect_log)
+    assert "STOPPED BY OWNER" in r.stdout, r.stdout
+    assert "DOWN" not in r.stdout, r.stdout
+
+
+def test_a_deliberately_stopped_pane_runner_is_never_relaunched_in_a_tab(rig):
+    write_config(rig)
+    provably_gone(rig)
+    stopped_by_owner(rig)
+    r = watchdog(rig)
+    assert r.returncode == 0, r.stderr
+    assert not _lines(rig.resurrect_log)
+    assert not _lines(rig.launchctl_log)
+
+
+def test_removing_the_stop_marker_restores_the_resurrection_path(rig):
+    # The off switch must not latch: once the marker is gone the guardian guards again.
+    write_config(rig, runner_home="login-item")
+    provably_gone(rig, pane=False)
+    stopped_by_owner(rig)
+    watchdog(rig)
+    (rig.home / "state" / "runner.stopped").unlink()
+    (rig.home / "state" / "runner.heartbeat").write_text(str(int(time.time()) - 3600))
+    r = watchdog(rig)
+    assert any("kickstart" in line for line in _lines(rig.launchctl_log)), _lines(rig.launchctl_log)
+    assert "resurrected the runner" in r.stdout
