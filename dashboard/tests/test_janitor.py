@@ -338,6 +338,27 @@ def test_an_unreadable_proposal_list_is_a_failed_read_not_a_clean_apron(jan_fix)
     assert res["groups"] == [] and res["count"] == 0
 
 
+def test_an_explicitly_null_proposal_list_is_not_an_empty_sweep(jan_fix):
+    # `doc.get(k)` cannot tell an ABSENT key from an explicit JSON null, and the two mean opposite
+    # things: absent is a quieter CLI reporting nothing, null is an answer we could not read. Read
+    # with a sentinel so null fails closed instead of rendering the all-clear.
+    verb, fixtures = jan_fix
+    (fixtures / "propose.json").write_text('{"ok": true, "proposals": null, "held": []}')
+    assert verb.propose(SLUG)["ok"] is False
+
+
+def test_a_wrong_typed_held_list_fails_closed_like_the_proposals(jan_fix):
+    # Same rule, same reason: coercing a garbled `held` to [] reports "nothing held back" while the
+    # CLI is in fact holding failed writes — a silent drop on the one panel whose whole job is to
+    # show the owner what is stuck.
+    verb, fixtures = jan_fix
+    (fixtures / "propose.json").write_text(json.dumps(
+        {"ok": True, "proposals": [], "held": {"pr:41": "boom"}}))
+    res = verb.propose(SLUG)
+    assert res["ok"] is False
+    assert "held" in res["error"]
+
+
 def test_an_absent_proposal_list_is_still_an_honest_empty_sweep(jan_fix):
     # ...but ABSENT is not the same as wrong-typed: a CLI that simply reported no proposals ran
     # fine and found nothing, and must still get the all-clear.

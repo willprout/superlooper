@@ -203,6 +203,12 @@
     return String(s).replace(/["\\]/g, "\\$&");
   }
 
+  // One group's rows, fail-closed: anything but a real array is NO rows. Every count and every
+  // template reads through this, so a wrong-typed `items` can never be counted as shown-but-blank.
+  function itemsOf(g) {
+    return Array.isArray(g && g.items) ? g.items : [];
+  }
+
   // The proposal list, grouped by kind, each item a tap target. Nothing is pre-selected.
   //
   // `total` is the server's OWN count of what the sweep proposed and `lost` the part of it no row
@@ -211,18 +217,29 @@
   // the honest third case — debris found, none of it drawable here — which says so and names the
   // terminal that can act on it.
   function renderProposals(groups, held, heldItems, count, unreadable, withheld) {
+    // Array.isArray, not truthiness, on both the group list and every group's items: a garbled or
+    // skewed body must degrade into the honest "found more than we can show" path, never throw out
+    // of the render (the .catch() upstream would then blame the network for a body problem) and
+    // never make `shown` NaN, which would slip past the all-clear guard as a blank dialog.
+    groups = Array.isArray(groups) ? groups : [];
     var total = Number(count) || 0;
     var lost = Number(unreadable) || 0;
     // Count the rows actually about to be DRAWN and reconcile them against the server's own total,
     // rather than trusting the server's `unreadable` to be exact. Then the dialog's honesty is
     // self-enforcing: an older server that dropped a kind (the 2026-07-14 skew shape — new bundle
     // on disk, old Python in the running process) sends no `unreadable` at all, and a group that
-    // arrived with an empty `items` list contributes nothing — both cases still get said out loud.
-    var shown = groups.reduce(function (a, g) { return a + ((g.items || []).length); }, 0);
+    // arrived with an empty or wrong-typed `items` contributes nothing — every case gets said out
+    // loud rather than quietly shrinking the sweep.
+    var shown = groups.reduce(function (a, g) { return a + itemsOf(g).length; }, 0);
     var missing = Math.max(lost, total - shown);
+    var capped = Number(withheld) || 0;
     var closer = heldHTML(held, heldItems) +
       '<div class="cc-jan-actions"><button class="btn ghost" data-jan-close>Done</button></div>';
-    if (!shown && total === 0 && missing === 0) {
+    // `capped` joins the all-clear guard for the same reason `total` did: the reopen cap's
+    // remainder is debris the sweep FOUND. Unreachable from today's engine (a withheld remainder
+    // implies a full cap of proposals), but "the engine's invariant holds" is exactly the
+    // assumption this issue exists to stop depending on.
+    if (!shown && total === 0 && missing === 0 && !capped) {
       setBody('<div class="cc-jan-empty">Apron’s clear — no GitHub debris to sweep ✓</div>' + closer);
       return;
     }
@@ -234,7 +251,6 @@
     // The reopen class is the one class the engine caps per sweep. Say what the cap left out — a
     // cap that is not said reads as "there was nothing else", which is the over-claim this whole
     // dialog is being fixed for.
-    var capped = Number(withheld) || 0;
     var capNote = capped
       ? '<div class="cc-jan-lost">' + capped + ' more keyword-closed issue' +
           (capped === 1 ? '' : 's') + ' found and NOT proposed this sweep — the reopen class is ' +
@@ -246,7 +262,7 @@
       // with the CLI's own action word and the raw key `--execute-keys` takes — but never armed:
       // the dashboard offers no consent whose consequence it cannot state.
       var arm = g.tappable !== false;
-      var items = (g.items || []).map(function (it) {
+      var items = itemsOf(g).map(function (it) {
         if (!arm) {
           return '<div class="cc-jan-row is-flat">' +
             '<span class="cc-jan-what">' + esc(it.what) + '</span>' +
@@ -263,7 +279,7 @@
       }).join("");
       return '<div class="cc-jan-group cc-jan-' + esc(g.kind) + (arm ? '' : ' is-flat') + '">' +
         '<div class="cc-jan-group-head"><span class="cc-jan-kind" aria-hidden="true"></span>' +
-          esc(g.label) + ' <span class="cc-jan-count">' + (g.items || []).length + '</span></div>' +
+          esc(g.label) + ' <span class="cc-jan-count">' + itemsOf(g).length + '</span></div>' +
         items +
         (arm ? "" : '<div class="cc-jan-group-note">no tap for these yet — run <code>superlooper ' +
           'janitor</code> in the terminal to act on them.</div>') +
@@ -273,7 +289,7 @@
     // disabled Sweep button describe a dialog the owner is not looking at. Say what is true instead
     // and drop the confirm row — the Done closer is the only honest control there.
     var anyArmable = groups.some(function (g) {
-      return g.tappable !== false && (g.items || []).length > 0;
+      return g.tappable !== false && itemsOf(g).length > 0;
     });
     var lead = anyArmable
       ? '<div class="cc-jan-lead">Tap the debris to clear, then sweep. Deleting a branch, closing ' +

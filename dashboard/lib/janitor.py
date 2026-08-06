@@ -73,6 +73,12 @@ _KIND_LABEL = {
 _OTHER_KIND = "other"
 _OTHER_LABEL = "Not renderable here — terminal only"
 
+# Absent-vs-null sentinel. ``doc.get(k)`` cannot tell a MISSING key from an explicit JSON ``null``,
+# and the two mean opposite things here: absent is an older/quieter CLI that reported nothing (an
+# honest empty sweep), while a null list is an answer we could not read — which must fail closed,
+# not render as a clean apron.
+_MISSING = object()
+
 
 def _binary(configured):
     """The superlooper CLI to run: the ``SL_SUPERLOOPER`` env override wins over the configured
@@ -182,16 +188,22 @@ def held_rows(held):
     see is one he can never clear).
 
     ``named`` says whether the verb above is a real one or the raw key falling back on itself, so
-    the dialog can word an unnamed row's confirm honestly. It deliberately does NOT withdraw the
-    Retry, unlike the untappable proposal rows in :func:`group_proposals`, and the difference is
+    the row can carry that caveat beside its Retry instead of passing a raw key off as a
+    plain-language consequence. It deliberately does NOT withdraw the Retry, unlike the untappable
+    proposal rows in :func:`group_proposals`, and the difference is
     the point: a proposal row would ORIGINATE an action in a class this file does not understand,
     while a held row re-runs a write the owner already chose once — from the terminal, where the
     CLI named it in full — and that failed. Refusing to re-offer his own prior choice would take a
     working verb off the primary surface (owner ruling 2026-07-13: full parity), and it is the CLI,
     not this file, that re-derives freshly at act time and can still decline."""
     items = held if isinstance(held, list) else []
-    return [{"key": k, "what": _held_what(k), "named": _held_what(k) != k}
-            for k in items if isinstance(k, str) and k]
+    rows = []
+    for k in items:
+        if not (isinstance(k, str) and k):
+            continue
+        what = _held_what(k)
+        rows.append({"key": k, "what": what, "named": what != k})
+    return rows
 
 
 def _row(p):
@@ -288,19 +300,22 @@ class Janitor:
                     "count": 0, "unreadable": 0, "reopen_withheld": 0,
                     "held": [], "held_items": [],
                     "error": doc.get("error") or _error(rc, err, binary), "raw": out}
-        proposals = doc.get("proposals")
-        if proposals is not None and not isinstance(proposals, list):
-            # An `ok: true` envelope whose proposal list is unreadable. Coercing it to [] would
-            # render as "apron's clear ✓" — turning "we could not read the sweep" into "the sweep
-            # found nothing", which is the exact substitution this whole issue exists to stop. An
-            # unreadable answer is a FAILED read, and says so.
-            return {"ok": False, "verb": "janitor-propose", "repo": repo, "groups": [],
-                    "count": 0, "unreadable": 0, "reopen_withheld": 0,
-                    "held": [], "held_items": [],
-                    "error": "the sweep's proposal list came back unreadable — nothing is being "
-                             "shown, and nothing was swept", "raw": out}
-        proposals = proposals or []
-        held = doc.get("held") or []
+        # An `ok: true` envelope whose proposal or held list is unreadable. Coercing either to []
+        # would render as "apron's clear ✓" / "nothing held back" — turning "we could not read the
+        # sweep" into "the sweep found nothing", the exact substitution this whole issue exists to
+        # stop. An unreadable answer is a FAILED read, and says so. ABSENT is different and stays
+        # honest-empty: a CLI that simply reported no proposals ran fine and found nothing.
+        proposals = doc.get("proposals", _MISSING)
+        held = doc.get("held", _MISSING)
+        for name, value in (("proposal list", proposals), ("held-back list", held)):
+            if value is not _MISSING and not isinstance(value, list):
+                return {"ok": False, "verb": "janitor-propose", "repo": repo, "groups": [],
+                        "count": 0, "unreadable": 0, "reopen_withheld": 0,
+                        "held": [], "held_items": [],
+                        "error": "the sweep's %s came back unreadable — nothing is being shown, "
+                                 "and nothing was swept" % name, "raw": out}
+        proposals = [] if proposals is _MISSING else proposals
+        held = [] if held is _MISSING else held
         # `held` (the raw keys) is the ORIGINAL contract and stays byte-for-byte; `held_items` is
         # added beside it (issue #131) so the dialog can name what a retry would do — and so the
         # front-end can tell a retry-capable server from an older one still serving only `held`.

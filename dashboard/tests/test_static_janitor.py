@@ -100,17 +100,20 @@ def test_the_all_clear_is_gated_on_more_than_the_groups_it_drew():
     # Issue #289's headline defect: the dialog rendered "Apron's clear" whenever it had no GROUPS to
     # show — so a proposal class it could not draw (the accidental-close reopen) read as no debris
     # at all, on the owner's primary surface. Pinned on the SEMANTIC tokens the guard must consult,
-    # not on the syntax of the condition, so a correct refactor is free to move.
-    guard = re.search(r"if \([^\n]*\)\s*\{[\s\S]{0,300}?Apron’s clear", _JAN_JS)
-    assert guard, "the all-clear message must still exist for a genuinely empty apron"
-    cond = guard.group(0).split("{", 1)[0]
+    # not on the syntax of the condition (the condition may wrap across lines), so a correct
+    # refactor is free to move.
+    assert "Apron’s clear" in _JAN_JS, (
+        "the all-clear message must still exist for a genuinely empty apron")
+    guard = re.search(r"if \(([\s\S]{0,240}?)\)\s*\{\s*\n[\s\S]{0,300}?Apron’s clear", _JAN_JS)
+    assert guard, "the all-clear must live behind an explicit guard condition"
+    cond = guard.group(1)
     assert "groups.length" not in cond, (
         "the all-clear must not be decided by whether this file found a tile to draw — that is the "
         "bug (an unrenderable kind read as 'nothing to sweep')")
-    for token in ("total", "missing"):
+    for token in ("total", "missing", "capped"):
         assert token in cond, (
-            "the all-clear must consult `%s` — the server's own proposal count, reconciled against "
-            "the rows actually drawn" % token)
+            "the all-clear must consult `%s` — every count of debris the sweep FOUND, not just the "
+            "rows this file managed to draw" % token)
 
 
 def test_the_dialog_reconciles_the_rows_it_drew_against_the_servers_count():
@@ -142,9 +145,14 @@ def test_the_reopen_caps_withheld_remainder_is_said_out_loud():
 
 def test_a_group_the_server_marks_untappable_is_shown_but_never_armed():
     # An unknown kind is SURFACED, never dropped — but it is not a tap target either: the dashboard
-    # must not offer a consent it cannot state the consequence of. The server decides, via `tappable`.
-    assert re.search(r"\bg\.tappable\b", _JAN_JS), (
-        "the row template must branch on the server's `tappable` flag, not on a kind list here")
+    # must not offer a consent it cannot state the consequence of. The server decides, via
+    # `tappable`. This is the PR's most safety-relevant JS invariant, so it is bound TEXTUALLY to
+    # the assignment as well as to the branch: a round-2 mutation proved that checking only for the
+    # presence of `g.tappable` somewhere in the file lets `var arm = true` — which arms every row,
+    # including the choose_group alternatives a bulk approval must never touch — ship green.
+    assert re.search(r"var arm = g\.tappable !== false", _JAN_JS), (
+        "`arm` must be assigned FROM the server's tappable flag — not from a kind list here, and "
+        "not from a constant")
     flat = re.search(r"if \(!arm\) \{([\s\S]{0,600}?)\n\s*\}", _JAN_JS)
     assert flat, "renderProposals must build a separate row template for an untappable group"
     for marker in ("data-jan-key", 'role="checkbox"', "cc-jan-check", "tabindex"):
@@ -154,11 +162,56 @@ def test_a_group_the_server_marks_untappable_is_shown_but_never_armed():
 
 def test_a_sweep_with_nothing_armable_offers_no_sweep_button():
     # A permanently-disabled "Sweep 0 selected" under a lead reading "tap the debris to clear"
-    # describes a dialog the owner is not looking at.
+    # describes a dialog the owner is not looking at. Bound to the BRANCH, not to proximity: a
+    # round-2 mutation proved a loose `anyArmable[\s\S]{0,900}?data-jan-confirm` was already
+    # satisfied by an unrelated earlier `anyArmable` and passed with the gating reverted.
     assert re.search(r"anyArmable\s*=\s*groups\.some", _JAN_JS), (
         "renderProposals must ask whether ANY group is armable before offering the confirm row")
-    assert re.search(r"anyArmable[\s\S]{0,900}?data-jan-confirm", _JAN_JS), (
-        "the confirm control must be gated on there being something to arm")
+    branch = re.search(r"\(anyArmable\s*\n?\s*\?([\s\S]{0,700}?)\s*:([\s\S]{0,400}?)\)\);", _JAN_JS)
+    assert branch, "the footer must be a two-way branch on anyArmable"
+    assert "data-jan-confirm" in branch.group(1), (
+        "the armable footer is the one that carries the sweep confirm")
+    assert "data-jan-confirm" not in branch.group(2), (
+        "a sweep with nothing armable must offer NO confirm — a permanently disabled Sweep button "
+        "describes a dialog that is not on screen")
+    assert "data-jan-close" in branch.group(2), (
+        "...it offers Done instead, the only honest control left")
+
+
+def test_the_honesty_notes_are_actually_rendered_not_merely_computed():
+    # Round-2 mutation: suppressing either note (`var lostNote = false`) left the suite green,
+    # because the guards matched the surrounding source rather than the interpolation.
+    assert re.search(r"lostNote\s*\+\s*capNote", _JAN_JS), (
+        "both honesty notes must reach the body on the path that draws tiles")
+    assert re.search(r"setBody\(lostNote \+ capNote", _JAN_JS), (
+        "...and on the path where the sweep found debris but drew no tile at all")
+    assert re.search(r"var lostNote = missing", _JAN_JS) and re.search(r"var capNote = capped",
+                                                                      _JAN_JS), (
+        "each note must be conditioned on its own count, so it disappears only when that count is 0")
+
+
+def test_every_server_string_reaching_the_dom_is_escaped():
+    # `_what()` interpolates the GitHub ISSUE TITLE, and this is a public repo — anyone who can open
+    # an issue can write that string. The PR adds three new innerHTML sinks (the flat row, the raw
+    # key, the unnamed-held caveat), so pin the escaping rather than trusting review to catch it.
+    for field in ("esc(it.what)", "esc(it.why)", "esc(it.key)", "esc(g.label)", "esc(g.kind)"):
+        assert field in _JAN_JS, (
+            "%s must go through esc() before it reaches innerHTML" % field)
+    assert not re.search(r"\+ it\.(what|why|key)\b", _JAN_JS), (
+        "no row field may be concatenated into HTML raw")
+
+
+def test_a_wrong_typed_items_list_can_never_count_as_a_drawn_row():
+    # If `shown` goes NaN on a garbled group, the all-clear guard's arithmetic silently passes and
+    # the dialog renders an empty body. Every count and every template reads through one
+    # fail-closed accessor instead.
+    assert re.search(r"function itemsOf\(g\)[\s\S]{0,200}?Array\.isArray", _JAN_JS), (
+        "one fail-closed accessor must decide what a group's rows are")
+    assert "(g.items || [])" not in _JAN_JS, (
+        "no caller may read g.items directly — a wrong-typed items would count as shown-but-blank")
+    assert re.search(r"groups = Array\.isArray\(groups\)", _JAN_JS), (
+        "a wrong-typed `groups` must degrade into the honest 'more than we can show' path, never "
+        "throw out of the render (the upstream catch would then blame the network)")
 
 
 def test_a_held_row_the_server_could_not_name_says_so():
