@@ -879,7 +879,13 @@ html, body {
 /* ---- toast: transient action feedback, floats over everything ---- */
 .cc-toast {
   position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 20px);
-  max-width: min(560px, 92vw); z-index: 60;
+  /* Above every overlay (the drawer is 80, the dialogs 76–80), because a toast is the ANSWER to
+     something the owner just did — and the surfaces those verbs live on are exactly those overlays.
+     At 60 it sat UNDER the drawer's full-viewport scrim, so a verb tapped on a flight card reported
+     back dimmed and half-hidden behind the panel (seen in a real browser on issue #340, whose whole
+     job is to deliver the engine's sentence to the owner). Transient and pointer-events: none, so
+     outranking them costs nothing. */
+  max-width: min(560px, 92vw); z-index: 90;
   padding: 11px 18px; border-radius: 8px;
   font: 600 12.5px var(--sans); letter-spacing: 0.2px;
   background: #17351F; color: #CFF3D9; border: 1px solid #2C6B3D;
@@ -888,6 +894,11 @@ html, body {
 }
 .cc-toast.show { opacity: 1; transform: translate(-50%, 0); }
 .cc-toast.err { background: #3A2422; color: #F2C4BC; border-color: #5A2A25; }
+/* The THIRD tone (issue #340): an ordinary answer that is neither a success nor a fault — "that
+   lane has no window to raise" is exactly what a finished, tidied session should say. Amber, the
+   NOTAM's palette, because it is the same register: a standing fact about the building, not an
+   alarm. Green would be a lie and red would teach the owner to distrust a truthful answer. */
+.cc-toast.note { background: #3A3222; color: #F2DDAE; border-color: #6B5324; }
 
 /* ---- flag composer: a centered overlay OUTSIDE #root (survives the 2s poll re-render) ---- */
 .cc-flagbox {
@@ -1104,6 +1115,12 @@ html, body {
   border-top: 1px solid #EDF0F4;
 }
 .drawer-actions .btn-note.link { margin-left: auto; }
+/* The Open-session-window button (issue #340) — the one verb in this row that only LOOKS at the
+   work rather than changing it, so it reads quieter than its neighbours: mono, like the terminal it
+   opens, and never the primary weight even when it is the only button present. */
+.drawer-actions .drawer-session {
+  font: 600 10.5px var(--mono); letter-spacing: 0.3px; white-space: nowrap;
+}
 
 /* ============================ Task 11 — night replay + morning digest ============================ */
 

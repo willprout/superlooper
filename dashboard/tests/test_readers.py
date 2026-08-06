@@ -93,7 +93,7 @@ def test_state_home_returns_every_contract_key():
     assert set(facts) == {
         "issues_state", "activity", "blocked", "exited", "awaiting",
         "heartbeat_epoch", "heartbeat_age", "merges_frozen", "alert", "reports",
-        "state_format", "published_view"}
+        "state_format", "published_view", "session_windows"}
 
 
 def test_state_home_issues_json_content():
@@ -297,3 +297,39 @@ def test_published_view_corrupt_fails_closed_to_empty_dict(tmp_path):
 def test_published_view_non_dict_body_fails_closed_to_empty_dict(tmp_path):
     (_state(tmp_path) / "gh_view.json").write_text("[1, 2, 3]")
     assert readers.read_state_home(tmp_path, now=1300)["published_view"] == {}
+
+
+# --------------------------- recorded session windows (issue #340) ---------------------------
+
+def test_recorded_session_windows_are_read_from_the_engines_own_markers(tmp_path):
+    # The engine writes ``state/panes/<id>`` when it launches a session and removes it when the
+    # window is closed; the ``<id>.ws`` sidecar names the workspace. Reading the SAME marker
+    # ``superlooper tidy`` selects on (engine ``lib/panes.recorded_ids``) is what keeps the flight
+    # card's Open-session-window button and the verb that CLOSES a window agreeing about which lanes
+    # have one — neither derives it from a status.
+    panes = tmp_path / "state" / "panes"
+    panes.mkdir(parents=True)
+    (panes / "i23").write_text("host-pane-23\n")
+    (panes / "i23.ws").write_text("ws-23\n")          # the sidecar is NOT a window of its own
+    (panes / "i7").write_text("")                     # a window whose pane could not be read
+    (panes / "notanid").write_text("x")               # anything that is not a lane id is ignored
+    facts = readers.read_state_home(tmp_path)
+    assert facts["session_windows"] == {"i23", "i7"}
+
+
+def test_a_missing_or_unreadable_panes_dir_reads_as_no_windows(tmp_path):
+    # Fail closed: no marker dir ⇒ no lane claims a window ⇒ no button offered anywhere. A reader
+    # that guessed the other way would put a button on every card on a machine it knows nothing
+    # about, and every tap would fail.
+    assert readers.read_state_home(tmp_path)["session_windows"] == set()
+
+
+def test_a_pane_marker_named_with_an_unparseable_digit_does_not_take_the_poll_down(tmp_path):
+    # ``"i²"`` passes ``str.isdigit()`` but ``int("²")`` raises, and this reader runs inside the
+    # 2-second snapshot poll — one such filename must be ignored, never propagate an exception that
+    # blanks the whole board for every repo (the #139 defect class).
+    panes = tmp_path / "state" / "panes"
+    panes.mkdir(parents=True)
+    (panes / "i23").write_text("x")
+    (panes / "i²").write_text("x")
+    assert readers.read_state_home(tmp_path)["session_windows"] == {"i23"}

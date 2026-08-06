@@ -297,3 +297,26 @@ def test_tower_seen_never_reaches_gh_actions():
                         actions=None, body=b'{"ts": 5}', desk=desk_mod.Desk("/nonexistent/x"))
     # desk write to /nonexistent fails silently (mkdir may fail) but the route still answers cleanly.
     assert resp.status in (200, 400)
+
+
+# --------------------------- the Open-session-window button (issue #340) ---------------------------
+
+def test_the_drawer_offers_the_session_window_only_for_lanes_that_have_one(home):
+    # End of the plumbing, asserted where it matters: the engine's state/panes/<id> marker reaches
+    # the drawer the browser binds. i23 has a window recorded; i7 (parked, never launched a session
+    # in this fixture) does not.
+    panes = home / "state" / "panes"
+    panes.mkdir(parents=True, exist_ok=True)
+    (panes / "i23").write_text("pane-23\n")
+    (panes / "i23.ws").write_text("ws-23\n")
+    snap = server.assemble_snapshot(_config(home), now=NOW)
+    drawers = {f["num"]: f["drawer"]["session"] for f in snap["repos"][0]["flights"]}
+    assert drawers[23] == {"present": True}
+    assert drawers[7]["present"] is False
+
+
+def test_no_panes_dir_offers_the_button_nowhere(home):
+    # A state home the engine has never launched into (or one whose markers we cannot read) must not
+    # sprout a button on every card — fail closed.
+    snap = server.assemble_snapshot(_config(home), now=NOW)
+    assert not any(f["drawer"]["session"]["present"] for f in snap["repos"][0]["flights"])

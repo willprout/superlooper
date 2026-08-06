@@ -170,6 +170,34 @@ def _iid_num(name):
     return None
 
 
+def _session_window_ids(panes_dir):
+    """The lane ids that have a RECORDED session window — the engine writes ``state/panes/<id>``
+    when it launches a session and removes it when that window is closed (issue #340).
+
+    The engine's own selection rule, deliberately: an entry named ``i<N>`` counts, the ``<id>.ws``
+    workspace sidecar does not, and anything else in the directory is ignored (engine
+    ``lib/panes.recorded_ids``, narrowed to the issue lanes this board renders). Matching it is what
+    keeps the flight card's Open-session-window button and ``superlooper tidy`` agreeing about which
+    lanes have a window — the alternative, deriving it from a status, gets both ends wrong: a parked
+    lane's window is kept alive on purpose and is exactly the one the owner most needs to open, and
+    a merged-and-tidied lane looks launched forever with its window long gone.
+
+    The marker is not a *guarantee* the window is still open, and it is not meant to be: whether
+    that lane still HAS a window is a question only the session host can answer, and the engine's
+    ``focus-session`` verb asks it at tap time and reports the answer honestly (``no_window`` is an
+    ordinary outcome there, not a failure). This decides only whether there is anything worth
+    asking about.
+
+    Missing/unreadable dir ⇒ an empty set. Fail closed: no marker ⇒ no lane claims a window ⇒ no
+    button offered, which is the safe direction for a reader that cannot see the markers at all.
+    """
+    try:
+        names = os.listdir(panes_dir)
+    except OSError:
+        return set()
+    return {n for n in names if _iid_num(n) is not None}
+
+
 def _report_ids(reports_dir):
     """Sorted issue ids that have a per-issue report *file* (``reports/i<N>.md``); the morning
     digest, any other non-issue file, and directories that merely look like an id are all excluded
@@ -227,6 +255,9 @@ def read_state_home(home, now=None):
       ``merges_frozen``  ``state/merges_frozen.json`` (``None`` absent; ``{}`` corrupt ⇒ frozen)
       ``alert``          ``state/ALERT`` (``None`` absent; ``{}`` corrupt ⇒ alerting)
       ``reports``        sorted issue ids with a per-issue report (morning digest excluded)
+      ``session_windows`` the set of lane ids with a recorded session window (``state/panes/<id>``
+                         — the engine's own marker, written at launch and removed when the window
+                         is closed; the same one ``superlooper tidy`` selects on)
       ``state_format``   ``state/state_format.json`` — the engine's state-home format stamp (issue
                          #45). ``None`` when ABSENT (a pre-handshake home ⇒ grandfathered by the
                          flight model); the parsed dict (e.g. ``{"version": 1}``) when present;
@@ -254,6 +285,9 @@ def read_state_home(home, now=None):
         "merges_frozen": _read_json_existence(os.path.join(state, "merges_frozen.json")),
         "alert": _read_json_existence(os.path.join(state, "ALERT")),
         "reports": _report_ids(os.path.join(home, "reports")),
+        # The lane ids with a recorded session window (state/panes/<id>) — the Open-session-window
+        # button's gate, and the same marker `superlooper tidy` selects on (issue #340).
+        "session_windows": _session_window_ids(os.path.join(home, "state", "panes")),
         # The engine's state-home format stamp (issue #45): absent ⇒ None (grandfathered), any
         # present-but-untrustworthy read ⇒ {} which the flight model names as an INCOMPATIBLE stamp
         # — never a silent blank. Uses its own reader (not _read_json_existence) so a present-but-

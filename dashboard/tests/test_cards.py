@@ -854,3 +854,46 @@ def test_memo_history_carries_bounces_too():
     ]
     d = cards.flight_drawer(_flight(memo="a later park reason"), jslice, "r", "Air")
     assert d["memos"] == ["BOUNCED: an earlier push-back", "a later park reason"]
+
+
+# =============================== the session window (issue #340) ===============================
+
+def test_drawer_offers_the_session_window_for_a_flight_that_has_one():
+    # Owner ruling 2026-07-30 (HERDR-ADOPTION-PLAN §9): the card gains a button that opens THAT
+    # session's window. The drawer carries the whole decision, so the JS binds a boolean it never
+    # derives (design record B.1).
+    d = cards.flight_drawer(_flight(num=340, session_window=True), [], "will-titan/sandbox",
+                            "Sandbox Air")
+    assert d["session"] == {"present": True}
+
+
+def test_drawer_offers_no_session_window_for_a_lane_with_no_recorded_window():
+    # A queued lane never had one, and a tidied lane no longer does — either way there is nothing to
+    # open, so the button must not be offered.
+    d = cards.flight_drawer(_flight(num=340, session_window=False), [], "r", "Air")
+    assert d["session"] == {"present": False}
+
+
+def test_drawer_session_is_absent_rather_than_hopeful_when_the_flight_predates_the_fact():
+    # A flight object without ``session_window`` (an older snapshot shape) reads as NO session —
+    # fail closed, never a button nothing vouches for.
+    d = cards.flight_drawer(_flight(num=340), [], "r", "Air")
+    assert d["session"] == {"present": False}
+
+
+def test_drawer_offers_no_session_window_for_a_flight_with_no_usable_number():
+    # The verb's target is DERIVED from the flight number (lib/session_window.lane_id). No number ⇒
+    # no lane to open ⇒ no button, rather than one that could only ever fail.
+    d = cards.flight_drawer(_flight(num=None, session_window=True), [], "r", "Air")
+    assert d["session"] == {"present": False}
+
+
+def test_the_drawer_names_the_lane_the_verb_will_actually_open():
+    # ONE derivation of the target (B.1): if the drawer offers the button, ``lib/session_window``
+    # must be able to turn that flight's number into the engine's ``--id``. A drawer that offered a
+    # button for a flight the verb would refuse is the two halves drifting apart.
+    import session_window
+    for num in (1, 7, 340):
+        d = cards.flight_drawer(_flight(num=num, session_window=True), [], "r", "Air")
+        assert d["session"]["present"] is True
+        assert session_window.lane_id(num) == "i%d" % num

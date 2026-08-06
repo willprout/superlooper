@@ -90,7 +90,12 @@ Field by field:
   runs locally to close the terminal windows of finished sessions (default
   `~/.claude/skills/superlooper/bin/superlooper`, `~` expanded). Change it only if your skill lives
   elsewhere. Tidy always asks first (it shows exactly which windows it will close) and only ever
-  closes *finished* sessions — never one still building.
+  closes *finished* sessions — never one still building. The same CLI backs the flight card's
+  **Open session window** button, which brings that one session's window to the front so you can
+  watch it — and type into it — with your own eyes. Nothing about the loop changes, and if that
+  lane has no window (its session ended, or Tidy closed it) the button says so in the engine's own
+  words rather than pretending it worked. It needs an installed engine new enough to carry
+  `superlooper focus-session`; an older one is named plainly on the first tap.
 - **`notify`** — where the dashboard's one push (RUNNER DOWN) goes. `imessage_to` is a phone
   number/handle to text; `cmd` is a shell command to run instead. Both `null` by default — a
   fresh install nags no one.

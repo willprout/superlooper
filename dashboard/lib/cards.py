@@ -17,6 +17,7 @@ and the tower log can never drift.
 import json
 
 import flights
+import session_window
 import tower
 
 _GH = "https://github.com"
@@ -562,6 +563,30 @@ def _cargo(flight):
     return {"present": present, "added": added, "removed": removed, "files": files, "chip": chip}
 
 
+def _session(flight):
+    """The Open-session-window button's whole decision (issue #340): may the card offer to open THIS
+    flight's session window?
+
+    One fact, settled elsewhere and joined here so the JS derives nothing: the flight's own
+    ``session_window`` — the loop recorded a window for this lane, the same marker ``superlooper
+    tidy`` selects on. A queued lane has none, and a tidied one no longer does; a button that could
+    only ever fail would be a lie about what the surface can do. Missing/falsy reads as absent: fail
+    closed, never a hopeful button.
+
+    The flight NUMBER is required too, and it is checked with the verb's OWN function
+    (``lib/session_window.lane_id``) rather than a lookalike: a flight with no usable number has no
+    lane to open, so a button offered for one could only ever fail. One derivation, so the surface
+    that offers the button and the verb that performs it cannot disagree about which cards have one.
+
+    Neither the session host nor its name appears here, and that is the owner's 2026-08-04 ruling
+    rather than an omission: the button shells the engine's ``focus-session`` verb, which owns the
+    whole question of what a window is and how to reach one. "Is that window still open?" is a
+    question only the host can answer, it is asked at TAP time, and its answer is shown honestly.
+    """
+    return {"present": bool(flight.get("session_window"))
+                       and session_window.lane_id(flight.get("num")) is not None}
+
+
 def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, operator="the owner"):
     """The whole flight-card drawer (design record §4) — pure over the flight + its journal slice.
 
@@ -627,6 +652,9 @@ def flight_drawer(flight, journal_slice, slug, name, title=None, hhmm=None, oper
         "cargo": _cargo(flight),
         "journal": journal,
         "decision": decision,
+        # The Open-session-window button (issue #340) — offered only for a flight that HAS a
+        # recorded session window; the engine's `focus-session` verb does the opening.
+        "session": _session(flight),
         "attempt": _attempt(flight),
         "go_arounds": _go_arounds(flight),   # conflicts only — not every attempt is a collision (#272)
     }

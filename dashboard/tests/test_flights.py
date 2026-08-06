@@ -1770,3 +1770,34 @@ def test_an_investigation_is_never_held_for_paperwork_it_does_not_need():
 def test_the_label_refusal_still_wins_when_both_are_wrong():
     rows = _rows225(_cand(5, typed=False, body="## Goal\nx\n"))
     assert rows[0]["refusal"] == "type_missing"          # the rule the runner hits FIRST
+
+
+# =============================== the session-window fact (issue #340) ===============================
+
+def test_build_flight_carries_whether_a_session_window_was_recorded():
+    # The flight card's Open-session-window button needs ONE fact — did the loop record a session
+    # window for this lane? That fact is the engine's own marker (state/panes/<id>), the SAME thing
+    # `superlooper tidy` selects on, so the button that opens a window and the verb that closes one
+    # can never disagree about which lanes have one.
+    #
+    # Deliberately NOT derived from status or stage. A parked lane is exactly the one the owner most
+    # needs to open (its window is kept alive on purpose so stalled work can be looked at), yet it is
+    # not in the launched-status set; a merged-and-tidied lane looks launched forever yet its window
+    # is gone. Only the marker tracks the window.
+    with_window = flights.build_flight(
+        {"id": "i9", "num": 9, "status": "parked", "session_window": True, "journal": []}, _REPO)
+    assert with_window["session_window"] is True
+
+    tidied = flights.build_flight(
+        {"id": "i9", "num": 9, "status": "merged", "session_window": False,
+         "activity_mtime": _REPO["now"] - 5, "journal": []}, _REPO)
+    assert tidied["session_window"] is False, (
+        "a merged lane whose window tidy already closed must not claim one")
+
+
+def test_build_flight_session_window_fails_closed_when_the_fact_is_missing():
+    # An older snapshot shape (or an unreadable panes dir) carries no marker: read that as NO
+    # window, never a hopeful one. A button that could only ever fail is a lie about what the
+    # surface can do.
+    f = flights.build_flight({"id": "i9", "num": 9, "status": "running", "journal": []}, _REPO)
+    assert f["session_window"] is False
