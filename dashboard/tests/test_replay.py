@@ -130,12 +130,19 @@ def test_a_reapproval_that_rotated_the_branch_is_a_new_attempt_here_too():
     # prunes the worktree, DELETES the filed report and relaunches on a fresh generation. The replay
     # and the live board read the same journal, so a lane the board calls SL-4·A2 must not be SL-4
     # in the time-lapse, still parked at the report it no longer has.
+    # The engine journals each re-approval TWICE at the same ts — the executor's detail record,
+    # which carries the branch pair, and the tick loop's copy of the action with its outcome, which
+    # does not. Both are modelled here: one attempt must be counted, and the second record must not
+    # put the plane back on the leg the first one just took it off.
     j = [_rec(100, "launch", num=4),
          _rec(200, "event", event={"type": "session_finished", "id": "i4"}),
          _rec(300, "park", num=4, needs_william=True, memo="your call"),
-         _rec(400, "reapprove", num=4, old_branch="sl/i4-x", new_branch="sl/i4-x-r1")]
+         _rec(400, "reapprove", id="i4", old_counters={"launches": 1},
+              old_branch="sl/i4-x", new_branch="sl/i4-x-r1"),
+         _rec(400, "reapprove", num=4, id="i4",
+              outcome="reapproved (reset {'launches': 1}; rebuilding on sl/i4-x-r1)")]
     last = replay.build_replay(j, slug="o/r")["frames"][-1]["flights"][0]
-    assert last["label"] == flights.flight_label(4, 2)     # SL-4·A2
+    assert last["label"] == flights.flight_label(4, 2)     # SL-4·A2, counted ONCE
     assert last["stage"] == flights.TAKEOFF                # rebuilding from the start, report gone
 
 

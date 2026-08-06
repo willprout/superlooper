@@ -90,8 +90,8 @@ def _apply(facts, rec):
     # — the engine's re-approval prunes the worktree, deletes the filed report and relaunches on a
     # fresh generation, exactly as a regeneration does. A re-approval carrying no branch pair
     # rotated nothing (there was no branch to retire), so it is a plain relaunch, not a new attempt.
-    rebuilt = act == "regenerate" or (act == "reapprove"
-                                      and rec.get("old_branch") and rec.get("new_branch"))
+    rebuilt = act == "regenerate" or bool(act == "reapprove"
+                                         and rec.get("old_branch") and rec.get("new_branch"))
     if act == "launch":
         facts["launched"] = True
         facts["session_started"] = False       # just off the stand — a brief takeoff before the leg
@@ -141,7 +141,14 @@ def _apply(facts, rec):
     # Any post-launch record for a live flight proves the session is doing work → on the leg, not
     # merely just-airborne. (Applied after the specific handlers so a session_finished still wins
     # its BASE_TURN via report=True.)
-    if act != "launch" and not rebuilt and facts["launched"]:
+    #
+    # A `reapprove` proves the opposite and is excluded WHOLESALE, not just when it rotated (fresh
+    # review P2): the engine journals each re-approval TWICE at the same ts — the executor's own
+    # detail record, which carries the branch pair, and the tick loop's copy of the action with its
+    # outcome, which does not. The second one is not a rotation, but it is not a working session
+    # either — `_exec_reapprove` has just torn that session down — and letting it through put the
+    # plane back on the leg one record after the rebuild had it taxiing out.
+    if act not in ("launch", "reapprove") and not rebuilt and facts["launched"]:
         facts["session_started"] = True
 
 
