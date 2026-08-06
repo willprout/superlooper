@@ -1007,10 +1007,10 @@ class SessionHost:
 
     It was five until issue #339, and the sixth arrived through the only door that should ever open
     one: an owner ruling that a CALLER must not reach the host itself. The dashboard's
-    open-session-window button needed the host binary, the host's token and the repo→lane map to
-    do its own focusing — the exact three things the fence exists to keep out of a caller — so the
-    capability moved here instead. That is the bar for a seventh: not "this would be convenient
-    here", but "a caller would otherwise have to hold the host".
+    open-session-window button would have needed the host binary, the repo→lane map and — on a
+    fenced machine — a credential for the control socket, to do its own focusing. That is the bar
+    for a seventh: not "this would be convenient here", but "a caller would otherwise have to hold
+    the host".
     """
 
     def __init__(self, probe=None, binary=None, env=None, prompt_timeout_ms=_PROMPT_TIMEOUT_MS,

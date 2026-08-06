@@ -4,11 +4,14 @@ The owner ruled on 2026-08-04 (issue #310) that a caller must never name the ses
 dashboard's open-session-window button reaches it through an ENGINE verb instead. This module is
 that verb's decision core, and `superlooper focus-session` is its command line.
 
-**Why the engine and not the caller.** Focusing a lane's window needs three things: the host
-binary, the host's control-socket token (#305), and the map from "repo + i<N>" to the window that
-lane actually opened. A caller holding all three IS a second doorway — exactly what
+**Why the engine and not the caller.** Focusing a lane's window needs the host binary, the map from
+"repo + i<N>" to the window that lane actually opened, and — on a fenced machine (#305) — a
+credential for the host's control socket. A caller holding those IS a second doorway: exactly what
 ``tests/test_one_session_host_door.py`` exists to prevent, and why #333 was closed with "the
-dashboard is NOT a token holder; the engine verb is the doorway".
+dashboard is NOT a token holder; the engine verb is the doorway". Note what the engine does NOT do
+about the third: it hands no token to the host and holds none in this code — ``SessionHost._call``
+runs the binary in the engine process's OWN environment, so whether a fenced host serves a given
+invocation is a property of who ran the engine, never something a caller can supply.
 
 **How a lane id becomes a window, and why it is not the lane's NAME.** The doorway addresses agents
 by name everywhere else, and refuses to here. A lane id is unique inside ONE repo's state home and
@@ -29,7 +32,8 @@ mints the same id for somebody else, this addresses a stranger's window — issu
 **Four outcomes, and none of them is an exception.** The caller RENDERS this, so every answer has
 to be one it can render honestly:
 
-``focused``            the window came to the front
+``focused``            the host brought that window to the front. It is a claim about the HOST's
+                       focus, not about a screen — a screen shows it wherever a viewer is attached
 ``no_window``          that lane has no open window — it exited, or `tidy` closed it. The COMMON
                        answer, not an error, and the one thing this verb must never dress up as a
                        failure

@@ -318,8 +318,9 @@ def test_the_doorway_still_exists_and_is_still_six_verbs_wide():
     # SIX since issue #339, and the widening is the mechanism working rather than failing: the
     # owner ruled that the dashboard must never name the session host, so `focus` — bring an
     # existing session's window to the front — had to land HERE, behind the same door, instead of
-    # in a caller that would then need the binary, the token and the repo→lane map. The exact-set
-    # assertion is what makes a SEVENTH verb an argument somebody has in review.
+    # in a caller that would then need the host binary, the repo→lane map and (on a fenced machine)
+    # a control-socket credential. The exact-set assertion is what makes a SEVENTH verb an argument
+    # somebody has in review.
     import session_host
     public = {n for n in vars(session_host.SessionHost)
               if not n.startswith("_") and callable(getattr(session_host.SessionHost, n))}
