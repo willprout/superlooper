@@ -3693,6 +3693,28 @@ def test_a_terminal_lane_with_no_fresh_agent_ready_never_alerts():
         assert only(out, "alert") == [], f"a {status} lane with no live label must not alert"
 
 
+def test_a_merged_lane_can_never_pin_the_alert_open():
+    """FRESH-REVIEW P3. `merged` is the one terminal status decide has NO path to clear a marker
+    from — not re-approvable, reconciliation wants `parked`, and clear_park_marker sits inside a
+    gate branch the terminal `continue` never reaches. An un-clearable reason does not merely nag:
+    the dedup compares the whole reasons LIST, so it would silence every other alert too. No park
+    is ever emitted for a merged lane, so the escape has nothing to say there."""
+    d = _stuck_reapproved_park()
+    d["issues_state"]["issues"]["i5"]["status"] = "merged"
+    out = decide(parsed_issues=[parsed(5)], dsk=d)
+    assert only(out, "alert") == [] and not has_notify(out)
+
+
+def test_a_wrong_typed_labels_field_is_never_read_as_carrying_agent_ready():
+    # The membership test must be a LIST membership. A wrong-typed `labels` (corruption, or a
+    # future shape change) that happens to CONTAIN the substring must not satisfy it.
+    for bad in ("agent-ready,type:build", {"agent-ready": True}, None, 7):
+        # built past `parsed()`'s own list() coercion — the guard under test is decide's, not the
+        # fixture's, and a corrupt view reaches decide uncoerced.
+        out = decide(parsed_issues=[dict(parsed(5), labels=bad)], dsk=_stuck_reapproved_park())
+        assert only(out, "alert") == [], f"{bad!r} must not read as the label standing"
+
+
 def test_a_stale_view_never_escalates_a_terminal_lane_off_old_labels():
     # The `agent-ready` reading must be FRESH. A stale view's labels are last poll's, and the whole
     # point of the conjunct is that the label is still standing RIGHT NOW.
@@ -3800,6 +3822,35 @@ def test_per_poll_view_health_can_delay_the_page_but_never_re_sends_it():
                  lambda k: ghv(stale=k % 2 == 0),               # ...and the whole view flapping
                  lambda k: ghv(stale=k % 3 == 0, closed_read_ok=k % 2 == 0)):
         assert _ticks(_stuck_reapproved_park(), view) == (1, 1, 0), "one text per outage, not per flip"
+
+
+def test_the_non_terminal_population_is_flap_proof_too():
+    # `closed_read_ok` is a behaviour CHANGE for the ordinary non-terminal hand-back, so its storm
+    # bound wants its own pin rather than riding the terminal fixture's.
+    alerts = texts = clears = 0
+    d = _stuck_bounce()
+    for k in range(40):
+        out = decide(now=NOW + k * 15, dsk=d, gh_view=ghv(closed_read_ok=k % 2 == 0))
+        a = only(out, "alert")
+        alerts += len(a)
+        texts += len(only(out, "notify"))
+        if a:
+            d = dict(d, alert={"reasons": a[0]["reasons"], "since": NOW + k * 15})
+        elif only(out, "clear_alert"):
+            clears += 1
+            d = dict(d, alert=None)
+    assert (alerts, texts, clears) == (1, 1, 0)
+
+
+def test_a_genuinely_new_stuck_episode_texts_again_after_a_retraction():
+    # `standing` must not turn into a latch that eats the NEXT episode's page. Once the reason has
+    # been retracted, a lane that gets stuck again is a new episode and speaks.
+    d = _stuck_reapproved_park(park_landed_cause=actions.TEARDOWN_CAUSE_REAPPROVED)
+    d = dict(d, alert={"reasons": ["park_label_stuck:i5"], "since": NOW})
+    assert only(decide(parsed_issues=[parsed(5)], dsk=d), "clear_alert") == [{"act": "clear_alert"}]
+    again = dict(_stuck_reapproved_park(), alert=None)       # ...stuck once more, marker mismatched
+    out = decide(parsed_issues=[parsed(5)], dsk=again)
+    assert len(only(out, "alert")) == 1 and has_notify(out)
 
 
 def test_a_page_already_sent_is_still_retracted_by_evidence():

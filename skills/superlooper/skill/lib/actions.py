@@ -1414,7 +1414,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # The reasons the durable ALERT already names — the same on-disk episode marker prev_systemic
     # reads, kept as a list so any reason can ask "am I already standing?" (issue #256 uses it to
     # keep per-poll view health from RETRACTING a page it already sent; see park_label_stuck).
-    prev_alert_reasons = _dget(alert_on_disk, "reasons", list) if alert_on_disk else []
+    # `_dget` coerces a missing/wrong-typed value to [], so a damaged ALERT costs at most a
+    # re-raise on the next tick — never a raise into the tick.
+    prev_alert_reasons = _dget(alert_on_disk, "reasons", list)
 
     # ================= A. alerts (safety first, before any work) =================
     reasons = []
@@ -1468,8 +1470,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # failing past the bound: the marker is stamped and the silent retries have run long enough
         # to be ALERT-worthy (one text via the standard dedup — never twenty). The marker clearing
         # (recovery / reapprove / absorb_close) drops the reason, which auto-clears the ALERT. Skip
-        # an issue the owner has CLOSED on GitHub: its stuck label is moot — absorb_close settles it
-        # this same tick — so a "label stuck" text as the owner drops it is pure noise (#108 P2).
+        # an issue the owner has CLOSED on GitHub, on a read that VOUCHED for itself: its stuck label
+        # is moot — that same vouched read is what lets absorb_close settle it this tick — so a
+        # "label stuck" text as the owner drops it is pure noise (#108 P2, scoped by #256 half 2).
         stamped = ist_of(iid).get("park_notify_at")
         being_absorbed = not gh_stale and _iid_num(iid) in closed_nums
         # The terminal veto is scoped by POSITIVE PROOF, not by status alone (issue #256, half 1).
@@ -1513,11 +1516,23 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # label move stick in the first place. So per-poll doubt gates only the RAISE — a page
         # already sent stands until EVIDENCE retracts it (the marker clears, the park lands, or a
         # vouched read says the owner closed the issue), never until the weather improves.
+        #
+        # Scoped to REAPPROVAL_STATUSES — the hand-back statuses — rather than to every terminal
+        # one, because `merged` is the single terminal status `decide` has no path to clear a
+        # marker from: it is not re-approvable, the reconciliation branch wants `parked`, and
+        # `clear_park_marker` lives inside a gate branch the terminal `continue` never reaches. No
+        # park can be emitted for a merged lane, so the escape would be pure noise there — and an
+        # un-clearable reason does not merely nag, it poisons the dedup for every OTHER reason (the
+        # `existing != reasons` compare below is what decides whether anything at all gets said).
+        # Reaching that state looks impossible today, but only because of a property of a DIFFERENT
+        # executor (`_exec_close_investigate` leaves the pair equal), which is exactly the kind of
+        # invariant that should not be load-bearing at a distance.
         standing = f"park_label_stuck:{iid}" in prev_alert_reasons
         p_now = parsed_by_id.get(iid)
         labels_now = p_now.get("labels") if isinstance(p_now, dict) else None
         landed_cause = ist_of(iid).get("park_landed_cause")
-        park_unlanded = (isinstance(labels_now, list) and "agent-ready" in labels_now
+        park_unlanded = (_status_of(ist_of(iid)) in REAPPROVAL_STATUSES
+                         and isinstance(labels_now, list) and "agent-ready" in labels_now
                          and (not gh_stale or standing)
                          and isinstance(landed_cause, str)
                          and landed_cause != ist_of(iid).get("park_notify_cause"))
@@ -1526,14 +1541,20 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # answers, the poll completes, the view is stamped FRESH, and the closed set is empty for a
         # reason nobody observed — the staleness check overhead never fires. Reading that emptiness
         # as "the issue is still open" pages the owner about a park they resolved seconds ago (the
-        # dashboard's Drop, or a close by hand). Holding instead costs a DELAYED true page, never a
-        # lost one: this reason re-derives every tick, so the first vouched read that still shows
-        # the issue open escalates. `closed_read_ok` folds gh_stale in deliberately (see its
-        # definition): when the WHOLE view is doubted, #108's rule stands unchanged — an unproven
-        # close must never suppress a real alert. The `absorb_close` sibling needs no such conjunct:
-        # it requires POSITIVE membership, so an unvouched read only delays absorption. `standing`
-        # again bounds this to the RAISE: an unvouched read must not retract a page already sent
-        # (that is the same per-poll flap as above, and the same one text per flip).
+        # dashboard's Drop, or a close by hand). Holding instead costs a delay: this reason
+        # re-derives every tick, so the first vouched read that still shows the issue open
+        # escalates. Be exact about that cost, because the read side and the write side fail
+        # TOGETHER (the 2026-07-08 dead zone) — for the whole of a read throttle this reason says
+        # nothing, and if the label write recovers FIRST the episode ends, the marker clears, and
+        # the page is never sent at all. That last one is a page about a problem that resolved
+        # itself, which is why the vouch is still the right trade; it is not a page merely deferred.
+        # Buying the read-side proof back would take a positive openness observation, which is an
+        # owner call about how much silence a throttle should buy, not a reviewer's (issue #378).
+        # `closed_read_ok` folds gh_stale in deliberately (see its definition): when the WHOLE view
+        # is doubted, #108's rule stands unchanged — an unproven close must never suppress a real
+        # alert. The `absorb_close` sibling needs no such conjunct: it requires POSITIVE membership,
+        # so an unvouched read only delays absorption. `standing` again bounds this to the RAISE: an
+        # unvouched read must not retract a page already sent (the same per-poll flap as above).
         if (not being_absorbed and (closed_read_ok or standing)
                 and (_status_of(ist_of(iid)) not in TERMINAL_STATUSES or park_unlanded)
                 and isinstance(ist_of(iid).get("park_notify_cause"), str)
