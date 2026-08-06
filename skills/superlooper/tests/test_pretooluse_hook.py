@@ -1,6 +1,7 @@
-"""Issues #156 / #185 / #225 — the Claude PreToolUse deny hook for UNATTENDED loop sessions.
+"""Issues #156 / #185 / #225 / #226 — the Claude PreToolUse deny hook for UNATTENDED loop sessions.
 
-Three of the costliest worker-instruction-drift incidents are made mechanically impossible here
+The costliest worker-instruction-drift incidents — and, since #226, the three paths to a bad merge
+(see that section's own header at the foot of this file) — are made mechanically impossible here
 rather than merely instructed-against:
 
   * AskUserQuestion in an unattended lane (i280): a human-facing dialog with no human at the pane,
@@ -825,3 +826,367 @@ def test_attached_and_separated_short_options_mix(tmp_path):
 def test_an_attached_short_label_holding_a_variable_still_stands_the_duty_down(tmp_path):
     _worktree(tmp_path)
     assert _create("gh issue create --title x -l$labels --body '## Goal\nx\n'", tmp_path) is None
+
+
+# ======================= duties 4-6: the three bad-merge paths (issue #226) =======================
+# Three routes to a bad merge were guarded only by prose. The owner ruled on 2026-08-05 (Q11) that
+# there will be NO bot account — every loop action stays on the owner's own identity, so no
+# vendor-side token scoping is coming and no after-the-fact provenance check is even possible (every
+# session posts as the same login). The moment of the tool call is the only place identity exists,
+# which makes these denies THE protection for all three paths rather than one layer of several.
+#
+#   4. FORGED COMMIT STATUS. The gate's required-checks rollup folds gh's two shapes — CheckRun
+#      (name/conclusion) and StatusContext (context/state) — into one verdict, and GitHub's own
+#      branch protection accepts a hand-posted context just as readily, so a failing diff can merge
+#      green. #232 measured the account-credential-writable surface: exactly one endpoint,
+#      POST /repos/{o}/{r}/statuses/{sha}.
+#   5. APPROVAL LABELS. `agent-ready` IS the launch gate and `pre-authorized:*` is what the merge
+#      gate consumes (#165) — a session that can apply either self-approves work the owner never
+#      saw. Workers are INSTRUCTED to file child issues, so they hold the very tool that does it.
+#   6. OUT-OF-BAND SHIPPING. `gh pr merge`, a direct push to the dev branch, and any force-push.
+#      Precedent i328 (2026-07-15): a worker merged its own PR, defeating all three completion
+#      signals at once and stalling the queue two hours.
+#
+# Same fail-open discipline as duties 2 and 3: deny only on confident matches, let ambiguous or
+# read-shaped calls through, and PIN the accepted misses so a future tightening is deliberate.
+
+
+def _bash(command, tmp_path=None, env=None, cwd=None):
+    """The hook's verdict for one Bash command — the deny reason, or None to allow."""
+    return _create(command, tmp_path=tmp_path, env=env, cwd=cwd)
+
+
+# --------------------------- matcher A: a forged commit status ---------------------------
+
+@pytest.mark.parametrize("command", [
+    "gh api repos/willprout/superlooper/statuses/abc123 -f state=success -f context=tests",
+    "gh api /repos/willprout/superlooper/statuses/abc123 --method POST -f state=success",
+    "gh api -X POST repos/willprout/superlooper/statuses/$SHA -f state=success",
+    "gh api --method POST 'repos/willprout/superlooper/statuses/abc' -f context=tests",
+    "gh api https://api.github.com/repos/o/r/statuses/deadbeef -f state=success",
+    "cd /tmp && gh api repos/o/r/statuses/abc -f state=success",
+    "SHA=$(git rev-parse HEAD)\ngh api repos/o/r/statuses/$SHA -f state=success",
+    "/opt/homebrew/bin/gh api repos/o/r/statuses/abc -f state=success",
+])
+def test_a_hand_posted_commit_status_is_denied(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path), "writing a commit status must be denied: %r" % command
+
+
+def test_the_status_deny_names_the_contract_it_protects(tmp_path):
+    """The reason reaches the model VERBATIM at the moment it errs, so it must teach the contract,
+    not merely forbid: CI goes green because the tests RAN, the gate reads real checks, and writing
+    one is never a worker's job."""
+    _worktree(tmp_path)
+    reason = _bash("gh api repos/o/r/statuses/abc -f state=success", tmp_path)
+    low = reason.lower()
+    assert "commit status" in low
+    assert "gate" in low, "the deny must name what a forged status would fool"
+    assert "tests ran" in low or "tests actually ran" in low, \
+        "the deny must state WHY CI goes green — because the tests ran, not because someone said so"
+
+
+@pytest.mark.parametrize("command", [
+    # READS of the same data are a different endpoint shape entirely (`/commits/<sha>/status`,
+    # `/commits/<sha>/statuses`) and are exactly how a worker checks its own CI. Never denied.
+    "gh api repos/willprout/superlooper/commits/abc123/status",
+    "gh api repos/willprout/superlooper/commits/abc123/statuses",
+    "gh api repos/o/r/commits/abc/check-runs --jq '.check_runs[].conclusion'",
+    "gh pr checks 42",
+    "gh api repos/o/r/pulls/42 --jq .mergeable",
+    "gh pr comment 42 --body 'the statuses/ endpoint is not for us'",
+    "gh issue comment 7 --body 'see repos/o/r/statuses/abc in the docs'",
+])
+def test_reading_status_and_ordinary_gh_calls_are_untouched(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path) is None, "must NOT deny: %r" % command
+
+
+# --------------------------- matcher B: approval labels ---------------------------
+
+@pytest.mark.parametrize("command", [
+    "gh issue edit 42 --add-label agent-ready",
+    "gh issue edit 42 --add-label=agent-ready",
+    "gh issue edit 42 --add-label 'needs-owner,agent-ready'",
+    "gh pr edit 42 --add-label agent-ready",
+    "gh issue edit 42 --add-label pre-authorized:referee",
+    "gh pr edit 42 --add-label pre-authorized:anything",
+    "gh issue create --title x --label type:build,agent-ready --body 'b'",
+    "gh issue create --title x -lagent-ready --body 'b'",
+    "gh api repos/o/r/issues/42/labels -f labels[]=agent-ready",
+    "gh api --method POST repos/o/r/issues/42/labels -f 'labels[]=pre-authorized:referee'",
+    "gh api -X PUT repos/o/r/issues/42/labels -f labels[]=agent-ready",
+    "cd /tmp && gh issue edit 42 --add-label agent-ready",
+])
+def test_applying_an_approval_label_is_denied(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path), "applying an approval label must be denied: %r" % command
+
+
+def test_the_approval_deny_hands_back_the_sanctioned_path(tmp_path):
+    """Forbidding alone would leave the session stuck holding work it believes is ready. The deny
+    must name the label that actually puts the issue in front of the owner."""
+    _worktree(tmp_path)
+    reason = _bash("gh issue edit 42 --add-label agent-ready", tmp_path)
+    low = reason.lower()
+    assert "needs-owner" in low, "the deny must hand back the sanctioned label"
+    assert "agent-ready" in low
+    assert "owner" in low, "the deny must say whose verb approval is"
+
+
+@pytest.mark.parametrize("command", [
+    # REMOVAL is a safety act, not approval — never denied.
+    "gh issue edit 42 --remove-label agent-ready",
+    "gh pr edit 42 --remove-label pre-authorized:referee",
+    "gh api -X DELETE repos/o/r/issues/42/labels/agent-ready",
+    "gh api --method DELETE repos/o/r/issues/42/labels/pre-authorized:referee",
+    # the METHOD belt on its own, both spellings: a DELETE naming the label in a FIELD rather than
+    # in the path is still a removal. `-X` must be reached even though `--method` is tried first.
+    "gh api -X DELETE repos/o/r/issues/42/labels -f labels[]=agent-ready",
+    "gh api -XDELETE repos/o/r/issues/42/labels -f labels[]=agent-ready",
+    # ...and ordinary labels of every shape.
+    "gh issue edit 42 --add-label needs-owner",
+    "gh issue edit 42 --add-label type:build,parked",
+    "gh issue create --title x --label type:build,needs-owner "
+    "--body '## Goal\nx\n\n## Loop metadata\ntouches: engine\n'",
+    # reading labels, and creating a label in the repo's vocabulary, are not applying one
+    "gh api repos/o/r/issues/42/labels",
+    "gh label list",
+    # the words as TEXT, inside something else
+    "gh issue comment 7 --body 'this needs agent-ready from the owner'",
+    "git commit -m 'never apply agent-ready'",
+])
+def test_ordinary_label_work_and_removal_stay_allowed(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path) is None, "must NOT deny: %r" % command
+
+
+def test_an_approval_label_held_in_a_variable_stands_the_matcher_down(tmp_path):
+    # `--add-label "$LABEL"` — shlex leaves the literal `$LABEL`, which is a recipe, not the value.
+    # Judging it would be a verdict on evidence we never read (the duty-3 rule, applied here).
+    _worktree(tmp_path)
+    assert _bash('gh issue edit 42 --add-label "$LABEL"', tmp_path) is None
+
+
+def test_the_approval_deny_beats_the_issue_create_format_deny(tmp_path):
+    """`gh issue create --label agent-ready` with a malformed body trips duty 3 as well. The
+    approval line is the harder one — the session must be told it may not self-approve, not handed
+    a format lecture that implies the command is fine once the body is fixed."""
+    _worktree(tmp_path)
+    reason = _bash("gh issue create --title x --label agent-ready --body '## Goal\nx\n'", tmp_path)
+    assert reason and "needs-owner" in reason.lower()
+    assert "MECHANICALLY INVALID" not in reason
+
+
+# --------------------------- matcher C: out-of-band shipping ---------------------------
+
+@pytest.mark.parametrize("command", [
+    "gh pr merge 42",
+    "gh pr merge --squash --admin 42",
+    "gh pr merge --auto --squash",
+    "cd /tmp && gh pr merge 42 --squash",
+    "gh pr create --fill\ngh pr merge --squash",
+    "/opt/homebrew/bin/gh pr merge 42",
+    "sudo gh pr merge 42",
+])
+def test_gh_pr_merge_is_denied(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path), "self-merging must be denied: %r" % command
+
+
+@pytest.mark.parametrize("command", [
+    "git push origin main",
+    "git push origin HEAD:main",
+    "git push origin main:main",
+    "git push origin HEAD:refs/heads/main",
+    "git push -u origin main",
+    "git push --delete origin main",
+    "git push origin :main",
+    "git -C /some/checkout push origin main",
+    "git -c user.name=x push origin main",
+    "cd /tmp && git push origin main",
+    "git fetch origin\ngit push origin main",
+])
+def test_a_direct_push_to_the_dev_branch_is_denied(tmp_path, command):
+    _worktree(tmp_path)                              # REPO_CFG carries no dev_branch -> "main"
+    assert _bash(command, tmp_path), "a direct dev-branch push must be denied: %r" % command
+
+
+def test_the_dev_branch_comes_from_config_not_from_a_hardcoded_name(tmp_path):
+    _worktree(tmp_path, cfg={**REPO_CFG, "dev_branch": "develop"})
+    assert _bash("git push origin develop", tmp_path), "the CONFIGURED dev branch must be denied"
+    assert _bash("git push origin main", tmp_path) is None, \
+        "a branch that is not this repo's mainline is an ordinary branch"
+
+
+def test_without_a_config_the_dev_branch_dimension_stands_down(tmp_path):
+    # We do not know this repo's mainline, so we do not guess one. The repo-INDEPENDENT halves of
+    # the matcher (force-push, `gh pr merge`) still fire.
+    _worktree(tmp_path, cfg=None)
+    assert _bash("git push origin main", tmp_path) is None
+    assert _bash("git push --force origin sl/i226-x", tmp_path)
+    assert _bash("gh pr merge 42", tmp_path)
+
+
+@pytest.mark.parametrize("command", [
+    "git push --force origin main",
+    "git push --force origin sl/i226-pretooluse",
+    "git push --force-with-lease origin sl/i226-pretooluse",
+    "git push --force-with-lease=sl/i226-x origin sl/i226-x",
+    "git push -f origin sl/i226-x",
+    "git push origin +sl/i226-x",
+    "git push origin +HEAD:sl/i226-x",
+    "cd /tmp && git push --force origin sl/i226-x",
+])
+def test_any_force_push_is_denied_whatever_the_branch(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path), "a force-push must be denied: %r" % command
+
+
+def test_the_shipping_deny_teaches_the_sanctioned_path(tmp_path):
+    _worktree(tmp_path)
+    for command in ("gh pr merge 42", "git push origin main", "git push --force origin sl/x"):
+        low = _bash(command, tmp_path).lower()
+        assert "gh pr create" in low, "the deny must name the PR the worker DOES open: %r" % command
+        assert "gate" in low, "the deny must say who merges: %r" % command
+
+
+def test_the_force_push_deny_names_the_stale_review_pin_cost(tmp_path):
+    """Bright line 6 is server-enforced on the dev branch only; on an `sl/*` branch the real cost is
+    a PR stranded on a review verdict pinned to a commit that no longer exists (post-#154), which is
+    stall-shaped waste. Say so, or the deny reads as arbitrary on a feature branch."""
+    _worktree(tmp_path)
+    low = _bash("git push --force origin sl/i226-x", tmp_path).lower()
+    assert "review" in low and "pin" in low
+
+
+@pytest.mark.parametrize("command", [
+    "git push -u origin HEAD",
+    "git push origin HEAD",
+    "git push origin sl/i226-pretooluse-deny-wave",
+    "git push origin HEAD:sl/i226-pretooluse-deny-wave",
+    "git push",
+    "git push origin",
+    "git fetch origin main",
+    "git rebase origin/main",
+    "git merge origin/main",
+    "git log origin/main..HEAD",
+    "gh pr create --fill --body 'Closes #226'",
+    "gh pr view 42 --json mergeable",
+    "gh pr comment 42 --body 'ready to merge'",
+    "gh pr list --state merged",
+    # the words as TEXT, inside something else
+    "git commit -m 'never gh pr merge, never --force'",
+    "echo 'git push --force origin main'",
+])
+def test_ordinary_shipping_work_stays_allowed(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path) is None, "must NOT deny: %r" % command
+
+
+@pytest.mark.parametrize("command", [
+    # ACCEPTED MISSES — the same deliberately-narrow posture duty 2 documents. The brief still
+    # instructs against all three, and the runner's per-tick branch->PR reconcile still settles the
+    # fact after; a miss costs the safety net, not the guard rail.
+    "sh -c 'git push --force origin main'",          # the call sits behind a quote
+    "bash -c \"gh pr merge 42\"",
+    "eval 'git push --force'",
+])
+def test_known_bad_merge_misses_are_intentional(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path) is None, "pinned accepted miss: %r" % command
+
+
+@pytest.mark.parametrize("command", [
+    # ACCEPTED FALSE DENIES, the same safe-direction trade duty 2 already makes. An unquoted newline
+    # is read as the separator it is, so a heredoc BODY line reads as a command position. Erring
+    # toward denying costs the session a rephrase; erring the other way costs a rewritten branch.
+    "cat <<EOF\ngit push --force\nEOF",
+    "cat <<EOF\ngh pr merge is what the gate does, not you\nEOF",
+])
+def test_known_bad_merge_false_denies_are_intentional(tmp_path, command):
+    _worktree(tmp_path)
+    assert _bash(command, tmp_path) is not None, "pinned accepted false deny: %r" % command
+
+
+def test_a_quoted_refspec_is_still_an_ordinary_refspec(tmp_path):
+    # Quoting is not hiding: shlex unquotes, so `'HEAD:main'` is read exactly like `HEAD:main`.
+    _worktree(tmp_path)
+    assert _bash("git push origin 'HEAD:main'", tmp_path)
+
+
+def test_an_exotic_refspec_is_an_accepted_miss(tmp_path):
+    # `git push origin HEAD:refs/for/main` (gerrit-style) and a remote spelled as a URL are not
+    # resolved. Pinned so a future tightening is a conscious change.
+    _worktree(tmp_path)
+    assert _bash("git push origin HEAD:refs/for/main", tmp_path) is None
+    assert _bash("git push git@github.com:willprout/superlooper.git HEAD", tmp_path) is None
+
+
+# --------------------------- the three duties hold everywhere the others do ---------------------
+
+@pytest.mark.parametrize("env", [WORKER_ENV, DEBUGGER_ENV, ATTENDED_DEBUGGER_ENV])
+@pytest.mark.parametrize("command", ["gh api repos/o/r/statuses/abc -f state=success",
+                                     "gh issue edit 4 --add-label agent-ready",
+                                     "gh pr merge 42",
+                                     "git push --force origin sl/x"])
+def test_the_bad_merge_denies_hold_for_every_role_attended_or_not(tmp_path, env, command):
+    # Attendance carves out duty 1 ONLY. The sl-debugger's own unattended contract already forbids
+    # merging and force-pushing at EVERY authority tier, `full` included, so there is nothing to
+    # carve out here either.
+    _worktree(tmp_path, issue_id=env["SL_ISSUE_ID"])
+    assert _bash(command, tmp_path, env=env)
+
+
+@pytest.mark.parametrize("command", ["gh api repos/o/r/statuses/abc -f state=success",
+                                     "gh issue edit 4 --add-label agent-ready",
+                                     "gh pr merge 42",
+                                     "git push --force origin sl/x"])
+def test_no_bad_merge_deny_outside_a_loop_session(tmp_path, command):
+    _worktree(tmp_path)
+    assert wp.run(_pre("Bash", {"command": command}),
+                  {"SL_ISSUE_ID": "", "SL_RUN_ROOT": str(tmp_path)}) is None
+    assert _bash(command, tmp_path, env={**WORKER_ENV, "SL_AGENT": "codex"}) is None
+
+
+def test_a_malformed_command_line_is_never_judged(tmp_path):
+    _worktree(tmp_path)
+    assert _bash("git push --force origin 'unbalanced", tmp_path) is None
+    assert wp.run(_pre("Bash", {"command": None}), WORKER_ENV) is None
+
+
+def test_a_broken_config_read_never_takes_the_shipping_matcher_down(tmp_path):
+    d = tmp_path / "worktrees" / "i7" / ".superlooper"
+    d.mkdir(parents=True)
+    (d / "config.json").mkdir()                      # a DIRECTORY where the config should be
+    assert _bash("git push origin main", tmp_path) is None      # dev branch unknown -> stands down
+    assert _bash("gh pr merge 42", tmp_path)                    # repo-independent half still fires
+
+
+# --------------------------- end to end, through the hook script ---------------------------
+
+@pytest.mark.parametrize("command,needle", [
+    ("gh api repos/o/r/statuses/abc -f state=success", "commit status"),
+    ("gh issue edit 42 --add-label agent-ready", "needs-owner"),
+    ("gh pr merge 42", "gh pr create"),
+    ("git push --force origin sl/i226-x", "force"),
+    ("git push origin main", "main"),
+])
+def test_the_hook_script_denies_each_bad_merge_path_end_to_end(tmp_path, command, needle):
+    (tmp_path / "worktrees" / "i7" / ".superlooper").mkdir(parents=True)
+    (tmp_path / "worktrees" / "i7" / ".superlooper" / "config.json").write_text(json.dumps(REPO_CFG))
+    r = _run_hook(tmp_path, _pre("Bash", {"command": command}))
+    assert r.returncode == 0, r.stderr
+    d = _decision(r.stdout)
+    assert d and d["hookSpecificOutput"]["permissionDecision"] == "deny", command
+    assert needle in d["hookSpecificOutput"]["permissionDecisionReason"], command
+
+
+def test_the_hook_script_still_lets_the_worker_ship_the_sanctioned_way(tmp_path):
+    (tmp_path / "worktrees" / "i7" / ".superlooper").mkdir(parents=True)
+    (tmp_path / "worktrees" / "i7" / ".superlooper" / "config.json").write_text(json.dumps(REPO_CFG))
+    for command in ("git push -u origin HEAD", "gh pr create --fill --body 'Closes #226'",
+                    "gh pr comment 42 --body '<!-- superlooper-review sha=abc --> LGTM'"):
+        r = _run_hook(tmp_path, _pre("Bash", {"command": command}))
+        assert r.returncode == 0, r.stderr
+        assert _decision(r.stdout) is None, "the sanctioned path must be untouched: %r" % command

@@ -102,6 +102,18 @@ def test_ship_instructions_without_ship_cmd(_sl_home):
         "the brief must teach paste-the-oid, not a substitution gh will not expand"
 
 
+def test_the_no_ship_cmd_flavour_states_the_shipping_rule_too(_sl_home):
+    """Issue #226. `_SHIP_WITH_CMD` has always carried the rule — never a direct push to the dev
+    branch, never `gh pr merge`, never a hand-posted status — and `_SHIP_NO_CMD` never did, so the
+    repos that ship WITHOUT a pipeline (this one included) were the ones told nothing. The
+    PreToolUse deny wave now refuses all three at the call, but the deny has documented accepted
+    misses; the brief is what covers those, so both flavours must say it."""
+    out = brief.build(_issue(), _cfg(_sl_home, ship_cmd=None, dev_branch="trunk"))
+    assert "gh pr merge" in out, "the no-pipeline brief must forbid self-merging"
+    assert "trunk" in out, "the rule must name THIS repo's dev branch, not a hardcoded one"
+    assert "hand-posted" in out or "hand-post" in out
+
+
 # --------------------------------------------------------------------------- type variants
 def test_build_footer_has_ship_gate(_sl_home):
     out = brief.build(_issue(type="build"), _cfg(_sl_home))

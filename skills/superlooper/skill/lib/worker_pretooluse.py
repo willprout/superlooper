@@ -1,8 +1,9 @@
-"""The Claude PreToolUse hook's core (issues #156 + #185): two of the costliest
-session-instruction-drift incidents made mechanically impossible rather than instructed-against.
+"""The Claude PreToolUse hook's core (issues #156 + #185 + #225 + #226): the costliest
+session-instruction-drift incidents, and the three paths to a bad merge, made mechanically
+impossible rather than instructed-against.
 
 pretooluse-hook.sh fences the session (loop-only, Claude-only, cwd-safe) and hands the hook
-payload here. This decides ONE thing: does this tool call cross one of two named hard lines, and if
+payload here. This decides ONE thing: does this tool call cross one of the named hard lines, and if
 so, what reason does the session receive? The spike (docs/SPIKE-2026-07-15-hook-capabilities.md)
 proved a PreToolUse hook returning permissionDecision:"deny" blocks the call even under
 --dangerously-skip-permissions, with the reason delivered to the model verbatim.
@@ -24,7 +25,23 @@ proved a PreToolUse hook returning permissionDecision:"deny" blocks the call eve
      moment it files wrong. The issue is validated BEFORE it exists; the deny names exactly what is
      missing and the required shape; the session retries correctly on the freshest possible turn.
 
-DENY ONLY THE THREE NAMED HAZARDS. Everything else is allowed — no broad allowlist that could break
+  4. A FORGED COMMIT STATUS, 5. AN APPROVAL LABEL (`agent-ready` / `pre-authorized:*`), and
+     6. OUT-OF-BAND SHIPPING (`gh pr merge`, a direct push to the dev branch, any force-push) —
+     issue #226, the three paths to a bad merge. Their full rationale, their accepted misses and the
+     one posture difference from duty 3 sit above the matchers themselves, below. Two facts belong
+     up here because they shape the whole module:
+
+       * WHY THIS IS THE ONLY LAYER. The owner ruled on 2026-08-05 (Q11) that there will be NO bot
+         account: every loop action runs on his own identity, so no vendor-side token scoping is
+         coming, and because every session posts as the same login no after-the-fact provenance
+         check is even possible. The moment of the tool call is the only place identity exists.
+       * WHAT IS OUT OF SURFACE, measured on #232 (2026-08-05). The forgery surface writable by an
+         ACCOUNT credential is exactly one endpoint: POST /repos/{o}/{r}/statuses/{sha}. Check-run
+         creation is App-only and the status-creating GraphQL mutations are unreachable the same
+         way, so deny branches for those would test an impossible call. They are recorded, not
+         coded — and if GitHub ever opens either, this note is where the gap is already named.
+
+DENY ONLY THE NAMED HAZARDS. Everything else is allowed — no broad allowlist that could break
 legitimate tool use (issue Boundaries).
 
 EVERY UNATTENDED SESSION THE LOOP LAUNCHES (owner ruling on #185, 2026-07-16). #156 shipped this
@@ -56,10 +73,11 @@ ATTENDANCE — NOT ROLE — IS THE ONE CARVE-OUT. `superlooper debug` (issue #14
 session through the SAME shim as the watchdog, but with a person at the keyboard; its brief says so
 and invites them to ask. That launch sets SL_ATTENDED=1 and duty 1 stands down for it: the deny's
 whole premise ("no human is at this pane") would be a falsehood, and a falsehood that pushes the
-session into the unattended contract costs more than the dialog. Duty 2 is NOT carved out — a
-pattern can match the owner's live processes whether or not anyone is watching, and no brief ever
-promises pattern-kills (the sl-debugger contract forbids them at every authority tier, `full`
-included). The flag is honored for `d<N>` ALONE, because the owner tap is the only attended launch
+session into the unattended contract costs more than the dialog. NO OTHER DUTY is carved out — a
+pattern can match the owner's live processes whether or not anyone is watching, an unlaunchable
+issue is unlaunchable either way, and a person at the pane makes a forged status or a self-merge no
+less of a bad merge. No brief ever promises any of them (the sl-debugger contract forbids
+pattern-kills, merging and force-pushing at every authority tier, `full` included). The flag is honored for `d<N>` ALONE, because the owner tap is the only attended launch
 that exists: a worker's env descends from the runner's shell, and an ambient `export SL_ATTENDED=1`
 there must never quietly disarm the deny i280 paid for. (Belt AND suspenders: runner._script_env
 and _debugger_shim_run both PIN the flag empty on every unattended launch, so the leak is closed at
@@ -76,6 +94,10 @@ then walk away.
 
 CLAUDE ONLY. Codex has no PreToolUse event (spike verdict); its backstop is the classifier's
 at_dialog/logged_out states. run() no-ops for SL_AGENT=codex so a global registration is inert there.
+This is an honest limit, not a footnote: a seat with no PreToolUse layer is simply not reached, and
+one such seat exists TODAY inside a worker's own session — `/superlooper:cross-review` runs a
+non-Claude agent as a subprocess in the worker's pane, inheriting the worker's credential with no
+hook of its own (#232's finding). Nothing here can cover it; the brief's own words are what does.
 
 FAIL OPEN, ALWAYS. This fires before EVERY tool call. A broken duty must degrade to "allow" (today's
 behavior — the brief still instructs against them), never to blocking every tool and wedging the
@@ -391,6 +413,384 @@ def parse_issue_create(command):
             "body": body if (body_readable and body is not None) else None}
 
 
+# ================= duties 4-6: the three bad-merge paths (issue #226) =================
+#
+# Three routes to a bad merge were guarded by prose alone. The owner ruled on 2026-08-05 (Q11) that
+# there will be NO bot account: every loop action stays on his own identity, so no vendor-side token
+# scoping is coming, and because every session posts as the same login no after-the-fact provenance
+# check is even possible. The moment of the tool call is the only place identity exists — which makes
+# these denies THE protection for all three paths, not one layer of several.
+#
+#   4. A FORGED COMMIT STATUS. gate.py's required-checks rollup folds gh's two shapes — CheckRun
+#      (name/conclusion) and StatusContext (context/state) — into one verdict, and GitHub's own
+#      branch protection accepts a hand-posted context just as readily, so a failing diff can merge
+#      green.
+#   5. AN APPROVAL LABEL. `agent-ready` IS the launch gate (actions.py) and `pre-authorized:*` is
+#      what the merge gate consumes (#165), so a session that can apply either self-approves work the
+#      owner never saw. Workers are INSTRUCTED to file child issues (brief.py), so they hold the very
+#      tool that does it.
+#   6. OUT-OF-BAND SHIPPING. `gh pr merge`, a direct push to the dev branch, and any force-push.
+#      Precedent i328 (2026-07-15): a worker merged its own PR, defeating all three completion
+#      signals at once and stalling the queue two hours. #155's per-tick branch->PR reconcile is
+#      post-hoc — it settles the fact, it prevents nothing.
+#
+# OUT OF SURFACE, DELIBERATELY UNGUARDED (measured on #232, 2026-08-05). The forgery surface
+# writable by an ACCOUNT credential is exactly one endpoint: POST /repos/{o}/{r}/statuses/{sha}.
+# Check runs cannot be created by any account credential at all (the Checks API is App-only), and the
+# status-creating GraphQL mutations are unreachable the same way. Shipping deny branches for those
+# would be testing an impossible call, so they are recorded here instead of coded.
+#
+# ACCEPTED MISSES, stated so they stay conscious choices (the same posture as the pattern-kill
+# matcher's, and pinned in test_pretooluse_hook.py):
+#   * a call behind a quote — `sh -c '…'`, `bash -c "…"`, `eval '…'` — or inside a heredoc body,
+#     where the name never sits at a command position this parser can see;
+#   * a hand-rolled `curl` to the statuses endpoint (it needs a token the worker has no handy route
+#     to; `gh` is what a session actually reaches for);
+#   * `git push` with no refspec while the checkout happens to sit ON the dev branch — the command
+#     line does not say which branch that is, and reading the checkout is a new I/O this hook does
+#     not do;
+#   * exotic refspecs (`HEAD:refs/for/main`) and a remote spelled as a URL;
+#   * a seat with no PreToolUse layer at all — today that is `/superlooper:cross-review`'s non-Claude
+#     subprocess running inside the worker's own pane on the worker's credential (#232). See the
+#     module docstring's CLAUDE ONLY note.
+# The brief still instructs against all three hazards — brief.py's `_SHIP_NO_CMD` now says so, and
+# the brief-footer line about never hand-posting a commit status is the documented backstop for
+# exactly these misses, not redundant teaching.
+#
+# ONE POSTURE DIFFERENCE FROM DUTY 3, on purpose. There, a deny was the DANGEROUS direction (refusing
+# a legitimate `gh issue create`), so two calls on one line stand the duty down. Here a deny is the
+# CHEAP direction — it costs the session a rephrase, never a lost merge — so EVERY invocation on the
+# line is judged and any one match denies. What stays identical is the rule that we never judge what
+# we could not read: an unreadable command line, an argument held in a shell variable, or a dev
+# branch no config in reach declares each stands its own check down.
+
+# `git`'s global options that consume the NEXT token, so `git -C /path push --force` and
+# `git -c user.name=x push …` are still read as pushes rather than as some other subcommand.
+_GIT_GLOBAL_WITH_VALUE = frozenset(("-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                                    "--exec-path", "--super-prefix"))
+
+# Leading words that wrap a real command without changing what it is — the same list duty 2's regex
+# sees through, so `sudo gh pr merge 42` is still `gh pr merge`.
+_WRAPPERS = frozenset(("sudo", "env", "nohup", "time", "command", "builtin", "exec", "xargs",
+                       "then", "do", "else"))
+
+
+def _newline_separated(command):
+    """`command` with every newline OUTSIDE a quoted string replaced by an explicit `;`.
+
+    shlex treats a newline as ordinary whitespace, so `cd /x\\ngit push --force` splits to
+    [cd, /x, git, push, --force] and the `git` no longer follows a separator — the ORDINARY
+    multi-line Bash call would walk straight past every command-position check below. A newline IS a
+    separator in a shell, so we say so before splitting. Newlines INSIDE quotes are left alone: a PR
+    body or a commit message is text, not structure, and turning its line breaks into separators is
+    how `git commit -m 'a\\ngit push --force'` would become a false deny.
+
+    A deliberately small scanner, not a shell: it tracks single and double quotes and a backslash
+    escape, and nothing else. When it guesses wrong the result usually fails to shlex-split, which
+    is the fail-open answer anyway."""
+    out, quote, i, n = [], None, 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote is None and ch == "\\":
+            out.append(command[i:i + 2])          # an escaped char is never structure
+            i += 2
+            continue
+        if quote == "'":
+            quote = None if ch == "'" else quote
+        elif quote == '"':
+            if ch == "\\":
+                out.append(command[i:i + 2])
+                i += 2
+                continue
+            quote = None if ch == '"' else quote
+        elif ch in "\"'":
+            quote = ch
+        out.append(" ; " if (ch == "\n" and quote is None) else ch)
+        i += 1
+    return "".join(out)
+
+
+def _split_shell(command):
+    """The command's tokens with unquoted newlines as `;` separators, or None when it cannot be read.
+
+    Kept separate from `_split_command` (duty 3's) so this change cannot move duty 3's verdicts: the
+    newline handling is new, and duty 3's fail-open direction makes its own misses harmless."""
+    if not isinstance(command, str) or ("gh" not in command and "git" not in command):
+        return None
+    try:
+        return shlex.split(_newline_separated(command))
+    except ValueError:
+        return None
+
+
+def _at_command_position(tokens, i):
+    """Is `tokens[i]` a command being RUN, rather than an argument to something else? True at the
+    line start, right after a separator, or behind a chain of benign wrappers."""
+    j = i - 1
+    while j >= 0 and tokens[j] in _WRAPPERS:
+        j -= 1
+    return j < 0 or tokens[j] in _SEPARATORS
+
+
+def _invocations(tokens, binary):
+    """[(start, end)] — the ARGUMENT run of every `binary` invoked at a command position. `start` is
+    the index of its first argument, `end` the index of the next separator (or the line's end). An
+    absolute or relative path to the binary is seen through."""
+    out = []
+    for i, tok in enumerate(tokens):
+        if not (tok == binary or tok.endswith("/" + binary)):
+            continue
+        if not _at_command_position(tokens, i):
+            continue
+        end = len(tokens)
+        for j in range(i + 1, len(tokens)):
+            if tokens[j] in _SEPARATORS:
+                end = j
+                break
+        out.append((i + 1, end))
+    return out
+
+
+# --------------------------- matcher A: a forged commit status ---------------------------
+
+# The ONE endpoint an account credential can forge a required check through (#232). Anchored on
+# `repos/<owner>/<repo>/statuses/<sha>` so the READ shapes — `commits/<sha>/status` and
+# `commits/<sha>/statuses`, which is how a worker legitimately checks its own CI — cannot match: the
+# write path ends in the sha, the read paths do not contain `statuses/` at all.
+_STATUS_WRITE_RE = re.compile(r"(?:^|/)repos/[^/\s]+/[^/\s]+/statuses/[^/\s?#&]+")
+
+_STATUS_REASON = (
+    "Hand-posting a commit status is forbidden in a superlooper loop session. The merge gate's "
+    "required-checks rollup folds BOTH of GitHub's shapes — check runs and commit statuses — into "
+    "one verdict, and GitHub's own branch protection accepts a hand-posted context just as readily, "
+    "so a status you write yourself can merge a failing diff green. CI goes green because the tests "
+    "ran, not because anyone said so, and the gate is entitled to read a check as evidence. Nothing "
+    "was posted. READING status is fine and is what you actually want here "
+    "(`gh api repos/{owner}/{repo}/commits/<sha>/status`, or `gh pr checks`). If a required check is "
+    "red, fix the diff; if you cannot, say so plainly in your report and let the gate park the issue "
+    "for the owner. Writing a check is never a worker's job."
+)
+
+
+def _forged_status_deny(tokens):
+    for start, end in _invocations(tokens, "gh"):
+        if start >= end or tokens[start] != "api":
+            continue
+        if any(_STATUS_WRITE_RE.search(t) for t in tokens[start + 1:end]):
+            return _STATUS_REASON
+    return None
+
+
+# --------------------------- matcher B: approval labels ---------------------------
+
+# `agent-ready` is the launch gate; the `pre-authorized:` FAMILY (gate.PREAUTHORIZED_REFEREE_LABEL
+# is today's only member) is what the merge gate consumes. Held as literals rather than imported:
+# this module runs before EVERY tool call, and pulling gate.py in would trade that for a constant
+# whose value has never moved. The prefix is matched, not the one label, so a future member is
+# covered the day it is minted.
+_APPROVAL_LABEL = "agent-ready"
+_PREAUTH_PREFIX = "pre-authorized:"
+
+# Long forms FIRST: `_flag_value`'s attached-short branch would read `--label` as `-l` with the
+# value `-label`, so the order here is load-bearing (the same ordering duty 3 relies on).
+_LABEL_ADD_FLAGS = ("--add-label", "--label", "-l")
+
+# `repos/<o>/<r>/issues/<n>/labels[…]` — GitHub routes PR labels through the ISSUES endpoint too, so
+# this one shape covers both. The DELETE form carries the label name in the path (`…/labels/<name>`)
+# and is excluded twice over: the path token is never scanned for a label name, and an explicit
+# DELETE method stands the check down outright.
+_LABELS_ENDPOINT_RE = re.compile(r"(?:^|/)issues/[^/\s]+/labels(?:$|[/?#])")
+_METHOD_FLAGS = ("--method", "-X")
+
+_APPROVAL_REASON = (
+    "Applying `agent-ready` or a `pre-authorized:*` label is forbidden in a superlooper loop "
+    "session: approval and pre-authorization are the OWNER's verbs alone (a bright line of this "
+    "system). `agent-ready` IS the launch gate — it is what puts an issue into a lane — and "
+    "`pre-authorized:referee` is what the merge gate consumes, so applying either would approve work "
+    "the owner never saw, using the owner's own identity. Nothing was labeled. File it "
+    "`needs-owner` instead: that is the label that puts the issue in front of the owner, and they "
+    "approve it in their own words. (Removing one of these labels is NOT denied — removal is a "
+    "safety act, not an approval.)"
+)
+
+
+def _is_approval_label(value):
+    """Does this `--label`-style argument name an approval label? A comma list is split, each part
+    compared whole (so `agent-ready-followup` is an ordinary label) and the `pre-authorized:` family
+    matched by prefix. An argument holding a shell variable is a recipe, not a value — see
+    `_unexpanded` — so it is never judged."""
+    if not isinstance(value, str) or _unexpanded(value):
+        return False
+    for part in value.split(","):
+        p = part.strip().lower()
+        if p == _APPROVAL_LABEL or p.startswith(_PREAUTH_PREFIX):
+            return True
+    return False
+
+
+def _api_method(tokens, start, end):
+    """The HTTP method a `gh api` call declares (`-X POST`, `--method=DELETE`, `-XDELETE`), upper
+    cased, or None when it declares none.
+
+    Walks one token at a time and tries BOTH spellings at each — not duty 3's advance-by-flag-width
+    loop, which would consume the token on the first spelling and never reach the second (`-X` would
+    have been unreachable behind `--method`)."""
+    for i in range(start, end):
+        for name in _METHOD_FLAGS:
+            val, _ = _flag_value(tokens, i, name)
+            if val is not None:
+                return val.strip().upper()
+    return None
+
+
+def _approval_label_deny(tokens):
+    for start, end in _invocations(tokens, "gh"):
+        args = tokens[start:end]
+        if len(args) >= 2 and args[0] in ("issue", "pr") and args[1] in ("create", "edit"):
+            i = start + 2
+            while i < end:
+                for name in _LABEL_ADD_FLAGS:
+                    val, nxt = _flag_value(tokens, i, name)
+                    if val is not None:
+                        if _is_approval_label(val):
+                            return _APPROVAL_REASON
+                        i = nxt
+                        break
+                else:
+                    i += 1
+        elif args and args[0] == "api":
+            if _api_method(tokens, start, end) == "DELETE":
+                continue                     # a removal, whatever it names
+            on_labels, names_one = False, False
+            for tok in tokens[start:end]:
+                if _LABELS_ENDPOINT_RE.search(tok):
+                    on_labels = True         # the PATH — never scanned for a label name
+                    continue
+                # `-f labels[]=agent-ready` reaches shlex as one token; a bare value is one too.
+                if _is_approval_label(tok.split("=", 1)[1] if "=" in tok else tok):
+                    names_one = True
+            if on_labels and names_one:
+                return _APPROVAL_REASON
+    return None
+
+
+# --------------------------- matcher C: out-of-band shipping ---------------------------
+
+_PUSH_FORCE_FLAGS = frozenset(("-f", "--force", "--force-with-lease", "--force-if-includes"))
+_PUSH_FORCE_PREFIXES = ("--force-with-lease=", "--force-if-includes=")
+# `git push` options that consume the NEXT token, so their values are never read as refspecs.
+_PUSH_VALUE_FLAGS = frozenset(("--repo", "-o", "--push-option", "--receive-pack", "--exec"))
+
+_SANCTIONED_PATH = (
+    " The sanctioned path is the whole point of the loop and it is short: push your work to THIS "
+    "issue's branch (`git push -u origin HEAD`), open the PR (`gh pr create --fill`), post the "
+    "pinned review verdict as a PR comment, write your report — then the GATE merges it once CI is "
+    "green and the verdict pins your head commit. Ending the session with the PR open is finishing, "
+    "not stopping short."
+)
+
+_MERGE_REASON = (
+    "`gh pr merge` is forbidden in a superlooper loop session: the GATE merges, never the worker. A "
+    "self-merged PR defeats all three completion signals at once — incident i328 (2026-07-15) "
+    "stalled the queue two hours that way — and nothing else in the system re-checks the diff after "
+    "you take that step. Nothing was merged." + _SANCTIONED_PATH
+)
+
+_FORCE_REASON = (
+    "Force-pushing is forbidden in a superlooper loop session — `No force-push, ever` is a bright "
+    "line, and it holds for your OWN `sl/*` branch too, not just the mainline. On a feature branch "
+    "the cost is a stranded PR: the merge gate reads a review verdict PINNED to the commit that was "
+    "reviewed, and a force-push rewrites that commit out of existence, so the PR sits on a stale "
+    "review pin until someone unsticks it by hand. Nothing was pushed. If your branch needs to catch "
+    "up with the mainline, MERGE it in (`git fetch origin && git merge origin/<dev branch>`) — "
+    "history you have already pushed is never rewritten here." + _SANCTIONED_PATH
+)
+
+_DEV_PUSH_REASON = (
+    "A direct `git push` to `%s` — this repo's dev mainline — is forbidden in a superlooper loop "
+    "session: the GATE merges to the mainline, never a worker, and a direct push lands work that no "
+    "PR and no required check ever judged. Nothing was pushed. Worker pushes go to THIS issue's "
+    "branch only." + _SANCTIONED_PATH
+)
+
+
+def _push_argv(tokens, start, end):
+    """The arguments of a `git push` whose argument run is [start, end), or None when this `git` call
+    is some other subcommand. Global options are stepped over first, so `git -C /path push …` and
+    `git -c user.name=x push …` are read for what they are."""
+    i = start
+    while i < end:
+        tok = tokens[i]
+        if tok in _GIT_GLOBAL_WITH_VALUE:
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        break
+    return tokens[i + 1:end] if i < end and tokens[i] == "push" else None
+
+
+def _push_refspecs(argv):
+    """The refspec arguments of a `git push`. The FIRST positional is the remote, so it is dropped —
+    which is also why `git push` and `git push origin` yield nothing to judge (an accepted miss: the
+    branch they would push is in the checkout, not on the command line)."""
+    positional, i = [], 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in _PUSH_VALUE_FLAGS:
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        positional.append(arg)
+        i += 1
+    return positional[1:]
+
+
+def _refspec_dest(refspec):
+    """The branch a refspec WRITES: the right of the colon when there is one, the whole thing when
+    there is not, with a force `+` and a `refs/heads/` prefix stripped. `HEAD:main`, `main`,
+    `main:main`, `:main` (a delete) and `HEAD:refs/heads/main` all resolve to `main`."""
+    spec = refspec[1:] if refspec.startswith("+") else refspec
+    dest = spec.split(":", 1)[1] if ":" in spec else spec
+    return dest[len("refs/heads/"):] if dest.startswith("refs/heads/") else dest
+
+
+def _out_of_band_deny(tokens, contract):
+    for start, end in _invocations(tokens, "gh"):
+        if tokens[start:start + 2] == ["pr", "merge"]:
+            return _MERGE_REASON
+    for start, end in _invocations(tokens, "git"):
+        argv = _push_argv(tokens, start, end)
+        if argv is None:
+            continue
+        if any(a in _PUSH_FORCE_FLAGS or a.startswith(_PUSH_FORCE_PREFIXES) for a in argv):
+            return _FORCE_REASON
+        refspecs = _push_refspecs(argv)
+        if any(r.startswith("+") for r in refspecs):
+            return _FORCE_REASON             # `+refspec` is the same force, spelled the other way
+        if refspecs:
+            # Read the config only once a push with a real refspec is in hand — this runs before
+            # every tool call, and a dev branch nobody declared stands this check down (never a
+            # guessed mainline: denying a push over a name we invented is the one wrong direction).
+            dev = _contract(contract).get("dev_branch")
+            if isinstance(dev, str) and dev and any(_refspec_dest(r) == dev for r in refspecs):
+                return _DEV_PUSH_REASON % dev
+    return None
+
+
+def _bad_merge_deny(command, contract):
+    """The duty-4/5/6 verdict for one Bash call: a deny reason, or None to allow."""
+    tokens = _split_shell(command)
+    if not tokens:
+        return None
+    return (_forged_status_deny(tokens)
+            or _approval_label_deny(tokens)
+            or _out_of_band_deny(tokens, contract))
+
+
 def _read_config(path):
     """A repo's `.superlooper/config.json` as a dict, or None. Every failure — absent, a directory,
     unreadable, unparseable, wrong-typed — is the same answer: we do not know this repo's contract."""
@@ -418,7 +818,7 @@ def _walk_up_for_config(cwd):
 
 
 def repo_contract(state_home, issue_id, cwd=None):
-    """This repo's half of the mechanical contract: {"areas", "touches_required"}.
+    """This repo's half of the mechanical contract: {"areas", "touches_required", "dev_branch"}.
 
     Two routes to the same file, because the two session shapes sit in different places. A worker's
     cwd IS its worktree — `<state home>/worktrees/<id>` is exactly what the launcher creates —
@@ -431,16 +831,33 @@ def repo_contract(state_home, issue_id, cwd=None):
     runner, which knows it is looking at its own adopted repo; here, not finding a config means we
     do not know that we are — and a confident demand on evidence we do not have is the one thing
     this duty must never make. The `type:` vocabulary is superlooper's own and repo-independent, so
-    it is still judged."""
+    it is still judged.
+
+    `dev_branch` (issue #226) rides the SAME file and the same posture: no config in reach means no
+    mainline we can name, and matcher C's dev-branch check stands down rather than guessing one. A
+    config that simply omits the key does declare a mainline — config.py's own default is `main`, so
+    that is what the runner would use and what we hold the session to."""
     cfg = _walk_up_for_config(cwd)
     if cfg is None and isinstance(state_home, str) and isinstance(issue_id, str):
         cfg = _read_config(os.path.join(state_home, "worktrees", issue_id,
                                         ".superlooper", "config.json"))
     if cfg is None:
-        return {"areas": None, "touches_required": False}
+        return {"areas": None, "touches_required": False, "dev_branch": None}
     tr = cfg.get("touches_required")
+    dev = cfg.get("dev_branch")
     return {"areas": cfg.get("areas"),
-            "touches_required": tr if isinstance(tr, bool) else True}
+            "touches_required": tr if isinstance(tr, bool) else True,
+            "dev_branch": dev.strip() if isinstance(dev, str) and dev.strip() else "main"}
+
+
+# Nothing known: no areas, no demand for `touches:`, no mainline. Every dimension reading this
+# stands itself down, so a caller that omits the contract can only ever deny LESS, never more.
+_NO_CONTRACT = {"areas": None, "touches_required": False, "dev_branch": None}
+
+
+def _contract(contract):
+    """Resolve the contract thunk, degrading to "nothing known" for a missing or broken one."""
+    return contract() if callable(contract) else dict(_NO_CONTRACT)
 
 
 _CREATE_PREAMBLE = (
@@ -491,7 +908,7 @@ def _issue_create_deny(tool_input, contract):
         # investigation — which needs no `touches:` at all — from a build, so demanding a
         # declaration would be a guess dressed as a rule.
         return None
-    got = contract() if callable(contract) else {"areas": None, "touches_required": False}
+    got = _contract(contract)
     areas = got.get("areas")
     body = parsed["body"]
     defects = queue_lint.lint(parsed["labels"], body if body is not None else "",
@@ -520,7 +937,7 @@ def _attended(env, role):
 
 def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=False,
            contract=None):
-    """Return a deny-reason string, or None to let the call proceed. Deny ONLY the three named
+    """Return a deny-reason string, or None to let the call proceed. Deny ONLY the named
     hazards — no broad allowlist. `ask_reason` is the caller's role-specific fallback text builder;
     `attended` stands duty 1 down when a human is genuinely present.
 
@@ -542,7 +959,10 @@ def decide(tool_name, tool_input, state_home, issue_id, ask_reason, attended=Fal
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
         if _is_pattern_kill(command):
             return _KILL_REASON          # never carved out, attended or not
-        return _issue_create_deny(tool_input, contract)
+        # The bad-merge matchers run BEFORE the issue-create format check, deliberately:
+        # `gh issue create --label agent-ready` trips both, and the session must be told it may not
+        # self-approve — not handed a format lecture implying the command is fine once the body is.
+        return _bad_merge_deny(command, contract) or _issue_create_deny(tool_input, contract)
     return None
 
 
