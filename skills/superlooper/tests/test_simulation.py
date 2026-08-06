@@ -1813,11 +1813,16 @@ def test_red_dev_freezes_files_once_builds_continue_green_unfreezes(sim_factory)
     assert fixes[0]["labels"] == "type:diagnose-and-fix,agent-ready,auto-approved:nightly-red,expedite"
     assert any("frozen" in ln for ln in sim.notify_lines())
 
-    # the finished PR HOLDS while frozen (never merges), and the fix issue never re-files
+    # the finished PR HOLDS while frozen (never merges), and the fix issue never re-files.
+    # A frozen mainline holds every merge but ONE — the standing-rule fix's own PR (#295) — so
+    # this asserts about THIS issue rather than about the merge count, which the auto-filed fix
+    # racing to its own merge would otherwise make timing-dependent.
     assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "holding")
     sim.tick()
-    assert not sim.mutations("merge_pr"), "a frozen mainline must hold every merge"
+    assert sim.loop_issue(sid).get("status") == "holding", \
+        "a frozen mainline must hold an ordinary finished PR"
+    assert sid not in {r.get("id") for r in sim.journal("merge") if r.get("outcome") == "ok"}
     assert len(sim.mutations("create_issue")) == 1, \
         "one fix issue per distinct breakage (fingerprint dedup)"
 
@@ -1915,6 +1920,73 @@ def test_restore_green_launches_past_a_finished_lane_holding_territory(sim_facto
     assert sim.loop_issue("i900").get("status") == "holding"
 
 
+def test_a_dev_check_freeze_lifts_itself_with_no_human_and_no_external_flip(sim_factory):
+    # issue #295 — the last rung of the autonomous ladder. #294 restored the FILING and the LAUNCH
+    # of the standing-rule fix; its PR was then held by gate step 4 like every other merge, so a
+    # dev-check freeze could only ever be lifted by a human merging that PR by hand. Nothing in the
+    # suite caught it because every earlier simulation of this cycle flipped `branch_checks` green
+    # from the OUTSIDE (a re-run, an external fix) — never by merging the fix the loop produced.
+    #
+    # So this test flips nothing. `ci_greens_on_merge` makes the fake repo's CI re-run on the new
+    # dev head and pass, exactly as a real CI would; the only way dev can green here is if the loop
+    # merged something itself, and while frozen the ONLY thing it may merge is the restore-green PR.
+    sim = sim_factory()
+    sim.edit_gh_state(lambda st: st.update(ci_greens_on_merge=True))
+    sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in RED_CI]))
+
+    sim.tick()
+    marker = sim.frozen_marker()
+    assert marker and marker.get("source") == "dev-check", marker
+    assert len(sim.mutations("create_issue")) == 1, "the standing rule files its fix once"
+    fix_num = list(_fix_map(sim).values())[0]
+    fix_id = "i%d" % fix_num
+    assert "auto-approved:nightly-red" in sim.issue(fix_num)["labels"]
+
+    # ... the loop launches it, builds it, reviews it, opens its PR, and MERGES it under the freeze
+    assert sim.tick_until(lambda: sim.loop_issue(fix_id).get("status") == "merged", ticks=25), \
+        [(r.get("act"), r.get("id"), r.get("outcome")) for r in sim.journal()]
+    merges = sim.mutations("merge_pr")
+    assert len(merges) == 1, "exactly one merge — the fix's own PR, nothing else"
+    assert [r for r in sim.journal("merge")
+            if r.get("id") == fix_id and r.get("outcome") == "ok"]
+
+    # ... and that merge is what greens dev, which lifts the freeze. No hand merge, no test-side
+    # flip of the dev checks: the whole ladder ran on the loop's own actions.
+    assert sim.tick_until(lambda: sim.frozen_marker() is None, ticks=6), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert [r for r in sim.journal("unfreeze") if r.get("outcome") == "ok"]
+    assert sim.gh_state()["branch_checks"]["main"][0]["conclusion"] == "success"
+
+
+def test_the_freeze_exemption_never_lets_ordinary_work_merge(sim_factory):
+    # The other half of #295's boundary: the exemption is scoped to the standing-rule issue, so an
+    # ordinary approved build finishing under the same freeze still HOLDS — frozen-on-red is
+    # unchanged for everything that is not the fix. (The dev checks stay red the whole time here:
+    # nothing greens the mainline, so nothing may lift the freeze.)
+    sim = sim_factory()
+    sim.edit_gh_state(lambda st: st["branch_checks"].update(main=[dict(c) for c in RED_CI]))
+    num = sim.add_issue(title="Ordinary work under the freeze",
+                        scenario={"scenario": "happy", "linger": True})
+    sid = "i%d" % num
+
+    sim.tick()
+    assert sim.frozen_marker() is not None
+    fix_id = "i%d" % list(_fix_map(sim).values())[0]
+
+    # the ordinary build finishes and reaches the gate — and stays held
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "holding")
+    for _ in range(4):
+        sim.tick()
+    assert sim.loop_issue(sid).get("status") == "holding", \
+        "an ordinary PR must still be held by the freeze"
+    assert sim.loop_issue(sid).get("status") != "merged"
+    merged_ids = {r.get("id") for r in sim.journal("merge") if r.get("outcome") == "ok"}
+    assert sid not in merged_ids, "only the standing-rule fix may cross the freeze"
+    assert merged_ids <= {fix_id}, merged_ids
+    assert sim.frozen_marker() is not None, "dev is still red — the freeze must stand"
+
+
 def test_dev_commit_status_freeze_auto_lifts_when_status_greens(sim_factory):
     # issue #23: the required check reports on the dev branch ONLY as a commit STATUS (a
     # ship-script stamp), never a check-run. A dev poll that read only the REST check-runs API
@@ -1946,7 +2018,11 @@ def test_dev_commit_status_freeze_auto_lifts_when_status_greens(sim_factory):
     assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
     assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") == "holding")
     sim.tick()
-    assert not sim.mutations("merge_pr"), "a frozen mainline must hold every merge"
+    # about THIS issue, not the merge count: the standing-rule fix's own PR is the one merge a
+    # frozen mainline lets through (#295), and it races this window.
+    assert sim.loop_issue(sid).get("status") == "holding", \
+        "a frozen mainline must hold an ordinary finished PR"
+    assert sid not in {r.get("id") for r in sim.journal("merge") if r.get("outcome") == "ok"}
 
     # the ship STATUS goes green on dev -> the widened dev view sees it -> unfreeze -> merge flows
     sim.edit_gh_state(lambda st: st["branch_statuses"].update(

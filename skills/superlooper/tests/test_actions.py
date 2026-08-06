@@ -2530,6 +2530,53 @@ def test_green_gate_merges_with_configured_method():
     assert m[0]["num"] == 5 and m[0]["pr"] == 555 and m[0]["method"] == "squash"
 
 
+# ------- the restore-green PR crosses its OWN dev-check freeze (issue #295), translated -------
+# The gate owns the rule (test_gate pins every branch of it); what decide owns is handing the gate
+# the two facts it needs — the freeze MARKER (so its `source` is readable, not flattened to a bool)
+# and the standing-rule label read from the issue's LIVE labels.
+
+DEV_FREEZE = {"reason": "dev checks red: ci (FAILURE)", "source": "dev-check", "since": NOW - 600}
+NIGHTLY_FREEZE = {"reason": "nightly red: 1 persistent failure(s)", "source": "nightly"}
+FIX_LABELS = ("in-progress", "type:diagnose-and-fix", gate.RESTORE_GREEN_LABEL)
+
+
+def _red_mainline_gating(frozen=None, labels=FIX_LABELS):
+    d, g = _gating(frozen=frozen or DEV_FREEZE)
+    return decide(dsk=d, gh_view={**g, "dev_checks": list(RED)},
+                  parsed_issues=[parsed(5, labels=labels, touches=("*",))])
+
+
+def test_restore_green_pr_merges_while_its_own_dev_check_freeze_stands():
+    # THE deadlock: before this the loop filed, launched, built, reviewed and opened the fix's PR —
+    # then held it forever, because only that merge could green dev and only green dev could unfreeze.
+    m = only(_red_mainline_gating(), "merge")
+    assert len(m) == 1 and m[0]["num"] == 5 and m[0]["pr"] == 555
+
+
+def test_ordinary_finished_pr_still_holds_under_the_same_freeze():
+    out = _red_mainline_gating(labels=("in-progress", "type:build"))
+    assert only(out, "merge") == []
+    assert [h for h in only(out, "hold") if h["id"] == "i5"]
+
+
+def test_restore_green_pr_holds_under_a_nightly_owned_freeze():
+    # decide must hand the gate the MARKER, not bool(marker): flattened to True the source is gone
+    # and the fix would cross a freeze only a green nightly may clear.
+    out = _red_mainline_gating(frozen=NIGHTLY_FREEZE)
+    assert only(out, "merge") == []
+    assert [h for h in only(out, "hold") if h["id"] == "i5"]
+
+
+def test_restore_green_exemption_reads_the_live_label_not_loopstate():
+    # the label is William's standing rule recorded on GitHub; an issue whose LIVE labels no longer
+    # carry it (he stripped it) is ordinary work again and holds, whatever loopstate remembers.
+    d, g = _gating(frozen=DEV_FREEZE, issues_extra={})
+    out = decide(dsk=d, gh_view={**g, "dev_checks": list(RED)},
+                 parsed_issues=[parsed(5, labels=("in-progress", "type:diagnose-and-fix"),
+                                       touches=("*",))])
+    assert only(out, "merge") == []
+
+
 # --------------------------- merge refusals: bounded + surfaced (issue #27) ---------------------------
 # A gate-green PR whose merge GitHub refuses (ordinary branch protection — required approvals /
 # strict up-to-date — or a token without merge rights) used to retry every tick forever: no

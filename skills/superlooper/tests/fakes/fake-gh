@@ -26,6 +26,11 @@ the real service. Extra realism, all of it load-bearing for the simulated failur
     the runner's "close issue happens via Closes #N" step depends on).
   - statusCheckRollup "auto" renders from state's check_names x pr_check_conclusion, so a test
     flips CI red/green by editing two state keys, never a per-PR fixture.
+  - `ci_greens_on_merge: true` makes the DEV BRANCH's checks go green the moment a PR merges — the
+    repo's CI re-running on the new dev head and passing. It is how a simulation drives the
+    red-mainline recovery ladder (#295) honestly: the dev checks flip because the loop's own fix
+    LANDED, not because the test reached in and flipped them, which is the one thing a
+    "the freeze lifts itself" assertion must never be allowed to fake.
 
 Fail injection (both modes):
 - GH_SLEEP=<secs>  makes every call sleep (to exercise gh.py's hard-timeout path).
@@ -629,6 +634,17 @@ def main_stateful():
                 issue = st.get("issues", {}).get(str(n))
                 if issue is not None:
                     issue["state"] = "closed"  # GitHub's server-side Closes-#N behaviour
+            if st.get("ci_greens_on_merge"):
+                # the repo's CI re-runs on the new dev head and passes. Both surfaces the dev poll
+                # reads (check-runs AND commit statuses, issue #23) are refreshed from the names
+                # this little GitHub reports, so a status-only repo greens exactly like a
+                # check-run one.
+                dev = st.get("dev_branch", "main")
+                st.setdefault("branch_checks", {})[dev] = [
+                    {"name": n, "status": "completed", "conclusion": "success"}
+                    for n in st.get("check_names", [])]
+                st.setdefault("branch_statuses", {})[dev] = [
+                    {"context": c, "state": "success"} for c in st.get("status_names", [])]
             save_state(st)
         record("merge_pr", num=ARGS[2], method=method)
         sys.exit(0)

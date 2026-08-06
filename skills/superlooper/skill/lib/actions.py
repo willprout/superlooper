@@ -1996,19 +1996,30 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # the bright line holds by default.
             pre_auth_referee = gate.preauthorized_referee(p.get("labels")) if isinstance(p, dict) \
                 else False
+            # issue #295: the standing-rule marker, read from the LIVE labels the same way — it is
+            # what makes the restore-green PR (and only it) merge-eligible while its own dev-check
+            # freeze stands. An issue absent from the poll has no readable labels, so it reads False
+            # and the freeze holds it: fail closed, exactly like the pre-authorization above.
+            restore_green = gate.restore_green(p.get("labels")) if isinstance(p, dict) else False
             g = gate.gate_decision(
                 {"type": itype, "conflicts": conflicts, "nudged": nudged,
                  "nudge_expired": nudge_expired,
                  "declared_touches": declared, "update_result": update_result,
                  "review_carry": ist.get("review_carry"),
                  "pre_authorized_referee": pre_auth_referee,
+                 "restore_green": restore_green,
                  "investigation_done": inv_done,
                  "exit_reply": exit_reply, "exit_asks": ist.get("exit_asks"),
                  "exit_asked_key": ist.get("exit_asked_key"),
                  "exit_verify": ist.get("exit_verify"),
                  "exit_ask_expired": exit_expired, "exit_delivered": exit_delivered,
                  "exit_relay_pending": exit_relay_pending},
-                pv, reports.get(iid), cfg, bool(frozen), inflight)
+                # the MARKER, not bool(marker): step 4 reads its `source` to tell a dev-check freeze
+                # (which the loop clears, and which its own restore-green fix may cross) from a
+                # nightly-owned one (the nightly's to clear, and nobody's to cross) — issue #295.
+                # `frozen` is already normalized above to a dict-or-None, so truthiness still means
+                # "frozen" exactly as it did when this passed a bool.
+                pv, reports.get(iid), cfg, frozen, inflight)
 
             act, wander = g.get("action"), g.get("wander", False)
 

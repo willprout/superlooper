@@ -90,6 +90,65 @@ PREAUTHORIZED_REFEREE_LABEL = "pre-authorized:referee"
 # scheduler must not import the actions -> brief/gate/scheduler chain.
 RESTORE_GREEN_LABEL = "auto-approved:nightly-red"
 
+# Who OWNS a standing merge freeze, read from the marker the freezer wrote. The runner's
+# `_exec_freeze` stamps source="dev-check"; the nightly stamps source="nightly". The distinction is
+# about who may CLEAR it — a dev-check freeze lifts on a green dev branch, a nightly freeze only on
+# a green nightly — and, since issue #295, about who may CROSS it (see freeze_exempt).
+NIGHTLY_FREEZE_SOURCE = "nightly"
+
+
+def restore_green(labels):
+    """Is this the standing-rule restore-green fix (spec §4.4) — the auto-filed, auto-approved issue
+    whose whole job is to un-red the mainline? Read from the issue's LIVE labels, so it is exactly
+    the issue the runner (or the nightly) filed under the standing rule and never a look-alike:
+    nothing but those two filers applies RESTORE_GREEN_LABEL, and `agent-ready` (William's word)
+    would not do — ordinary approved work carries that too.
+
+    THE one definition, shared by the scheduler's territory-claim exemption (#294) and the gate's
+    freeze exemption (#295), so the two exemptions can never come to disagree about which issue is
+    the standing-rule fix. Fail closed on any wrong-typed label set (None, a bare string, non-string
+    entries): unreadable labels are never the standing-rule issue, so every exemption stays shut."""
+    if not isinstance(labels, (list, set, tuple, frozenset)):
+        return False
+    return RESTORE_GREEN_LABEL in [x for x in labels if isinstance(x, str)]
+
+
+def nightly_owned_freeze(frozen):
+    """True iff the standing freeze marker belongs to the NIGHTLY (source="nightly"). An explicit
+    "dev-check" marker, a marker written before the tag existed, a reason-only dict the runner
+    substituted for an unreadable file, and a bare `True` from a caller that carries no marker at
+    all are all dev-check owned — the runner's `_exec_unfreeze` reads ownership by exactly this
+    rule when it decides which freezes it may CLEAR, and it calls this function to do it. One
+    definition, so "a freeze the loop can clear" and "a freeze the loop's own fix may cross"
+    (freeze_exempt) can never drift apart into a freeze that is crossable but never cleared."""
+    return isinstance(frozen, dict) and frozen.get("source") == NIGHTLY_FREEZE_SOURCE
+
+
+def freeze_exempt(frozen, restore_green_issue):
+    """§C.4 step 4's ONE exemption (issue #295): while a DEV-CHECK freeze stands, the restore-green
+    PR that freeze itself filed is merge-eligible. Every other PR still holds.
+
+    Without it a dev-check freeze could never lift itself. The freeze is released only when the dev
+    branch reads green (actions section B), a genuinely broken dev branch only greens when a fix
+    MERGES, and step 4 held every merge — including the auto-filed fix's own PR. So the autonomous
+    ladder ended one step short of the merge: the loop filed, launched, built, reviewed and opened a
+    green PR, then held it forever waiting for a human. (#294 restored the filing and the launch and
+    was explicitly bounded away from this rule.)
+
+    Scoped two ways, and both halves are load-bearing:
+      * `restore_green_issue` — the issue carries the standing rule's own marker label, applied by
+        nothing but the runner's and the nightly's auto-filing. Ordinary approved work never carries
+        it, so frozen-on-red is unchanged for everything else. Must be exactly True: a truthy string
+        or int is corrupt bookkeeping, and corruption holds.
+      * NOT nightly-owned — a nightly freeze has an external clearer (a green nightly) and is the
+        nightly's to release; the loop never crosses one. That keeps the nightly's ownership
+        semantics exactly as they were.
+
+    This consumes ONLY step 4. Review evidence, required checks, referee paths, lane overlap and
+    mergeability all still gate the fix's PR, so it merges only when everything else is green too."""
+    return bool(frozen) and restore_green_issue is True and not nightly_owned_freeze(frozen)
+
+
 # A required H2 section must carry at least this many NON-WHITESPACE characters of prose.
 # Cross-review C3: a report whose headings exist but whose bodies are empty once looked
 # "complete" to a headings-only check — empty headings must never merge.
@@ -712,12 +771,16 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
         (list), update_result
         (None|'clean'|'conflict' — the outcome of gitops.merge_update for the CURRENT head;
         the runner clears it whenever the PR head changes), investigation_done (bool,
-        precomputed via investigation_done() on the issue comments).
+        precomputed via investigation_done() on the issue comments), restore_green (bool,
+        precomputed via restore_green() on the issue's LIVE labels — the standing-rule marker
+        that fires step 4's one exemption, issue #295).
       pr_view — gh.pr_for_branch(branch) ({} when none) with the PR's comments attached
         under 'comments' (gh.pr_comments) ONLY on a clean read; a REFUSED/starved comments read
         leaves the key ABSENT, and step 2b WAITs on it (comments_unread) rather than reading the
         fail-closed empty as "no review marker" and parking a reviewed build (issue #78).
-      frozen — merges_frozen.json exists (freeze stops MERGES only, never builds/closes).
+      frozen — the merges_frozen.json MARKER dict, whose existence IS the freeze (a freeze stops
+        MERGES only, never builds/closes), or any truthy value from a caller with no marker to
+        hand over. Step 4 reads its `source` to tell a dev-check freeze from a nightly-owned one.
       inflight — {lane_issue_id: declared_touches} for the OTHER currently-running lanes.
     """
     ist = issue_state if isinstance(issue_state, dict) else {}
@@ -938,8 +1001,12 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
                 "overlap_wildcard": bool(verdict.get("overlap_wildcard")),
                 "wander": wander, "reason": reason}
 
-    # step 4: frozen mainline holds every merge (frozen-but-building is the safe idle state).
-    if frozen:
+    # step 4: frozen mainline holds every merge (frozen-but-building is the safe idle state) —
+    # with the ONE exemption the freeze exists to make possible: the standing-rule restore-green PR
+    # crosses its own dev-check freeze, because nothing else can ever lift it (issue #295; see
+    # freeze_exempt for the full scoping). Everything below still runs on the exempt PR.
+    exempt = freeze_exempt(frozen, ist.get("restore_green"))
+    if frozen and not exempt:
         return {"action": "hold", "wander": wander,
                 "reason": "merges frozen (fix-forward in progress) — holding"}
 
@@ -993,6 +1060,13 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
         # runner's executor mechanics).
         out = {"action": "merge", "wander": wander,
                "reason": "gate green: PR + report + review evidence + checks + mergeable"}
+        if exempt:
+            # a merge landing while the mainline is FROZEN is the one thing an operator reading the
+            # journal must never have to infer — name the standing rule that let it through.
+            out["freeze_exempt"] = True
+            out["reason"] += (" (merges are frozen, and this is the standing-rule restore-green fix "
+                              f"`{RESTORE_GREEN_LABEL}` — the one PR that crosses its own dev-check "
+                              "freeze, because only its merge can green the mainline again)")
         if referee_preauthorized:
             # record that a referee-touching diff merged under the owner's pre-authorization, so the
             # merge journal names the paths — a pre-authorized merge is never a silent auto-merge.
