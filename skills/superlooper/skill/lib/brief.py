@@ -92,7 +92,14 @@ _SHIP_NO_CMD = ("Get a fresh-agent review of your diff (an agent that wrote none
                 "the gate reads the unexpanded text as no verdict. "
                 "The pin names the commit that was reviewed, so a verdict for a superseded diff "
                 "does not count: if you push again, get the new diff reviewed and post a verdict "
-                "pinned to the new head.")
+                "pinned to the new head. "
+                # The rule _SHIP_WITH_CMD has always carried, and this flavour never did (issue
+                # #226) — so the repos that ship WITHOUT a pipeline were the ones told nothing about
+                # the three bad-merge paths. The PreToolUse deny wave now refuses all three at the
+                # call; this sentence is what covers the deny's documented accepted misses (a call
+                # behind `sh -c`, a hand-rolled curl, a seat with no hook layer at all).
+                "The GATE is what merges: never a direct `git push` to {dev_branch}, never "
+                "`gh pr merge`, never a hand-posted commit status.")
 
 
 def _slug(title):
