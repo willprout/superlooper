@@ -3863,11 +3863,29 @@ def test_a_refused_issue_list_read_holds_the_page_instead_of_re_sending_it():
 
 
 def test_that_hold_does_not_swallow_the_owner_taking_the_label_off():
-    """The other side of it: an issue we DID see, wearing no `agent-ready`, is evidence — the owner
-    really took the label off — and must still retract the page. Only an UNOBSERVED issue holds."""
+    """FRESH-REVIEW P2 — the hold must not become a LATCH. The poll's two issue reads are both
+    label-filtered, so the owner hand-stripping `agent-ready` from a parked lane does NOT arrive as
+    "seen without the label": the issue leaves both lists and reads as unobserved, exactly like a
+    refused read. Held on that forever the reason could never clear — no park re-derives without
+    the label, reapprove needs it, absorb_close needs a close — pinning the ALERT open AND
+    silencing this lane's next real escalation. Any OTHER issue in the view proves the read landed,
+    so this one's absence is real."""
     d = dict(_stuck_reapproved_park(), alert={"reasons": ["park_label_stuck:i5"], "since": NOW})
-    out = decide(parsed_issues=[parsed(5, labels=("type:build",))], dsk=d)
+    out = decide(parsed_issues=[parsed(9)], dsk=d)       # i5 gone from a read that plainly landed
     assert only(out, "clear_alert") == [{"act": "clear_alert"}]
+    # ...and the lane is then free to page again if it ever gets stuck anew (no latch)
+    again = decide(parsed_issues=[parsed(5), parsed(9)], dsk=dict(d, alert=None))
+    assert len(only(again, "alert")) == 1 and has_notify(again)
+    # the directly-observed form retracts too, when the poll can produce it (a lane still in flight)
+    seen = decide(parsed_issues=[parsed(5, labels=("type:build",))], dsk=d)
+    assert only(seen, "clear_alert") == [{"act": "clear_alert"}]
+
+
+def test_the_latch_guard_does_not_reopen_the_refused_read_storm():
+    # The one ambiguous shape stays held: a WHOLLY empty parsed view is the refused-read signature
+    # (both label reads fail closed to []), not evidence that every issue lost its label.
+    assert _ticks(_stuck_reapproved_park(), lambda k: ghv(),
+                  issues=lambda k: [] if k % 2 else [parsed(5)]) == (1, 1, 0)
 
 
 def test_a_refused_issue_list_read_re_pages_no_other_standing_reason():

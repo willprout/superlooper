@@ -1543,14 +1543,25 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # which is the same one-text-per-flip storm `standing` exists to stop, arriving through a
         # different input — and because the dedup key is the whole reasons LIST, each flap re-pages
         # every OTHER standing reason with it. So: an unobserved issue HOLDS what was already said,
-        # while an issue we did see, wearing no `agent-ready`, retracts it — the owner really did
-        # take the label off, which is real evidence and must still clear the page.
+        # while an issue we did see, wearing no `agent-ready`, retracts it.
+        #
+        # `list_landed` is what keeps that hold from becoming a LATCH (fourth fresh review, P2).
+        # The poll's two issue reads are both LABEL-FILTERED (`agent-ready`, `in-progress`), so the
+        # owner hand-stripping `agent-ready` from a parked lane does not show up as "seen without
+        # the label" — the issue leaves BOTH lists and reads as unobserved. Held forever on that,
+        # the reason could never clear (no park re-derives without the label, reapprove needs it,
+        # and absorb_close needs a close), which pins the ALERT open AND silences this lane's NEXT
+        # genuine escalation — the very silence this issue exists to end. Any other issue in the
+        # view is proof the read LANDED, so this one's absence is real and retracts. Only a wholly
+        # empty parsed view is ambiguous, and that is exactly the refused-read shape (both reads
+        # fail closed to []), so it alone still holds.
+        list_landed = bool(parsed_by_id)
         seen_now = isinstance(p_now, dict)
         labels_now = p_now.get("labels") if seen_now else None
         ready_now = isinstance(labels_now, list) and "agent-ready" in labels_now
         landed_cause = ist_of(iid).get("park_landed_cause")
         park_unlanded = (_status_of(ist_of(iid)) in REAPPROVAL_STATUSES
-                         and (ready_now or (standing and not seen_now))
+                         and (ready_now or (standing and not seen_now and not list_landed))
                          and (not gh_stale or standing)
                          # a RECORDED cause: every writer stamps a real name, so a blank is
                          # corruption and fails closed to silence like any other wrong type
