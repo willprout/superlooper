@@ -810,16 +810,17 @@ def test_restore_green_reads_the_standing_rule_label():
 
 
 def test_restore_green_fails_closed_on_wrong_typed_labels():
-    # an unreadable label set is never the standing-rule issue: the freeze holds by default
+    # an unreadable label CONTAINER is never the standing-rule issue: the freeze holds by default
     for bad in (None, "auto-approved:nightly-red", 7, {"name": gate.RESTORE_GREEN_LABEL}):
         assert gate.restore_green(bad) is False
-    assert gate.restore_green([None, 3, gate.RESTORE_GREEN_LABEL]) is True   # junk never raises
+    # junk ENTRIES beside a real label are ignored, never a raise: the label is still there
+    assert gate.restore_green([None, 3, gate.RESTORE_GREEN_LABEL]) is True
 
 
 def test_nightly_owned_freeze_only_for_the_nightlys_own_marker():
+    # the CLEAR-direction predicate (what _exec_unfreeze may remove) — unchanged semantics
     assert gate.nightly_owned_freeze(NIGHTLY_FREEZE) is True
     assert gate.nightly_owned_freeze(DEV_FREEZE) is False
-    # untagged/legacy markers and a bare bool are dev-check owned, exactly as _exec_unfreeze reads them
     for other in ({"reason": "merges_frozen.json unreadable"}, True, None, "nightly"):
         assert gate.nightly_owned_freeze(other) is False
 
@@ -844,13 +845,19 @@ def test_gate_restore_green_never_crosses_a_nightly_owned_freeze():
     assert d["action"] == "hold" and d.get("freeze_exempt") is not True
 
 
-def test_gate_restore_green_crosses_an_untagged_freeze():
-    # a marker written before the source tag existed (or an unreadable one the runner replaced with
-    # a reason-only dict) is dev-check owned for BOTH verbs — the runner clears it, so the fix may
-    # cross it. Same back-compat rule in one place, so clearing and crossing cannot drift apart.
-    for legacy in (True, {"reason": "merges_frozen.json unreadable"}, {"since": 1}):
-        d = _decide(issue=_issue(restore_green=True), frozen=legacy)
-        assert d["action"] == "merge" and d.get("freeze_exempt") is True, legacy
+def test_gate_restore_green_never_crosses_a_freeze_of_unproven_ownership():
+    # (fresh-review P0) Crossing demands POSITIVE proof of dev-check ownership — "not tagged
+    # nightly" is not proof. A marker the runner manufactured for an unreadable file, a marker
+    # predating the source tag, a wrong-typed source, a source this build has never heard of, and a
+    # bare bool from a caller with no marker at all could each be hiding a nightly-owned (or worse,
+    # unknown-owner) freeze — so every one of them HOLDS. Merging on a corrupt input is the exact
+    # fail-open this module exists to refuse.
+    for unproven in (True, {"reason": "merges_frozen.json unreadable"}, {"since": 1},
+                     {"source": 7}, {"source": None}, {"source": "browser-suite"},
+                     {"source": "dev-check "}, {"source": "DEV-CHECK"}):
+        d = _decide(issue=_issue(restore_green=True), frozen=unproven)
+        assert d["action"] == "hold", unproven
+        assert d.get("freeze_exempt") is not True, unproven
 
 
 def test_gate_restore_green_flag_fails_closed_on_wrong_typed_values():

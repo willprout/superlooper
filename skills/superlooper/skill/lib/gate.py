@@ -90,11 +90,20 @@ PREAUTHORIZED_REFEREE_LABEL = "pre-authorized:referee"
 # scheduler must not import the actions -> brief/gate/scheduler chain.
 RESTORE_GREEN_LABEL = "auto-approved:nightly-red"
 
-# Who OWNS a standing merge freeze, read from the marker the freezer wrote. The runner's
-# `_exec_freeze` stamps source="dev-check"; the nightly stamps source="nightly". The distinction is
-# about who may CLEAR it — a dev-check freeze lifts on a green dev branch, a nightly freeze only on
-# a green nightly — and, since issue #295, about who may CROSS it (see freeze_exempt).
+# Who OWNS a standing merge freeze, stamped on the marker by whoever wrote it: the runner's
+# `_exec_freeze` writes DEV_CHECK_FREEZE_SOURCE, the nightly writes NIGHTLY_FREEZE_SOURCE. Two
+# separate questions ride on it, and they are deliberately NOT the same predicate:
+#
+#   who may CLEAR it   — nightly_owned_freeze(): the runner clears anything that is not provably
+#                        the nightly's. It only ever asks while the dev branch reads GREEN, so an
+#                        unknown-owner marker resolving to "the runner clears it" merely ends a
+#                        freeze on a healthy mainline. Unchanged since Codex R2 C2.
+#   who may CROSS it   — freeze_exempt(): merging under a freeze needs POSITIVE proof the freeze is
+#                        the one the loop can also clear. "Not tagged nightly" is not proof, and
+#                        acting on a corrupt marker by MERGING is the fail-open this module exists
+#                        to refuse (fresh-review P0 on issue #295).
 NIGHTLY_FREEZE_SOURCE = "nightly"
+DEV_CHECK_FREEZE_SOURCE = "dev-check"
 
 
 def restore_green(labels):
@@ -106,21 +115,25 @@ def restore_green(labels):
 
     THE one definition, shared by the scheduler's territory-claim exemption (#294) and the gate's
     freeze exemption (#295), so the two exemptions can never come to disagree about which issue is
-    the standing-rule fix. Fail closed on any wrong-typed label set (None, a bare string, non-string
-    entries): unreadable labels are never the standing-rule issue, so every exemption stays shut."""
+    the standing-rule fix. A wrong-typed label CONTAINER (None, a bare string, a dict) fails closed
+    — it cannot vouch for anything, so every exemption stays shut. Junk ENTRIES beside a readable
+    label are simply skipped rather than raising: the answer is whether the marker string is
+    genuinely present, and a corrupt neighbour neither adds it nor takes it away."""
     if not isinstance(labels, (list, set, tuple, frozenset)):
         return False
     return RESTORE_GREEN_LABEL in [x for x in labels if isinstance(x, str)]
 
 
 def nightly_owned_freeze(frozen):
-    """True iff the standing freeze marker belongs to the NIGHTLY (source="nightly"). An explicit
-    "dev-check" marker, a marker written before the tag existed, a reason-only dict the runner
-    substituted for an unreadable file, and a bare `True` from a caller that carries no marker at
-    all are all dev-check owned — the runner's `_exec_unfreeze` reads ownership by exactly this
-    rule when it decides which freezes it may CLEAR, and it calls this function to do it. One
-    definition, so "a freeze the loop can clear" and "a freeze the loop's own fix may cross"
-    (freeze_exempt) can never drift apart into a freeze that is crossable but never cleared."""
+    """True iff the standing freeze marker belongs to the NIGHTLY (source="nightly") — the CLEAR
+    question. The runner's `_exec_unfreeze` calls this to decide which freezes a green dev branch
+    lets it remove: a nightly/browser-suite freeze is the nightly's to clear (a green nightly does
+    it), and removing it on dev-green would let merges flow while the nightly is still red.
+    Everything else — an explicit dev-check marker, one written before the tag existed, the
+    reason-only dict the runner substitutes for an unreadable file, a bare `True` — reads as the
+    runner's to clear, which is the long-standing behaviour and is safe because it is only ever
+    asked on a GREEN mainline. Do NOT reuse this to decide what may be MERGED under a freeze;
+    freeze_exempt owns that and demands the stronger, positive proof."""
     return isinstance(frozen, dict) and frozen.get("source") == NIGHTLY_FREEZE_SOURCE
 
 
@@ -140,13 +153,21 @@ def freeze_exempt(frozen, restore_green_issue):
         nothing but the runner's and the nightly's auto-filing. Ordinary approved work never carries
         it, so frozen-on-red is unchanged for everything else. Must be exactly True: a truthy string
         or int is corrupt bookkeeping, and corruption holds.
-      * NOT nightly-owned — a nightly freeze has an external clearer (a green nightly) and is the
-        nightly's to release; the loop never crosses one. That keeps the nightly's ownership
-        semantics exactly as they were.
+      * the freeze is PROVABLY dev-check owned — the marker is a readable dict whose `source` is
+        exactly DEV_CHECK_FREEZE_SOURCE. Not "not tagged nightly": an unreadable marker, one
+        predating the source tag, a wrong-typed source, a source a future writer invents, and a bare
+        `True` from a caller with no marker all HOLD, because none of them proves the freeze is the
+        one this exemption reasons about. That asymmetry against nightly_owned_freeze is the point
+        — clearing an unknown-owner freeze happens only on a green mainline, while crossing one
+        would merge under a freeze nobody can vouch for (fresh-review P0). In production the
+        question never even arises: both writers stamp an exact source, so a marker that fails this
+        test is a corrupt state home the operator needs to see, not a case to merge through.
+        A nightly freeze in particular keeps its ownership semantics exactly as they were.
 
     This consumes ONLY step 4. Review evidence, required checks, referee paths, lane overlap and
     mergeability all still gate the fix's PR, so it merges only when everything else is green too."""
-    return bool(frozen) and restore_green_issue is True and not nightly_owned_freeze(frozen)
+    return (restore_green_issue is True and isinstance(frozen, dict)
+            and frozen.get("source") == DEV_CHECK_FREEZE_SOURCE)
 
 
 # A required H2 section must carry at least this many NON-WHITESPACE characters of prose.

@@ -1573,13 +1573,14 @@ def cmd_nightly(args):
             # direction (stays frozen until the slow condition clears).
             loopstate.save(frozen_path,
                            {"reason": f"nightly red: {len(to_file)} persistent failure(s)",
-                            "fingerprint": to_file[0]["fp"], "since": now, "source": "nightly"})
+                            "fingerprint": to_file[0]["fp"], "since": now,
+                            "source": gate.NIGHTLY_FREEZE_SOURCE})
             filed = _file_fix_issues(home, to_file, dev, config_lib.operator(cfg))
         else:
             # A green nightly clears ONLY a nightly-owned freeze — never a runner dev-check freeze
             # (which the runner clears when dev checks go green).
             cur = _read_json_file(frozen_path, None)
-            if isinstance(cur, dict) and cur.get("source") == "nightly":
+            if gate.nightly_owned_freeze(cur):
                 try:
                     os.remove(frozen_path)
                 except OSError:

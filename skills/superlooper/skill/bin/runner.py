@@ -4368,9 +4368,12 @@ class Runner:
     def _exec_freeze(self, a, now):
         # Tag the freeze with its OWNER (Codex R2 C2): the runner freezes only on a red dev
         # required-check, so its marker is source="dev-check". The nightly writes source="nightly".
+        # The literal comes from gate, because since #295 the gate demands an EXACT match on it
+        # before it will let the standing-rule fix merge under this freeze — a drifted spelling here
+        # would silently re-deadlock the mainline instead of failing loudly.
         loopstate.save(os.path.join(self.state, "merges_frozen.json"),
                        {"reason": a.get("reason"), "fingerprint": a.get("fingerprint"),
-                        "since": now, "source": "dev-check"})
+                        "since": now, "source": gate.DEV_CHECK_FREEZE_SOURCE})
         self._end_fix_issue_episode()      # a NEW episode re-checks its fingerprints once (#294)
         return "ok"
 
