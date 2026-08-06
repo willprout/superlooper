@@ -49,6 +49,15 @@ _REAL_PROPOSE = json.dumps({
     "aged_park_days": 14,
 })
 
+# The FOURTH debris class (issue #229, rendered here by issue #289): an issue closed as COMPLETED
+# by a bare commit-message keyword, proposed for REOPEN. Copied from the engine's own emit — kind
+# `issue-reopen`, key `reopen:<num>` (the two spellings deliberately differ; a close and a reopen of
+# the same issue must never conflate in the refused map).
+_REOPEN_PROPOSAL = {"kind": "issue-reopen", "key": "reopen:12", "action": "reopen-issue",
+                    "target": 12, "title": "retry backoff never fires",
+                    "commit": "abc1234",
+                    "why": "closed as COMPLETED by commit abc1234 — a bare keyword, no PR"}
+
 
 def test_parse_propose_reads_the_real_cli_envelope():
     doc = janitor_mod.parse_propose(_REAL_PROPOSE)
@@ -85,6 +94,76 @@ def test_group_proposals_omits_empty_kinds_and_drops_wrong_typed_items():
     groups = janitor_mod.group_proposals(only_pr)
     assert [g["kind"] for g in groups] == ["pr"]
     assert [i["key"] for i in groups[0]["items"]] == ["pr:5"]
+
+
+# =============================== the reopen class + the never-drop rule (issue #289) ===============================
+
+def test_group_proposals_gives_the_reopen_kind_its_own_tile():
+    # Issue #289: the CLI proposes and executes the accidental-close REOPEN end to end, but this
+    # adapter's kind ordering knew only three kinds and dropped it — while still COUNTING it, so a
+    # reopen-only sweep read as "apron's clear" on the owner's primary surface. It gets a tile.
+    groups = janitor_mod.group_proposals([_REOPEN_PROPOSAL])
+    assert [g["kind"] for g in groups] == ["issue-reopen"]
+    assert groups[0]["label"], "the reopen tile must name itself"
+    assert groups[0]["tappable"] is True, "a reopen is a one-touch approve-then-execute item"
+    item = groups[0]["items"][0]
+    assert item["key"] == "reopen:12"                 # the identity --execute-keys sends back
+    assert item["what"] == "reopen issue #12: retry backoff never fires"
+    assert "abc1234" in item["why"]
+
+
+def test_group_proposals_keeps_the_reopen_tile_in_the_clis_own_emission_order():
+    doc = janitor_mod.parse_propose(_REAL_PROPOSE)
+    groups = janitor_mod.group_proposals(doc["proposals"] + [_REOPEN_PROPOSAL])
+    assert [g["kind"] for g in groups] == ["branch", "pr", "issue", "issue-reopen"]
+
+
+def test_group_proposals_surfaces_an_unrenderable_kind_instead_of_dropping_it():
+    # The bug one layer up from #229's own: a kind this file has no tile for was silently dropped
+    # while the count still included it. Now it is SHOWN — raw key plus the action the CLI named —
+    # in a trailing group the dialog marks NOT tappable (the dashboard must not offer a tap whose
+    # consequence it cannot state). `metadata` (issue #225) is exactly such a kind today.
+    meta = {"kind": "metadata", "key": "meta:7:type=type:bug", "action": "add-label", "target": 7,
+            "label": "type:bug", "choose_group": "issue:7:type", "why": "no type: label"}
+    future = {"kind": "gremlin", "key": "gremlin:3", "action": "banish-gremlin", "target": 3,
+              "why": "it is a gremlin"}
+    groups = janitor_mod.group_proposals([_REOPEN_PROPOSAL, meta, future])
+    assert [g["kind"] for g in groups] == ["issue-reopen", "other"]
+    other = groups[1]
+    assert other["tappable"] is False
+    assert other["label"], "the catch-all group must name itself too"
+    assert [i["key"] for i in other["items"]] == ["meta:7:type=type:bug", "gremlin:3"]
+    # it names the raw facts the CLI gave it rather than inventing a verb it does not know
+    assert other["items"][0]["what"] == "add-label 7"
+    assert other["items"][1]["what"] == "banish-gremlin 3"
+
+
+def test_unreadable_count_counts_exactly_what_the_grouping_cannot_place():
+    # The residue: an entry with no string `key` cannot be tapped and cannot even name itself, so it
+    # is not grouped — but it must not vanish either. It is COUNTED so the dialog can say plainly
+    # that the sweep found more than it can show, instead of an all-clear.
+    props = [_REOPEN_PROPOSAL, "garbage", {"kind": "branch"}, {"no": "key"}, {"key": 5}]
+    assert janitor_mod.unreadable_count(props) == 4
+    assert janitor_mod.unreadable_count([_REOPEN_PROPOSAL]) == 0
+    assert janitor_mod.unreadable_count("not a list") == 0
+    assert janitor_mod.unreadable_count(None) == 0
+    # the invariant the dialog's all-clear depends on: every proposal is either shown or counted
+    shown = sum(len(g["items"]) for g in janitor_mod.group_proposals(props))
+    assert shown + janitor_mod.unreadable_count(props) == len(props)
+
+
+def test_module_docstring_names_the_reopen_class_not_three_kinds():
+    # Issue #290, absorbed here: the prose enumerating "three classes of debris" outlived the fourth.
+    # Stale prose on a trusted surface is the same failure as a dropped tile, one layer up.
+    doc = (janitor_mod.__doc__ or "").lower()
+    assert "reopen" in doc, "the module docstring must name the accidental-close reopen class"
+
+
+def test_held_rows_name_a_held_reopen():
+    # A held-back reopen is reported by the CLI as the bare key `reopen:<num>`; the retry row must
+    # state the consequence of tapping it, exactly as the other three kinds do.
+    assert janitor_mod.held_rows(["reopen:12"]) == \
+        [{"key": "reopen:12", "what": "reopen issue #12"}]
 
 
 def test_held_rows_name_what_each_held_action_would_do():
@@ -162,6 +241,46 @@ def test_propose_groups_the_proposals_the_cli_names(jan_fix):
     assert res["ok"] is True and res["verb"] == "janitor-propose"
     assert res["count"] == 3
     assert [g["kind"] for g in res["groups"]] == ["branch", "pr", "issue"]
+
+
+def test_a_reopen_only_sweep_renders_a_tile_and_is_tappable(jan_fix):
+    # The exact live shape issue #289 was filed on: a keyword-closed issue as the ONLY debris. The
+    # CLI says it will reopen an issue; before this, the command center said there was nothing to
+    # sweep. Now the tile is there, and tapping it drives the same --execute-keys path.
+    verb, fixtures = jan_fix
+    (fixtures / "propose.json").write_text(json.dumps(
+        {"ok": True, "proposals": [_REOPEN_PROPOSAL], "held": [], "aged_park_days": 14}))
+    res = verb.propose(SLUG)
+    assert res["ok"] is True and res["count"] == 1
+    assert res["unreadable"] == 0
+    assert [g["kind"] for g in res["groups"]] == ["issue-reopen"]
+    assert res["groups"][0]["items"][0]["key"] == "reopen:12"
+
+    ex = verb.execute(SLUG, ["reopen:12"])
+    assert ex["ok"] is True and ex["executed"] == 1
+    argv = _calls(fixtures)[-1]["argv"]
+    assert argv[argv.index("--execute-keys") + 1] == "reopen:12"
+    mut = [m for m in _mutations(fixtures) if m["kind"] == "janitor_execute"][-1]
+    assert mut["keys"] == ["reopen:12"]
+
+
+def test_propose_reports_the_proposals_it_could_not_read(jan_fix):
+    # count vs unreadable is what lets the dialog refuse to say "apron's clear" while the sweep
+    # found debris it cannot draw. A keyless entry is counted, never silently swallowed.
+    verb, fixtures = jan_fix
+    (fixtures / "propose.json").write_text(json.dumps(
+        {"ok": True, "proposals": [{"kind": "branch"}], "held": [], "aged_park_days": 14}))
+    res = verb.propose(SLUG)
+    assert res["ok"] is True and res["count"] == 1
+    assert res["groups"] == [] and res["unreadable"] == 1
+
+
+def test_a_failed_propose_still_carries_the_unreadable_field(jan_fix, monkeypatch):
+    # The front-end reads `unreadable` on every propose reply; the fail-closed envelope must carry
+    # it too, so an error body can never be read as "1 proposal we couldn't draw".
+    verb, _ = jan_fix
+    monkeypatch.setenv("SL_JANITOR_FAIL", "1")
+    assert verb.propose(SLUG)["unreadable"] == 0
 
 
 def test_propose_invokes_json_against_the_right_repo_and_changes_nothing(jan_fix):

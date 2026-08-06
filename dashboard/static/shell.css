@@ -1401,6 +1401,22 @@ html, body {
 .cc-jan-pr .cc-jan-kind::before { content: "\1F500"; }       /* PR → superseded/replaced */
 .cc-jan-issue .cc-jan-kind { background: #FBF2DE; }
 .cc-jan-issue .cc-jan-kind::before { content: "\1F4CB"; }    /* issue → a clipboard on the gate */
+/* `cc-jan-issue-reopen` is its OWN class token — `.cc-jan-issue` never matches it — so the fourth
+   tile needs its own chip or it renders as an unglyphed grey box (issue #289). */
+.cc-jan-issue-reopen .cc-jan-kind { background: #FCE9E9; }
+.cc-jan-issue-reopen .cc-jan-kind::before { content: "\1F513"; }  /* reopen → the lock comes off */
+.cc-jan-other .cc-jan-kind { background: #EEF2F6; }
+.cc-jan-other .cc-jan-kind::before { content: "\2753"; }     /* a kind this dialog has no verb for */
+/* The catch-all pile reads as a NOTICE, not a cart: dashed border, no shadow to press. */
+.cc-jan-group.is-flat { background: #F7F9FB; border-style: dashed; box-shadow: none; }
+.cc-jan-group-note { font: 400 10.5px/1.5 var(--sans); color: var(--muted); padding: 0 2px; }
+.cc-jan-group-note code { font: 500 10px var(--mono); color: var(--ink-3); background: #F1F4F8; padding: 1px 4px; border-radius: 3px; }
+/* Debris the sweep found and this dialog cannot draw at all — said out loud, never an all-clear. */
+.cc-jan-lost {
+  font: 500 11.5px/1.5 var(--sans); color: var(--amber-ink); background: var(--amber-bg);
+  border: 2px solid var(--amber-border); border-radius: 6px; padding: 8px 11px;
+}
+.cc-jan-lost code { font: 500 10px var(--mono); color: var(--ink-3); background: #FFF; padding: 1px 4px; border-radius: 3px; }
 /* One piece of debris — a tap target. Nothing is pre-selected; tapping ARMS it (a satisfying press
    into the amber "loaded onto the cart" state with a pixel check). */
 .cc-jan-row {
@@ -1410,6 +1426,14 @@ html, body {
   transition: transform 0.05s ease, background 0.08s ease, border-color 0.08s ease;
 }
 .cc-jan-row:hover { border-color: #C6D0DA; background: #FAFCFE; }
+/* An untappable row: no checkbox column, no press affordance, and the raw key on its own line —
+   that key is what `superlooper janitor --execute-keys` takes in the terminal. */
+.cc-jan-row.is-flat {
+  grid-template-columns: 1fr; grid-template-areas: "what" "why" "key"; cursor: default;
+  border-style: dashed; box-shadow: none;
+}
+.cc-jan-row.is-flat:hover { border-color: #E4E9EF; background: #FFF; }
+.cc-jan-rawkey { grid-area: key; font: 500 10px var(--mono); color: var(--muted); word-break: break-all; margin-top: 2px; }
 .cc-jan-check {
   grid-area: check; width: 16px; height: 16px; border: 2px solid #8A94A0; border-radius: 3px;
   background: #FFF; display: inline-flex; align-items: center; justify-content: center;

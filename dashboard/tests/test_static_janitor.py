@@ -93,6 +93,82 @@ def test_held_back_actions_are_surfaced():
     assert re.search(r"\.held", _JAN_JS), "janitor.js must surface the server's held-back keys"
 
 
+# =============================== the reopen tile + the never-drop rule (issue #289) ===============================
+
+def test_the_all_clear_is_gated_on_the_servers_proposal_count():
+    # Issue #289's headline defect: the dialog rendered "Apron's clear" whenever it had no GROUPS to
+    # show — so a proposal class it could not draw (the accidental-close reopen) read as no debris at
+    # all, on the owner's primary surface. The all-clear must now be gated on the server's own count.
+    empty = re.search(r"Apron’s clear", _JAN_JS)
+    assert empty, "the all-clear message must still exist for a genuinely empty apron"
+    guard = re.search(r"if \(!groups\.length && [^)]*\)\s*\{[\s\S]{0,400}?Apron’s clear", _JAN_JS)
+    assert guard, ("the all-clear branch must test more than groups.length — an unrenderable kind "
+                   "must never read as 'nothing to sweep'")
+    assert re.search(r"total\s*===\s*0|!total\b", guard.group(0)), (
+        "the all-clear must be gated on the server's proposal count (total), not just the groups")
+
+
+def test_the_dialog_binds_the_servers_count_and_unreadable_fields():
+    assert re.search(r"renderProposals\([\s\S]{0,160}?\bb\.count\b", _JAN_JS), (
+        "loadPropose must hand the server's proposal count to renderProposals")
+    assert re.search(r"\bb\.unreadable\b", _JAN_JS), (
+        "the dialog must read the server's count of proposals it could not place (design B.1: the "
+        "JS derives no janitor semantics of its own)")
+    assert re.search(r"superlooper janitor</code>[\s\S]{0,200}terminal|terminal[\s\S]{0,200}"
+                     r"superlooper janitor", _JAN_JS), (
+        "a proposal the dialog cannot draw must point the owner at the terminal that can act on it")
+
+
+def test_a_group_the_server_marks_untappable_is_shown_but_never_armed():
+    # An unknown kind is SURFACED, never dropped — but it is not a tap target either: the dashboard
+    # must not offer a consent it cannot state the consequence of. The server decides, via `tappable`.
+    assert re.search(r"\bg\.tappable\b", _JAN_JS), (
+        "the row template must branch on the server's `tappable` flag, not on a kind list here")
+    arm = re.search(r"var arm = g\.tappable !== false;([\s\S]{0,900}?)\}\)\.join\(\"\"\);", _JAN_JS)
+    assert arm, "renderProposals must compute `arm` from g.tappable before building its rows"
+    flat = re.search(r"if \(!arm\) \{([\s\S]{0,500}?)\}\s*return", arm.group(1))
+    assert flat, "the untappable branch must build its own row template"
+    for marker in ("data-jan-key", 'role="checkbox"', "cc-jan-check"):
+        assert marker not in flat.group(1), (
+            "an untappable row must carry no %s — it is shown, never armed" % marker)
+
+
+def test_the_untappable_row_shows_the_raw_key_so_the_terminal_can_act_on_it():
+    assert "cc-jan-rawkey" in _JAN_JS, (
+        "an unrenderable proposal must show its raw key — that is what --execute-keys takes")
+
+
+def test_the_sweep_breakdown_counts_reopens():
+    # The confirm button states the consequence: "Sweep 3 — 1 branch, 2 reopens". The breakdown reads
+    # the KEY prefixes the server minted, and `reopen:` was missing from that map.
+    bd = re.search(r"function breakdown\(keys\)[\s\S]{0,900}?\n  \}", _JAN_JS)
+    assert bd, "breakdown() must exist"
+    assert re.search(r"reopen:\s*0", bd.group(0)), (
+        "the per-kind tally must count the reopen: key prefix, or a reopen sweeps unnamed")
+    assert "reopen" in bd.group(0) and "reopens" in bd.group(0), (
+        "the breakdown must name reopens in singular and plural")
+
+
+def test_the_static_subtitle_names_every_debris_class():
+    # Issue #290 (absorbed): the dialog's own standing prose enumerated three classes and never grew
+    # the fourth. Stale prose on a trusted surface is the same lie as a missing tile.
+    sub = re.search(r'cc-jan-sub">([\s\S]{0,600}?)</span>', _JAN_JS)
+    assert sub, "the dialog must keep its static subtitle"
+    text = sub.group(1).lower()
+    for word in ("branch", "pr", "parked", "closed"):
+        assert word in text, "the subtitle must name the %s class of debris" % word
+    assert "reopen" in text, (
+        "the subtitle must name the accidental-close class it now renders (issue #229/#289)")
+
+
+def test_the_reopen_tile_and_the_catch_all_are_styled():
+    assert ".cc-jan-issue-reopen" in _CSS, (
+        "shell.css must style the reopen tile — `.cc-jan-issue` does not match `cc-jan-issue-reopen`,"
+        " so without this the fourth tile renders as an unglyphed grey box")
+    assert ".cc-jan-other" in _CSS, "shell.css must style the catch-all group for unknown kinds"
+    assert ".cc-jan-rawkey" in _CSS, "shell.css must style the raw-key line on an untappable row"
+
+
 # =============================== the held-back retry (issue #131) ===============================
 
 def test_a_held_back_row_offers_its_own_retry_control():

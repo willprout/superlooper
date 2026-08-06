@@ -3,8 +3,21 @@ in the LOCAL-COMMAND class the Tidy verb (issue #41) opened.
 
 Owner ruling 2026-07-13: no one should have to use the terminal to use superlooper fully. This is
 the janitor's half of that — the owner sees, and taps, every GitHub-side cleanup the CLI's
-``superlooper janitor`` would propose (stale merged/superseded ``sl/*`` branches, open ``superseded``
-PRs, aged parked/needs-owner issues) without leaving the dashboard.
+``superlooper janitor`` would propose without leaving the dashboard. Four classes get a tile of
+their own: stale merged/superseded ``sl/*`` branches, open ``superseded`` PRs, aged parked/
+needs-owner issues, and — issue #229 — an issue closed as COMPLETED by a bare commit-message
+keyword, proposed for REOPEN.
+
+That fourth class was proposed and executed by the CLI for weeks while this adapter's kind ordering
+still knew only three, so it was DROPPED from the tiles and yet still COUNTED — and the dialog's
+all-clear fired on "no groups to draw". A keyword-closed issue as the only debris therefore read as
+"apron's clear" on the owner's primary surface while the terminal said it would reopen an issue:
+the same trusted-signal failure #229 exists to stop, one layer up (issue #289). So the rule here is
+now the opposite of dropping: **every proposal the CLI names is either shown or counted as
+unshowable.** A kind this file has no tile for lands in a trailing catch-all group, named by its raw
+key and the CLI's own action word and marked NOT tappable (the dashboard must not offer a tap whose
+consequence it cannot state); anything it cannot even name is reported in ``unreadable`` so the
+dialog can say so plainly instead of claiming a clean apron.
 
 **The dashboard re-derives NONE of the janitor's safety rules.** Exactly like Tidy drives
 ``superlooper tidy``, this adapter drives ``superlooper janitor`` — the CLI, backed by the engine's
@@ -41,15 +54,24 @@ import subprocess
 # path in a fraction of a second (mirrors lib/tidy._DEFAULT_TIMEOUT).
 _DEFAULT_TIMEOUT = 30
 
-# The debris kinds, in the CLI's own deterministic emission order (branches, then PRs, then issues),
-# each with the human label the front-end tiles show. The grouping below never invents a kind — an
-# unknown kind is simply dropped (fail closed: an unrenderable proposal is not rendered).
-_KIND_ORDER = ("branch", "pr", "issue")
+# The debris kinds, in the CLI's own deterministic emission order (branches, then PRs, then issues,
+# then reopens), each with the human label the front-end tiles show. The spellings are the ENGINE's,
+# read off its emit — note that the reopen's KIND (`issue-reopen`) and its KEY prefix (`reopen:`)
+# deliberately differ, so a close and a reopen of the same issue can never conflate.
+_KIND_ORDER = ("branch", "pr", "issue", "issue-reopen")
 _KIND_LABEL = {
     "branch": "Stale branches",
     "pr": "Superseded PRs",
     "issue": "Aged parked issues",
+    "issue-reopen": "Accidentally closed",
 }
+# The catch-all every OTHER kind lands in. This file never invents a verb for a kind it does not
+# know — but it never drops one either (issue #289): the row is shown under its raw key and the
+# CLI's own action word, and the group is marked untappable so the dialog offers no consent it
+# cannot state the consequence of. The terminal's `superlooper janitor` remains the way to act on
+# these. (`metadata`, issue #225's mutually-exclusive repair menus, is exactly such a kind today.)
+_OTHER_KIND = "other"
+_OTHER_LABEL = "Not renderable here — terminal only"
 
 
 def _binary(configured):
@@ -119,19 +141,26 @@ def _what(p):
     if kind == "pr":
         head = p.get("head")
         return "close PR #%s%s" % (target, (" (%s)" % head) if head else "")
-    if kind == "issue":
+    if kind in ("issue", "issue-reopen"):
         title = p.get("title") or ""
         title = title[:60] if isinstance(title, str) else ""
-        return "close issue #%s%s" % (target, (": %s" % title) if title else "")
-    return str(p.get("action") or "")
+        verb = "reopen" if kind == "issue-reopen" else "close"
+        return "%s issue #%s%s" % (verb, target, (": %s" % title) if title else "")
+    # A kind with no tile of its own: name the raw facts the CLI gave us — its action word and its
+    # target — rather than inventing a verb, and never fall through to an empty string that would
+    # render as a blank row (issue #289).
+    action = p.get("action") if isinstance(p.get("action"), str) else ""
+    bits = [b for b in (action, "" if target is None else str(target)) if b]
+    return " ".join(bits) or str(p.get("key") or "")
 
 
 def _held_what(key):
     """The plain-language verb a held-back key would run if retried. The CLI reports ``held`` as
-    bare keys (``branch:<name>`` / ``pr:<n>`` / ``issue:<n>`` — the identities it minted), so unlike
-    :func:`_what` there is no proposal dict to read; the verb comes from the key's own kind prefix.
-    This names a CONSEQUENCE, it does not decide one: the CLI still re-derives freshly at act time
-    and can skip the key. An unrecognized shape names itself rather than inventing a verb."""
+    bare keys (``branch:<name>`` / ``pr:<n>`` / ``issue:<n>`` / ``reopen:<n>`` — the identities it
+    minted), so unlike :func:`_what` there is no proposal dict to read; the verb comes from the
+    key's own kind prefix. This names a CONSEQUENCE, it does not decide one: the CLI still
+    re-derives freshly at act time and can skip the key. An unrecognized shape names itself rather
+    than inventing a verb."""
     kind, sep, rest = key.partition(":")
     if sep and rest:
         if kind == "branch":
@@ -140,6 +169,8 @@ def _held_what(key):
             return "close PR #%s" % rest
         if kind == "issue":
             return "close issue #%s" % rest
+        if kind == "reopen":
+            return "reopen issue #%s" % rest
     return key
 
 
@@ -153,23 +184,52 @@ def held_rows(held):
     return [{"key": k, "what": _held_what(k)} for k in items if isinstance(k, str) and k]
 
 
+def _row(p):
+    return {"key": p["key"], "what": _what(p), "why": p.get("why") or "",
+            "target": p.get("target")}
+
+
+def _actionable(p):
+    """A proposal this file can put on a row at all: a dict carrying the string ``key`` that IS its
+    identity (what a tap sends back to ``--execute-keys``). Anything else cannot be tapped and
+    cannot even name itself — see :func:`unreadable_count`, which counts exactly these."""
+    return isinstance(p, dict) and isinstance(p.get("key"), str)
+
+
 def group_proposals(proposals):
-    """Group the CLI's flat, already-sorted proposal list into per-kind tiles the front-end binds:
-    ``[{"kind", "label", "items": [{"key", "what", "why", "target"}, ...]}, ...]`` in
-    ``_KIND_ORDER``. An empty kind is omitted (no empty tile); a wrong-typed entry, or one with no
-    string ``key`` (the identity the execute call sends back), is dropped — fail closed: an
-    unrenderable/unactionable proposal is never shown."""
-    items = proposals if isinstance(proposals, list) else []
+    """Group the CLI's flat, already-sorted proposal list into the tiles the front-end binds:
+    ``[{"kind", "label", "tappable", "items": [{"key", "what", "why", "target"}, ...]}, ...]`` —
+    the known kinds first, in ``_KIND_ORDER``, then ONE trailing catch-all holding every other kind
+    in the CLI's own order.
+
+    An empty group is omitted (no empty tile). ``tappable`` is ``True`` for the known kinds and
+    ``False`` for the catch-all: those rows are SHOWN — a proposal the owner cannot see is a
+    proposal he can never act on, and a hidden one made the dialog claim a clean apron (issue
+    #289) — but never armed, because the dashboard must not offer a tap whose consequence it cannot
+    state. A wrong-typed entry, or one with no string ``key``, is not grouped at all; it is counted
+    by :func:`unreadable_count` so nothing the CLI proposed goes unmentioned."""
+    items = [p for p in (proposals if isinstance(proposals, list) else []) if _actionable(p)]
     groups = []
     for kind in _KIND_ORDER:
-        kitems = [{"key": p["key"], "what": _what(p), "why": p.get("why") or "",
-                   "target": p.get("target")}
-                  for p in items
-                  if isinstance(p, dict) and p.get("kind") == kind
-                  and isinstance(p.get("key"), str)]
+        kitems = [_row(p) for p in items if p.get("kind") == kind]
         if kitems:
-            groups.append({"kind": kind, "label": _KIND_LABEL[kind], "items": kitems})
+            groups.append({"kind": kind, "label": _KIND_LABEL[kind], "tappable": True,
+                           "items": kitems})
+    other = [_row(p) for p in items if p.get("kind") not in _KIND_ORDER]
+    if other:
+        groups.append({"kind": _OTHER_KIND, "label": _OTHER_LABEL, "tappable": False,
+                       "items": other})
     return groups
+
+
+def unreadable_count(proposals):
+    """How many of the CLI's proposals this file could not place on a row at ALL — not a dict, or
+    with no string ``key``. They are COUNTED rather than silently dropped so the dialog can say
+    plainly that the sweep found more than it can show: with the catch-all group above, every
+    proposal is now either shown or in this number, which is exactly what lets the all-clear be
+    gated on the honest count instead of on "did we find a tile to draw" (issue #289)."""
+    items = proposals if isinstance(proposals, list) else []
+    return sum(1 for p in items if not _actionable(p))
 
 
 # =============================== the verb executor ===============================
@@ -212,15 +272,21 @@ class Janitor:
             # the CLI speaks for itself when it can (its fail-closed envelope carries an error);
             # otherwise a missing binary / crash gets the rc-derived message.
             return {"ok": False, "verb": "janitor-propose", "repo": repo, "groups": [],
-                    "count": 0, "held": [], "held_items": [],
+                    "count": 0, "unreadable": 0, "held": [], "held_items": [],
                     "error": doc.get("error") or _error(rc, err, binary), "raw": out}
-        proposals = doc.get("proposals") or []
+        proposals = doc.get("proposals")
+        proposals = proposals if isinstance(proposals, list) else []
         held = doc.get("held") or []
         # `held` (the raw keys) is the ORIGINAL contract and stays byte-for-byte; `held_items` is
         # added beside it (issue #131) so the dialog can name what a retry would do — and so the
         # front-end can tell a retry-capable server from an older one still serving only `held`.
+        #
+        # `count` is every proposal the CLI named and `unreadable` is the part of it no row could
+        # carry; the dialog's all-clear is gated on `count`, so a proposal that never reaches a tile
+        # can no longer read as "nothing to sweep" (issue #289).
         return {"ok": True, "verb": "janitor-propose", "repo": repo,
                 "groups": group_proposals(proposals), "count": len(proposals),
+                "unreadable": unreadable_count(proposals),
                 "held": held, "held_items": held_rows(held), "raw": out}
 
     def execute(self, repo, keys, retry=False):
