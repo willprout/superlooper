@@ -326,6 +326,9 @@ def _green_probe(files=None, commands=None, env=None, accounts=None):
     all_files = {
         _BIN: "ELF-ish bytes " + fleet.FENCE_SIGNATURE + " more bytes",
         fleet.token_file(_PREFIX): "s3cret\n",
+        # A BUILT machine arms its own runner (issue #355). Before this file existed the fleet
+        # judge could go entirely green on a machine whose launcher checked nothing.
+        fleet.env_file(_PREFIX): fleet.render_env_file(),
         fleet.server_plist_path(_HOME): _green_plist(),
         fleet.host_config_path(_HOST_CONFIG_DIR): fleet.render_host_config(),
         fleet.override_path(_HOST_CONFIG_DIR, "claude"):
@@ -388,6 +391,194 @@ def test_the_fence_check_is_red_on_an_open_socket_and_on_silence():
     # An OPEN socket is the dangerous answer, not the milder one: it is the state that looks
     # healthy from the runner's seat, so the wording has to carry the consequence.
     assert "unattended" in fleet.check_fence("/s.sock", lambda p: session_host.OPEN).detail
+
+
+# ------------------------------------------- the machine's own runner environment (issue #355)
+# The fence pre-flight (#326) is armed by SL_FLEET_FENCE on the RUNNER's own process, and until
+# this issue nothing in the engine set it — so the gate shipped correct and inert on the one
+# machine it was built for. These are the tests for the file the build-up writes, for the rule
+# that a machine's own declaration beats an ambient variable, and for the block that reports it.
+
+
+class _Unreadable(FakeProbe):
+    """A probe for which a file EXISTS and cannot be read — the one state `read_text` alone
+    cannot express (it answers None for both absent and unreadable)."""
+
+    def read_text(self, path):
+        return None
+
+
+def test_the_env_file_lives_in_the_fleet_prefix_and_not_in_a_repo():
+    # Same reason the prefix itself does: the fence is a property of the MACHINE's host server, and
+    # a per-repo file would be two repos disagreeing about one socket.
+    assert fleet.env_file(_PREFIX) == _PREFIX + "/environment"
+
+
+def test_the_rendered_env_file_arms_the_switch_carries_the_marker_and_is_readable():
+    text = fleet.render_env_file()
+    assert fleet.ENV_MARKER in text, "install must be able to recognise its own file"
+    assert "%s=%s" % (session_host.FENCE_REQUIRED_VAR, session_host.FENCE_REQUIRED) in text
+    # DoD: an operator can tell an armed machine from an unarmed one by reading it, so the value
+    # is on a line of its own, in plain sight, and the file says what it is for.
+    assert any(line.strip() == "%s=%s" % (session_host.FENCE_REQUIRED_VAR,
+                                          session_host.FENCE_REQUIRED)
+               for line in text.splitlines())
+    assignments, problem, ignored = fleet.machine_env(text)
+    assert problem is None and ignored == []
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+
+
+def test_a_machine_the_build_up_never_touched_assigns_nothing():
+    # The dev-workstation bullet, and the whole reason this is a FILE the build-up writes rather
+    # than a default in the code: no build-up, no switch, no gate, no new refusal.
+    assert fleet.machine_env(None, present=False) == ({}, None, [])
+    probe = FakeProbe(home=_HOME)
+    assert fleet.load_machine_env(probe, _PREFIX) == ({}, None, [])
+
+
+def test_a_machine_may_be_taken_out_of_the_fenced_set_in_writing():
+    # `off` exists for exactly this (session_host.fence_required): deleting the file disarms too,
+    # but leaves nothing on disk that SAYS so — which is indistinguishable from never having built.
+    assignments, problem, ignored = fleet.machine_env(
+        "%s\n%s=off\n" % ("# " + fleet.ENV_MARKER, session_host.FENCE_REQUIRED_VAR))
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: "off"} and problem is None
+    assert ignored == []
+
+
+def test_a_file_that_names_no_switch_fails_closed_to_required():
+    # The file exists only because the build-up ran here, so its PRESENCE is the machine's
+    # declaration. A hand-edit that deleted the line must not read as "unfenced" — that is the
+    # silently-disarmed-fence failure this issue exists to end, one layer up.
+    assignments, problem, ignored = fleet.machine_env("# " + fleet.ENV_MARKER + "\n")
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+    assert problem and "no" in problem.lower()
+
+
+def test_a_present_but_empty_switch_is_not_a_disarm():
+    # The #300 landmine shape: present-but-empty reads to a parser as nothing at all while reading
+    # to a human as "set". `off` is the word that disarms; an empty value is a broken file.
+    assignments, problem, _ = fleet.machine_env(
+        "%s=\n" % session_host.FENCE_REQUIRED_VAR)
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+    assert problem
+
+
+def test_a_file_that_cannot_be_read_fails_closed_to_required():
+    probe = _Unreadable(files={fleet.env_file(_PREFIX): "unused"}, home=_HOME)
+    assignments, problem, _ = fleet.load_machine_env(probe, _PREFIX)
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+    assert problem and "read" in problem
+
+
+def test_an_unrecognised_spelling_is_carried_verbatim_rather_than_repaired():
+    # The switch's parsing belongs to session_host.fence_required (#326) and is not re-implemented
+    # here: a typo must reach it intact so the launch refusal can NAME the value it refused on.
+    assignments, _, _ = fleet.machine_env("%s=requried\n" % session_host.FENCE_REQUIRED_VAR)
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: "requried"}
+    assert session_host.fence_required(assignments) == (True, "requried")
+
+
+def test_only_the_variables_this_build_up_declares_are_ever_applied():
+    # An ALLOW-LIST, not a general env file. A machine-level file that could set anything would put
+    # SL_ATTENDED, SL_RESUME_SESSION_ID and the rest of the launcher's contract on disk, where the
+    # runner pins them empty precisely because an ambient value must never ride into a worker.
+    assignments, _, ignored = fleet.machine_env(
+        "SL_ATTENDED=1\n%s=required\nPATH=/evil\n" % session_host.FENCE_REQUIRED_VAR)
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+    assert sorted(ignored) == ["PATH", "SL_ATTENDED"]
+
+
+def test_comments_blank_lines_and_shell_habits_are_read():
+    assignments, problem, _ = fleet.machine_env(
+        "# a comment\n\n   export %s = 'required'  \n" % session_host.FENCE_REQUIRED_VAR)
+    assert assignments == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+    assert problem is None
+
+
+def test_the_machines_own_declaration_beats_an_ambient_variable():
+    # The rule, and the reason for it: an `export SL_FLEET_FENCE=off` left in a shell rc file or a
+    # LaunchAgent would otherwise silently disarm the fleet machine — the same inheritance hazard
+    # the runner pins SL_ATTENDED empty for, and it would make the file unreadable as evidence.
+    env = {session_host.FENCE_REQUIRED_VAR: "off", "HOME": _HOME}
+    applied, replaced = fleet.apply_machine_env(
+        env, {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED})
+    assert env[session_host.FENCE_REQUIRED_VAR] == session_host.FENCE_REQUIRED
+    assert applied == {session_host.FENCE_REQUIRED_VAR: session_host.FENCE_REQUIRED}
+    assert replaced == {session_host.FENCE_REQUIRED_VAR: "off"}
+
+
+def test_applying_nothing_leaves_an_unbuilt_machines_environment_exactly_as_it_was():
+    env = {"HOME": _HOME}
+    assert fleet.apply_machine_env(env, {}) == ({}, {})
+    assert env == {"HOME": _HOME}
+
+
+def _unarmed_probe(**kw):
+    """A fully built machine whose runner nothing arms — the exact state #326 shipped into."""
+    probe = _green_probe(**kw)
+    probe.files.pop(fleet.env_file(_PREFIX), None)
+    return probe
+
+
+def test_the_launch_gate_block_is_red_on_a_machine_the_build_up_never_armed():
+    r = fleet.check_launch_gate(_unarmed_probe(), _PREFIX)
+    assert not r.ok
+    assert fleet.env_file(_PREFIX) in r.detail
+    assert "fleet --install" in (r.fix or "")
+
+
+def test_the_launch_gate_block_is_green_when_the_machine_arms_it():
+    r = fleet.check_launch_gate(_green_probe(), _PREFIX)
+    assert r.ok and not r.warn
+    assert session_host.FENCE_REQUIRED_VAR in r.detail and fleet.env_file(_PREFIX) in r.detail
+
+
+def test_the_launch_gate_block_is_red_when_the_machine_disarms_itself():
+    probe = _green_probe(files={fleet.env_file(_PREFIX): "%s=off\n"
+                                % session_host.FENCE_REQUIRED_VAR})
+    r = fleet.check_launch_gate(probe, _PREFIX)
+    assert not r.ok and "off" in r.detail
+
+
+def test_the_launch_gate_block_is_red_when_the_file_cannot_be_read():
+    probe = _Unreadable(files={fleet.env_file(_PREFIX): "unused"}, home=_HOME)
+    r = fleet.check_launch_gate(probe, _PREFIX)
+    assert not r.ok
+    # It still says which way a runner would fail, because the runner arms anyway — a red line that
+    # left the operator guessing about the live posture would be worse than the file.
+    assert session_host.FENCE_REQUIRED in r.detail
+
+
+def test_the_launch_gate_block_says_an_ambient_variable_is_overridden_and_stays_green():
+    probe = _green_probe(env={"HOME": _HOME, session_host.FENCE_REQUIRED_VAR: "off"})
+    r = fleet.check_launch_gate(probe, _PREFIX)
+    assert r.ok and r.warn, "the machine's file wins, so the gate IS armed — but say it out loud"
+    assert "off" in r.detail
+
+
+def test_the_launch_gate_block_warns_about_variables_it_will_not_apply():
+    probe = _green_probe(files={fleet.env_file(_PREFIX):
+                                fleet.render_env_file() + "SL_ATTENDED=1\n"})
+    r = fleet.check_launch_gate(probe, _PREFIX)
+    assert r.ok and r.warn and "SL_ATTENDED" in r.detail
+
+
+def test_the_launch_gate_and_the_host_fence_are_two_different_facts():
+    # The DoD's own words: a machine can have one without the other. A fenced socket with nothing
+    # arming the launcher is the exact state #326 shipped into, and the report must not blur them.
+    results = fleet.check_fleet(_unarmed_probe(), state_base=_STATE_BASE,
+                                host_config_dir=_HOST_CONFIG_DIR,
+                                fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
+                                fence=lambda p: session_host.FENCED)
+    by_name = {r.name: r for r in results}
+    assert by_name["host fence"].ok and not by_name["launch gate"].ok
+    # ...and the mirror image: armed launcher, open socket.
+    results = fleet.check_fleet(_green_probe(), state_base=_STATE_BASE,
+                                host_config_dir=_HOST_CONFIG_DIR,
+                                fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
+                                fence=lambda p: session_host.OPEN)
+    by_name = {r.name: r for r in results}
+    assert not by_name["host fence"].ok and by_name["launch gate"].ok
 
 
 def test_the_fence_wait_stops_at_the_first_answer_and_never_waits_out_a_bad_one():
@@ -678,9 +869,12 @@ def test_check_fleet_returns_one_named_block_per_dod_property():
                                 fence=lambda p: session_host.FENCED)
     names = [r.name for r in results]
     assert names == list(dict.fromkeys(names)), "duplicate block names: %s" % names
-    for expected in ("host binary", "host login item", "host fence", "host config",
+    for expected in ("host binary", "host login item", "host fence", "launch gate", "host config",
                      "screen fallback", "claude binary", "fleet identity", "fleet isolation"):
         assert expected in names, "%s missing from %s" % (expected, names)
+    # The gate is downstream of the socket it guards: a reader who fixes an open socket first is
+    # not then told to go and arm a launcher against a fence that was not there.
+    assert names.index("host fence") < names.index("launch gate")
     # The binary pin comes BEFORE the identity read for the same reason it does in doctor --stack:
     # which claude is in use is upstream of which account it is logged into.
     assert names.index("claude binary") < names.index("fleet identity")

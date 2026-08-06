@@ -223,6 +223,99 @@ def test_run_in_the_pane_home_still_fails_hard_without_a_pane(rig):
     assert "FATAL" in (r.stdout + r.stderr)
 
 
+# --------------------------------------------- the fleet machine arms its own runner (issue #355)
+# The fence pre-flight (#326) reads SL_FLEET_FENCE off the RUNNER's own process, and nothing in the
+# engine used to set it — so the gate shipped correct and inert on the one machine it was built for.
+# These drive the boot through the real CLI: the switch reaches the runner's environment from the
+# file the build-up writes, and it reaches it in BOTH homes, because which home a runner lives in
+# is a separate decision from whether its launches are gated.
+
+
+def _arm(rig, body="SL_FLEET_FENCE=required\n"):
+    """Write what `superlooper fleet --install` writes on a fleet machine."""
+    prefix = Path(rig.env["SL_HOME"]) / "fleet"
+    prefix.mkdir(parents=True, exist_ok=True)
+    path = prefix / "environment"
+    path.write_text("# superlooper fleet environment\n" + body)
+    return path
+
+
+def _in_a_pane(rig):
+    """env for a runner booting in the PANE home — today's default and the one a plist misses."""
+    cmux = _script(rig.tmp / "cmux-ok", 'echo "surface:1  a tab"\nexit 0\n')
+    return {"SL_CMUX": str(cmux), "SL_PANE": "pane-1"}
+
+
+def test_a_runner_on_a_built_fleet_machine_boots_with_the_launch_gate_armed(rig):
+    path = _arm(rig)
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0", env_over=_in_a_pane(rig))
+    assert r.returncode == 0, r.stdout + r.stderr
+    # The line is read back OUT of the booted process's own environment through the pre-flight's
+    # own parser — not printed from the file — so it is evidence about what a launch will see.
+    assert "SL_FLEET_FENCE" in r.stdout and "required" in r.stdout
+    assert str(path) in r.stdout
+
+
+def test_the_login_item_home_arms_the_same_way(rig):
+    # Whichever home the runner has: the machine's declaration is a machine fact, and a build-up
+    # that only reached a LaunchAgent would leave today's default (the pane home) unarmed.
+    write_config(rig.repo, runner_home="login-item")
+    _arm(rig)
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "SL_FLEET_FENCE" in r.stdout and "required" in r.stdout
+
+
+def test_a_dev_workstation_boots_exactly_as_it_did(rig):
+    # The DoD's fourth bullet. No build-up, no file, no switch, no gate — and nothing new printed
+    # either: a machine that never opted in must not start explaining a fence it does not have.
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0", env_over=_in_a_pane(rig))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "SL_FLEET_FENCE" not in r.stdout + r.stderr
+
+
+def test_the_machines_file_overrides_an_ambient_switch_at_boot(rig):
+    # An `export SL_FLEET_FENCE=off` in a shell rc file or a LaunchAgent would otherwise silently
+    # disarm the fleet machine — the same inheritance hazard the runner pins SL_ATTENDED empty for.
+    _arm(rig)
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0",
+            env_over={**_in_a_pane(rig), "SL_FLEET_FENCE": "off"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "required" in r.stdout
+    # And it says so rather than quietly winning: an operator who set that variable on purpose has
+    # to be able to see that the machine disagreed with them.
+    assert "off" in r.stdout
+
+
+def test_a_machine_may_disarm_itself_in_writing(rig):
+    _arm(rig, "SL_FLEET_FENCE=off\n")
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0", env_over=_in_a_pane(rig))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "SL_FLEET_FENCE" in r.stdout and "off" in r.stdout
+    assert "DISARMED" in r.stdout
+
+
+def test_a_broken_env_file_arms_the_gate_and_says_what_is_wrong(rig):
+    # Fail closed: the file exists only because the build-up ran here, so a hand-edit that lost the
+    # line must not read as "this machine is unfenced" — and the runner must still start.
+    _arm(rig, "")
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0", env_over=_in_a_pane(rig))
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert "required" in out and "SL_FLEET_FENCE" in out
+    assert "WARNING" in out
+
+
+def test_the_file_may_not_set_the_rest_of_the_launchers_contract(rig):
+    # An allow-list, not a general env file: SL_ATTENDED is pinned empty by the runner precisely
+    # because an ambient value must never ride into a worker session, and a machine-level file that
+    # could set it would put that whole contract on disk.
+    _arm(rig, "SL_FLEET_FENCE=required\nSL_ATTENDED=1\n")
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0", env_over=_in_a_pane(rig))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "SL_ATTENDED" in r.stdout and "never applies" in r.stdout
+
+
 # --------------------------------------------------------------- request-restart speaks the home
 
 def test_request_restart_names_the_right_manual_start_for_the_login_item_home(rig):
