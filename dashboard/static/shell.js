@@ -513,6 +513,7 @@
     if (act === "fixer-open") { if (window.CCFixer) window.CCFixer.open(repo); return; }
     if (act === "replay-open") { if (window.CCReplay) window.CCReplay.open(repo, state.snapshot && state.snapshot.fun); return; }
     if (act === "digest-open") { if (window.CCDigest) window.CCDigest.open(repo); return; }
+    if (act === "session-window") { doSessionWindow(repo, num); return; }
     if (act === "discuss") { doDiscuss(repo, num); return; }
     if (act === "answer") { doAnswer(el, repo, num); return; }
     if (act === "approve") {
@@ -545,6 +546,26 @@
     window.clearTimeout(armThenFire._t);
     state.confirming = null;
     postVerb(path, repo, num, okMsg);
+  }
+
+  // #340: bring this flight's own session window to the front. A LOCAL command, never a GitHub
+  // write — so it deliberately does NOT go through postVerb (whose toast and refresh both speak the
+  // language of a label landing) and it does not re-poll: nothing about the loop changed, only
+  // which window is in front. One tap, no confirm gate: it opens a window the owner already owns.
+  //
+  // THE SENTENCE IS THE SERVER'S, in all three tones. The engine keeps "that lane has no window"
+  // apart from its failures on purpose — a session that exited, or a window `superlooper tidy`
+  // closed, is the COMMON answer, not a fault — so it gets a neutral tone of its own here. Painting
+  // it red would teach the owner to distrust a truthful answer; toasting a success would be a lie.
+  function doSessionWindow(repo, num) {
+    postJSON("/api/session-window", { repo: repo, num: Number(num) })
+      .then(function (res) {
+        var b = (res && res.body) || {};
+        var said = b.message || b.error || "couldn't open the session window for SL-" + num;
+        if (res.status === 200 && b.ok) { toast(said, "ok"); return; }
+        toast(said, b.outcome === "no_window" ? "note" : "err");
+      })
+      .catch(function () { toast("couldn't reach the command center", "err"); });
   }
 
   function postVerb(path, repo, num, okMsg) {
@@ -624,6 +645,12 @@
   }
 
   // ---- toast: transient feedback, lives OUTSIDE #root so a poll re-render never clobbers it ----
+  // THREE tones since issue #340, and the third is not decoration. "That lane has no window to
+  // raise" is an ordinary answer, neither a success nor a fault — green would be a lie about what
+  // just happened and red would teach the owner to distrust a truthful answer. Unknown kinds still
+  // fall back to the success tone, which is the historical behaviour every other caller relies on.
+  var TOAST_TONES = { err: "err", note: "note", ok: "ok" };
+
   function toast(msg, kind) {
     var t = el("cc-toast");
     if (!t) {
@@ -632,7 +659,7 @@
       document.body.appendChild(t);
     }
     t.textContent = msg;
-    t.className = "cc-toast show " + (kind === "err" ? "err" : "ok");
+    t.className = "cc-toast show " + (TOAST_TONES[kind] || "ok");
     window.clearTimeout(toast._t);
     toast._t = window.setTimeout(function () { t.className = "cc-toast"; }, 3400);
   }

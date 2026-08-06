@@ -127,6 +127,28 @@
       '</div></div>';
   }
 
+  // The Open-session-window button (issue #340). Owner ruling 2026-07-30: the card gets a button
+  // that opens THAT session's own window — attach, which is proven — and no observe-stream
+  // plumbing, so there is no frame to render here and never will be. What comes to the front is the
+  // REAL interactive terminal: the owner can read it, and type into it to interject.
+  //
+  // The whole decision is the server's (cards._session): whether this lane has a recorded window at
+  // all. This layer only decides whether to draw a button. It names no session host and derives no
+  // target — the number on the button is the flight's, and the server turns it into the engine's
+  // lane id (owner ruling 2026-08-04 on #310).
+  function sessionHTML(d) {
+    var s = d.session;
+    if (!s || !s.present) return "";
+    return '<button class="btn ghost drawer-session" data-act="session-window"' +
+      ' data-repo="' + esc(d.repo) + '" data-num="' + esc(d.num) + '"' +
+      ' title="Bring this session’s own window to the front — the real terminal, so you can' +
+      ' watch it and type into it. Nothing about the loop changes.">' +
+      // U+1F5A5 (desktop computer), not the more literal U+1F5D4 "window": that codepoint has no
+      // glyph in the platform emoji font and renders as tofu — checked in the real browser, not
+      // guessed. It sits in the same family as the Sweep bin and the Fixer wrench already here.
+      '\u{1F5A5}️ Open session window</button>';
+  }
+
   function actionsHTML(d) {
     var da = ' data-repo="' + esc(d.repo) + '" data-num="' + esc(d.num) + '"';
     // The verb + label + whether Discuss is the default are the SERVER's (d.decision) — so a bounced
@@ -134,14 +156,17 @@
     // exactly as on the card. The destructive verbs — Drop, and Rebuild on a finished lane (issue
     // #161) — stay on the card, where their two-tap confirm lives. Discuss is always available.
     var dec = d.decision;
+    // The session-window button leads the row on every flight that has one: it is the only verb
+    // here that is purely a way to LOOK at the work, so it sits ahead of the verbs that change it.
+    var session = sessionHTML(d);
     var discuss = '<button class="btn-note link" data-act="discuss"' + da + '>Discuss →</button>';
-    if (!dec) return '<div class="drawer-actions">' + discuss + '</div>';
+    if (!dec) return '<div class="drawer-actions">' + session + discuss + '</div>';
     var approve = '<button class="btn ' + (dec.discuss_default ? "ghost" : "primary") +
       '" data-act="' + esc(dec.approve_act) + '"' + da + '>' + esc(dec.approve_label) + '</button>';
     var bits = dec.discuss_default
       ? ['<button class="btn primary" data-act="discuss"' + da + '>Discuss →</button>', approve]
       : [approve, discuss];
-    return '<div class="drawer-actions">' + bits.join("") + '</div>';
+    return '<div class="drawer-actions">' + session + bits.join("") + '</div>';
   }
 
   function render(d) {

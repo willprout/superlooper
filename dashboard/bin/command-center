@@ -41,6 +41,7 @@ import pollers                # noqa: E402
 import janitor as janitor_mod  # noqa: E402
 import restart as restart_mod # noqa: E402
 import server                 # noqa: E402
+import session_window as session_window_mod  # noqa: E402
 import tidy as tidy_mod       # noqa: E402
 import version as version_mod  # noqa: E402
 import watchdog as watchdog_mod  # noqa: E402
@@ -197,6 +198,15 @@ def main(argv):
     fixer = fixer_mod.Fixer(cfg["superlooper_cli"],
                             {r["slug"]: r["path"] for r in cfg["repos"]},
                             operator=config_mod.operator(cfg))
+    # The Open-session-window button (issue #340) — a local-command verb, and the ONLY new thing
+    # the flight card can do: bring THAT lane's session window to the front — the real interactive
+    # terminal, so the owner can watch it and type into it. It reaches a window the way every other
+    # host-shaped verb here does — by shelling the ENGINE (`superlooper focus-session`, #339), which
+    # owns the one doorway to the session host. The dashboard names no host and holds no token for
+    # one (owner ruling 2026-08-04 on #310); tests/test_host_neutrality.py is the ratchet on that.
+    # Bound to the same configured CLI and watched-repo allow-list as Tidy, Restart and the Fixer.
+    session_window = session_window_mod.SessionWindow(
+        cfg["superlooper_cli"], {r["slug"]: r["path"] for r in cfg["repos"]})
     replay_provider, digest_provider = build_data_providers(cfg)
     # The bind (in build_server) is the first thing that can fail on an otherwise-valid config: the
     # configured port may be taken by a second command-center or another app. Answer it the way a bad
@@ -206,7 +216,8 @@ def main(argv):
     try:
         httpd = server.build_server(provider, static_dir, port=cfg["port"], actions=verbs,
                                     desk=dashboard_desk, tidy=tidy, restart=restart, janitor=janitor,
-                                    fixer=fixer, replay_provider=replay_provider,
+                                    fixer=fixer, session_window=session_window,
+                                    replay_provider=replay_provider,
                                     digest_provider=digest_provider, version=code_version)
     except OSError as e:
         sys.stderr.write(_bind_error_line(cfg["port"], e))

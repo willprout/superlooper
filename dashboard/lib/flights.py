@@ -1201,6 +1201,21 @@ def build_flight(issue, repo):
         "progress": prog,
         "spinning": spinning,
         "wander": wander,
+        # Did the loop record a session WINDOW for this lane (the engine's state/panes/<id> marker)?
+        # The flight card's Open-session-window button (issue #340) is gated on exactly this, and it
+        # is the same marker `superlooper tidy` selects on — so the button that opens a window and
+        # the verb that closes one can never disagree about which lanes have one.
+        #
+        # Deliberately not derived from status or stage. A PARKED lane is the one the owner most
+        # needs to open, and its window is kept alive on purpose (engine lib/tidy: a stalled lane's
+        # window persists until an owner verb resolves it) — yet parked is not a launched status. A
+        # merged-and-tidied lane is the mirror case: launched forever, window long gone. Absent
+        # marker ⇒ False, which fails toward offering no button.
+        #
+        # Note what it is still NOT: proof the window is open RIGHT NOW. Only the session host knows
+        # that; the engine's `focus-session` asks it at tap time and answers honestly. This decides
+        # whether there is anything worth asking.
+        "session_window": bool(issue.get("session_window")),
         "merged": merged,
         "celebrate": celebrate,
         "gate": gate,

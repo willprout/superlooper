@@ -19,6 +19,10 @@ inject a fail-closed ``{"ok": false, ...}`` envelope), else a default 3-proposal
 ok-per-key result echoing the requested keys, and records a ``janitor_execute`` mutation carrying
 the exact keys so a test proves ONLY the tapped subset was sent.
 
+And the Open-session-window button's shell (issue #340; see ``route_focus_session``):
+
+    superlooper focus-session --repo <path> --id i<N> --json   → one of the engine's four outcomes
+
 It also models the Restart button's shell (issue #116; see ``route_request_restart``):
 
     superlooper request-restart --repo <path> --check --json   → reports live-runner liveness (JSON)
@@ -51,7 +55,7 @@ ARGS = sys.argv[1:]
 # One fixtures dir, whichever local-command button set it (Tidy or Janitor). calls.jsonl and
 # mutations.jsonl land here for either verb.
 FIX = (os.environ.get("SL_TIDY_FIXTURES") or os.environ.get("SL_JANITOR_FIXTURES")
-       or os.environ.get("SL_FIXER_FIXTURES") or "")
+       or os.environ.get("SL_FIXER_FIXTURES") or os.environ.get("SL_FOCUS_FIXTURES") or "")
 
 _DEFAULT_DRY_RUN = (
     "tidy will close 2 finished (merged) session window(s):\n"
@@ -144,6 +148,9 @@ def route():
         return
     if ARGS[:1] == ["debug"]:
         route_debug()
+        return
+    if ARGS[:1] == ["focus-session"]:
+        route_focus_session()
         return
     if ARGS[:1] != ["tidy"]:
         die("unhandled command: %s" % " ".join(ARGS))
@@ -242,13 +249,63 @@ def route_debug():
     sys.exit(0)
 
 
+# The engine's four outcomes, each with the REAL detail sentence `superlooper focus-session --json`
+# prints for it (skill/lib/focus.py + skill/lib/session_host.py) and the REAL exit code
+# (focus.EXIT_CODES). Copied verbatim so lib/session_window is exercised against the true contract
+# — including the property the dashboard leans on hardest: `no_window` is an ordinary answer with an
+# explanatory sentence, not an error string.
+_FOCUS_DETAIL = {
+    "focused": "the host moved its focus to workspace ws-340; a viewer attached to this session "
+               "follows it",
+    "no_window": "no session window is recorded for %s — it has not launched, its session ended, "
+                 "or `superlooper tidy` closed the window",
+    "host_unreachable": "could not ask the host to focus workspace ws-340 (rc=1; unauthorized)",
+    "unknown_lane": "no loop state for %s: [Errno 2] no such file or directory",
+}
+_FOCUS_EXIT = {"focused": 0, "no_window": 3, "host_unreachable": 4, "unknown_lane": 5}
+
+
+def route_focus_session():
+    """Model the real `superlooper focus-session --repo <path> --id i<N> --json` contract
+    ``lib/session_window`` parses (issue #340) — the ENGINE's read-only door onto one lane's session
+    window (issue #339). The dashboard only shells it and never names a session host, so this fake
+    is the whole of what a session-window test may see of a window.
+
+    ``SL_FOCUS_OUTCOME`` picks which of the four the engine answers (default ``focused``);
+    ``SL_FOCUS_GARBAGE=1`` prints non-JSON so a test can exercise the unparseable path; and
+    ``SL_FOCUS_UNKNOWN_VERB=1`` models an INSTALLED engine that predates the verb — argparse's
+    `invalid choice` on stderr, rc 2, and no JSON at all, which is the publish-drift case the
+    dashboard has to name rather than mistake for an unknown lane.
+    """
+    if os.environ.get("SL_FOCUS_UNKNOWN_VERB"):
+        sys.stderr.write("usage: superlooper [-h] {run,adopt,tidy,janitor} ...\n"
+                         "superlooper: error: argument cmd: invalid choice: 'focus-session'\n")
+        sys.exit(2)
+    if os.environ.get("SL_FOCUS_GARBAGE"):
+        sys.stdout.write("not json — the CLI misbehaved\n")
+        sys.exit(0)
+    outcome = os.environ.get("SL_FOCUS_OUTCOME") or "focused"
+    iid = opt("--id") or ""
+    detail = _FOCUS_DETAIL.get(outcome, "")
+    if "%s" in detail:
+        detail = detail % (opt("--repo") if outcome == "unknown_lane" else iid)
+    out = {"ok": outcome == "focused", "verb": "focus-session", "id": iid, "outcome": outcome,
+           "workspace": "ws-340" if outcome in ("focused", "host_unreachable") else None,
+           "repo": "will-titan/command-center", "detail": detail}
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.exit(_FOCUS_EXIT.get(outcome, 1))
+
+
 def main():
     if FIX:
         with open(os.path.join(FIX, "calls.jsonl"), "a") as f:
             f.write(json.dumps({"argv": ARGS, "cwd": os.getcwd()}) + "\n")
-    if os.environ.get("SL_TIDY_SLEEP") or os.environ.get("SL_JANITOR_SLEEP"):
-        time.sleep(float(os.environ.get("SL_TIDY_SLEEP") or os.environ.get("SL_JANITOR_SLEEP")))
-    if os.environ.get("SL_TIDY_FAIL") or os.environ.get("SL_JANITOR_FAIL"):
+    sleep = (os.environ.get("SL_TIDY_SLEEP") or os.environ.get("SL_JANITOR_SLEEP")
+             or os.environ.get("SL_FOCUS_SLEEP"))
+    if sleep:
+        time.sleep(float(sleep))
+    if (os.environ.get("SL_TIDY_FAIL") or os.environ.get("SL_JANITOR_FAIL")
+            or os.environ.get("SL_FOCUS_FAIL")):
         die("forced failure")
     route()
 
