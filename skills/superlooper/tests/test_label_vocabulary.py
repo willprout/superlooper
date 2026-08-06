@@ -753,7 +753,10 @@ _APPLY_SIDE_FAMILY_SITES = {
 # token-only pattern would miss exactly the shape a scheduling filter would be written in
 # (review round 2). The bare prefix is matched only when the string ENDS there, so the
 # freeze-marker sentence (which continues `source: "nightly"`) still does not trip it.
-_SOURCE_TOKEN = re.compile(re.escape(labels_mod.SOURCE_PREFIX) + r"[a-z0-9-]*(?![ \w])")
+# The value grammar is deliberately WIDER than the starter set's kebab-case: the family is OPEN, so
+# an adopter's `source:QA` or `source:foo_bar` is a real label, and a narrower class would let a
+# hardcoded one of those through as a false negative (fresh-agent verification pass, Codex).
+_SOURCE_TOKEN = re.compile(re.escape(labels_mod.SOURCE_PREFIX) + r"[A-Za-z0-9_.-]*(?![ \w])")
 
 
 # Every public name in `labels` that exposes the family. A read through the helper is as much a
@@ -870,6 +873,10 @@ def test_the_absence_guard_would_notice_a_read_being_added():
                 # shape a scheduling filter would be written in (review round 2).
                 'def pick(x):\n    return x.startswith("source:")\n',
                 'def pick(xs):\n    return [x for x in xs if not x.startswith("source:")]\n',
+                # an ADOPTER's own value, outside the starter set's kebab-case — the family is open,
+                # so the guard's grammar must be at least as wide as the label's.
+                'def pick(x):\n    return "source:foo_bar" in x\n',
+                'def pick(x):\n    return "source:QA" in x\n',
                 # ...and the family through its HELPER rather than its constants.
                 'import labels\ndef rank(p):\n    return set(p) & set(labels.source_labels())\n',
                 'from labels import source_labels\ndef rank(p):\n    return source_labels()\n'):
