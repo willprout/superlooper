@@ -32,6 +32,11 @@ _ISSUE_FIELDS = "number,title,labels,body,createdAt"
 # says update_result is "for the CURRENT head; the runner clears it whenever the PR head
 # changes", and the head is only detectable by its oid (Task 10).
 _PR_FIELDS = "number,state,mergeable,statusCheckRollup,files,headRefName,headRefOid,labels"
+# statusCheckRollup needs no companion field for the gate's latest-run-per-name fold (issue #402):
+# `--json statusCheckRollup` is atomic — gh's own query already selects startedAt/completedAt on
+# every CheckRun and createdAt on every StatusContext, which is the recency gate._rollup_entries
+# ranks by. Nothing to add here; a future gh that drops those timestamps would land the fold on
+# its documented fail-closed fallback (any-failure-wins), not on a wrong answer.
 
 
 def _binary():
@@ -417,6 +422,27 @@ def branch_checks(branch):
     them with no special-casing: check-runs -> {name, status, conclusion}; statuses ->
     {context, state}. gh substitutes {owner}/{repo}; the ref is URL-encoded so a slashed branch
     (sl/i1-x) doesn't split into extra path segments.
+
+    UNCHANGED by issue #402, deliberately, and here is exactly how the two surfaces line up now
+    that the PR rollup judges each required name by its LATEST run (gate._rollup_entries).
+
+    This poll's entries carry NO timestamps — the normalization above drops them — so they always
+    take that fold's fail-closed any-failure-wins branch. Behavior here is bit-for-bit what it was.
+    That is the right answer for the shape this poll actually sees: a re-run of a workflow run
+    supersedes its own earlier attempt WITHIN one check suite, and both endpoints already collapse
+    that (/check-runs' default filter=latest, /status being the COMBINED latest-per-context), so a
+    dev-branch commit carrying ONE suite reports each name exactly once and there is no superseded
+    run to outvote anything.
+
+    What `filter=latest` does NOT do is dedupe ACROSS check suites — measured, not assumed: on a
+    commit carrying two suites the default call returned BOTH runs of the name (willprout/
+    superlooper b259992, 2026-08-07). A dev-branch commit only grows a second suite if it was
+    ALREADY built as a PR head and then reached the branch unchanged, which the default squash
+    merge never produces (it writes a fresh commit whose only suite is the push one). Under
+    `merge_method: "rebase"` it could, and then a superseded red here would freeze the mainline
+    with no way to rank it away — filed for the owner rather than fixed inside #402's boundary,
+    which holds this poll unchanged. Fail-closed either way: a spurious freeze, never a false
+    unfreeze.
 
     The two reads fail closed INDEPENDENTLY to their empty contribution: a required check that
     never reports still reads pending (never a false green -> never a spurious unfreeze), and a

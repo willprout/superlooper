@@ -607,20 +607,103 @@ def touch_verdict(declared, actual_areas, inflight):
     return {"wander": wander, "overlap_lane": overlap_lane, "overlap_wildcard": overlap_wildcard}
 
 
+# The rollup's ONLY ordering signal, in exactly the shape gh's statusCheckRollup query selects:
+# CheckRun carries startedAt/completedAt, StatusContext carries createdAt (issue #402). All three
+# are GraphQL DateTime — fixed-width second-precision UTC, "2026-08-06T23:52:14Z" — so a
+# lexicographic compare IS a chronological compare, with no date parsing and no 3.9-era ISO gaps.
+# The pattern is deliberately exact rather than lenient: a fractional-second or offset form
+# ("...14.5Z" sorts BELOW "...14Z"; "+01:00" is incomparable with "Z") would sort wrong under that
+# compare, so an unexpected shape must read as NO ordering — see _rollup_entries' fail-closed
+# fallback — never as a silent guess about which run is current.
+_ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_RECENCY_FIELDS = ("completedAt", "startedAt", "createdAt")
+# gh does not hand a null timestamp through as null: `gh pr view --json statusCheckRollup`
+# marshals its Go zero time instead, so a still-running check reports completedAt
+# "0001-01-01T00:00:00Z" and conclusion "" (observed on a real two-suite rollup while building
+# #402). Year 1 is a perfectly well-formed DateTime, so it would rank as the OLDEST record rather
+# than the missing one it stands for — a completedAt-only ranking would have scored a live re-run
+# below the failure it supersedes and failed the PR for the whole re-run window. It is the absence
+# of a timestamp, so it is never treated as one.
+_ZERO_TIME = "0001-01-01T00:00:00Z"
+
+
+def _entry_recency(c):
+    """When a rollup entry last showed signs of life: the MAX of whichever of gh's timestamps it
+    carries, or None when it carries none in the exact DateTime shape (issue #402).
+
+    Max across the fields, not completedAt alone: a re-run still in flight has no completedAt but a
+    real startedAt, and it must still outrank the completed record it supersedes — otherwise the
+    stale failure wins the whole re-run window, which is the park this fold exists to stop. gh's
+    zero time (_ZERO_TIME) is the missing value, not the year 1, and is skipped like a null."""
+    stamps = [c.get(f) for f in _RECENCY_FIELDS]
+    stamps = [s for s in stamps
+              if isinstance(s, str) and s != _ZERO_TIME and _ISO_Z.match(s)]
+    return max(stamps) if stamps else None
+
+
 def _rollup_entries(status_rollup):
-    """Fold a check rollup into {check_name: [UPPERCASED state str | None]}. Rollup entries carry
-    gh's two shapes: CheckRun (name/conclusion) and StatusContext (context/state). Non-string
-    states (wrong-typed, unhashable) normalize to None. Strings are UPPERCASED: the GraphQL PR
-    rollup reports "FAILURE" but the REST check-runs API (gh.branch_checks — the dev poll behind
-    freeze/unfreeze) reports "failure"; without this fold the dev branch always read "pending", so
-    red never froze and green never unfroze (Task-15 simulation catch)."""
-    entries = {}
+    """Fold a check rollup into {check_name: [UPPERCASED state str | None]} — the LATEST run per
+    name. Rollup entries carry gh's two shapes: CheckRun (name/conclusion) and StatusContext
+    (context/state). Non-string states (wrong-typed, unhashable) normalize to None. Strings are
+    UPPERCASED: the GraphQL PR rollup reports "FAILURE" but the REST check-runs API
+    (gh.branch_checks — the dev poll behind freeze/unfreeze) reports "failure"; without this fold
+    the dev branch always read "pending", so red never froze and green never unfroze (Task-15
+    simulation catch).
+
+    LATEST-per-name, and how recency is decided (issue #402): the PR's GraphQL statusCheckRollup
+    keeps EVERY run attached to the head commit, so a re-run on an unchanged SHA (a close/reopen,
+    a nudge-triggered re-run) leaves the SUPERSEDED failure sitting beside the live green one.
+    Keeping both let any-failure-wins re-park a PR whose real state was green — proven live twice
+    on the eApp loop (2026-08-05, its PRs #714/#717). Each name is therefore ranked by
+    _entry_recency and only the newest run's state survives the fold; ties keep every tied entry.
+
+    Recency ranks only entries of the SAME NAME FROM THE SAME REPORTER — a re-run supersedes its
+    own earlier attempt, and nothing else. Reporter identity is the pair the rollup can actually
+    prove: which shape carried the name (CheckRun vs StatusContext), and for a CheckRun the
+    workflowName gh returns with it. So a commit status and a check-run that share a name, or two
+    DIFFERENT workflows both publishing one required name, are independent reporters of it — each
+    keeps its own vote, and a live red on one is never silenced by a newer green on the other.
+    Both were caught as fail-OPENs the old fold did not have (two cross-review rounds); the
+    double-reported shape is the same corner gh.branch_checks' docstring already names.
+
+    The residual, stated rather than hidden: check runs that carry NO workflowName (a non-Actions
+    app) group under one reporter per name, so there the fold cannot tell a re-run from a second
+    app claiming the same required name and ranks them together. That is GitHub's own reading of a
+    required check — it evaluates the name by its latest run — so the gate is not merging anything
+    GitHub itself would call red, and the alternative (never ranking such runs) would leave the
+    whole #402 bug unfixed for every repo whose CI is not Actions.
+
+    FAIL-CLOSED FALLBACK: if ANY entry under a name+reporter has no usable timestamp, that group
+    keeps ALL its entries and stays any-failure-wins — the old behavior, unchanged. No ordering
+    means the fold genuinely cannot tell which run is current, and voting every run is the safe
+    answer (worst case a green PR waits for a human, never a red one merges). This is also the ONLY
+    branch the dev-branch surface ever takes: gh.branch_checks normalizes its REST reads down to
+    name/status/conclusion with no timestamps at all, so that poll keeps its exact pre-#402
+    behavior — which is the right verdict for the one-suite-per-commit shape it sees. Its residual
+    corner, and why it is not fixed in here, is written up at gh.branch_checks."""
+    runs = {}
     for c in status_rollup if isinstance(status_rollup, list) else []:
         if isinstance(c, dict):
-            key = c.get("name") or c.get("context")
+            # Which field supplied the name IS the reporter — `name or context` verbatim (a
+            # wrong-typed truthy `name` still shadows `context`, then fails the isinstance below
+            # exactly as before), just kept alongside the key it produced. For a CheckRun the
+            # workflow behind it refines that: gh hands us workflowName, and two different
+            # workflows publishing one required name are two reporters of it, not two attempts.
+            named = c.get("name")
+            if named:
+                wf = c.get("workflowName")
+                key, reporter = named, ("run", wf if isinstance(wf, str) else None)
+            else:
+                key, reporter = c.get("context"), ("status",)
             if isinstance(key, str):
                 v = c.get("conclusion") or c.get("state")
-                entries.setdefault(key, []).append(v.upper() if isinstance(v, str) else None)
+                runs.setdefault((key, reporter), []).append(
+                    (_entry_recency(c), v.upper() if isinstance(v, str) else None))
+    entries = {}
+    for (key, _reporter), vals in runs.items():
+        newest = None if any(t is None for t, _ in vals) else max(t for t, _ in vals)
+        entries.setdefault(key, []).extend(
+            [s for t, s in vals if newest is None or t == newest])
     return entries
 
 
@@ -629,7 +712,12 @@ def required_checks_state(status_rollup, required) -> str:
     'fail' (any required check failed — beats pending), 'pending' (any required check missing
     or still running, or the rollup/required list is unreadable — fail closed: WAIT, never
     merge on a half-read rollup), else 'green'. An EMPTY required list is vacuously green here;
-    doctor fails hard on it at adopt time (cross-review C3)."""
+    doctor fails hard on it at adopt time (cross-review C3).
+
+    Each required name is judged by its LATEST run only — a superseded failure riding the same
+    head commit no longer outvotes the green that replaced it (issue #402). _rollup_entries owns
+    that ranking and documents both how recency is read and the fail-closed fallback when the
+    rollup offers no usable ordering; everything above stays exactly as fail-closed as before."""
     if not isinstance(required, list) or any(not isinstance(r, str) for r in required):
         return "pending"
     if not required:
@@ -655,7 +743,9 @@ def pending_required_breakdown(status_rollup, required):
     issue #26; a check that merely reports late is absent only transiently) and those present-but-
     not-yet-terminal ('running'). Names already satisfied or failing are omitted — they are not
     what the wait is on. Returns {"unreported": [sorted], "running": [sorted]}. Wrong-typed
-    required -> both empty (fail closed)."""
+    required -> both empty (fail closed). Reads the same latest-per-name fold as the decision
+    above, so the memo names the run the gate is actually waiting on and never a superseded one
+    (issue #402)."""
     if not isinstance(required, list):
         return {"unreported": [], "running": []}
     entries = _rollup_entries(status_rollup)
