@@ -31,6 +31,7 @@ a test in ``tests/test_flights.py``:
   promotion never does. And the corner counter is outcome-only — no human-latency stopwatch may
   ever exist on this surface (§7 kill list #4).
 """
+import math
 import re
 import time
 
@@ -772,6 +773,25 @@ def source_mode(view, heartbeat_age, heartbeat_epoch, now, silent_after,
                      "banner": {"lines": [first, _GITHUB_DIRECT_LINE]}}, fmt)
 
 
+def _stop_epoch(v):
+    """A usable wall-clock epoch from the stop marker, or ``None``.
+
+    The marker is an untrusted file, and this is the boundary it enters through — so it is where a
+    value that cannot survive arithmetic has to be dropped. NaN and the infinities are the obvious
+    ones (``json.loads`` accepts both spellings). The one that is not obvious, and the one a fresh
+    reviewer caught: a 1000-digit INTEGER passes every ``isinstance`` check and then raises
+    ``OverflowError`` out of ``math.isfinite`` downstream, inside the 2-second snapshot poll — which
+    would blank the board for every repo over one junk file. So the finiteness test is taken here,
+    where it can be wrapped, and nothing downstream ever sees a number it cannot format.
+    """
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    try:
+        return v if math.isfinite(v) else None
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
 def stop_state(stopped, runner_live=None, heartbeat_epoch=None, heartbeat_age=None,
                heartbeat_down_seconds=300):
     """Is this repo's loop off because the OWNER turned it off — and did the stop actually take?
@@ -815,9 +835,7 @@ def stop_state(stopped, runner_live=None, heartbeat_epoch=None, heartbeat_age=No
         return {"present": False, "state": None, "condition": None,
                 "at": None, "operator": None, "source": None}
     rec = stopped if isinstance(stopped, dict) else {}
-    at = rec.get("stopped_at")
-    if not isinstance(at, (int, float)) or isinstance(at, bool) or at != at:   # NaN != NaN
-        at = None
+    at = _stop_epoch(rec.get("stopped_at"))
     epoch = heartbeat_epoch if (isinstance(heartbeat_epoch, (int, float))
                                 and not isinstance(heartbeat_epoch, bool)) else None
     live = runner_live

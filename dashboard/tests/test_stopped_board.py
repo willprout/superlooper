@@ -74,6 +74,14 @@ def test_no_pidfile_a_dead_pid_or_junk_all_read_as_no_live_runner(tmp_path):
     assert _home(tmp_path, lock=-1)["runner_live"] is False
 
 
+def test_an_absurd_pid_is_answered_not_raised(tmp_path):
+    # `os.kill` raises OverflowError — NOT an OSError — for a pid too large for a C int, so a
+    # `runner.lock` holding one would escape the reader and 500 the 2-second snapshot poll, taking
+    # the whole board down for every repo. The engine's own `_probe_pid` catches it; so must this.
+    # (Found by a fresh reviewer, who ran the probe rather than assuming.)
+    assert _home(tmp_path, lock=10 ** 100)["runner_live"] is False
+
+
 # --------------------------- the reader ---------------------------
 
 def test_the_marker_is_a_contract_key_of_every_state_home_read(tmp_path):
@@ -97,6 +105,28 @@ def test_an_unparseable_marker_still_counts_as_a_stop(tmp_path):
     # Existence is the signal (the engine reads it the same way). A marker lost to a truncated
     # write would hand the loop back to the guardians the owner just overruled.
     assert _home(tmp_path, stopped="{half-writ")["stopped"] == {}
+
+
+def test_a_present_but_unreadable_marker_still_counts_as_a_stop(tmp_path):
+    # The half the generic existence-reader loses: it maps a missing file AND an unopenable one
+    # (a directory in its place, a permission-denied read) to the same `None`. For THIS file those
+    # are opposite answers — the engine's own `read_stop_marker` distinguishes them with an
+    # `os.path.exists` check for exactly this reason. Reading an unreadable marker as absent would
+    # put the board back to RUNNER DOWN and fire the push, over a stop the owner made: the precise
+    # failure this issue exists to prevent, arriving through a permission bit.
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "runner.stopped").mkdir()      # a directory where the marker should be
+    assert readers.read_state_home(tmp_path)["stopped"] == {}
+
+
+def test_an_absurd_stopped_at_cannot_crash_the_poll(tmp_path):
+    # A marker carrying a 1000-digit `stopped_at` reaches the server's duration arithmetic, and
+    # `math.isfinite` RAISES on an int too large to convert to a float — inside the 2-second
+    # snapshot poll, which would blank the board for every repo. The value is screened where the
+    # untrusted file enters, so nothing downstream ever sees it.
+    st = flights.stop_state({"stopped_at": 10 ** 1000}, runner_live=False)
+    assert st["present"] is True and st["at"] is None
+    assert server._stopped_message(st, NOW)              # a sentence, not an exception
 
 
 # --------------------------- the three states ---------------------------
