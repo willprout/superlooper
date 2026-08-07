@@ -39,8 +39,8 @@ import server
 import watchdog as watchdog_mod
 
 
-def _home(tmp_path, *, stopped=None, heartbeat=None, now=1_000_000):
-    """A minimal state home: an optional stop marker, an optional heartbeat epoch."""
+def _home(tmp_path, *, stopped=None, heartbeat=None, lock=None, now=1_000_000):
+    """A minimal state home: an optional stop marker, heartbeat epoch, and runner pidfile."""
     state = tmp_path / "state"
     state.mkdir(parents=True, exist_ok=True)
     if stopped is not None:
@@ -48,7 +48,30 @@ def _home(tmp_path, *, stopped=None, heartbeat=None, now=1_000_000):
             stopped if isinstance(stopped, str) else json.dumps(stopped))
     if heartbeat is not None:
         (state / "runner.heartbeat").write_text(str(heartbeat))
+    if lock is not None:
+        (state / "runner.lock").write_text(str(lock))
     return readers.read_state_home(tmp_path, now=now)
+
+
+# A pid that is definitely alive (this test process) and one that definitely is not. `os.kill(p, 0)`
+# SENDS no signal — it is the existence probe the engine's own `live_runner_pid` uses — so pointing
+# a fixture at a real pid can never disturb it.
+LIVE_PID = os.getpid()
+DEAD_PID = 999_999
+
+
+def test_a_pidfile_naming_a_live_process_reads_as_a_live_runner(tmp_path):
+    assert _home(tmp_path, lock=LIVE_PID)["runner_live"] is True
+
+
+def test_no_pidfile_a_dead_pid_or_junk_all_read_as_no_live_runner(tmp_path):
+    # Every one of these is "nothing is running" in the engine's own reader, and the direction
+    # matters: this is the POSITIVE read that lets a stop marker mean the loop is off.
+    assert _home(tmp_path)["runner_live"] is False
+    assert _home(tmp_path, lock=DEAD_PID)["runner_live"] is False
+    assert _home(tmp_path, lock="not-a-pid")["runner_live"] is False
+    assert _home(tmp_path, lock=0)["runner_live"] is False
+    assert _home(tmp_path, lock=-1)["runner_live"] is False
 
 
 # --------------------------- the reader ---------------------------
@@ -86,57 +109,73 @@ def test_no_marker_is_no_stop_state():
     assert st["present"] is False and st["state"] is None and st["condition"] is None
 
 
-def test_a_quiet_runner_under_a_marker_is_stopped_by_owner_not_down():
-    st = flights.stop_state({"stopped_at": NOW - 900, "operator": "William"},
-                            heartbeat_epoch=NOW - 900, heartbeat_age=900,
-                            heartbeat_down_seconds=300)
+def test_a_gone_runner_under_a_marker_is_stopped_by_owner_not_down():
+    st = flights.stop_state({"stopped_at": NOW - 900, "operator": "William"}, runner_live=False,
+                            heartbeat_epoch=NOW - 900, heartbeat_age=900)
     assert st["state"] == "off" and st["condition"] == flights.STOPPED
     assert st["present"] is True and st["operator"] == "William" and st["at"] == NOW - 900
 
 
-def test_a_never_ticked_runner_under_a_marker_is_also_stopped():
-    # No heartbeat at all is the same positive "nothing is running" read a stale one gives.
-    st = flights.stop_state({"stopped_at": NOW - 60}, heartbeat_epoch=None, heartbeat_age=None)
-    assert st["condition"] == flights.STOPPED and st["state"] == "off"
+def test_a_clean_final_tick_after_the_marker_is_a_completed_stop_not_a_failed_one():
+    # THE case a heartbeat-only read gets wrong, and it is the COMMON one: `stop` lets the runner
+    # finish its tick, so a successful stop routinely stamps a heartbeat AFTER the marker and then
+    # exits. Judging on that alone would paint STOP NOT TAKEN over almost every real stop, for the
+    # whole five minutes it takes the heartbeat to go stale. The runner being gone settles it.
+    st = flights.stop_state({"stopped_at": NOW - 20}, runner_live=False,
+                            heartbeat_epoch=NOW - 5, heartbeat_age=5)
+    assert st["state"] == "off" and st["condition"] == flights.STOPPED
 
 
-def test_a_fresh_stop_over_a_runner_still_in_its_tick_is_stopping_not_a_lie():
-    # The marker lands BEFORE anything is taken down, so this window is normal — and it must not
-    # be reported as either a completed stop or a failed one.
-    st = flights.stop_state({"stopped_at": NOW - 5}, heartbeat_epoch=NOW - 20, heartbeat_age=20,
-                            heartbeat_down_seconds=300)
-    assert st["state"] == "stopping" and st["condition"] == flights.STOPPED
-
-
-def test_a_tick_that_landed_after_the_marker_is_a_stop_that_did_not_take():
-    # The runner completed a whole tick with the off switch already on disk: the stop did not hold,
-    # or a `start` failed to withdraw the marker and latched it over a live runner.
-    st = flights.stop_state({"stopped_at": NOW - 600}, heartbeat_epoch=NOW - 30, heartbeat_age=30,
-                            heartbeat_down_seconds=300)
+def test_a_live_runner_that_ticked_after_the_marker_is_the_stop_that_did_not_take():
+    # Same heartbeat, opposite truth: the process is still there. The stop did not hold, or a
+    # `start` failed to withdraw the marker and latched it over a running loop.
+    st = flights.stop_state({"stopped_at": NOW - 600}, runner_live=True,
+                            heartbeat_epoch=NOW - 30, heartbeat_age=30)
     assert st["state"] == "not-taken" and st["condition"] == flights.STOP_NOT_TAKEN
 
 
-def test_a_tick_after_the_marker_but_long_since_quiet_is_stopped_after_all():
-    # It survived the stop briefly, then went quiet: the positive no-live-runner read decides, so
-    # this is 'off', not a permanent STOP NOT TAKEN over a loop that really is down.
-    st = flights.stop_state({"stopped_at": NOW - 4000}, heartbeat_epoch=NOW - 3990,
-                            heartbeat_age=3990, heartbeat_down_seconds=300)
-    assert st["state"] == "off"
+def test_a_live_runner_with_no_tick_since_the_marker_is_stopping():
+    # The marker lands BEFORE anything is taken down, so this window is normal — and it must not be
+    # reported as either a completed stop or a failed one.
+    st = flights.stop_state({"stopped_at": NOW - 5}, runner_live=True,
+                            heartbeat_epoch=NOW - 20, heartbeat_age=20)
+    assert st["state"] == "stopping" and st["condition"] == flights.STOPPED
+
+
+def test_a_live_runner_that_has_never_ticked_is_never_called_off():
+    # The false all-clear in the other direction: no heartbeat at all, but a runner IS running. An
+    # 'off' here would suppress the dead-man's switch over a live loop nobody is watching.
+    st = flights.stop_state({"stopped_at": NOW - 60}, runner_live=True,
+                            heartbeat_epoch=None, heartbeat_age=None)
+    assert st["state"] != "off"
 
 
 def test_a_corrupt_marker_over_a_live_runner_never_claims_the_stop_took():
     # No `stopped_at` to compare against ⇒ we cannot prove a tick came after it. With the runner
-    # demonstrably ticking, 'stopping' is the honest read; 'off' would be a flat lie.
-    st = flights.stop_state({}, heartbeat_epoch=NOW - 10, heartbeat_age=10)
+    # demonstrably alive, 'stopping' is the honest read; 'off' would be a flat lie.
+    st = flights.stop_state({}, runner_live=True, heartbeat_epoch=NOW - 10, heartbeat_age=10)
     assert st["present"] is True and st["state"] == "stopping"
     assert st["at"] is None and st["operator"] is None
+
+
+def test_without_a_liveness_read_it_falls_back_to_the_heartbeat_rather_than_guessing():
+    # `runner_live=None` means the caller could not tell. The heartbeat is a weaker signal, so the
+    # fallback is deliberately the CONSERVATIVE one: stale ⇒ off (what the dashboard used to
+    # decide anyway), fresh ⇒ never 'off'.
+    stale = flights.stop_state({"stopped_at": NOW - 900}, runner_live=None,
+                               heartbeat_epoch=NOW - 900, heartbeat_age=900,
+                               heartbeat_down_seconds=300)
+    fresh = flights.stop_state({"stopped_at": NOW - 900}, runner_live=None,
+                               heartbeat_epoch=NOW - 30, heartbeat_age=30,
+                               heartbeat_down_seconds=300)
+    assert stale["state"] == "off" and fresh["state"] == "not-taken"
 
 
 def test_stop_state_is_total_over_junk():
     # It runs inside the 2s poll; a marker written by an engine this build has not met, or a
     # nonsense timestamp, must degrade rather than raise.
     for junk in ({"stopped_at": "yesterday"}, {"stopped_at": float("nan")}, {"stopped_at": True}):
-        st = flights.stop_state(junk, heartbeat_epoch=NOW, heartbeat_age=1)
+        st = flights.stop_state(junk, runner_live=True, heartbeat_epoch=NOW, heartbeat_age=1)
         assert st["present"] is True and st["state"] in ("stopping", "off")
 
 
@@ -153,15 +192,15 @@ def test_without_a_marker_a_stale_heartbeat_is_still_runner_down():
 
 
 def test_a_deliberate_stop_replaces_runner_down_rather_than_riding_beside_it():
-    st = flights.stop_state({"stopped_at": NOW - 900}, heartbeat_epoch=NOW - 900,
-                            heartbeat_age=900, heartbeat_down_seconds=300)
+    st = flights.stop_state({"stopped_at": NOW - 900}, runner_live=False,
+                            heartbeat_epoch=NOW - 900, heartbeat_age=900)
     r = _state(stop=st, age=900)
     assert r["state"] == flights.STOPPED
     assert r["level"] == "attention", "an off switch the owner threw is not an alarm (§0.2)"
 
 
 def test_stopped_outranks_a_park_so_the_reason_nothing_moves_is_named_first():
-    st = flights.stop_state({"stopped_at": NOW - 900}, heartbeat_epoch=None, heartbeat_age=None)
+    st = flights.stop_state({"stopped_at": NOW - 900}, runner_live=False, heartbeat_age=None)
     r = flights.repo_state(slug="a/b", states=[flights.PARKED, flights.AWAITING], spinning=False,
                            merges_frozen=None, alert=None, heartbeat_age=None, stop=st)
     assert r["state"] == flights.STOPPED
@@ -169,14 +208,15 @@ def test_stopped_outranks_a_park_so_the_reason_nothing_moves_is_named_first():
 
 def test_an_alert_still_outranks_a_deliberate_stop():
     # A factory-stop the runner declared is a louder fact than an off switch, and stays louder.
-    st = flights.stop_state({"stopped_at": NOW - 900}, heartbeat_epoch=None, heartbeat_age=None)
+    st = flights.stop_state({"stopped_at": NOW - 900}, runner_live=False, heartbeat_age=None)
     r = flights.repo_state(slug="a/b", states=[], spinning=False, merges_frozen=None,
                            alert={"reasons": ["x"]}, heartbeat_age=None, stop=st)
     assert r["state"] == "alert" and r["level"] == "alert"
 
 
 def test_a_stop_that_did_not_take_is_its_own_condition_and_outranks_a_working_one():
-    st = flights.stop_state({"stopped_at": NOW - 600}, heartbeat_epoch=NOW - 30, heartbeat_age=30)
+    st = flights.stop_state({"stopped_at": NOW - 600}, runner_live=True,
+                            heartbeat_epoch=NOW - 30, heartbeat_age=30)
     r = _state(stop=st, age=30)
     assert r["state"] == flights.STOP_NOT_TAKEN
     assert flights.condition_rank(flights.STOP_NOT_TAKEN) > flights.condition_rank(flights.STOPPED)
@@ -186,7 +226,8 @@ def test_a_stop_that_did_not_take_is_its_own_condition_and_outranks_a_working_on
 def test_stopping_shows_immediately_rather_than_waiting_out_the_down_threshold():
     # The tap has to change the board NOW. Five minutes of "all systems ok" after an owner stopped
     # the loop is five minutes of a surface disagreeing with the thing it watches.
-    st = flights.stop_state({"stopped_at": NOW - 3}, heartbeat_epoch=NOW - 10, heartbeat_age=10)
+    st = flights.stop_state({"stopped_at": NOW - 3}, runner_live=True,
+                            heartbeat_epoch=NOW - 10, heartbeat_age=10)
     assert _state(stop=st, age=10)["state"] == flights.STOPPED
 
 
@@ -226,6 +267,12 @@ def _beat(home, epoch):
     (home / "state" / "runner.heartbeat").write_text(str(epoch))
 
 
+def _live(home, alive):
+    """Point the state home's pidfile at a live process or a dead one — the same read the engine's
+    own `live_runner_pid` takes, and now the fact that decides whether a stop actually took."""
+    (home / "state" / "runner.lock").write_text(str(os.getpid() if alive else 999_999))
+
+
 def test_a_crashed_runner_with_no_marker_is_still_runner_down_and_still_pushes(home):
     _beat(home, SNAP_NOW - 900)
     snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
@@ -237,6 +284,7 @@ def test_a_crashed_runner_with_no_marker_is_still_runner_down_and_still_pushes(h
 def test_a_stopped_runner_is_shown_as_stopped_and_never_as_down(home):
     _mark(home, stopped_at=SNAP_NOW - 900)
     _beat(home, SNAP_NOW - 900)
+    _live(home, False)
     snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
     repo = snap["repos"][0]
     assert repo["state"]["state"] == flights.STOPPED
@@ -247,6 +295,7 @@ def test_a_stopped_runner_is_shown_as_stopped_and_never_as_down(home):
 def test_the_dead_mans_switch_does_not_text_the_owner_about_their_own_off_switch(home):
     _mark(home, stopped_at=SNAP_NOW - 900)
     _beat(home, SNAP_NOW - 900)
+    _live(home, False)
     snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
     assert watchdog_mod.Watchdog().newly_down(snap["runner"]["repos"]) == []
 
@@ -254,6 +303,7 @@ def test_the_dead_mans_switch_does_not_text_the_owner_about_their_own_off_switch
 def test_the_snapshot_carries_who_stopped_it_when_and_the_way_back(home):
     _mark(home, stopped_at=SNAP_NOW - 900, operator="William")
     _beat(home, SNAP_NOW - 900)
+    _live(home, False)
     snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
     stopped = snap["repos"][0]["stopped"]
     assert stopped["present"] is True and stopped["state"] == "off"
@@ -273,6 +323,7 @@ def test_the_snapshot_carries_who_stopped_it_when_and_the_way_back(home):
 def test_the_pill_and_the_trouble_banner_both_name_the_stop(home):
     _mark(home, stopped_at=SNAP_NOW - 900)
     _beat(home, SNAP_NOW - 900)
+    _live(home, False)
     snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
     assert snap["pill"]["message"] == "STOPPED BY OWNER"
     assert snap["pill"]["level"] == "attention"
@@ -286,6 +337,7 @@ def test_a_deliberate_stop_offers_no_debugger_to_deploy(home):
     # would cost a real agent launch and, worse, would frame the owner's own decision as damage.
     _mark(home, stopped_at=SNAP_NOW - 900)
     _beat(home, SNAP_NOW - 900)
+    _live(home, False)
     snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
     assert snap["trouble"]["present"] is True, "the banner still NAMES the state"
     assert snap["trouble"]["fixable"] is False, "…but offers no fixer for it"
@@ -296,6 +348,7 @@ def test_a_stop_that_did_not_take_is_worth_debugging(home):
     # hold, or an off switch latched over a live runner — and that is a patient.
     _mark(home, stopped_at=SNAP_NOW - 600)
     _beat(home, SNAP_NOW - 30)
+    _live(home, True)
     assert server.assemble_snapshot(_config(home), now=SNAP_NOW)["trouble"]["fixable"] is True
 
 
@@ -309,6 +362,7 @@ def test_a_stop_that_did_not_take_says_so_rather_than_reassuring_anyone(home):
     # stopped: the loop is live, merging, and its guardians will stand down the moment it dies.
     _mark(home, stopped_at=SNAP_NOW - 600)
     _beat(home, SNAP_NOW - 30)
+    _live(home, True)
     snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
     assert snap["repos"][0]["stopped"]["state"] == "not-taken"
     assert snap["repos"][0]["stopped"]["headline"] == "STOP NOT TAKEN"
@@ -320,6 +374,7 @@ def test_a_stop_that_did_not_take_says_so_rather_than_reassuring_anyone(home):
 def test_a_stop_still_in_flight_reads_as_stopping(home):
     _mark(home, stopped_at=SNAP_NOW - 3)
     _beat(home, SNAP_NOW - 20)
+    _live(home, True)
     snap = server.assemble_snapshot(_config(home), now=SNAP_NOW)
     stopped = snap["repos"][0]["stopped"]
     assert stopped["state"] == "stopping"
@@ -333,3 +388,33 @@ def test_a_healthy_repo_carries_an_absent_stop_block_rather_than_no_key(home):
     _beat(home, SNAP_NOW - 10)
     stopped = server.assemble_snapshot(_config(home), now=SNAP_NOW)["repos"][0]["stopped"]
     assert stopped["present"] is False and stopped["message"] == "" and stopped["headline"] == ""
+
+
+def test_the_truth_strip_does_not_call_a_deliberate_stop_a_loop_that_may_be_down(home):
+    # The contradiction a browser finds and a unit test does not: the top banner says STOPPED BY
+    # OWNER while the field's own truth strip, three inches below, says "loop may be down" in
+    # alarm red. Both describe the same silent runner; only one of them knows why.
+    _mark(home, stopped_at=SNAP_NOW - 900)
+    _beat(home, SNAP_NOW - 900)
+    _live(home, False)
+    strip = server.assemble_snapshot(_config(home), now=SNAP_NOW)["repos"][0]["truth"]
+    assert "may be down" not in strip["tick"]["text"]
+    assert "stopped by owner" in strip["tick"]["text"].lower()
+    assert strip["tick"]["state"] == "stopped"
+    assert strip["level"] != "down", "an off switch the owner threw is not an alarm"
+
+
+def test_the_truth_strip_still_shouts_for_a_runner_that_really_died(home):
+    _beat(home, SNAP_NOW - 900)
+    strip = server.assemble_snapshot(_config(home), now=SNAP_NOW)["repos"][0]["truth"]
+    assert "may be down" in strip["tick"]["text"] and strip["level"] == "down"
+
+
+def test_a_stop_that_did_not_take_leaves_the_strip_alone(home):
+    # The runner IS ticking, so the strip's ordinary healthy reading is the true one; the
+    # contradiction is named by the banner and the pill, not by muffling the strip.
+    _mark(home, stopped_at=SNAP_NOW - 600)
+    _beat(home, SNAP_NOW - 30)
+    _live(home, True)
+    strip = server.assemble_snapshot(_config(home), now=SNAP_NOW)["repos"][0]["truth"]
+    assert strip["tick"]["state"] == "ok"

@@ -280,3 +280,20 @@ def test_the_summary_never_names_a_session_host():
     body = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
     for host in ("cmux", "herdr", "tmux", "iterm", "wezterm", "kitty"):
         assert host not in body.lower(), "lib/stopswitch must never name a session host"
+
+
+def test_a_start_that_found_a_live_runner_never_says_the_loop_is_off(switch, monkeypatch):
+    # The engine's `loaded is None and pid is not None` outcome: a runner IS live, but launchd could
+    # not be asked whether its job is loaded, so `start` deliberately acts on nothing — ok:true,
+    # started:false, already_running:true, with a live pid. Reading `started` alone and concluding
+    # "the loop is still off" would tell the owner their running loop is down, which is the exact
+    # inversion of the fact they opened this dialog to learn.
+    monkeypatch.setenv("SL_START_OUTCOME", "live_unconfirmed")
+    verb, _ = switch
+    res = verb.start(SLUG)
+    assert res["ok"] is True and res["started"] is False and res["already_running"] is True
+    s = res["summary"]
+    assert "still off" not in s["headline"], "a live runner must never be reported as off"
+    assert "already live" in s["headline"] and "4242" in s["headline"]
+    assert s["started"] is False, "…and nothing was started, which is also true"
+    assert any("launchd could not be asked" in ln for ln in s["lines"])

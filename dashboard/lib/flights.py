@@ -772,35 +772,44 @@ def source_mode(view, heartbeat_age, heartbeat_epoch, now, silent_after,
                      "banner": {"lines": [first, _GITHUB_DIRECT_LINE]}}, fmt)
 
 
-def stop_state(stopped, heartbeat_epoch=None, heartbeat_age=None, heartbeat_down_seconds=300):
+def stop_state(stopped, runner_live=None, heartbeat_epoch=None, heartbeat_age=None,
+               heartbeat_down_seconds=300):
     """Is this repo's loop off because the OWNER turned it off — and did the stop actually take?
 
     ``stopped`` is ``readers``' raw ``state/runner.stopped`` fact (``None`` absent, ``{}`` present-
-    but-unparseable, else the record). Returns
-    ``{present, state, condition, at, operator, source}`` where ``state`` is one of:
+    but-unparseable, else the record); ``runner_live`` is ``readers``' pidfile liveness read
+    (``None`` ⇒ could not tell). Returns ``{present, state, condition, at, operator, source}`` where
+    ``state`` is one of:
 
       * ``None``       — no stop recorded
       * ``"off"``      — recorded, and there is a positive "no live runner" read
-      * ``"stopping"`` — recorded, and the runner is still inside its tick (the marker lands BEFORE
-        anything is taken down, so this window is normal — and transient)
-      * ``"not-taken"``— recorded, and the runner has completed a tick SINCE. The engine's own STOP
-        NOT TAKEN: the owner believes the loop is off, it is not, and the guardians will stand down
-        the moment it does die
+      * ``"stopping"`` — recorded, and a runner is still up (the marker lands BEFORE anything is
+        taken down, so this window is normal — and transient)
+      * ``"not-taken"``— recorded, a runner is still up, AND it has completed a tick since. The
+        engine's own STOP NOT TAKEN: the owner believes the loop is off, it is not, and the
+        guardians will stand down the moment it does die
 
-    **Why ``stopped_at`` decides, and not the heartbeat alone.** ``heartbeat_down_seconds`` is five
-    minutes. A purely heartbeat-based read would call every SUCCESSFUL stop "not taken" for the
-    first five minutes after the tap — a five-minute lie, every single time, about the one thing
-    this surface exists to get right. A tick that COMPLETED after the marker landed is proof the
-    stop did not hold; nothing weaker is.
+    **The LIVE-RUNNER read decides, not the heartbeat — and the difference is not academic.** The
+    heartbeat says when the runner last finished a TICK, judged on a five-minute threshold. But
+    ``stop`` deliberately lets the runner finish the tick it is in, so a SUCCESSFUL stop routinely
+    stamps a heartbeat *after* the marker and then exits. Deciding on the heartbeat alone would
+    therefore read almost every real stop as ``not-taken`` — for the whole five minutes it takes
+    that final tick to go stale — which is the loudest possible false alarm about the one thing this
+    surface exists to get right. It fails the other way too: a runner that is up but has never
+    ticked would read ``off``, and ``off`` is what suppresses the dead-man's switch. (Both found by
+    a fresh reviewer against the engine's own contract.)
 
-    **The positive read decides "off", exactly as the engine decides silence.** ``stop``'s own
-    fresh-agent review established that the marker buys quiet only alongside a real "nothing is
-    running" observation — honour it on its own and a stop that failed silences the guardians over a
-    live runner. The same rule holds here, which is also why a runner that ticked once after the
-    marker and then went quiet reads ``off`` rather than latching on the contradiction.
+    So this asks the engine's question, the engine's way: is the process there? ``off`` requires the
+    positive "nothing is running" observation, exactly as ``stop``'s own review established that a
+    marker buys the watchdog's silence only alongside one. And ``stopped_at`` versus the last tick
+    then separates the two LIVE cases — a runner that has completed a whole tick with the off switch
+    already on disk did not honour it; nothing weaker proves that.
+
+    ``runner_live=None`` (the caller could not tell) falls back to the heartbeat rule, conservatively:
+    stale ⇒ ``off``, fresh ⇒ never ``off``.
 
     Total and clock-free: every failure to read the record degrades (unknown ``stopped_at`` ⇒ we
-    cannot prove a tick came after it ⇒ never ``off`` over a demonstrably live runner), and it never
+    cannot prove a tick came after it ⇒ ``stopping``, never a claim either way), and it never
     raises — it is called from the 2-second poll."""
     if stopped is None:
         return {"present": False, "state": None, "condition": None,
@@ -809,10 +818,12 @@ def stop_state(stopped, heartbeat_epoch=None, heartbeat_age=None, heartbeat_down
     at = rec.get("stopped_at")
     if not isinstance(at, (int, float)) or isinstance(at, bool) or at != at:   # NaN != NaN
         at = None
-    down = heartbeat_age is None or heartbeat_age > heartbeat_down_seconds
     epoch = heartbeat_epoch if (isinstance(heartbeat_epoch, (int, float))
                                 and not isinstance(heartbeat_epoch, bool)) else None
-    if down:
+    live = runner_live
+    if live is None:
+        live = not (heartbeat_age is None or heartbeat_age > heartbeat_down_seconds)
+    if not live:
         state = "off"
     elif at is not None and epoch is not None and epoch > at:
         state = "not-taken"

@@ -228,6 +228,16 @@ def summarize_start(result):
         if not result.get("cleared"):
             lines.append("the recorded stop still stands — it is still true until a runner boots, "
                          "and the runner clears it itself the moment one does.")
+        # "Nothing was started" and "the loop is off" are DIFFERENT facts, and the engine has an
+        # outcome where they disagree: a runner is live, but launchd could not be asked whether it
+        # holds the job, so `start` deliberately acts on nothing rather than reach for a `kickstart
+        # -k` that would kill the running runner. Reading `started` alone and concluding "the loop
+        # is still off" would tell an owner their RUNNING loop is down — the exact inversion of what
+        # they opened this dialog to find out (fresh-agent review).
+        pid = result.get("pid")
+        if result.get("already_running") and pid:
+            return _summary("warn", "nothing was started — a runner is already live (pid %s)." % pid,
+                            lines)
         home_note = ("a runner in this home must live in a session window you open yourself"
                      if result.get("home") == "pane" else "the loop is still off")
         return _summary("warn", "nothing was started — %s." % home_note, lines)

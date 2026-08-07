@@ -298,6 +298,15 @@ def route_start():
         out.update(cleared=False, started=False, job=None, domain=None, pid=None, job_loaded=None,
                    manual="now start the runner in a visible cmux tab: superlooper run --repo %s"
                           " — the stop clears when it boots" % repo)
+    elif outcome == "live_unconfirmed":
+        # A runner IS live, but launchd could not be asked whether its job is loaded — so `start`
+        # acts on nothing, because the only way to act on that guess is a `kickstart -k` that would
+        # kill the running runner. `started` is false and the loop is nonetheless UP: the one
+        # outcome where those two facts come apart.
+        out.update(started=False, already_running=True, job_loaded=None,
+                   manual="a runner is live (pid 4242), but launchd could not be asked whether its "
+                          "job is loaded — nothing was started, because the only way to act on that "
+                          "guess is to restart the job, and `kickstart -k` would kill this runner.")
     elif outcome == "no_job":
         out.update(ok=False, cleared=False, started=False, pid=None, job_loaded=None,
                    error="no LaunchAgent is installed for this repo at "

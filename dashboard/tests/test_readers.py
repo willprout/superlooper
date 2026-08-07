@@ -93,7 +93,7 @@ def test_state_home_returns_every_contract_key():
     assert set(facts) == {
         "issues_state", "activity", "blocked", "exited", "awaiting",
         "heartbeat_epoch", "heartbeat_age", "merges_frozen", "alert", "reports",
-        "state_format", "published_view", "session_windows", "stopped"}
+        "state_format", "published_view", "session_windows", "stopped", "runner_live"}
 
 
 def test_state_home_issues_json_content():

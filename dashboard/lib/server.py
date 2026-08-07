@@ -1599,8 +1599,8 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
     # The deliberate off switch (issue #365, over the engine's #239 marker). Computed BEFORE the
     # repo state because it is what decides whether a missing runner is an outage or a decision.
     stopped = flights.stop_state(
-        facts["stopped"], heartbeat_epoch=facts["heartbeat_epoch"],
-        heartbeat_age=facts["heartbeat_age"],
+        facts["stopped"], runner_live=facts["runner_live"],
+        heartbeat_epoch=facts["heartbeat_epoch"], heartbeat_age=facts["heartbeat_age"],
         heartbeat_down_seconds=config.get("heartbeat_down_seconds", 300))
     stopped["headline"] = _stopped_headline(stopped)
     stopped["message"] = _stopped_message(stopped, now)
@@ -1760,7 +1760,11 @@ def _stopped_message(stopped, now):
                 "Start withdraws the stop; Stop tries again."
                 % (" (%s ago)" % ago if ago else ""))
     if state == "stopping":
-        return ("stopping — the runner finishes its current tick, then nothing will start it again")
+        # Deliberately not "it will be gone in a moment": the runner may be finishing a long tick,
+        # or wedged inside one (launchd's own ExitTimeOut is what ends that, not this verb). Both
+        # are "recorded and not gone yet", which is the only thing that is true in both.
+        return ("stopping — the stop is recorded and the runner has not gone yet; it stops at the "
+                "end of its current tick, and nothing will start it again")
     lead = "stopped by %s" % (who or "owner")
     when = " · %s ago" % ago if ago else ""
     return "%s%s — the watchdog stands down; Start brings it back" % (lead, when)
@@ -2009,7 +2013,8 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
     # gets its own strip: the runner, the heartbeat and the published view are all per-repo, so a
     # single field-wide freshness line would be a lie the moment two repos disagreed.
     for rs in repo_snaps:
-        rs["truth"] = truth.banner(rs.get("source"), engine=engine_state, github=rs.get("github"))
+        rs["truth"] = truth.banner(rs.get("source"), engine=engine_state, github=rs.get("github"),
+                                   stopped=rs.get("stopped"))
 
     # The same truth, for the view that has no field to hang a strip on (issue #180). Boring mode
     # shows every repo in ONE table, so it needs the whole field's verdict rather than one repo's:
