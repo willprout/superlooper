@@ -4114,20 +4114,30 @@ class Runner:
         "merges frozen" — the record shows a merge under a freeze that nothing explains.
 
         The rule is deliberately COARSE and fail-closed: a marker on disk holds the merge unless the
-        gate positively judged this PR exempt against that same marker. It does not try to salvage
-        the tick by re-deciding — decide is where merges are decided, and next tick's snapshot
-        contains the marker, so ordinary work holds (gate step 4) and the standing-rule restore-green
-        fix crosses (#295) by the ordinary route, judged rather than guessed.
+        gate judged this PR freeze-exempt AND the marker standing now is still one such a PR may
+        cross. It does not try to salvage the tick by re-deciding — decide is where merges are
+        decided, and next tick's snapshot contains the marker, so ordinary work holds (gate step 4)
+        and the standing-rule restore-green fix crosses (#295) by the ordinary route, judged rather
+        than guessed.
 
-        The exemption is re-verified, not merely trusted. `freeze_exempt` on the act encodes BOTH
-        halves of gate.freeze_exempt — the issue carried the standing-rule label, and the marker the
-        gate saw was provably dev-check owned — so the label half is settled and the marker half is
-        re-asked against what is on disk NOW, through the gate's own predicate rather than a copy of
-        it. In the runner's own emissions the two can't disagree (`_exec_freeze` fires only when the
-        snapshot showed NO freeze, and no act can be exempt without one), but the nightly writes this
-        marker too, from outside the tick: a nightly freeze landing mid-tick would otherwise be
-        crossed on the strength of a verdict about a different, dev-check marker — exactly the
-        fail-open gate.freeze_exempt exists to refuse.
+        Be precise about what the exempt path actually proves, because it is less than "the same
+        marker". `freeze_exempt` on the act encodes both halves of gate.freeze_exempt as they stood
+        at decision time — the issue carried the standing-rule label, and the marker the gate saw
+        was dev-check owned. The label half is settled (a live-label read, nothing on disk can
+        change it), so it is passed straight back in; the marker half is re-asked against the file
+        as it stands NOW, through the gate's own predicate rather than a copy of it. What that
+        establishes is "the gate found the standing rule, and the freeze standing now is dev-check
+        owned" — NOT that the two markers are the same object. No identity is carried (no
+        fingerprint, no `since`), and none is needed: dev-check ownership is the entire property
+        #295 reasons about, and one dev-check freeze is as crossable as another by the PR whose
+        merge is the only thing that can lift either.
+
+        The re-ask is what earns its keep against a marker the runner did not write. Within one
+        tick the runner's own acts cannot disagree — `_exec_freeze` fires only when the snapshot
+        showed NO freeze, and no act can be exempt without one — but the nightly writes this marker
+        too, from outside the tick. A nightly freeze landing mid-tick would otherwise be crossed on
+        the strength of a verdict about a dev-check freeze, which is exactly the fail-open
+        gate.freeze_exempt exists to refuse.
 
         Existence = frozen, like everywhere else this marker is read: an unreadable file holds."""
         frozen = _read_json(os.path.join(self.state, "merges_frozen.json"))
