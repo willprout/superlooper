@@ -183,7 +183,14 @@ def dep_met(dep, closed_issue_nums):
 
     The try/except then covers the other side — an unreadable closed set (None, an int, a str)
     raises rather than answering. Unmet throughout: what cannot be affirmed as closed holds the
-    issue, which is the fail-closed direction."""
+    issue, which is the fail-closed direction.
+
+    The asymmetry is deliberate, not an oversight: the ENTRY is type-checked and the closed set's
+    MEMBERS are not, because `dep_met(1, {True})` is the same `==`-by-value trap mirrored. It is
+    unreachable only because the closed set is int-only at its source — gh.closed_issue_nums and its
+    read-health twin both filter on `type(i.get("number")) is int`, and published_view does the same
+    — so this is safe by an upstream invariant, and that is where a check for it belongs (naming it
+    here so a future closed-set producer knows it is inheriting a contract)."""
     if not isinstance(dep, int) or isinstance(dep, bool):
         return False
     try:

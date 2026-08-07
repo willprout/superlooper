@@ -1827,14 +1827,22 @@ def test_a_wrong_typed_dependency_is_still_NAMED_in_the_reason():
     # Totality must not cost legibility: a non-int `blocked-by` entry reads as unmet (matching
     # issues.eligible exactly) and is NAMED, rather than filtered out into the unnamed fallback —
     # which is what a `type(d) is int` filter did in the first review round (second round, P2-3).
-    p = parsed(5, blocked_by=["7"])
+    # NB #266's issues.dep_met also type-checks the entry, and this test is why that is not the same
+    # mistake: it narrows what counts as MET, it does not drop the entry from the walk. Unmet AND
+    # named — the entry still reaches the prose below.
     d = disk(issues_state={"version": 1,
                            "issues": {"i5": ist(status=None,
                                                 launch_hold_reason=_stale_unlanded_stamp())}})
-    out = decide(parsed_issues=[p], dsk=d, gh_view=ghv(closed_nums=set(), closed_read_ok=True))
-    holds = only(out, "launch_hold")
-    assert len(holds) == 1 and "#7" in holds[0]["reason"]
-    assert "no single condition named" not in holds[0]["reason"]
+    # `"7"` was already unmet before #266 tightened dep_met. True/41.0 were NOT — against these
+    # closed sets they read as MET and the issue launched, so nothing pinned their prose. They are
+    # here because the fix moved them into the held-and-named class for the first time (fresh-agent
+    # review, medium-2): a newly-held dependency that the reason cannot name is a silent hold.
+    for dep, closed, shown in (("7", set(), "#7"), (True, {1}, "#True"), (41.0, {41}, "#41.0")):
+        out = decide(parsed_issues=[parsed(5, blocked_by=[dep])], dsk=d,
+                     gh_view=ghv(closed_nums=closed, closed_read_ok=True))
+        holds = only(out, "launch_hold")
+        assert len(holds) == 1 and shown in holds[0]["reason"], (dep, closed)
+        assert "no single condition named" not in holds[0]["reason"], (dep, closed)
 
 
 # ---- issue #405: a held RELAUNCH must not read as a live flight ----

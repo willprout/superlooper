@@ -385,10 +385,18 @@ def test_eligible_fails_closed_on_a_wrong_typed_labels_or_parsed():
     # now gives the same answer on its own instead of relying on its caller's try/except.
     for bad in (None, [], "x", 7):
         assert issues.eligible(bad, set(), frozen=False) is False, bad
-    for labels in (None, 7, "agent-ready", {"agent-ready": True}):
+    # `"agent-ready"` and `{"agent-ready": True}` are the two that matter: a bare `in` against
+    # either answers TRUE (a substring hit, a dict-key hit) and would approve an issue off a label
+    # set nobody wrote. Fail closed instead.
+    for labels in (None, 7, "agent-ready", "xxagent-readyxx", {"agent-ready": True}):
         p = _ready()
         p["labels"] = labels
         assert issues.eligible(p, set(), frozen=False) is False, labels
+    for labels in ({"type:build", "agent-ready"}, frozenset({"type:build", "agent-ready"}),
+                   ("type:build", "agent-ready")):
+        p = _ready()                     # a set/tuple label collection IS readable — verdict is
+        p["labels"] = labels             # unchanged, so the guard refuses garbage, not shapes
+        assert issues.eligible(p, set(), frozen=False) is True, labels
     p = _ready()
     del p["labels"]
     assert issues.eligible(p, set(), frozen=False) is False
