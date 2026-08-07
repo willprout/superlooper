@@ -323,8 +323,15 @@ _LAUNCH_TEXT = (
 # hold the queue behind the systemic-launch ALERT, whose body names App Nap and the cmux anchor —
 # so dead GitHub auth would be reported to the owner as a cmux problem, the exact mis-blame the
 # text table above exists to end. Parked per-issue, the memo names the auth and the `gh auth login`
-# remedy. (A SYSTEMIC gh-auth hold — the sibling of #159's pre-launch claude-auth gate — is a
-# runner-side probe, not a launch rc, and is not built here.)
+# remedy.
+#
+# Both of those notes end at the same wall — "we would hold it if the hold could name its own cause"
+# — and #320 is where that wall came down. Neither reason moved into this set: a single sample still
+# cannot tell one broken worktree from a broken machine, so both still park their own lane on one.
+# What changed is that a SECOND distinct lane refusing the same way now escalates them to a held
+# queue under an alert reason of their own (SYSTEMIC_ESCALATION_REASONS below, and the layer in
+# actions.py). So the reasoning above stands exactly as written, and the "or park it wrongly" horn
+# of its dilemma is gone.
 CHANNEL_FAULT_REASONS = frozenset({
     "anchor_workspace_missing",       # the 07-09 storm: anchor targets a deleted cmux workspace
     "anchor_socket_lost",             # the runner lost its cmux socket — it reaches no pane at all
@@ -361,6 +368,48 @@ CHANNEL_FAULT_REASONS = frozenset({
     # to waiting is flying workers onto an open socket.
     "fence_down",
 })
+
+
+# ---- faults that are PER-ISSUE on one sample and MACHINE-WIDE across several (issue #320) -------
+#
+# The set above answers "did any queued issue cause this?" from a SINGLE launch. For three reasons
+# that question genuinely cannot be answered from one sample, and each of them carries a note above
+# saying so: gh_auth_dead, claude_identity_wrong and env_poisoned are all environment faults, and
+# the environment they describe might be ONE worktree's (this lane's problem, park it) or EVERY
+# worker's (nobody's problem, hold the queue). Read as per-issue they cost the 2026-07-29 shape: an
+# inherited XDG_CONFIG_HOME de-authenticates `gh` in every worker's fresh env while the RUNNER's own
+# stays healthy, so the poll keeps working, every approved issue launches, refuses, and parks in
+# turn, and the owner pays N re-approvals for a 30-second `gh auth login`. Read as channel faults
+# they cost the opposite mistake — a one-off broken worktree freezing the whole loop, and (worse) a
+# hold whose alert body names the cmux anchor and macOS App Nap, which is why each of those notes
+# concluded "parked per-issue, the memo names the real cause".
+#
+# The discriminator is the owner's own (2026-08-03), and it is the same inference the systemic-launch
+# streak already makes for the delivery channel one rung up: N consecutive refusals across DISTINCT
+# issues means it is not the issues, it is the environment. So the reasons below stay per-issue on
+# one sample — a genuinely one-off session fault still parks just its own lane, with its own memo —
+# and the layer in actions.py escalates them to a HELD queue once a second distinct lane refuses the
+# same way. Each escalated class carries its OWN alert reason and remedy there; a class held under
+# another class's banner is the mis-blame this whole family of notes exists to prevent.
+#
+# Adding a class is this frozenset plus one row in actions.LAUNCH_ALERT_REASONS (and its message).
+# Nothing about the detector, the hold, the recovery probe or the resume edge changes.
+SYSTEMIC_ESCALATION_REASONS = frozenset({
+    "gh_auth_dead",           # rc=4 — the SESSION's own gh could not say who it is
+    "claude_identity_wrong",  # rc=7 — the SESSION's own Anthropic account is absent/wrong
+    "env_poisoned",           # rc=6 — the launch-floor scrub could not clean the session's env
+})
+
+
+def is_escalatable_fault(rec):
+    """True when this launch-failure evidence names a fault that is honestly PER-ISSUE on one
+    sample and MACHINE-WIDE across several (issue #320) — the set above.
+
+    Fails SAFE exactly as `is_channel_fault` does: a corrupt or unmapped record returns False, so a
+    novel reason can never join a streak that holds the queue. The caller still charges the lane's
+    own launch cap either way — escalation ADDS a sample to the environment question, it never
+    spends the per-issue accounting that makes a one-off fault park."""
+    return isinstance(rec, dict) and rec.get("reason") in SYSTEMIC_ESCALATION_REASONS
 
 
 def is_channel_fault(rec):

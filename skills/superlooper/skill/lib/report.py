@@ -35,6 +35,11 @@ FREEZE_ALERT_SECONDS = DAY_SECONDS
 # the two together, so they cannot drift apart silently.
 _TERMINAL_STATUSES = frozenset({"merged", "parked", "needs_william", "bounced"})
 
+# actions.ALERT_UNREADABLE — the sentinel a state/ALERT read yields when the marker EXISTS but could
+# not be parsed (#320). Mirrored rather than imported for the same reason the set above is: this is
+# the pure renderer, and it must not drag the decide graph into every report. tests pin the pair.
+_ALERT_UNREADABLE = "alert_unreadable"
+
 # A `launch_hold_reason` that begins with this is the ONE stamp whose content says the issue is NOT
 # held: issue #172's retirement prose, written when a previously-unlanded closed-list read has since
 # landed and the gate now PASSES. The engine has no clear-the-stamp verb, so it retires a stale stamp
@@ -689,6 +694,49 @@ def _hold_alerts(holds, view, now):
     return lines
 
 
+def _queue_hold(view, now):
+    """The ALERT-tier line for a PAUSED queue (issue #320), or None.
+
+    A systemic hold is the quietest state the loop has: one alert went out when it tripped, and then
+    nothing — no park, no notify, no label anywhere changes. On the morning after, a full queue with
+    nothing moving renders exactly like a queue with nothing to do, and "Nothing happened overnight"
+    is a true sentence about the worst possible night. So this line sits with the aged-hold alerts,
+    above every section, and breaks `quiet` unconditionally.
+
+    Unlike a standing hold it is NOT age-gated: a per-issue hold is a wait by design and hours of it
+    are normal, whereas a held queue means the machine is broken and no tick will fix it. One minute
+    of that is already the thing the owner must see.
+
+    The caller pre-computes `view['queue_hold']` (actions.queue_hold_reasons over state/ALERT) — the
+    same discipline `engine_drift` follows, so this module never imports the runner's brain to read
+    one frozenset."""
+    hold = view.get("queue_hold")
+    if not isinstance(hold, dict):
+        return None
+    reasons = [r for r in hold.get("reasons") if isinstance(r, str) and r.strip()] \
+        if isinstance(hold.get("reasons"), list) else []
+    if not reasons:
+        return None
+    since = _since(hold.get("since"))
+    rendered = _age(None if since is None else now - since)
+    for_bit = f" for {rendered}" if rendered else ""
+    if reasons == [_ALERT_UNREADABLE]:
+        # The fail-closed half: the marker exists and nothing could be read out of it, so the report
+        # may not claim a cause OR claim the queue is fine. Say exactly what is known.
+        return (f"**The loop's ALERT marker is present but UNREADABLE{for_bit}** — its hold state "
+                "cannot be read, so the launch queue may be paused with nothing running. Read "
+                "`state/ALERT` and run `superlooper status` / `superlooper doctor` before assuming "
+                "the night was merely quiet.")
+    # The claim is scoped to THE HOLD, not to the world: the hold takes no action, which is true of
+    # every held class. "Nothing is parked" flatly is not — a lane that reached its own launch cap
+    # before a second distinct refusal proved the outage parked on its own account, and telling the
+    # owner otherwise walks them past a real re-approval (#320, fresh review).
+    return (f"**The launch queue is HELD{for_bit} — nothing is launching** ({', '.join(reasons)}). "
+            "This is a PAUSE, not an idle queue: the hold itself parks nothing and moves no label, "
+            "so every approved issue keeps its place and launching resumes by itself once the "
+            "cause clears. `superlooper status` prints the same line with the remedy.")
+
+
 def _freeze(view, now):
     frozen = view.get("frozen")
     if isinstance(frozen, dict) and frozen:
@@ -760,7 +808,10 @@ def morning(journal_records, gh_view, ledger, config):
                           "queue": [{"num","title"}, …] ready issues, "usage": usage dict|None,
                           "issues_state": the runner's loopstate dict (issues.json) — the durable
                           hold stamps the Standing holds section is derived from (#405); absent or
-                          wrong-typed simply yields no holds}
+                          wrong-typed simply yields no holds,
+                          "queue_hold": {"reasons": [...], "since": epoch}|None — the PAUSED-queue
+                          state (#320), pre-computed by the caller from state/ALERT via
+                          actions.queue_hold_reasons; absent/empty renders no hold}
       ledger           the known-failure ledger dict {fingerprint: {...}} (accepted-failure count).
       config           the per-repo config (repo for links, qa.quarantine size).
     Never raises; every arg is coerced to a safe empty shape."""
@@ -790,6 +841,7 @@ def morning(journal_records, gh_view, ledger, config):
     questions, q_total = _questions(records, overnight_start)   # owner-question rate (#163)
     holds = standing_holds(view.get("issues_state"), records)   # standing holds + ages (#405)
     hold_alerts = _hold_alerts(holds, view, now)
+    queue_hold = _queue_hold(view, now)                         # the PAUSED queue (#320)
     frozen = isinstance(view.get("frozen"), dict) and bool(view.get("frozen"))
     queue = [q for q in view.get("queue") if isinstance(q, dict)] if isinstance(view.get("queue"), list) else []
 
@@ -801,12 +853,21 @@ def morning(journal_records, gh_view, ledger, config):
     # will move for a day is not "nothing happened overnight" — it is the one night that reads
     # quiet precisely BECAUSE nothing moved. A hold under the threshold does NOT break quiet: it is
     # a standing condition working as designed, and the section below lists it either way.
+    # A HELD QUEUE breaks quiet unconditionally (#320) and does not wait on an age threshold like a
+    # per-lane hold: a paused loop is precisely the night that reads "nothing happened" BECAUSE
+    # nothing could happen, and the queue may well be empty on top of it (the outage started before
+    # anything was approved), so no other term here would catch it.
     quiet = not any((merged, parked, bounces, regens, wanders, watchdog, resurrections,
-                     questions, queue, frozen, hold_alerts))
+                     questions, queue, frozen, hold_alerts, queue_hold))
     summary = ("Nothing happened overnight — queue empty." if quiet else
                f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · "
                f"{q_total} question(s) · queue: {len(queue)}.")
+    if queue_hold:
+        # The summary line IS the push body, so this rides the report's one notification. It leads
+        # the other alert-tier suffixes because it is the only one that says the whole loop stopped:
+        # a tally reading "0 merged · queue: 6" is otherwise a normal-looking slow night.
+        summary += " **THE LAUNCH QUEUE IS HELD — nothing is launching; see below.**"
     if hold_alerts:
         # The summary line IS the push body, so the count rides the one notification the report
         # already sends — an aged hold reaches the phone without earning a push of its own. It names
@@ -821,7 +882,8 @@ def morning(journal_records, gh_view, ledger, config):
     ]
     # Alert-tier lines sit directly under the summary tally — above every section, and after the
     # first non-title line so they never hijack the push body (the drift nudge's own discipline).
-    parts += [f"{line}\n" for line in hold_alerts]
+    # The queue hold leads them: an aged lane hold is one issue, a held queue is every issue.
+    parts += [f"{line}\n" for line in ([queue_hold] if queue_hold else []) + hold_alerts]
     # The publish-drift nudge sits AFTER the summary tally so it never hijacks the push body (the
     # first non-title, non-blank line). Drift is a standing condition, not overnight activity, so it
     # is rendered independently of `quiet` — a quiet night with drift still reads "nothing happened".

@@ -163,15 +163,55 @@ NUDGE_GRACE_WINDOW_SECONDS = 480
 # owner answers, and far inside the 94-minute class of silence this issue exists to end.
 AT_DIALOG_ALERT_SECONDS = 1800
 LAUNCH_FAILURE_CAP = 2             # launch never delivered twice -> park (RC-LAUNCHVERIFY x2)
-# (#299) EVIDENCE reason -> the ALERT reason that names it, for the channel-attributable gh faults.
-# Without this the systemic-launch alert is the only thing said about them, and it blames the cmux
-# anchor and App Nap. `gh_probe_unreachable` maps onto the EXISTING `gh_unreachable` alert reason
-# rather than minting a second name for one condition: both mean "GitHub did not answer", whether
-# the runner noticed it while polling or while asserting its identity at launch.
-GH_LAUNCH_ALERT_REASONS = {
+# (#299/#320) EVIDENCE reason -> the ALERT reason that names it, for every launch fault the loop
+# HOLDS the queue on. Without this the systemic-launch alert is the only thing said about them, and
+# it blames the cmux anchor and App Nap. A held queue writes NO park memo, so this alert body is the
+# entire story the owner is ever told: a hold that mis-names its cause is worse than a park that
+# names it correctly (#320's boundary, in the owner's own words).
+#
+# `gh_probe_unreachable` maps onto the EXISTING `gh_unreachable` alert reason rather than minting a
+# second name for one condition: both mean "GitHub did not answer", whether the runner noticed it
+# while polling or while asserting its identity at launch. Every other entry earns its own name,
+# because every other entry is a distinct fault with a distinct remedy.
+#
+# A reason ABSENT here still holds under `launch_systemic_failure` — and that is correct for the
+# anchor/shim family (`anchor_workspace_missing`, `shim_not_fired`, `launch_failed_before_delivery`,
+# `launch_timeout`, `launch_script_unrunnable`, `agent_unsupported`), whose cause and remedy are
+# exactly what that generic body describes. The entries below are the ones for which it is a lie.
+LAUNCH_ALERT_REASONS = {
+    # --- CHANNEL faults: held on the FIRST failure (evidence.CHANNEL_FAULT_REASONS) ---
     "gh_auth_dead_runner": "gh_auth_dead_runner",
     "gh_probe_unreachable": "gh_unreachable",
+    "claude_identity_wrong_runner": "claude_identity_wrong_runner",
+    # the session host's control socket, the #320 class: no lane can be spoken to at all. The
+    # generic body's "restart superlooper in a visible cmux tab" happens to be right, but its
+    # diagnosis — App Nap suspending an idle cmux — sends the owner to reconfigure a component that
+    # is not the one that failed.
+    "anchor_socket_lost": "session_host_unreachable",
+    "fence_down": "fence_down",
+    # --- ENVIRONMENT faults: per-issue on one sample, held once SYSTEMIC_ENV_FAILURE_CAP distinct
+    # lanes refuse the same way (evidence.SYSTEMIC_ESCALATION_REASONS). The `_workers` suffix is
+    # load-bearing: each has a runner-side sibling above, and telling the owner the RUNNER's own
+    # credential is dead when the runner's is the one thing still working is a night lost.
+    "gh_auth_dead": "gh_auth_dead_workers",
+    "claude_identity_wrong": "claude_identity_wrong_workers",
+    "env_poisoned": "env_poisoned_workers",
 }
+# >= this many DISTINCT issues refusing for the SAME escalatable reason -> machine-wide (issue #320).
+# Two, and the count is per REASON: one sample cannot tell "one worktree with a broken env" from
+# "every worker env", and the second distinct lane is exactly the evidence that settles it. Two
+# different environment faults with one lane each is the one-off case twice over, not an outage.
+SYSTEMIC_ENV_FAILURE_CAP = 2
+# How long the launcher prefers an UNSAMPLED lane while an environment streak is open but below the
+# cap (issue #320). With one refusal on the board the environment question is open, and the cheapest
+# way to settle it is to try a DIFFERENT lane — otherwise a serialized queue (one lane, or one
+# territory) retries the same issue into its per-issue cap and PARKS it before a second sample ever
+# exists, which is the one relabel this issue exists to remove. Bounded on the clock so a peer that
+# is never actually schedulable (its territory claimed, usage saying no) can never starve the
+# refused lane out of the queue: past this the preference lets go and the queue runs in plain
+# priority order again. ~5-8 ticks — generous for the scheduler to pick a peer, far short of a
+# stall. Fails OPEN (no preference) on an unreadable clock.
+ENV_SAMPLE_WINDOW_SECONDS = 120
 # A dead DELIVERY CHANNEL — the cmux launch anchor (the pane every worker tab is born in), the
 # launch shim, or the launch machinery — is a RUNNER-level fault, never N per-issue parks (incident
 # 2026-07-09: a dead anchor walked 10 approved issues into 10 parks in ~8 min). The runner records
@@ -334,6 +374,95 @@ ALERT_MESSAGES = {
                            "healthy. Fix: `gh auth login --hostname github.com` as the account that "
                            "owns the loop repo. This is the gh-side sibling of the claude-side "
                            "auth_dead banner.",
+    # ---- the systemic-outage classes (issue #320) ----
+    # Each of these HOLDS the queue, and a held queue writes no park memo — so the body below is the
+    # entire account the owner ever gets. Every one names the component that actually failed and the
+    # command that actually repairs it; none of them may borrow another's remedy.
+    "gh_auth_dead_workers": "every WORKER's GitHub auth is dead while the runner's own is healthy "
+                            "(issue #320): several distinct lanes in a row refused their flight "
+                            "because `gh` inside the SESSION's fresh environment could not answer "
+                            "as the login this loop runs as. One lane could be a broken worktree; "
+                            "this many distinct lanes is the ENVIRONMENT. A lane that reached its "
+                            "OWN launch cap before the outage was proven may already have parked; "
+                            "re-approve that one after the fix. The known cause is an "
+                            "inherited XDG_CONFIG_HOME (or another gh config redirect) that the "
+                            "runner does not see but every worker does — the runner's own polling "
+                            "keeps working throughout, which is why nothing else complained. "
+                            "Launches are HELD: the hold itself parks nothing and moves no "
+                            "label, so every approved issue keeps its place and resumes "
+                            "automatically once a probe launch flies. Fix: `gh auth login "
+                            "--hostname github.com` as the "
+                            "account that owns the loop repo, and check for an exported "
+                            "XDG_CONFIG_HOME/GH_CONFIG_DIR in a shell rc file, a LaunchAgent or a "
+                            "wrapper. This is NOT the runner's own credential (gh_auth_dead_runner) "
+                            "and NOT a cmux/App Nap fault.",
+    "claude_identity_wrong_workers": "CLAUDE CODE is unusable in every WORKER environment (issue "
+                                     "#320): several distinct lanes in a row refused their flight "
+                                     "because, from inside the SESSION's own environment, `claude "
+                                     "auth status` did not report the account the launch assigned "
+                                     "— not logged in, on an API key, or on a different org. One "
+                                     "lane could be a broken worktree; this many distinct lanes is "
+                                     "the ENVIRONMENT. A lane that reached its OWN launch cap "
+                                     "before the outage was proven may already have parked; "
+                                     "re-approve that one after the fix. Launches are HELD: the "
+                                     "hold itself parks nothing and moves no label, so every "
+                                     "approved issue keeps its place and resumes automatically "
+                                     "once a probe launch flies. Fix: open a "
+                                     "supervised `claude` window under the fleet's config dir and "
+                                     "log it into the loop's subscription account (an API-key "
+                                     "session bills per token while still answering `loggedIn: "
+                                     "true`, so check which it is). Nothing about GitHub auth or "
+                                     "the cmux anchor is involved.",
+    "env_poisoned_workers": "a POISONED ENVIRONMENT is reaching every worker (issue #320): several "
+                            "distinct lanes in a row refused their flight because the launch-floor "
+                            "scrub could not clean the session's own environment. One lane could be "
+                            "a broken worktree; this many distinct lanes means the variables are "
+                            "exported somewhere every session inherits (and a lane that reached "
+                            "its OWN launch cap before that was proven may already have parked; "
+                            "re-approve that one after the fix). Left alone they are "
+                            "invisible — ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL move sessions off "
+                            "Max-subscription billing onto API billing with no error and no "
+                            "signal, and an inherited CLAUDE_CODE_* turns transcript saving off, "
+                            "which silently breaks `--resume`. Launches are HELD: the hold "
+                            "itself parks nothing and moves no label, so every approved issue "
+                            "keeps its place and resumes automatically once a probe launch flies. "
+                            "Fix: `superlooper status` "
+                            "and the journal's launch records name the exact variables each "
+                            "refusal saw; find where they are exported (a shell rc file, a "
+                            "LaunchAgent, a wrapper) and remove them.",
+    "session_host_unreachable": "the SESSION HOST's control socket is unreachable (issue #320) — "
+                                "the runner lost the socket it drives every pane through (a "
+                                "detached/nohup start, or the terminal multiplexer went away), so "
+                                "it can reach NO lane at all: not to launch one, not to speak to "
+                                "one. No queued issue caused this and none can fix it by "
+                                "re-approving. Launches are HELD (the queue is intact, NOTHING "
+                                "parked, no issue charged) and resume automatically once a probe "
+                                "launch flies. Fix: restart the runner from inside a VISIBLE tab of "
+                                "the multiplexer it should be driving, so it inherits a live "
+                                "socket. This is not App Nap and not a dead shim — the channel is "
+                                "not slow, it is absent.",
+    "fence_down": "the pre-flight FENCE check refused every flight (issue #326) — this machine "
+                  "declares its fleet fenced, and a TOKENLESS connection to the session host's "
+                  "control socket was either SERVED or unanswerable. A served one means there is no "
+                  "fence at all: every worker pane already carries the socket path, so any session "
+                  "launched onto it could drive the whole fleet. No queued issue caused this and "
+                  "none can fix it. Launches are HELD (the queue is intact, NOTHING parked) and "
+                  "resume automatically once a probe launch flies. Fix: rebuild the patched host "
+                  "(vendor/herdr/build.sh) and re-run `superlooper fleet --install`, or write "
+                  "SL_FLEET_FENCE=off into the fleet prefix's `environment` file on a machine that "
+                  "is deliberately unfenced.",
+    "claude_identity_wrong_runner": "the RUNNER's own environment cannot produce the Anthropic "
+                                    "account every session would be launched against (issue #314), "
+                                    "so no pane was ever opened — its fleet config dir is logged "
+                                    "out, on an API key, or on the wrong org. This is a "
+                                    "machine-level identity fault: the delivery channel is fine, "
+                                    "nothing is wrong with any issue, and re-approving fixes "
+                                    "nothing. Launches are HELD (the queue is intact, NOTHING "
+                                    "parked, no issue charged) and resume automatically once "
+                                    "identity reads healthy. Fix: log the fleet's config dir into "
+                                    "its own account in a supervised `claude` window, or correct "
+                                    "SL_FLEET_CLAUDE_CONFIG_DIR. This is the Anthropic-side sibling "
+                                    "of the gh_auth_dead_runner banner.",
     "auth_dead": "the account AUTH probe reads DEAD — `claude auth status` reports not-logged-in "
                  "(or the Claude Code credential keychain item is gone), so a fresh launch or a "
                  "recovery relaunch would start LOGGED OUT and burn the spend (the i336 class). "
@@ -444,6 +573,80 @@ def _alert_message(reason):
                 "retries continue silently. Check GitHub availability / rate limits "
                 "(`gh api rate_limit`).")
     return ALERT_MESSAGES.get(reason, reason)
+
+
+# ---- "the queue is PAUSED, not idle" (issue #320) -----------------------------------------------
+# The ALERT reasons that mean NOTHING IS LAUNCHING. A held queue is the quietest state the loop has:
+# no park, no notify beyond the one alert, no label anywhere changes — which is exactly what makes
+# it indistinguishable from a queue that simply has nothing to do. Every owner-facing surface that
+# reports "idle" must be able to say "held" instead, from ONE list, so a class added to the layer
+# above becomes visible everywhere without a second edit.
+QUEUE_HELD_ALERT_REASONS = frozenset(
+    {"launch_anchor_down", "launch_systemic_failure", "auth_dead"} | set(LAUNCH_ALERT_REASONS.values()))
+
+# The subset of those that ONLY a launch-streak hold ever raises — so their FALLING edge really is
+# "launch delivery works again" and nothing else. This is the durable episode marker the #115
+# recovery journal reads off the on-disk ALERT.
+#
+# Two deliberate exclusions, and both would otherwise journal a recovery that never happened:
+#   * `gh_unreachable` — the POLL detector raises it too, from consecutive_failures.
+#   * `launch_anchor_down` / `auth_dead` — separate detectors with their own self-re-arming probes;
+#     neither is a streak, so neither has a streak to recover.
+LAUNCH_HOLD_ALERT_REASONS = frozenset(
+    {"launch_systemic_failure"} | set(LAUNCH_ALERT_REASONS.values())) - {"gh_unreachable"}
+
+
+# The one non-reason `queue_hold_reasons` can return: a state/ALERT marker EXISTS but nothing can be
+# read out of it. Both callers read the marker with the runner's tri-state discipline (None absent,
+# {} present-but-unreadable), and this is what keeps that distinction from collapsing into a
+# confident "flowing" printed underneath a visibly damaged ALERT line.
+ALERT_UNREADABLE = "alert_unreadable"
+
+
+def queue_hold_reasons(alert):
+    """The sorted held-reason codes named by a state/ALERT read, or [] when nothing holds.
+
+    Takes the tri-state the marker readers produce: None = NO marker (nothing held), a dict = the
+    parsed marker, and anything else — {} in particular — = a marker that EXISTS but could not be
+    read. That last case fails CLOSED to [ALERT_UNREADABLE] rather than to []: existence is the
+    signal (the same posture `_read_json` takes for merges_frozen.json), and the honest answer to
+    "is the queue held?" from a damaged marker is "assume so and go look", never "no".
+
+    Pure and total: every caller is a display surface, and a damaged ALERT must cost a hedged line,
+    never a raised status command."""
+    if alert is None:
+        return []
+    if not isinstance(alert, dict) or not isinstance(alert.get("reasons"), list):
+        return [ALERT_UNREADABLE]
+    return sorted({r for r in alert["reasons"]
+                   if isinstance(r, str) and r in QUEUE_HELD_ALERT_REASONS})
+
+
+def queue_hold_line(alert):
+    """The one-line queue state for `superlooper status`. Says HELD and names the classes, and says
+    in the same breath that nothing was parked — because the owner's first instinct on reading
+    "held" is to go looking for issues to re-approve, and there are none.
+
+    What it claims is scoped to THE HOLD — "the hold parks nothing and moves no label" — rather than
+    to the world, and both halves of that scoping were paid for by fresh review. It may not say "no
+    issue charged": the CHANNEL classes really do charge nothing, but the escalated ENVIRONMENT ones
+    bump the refusing lane's own launch cap on the way in, which is exactly what keeps a one-off
+    broken worktree parking normally. And it may not say "nothing is parked" flatly: a lane that
+    reached that cap BEFORE a second distinct refusal proved the outage parked on its own account,
+    and telling the owner otherwise sends them past a real re-approval. One line covers every class,
+    so it may only claim what is true of all of them — and what IS true of all of them is that the
+    hold itself takes no action at all."""
+    held = queue_hold_reasons(alert)
+    if not held:
+        return "queue: flowing"
+    if held == [ALERT_UNREADABLE]:
+        return ("queue: UNKNOWN — an ALERT marker is present but unreadable, so the loop's own hold "
+                "state cannot be read. Treat the queue as HELD until you can read it (the raw ALERT "
+                "line above is the file's actual contents); `superlooper doctor` checks the rest of "
+                "the state files.")
+    return ("queue: HELD — launches are paused. The hold itself parks nothing and moves no label: "
+            "every approved issue keeps its place and launching resumes by itself once the cause "
+            "clears. Cause: " + ", ".join(held))
 
 
 LAUNCH_STDERR_MEMO_MAX = 1200      # chars of a failed launch's stderr tail carried into a park memo
@@ -1404,6 +1607,45 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     fail_ids = {x for x in raw_fail_ids if _iid_num(x) is not None} \
         if isinstance(raw_fail_ids, (list, set, tuple, frozenset)) else set()
     systemic_launch = len(fail_ids) >= SYSTEMIC_LAUNCH_FAILURE_CAP
+    # ---- the systemic-outage layer (issue #320), sitting ABOVE the per-lane handling -------------
+    # The streak above is channel-only, so ONE entry already means the channel is down. This one
+    # counts the faults that are honestly per-issue on a single sample — a session's own dead gh, a
+    # session's own wrong Anthropic account, a session's own poisoned env — and asks the one question
+    # a single sample cannot answer: is this worktree's environment broken, or is the MACHINE's? The
+    # runner hands us {evidence reason: [distinct issue ids]}; SYSTEMIC_ENV_FAILURE_CAP distinct
+    # lanes refusing the SAME way is the answer, and the same inference the channel streak makes one
+    # rung up. Below the cap NOTHING changes: the lane's own launch cap keeps ticking and a genuine
+    # one-off still parks with its own memo.
+    #
+    # Read defensively and fail OPEN on anything unusable (a garbage streak view must never freeze
+    # the queue — the #46/#76 asymmetry again): unknown reasons are dropped, so a runner that starts
+    # recording a novel reason cannot hold the loop behind a class this engine has no message for.
+    env_streaks = {}
+    raw_env = dsk.get("launch_env_fail_ids")
+    if isinstance(raw_env, dict):
+        for reason, ids in raw_env.items():
+            if reason not in evidence.SYSTEMIC_ESCALATION_REASONS \
+                    or reason not in LAUNCH_ALERT_REASONS \
+                    or not isinstance(ids, (list, set, tuple, frozenset)):
+                continue
+            env_streaks[reason] = {x for x in ids if _iid_num(x) is not None}
+    systemic_env_reasons = sorted(r for r, ids in env_streaks.items()
+                                  if len(ids) >= SYSTEMIC_ENV_FAILURE_CAP)
+    systemic_env = bool(systemic_env_reasons)
+    # The lanes this episode has ALREADY sampled. Launching one of them again learns nothing about
+    # whether its environment or the MACHINE's is broken; launching a DIFFERENT one settles it. See
+    # ENV_SAMPLE_WINDOW_SECONDS for why that preference is what makes "nothing parked" structural
+    # rather than a property of how many lanes happen to be free.
+    #
+    # It matters MOST once the hold stands, which is not the intuitive reading and was a fresh-review
+    # P0. Under the hold the only thing that launches is the #115 recovery probe, and the probe's
+    # whole job is to find out whether the escalation was RIGHT. Sent at front-of-queue priority it
+    # goes straight back to a lane that has already refused: if the escalation was wrong — two
+    # genuinely lane-local faults, and a healthy issue sitting behind them — the probe re-fails
+    # forever, charges no cap (by design), and the hold never lifts. Preferring an unsampled lane is
+    # what makes a WRONGLY-held queue self-heal, which is the failure this whole layer must not
+    # introduce: a wrongly-held queue is the bigger, quieter outage.
+    env_sampled = {i for ids in env_streaks.values() for i in ids}
     # A dead anchor only matters when approved work is held behind it: an agent-ready, not-in-flight
     # issue. Deliberately does NOT exclude an at-cap / corrupt-counter issue — while degraded ITS
     # launch-cap park is SUPPRESSED too (below), so it is part of the held queue the alert must
@@ -1416,7 +1658,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     has_pending_launch = any(_held_queue_member(iid, p) for iid, p in parsed_by_id.items())
     # One degraded mode for both detectors: hold every fresh launch and suppress the per-issue
     # launch-cap park (phases D+E), so the queue is left intact for when the anchor resolves.
-    launch_degraded = anchor_down or systemic_launch
+    launch_degraded = anchor_down or systemic_launch or systemic_env
     # Account-level AUTH gate (issue #159 / forensics U3). The runner hands us a `claude auth status`
     # + credential-keychain snapshot when a spend is pending; a DEFINITIVE dead reading (valid is
     # literally False — the CLI is not-logged-in, or the keychain item is gone) means a fresh launch
@@ -1461,7 +1703,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # the same durable-marker discipline usage's prev_dark uses. Its falling edge (prev_systemic and
     # not systemic_launch) is the recovery the canary probe (or a restart) produces: the streak
     # cleared on a verified delivery while the alert still names it. Journaled once below (#115).
-    prev_systemic = bool(alert_on_disk) and "launch_systemic_failure" in _dget(alert_on_disk, "reasons", list)
+    # ...and it is read through LAUNCH_HOLD_ALERT_REASONS rather than the bare generic name (#320
+    # fresh review P2). The marker used to be `launch_systemic_failure` alone, which was complete
+    # only while that was the ONLY thing a launch streak could be called. #299 broke that (a runner
+    # gh-auth hold names itself and journaled no recovery when it lifted) and this issue widened it
+    # to five more classes, so a hold under any of them would clear silently — the alert retracts,
+    # launching resumes, and the journal records that the outage simply stopped existing.
+    prev_systemic = any(r in LAUNCH_HOLD_ALERT_REASONS
+                        for r in _dget(alert_on_disk, "reasons", list))
     # The reasons the durable ALERT already names — the same on-disk episode marker prev_systemic
     # reads, kept as a list so any reason can ask "am I already standing?" (issue #256 uses it to
     # keep per-poll view health from RETRACTING a page it already sent; see park_label_stuck).
@@ -1652,11 +1901,15 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # carry the launcher's own classification in their stamped evidence, so speak it.
         # Mixed / unclassified streaks still raise the generic reason, so nothing goes unreported.
         ev_reasons = {_launch_ev_reason(ist_of(i)) for i in fail_ids}
-        named = sorted({GH_LAUNCH_ALERT_REASONS[r] for r in ev_reasons
-                        if r in GH_LAUNCH_ALERT_REASONS})
+        named = sorted({LAUNCH_ALERT_REASONS[r] for r in ev_reasons
+                        if r in LAUNCH_ALERT_REASONS})
         reasons.extend(named)
-        if not named or (ev_reasons - set(GH_LAUNCH_ALERT_REASONS)):
+        if not named or (ev_reasons - set(LAUNCH_ALERT_REASONS)):
             reasons.append("launch_systemic_failure")
+    # ...and the ESCALATED environment classes (issue #320), each under its own name. No generic
+    # fallback here and none wanted: this streak is keyed BY the reason, so a class that reached the
+    # cap is a class this engine has a message for — the reader above drops any reason it does not.
+    reasons.extend(LAUNCH_ALERT_REASONS[r] for r in systemic_env_reasons)
     if auth_invalid and (has_pending_launch or has_relaunch_demand):   # dead auth only matters with a
         reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
     # DEDUPE, not just sort (#299). Two independent detectors can now name the SAME reason:
@@ -1698,7 +1951,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # fallback — clears the streak the same way, so it too journals exactly one recovery. Deduped on
     # the durable marker (prev_systemic): once section A clears the alert, the next tick sees no
     # marker and emits nothing.
-    if prev_systemic and not systemic_launch:
+    #
+    # (#320) The ESCALATED environment classes ride the identical edge — one marker, read through
+    # LAUNCH_HOLD_ALERT_REASONS, covers every name a launch streak can wear. The `held_now` conjunct
+    # is what keeps that from mis-firing when two classes stand at once: one clearing must not
+    # announce that launching resumed while the other still holds the queue.
+    held_now = systemic_launch or systemic_env
+    if prev_systemic and not held_now:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "
                               "systemic launch streak is cleared and normal launching resumes in "
@@ -2708,24 +2967,83 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # delivery fail, so attempting more only walks the queue. The queue is preserved (agent-ready
     # intact) and resumes the tick the anchor resolves — no William relabeling. The #115 canary
     # (below) is the ONE exception: a single probe re-arms a systemic hold that cannot clear itself.
-    def _eligible_launch_ids():
+    # (#320) Is the environment question OPEN — has a lane refused for a reason that would be
+    # machine-wide across two, and is a fresh sample still the live question?
+    #
+    # The clock bound applies only BELOW the cap, where the normal launch path is still running and
+    # a never-schedulable peer could otherwise hold the refused lane out of the queue indefinitely.
+    # It fails OPEN (no preference) on an unreadable or stale clock, leaving plain priority order.
+    # ONCE HELD the bound is deliberately dropped: nothing but the #115 probe launches, so there is
+    # nothing to starve — and the probe fires every CANARY_RETRY_SECONDS (300s), which is already
+    # past this window, so keeping the bound would silently disable the preference exactly where it
+    # is load-bearing (see env_sampled above).
+    _env_fail_at = dsk.get("launch_fail_at")
+    _sampling = bool(env_sampled) and (
+        systemic_env or (_real(_env_fail_at) and now - _env_fail_at < ENV_SAMPLE_WINDOW_SECONDS))
+
+    def _eligible_rows(ignore_launch_cap=False):
         """Approved, not-in-flight, launchable issues in priority order — the shared candidate set
         for both normal fresh launches AND the #115 canary probe. A PURE filter with NO side effects
         (it never parks): the touches-required park belongs to the normal path only, and a canary must
-        never park while the systemic hold stands."""
+        never park while the systemic hold stands.
+
+        `ignore_launch_cap` sets aside the whole per-issue LAUNCH-FAILURE accounting — the cap AND an
+        unreadable counter — and ONLY the recovery probe passes it (issue #320, fresh review). That
+        accounting answers "should this ISSUE be launched again, or parked?", which is the right
+        filter for the normal path and the wrong one for a probe: the probe asks whether the MACHINE
+        can start a session at all, and any lane answers that. Applied to both, a hold whose every
+        candidate had reached the cap — or whose counters were corrupt — could emit no probe (they
+        are filtered out here) AND no park (the hold suppresses it), a state nothing in the loop can
+        leave. A probe charges no cap and parks nothing, so setting the accounting aside there costs
+        it nothing; and if the probe VERIFIES, the lane runs, which is exactly what the hold has been
+        claiming all along — those failures were the machine's, not the issue's. The corrupt-counter
+        park is not lost, only deferred: it re-derives the moment the hold lifts.
+
+        What the probe does NOT relax is anything about launch SAFETY or the queue contract: a
+        wrong-typed status still never launches (#95), and a merge-producing issue that declares no
+        `touches:` is still refused (#36 — the probe filters those out at its call site). Both would
+        be real harm; a launch-failure counter is only bookkeeping."""
+        rows = []
         for iid in _sorted_ids(parsed_by_id):
             p = parsed_by_id[iid]
             labels = p.get("labels") if isinstance(p.get("labels"), list) else []
             ist = ist_of(iid)
             launch_fails, corrupt = _counter(ist, "launch_failures")
+            at_cap = corrupt or launch_fails >= LAUNCH_FAILURE_CAP
             if ("agent-ready" not in labels or "in-progress" in labels
                     or iid in parked_now
                     or iid in reapproved_now   # just re-released: launch next tick, reset counters
                     or iid in resumed_now      # just re-claimed for the gate (#161): never rebuild it
                     or _status_of(ist) not in RELAUNCHABLE_STATUSES   # wrong-typed status: never launch (#95)
-                    or corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
+                    or (at_cap and not ignore_launch_cap)):
                 continue
-            yield iid, p, ist
+            rows.append((iid, p, ist))
+        return rows
+
+    def _unsampled(rows):
+        """The rows for lanes this episode's environment streak has NOT already tried (issue #320),
+        or [] when the question is not open. Relaunching a lane that just refused learns nothing
+        about whether ITS environment or the MACHINE's is broken; trying a different one settles
+        it."""
+        return [r for r in rows if r[0] not in env_sampled] if _sampling else []
+
+    def _eligible_launch_ids():
+        """The NORMAL fresh-launch candidate set: eligible rows, with already-sampled lanes deferred
+        while the environment question is open.
+
+        That deferral is what makes "a machine-wide outage parks nothing" structural rather than a
+        property of how many lanes happen to be free — a serialized queue would otherwise retry the
+        same issue into its per-issue cap and park it before a second sample ever existed. It is a
+        PREFERENCE, never an exclusion: with no unsampled candidate the sampled ones are returned
+        exactly as today, so a one-issue queue reaches its cap and parks on the unchanged schedule.
+
+        The deferral is applied BEFORE the scheduler, so an unsampled candidate the scheduler then
+        refuses (its territory claimed, a closed dependency) can leave this tick launching nothing.
+        That is bounded — and only — by ENV_SAMPLE_WINDOW_SECONDS, which is why that bound exists;
+        the recovery probe, which has no such clock, handles the same case by falling back instead
+        (see the canary below)."""
+        rows = _eligible_rows()
+        return _unsampled(rows) or rows
 
     def _needs_touches(p):
         # touches_required (issue #36): an approved merge-producing issue that declares no `touches:`
@@ -2872,7 +3190,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # costs the same by a second route (`or gh_stale` above swaps the wording whenever
                 # the whole view is doubted).
                 launch_hold(cid, c.get("num"), c, reason=reason)
-    elif (systemic_launch and not anchor_down and not auth_invalid and not display_asleep
+    elif ((systemic_launch or systemic_env) and not anchor_down and not auth_invalid
+            and not display_asleep
             and not gh_stale and not issue_state_corrupt_for_launches):
         # ...and NOT while the display sleeps (#124): a canary into a sleeping display would just
         # create+close an orphan, the very burned attempt this hold exists to prevent. The systemic
@@ -2887,14 +3206,51 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # anchor DEAD (anchor_down): that detector self-re-arms via its per-tick probe, and a canary
         # into a probe-dead pane is wasted; once the probe recovers but the streak persists, THIS path
         # fires and clears it. The interval gate fails CLOSED on a garbage/absent clock (no probe).
+        #
+        # (#320) This is ALSO the recovery probe for the escalated environment classes, and reusing
+        # it rather than adding a per-class health check is the whole reason the layer needs no new
+        # `gh`/`claude` call per tick (the owner's recommendation, 2026-08-03). It is exactly as
+        # READ-ONLY as it has always been: the probe LAUNCHES, it does not repair — it mutates no
+        # credential, logs nothing in and restarts nothing the runner did not start. The owner fixes
+        # the machine; a green probe is how the loop finds out.
+        #
+        # TWO fresh-review P0 fixes live in the candidate selection below, and both are the same
+        # shape: the probe must ALWAYS have someone to ask, because while the hold stands its own
+        # suppression stops any lane parking — a tick that emits no probe AND no park is a state
+        # nothing in the loop can leave except a restart.
+        #
+        #   * it PREFERS an unsampled lane but FALLS BACK rather than filtering. Sent at plain
+        #     front-of-queue priority the probe lands back on a lane that has already refused, so a
+        #     WRONGLY-escalated hold (two genuinely lane-local faults, a healthy issue behind them)
+        #     would re-fail forever, charge no cap by design, and never lift. But an unsampled lane
+        #     the SCHEDULER then refuses — its territory claimed, a dependency still open — must not
+        #     cost the probe either; hence two passes rather than one filtered list.
+        #   * it sets aside the per-issue launch-failure accounting (`ignore_launch_cap`) — the cap
+        #     AND an unreadable counter, which are the same exclusion here. That accounting answers
+        #     "should this issue be launched again, or parked?" — a question about the ISSUE. The
+        #     probe asks whether the MACHINE can start a session at all, which such a lane answers as
+        #     well as any other, and it charges no cap either way. If that probe VERIFIES, the lane
+        #     runs — exactly the outcome the hold has been claiming all along.
+        #
+        # The one candidate the probe still refuses is a merge-producing issue with no `touches:`
+        # (#36's hard refusal, applied below). If a hold ever stood with NOTHING else to probe, that
+        # is a hold the owner must resolve — the alert stands throughout and `superlooper status`
+        # names it — because flying an undeclared-territory session is real harm, where a deferred
+        # bookkeeping park is not.
         fail_at = dsk.get("launch_fail_at")
         if _real(fail_at) and now - fail_at >= CANARY_RETRY_SECONDS:
-            candidates = [dict(p, requeue_front=bool(ist.get("requeue_front")))
-                          for iid, p, ist in _eligible_launch_ids()
-                          if not _needs_touches(p)]   # a touches-missing issue is never the probe
+            rows = _eligible_rows(ignore_launch_cap=True)
             claims = territory_claims_from(issues_state)
-            probe = scheduler.launchable(candidates, lanes_in, cfg, usage_sched,
-                                         closed_nums, bool(frozen), territory_claims=claims)
+
+            def _probe_from(subset):
+                candidates = [dict(p, requeue_front=bool(ist.get("requeue_front")))
+                              for iid, p, ist in subset
+                              if not _needs_touches(p)]   # a touches-missing issue is never the probe
+                return scheduler.launchable(candidates, lanes_in, cfg, usage_sched,
+                                            closed_nums, bool(frozen), territory_claims=claims) \
+                    if candidates else []
+
+            probe = _probe_from(_unsampled(rows)) or _probe_from(rows)
             if probe:
                 sel = probe[0]                         # the single front-of-queue issue, priority order
                 out.append({"act": "launch", "id": sel["id"], "num": sel["num"],
