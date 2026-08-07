@@ -4679,8 +4679,9 @@ class Runner:
         # down here would take the window out from under a lane the loop is still working. The
         # position relative to the status write above does not matter TO THE DRAIN (it reads status
         # on a later tick, by which time both have landed either way) — but this order is still the
-        # safer one, because a runner death between the two leaks a lane once, where the reverse
-        # order would leave a `gating` lane already torn down and re-issuing its close every tick.
+        # safer one across a runner death between the two. It leaks that lane once. The reverse
+        # leaves a `gating` lane already torn down, and recovers on the next tick only BECAUSE `gh
+        # issue close` exits 0 on an already-closed issue; this order depends on nothing.
         self._settle_merged_lane(iid)                  # ordered (#149); per-knob (#178); (#275)
         return "ok"
 
