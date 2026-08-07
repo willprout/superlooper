@@ -420,14 +420,56 @@ def test_a_probes_own_per_issue_misfortune_never_renames_the_standing_hold(rig):
     assert issue_state(rig, "i101").get("launch_failures", 0) == 0, "and charges no cap either"
 
 
-def test_a_probes_CHANNEL_failure_does_still_feed_the_channel_streak(rig):
-    """The other side of that line: when the probe's own evidence really does name the channel, it
-    is evidence about the channel and belongs in the streak."""
+def test_not_even_a_probes_CHANNEL_failure_renames_the_episode(rig):
+    """Round 3 of the same finding, one rung up: a GENUINE channel reason the alert table has no
+    mapping for — a `launch_timeout` probed during a dead-socket episode — takes the identical route
+    to the identical wrong banner. #299's mixed-streak rule is right for what it was written about
+    (two different lanes failing differently is two causes, and both must be named); a probe
+    re-reading the same outage is not a second cause. So a canary contributes to the retry clock and
+    nothing else, and the episode keeps the name the lanes that TRIPPED it gave it."""
+    rig.r.tick(now=NOW)
+    rig.r._launch_fail_ids = {"i102"}
+    rig.calls.clear()
+    rig.rc_queue.append(runner_mod.ScriptRC(124, "[i101] launcher hung"))
+    rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    assert rig.r._launch_fail_ids == {"i102"}, "the streak keeps the lanes that tripped the hold"
+    assert rig.r._launch_fail_at == NOW
+
+
+def test_a_real_launchs_channel_failure_does_still_feed_the_streak(rig):
+    """The line that keeps the rule above from disarming #24: a REAL launch is a sample, and its
+    channel fault is exactly what establishes and sustains the hold."""
     rig.r.tick(now=NOW)
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(2, "[i101] shim never fired"))
-    rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    rig.r._execute(_launch_action(), NOW)
     assert "i101" in rig.r._launch_fail_ids
+
+
+def test_the_probe_still_fires_when_a_candidates_launch_counter_is_CORRUPT():
+    """Round-3 P0, the same no-probe/no-park shape through a different door: a wrong-typed
+    `launch_failures` excludes a lane from the candidate set, while the hold suppresses the
+    corrupt-counter park that would otherwise resolve it. The probe sets the whole launch-failure
+    accounting aside — cap and readability alike — because it is bookkeeping about an ISSUE and the
+    probe's question is about the MACHINE."""
+    dsk = _env_streak("gh_auth_dead", ["i5", "i6"], extra_ist={
+        "i5": ist("ready", launch_failures="oops", launch_evidence=_ev("gh_auth_dead")),
+        "i6": ist("ready", launch_failures=None, launch_evidence=_ev("gh_auth_dead"))})
+    dsk["launch_fail_at"] = NOW - actions.CANARY_RETRY_SECONDS - 1
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    probes = only(out, "launch")
+    assert len(probes) == 1 and probes[0]["canary"] is True, out
+    assert only(out, "park") == []
+
+
+def test_a_corrupt_counter_still_parks_its_lane_when_nothing_is_held():
+    """...and the deferral is only a deferral: with no hold standing, a corrupt counter parks
+    exactly as it does today, and the probe's relaxation never reaches the normal launch path."""
+    dsk = disk(launch_anchor={"ok": True},
+               issues_state={"version": 1, "issues": {"i5": ist("ready", launch_failures="oops")}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert only(out, "launch") == []
+    assert [a["id"] for a in only(out, "park")] == ["i5"]
 
 
 def test_a_per_issue_fault_outside_the_registry_never_enters_the_streak(rig):

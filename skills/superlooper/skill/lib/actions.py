@@ -2966,35 +2966,41 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     _sampling = bool(env_sampled) and (
         systemic_env or (_real(_env_fail_at) and now - _env_fail_at < ENV_SAMPLE_WINDOW_SECONDS))
 
-    def _eligible_rows(at_cap_ok=False):
+    def _eligible_rows(ignore_launch_cap=False):
         """Approved, not-in-flight, launchable issues in priority order — the shared candidate set
         for both normal fresh launches AND the #115 canary probe. A PURE filter with NO side effects
         (it never parks): the touches-required park belongs to the normal path only, and a canary must
         never park while the systemic hold stands.
 
-        `at_cap_ok` relaxes the per-issue launch cap, and ONLY the recovery probe passes it (issue
-        #320, fresh-review P0). The cap answers "should this issue be launched AGAIN, or parked?" —
-        a question about the ISSUE, and the right filter for the normal path. The probe asks a
-        different question: "can this machine start a session at all?", which any lane answers. With
-        the cap applied to both, a hold whose every candidate had reached the cap could emit no
-        probe (they are filtered out) AND no park (the hold suppresses it) — a state nothing in the
-        loop can leave. A probe charges no cap and parks nothing, so relaxing it there costs the
-        per-issue accounting nothing; and if that probe VERIFIES, the lane runs, which is exactly the
-        outcome the hold has been claiming all along — those failures were the machine's, not the
-        issue's."""
+        `ignore_launch_cap` sets aside the whole per-issue LAUNCH-FAILURE accounting — the cap AND an
+        unreadable counter — and ONLY the recovery probe passes it (issue #320, fresh review). That
+        accounting answers "should this ISSUE be launched again, or parked?", which is the right
+        filter for the normal path and the wrong one for a probe: the probe asks whether the MACHINE
+        can start a session at all, and any lane answers that. Applied to both, a hold whose every
+        candidate had reached the cap — or whose counters were corrupt — could emit no probe (they
+        are filtered out here) AND no park (the hold suppresses it), a state nothing in the loop can
+        leave. A probe charges no cap and parks nothing, so setting the accounting aside there costs
+        it nothing; and if the probe VERIFIES, the lane runs, which is exactly what the hold has been
+        claiming all along — those failures were the machine's, not the issue's. The corrupt-counter
+        park is not lost, only deferred: it re-derives the moment the hold lifts.
+
+        What the probe does NOT relax is anything about launch SAFETY or the queue contract: a
+        wrong-typed status still never launches (#95), and a merge-producing issue that declares no
+        `touches:` is still refused (#36 — the probe filters those out at its call site). Both would
+        be real harm; a launch-failure counter is only bookkeeping."""
         rows = []
         for iid in _sorted_ids(parsed_by_id):
             p = parsed_by_id[iid]
             labels = p.get("labels") if isinstance(p.get("labels"), list) else []
             ist = ist_of(iid)
             launch_fails, corrupt = _counter(ist, "launch_failures")
+            at_cap = corrupt or launch_fails >= LAUNCH_FAILURE_CAP
             if ("agent-ready" not in labels or "in-progress" in labels
                     or iid in parked_now
                     or iid in reapproved_now   # just re-released: launch next tick, reset counters
                     or iid in resumed_now      # just re-claimed for the gate (#161): never rebuild it
                     or _status_of(ist) not in RELAUNCHABLE_STATUSES   # wrong-typed status: never launch (#95)
-                    or corrupt
-                    or (launch_fails >= LAUNCH_FAILURE_CAP and not at_cap_ok)):
+                    or (at_cap and not ignore_launch_cap)):
                 continue
             rows.append((iid, p, ist))
         return rows
@@ -3204,14 +3210,21 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         #     would re-fail forever, charge no cap by design, and never lift. But an unsampled lane
         #     the SCHEDULER then refuses — its territory claimed, a dependency still open — must not
         #     cost the probe either; hence two passes rather than one filtered list.
-        #   * it relaxes the per-issue launch CAP (`at_cap_ok`). The cap answers "should this issue
-        #     be launched again, or parked?" — a question about the ISSUE. The probe asks whether the
-        #     MACHINE can start a session at all, which an at-cap lane answers as well as any other,
-        #     and it charges no cap either way. If that probe VERIFIES, the lane runs — exactly the
-        #     outcome the hold has been claiming all along: those failures were not the issue's.
+        #   * it sets aside the per-issue launch-failure accounting (`ignore_launch_cap`) — the cap
+        #     AND an unreadable counter, which are the same exclusion here. That accounting answers
+        #     "should this issue be launched again, or parked?" — a question about the ISSUE. The
+        #     probe asks whether the MACHINE can start a session at all, which such a lane answers as
+        #     well as any other, and it charges no cap either way. If that probe VERIFIES, the lane
+        #     runs — exactly the outcome the hold has been claiming all along.
+        #
+        # The one candidate the probe still refuses is a merge-producing issue with no `touches:`
+        # (#36's hard refusal, applied below). If a hold ever stood with NOTHING else to probe, that
+        # is a hold the owner must resolve — the alert stands throughout and `superlooper status`
+        # names it — because flying an undeclared-territory session is real harm, where a deferred
+        # bookkeeping park is not.
         fail_at = dsk.get("launch_fail_at")
         if _real(fail_at) and now - fail_at >= CANARY_RETRY_SECONDS:
-            rows = _eligible_rows(at_cap_ok=True)
+            rows = _eligible_rows(ignore_launch_cap=True)
             claims = territory_claims_from(issues_state)
 
             def _probe_from(subset):

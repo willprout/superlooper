@@ -3096,24 +3096,30 @@ class Runner:
         `fields` are the caller's path-specific loopstate fields; launch_evidence is always stamped.
         Returns True when charged to the channel (held), False when charged to the issue."""
         merged = dict(fields or {}, launch_evidence=ev)
-        channel = evidence.is_channel_fault(ev)
-        if canary or channel:
+        if canary or evidence.is_channel_fault(ev):
             self._launch_fail_at = now
-            # A canary is a PROBE, and a probe's own PER-ISSUE misfortune is not evidence about the
-            # channel: a worktree that would not create, a brief that could not be written, an
-            # unusable identity — none of them say whether the machine can start sessions. Recording
-            # one in the channel streak RENAMES the standing hold after it (#320 fresh review P1):
-            # decide reads the streak's stamped evidence to name the alert, finds a reason it has no
-            # mapping for, and appends the generic `launch_systemic_failure` — so a queue held for
-            # dead worker auth would suddenly page the owner a second time, mid-episode, telling them
-            # to go reconfigure macOS App Nap. That is the exact mis-blame this layer exists to end.
+            # A canary is a PROBE, not a SAMPLE, and the difference is what keeps a held queue to one
+            # owner page (#320, fresh review rounds 2 and 3). The streak is decide's evidence for two
+            # questions: is a hold standing, and what is it CALLED. A canary only ever runs while a
+            # hold already stands, so it answers the first question with nothing new; and letting it
+            # answer the second re-pages the owner mid-episode, because the ALERT's dedup key is the
+            # whole reasons LIST:
             #
-            # Nothing is lost by leaving it out: a canary only ever runs while a hold ALREADY stands,
-            # so the streak that tripped it is what keeps it standing, and the retry clock above —
-            # which is what a failed probe is really for — is stamped either way. This also makes the
-            # rule uniform with rc=3 (base_missing), whose own branch above has always kept a
-            # canary's per-issue fault out of the streak.
-            if channel:
+            #   * a probe's own PER-ISSUE misfortune — a worktree that would not create, a brief that
+            #     could not be written — has no mapping, so decide appends the generic
+            #     `launch_systemic_failure`, and a queue held for dead worker auth suddenly tells the
+            #     owner to go reconfigure macOS App Nap. That is the exact mis-blame this layer
+            #     exists to end.
+            #   * so does a genuine but UNMAPPED channel reason (a `launch_timeout` probed during a
+            #     dead-socket episode), by the same route and with the same wrong banner.
+            #
+            # #299's mixed-streak rule is right for what it was written about — two DIFFERENT lanes
+            # failing DIFFERENTLY is two causes, and both must be named. A probe re-reading the same
+            # outage is not a second cause. So the streak keeps the lanes that TRIPPED the hold and
+            # the episode keeps its name; the retry clock above, which is what a failed probe is
+            # really for, is stamped either way. Uniform with rc=3 (base_missing), whose own branch
+            # above has always kept a canary's failure out of the streak.
+            if not canary:
                 self._launch_fail_ids.add(iid)
             self._update_issue(iid, merged)
             return True
