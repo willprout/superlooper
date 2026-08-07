@@ -1510,6 +1510,33 @@ def test_morning_report_writes_and_reflects_the_journal(rig):
     assert "#5" in text and "https://github.com/o/r/pull/9" in text
 
 
+def test_morning_report_renders_standing_holds_from_loopstate(rig):
+    # Issue #405: the hand-run report is the SECOND entry point (runner.py's own hook is the first)
+    # and the two must assemble the same view — a hold visible only when the runner happens to write
+    # the 08:45 report would be exactly the silence this issue closes. Also pins the tolerant read:
+    # a corrupt/absent issues.json renders a report with no holds, never a crash.
+    home = rig.tmp / "slhome" / "o__r"
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    loopstate.save(str(home / "state" / "issues.json"),
+                   {"version": 1, "issues": {"i5": {"status": "ready",
+                                                    "launch_hold_reason": "waiting on #77",
+                                                    "launch_hold_since": time.time() - 3 * 86400}}})
+    r = cli(rig, "morning-report", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    text = sorted((home / "reports").glob("morning-*.md"))[0].read_text()
+    section = text.split("## Standing holds")[1].split("\n## ")[0]
+    assert "#5" in section and "waiting on #77" in section and "3d 0h" in section
+    assert "STALL" in text                                   # past the threshold -> alert tier
+
+    (home / "state" / "issues.json").write_text("{{{ not json")
+    for f in (home / "reports").glob("morning-*.md"):
+        f.unlink()
+    r = cli(rig, "morning-report", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    text = sorted((home / "reports").glob("morning-*.md"))[0].read_text()
+    assert "None — nothing is held." in text.split("## Standing holds")[1]
+
+
 # --------------------------- D1: gh pinned to config.repo, never cwd ---------------------------
 
 def _recording_gh(rig):
