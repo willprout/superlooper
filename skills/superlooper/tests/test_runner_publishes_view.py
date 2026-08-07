@@ -297,11 +297,15 @@ def test_the_landing_ticks_own_document_carries_the_flights_cargo(rig, monkeypat
     assert (pr["additions"], pr["deletions"], pr["changedFiles"]) == (58, 2, 2)
 
 
-def test_the_landing_tick_keeps_the_lane_tracked_so_its_carry_survives(rig, monkeypatch):
+def test_a_real_landings_title_and_pr_outlive_the_poll_that_forgets_it(rig, monkeypatch):
     # The other half of the change (issue #276): the map the publish reads is not only the merged
     # set, it is also the TRACKED set that bounds both carries. Reading it post-execute must not
     # drop a lane that just went terminal — that lane is exactly the one whose title and PR the
     # board still wants, and the next poll's want-set skips it outright.
+    #
+    # This holds BEFORE and AFTER the change, which is the point: it is the invariant the change
+    # had to keep, driven off a real landing rather than a seeded one (the seeded siblings above
+    # never exercise the map the runner itself hands the publish).
     monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
     _seed_landing_lane(rig, in_the_poll_set=True)
     rig.r.tick(now=NOW)
@@ -317,3 +321,40 @@ def test_the_landing_tick_keeps_the_lane_tracked_so_its_carry_survives(rig, monk
     doc = view(rig)
     assert doc["titles"].get("i123") == _LANDING_TITLE, "the landing lost its carried title"
     assert doc["prs"].get("i123", {}).get("state") == "MERGED", "the landing lost its carried PR"
+
+
+def test_an_unreadable_post_execute_state_read_never_prunes_the_carries(rig, monkeypatch):
+    """The failure the post-execute read opens, and the fallback that closes it (fresh-agent
+    review of #276).
+
+    `_load_state` fails CLOSED to an empty state, so an unreadable loopstate and a loopstate that
+    tracks nothing reach the publish as the same empty map — and an empty tracked set prunes every
+    carried title and settled PR, out of the document AND out of the in-memory carry that re-seeds
+    it. One bad read would blank every landed flight on the arrivals board for good. So a
+    post-execute read that comes back empty where the pre-execute one had lanes falls back to the
+    pre-execute map: nothing removes an issue from loopstate, so that emptiness is never real."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _seed_landing_lane(rig, in_the_poll_set=True)
+    rig.r.tick(now=NOW)                              # lands: the document now carries title + PR
+    assert view(rig)["prs"]["i123"]["state"] == "MERGED"
+
+    # GitHub forgets the now-terminal issue (the want-set skips it), so ONLY the carry holds it...
+    rig.r._parsed_by_id, rig.r._raw_by_id = {}, {}
+    rig.r.gh_view = {**rig.r.gh_view, "prs": {}}
+    rig.r._last_poll = NOW + 10_000                  # inside the window: no poll, so exactly two
+                                                     # state reads this tick — disk_view's, then
+                                                     # the post-execute one
+    reads = []
+    real_load = rig.r._load_state
+
+    def flaky():                                     # the top-of-tick read lands; every later one
+        reads.append(1)                              # comes back unreadable -> fail-closed empty
+        return real_load() if len(reads) == 1 else loopstate.new_state()
+
+    rig.r._load_state = flaky
+    rig.r.tick(now=NOW + 15)
+    assert len(reads) >= 2, "the post-execute read never happened — this test proves nothing"
+    doc = view(rig)
+    assert doc["titles"].get("i123") == _LANDING_TITLE, "an unreadable read pruned the carried title"
+    assert doc["prs"].get("i123", {}).get("state") == "MERGED", \
+        "an unreadable read pruned the landed flight's PR"

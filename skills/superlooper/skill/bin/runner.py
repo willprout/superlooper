@@ -2243,6 +2243,16 @@ class Runner:
         # that is one phase out of date.
         fresh = self._load_state()
         fresh_ist_map = fresh.get("issues") if isinstance(fresh.get("issues"), dict) else {}
+        # What the publish below reads (#276), and the `or` is the load-bearing half (fresh-agent
+        # review). `_load_state` FAILS CLOSED to an empty state, so "loopstate is unreadable" and
+        # "loopstate tracks nothing" arrive here as the same empty map — and publishing that empty
+        # map would prune every carried title and settled PR out of the document AND out of the
+        # in-memory carry that re-seeds it, so one bad read would blank the arrivals board's landed
+        # flights PERMANENTLY. Nothing ever removes an issue from loopstate, so an empty
+        # post-execute map where the pre-execute one had entries can only be that failure: fall
+        # back to the map decide itself used rather than publish a prune nobody observed. When the
+        # read genuinely holds nothing, both maps are empty and the fallback changes nothing.
+        publish_ist_map = fresh_ist_map or ist_map
         self._reclaim_terminal_worktrees(fresh)        # opt-in only (#168): OFF by default, park-family persists
         self._drain_pending_teardowns(fresh)           # (#149) retry prunes declined under a live CLI
         if now - self._last_journal_rotate >= JOURNAL_ROTATE_SECONDS:
@@ -2266,10 +2276,12 @@ class Runner:
         # and `_exec_merge` wrote it a few statements ago), and the tracked set that bounds both
         # carries. Pre-execute, a lane the loop had already merged published as still in flight for
         # a whole tick — ~15s of a dashboard polling every ~2s, and every one of those polls a
-        # landed PR rendered as OPEN. Nothing ever REMOVES an issue from loopstate, so post-execute
-        # the tracked set can only be the same or larger: no lane loses its carried title or PR by
-        # this being read later. Free, too — the read already happened for the sweeps.
-        self._publish_view(now, fresh_ist_map)
+        # landed PR rendered as OPEN. Nothing ever REMOVES an issue from loopstate, and an
+        # unreadable read falls back above rather than arriving as an empty one, so the tracked set
+        # this publishes can only be the same or larger than the pre-execute one: no lane loses its
+        # carried title or PR by the map being read later. Free, too — the read already happened
+        # for the sweeps.
+        self._publish_view(now, publish_ist_map)
 
         # Heartbeat = "a full tick completed", stamped LAST (incident 2026-07-07). It used to be
         # stamped at the TOP of the tick, so a tick that crashed part-way still read as freshly
