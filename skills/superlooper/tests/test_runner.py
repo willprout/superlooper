@@ -2013,6 +2013,115 @@ def test_ordinary_merge_comment_says_nothing_about_referee(rig, monkeypatch):
     assert "referee" not in body and "pre-authorized" not in body
 
 
+# ---- issue #403: a freeze emitted THIS tick suppresses this tick's merges ----
+# The tick snapshots merges_frozen.json once, before decide runs. A `freeze` act emitted mid-tick
+# does not refresh that snapshot, so on the exact tick a freeze BEGINS the gate judged every
+# pending merge against a view in which the mainline was still green — and safety acts execute
+# FIRST, so the marker is already on disk by the time the merge runs. The merge executor is the
+# only place left that can see the freeze that its own tick created.
+
+def _freeze_marker(rig, **over):
+    m = {"reason": "dev checks red: ci (failure)", "fingerprint": "fp",
+         "since": NOW, "source": runner_mod.gate.DEV_CHECK_FREEZE_SOURCE}
+    m.update(over)
+    loopstate.save(str(rig.home / "state" / "merges_frozen.json"), m)
+
+
+def test_a_freeze_written_this_tick_holds_a_merge_decided_before_it(rig, monkeypatch):
+    """The exact tick a freeze begins: dev goes red, `_exec_freeze` writes the marker, and a merge
+    the gate cleared against the PRE-freeze snapshot is still queued behind it. It must not land —
+    the gate never judged this PR against the freeze at all, so its verdict speaks to a mainline
+    that no longer exists. Held, not failed: the next tick re-decides against a snapshot that
+    actually contains the marker, and either holds it (ordinary work) or crosses it (#295)."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    # the safety act ran first, exactly as decide orders it
+    assert rig.r._execute({"act": "freeze", "reason": "dev checks red: ci (failure)",
+                           "fingerprint": "fp"}, NOW) == "ok"
+    out = rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                          "method": "squash", "wander": False}, NOW)
+    assert out != "ok" and "never judged against" in out, out
+    assert [m for m in mutations(rig) if m["kind"] == "merge_pr"] == [], \
+        "a merge decided on a pre-freeze snapshot must never reach GitHub"
+    assert issue_state(rig, "i5")["status"] == "gating", \
+        "the lane stays gating so the next tick re-decides it under the freeze"
+    # ...and it is NOT charged as a GitHub refusal — nothing refused anything (issue #27's cap
+    # must not be spent by the loop holding its own merge).
+    assert not issue_state(rig, "i5").get("merge_refusals")
+
+
+def test_an_exempt_merge_still_crosses_the_dev_check_freeze_it_exists_to_lift(rig, monkeypatch):
+    """The #295 exemption survives the re-read: the standing-rule restore-green PR was judged
+    against this very marker and must still land, or the dev-check freeze goes back to being
+    unliftable without a human."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _freeze_marker(rig)
+    out = rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash",
+                          "wander": False, "freeze_exempt": True}, NOW)
+    assert out == "ok"
+    assert [m for m in mutations(rig) if m["kind"] == "merge_pr"]
+    assert issue_state(rig, "i5")["status"] == "merged"
+
+
+def test_an_exempt_merge_holds_when_the_marker_on_disk_is_no_longer_the_one_judged(rig,
+                                                                                   monkeypatch):
+    """The exemption is proof about a SPECIFIC marker (`source: dev-check`), and the re-read asks
+    gate.freeze_exempt again rather than trusting the act's flag alone. If the marker on disk is
+    now the nightly's — it rewrote it between the snapshot and this executor — crossing it would
+    merge under a freeze nobody may clear but a green nightly. Fail closed."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _freeze_marker(rig, source=runner_mod.gate.NIGHTLY_FREEZE_SOURCE)
+    out = rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash",
+                          "wander": False, "freeze_exempt": True}, NOW)
+    assert out != "ok" and "never judged against" in out, out
+    assert [m for m in mutations(rig) if m["kind"] == "merge_pr"] == []
+    assert issue_state(rig, "i5")["status"] == "gating"
+
+
+def test_an_unreadable_freeze_marker_holds_the_merge(rig, monkeypatch):
+    """Existence = frozen, fail closed — the same rule disk_view applies. A merges_frozen.json the
+    runner cannot parse must keep merges frozen, never silently un-freeze them."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    (rig.home / "state" / "merges_frozen.json").write_bytes(b"\x00\xff not json")
+    out = rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                          "method": "squash", "wander": False}, NOW)
+    assert out != "ok" and "never judged against" in out, out
+    assert [m for m in mutations(rig) if m["kind"] == "merge_pr"] == []
+
+
+def test_an_unfrozen_mainline_merges_exactly_as_before(rig, monkeypatch):
+    """The re-read costs the ordinary path nothing: no marker on disk, no change in behaviour."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    assert not (rig.home / "state" / "merges_frozen.json").exists()
+    out = rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                          "method": "squash", "wander": False}, NOW)
+    assert out == "ok"
+    assert issue_state(rig, "i5")["status"] == "merged"
+
+
+def test_the_journaled_merge_line_carries_the_gates_rationale(rig, monkeypatch):
+    """Issue #403's second half: `_journal_outcome` writes the act verbatim, so whatever rationale
+    the gate put on the act is what an operator reads back. An exempt merge's line must NAME the
+    standing rule — a merge landing while the mainline is frozen is the one record nobody should
+    have to infer."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _freeze_marker(rig)
+    act = {"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash", "wander": False,
+           "freeze_exempt": True,
+           "reason": "gate green: PR + report + review evidence + checks + mergeable (merges are "
+                     "frozen, and this is the standing-rule restore-green fix "
+                     f"`{runner_mod.gate.RESTORE_GREEN_LABEL}`)"}
+    rig.r._journal_outcome(act, rig.r._execute(act, NOW), NOW)
+    line = [r for r in journal.read(str(rig.home)) if r.get("act") == "merge"][-1]
+    assert line["outcome"] == "ok"
+    assert runner_mod.gate.RESTORE_GREEN_LABEL in line["reason"]
+
+
 def test_merge_failure_retries_next_tick(rig, monkeypatch):
     seed_issue(rig, "i5", status="gating")
     monkeypatch.setenv("GH_FAIL", "1")

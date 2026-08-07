@@ -4101,8 +4101,61 @@ class Runner:
             return f"{why} — nudge spent, gate parks next pass"
         return f"nudge rc={rc} (retrying next tick)"
 
+    def _freeze_holds_merge(self, a):
+        """Re-read the freeze marker at EXECUTION time and decide whether this merge may still land
+        (issue #403). Returns the hold's outcome string, or None to proceed.
+
+        The tick snapshots `merges_frozen.json` ONCE, in `disk_view`, before decide runs — and a
+        `freeze` act emitted by that same decide does not refresh the snapshot. Safety acts execute
+        first (decide's own ordering), so on the exact tick a freeze BEGINS the marker is already on
+        disk while every merge behind it is still carrying a verdict the gate reached against a
+        mainline that read green. Step 4 of the gate never even ran on this PR. Without this re-read
+        the loop merges into a mainline it froze moments earlier, in the same tick that texts
+        "merges frozen" — the record shows a merge under a freeze that nothing explains.
+
+        The rule is deliberately COARSE and fail-closed: a marker on disk holds the merge unless the
+        gate positively judged this PR exempt against that same marker. It does not try to salvage
+        the tick by re-deciding — decide is where merges are decided, and next tick's snapshot
+        contains the marker, so ordinary work holds (gate step 4) and the standing-rule restore-green
+        fix crosses (#295) by the ordinary route, judged rather than guessed.
+
+        The exemption is re-verified, not merely trusted. `freeze_exempt` on the act encodes BOTH
+        halves of gate.freeze_exempt — the issue carried the standing-rule label, and the marker the
+        gate saw was provably dev-check owned — so the label half is settled and the marker half is
+        re-asked against what is on disk NOW, through the gate's own predicate rather than a copy of
+        it. In the runner's own emissions the two can't disagree (`_exec_freeze` fires only when the
+        snapshot showed NO freeze, and no act can be exempt without one), but the nightly writes this
+        marker too, from outside the tick: a nightly freeze landing mid-tick would otherwise be
+        crossed on the strength of a verdict about a different, dev-check marker — exactly the
+        fail-open gate.freeze_exempt exists to refuse.
+
+        Existence = frozen, like everywhere else this marker is read: an unreadable file holds."""
+        frozen = _read_json(os.path.join(self.state, "merges_frozen.json"))
+        if frozen == {}:
+            frozen = {"reason": "merges_frozen.json unreadable"}   # existence = frozen (fail closed)
+        if not frozen:
+            return None
+        # `freeze_exempt is True` IS the gate's finding that this issue carries the standing-rule
+        # label, so that half is settled and passed straight back in; the marker half is re-asked
+        # against the file as it stands now.
+        gate_found_the_standing_rule_label = a.get("freeze_exempt") is True
+        if gate_found_the_standing_rule_label and gate.freeze_exempt(
+                frozen, gate_found_the_standing_rule_label):
+            return None
+        # One wording for both routes, because both are the same fact: the marker standing NOW is
+        # not the one this decision was made against. A freeze that began mid-tick is the common
+        # case; a marker the nightly rewrote mid-tick is the rare one.
+        return ("held: merges frozen by a marker this merge was never judged against (it landed "
+                "after this tick's snapshot) — re-deciding next tick under the marker")
+
     def _exec_merge(self, a, now):
         iid, num, pr = a["id"], a.get("num"), a.get("pr")
+        # (#403) The freeze this very tick may have written is invisible to the decision that
+        # produced this act. Ask the disk before touching GitHub. No counter is charged: nothing
+        # refused anything, so the #27 refusal cap must not be spent holding our own merge.
+        held = self._freeze_holds_merge(a)
+        if held:
+            return held
         ok, reason = gh.merge_pr(pr, a.get("method", "squash"), head_oid=a.get("head_oid"))
         if not ok:
             # GitHub REFUSED the merge of a gate-green PR — ordinary branch protection (required

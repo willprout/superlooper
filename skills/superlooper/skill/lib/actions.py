@@ -2111,11 +2111,27 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     continue
                 method = cfg.get("merge_method")
                 method = method if method in ("squash", "merge", "rebase") else "squash"
+                # (#403) The gate's RATIONALE rides out on the act. _journal_outcome writes the act
+                # verbatim, so `reason` is the whole of what an operator reads back about why a
+                # merge happened — and until now every merge line carried none of it. The exempt
+                # case is what forced the issue: a restore-green PR crossing its own freeze (#295)
+                # journalled indistinguishably from an ordinary merge, so the record showed an
+                # unexplained merge under a freeze. Carried verbatim from the gate, never
+                # re-asserted here, so the journal and the decision cannot come to say different
+                # things.
                 # head_oid pins the merge to the commit this decision actually judged (#154): the
                 # review verdict was matched against THIS head, so the merge must land on it or be
                 # refused — never on whatever the branch grew since the last poll.
                 merge_act = {"act": "merge", "id": iid, "num": num, "pr": pv.get("number"),
-                             "method": method, "head_oid": head, "wander": wander}
+                             "method": method, "head_oid": head, "wander": wander,
+                             "reason": g.get("reason")}
+                if g.get("freeze_exempt") is True:
+                    # (#403) The FLAG, beside the prose: the merge executor re-reads the freeze
+                    # marker at execution time (a freeze emitted THIS tick is invisible to the
+                    # snapshot this decision rests on) and this is what tells it the gate genuinely
+                    # judged this PR against a freeze rather than never having seen one. The
+                    # executor must never re-derive the exemption — the gate owns it.
+                    merge_act["freeze_exempt"] = True
                 if g.get("referee_preauthorized") is True:
                     # (#165) Carry the owner's pre-authorization onto the ACT. The gate already
                     # decided it; the executor must never re-derive it. Without this the journal
