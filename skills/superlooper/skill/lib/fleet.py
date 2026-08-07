@@ -825,6 +825,12 @@ def check_host_binary(probe, fleet_prefix):
     # message, compiled into the binary. Verified to discriminate: 1 occurrence in the built
     # binary, 0 in the stock release. `host fence` proves the running server; this proves the file,
     # which is what a `--force`-less rebuild or a hand-copied binary would otherwise slip past.
+    #
+    # What it CANNOT discriminate — stated here because a reader would otherwise reasonably assume
+    # it does — is WHICH GENERATION of the patch the file carries. The fence as first built (#305)
+    # and the fence carrying the state-report allowance (#331) compile the same refusal message, so
+    # this block is green for both and the second's absence is invisible on disk. `host state
+    # capture` is the block that tells them apart, and it can only do it by asking the socket.
     fenced = probe.contains(path, FENCE_SIGNATURE)
     if fenced is None:
         return CheckResult(name, False,
@@ -992,6 +998,103 @@ def check_fence(socket, fence=None):
         name, False,
         "%s did not answer — silence is UNREACHABLE, never proof of a fence (c2)" % socket,
         "start the server: `superlooper fleet --install`, then check the log under the fleet prefix")
+
+
+# The rebuild this block sends a machine to, and the flag is load-bearing: `build.sh` is idempotent
+# by design — an installed binary already reporting the pinned version is LEFT ALONE — so a host
+# built before the allowance is at the pin, and re-running the build without `--force` changes
+# nothing while looking like it did. A patch change is a rebuild trigger exactly as a version bump
+# is (vendor/herdr/README.md).
+_REBUILD_FIX = ("rebuild the host from the CURRENT carried patch: `vendor/herdr/build.sh --force` "
+                "(without --force it leaves an installed binary at the pin alone, which is what "
+                "this host already is), then `superlooper fleet --install --load` to restart the "
+                "server on it")
+_UNMEASURED_FIX = ("start or repair the server — `superlooper fleet --install --load`, then read "
+                   "the log under the fleet prefix — and re-run this. Nothing was measured, so "
+                   "nothing here says the host needs rebuilding")
+
+
+def check_state_capture(socket, capture=None, fence=None):
+    """`host state capture` — the fence admits the ONE method the ruling opened (issue #331).
+
+    A DIFFERENT fact from `host fence`, and the one nothing on this machine's filesystem can
+    answer. Two generations of the host binary exist — the fence as first built (#305), and the
+    fence carrying the owner's 2026-08-04 state-report allowance (#331) — and `host binary` is
+    green for BOTH: they report the same version and carry the same compiled-in refusal message,
+    which is the signature that block reads. From the runner's seat they are the same machine too,
+    because sessions launch, run and work under either. The difference is that under the first one
+    no worker's session id is ever captured, so a headless restart brings the pane back as a bare
+    shell — measured, with its A/B control, in #311's root-cause comment.
+
+    So this block asks the SOCKET, exactly as the vendor's hook script in a worker pane would, and
+    takes no filesystem probe at all: there is nothing on disk it could be tempted to read instead.
+
+    The two probes are read together, the way `doctor --stack`'s block of the same name does, and
+    for the same reason — ADMITTED alone is not the allowance, because a host with no fence admits
+    everything. What is shared with that block is the PROBE (`session_host.state_report_probe`),
+    never a second copy of it; the block itself is separate because the two judges resolve their
+    socket differently. The doctor asks the host's own resolution order about whatever session this
+    machine's environment names; the build-up asks about the fleet's named session specifically —
+    the same socket `host fence` two lines up judged.
+
+    It asks that fence question ITSELF — once, and only when the report was admitted — rather than
+    being handed the neighbouring block's answer. The block has to stand alone (its own tests, and
+    any later caller), and a seam that took only a capture verdict would let a caller hand it half
+    a measurement, which is the shape of the failure this issue closes. The cost is one extra local
+    round trip on the good path.
+    """
+    name = "host state capture"
+    verdict = (capture or session_host.state_report_probe)(socket)
+    if verdict == session_host.REFUSED:
+        return CheckResult(
+            name, False,
+            "%s refused the state report (%s) from a tokenless caller, so no worker's session id "
+            "is ever captured on this host and a crashed pane comes back as a bare shell. Nothing "
+            "about this looks broken from the runner's seat — the sessions launch, run and work, "
+            "and the binary reports the pin. What is missing is the host-side second layer; the "
+            "loop's own --session-id/--resume floor is unaffected" % (socket,
+                                                                     session_host.
+                                                                     STATE_REPORT_METHOD),
+            _REBUILD_FIX)
+    if verdict != session_host.ADMITTED:
+        # Not a warn, and not the rebuild fix either. This is a build-up gate: "the question went
+        # unanswered" may never read as ready (c2, as `host login item` says at more length) — and
+        # sending an operator to rebuild a host on the strength of a question nothing answered
+        # would be the same unmeasured certification this block exists to end, pointing the other
+        # way.
+        return CheckResult(
+            name, False,
+            "%s did not answer the state-report probe, or answered something that is neither a "
+            "refusal nor a served request, so whether a worker's session id would be captured here "
+            "is unknown — and unknown is not health (c2)" % socket,
+            _UNMEASURED_FIX)
+    posture = (fence or session_host.fence_probe)(socket)
+    if posture == session_host.FENCED:
+        # Says what was PROVEN and not a word more (the same restraint as the doctor's block): the
+        # report can cross the fence on this machine. Whether the hook that fires it is installed
+        # is `doctor --stack`'s `host state hook` question, and a line here that claimed "ids are
+        # being captured" would be answering it without having asked.
+        return CheckResult(
+            name, True,
+            "%s is fenced and admits the state report (%s) from a tokenless caller — so this host "
+            "carries the ruled allowance, and a worker's session-id report can cross the fence "
+            "here" % (socket, session_host.STATE_REPORT_METHOD))
+    if posture == session_host.OPEN:
+        return CheckResult(
+            name, False,
+            "%s admitted the state report (%s) — but it also SERVED a tokenless caller asking for "
+            "something else, so it has no fence and admitting the report proves nothing about the "
+            "allowance. `host fence` above is the failure to fix first; this line stays red until "
+            "there is a fence for the hole to be in" % (socket, session_host.STATE_REPORT_METHOD),
+            "fix `host fence` first — a patched build running with its token — then re-run; this "
+            "block cannot judge an allowance on a socket that admits everyone")
+    return CheckResult(
+        name, False,
+        "%s admitted the state report (%s), but the fence question went unanswered — so whether it "
+        "was admitted by the ruled allowance or by a host that admits everyone cannot be told "
+        "apart, and absence of signal is not health (c2)" % (socket,
+                                                             session_host.STATE_REPORT_METHOD),
+        _UNMEASURED_FIX)
 
 
 def check_launch_gate(probe, fleet_prefix, env=None):
@@ -1265,7 +1368,8 @@ def check_isolation(probe, fleet_prefix, host_config_dir):
 
 
 def check_fleet(probe, state_base, host_config_dir=None, fleet_config_dir=None, uid=None,
-                home=None, fence=None, live_manifest_version=None, agent=DEFAULT_AGENT):
+                home=None, fence=None, live_manifest_version=None, agent=DEFAULT_AGENT,
+                capture=None):
     """Every block, in the order a build-up goes wrong.
 
     Binary before login item before fence before config: each one is upstream of the next, and a
@@ -1276,10 +1380,20 @@ def check_fleet(probe, state_base, host_config_dir=None, fleet_config_dir=None, 
     uid = os.getuid() if uid is None else uid
     fleet_prefix = prefix(state_base)
     claude = stack_doctor.resolve_claude(probe)
+    # ONE socket for both socket blocks, derived once. `host fence` and `host state capture` are
+    # two questions about the same server, and a report in which they could describe two different
+    # sockets would be a report about two machines.
+    socket = socket_path(host_config_dir)
     return [
         check_host_binary(probe, fleet_prefix),
         check_login_item(probe, uid, home, fleet_prefix=fleet_prefix),
-        check_fence(socket_path(host_config_dir), fence=fence),
+        check_fence(socket, fence=fence),
+        # The hole in the fence the block above just judged (issues #331, #344). Separate because
+        # the two states it tells apart are invisible to every other block here: `host binary` is
+        # green for a host built before the allowance AND for one carrying it — same version, same
+        # compiled-in refusal string — and the machine works either way, silently capturing no
+        # session ids under the first. A judge that never asked was certifying that.
+        check_state_capture(socket, capture=capture, fence=fence),
         # Downstream of the socket it guards (issue #355), and never merged into it: `host fence`
         # is a fact about the server, this is a fact about every launch made on this machine, and
         # #326 shipped exactly the machine where the first was green and the second was inert.

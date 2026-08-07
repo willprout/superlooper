@@ -219,6 +219,32 @@ reads like a broken toolchain rather than a missing shim. Resolve the toolchain'
 `zig@0.15` must be on `PATH` if the link step needs it (`brew install zig@0.15`; Homebrew's own
 formula prepends it).
 
+## What triggers a rebuild — the version is only half of it
+
+**A change to THIS PATCH is a rebuild trigger, exactly as a version bump is.** The two are one rule
+in the same sentence because the machine cannot tell them apart afterwards, and one of them has
+already been missed: #331 added the state-report allowance to the patch at an unchanged pin, so the
+fleet mini kept running a v0.8.0 binary built before it — captured no session ids, and looked
+perfectly healthy doing it (#311).
+
+`build.sh` will not fix that by itself, and this is the trap: it is **idempotent on the version**,
+so an installed binary already reporting the pinned version is left alone. After editing the patch,
+the rebuild is
+
+```sh
+skills/superlooper/vendor/herdr/build.sh --force     # --force, or nothing happens
+superlooper fleet --install --load                   # restart the server on the new binary
+superlooper fleet                                    # `host state capture` says which build is live
+```
+
+and step 4 of the procedure below (the negative test against the built binary) is re-run for a
+patch change for the same reason it is re-run for a bump: the property changed.
+
+Nothing on the filesystem records which generation of the patch a binary was built from — same
+version string, same compiled-in refusal message — so the live socket is the only witness, which is
+what the two probes at the end of this file and the `host state capture` blocks in
+`superlooper fleet` and `doctor --stack` exist to ask.
+
 ## Re-applying at a version bump — the deliberate-event rule
 
 **Every upgrade re-runs this verification. A bump that skips it is a bump that may have silently
@@ -274,8 +300,11 @@ would ask), and both treat silence as `UNREACHABLE` rather than as safety:
   so the host's own handler refuses it before touching state, and being refused *by the handler* is
   precisely the evidence that it got past the fence.
 
-`doctor --stack`'s `host state capture` block reads the two together, which is the only way to tell
-a fenced host with a working capture from one that admits the report because it admits everything.
+Both judges read the two together — `doctor --stack`'s `host state capture` block and, since #344,
+the `host state capture` block in `superlooper fleet` — which is the only way to tell a fenced host
+with a working capture from one that admits the report because it admits everything. The build-up
+judge asks about the **fleet's** named session specifically, the same socket its `host fence` line
+judged; the doctor asks about whatever session the machine's environment names.
 
 ## Not done here — the pre-flight is not yet wired
 
