@@ -1213,6 +1213,72 @@ def test_run_fails_hard_when_no_pane_and_not_in_cmux(rig):
     assert "cmux tab" in (r.stdout + r.stderr).lower()
 
 
+# ------------- run refuses a repo whose merge gate would require NO checks (issue #401) -------------
+# The gate folds an EMPTY required list to vacuously GREEN by design (§C.4 step 5), so a runner
+# booted against a fresh or mis-edited config merges every PR with no CI requirement at all —
+# silently, every light green. doctor has always failed hard on this, but nothing forces
+# adopt -> doctor -> run, so the same D7 rule ("a runner that starts wrong is worse than one that
+# never starts") applies at the doorway a runner actually comes through.
+
+def _write_config(rig, **over):
+    cfg = {"version": 1, "repo": "o/r", "required_checks": ["review/local-gate", "quality-gate"]}
+    cfg.update(over)
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(cfg))
+
+
+def test_run_refuses_to_start_when_required_checks_is_empty(rig):
+    _write_config(rig, required_checks=[])
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "FATAL" in out
+    # the three things the refusal must teach: the key, the consequence, the remedy
+    assert "required_checks" in out
+    assert "no ci requirement" in out.lower()
+    assert "superlooper doctor" in out
+    # and it never started: the loop's own heartbeat is the proof
+    assert not (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+
+
+def test_run_refuses_when_the_object_form_leaves_the_pr_set_empty(rig):
+    # `required_checks` may be split by surface (issue #52). An empty DEV set is legitimate (a repo
+    # whose CI runs on PRs only); an empty PR set is the vacuous-green hole. Judging through
+    # config.pr_required_checks — the accessor the gate itself consumes — is what makes this true
+    # by construction rather than by a second, drifting emptiness test.
+    _write_config(rig, required_checks={"pr": [], "dev": ["quality-gate"]})
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode != 0
+    assert "required_checks" in (r.stdout + r.stderr)
+    assert not (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+
+
+def test_run_starts_normally_when_the_object_form_names_a_pr_check(rig):
+    # The other half of the same accessor: a non-empty PR set boots, and an empty DEV set beside it
+    # is NOT a refusal — the freeze mechanism simply idles (config.dev_required_checks).
+    _write_config(rig, required_checks={"pr": ["quality-gate"], "dev": []})
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
+
+
+def test_an_empty_required_checks_config_still_loads_while_run_refuses_it(rig):
+    # Both halves in ONE test, because they are one decision: the loader deliberately keeps an empty
+    # `required_checks` LOADABLE so a freshly-adopted stub can be inspected — doctor reaches its own
+    # hard fail, which it could not do if load() rejected the file — and `run` is what refuses to
+    # boot on it. Tightening the loader instead would break adopt/doctor on the very repo they exist
+    # to fix; this pins that split so a later "fix" cannot quietly close it at the wrong layer.
+    _write_config(rig, required_checks=[])
+    d = cli(rig, "doctor", "--repo", str(rig.repo))
+    assert "ok   config" in d.stdout, d.stdout + d.stderr        # the file LOADED
+    assert "required_checks" in d.stdout and d.returncode != 0   # ...and doctor still fails on it
+    r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
+            env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
+    assert r.returncode != 0 and "FATAL" in (r.stdout + r.stderr)
+
+
 # ------------- request-restart: the command-center Restart button's shell (issue #116) -------------
 
 def _state_dir(rig):

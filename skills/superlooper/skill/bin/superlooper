@@ -889,6 +889,33 @@ def cmd_run(args):
     # unit test or a one-shot CLI command must not silently acquire a machine's launch posture.
     _arm_machine_env()
     cfg = _load_config(args.repo)
+    # The D7 rule below, aimed at the MERGE gate instead of the launch channel (issue #401). §C.4
+    # step 5 folds an EMPTY required list to vacuously GREEN — a deliberate design this does not
+    # reopen — so a runner booted against a fresh or mis-edited config merges every PR it opens with
+    # no CI requirement at all: silently, with every light green. `doctor` has always failed hard on
+    # this, but nothing FORCES the adopt -> doctor -> run sequence, and a voluntary preflight is a
+    # step somebody skips exactly once. So the refusal sits at the doorway a runner actually comes
+    # through (#215/#225: enforce at the moment of the mistake, never teach in a brief what a gate
+    # can refuse) — and ABOVE the runner_home fork below, so BOTH homes refuse by construction
+    # rather than by two copies somebody arms one of.
+    #
+    # Judged through the accessor the GATE ITSELF consumes, never a re-read of the raw key:
+    # `required_checks` is either a flat list or {"pr": [...], "dev": [...]}, and only the PR set
+    # gates merges (an empty DEV set is a legitimate choice — a repo whose CI runs on PRs only).
+    # Asking config.pr_required_checks covers both forms by construction and cannot drift away from
+    # what the gate actually requires. The loader still ACCEPTS an empty list, on purpose: a
+    # freshly-adopted stub must load or adopt/doctor could not inspect the very repo they exist to
+    # fix. Loadable, not runnable.
+    if not config_lib.pr_required_checks(cfg):
+        repo_path = os.path.abspath(args.repo)
+        print("FATAL: `required_checks` is EMPTY — this repo's merge gate would require no CI "
+              "check, so every PR this loop opens would merge with NO CI requirement behind it "
+              "(an empty required set is vacuously green at the gate, by design).", file=sys.stderr)
+        print("Name at least one CI check that runs this repo's tests in `required_checks` (%s), "
+              "then: superlooper doctor --repo %s"
+              % (os.path.join(repo_path, ".superlooper", "config.json"), repo_path),
+              file=sys.stderr)
+        return 2
     fetch_usage = None
     fake = os.environ.get("SL_FAKE_USAGE")
     if fake:

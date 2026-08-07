@@ -782,8 +782,10 @@ def required_checks_state(status_rollup, required) -> str:
     """§C.4 step 5: fold the PR's check rollup down to the REQUIRED checks' joint state:
     'fail' (any required check failed — beats pending), 'pending' (any required check missing
     or still running, or the rollup/required list is unreadable — fail closed: WAIT, never
-    merge on a half-read rollup), else 'green'. An EMPTY required list is vacuously green here;
-    doctor fails hard on it at adopt time (cross-review C3).
+    merge on a half-read rollup), else 'green'. An EMPTY required list is vacuously green here —
+    two doorways keep a live repo from ever reaching this function in that state: `doctor` fails
+    hard on it at adopt time (cross-review C3), and `superlooper run` REFUSES TO BOOT against it
+    (issue #401), because nothing forces the adopt -> doctor -> run sequence.
 
     Each required name is judged by its LATEST run only — a superseded failure riding the same
     head commit no longer outvotes the green that replaced it (issue #402). _rollup_entries owns
