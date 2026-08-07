@@ -616,14 +616,18 @@ def standing_holds(issues_state, journal_records=None):
             v = ist.get(stamp)
             if not v:
                 continue
-            if act == "launch_hold" and isinstance(v, str) and v.startswith(_LANE_BOUND_PREFIX):
-                continue                       # an all-clear stamp, not a hold (see the constant)
             # `launch_hold_reason` IS the prose; the other two stamps carry none, so their reason
             # comes from the journal. A wrong-typed stamp falls through to the same lookup rather
             # than being rendered raw, and an unrecoverable reason falls back to the family's own
             # prose — the line always says SOMETHING about why, never a bare "held".
             reason = v if stamp_is_reason and isinstance(v, str) and v.strip() \
                 else reasons.get((iid, act))
+            # The all-clear check sits HERE, on the RESOLVED reason, not on the raw stamp: a
+            # wrong-typed `launch_hold_reason` (a truthy list) falls through to the journal
+            # fallback, which would re-supply the very retirement prose the skip exists to catch —
+            # and the line would then read "has been held 3d — this issue is no longer held".
+            if isinstance(reason, str) and reason.startswith(_LANE_BOUND_PREFIX):
+                continue                       # an all-clear, not a hold (see the constant)
             out.append({"id": iid, "num": _iid_num(iid), "kind": act, "tag": tag,
                         "reason": reason.strip() if isinstance(reason, str) and reason.strip()
                         else fallback,

@@ -1332,7 +1332,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         return scheduler.launch_ok(p, closed_nums, bool(frozen), usage_sched, resume=resume,
                                    config=cfg)
 
-    def launch_hold(iid, num, p, reason=None, relaunch=False):
+    def launch_hold(iid, num, p, reason=None, relaunch=False, all_clear=False):
         """start_ok (or the #159 auth gate) said no: HOLD, legibly — never a silent launch (D8), and
         never a park. This is a WAIT, not a verdict: the retry cap and park semantics are untouched (a
         boundary of #150), the marker/labels stay exactly as they are, and the restart fires on the
@@ -1355,7 +1355,16 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         than this flag, and such a stamp carries no generation either — so the generation half of the
         key already re-journals it once, which re-stamps the flag. Adding `relaunch` to the key on top
         of that would buy nothing and would re-journal a standing hold whose cause never changed —
-        the per-tick spam the stamp exists to prevent."""
+        the per-tick spam the stamp exists to prevent.
+
+        `all_clear` marks the ONE reason this ledger carries that is not a hold at all: #172's
+        lane-bound retirement, which says the gate now PASSES and only scheduling stands in the way.
+        The engine has no clear-the-stamp verb, so it retires a stale stamp by OVERWRITING it — which
+        makes this an EPISODE BOUNDARY the age clock has to observe. Without the flag the clock
+        started by the hold being retired would be preserved straight through the all-clear and then
+        inherited by the next, unrelated hold: a minutes-old refusal reported as "held 3d" and
+        alerted as a stall. The flag travels to the executor, which ENDS the clock rather than
+        starting one."""
         reason = reason if isinstance(reason, str) and reason \
             else _launch_gate_reason(p, closed_nums, usage_sched, config=cfg,
                                      closed_read_ok=closed_read_ok)
@@ -1364,7 +1373,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 and ist.get("launch_hold_generation") == hold_generation:
             return
         out.append({"act": "launch_hold", "id": iid, "num": num, "reason": reason,
-                    "relaunch": relaunch, "generation": hold_generation})
+                    "relaunch": relaunch, "generation": hold_generation, "all_clear": all_clear})
 
     # ---- launch-anchor liveness (issue #24): a dead launch anchor must never walk the queue ----
     # The runner launches every worker as a cmux tab in ONE pane (the anchor). When that pane stops
@@ -2830,7 +2839,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # "said once" property holds — but the moment the gate starts refusing again
                     # (the dependency re-opens, the meter dies, a label goes ambiguous) the branch
                     # below re-derives and the false all-clear is replaced.
-                    launch_hold(cid, c.get("num"), c, reason=_LANE_BOUND_AFTER_UNLANDED_READ)
+                    launch_hold(cid, c.get("num"), c, all_clear=True,
+                                reason=_LANE_BOUND_AFTER_UNLANDED_READ)
                 continue
             reason = _launch_gate_reason(c, closed_nums, usage_sched, config=cfg,
                                          closed_read_ok=closed_read_ok)

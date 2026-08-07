@@ -528,6 +528,22 @@ def test_the_all_clear_prefix_tracks_the_engines_own():
     assert _retirement_stamp().startswith(report._LANE_BOUND_PREFIX)
 
 
+def test_a_wrong_typed_stamp_cannot_smuggle_the_all_clear_in_through_the_journal():
+    # The skip has to sit on the RESOLVED reason, not the raw stamp: a wrong-typed
+    # `launch_hold_reason` (a truthy list) falls through to the journal fallback, which would
+    # re-supply the retirement prose — and the line would read "has been held 5d — this issue is
+    # no longer held by the eligibility gate at all", with a STALL alert on top of it.
+    now = 1_000_000
+    state = _held_state(i50={"status": "ready", "launch_hold_reason": ["nope"],
+                             "launch_hold_since": now - 5 * DAY})
+    j = [_rec(now - 5 * DAY, "launch_hold", id="i50", num=50, reason=_retirement_stamp(),
+              outcome="ok")]
+    assert report.standing_holds(state, j) == []
+    out = report.morning(j, _view(now=now, queue=[], issues_state=state), ledger={}, config=_cfg())
+    assert "None — nothing is held." in out.split("## Standing holds")[1]
+    assert "STALL" not in out
+
+
 def test_an_unlanded_read_hold_IS_still_listed():
     # The mirror: only the RETIREMENT is an all-clear. The unlanded-read hold it replaces is a real
     # hold and must still be reported.

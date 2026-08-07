@@ -204,6 +204,48 @@ def test_an_engine_generation_is_unique_per_process(rig):
 
 # =================== the age clock, stamped where the hold is stamped ===================
 
+def test_the_all_clear_ENDS_the_age_clock_rather_than_preserving_it(rig):
+    # #172 has no clear-the-stamp verb: it retires a stale hold by OVERWRITING it with prose that
+    # says the gate now passes. That is an episode BOUNDARY, and the clock has to observe it —
+    # otherwise the retired hold's clock survives the all-clear and is inherited by the next,
+    # unrelated hold, which the report would then call days old and alert as a stall on its first
+    # minute. (The report already refuses to LIST an all-clear; this is the other half.)
+    import actions
+    rig.r._exec_launch_hold({"id": "i101", "num": 101, "reason": "waiting on #3"}, NOW - 3 * DAY)
+    rig.r._exec_launch_hold({"id": "i101", "num": 101, "all_clear": True,
+                             "reason": actions._LANE_BOUND_AFTER_UNLANDED_READ}, NOW - 3 * DAY + 300)
+    assert state_of(rig)["launch_hold_since"] is None
+    # ...so a genuinely NEW hold three days later is timed from ITSELF, not from the retired one.
+    rig.r._exec_launch_hold({"id": "i101", "num": 101, "reason": "no usage headroom"}, NOW)
+    ist = state_of(rig)
+    assert ist["launch_hold_since"] == NOW
+    assert report.standing_holds({"version": 1, "issues": {"i101": ist}})[0]["since"] == NOW
+
+
+def test_decide_flags_the_all_clear_and_nothing_else(rig):
+    # The flag must ride the ONE reason that is an all-clear. Asked of decide itself, so a future
+    # edit that re-words the retirement without tagging it is caught here rather than by an owner
+    # reading "held 3d" on a minute-old hold.
+    import actions
+    said = [a for a in actions.decide(
+        NOW, make_config(), {"auth_status": "ok", "five_hour_pct": 10.0, "seven_day_pct": 20.0,
+                             "last_ok_at": NOW, "first_attempt_at": NOW - 60},
+        [{"num": 5, "id": "i5", "title": "t", "type": "build",
+          "labels": ["agent-ready", "type:build"], "touches": ["frontend"], "blocked_by": [3],
+          "parent": None, "created_at": "2026-07-01T00:00:05Z", "priority": 2, "expedite": False}],
+        [], [],
+        {"issues_state": {"version": 1, "issues": {}}, "blocked": {}, "reports": {}, "exited": {},
+         "frozen": None, "alert": None, "live_lock_ids": set(), "filed_fingerprints": {},
+         "settled_fix_issues": {}, "local_date": "2026-07-02", "local_hhmm": "12:00",
+         "last_report_date": "2026-07-02"},
+        {"stale": False, "consecutive_failures": 0, "closed_nums": set(), "closed_read_ok": False,
+         "prs": {}, "issue_comments": {}, "dev_checks": []})
+        if a.get("act") == "launch_hold"]
+    # A REAL hold (the unlanded closed read) is never flagged as an all-clear.
+    assert len(said) == 1 and said[0]["all_clear"] is False
+    assert said[0]["reason"].startswith(actions.UNLANDED_CLOSED_READ_PREFIX)
+
+
 def test_a_launch_hold_stamps_its_reason_its_clock_and_whether_a_worker_died(rig):
     rig.r._exec_launch_hold({"act": "launch_hold", "id": "i101", "num": 101,
                              "reason": "no usage headroom", "relaunch": True}, NOW)

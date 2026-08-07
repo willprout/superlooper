@@ -1174,9 +1174,14 @@ class Runner:
             executors and cleared together at the five points a hold genuinely ends.
 
         `time.time()` + pid, because two live runners cannot share a pid and a restart cannot reuse a
-        second. A re-exec PRESERVES the pid (that is how the runner keeps its tab), so a re-exec
-        inside the same second mints the same token and skips one re-announce — of a hold that was
-        journaled seconds earlier, which is the harmless direction."""
+        second. Two known imperfections, both bounded and both in the harmless direction:
+
+          * a re-exec PRESERVES the pid (that is how the runner keeps its tab), so a re-exec inside
+            the same second mints the same token and SKIPS one re-announce — of a hold that was
+            journaled seconds earlier;
+          * two runners against ONE state home would alternate tokens and re-journal every tick,
+            from both. The pidfile singleton is what prevents that, and it is the same guarantee
+            every other per-tick write in this runner already rests on."""
         now = time.time() if now is None else now
         return "%d.%d" % (int(now), os.getpid())
 
@@ -4129,10 +4134,17 @@ class Runner:
         status and reads as a live flight to everything downstream, while the runner is deliberately
         waiting for quota. Written on EVERY hold, never conditionally, so it can never survive from a
         prior episode into one where it is false."""
+        # An ALL-CLEAR (#172's lane-bound retirement) is an episode END wearing this ledger's
+        # clothes: the gate now passes, and only scheduling stands in the way. END the age clock
+        # rather than starting one — otherwise the clock of the hold this retires survives the
+        # all-clear and is inherited by the NEXT, unrelated hold, which would then be reported as
+        # days old and alerted as a stall on its first minute (fresh-review P1-A).
+        all_clear = bool(a.get("all_clear"))
         self._update_issue(a["id"], {"launch_hold_reason": a.get("reason"),
                                      "launch_hold_generation": a.get("generation"),
                                      "relaunch_held": bool(a.get("relaunch"))},
-                           fn=lambda st, i: self._start_hold_clock(i, "launch_hold_since", now))
+                           fn=lambda st, i: i.update({"launch_hold_since": None}) if all_clear
+                           else self._start_hold_clock(i, "launch_hold_since", now))
         return a.get("reason", "launch held by the eligibility gate")
 
     def _exec_hold(self, a, now):
