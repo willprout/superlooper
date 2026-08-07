@@ -94,100 +94,112 @@ def acts(rig, act):
     return [r for r in journal.read(str(rig.home)) if r.get("act") == act]
 
 
-# =================== the boot re-announce (one hold, one engine generation) ===================
+# =================== the re-announce (one hold, one engine generation) ===================
 
-def test_boot_clears_every_hold_dedup_stamp_so_the_next_tick_re_journals(rig):
-    write_state(rig, {"i101": {"status": "ready", "launch_hold_reason": "waiting on #3"},
-                      "i102": {"status": "ready", "wildcard_hold_journaled": True},
-                      "i103": {"status": "ready", "queue_invalid_signature": "sig-1"}})
-    assert rig.r._rearm_hold_journaling(now=NOW) == ["i101", "i102", "i103"]
-    st = json.loads((rig.home / "state" / "issues.json").read_text())["issues"]
-    assert st["i101"]["launch_hold_reason"] is None
-    assert st["i102"]["wildcard_hold_journaled"] is False
-    assert st["i103"]["queue_invalid_signature"] is None
-    # ...and it is on the record that the loop re-armed, not that the holds simply vanished.
-    assert acts(rig, "hold_rearm")[0]["issues"] == ["i101", "i102", "i103"]
-
-
-def test_the_re_announce_preserves_the_age_of_a_hold_it_re_arms(rig):
-    # THE trap: a hold that re-announces every boot but restarts its clock every boot can never be
-    # older than one boot, so the age alert could never fire on the very stall it exists to catch.
-    write_state(rig, {"i101": {"status": "ready", "launch_hold_reason": "waiting on #3",
-                               "launch_hold_since": NOW - 3 * DAY}})
-    rig.r._rearm_hold_journaling(now=NOW)
-    assert state_of(rig)["launch_hold_since"] == NOW - 3 * DAY
-
-
-def test_the_re_announce_backfills_a_clock_a_pre_405_stamp_never_had(rig):
-    # A stamp written by an older engine has no clock at all. Backfill it from THIS boot: the age
-    # then understates how long the hold has really stood, which is the honest direction — the loop
-    # can prove "at least since this boot" and must never invent more than it can prove.
-    write_state(rig, {"i101": {"status": "ready", "launch_hold_reason": "waiting on #3"}})
-    rig.r._rearm_hold_journaling(now=NOW)
-    assert state_of(rig)["launch_hold_since"] == NOW
-
-
-def test_a_terminal_issue_is_not_re_announced(rig):
-    # merged/parked/bounced/needs_william ended the episode: re-announcing a stamp left on one of
-    # those would put history back on the board as a live hold.
-    write_state(rig, {"i101": {"status": "parked", "launch_hold_reason": "waiting on #3"},
-                      "i102": {"status": "merged", "queue_invalid_signature": "sig-1"}})
-    assert rig.r._rearm_hold_journaling(now=NOW) == []
-    assert state_of(rig)["launch_hold_reason"] == "waiting on #3"     # left exactly as it was
-
-
-def test_a_loop_with_nothing_held_re_announces_nothing_and_journals_nothing(rig):
-    write_state(rig, {"i101": {"status": "ready"}})
-    assert rig.r._rearm_hold_journaling(now=NOW) == []
-    assert acts(rig, "hold_rearm") == []
-
-
-def test_the_re_announce_never_aborts_a_boot(rig):
-    # It runs on the boot path, so it must fail like every other diagnostic there: report, never
-    # raise. No issues.json at all (a first-ever boot) and a corrupt one both degrade to a no-op.
-    assert rig.r._rearm_hold_journaling(now=NOW) == []                   # no state file yet
-    (rig.home / "state").mkdir(parents=True, exist_ok=True)
-    (rig.home / "state" / "issues.json").write_text("{{{not json")
-    assert rig.r._rearm_hold_journaling(now=NOW) == []
-    write_state(rig, {"i101": "nope", "i102": 7, "i103": None})          # wrong-typed entries
-    assert rig.r._rearm_hold_journaling(now=NOW) == []
-    loopstate.save(str(rig.home / "state" / "issues.json"), {"version": 1, "issues": "nope"})
-    assert rig.r._rearm_hold_journaling(now=NOW) == []
-
-
-def test_a_standing_hold_re_journals_on_the_first_tick_after_a_boot(tmp_path, monkeypatch):
-    # The DoD, end to end: stamp present -> boot -> the first tick says it again. A worker died
-    # while usage is over ceiling, so the relaunch is held and nothing will move this lane; the hold
-    # was already journaled once in a previous engine generation and its stamp is still on disk.
+def _exited_over_ceiling(tmp_path, monkeypatch, stamp=None, **ist):
+    """A lane whose worker DIED while usage sits over the ceiling — the realized #405 case. Its hold
+    is journal-only, so nothing but the journal and the durable state can ever say it."""
     r = _runner(tmp_path, monkeypatch, usage=OVER_CEILING)
     home = tmp_path / "home"
     (home / "state" / "exited").mkdir(parents=True, exist_ok=True)
     (home / "state" / "exited" / "i101").write_text("100 rc=1 (died)\n")
-    held = ("no usage headroom (the meter is unreadable/unhealthy, or at-or-over a ceiling) — "
-            "the restart waits for quota, exactly as a fresh launch does")
-    loopstate.save(str(home / "state" / "issues.json"),
-                   {"version": 1, "issues": {"i101": {"status": "running", "retries": 0,
-                                                      "launch_hold_reason": held}}})
-    # Without the boot re-announce this tick is SILENT — the stamp already matches the cause.
+    issue = {"status": "running", "retries": 0}
+    if stamp is not None:
+        issue["launch_hold_reason"] = stamp
+    issue.update(ist)
+    loopstate.save(str(home / "state" / "issues.json"), {"version": 1, "issues": {"i101": issue}})
+    return r, home
+
+
+HELD_FOR_QUOTA = ("no usage headroom (the meter is unreadable/unhealthy, or at-or-over a ceiling) — "
+                  "the restart waits for quota, exactly as a fresh launch does")
+
+
+def test_a_standing_hold_re_journals_once_on_the_first_tick_of_a_new_generation(tmp_path, monkeypatch):
+    # THE DoD, end to end: a stamp written by a PREVIOUS engine generation is still on disk, and the
+    # cause has not changed — so under the old reason-only dedup this loop was silent for life.
+    r, home = _exited_over_ceiling(tmp_path, monkeypatch, stamp=HELD_FOR_QUOTA,
+                                   launch_hold_generation="1700000000.999")
     r.tick(now=NOW)
-    assert [a for a in journal.read(str(home)) if a.get("act") == "launch_hold"] == []
-    r._rearm_hold_journaling(now=NOW)
-    r.tick(now=NOW + 15)
     said = [a for a in journal.read(str(home)) if a.get("act") == "launch_hold"]
     assert len(said) == 1 and said[0]["id"] == "i101" and "usage" in said[0]["reason"]
+    # ...and then quiet: ONCE per generation, never per tick. A 15s tick must not be spammed.
+    for i in range(1, 4):
+        r.tick(now=NOW + 15 * i)
+    assert len([a for a in journal.read(str(home)) if a.get("act") == "launch_hold"]) == 1
 
 
-def test_run_re_announces_before_the_first_tick(rig, monkeypatch):
-    # Wiring: the boot path itself calls it, not just a test. Assert on the ORDER — a re-announce
-    # that ran after the first tick would let that tick pass silently, which is the whole defect.
-    write_state(rig, {"i101": {"status": "ready", "launch_hold_reason": "waiting on #3"}})
-    seen = []
-    monkeypatch.setattr(rig.r, "tick", lambda *a, **k: seen.append("tick"))
-    real = rig.r._rearm_hold_journaling
-    monkeypatch.setattr(rig.r, "_rearm_hold_journaling",
-                        lambda *a, **k: (seen.append("rearm"), real(*a, **k))[1])
-    rig.r.run(max_ticks=1, sleep=lambda *_: None)
-    assert seen[:2] == ["rearm", "tick"]
+def test_a_stamp_from_THIS_generation_stays_silent(tmp_path, monkeypatch):
+    # The mirror, and the reason the generation is a KEY rather than a reaper: a hold this process
+    # already announced must not announce again just because the process ticked.
+    r, home = _exited_over_ceiling(tmp_path, monkeypatch)
+    r.tick(now=NOW)                                    # first tick of this generation: says it
+    assert len([a for a in journal.read(str(home)) if a.get("act") == "launch_hold"]) == 1
+    r.tick(now=NOW + 15)
+    assert len([a for a in journal.read(str(home)) if a.get("act") == "launch_hold"]) == 1
+
+
+def test_a_RESTART_is_what_re_arms_the_hold(tmp_path, monkeypatch):
+    # A new process = a new generation = one more announcement. This is the whole mechanism: the
+    # restart is exactly when an operator's model of the loop is rebuilt, and when a republished
+    # engine takes effect.
+    r, home = _exited_over_ceiling(tmp_path, monkeypatch)
+    r.tick(now=NOW)
+    r2 = _runner(tmp_path, monkeypatch, usage=OVER_CEILING)
+    r2._hold_generation = "9999999999.1"               # a genuinely different process
+    r2.tick(now=NOW + 60)
+    assert len([a for a in journal.read(str(home)) if a.get("act") == "launch_hold"]) == 2
+
+
+def test_the_re_announce_never_resets_the_age_of_the_hold_it_re_states(tmp_path, monkeypatch):
+    # THE trap: a hold that re-announces every restart but restarts its clock every restart could
+    # never be older than one restart, so the age alert could never fire on the very stall it exists
+    # to catch. The clock is a separate field precisely so it survives the re-key.
+    r, home = _exited_over_ceiling(tmp_path, monkeypatch, stamp=HELD_FOR_QUOTA,
+                                   launch_hold_generation="old", launch_hold_since=NOW - 3 * DAY)
+    r.tick(now=NOW)
+    ist = json.loads((home / "state" / "issues.json").read_text())["issues"]["i101"]
+    assert ist["launch_hold_since"] == NOW - 3 * DAY
+    assert ist["launch_hold_generation"] == r._hold_generation      # re-keyed to THIS generation
+
+
+def test_a_pre_405_stamp_gains_a_clock_on_its_first_re_announce(tmp_path, monkeypatch):
+    # A stamp written by an engine older than #405 has no clock at all, and no generation either —
+    # which is exactly what makes the generation half of the key re-journal it. The clock then starts
+    # from that tick: the age understates how long the hold really stood, the honest direction.
+    r, home = _exited_over_ceiling(tmp_path, monkeypatch, stamp=HELD_FOR_QUOTA)
+    r.tick(now=NOW)
+    assert json.loads((home / "state" / "issues.json").read_text())["issues"]["i101"][
+        "launch_hold_since"] == NOW
+
+
+def test_a_boot_that_cannot_re_derive_its_holds_never_ERASES_them(tmp_path, monkeypatch):
+    # The reason this re-keys instead of clearing the stamps at boot. Every launch-phase hold lives
+    # behind `not launches_held` — and a SLEEPING DISPLAY is normal overnight — so a 3am resurrection
+    # restart that cleared the stamps would leave the 08:45 report saying "nothing is held" with the
+    # whole queue held: the exact silence this issue exists to end, reintroduced by its own fix.
+    r = _runner(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+    r._display_asleep = lambda: True                   # the overnight condition, held all night
+    loopstate.save(str(home / "state" / "issues.json"),
+                   {"version": 1, "issues": {"i101": {
+                       "status": "ready", "queue_invalid_signature": "sig-1",
+                       "queue_invalid_since": NOW - 3 * DAY, "queue_invalid_generation": "old"}}})
+    r.tick(now=NOW)
+    assert [a for a in journal.read(str(home)) if a.get("act") == "queue_invalid"] == []  # held
+    ist = json.loads((home / "state" / "issues.json").read_text())["issues"]["i101"]
+    assert ist["queue_invalid_signature"] == "sig-1"           # the stamp SURVIVES
+    assert ist["queue_invalid_since"] == NOW - 3 * DAY         # ...and so does its age
+    held = report.standing_holds({"version": 1, "issues": {"i101": ist}})
+    assert len(held) == 1 and held[0]["kind"] == "queue_invalid"
+
+
+def test_an_engine_generation_is_unique_per_process(rig):
+    # Two live runners cannot share a pid, and a restart cannot reuse a second — so the token is
+    # distinct wherever it matters. (A re-exec preserves the pid by design; a re-exec inside the same
+    # second reuses the token and skips one re-announce of a hold journaled seconds earlier.)
+    assert isinstance(rig.r._hold_generation, str) and rig.r._hold_generation
+    assert rig.r._mint_hold_generation(now=NOW) != rig.r._mint_hold_generation(now=NOW + 1)
 
 
 # =================== the age clock, stamped where the hold is stamped ===================

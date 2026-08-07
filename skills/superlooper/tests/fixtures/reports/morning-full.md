@@ -1,6 +1,6 @@
 # superlooper morning report — 2026-07-02
 
-3 merged · 2 parked/needs-owner · 1 bounce(s) · 1 regen(s) · 2 question(s) · queue: 2. **1 standing hold/freeze past 24h — see below.**
+3 merged · 2 parked/needs-owner · 1 bounce(s) · 1 regen(s) · 2 question(s) · queue: 2. **1 standing hold/freeze past its age threshold — see below.**
 
 **#17 (i17) has been held 3d 1h** — no usage headroom (the meter is unreadable/unhealthy, or at-or-over a ceiling) — the restart waits for quota, exactly as a fresh launch does (a hold that old is a STALL, not a wait: nothing in the loop moves it until the cause clears).
 

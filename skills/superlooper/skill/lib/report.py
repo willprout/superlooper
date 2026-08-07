@@ -35,6 +35,17 @@ FREEZE_ALERT_SECONDS = DAY_SECONDS
 # the two together, so they cannot drift apart silently.
 _TERMINAL_STATUSES = frozenset({"merged", "parked", "needs_william", "bounced"})
 
+# A `launch_hold_reason` that begins with this is the ONE stamp whose content says the issue is NOT
+# held: issue #172's retirement prose, written when a previously-unlanded closed-list read has since
+# landed and the gate now PASSES. The engine has no clear-the-stamp verb, so it retires a stale stamp
+# by overwriting it with an honest all-clear — which means a truthy `launch_hold_reason` is not, by
+# itself, evidence of a hold. Listing one would print a self-refuting line ("has been held 1d 6h —
+# this issue is no longer held by the eligibility gate at all"), and an issue merely waiting for lane
+# capacity would raise a STALL alert at 24h. MIRRORS actions._LANE_BOUND_PREFIX, matched on the
+# PREFIX for the reason that constant documents (the tail prose may differ across releases, and a
+# stamp that cannot be recognized cannot be corrected). tests/test_report.py pins the two together.
+_LANE_BOUND_PREFIX = "the closed-issue list read has since LANDED"
+
 # The three durable stamps a standing hold dedups its JOURNALING on (issue #405). Each entry:
 # (stamp, the age clock its executor stamps beside it, the journal act that carries its prose, the
 # short TAG the report line uses, prose to fall back on when no reason can be recovered, and whether
@@ -47,13 +58,20 @@ _TERMINAL_STATUSES = frozenset({"merged", "parked", "needs_william", "bounced"})
 # Only `launch_hold_reason` (#150) carries prose. `wildcard_hold_journaled` (#36) is a bare bool, and
 # `queue_invalid_signature` (#225) is a string but an opaque defect FINGERPRINT — rendering it would
 # put "sig-a1b2" where the owner needs "missing `## Loop metadata`". Both read their reason back from
-# the latest journal record instead; the engine-generation re-announce guarantees one such record per
-# boot, so the lookup is never left reading a stamp whose record predates the journal it can see.
+# the latest journal record instead. The engine-generation re-announce puts one such record in the
+# journal per generation, which covers every restart; a runner whose UPTIME exceeds the journal's own
+# hot-retention window (journal.HOT_RETAIN_SECONDS) can still outlive its record, and that is what
+# the per-family fallback prose below is for — the line then names the family without claiming a
+# specific cause it can no longer read.
 _HOLD_KINDS = (
     ("launch_hold_reason", "launch_hold_since", "launch_hold", "launch",
      "the launch gate refused this start", True),
+    # Deliberately says WHICH SIDE is unknown: scheduler.launch_holds emits when the candidate is the
+    # no-touches wildcard AND when the in-flight lane blocking it is, and with no record to read back
+    # this line cannot tell them apart. Naming one would assert a mechanism that may be the wrong one.
     ("wildcard_hold_journaled", "wildcard_hold_since", "wildcard_hold", "wildcard",
-     "a no-touches wildcard overlaps every lane under hard affinity — the queue serializes", False),
+     "a no-touches wildcard (this issue, or the lane blocking it) overlaps every lane under hard "
+     "affinity — the queue serializes", False),
     ("queue_invalid_signature", "queue_invalid_since", "queue_invalid", "queue contract",
      "the issue fails the mechanical queue contract", False),
 )
@@ -546,7 +564,9 @@ def _hold_reasons(records):
     latest = {}
     for r in records:
         act, iid = r.get("act"), r.get("id")
-        if act not in _HOLD_ACTS or not isinstance(iid, str):
+        # `isinstance` first: a wrong-typed `act` could be an unhashable list, and `x in frozenset`
+        # raises on one — a corrupt journal line must be skipped, never fatal.
+        if not isinstance(act, str) or act not in _HOLD_ACTS or not isinstance(iid, str):
             continue
         ts = _ts(r)
         ts = ts if ts is not None else float("-inf")
@@ -574,9 +594,9 @@ def standing_holds(issues_state, journal_records=None):
     is being reported, and it is what an age is worth alerting on. But nothing clears a stamp when
     only its CAUSE resolves (an issue whose queue-contract defect was fixed, then sat lane-bound,
     still wears the old complaint until it launches); there is deliberately no clear-the-stamp verb
-    in the engine, and inventing one is a policy change this issue's boundaries exclude. What bounds
-    the lag is the engine-generation re-announce: every boot clears the stamps, and the first tick
-    re-derives — so a reason is never older than the current engine generation.
+    in the engine, and inventing one is a policy change this issue's boundaries exclude. The one
+    exception the engine DOES write is #172's lane-bound retirement, whose prose says the issue is
+    not held at all — skipped here, or it would print a self-refuting alert (see _LANE_BOUND_PREFIX).
 
     ``relaunch`` is the fact that makes an exited lane legible: True means the worker DIED and its
     relaunch is what is held, so a surface reading a lane whose status still says `running` can name
@@ -587,12 +607,17 @@ def standing_holds(issues_state, journal_records=None):
     for iid, ist in issues.items():
         if not isinstance(iid, str) or not isinstance(ist, dict):
             continue
-        if ist.get("status") in _TERMINAL_STATUSES:
+        # `isinstance` before the membership test: a wrong-typed status could be an unhashable list,
+        # and `x in frozenset` RAISES on one — the coercion contract has to hold at the lookup too.
+        status = ist.get("status")
+        if isinstance(status, str) and status in _TERMINAL_STATUSES:
             continue
         for stamp, since_key, act, tag, fallback, stamp_is_reason in _HOLD_KINDS:
             v = ist.get(stamp)
             if not v:
                 continue
+            if act == "launch_hold" and isinstance(v, str) and v.startswith(_LANE_BOUND_PREFIX):
+                continue                       # an all-clear stamp, not a hold (see the constant)
             # `launch_hold_reason` IS the prose; the other two stamps carry none, so their reason
             # comes from the journal. A wrong-typed stamp falls through to the same lookup rather
             # than being rendered raw, and an unrecoverable reason falls back to the family's own
@@ -780,9 +805,11 @@ def morning(journal_records, gh_view, ledger, config):
                f"{q_total} question(s) · queue: {len(queue)}.")
     if hold_alerts:
         # The summary line IS the push body, so the count rides the one notification the report
-        # already sends — an aged hold reaches the phone without earning a push of its own.
-        summary += (f" **{len(hold_alerts)} standing hold/freeze past "
-                    f"{HOLD_ALERT_SECONDS // 3600}h — see below.**")
+        # already sends — an aged hold reaches the phone without earning a push of its own. It names
+        # no threshold: the count can mix hold and freeze alerts, which are governed by two constants
+        # that only happen to be equal today, and a single hardcoded number would become a lie the
+        # day they diverge. The alert lines below each state their own age.
+        summary += f" **{len(hold_alerts)} standing hold/freeze past its age threshold — see below.**"
 
     parts = [
         f"# superlooper morning report — {date}\n",

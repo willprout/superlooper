@@ -786,6 +786,11 @@ class Runner:
         # tick ago.
         self._published_titles = None
         self._published_prs = None
+        # This process's ENGINE GENERATION (issue #405) — minted in __init__ rather than in run() so
+        # a tick driven directly (tests, a one-shot diagnostic) carries one too, and so it is fixed
+        # for the whole process: every tick of this runner shares it, which is what makes a standing
+        # hold re-announce exactly ONCE per generation rather than once per tick.
+        self._hold_generation = self._mint_hold_generation()
         self._last_journal_rotate = 0.0     # 0 => the first tick rotates (journal bound, issue #41)
         # Wake-gap detection (issue #42): _last_tick_now is the previous tick's wall-clock (used to
         # spot a resume that landed far past the cadence); _wake_grace_until is the deadline until
@@ -1140,15 +1145,9 @@ class Runner:
             return False
         return True
 
-    # The three durable stamps a standing hold dedups its JOURNALING on, each paired with the age
-    # clock it owns and the value that means "no stamp" for it (issue #405). Kept in one place so a
-    # fourth hold family cannot be added to decide without the re-announce learning about it.
-    _HOLD_STAMPS = (("launch_hold_reason", "launch_hold_since", None),
-                    ("wildcard_hold_journaled", "wildcard_hold_since", False),
-                    ("queue_invalid_signature", "queue_invalid_since", None))
-
-    def _rearm_hold_journaling(self, now=None):
-        """Re-announce every standing hold once per ENGINE GENERATION (issue #405).
+    @staticmethod
+    def _mint_hold_generation(now=None):
+        """The ENGINE GENERATION token this process's ticks carry (issue #405).
 
         Hold conditions are re-derived every tick — that part is right. Their JOURNALING is deduped
         on durable stamps that reset only when the issue launches, parks, or is re-approved, so an
@@ -1157,58 +1156,29 @@ class Runner:
         migration and no stamp reaper either, so an engine update did not break the silence — a
         realized three-day silent hold on the eApp loop, 2026-07-31 -> 08-03.
 
-        Clearing the stamps at boot is the reaper. The first tick then re-derives the same conditions
-        and journals them afresh, which makes "once per lifetime" into "once per engine generation":
-        a restart is exactly the moment an operator's model of the loop is rebuilt, and it is also
-        when a republished engine takes effect. It stays bounded — one line per held issue per boot,
-        journal-only, no notify, no label move, no park — so it can never become the per-tick spam
-        the stamps exist to prevent.
+        This token is the fix, and it works by RE-KEYING rather than reaping. It joins each hold's
+        dedup key, so the first tick of a new process finds every standing stamp keyed to the
+        previous generation, re-journals it once, and then goes quiet again: "once per engine
+        generation" instead of "once per lifetime". A restart is exactly the moment an operator's
+        model of the loop is rebuilt, and it is also when a republished engine takes effect.
 
-        The AGE clock is deliberately NOT cleared, only backfilled when absent: a hold that restarted
-        its clock every boot could never be older than the last boot, and the age alert could never
-        fire on the multi-day stall it exists to catch. A stamp written by an engine older than this
-        one has no clock at all, so it is backfilled from THIS boot — the age then understates how
-        long the hold has really stood, which is the honest direction.
+        Re-keying rather than CLEARING the stamps at boot is load-bearing twice over:
 
-        TERMINAL issues are skipped: their episode ended, so a stamp left on one of them is history,
-        and re-announcing it would put an answered hand-back back on the board as a live hold.
+          * the stamps and their reasons survive, so a boot that cannot re-derive its holds never
+            blanks them. The launch-phase holds live behind `not launches_held` — and a sleeping
+            display is normal overnight — so a 3am resurrection restart that cleared them would have
+            left the 08:45 report saying "nothing is held" with the whole queue held. That is the
+            exact silence this issue exists to end, reintroduced by its own fix;
+          * nothing ever creates a clock without a stamp, so a hold's AGE cannot be orphaned and
+            adopted by a later, unrelated episode. Stamp and clock are written together by the
+            executors and cleared together at the five points a hold genuinely ends.
 
-        Never raises. It runs on the boot path (after the migration gate, before the first tick), so
-        it fails like every other diagnostic there: a missing or corrupt issues.json, or a wrong-typed
-        entry, degrades to a no-op. Returns the ids re-armed (for the journal, and for tests)."""
+        `time.time()` + pid, because two live runners cannot share a pid and a restart cannot reuse a
+        second. A re-exec PRESERVES the pid (that is how the runner keeps its tab), so a re-exec
+        inside the same second mints the same token and skips one re-announce — of a hold that was
+        journaled seconds earlier, which is the harmless direction."""
         now = time.time() if now is None else now
-        rearmed = []
-
-        def m(st):
-            issues = st.get("issues")
-            if not isinstance(issues, dict):
-                return
-            for iid in sorted(k for k in issues if isinstance(k, str)):
-                i = issues.get(iid)
-                if not isinstance(i, dict) or i.get("status") in actions.TERMINAL_STATUSES:
-                    continue
-                held = False
-                for stamp, since, empty in self._HOLD_STAMPS:
-                    if not i.get(stamp):
-                        continue
-                    self._start_hold_clock(i, since, now)   # backfill only; a running clock survives
-                    i[stamp] = empty
-                    held = True
-                if held:
-                    rearmed.append(iid)
-        try:
-            loopstate.update(self.issues_path, m)
-        except Exception as e:                 # no state file yet, corrupt json, a locked home —
-            self._log(f"hold re-announce skipped: {_short_repr(e)}")   # a boot is never aborted
-            return []
-        if rearmed:
-            try:
-                journal.append(self.home, {"act": "hold_rearm", "issues": rearmed,
-                                           "outcome": "ok"}, now)
-            except Exception:
-                pass
-            self._log(f"re-armed hold journaling for {len(rearmed)} issue(s): {', '.join(rearmed)}")
-        return rearmed
+        return "%d.%d" % (int(now), os.getpid())
 
     def _hold_boot_migration(self, failures, now):
         """Hold the boot on a migration that could not be applied (issue #160): write the LEGIBLE
@@ -1343,10 +1313,6 @@ class Runner:
                       "ALERT and the notification. Fix it (check gh auth / re-run `superlooper "
                       "adopt`, both idempotent) and restart the runner.", file=sys.stderr)
                 return 2
-            # Re-announce every standing hold BEFORE the first tick (issue #405): the dedup stamps
-            # are cleared here so that tick re-derives and re-journals them. Order is the whole
-            # point — running it after a tick would let that tick pass silently, which is the defect.
-            self._rearm_hold_journaling()
             while not self.stop and (max_ticks is None or ticks < max_ticks):
                 try:
                     self.tick()
@@ -1929,6 +1895,9 @@ class Runner:
             "exit_receipts": self._exit_receipts(),      # {id: newest mail-consumption ts} (#148/#215)
             "frozen": frozen,
             "alert": alert,
+            # This process's engine generation (#405) — joins each standing hold's journaling dedup
+            # key, so every hold re-announces once per generation instead of once per lifetime.
+            "hold_generation": self._hold_generation,
             "live_lock_ids": self._live_lock_ids(),
             "filed_fingerprints": _read_json(os.path.join(self.state, "fix_issues.json")) or {},
             # {fp: num} settled during THIS red-mainline episode (#294) — the re-arm bound
@@ -3084,11 +3053,13 @@ class Runner:
                                  "wildcard_hold_journaled": False,    # launch ends the hold episode (#36)
                                  "queue_invalid_signature": None,     # ...and the lint complaint (#225)
                                  "launch_hold_reason": None,          # ...and the eligibility hold (#150)
-                                 # ...and every hold's AGE clock + the dead-worker flag with them
-                                 # (#405): a launched lane must not keep reporting a hold that ended
-                                 # at the moment it started.
+                                 # ...and every hold's AGE clock, generation key and the dead-worker
+                                 # flag with them (#405): a launched lane must not keep reporting a
+                                 # hold that ended at the moment it started.
                                  "launch_hold_since": None, "wildcard_hold_since": None,
-                                 "queue_invalid_since": None, "relaunch_held": False})
+                                 "queue_invalid_since": None, "relaunch_held": False,
+                                 "launch_hold_generation": None, "wildcard_hold_generation": None,
+                                 "queue_invalid_generation": None})
         # NB: the per-issue model/effort override is stamped into durable state by _worker_env below
         # (it refreshes on EVERY worker launch so the stamp tracks William's current labels) — see
         # its docstring. Kept in one place so recover/resolve_conflict relaunches stamp identically.
@@ -3390,8 +3361,9 @@ class Runner:
             # third review round). That is a durable narration of a cause that is no longer the
             # reason anything is stopped, on the one artifact the owner reads to decide what to do.
             i["launch_hold_reason"] = None
-            i["launch_hold_since"] = None       # ...and the age clock + dead-worker flag it owns
-            i["relaunch_held"] = False          # (#405), so a park never reads as a standing hold
+            i["launch_hold_since"] = None       # ...and the age clock, generation key and
+            i["launch_hold_generation"] = None  # dead-worker flag it owns (#405), so a park
+            i["relaunch_held"] = False          # never reads as a standing hold
             # (#169) The one durable record that a park's LABELS actually moved — written here and
             # nowhere else, because this block runs only past the set_labels above. `status` cannot
             # carry that fact: a lane that was ALREADY needs_william (parked before, for some other
@@ -3509,6 +3481,9 @@ class Runner:
                       "launch_hold_since": None,       # ...each timed from the NEW episode, never
                       "wildcard_hold_since": None,     # carrying the old run's age forward (#405)
                       "queue_invalid_since": None, "relaunch_held": False,
+                      "launch_hold_generation": None,  # ...and re-keyed, so the fresh episode's
+                      "wildcard_hold_generation": None,   # own hold speaks under this generation
+                      "queue_invalid_generation": None,
                       "merge_refusal_reason": None,    # paired with merge_refusals=0 above (#27)
                       "pr_read_pending_since": None,   # a re-run's refused-read hold times fresh (#61)
                       "comments_read_pending_since": None,   # ...and its comments-read hold too (#78)
@@ -3715,7 +3690,7 @@ class Runner:
             # matched it never spoke. Its age clock and the dead-worker flag (#405) clear with it:
             # the relaunch is happening, so the lane is no longer a corpse waiting on the gate.
             self._update_issue(iid, {"launch_hold_reason": None, "launch_hold_since": None,
-                                     "relaunch_held": False})
+                                     "launch_hold_generation": None, "relaunch_held": False})
             rc = self._run_script([self._script(LAUNCHER), iid],
                                   env=self._worker_env(iid),
                                   timeout=LAUNCH_TIMEOUT)
@@ -4101,7 +4076,8 @@ class Runner:
         so the same continuous hold does not re-journal every tick, and return the reason so the
         journal outcome carries the WHY. The flag is reset on launch (_exec_launch) and on reapprove,
         so a later, fresh episode re-journals. Journal-only: no label move, no notify."""
-        self._update_issue(a["id"], {"wildcard_hold_journaled": True},
+        self._update_issue(a["id"], {"wildcard_hold_journaled": True,
+                                     "wildcard_hold_generation": a.get("generation")},
                            fn=lambda st, i: self._start_hold_clock(i, "wildcard_hold_since", now))
         return a.get("reason", "launch held by a no-touches wildcard — the lane serializes")
 
@@ -4115,7 +4091,8 @@ class Runner:
         a CHANGED complaint re-journals immediately because its signature no longer matches.
         Journal-only: no label move, no notify, no park — the queue is untouched and the issue
         launches the tick its metadata is fixed."""
-        self._update_issue(a["id"], {"queue_invalid_signature": a.get("signature")},
+        self._update_issue(a["id"], {"queue_invalid_signature": a.get("signature"),
+                                     "queue_invalid_generation": a.get("generation")},
                            fn=lambda st, i: self._start_hold_clock(i, "queue_invalid_since", now))
         return a.get("reason", "the issue fails the mechanical queue contract")
 
@@ -4123,17 +4100,18 @@ class Runner:
     def _start_hold_clock(issue, key, now):
         """Start a hold's AGE clock — but only if it is not already running (issue #405).
 
-        The clock is deliberately a SEPARATE field from the dedup stamp, because the two have
-        opposite lifetimes. The stamp is cleared once per engine generation so every standing hold
-        re-announces itself (_rearm_hold_journaling); the clock must survive that, or a hold could
-        never be older than the last boot and the age alert could never fire on the multi-day stall
-        it exists to catch. Only the events that genuinely END a hold (launch, recover, resolve,
-        park, re-approve) clear it — the same points that clear the stamp.
+        "Only if not already running" is what makes the once-per-generation re-announce a no-op for
+        the clock: the first tick of a new engine generation re-derives the same cause and re-stamps
+        it under the new generation key, and this leaves the original start time alone. Without that,
+        a hold could never be older than the last restart and the age alert could never fire on the
+        multi-day stall it exists to catch.
 
-        "Only if not already running" is what makes the re-announce a no-op for the clock: the first
-        tick after a boot re-derives the same cause and re-stamps it, and this leaves the original
-        start time alone. A wrong-typed stored value (bool is an int — excluded) restarts the clock
-        rather than being trusted; an unusable clock is worth less than an honest recent one."""
+        The clock is written by the same executors that write the stamp, and cleared by the same five
+        sites (launch, recover, resolve, park, re-approve) — so a clock without a stamp cannot exist,
+        and a later, unrelated hold episode can never inherit an orphaned age.
+
+        A wrong-typed stored value (bool is an int — excluded) restarts the clock rather than being
+        trusted; an unusable clock is worth less than an honest recent one."""
         cur = issue.get(key)
         if not isinstance(cur, (int, float)) or isinstance(cur, bool):
             issue[key] = now
@@ -4152,6 +4130,7 @@ class Runner:
         waiting for quota. Written on EVERY hold, never conditionally, so it can never survive from a
         prior episode into one where it is false."""
         self._update_issue(a["id"], {"launch_hold_reason": a.get("reason"),
+                                     "launch_hold_generation": a.get("generation"),
                                      "relaunch_held": bool(a.get("relaunch"))},
                            fn=lambda st, i: self._start_hold_clock(i, "launch_hold_since", now))
         return a.get("reason", "launch held by the eligibility gate")
@@ -4482,7 +4461,7 @@ class Runner:
         # the stamp before the attempt, as _exec_launch/_exec_recover do (review P2-2, #150) — with
         # the age clock and the dead-worker flag it owns (#405).
         self._update_issue(iid, {"launch_hold_reason": None, "launch_hold_since": None,
-                                 "relaunch_held": False})
+                                 "launch_hold_generation": None, "relaunch_held": False})
         rc = self._run_script([self._script(LAUNCHER), iid],
                               env=self._worker_env(iid), timeout=LAUNCH_TIMEOUT)
         if rc == 0:

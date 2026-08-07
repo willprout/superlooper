@@ -1179,6 +1179,14 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     exit_receipts = _dget(dsk, "exit_receipts", dict)    # {id: newest mail-consumption ts} (#148/#215)
     frozen = dsk.get("frozen") if isinstance(dsk.get("frozen"), dict) else None
     alert_on_disk = dsk.get("alert") if isinstance(dsk.get("alert"), dict) else None
+    # The ENGINE GENERATION this tick belongs to (issue #405) — a token the runner mints once per
+    # boot. It joins each standing hold's journaling dedup key, so a hold that has already said its
+    # piece says it again ONCE under a new generation and then goes quiet: "once per engine
+    # generation" instead of the "once per lifetime" that let a hold sit silent for three days.
+    # Absent or wrong-typed (an older runner, a hand-built view) reads as None on BOTH sides of the
+    # comparison — the pre-#405 dedup exactly, so nothing is re-journaled by an unknown generation.
+    hold_generation = dsk.get("hold_generation")
+    hold_generation = hold_generation if isinstance(hold_generation, str) and hold_generation else None
     raw_locks = dsk.get("live_lock_ids")
     live_locks = set(raw_locks) if isinstance(raw_locks, (set, frozenset, list, tuple)) else set()
 
@@ -1328,10 +1336,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         """start_ok (or the #159 auth gate) said no: HOLD, legibly — never a silent launch (D8), and
         never a park. This is a WAIT, not a verdict: the retry cap and park semantics are untouched (a
         boundary of #150), the marker/labels stay exactly as they are, and the restart fires on the
-        tick the gate passes. Journal ONCE per CAUSE — dedup on the reason the executor stamps
-        durably, so a standing hold can't spam a 15s tick, while a CHANGED cause (the blocker closed
-        but the labels went ambiguous) still speaks rather than leaving stale prose on the board. An
-        explicit `reason` overrides the usage/eligibility reason (the auth gate names auth).
+        tick the gate passes. Journal ONCE per CAUSE per ENGINE GENERATION — dedup on the reason AND
+        the generation the executor stamps durably, so a standing hold can't spam a 15s tick, while a
+        CHANGED cause (the blocker closed but the labels went ambiguous) still speaks rather than
+        leaving stale prose on the board, and a hold that outlives a restart says its piece once more
+        under the new generation instead of staying silent for its whole life (#405). An explicit
+        `reason` overrides the usage/eligibility reason (the auth gate names auth).
 
         `relaunch` (issue #405) says this hold is holding the RESTART of a lane whose worker already
         EXITED, not a start that never happened. Without it the two are indistinguishable in durable
@@ -1342,16 +1352,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         It is payload, NOT part of the dedup key, and that is deliberate. The executor writes the
         flag and the reason together and clears them together, so the two can never disagree within
         an engine generation; the only state where they could is a stamp written by an engine older
-        than this flag, and the boot re-announce (#405) clears every such stamp before the first tick.
-        Adding it to the key would buy nothing there and would re-journal a standing hold whose cause
-        never changed — the per-tick spam the stamp exists to prevent."""
+        than this flag, and such a stamp carries no generation either — so the generation half of the
+        key already re-journals it once, which re-stamps the flag. Adding `relaunch` to the key on top
+        of that would buy nothing and would re-journal a standing hold whose cause never changed —
+        the per-tick spam the stamp exists to prevent."""
         reason = reason if isinstance(reason, str) and reason \
             else _launch_gate_reason(p, closed_nums, usage_sched, config=cfg,
                                      closed_read_ok=closed_read_ok)
-        if ist_of(iid).get("launch_hold_reason") == reason:
+        ist = ist_of(iid)
+        if ist.get("launch_hold_reason") == reason \
+                and ist.get("launch_hold_generation") == hold_generation:
             return
         out.append({"act": "launch_hold", "id": iid, "num": num, "reason": reason,
-                    "relaunch": relaunch})
+                    "relaunch": relaunch, "generation": hold_generation})
 
     # ---- launch-anchor liveness (issue #24): a dead launch anchor must never walk the queue ----
     # The runner launches every worker as a cmux tab in ONE pane (the anchor). When that pane stops
@@ -2714,6 +2727,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         the issue launches the tick its metadata is fixed. Deduped on the defect SIGNATURE rather
         than a bare flag, so the same complaint is made ONCE while a CHANGED complaint — a half-fix
         that traded one defect for another — speaks up again instead of inheriting the old silence.
+        The ENGINE GENERATION joins that key (#405): an issue that never launches, parks or is
+        re-approved would otherwise make its complaint once and then be silent for its whole life,
+        across engine updates too. Once per generation, never per tick.
 
         An issue that only fails the AREA-NAME check is still journaled even though it launches:
         the runner never validates area names, so nothing else would say it until the gate reads
@@ -2721,10 +2737,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         defects = queue_lint.lint_parsed(p, areas=cfg.get("areas") if isinstance(cfg, dict) else None,
                                          touches_required=_touches_required(cfg))
         sig = queue_lint.signature(defects)
-        if not defects or ist.get("queue_invalid_signature") == sig:
+        if not defects or (ist.get("queue_invalid_signature") == sig
+                           and ist.get("queue_invalid_generation") == hold_generation):
             return
         out.append({"act": "queue_invalid", "id": iid, "num": p.get("num"), "signature": sig,
                     "blocks_launch": queue_lint.blocking(defects),
+                    "generation": hold_generation,
                     "reason": "; ".join(queue_lint.describe(d) for d in defects)})
 
     if not gh_stale and not issue_state_corrupt_for_launches and not launches_held:
@@ -2748,15 +2766,19 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # Wildcard launch-suppression journaling (issue #36): a no-touches wildcard — the candidate
         # itself, or the lane blocking it — serializes the queue silently under hard affinity. Record
         # WHY, ONCE per episode (dedup on the issue's `wildcard_hold_journaled` flag, reset on launch/
-        # reapprove), so "why is only one lane busy" is answerable from the journal. Bounded and
-        # journal-only: no notify, no park, the queue is untouched.
+        # reapprove) and once per ENGINE GENERATION on top of that (#405, so a hold that outlives a
+        # restart is not silent for life), so "why is only one lane busy" is answerable from the
+        # journal. Bounded and journal-only: no notify, no park, the queue is untouched.
         for h in scheduler.launch_holds(candidates, lanes_in, cfg, usage_sched,
                                         closed_nums, bool(frozen), territory_claims=claims):
             hid = h.get("id")
-            if hid in selected_ids or ist_of(hid).get("wildcard_hold_journaled"):
+            hist = ist_of(hid)
+            if hid in selected_ids or (hist.get("wildcard_hold_journaled")
+                                       and hist.get("wildcard_hold_generation") == hold_generation):
                 continue
             out.append({"act": "wildcard_hold", "id": hid, "num": h.get("num"),
-                        "blocker": h.get("blocker_id"), "reason": _wildcard_hold_reason(h)})
+                        "blocker": h.get("blocker_id"), "generation": hold_generation,
+                        "reason": _wildcard_hold_reason(h)})
         # Foreseeable-referee launch hold (issue #165): an approved issue whose declared touches
         # resolve to a referee path is withheld by launch_ok unless pre-authorized — so it never
         # reaches launchable/launch_holds above. Journal WHY here (via the same #150 launch_hold

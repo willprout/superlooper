@@ -497,6 +497,61 @@ def test_standing_holds_terminal_set_tracks_the_runners_own():
     assert report._TERMINAL_STATUSES == actions.TERMINAL_STATUSES
 
 
+# --- the one stamp that means NOT held -----------------------------------------------------------
+# The engine has no clear-the-stamp verb, so #172 retires a stale unlanded-read stamp by OVERWRITING
+# it with an honest all-clear. A truthy `launch_hold_reason` is therefore not, by itself, evidence of
+# a hold — and listing that one would print a line that refutes itself, then alert on it at 24h.
+
+def _retirement_stamp():
+    import actions
+    return actions._LANE_BOUND_AFTER_UNLANDED_READ
+
+
+def test_the_lane_bound_all_clear_stamp_is_never_listed_as_a_hold():
+    now = 1_000_000
+    state = _held_state(i50={"status": "ready", "launch_hold_reason": _retirement_stamp(),
+                             "launch_hold_since": now - 5 * DAY})
+    out = report.morning([], _view(now=now, queue=[], issues_state=state),
+                         ledger={}, config=_cfg())
+    assert report.standing_holds(state) == []
+    assert "None — nothing is held." in out.split("## Standing holds")[1]
+    assert "STALL" not in out                       # ...and no self-refuting alert at 24h
+    assert "nothing happened" in out.lower()        # ...and it never breaks a genuinely quiet night
+
+
+def test_the_all_clear_prefix_tracks_the_engines_own():
+    # Matched on the PREFIX, and pinned to the engine's constant: the tail prose is free to change
+    # across releases (durable stamps written by an older one are still on disk), but if the PREFIX
+    # ever drifts this report starts listing all-clears as holds again.
+    import actions
+    assert report._LANE_BOUND_PREFIX == actions._LANE_BOUND_PREFIX
+    assert _retirement_stamp().startswith(report._LANE_BOUND_PREFIX)
+
+
+def test_an_unlanded_read_hold_IS_still_listed():
+    # The mirror: only the RETIREMENT is an all-clear. The unlanded-read hold it replaces is a real
+    # hold and must still be reported.
+    import actions
+    now = 1_000_000
+    state = _held_state(i50={"status": "ready",
+                             "launch_hold_reason": actions.UNLANDED_CLOSED_READ_PREFIX + " — …",
+                             "launch_hold_since": now - 2 * 3600})
+    held = report.standing_holds(state)
+    assert len(held) == 1 and held[0]["id"] == "i50"
+
+
+def test_an_unhashable_status_or_journal_act_never_raises():
+    # `x in frozenset` RAISES on an unhashable value, so the coercion contract has to hold at the
+    # membership tests too — not just at the type checks around them.
+    state = _held_state(i12={"status": ["nope"], "launch_hold_reason": "held",
+                             "launch_hold_since": 1})
+    assert len(report.standing_holds(state)) == 1               # a wrong-typed status is not terminal
+    j = [{"ts": 1, "act": ["nope"], "id": "i12", "reason": "x"}, {"ts": 2, "act": {}, "id": "i12"}]
+    assert isinstance(report.standing_holds(state, j), list)
+    assert isinstance(report.morning(j, _view(now=1_000_000, queue=[], issues_state=state),
+                                     ledger={}, config=_cfg()), str)
+
+
 # --- the freeze marker's age (issue #405) -------------------------------------------------------
 
 def test_the_freeze_line_carries_its_age():
