@@ -312,6 +312,99 @@ def test_eligible_requires_all_blocked_by_closed():
     assert issues.eligible(p, closed_issue_nums={41, 52}, frozen=False) is True    # both closed
 
 
+# ---- issue #266: eligible is TOTAL — it answers, it never raises ----
+# It is THE launch gate, and decide's `_needs_touches` calls it UNGUARDED, so a raise here does not
+# refuse a launch: it kills the whole tick. Every garbage shape therefore has to land on a verdict,
+# and the verdict is always the fail-closed one — what cannot be affirmed as satisfied is UNMET.
+
+def test_eligible_treats_an_unhashable_blocked_by_entry_as_unmet():
+    # The bare `dep in closed_set` raised TypeError on an unhashable entry (a dict, a list, a set).
+    # Every other garbage shape simply isn't in the closed set and already read as unmet — both now
+    # give the same answer, which is the one actions._dep_unmet gives on the prose side.
+    for dep in ({"nope": 1}, ["x"], {1, 2}, bytearray(b"x"), object(), (), (1, 2), "41", None):
+        p = _ready()
+        p["blocked_by"] = [dep]
+        assert issues.eligible(p, {41}, frozen=False) is False, dep
+        assert issues.eligible(p, {41}, frozen=False, resume=True) is False, dep
+
+
+def test_a_garbage_entry_is_never_POSITIVE_proof_that_a_dependency_closed():
+    # Fresh-agent review, P1. Not raising is only half of "counts as UNMET": a garbage entry must
+    # also never be ANSWERED YES. Bare `in` compares by VALUE, and `True == 1` / `41.0 == 41` — so
+    # against a perfectly well-formed closed set of ints, `blocked_by=[True]` read as MET and the
+    # issue LAUNCHED past a dependency nobody could read. Fail-open, the named defect class, and
+    # exactly what this predicate exists to refuse.
+    for dep, closed in ((True, {1}), (False, {0}), (41.0, {41}), ("41", {"41"}),
+                        (41.0, {41.0}), (True, {True})):
+        p = _ready()
+        p["blocked_by"] = [dep]
+        assert issues.eligible(p, closed, frozen=False) is False, (dep, closed)
+    # ...while a real issue NUMBER against a real closed set is met, exactly as before.
+    p = _ready()
+    p["blocked_by"] = [41]
+    assert issues.eligible(p, {41}, frozen=False) is True
+
+
+def test_a_garbage_entry_beside_a_closed_one_still_blocks():
+    # Totality must not become permissiveness: ALL deps must be met, so one unreadable entry is
+    # enough to hold the issue even when its well-formed sibling is closed.
+    p = _ready()
+    p["blocked_by"] = [41, {"nope": 1}]
+    assert issues.eligible(p, {41}, frozen=False) is False
+    p["blocked_by"] = [41]
+    assert issues.eligible(p, {41}, frozen=False) is True
+
+
+def test_eligible_fails_closed_on_a_wrong_typed_blocked_by_container():
+    # A dependency LIST that is not a list of deps cannot be read, and an unreadable dependency list
+    # is never evidence that nothing blocks — so it refuses, rather than launching on an empty walk.
+    for deps in (None, 41, {"a": 1}, "41", object()):
+        p = _ready()
+        p["blocked_by"] = deps
+        assert issues.eligible(p, {41}, frozen=False) is False, deps
+    p = _ready()
+    del p["blocked_by"]                          # absent entirely (the old KeyError route)
+    assert issues.eligible(p, {41}, frozen=False) is False
+    p = _ready()
+    p["blocked_by"] = (41,)                      # a tuple IS a readable dep list — verdict unchanged
+    assert issues.eligible(p, {41}, frozen=False) is True
+
+
+def test_eligible_fails_closed_on_a_garbage_closed_set():
+    # The other side of the membership test: a wrong-typed closed set is an unreadable answer about
+    # closure, so nothing in it can be affirmed as closed.
+    p = _ready(body="## Loop metadata\nblocked-by: #41\n")
+    for closed in (None, 41, object()):
+        assert issues.eligible(p, closed, frozen=False) is False, closed
+
+
+def test_eligible_fails_closed_on_a_wrong_typed_labels_or_parsed():
+    # The rest of the predicate's reads, closed at the same time so the ONE gate is total for every
+    # caller rather than for one field. A non-dict `parsed` is what the recovery paths can hand in
+    # for an issue absent from the GitHub view — scheduler.launch_ok already refuses it; eligible
+    # now gives the same answer on its own instead of relying on its caller's try/except.
+    for bad in (None, [], "x", 7):
+        assert issues.eligible(bad, set(), frozen=False) is False, bad
+    # `"agent-ready"` and `{"agent-ready": True}` are the two that matter: a bare `in` against
+    # either answers TRUE (a substring hit, a dict-key hit) and would approve an issue off a label
+    # set nobody wrote. Fail closed instead.
+    for labels in (None, 7, "agent-ready", "xxagent-readyxx", {"agent-ready": True}):
+        p = _ready()
+        p["labels"] = labels
+        assert issues.eligible(p, set(), frozen=False) is False, labels
+    for labels in ({"type:build", "agent-ready"}, frozenset({"type:build", "agent-ready"}),
+                   ("type:build", "agent-ready")):
+        p = _ready()                     # a set/tuple label collection IS readable — verdict is
+        p["labels"] = labels             # unchanged, so the guard refuses garbage, not shapes
+        assert issues.eligible(p, set(), frozen=False) is True, labels
+    p = _ready()
+    del p["labels"]
+    assert issues.eligible(p, set(), frozen=False) is False
+    p = _ready()
+    del p["type"]
+    assert issues.eligible(p, set(), frozen=False) is False
+
+
 def test_eligible_unaffected_by_freeze():
     # freeze only stops MERGES, not builds — a frozen mainline must not change eligibility.
     p = _ready()

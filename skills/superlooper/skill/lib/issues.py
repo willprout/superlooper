@@ -155,9 +155,60 @@ def parse_issue(gh_issue):
     }
 
 
+# What eligible() accepts as a COLLECTION (its labels, its `blocked-by` list). parse_issue always
+# builds plain lists, but eligible is asked about parsed dicts that came off disk and out of the
+# recovery paths too, so the shape is not guaranteed. Sets/tuples read the same as lists; a str is
+# deliberately NOT one (it is iterable, but iterating it yields characters — garbage dressed as
+# members), and neither is a dict (its `in` reads keys, which is a different question).
+_LIST_LIKE = (list, tuple, set, frozenset)
+
+
+def dep_met(dep, closed_issue_nums):
+    """Is this ONE `blocked-by` entry satisfied — i.e. is it a closed issue number?
+
+    THE per-entry dependency test, shared so the eligibility verdict and the prose that explains it
+    (actions._dep_unmet) cannot answer differently. Only an issue NUMBER can be met: `blocked-by`
+    means "issue #N", parse_issue only ever builds ints, and an entry that is not one is not a
+    dependency this loop can look up, let alone affirm as closed.
+
+    That type check is doing TWO jobs, and the second is the load-bearing one (fresh-agent review,
+    P1). It keeps an UNHASHABLE entry (a dict, a list) from reaching a set membership test that
+    raises instead of answering — the #266 hole. And it keeps a garbage entry from being answered
+    YES: `in` compares by VALUE, and `True == 1` / `41.0 == 41`, so against a perfectly well-formed
+    closed set of ints `blocked_by=[True]` used to read as MET and launch the issue past a
+    dependency nothing could read. Not-raising is only half of "counts as UNMET".
+
+    `isinstance(dep, bool)` is excluded explicitly: bool IS an int subclass in Python, so an
+    isinstance check alone would let True/False through as issue #1/#0.
+
+    The try/except then covers the other side — an unreadable closed set (None, an int, a str)
+    raises rather than answering. Unmet throughout: what cannot be affirmed as closed holds the
+    issue, which is the fail-closed direction.
+
+    The asymmetry is deliberate, not an oversight: the ENTRY is type-checked and the closed set's
+    MEMBERS are not, because `dep_met(1, {True})` is the same `==`-by-value trap mirrored. It is
+    unreachable only because the closed set is int-only at its source — gh.closed_issue_nums and its
+    read-health twin both filter on `type(i.get("number")) is int`, and published_view does the same
+    — so this is safe by an upstream invariant, and that is where a check for it belongs (naming it
+    here so a future closed-set producer knows it is inheriting a contract)."""
+    if not isinstance(dep, int) or isinstance(dep, bool):
+        return False
+    try:
+        return dep in closed_issue_nums
+    except TypeError:
+        return False
+
+
 def eligible(parsed, closed_issue_nums, frozen, resume=False):
     """Is this issue launchable NOW? Approved (`agent-ready`) AND a valid type AND every
     `blocked-by` issue is closed.
+
+    TOTAL on garbage input (issue #266): it always ANSWERS, and the answer for anything it cannot
+    read is False. That is not politeness — this is the launch gate, and decide's `_needs_touches`
+    asks it UNGUARDED, so a raise here does not refuse one launch, it kills the whole tick (decide's
+    own contract is defensive coercion of every input, never a raise). scheduler.launch_ok, the
+    other caller, wraps this call and fails closed on the same shapes; doing it HERE instead means
+    every caller — present and future — inherits the guard rather than having to remember it.
 
     `frozen` is accepted for interface symmetry with the scheduler and to make the constitutional
     rule EXPLICIT and testable: a frozen mainline stops MERGES, not builds (frozen-but-building is
@@ -172,17 +223,28 @@ def eligible(parsed, closed_issue_nums, frozen, resume=False):
     sameness IS the fix: D8's relaunch tier skipped this predicate entirely and started a worker
     past its open `blocked-by`. If William has taken BOTH tokens away (parked it mid-flight), no
     approval stands and the restart is refused."""
-    approved = "agent-ready" in parsed["labels"] or (resume and "in-progress" in parsed["labels"])
+    # Not an issue at all (the recovery paths can reach this for an issue absent from the GitHub
+    # view): with nothing to read, not one condition below can be affirmed -> never launch.
+    if not isinstance(parsed, dict):
+        return False
+    labels = parsed.get("labels")
+    if not isinstance(labels, _LIST_LIKE):
+        labels = []                  # unreadable labels -> no approval token -> refuse
+    approved = "agent-ready" in labels or (resume and "in-progress" in labels)
     if not approved:
         return False
-    if parsed["type"] not in VALID_TYPES:
+    if parsed.get("type") not in VALID_TYPES:
         return False
     # A control-label conflict (2+ `model:*` or 2+ `effort:*`) is ambiguous — refuse to launch until
     # William fixes the labels, exactly as an invalid type is refused. `.get` keeps this backward-safe
     # if an older parsed dict (no `label_conflict` key) is ever passed in.
     if parsed.get("label_conflict"):
         return False
-    return all(dep in closed_issue_nums for dep in parsed["blocked_by"])
+    deps = parsed.get("blocked_by")
+    if not isinstance(deps, _LIST_LIKE):
+        return False                 # an unreadable dependency list is never proof that nothing
+                                     # blocks — refuse, rather than launch on an empty walk
+    return all(dep_met(dep, closed_issue_nums) for dep in deps)
 
 
 def sort_key(parsed, requeue_front):
