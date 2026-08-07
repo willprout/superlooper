@@ -164,13 +164,28 @@ _LIST_LIKE = (list, tuple, set, frozenset)
 
 
 def dep_met(dep, closed_issue_nums):
-    """Is this ONE `blocked-by` entry satisfied — i.e. is it in the closed set?
+    """Is this ONE `blocked-by` entry satisfied — i.e. is it a closed issue number?
 
     THE per-entry dependency test, shared so the eligibility verdict and the prose that explains it
-    (actions._dep_unmet) cannot answer differently. A wrong-typed entry is never in the closed set,
-    so it reads as unmet; an UNHASHABLE one (a dict, a list) makes the bare `in` against a set raise
-    instead of answering, so it is caught and read as unmet too. Same for an unreadable closed set.
-    Unmet is the fail-closed answer: what cannot be affirmed as closed holds the issue."""
+    (actions._dep_unmet) cannot answer differently. Only an issue NUMBER can be met: `blocked-by`
+    means "issue #N", parse_issue only ever builds ints, and an entry that is not one is not a
+    dependency this loop can look up, let alone affirm as closed.
+
+    That type check is doing TWO jobs, and the second is the load-bearing one (fresh-agent review,
+    P1). It keeps an UNHASHABLE entry (a dict, a list) from reaching a set membership test that
+    raises instead of answering — the #266 hole. And it keeps a garbage entry from being answered
+    YES: `in` compares by VALUE, and `True == 1` / `41.0 == 41`, so against a perfectly well-formed
+    closed set of ints `blocked_by=[True]` used to read as MET and launch the issue past a
+    dependency nothing could read. Not-raising is only half of "counts as UNMET".
+
+    `isinstance(dep, bool)` is excluded explicitly: bool IS an int subclass in Python, so an
+    isinstance check alone would let True/False through as issue #1/#0.
+
+    The try/except then covers the other side — an unreadable closed set (None, an int, a str)
+    raises rather than answering. Unmet throughout: what cannot be affirmed as closed holds the
+    issue, which is the fail-closed direction."""
+    if not isinstance(dep, int) or isinstance(dep, bool):
+        return False
     try:
         return dep in closed_issue_nums
     except TypeError:

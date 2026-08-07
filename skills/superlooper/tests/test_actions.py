@@ -1481,6 +1481,21 @@ def test_needs_touches_survives_a_wrong_typed_blocked_by_container():
     assert only(out, "launch") == [] and only(out, "park") == []
 
 
+def test_a_garbage_dependency_never_LAUNCHES_an_issue_past_its_blocker():
+    # Fresh-agent review, P1 — the fail-open half of the same hole, and the one that costs a lane.
+    # `True == 1` and `41.0 == 41`, so a bare value-membership test affirmed a garbage `blocked-by`
+    # entry against a WELL-FORMED closed set of ints (which is the only kind gh.py builds) and
+    # decide launched the issue straight past a dependency nothing could actually read.
+    for dep, closed in ((True, {1}), (41.0, {41}), ("41", {"41"})):
+        p = parsed(5, blocked_by=[dep])               # touches declared: the plain launch path
+        out = decide(parsed_issues=[p], gh_view=ghv(closed_nums=closed))
+        assert only(out, "launch") == [], (dep, closed)
+        assert scheduler.launch_ok(p, closed, False, usage_ok()) is False, (dep, closed)
+    # the well-formed control still launches — this tightening costs a real dependency nothing.
+    out = decide(parsed_issues=[parsed(5, blocked_by=[41])], gh_view=ghv(closed_nums={41}))
+    assert len(only(out, "launch")) == 1
+
+
 def test_the_two_eligible_callers_reach_the_same_verdict_on_garbage():
     # GUARD PARITY, pinned: scheduler.launch_ok (guarded, fails closed) and decide's `_needs_touches`
     # (unguarded) both ask issues.eligible, and they must not answer differently for the same input —

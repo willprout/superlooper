@@ -328,6 +328,23 @@ def test_eligible_treats_an_unhashable_blocked_by_entry_as_unmet():
         assert issues.eligible(p, {41}, frozen=False, resume=True) is False, dep
 
 
+def test_a_garbage_entry_is_never_POSITIVE_proof_that_a_dependency_closed():
+    # Fresh-agent review, P1. Not raising is only half of "counts as UNMET": a garbage entry must
+    # also never be ANSWERED YES. Bare `in` compares by VALUE, and `True == 1` / `41.0 == 41` — so
+    # against a perfectly well-formed closed set of ints, `blocked_by=[True]` read as MET and the
+    # issue LAUNCHED past a dependency nobody could read. Fail-open, the named defect class, and
+    # exactly what this predicate exists to refuse.
+    for dep, closed in ((True, {1}), (False, {0}), (41.0, {41}), ("41", {"41"}),
+                        (41.0, {41.0}), (True, {True})):
+        p = _ready()
+        p["blocked_by"] = [dep]
+        assert issues.eligible(p, closed, frozen=False) is False, (dep, closed)
+    # ...while a real issue NUMBER against a real closed set is met, exactly as before.
+    p = _ready()
+    p["blocked_by"] = [41]
+    assert issues.eligible(p, {41}, frozen=False) is True
+
+
 def test_a_garbage_entry_beside_a_closed_one_still_blocks():
     # Totality must not become permissiveness: ALL deps must be met, so one unreadable entry is
     # enough to hold the issue even when its well-formed sibling is closed.

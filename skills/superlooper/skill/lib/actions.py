@@ -869,9 +869,14 @@ def _is_i172_hold_stamp(reason):
 def _dep_unmet(d, closed_nums):
     """Is this `blocked-by` ENTRY unsatisfied? Now literally the SAME test issues.eligible applies
     (issue #266 moved the per-entry walk into issues.dep_met and this delegates to it), so the
-    verdict and the prose explaining it cannot drift: a wrong-typed entry is never in the closed
-    set, an UNHASHABLE one makes the bare `in` raise rather than answer, and both read as unmet —
-    the fail-closed answer.
+    verdict and the prose explaining it cannot drift: only a real issue NUMBER can be met, so every
+    wrong-typed entry reads as unmet — including the unhashable ones the bare `in` used to raise on,
+    and the ones it used to answer YES to by value (`True == 1`). Unmet is the fail-closed answer.
+
+    Note what that does NOT do here, because an earlier review round paid for the distinction: the
+    entry is still WALKED and still NAMED in the prose below. dep_met narrows what counts as MET; it
+    never filters an entry out of the reason, which is what a `type(d) is int` list filter did in
+    #172's first round (round two, P2-3) and which made a malformed dependency invisible.
 
     Scope, precisely (third review round: the earlier wording over-claimed). This aligns the two on
     each ENTRY. It does not align them on the CONTAINER: _launch_gate_reason guards with
