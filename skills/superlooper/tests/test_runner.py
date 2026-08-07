@@ -2800,7 +2800,7 @@ def test_conflict_brief_does_not_claim_the_resume_depends_on_the_push(rig):
     assert "answerer" not in low, "the answerer seat is retired (#194) — never teach it"
 
 
-def _quiet_teardown(rig, monkeypatch):
+def _quiet_teardown(monkeypatch):
     """Neutralize the teardown for a test that is about the CLOSE, not the stand-down (#275). The
     settle reaches gitops otherwise, and these two tests seed no worktree — so the real
     `git worktree prune` would run against the rig's non-git repo dir, fail, and leave a
@@ -2810,7 +2810,7 @@ def _quiet_teardown(rig, monkeypatch):
 
 
 def test_close_investigate_executor(rig, monkeypatch):
-    _quiet_teardown(rig, monkeypatch)
+    _quiet_teardown(monkeypatch)
     seed_issue(rig, "i7", status="gating", type="investigate")
     out = rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW)
     assert out == "ok"
@@ -2821,7 +2821,7 @@ def test_close_investigate_executor(rig, monkeypatch):
 
 def test_close_investigate_comment_carries_the_accounted_claim(rig, monkeypatch):
     # #215: the close comment names the exit-interview outcome — the owner-auditable claim.
-    _quiet_teardown(rig, monkeypatch)
+    _quiet_teardown(monkeypatch)
     seed_issue(rig, "i7", status="gating", type="investigate")
     rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7,
                     "exit": "FINDINGS-FILED: #41 #42"}, NOW)
@@ -2881,10 +2881,10 @@ def test_close_investigate_prunes_a_DIRTY_checkout_deliberately(rig, monkeypatch
 def test_close_investigate_also_stands_down_a_reconciled_parked_lane(rig, monkeypatch):
     """decide's #21 reconciliation emits this act for a PARKED investigation whose marker comment
     turned up on a later trustworthy read, and by default that lane's window is still standing
-    (#168 keeps park-family windows until something resolves the lane). It is torn down like any
-    other conclusion: #168's subject is STALLED work the owner must be able to open, and this lane
-    is not stalled — its report landed and its exit interview verified, which is the whole reason
-    decide is closing it.
+    (#168 as recorded says a park-family lane's window persists until an OWNER VERB resolves the
+    lane, and on this route there is no owner verb). It is torn down like any other conclusion, for
+    the reason the executor's docstring spells out: closing the owner's ISSUE on this route already
+    ships, so standing down the window the loop itself opened is the strictly smaller act.
 
     The marker seeded here is what makes this route different from the gating one rather than a
     re-run of it: the opt-in parked reaper can have refused this very checkout under #190 and left
