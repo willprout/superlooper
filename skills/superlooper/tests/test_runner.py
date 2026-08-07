@@ -2800,7 +2800,17 @@ def test_conflict_brief_does_not_claim_the_resume_depends_on_the_push(rig):
     assert "answerer" not in low, "the answerer seat is retired (#194) — never teach it"
 
 
-def test_close_investigate_executor(rig):
+def _quiet_teardown(rig, monkeypatch):
+    """Neutralize the teardown for a test that is about the CLOSE, not the stand-down (#275). The
+    settle reaches gitops otherwise, and these two tests seed no worktree — so the real
+    `git worktree prune` would run against the rig's non-git repo dir, fail, and leave a
+    pending_teardown marker as a side effect of a test that asserts nothing about either."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+
+
+def test_close_investigate_executor(rig, monkeypatch):
+    _quiet_teardown(rig, monkeypatch)
     seed_issue(rig, "i7", status="gating", type="investigate")
     out = rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW)
     assert out == "ok"
@@ -2809,13 +2819,139 @@ def test_close_investigate_executor(rig):
     assert issue_state(rig, "i7")["status"] == "merged"
 
 
-def test_close_investigate_comment_carries_the_accounted_claim(rig):
+def test_close_investigate_comment_carries_the_accounted_claim(rig, monkeypatch):
     # #215: the close comment names the exit-interview outcome — the owner-auditable claim.
+    _quiet_teardown(rig, monkeypatch)
     seed_issue(rig, "i7", status="gating", type="investigate")
     rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7,
                     "exit": "FINDINGS-FILED: #41 #42"}, NOW)
     close = [m for m in mutations(rig) if m["kind"] == "close_issue"][-1]
     assert "FINDINGS-FILED: #41 #42" in close["comment"]
+
+
+# --- a concluded investigation is torn down like its three terminal-good siblings (issue #275) ---
+# It settled to `merged` and called NO teardown at all: no pending_teardown marker was written, the
+# parked reaper skips `merged`, and decide never looks at a settled lane again — so the session
+# window and the checkout survived forever under BOTH knobs, including the shipped defaults where
+# every other terminal-good lane is closed and reclaimed. `superlooper tidy` was the only thing that
+# ever closed the window, and nothing at all pruned the checkout.
+
+def test_close_investigate_closes_the_window_and_prunes_by_default(rig, monkeypatch):
+    """The #275 headline. Ordered exactly as #149 requires — close the session, see it go, THEN
+    prune — because that ordering is the shared settle's, inherited rather than re-implemented."""
+    order = []
+    rig.host.on_close = lambda session: order.append("close")
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: order.append("prune") or True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i7", status="gating", type="investigate", num=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"
+    assert order == ["close", "prune"]
+    # ...and the handles die with the session (D9): no marker outlives the lane it identified.
+    assert not (rig.home / "state" / "panes" / "i7").exists()
+    assert not (rig.home / "state" / "worker.i7.lock").exists()
+    assert not (rig.home / "state" / "pending_teardown" / "i7").exists()
+
+
+def test_close_investigate_prunes_a_DIRTY_checkout_deliberately(rig, monkeypatch):
+    """The unguarded prune is a DECISION here, so pin it rather than leave it to inheritance. #190's
+    guard counts untracked files as "dirty", and scratch notes are the ordinary state of an
+    investigation's worktree — the brief permits those and forbids everything else — so a guard on
+    this path would refuse essentially always, with no commit-and-push ever coming to release it,
+    and the checkout half of #275 would silently reopen. Without this test that regression is
+    invisible: the rig's worktree is not a git checkout, so `worktree_reclaim_block` answers None
+    unconditionally and a `guard_worktree=True` added to the settle passes the whole suite."""
+    pruned = []
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: pruned.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    # what a real investigation's checkout answers: the worker's scratch notes, never `git add`ed
+    monkeypatch.setattr(runner_mod.gitops, "worktree_reclaim_block", lambda path: "dirty")
+    seed_issue(rig, "i7", status="gating", type="investigate", num=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW) == "ok"
+    assert pruned != [], "a concluded investigation's checkout is reclaimed dirty or clean"
+    assert not (rig.home / "state" / "pending_teardown" / "i7").exists()
+
+
+def test_close_investigate_also_stands_down_a_reconciled_parked_lane(rig, monkeypatch):
+    """decide's #21 reconciliation emits this act for a PARKED investigation whose marker comment
+    turned up on a later trustworthy read, and by default that lane's window is still standing
+    (#168 keeps park-family windows until something resolves the lane). It is torn down like any
+    other conclusion: #168's subject is STALLED work the owner must be able to open, and this lane
+    is not stalled — its report landed and its exit interview verified, which is the whole reason
+    decide is closing it.
+
+    The marker seeded here is what makes this route different from the gating one rather than a
+    re-run of it: the opt-in parked reaper can have refused this very checkout under #190 and left
+    `pending_teardown/i7` behind indefinitely (a #190 refusal returns True before the marker is
+    cleared, and the drain's stale-marker sweep only fires for NON-terminal lanes — which a
+    park->merged settle never passes through). The settle must resolve it, not inherit it."""
+    order = []
+    rig.host.on_close = lambda session: order.append("close")
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: order.append("prune") or True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    seed_issue(rig, "i7", status="parked", type="investigate", num=7)
+    _teardown_rig(rig, "i7")
+    (rig.home / "state" / "pending_teardown").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "pending_teardown" / "i7").write_text("held: dirty\n")
+
+    assert rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"       # no longer park-family
+    assert order == ["close", "prune"]
+    assert not (rig.home / "state" / "pending_teardown" / "i7").exists(), \
+        "the settle owes nothing further on this lane, so the stale marker must not survive it"
+
+
+def test_close_investigate_tears_nothing_down_when_the_github_close_fails(rig, monkeypatch):
+    """The teardown rides the SETTLE, never the attempt. A close that did not land leaves the lane
+    non-terminal and retrying next tick — ending its session there would take the window out from
+    under a lane the loop is still working, and the worker still owes the retry its liveness."""
+    order = []
+    rig.host.on_close = lambda session: order.append("close")
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: order.append("prune") or True)
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: False)
+    monkeypatch.setenv("GH_FAIL", "1")                       # the close cannot land this tick
+    seed_issue(rig, "i7", status="gating", type="investigate", num=7)
+    _teardown_rig(rig, "i7")
+
+    out = rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW)
+    assert "retry" in out
+    assert issue_state(rig, "i7")["status"] == "gating"      # not settled -> not torn down
+    assert order == []
+    assert (rig.home / "state" / "panes" / "i7").exists()
+
+
+def test_close_investigate_defers_and_retries_when_the_worker_outlives_the_close(rig, monkeypatch):
+    """"Nothing retries" was the other half of the #275 defect. With no teardown ever attempted no
+    `pending_teardown` marker was written either, so the drain — the ONLY retry a settled lane has,
+    because decide never looks at one again — had nothing to sweep. Now a worker that outlives its
+    close is RECORDED, and the drain finishes the job through the same knob-honouring settle."""
+    closed, pruned = [], []
+    rig.host.on_close = lambda session: closed.append(1)
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove",
+                        lambda repo, path: pruned.append(str(path)) or True)
+    monkeypatch.setattr(runner_mod, "WORKER_EXIT_TIMEOUT", 0)   # no real stall on the refusal
+    # Alive through the settle's wait, gone by the drain's probe. Keyed on the close COUNT, not a
+    # call count: a declined teardown clears nothing, so the drain re-issues the close.
+    monkeypatch.setattr(runner_mod, "_pid_alive", lambda pid: len(closed) < 2)
+    seed_issue(rig, "i7", status="gating", type="investigate", num=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW) == "ok"
+    assert pruned == [], "a live worker's checkout is never pruned under it (#149)"
+    assert (rig.home / "state" / "pending_teardown" / "i7").exists(), "the retry must be recorded"
+
+    rig.r._drain_pending_teardowns(loopstate.load(str(rig.home / "state" / "issues.json")))
+    assert closed == [1, 1] and pruned != []
+    assert not (rig.home / "state" / "pending_teardown" / "i7").exists()
+    assert not (rig.home / "state" / "panes" / "i7").exists()
 
 
 # --------------------------- the exit interview's executors (issue #215) ---------------------------
@@ -4875,6 +5011,20 @@ def test_absorb_close_does_not_auto_close_when_gated_off(rig, monkeypatch):
     assert (rig.home / "state" / "panes" / "i7").exists()
 
 
+def test_close_investigate_does_not_auto_close_when_gated_off(rig, monkeypatch):
+    """(#275) The fourth terminal-good path answers to the same knob as the other three: an
+    operator who keeps finished windows keeps a concluded investigation's window too."""
+    closed, pruned = _no_close_no_prune(rig, monkeypatch)
+    seed_issue(rig, "i7", status="gating", type="investigate", num=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"       # the close itself lands regardless
+    assert closed == [] and pruned == []
+    assert (rig.home / "state" / "panes" / "i7").exists()     # window kept for inspection
+    assert (rig.home / "state" / "worker.i7.lock").exists()
+
+
 def test_merge_auto_closes_by_default(rig, monkeypatch):
     """The shipped default (auto_close_merged_windows absent -> True) still closes then prunes a
     landed lane — point 1 of the ruling ALLOWS auto-close for merged-and-landed."""
@@ -4954,6 +5104,20 @@ def test_absorb_close_closes_the_live_session_when_only_the_prune_is_gated_off(r
     _teardown_rig(rig, "i7")
 
     assert rig.r._execute({"act": "absorb_close", "id": "i7", "num": 7}, NOW) == "ok"
+    assert issue_state(rig, "i7")["status"] == "merged"
+    _assert_session_ended_checkout_kept(rig, closed, pruned)
+
+
+def test_close_investigate_closes_the_live_session_when_only_the_prune_is_gated_off(rig, monkeypatch):
+    """(#275) The investigation worker is ALIVE when this fires — the exit-interview reply that
+    authorized the close came from that very session, which then idles at the prompt. So the split
+    matters here for the same reason it does on the merge paths: the knob that keeps the CHECKOUT
+    must not also leave a finished worker standing in a lane local state has already freed."""
+    closed, pruned = _close_but_keep_checkout(rig, monkeypatch)
+    seed_issue(rig, "i7", status="gating", type="investigate", num=7)
+    _teardown_rig(rig, "i7")
+
+    assert rig.r._execute({"act": "close_investigate", "id": "i7", "num": 7}, NOW) == "ok"
     assert issue_state(rig, "i7")["status"] == "merged"
     _assert_session_ended_checkout_kept(rig, closed, pruned)
 

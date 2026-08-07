@@ -4594,6 +4594,63 @@ class Runner:
         return self._failed("launch", rc, f"conflict-session launch rc={rc} ({tag})", ev=ev)
 
     def _exec_close_investigate(self, a, now):
+        """An investigation CONCLUDED: close the issue, settle terminal-good, and stand the lane
+        down like the three other terminal-good paths (issue #275).
+
+        It used to settle and tear NOTHING down, and that was not a deliberate exception — it was
+        the one route to `merged` that never grew the settle #178 introduced. Nothing else would
+        have covered it either: no `pending_teardown` marker is written when nobody tries, the
+        parked reaper's selector skips `merged`, and decide never looks at a settled lane again. So
+        an investigation's window and checkout survived forever under BOTH knobs, including the
+        shipped defaults where every other terminal-good lane is closed and reclaimed; `superlooper
+        tidy` was the only thing that ever closed the window, and nothing at all pruned the
+        checkout. Routing through _settle_merged_lane inherits both knobs unchanged, so an operator
+        who keeps finished windows or finished checkouts keeps this lane's too.
+
+        On the ordinary route the session being ended is LIVE, and that is the point rather than
+        mere tidiness: the exit-interview reply that authorized this close came from that very
+        session (#215), which then idles at the prompt exactly as a finished builder does. Ordered
+        teardown (#149) applies for the same reason it does on the merge path — the worker is
+        standing in the worktree this prunes.
+
+        decide's #21 reconciliation emits this act for a PARKED investigation too — one whose marker
+        comment turned up on a later trustworthy read — and by default that lane's window is still
+        standing. State that carefully, because it is the one place this change reaches past its own
+        route: #168 as recorded in _reclaim_terminal_worktrees says a park-family lane's window and
+        worktree persist until an OWNER VERB resolves the lane, and on this route there is no owner
+        verb — decide closes the issue itself. The reading taken here is that #168's subject is
+        STALLED work the owner must be able to open and look at, and a reconciled investigation is
+        not stalled: decide reaches this act only with the marker comment present AND the exit
+        interview's verdict clean, the same completion evidence the gating route carries. The lane
+        stops being park-family in the same breath, so the merged knobs govern it rather than the
+        opt-in parked reaper. _exec_absorb_close is the shape but NOT the authority — there the
+        owner's close IS the owner verb, and it says so. This is the loop's own judgment that
+        finished is finished, and it is flagged for the owner rather than smuggled: carving the
+        route out instead would leave the identical leak #275 exists to close, one route along.
+
+        The prune is UNGUARDED (the settle's `guard_worktree=False`), and here that is a decision,
+        not an inheritance. #190's guard refuses to drop a checkout holding the sole copy of a
+        worker's output, and "dirty" there includes UNTRACKED files — which is the ordinary state
+        of an investigation's worktree, since the brief allows it scratch notes and forbids it
+        everything else (no PR, no file changes beyond those notes). Guarding would therefore refuse
+        this prune essentially always, with no push or commit ever coming to release it, and the
+        CHECKOUT half of #275 would reopen wearing a journal line (the session half would still
+        land — the guard refuses at step 5, after the pane, markers and lock are already cleared).
+        What makes dropping it safe is the same thing that makes the close safe: an investigation's
+        deliverables are off-worktree BY CONTRACT — the marker comment, the child issues that
+        verify_exit_refs checked against the parent's real child set, and the report at
+        <home>/reports/<id>.md — and the exit interview has already made the worker account for
+        them. That is a stronger save-point than a merge's.
+
+        Two honest limits on that argument. The dichotomy is not forced: worktree_reclaim_block
+        returns a REASON, so a future path could refuse only on `unpushed`/`unreadable` — the one
+        genuinely unrecoverable shape, commits on no remote ref — while still pruning the untracked
+        scratch that would make a blanket guard inert. Realizing it means touching the shared settle,
+        which #275's boundary forbids, so it is left named rather than built. And the #274 ruling is
+        NOT authority for this: it exempted the owner's close and the two rebuild paths, said the
+        #190 guard "remains for automatic paths only", and held #275 open as undecided. This route
+        is automatic. So the reasoning above is this session's reading of an unruled case, put in
+        front of the owner in the PR — not his word being quoted back."""
         iid, num = a["id"], a.get("num")
         claim = a.get("exit")
         claim = claim.strip() if isinstance(claim, str) and claim.strip() else None
@@ -4608,6 +4665,12 @@ class Runner:
             return "close failed (will retry next tick)"
         gh.set_labels(num, remove=["in-progress"])
         self._update_issue(iid, {"status": "merged"})  # terminal-good (loopstate has no 'closed')
+        # Below the close's early return, and that placement is the load-bearing one: a close that
+        # did not land leaves the lane non-terminal and retrying next tick, so tearing its session
+        # down here would take the window out from under a lane the loop is still working. (The
+        # position relative to the status write above is NOT load-bearing — the drain reads status
+        # on a later tick, by which time both have happened either way.)
+        self._settle_merged_lane(iid)                  # ordered (#149); per-knob (#178); (#275)
         return "ok"
 
     # --------------- the exit interview (issue #215) ---------------
