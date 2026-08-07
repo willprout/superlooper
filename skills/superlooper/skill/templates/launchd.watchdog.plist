@@ -16,8 +16,13 @@
      /usr/bin:/bin:/usr/sbin:/sbin — no Homebrew, no ~/.local/bin — so a bare `gh` is not found.
      A watchdog without it still reads the heartbeat (a file) but every GitHub read refuses, which
      it correctly treats as UNOBSERVABLE and so freezes its clocks: the no-progress detector never
-     fires, silently, on a job that looks perfectly healthy. Substitute the absolute dirs THIS
-     machine resolves gh and git in, ahead of launchd's own four.
+     fires, silently, on a job that looks perfectly healthy. Substitute the absolute dir THIS
+     machine resolves gh in (`command -v gh`), ahead of launchd's own four. The `watchdog job`
+     block of `superlooper doctor` in stack mode judges the installed job against exactly that
+     (issue #328), and it judges what launchd is HOLDING — so editing this file changes nothing
+     until the job is booted out and bootstrapped again.
+     (Written the long way round because an XML comment may not contain a double hyphen, which is
+     what a literal `doctor` flag would put here; the same trap this file already sprang once.)
 
      Placeholders ({label}, {superlooper_bin}, {repo_path}, {state_home}, {interval_seconds},
      {path}) are substituted literally. -->

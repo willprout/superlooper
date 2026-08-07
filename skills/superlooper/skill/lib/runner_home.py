@@ -87,13 +87,17 @@ AQUA = "Aqua"
 # (#304), so neither belongs in a PATH check owned by the runner's process home.
 REQUIRED_COMMANDS = ("gh", "git")
 
-# What the WATCHDOG's job shells by bare name (issue #328). SHORTER than the runner's, and it is a
-# separate constant rather than a re-use precisely so it can be: a fresh-agent review traced the
-# whole check path and found exactly one — `gh`, through `lib/gh.py`'s `SL_GH` default. Nothing on
-# that path runs `git` (the check is file reads plus GitHub reads; the debugger it may launch is
-# `--cwd` into an existing tree, and its session is created by the session-host server rather than
-# inheriting this job's environment), and a health check that FAILS a job over a command it never
-# shells is a false red — the one thing a health check may not produce.
+# What a watchdog job's PATH must be PROVED to resolve (issue #328). SHORTER than the runner's, and
+# a separate constant rather than a re-use precisely so it can be. The test is not "every bare-name
+# command on the check's path" but "every one launchd's own PATH does not already supply", because
+# LAUNCHD_PATH is what a job gets for free and nothing on it can go missing by omission. Two
+# fresh-agent reviews traced the path: `gh` (through `lib/gh.py`'s `SL_GH` default) is the only
+# command outside those four. `security`, which `usage.py` shells on the same path, lives in
+# /usr/bin and so is always resolvable; `git` is never shelled there at all (the check is file reads
+# plus GitHub reads, and the debugger it may launch is `--cwd` into an existing tree, with its
+# session created by the session-host server rather than inheriting this job's environment).
+# Widening the set past that would FAIL a job over a command it never runs — a false red, the one
+# thing a health check may not produce.
 #
 # `gh` is the one whose absence is SILENT, which is the whole reason this is judged at all: the
 # heartbeat and ALERT detectors read FILES and keep working, while every GitHub read refuses, which
