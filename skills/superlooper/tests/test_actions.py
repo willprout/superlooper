@@ -24,6 +24,8 @@ import actions
 import brief
 import evidence
 import gate
+import issues as issues_mod
+import scheduler
 
 
 NOW = 1_750_000_000
@@ -1439,6 +1441,65 @@ def test_touches_required_does_not_park_a_blocked_issue_early():
     assert len(only(out2, "park")) == 1 and only(out2, "park")[0]["needs_william"] is True
 
 
+# ---- issue #266: the eligibility predicate is TOTAL, so `_needs_touches` cannot kill the tick ----
+# `_needs_touches` is the ONE route that reaches issues.eligible unguarded (scheduler.launch_ok, the
+# other caller, already wraps it and fails closed). Its guard order — touches_required AND a
+# merge-producing type AND no declared touches — means only a no-touches merge-producing issue under
+# `touches_required: true` gets as far as eligible at all; every other shape short-circuits before
+# it. That exact input with an unhashable `blocked-by` entry raised TypeError straight out of
+# decide, which is contractually TOTAL on garbage input (a raise there kills the whole tick).
+
+_GARBAGE_DEPS = ({"nope": 1}, ["x"], {1, 2}, bytearray(b"x"), object(), (), "41", None)
+
+
+def test_needs_touches_survives_an_unhashable_blocked_by_entry():
+    # THE repro. Fixed in issues.eligible itself, not at this call site: a garbage entry reads as
+    # UNMET, which is both the fail-closed answer and the one actions._dep_unmet already gave on the
+    # prose side. Unmet -> not eligible -> not the true launch point -> no touches park, no launch:
+    # the issue keeps waiting, exactly as it does behind a plainly open dependency.
+    for dep in _GARBAGE_DEPS:
+        p = parsed(5, touches=(), blocked_by=[dep])
+        out = decide(config=cfg(touches_required=True), parsed_issues=[p],
+                     gh_view=ghv(closed_nums={41}))          # must RETURN, never raise
+        assert only(out, "launch") == [], dep
+        assert only(out, "park") == [], dep
+
+
+def test_needs_touches_survives_a_wrong_typed_blocked_by_container():
+    # ...and the container itself, not just its entries: an unreadable dependency LIST cannot be
+    # affirmed as satisfied either, so it fails closed the same way (this is the shape a missing or
+    # wrong-typed loopstate/GitHub read hands in, which is where decide's totality contract bites).
+    for deps in (None, 41, {"a": 1}, "41", object()):
+        p = parsed(5, touches=(), blocked_by=deps)
+        out = decide(config=cfg(touches_required=True), parsed_issues=[p],
+                     gh_view=ghv(closed_nums={41}))
+        assert only(out, "launch") == [] and only(out, "park") == [], deps
+    p = parsed(5, touches=())
+    del p["blocked_by"]                                      # the key absent entirely
+    out = decide(config=cfg(touches_required=True), parsed_issues=[p],
+                 gh_view=ghv(closed_nums={41}))
+    assert only(out, "launch") == [] and only(out, "park") == []
+
+
+def test_the_two_eligible_callers_reach_the_same_verdict_on_garbage():
+    # GUARD PARITY, pinned: scheduler.launch_ok (guarded, fails closed) and decide's `_needs_touches`
+    # (unguarded) both ask issues.eligible, and they must not answer differently for the same input —
+    # the divergence this issue exists to close. Asserted in both directions off ONE table, so a
+    # future guard added to one caller alone shows up here as a mismatch rather than as a tick that
+    # dies at 3am.
+    for dep, met in [(d, False) for d in _GARBAGE_DEPS] + [(41, True)]:
+        p = parsed(5, touches=(), blocked_by=[dep])
+        verdict = issues_mod.eligible(p, {41}, False)
+        assert verdict is met, dep
+        # caller A: the scheduler's own gate, wrapped and fail-closed, agrees with the predicate.
+        assert scheduler.launch_ok(p, {41}, False, usage_ok()) is met, dep
+        # caller B: `_needs_touches` fires the touches park EXACTLY when the predicate says eligible.
+        parks = only(decide(config=cfg(touches_required=True), parsed_issues=[p],
+                            gh_view=ghv(closed_nums={41})), "park")
+        assert bool(parks) is met, dep
+        assert not parks or parks[0]["cause"] == "touches_missing"
+
+
 # ---- issue #172: a REFUSED closed-list read is not an answered-empty closed set ----
 # gh's closed-list read fails CLOSED to an empty set while `probe` (`gh api rate_limit`) is EXEMPT
 # from rate limiting — so a THROTTLED poll still stamps the view FRESH and every `blocked-by` issue
@@ -1732,10 +1793,9 @@ def test_the_hold_reason_survives_a_tuple_dependency():
 
 def test_the_hold_reason_path_is_total_on_a_wrong_typed_blocked_by():
     # The reason path must never raise, on any input, on any read health: an unhashable dep would go
-    # straight into a set membership test. NB this covers _launch_gate_reason's own walk, NOT every
-    # route into issues.eligible — `_needs_touches` reaches eligible unguarded, which raises on the
-    # same input. That is pre-existing (it predates #172 and is unreachable from parse_issue, which
-    # always yields ints); filed as its own issue rather than widened into this diff.
+    # straight into a set membership test. NB this covers _launch_gate_reason's own walk; the OTHER
+    # route into issues.eligible — `_needs_touches`, which reached it unguarded and raised on this
+    # same input — was closed in issues.eligible itself by #266 (see the totality tests above).
     p = parsed(5, blocked_by=[{"nope": 1}, ["x"], "7", 3, True])
     for ok in (False, True):
         assert only(decide(parsed_issues=[p], gh_view=ghv(closed_nums=set(), closed_read_ok=ok)),

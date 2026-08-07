@@ -155,9 +155,38 @@ def parse_issue(gh_issue):
     }
 
 
+# What eligible() accepts as a COLLECTION (its labels, its `blocked-by` list). parse_issue always
+# builds plain lists, but eligible is asked about parsed dicts that came off disk and out of the
+# recovery paths too, so the shape is not guaranteed. Sets/tuples read the same as lists; a str is
+# deliberately NOT one (it is iterable, but iterating it yields characters — garbage dressed as
+# members), and neither is a dict (its `in` reads keys, which is a different question).
+_LIST_LIKE = (list, tuple, set, frozenset)
+
+
+def dep_met(dep, closed_issue_nums):
+    """Is this ONE `blocked-by` entry satisfied — i.e. is it in the closed set?
+
+    THE per-entry dependency test, shared so the eligibility verdict and the prose that explains it
+    (actions._dep_unmet) cannot answer differently. A wrong-typed entry is never in the closed set,
+    so it reads as unmet; an UNHASHABLE one (a dict, a list) makes the bare `in` against a set raise
+    instead of answering, so it is caught and read as unmet too. Same for an unreadable closed set.
+    Unmet is the fail-closed answer: what cannot be affirmed as closed holds the issue."""
+    try:
+        return dep in closed_issue_nums
+    except TypeError:
+        return False
+
+
 def eligible(parsed, closed_issue_nums, frozen, resume=False):
     """Is this issue launchable NOW? Approved (`agent-ready`) AND a valid type AND every
     `blocked-by` issue is closed.
+
+    TOTAL on garbage input (issue #266): it always ANSWERS, and the answer for anything it cannot
+    read is False. That is not politeness — this is the launch gate, and decide's `_needs_touches`
+    asks it UNGUARDED, so a raise here does not refuse one launch, it kills the whole tick (decide's
+    own contract is defensive coercion of every input, never a raise). scheduler.launch_ok, the
+    other caller, wraps this call and fails closed on the same shapes; doing it HERE instead means
+    every caller — present and future — inherits the guard rather than having to remember it.
 
     `frozen` is accepted for interface symmetry with the scheduler and to make the constitutional
     rule EXPLICIT and testable: a frozen mainline stops MERGES, not builds (frozen-but-building is
@@ -172,17 +201,28 @@ def eligible(parsed, closed_issue_nums, frozen, resume=False):
     sameness IS the fix: D8's relaunch tier skipped this predicate entirely and started a worker
     past its open `blocked-by`. If William has taken BOTH tokens away (parked it mid-flight), no
     approval stands and the restart is refused."""
-    approved = "agent-ready" in parsed["labels"] or (resume and "in-progress" in parsed["labels"])
+    # Not an issue at all (the recovery paths can reach this for an issue absent from the GitHub
+    # view): with nothing to read, not one condition below can be affirmed -> never launch.
+    if not isinstance(parsed, dict):
+        return False
+    labels = parsed.get("labels")
+    if not isinstance(labels, _LIST_LIKE):
+        labels = []                  # unreadable labels -> no approval token -> refuse
+    approved = "agent-ready" in labels or (resume and "in-progress" in labels)
     if not approved:
         return False
-    if parsed["type"] not in VALID_TYPES:
+    if parsed.get("type") not in VALID_TYPES:
         return False
     # A control-label conflict (2+ `model:*` or 2+ `effort:*`) is ambiguous — refuse to launch until
     # William fixes the labels, exactly as an invalid type is refused. `.get` keeps this backward-safe
     # if an older parsed dict (no `label_conflict` key) is ever passed in.
     if parsed.get("label_conflict"):
         return False
-    return all(dep in closed_issue_nums for dep in parsed["blocked_by"])
+    deps = parsed.get("blocked_by")
+    if not isinstance(deps, _LIST_LIKE):
+        return False                 # an unreadable dependency list is never proof that nothing
+                                     # blocks — refuse, rather than launch on an empty walk
+    return all(dep_met(dep, closed_issue_nums) for dep in deps)
 
 
 def sort_key(parsed, requeue_front):

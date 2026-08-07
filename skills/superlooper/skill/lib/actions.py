@@ -867,20 +867,19 @@ def _is_i172_hold_stamp(reason):
 
 
 def _dep_unmet(d, closed_nums):
-    """Is this `blocked-by` ENTRY unsatisfied? Mirrors issues.eligible's per-entry membership test —
-    a wrong-typed entry is never in the closed set, so it reads as unmet, which is the fail-closed
-    answer — but survives an UNHASHABLE entry, which the bare `in` raises on.
+    """Is this `blocked-by` ENTRY unsatisfied? Now literally the SAME test issues.eligible applies
+    (issue #266 moved the per-entry walk into issues.dep_met and this delegates to it), so the
+    verdict and the prose explaining it cannot drift: a wrong-typed entry is never in the closed
+    set, an UNHASHABLE one makes the bare `in` raise rather than answer, and both read as unmet —
+    the fail-closed answer.
 
     Scope, precisely (third review round: the earlier wording over-claimed). This aligns the two on
-    each ENTRY. It does not align them on the CONTAINER: _launch_gate_reason still guards with
-    `isinstance(deps, list)` while issues.eligible iterates whatever it is, so a non-list container
-    (a tuple) is refused by the gate but falls to the unnamed reason. Pre-existing, unreachable from
-    parse_issue (which always builds a list of ints), and tracked with the wider eligibility-totality
-    hole in its own issue rather than widened into this diff."""
-    try:
-        return d not in closed_nums
-    except TypeError:
-        return True
+    each ENTRY. It does not align them on the CONTAINER: _launch_gate_reason guards with
+    `isinstance(deps, list)` and falls to the unnamed reason for anything else, while eligible reads
+    a tuple/set as a dependency list and refuses outright on a container it cannot read at all. Both
+    HOLD the issue either way — the asymmetry is in which prose says so, and it is unreachable from
+    parse_issue, which always builds a list of ints."""
+    return not issues_mod.dep_met(d, closed_nums)
 
 
 def _unlanded_closed_read_reason(open_deps):
