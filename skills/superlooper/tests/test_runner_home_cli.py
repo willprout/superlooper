@@ -223,6 +223,24 @@ def test_run_in_the_pane_home_still_fails_hard_without_a_pane(rig):
     assert "FATAL" in (r.stdout + r.stderr)
 
 
+@pytest.mark.parametrize("home", ["pane", "login-item"])
+def test_both_homes_refuse_a_repo_whose_merge_gate_would_require_no_checks(rig, home):
+    # Issue #401, and it belongs HERE rather than beside its siblings in test_cli.py: which home a
+    # runner boots into is a per-repo decision, and a refusal wired into one branch of that fork is
+    # a refusal somebody eventually discovers was never armed on the other (the #355 failure mode
+    # wearing a different hat). Driving both homes through the real CLI is what proves the check
+    # sits ABOVE the fork.
+    write_config(rig.repo, runner_home=home, required_checks=[])
+    env_over = None if home == "login-item" else _in_a_pane(rig)
+    r = cli(rig, "run", "--repo", str(rig.repo), "--ticks", "0", env_over=env_over)
+    assert r.returncode == 2, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert "FATAL" in out and "required_checks" in out
+    assert "superlooper doctor" in out
+    # Neither home got as far as its own preflight, so neither home's runner ever existed.
+    assert not (Path(rig.env["SL_HOME"]) / "o__r" / "state" / "runner.heartbeat").exists()
+
+
 # --------------------------------------------- the fleet machine arms its own runner (issue #355)
 # The fence pre-flight (#326) reads SL_FLEET_FENCE off the RUNNER's own process, and nothing in the
 # engine used to set it — so the gate shipped correct and inert on the one machine it was built for.
