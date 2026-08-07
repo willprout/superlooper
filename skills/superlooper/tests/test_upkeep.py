@@ -542,8 +542,8 @@ def test_upkeep_verb_has_no_execute_flag():
 
 def test_an_unswept_merged_open_class_never_reads_as_a_clean_one():
     """`gh.sl_head_prs` reports ok=False on a refusal AND on a full page ("a list capped at `limit`
-    cannot prove a PR's absence"), and either way the class proposes nothing — which the weekly
-    glance would otherwise print as "nothing to propose". That is #21/#61's refused-vs-answered-empty
+    cannot prove a PR's absence"), and either way an ABSENCE in the class is unproven — which the
+    weekly glance would otherwise print as "nothing to propose". That is #21/#61's refused-vs-answered-empty
     on the LAST link of the closure chain: the post-merge verify journals an unverifiable merge and
     delegates it to this sweep, and `doctor` has no surface for the class (#404)."""
     empty = _text(_view(janitor={"error": None, "proposals": [], "held": [],

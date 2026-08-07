@@ -2867,9 +2867,10 @@ def _corrupt_sl_head_prs(rig):
 def test_a_refused_sl_pr_list_is_never_reported_as_a_clean_sweep(rig):
     """The PLUMBING guard for the sweep's health flag, on all three surfaces (sixth fresh review).
 
-    `gh.sl_head_prs` reports ok=False on a refusal AND on a full page, and either way the
-    merged-PR/still-open class proposes nothing — which the sweep would otherwise print as "no
-    GitHub-side debris found". That is #21/#61's refused-vs-answered-empty on the LAST link of this
+    `gh.sl_head_prs` reports ok=False on a refusal AND on a full page, and either way an ABSENCE in
+    the merged-PR/still-open class is unproven — which the sweep would otherwise print as "no
+    GitHub-side debris found". (A truncated read does propose from its partial page; only a refused
+    one sweeps nothing. What both share is that "none found" proves nothing.) That is #21/#61's refused-vs-answered-empty on the LAST link of this
     chain: the post-merge verify journals an unverifiable merge and delegates it here, and `doctor`
     has no surface for the class.
 

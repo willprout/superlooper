@@ -127,6 +127,11 @@ def test_the_brief_never_tells_a_ship_pipeline_worker_it_can_skip_the_keyword(_s
     assert "which already does this" not in out
     assert gate.closing_keyword_line(123) in out
     assert "CHECK" in out or "check that it wrote" in out.lower()
+    # ...and the brief carries the same destructive-replace warning the gate's nudge does. The brief
+    # is the FIRST place a worker reads this, and on a ship_cmd repo it points at a body someone
+    # else's pipeline wrote — `gh pr edit --body 'Closes #N'` would wipe it, and the gate would then
+    # pass the PR. Teaching the hazard only in the correction is teaching it too late.
+    assert "REPLACES the body" in out
 
 
 def test_the_no_ship_cmd_flavour_states_the_shipping_rule_too(_sl_home):

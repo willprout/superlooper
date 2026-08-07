@@ -2161,6 +2161,11 @@ def test_post_merge_verify_never_breaks_the_merge(rig, monkeypatch):
     assert rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
                            "method": "squash"}, NOW) == "ok"
     assert issue_state(rig, "i5")["status"] == "merged"
+    # ...and the swallow still leaves a RECORD. The docstring's contract is "every failure is
+    # swallowed into a journal line", and this is the one function whose entire product on the
+    # absorb path is the audit trail — an unasserted recovery line is an unpinned promise.
+    rec = [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+    assert len(rec) == 1 and rec[0]["outcome"] == "error" and rec[0].get("error")
 
 
 def test_a_refused_merge_never_touches_the_issue(rig):
@@ -7273,3 +7278,22 @@ def test_a_present_but_corrupt_stop_marker_still_reads_as_stopped(rig):
     assert runner_mod.read_stop_marker(rig.home / "state") == {}
     _stop_marker(rig).unlink()
     assert runner_mod.read_stop_marker(rig.home / "state") is None
+
+
+def test_absorb_on_a_freshly_launched_lane_closes_its_merged_issue(rig, monkeypatch):
+    """The one place layers 2 and 3 treat the same evidence differently, pinned as a DECISION.
+
+    The janitor refuses to propose a pair whose issue carries `agent-ready` — it reads that as the
+    owner having reopened and re-approved the work deliberately. The runner has no such guard, and
+    the reachable path starts from exactly that label: a wiped state home (the incident's own cause)
+    leaves no lane record, the owner re-approves, the lane launches, and the reconcile finds the
+    already-MERGED PR on its branch. Closing there is CORRECT and is the whole point of #404 — the
+    runner owns that lane and verified the merge itself, where the janitor only observed one from
+    outside. Different evidence, different rules; this makes it a decision rather than a side effect.
+    """
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="running", branch="sl/i5-x")   # just launched, no prior record
+    _seed_issue_state(rig, 5, "OPEN")
+    assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}, NOW) == "ok"
+    assert [m["num"] for m in mutations(rig) if m["kind"] == "close_issue"] == ["5"]
+    assert issue_state(rig, "i5")["status"] == "merged"

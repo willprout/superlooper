@@ -108,9 +108,11 @@ _INVESTIGATE_WORK_BLOCK = """\
 # claim one. Verify, don't assume.
 _FINISH_PR = ("Make sure the PR body carries `" + gate.closing_keyword_line("{issue_num}")
               + "` — if you shipped via the configured ship command, CHECK that it wrote that line "
-                "and add it with `gh pr edit` if it did not. The gate refuses to merge a PR whose "
-                "body would leave its issue open, and editing the body does not move the head, so "
-                "it costs you no re-review. ")
+                "and add it with `gh pr edit` if it did not (`--body` REPLACES the body, so re-send "
+                "the existing text plus the line; on a ship-command repo that body is your "
+                "pipeline's, not yours to discard). The gate refuses to merge a PR whose body would "
+                "leave its issue open, and editing the body does not move the head, so it costs you "
+                "no re-review. ")
 
 # The "if you can safely proceed on one assumption" hint — code types point at the PR body, but an
 # investigation opens no PR (cross-review Task 7: a PR instruction must not leak into a no-PR flow).

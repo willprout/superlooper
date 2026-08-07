@@ -4226,6 +4226,16 @@ class Runner:
         refused-vs-answered-empty discipline on the one read whose failure re-opens this very
         incident. The same goes for a refused close.
 
+        One asymmetry with layer 3, named rather than left as a side effect: the janitor REFUSES to
+        propose a pair whose issue carries `agent-ready`, reading it as "the owner reopened and
+        re-approved this deliberately". This function has no such guard, and a reachable path
+        starts from exactly that label — a wiped or migrated state home (the incident's own stated
+        cause) leaves no lane record, the owner re-approves the issue, the lane launches, and the
+        next tick's reconcile finds the already-MERGED PR on its branch and absorbs it. Closing
+        there is CORRECT and is the whole point of #404: the runner owns that lane, and it verified
+        the merge itself. The janitor's caution is for pairs it merely observed from outside, with
+        no lane and no verification of its own. Different evidence, so different rules.
+
         Bounded by construction: this runs ONCE per merge, after the merge already landed. It
         therefore must never be able to lose the merged fact — a raised exception here would skip
         the `merged` status, the label cleanup and the lane teardown, leaving the crash window

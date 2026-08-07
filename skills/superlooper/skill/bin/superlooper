@@ -2914,7 +2914,7 @@ def _janitor_fetch(ls_issues, cfg=None):
           if isinstance(b, str) and b.startswith(janitor_lib.BRANCH_PREFIX)}
     # `ok` is load-bearing on THIS read and nowhere else in the sweep (issue #404). `sl_head_prs`
     # reports ok=False on a refusal AND on a full page — "a list capped at `limit` cannot prove a
-    # PR's absence" — and either way the class proposes nothing, which the sweep would otherwise
+    # PR's absence" — so either way an ABSENCE here is unproven, which the sweep would otherwise
     # print as "no GitHub-side debris found". That is the #21/#61 refused-vs-answered-empty defect
     # on the LAST link of the closure chain: `_verify_issue_closed` journals an unverifiable merge
     # and explicitly delegates it to this sweep, and `doctor` has no surface for this class, so a
@@ -3202,9 +3202,9 @@ def cmd_janitor(args):
     # otherwise render as "no debris found". Say which class went unswept (#404).
     # Wording covers BOTH halves of `ok`, which are different facts: a REFUSED read swept nothing,
     # while a TRUNCATED one (a full page — `sl_head_prs` counts every PR, not just `sl/*`, so any
-    # repo past its limit trips this permanently) swept as far as the page went and may well have
-    # proposed from it. "NOT swept" would be false beside those very proposals. What is true of both:
-    # an absence here is unproven.
+    # repo past its limit trips this permanently) swept as far as the page went and DOES propose
+    # from it — `_janitor_fetch` passes the partial page straight through. So "NOT swept" would be
+    # false beside those very proposals. What is true of both: an absence here is unproven.
     unswept_note = ("(the sl/* PR list was refused or truncated, so this class is INCOMPLETE — "
                     "read 'none found' as unproven, not as none)" if not sl_prs_ok else "")
     mo_note = (f"({mo_withheld} more merged-PR/still-open issue(s) were found and NOT proposed this "
@@ -3350,8 +3350,8 @@ def _upkeep_janitor_view(home, cfg, dev):
     return ({"error": None, "proposals": result["proposals"], "held": result["refused"],
              "reopen_withheld": result.get("reopen_withheld") or 0,
              "merged_open_withheld": result.get("merged_open_withheld") or 0,
-             # a refused/truncated sl/* PR list means that class was not swept — upkeep's whole job
-             # is "did I miss anything", so an unswept class must never read as a clean one (#404)
+             # a refused/truncated sl/* PR list means an absence in that class is unproven — and
+             # upkeep's whole job is "did I miss anything", so it must never read as a clean one
              "merged_open_swept": bool(sl_prs_ok)},
             fetched["branches"])
 
