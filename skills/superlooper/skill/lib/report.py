@@ -727,10 +727,14 @@ def _queue_hold(view, now):
                 "cannot be read, so the launch queue may be paused with nothing running. Read "
                 "`state/ALERT` and run `superlooper status` / `superlooper doctor` before assuming "
                 "the night was merely quiet.")
+    # The claim is scoped to THE HOLD, not to the world: the hold takes no action, which is true of
+    # every held class. "Nothing is parked" flatly is not — a lane that reached its own launch cap
+    # before a second distinct refusal proved the outage parked on its own account, and telling the
+    # owner otherwise walks them past a real re-approval (#320, fresh review).
     return (f"**The launch queue is HELD{for_bit} — nothing is launching** ({', '.join(reasons)}). "
-            "This is a PAUSE, not an idle queue: no issue was parked, no label moved, and there is "
-            "nothing to re-approve — launching resumes by itself once the cause clears. "
-            "`superlooper status` prints the same line with the remedy.")
+            "This is a PAUSE, not an idle queue: the hold itself parks nothing and moves no label, "
+            "so every approved issue keeps its place and launching resumes by itself once the "
+            "cause clears. `superlooper status` prints the same line with the remedy.")
 
 
 def _freeze(view, now):

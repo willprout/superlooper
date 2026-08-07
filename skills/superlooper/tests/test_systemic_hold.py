@@ -527,11 +527,11 @@ def test_the_hold_line_names_every_held_class_at_once():
     assert "env_poisoned_workers" in line and "gh_auth_dead_workers" in line
 
 
-def test_the_hold_line_says_nothing_is_parked():
+def test_the_hold_line_says_the_hold_itself_takes_no_action():
     """The whole point of surfacing it: a paused queue must never be read as an idle one, and the
     owner must not go looking for issues to re-approve."""
     line = actions.queue_hold_line({"reasons": ["gh_auth_dead_workers"]})
-    assert "parked" in line.lower() or "re-approv" in line.lower()
+    assert "parks nothing" in line and "moves no label" in line
 
 
 def test_no_held_class_claims_an_accounting_it_did_not_keep():
@@ -539,12 +539,21 @@ def test_no_held_class_claims_an_accounting_it_did_not_keep():
     environment ones: those bump the refusing lane's own launch cap on the way in, which is exactly
     what keeps a one-off broken worktree parking normally. A status line and an alert body that
     overclaim are how an owner learns to stop believing them."""
-    assert "no issue charged" not in actions.queue_hold_line(
-        {"reasons": ["gh_auth_dead_workers"]}).lower()
+    shared = actions.queue_hold_line({"reasons": ["gh_auth_dead_workers"]}).lower()
+    assert "no issue charged" not in shared
+    # ...and it may not flatly claim NOTHING is parked either (round-4 P2): a lane that reached its
+    # own launch cap BEFORE a second distinct refusal proved the outage parked on its own account,
+    # and an owner told otherwise walks past a real re-approval. What is true of every class is that
+    # the hold ITSELF takes no action, so that is what the shared surfaces claim.
+    assert "nothing is parked" not in shared and "nothing parked" not in shared
+    assert "parks nothing" in shared
     for ev_reason in evidence.SYSTEMIC_ESCALATION_REASONS:
         msg = actions._alert_message(actions.LAUNCH_ALERT_REASONS[ev_reason]).lower()
         assert "no issue charged" not in msg, ev_reason
-        assert "nothing parked" in msg, ev_reason
+        assert "nothing parked" not in msg, ev_reason
+        assert "parks nothing" in msg, ev_reason
+        # and each says out loud what the late-escalation case costs
+        assert "may already have parked" in msg, ev_reason
 
 
 def test_the_morning_report_never_reads_a_held_queue_as_a_quiet_night():
@@ -560,13 +569,13 @@ def test_the_morning_report_never_reads_a_held_queue_as_a_quiet_night():
     assert "HELD" in summary, summary
 
 
-def test_the_morning_report_names_the_cause_and_says_nothing_was_parked():
+def test_the_morning_report_names_the_cause_and_says_the_hold_took_no_action():
     view = {"date": "2026-08-07", "now": NOW, "frozen": None,
             "queue": [{"num": 5, "title": "a"}, {"num": 6, "title": "b"}], "usage": None,
             "queue_hold": {"reasons": ["gh_auth_dead_workers"], "since": NOW - 3600}}
     text = report_lib.morning([], view, {}, cfg())
     assert "gh_auth_dead_workers" in text
-    assert "re-approve" in text
+    assert "parks nothing" in text and "moves no label" in text
     assert "1h 0m" in text, "how long the loop has been down is the first thing to know"
 
 

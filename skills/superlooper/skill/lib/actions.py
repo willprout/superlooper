@@ -382,13 +382,16 @@ ALERT_MESSAGES = {
                             "(issue #320): several distinct lanes in a row refused their flight "
                             "because `gh` inside the SESSION's fresh environment could not answer "
                             "as the login this loop runs as. One lane could be a broken worktree; "
-                            "this many distinct lanes is the ENVIRONMENT. The known cause is an "
+                            "this many distinct lanes is the ENVIRONMENT. A lane that reached its "
+                            "OWN launch cap before the outage was proven may already have parked; "
+                            "re-approve that one after the fix. The known cause is an "
                             "inherited XDG_CONFIG_HOME (or another gh config redirect) that the "
                             "runner does not see but every worker does — the runner's own polling "
                             "keeps working throughout, which is why nothing else complained. "
-                            "Launches are HELD (the queue is intact, NOTHING parked, no label "
-                            "moved, no re-approval needed) and resume automatically once a probe "
-                            "launch flies. Fix: `gh auth login --hostname github.com` as the "
+                            "Launches are HELD: the hold itself parks nothing and moves no "
+                            "label, so every approved issue keeps its place and resumes "
+                            "automatically once a probe launch flies. Fix: `gh auth login "
+                            "--hostname github.com` as the "
                             "account that owns the loop repo, and check for an exported "
                             "XDG_CONFIG_HOME/GH_CONFIG_DIR in a shell rc file, a LaunchAgent or a "
                             "wrapper. This is NOT the runner's own credential (gh_auth_dead_runner) "
@@ -399,9 +402,12 @@ ALERT_MESSAGES = {
                                      "auth status` did not report the account the launch assigned "
                                      "— not logged in, on an API key, or on a different org. One "
                                      "lane could be a broken worktree; this many distinct lanes is "
-                                     "the ENVIRONMENT. Launches are HELD (the queue is intact, "
-                                     "NOTHING parked, no re-approval needed) and resume "
-                                     "automatically once a probe launch flies. Fix: open a "
+                                     "the ENVIRONMENT. A lane that reached its OWN launch cap "
+                                     "before the outage was proven may already have parked; "
+                                     "re-approve that one after the fix. Launches are HELD: the "
+                                     "hold itself parks nothing and moves no label, so every "
+                                     "approved issue keeps its place and resumes automatically "
+                                     "once a probe launch flies. Fix: open a "
                                      "supervised `claude` window under the fleet's config dir and "
                                      "log it into the loop's subscription account (an API-key "
                                      "session bills per token while still answering `loggedIn: "
@@ -411,13 +417,16 @@ ALERT_MESSAGES = {
                             "distinct lanes in a row refused their flight because the launch-floor "
                             "scrub could not clean the session's own environment. One lane could be "
                             "a broken worktree; this many distinct lanes means the variables are "
-                            "exported somewhere every session inherits. Left alone they are "
+                            "exported somewhere every session inherits (and a lane that reached "
+                            "its OWN launch cap before that was proven may already have parked; "
+                            "re-approve that one after the fix). Left alone they are "
                             "invisible — ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL move sessions off "
                             "Max-subscription billing onto API billing with no error and no "
                             "signal, and an inherited CLAUDE_CODE_* turns transcript saving off, "
-                            "which silently breaks `--resume`. Launches are HELD (the queue is "
-                            "intact, NOTHING parked, no re-approval needed) and resume "
-                            "automatically once a probe launch flies. Fix: `superlooper status` "
+                            "which silently breaks `--resume`. Launches are HELD: the hold "
+                            "itself parks nothing and moves no label, so every approved issue "
+                            "keeps its place and resumes automatically once a probe launch flies. "
+                            "Fix: `superlooper status` "
                             "and the journal's launch records name the exact variables each "
                             "refusal saw; find where they are exported (a shell rc file, a "
                             "LaunchAgent, a wrapper) and remove them.",
@@ -618,10 +627,15 @@ def queue_hold_line(alert):
     in the same breath that nothing was parked — because the owner's first instinct on reading
     "held" is to go looking for issues to re-approve, and there are none.
 
-    It claims "nothing parked, no label moved" and deliberately NOT "no issue charged" (fresh-review
-    P2). The CHANNEL classes really do charge nothing; the escalated ENVIRONMENT ones bump the
-    refusing lane's own launch cap on the way in, which is exactly what keeps a one-off broken
-    worktree parking normally. One line covers both, so it may only claim what is true of both."""
+    What it claims is scoped to THE HOLD — "the hold parks nothing and moves no label" — rather than
+    to the world, and both halves of that scoping were paid for by fresh review. It may not say "no
+    issue charged": the CHANNEL classes really do charge nothing, but the escalated ENVIRONMENT ones
+    bump the refusing lane's own launch cap on the way in, which is exactly what keeps a one-off
+    broken worktree parking normally. And it may not say "nothing is parked" flatly: a lane that
+    reached that cap BEFORE a second distinct refusal proved the outage parked on its own account,
+    and telling the owner otherwise sends them past a real re-approval. One line covers every class,
+    so it may only claim what is true of all of them — and what IS true of all of them is that the
+    hold itself takes no action at all."""
     held = queue_hold_reasons(alert)
     if not held:
         return "queue: flowing"
@@ -630,8 +644,9 @@ def queue_hold_line(alert):
                 "state cannot be read. Treat the queue as HELD until you can read it (the raw ALERT "
                 "line above is the file's actual contents); `superlooper doctor` checks the rest of "
                 "the state files.")
-    return ("queue: HELD — launches are paused (the queue is intact: nothing parked, no label "
-            "moved, no re-approval needed). Cause: " + ", ".join(held))
+    return ("queue: HELD — launches are paused. The hold itself parks nothing and moves no label: "
+            "every approved issue keeps its place and launching resumes by itself once the cause "
+            "clears. Cause: " + ", ".join(held))
 
 
 LAUNCH_STDERR_MEMO_MAX = 1200      # chars of a failed launch's stderr tail carried into a park memo
