@@ -22,8 +22,6 @@ one owner alert -> the owner fixes it -> the canary probe goes green -> the queu
 own, with nothing parked, nothing relabeled and no re-approval.
 """
 import json
-import shutil
-from pathlib import Path
 
 import pytest
 
@@ -34,8 +32,7 @@ import report as report_lib
 import runner as runner_mod
 
 from test_actions import NOW, cfg, decide, disk, ist, only, parsed, has_notify
-from test_runner import (_launch_action, issue_state, make_config, mutations,  # noqa: F401
-                         rig, seed_issue)
+from test_runner import _launch_action, issue_state, mutations, rig  # noqa: F401  (rig is a fixture)
 
 
 # --------------------------- the class registry (extensibility) ---------------------------
