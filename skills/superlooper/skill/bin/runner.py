@@ -4259,8 +4259,8 @@ class Runner:
                 closed = gh.close_issue(
                     num, comment=f"{which} merged, but this issue was still open when superlooper "
                                  "checked immediately afterwards — so superlooper closed it "
-                                 "(post-merge closure verify). If you expected the PR body's "
-                                 "closing keyword to do this, it did not.")
+                                 "(post-merge closure verify). The PR body's closing keyword had "
+                                 "not closed it by then.")
                 outcome = "closed" if closed else "close_refused"
             journal.append(self.home, {"act": "post_merge_close", "id": iid, "num": num,
                                        "pr": pr, "outcome": outcome}, now)

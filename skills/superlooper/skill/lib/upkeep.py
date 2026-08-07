@@ -344,7 +344,8 @@ def _janitor_row(janitor, repo_path, out):
     mo_withheld = janitor.get("merged_open_withheld")
     mo_withheld = mo_withheld if type(mo_withheld) is int and mo_withheld > 0 else 0
     mo_note = ("%s more merged-PR/still-open issue(s) found beyond this sweep's close cap — "
-               "later sweeps propose the rest" % mo_withheld) if mo_withheld else ""
+               "the next sweep proposes more once these are cleared" % mo_withheld) \
+        if mo_withheld else ""
     if not props:
         _row("janitor", "nothing to propose"
              + (" (%s held back from a prior failure)" % _plural(len(held), "action")

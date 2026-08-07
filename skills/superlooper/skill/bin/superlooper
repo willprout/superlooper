@@ -3183,8 +3183,8 @@ def cmd_janitor(args):
     # than the reopen one: a repo whose dev_branch is not its DEFAULT branch never had a closing
     # keyword honoured at all, so its very first sweep finds one pair per merged issue.
     mo_note = (f"({mo_withheld} more merged-PR/still-open issue(s) were found and NOT proposed this "
-               f"sweep — at most {janitor_lib.MERGED_OPEN_SWEEP_CAP} closes per sweep; later sweeps "
-               "propose the rest)" if mo_withheld else "")
+               f"sweep — at most {janitor_lib.MERGED_OPEN_SWEEP_CAP} closes per sweep; the next sweep "
+               "proposes more once these are cleared)" if mo_withheld else "")
 
     if not props:
         print("janitor: nothing to propose — no GitHub-side debris found."

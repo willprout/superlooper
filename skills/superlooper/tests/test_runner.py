@@ -2069,6 +2069,10 @@ def test_merge_closes_an_issue_the_keyword_left_open(rig, monkeypatch):
     # fires. A permanent GitHub comment must not assert a cause nobody established.
     assert "DEFAULT branch" not in body and "default branch" not in body
     assert "still open when superlooper checked" in body
+    # ...and it does not claim the keyword WOULD NOT have fired — the comment above notes GitHub's
+    # closure is a background job, so this read can land in front of one. "had not closed it by
+    # then" is observation; "it did not" would be a prediction.
+    assert "had not closed it by then" in body
     rec = [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
     assert len(rec) == 1 and rec[0]["id"] == "i5" and rec[0]["num"] == 5
     assert rec[0]["outcome"] == "closed"

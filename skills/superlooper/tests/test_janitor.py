@@ -932,3 +932,13 @@ def test_a_reopen_and_a_close_of_the_same_issue_never_share_one_menu():
     keys = [p["key"] for p in r["proposals"]]
     assert "reopen:5" in keys                        # the reopen is proposed, as before
     assert "closemerged:5" not in keys               # ...and never its opposite in the same sweep
+
+
+def test_a_duplicated_open_issue_entry_is_proposed_once():
+    """`lint_issues` is a raw gh list, and a duplicated entry would otherwise emit `closemerged:5`
+    twice. A duplicated close is not harmless: under `--yes` the second `gh issue close` returns
+    nonzero, which lands the key in the refused map and blocks the class for that issue until
+    `--retry-refused`. Every sibling class dedups inside its own emit loop; so does this one."""
+    iss = _open_issue(5, ["type:build"])
+    props = _of_kind(_pair_propose(lint_issues=[iss, dict(iss), dict(iss)]), "issue-merged-open")
+    assert [p["key"] for p in props] == ["closemerged:5"]

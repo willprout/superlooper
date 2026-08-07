@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import janitor as janitor_lib
 import labels as labels_lib
 import loopstate
 
@@ -2043,6 +2044,33 @@ def test_janitor_executes_an_approved_merged_open_close_with_its_audit_comment(r
     recs = [x for x in _janitor_journal(rig)
             if x.get("act") == "janitor" and x.get("target") == 101]
     assert len(recs) == 1 and recs[0]["outcome"] == "ok" and recs[0]["action"] == "close-issue"
+
+
+def test_upkeep_names_what_the_merged_open_cap_left_out(rig):
+    """The regression guard for the PLUMBING, not the renderer (third fresh review, P1).
+
+    `superlooper upkeep` is the weekly "did I miss anything" read, and it once reported only
+    `reopen_withheld` — so the second capped class was invisible there while `janitor` said "240
+    more found". A renderer test cannot catch that: it hands `_janitor_row` a dict that already has
+    the key. This drives the REAL command over a repo with more pairs than the cap, so deleting the
+    key anywhere between propose() and the page turns it red."""
+    _seed_janitor_fixtures(rig)
+    over = janitor_lib.MERGED_OPEN_SWEEP_CAP + 4
+    # numbered from 100 so none collides with the committed fixtures' own issues (the aged-park
+    # sweep proposes closing #9, which would legitimately drop one pair out of this class and make
+    # the arithmetic below read as an off-by-one rather than as the exclusion it is)
+    nums = list(range(100, 100 + over))
+    (rig.fixdir / "pr_list_heads.json").write_text(json.dumps(
+        [{"number": 500 + n, "state": "MERGED", "headRefName": "sl/i%d-x" % n} for n in nums]))
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(
+        [{"number": n, "title": "pair %d" % n, "createdAt": "2026-07-01T09:00:00Z",
+          "labels": [{"name": "type:build"}],
+          "body": "## Loop metadata\ntouches: frontend\n"} for n in nums]))
+    r = cli(rig, "upkeep", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "%d issue-merged-open" % janitor_lib.MERGED_OPEN_SWEEP_CAP in r.stdout
+    assert "4 more merged-PR" in r.stdout, \
+        "upkeep showed the capped list and never said what the cap left out:\n" + r.stdout
 
 
 def test_janitor_json_carries_the_merged_open_pair_for_the_command_center(rig):

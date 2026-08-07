@@ -511,6 +511,14 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
         # sort by the NUMBER only — the tuples carry a raw gh dict, and a key-less sort would
         # compare dicts on a tie and raise inside a module that must never raise.
         for num, pr, i in sorted(stale + fresh[:cap], key=lambda c: c[0]):
+            # ...and the dedup runs HERE too, not only at candidate-build time: `lint_issues` is a
+            # raw gh list, and two entries for the same issue would otherwise emit the key twice.
+            # A duplicated close is not harmless — under `--yes` the second `gh issue close` returns
+            # nonzero, which lands the key in the refused map and blocks the class for that issue
+            # until `--retry-refused`. Every sibling class guards inside its own emit loop for the
+            # same reason (`seen_issues` for aged-park, `seen_reopens` for reopens).
+            if num in seen_issues:
+                continue
             seen_issues.add(num)                 # one close per issue, whichever justified it
             emit({"kind": "issue-merged-open", "key": f"closemerged:{num}",
                   "action": "close-issue", "target": num,
