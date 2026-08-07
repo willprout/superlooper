@@ -201,11 +201,14 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
         # DEFINITIONALLY pre-merge (the gate only merges an OPEN one) and will never be refreshed —
         # the issue is terminal, so it is never polled again.
         #
-        # Precisely: this settles on the LANDING TICK itself (#276). The runner hands us the
-        # post-execute issue map — the one `_exec_merge` has already written `status: merged` into —
-        # so the tick that merges a lane is the tick that publishes it merged. It used to hand us
-        # the map loaded at the top of the tick, and the landing then took a whole tick (~15s, and a
-        # dashboard polling every ~2s behind it) to appear.
+        # Precisely: this settles on the LANDING TICK itself (#276). The runner normally hands us
+        # the post-execute issue map — the one `_exec_merge` has already written `status: merged`
+        # into — so the tick that merges a lane is the tick that publishes it merged. It used to
+        # hand us the map loaded at the top of the tick, and the landing then took a whole tick
+        # (~15s, and a dashboard polling every ~2s behind it) to appear. It still can, on the one
+        # path where the runner deliberately falls back to that older map (an unreadable
+        # post-execute state read, whose empty answer would prune the carries) — a landing shown a
+        # tick late, which is what that fallback trades for never losing one.
         #
         # Which map arrives is the runner's business, not ours; this stays correct either way,
         # including the worst interleaving (a poll firing between the merge and the publish, which

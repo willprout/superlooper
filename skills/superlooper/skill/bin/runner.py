@@ -1231,6 +1231,11 @@ class Runner:
         has merged itself. Handed the pre-execute map instead, both are one phase out of date and a
         lane the loop merged this tick publishes as still in flight.
 
+        With ONE exception the caller owns: when that post-execute read fail-closes to empty, the
+        caller hands the pre-execute map instead, because an empty tracked set would prune the
+        carries permanently and a one-tick-stale merged set only delays a landing by a tick. Losing
+        a fact forever is worse than showing it late — see the fallback beside the call.
+
         The runner has always held this view and thrown it away each tick, which left the dashboard
         no choice but to ask GitHub the same questions on its own clock: a second poller on one
         rate-limit budget (a contributor to the 2026-07-08 storm, §1b) whose answers drifted from the
