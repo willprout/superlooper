@@ -617,17 +617,27 @@ def touch_verdict(declared, actual_areas, inflight):
 # fallback — never as a silent guess about which run is current.
 _ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _RECENCY_FIELDS = ("completedAt", "startedAt", "createdAt")
+# gh does not hand a null timestamp through as null: `gh pr view --json statusCheckRollup`
+# marshals its Go zero time instead, so a still-running check reports completedAt
+# "0001-01-01T00:00:00Z" and conclusion "" (observed on a real two-suite rollup while building
+# #402). Year 1 is a perfectly well-formed DateTime, so it would rank as the OLDEST record rather
+# than the missing one it stands for — a completedAt-only ranking would have scored a live re-run
+# below the failure it supersedes and failed the PR for the whole re-run window. It is the absence
+# of a timestamp, so it is never treated as one.
+_ZERO_TIME = "0001-01-01T00:00:00Z"
 
 
 def _entry_recency(c):
     """When a rollup entry last showed signs of life: the MAX of whichever of gh's timestamps it
     carries, or None when it carries none in the exact DateTime shape (issue #402).
 
-    Max across the fields, not completedAt alone: a re-run still in flight has completedAt null
-    and startedAt set, and it must still outrank the completed record it supersedes — otherwise
-    the stale failure wins the whole re-run window, which is the park this fold exists to stop."""
+    Max across the fields, not completedAt alone: a re-run still in flight has no completedAt but a
+    real startedAt, and it must still outrank the completed record it supersedes — otherwise the
+    stale failure wins the whole re-run window, which is the park this fold exists to stop. gh's
+    zero time (_ZERO_TIME) is the missing value, not the year 1, and is skipped like a null."""
     stamps = [c.get(f) for f in _RECENCY_FIELDS]
-    stamps = [s for s in stamps if isinstance(s, str) and _ISO_Z.match(s)]
+    stamps = [s for s in stamps
+              if isinstance(s, str) and s != _ZERO_TIME and _ISO_Z.match(s)]
     return max(stamps) if stamps else None
 
 
@@ -659,9 +669,10 @@ def _rollup_entries(status_rollup):
     keeps ALL its entries and stays any-failure-wins — the old behavior, unchanged. No ordering
     means the fold genuinely cannot tell which run is current, and voting every run is the safe
     answer (worst case a green PR waits for a human, never a red one merges). This is also the ONLY
-    branch the dev-branch surface takes: gh.branch_checks normalizes its REST reads down to
-    name/status/conclusion with no timestamps, and REST already returns latest-per-name, so
-    there the two rules coincide (see gh.branch_checks)."""
+    branch the dev-branch surface ever takes: gh.branch_checks normalizes its REST reads down to
+    name/status/conclusion with no timestamps at all, so that poll keeps its exact pre-#402
+    behavior — which is the right verdict for the one-suite-per-commit shape it sees. Its residual
+    corner, and why it is not fixed in here, is written up at gh.branch_checks."""
     runs = {}
     for c in status_rollup if isinstance(status_rollup, list) else []:
         if isinstance(c, dict):

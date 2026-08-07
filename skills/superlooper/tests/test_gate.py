@@ -521,6 +521,33 @@ def test_checks_status_context_shape_folds_latest_by_created_at():
     assert gate.required_checks_state(rollup, ["quality-gate"]) == "green"
 
 
+def test_checks_gh_zero_time_is_not_a_timestamp():
+    # Captured from a REAL rollup (willprout/superlooper PR #409, one head SHA carrying two check
+    # suites, 2026-08-07): `gh pr view --json statusCheckRollup` does NOT render a null completedAt
+    # as null — its Go struct marshals the ZERO TIME, "0001-01-01T00:00:00Z", and a null conclusion
+    # as "". Year 1 parses as a perfectly good DateTime, so a completedAt-only ranking would have
+    # scored the live re-run as older than the failure it supersedes and failed the PR for the whole
+    # re-run window. The zero time is the ABSENCE of a timestamp, so it is never one here.
+    live = [{"__typename": "CheckRun", "name": "tests", "conclusion": "CANCELLED",
+             "status": "COMPLETED", "startedAt": "2026-08-07T00:25:30Z",
+             "completedAt": "2026-08-07T00:25:41Z"},
+            {"__typename": "CheckRun", "name": "tests", "conclusion": "",
+             "status": "IN_PROGRESS", "startedAt": "2026-08-07T00:25:59Z",
+             "completedAt": "0001-01-01T00:00:00Z"}]
+    assert gate.required_checks_state(live, ["tests"]) == "pending"     # wait out the re-run
+    # ...and the same two suites once the live one lands green (the second real capture).
+    live[1] = {"__typename": "CheckRun", "name": "tests", "conclusion": "SUCCESS",
+               "status": "COMPLETED", "startedAt": "2026-08-07T00:25:59Z",
+               "completedAt": "2026-08-07T00:41:27Z"}
+    assert gate.required_checks_state(live, ["tests"]) == "green"
+    # An entry whose ONLY stamps are the zero time carries no ordering at all -> fail closed.
+    zeroed = [{"name": "tests", "conclusion": "FAILURE", "startedAt": "2026-08-07T00:25:30Z",
+               "completedAt": "2026-08-07T00:25:41Z"},
+              {"name": "tests", "conclusion": "SUCCESS", "startedAt": "0001-01-01T00:00:00Z",
+               "completedAt": "0001-01-01T00:00:00Z"}]
+    assert gate.required_checks_state(zeroed, ["tests"]) == "fail"
+
+
 def test_checks_two_reporters_of_one_name_both_keep_a_vote():
     # Cross-review P0: recency ranks RE-RUNS, and only a later run of the same reporter supersedes
     # an earlier one. A commit status and a check-run that happen to share a name are two
