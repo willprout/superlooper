@@ -9,15 +9,41 @@ file is the judge's own tests.
 Everything here is pure or probe-injected. No test reaches a real launchctl, a real control socket,
 a real `claude`, or the operator's own host config — the suite-wide ratchet.
 """
+import inspect
+import json
 import plistlib
 import re
 from pathlib import Path
+
+import pytest
 
 import fleet
 import runner_home
 import session_host
 
 from test_stack_doctor import FakeProbe
+
+
+@pytest.fixture(autouse=True)
+def _no_fleet_test_opens_a_real_control_socket(monkeypatch):
+    """Fail LOUD if anything in this module reaches the socket layer (fresh-agent review, P1).
+
+    The suite-wide ratchet in `conftest.py` points `HERDR_SOCKET_PATH` at a path that cannot exist,
+    and by its own admission that does not cover this file: `fleet.socket_path()` derives the
+    fleet's socket from the host CONFIG DIR, so a `check_fleet` call that forgot to inject one of
+    its socket seams opens whatever is at the derived path — on the fleet machine, a live server.
+    Today that only happened to be harmless because the rigs here name a HOME that does not exist,
+    which is luck, not a rule.
+
+    Scoped to this module, not the conftest: `test_fence_token_auth.py` stands up a REAL patched
+    server on an isolated socket and must keep being able to speak to it — that opt-in test is the
+    fence's own contract.
+    """
+    def refuse(socket_path, payload, timeout):
+        raise AssertionError(
+            "a fleet test tried to open a control socket at %s — inject the block's seam instead "
+            "(`fence=` / `capture=`, or a probe bound to a scripted `connect=`)" % socket_path)
+    monkeypatch.setattr(session_host, "_speak", refuse)
 
 _TEMPLATES = Path(__file__).resolve().parent.parent / "skill" / "templates"
 
@@ -393,6 +419,98 @@ def test_the_fence_check_is_red_on_an_open_socket_and_on_silence():
     assert "unattended" in fleet.check_fence("/s.sock", lambda p: session_host.OPEN).detail
 
 
+# --------------------------------- the ruled state-report allowance (issues #331, #344)
+# `host fence` asks whether a tokenless caller is refused at all. This asks the second half — is
+# the ONE method the owner's 2026-08-04 ruling opened admitted — and it is the half nothing on the
+# machine's filesystem can answer. Two generations of the host binary exist (the fence as first
+# built, and the fence carrying the allowance); they report the same version and carry the same
+# compiled-in refusal message, so `host binary` is green for both, and from the runner's seat both
+# machines launch, run and work. Only the live socket tells them apart.
+#
+# Every case below drives the REAL probes in session_host through a scripted socket, never a
+# stand-in for the probes themselves: a second implementation of that reading is exactly what this
+# issue exists to avoid.
+
+def _socket_saying(**by_method):
+    """A fake control socket: one canned reply line per method asked for, silence for the rest."""
+    def connect(socket_path, payload, timeout):
+        reply = by_method.get(json.loads(payload)["method"])
+        return "" if reply is None else json.dumps(reply)
+    return connect
+
+
+def _unauthorized():
+    return {"id": "x", "error": {"code": "unauthorized", "message": fleet.FENCE_SIGNATURE}}
+
+
+def _probes_for(**by_method):
+    """(fence, capture) — the real probes bound to one scripted socket, in check_* seam shape."""
+    connect = _socket_saying(**by_method)
+    return (lambda s: session_host.fence_probe(s, connect=connect),
+            lambda s: session_host.state_report_probe(s, connect=connect))
+
+
+def test_the_state_capture_check_fails_a_fenced_host_that_refuses_the_state_report():
+    """The failure this issue closes: the machine looks entirely healthy, and captures nothing."""
+    fence, capture = _probes_for(ping=_unauthorized(),
+                                 **{session_host.STATE_REPORT_METHOD: _unauthorized()})
+    r = fleet.check_state_capture("/s.sock", capture=capture, fence=fence)
+    assert not r.ok
+    assert session_host.STATE_REPORT_METHOD in r.detail and "bare shell" in r.detail
+    # The rebuild, named — and named with the flag that makes it happen, because an installed
+    # binary already reporting the pin is what build.sh otherwise leaves alone.
+    assert "build.sh" in (r.fix or "") and "--force" in (r.fix or "")
+
+
+def test_the_state_capture_check_passes_only_when_a_FENCED_host_admits_the_report():
+    """The ruled state: refused everywhere, admitted for that one method (owner, 2026-08-04)."""
+    fence, capture = _probes_for(
+        ping=_unauthorized(),
+        **{session_host.STATE_REPORT_METHOD: {"id": "x", "error": {"code": "pane_not_found",
+                                                                   "message": "no such pane"}}})
+    r = fleet.check_state_capture("/s.sock", capture=capture, fence=fence)
+    assert r.ok and not r.warn, r.detail
+    assert session_host.STATE_REPORT_METHOD in r.detail
+
+
+def test_a_socket_that_admits_everything_is_not_the_ruled_allowance():
+    """An unfenced host admits the report BECAUSE it admits everything, and a build-up judge that
+    rendered that as the allowance would be certifying a property it never measured."""
+    fence, capture = _probes_for(
+        ping={"id": "x", "result": {"type": "pong", "version": fleet.PINNED_VERSION}},
+        **{session_host.STATE_REPORT_METHOD: {"id": "x", "result": {"type": "ok"}}})
+    r = fleet.check_state_capture("/s.sock", capture=capture, fence=fence)
+    assert not r.ok and "no fence" in r.detail
+
+
+def test_an_unreachable_socket_is_read_as_neither_admitted_nor_refused():
+    """Absence of signal is unknown, never health (c2) — and never the REBUILD either: sending
+    somebody to rebuild a host on the strength of a question that went unanswered is the same
+    unmeasured certification in the other direction."""
+    for answers in ({}, {"ping": _unauthorized()}):
+        fence, capture = _probes_for(**answers)
+        r = fleet.check_state_capture("/s.sock", capture=capture, fence=fence)
+        assert not r.ok, answers
+        assert "--force" not in (r.fix or ""), answers
+        assert "REFUSES" not in r.detail and "admits the state report" not in r.detail, answers
+    # ...and the third shape of silence: the report gets through, the fence question does not.
+    fence, capture = _probes_for(
+        **{session_host.STATE_REPORT_METHOD: {"id": "x", "error": {"code": "pane_not_found",
+                                                                   "message": "no such pane"}}})
+    r = fleet.check_state_capture("/s.sock", capture=capture, fence=fence)
+    assert not r.ok and "--force" not in (r.fix or "")
+
+
+def test_the_state_capture_check_cannot_reach_the_binarys_contents_at_all():
+    """The DoD's own words, kept structurally. A block that consulted the file on disk would be
+    green on both generations — that is the defect — so this one takes no filesystem probe: it is
+    handed a socket path and two callables, and there is nothing else it could read."""
+    assert "probe" not in inspect.signature(fleet.check_state_capture).parameters
+    fence, capture = _probes_for(ping=_unauthorized(),
+                                 **{session_host.STATE_REPORT_METHOD: _unauthorized()})
+    assert not fleet.check_state_capture("/s.sock", capture=capture, fence=fence).ok
+
+
 # ------------------------------------------- the machine's own runner environment (issue #355)
 # The fence pre-flight (#326) is armed by SL_FLEET_FENCE on the RUNNER's own process, and until
 # this issue nothing in the engine set it — so the gate shipped correct and inert on the one
@@ -632,14 +750,17 @@ def test_the_launch_gate_and_the_host_fence_are_two_different_facts():
     results = fleet.check_fleet(_unarmed_probe(), state_base=_STATE_BASE,
                                 host_config_dir=_HOST_CONFIG_DIR,
                                 fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
-                                fence=lambda p: session_host.FENCED)
+                                fence=lambda p: session_host.FENCED,
+                                capture=lambda p: session_host.ADMITTED)
     by_name = {r.name: r for r in results}
     assert by_name["host fence"].ok and not by_name["launch gate"].ok
-    # ...and the mirror image: armed launcher, open socket.
+    # ...and the mirror image: armed launcher, open socket. An unfenced host admits every method,
+    # the state report included, which is why the capture seam answers ADMITTED here.
     results = fleet.check_fleet(_green_probe(), state_base=_STATE_BASE,
                                 host_config_dir=_HOST_CONFIG_DIR,
                                 fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
-                                fence=lambda p: session_host.OPEN)
+                                fence=lambda p: session_host.OPEN,
+                                capture=lambda p: session_host.ADMITTED)
     by_name = {r.name: r for r in results}
     assert not by_name["host fence"].ok and by_name["launch gate"].ok
 
@@ -929,15 +1050,21 @@ def test_check_fleet_returns_one_named_block_per_dod_property():
     results = fleet.check_fleet(_green_probe(), state_base=_STATE_BASE,
                                 host_config_dir=_HOST_CONFIG_DIR,
                                 fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
-                                fence=lambda p: session_host.FENCED)
+                                fence=lambda p: session_host.FENCED,
+                                capture=lambda p: session_host.ADMITTED)
     names = [r.name for r in results]
     assert names == list(dict.fromkeys(names)), "duplicate block names: %s" % names
-    for expected in ("host binary", "host login item", "host fence", "launch gate", "host config",
-                     "screen fallback", "claude binary", "fleet identity", "fleet isolation"):
+    for expected in ("host binary", "host login item", "host fence", "host state capture",
+                     "launch gate", "host config", "screen fallback", "claude binary",
+                     "fleet identity", "fleet isolation"):
         assert expected in names, "%s missing from %s" % (expected, names)
     # The gate is downstream of the socket it guards: a reader who fixes an open socket first is
     # not then told to go and arm a launcher against a fence that was not there.
     assert names.index("host fence") < names.index("launch gate")
+    # The allowance sits with the fence it is a hole in, and after it: "is anything refused" is
+    # upstream of "is the one ruled method admitted", and an operator reading down the report
+    # should meet them in that order.
+    assert names.index("host fence") < names.index("host state capture") < names.index("launch gate")
     # The binary pin comes BEFORE the identity read for the same reason it does in doctor --stack:
     # which claude is in use is upstream of which account it is logged into.
     assert names.index("claude binary") < names.index("fleet identity")
@@ -947,10 +1074,44 @@ def test_check_fleet_is_green_on_a_built_machine_and_red_on_an_open_socket():
     green = fleet.check_fleet(_green_probe(), state_base=_STATE_BASE,
                               host_config_dir=_HOST_CONFIG_DIR,
                               fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
-                              fence=lambda p: session_host.FENCED)
+                              fence=lambda p: session_host.FENCED,
+                              capture=lambda p: session_host.ADMITTED)
     assert [r.name for r in green if not r.ok] == []
     open_socket = fleet.check_fleet(_green_probe(), state_base=_STATE_BASE,
                                     host_config_dir=_HOST_CONFIG_DIR,
                                     fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
-                                    fence=lambda p: session_host.OPEN)
-    assert [r.name for r in open_socket if not r.ok] == ["host fence"]
+                                    fence=lambda p: session_host.OPEN,
+                                    capture=lambda p: session_host.ADMITTED)
+    # Both lines go red, and they are not one line reported twice: the fence is down AND the
+    # allowance is unproven, because a socket that serves everyone proves nothing about a hole.
+    assert [r.name for r in open_socket if not r.ok] == ["host fence", "host state capture"]
+
+
+def test_the_judge_fails_a_perfectly_built_machine_whose_socket_refuses_the_state_report():
+    """This issue in one test: `host binary` is green — the installed file reports the pin and
+    carries the fence's compiled-in refusal string, which is true of BOTH generations — while the
+    live socket says this host captures no session ids. Before this block, that machine printed
+    `fleet build-up complete`."""
+    results = fleet.check_fleet(_green_probe(), state_base=_STATE_BASE,
+                                host_config_dir=_HOST_CONFIG_DIR,
+                                fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
+                                fence=lambda p: session_host.FENCED,
+                                capture=lambda p: session_host.REFUSED)
+    by_name = {r.name: r for r in results}
+    assert by_name["host binary"].ok and by_name["host fence"].ok
+    assert not by_name["host state capture"].ok
+    assert [r.name for r in results if not r.ok] == ["host state capture"]
+
+
+def test_the_judge_asks_the_capture_question_of_the_socket_the_fence_block_judged():
+    """One socket, both questions. A capture block that resolved its own path (from the
+    environment, say) could report on the owner's default session while `host fence` reported on
+    the fleet's — two machines in one report, and neither reader would know."""
+    asked = []
+    fleet.check_fleet(_green_probe(), state_base=_STATE_BASE, host_config_dir=_HOST_CONFIG_DIR,
+                      fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
+                      fence=lambda p: (asked.append(("fence", p)), session_host.FENCED)[1],
+                      capture=lambda p: (asked.append(("capture", p)), session_host.ADMITTED)[1])
+    paths = {p for _who, p in asked}
+    assert paths == {fleet.socket_path(_HOST_CONFIG_DIR)}, asked
+    assert ("capture", fleet.socket_path(_HOST_CONFIG_DIR)) in asked

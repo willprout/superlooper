@@ -139,6 +139,23 @@ would otherwise fly a session onto an open socket:
 * it probes the socket **the spawn itself would use**, resolved through the doorway's own resolver
   from the launcher's environment — the same environment the host CLI child inherits.
 
+**`host state capture`** — the fence admits the **one** method the owner's 2026-08-04 ruling opened
+(`pane.report_agent_session`, issue #331), and refuses a tokenless caller otherwise. The second half
+of the fence's question, and the half nothing on the filesystem can answer: two generations of the
+patched binary exist — the fence as first built, and the fence carrying the allowance — and they
+report the same version and carry the same compiled-in refusal message, so `host binary` is green
+for both. Both machines launch, run and work; under the first, no worker's session id is ever
+captured and a headless restart brings the pane back as a bare shell (measured, with its A/B
+control, in #311).
+
+So this block asks the socket — the same socket `host fence` judged, exactly as the vendor's hook
+script in a worker pane would — and reads the two answers together, because `ADMITTED` alone is not
+the allowance: a host with no fence admits everything. Silence is neither answer and stays red:
+sending somebody to rebuild a host on the strength of a question nothing answered is the same
+unmeasured certification in reverse. Fix, when it is genuinely refused:
+`vendor/herdr/build.sh --force` then `superlooper fleet --install --load` — **`--force` matters**,
+because the build is idempotent on the version and the stale binary is already at the pin.
+
 **`launch gate`** — a runner booting on this machine **arms** that pre-flight. A separate block from
 `host fence` on purpose: the two are different facts and a machine can have either without the
 other. `host fence` asks the socket whether a tokenless caller is refused; this asks whether the
@@ -284,8 +301,14 @@ launchctl kickstart -k gui/$UID/com.superlooper.session-host
 superlooper fleet
 ```
 
-The `host binary` and `host fence` blocks are what catch a bump that lost the patch. Neither is
-something to assume: an unfenced socket answers.
+The `host binary`, `host fence` and `host state capture` blocks are what catch a bump that lost the
+patch — the last of them a bump (or an edit) that lost only the state-report hunk, which the other
+two are green for. None of it is something to assume: an unfenced socket answers, and a host that
+captures nothing works.
+
+**The same three runs after a change to the PATCH at an unchanged pin**, and the `--force` above is
+why: `build.sh` is idempotent on the version, so without it a binary already reporting the pin is
+left exactly where it is. `vendor/herdr/README.md` states that rule as its own trigger.
 
 ## Why this doc is not in the published ops mirror
 
