@@ -307,8 +307,9 @@ rest are workflow state the runner and William drive.
   only its PR — may merge while a **dev-check** freeze stands, because that freeze lifts only when
   the dev branch greens and only this merge can green it; without the exemption the loop built,
   reviewed and opened a perfect fix PR and then held it forever waiting for you to merge it by hand.
-  Everything else the gate checks (review evidence, the closing keyword, required checks on the PR,
-  referee paths, lane overlap, mergeability) still applies to it, and every other PR still holds. Crossing needs the
+  Everything else the gate checks (review evidence, the closing keyword, required checks on the
+  PR, referee paths, lane overlap, mergeability) still applies to it, and every other PR still
+  holds. Crossing needs the
   freeze marker (`state/merges_frozen.json`) to *say* it is dev-check owned: a **nightly**-owned
   freeze is crossed by nobody (only a green nightly clears it), and a marker the loop cannot read
   holds everything, the fix included — a corrupt freeze marker is a state-home fault for you to

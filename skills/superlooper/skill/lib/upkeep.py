@@ -349,8 +349,12 @@ def _janitor_row(janitor, repo_path, out):
     # A refused or truncated sl/* PR list means the merged-PR/still-open class was not swept at
     # all, and it proposes nothing either way — so without this the weekly glance renders an
     # UNSWEPT class as a clean one, which is the exact claim this row exists not to make (#404).
-    unswept_note = ("the sl/* PR list was refused or truncated — the merged-PR/still-open class "
-                    "was NOT swept" if janitor.get("merged_open_swept") is False else "")
+    # Both halves of `ok` at once: a REFUSED read swept nothing, a TRUNCATED one (a full page) swept
+    # partially and may have proposed from it — so "not swept" would be false beside its own
+    # proposals. What holds for both is that an absence here proves nothing.
+    unswept_note = ("the sl/* PR list was refused or truncated, so the merged-PR/still-open class "
+                    "is INCOMPLETE — read 'none' as unproven"
+                    if janitor.get("merged_open_swept") is False else "")
     if not props:
         _row("janitor", "nothing to propose"
              + (" (%s held back from a prior failure)" % _plural(len(held), "action")

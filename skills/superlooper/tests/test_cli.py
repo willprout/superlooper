@@ -2856,3 +2856,41 @@ def test_janitor_leaves_a_valid_queue_alone(rig):
     _seed_invalid_queue(rig, [_issue(7, ["type:build"])])
     r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
     assert "nothing to propose" in r.stdout
+
+
+def _corrupt_sl_head_prs(rig):
+    """Make `gh.sl_head_prs` REFUSE (unparseable body -> ReadHealth.ok False), the shape
+    tests/test_gh.py already pins. `pr_list_heads.json` is that read's own fixture."""
+    (rig.fixdir / "pr_list_heads.json").write_text("{not json")
+
+
+def test_a_refused_sl_pr_list_is_never_reported_as_a_clean_sweep(rig):
+    """The PLUMBING guard for the sweep's health flag, on all three surfaces (sixth fresh review).
+
+    `gh.sl_head_prs` reports ok=False on a refusal AND on a full page, and either way the
+    merged-PR/still-open class proposes nothing — which the sweep would otherwise print as "no
+    GitHub-side debris found". That is #21/#61's refused-vs-answered-empty on the LAST link of this
+    chain: the post-merge verify journals an unverifiable merge and delegates it here, and `doctor`
+    has no surface for the class.
+
+    Driven through the real CLIs, not a hand-built view: a renderer test hands `_janitor_row` a dict
+    that already carries the key and so cannot catch the key being dropped in the plumbing — the
+    same vacuous shape this issue's third and sixth reviews both had to reject.
+    """
+    _seed_janitor_fixtures(rig)
+    _corrupt_sl_head_prs(rig)
+    assert "INCOMPLETE" in cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo)).stdout
+    doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
+    assert doc["merged_open_swept"] is False
+    assert "INCOMPLETE" in cli(rig, "upkeep", "--repo", str(rig.repo)).stdout
+
+
+def test_a_healthy_sl_pr_list_says_nothing_about_completeness(rig):
+    # the counterpart, so the flag cannot be pinned by a constant: a clean read must be silent, or
+    # the note becomes boilerplate and stops being a signal.
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert "INCOMPLETE" not in r.stdout
+    doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
+    assert doc["merged_open_swept"] is True
+    assert "INCOMPLETE" not in cli(rig, "upkeep", "--repo", str(rig.repo)).stdout

@@ -548,12 +548,15 @@ def test_an_unswept_merged_open_class_never_reads_as_a_clean_one():
     delegates it to this sweep, and `doctor` has no surface for the class (#404)."""
     empty = _text(_view(janitor={"error": None, "proposals": [], "held": [],
                                  "merged_open_swept": False}))
-    assert "NOT swept" in empty and "sl/* PR list" in empty
+    assert "INCOMPLETE" in empty and "sl/* PR list" in empty
     # ...and it is said beside real proposals too, not only on the empty branch
     props = [{"kind": "branch", "key": "branch:sl/i5-a", "action": "delete-branch",
               "target": "sl/i5-a", "why": "PR #34 merged"}]
-    assert "NOT swept" in _text(_view(janitor={"error": None, "proposals": props, "held": [],
-                                               "merged_open_swept": False}))
+    assert "INCOMPLETE" in _text(_view(janitor={"error": None, "proposals": props, "held": [],
+                                                "merged_open_swept": False}))
     # a healthy sweep says nothing about it — the note must stay a signal, never boilerplate
-    assert "NOT swept" not in _text(_view(janitor={"error": None, "proposals": props, "held": [],
-                                                   "merged_open_swept": True}))
+    assert "INCOMPLETE" not in _text(_view(janitor={"error": None, "proposals": props, "held": [],
+                                                    "merged_open_swept": True}))
+    # ...and it must not claim the class was NOT SWEPT: `ok` is False on a full page too, and that
+    # half swept as far as the page went and may have proposed from it.
+    assert "NOT swept" not in empty

@@ -4216,8 +4216,9 @@ class Runner:
         issue stayed open, was re-approved, and its definition of done rotates live database
         credentials. Not every definition of done is idempotent.
 
-        One read and (only when needed) one write, on the MERGE path only — nothing here touches the
-        per-tick poll, so the steady-state API burn is unchanged.
+        One read on the healthy path (the keyword worked), a second only to CONFIRM an apparent
+        OPEN before acting on it, and a write only when that confirms — all on the MERGE path only,
+        so nothing here touches the per-tick poll and the steady-state API burn is unchanged.
 
         Fail direction, and it is the whole design: an UNREADABLE state (gh refused) is never read
         as "already closed". It journals `unverified` and leaves the pair to the janitor's sweep

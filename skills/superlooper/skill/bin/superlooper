@@ -3179,9 +3179,10 @@ def cmd_janitor(args):
         print(json.dumps({"ok": True, "proposals": props, "held": held,
                           "aged_park_days": days, "reopen_withheld": withheld,
                           "merged_open_withheld": mo_withheld,
-                          # False = the sl/* PR list was refused or truncated, so the
-                          # merged-PR/still-open class was not swept (#404). The board must not
-                          # render an unswept class as a clean one.
+                          # False = the sl/* PR list was refused or truncated, so this class is
+                          # incomplete (#404). Published for the command center to render once it
+                          # learns this kind (issue #416) — today's board does not read it, so this
+                          # is the datum being made available, not a property the board yet has.
                           "merged_open_swept": bool(sl_prs_ok)}))
         return 0
 
@@ -3199,9 +3200,13 @@ def cmd_janitor(args):
     # A REFUSED (or truncated) sl/* PR list means the merged-PR/open-issue class was not swept at
     # all — and it proposes nothing either way, which the "nothing to propose" sentence below would
     # otherwise render as "no debris found". Say which class went unswept (#404).
-    unswept_note = ("(the sl/* PR list was refused or truncated — the merged-PR/still-open class "
-                    "was NOT swept this run; nothing here says anything about it)"
-                    if not sl_prs_ok else "")
+    # Wording covers BOTH halves of `ok`, which are different facts: a REFUSED read swept nothing,
+    # while a TRUNCATED one (a full page — `sl_head_prs` counts every PR, not just `sl/*`, so any
+    # repo past its limit trips this permanently) swept as far as the page went and may well have
+    # proposed from it. "NOT swept" would be false beside those very proposals. What is true of both:
+    # an absence here is unproven.
+    unswept_note = ("(the sl/* PR list was refused or truncated, so this class is INCOMPLETE — "
+                    "read 'none found' as unproven, not as none)" if not sl_prs_ok else "")
     mo_note = (f"({mo_withheld} more merged-PR/still-open issue(s) were found and NOT proposed this "
                f"sweep — at most {janitor_lib.MERGED_OPEN_SWEEP_CAP} closes per sweep; the next sweep "
                "proposes more once these are cleared)" if mo_withheld else "")
