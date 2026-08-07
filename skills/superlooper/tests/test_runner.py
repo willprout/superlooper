@@ -2080,6 +2080,38 @@ def test_merge_closes_an_issue_the_keyword_left_open(rig, monkeypatch):
     assert rec[0]["outcome"] == "closed"
 
 
+def test_the_verify_confirms_an_open_read_before_closing_anything(rig, monkeypatch):
+    """GitHub's linked-issue closure is a BACKGROUND job and only two gh calls separate the merge
+    from this read, so on a healthy repo the FIRST read legitimately answers OPEN a moment before
+    the keyword fires. Closing on that would post "superlooper closed it" on essentially every
+    merge — an unnecessary write, and the end of this journal line's signal value. So: read twice,
+    act only on a second OPEN."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    reads = []
+
+    def racing(num):                       # OPEN, then CLOSED — the keyword landing a beat late
+        reads.append(num)
+        return len(reads) == 1
+    monkeypatch.setattr(runner_mod.gh, "issue_is_open", racing)
+    assert rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                           "method": "squash"}, NOW) == "ok"
+    assert reads == [5, 5], "the verify must re-read before acting on an OPEN"
+    assert not [m for m in mutations(rig) if m["kind"] == "close_issue"]
+    assert not [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+
+
+def test_the_healthy_merge_still_costs_exactly_one_read(rig, monkeypatch):
+    # the confirm must not double the steady-state cost: a keyword that worked reads CLOSED first
+    # and stops there. Only the rare it-looks-open path pays the second read.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    reads = []
+    monkeypatch.setattr(runner_mod.gh, "issue_is_open", lambda num: reads.append(num) or False)
+    rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash"}, NOW)
+    assert reads == [5]
+
+
 def test_merge_leaves_an_already_closed_issue_alone(rig, monkeypatch):
     # the healthy path: the keyword fired, GitHub closed it. The verify must be a no-op — no second
     # close, no comment, and nothing in the journal claiming the engine did the closing.

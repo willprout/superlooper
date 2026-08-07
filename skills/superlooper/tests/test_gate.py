@@ -460,6 +460,12 @@ def test_gate_missing_closing_keyword_nudges_once_then_parks():   # step 2c
     assert d["action"] == "nudge" and d["nudge_key"] == "closes"
     # the nudge must name EXACTLY what to add — a defect the worker cannot act on is a false park
     assert "Closes #7" in d["reason"]
+    # ...and it must not teach a body-DESTROYING verb. `gh pr edit --body` replaces the body, and a
+    # worker following this literally would satisfy the gate by deleting the evidence the brief told
+    # it to write. Say ADD, and say what --body does.
+    assert "REPLACES the body" in d["reason"]
+    low = d["reason"].lower()
+    assert "keeping everything already in it" in low or "add the line" in low
     # #222: the compliance window applies here like every other worker-paperwork cause
     d2 = _decide(issue=_issue(nudged=["closes"], nudge_expired=[]), pr=_pr(body=body))
     assert d2["action"] == "wait"

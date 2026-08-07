@@ -538,3 +538,22 @@ def test_upkeep_verb_has_no_execute_flag():
     assert r.returncode == 0, r.stdout + r.stderr
     for flag in ("--execute", "--yes", "--apply", "--fix"):
         assert flag not in r.stdout, "upkeep grew %s — it is read-only by contract" % flag
+
+
+def test_an_unswept_merged_open_class_never_reads_as_a_clean_one():
+    """`gh.sl_head_prs` reports ok=False on a refusal AND on a full page ("a list capped at `limit`
+    cannot prove a PR's absence"), and either way the class proposes nothing — which the weekly
+    glance would otherwise print as "nothing to propose". That is #21/#61's refused-vs-answered-empty
+    on the LAST link of the closure chain: the post-merge verify journals an unverifiable merge and
+    delegates it to this sweep, and `doctor` has no surface for the class (#404)."""
+    empty = _text(_view(janitor={"error": None, "proposals": [], "held": [],
+                                 "merged_open_swept": False}))
+    assert "NOT swept" in empty and "sl/* PR list" in empty
+    # ...and it is said beside real proposals too, not only on the empty branch
+    props = [{"kind": "branch", "key": "branch:sl/i5-a", "action": "delete-branch",
+              "target": "sl/i5-a", "why": "PR #34 merged"}]
+    assert "NOT swept" in _text(_view(janitor={"error": None, "proposals": props, "held": [],
+                                               "merged_open_swept": False}))
+    # a healthy sweep says nothing about it — the note must stay a signal, never boilerplate
+    assert "NOT swept" not in _text(_view(janitor={"error": None, "proposals": props, "held": [],
+                                                   "merged_open_swept": True}))

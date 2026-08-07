@@ -4240,6 +4240,16 @@ class Runner:
                                            "error": "issue number unreadable"}, now)
                 return
             state = gh.issue_is_open(num)
+            if state is True:
+                # CONFIRM before acting. GitHub's linked-issue closure is a BACKGROUND job, and only
+                # two gh calls separate the merge from this read — so on a healthy repo whose keyword
+                # is about to fire, the first read legitimately answers OPEN. Closing on that would
+                # post "superlooper closed it" on essentially every merge, which is both a write we
+                # do not need and the destruction of this journal line's signal value: an operator
+                # who sees `post_merge_close` on every landing learns nothing from seeing it at all.
+                # One extra read, on the supposedly-rare path only — the steady state (keyword works)
+                # still costs exactly one. A second OPEN is the finding; anything else is the race.
+                state = gh.issue_is_open(num)
             if state is False:
                 return                       # the healthy path: the keyword fired. Say nothing.
             if state is None:

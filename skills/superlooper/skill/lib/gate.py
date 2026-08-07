@@ -1172,12 +1172,18 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
                 "reason": "PR body unreadable — refetching before judging whether it closes the "
                           "issue on merge"}
     if not closes_issue(body, num):
+        # The remedy names the NON-destructive shape on purpose. `gh pr edit --body` REPLACES the
+        # body, and this text is read by a worker at the moment it is being corrected — the posture
+        # worker_pretooluse's own deny text is written for ("most likely to follow the next
+        # instruction to the letter"). A worker that runs a bare `--body 'Closes #N'` satisfies this
+        # gate by DELETING the evidence the brief told it to put there, and the gate then passes it.
         return nudge_or_park(
             "closes",
             f"the PR body carries no closing keyword for issue #{num}, so merging it would leave "
-            f"the issue OPEN — add the line `{closing_keyword_line(num)}` to the PR body "
-            f"(`gh pr edit {pv.get('number')} --body ...`); a bare `#{num}` or `Part of #{num}` "
-            "does not close anything")
+            f"the issue OPEN — ADD the line `{closing_keyword_line(num)}` to the PR body, keeping "
+            "everything already in it (`gh pr edit --body` REPLACES the body, so re-send the "
+            f"existing text plus the line); a bare `#{num}` or `Part of #{num}` does not close "
+            "anything")
 
     # step 3: touch verification from the PR's ACTUAL files (declared touches are a promise;
     # the diff is the truth). Wander only journals; an overlap with a live lane holds the merge.
