@@ -475,7 +475,13 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
     merged_by_issue = _merged_pr_by_issue(sl_prs)
     merged_open_withheld = 0
     if merged_by_issue:
-        candidates = []
+        # `picked` dedups at CANDIDATE-BUILD time, which is the only place it can be counted right:
+        # `lint_issues` is a raw gh list, and a duplicated entry that reached `candidates` would
+        # consume a cap slot and inflate `merged_open_withheld` — telling the owner "2 more were
+        # found and NOT proposed" when there are none, on the surface whose whole job is "did I miss
+        # anything". The emit loop keeps its own guard for the CROSS-class case (an issue this sweep
+        # already proposed closing as aged debris).
+        candidates, picked = [], set()
         for i in sorted((i for i in (lint_issues if isinstance(lint_issues, list) else [])
                          if isinstance(i, dict)),
                         key=lambda i: (_pr_int(i.get("number")) is None,
@@ -487,7 +493,8 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
             # are separate reads, so the issue must be closed for the first and open for the second
             # — but that is exactly the shape #229's own close/reopen guard exists to refuse, and
             # leaving this class out of it would break a symmetry every other close class keeps.
-            if num is None or num in ex_nums or num in seen_issues or num in seen_reopens:
+            if num is None or num in ex_nums or num in seen_issues or num in seen_reopens \
+                    or num in picked:
                 continue
             pr = merged_by_issue.get(num)
             if pr is None:
@@ -500,6 +507,7 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
             # applied to a lane that merged (park and merge are different terminal paths).
             if ({"in-progress", "agent-ready"} | set(PARK_LABELS)) & _label_names(i.get("labels")):
                 continue
+            picked.add(num)
             candidates.append((num, pr, i))
         cap = max(1, MERGED_OPEN_SWEEP_CAP)      # a 0 cap would invert the slice to "propose all"
         # The cap bounds ACTIONS, so previously-refused keys keep their report without occupying a
@@ -524,9 +532,14 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
                   "action": "close-issue", "target": num,
                   "title": i.get("title") if isinstance(i.get("title"), str) else "",
                   "pr": pr,
-                  "why": f"PR #{pr} merged but the issue is still OPEN — the closing keyword never "
-                         "closed it, so the work reads as unstarted and can be re-approved and run "
-                         "again"})
+                  # Observation only. `_janitor_execute` posts this verbatim as the close comment
+                  # on GitHub, and this module never reads the PR body — so "the closing keyword
+                  # never closed it" would assert a cause it cannot see, and would be plainly WRONG
+                  # in the counter-case named above: an owner-reopened issue whose PR did merge, and
+                  # whose keyword therefore worked exactly as intended. Say what is true of every
+                  # pair: merged work behind an open issue.
+                  "why": f"PR #{pr} merged but the issue is still OPEN — merged work behind an open "
+                         "issue reads as unstarted, so it can be re-approved and run again"})
 
     # --- mechanically-invalid issues: the metadata the runner cannot launch without (issue #225) ---
     # `seen_issues` joins the exclusions here for the same reason it bounds the reopens above: an

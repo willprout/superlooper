@@ -942,3 +942,22 @@ def test_a_duplicated_open_issue_entry_is_proposed_once():
     iss = _open_issue(5, ["type:build"])
     props = _of_kind(_pair_propose(lint_issues=[iss, dict(iss), dict(iss)]), "issue-merged-open")
     assert [p["key"] for p in props] == ["closemerged:5"]
+
+
+def test_duplicate_open_issue_entries_never_skew_the_cap_or_the_withheld_count():
+    """The dedup must run at CANDIDATE-BUILD time, not only at emit. A duplicate that reaches the
+    candidate list consumes a cap slot and inflates `merged_open_withheld` — telling the owner
+    "N more were found and NOT proposed" when there are none, on the surface whose whole job is
+    "did I miss anything" (fourth fresh review, P2)."""
+    iss = _open_issue(5, ["type:build"])
+    r = propose(sl_prs=[_merged(12, "sl/i5-x")], lint_issues=[dict(iss) for _ in range(12)],
+                areas=_AREAS, touches_required=True)
+    assert len(_of_kind(r["proposals"], "issue-merged-open")) == 1
+    assert r["merged_open_withheld"] == 0, "duplicates were counted as withheld work"
+    # ...and a duplicate must not steal a slot from a real pair: 10 unique + 1 dupe still fills
+    # the cap with 10 DISTINCT issues.
+    prs = [_merged(100 + n, "sl/i%d-x" % n) for n in range(1, 11)]
+    issues = [_open_issue(n) for n in range(1, 11)] + [_open_issue(1)]
+    props = _of_kind(propose(sl_prs=prs, lint_issues=issues, areas=_AREAS,
+                             touches_required=True)["proposals"], "issue-merged-open")
+    assert [p["target"] for p in props] == list(range(1, 11))

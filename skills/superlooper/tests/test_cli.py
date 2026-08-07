@@ -2073,6 +2073,30 @@ def test_upkeep_names_what_the_merged_open_cap_left_out(rig):
         "upkeep showed the capped list and never said what the cap left out:\n" + r.stdout
 
 
+def test_janitor_caps_the_merged_open_class_and_says_what_it_withheld_on_both_surfaces(rig):
+    """The sibling of test_janitor_caps_the_reopen_class_..., and it pins the SAME two surfaces:
+    the human note the owner reads and the `--json` envelope the command center reads. The cap
+    itself is unit-tested; what this guards is that the count survives the trip out of propose()
+    to each surface — mutation-proved necessary, because `mo_note = ""` and a dropped JSON key
+    both left the whole suite green (fourth fresh review, P1)."""
+    _seed_janitor_fixtures(rig)
+    over = janitor_lib.MERGED_OPEN_SWEEP_CAP + 5
+    _seed_merged_open_pair(rig)                      # strips the owner labels off the fixtures
+    nums = list(range(200, 200 + over))
+    (rig.fixdir / "pr_list_heads.json").write_text(json.dumps(
+        [{"number": 700 + n, "state": "MERGED", "headRefName": "sl/i%d-x" % n} for n in nums]))
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(
+        [{"number": n, "title": "pair %d" % n, "createdAt": "2026-07-01T09:00:00Z",
+          "labels": [{"name": "type:build"}],
+          "body": "## Loop metadata\ntouches: frontend\n"} for n in nums]))
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.count("(PR #") == janitor_lib.MERGED_OPEN_SWEEP_CAP
+    assert "5 more merged-PR/still-open issue(s) were found and NOT proposed" in r.stdout
+    doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
+    assert doc["merged_open_withheld"] == 5
+
+
 def test_janitor_json_carries_the_merged_open_pair_for_the_command_center(rig):
     _seed_janitor_fixtures(rig)
     _seed_merged_open_pair(rig)

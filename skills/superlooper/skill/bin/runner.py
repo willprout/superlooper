@@ -4256,11 +4256,16 @@ class Runner:
                 # can catch a default-branch repo a moment before its keyword fires. Naming that
                 # unverified cause in a permanent GitHub comment would assert a fact nobody
                 # established, on the one artifact a later reader treats as the record.
+                # PATH-NEUTRAL wording. This runs from `_exec_merge` (a merge the runner just
+                # performed) AND from `_exec_absorb_merged` (a crash window, a hand-merge by the
+                # owner, or a wake gap the runner slept through) — so "immediately afterwards" can
+                # be hours off on the second path, and no gate ever saw that PR's body, so naming
+                # "the PR body's closing keyword" presupposes one that may not exist. State only
+                # what is true on both paths: it was open when we looked, and we closed it.
                 closed = gh.close_issue(
                     num, comment=f"{which} merged, but this issue was still open when superlooper "
-                                 "checked immediately afterwards — so superlooper closed it "
-                                 "(post-merge closure verify). The PR body's closing keyword had "
-                                 "not closed it by then.")
+                                 "checked after the merge — so superlooper closed it (post-merge "
+                                 "closure verify). Nothing had closed it by then.")
                 outcome = "closed" if closed else "close_refused"
             journal.append(self.home, {"act": "post_merge_close", "id": iid, "num": num,
                                        "pr": pr, "outcome": outcome}, now)
