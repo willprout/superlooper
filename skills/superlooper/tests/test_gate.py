@@ -472,6 +472,177 @@ def test_checks_rest_lowercase_conclusions_fold_like_graphql_uppercase():
     assert gate.required_checks_state(skipped, ["ci"]) == "green"
 
 
+# ------------- latest-run-per-name in the PR rollup (issue #402) -------------
+# The PR's GraphQL statusCheckRollup keeps EVERY run attached to the head commit, not the
+# latest per name (unlike the REST reads behind the dev poll, which are latest-by-default).
+# The fold used to let any of them fail the name, so one SUPERSEDED failure re-parked a PR
+# whose live runs were all green — proven twice on the eApp loop (2026-08-05, PRs #714/#717:
+# close/reopen preserving the SHA, and a nudge-triggered re-run).
+
+def _run(name, conclusion, started, completed=None, workflow=None):
+    """A CheckRun rollup entry in gh's exact shape (see gh.py's _PR_FIELDS query)."""
+    return {"__typename": "CheckRun", "name": name, "conclusion": conclusion,
+            "status": "COMPLETED" if completed else "IN_PROGRESS", "workflowName": workflow,
+            "startedAt": started, "completedAt": completed}
+
+
+def test_checks_two_workflows_publishing_one_name_both_keep_a_vote():
+    # Second cross-review round, same class as the CheckRun-vs-StatusContext finding: recency ranks
+    # a RE-RUN against its own lineage. Two DIFFERENT workflows that both publish a required name
+    # are two reporters of it, not two attempts at it, so a newer green from one must not silence a
+    # live red from the other. gh hands us workflowName on every CheckRun, so this is decidable.
+    rollup = [_run("ci", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z", "nightly"),
+              _run("ci", "SUCCESS", "2026-08-05T11:00:00Z", "2026-08-05T11:05:00Z", "pr-checks")]
+    assert gate.required_checks_state(rollup, ["ci"]) == "fail"
+    # ...while a re-run of the SAME workflow is a lineage, and the latest attempt is the truth —
+    # the whole point of #402, and the shape actually observed on a live two-suite rollup.
+    same = [_run("ci", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z", "pr-checks"),
+            _run("ci", "SUCCESS", "2026-08-05T11:00:00Z", "2026-08-05T11:05:00Z", "pr-checks")]
+    assert gate.required_checks_state(same, ["ci"]) == "green"
+
+
+def test_checks_superseded_failure_loses_to_the_latest_green_run():
+    # The whole issue: both records ride the SAME head commit; only the newer one is the truth.
+    rollup = [_run("tests", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z"),
+              _run("tests", "SUCCESS", "2026-08-05T11:00:00Z", "2026-08-05T11:05:00Z")]
+    assert gate.required_checks_state(rollup, ["tests"]) == "green"
+    assert gate.required_checks_state(list(reversed(rollup)), ["tests"]) == "green"  # order-free
+
+
+def test_checks_latest_run_failing_still_fails():
+    # The mirror image, and the one that must NEVER regress: a green run that has since been
+    # superseded by a red one is not evidence of anything.
+    rollup = [_run("tests", "SUCCESS", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z"),
+              _run("tests", "FAILURE", "2026-08-05T11:00:00Z", "2026-08-05T11:05:00Z")]
+    assert gate.required_checks_state(rollup, ["tests"]) == "fail"
+
+
+def test_checks_in_flight_rerun_outranks_the_failure_it_supersedes():
+    # A re-run still running has NO completedAt — ranking on completedAt alone would hand the
+    # window back to the stale failure and park the PR mid-re-run. Pending is the honest read:
+    # the gate waits, and pending never merges.
+    rollup = [_run("tests", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z"),
+              _run("tests", None, "2026-08-05T11:00:00Z")]
+    assert gate.required_checks_state(rollup, ["tests"]) == "pending"
+
+
+def test_checks_status_context_shape_folds_latest_by_created_at():
+    # The rollup's other shape: gh selects createdAt on StatusContext, so the same ordering
+    # applies without special-casing.
+    rollup = [{"__typename": "StatusContext", "context": "quality-gate", "state": "FAILURE",
+               "createdAt": "2026-08-05T10:00:00Z"},
+              {"__typename": "StatusContext", "context": "quality-gate", "state": "SUCCESS",
+               "createdAt": "2026-08-05T11:00:00Z"}]
+    assert gate.required_checks_state(rollup, ["quality-gate"]) == "green"
+
+
+def test_checks_gh_zero_time_is_not_a_timestamp():
+    # Captured from a REAL rollup (willprout/superlooper PR #409, one head SHA carrying two check
+    # suites, 2026-08-07): `gh pr view --json statusCheckRollup` does NOT render a null completedAt
+    # as null — its Go struct marshals the ZERO TIME, "0001-01-01T00:00:00Z", and a null conclusion
+    # as "". Year 1 parses as a perfectly good DateTime, so a completedAt-only ranking would have
+    # scored the live re-run as older than the failure it supersedes and failed the PR for the whole
+    # re-run window. The zero time is the ABSENCE of a timestamp, so it is never one here.
+    live = [{"__typename": "CheckRun", "name": "tests", "conclusion": "CANCELLED",
+             "status": "COMPLETED", "workflowName": "tests",
+             "startedAt": "2026-08-07T00:25:30Z", "completedAt": "2026-08-07T00:25:41Z"},
+            {"__typename": "CheckRun", "name": "tests", "conclusion": "",
+             "status": "IN_PROGRESS", "workflowName": "tests",
+             "startedAt": "2026-08-07T00:25:59Z", "completedAt": "0001-01-01T00:00:00Z"}]
+    assert gate.required_checks_state(live, ["tests"]) == "pending"     # wait out the re-run
+    # ...and the same two suites once the live one lands green (the second real capture).
+    live[1] = {"__typename": "CheckRun", "name": "tests", "conclusion": "SUCCESS",
+               "status": "COMPLETED", "workflowName": "tests",
+               "startedAt": "2026-08-07T00:25:59Z", "completedAt": "2026-08-07T00:41:27Z"}
+    assert gate.required_checks_state(live, ["tests"]) == "green"
+    # An entry whose ONLY stamps are the zero time carries no ordering at all -> fail closed.
+    zeroed = [{"name": "tests", "conclusion": "FAILURE", "startedAt": "2026-08-07T00:25:30Z",
+               "completedAt": "2026-08-07T00:25:41Z"},
+              {"name": "tests", "conclusion": "SUCCESS", "startedAt": "0001-01-01T00:00:00Z",
+               "completedAt": "0001-01-01T00:00:00Z"}]
+    assert gate.required_checks_state(zeroed, ["tests"]) == "fail"
+
+
+def test_checks_two_reporters_of_one_name_both_keep_a_vote():
+    # Cross-review P0: recency ranks RE-RUNS, and only a later run of the same reporter supersedes
+    # an earlier one. A commit status and a check-run that happen to share a name are two
+    # independent reporters, not two attempts — ranking them against each other would let a newer
+    # CheckRun SUCCESS silence a live StatusContext FAILURE, a fail-OPEN the old fold never had
+    # (gh.branch_checks' docstring already names this double-reported shape as a real corner).
+    status_red = {"__typename": "StatusContext", "context": "ci", "state": "FAILURE",
+                  "createdAt": "2026-08-05T10:00:00Z"}
+    rollup = [status_red, _run("ci", "SUCCESS", "2026-08-05T11:00:00Z", "2026-08-05T11:05:00Z")]
+    assert gate.required_checks_state(rollup, ["ci"]) == "fail"
+    # ...and each reporter still supersedes ITSELF: once the status side reports green too,
+    # nothing red is current anywhere and the name folds green.
+    later_green = {"__typename": "StatusContext", "context": "ci", "state": "SUCCESS",
+                   "createdAt": "2026-08-05T12:00:00Z"}
+    assert gate.required_checks_state(rollup + [later_green], ["ci"]) == "green"
+
+
+def test_checks_untimestamped_duplicates_stay_any_failure_wins():
+    # The documented fail-closed fallback: no usable ordering for an entry of that name means
+    # the fold cannot tell which run is current, so EVERY run still gets a vote. This is also
+    # the dev-branch surface's shape (gh.branch_checks normalizes away timestamps), where REST
+    # already delivered one run per name — so there the two rules coincide.
+    rollup = [{"name": "tests", "conclusion": "failure"},
+              {"name": "tests", "conclusion": "success"}]
+    assert gate.required_checks_state(rollup, ["tests"]) == "fail"
+
+
+def test_checks_one_bare_entry_disables_recency_for_that_name_only():
+    # Mixed evidence is not partial evidence: a name with even one unrankable entry falls back
+    # whole, while a sibling name that IS fully ranked still folds latest-wins.
+    rollup = [{"name": "tests", "conclusion": "FAILURE"},                      # no timestamps
+              _run("tests", "SUCCESS", "2026-08-05T11:00:00Z", "2026-08-05T11:05:00Z"),
+              _run("lint", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z"),
+              _run("lint", "SUCCESS", "2026-08-05T11:00:00Z", "2026-08-05T11:05:00Z")]
+    assert gate.required_checks_state(rollup, ["tests"]) == "fail"
+    assert gate.required_checks_state(rollup, ["lint"]) == "green"
+
+
+def test_checks_unparseable_timestamps_are_no_ordering_never_a_guess():
+    # Only gh's exact DateTime shape is an ordering. A fractional-second or offset form would
+    # sort WRONG under a lexicographic compare ("...14.5Z" < "...14Z"), and junk sorts
+    # arbitrarily — both read as no ordering, so the superseded failure keeps its vote.
+    for stamp in ("2026-08-05T11:00:00.500Z", "2026-08-05T11:00:00+01:00", "later", 42, None):
+        rollup = [_run("tests", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z"),
+                  {"name": "tests", "conclusion": "SUCCESS", "startedAt": stamp,
+                   "completedAt": stamp}]
+        assert gate.required_checks_state(rollup, ["tests"]) == "fail"
+
+
+def test_checks_ties_keep_every_tied_run_fail_closed():
+    # Same timestamp on two records of one name: nothing distinguishes them, so both vote.
+    rollup = [_run("tests", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T11:05:00Z"),
+              _run("tests", "SUCCESS", "2026-08-05T10:00:00Z", "2026-08-05T11:05:00Z")]
+    assert gate.required_checks_state(rollup, ["tests"]) == "fail"
+
+
+def test_checks_recency_never_invents_a_run_for_an_unreported_name():
+    # Fail-closed floor, unchanged by the fold: a required name with ZERO runs is pending, no
+    # matter how green the rollup's other names are.
+    rollup = [_run("tests", "SUCCESS", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z")]
+    assert gate.required_checks_state(rollup, ["tests", "never-reports"]) == "pending"
+
+
+def test_checks_wrong_typed_required_list_is_pending():
+    # The other unreadable input (the rollup's twin, tested above): a required list that is not
+    # a list of strings is no contract at all — wait, never merge.
+    rollup = [_run("tests", "SUCCESS", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z")]
+    for bad in (None, "tests", 42, ["tests", 7], [None]):
+        assert gate.required_checks_state(rollup, bad) == "pending"
+
+
+def test_pending_breakdown_reads_the_latest_run_too():
+    # The breakdown names what the wait is ON; it must not report a name as satisfied-or-failing
+    # on a superseded record while its live re-run is still going.
+    rollup = [_run("tests", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z"),
+              _run("tests", None, "2026-08-05T11:00:00Z")]
+    assert gate.pending_required_breakdown(rollup, ["tests"]) == {
+        "unreported": [], "running": ["tests"]}
+
+
 # ---------------- check_names / pending breakdown / audit (issue #26) ----------------
 
 def test_check_names_extracts_both_rollup_shapes():
