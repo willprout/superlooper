@@ -169,6 +169,24 @@ def test_a_closed_prs_facts_carry_forward_too():
     assert doc["prs"]["i7"]["state"] == "CLOSED"
 
 
+def test_the_pr_body_is_never_published():
+    """`body` joined gh's PR read so the GATE can check the closing keyword before merging (#404).
+    It is a gate-only fact: nothing downstream reads it, and this document is rewritten every tick
+    and re-read every 2s — the same growth `files` is collapsed to avoid. And a PR body here is not
+    small: the brief tells workers to attach their evidence in the PR description."""
+    big = "x" * 20_000
+    live = {"i7": {"number": 12, "state": "OPEN", "body": big,
+                   "files": [{"path": "a.py", "additions": 1, "deletions": 0}]}}
+    doc = published_view.build(_view(prs=live), {}, tracked_ids={"i7"}, now=1, polled_at=1)
+    assert "body" not in doc["prs"]["i7"]
+    assert doc["prs"]["i7"]["number"] == 12          # everything else survives untouched
+    assert doc["prs"]["i7"]["files"] == live["i7"]["files"]
+    # ...and it does not sneak back in through the carry path either
+    carried = published_view.build(_view(prs={}), {}, tracked_ids={"i7"}, now=2, polled_at=2,
+                                   carry_prs={"i7": dict(live["i7"], state="MERGED")})
+    assert "body" not in carried["prs"]["i7"]
+
+
 def test_an_open_pr_is_never_carried():
     # It can still change. A frozen OPEN read would show yesterday's CI as today's — the exact
     # false-clearance the gate exists to prevent.

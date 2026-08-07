@@ -473,7 +473,8 @@ def test_an_unreadable_loopstate_still_fails_the_whole_sweep_closed_including_re
     r = janitor.propose(branches={}, branch_prs={}, superseded_prs=[], parked_issues=[],
                         closed_issues=[_closed(189, closer=_bare())], ls_issues="garbage",
                         now=NOW, aged_park_days=14)
-    assert r == {"proposals": [], "refused": [], "reopen_withheld": 0}
+    assert r == {"proposals": [], "refused": [], "reopen_withheld": 0,
+                 "merged_open_withheld": 0}
 
 
 def test_closed_issues_defaults_to_nothing_so_every_existing_caller_keeps_working():
@@ -481,7 +482,7 @@ def test_closed_issues_defaults_to_nothing_so_every_existing_caller_keeps_workin
     # rather than raising (the CLI, upkeep and the dashboard all reach propose()).
     assert janitor.propose(branches={}, branch_prs={}, superseded_prs=[], parked_issues=[],
                            ls_issues={}, now=NOW, aged_park_days=14) == \
-        {"proposals": [], "refused": [], "reopen_withheld": 0}
+        {"proposals": [], "refused": [], "reopen_withheld": 0, "merged_open_withheld": 0}
 
 
 def test_a_tuple_of_closed_issues_is_accepted_like_a_list():
@@ -744,3 +745,219 @@ def test_a_metadata_repair_still_stands_for_an_issue_the_sweep_leaves_alone():
     keys = [p["key"] for p in res["proposals"]]
     assert "issue:9" not in keys                     # too fresh to close
     assert [k for k in keys if k.startswith("meta:9:")]
+
+
+# ------------- merged PR, issue still open (issue #404) -------------
+# Layer 3 of "no merged PR may leave its issue open": the DETECTION for pairs that already exist.
+# The gate now refuses to merge a keyword-less PR and the engine verifies the closure right after
+# the merge — but neither reaches backwards. Every pair created before those layers shipped (and
+# every one their read failures could not confirm) is debris only a sweep can find, and the harm is
+# specific: an open issue behind merged work reads as UNSTARTED, gets re-approved, and the work runs
+# a second time against a definition of done that may not be idempotent.
+#
+# Propose-only, like every other class here.
+
+def _merged(num, head, state="MERGED"):
+    """A gh.sl_head_prs entry: {number, state, headRefName}."""
+    return {"number": num, "state": state, "headRefName": head}
+
+
+def _pair_propose(**kw):
+    kw.setdefault("sl_prs", [_merged(12, "sl/i5-fix-thing")])
+    kw.setdefault("lint_issues", [_open_issue(5, ["type:build"])])
+    kw.setdefault("areas", _AREAS)
+    kw.setdefault("touches_required", True)
+    return propose(**kw)["proposals"]
+
+
+def test_a_merged_pr_whose_issue_is_still_open_is_proposed_for_closing():
+    props = _of_kind(_pair_propose(), "issue-merged-open")
+    assert [p["key"] for p in props] == ["closemerged:5"]
+    p = props[0]
+    assert p["action"] == "close-issue" and p["target"] == 5 and p["title"] == "An issue"
+    assert p["pr"] == 12
+    # the why becomes the audit comment on the closed issue: it must NAME the merged PR, or the
+    # close cannot be traced back to the work that justified it
+    assert "#12" in p["why"] and "merged" in p["why"].lower()
+
+
+def test_the_pair_key_never_collides_with_the_aged_park_close():
+    # `issue:<n>` is the aged-park close. A shared key would conflate two different justifications
+    # in the refused map and in a per-key tap — the same reason #229's reopen got its own prefix.
+    props = _pair_propose()
+    assert "issue:5" not in [p["key"] for p in props]
+
+
+def test_an_open_issue_with_no_merged_pr_is_never_proposed():
+    for prs in ([], [_merged(12, "sl/i5-x", state="OPEN")], [_merged(12, "sl/i5-x", "CLOSED")],
+                [_merged(12, "sl/i9-other")]):
+        assert _of_kind(_pair_propose(sl_prs=prs), "issue-merged-open") == [], prs
+
+
+def test_a_closed_issue_is_never_proposed_because_it_is_not_in_the_open_set():
+    # `lint_issues` IS the open-issue universe (gh.open_issues_all) — the same read the metadata
+    # sweep already makes, so this class adds no second issue read. An issue absent from it is
+    # either closed (nothing to do) or unread (fail closed to proposing nothing).
+    assert _of_kind(_pair_propose(lint_issues=[]), "issue-merged-open") == []
+    assert _of_kind(_pair_propose(lint_issues=None), "issue-merged-open") == []
+
+
+def test_a_generation_branch_still_names_its_issue():
+    # sl/i5-x-r2 is issue 5's rebuild — the same convention brief.branch_for/closures use.
+    props = _of_kind(_pair_propose(sl_prs=[_merged(30, "sl/i5-fix-thing-r2")]),
+                     "issue-merged-open")
+    assert [p["target"] for p in props] == [5]
+
+
+def test_an_issue_with_several_sl_prs_is_proposed_once_naming_a_merged_one():
+    props = _of_kind(_pair_propose(sl_prs=[_merged(12, "sl/i5-x", state="CLOSED"),
+                                           _merged(30, "sl/i5-x-r2")]), "issue-merged-open")
+    assert [p["target"] for p in props] == [5]
+    assert props[0]["pr"] == 30                      # the MERGED one, never the closed rebuild
+
+
+def test_an_in_flight_lane_is_never_proposed():
+    # a live lane on issue 5 (a rebuild after the first PR merged, say) is already being dealt with
+    props = _of_kind(_pair_propose(ls_issues={"i5": {"status": "running", "branch": "sl/i5-x"}}),
+                     "issue-merged-open")
+    assert props == []
+
+
+def test_a_reapproved_or_claimed_issue_is_never_proposed():
+    # the owner's own word is on it. `agent-ready` on a merged-PR issue means he deliberately
+    # re-opened and re-approved the work; `in-progress` means a lane holds it. Neither is debris.
+    # (Both labels are REMOVED by the normal launch/merge path — an issue left open by a merged PR
+    # carries neither — so this guard cannot silently swallow the class it is guarding.)
+    for label in ("agent-ready", "in-progress"):
+        props = _of_kind(_pair_propose(lint_issues=[_open_issue(5, ["type:build", label])]),
+                         "issue-merged-open")
+        assert props == [], label
+
+
+def test_an_issue_this_sweep_proposes_closing_as_aged_debris_is_not_proposed_twice():
+    # two justifications, one action: emitting both would put the same close in the menu twice.
+    aged = _issue(5, ("parked",), NOW - 21 * DAY)
+    keys = [p["key"] for p in propose(parked_issues=[aged], sl_prs=[_merged(12, "sl/i5-x")],
+                                      lint_issues=[_open_issue(5, ["parked"])],
+                                      areas=_AREAS, touches_required=True)["proposals"]]
+    assert "issue:5" in keys and "closemerged:5" not in keys
+
+
+def test_pairs_are_deterministic_and_sorted_by_issue():
+    props = _of_kind(_pair_propose(
+        sl_prs=[_merged(30, "sl/i9-b"), _merged(12, "sl/i5-a"), _merged(20, "sl/i7-c")],
+        lint_issues=[_open_issue(9), _open_issue(5), _open_issue(7)]), "issue-merged-open")
+    assert [p["target"] for p in props] == [5, 7, 9]
+
+
+def test_a_refused_pair_is_held_back_not_silently_retried():
+    r = propose(sl_prs=[_merged(12, "sl/i5-x")], lint_issues=[_open_issue(5, ["type:build"])],
+                areas=_AREAS, touches_required=True, refused=frozenset({"closemerged:5"}))
+    assert _of_kind(r["proposals"], "issue-merged-open") == []
+    assert r["refused"] == ["closemerged:5"]
+
+
+@pytest.mark.parametrize("bad", [None, "not a list", 42, [None], ["x"], [{}],
+                                 [{"number": 12}], [{"headRefName": "sl/i5-x"}],
+                                 [{"number": "12", "state": "MERGED", "headRefName": "sl/i5-x"}],
+                                 [{"number": 0, "state": "MERGED", "headRefName": "sl/i5-x"}],
+                                 [{"number": 12, "state": "MERGED", "headRefName": 42}]])
+def test_wrong_typed_sl_prs_propose_nothing(bad):
+    assert _of_kind(_pair_propose(sl_prs=bad), "issue-merged-open") == []
+
+
+def test_a_wrong_typed_open_issue_entry_is_skipped_not_proposed():
+    for bad in ([None], [42], [{}], [{"number": None}], [{"number": "5"}], [{"number": 0}]):
+        assert _of_kind(_pair_propose(lint_issues=bad), "issue-merged-open") == [], bad
+
+
+def test_the_merged_open_class_is_capped_per_sweep_and_the_remainder_is_reported():
+    """UNLIKE a branch delete or an aged park, this class's population can be large ALL AT ONCE
+    through no fault of the owner — and the headline case is exactly that. GitHub honors closing
+    keywords only for merges into the DEFAULT branch, so a repo whose `dev_branch` is not the
+    default has never had one honored: every merged issue is a pair, from adoption. `--yes` is a
+    blanket approval, and one that fires hundreds of closes (each a comment, each a notification,
+    with no single undo) is the harm REOPEN_SWEEP_CAP exists for, pointed the other way."""
+    prs = [_merged(100 + n, "sl/i%d-x" % n) for n in range(1, 26)]
+    issues = [_open_issue(n) for n in range(1, 26)]
+    r = propose(sl_prs=prs, lint_issues=issues, areas=_AREAS, touches_required=True)
+    pairs = _of_kind(r["proposals"], "issue-merged-open")
+    assert len(pairs) == janitor.MERGED_OPEN_SWEEP_CAP
+    assert r["merged_open_withheld"] == 25 - janitor.MERGED_OPEN_SWEEP_CAP
+    # the OLDEST debris goes first, and the order is stable — nothing in this class's inputs
+    # carries when the merge happened, so a recency order would be invented, not read
+    assert [p["target"] for p in pairs] == list(range(1, 11))
+
+
+def test_a_refused_pair_keeps_its_report_without_occupying_a_cap_slot():
+    # a handful of stuck keys must never starve the class: the cap bounds ACTIONS, and a
+    # previously-refused key is a report (the same split the reopen class makes).
+    prs = [_merged(100 + n, "sl/i%d-x" % n) for n in range(1, 26)]
+    issues = [_open_issue(n) for n in range(1, 26)]
+    r = propose(sl_prs=prs, lint_issues=issues, areas=_AREAS, touches_required=True,
+                refused=frozenset({"closemerged:3"}))
+    pairs = _of_kind(r["proposals"], "issue-merged-open")
+    assert "closemerged:3" not in [p["key"] for p in pairs]
+    assert r["refused"] == ["closemerged:3"]
+    assert len(pairs) == janitor.MERGED_OPEN_SWEEP_CAP   # the refusal cost the class no slot
+
+
+def test_a_sweep_below_the_cap_reports_nothing_withheld():
+    r = propose(sl_prs=[_merged(12, "sl/i5-x")], lint_issues=[_open_issue(5)],
+                areas=_AREAS, touches_required=True)
+    assert r["merged_open_withheld"] == 0
+    # ...and a sweep that fails closed on an unreadable exclusion source still answers the key
+    assert propose(ls_issues="not a dict")["merged_open_withheld"] == 0
+
+
+def test_an_issue_in_the_owners_attention_queue_is_never_proposed():
+    """A park label means he is holding the issue open on purpose — closing it would answer a
+    question he has not answered. Combined with the cap above, this is the one way the class could
+    otherwise undo an owner decision under `--yes`. It cannot swallow the class it guards: park and
+    merge are different terminal paths, so an issue a merged PR left open carries no park label."""
+    for label in janitor.PARK_LABELS:
+        props = _of_kind(_pair_propose(lint_issues=[_open_issue(5, ["type:build", label])]),
+                         "issue-merged-open")
+        assert props == [], label
+
+
+def test_a_reopen_and_a_close_of_the_same_issue_never_share_one_menu():
+    """Opposite actions on one issue, both bulk-approvable under `--yes`, is exactly the
+    contradiction #229's own close/reopen guard exists to refuse. It takes a race to reach — the
+    closed set and the open set are separate reads, so the issue must be closed for one and open for
+    the other — but every other close class is guarded against it and this one must be too."""
+    r = propose(closed_issues=[_closed(5, closer=_bare())],
+                sl_prs=[_merged(12, "sl/i5-x")], lint_issues=[_open_issue(5, ["type:build"])],
+                areas=_AREAS, touches_required=True)
+    keys = [p["key"] for p in r["proposals"]]
+    assert "reopen:5" in keys                        # the reopen is proposed, as before
+    assert "closemerged:5" not in keys               # ...and never its opposite in the same sweep
+
+
+def test_a_duplicated_open_issue_entry_is_proposed_once():
+    """`lint_issues` is a raw gh list, and a duplicated entry would otherwise emit `closemerged:5`
+    twice. A duplicated close is not harmless: under `--yes` the second `gh issue close` returns
+    nonzero, which lands the key in the refused map and blocks the class for that issue until
+    `--retry-refused`. Every sibling class dedups inside its own emit loop; so does this one."""
+    iss = _open_issue(5, ["type:build"])
+    props = _of_kind(_pair_propose(lint_issues=[iss, dict(iss), dict(iss)]), "issue-merged-open")
+    assert [p["key"] for p in props] == ["closemerged:5"]
+
+
+def test_duplicate_open_issue_entries_never_skew_the_cap_or_the_withheld_count():
+    """The dedup must run at CANDIDATE-BUILD time, not only at emit. A duplicate that reaches the
+    candidate list consumes a cap slot and inflates `merged_open_withheld` — telling the owner
+    "N more were found and NOT proposed" when there are none, on the surface whose whole job is
+    "did I miss anything" (fourth fresh review, P2)."""
+    iss = _open_issue(5, ["type:build"])
+    r = propose(sl_prs=[_merged(12, "sl/i5-x")], lint_issues=[dict(iss) for _ in range(12)],
+                areas=_AREAS, touches_required=True)
+    assert len(_of_kind(r["proposals"], "issue-merged-open")) == 1
+    assert r["merged_open_withheld"] == 0, "duplicates were counted as withheld work"
+    # ...and a duplicate must not steal a slot from a real pair: 10 unique + 1 dupe still fills
+    # the cap with 10 DISTINCT issues.
+    prs = [_merged(100 + n, "sl/i%d-x" % n) for n in range(1, 11)]
+    issues = [_open_issue(n) for n in range(1, 11)] + [_open_issue(1)]
+    props = _of_kind(propose(sl_prs=prs, lint_issues=issues, areas=_AREAS,
+                             touches_required=True)["proposals"], "issue-merged-open")
+    assert [p["target"] for p in props] == list(range(1, 11))

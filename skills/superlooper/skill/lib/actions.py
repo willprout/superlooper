@@ -279,6 +279,10 @@ NUDGE_MESSAGES = {
                     "nothing vouches for.",
     "checks": "A required check failed on your PR. Investigate the failure, fix it, and push — "
               "the gate re-runs automatically.",
+    # `closes` (issue #404) is deliberately ABSENT: the nudge for a missing closing keyword has to
+    # name the issue's own number ("add `Closes #404`"), and a static string here cannot interpolate
+    # it. The fallback below delivers gate step 2c's reason, which already renders the exact literal
+    # from gate.closing_keyword_line — the one source of truth the gate itself parses.
     "investigation": "Post your root-cause report as an issue comment BEGINNING "
                      "`<!-- superlooper-investigation -->` — without that marker comment the "
                      "runner cannot even begin closing the parent (the close itself runs "
@@ -1960,7 +1964,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # crash window (Codex round-1 C2): the merge landed but the runner died
                     # before settling local state/labels — ABSORB the merged fact
                     # (idempotent), never wedge in gate-wait with a stuck in-progress label.
-                    out.append({"act": "absorb_merged", "id": iid, "num": num})
+                    # `pr` rides along (#404): the executor's closure verify NAMES the merged PR in
+                    # the comment it leaves on a still-open issue, and on this path that audit trail
+                    # is the entire product. Absent/unreadable, the executor says so instead of
+                    # printing a number it does not have.
+                    out.append({"act": "absorb_merged", "id": iid, "num": num,
+                                "pr": pv.get("number")})
                     continue
 
             update_result = ist.get("update_result")
@@ -2009,7 +2018,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # and the freeze holds it: fail closed, exactly like the pre-authorization above.
             restore_green = gate.restore_green(p.get("labels")) if isinstance(p, dict) else False
             g = gate.gate_decision(
-                {"type": itype, "conflicts": conflicts, "nudged": nudged,
+                # `num` is the issue's own GitHub number, from the loopstate KEY (no GitHub read can
+                # blip it): step 2c verifies the PR body closes THIS issue before any merge (#404).
+                {"num": num, "type": itype, "conflicts": conflicts, "nudged": nudged,
                  "nudge_expired": nudge_expired,
                  "declared_touches": declared, "update_result": update_result,
                  "review_carry": ist.get("review_carry"),
@@ -2260,7 +2271,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # fact about the BRANCH, true whoever opened the PR, and the runner may have
                     # slept through the whole open->merge (a wake gap) and so never recorded it.
                     # Refusing to settle without a recorded number would re-open the i328 stall.
-                    out.append({"act": "absorb_merged", "id": iid, "num": num})
+                    # `pr` rides along for the executor's closure verify (#404) — see the sibling
+                    # emit above; it is the PR the poll actually read, not the lane's stale record.
+                    out.append({"act": "absorb_merged", "id": iid, "num": num, "pr": pr_num})
                     continue
                 if state == "CLOSED" and pr_num == ist.get("pr"):
                     # THIS episode's PR was closed under it. Out-of-band by construction: the runner

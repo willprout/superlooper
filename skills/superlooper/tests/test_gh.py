@@ -608,6 +608,50 @@ def test_pr_view_carries_head_oid(ghenv):
     assert "headRefOid" in _after(argv, "--json")
 
 
+# --------------------- the closing-keyword layers (issue #404) ---------------------
+
+def test_pr_view_carries_the_body_on_the_read_the_poll_already_makes(ghenv):
+    # The gate's step 2c judges the closing keyword on the PR BODY. It must ride the EXISTING
+    # pr_for_branch read — a second call per tick would be new steady-state API burn.
+    pr = gh.pr_for_branch("sl/i123-render-the-widget").pr
+    assert "Closes #123" in pr["body"]
+    argv = _calls(ghenv)[-1]
+    assert "body" in _after(argv, "--json")
+    assert argv[:2] == ["pr", "list"]                 # one call, not two
+
+
+def test_issue_is_open_reads_the_state(ghenv):
+    (ghenv / "issue_view_123.json").write_text('{"state": "OPEN"}')
+    assert gh.issue_is_open(123) is True
+    argv = _calls(ghenv)[-1]
+    assert argv[:3] == ["issue", "view", "123"] and _after(argv, "--json") == "state"
+    (ghenv / "issue_view_123.json").write_text('{"state": "CLOSED"}')
+    assert gh.issue_is_open(123) is False
+
+
+def test_issue_is_open_tolerates_the_lowercase_shape(ghenv):
+    # the stateful fake (and some gh paths) render the state lowercase; the answer is the same fact
+    (ghenv / "issue_view_123.json").write_text('{"state": "open"}')
+    assert gh.issue_is_open(123) is True
+    (ghenv / "issue_view_123.json").write_text('{"state": "closed"}')
+    assert gh.issue_is_open(123) is False
+
+
+def test_issue_is_open_refused_is_none_not_closed(ghenv, monkeypatch):
+    # THE fail direction: a refused read must never read as "already closed" — that would let the
+    # post-merge verify (issue #404) declare victory on a read GitHub never answered. None = unknown,
+    # and the caller journals the unverified merge and leaves the pair to the janitor sweep.
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.issue_is_open(123) is None
+
+
+def test_issue_is_open_wrong_typed_state_is_none(ghenv):
+    for body in ('{"state": null}', '{"state": 42}', '{}', '[]', '"a string"', "not json {{",
+                 '{"state": "MERGED"}'):
+        (ghenv / "issue_view_123.json").write_text(body)
+        assert gh.issue_is_open(123) is None, body
+
+
 def test_new_helpers_fail_closed(ghenv, monkeypatch):
     monkeypatch.setenv("GH_FAIL", "1")
     assert gh.open_issues("in-progress") == []

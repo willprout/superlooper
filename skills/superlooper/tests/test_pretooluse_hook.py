@@ -1083,6 +1083,19 @@ def test_the_shipping_deny_teaches_the_sanctioned_path(tmp_path):
         assert "gate" in low, "the deny must say who merges: %r" % command
 
 
+def test_the_shipping_deny_teaches_a_pr_body_that_closes_the_issue(tmp_path):
+    """(#404) A denied worker follows the next instruction literally, so the PR line it is handed
+    must be one the gate will actually merge. A bare `gh pr create --fill` takes its body from the
+    commit message, which need carry no closing keyword — and the gate now refuses a PR whose body
+    would leave its issue open. The deny is the second place PR creation is taught (brief.py is the
+    first); this is the drift #238 exists to catch, one site over."""
+    _worktree(tmp_path)
+    for command in ("gh pr merge 42", "git push origin main", "git push --force origin sl/x"):
+        low = _bash(command, tmp_path).lower()
+        assert "--body" in low, "the deny must teach a PR BODY, not a bare --fill: %r" % command
+        assert "closes #" in low, "the deny must name the closing keyword: %r" % command
+
+
 def test_the_force_push_deny_names_the_stale_review_pin_cost(tmp_path):
     """Bright line 6 is server-enforced on the dev branch only; on an `sl/*` branch the real cost is
     a PR stranded on a review verdict pinned to a commit that no longer exists (post-#154), which is

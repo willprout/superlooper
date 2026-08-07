@@ -3,6 +3,7 @@
     "number": 555,
     "state": "OPEN",
     "mergeable": "MERGEABLE",
+    "body": "Render the widget.\n\nCloses #123\n",
     "headRefName": "sl/i123-render-the-widget",
     "labels": [],
     "statusCheckRollup": [

@@ -39,7 +39,7 @@ def _issue(**over):
     parsed-issue facts (type) and precomputed marker facts (investigation_done)."""
     base = {"type": "build", "status": "gating", "conflicts": 0, "nudged": [],
             "update_result": None, "declared_touches": ["frontend"],
-            "investigation_done": False}
+            "investigation_done": False, "num": 7}
     base.update(over)
     return base
 
@@ -48,7 +48,7 @@ def _pr(**over):
     """A pr_view: gh.pr_for_branch(...) merged with comments (the runner attaches
     gh.pr_comments(num) under 'comments')."""
     base = {"number": 555, "state": "OPEN", "mergeable": "MERGEABLE", "labels": [],
-            "headRefOid": HEAD,
+            "headRefOid": HEAD, "body": "Closes #7",
             "statusCheckRollup": [{"context": "quality-gate", "state": "SUCCESS"}],
             "files": [{"path": "src/components/Widget.tsx"}],
             "comments": [{"body": f"{_marker(HEAD)} fresh-agent review: "
@@ -345,6 +345,184 @@ def test_review_evidence_carry_honors_a_runner_merge_update():
     # ...and a wrong-typed / half-written carry never rescues a stale pin (fail closed)
     for bad in (None, {}, {"from": OTHER}, {"to": HEAD}, {"from": 1, "to": HEAD}, "x"):
         assert gate.review_evidence_ok(_cfg(), reviewed, HEAD, bad) is False, bad
+
+
+# --------------------------- closes_issue (step 2c, issue #404) ---------------------------
+# No merged PR may leave its issue open. Closure is delegated entirely to GitHub's closing keyword
+# in the PR body, and until #404 NOTHING verified the keyword was there — the brief taught it and
+# hoped. The realized stakes (old-engine eApp): a merged issue stayed open, read as unstarted, was
+# re-approved, and its definition of done rotates live database credentials.
+
+def test_closes_issue_accepts_every_github_keyword():
+    for word in ("close", "closes", "closed", "fix", "fixes", "fixed",
+                 "resolve", "resolves", "resolved"):
+        assert gate.closes_issue(f"{word} #404", 404) is True, word
+        assert gate.closes_issue(f"{word.upper()} #404", 404) is True, word
+        assert gate.closes_issue(f"{word.capitalize()} #404", 404) is True, word
+
+
+def test_closes_issue_accepts_the_forms_github_honors():
+    # colon and the GH- shorthand are both GitHub-honored references to THIS repo's issue
+    assert gate.closes_issue("Closes: #404", 404) is True
+    assert gate.closes_issue("Fixes GH-404", 404) is True
+    # ...and it is found anywhere in a multi-line body, not only on the first line
+    assert gate.closes_issue("## Summary\nsomething\n\nCloses #404\n\n## Tests\nall green",
+                             404) is True
+
+
+def test_closes_issue_refuses_every_repo_qualified_reference():
+    """`owner/repo#404` and a full issue URL are real GitHub closing references — and both can name
+    ANOTHER repository, where they close someone else's #404 while ours stays open. A pure function
+    handed a body and a number cannot tell the two apart, so accepting either would be a false
+    ACCEPT on the one proposition this exists to decide: the gate would vouch for a closure that
+    never happens. Refusing costs a nudge naming the form that works."""
+    for body in ("Closes willprout/superlooper#404",
+                 "Closes https://github.com/willprout/superlooper/issues/404",
+                 "Fixes https://github.com/SOMEONE-ELSE/other-repo/issues/404"):
+        assert gate.closes_issue(body, 404) is False, body
+
+
+def test_closes_issue_rejects_a_bare_reference_or_the_wrong_issue():
+    # THE incident shape: the PR mentions its issue but never CLOSES it, so the merge leaves it open
+    assert gate.closes_issue("Part of #404", 404) is False
+    assert gate.closes_issue("#404", 404) is False
+    assert gate.closes_issue("See issue #404 for context", 404) is False
+    # a keyword for a DIFFERENT issue is not a keyword for this one — GitHub closes each reference
+    # separately, and `Closes #404, #405` closes only the first
+    assert gate.closes_issue("Closes #405", 404) is False
+    assert gate.closes_issue("Closes #404, #405", 405) is False
+    # ...and a longer number that merely starts with ours never counts
+    assert gate.closes_issue("Closes #4040", 404) is False
+
+
+def test_closes_issue_never_reads_across_a_line_break():
+    # the keyword and its reference must sit together, as GitHub wants them. Allowing any
+    # whitespace between them turns ordinary prose into a false ACCEPT — and a false accept here
+    # merges a PR the gate has vouched for on evidence that does not exist.
+    assert gate.closes_issue("this PR does not fix\n#404 tracks the real work", 404) is False
+    assert gate.closes_issue("...out of scope for this fix\n\n#404", 404) is False
+    assert gate.closes_issue("Closes\n#404", 404) is False
+    # ...while every same-line spelling still counts
+    assert gate.closes_issue("Closes   #404", 404) is True
+    assert gate.closes_issue("Closes:#404", 404) is True
+    assert gate.closes_issue("closes#404", 404) is True
+
+
+def test_closes_issue_ignores_a_keyword_inside_a_longer_word():
+    for body in ("prefixes #404", "unfixed #404", "disclosed #404", "foreclosure #404"):
+        assert gate.closes_issue(body, 404) is False, body
+
+
+def test_closes_issue_fails_closed_on_wrong_typed_input():
+    for body in (None, 42, [], {"body": "Closes #404"}):
+        assert gate.closes_issue(body, 404) is False, body
+    for num in (None, "404", 0, -1, True):
+        assert gate.closes_issue("Closes #404", num) is False, num
+
+
+def test_a_pathological_pr_body_cannot_make_the_gate_spin():
+    """A PR body is worker-authored text judged on the tick path, so this predicate must be LINEAR
+    in it. The natural `[ \\t]*:?[ \\t]*` separator is two ambiguous stars: the engine tries every
+    split of a run of spaces that is not followed by a reference, which measured quadratic (20k
+    spaces after `closes` took 2.6s; 1M would take hours). A gate that can be made to spin is a
+    wedge, not a refusal — and this test fails loudly rather than slowly."""
+    import time
+    body = "closes" + " " * 400_000 + "\nPart of #404"
+    start = time.time()
+    assert gate.closes_issue(body, 404) is False
+    assert time.time() - start < 2.0, "the closing-keyword scan is superlinear in the PR body"
+
+
+def test_a_pathological_issue_number_never_raises_into_the_tick():
+    """The gate's never-raise contract, against text a WORKER authors. Python 3.11+ raises
+    ValueError converting a >4300-digit string to int, so an unbounded `\\d+` here would let
+    `Closes #<5000 digits>` in a PR body blow up the whole tick from inside a pure function."""
+    assert gate.closes_issue("Closes #" + "9" * 5000, 404) is False
+    # a 9-digit number is still an ordinary reference; only longer runs stop matching
+    assert gate.closes_issue("Closes #999999999", 999999999) is True
+    assert gate.closes_issue("Closes #1234567890", 1234567890) is False
+    # ...and the decision path swallows nothing by accident: it lands on the ordinary ladder
+    d = _decide(pr=_pr(body="Closes #" + "9" * 5000))
+    assert d["action"] == "nudge" and d["nudge_key"] == "closes"
+
+
+def test_closing_keyword_line_is_the_one_source_of_truth():
+    # the brief teaches it, the nudge names it, the gate parses it — all from here, so what the
+    # worker is told to write cannot drift from what the gate accepts
+    line = gate.closing_keyword_line(404)
+    assert "#404" in line
+    assert gate.closes_issue(line, 404) is True
+
+
+def test_gate_missing_closing_keyword_nudges_once_then_parks():   # step 2c
+    body = "## Summary\nBuilt the thing. Part of #7."
+    d = _decide(pr=_pr(body=body))
+    assert d["action"] == "nudge" and d["nudge_key"] == "closes"
+    # the nudge must name EXACTLY what to add — a defect the worker cannot act on is a false park
+    assert "Closes #7" in d["reason"]
+    # ...and it must not teach a body-DESTROYING verb. `gh pr edit --body` replaces the body, and a
+    # worker following this literally would satisfy the gate by deleting the evidence the brief told
+    # it to write. Say ADD, and say what --body does.
+    assert "REPLACES the body" in d["reason"]
+    low = d["reason"].lower()
+    assert "keeping everything already in it" in low or "add the line" in low
+    # #222: the compliance window applies here like every other worker-paperwork cause
+    d2 = _decide(issue=_issue(nudged=["closes"], nudge_expired=[]), pr=_pr(body=body))
+    assert d2["action"] == "wait"
+    d3 = _decide(issue=_issue(nudged=["closes"], nudge_expired=["closes"]), pr=_pr(body=body))
+    assert d3["action"] == "park"
+
+
+def test_a_ship_pipeline_repo_is_held_to_the_keyword_too():
+    """There is NO ship_cmd exemption, and that is the point: a repo whose pipeline opens PRs
+    without the keyword was already leaking open issues, which is the incident. But it means the
+    brief must not tell a worker the pipeline handles it — it says VERIFY, and this pins that the
+    gate really does judge a ship_cmd repo's body (step 2b is skipped there; 2c is not)."""
+    ship = _cfg(ship_cmd="scripts/ship.sh")
+    d = _decide(pr=_pr(body="Shipped via scripts/ship.sh", comments=[]), cfg=ship)
+    assert d["action"] == "nudge" and d["nudge_key"] == "closes"
+    assert "Closes #7" in d["reason"]
+    # ...and the same PR merges once the line is there, with no review comment needed (ship path)
+    assert _decide(pr=_pr(body="Shipped via scripts/ship.sh\n\nCloses #7", comments=[]),
+                   cfg=ship)["action"] == "merge"
+
+
+def test_gate_closing_keyword_for_another_issue_never_merges():
+    # the lane is issue 7; the body closes 8. Merging this leaves 7 open — the whole defect.
+    d = _decide(pr=_pr(body="Closes #8"))
+    assert d["action"] == "nudge" and d["nudge_key"] == "closes"
+
+
+def test_gate_unreadable_pr_body_waits_rather_than_parking():
+    # a corrupt VIEW is refetched, never punished: same discipline as step 3's unreadable `files`
+    # and step 2b's unreadable head. A wrong-typed body is not proof the worker wrote nothing.
+    for bad in (None, 42, []):
+        d = _decide(pr=_pr(body=bad))
+        assert d["action"] == "wait", bad
+        assert "body" in d["reason"]
+
+
+def test_gate_unreadable_issue_number_parks_to_the_owner():
+    # the gate cannot verify "the PR closes ITS issue" without knowing which issue that is. A
+    # corrupt loopstate key is not a transient the next tick heals, so it goes to the owner —
+    # never merged on the assumption that the keyword is probably fine.
+    for bad in (None, "7", 0, -3):
+        d = _decide(issue=_issue(num=bad))
+        assert d["action"] == "park" and d.get("needs_william") is True, bad
+
+
+def test_gate_closing_keyword_is_checked_before_the_merge_not_after():
+    # the ONE property #404 buys: a green-everything-else PR with no keyword does not merge
+    d = _decide(pr=_pr(body=""))
+    assert d["action"] != "merge"
+
+
+def test_gate_editing_the_body_does_not_stale_the_review_pin():
+    # why this check sits at 2c and not behind a re-review: the fix (add `Closes #N` to the PR
+    # BODY) does not move the head, so the verdict pinned to it still vouches for the same diff.
+    # Prove the two are independent — the same PR with the keyword added merges unchanged.
+    assert _decide(pr=_pr(body="Part of #7"))["action"] == "nudge"
+    assert _decide(pr=_pr(body="Part of #7\n\nCloses #7"))["action"] == "merge"
 
 
 # --------------------------- investigation_done (cross-review C1) ---------------------------

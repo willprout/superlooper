@@ -4194,6 +4194,7 @@ class Runner:
             gh.comment(num, f"Merged as PR #{pr} by superlooper (gate green: report + review "
                             "evidence + required checks + mergeable).")
         gh.set_labels(num, remove=["in-progress"])
+        self._verify_issue_closed(iid, num, pr, now)               # (#404)
         self._update_issue(iid, {"status": "merged"})
         # (#149) The D14 hot path: the lane that just merged still has its worker idling at the
         # prompt in this very worktree, so the old bare prune unlinked a live CLI's cwd at the
@@ -4201,6 +4202,107 @@ class Runner:
         # (#168) A merged-and-landed lane is the ONE case the owner allows to auto-close.
         self._settle_merged_lane(iid)                              # per-knob (#178)
         return "ok"
+
+    def _verify_issue_closed(self, iid, num, pr, now):
+        """The merge landed — did the issue actually CLOSE? (Issue #404, layer 2.)
+
+        Closure is delegated entirely to GitHub's closing keyword in the PR body. The gate now
+        refuses to merge without it (layer 1, gate step 2c), but a present keyword is still not a
+        closed issue: **GitHub honors closing keywords only for merges into the repository's DEFAULT
+        branch**, so a repo whose `dev_branch` is not the default gets no server-side closure however
+        perfect the body. An open issue then reads as unstarted, gets re-approved, and the work RUNS
+        AGAIN — and the only guard against re-execution was the machine-local state file, which a
+        wiped or migrated state home loses entirely. The realized stakes (old-engine eApp): a merged
+        issue stayed open, was re-approved, and its definition of done rotates live database
+        credentials. Not every definition of done is idempotent.
+
+        One read on the healthy path (the keyword worked), a second only to CONFIRM an apparent
+        OPEN before acting on it, and a write only when that confirms — all on the MERGE path only,
+        so nothing here touches the per-tick poll and the steady-state API burn is unchanged.
+
+        Fail direction, and it is the whole design: an UNREADABLE state (gh refused) is never read
+        as "already closed". It journals `unverified` and leaves the pair to the janitor's sweep
+        (layer 3) rather than declaring victory on an answer GitHub never gave — the #21/#61
+        refused-vs-answered-empty discipline on the one read whose failure re-opens this very
+        incident. The same goes for a refused close.
+
+        One asymmetry with layer 3, named rather than left as a side effect: the janitor REFUSES to
+        propose a pair whose issue carries `agent-ready`, reading it as "the owner reopened and
+        re-approved this deliberately". This function has no such guard, and a reachable path
+        starts from exactly that label — a wiped or migrated state home (the incident's own stated
+        cause) leaves no lane record, the owner re-approves the issue, the lane launches, and the
+        next tick's reconcile finds the already-MERGED PR on its branch and absorbs it. Closing
+        there is CORRECT and is the whole point of #404: the runner owns that lane, and it verified
+        the merge itself. The janitor's caution is for pairs it merely observed from outside, with
+        no lane and no verification of its own. Different evidence, so different rules.
+
+        Bounded by construction: this runs ONCE per merge, after the merge already landed. It
+        therefore must never be able to lose the merged fact — a raised exception here would skip
+        the `merged` status, the label cleanup and the lane teardown, leaving the crash window
+        `absorb_merged` exists to heal. So every failure is swallowed into a journal line.
+        """
+        try:
+            if type(num) is not int or num <= 0:
+                # unreachable in both callers (the gate parks an unreadable number before it can
+                # merge; absorb's own set_labels fails first) — but it must still leave a RECORD.
+                # A silent return would be the one exit of this function nothing can audit.
+                journal.append(self.home, {"act": "post_merge_close", "id": iid, "num": num,
+                                           "pr": pr, "outcome": "unverified",
+                                           "error": "issue number unreadable"}, now)
+                return
+            state = gh.issue_is_open(num)
+            if state is True:
+                # CONFIRM before acting. GitHub's linked-issue closure is a BACKGROUND job, and only
+                # two gh calls separate the merge from this read — so on a healthy repo whose keyword
+                # is about to fire, the first read legitimately answers OPEN. Closing on that would
+                # post "superlooper closed it" on essentially every merge, which is both a write we
+                # do not need and the destruction of this journal line's signal value: an operator
+                # who sees `post_merge_close` on every landing learns nothing from seeing it at all.
+                # One extra read, on the supposedly-rare path only — the steady state (keyword works)
+                # still costs exactly one. A second OPEN is the finding; anything else is the race.
+                state = gh.issue_is_open(num)
+            if state is False:
+                return                       # the healthy path: the keyword fired. Say nothing.
+            if state is None:
+                outcome = "unverified"       # refused read — never "closed", never a close
+            else:
+                # Name the merged PR when we have it, and say plainly that we do not when we don't.
+                # `absorb_merged` can reach here with an unreadable number (a poll that answered
+                # without one), and "PR #None merged" on the one path whose whole product is the
+                # audit trail would be worse than the honest sentence.
+                which = f"PR #{pr}" if type(pr) is int and pr > 0 else "its pull request"
+                # Say ONLY what was observed. The docstring above explains the cause we expect
+                # (a non-default dev branch), but this function never CHECKS it — and GitHub's
+                # linked-issue closure is a background job, so a read this close behind the merge
+                # can catch a default-branch repo a moment before its keyword fires. Naming that
+                # unverified cause in a permanent GitHub comment would assert a fact nobody
+                # established, on the one artifact a later reader treats as the record.
+                # PATH-NEUTRAL wording. This runs from `_exec_merge` (a merge the runner just
+                # performed) AND from `_exec_absorb_merged` (a crash window, a hand-merge by the
+                # owner, or a wake gap the runner slept through) — so "immediately afterwards" can
+                # be hours off on the second path, and no gate ever saw that PR's body, so naming
+                # "the PR body's closing keyword" presupposes one that may not exist. State only
+                # what is true on both paths: it was open when we looked, and we closed it.
+                closed = gh.close_issue(
+                    num, comment=f"{which} merged, but this issue was still open when superlooper "
+                                 "checked after the merge — so superlooper closed it (post-merge "
+                                 "closure verify). Nothing had closed it by then.")
+                outcome = "closed" if closed else "close_refused"
+            journal.append(self.home, {"act": "post_merge_close", "id": iid, "num": num,
+                                       "pr": pr, "outcome": outcome}, now)
+        except Exception as e:                                     # noqa: BLE001 — see docstring
+            # The recovery write must not be able to fail the SAME way the original did. A journal
+            # append can itself raise (a read-only or full state home; an unserializable value), and
+            # re-appending the identical payload would send that exception straight back out of a
+            # function whose whole contract is that it cannot lose the merged fact. So: a minimal,
+            # provably-serializable record, and if even that fails, swallow it — the merge is
+            # already landed, and `_journal_outcome` on the very next line owns reporting a state
+            # home that cannot be written at all.
+            try:
+                journal.append(self.home, {"act": "post_merge_close", "id": iid,
+                                           "outcome": "error", "error": _short_repr(e)}, now)
+            except Exception:                                      # noqa: BLE001
+                pass
 
     def _review_carry(self, iid, head, pre, wt):
         """Carry the PR's review verdict across the runner's OWN merge-update (issue #154).
@@ -4570,6 +4672,13 @@ class Runner:
         iid, num = a["id"], a.get("num")
         if not gh.set_labels(num, remove=["in-progress"]):
             return "label cleanup failed (will retry next tick)"
+        # (#404) The OTHER post-merge settle path, and the one that owns _exec_merge's own crash
+        # window: a runner that died between `gh pr merge` and the closure verify would otherwise
+        # leave that merge's issue open with nothing left to notice — the exact pair the sweep
+        # exists to clean up, created by the engine itself. Same discipline as the merge path: it
+        # closes only THIS merged PR's issue, only when GitHub says it is still open, and never off
+        # a read it could not trust.
+        self._verify_issue_closed(iid, num, a.get("pr"), now)
         self._update_issue(iid, {"status": "merged"})
         # (#178) Since #155 this can fire on an IN-FLIGHT lane — a PR merged out of band while the
         # worker is still building — so ending that session is the point, not tidiness: the knob that

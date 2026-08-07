@@ -135,6 +135,25 @@ unless you specifically want this build-vs-investigation split.)
 | `report_required_sections` | `["Tests", "Review"]` | H2 headings a worker's final report must contain, each with real prose — the runner checks their presence mechanically as part of the gate. The default is deliberately **web-agnostic**: every worker can produce passing **Tests** and a fresh-agent **Review**, so a CLI/library/service repo is never nudged-then-parked for evidence it cannot give. Web/UI repos opt into richer evidence explicitly (see below). |
 | `bright_lines` | `[]` | Prose rules injected **verbatim** into every worker brief (e.g. "force-push forbidden", "ship only via ship.sh"). The skill hardcodes none; the repo's adaptation fills these. |
 
+**A PR that would leave its issue open does not merge.** GitHub closes an issue on merge only
+because the PR **body** carries a closing keyword for it — `Closes #N`, `Fixes #N`, `Resolves #N` —
+so a body that says `Part of #N` merges the work and leaves the issue open, where it reads as
+unstarted, can be re-approved, and runs a second time against a definition of done that may not be
+idempotent. The gate therefore refuses to merge a PR whose body carries no closing keyword for its
+own issue: it nudges once, naming the exact line to add, then parks. Editing a PR body does not move
+its head, so the fix costs no re-review.
+
+There is **no `ship_cmd` exemption**. If your pipeline opens PRs, make sure it writes the keyword —
+a pipeline that does not will nudge and then park every issue whose worker has already exited. A
+repo-qualified reference (`owner/repo#N`, or a full issue URL) is deliberately **not** accepted: it
+can name another repository, and the gate cannot tell yours from theirs. Write the bare `#N`.
+
+Two things back it up after the fact. The engine re-reads the issue after every merge and closes it
+if it is still open, recording that it did — which matters most when your `dev_branch` is **not**
+the repository's default branch, because GitHub honors closing keywords only for merges into the
+default branch, so on such a repo the keyword never fires at all. And `superlooper janitor` proposes
+closing any issue whose `sl/i<N>` PR has already merged, for pairs that predate all of this.
+
 **Review is always mechanically gated, and pinned to the diff it reviewed.** On a repo with its own
 pipeline (`ship_cmd` set), that pipeline owns review. On a repo without one, the gate refuses to
 merge until a fresh agent that wrote none of the code posts a review verdict as a PR comment
@@ -288,8 +307,9 @@ rest are workflow state the runner and William drive.
   only its PR — may merge while a **dev-check** freeze stands, because that freeze lifts only when
   the dev branch greens and only this merge can green it; without the exemption the loop built,
   reviewed and opened a perfect fix PR and then held it forever waiting for you to merge it by hand.
-  Everything else the gate checks (review evidence, required checks on the PR, referee paths, lane
-  overlap, mergeability) still applies to it, and every other PR still holds. Crossing needs the
+  Everything else the gate checks (review evidence, the closing keyword, required checks on the
+  PR, referee paths, lane overlap, mergeability) still applies to it, and every other PR still
+  holds. Crossing needs the
   freeze marker (`state/merges_frozen.json`) to *say* it is dev-check owned: a **nightly**-owned
   freeze is crossed by nobody (only a green nightly clears it), and a marker the loop cannot read
   holds everything, the fix included — a corrupt freeze marker is a state-home fault for you to

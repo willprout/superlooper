@@ -104,6 +104,36 @@ def test_ship_instructions_without_ship_cmd(_sl_home):
         "the brief must teach paste-the-oid, not a substitution gh will not expand"
 
 
+def test_the_brief_teaches_the_exact_closing_keyword_the_gate_parses(_sl_home):
+    """Issue #404. Since the gate refuses to merge a PR whose body lacks the closing keyword for
+    its issue, the literal the brief teaches and the literal the gate parses must be ONE string —
+    a hand-copied divergence would walk every worker into a nudge->park for paperwork they were
+    told to write differently (the #238 defect class). Proved by RENAMING the keyword: pinning the
+    same hardcoded text on both sides of the assertion would prove nothing."""
+    for cmd in (None, "scripts/ship.sh"):
+        out = brief.build(_issue(), _cfg(_sl_home, ship_cmd=cmd))
+        taught = gate.closing_keyword_line(123)            # _issue() is issue #123
+        assert taught in out, cmd
+        assert gate.closes_issue(taught, 123) is True      # what is taught is what merges
+
+
+def test_the_brief_never_tells_a_ship_pipeline_worker_it_can_skip_the_keyword(_sl_home):
+    """The gate has NO ship_cmd exemption for the closing keyword, so the brief must not claim one.
+    It used to say "(unless you shipped via the configured ship command, which already does this)" —
+    an unverified assumption about someone else's script, now standing in front of a hard gate: a
+    worker who believed it would be told not to write the line and then parked for not writing it."""
+    out = brief.build(_issue(), _cfg(_sl_home, ship_cmd="scripts/ship.sh"))
+    assert "unless you shipped" not in out
+    assert "which already does this" not in out
+    assert gate.closing_keyword_line(123) in out
+    assert "CHECK" in out or "check that it wrote" in out.lower()
+    # ...and the brief carries the same destructive-replace warning the gate's nudge does. The brief
+    # is the FIRST place a worker reads this, and on a ship_cmd repo it points at a body someone
+    # else's pipeline wrote — `gh pr edit --body 'Closes #N'` would wipe it, and the gate would then
+    # pass the PR. Teaching the hazard only in the correction is teaching it too late.
+    assert "REPLACES the body" in out
+
+
 def test_the_no_ship_cmd_flavour_states_the_shipping_rule_too(_sl_home):
     """Issue #226. `_SHIP_WITH_CMD` has always carried the rule — never a direct push to the dev
     branch, never `gh pr merge`, never a hand-posted status — and `_SHIP_NO_CMD` never did, so the

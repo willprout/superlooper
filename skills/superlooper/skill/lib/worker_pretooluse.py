@@ -764,9 +764,18 @@ _PUSH_VALUE_FLAGS = frozenset(("--repo", "-o", "--push-option", "--receive-pack"
 # take away the only safe way a worker has to check what a refspec would do.
 _PUSH_DRY_RUN_FLAGS = frozenset(("--dry-run", "-n"))
 
+# Read by a worker at the moment its own shortcut was just DENIED — which is the moment it is most
+# likely to follow the next instruction to the letter. So the PR line must be the one the gate will
+# actually merge: since issue #404 the gate refuses a PR whose body carries no closing keyword for
+# its issue, and a bare `gh pr create --fill` takes its body from the commit message, which may
+# carry nothing of the sort. The literal is spelled out rather than imported from gate.py on
+# purpose: this module is a hook leaf that runs in the WORKER's process, and it holds no issue
+# number to render — the brief (brief._FINISH_PR) is where the number-bearing form is taught.
 _SANCTIONED_PATH = (
     " The sanctioned path is the whole point of the loop and it is short: push your work to THIS "
-    "issue's branch (`git push -u origin HEAD`), open the PR (`gh pr create --fill`), post the "
+    "issue's branch (`git push -u origin HEAD`), open the PR with a body that CLOSES your issue "
+    "(`gh pr create --fill --body 'Closes #<your issue number>'` — the gate will not merge a PR "
+    "that would leave its issue open), post the "
     "pinned review verdict as a PR comment, write your report — then the GATE merges it once CI is "
     "green and the verdict pins your head commit. Ending the session with the PR open is finishing, "
     "not stopping short."

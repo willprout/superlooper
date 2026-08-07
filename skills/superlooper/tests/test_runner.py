@@ -475,6 +475,32 @@ def test_poll_builds_a_fresh_gh_view(rig):
     assert isinstance(gv["dev_checks"], list) and gv["dev_checks"]
 
 
+def _gh_calls(rig):
+    p = rig.fixdir / "calls.jsonl"
+    return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+
+def test_the_closing_keyword_check_adds_no_per_tick_github_read(rig):
+    """Issue #404's API-burn discipline, pinned mechanically rather than promised in a comment.
+
+    The gate's step 2c judges the PR BODY, and the body rides the pr_for_branch read the poll
+    ALREADY makes — one more `--json` field, not one more call. The closure verify rides the MERGE
+    path only. So a steady-state tick over a finished, gating issue must issue exactly the reads it
+    issued before: no `issue view --json state` anywhere.
+    """
+    seed_issue(rig, "i123", status="gating", branch="sl/i123-render-the-widget", type="build")
+    (rig.home / "reports" / "i123.md").write_text("## Tests\n" + "x" * 60)
+    rig.r.tick(now=NOW)
+    calls = _gh_calls(rig)
+    assert calls, "the tick must have polled at all — an empty log would make this vacuous"
+    pr_reads = [c for c in calls if c[:2] == ["pr", "list"] and "--head" in c]
+    assert pr_reads, "the poll's PR read must still happen"
+    assert all("body" in (c[c.index("--json") + 1] if "--json" in c else "") for c in pr_reads), \
+        "the body must ride the poll's own PR read"
+    assert not [c for c in calls if c[:2] == ["issue", "view"] and "state" in c], \
+        "the closure verify must never run on the poll path — it rides the merge only"
+
+
 def test_gh_outage_marks_the_view_stale_and_counts_failures(rig, monkeypatch):
     monkeypatch.setenv("GH_FAIL", "1")
     rig.r.tick(now=NOW)
@@ -2013,6 +2039,144 @@ def test_ordinary_merge_comment_says_nothing_about_referee(rig, monkeypatch):
     assert "referee" not in body and "pre-authorized" not in body
 
 
+# ---------- the post-merge closure verify (issue #404) ----------
+# Layer 2 of "no merged PR may leave its issue open". The gate refuses to merge a PR without the
+# closing keyword (layer 1), but GitHub honors that keyword ONLY for merges into the repository's
+# DEFAULT branch — a repo whose `dev_branch` is not the default gets no server-side closure however
+# perfect the keyword. So after every merge the engine reads the issue and closes it if it is still
+# open, journaling that it did.
+
+def _seed_issue_state(rig, num, state):
+    """Serve `issue view <num> --json state` from the fixtures (fixture mode serves the whole file,
+    so this stands in for the one field the verify reads)."""
+    (rig.fixdir / f"issue_view_{num}.json").write_text(json.dumps({"state": state}))
+
+
+def test_merge_closes_an_issue_the_keyword_left_open(rig, monkeypatch):
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _seed_issue_state(rig, 5, "OPEN")            # the keyword was absent, or GitHub ignored it
+    assert rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                           "method": "squash"}, NOW) == "ok"
+    closes = [m for m in mutations(rig) if m["kind"] == "close_issue"]
+    assert [c["num"] for c in closes] == ["5"]
+    # the close explains itself where the next reader will look — it names the merged PR
+    body = closes[0]["comment"] or ""
+    assert "555" in body
+    # ...and it states ONLY what was observed. The docstring's expected cause (a non-default dev
+    # branch) is never CHECKED here, and GitHub's linked-issue closure is a background job, so a
+    # read this close behind the merge can catch a default-branch repo a moment before its keyword
+    # fires. A permanent GitHub comment must not assert a cause nobody established.
+    assert "DEFAULT branch" not in body and "default branch" not in body
+    assert "still open when superlooper checked" in body
+    # ...and every word of it holds on BOTH paths. absorb_merged also fires on a hand-merge or a
+    # wake gap the runner slept through, where "immediately afterwards" is hours off and no gate
+    # ever saw the body — so the comment names neither a timing nor a keyword it cannot vouch for.
+    assert "immediately" not in body
+    assert "closing keyword" not in body
+    assert "Nothing had closed it by then" in body
+    rec = [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+    assert len(rec) == 1 and rec[0]["id"] == "i5" and rec[0]["num"] == 5
+    assert rec[0]["outcome"] == "closed"
+
+
+def test_the_verify_confirms_an_open_read_before_closing_anything(rig, monkeypatch):
+    """GitHub's linked-issue closure is a BACKGROUND job and only two gh calls separate the merge
+    from this read, so on a healthy repo the FIRST read legitimately answers OPEN a moment before
+    the keyword fires. Closing on that would post "superlooper closed it" on essentially every
+    merge — an unnecessary write, and the end of this journal line's signal value. So: read twice,
+    act only on a second OPEN."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    reads = []
+
+    def racing(num):                       # OPEN, then CLOSED — the keyword landing a beat late
+        reads.append(num)
+        return len(reads) == 1
+    monkeypatch.setattr(runner_mod.gh, "issue_is_open", racing)
+    assert rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                           "method": "squash"}, NOW) == "ok"
+    assert reads == [5, 5], "the verify must re-read before acting on an OPEN"
+    assert not [m for m in mutations(rig) if m["kind"] == "close_issue"]
+    assert not [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+
+
+def test_the_healthy_merge_still_costs_exactly_one_read(rig, monkeypatch):
+    # the confirm must not double the steady-state cost: a keyword that worked reads CLOSED first
+    # and stops there. Only the rare it-looks-open path pays the second read.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    reads = []
+    monkeypatch.setattr(runner_mod.gh, "issue_is_open", lambda num: reads.append(num) or False)
+    rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555, "method": "squash"}, NOW)
+    assert reads == [5]
+
+
+def test_merge_leaves_an_already_closed_issue_alone(rig, monkeypatch):
+    # the healthy path: the keyword fired, GitHub closed it. The verify must be a no-op — no second
+    # close, no comment, and nothing in the journal claiming the engine did the closing.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _seed_issue_state(rig, 5, "CLOSED")
+    assert rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                           "method": "squash"}, NOW) == "ok"
+    assert not [m for m in mutations(rig) if m["kind"] == "close_issue"]
+    assert not [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+
+
+def test_merge_journals_an_unverifiable_closure_and_never_guesses(rig, monkeypatch):
+    # A REFUSED state read is not "already closed". The verify records that it could not tell, so
+    # the pair is visible in the journal and the janitor sweep is the durable backstop — and it
+    # NEVER closes an issue off a read GitHub did not answer (#21/#61 refused != answered-empty).
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _fail_rule(rig, "issue view", 5)             # only the verify read is refused; the merge lands
+    assert rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                           "method": "squash"}, NOW) == "ok"
+    assert not [m for m in mutations(rig) if m["kind"] == "close_issue"]
+    rec = [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+    assert len(rec) == 1 and rec[0]["outcome"] == "unverified"
+
+
+def test_post_merge_close_records_a_refused_close(rig, monkeypatch):
+    # the issue reads OPEN and gh refuses the close: the journal must say so rather than imply the
+    # issue is now closed. The pair survives into the janitor sweep either way.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    _seed_issue_state(rig, 5, "OPEN")
+    _fail_rule(rig, "issue close", 5)
+    assert rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                           "method": "squash"}, NOW) == "ok"
+    rec = [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+    assert len(rec) == 1 and rec[0]["outcome"] == "close_refused"
+
+
+def test_post_merge_verify_never_breaks_the_merge(rig, monkeypatch):
+    # the merge ALREADY LANDED when the verify runs. A blow-up here must not lose the merged fact
+    # (status, labels, teardown) — a half-settled lane is the crash window absorb_merged exists for.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    monkeypatch.setattr(runner_mod.gh, "issue_is_open",
+                        lambda num: (_ for _ in ()).throw(RuntimeError("boom")))
+    seed_issue(rig, "i5", status="gating", branch="sl/i5-x")
+    assert rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                           "method": "squash"}, NOW) == "ok"
+    assert issue_state(rig, "i5")["status"] == "merged"
+    # ...and the swallow still leaves a RECORD. The docstring's contract is "every failure is
+    # swallowed into a journal line", and this is the one function whose entire product on the
+    # absorb path is the audit trail — an unasserted recovery line is an unpinned promise.
+    rec = [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+    assert len(rec) == 1 and rec[0]["outcome"] == "error" and rec[0].get("error")
+
+
+def test_a_refused_merge_never_touches_the_issue(rig):
+    # the verify rides the merge path ONLY: no merge, no read, no close.
+    seed_issue(rig, "i5", status="gating")
+    _fail_rule(rig, "pr merge", 5)
+    assert rig.r._execute({"act": "merge", "id": "i5", "num": 5, "pr": 555,
+                           "method": "squash"}, NOW) != "ok"
+    assert not [m for m in mutations(rig) if m["kind"] == "close_issue"]
+    assert not [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+
 # ---- issue #403: a freeze emitted THIS tick suppresses this tick's merges ----
 # The tick snapshots merges_frozen.json once, before decide runs. A `freeze` act emitted mid-tick
 # does not refresh that snapshot, so on the exact tick a freeze BEGINS the gate judged every
@@ -2868,6 +3032,57 @@ def test_absorb_merged_settles_labels_state_and_worktree(rig, monkeypatch):
     assert lab["remove"] == "in-progress"
     assert issue_state(rig, "i5")["status"] == "merged"
     assert removed and removed[0].endswith("worktrees/i5")
+
+
+def test_absorb_merged_also_closes_an_issue_the_merge_left_open(rig, monkeypatch):
+    # (#404) absorb_merged owns _exec_merge's OWN crash window: a runner that died between
+    # `gh pr merge` and the closure verify would otherwise leave that merge's issue open with
+    # nothing left to notice — the engine creating the very pair the janitor sweep cleans up.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating")
+    _seed_issue_state(rig, 5, "OPEN")
+    assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}, NOW) == "ok"
+    closes = [m for m in mutations(rig) if m["kind"] == "close_issue"]
+    assert [c["num"] for c in closes] == ["5"]
+    assert "555" in (closes[0]["comment"] or "")
+    rec = [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
+    assert len(rec) == 1 and rec[0]["outcome"] == "closed"
+
+
+def test_absorb_merged_without_a_readable_pr_number_says_so_instead_of_printing_none(rig,
+                                                                                     monkeypatch):
+    """The audit trail IS the product on this path, and `decide` can reach it with a PR number the
+    poll never answered. "PR #None merged" would be worse than saying we do not have it."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating")
+    _seed_issue_state(rig, 5, "OPEN")
+    assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5}, NOW) == "ok"
+    body = [m for m in mutations(rig) if m["kind"] == "close_issue"][0]["comment"]
+    assert "None" not in body and "#" not in body.split(" merged")[0]
+    assert "its pull request merged" in body
+
+
+def test_absorb_merged_leaves_an_already_closed_issue_alone(rig, monkeypatch):
+    # the ordinary case — the keyword fired, or the earlier verify already closed it. No second
+    # close, no comment: absorb_merged is re-emitted until it succeeds, so a verify that acted on
+    # a closed issue would be a comment per tick.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating")
+    _seed_issue_state(rig, 5, "CLOSED")
+    assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}, NOW) == "ok"
+    assert not [m for m in mutations(rig) if m["kind"] == "close_issue"]
+
+
+def test_absorb_merged_never_verifies_when_the_label_cleanup_failed(rig, monkeypatch):
+    # the executor returns early and decide re-emits: nothing may act on a settle that did not
+    # happen (and the issue is still `in-progress` on GitHub).
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating")
+    _seed_issue_state(rig, 5, "OPEN")
+    _fail_rule(rig, "issue edit", 5)
+    assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}, NOW) != "ok"
+    assert not [m for m in mutations(rig) if m["kind"] == "close_issue"]
+    assert not [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
 
 
 def test_file_fix_issue_reconciles_an_already_filed_issue_from_github(rig):
@@ -3992,7 +4207,9 @@ def test_externally_merged_pr_settles_a_building_lane_without_a_park(rig, monkey
         runner_mod.actions.lane_state_from(dsk["issues_state"]), [], dsk, rig.r.gh_view)
     assert [a for a in acts if a["act"] == "park"] == []       # no park, false or otherwise
     absorb = [a for a in acts if a["act"] == "absorb_merged"]
-    assert absorb == [{"act": "absorb_merged", "id": "i7", "num": 7}]
+    # `pr` rides the act (#404): the executor's closure verify names the merged PR in the comment
+    # it leaves on a still-open issue, and this is the end-to-end path that proves decide emits it.
+    assert absorb == [{"act": "absorb_merged", "id": "i7", "num": 7, "pr": 42}]
 
     rig.r._execute(absorb[0], NOW)                             # tick step 3: settle it
     st = loopstate.load(str(rig.home / "state" / "issues.json"))
@@ -7061,3 +7278,22 @@ def test_a_present_but_corrupt_stop_marker_still_reads_as_stopped(rig):
     assert runner_mod.read_stop_marker(rig.home / "state") == {}
     _stop_marker(rig).unlink()
     assert runner_mod.read_stop_marker(rig.home / "state") is None
+
+
+def test_absorb_on_a_freshly_launched_lane_closes_its_merged_issue(rig, monkeypatch):
+    """The one place layers 2 and 3 treat the same evidence differently, pinned as a DECISION.
+
+    The janitor refuses to propose a pair whose issue carries `agent-ready` — it reads that as the
+    owner having reopened and re-approved the work deliberately. The runner has no such guard, and
+    the reachable path starts from exactly that label: a wiped state home (the incident's own cause)
+    leaves no lane record, the owner re-approves, the lane launches, and the reconcile finds the
+    already-MERGED PR on its branch. Closing there is CORRECT and is the whole point of #404 — the
+    runner owns that lane and verified the merge itself, where the janitor only observed one from
+    outside. Different evidence, different rules; this makes it a decision rather than a side effect.
+    """
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="running", branch="sl/i5-x")   # just launched, no prior record
+    _seed_issue_state(rig, 5, "OPEN")
+    assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}, NOW) == "ok"
+    assert [m["num"] for m in mutations(rig) if m["kind"] == "close_issue"] == ["5"]
+    assert issue_state(rig, "i5")["status"] == "merged"

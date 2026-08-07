@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import janitor as janitor_lib
 import labels as labels_lib
 import loopstate
 
@@ -2004,6 +2005,110 @@ def test_janitor_yes_executes_all_three_actions_and_journals_them(rig):
     assert "3 executed" in r.stdout
 
 
+def _seed_merged_open_pair(rig, issue_num=101, pr=12, head=None):
+    """A merged sl/i<N> PR whose issue is still OPEN (issue #404) — the pair the janitor's fourth
+    close class exists to surface. `pr_list_heads.json` is gh.sl_head_prs's fixture; `issue_list.json`
+    is gh.open_issues_all's."""
+    head = head or f"sl/i{issue_num}-render-the-widget"
+    (rig.fixdir / "pr_list_heads.json").write_text(json.dumps(
+        [{"number": pr, "state": "MERGED", "headRefName": head}]))
+    issues = json.loads((rig.fixdir / "issue_list.json").read_text())
+    for i in issues:
+        # a merged-PR issue carries neither owner word: launch removes `agent-ready`, merge removes
+        # `in-progress`. Strip them so the fixture is the shape the defect actually leaves behind.
+        i["labels"] = [l for l in i["labels"] if l["name"] not in ("agent-ready", "in-progress")]
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(issues))
+
+
+def test_janitor_proposes_closing_an_issue_its_merged_pr_left_open(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_merged_open_pair(rig)
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    # the line names BOTH numbers: the issue being closed and the merged PR that justifies it
+    assert "close issue #101 (PR #12 merged)" in r.stdout
+    assert "still OPEN" in r.stdout and "run" in r.stdout
+    assert mutations(rig) == []                       # --dry-run executes nothing
+
+
+def test_janitor_executes_an_approved_merged_open_close_with_its_audit_comment(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_merged_open_pair(rig)
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    closes = {m["num"]: m for m in mutations(rig) if m["kind"] == "close_issue"}
+    assert "101" in closes
+    # the audit comment names the janitor AND the merged PR — a close nobody can trace back to the
+    # work that justified it is not evidence
+    assert "janitor" in closes["101"]["comment"] and "#12" in closes["101"]["comment"]
+    recs = [x for x in _janitor_journal(rig)
+            if x.get("act") == "janitor" and x.get("target") == 101]
+    assert len(recs) == 1 and recs[0]["outcome"] == "ok" and recs[0]["action"] == "close-issue"
+
+
+def test_upkeep_names_what_the_merged_open_cap_left_out(rig):
+    """The regression guard for the PLUMBING, not the renderer (third fresh review, P1).
+
+    `superlooper upkeep` is the weekly "did I miss anything" read, and it once reported only
+    `reopen_withheld` — so the second capped class was invisible there while `janitor` said "240
+    more found". A renderer test cannot catch that: it hands `_janitor_row` a dict that already has
+    the key. This drives the REAL command over a repo with more pairs than the cap, so deleting the
+    key anywhere between propose() and the page turns it red."""
+    _seed_janitor_fixtures(rig)
+    over = janitor_lib.MERGED_OPEN_SWEEP_CAP + 4
+    # numbered from 100 so none collides with the committed fixtures' own issues (the aged-park
+    # sweep proposes closing #9, which would legitimately drop one pair out of this class and make
+    # the arithmetic below read as an off-by-one rather than as the exclusion it is)
+    nums = list(range(100, 100 + over))
+    (rig.fixdir / "pr_list_heads.json").write_text(json.dumps(
+        [{"number": 500 + n, "state": "MERGED", "headRefName": "sl/i%d-x" % n} for n in nums]))
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(
+        [{"number": n, "title": "pair %d" % n, "createdAt": "2026-07-01T09:00:00Z",
+          "labels": [{"name": "type:build"}],
+          "body": "## Loop metadata\ntouches: frontend\n"} for n in nums]))
+    r = cli(rig, "upkeep", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "%d issue-merged-open" % janitor_lib.MERGED_OPEN_SWEEP_CAP in r.stdout
+    assert "4 more merged-PR" in r.stdout, \
+        "upkeep showed the capped list and never said what the cap left out:\n" + r.stdout
+
+
+def test_janitor_caps_the_merged_open_class_and_says_what_it_withheld_on_both_surfaces(rig):
+    """The sibling of test_janitor_caps_the_reopen_class_..., and it pins the SAME two surfaces:
+    the human note the owner reads and the `--json` envelope the command center reads. The cap
+    itself is unit-tested; what this guards is that the count survives the trip out of propose()
+    to each surface — mutation-proved necessary, because `mo_note = ""` and a dropped JSON key
+    both left the whole suite green (fourth fresh review, P1)."""
+    _seed_janitor_fixtures(rig)
+    over = janitor_lib.MERGED_OPEN_SWEEP_CAP + 5
+    _seed_merged_open_pair(rig)                      # strips the owner labels off the fixtures
+    nums = list(range(200, 200 + over))
+    (rig.fixdir / "pr_list_heads.json").write_text(json.dumps(
+        [{"number": 700 + n, "state": "MERGED", "headRefName": "sl/i%d-x" % n} for n in nums]))
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(
+        [{"number": n, "title": "pair %d" % n, "createdAt": "2026-07-01T09:00:00Z",
+          "labels": [{"name": "type:build"}],
+          "body": "## Loop metadata\ntouches: frontend\n"} for n in nums]))
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.count("(PR #") == janitor_lib.MERGED_OPEN_SWEEP_CAP
+    assert "5 more merged-PR/still-open issue(s) were found and NOT proposed" in r.stdout
+    doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
+    assert doc["merged_open_withheld"] == 5
+
+
+def test_janitor_json_carries_the_merged_open_pair_for_the_command_center(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_merged_open_pair(rig)
+    r = cli(rig, "janitor", "--json", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    props = json.loads(r.stdout)["proposals"]
+    pair = [p for p in props if p["kind"] == "issue-merged-open"]
+    assert [p["key"] for p in pair] == ["closemerged:101"]
+    assert pair[0]["pr"] == 12 and pair[0]["target"] == 101
+    assert mutations(rig) == []                       # --json is propose-only
+
+
 def test_janitor_prompt_y_executes(rig):
     _seed_janitor_fixtures(rig)
     r = cli(rig, "janitor", "--repo", str(rig.repo), inp="y\n")
@@ -2751,3 +2856,42 @@ def test_janitor_leaves_a_valid_queue_alone(rig):
     _seed_invalid_queue(rig, [_issue(7, ["type:build"])])
     r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
     assert "nothing to propose" in r.stdout
+
+
+def _corrupt_sl_head_prs(rig):
+    """Make `gh.sl_head_prs` REFUSE (unparseable body -> ReadHealth.ok False), the shape
+    tests/test_gh.py already pins. `pr_list_heads.json` is that read's own fixture."""
+    (rig.fixdir / "pr_list_heads.json").write_text("{not json")
+
+
+def test_a_refused_sl_pr_list_is_never_reported_as_a_clean_sweep(rig):
+    """The PLUMBING guard for the sweep's health flag, on all three surfaces (sixth fresh review).
+
+    `gh.sl_head_prs` reports ok=False on a refusal AND on a full page, and either way an ABSENCE in
+    the merged-PR/still-open class is unproven — which the sweep would otherwise print as "no
+    GitHub-side debris found". (A truncated read does propose from its partial page; only a refused
+    one sweeps nothing. What both share is that "none found" proves nothing.) That is #21/#61's refused-vs-answered-empty on the LAST link of this
+    chain: the post-merge verify journals an unverifiable merge and delegates it here, and `doctor`
+    has no surface for the class.
+
+    Driven through the real CLIs, not a hand-built view: a renderer test hands `_janitor_row` a dict
+    that already carries the key and so cannot catch the key being dropped in the plumbing — the
+    same vacuous shape this issue's third and sixth reviews both had to reject.
+    """
+    _seed_janitor_fixtures(rig)
+    _corrupt_sl_head_prs(rig)
+    assert "INCOMPLETE" in cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo)).stdout
+    doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
+    assert doc["merged_open_swept"] is False
+    assert "INCOMPLETE" in cli(rig, "upkeep", "--repo", str(rig.repo)).stdout
+
+
+def test_a_healthy_sl_pr_list_says_nothing_about_completeness(rig):
+    # the counterpart, so the flag cannot be pinned by a constant: a clean read must be silent, or
+    # the note becomes boilerplate and stops being a signal.
+    _seed_janitor_fixtures(rig)
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert "INCOMPLETE" not in r.stdout
+    doc = json.loads(cli(rig, "janitor", "--json", "--repo", str(rig.repo)).stdout)
+    assert doc["merged_open_swept"] is True
+    assert "INCOMPLETE" not in cli(rig, "upkeep", "--repo", str(rig.repo)).stdout

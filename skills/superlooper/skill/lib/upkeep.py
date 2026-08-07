@@ -336,12 +336,35 @@ def _janitor_row(janitor, repo_path, out):
     withheld = withheld if type(withheld) is int and withheld > 0 else 0
     withheld_note = ("%s more keyword-closed issue(s) found beyond this sweep's reopen cap — "
                      "`superlooper doctor` names them all" % withheld) if withheld else ""
+    # The merged-PR/still-open class is capped too (janitor.MERGED_OPEN_SWEEP_CAP, issue #404), and
+    # its cap is the likelier one to bite: a repo whose `dev_branch` is not its DEFAULT branch has
+    # never had a closing keyword honoured, so its first sweep finds one pair per merged issue. Its
+    # note deliberately does NOT point at `doctor` the way the reopen note does — doctor has no
+    # surface for this class, and naming a command that cannot answer is worse than naming none.
+    mo_withheld = janitor.get("merged_open_withheld")
+    mo_withheld = mo_withheld if type(mo_withheld) is int and mo_withheld > 0 else 0
+    mo_note = ("%s more merged-PR/still-open issue(s) found beyond this sweep's close cap — "
+               "the next sweep proposes more once these are cleared" % mo_withheld) \
+        if mo_withheld else ""
+    # A refused or truncated sl/* PR list means the merged-PR/still-open class was not swept at
+    # all, and it proposes nothing either way — so without this the weekly glance renders an
+    # UNSWEPT class as a clean one, which is the exact claim this row exists not to make (#404).
+    # Both halves of `ok` at once: a REFUSED read swept nothing, a TRUNCATED one (a full page) swept
+    # partially and DOES propose from it — so "not swept" would be false beside its own proposals.
+    # What holds for both, and is the only thing worth saying: an absence here proves nothing.
+    unswept_note = ("the sl/* PR list was refused or truncated, so the merged-PR/still-open class "
+                    "is INCOMPLETE — read 'none' as unproven"
+                    if janitor.get("merged_open_swept") is False else "")
     if not props:
         _row("janitor", "nothing to propose"
              + (" (%s held back from a prior failure)" % _plural(len(held), "action")
                 if held else ""), out)
         if withheld_note:
             _sub("(%s)" % withheld_note, out)
+        if mo_note:
+            _sub("(%s)" % mo_note, out)
+        if unswept_note:
+            _sub("(%s)" % unswept_note, out)
         return
     kinds = {}
     for p in props:
@@ -355,6 +378,10 @@ def _janitor_row(janitor, repo_path, out):
              % _plural(len(held), "action"), out)
     if withheld_note:
         _sub("(%s)" % withheld_note, out)
+    if mo_note:
+        _sub("(%s)" % mo_note, out)
+    if unswept_note:
+        _sub("(%s)" % unswept_note, out)
     # Nothing here executes without the owner's word — that is the janitor's whole contract, and
     # naming the command rather than doing it is why upkeep can stay read-only.
     _remedy("superlooper janitor --repo %s   (y/N per sweep; the command center taps the same "

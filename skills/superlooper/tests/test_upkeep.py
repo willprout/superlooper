@@ -228,6 +228,28 @@ def test_janitor_proposals_are_listed_with_the_command_that_approves_them():
     assert "superlooper janitor" in out
 
 
+def test_both_capped_janitor_classes_say_what_the_cap_left_out():
+    """Upkeep's whole job is "did I miss anything", so a bounded list that does not SAY it is
+    bounded reads as the whole picture. #229 established that for the reopen cap; #404 added a
+    second capped class, and its cap is the likelier one to bite — a repo whose `dev_branch` is not
+    its DEFAULT branch never had a closing keyword honoured, so its first sweep finds one pair per
+    merged issue. Both counts must survive the trip from propose() to this row."""
+    props = [{"kind": "issue-merged-open", "key": "closemerged:5", "action": "close-issue",
+              "target": 5, "why": "PR #12 merged but the issue is still OPEN"}]
+    out = _text(_view(janitor={"error": None, "proposals": props, "held": [],
+                               "reopen_withheld": 7, "merged_open_withheld": 240}))
+    assert "7" in out and "keyword-closed" in out
+    assert "240" in out and "merged-PR" in out
+    # ...and the merged-open note must NOT send the owner to `doctor`, which has no surface for
+    # this class — naming a command that cannot answer is worse than naming none.
+    mo_line = [l for l in out.splitlines() if "240" in l][0]
+    assert "doctor" not in mo_line
+    # the same must hold on the nothing-to-propose branch, where the cap is the ONLY thing to say
+    empty = _text(_view(janitor={"error": None, "proposals": [], "held": [],
+                                 "reopen_withheld": 0, "merged_open_withheld": 3}))
+    assert "3" in empty and "merged-PR" in empty
+
+
 def test_a_refused_janitor_read_is_reported_not_swallowed():
     out = _text(_view(janitor={"error": "state/issues.json is unreadable", "proposals": [],
                                "held": []}))
@@ -516,3 +538,25 @@ def test_upkeep_verb_has_no_execute_flag():
     assert r.returncode == 0, r.stdout + r.stderr
     for flag in ("--execute", "--yes", "--apply", "--fix"):
         assert flag not in r.stdout, "upkeep grew %s — it is read-only by contract" % flag
+
+
+def test_an_unswept_merged_open_class_never_reads_as_a_clean_one():
+    """`gh.sl_head_prs` reports ok=False on a refusal AND on a full page ("a list capped at `limit`
+    cannot prove a PR's absence"), and either way an ABSENCE in the class is unproven — which the
+    weekly glance would otherwise print as "nothing to propose". That is #21/#61's refused-vs-answered-empty
+    on the LAST link of the closure chain: the post-merge verify journals an unverifiable merge and
+    delegates it to this sweep, and `doctor` has no surface for the class (#404)."""
+    empty = _text(_view(janitor={"error": None, "proposals": [], "held": [],
+                                 "merged_open_swept": False}))
+    assert "INCOMPLETE" in empty and "sl/* PR list" in empty
+    # ...and it is said beside real proposals too, not only on the empty branch
+    props = [{"kind": "branch", "key": "branch:sl/i5-a", "action": "delete-branch",
+              "target": "sl/i5-a", "why": "PR #34 merged"}]
+    assert "INCOMPLETE" in _text(_view(janitor={"error": None, "proposals": props, "held": [],
+                                                "merged_open_swept": False}))
+    # a healthy sweep says nothing about it — the note must stay a signal, never boilerplate
+    assert "INCOMPLETE" not in _text(_view(janitor={"error": None, "proposals": props, "held": [],
+                                                    "merged_open_swept": True}))
+    # ...and it must not claim the class was NOT SWEPT: `ok` is False on a full page too, and that
+    # half swept as far as the page went and may have proposed from it.
+    assert "NOT swept" not in empty

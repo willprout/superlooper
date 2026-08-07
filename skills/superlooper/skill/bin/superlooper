@@ -41,8 +41,10 @@
                   host_unreachable / unknown_lane. A local ops UI shells this instead of reaching
                   the session host itself
   janitor         propose GitHub-side cleanup (stale merged/superseded sl/* branches, open
-                  `superseded` PRs, aged parked/needs-william issues, and issues closed as
-                  COMPLETED by a bare commit keyword with no merged PR behind them — issue #229)
+                  `superseded` PRs, aged parked/needs-william issues, issues closed as
+                  COMPLETED by a bare commit keyword with no merged PR behind them — issue #229 —
+                  and open issues whose sl/i<N> PR already MERGED, which read as unstarted and can
+                  be re-approved and run twice — issue #404)
                   and execute ONLY what William approves (y/N or --yes) — list/--dry-run changes
                   nothing anywhere; nothing is ever auto-closed, auto-deleted or auto-reopened
                   (issue #62, spec §8 V2)
@@ -2910,6 +2912,14 @@ def _janitor_fetch(ls_issues, cfg=None):
     on nothing."""
     sl = {b: tip for b, tip in gh.remote_branches().items()
           if isinstance(b, str) and b.startswith(janitor_lib.BRANCH_PREFIX)}
+    # `ok` is load-bearing on THIS read and nowhere else in the sweep (issue #404). `sl_head_prs`
+    # reports ok=False on a refusal AND on a full page — "a list capped at `limit` cannot prove a
+    # PR's absence" — so either way an ABSENCE here is unproven, which the sweep would otherwise
+    # print as "no GitHub-side debris found". That is the #21/#61 refused-vs-answered-empty defect
+    # on the LAST link of the closure chain: `_verify_issue_closed` journals an unverifiable merge
+    # and explicitly delegates it to this sweep, and `doctor` has no surface for this class, so a
+    # silent empty here is the one place a lost pair could go unnoticed end to end.
+    sl_prs = gh.sl_head_prs()
     parked = []
     for label in janitor_lib.PARK_LABELS:
         parked += gh.open_issues_activity(label)
@@ -2923,10 +2933,15 @@ def _janitor_fetch(ls_issues, cfg=None):
             # refused read yields [] here, which proposes no reopens (fail closed); `doctor` is the
             # surface that distinguishes "read refused" from "nothing accidentally closed".
             "closed_issues": gh.closed_issue_closers().value,
+            # the merged-PR-with-open-issue pairs (issue #404). ONE list read for the whole sl/*
+            # PR history, on the sweep's own schedule — nothing on the runner's per-tick path reads
+            # it. Its open-issue half is `lint_issues` below (the SAME read), so the class costs one
+            # extra call, not two. A refused read yields [] and proposes nothing (fail closed).
+            "sl_prs": sl_prs.value,
             "lint_issues": gh.open_issues_all(),
             "areas": cfg.get("areas"),
             "touches_required": bool(cfg.get("touches_required")),
-            "ls_issues": ls_issues}
+            "ls_issues": ls_issues}, sl_prs.ok
 
 
 def _janitor_what(p):
@@ -2943,6 +2958,11 @@ def _janitor_what(p):
     title = p.get("title") or ""
     if p["kind"] == "issue-reopen":
         return f"REOPEN issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
+    if p["kind"] == "issue-merged-open":
+        # name the merged PR in the VERB, not only in the why (issue #404): the owner is being
+        # asked to close an open issue, and the merged work is the entire justification.
+        return (f"close issue #{p['target']} (PR #{p.get('pr')} merged)"
+                + (f" {title[:60]!r}" if title else ""))
     return f"close issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
 
 
@@ -3060,7 +3080,8 @@ def _janitor_execute_subset(args, home, days, dev, cfg=None):
     # One refused set, used by both the listing and this re-derivation, and the divergence is gone.
     refused_now = set() if args.retry_refused else set(refused_map)
     held_keys = [k for k in keys if k in refused_now]
-    fresh = janitor_lib.propose(**_janitor_fetch(ls, cfg), now=now, aged_park_days=days,
+    fetched, _sl_ok = _janitor_fetch(ls, cfg)
+    fresh = janitor_lib.propose(**fetched, now=now, aged_park_days=days,
                                 refused=refused_now, dev_branch=dev)
     to_run, skipped = janitor_lib.reconcile(
         [{"key": k} for k in keys if k not in refused_now], fresh["proposals"])
@@ -3143,18 +3164,26 @@ def cmd_janitor(args):
         return 1
     refused_path = os.path.join(home, "state", _REFUSED_FILE)
 
-    result = janitor_lib.propose(**_janitor_fetch(ls, cfg), now=time.time(), aged_park_days=days,
+    fetched, sl_prs_ok = _janitor_fetch(ls, cfg)
+    result = janitor_lib.propose(**fetched, now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)
     props, held = result["proposals"], result["refused"]
     bulk, menus = _janitor_split_menus(props)
     withheld = result.get("reopen_withheld") or 0
+    mo_withheld = result.get("merged_open_withheld") or 0
 
     if getattr(args, "json", False):
         # machine-readable propose: the full snapshot, one JSON object, and NOTHING is executed
         # or written. The command center renders this exactly the way `--dry-run` prints for a
         # human — same pure propose(), no re-derived safety anywhere.
         print(json.dumps({"ok": True, "proposals": props, "held": held,
-                          "aged_park_days": days, "reopen_withheld": withheld}))
+                          "aged_park_days": days, "reopen_withheld": withheld,
+                          "merged_open_withheld": mo_withheld,
+                          # False = the sl/* PR list was refused or truncated, so this class is
+                          # incomplete (#404). Published for the command center to render once it
+                          # learns this kind (issue #416) — today's board does not read it, so this
+                          # is the datum being made available, not a property the board yet has.
+                          "merged_open_swept": bool(sl_prs_ok)}))
         return 0
 
     held_note = (f"({len(held)} previously refused action(s) held back — --retry-refused "
@@ -3165,11 +3194,29 @@ def cmd_janitor(args):
                      f"sweep — at most {janitor_lib.REOPEN_SWEEP_CAP} reopens per sweep; "
                      f"`superlooper doctor` lists them all and a later sweep proposes the rest)"
                      if withheld else "")
+    # Same discipline for the merged-PR/open-issue closes (issue #404). This cap is likelier to bite
+    # than the reopen one: a repo whose dev_branch is not its DEFAULT branch never had a closing
+    # keyword honoured at all, so its very first sweep finds one pair per merged issue.
+    # A REFUSED (or truncated) sl/* PR list means the merged-PR/open-issue class was not swept at
+    # all — and it proposes nothing either way, which the "nothing to propose" sentence below would
+    # otherwise render as "no debris found". Say which class went unswept (#404).
+    # Wording covers BOTH halves of `ok`, which are different facts: a REFUSED read swept nothing,
+    # while a TRUNCATED one (a full page — `sl_head_prs` counts every PR, not just `sl/*`, so any
+    # repo past its limit trips this permanently) swept as far as the page went and DOES propose
+    # from it — `_janitor_fetch` passes the partial page straight through. So "NOT swept" would be
+    # false beside those very proposals. What is true of both: an absence here is unproven.
+    unswept_note = ("(the sl/* PR list was refused or truncated, so this class is INCOMPLETE — "
+                    "read 'none found' as unproven, not as none)" if not sl_prs_ok else "")
+    mo_note = (f"({mo_withheld} more merged-PR/still-open issue(s) were found and NOT proposed this "
+               f"sweep — at most {janitor_lib.MERGED_OPEN_SWEEP_CAP} closes per sweep; the next sweep "
+               "proposes more once these are cleared)" if mo_withheld else "")
 
     if not props:
         print("janitor: nothing to propose — no GitHub-side debris found."
               + (" " + held_note if held_note else "")
-              + (" " + withheld_note if withheld_note else ""))
+              + (" " + withheld_note if withheld_note else "")
+              + (" " + mo_note if mo_note else "")
+              + (" " + unswept_note if unswept_note else ""))
         return 0
 
     print(f"janitor proposals ({len(props)}) — nothing executes without your approval:")
@@ -3184,6 +3231,10 @@ def cmd_janitor(args):
         print(held_note)
     if withheld_note:
         print(withheld_note)
+    if mo_note:
+        print(mo_note)
+    if unswept_note:
+        print(unswept_note)
     if args.dry_run:
         print("dry-run: nothing executed, nothing written.")
         return 0
@@ -3218,7 +3269,8 @@ def cmd_janitor(args):
     # explicit `--execute-keys` tap. Passing the full `props` here would let one "y" execute every
     # member of a `type:` menu at once — manufacturing the `type_duplicate` defect the menu exists
     # to fix, off an approval the owner was never shown.
-    fresh = janitor_lib.propose(**_janitor_fetch(ls2, cfg), now=time.time(), aged_park_days=days,
+    fetched2, _sl_ok2 = _janitor_fetch(ls2, cfg)
+    fresh = janitor_lib.propose(**fetched2, now=time.time(), aged_park_days=days,
                                 refused=refused_keys, dev_branch=dev)
     to_run, skipped = janitor_lib.reconcile(bulk, fresh["proposals"])
     now = time.time()
@@ -3280,19 +3332,27 @@ def _upkeep_janitor_view(home, cfg, dev):
     rather than rendering a reassuring empty sweep."""
     ls, _refused_map, refused_keys, err = _janitor_read_state(home, retry_refused=False)
     if err is not None:
-        return {"error": err, "proposals": [], "held": [], "reopen_withheld": 0}, {}
+        return {"error": err, "proposals": [], "held": [], "reopen_withheld": 0,
+                "merged_open_withheld": 0, "merged_open_swept": True}, {}
     # `cfg` matters: without it the territory facts are unknown, so the touches menus can never be
     # proposed and this weekly glance would report a DIFFERENT count than `superlooper janitor` on
     # the same repo — while pointing at that very command as the remedy (fresh-agent review).
-    fetched = _janitor_fetch(ls, cfg)
+    fetched, sl_prs_ok = _janitor_fetch(ls, cfg)
     days = cfg["janitor"]["aged_park_days"]
     result = janitor_lib.propose(**fetched, now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)
-    # reopen_withheld rides along because upkeep's whole job is "did I miss anything": a weekly
+    # BOTH withheld counts ride along because upkeep's whole job is "did I miss anything": a weekly
     # glance that showed the capped ten and never said N more were found would be the one surface
-    # where a bounded list reads as the whole picture (issue #229).
+    # where a bounded list reads as the whole picture (issue #229; issue #404 added the second
+    # capped class, and dropping ITS count here would have re-made the same hole one class over —
+    # the likelier one, since a repo whose dev_branch is not its DEFAULT branch has never had a
+    # closing keyword honoured and finds one pair per merged issue on its first sweep).
     return ({"error": None, "proposals": result["proposals"], "held": result["refused"],
-             "reopen_withheld": result.get("reopen_withheld") or 0},
+             "reopen_withheld": result.get("reopen_withheld") or 0,
+             "merged_open_withheld": result.get("merged_open_withheld") or 0,
+             # a refused/truncated sl/* PR list means an absence in that class is unproven — and
+             # upkeep's whole job is "did I miss anything", so it must never read as a clean one
+             "merged_open_swept": bool(sl_prs_ok)},
             fetched["branches"])
 
 
