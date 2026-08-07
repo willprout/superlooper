@@ -15,11 +15,35 @@ import plistlib
 import re
 from pathlib import Path
 
+import pytest
+
 import fleet
 import runner_home
 import session_host
 
 from test_stack_doctor import FakeProbe
+
+
+@pytest.fixture(autouse=True)
+def _no_fleet_test_opens_a_real_control_socket(monkeypatch):
+    """Fail LOUD if anything in this module reaches the socket layer (fresh-agent review, P1).
+
+    The suite-wide ratchet in `conftest.py` points `HERDR_SOCKET_PATH` at a path that cannot exist,
+    and by its own admission that does not cover this file: `fleet.socket_path()` derives the
+    fleet's socket from the host CONFIG DIR, so a `check_fleet` call that forgot to inject one of
+    its socket seams opens whatever is at the derived path — on the fleet machine, a live server.
+    Today that only happened to be harmless because the rigs here name a HOME that does not exist,
+    which is luck, not a rule.
+
+    Scoped to this module, not the conftest: `test_fence_token_auth.py` stands up a REAL patched
+    server on an isolated socket and must keep being able to speak to it — that opt-in test is the
+    fence's own contract.
+    """
+    def refuse(socket_path, payload, timeout):
+        raise AssertionError(
+            "a fleet test tried to open a control socket at %s — inject the block's seam instead "
+            "(`fence=` / `capture=`, or a probe bound to a scripted `connect=`)" % socket_path)
+    monkeypatch.setattr(session_host, "_speak", refuse)
 
 _TEMPLATES = Path(__file__).resolve().parent.parent / "skill" / "templates"
 
@@ -726,14 +750,17 @@ def test_the_launch_gate_and_the_host_fence_are_two_different_facts():
     results = fleet.check_fleet(_unarmed_probe(), state_base=_STATE_BASE,
                                 host_config_dir=_HOST_CONFIG_DIR,
                                 fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
-                                fence=lambda p: session_host.FENCED)
+                                fence=lambda p: session_host.FENCED,
+                                capture=lambda p: session_host.ADMITTED)
     by_name = {r.name: r for r in results}
     assert by_name["host fence"].ok and not by_name["launch gate"].ok
-    # ...and the mirror image: armed launcher, open socket.
+    # ...and the mirror image: armed launcher, open socket. An unfenced host admits every method,
+    # the state report included, which is why the capture seam answers ADMITTED here.
     results = fleet.check_fleet(_green_probe(), state_base=_STATE_BASE,
                                 host_config_dir=_HOST_CONFIG_DIR,
                                 fleet_config_dir=_FLEET_CLAUDE_DIR, uid=501, home=_HOME,
-                                fence=lambda p: session_host.OPEN)
+                                fence=lambda p: session_host.OPEN,
+                                capture=lambda p: session_host.ADMITTED)
     by_name = {r.name: r for r in results}
     assert not by_name["host fence"].ok and by_name["launch gate"].ok
 

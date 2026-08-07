@@ -1044,6 +1044,9 @@ def check_state_capture(socket, capture=None, fence=None):
     round trip on the good path.
     """
     name = "host state capture"
+    # The host's own word for the one open method, read through the doorway like everything else
+    # here — `fleet.py` spells no host vocabulary of its own (`test_one_session_host_door.py`).
+    method = session_host.STATE_REPORT_METHOD
     verdict = (capture or session_host.state_report_probe)(socket)
     if verdict == session_host.REFUSED:
         return CheckResult(
@@ -1052,9 +1055,7 @@ def check_state_capture(socket, capture=None, fence=None):
             "is ever captured on this host and a crashed pane comes back as a bare shell. Nothing "
             "about this looks broken from the runner's seat — the sessions launch, run and work, "
             "and the binary reports the pin. What is missing is the host-side second layer; the "
-            "loop's own --session-id/--resume floor is unaffected" % (socket,
-                                                                     session_host.
-                                                                     STATE_REPORT_METHOD),
+            "loop's own --session-id/--resume floor is unaffected" % (socket, method),
             _REBUILD_FIX)
     if verdict != session_host.ADMITTED:
         # Not a warn, and not the rebuild fix either. This is a build-up gate: "the question went
@@ -1078,22 +1079,21 @@ def check_state_capture(socket, capture=None, fence=None):
             name, True,
             "%s is fenced and admits the state report (%s) from a tokenless caller — so this host "
             "carries the ruled allowance, and a worker's session-id report can cross the fence "
-            "here" % (socket, session_host.STATE_REPORT_METHOD))
+            "here" % (socket, method))
     if posture == session_host.OPEN:
         return CheckResult(
             name, False,
             "%s admitted the state report (%s) — but it also SERVED a tokenless caller asking for "
             "something else, so it has no fence and admitting the report proves nothing about the "
             "allowance. `host fence` above is the failure to fix first; this line stays red until "
-            "there is a fence for the hole to be in" % (socket, session_host.STATE_REPORT_METHOD),
+            "there is a fence for the hole to be in" % (socket, method),
             "fix `host fence` first — a patched build running with its token — then re-run; this "
             "block cannot judge an allowance on a socket that admits everyone")
     return CheckResult(
         name, False,
         "%s admitted the state report (%s), but the fence question went unanswered — so whether it "
         "was admitted by the ruled allowance or by a host that admits everyone cannot be told "
-        "apart, and absence of signal is not health (c2)" % (socket,
-                                                             session_host.STATE_REPORT_METHOD),
+        "apart, and absence of signal is not health (c2)" % (socket, method),
         _UNMEASURED_FIX)
 
 
