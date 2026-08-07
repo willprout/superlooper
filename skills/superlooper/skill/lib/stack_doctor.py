@@ -1031,14 +1031,16 @@ def _launchd_uid(probe):
     return os.getuid()
 
 
-def _job_path_problem(probe, plist, commands=runner_home.REQUIRED_COMMANDS):
+def _job_path_problem(probe, plist, commands=runner_home.REQUIRED_COMMANDS,
+                      subject="its recorded PATH"):
     """"PATH does not resolve gh, git" for a job whose recorded PATH lost a required command, else
     "". An unreadable/unparseable plist is itself a problem — a job launchd cannot parse is a job
     that never starts.
 
     ``commands`` is a parameter because TWO launchd jobs are judged this way now — the runner's
-    (issue #306) and the watchdog's (issue #328) — and each one names the commands IT shells. It
-    defaults to the runner's set so no existing caller changed meaning.
+    (issue #306) and the watchdog's (issue #328) — and each one names the commands IT shells.
+    ``subject`` names which PATH is being reported on, for a caller whose sentence has already
+    introduced one. Both default to the runner's wording, so no existing caller changed meaning.
     """
     text = probe.read_text(plist)
     if not _nonempty_string(text):
@@ -1047,13 +1049,31 @@ def _job_path_problem(probe, plist, commands=runner_home.REQUIRED_COMMANDS):
         entries = plistlib.loads(text.encode()).get("EnvironmentVariables", {}).get("PATH", "")
     except Exception:
         return "its LaunchAgent is not parseable as a plist"
-    dirs = [d for d in str(entries).split(":") if d]
+    return _path_problem(probe, entries, commands, subject)
+
+
+def _path_problem(probe, path_value, commands, subject="its recorded PATH"):
+    """"…does not resolve gh" for a PATH string that lost a required command, else "".
+
+    Split out of ``_job_path_problem`` for issue #328: a job's PATH can now be read from two places
+    — the plist on disk, and what ``launchctl print`` says launchd is actually holding — and the
+    verdict over the resulting string is the same either way. The commands are STAT'ED rather than
+    trusted as directory names: a PATH entry that exists but no longer holds `gh` is the same
+    failure as one that was never there.
+
+    ``subject`` names WHICH of those two PATHs is being reported on, because a caller that has just
+    said "launchd is holding X" must not then be made to say "its recorded PATH" about the same
+    thing. It defaults to the plist wording, so ``_job_path_problem``'s existing callers are
+    unchanged.
+    """
+    dirs = [d for d in str(path_value).split(":") if d]
     missing = [c for c in commands
                if not any(probe.executable(os.path.join(d, c)) for d in dirs)]
     if not missing:
         return ""
-    return ("its recorded PATH does not resolve %s — launchd hands a job only %s, so these must be "
-            "on the job's own PATH" % (", ".join(missing), runner_home.LAUNCHD_PATH))
+    return ("%s does not resolve %s — launchd hands a job only %s, so %s must be on the job's own "
+            "PATH" % (subject, ", ".join(missing), runner_home.LAUNCHD_PATH,
+                      "these" if len(missing) > 1 else "it"))
 
 
 # The shipped template the watchdog's job is rendered from, repo-relative. Named once so the fix
@@ -1073,6 +1093,15 @@ def check_watchdog_job(probe, config):
     on the fleet machine: its installed job carried launchd's own
     ``/usr/bin:/bin:/usr/sbin:/sbin`` and no ``gh``. Issue #306 fixed the TEMPLATE, and a template
     fix is inert for an already-installed job — so the difference is reported here.
+
+    Which PATH is judged depends on whether launchd is holding one, and the distinction is
+    load-bearing (fresh-agent review). A LOADED job is judged on what ``launchctl print`` says
+    launchd actually holds — because the remedy has TWO steps, edit the file and then
+    bootout+bootstrap, and between them the file is already correct while the job goes on running
+    the old environment. A check that read the file would go green right there, on a watchdog whose
+    detector is still dark. An UNLOADED job has no live environment to read and is judged on its
+    plist, which is exactly what a bootstrap would load. The reverse drift — live PATH good, file
+    regressed — is a WARN: nothing is dark now, but the next reboot would make it so.
 
     Two deliberate DEPARTURES from the runner block, both of which would be bugs if copied across:
 
@@ -1104,29 +1133,28 @@ def check_watchdog_job(probe, config):
                            "watchdog is optional, so nothing is judged here" % plist)
 
     proc = probe.run(runner_home.print_argv(_launchctl_bin(probe), uid, job))
-    loaded = getattr(proc, "returncode", 1) == 0
-    path_problem = _job_path_problem(probe, plist, runner_home.WATCHDOG_COMMANDS)
-    if path_problem:
-        # Judged FIRST, and whatever the job's load state is. Bootstrapping a job whose PATH lost
-        # `gh` only re-establishes the silent failure, so the operator has to fix the file before
-        # loading it — which is the order the one remedy below already puts them in. The load state
-        # still rides along in the detail: it changes what the operator does after the edit, and a
-        # second FAIL a minute later for the fault they could have fixed in the same pass is how a
-        # doctor earns the reputation of drip-feeding.
-        detail = ("the watchdog job %s is loaded in %s, but %s"
-                  % (job, runner_home.domain(uid), path_problem)) if loaded else (
-                  "the watchdog job %s is installed at %s and not loaded in %s, and %s"
-                  % (job, plist, runner_home.domain(uid), path_problem))
-        return CheckResult(
-            name, False, detail,
-            "Re-render the job from %s with {path} set to the absolute directories THIS machine "
-            "resolves %s in (`command -v gh git`) ahead of launchd's own %s, write it back to %s, "
-            "then reload it: `launchctl bootout %s` (a 'not found' error there is fine) followed by "
-            "`launchctl bootstrap %s %s`. Nothing rewrites that file for you — it is yours."
-            % (_WATCHDOG_TEMPLATE_REL, " and ".join(runner_home.WATCHDOG_COMMANDS),
-               runner_home.LAUNCHD_PATH, plist, runner_home.service_target(uid, job),
-               runner_home.domain(uid), plist))
-    if not loaded:
+    commands = runner_home.WATCHDOG_COMMANDS
+    remedy = (
+        "Re-render the job from %s with {path} set to the absolute directories THIS machine "
+        "resolves %s in (`command -v %s`) ahead of launchd's own %s, write it back to %s, then "
+        "reload it — the file alone changes nothing until launchd re-reads it: `launchctl bootout "
+        "%s` (a 'not found' error there is fine) followed by `launchctl bootstrap %s %s`. Nothing "
+        "rewrites that file for you — it is yours."
+        % (_WATCHDOG_TEMPLATE_REL, " and ".join(commands), " ".join(commands),
+           runner_home.LAUNCHD_PATH, plist, runner_home.service_target(uid, job),
+           runner_home.domain(uid), plist))
+
+    if getattr(proc, "returncode", 1) != 0:
+        # NOT loaded. The plist is the only PATH there is to judge, and it is the right one: it is
+        # what a bootstrap would load. Its PATH is reported alongside the load fault rather than
+        # after it, so the operator fixes both in one pass instead of being told about the second
+        # one a minute later.
+        disk_problem = _job_path_problem(probe, plist, commands)
+        if disk_problem:
+            return CheckResult(
+                name, False,
+                "the watchdog job %s is installed at %s and not loaded in %s, and %s"
+                % (job, plist, runner_home.domain(uid), disk_problem), remedy)
         return CheckResult(
             name, False,
             "the watchdog job %s is installed at %s but not loaded in %s — launchd holds nothing "
@@ -1136,9 +1164,48 @@ def check_watchdog_job(probe, config):
             "machine, delete %s instead — an unloaded plist left lying there is indistinguishable "
             "from one that was meant to be running."
             % (runner_home.domain(uid), plist, plist))
-    return CheckResult(name, True, "watchdog job %s is loaded in %s and its PATH resolves %s"
-                       % (job, runner_home.domain(uid),
-                          ", ".join(runner_home.WATCHDOG_COMMANDS)))
+
+    # LOADED, so the authority is what launchd is HOLDING, not what the file says (fresh-agent
+    # review). The remedy has two steps — edit, then bootout+bootstrap — and between them the file
+    # is already right while the job still runs the old environment. Judging the file would go
+    # green there, on a watchdog whose no_progress detector is still dark.
+    live = runner_home.service_path(_out(proc))
+    if live is None:
+        return CheckResult(
+            name, False,
+            "the watchdog job %s is loaded in %s but no PATH could be read from it, so nothing "
+            "here can say whether its GitHub reads resolve at all"
+            % (job, runner_home.domain(uid)),
+            "Read it yourself: `launchctl print %s`. If the environment blocks look unfamiliar, "
+            "this check's reader is out of date with the service manager and "
+            "lib/runner_home.py's `service_path` needs updating — it deliberately refuses to guess."
+            % runner_home.service_target(uid, job))
+    # The live PATH is quoted back only when it is NOT launchd's own four — the sentence's tail
+    # already names those, and printing the same string twice in one line is how an operator starts
+    # skimming the one they were meant to read.
+    live_problem = _path_problem(
+        probe, live, commands,
+        subject="the PATH launchd is holding for it" if live == runner_home.LAUNCHD_PATH
+                else "the PATH launchd is holding for it (%s)" % live)
+    if live_problem:
+        return CheckResult(
+            name, False, "the watchdog job %s is loaded in %s, but %s"
+            % (job, runner_home.domain(uid), live_problem), remedy)
+    # The same two-step remedy from its other side: the running job is fine while the file the NEXT
+    # bootstrap would load has lost `gh`. Nothing is dark right now, so this cannot be a FAIL — and
+    # it is a trap set for the next reboot, so it cannot be silent either.
+    disk_problem = _job_path_problem(probe, plist, commands, subject="the plist at %s" % plist)
+    if disk_problem:
+        return CheckResult(
+            name, True,
+            "the watchdog job %s is loaded in %s with a PATH that resolves %s, but %s. That file is "
+            "what the next bootstrap would load, so reload the job from a corrected one: `launchctl "
+            "bootout %s` then `launchctl bootstrap %s %s`."
+            % (job, runner_home.domain(uid), ", ".join(commands), disk_problem,
+               runner_home.service_target(uid, job), runner_home.domain(uid), plist),
+            warn=True)
+    return CheckResult(name, True, "watchdog job %s is loaded in %s and the PATH launchd holds for "
+                       "it resolves %s" % (job, runner_home.domain(uid), ", ".join(commands)))
 
 
 def check_runner_anchor(probe, config):

@@ -87,14 +87,19 @@ AQUA = "Aqua"
 # (#304), so neither belongs in a PATH check owned by the runner's process home.
 REQUIRED_COMMANDS = ("gh", "git")
 
-# The same set for the WATCHDOG's job (issue #328). An ALIAS, not a copy, and shared on purpose:
-# `gh` is the one whose absence is silent — the watchdog's file-backed detectors keep reporting
-# while every GitHub read refuses, which it reads as UNOBSERVABLE and so freezes its clocks — and
-# `git` rides along because the shipped watchdog template instructs the operator to record both, and
-# because the watchdog hands its OWN environment to the launch shim it spawns a debugger session
-# through. A separate name rather than a bare re-use of REQUIRED_COMMANDS so the day the two jobs
-# genuinely need different sets, that is one edit here instead of a silent widening of both.
-WATCHDOG_COMMANDS = REQUIRED_COMMANDS
+# What the WATCHDOG's job shells by bare name (issue #328). SHORTER than the runner's, and it is a
+# separate constant rather than a re-use precisely so it can be: a fresh-agent review traced the
+# whole check path and found exactly one — `gh`, through `lib/gh.py`'s `SL_GH` default. Nothing on
+# that path runs `git` (the check is file reads plus GitHub reads; the debugger it may launch is
+# `--cwd` into an existing tree, and its session is created by the session-host server rather than
+# inheriting this job's environment), and a health check that FAILS a job over a command it never
+# shells is a false red — the one thing a health check may not produce.
+#
+# `gh` is the one whose absence is SILENT, which is the whole reason this is judged at all: the
+# heartbeat and ALERT detectors read FILES and keep working, while every GitHub read refuses, which
+# the watchdog correctly treats as UNOBSERVABLE and so freezes its clocks — so `no_progress` never
+# fires, on a job that prints as perfectly healthy.
+WATCHDOG_COMMANDS = ("gh",)
 
 # `launchctl print` renders a service as an indented block; the pid line is the one fact this
 # module reads out of it. Anchored to the line so a `pid` appearing inside some other value cannot
@@ -259,6 +264,43 @@ def service_is_idle(text):
     if state in _RUNNING_STATES:
         return False
     return None
+
+
+# The `environment` blocks `launchctl print` renders for a service. THREE of them are printed and
+# they mean different things, which is why this is parsed rather than grepped for `PATH =>`:
+#   inherited environment   the CALLER's leftovers (SSH_AUTH_SOCK and friends) — never the job's;
+#   default environment     what launchd would hand ANY job — printed even for a job that overrides
+#                           it, so reading this one in preference reports every correctly-installed
+#                           job as broken;
+#   environment             the job's own, from its plist's EnvironmentVariables.
+# The effective PATH is therefore `environment`'s if it names one, else `default environment`'s.
+# Shapes taken from a real `launchctl print gui/501/com.superlooper.session-host`.
+_ENV_BLOCK = re.compile(
+    r"^[ \t]*(inherited environment|default environment|environment)[ \t]*=[ \t]*\{$"
+    r"(.*?)^[ \t]*\}[ \t]*$", re.M | re.S)
+_ENV_PATH_LINE = re.compile(r"^[ \t]*PATH[ \t]*=>[ \t]*(.+?)[ \t]*$", re.M)
+
+
+def service_path(text):
+    """The PATH launchd is ACTUALLY holding for a service, out of ``launchctl print``, or None.
+
+    Added for issue #328 after a fresh-agent review: the plist on disk and the environment launchd
+    is running are DIFFERENT FACTS, and they disagree for exactly as long as the remedy takes —
+    editing the file is step one, bootout+bootstrap is step two. A check that read only the file
+    would go green the moment it was saved, while the job went on running the old environment. So
+    the live answer is read where a live answer exists.
+
+    None means UNKNOWN — absent, or an output shape this build cannot read — and callers fail
+    closed on it, the same rule ``service_pid`` and ``service_is_idle`` follow. There is no
+    fallback guess: the whole point of the block that reads this is to say whether a detector is
+    dark, and a guessed PATH answers that question wrongly with total confidence.
+    """
+    found = {}
+    for block, body in _ENV_BLOCK.findall(text or ""):
+        match = _ENV_PATH_LINE.search(body)
+        if match and block not in found:
+            found[block] = match.group(1)
+    return found.get("environment") or found.get("default environment")
 
 
 def service_pid(text):
