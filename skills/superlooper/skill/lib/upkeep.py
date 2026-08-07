@@ -336,12 +336,23 @@ def _janitor_row(janitor, repo_path, out):
     withheld = withheld if type(withheld) is int and withheld > 0 else 0
     withheld_note = ("%s more keyword-closed issue(s) found beyond this sweep's reopen cap — "
                      "`superlooper doctor` names them all" % withheld) if withheld else ""
+    # The merged-PR/still-open class is capped too (janitor.MERGED_OPEN_SWEEP_CAP, issue #404), and
+    # its cap is the likelier one to bite: a repo whose `dev_branch` is not its DEFAULT branch has
+    # never had a closing keyword honoured, so its first sweep finds one pair per merged issue. Its
+    # note deliberately does NOT point at `doctor` the way the reopen note does — doctor has no
+    # surface for this class, and naming a command that cannot answer is worse than naming none.
+    mo_withheld = janitor.get("merged_open_withheld")
+    mo_withheld = mo_withheld if type(mo_withheld) is int and mo_withheld > 0 else 0
+    mo_note = ("%s more merged-PR/still-open issue(s) found beyond this sweep's close cap — "
+               "later sweeps propose the rest" % mo_withheld) if mo_withheld else ""
     if not props:
         _row("janitor", "nothing to propose"
              + (" (%s held back from a prior failure)" % _plural(len(held), "action")
                 if held else ""), out)
         if withheld_note:
             _sub("(%s)" % withheld_note, out)
+        if mo_note:
+            _sub("(%s)" % mo_note, out)
         return
     kinds = {}
     for p in props:
@@ -355,6 +366,8 @@ def _janitor_row(janitor, repo_path, out):
              % _plural(len(held), "action"), out)
     if withheld_note:
         _sub("(%s)" % withheld_note, out)
+    if mo_note:
+        _sub("(%s)" % mo_note, out)
     # Nothing here executes without the owner's word — that is the janitor's whole contract, and
     # naming the command rather than doing it is why upkeep can stay read-only.
     _remedy("superlooper janitor --repo %s   (y/N per sweep; the command center taps the same "

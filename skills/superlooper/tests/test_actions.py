@@ -4107,10 +4107,12 @@ def test_absorb_merged_carries_the_pr_the_poll_actually_read():
     nothing — which is exactly how "PR #None merged" survived the first round of tests."""
     d, g = _gating(pv=pr_view(state="MERGED", num=909))
     assert only(decide(dsk=d, gh_view=g), "absorb_merged")[0]["pr"] == 909
-    # ...and an unreadable number rides through as None rather than being invented: the executor
-    # says "its pull request" instead of printing a number nobody read.
-    d, g = _gating(pv=dict(pr_view(state="MERGED"), number=555))
-    assert "pr" in only(decide(dsk=d, gh_view=g), "absorb_merged")[0]
+    # ...and an unreadable number rides through as None rather than being INVENTED: the executor
+    # says "its pull request" instead of printing a number nobody read. (`number=None`, not the
+    # helper's default — asserting against the default would restate the line above and pin
+    # nothing, which is the vacuous-test failure this whole test exists to close.)
+    d, g = _gating(pv=dict(pr_view(state="MERGED"), number=None))
+    assert only(decide(dsk=d, gh_view=g), "absorb_merged")[0]["pr"] is None
 
 
 # =============== in-flight branch->PR reconcile (issue #155) ===============

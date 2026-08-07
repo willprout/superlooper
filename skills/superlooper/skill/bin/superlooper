@@ -3303,7 +3303,8 @@ def _upkeep_janitor_view(home, cfg, dev):
     rather than rendering a reassuring empty sweep."""
     ls, _refused_map, refused_keys, err = _janitor_read_state(home, retry_refused=False)
     if err is not None:
-        return {"error": err, "proposals": [], "held": [], "reopen_withheld": 0}, {}
+        return {"error": err, "proposals": [], "held": [], "reopen_withheld": 0,
+                "merged_open_withheld": 0}, {}
     # `cfg` matters: without it the territory facts are unknown, so the touches menus can never be
     # proposed and this weekly glance would report a DIFFERENT count than `superlooper janitor` on
     # the same repo — while pointing at that very command as the remedy (fresh-agent review).
@@ -3311,11 +3312,15 @@ def _upkeep_janitor_view(home, cfg, dev):
     days = cfg["janitor"]["aged_park_days"]
     result = janitor_lib.propose(**fetched, now=time.time(), aged_park_days=days,
                                  refused=refused_keys, dev_branch=dev)
-    # reopen_withheld rides along because upkeep's whole job is "did I miss anything": a weekly
+    # BOTH withheld counts ride along because upkeep's whole job is "did I miss anything": a weekly
     # glance that showed the capped ten and never said N more were found would be the one surface
-    # where a bounded list reads as the whole picture (issue #229).
+    # where a bounded list reads as the whole picture (issue #229; issue #404 added the second
+    # capped class, and dropping ITS count here would have re-made the same hole one class over —
+    # the likelier one, since a repo whose dev_branch is not its DEFAULT branch has never had a
+    # closing keyword honoured and finds one pair per merged issue on its first sweep).
     return ({"error": None, "proposals": result["proposals"], "held": result["refused"],
-             "reopen_withheld": result.get("reopen_withheld") or 0},
+             "reopen_withheld": result.get("reopen_withheld") or 0,
+             "merged_open_withheld": result.get("merged_open_withheld") or 0},
             fetched["branches"])
 
 

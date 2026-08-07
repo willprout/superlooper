@@ -2061,7 +2061,14 @@ def test_merge_closes_an_issue_the_keyword_left_open(rig, monkeypatch):
     closes = [m for m in mutations(rig) if m["kind"] == "close_issue"]
     assert [c["num"] for c in closes] == ["5"]
     # the close explains itself where the next reader will look — it names the merged PR
-    assert "555" in (closes[0]["comment"] or "")
+    body = closes[0]["comment"] or ""
+    assert "555" in body
+    # ...and it states ONLY what was observed. The docstring's expected cause (a non-default dev
+    # branch) is never CHECKED here, and GitHub's linked-issue closure is a background job, so a
+    # read this close behind the merge can catch a default-branch repo a moment before its keyword
+    # fires. A permanent GitHub comment must not assert a cause nobody established.
+    assert "DEFAULT branch" not in body and "default branch" not in body
+    assert "still open when superlooper checked" in body
     rec = [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
     assert len(rec) == 1 and rec[0]["id"] == "i5" and rec[0]["num"] == 5
     assert rec[0]["outcome"] == "closed"

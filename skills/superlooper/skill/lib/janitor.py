@@ -481,7 +481,13 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
                         key=lambda i: (_pr_int(i.get("number")) is None,
                                        _pr_int(i.get("number")) or 0)):
             num = _pr_int(i.get("number"))
-            if num is None or num in ex_nums or num in seen_issues:
+            # `seen_reopens` joins the exclusions for the reason `seen_issues` does: a REOPEN and a
+            # CLOSE of the same issue in one menu are contradictory actions, and both are
+            # bulk-approvable. It takes a race to happen at all — `closed_issues` and `lint_issues`
+            # are separate reads, so the issue must be closed for the first and open for the second
+            # — but that is exactly the shape #229's own close/reopen guard exists to refuse, and
+            # leaving this class out of it would break a symmetry every other close class keeps.
+            if num is None or num in ex_nums or num in seen_issues or num in seen_reopens:
                 continue
             pr = merged_by_issue.get(num)
             if pr is None:

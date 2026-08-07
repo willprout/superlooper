@@ -919,3 +919,16 @@ def test_an_issue_in_the_owners_attention_queue_is_never_proposed():
         props = _of_kind(_pair_propose(lint_issues=[_open_issue(5, ["type:build", label])]),
                          "issue-merged-open")
         assert props == [], label
+
+
+def test_a_reopen_and_a_close_of_the_same_issue_never_share_one_menu():
+    """Opposite actions on one issue, both bulk-approvable under `--yes`, is exactly the
+    contradiction #229's own close/reopen guard exists to refuse. It takes a race to reach — the
+    closed set and the open set are separate reads, so the issue must be closed for one and open for
+    the other — but every other close class is guarded against it and this one must be too."""
+    r = propose(closed_issues=[_closed(5, closer=_bare())],
+                sl_prs=[_merged(12, "sl/i5-x")], lint_issues=[_open_issue(5, ["type:build"])],
+                areas=_AREAS, touches_required=True)
+    keys = [p["key"] for p in r["proposals"]]
+    assert "reopen:5" in keys                        # the reopen is proposed, as before
+    assert "closemerged:5" not in keys               # ...and never its opposite in the same sweep

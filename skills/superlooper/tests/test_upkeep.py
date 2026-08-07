@@ -228,6 +228,28 @@ def test_janitor_proposals_are_listed_with_the_command_that_approves_them():
     assert "superlooper janitor" in out
 
 
+def test_both_capped_janitor_classes_say_what_the_cap_left_out():
+    """Upkeep's whole job is "did I miss anything", so a bounded list that does not SAY it is
+    bounded reads as the whole picture. #229 established that for the reopen cap; #404 added a
+    second capped class, and its cap is the likelier one to bite — a repo whose `dev_branch` is not
+    its DEFAULT branch never had a closing keyword honoured, so its first sweep finds one pair per
+    merged issue. Both counts must survive the trip from propose() to this row."""
+    props = [{"kind": "issue-merged-open", "key": "closemerged:5", "action": "close-issue",
+              "target": 5, "why": "PR #12 merged but the issue is still OPEN"}]
+    out = _text(_view(janitor={"error": None, "proposals": props, "held": [],
+                               "reopen_withheld": 7, "merged_open_withheld": 240}))
+    assert "7" in out and "keyword-closed" in out
+    assert "240" in out and "merged-PR" in out
+    # ...and the merged-open note must NOT send the owner to `doctor`, which has no surface for
+    # this class — naming a command that cannot answer is worse than naming none.
+    mo_line = [l for l in out.splitlines() if "240" in l][0]
+    assert "doctor" not in mo_line
+    # the same must hold on the nothing-to-propose branch, where the cap is the ONLY thing to say
+    empty = _text(_view(janitor={"error": None, "proposals": [], "held": [],
+                                 "reopen_withheld": 0, "merged_open_withheld": 3}))
+    assert "3" in empty and "merged-PR" in empty
+
+
 def test_a_refused_janitor_read_is_reported_not_swallowed():
     out = _text(_view(janitor={"error": "state/issues.json is unreadable", "proposals": [],
                                "held": []}))

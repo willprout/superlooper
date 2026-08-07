@@ -4250,18 +4250,33 @@ class Runner:
                 # without one), and "PR #None merged" on the one path whose whole product is the
                 # audit trail would be worse than the honest sentence.
                 which = f"PR #{pr}" if type(pr) is int and pr > 0 else "its pull request"
+                # Say ONLY what was observed. The docstring above explains the cause we expect
+                # (a non-default dev branch), but this function never CHECKS it — and GitHub's
+                # linked-issue closure is a background job, so a read this close behind the merge
+                # can catch a default-branch repo a moment before its keyword fires. Naming that
+                # unverified cause in a permanent GitHub comment would assert a fact nobody
+                # established, on the one artifact a later reader treats as the record.
                 closed = gh.close_issue(
-                    num, comment=f"{which} merged but this issue was still open — closed by "
-                                 "superlooper's post-merge closure verify. GitHub's closing keyword "
-                                 "did not close it (it fires only for merges into the repository's "
-                                 "DEFAULT branch), so nothing else would have.")
+                    num, comment=f"{which} merged, but this issue was still open when superlooper "
+                                 "checked immediately afterwards — so superlooper closed it "
+                                 "(post-merge closure verify). If you expected the PR body's "
+                                 "closing keyword to do this, it did not.")
                 outcome = "closed" if closed else "close_refused"
             journal.append(self.home, {"act": "post_merge_close", "id": iid, "num": num,
                                        "pr": pr, "outcome": outcome}, now)
         except Exception as e:                                     # noqa: BLE001 — see docstring
-            journal.append(self.home, {"act": "post_merge_close", "id": iid, "num": num,
-                                       "pr": pr, "outcome": "error",
-                                       "error": _short_repr(e)}, now)
+            # The recovery write must not be able to fail the SAME way the original did. A journal
+            # append can itself raise (a read-only or full state home; an unserializable value), and
+            # re-appending the identical payload would send that exception straight back out of a
+            # function whose whole contract is that it cannot lose the merged fact. So: a minimal,
+            # provably-serializable record, and if even that fails, swallow it — the merge is
+            # already landed, and `_journal_outcome` on the very next line owns reporting a state
+            # home that cannot be written at all.
+            try:
+                journal.append(self.home, {"act": "post_merge_close", "id": iid,
+                                           "outcome": "error", "error": _short_repr(e)}, now)
+            except Exception:                                      # noqa: BLE001
+                pass
 
     def _review_carry(self, iid, head, pre, wt):
         """Carry the PR's review verdict across the runner's OWN merge-update (issue #154).
