@@ -12,6 +12,7 @@ module reads those back. The report's CURRENT-state facts (report date, freeze m
 queue, usage) arrive via `view` — the live snapshot the runner/CLI assembles for the report; its
 keys are documented on morning() below.
 """
+import math
 
 WEEK_SECONDS = 7 * 24 * 3600
 DAY_SECONDS = 24 * 3600
@@ -500,10 +501,17 @@ def _resurrection(records, window_start):
 def _age(seconds):
     """A span as the coarse, readable duration the report speaks in: "3d 4h", "5h 12m", "40m".
 
-    Returns None for anything that cannot be trusted as a span — a wrong-typed value, or a NEGATIVE
-    one (a hold stamped in the future by a clock jump). An age the loop cannot prove renders as no
-    age at all; it is never invented, and it never feeds the alert threshold."""
-    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or seconds < 0:
+    Returns None for anything that cannot be trusted as a span — a wrong-typed value, a NEGATIVE one
+    (a hold stamped in the future by a clock jump), or a NON-FINITE one. An age the loop cannot prove
+    renders as no age at all; it is never invented, and it never feeds the alert threshold.
+
+    The non-finite guard is load-bearing, not defensive decoration: Python's json module round-trips
+    the bare literals `NaN` and `Infinity` without complaint, so a corrupt or hand-edited issues.json
+    can hand this module a stamp that `int()` refuses (ValueError / OverflowError). This module's
+    whole contract is that a broken overnight never takes the report down — a raise here would blank
+    the one surface the owner reads, which is precisely the silence #405 exists to end."""
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) \
+            or not math.isfinite(seconds) or seconds < 0:
         return None
     s = int(seconds)
     d, rem = divmod(s, DAY_SECONDS)
@@ -517,8 +525,11 @@ def _age(seconds):
 
 
 def _since(v):
-    """An epoch stamp, or None if it is missing or wrong-typed (bool is an int — exclude it)."""
-    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    """An epoch stamp, or None if it is missing, wrong-typed (bool is an int — exclude it) or
+    non-finite (json round-trips `NaN`/`Infinity`). Dropped at the door so no downstream arithmetic —
+    the age render OR the alert threshold comparison — ever sees one."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) \
+        else None
 
 
 def _iid_num(iid):
@@ -625,20 +636,24 @@ def _hold_alerts(holds, view, now):
     has stood past its threshold. Rendered above the sections, where the owner cannot coffee past
     them. No new notification is earned — these ride the one daily push the report already sends,
     via the summary line's own count."""
+    # The threshold is tested against the age _age() would RENDER, never a raw span: an age this
+    # module cannot render honestly (wrong-typed, negative, non-finite) is one it cannot alert on
+    # either, and the two must agree or an alert could print "held None".
     lines = []
     for h in holds:
-        age = _hold_age(h, now)
-        if age is None or age < HOLD_ALERT_SECONDS:
+        age, rendered = _hold_age(h, now), _age(_hold_age(h, now))
+        if rendered is None or age < HOLD_ALERT_SECONDS:
             continue
-        lines.append(f"**{_hold_head(h)} has been held {_age(age)}** — {h['reason']} (a hold that "
+        lines.append(f"**{_hold_head(h)} has been held {rendered}** — {h['reason']} (a hold that "
                      "old is a STALL, not a wait: nothing in the loop moves it until the cause "
                      "clears).")
     frozen = view.get("frozen")
     if isinstance(frozen, dict) and frozen:
         since = _since(frozen.get("since"))
         age = None if since is None else now - since
-        if age is not None and age >= FREEZE_ALERT_SECONDS:
-            lines.append(f"**Merges have been FROZEN for {_age(age)}** — "
+        rendered = _age(age)
+        if rendered is not None and age >= FREEZE_ALERT_SECONDS:
+            lines.append(f"**Merges have been FROZEN for {rendered}** — "
                          f"{frozen.get('reason') or '(reason unrecorded)'}. A freeze this old has "
                          "outlived both of its own recovery paths (a green dev check, a green "
                          "nightly); it is a stall, not the safe idle state.")

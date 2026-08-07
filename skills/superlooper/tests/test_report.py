@@ -471,6 +471,25 @@ def test_standing_holds_never_raises_on_wrong_typed_state():
         assert isinstance(out, str) and "## Standing holds" in out
 
 
+def test_a_non_finite_timestamp_never_takes_the_report_down():
+    # json round-trips the bare literals NaN and Infinity, so a corrupt or hand-edited issues.json
+    # can hand this module a stamp int() refuses (ValueError / OverflowError). The report's whole
+    # contract is that a broken overnight never blanks it — the surface #405 exists to keep speaking.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        state = _held_state(i12={"status": "ready", "launch_hold_reason": "held",
+                                 "launch_hold_since": bad})
+        for frozen in (None, {"reason": "nightly red", "since": bad}):
+            out = report.morning([], _view(now=1_000_000, queue=[], issues_state=state,
+                                           frozen=frozen), ledger={}, config=_cfg())
+            section = out.split("## Standing holds")[1].split("\n## ")[0]
+            assert "#12" in section and "not recorded" in section   # listed, with no invented age
+            assert "None" not in out.split("## ")[0]                # and never an alert reading None
+    # ...and a non-finite reference clock (view['now']) is just as survivable.
+    state = _held_state(i12=_launch_held(0))
+    assert isinstance(report.morning([], _view(now=float("inf"), queue=[], issues_state=state),
+                                     ledger={}, config=_cfg()), str)
+
+
 def test_standing_holds_terminal_set_tracks_the_runners_own():
     # The report's "this episode is over" test must be the SAME set the runner acts on, or a status
     # the loop treats as terminal would keep renderings a hold forever (or vice versa).
