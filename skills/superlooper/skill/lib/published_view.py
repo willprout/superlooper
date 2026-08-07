@@ -201,13 +201,16 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
         # DEFINITIONALLY pre-merge (the gate only merges an OPEN one) and will never be refreshed —
         # the issue is terminal, so it is never polled again.
         #
-        # Precisely: this settles from the tick AFTER the landing, not the landing tick itself. The
-        # tick loads `ist_map` before `_exec_merge` writes `status: merged` to disk, so the landing
-        # tick still sees the pre-merge map and publishes the raw OPEN read. Harmless — nothing in
-        # the dashboard's LIVE path reads a PR's `state`, and cargo/gate render correctly from that
-        # raw entry — and it self-corrects on the very next tick, including the worst interleaving
-        # (a poll firing in between, which drops the entry to the carry: the `iid in merged` test
-        # below runs BEFORE the settled-state test in both loops, so an OPEN-stamped carry entry is
+        # Precisely: this settles on the LANDING TICK itself (#276). The runner hands us the
+        # post-execute issue map — the one `_exec_merge` has already written `status: merged` into —
+        # so the tick that merges a lane is the tick that publishes it merged. It used to hand us
+        # the map loaded at the top of the tick, and the landing then took a whole tick (~15s, and a
+        # dashboard polling every ~2s behind it) to appear.
+        #
+        # Which map arrives is the runner's business, not ours; this stays correct either way,
+        # including the worst interleaving (a poll firing between the merge and the publish, which
+        # drops the entry out of `view["prs"]` and into the carry: the `iid in merged` test below
+        # runs BEFORE the settled-state test in both loops, so an OPEN-stamped carry entry is
         # promoted anyway and nothing is ever lost).
         prs[iid] = _carried_pr(pr, "MERGED") if (isinstance(pr, dict) and iid in merged) \
             else _published_pr(pr)

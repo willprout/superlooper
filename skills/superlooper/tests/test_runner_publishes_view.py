@@ -161,13 +161,13 @@ def test_the_engine_stamps_the_state_format_that_names_this_shape():
 # gh is never asked again.
 
 def _seed_merged(rig, iid, pr):
-    """The runner's state on the tick AFTER a landing: loopstate says merged (`_exec_merge` wrote it
-    last tick), and the cached PR is still the pre-merge OPEN read the gate acted on — nothing ever
-    writes the merge back into gh_view, and the issue is terminal now, so it is never polled again.
+    """The runner's state on a tick AFTER a landing: loopstate says merged (`_exec_merge` wrote it
+    on some earlier tick), and the cached PR is still the pre-merge OPEN read the gate acted on —
+    nothing ever writes the merge back into gh_view, and the issue is terminal now, so it is never
+    polled again.
 
-    Deliberately the tick AFTER: a tick loads `ist_map` before `_exec_merge` writes to disk, so the
-    landing tick itself still publishes the raw OPEN read. That one-tick lag is by design (see
-    published_view.build) and self-corrects here."""
+    The LANDING tick itself is driven end-to-end further down (issue #276): these seeded cases pin
+    that the settle keeps holding on every later tick, which is what the arrivals board reads."""
     def m(st):
         st["issues"].setdefault(iid, loopstate.new_issue()).update(
             {"status": "merged", "branch": "sl/%s-a-thing" % iid, "pr": pr["number"]})
@@ -231,3 +231,89 @@ def test_a_parked_flights_open_pr_is_not_frozen_into_the_view(rig):
     rig.r.gh_view = {**rig.r.gh_view, "prs": {}}
     rig.r.tick(now=NOW + 10_015)
     assert "i15" not in view(rig)["prs"]
+
+
+# --------------------------- the LANDING tick itself (issue #276) ---------------------------
+# Everything above seeds a landing that already happened and drives the ticks after it. This drives
+# the landing itself — a real gating lane, through decide, through `_exec_merge`, on one tick — and
+# pins that the document THAT tick publishes already names the merge.
+#
+# It has to be an end-to-end tick, because the bug it guards is purely one of ORDER inside `tick`:
+# the issue map is loaded at the top, the executors move statuses in the middle, and publishing
+# reads that map at the bottom. Any test that hands `_publish_view` a map directly cannot see it.
+
+_LANDING_REPORT = "## Tests\n" + "all green, evidence attached " * 4
+
+
+_LANDING_TITLE = "Render the widget"
+
+
+def _seed_landing_lane(rig, in_the_poll_set=False):
+    """The fixture flight the gate can actually land on the very next tick: issue #123's PR 555
+    reads OPEN + MERGEABLE with a green `quality-gate` rollup and a review marker pinned to its
+    head oid (tests/fixtures/gh), and the lane has a report with the required section.
+
+    ``in_the_poll_set`` puts the issue in the ``in-progress`` queue too, which is where a live
+    gating lane actually is — that is what gives the published document a TITLE for it to carry."""
+    rig.r.config = make_config(required_checks=["quality-gate"])
+
+    def m(st):
+        st["issues"].setdefault("i123", loopstate.new_issue()).update(
+            {"status": "gating", "branch": "sl/i123-render-the-widget", "num": 123,
+             "type": "build", "declared_touches": []})
+    loopstate.update(str(rig.home / "state" / "issues.json"), m)
+    (rig.home / "reports" / "i123.md").write_text(_LANDING_REPORT)
+    if in_the_poll_set:
+        (rig.fixdir / "issue_list_in-progress.json").write_text(json.dumps([{
+            "number": 123, "title": _LANDING_TITLE, "createdAt": "2026-07-01T09:00:00Z",
+            "labels": [{"name": "type:build"}, {"name": "in-progress"}],
+            "body": "## Goal\nRender the widget.\n\n## Loop metadata\ntouches: frontend\n"}]))
+
+
+def _status(rig, iid):
+    return loopstate.load(str(rig.home / "state" / "issues.json"))["issues"][iid]["status"]
+
+
+def test_the_tick_that_merges_a_lane_publishes_it_as_merged(rig, monkeypatch):
+    # The published view is what the dashboard renders, and it polls every ~2s behind a runner that
+    # ticks every ~15s — so a landing missing from THIS tick's document is a PR the loop has already
+    # merged rendering as still in flight for a whole tick's worth of polls.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _seed_landing_lane(rig)
+    rig.r.tick(now=NOW)
+    assert _status(rig, "i123") == "merged", "the fixture flight never landed — this test drives nothing"
+    pr = view(rig)["prs"].get("i123")
+    assert pr, "the flight merged on this tick published no PR facts at all"
+    assert pr["state"] == "MERGED", "the tick that merged the lane still published its PR as OPEN"
+
+
+def test_the_landing_ticks_own_document_carries_the_flights_cargo(rig, monkeypatch):
+    # The chip the arrivals board draws, on the tick it becomes true. The fixture PR's two files are
+    # +40/−2 and +18/−0, and a settled entry collapses them to the three totals.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _seed_landing_lane(rig)
+    rig.r.tick(now=NOW)
+    pr = view(rig)["prs"]["i123"]
+    assert (pr["additions"], pr["deletions"], pr["changedFiles"]) == (58, 2, 2)
+
+
+def test_the_landing_tick_keeps_the_lane_tracked_so_its_carry_survives(rig, monkeypatch):
+    # The other half of the change (issue #276): the map the publish reads is not only the merged
+    # set, it is also the TRACKED set that bounds both carries. Reading it post-execute must not
+    # drop a lane that just went terminal — that lane is exactly the one whose title and PR the
+    # board still wants, and the next poll's want-set skips it outright.
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    _seed_landing_lane(rig, in_the_poll_set=True)
+    rig.r.tick(now=NOW)
+    assert _status(rig, "i123") == "merged", "the fixture flight never landed — this test drives nothing"
+    assert view(rig)["titles"].get("i123") == _LANDING_TITLE
+
+    # ...and now GitHub forgets it, exactly as it does for a closed issue: the want-set skips a
+    # terminal lane, so neither the issue nor its PR is read again. Only the carry can hold them.
+    rig.r._parsed_by_id, rig.r._raw_by_id = {}, {}
+    rig.r.gh_view = {**rig.r.gh_view, "prs": {}}
+    rig.r._last_poll = NOW + 10_000              # inside the window: no re-poll rebuilds either map
+    rig.r.tick(now=NOW + 15)
+    doc = view(rig)
+    assert doc["titles"].get("i123") == _LANDING_TITLE, "the landing lost its carried title"
+    assert doc["prs"].get("i123", {}).get("state") == "MERGED", "the landing lost its carried PR"
