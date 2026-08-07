@@ -323,6 +323,75 @@ def test_doctor_warns_when_no_checks_observed_yet(rig):
     assert "no checks observed" in (r.stdout + r.stderr).lower()
 
 
+# ------------- doctor: the dev surface is a WINDOW of commits, not one HEAD (issue #406) -------
+# The PR surface is read across ~30 recent PRs; the dev surface was read at the branch's single
+# HEAD commit. Minutes after a merge that HEAD carries no check-run object yet, so the doctor
+# announced "no check history yet to confirm it runs there" — a FAIL downgraded to a WARN, false
+# reassurance — while the commits right behind it carried green runs of that exact check.
+
+def _dev_window(rig, shas):
+    (rig.fixdir / "commits.json").write_text(json.dumps([{"sha": s} for s in shas]))
+
+
+def _dev_commit_checks(rig, sha, names):
+    (rig.fixdir / ("check_runs_%s.json" % sha)).write_text(json.dumps(
+        {"check_runs": [{"name": n, "status": "completed", "conclusion": "success"}
+                        for n in names]}))
+
+
+def test_doctor_reads_recent_dev_commits_not_only_the_branch_head(rig):
+    _set_checks(rig, ["quality-gate"])
+    # the incident shape: HEAD (== the branch ref the old read used) reports nothing yet...
+    _dev_commit_checks(rig, "main", [])
+    _dev_window(rig, ["fresh", "prior"])
+    _dev_commit_checks(rig, "fresh", [])
+    _dev_commit_checks(rig, "prior", ["quality-gate"])         # ...the commit behind it is green
+
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "no check history" not in out                       # the false reassurance is gone
+    assert "every name reports on its expected surface" in out
+
+
+def test_doctor_still_fails_a_dev_gap_the_whole_window_confirms(rig):
+    # The window may only ADD evidence. A dev-required name that reports on NO commit in it is
+    # still the 2026-07-09 incident — the dev-side poll reads pending forever — so it still FAILs.
+    (rig.repo / ".superlooper" / "config.json").write_text(json.dumps(
+        {"version": 1, "repo": "o/r",
+         "required_checks": {"pr": ["quality-gate", "ship"], "dev": ["quality-gate", "ship"]}}))
+    (rig.fixdir / "pr_list.json").write_text(json.dumps([{
+        "number": 555, "state": "OPEN", "statusCheckRollup": [
+            {"__typename": "StatusContext", "context": "quality-gate", "state": "SUCCESS"},
+            {"__typename": "StatusContext", "context": "ship", "state": "SUCCESS"}]}]))
+    _dev_window(rig, ["c1", "c2", "c3"])
+    for sha in ("c1", "c2", "c3"):
+        _dev_commit_checks(rig, sha, ["quality-gate"])         # never `ship`, on any commit
+
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "ship" in out and "dev" in out.lower()
+
+
+def test_doctor_stays_cautious_when_the_dev_window_read_is_refused(rig):
+    # An API blip must never manufacture evidence: with nothing observable on dev the doctor holds
+    # the cautious answer (a re-runnable "cannot confirm"), never a false ok.
+    _set_checks(rig, ["quality-gate"])
+    (rig.fixdir / "commits.json").write_text('"a bare string, wrong type"')   # the blip
+    _dev_commit_checks(rig, "main", [])                        # and the fallback HEAD read is bare
+
+    r = cli(rig, "doctor", "--repo", str(rig.repo))
+
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "quality-gate" in out
+    assert "check history" in out                              # the cautious WARN...
+    assert "every name reports on its expected surface" not in out   # ...never an ok
+
+
 # --- doctor's accidental-close audit (issue #229) ----------------------------------------------
 # An issue closed as COMPLETED by a bare commit-message keyword reads as fixed while nothing
 # shipped (the 2026-07-16 ledger commit that auto-closed the never-built #189). The doctor's job
@@ -635,6 +704,32 @@ def test_doctor_stack_fails_when_the_notify_test_send_fails(rig):
     assert "FAIL notify channel" in out
     assert "rc=2" in out
     assert "recipient file missing" in out          # the actual error rode onto the FAIL line
+
+
+def test_doctor_stack_unconfigured_notify_names_config_and_cites_the_canary(rig):
+    # Issue #406, end to end: with no channel configured the block still FAILs (the ruling is
+    # unchanged — host toasts are not a channel), but it must say WHAT is wrong. Nothing was sent,
+    # so nothing failed to deliver; and the journal's last canary DID deliver, which is the
+    # evidence that keeps the FAIL from reading as a broken channel.
+    cfg_path = rig.repo / ".superlooper" / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["notify"] = {"cmd": None, "imessage_to": None}
+    cfg_path.write_text(json.dumps(cfg))
+    (rig.home / ".zshrc").write_text('source "$HOME/.superlooper/launch-shim.zsh"\n')
+    state_home = Path(rig.env["SL_HOME"]) / "o__r"
+    state_home.mkdir(parents=True, exist_ok=True)
+    (state_home / "journal.jsonl").write_text(json.dumps(
+        {"ts": time.time(), "act": "notify_canary", "date": "2026-08-06",
+         "ok": True, "channel": "imessage", "rc": 0, "detail": ""}) + "\n")
+
+    r = cli(rig, "doctor", "--stack", "--repo", str(rig.repo), env_over=_stack_env(rig))
+
+    assert r.returncode != 0
+    out = r.stdout + r.stderr
+    assert "FAIL notify channel" in out
+    assert "CONFIGURED" in out and "nothing was sent" in out
+    assert "canary" in out.lower() and "imessage" in out
+    assert "Fix: Set notify.cmd or notify.imessage_to" in out
 
 
 # --------------------------- adopt ---------------------------

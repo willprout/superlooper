@@ -268,6 +268,125 @@ def test_recent_pr_check_entries_fail_closed(ghenv, monkeypatch):
     assert gh.recent_pr_check_entries() == []       # unreadable PR list -> no evidence, not a crash
 
 
+# --------------------------- the doctor's dev-surface WINDOW (issue #406) ---------------------
+# The PR surface is read across ~30 recent PRs; the dev surface was read at the branch's single
+# HEAD commit. Minutes after a merge that HEAD carries no check-run object yet, so the read folded
+# to empty and the doctor said "no check history yet to confirm it runs there" — a FAIL downgraded
+# to a WARN — while the commits right behind it carried green runs of that exact check.
+
+def _check_run_paths(fixdir):
+    return [c[1] for c in _calls(fixdir) if c and c[0] == "api" and "check-runs" in c[1]]
+
+
+def test_recent_branch_check_entries_unions_a_window_of_recent_commits(ghenv):
+    (ghenv / "commits.json").write_text(json.dumps([{"sha": "fresh"}, {"sha": "prior"}]))
+    (ghenv / "check_runs_fresh.json").write_text(json.dumps({"check_runs": []}))
+    (ghenv / "check_runs_prior.json").write_text(json.dumps(
+        {"check_runs": [{"name": "quality-gate", "status": "completed",
+                         "conclusion": "success"}]}))
+
+    entries = gh.recent_branch_check_entries("main")
+
+    # the fresh HEAD contributed nothing; the commit behind it carries the evidence
+    assert {e.get("name") for e in entries} == {"quality-gate"}
+
+
+def test_recent_branch_check_entries_window_is_small_and_fixed(ghenv):
+    # API-burn discipline: each commit in the window costs TWO REST calls (check-runs + status),
+    # so the bound is the whole budget of this read and it must not drift with what GitHub returns.
+    assert gh.DEV_CHECK_WINDOW == 5
+    (ghenv / "commits.json").write_text(json.dumps([{"sha": "c%d" % i} for i in range(9)]))
+    for i in range(9):
+        (ghenv / ("check_runs_c%d.json" % i)).write_text(json.dumps({"check_runs": []}))
+
+    gh.recent_branch_check_entries("main")
+
+    assert len(_check_run_paths(ghenv)) == gh.DEV_CHECK_WINDOW
+
+
+def test_recent_branch_check_entries_clamps_a_caller_that_asks_for_more(ghenv):
+    # The bound is ENFORCED, not merely defaulted: a caller passing a bigger number cannot turn an
+    # on-demand read into a page-walk while the docstrings still promise "small and fixed".
+    (ghenv / "commits.json").write_text(json.dumps([{"sha": "c%d" % i} for i in range(20)]))
+    for i in range(20):
+        (ghenv / ("check_runs_c%d.json" % i)).write_text(json.dumps({"check_runs": []}))
+
+    gh.recent_branch_check_entries("main", limit=99)
+
+    assert len(_check_run_paths(ghenv)) == gh.DEV_CHECK_WINDOW
+    listed = [c[1] for c in _calls(ghenv)
+              if c and c[0] == "api" and len(c) > 1 and "/commits?" in c[1]]
+    assert all("per_page=%d" % gh.DEV_CHECK_WINDOW in p for p in listed)   # and GitHub is not asked
+
+
+def test_recent_branch_check_entries_stops_once_every_audited_name_is_seen(ghenv):
+    # A name already observed on this surface cannot change its surface-membership by being
+    # observed again, so the walk stops there — the healthy case costs one commit's reads, not five.
+    (ghenv / "commits.json").write_text(json.dumps(
+        [{"sha": "aaa"}, {"sha": "bbb"}, {"sha": "ccc"}]))
+    (ghenv / "check_runs_aaa.json").write_text(json.dumps(
+        {"check_runs": [{"name": "quality-gate", "status": "completed",
+                         "conclusion": "success"}]}))
+
+    gh.recent_branch_check_entries("main", stop_when_seen={"quality-gate"})
+
+    paths = _check_run_paths(ghenv)
+    assert paths and all("commits/aaa/" in p for p in paths)     # bbb and ccc never read
+
+
+def test_recent_branch_check_entries_keeps_walking_until_the_missing_name_is_ruled_out(ghenv):
+    # The mirror: a name the window never sees must cost the FULL window before the doctor calls
+    # it a dev gap — an early stop on a partial match would resurrect the false-reassurance bug.
+    (ghenv / "commits.json").write_text(json.dumps([{"sha": "aaa"}, {"sha": "bbb"}]))
+    for sha in ("aaa", "bbb"):
+        (ghenv / ("check_runs_%s.json" % sha)).write_text(json.dumps(
+            {"check_runs": [{"name": "quality-gate", "status": "completed",
+                             "conclusion": "success"}]}))
+
+    gh.recent_branch_check_entries("main", stop_when_seen={"quality-gate", "ship"})
+
+    assert len(_check_run_paths(ghenv)) == 2
+
+
+def test_recent_branch_check_entries_falls_back_to_the_branch_ref_when_the_list_is_refused(ghenv):
+    # No commits.json fixture -> the commit LIST read is refused. The window degrades to exactly
+    # the single-commit read it replaces — never worse than the HEAD-only behaviour it inherits.
+    entries = gh.recent_branch_check_entries("main")
+
+    assert {e.get("name") for e in entries} == {"review/local-gate", "quality-gate"}
+    assert all("commits/main/" in p for p in _check_run_paths(ghenv))
+
+
+def test_recent_branch_check_entries_fails_closed_to_no_evidence(ghenv, monkeypatch):
+    # A total outage yields NO evidence, which the doctor renders as "cannot verify yet" — the
+    # cautious answer. It must never fabricate an observation that makes a bad name read as fine.
+    monkeypatch.setenv("GH_FAIL", "1")
+    assert gh.recent_branch_check_entries("main") == []
+
+
+def test_recent_branch_check_entries_skips_a_commit_it_cannot_read(ghenv):
+    # Per-commit fail-closed: one unreadable commit contributes nothing and the walk continues.
+    (ghenv / "commits.json").write_text(json.dumps([{"sha": "broken"}, {"sha": "prior"}]))
+    (ghenv / "check_runs_broken.json").write_text('"a bare string, wrong type"')
+    (ghenv / "check_runs_prior.json").write_text(json.dumps(
+        {"check_runs": [{"name": "quality-gate", "status": "completed",
+                         "conclusion": "success"}]}))
+
+    entries = gh.recent_branch_check_entries("main")
+
+    assert {e.get("name") for e in entries} == {"quality-gate"}
+
+
+def test_recent_branch_check_entries_argv_encodes_the_ref_and_pins_the_window(ghenv):
+    gh.recent_branch_check_entries("sl/i1-x")
+
+    listed = [c[1] for c in _calls(ghenv)
+              if c and c[0] == "api" and len(c) > 1 and "/commits?" in c[1]]
+    assert listed, "the commit LIST endpoint was never called"
+    assert all("sha=sl%2Fi1-x" in p for p in listed)              # encoded, never the raw slash
+    assert all("per_page=%d" % gh.DEV_CHECK_WINDOW in p for p in listed)
+
+
 # --------------------------- default branch + branch existence (issue #28) ----------
 # adopt writes the repo's REAL default branch as dev_branch (a master/develop repo would
 # otherwise fail every worktree creation off origin/main), and doctor validates it exists.

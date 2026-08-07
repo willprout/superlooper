@@ -675,12 +675,37 @@ def _stderr_tail(stderr, limit=240):
     return tail
 
 
-def check_notify(config, config_error=None, sender=None, announce=None):
+def _delivered_canary_clause(canary):
+    """The one clause the UNCONFIGURED-notify FAIL adds when the journal holds a notify canary that
+    actually delivered (issue #406).
+
+    That FAIL is about CONFIGURATION — nothing was sent, so nothing failed to deliver — and its old
+    text read as a broken channel. A delivered canary is the evidence that says otherwise out loud:
+    the send path worked the last time anything used it. Only a `healthy` verdict is cited;
+    `dead`/`unverified`/`unconfigured` prove nothing about the path, so they stay silent rather than
+    pad the line with a claim the journal does not support. Wrong-typed input cites nothing.
+
+    The claim is deliberately PAST TENSE. The canary proves the path worked when it ran, and the
+    config has demonstrably changed since (there is no channel now), so 'the send path works' would
+    be a present-tense claim this evidence cannot carry (fresh-agent review)."""
+    if not isinstance(canary, dict) or canary.get("status") != "healthy":
+        return ""
+    channel = canary.get("channel")
+    return (" — the journal's newest notify canary DID deliver (via %s), so the send path worked "
+            "when that canary ran; what is missing is the configuration"
+            % (channel if _nonempty_string(channel) else "an earlier channel"))
+
+
+def check_notify(config, config_error=None, sender=None, announce=None, canary=None):
     """Prove the notify channel by SENDING one real test message through the configured path — a
     channel that only checks 'is a value set' passed the live 2026-07-10 incident where every send
     exited 2 (recipient file gone) and a park alert never reached the owner. A nonzero send FAILs
     the block carrying rc + the stderr tail; a delivered send PASSes. This is doctor --stack's one
-    deliberate side effect, so we announce exactly what is about to go out before it does."""
+    deliberate side effect, so we announce exactly what is about to go out before it does.
+
+    `canary` is report.notify_canary's verdict dict when the caller has the journal (the CLI and
+    upkeep both do), None otherwise. It is EVIDENCE ONLY — it never changes a verdict, it only
+    keeps the unconfigured FAIL from reading as a delivery failure (issue #406)."""
     if config_error:
         return CheckResult(
             "notify channel", False, str(config_error),
@@ -697,8 +722,15 @@ def check_notify(config, config_error=None, sender=None, announce=None):
     elif _nonempty_string(notify_cfg.get("cmd")):
         channel = "cmd"
     else:
+        # A hard FAIL, unchanged — the ruling stands: only a CONFIGURED channel counts, and a cmux
+        # desktop toast is not a channel (nobody is at the machine at 03:00). What changed is the
+        # TEXT (issue #406): nothing was sent here, so nothing failed to deliver, and saying
+        # otherwise sent the owner hunting a broken channel when the config was simply empty.
         return CheckResult(
-            "notify channel", False, "notify.cmd and notify.imessage_to are empty",
+            "notify channel", False,
+            "no owner-reachable channel is CONFIGURED — notify.cmd and notify.imessage_to are "
+            "empty, so nothing was sent and nothing failed to deliver"
+            + _delivered_canary_clause(canary),
             "Set notify.cmd or notify.imessage_to in .superlooper/config.json; cmux desktop toasts "
             "are not enough for overnight stalls.",
         )
@@ -1639,7 +1671,8 @@ def check_superlooper_plugin(probe):
         warn=True)
 
 
-def check_stack(config, config_error=None, probe=None, sender=None, announce=None, repo_path=None):
+def check_stack(config, config_error=None, probe=None, sender=None, announce=None, repo_path=None,
+                canary=None):
     probe = probe or Probe()
     cfg = config if isinstance(config, dict) else {}
     dev = cfg.get("dev_branch")
@@ -1653,7 +1686,8 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_claude(probe),
         check_gh_auth(probe),
         check_gh_headroom(probe),
-        check_notify(config, config_error=config_error, sender=sender, announce=announce),
+        check_notify(config, config_error=config_error, sender=sender, announce=announce,
+                     canary=canary),
         check_launch_shim(probe),
         check_cmux_app_nap(probe),
         check_runner_anchor(probe, config),

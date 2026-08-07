@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import config as config_lib
 import notify
 import stack_doctor
@@ -470,6 +472,88 @@ def test_notify_check_unconfigured_still_fails_without_sending(tmp_path, monkeyp
     assert ".superlooper/config.json" in result.fix
     assert calls == []                                  # no test message sent when unconfigured
     assert announced == []                              # and nothing announced
+
+
+# --- the unconfigured FAIL names CONFIGURATION, not delivery (issue #406) ----------------------
+# The posture is a deliberate ruling and does NOT change: only a configured channel counts, host
+# toasts are not a channel, and an unconfigured notify FAILs hard. What was wrong was the TEXT —
+# it read as "your alerts are not getting through" when in fact nothing was ever sent.
+
+_UNCONFIGURED = {"notify": {"cmd": None, "imessage_to": None}}
+
+
+def _unconfigured(**kwargs):
+    return stack_doctor.check_notify(
+        _UNCONFIGURED, sender=lambda *a: pytest.fail("must not send when unconfigured"),
+        announce=lambda *a: None, **kwargs)
+
+
+def test_unconfigured_notify_fail_names_configuration_rather_than_delivery():
+    result = _unconfigured()
+
+    assert result.ok is False
+    assert "CONFIGURED" in result.detail                 # what is actually wrong
+    assert "notify.cmd and notify.imessage_to are empty" in result.detail
+    assert "nothing was sent" in result.detail           # so nothing failed to deliver
+
+
+def test_unconfigured_notify_fail_cites_a_journaled_canary_that_delivered():
+    # A passing canary is the evidence that the PATH works — cite it, so the FAIL cannot be read
+    # as a broken channel. It does not soften the verdict.
+    result = _unconfigured(canary={"status": "healthy", "channel": "imessage", "rc": 0,
+                                   "detail": ""})
+
+    assert result.ok is False
+    assert "canary" in result.detail.lower()
+    assert "imessage" in result.detail
+    # past tense on purpose: the canary proves the path worked WHEN IT RAN, and the config has
+    # demonstrably changed since (there is no channel now), so a present-tense claim would
+    # overstate the evidence.
+    assert "worked when that canary ran" in result.detail
+    assert "path works" not in result.detail
+
+
+@pytest.mark.parametrize("canary", [
+    None,
+    "not a dict",
+    {"status": "dead", "channel": "imessage", "rc": 2, "detail": "recipients missing"},
+    {"status": "unverified", "channel": "?", "rc": None, "detail": ""},
+    {"status": "unconfigured", "channel": "log-only", "rc": 0, "detail": ""},
+])
+def test_unconfigured_notify_cites_only_a_canary_that_actually_delivered(canary):
+    # Anything short of a delivered canary proves nothing about the path, so it stays out of the
+    # FAIL line rather than padding it with a claim the journal does not support.
+    result = _unconfigured(canary=canary)
+
+    assert result.ok is False
+    assert "canary" not in result.detail.lower()
+
+
+@pytest.mark.parametrize("canary", [
+    None,
+    {"status": "healthy", "channel": "imessage", "rc": 0, "detail": ""},
+])
+def test_unconfigured_notify_still_fails_hard_whatever_the_canary_says(canary):
+    # The ruling, pinned: only a CONFIGURED channel counts. Not a WARN, not a pass — a FAIL that
+    # fails the stack, with an actionable fix, and with no message sent.
+    result = _unconfigured(canary=canary)
+
+    assert result.ok is False
+    assert getattr(result, "warn", False) is False
+    assert ".superlooper/config.json" in result.fix
+
+
+def test_check_stack_threads_the_canary_into_the_notify_block(tmp_path, monkeypatch):
+    # The wiring, not just the block: check_stack is the only door the CLI and upkeep call.
+    monkeypatch.setenv("SL_CMUX", str(tmp_path / "no-cmux"))
+    results = stack_doctor.check_stack(
+        _UNCONFIGURED, probe=_healthy_probe(), sender=stack_doctor.SKIP_SEND,
+        announce=lambda *a: None,
+        canary={"status": "healthy", "channel": "imessage", "rc": 0, "detail": ""})
+
+    notify_block = next(r for r in results if r.name == "notify channel")
+    assert notify_block.ok is False
+    assert "canary" in notify_block.detail.lower() and "imessage" in notify_block.detail
 
 
 def test_notify_check_announces_before_it_sends(tmp_path):
