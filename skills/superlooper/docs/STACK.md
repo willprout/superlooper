@@ -200,6 +200,28 @@ An orchestrator additionally needs the tools used by the gate and by worker hand
   machine. `SL_LAUNCHCTL` overrides the service-manager binary and `SL_LAUNCHD_DIR` the directory
   the job is installed into; there is deliberately no override for the uid — the job is always
   addressed in this process's own `gui/$UID` domain.
+- `watchdog job`: the OTHER launchd job this repo runs — the unattended-debugger watchdog (issue
+  #328) — judged on the two things that make it dark. Running it at all is optional, so a machine
+  with no `com.superlooper.watchdog.<owner>__<repo>` LaunchAgent installed is a clean skip, never a
+  FAIL. When one IS installed, it FAILs if launchd holds nothing for it (a plist on disk that was
+  never bootstrapped fires no check at all, so the loop has no unattended fallback), and it FAILs
+  if the job's PATH does not resolve `gh`. That second one is the whole reason the block exists and
+  it is silent by construction: the watchdog's heartbeat and ALERT detectors read FILES, so a job
+  without `gh` keeps reporting them and prints as perfectly healthy — while every GitHub read
+  refuses, which the watchdog correctly treats as UNOBSERVABLE and so freezes its clocks, meaning
+  the `no_progress` detector never fires. The `Fix:` line names the concrete remedy: re-render the
+  job from `skills/superlooper/skill/templates/launchd.watchdog.plist` with `{path}` set to the
+  directories this machine resolves `gh` in, write it back, then `launchctl bootout` + `launchctl
+  bootstrap gui/$UID`. **Which PATH gets judged depends on the job's state, and the difference
+  matters:** a LOADED job is judged on the PATH `launchctl print` says launchd is actually holding,
+  because that remedy has two steps and between them the file is already correct while the job goes
+  on running the old environment; an UNLOADED job is judged on its plist, which is what a bootstrap
+  would load. The reverse drift — launchd holding a good PATH while the file on disk has lost `gh`
+  — is a WARN, since nothing is dark yet but the next reboot would make it so. Unlike `runner home`
+  this block never judges liveness (the watchdog is a `StartInterval` one-shot, so "not running" is
+  its healthy steady state) and it never repairs anything: the installed plist under
+  `~/Library/LaunchAgents` is yours. `SL_LAUNCHCTL` and `SL_LAUNCHD_DIR` steer it exactly as they
+  do the block above.
 - `installed engine current`: a visibility line that never fails the stack — being behind is by
   design, since a merged engine change is inert until someone republishes through the gated
   `bin/install.sh` (issue #39). It compares the installed copy's VERSION stamp

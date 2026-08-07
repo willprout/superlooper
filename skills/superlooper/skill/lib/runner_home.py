@@ -87,6 +87,24 @@ AQUA = "Aqua"
 # (#304), so neither belongs in a PATH check owned by the runner's process home.
 REQUIRED_COMMANDS = ("gh", "git")
 
+# What a watchdog job's PATH must be PROVED to resolve (issue #328). SHORTER than the runner's, and
+# a separate constant rather than a re-use precisely so it can be. The test is not "every bare-name
+# command on the check's path" but "every one launchd's own PATH does not already supply", because
+# LAUNCHD_PATH is what a job gets for free and nothing on it can go missing by omission. Two
+# fresh-agent reviews traced the path: `gh` (through `lib/gh.py`'s `SL_GH` default) is the only
+# command outside those four. `security`, which `usage.py` shells on the same path, lives in
+# /usr/bin and so is always resolvable; `git` is never shelled there at all (the check is file reads
+# plus GitHub reads, and the debugger it may launch is `--cwd` into an existing tree, with its
+# session created by the session-host server rather than inheriting this job's environment).
+# Widening the set past that would FAIL a job over a command it never runs — a false red, the one
+# thing a health check may not produce.
+#
+# `gh` is the one whose absence is SILENT, which is the whole reason this is judged at all: the
+# heartbeat and ALERT detectors read FILES and keep working, while every GitHub read refuses, which
+# the watchdog correctly treats as UNOBSERVABLE and so freezes its clocks — so `no_progress` never
+# fires, on a job that prints as perfectly healthy.
+WATCHDOG_COMMANDS = ("gh",)
+
 # `launchctl print` renders a service as an indented block; the pid line is the one fact this
 # module reads out of it. Anchored to the line so a `pid` appearing inside some other value cannot
 # be mistaken for the service's own.
@@ -101,6 +119,12 @@ _RUNNING_STATES = frozenset({"running", "spawn scheduled"})
 # The shipped launchd label shape, matching the nightly and watchdog jobs already installed
 # (com.superlooper.<job>.<owner>__<name>) so one glance at `launchctl list` groups a repo's jobs.
 _LABEL_FMT = "com.superlooper.runner.%s__%s"
+
+# The WATCHDOG's job, in the same shape (issue #328). It lives here rather than beside the watchdog
+# because this module is where the launchd vocabulary is spelled — the domain, the print/bootstrap
+# argvs and the PATH rule are already shared, and a second file minting launchd labels is a second
+# file that can drift from the domain rule they all have to obey.
+_WATCHDOG_LABEL_FMT = "com.superlooper.watchdog.%s__%s"
 
 # The plist itself is a SHIPPED TEMPLATE, not a string in here — same home as the nightly and
 # watchdog plists, so an operator can read the job before installing it and `tests/test_templates.py`
@@ -161,18 +185,33 @@ def restart_mechanism(home):
 
 # ---------------------------------------------------------------------------- addressing the job
 
-def label(repo_slug):
-    """The LaunchAgent label for a repo's runner, or ValueError.
+def _slug_parts(repo_slug, job):
+    """``(owner, name)`` from an ``owner/name`` slug, or ValueError naming which job wanted it.
 
     Raises rather than sanitizing: a label is how every later verb (bootout, kickstart, print)
-    addresses this job, and a quietly-repaired one would address a different job — or none.
+    addresses a job, and a quietly-repaired one would address a different job — or none.
     """
     if not isinstance(repo_slug, str) or repo_slug.count("/") != 1:
-        raise ValueError("a runner label needs an owner/name slug, got %r" % (repo_slug,))
+        raise ValueError("a %s label needs an owner/name slug, got %r" % (job, repo_slug))
     owner, name = repo_slug.split("/", 1)
     if not owner or not name:
-        raise ValueError("a runner label needs an owner/name slug, got %r" % (repo_slug,))
-    return _LABEL_FMT % (owner, name)
+        raise ValueError("a %s label needs an owner/name slug, got %r" % (job, repo_slug))
+    return owner, name
+
+
+def label(repo_slug):
+    """The LaunchAgent label for a repo's runner, or ValueError."""
+    return _LABEL_FMT % _slug_parts(repo_slug, "runner")
+
+
+def watchdog_label(repo_slug):
+    """The LaunchAgent label for a repo's WATCHDOG job, or ValueError (issue #328).
+
+    A separate function rather than a ``job=`` parameter on ``label``: every caller of ``label``
+    means the runner, and a defaulted parameter is how one of them one day addresses the wrong job
+    while reading as though it addressed the right one.
+    """
+    return _WATCHDOG_LABEL_FMT % _slug_parts(repo_slug, "watchdog")
 
 
 def domain(uid):
@@ -229,6 +268,43 @@ def service_is_idle(text):
     if state in _RUNNING_STATES:
         return False
     return None
+
+
+# The `environment` blocks `launchctl print` renders for a service. THREE of them are printed and
+# they mean different things, which is why this is parsed rather than grepped for `PATH =>`:
+#   inherited environment   the CALLER's leftovers (SSH_AUTH_SOCK and friends) — never the job's;
+#   default environment     what launchd would hand ANY job — printed even for a job that overrides
+#                           it, so reading this one in preference reports every correctly-installed
+#                           job as broken;
+#   environment             the job's own, from its plist's EnvironmentVariables.
+# The effective PATH is therefore `environment`'s if it names one, else `default environment`'s.
+# Shapes taken from a real `launchctl print gui/501/com.superlooper.session-host`.
+_ENV_BLOCK = re.compile(
+    r"^[ \t]*(inherited environment|default environment|environment)[ \t]*=[ \t]*\{$"
+    r"(.*?)^[ \t]*\}[ \t]*$", re.M | re.S)
+_ENV_PATH_LINE = re.compile(r"^[ \t]*PATH[ \t]*=>[ \t]*(.+?)[ \t]*$", re.M)
+
+
+def service_path(text):
+    """The PATH launchd is ACTUALLY holding for a service, out of ``launchctl print``, or None.
+
+    Added for issue #328 after a fresh-agent review: the plist on disk and the environment launchd
+    is running are DIFFERENT FACTS, and they disagree for exactly as long as the remedy takes —
+    editing the file is step one, bootout+bootstrap is step two. A check that read only the file
+    would go green the moment it was saved, while the job went on running the old environment. So
+    the live answer is read where a live answer exists.
+
+    None means UNKNOWN — absent, or an output shape this build cannot read — and callers fail
+    closed on it, the same rule ``service_pid`` and ``service_is_idle`` follow. There is no
+    fallback guess: the whole point of the block that reads this is to say whether a detector is
+    dark, and a guessed PATH answers that question wrongly with total confidence.
+    """
+    found = {}
+    for block, body in _ENV_BLOCK.findall(text or ""):
+        match = _ENV_PATH_LINE.search(body)
+        if match and block not in found:
+            found[block] = match.group(1)
+    return found.get("environment") or found.get("default environment")
 
 
 def service_pid(text):
