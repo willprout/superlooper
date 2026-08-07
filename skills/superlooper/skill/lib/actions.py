@@ -386,8 +386,8 @@ ALERT_MESSAGES = {
                             "inherited XDG_CONFIG_HOME (or another gh config redirect) that the "
                             "runner does not see but every worker does — the runner's own polling "
                             "keeps working throughout, which is why nothing else complained. "
-                            "Launches are HELD (the queue is intact, NOTHING parked, no issue "
-                            "charged, no re-approval needed) and resume automatically once a probe "
+                            "Launches are HELD (the queue is intact, NOTHING parked, no label "
+                            "moved, no re-approval needed) and resume automatically once a probe "
                             "launch flies. Fix: `gh auth login --hostname github.com` as the "
                             "account that owns the loop repo, and check for an exported "
                             "XDG_CONFIG_HOME/GH_CONFIG_DIR in a shell rc file, a LaunchAgent or a "
@@ -605,7 +605,12 @@ def queue_hold_reasons(alert):
 def queue_hold_line(alert):
     """The one-line queue state for `superlooper status`. Says HELD and names the classes, and says
     in the same breath that nothing was parked — because the owner's first instinct on reading
-    "held" is to go looking for issues to re-approve, and there are none."""
+    "held" is to go looking for issues to re-approve, and there are none.
+
+    It claims "nothing parked, no label moved" and deliberately NOT "no issue charged" (fresh-review
+    P2). The CHANNEL classes really do charge nothing; the escalated ENVIRONMENT ones bump the
+    refusing lane's own launch cap on the way in, which is exactly what keeps a one-off broken
+    worktree parking normally. One line covers both, so it may only claim what is true of both."""
     held = queue_hold_reasons(alert)
     if not held:
         return "queue: flowing"
@@ -614,8 +619,8 @@ def queue_hold_line(alert):
                 "state cannot be read. Treat the queue as HELD until you can read it (the raw ALERT "
                 "line above is the file's actual contents); `superlooper doctor` checks the rest of "
                 "the state files.")
-    return ("queue: HELD — launches are paused (the queue is intact: nothing parked, no issue "
-            "charged, no re-approval needed). Cause: " + ", ".join(held))
+    return ("queue: HELD — launches are paused (the queue is intact: nothing parked, no label "
+            "moved, no re-approval needed). Cause: " + ", ".join(held))
 
 
 LAUNCH_STDERR_MEMO_MAX = 1200      # chars of a failed launch's stderr tail carried into a park memo
@@ -1601,13 +1606,20 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     systemic_env_reasons = sorted(r for r, ids in env_streaks.items()
                                   if len(ids) >= SYSTEMIC_ENV_FAILURE_CAP)
     systemic_env = bool(systemic_env_reasons)
-    # The lanes already sampled by an OPEN (below-cap) streak. While the environment question stands
-    # open, launching one of these again learns nothing; launching a DIFFERENT one settles it. See
+    # The lanes this episode has ALREADY sampled. Launching one of them again learns nothing about
+    # whether its environment or the MACHINE's is broken; launching a DIFFERENT one settles it. See
     # ENV_SAMPLE_WINDOW_SECONDS for why that preference is what makes "nothing parked" structural
     # rather than a property of how many lanes happen to be free.
-    env_sampled = set()
-    if not systemic_env:
-        env_sampled = {i for ids in env_streaks.values() for i in ids}
+    #
+    # It matters MOST once the hold stands, which is not the intuitive reading and was a fresh-review
+    # P0. Under the hold the only thing that launches is the #115 recovery probe, and the probe's
+    # whole job is to find out whether the escalation was RIGHT. Sent at front-of-queue priority it
+    # goes straight back to a lane that has already refused: if the escalation was wrong — two
+    # genuinely lane-local faults, and a healthy issue sitting behind them — the probe re-fails
+    # forever, charges no cap (by design), and the hold never lifts. Preferring an unsampled lane is
+    # what makes a WRONGLY-held queue self-heal, which is the failure this whole layer must not
+    # introduce: a wrongly-held queue is the bigger, quieter outage.
+    env_sampled = {i for ids in env_streaks.values() for i in ids}
     # A dead anchor only matters when approved work is held behind it: an agent-ready, not-in-flight
     # issue. Deliberately does NOT exclude an at-cap / corrupt-counter issue — while degraded ITS
     # launch-cap park is SUPPRESSED too (below), so it is part of the held queue the alert must
@@ -2929,28 +2941,36 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # delivery fail, so attempting more only walks the queue. The queue is preserved (agent-ready
     # intact) and resumes the tick the anchor resolves — no William relabeling. The #115 canary
     # (below) is the ONE exception: a single probe re-arms a systemic hold that cannot clear itself.
-    # (#320) Is the environment question OPEN — one lane has refused for a reason that would be
-    # machine-wide across two, recently enough that a second sample is still the live question? Both
-    # bounds fail OPEN (no preference): an unreadable clock, or a streak too old to be about this
-    # episode, leaves the queue in plain priority order exactly as before this layer existed.
+    # (#320) Is the environment question OPEN — has a lane refused for a reason that would be
+    # machine-wide across two, and is a fresh sample still the live question?
+    #
+    # The clock bound applies only BELOW the cap, where the normal launch path is still running and
+    # a never-schedulable peer could otherwise hold the refused lane out of the queue indefinitely.
+    # It fails OPEN (no preference) on an unreadable or stale clock, leaving plain priority order.
+    # ONCE HELD the bound is deliberately dropped: nothing but the #115 probe launches, so there is
+    # nothing to starve — and the probe fires every CANARY_RETRY_SECONDS (300s), which is already
+    # past this window, so keeping the bound would silently disable the preference exactly where it
+    # is load-bearing (see env_sampled above).
     _env_fail_at = dsk.get("launch_fail_at")
-    _sampling = (bool(env_sampled) and _real(_env_fail_at)
-                 and now - _env_fail_at < ENV_SAMPLE_WINDOW_SECONDS)
+    _sampling = bool(env_sampled) and (
+        systemic_env or (_real(_env_fail_at) and now - _env_fail_at < ENV_SAMPLE_WINDOW_SECONDS))
 
-    def _eligible_launch_ids():
+    def _eligible_rows(at_cap_ok=False):
         """Approved, not-in-flight, launchable issues in priority order — the shared candidate set
         for both normal fresh launches AND the #115 canary probe. A PURE filter with NO side effects
         (it never parks): the touches-required park belongs to the normal path only, and a canary must
         never park while the systemic hold stands.
 
-        While an ENVIRONMENT streak is open (issue #320) an already-sampled lane goes to the back of
-        the bus: relaunching the lane that just refused learns nothing about whether its environment
-        or the MACHINE's is broken, and trying a different one settles it. This is what makes "a
-        machine-wide outage parks nothing" structural rather than a property of how many lanes
-        happen to be free — a serialized queue would otherwise retry the same issue into its
-        per-issue cap and park it before a second sample ever existed. It is a PREFERENCE, never an
-        exclusion: with no unsampled candidate the sampled one is yielded exactly as it is today, so
-        a one-issue queue reaches its cap and parks on the unchanged schedule."""
+        `at_cap_ok` relaxes the per-issue launch cap, and ONLY the recovery probe passes it (issue
+        #320, fresh-review P0). The cap answers "should this issue be launched AGAIN, or parked?" —
+        a question about the ISSUE, and the right filter for the normal path. The probe asks a
+        different question: "can this machine start a session at all?", which any lane answers. With
+        the cap applied to both, a hold whose every candidate had reached the cap could emit no
+        probe (they are filtered out) AND no park (the hold suppresses it) — a state nothing in the
+        loop can leave. A probe charges no cap and parks nothing, so relaxing it there costs the
+        per-issue accounting nothing; and if that probe VERIFIES, the lane runs, which is exactly the
+        outcome the hold has been claiming all along — those failures were the machine's, not the
+        issue's."""
         rows = []
         for iid in _sorted_ids(parsed_by_id):
             p = parsed_by_id[iid]
@@ -2962,14 +2982,36 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     or iid in reapproved_now   # just re-released: launch next tick, reset counters
                     or iid in resumed_now      # just re-claimed for the gate (#161): never rebuild it
                     or _status_of(ist) not in RELAUNCHABLE_STATUSES   # wrong-typed status: never launch (#95)
-                    or corrupt or launch_fails >= LAUNCH_FAILURE_CAP):
+                    or corrupt
+                    or (launch_fails >= LAUNCH_FAILURE_CAP and not at_cap_ok)):
                 continue
             rows.append((iid, p, ist))
-        if _sampling:
-            fresh = [r for r in rows if r[0] not in env_sampled]
-            if fresh:
-                return fresh
         return rows
+
+    def _unsampled(rows):
+        """The rows for lanes this episode's environment streak has NOT already tried (issue #320),
+        or [] when the question is not open. Relaunching a lane that just refused learns nothing
+        about whether ITS environment or the MACHINE's is broken; trying a different one settles
+        it."""
+        return [r for r in rows if r[0] not in env_sampled] if _sampling else []
+
+    def _eligible_launch_ids():
+        """The NORMAL fresh-launch candidate set: eligible rows, with already-sampled lanes deferred
+        while the environment question is open.
+
+        That deferral is what makes "a machine-wide outage parks nothing" structural rather than a
+        property of how many lanes happen to be free — a serialized queue would otherwise retry the
+        same issue into its per-issue cap and park it before a second sample ever existed. It is a
+        PREFERENCE, never an exclusion: with no unsampled candidate the sampled ones are returned
+        exactly as today, so a one-issue queue reaches its cap and parks on the unchanged schedule.
+
+        The deferral is applied BEFORE the scheduler, so an unsampled candidate the scheduler then
+        refuses (its territory claimed, a closed dependency) can leave this tick launching nothing.
+        That is bounded — and only — by ENV_SAMPLE_WINDOW_SECONDS, which is why that bound exists;
+        the recovery probe, which has no such clock, handles the same case by falling back instead
+        (see the canary below)."""
+        rows = _eligible_rows()
+        return _unsampled(rows) or rows
 
     def _needs_touches(p):
         # touches_required (issue #36): an approved merge-producing issue that declares no `touches:`
@@ -3139,14 +3181,37 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         # READ-ONLY as it has always been: the probe LAUNCHES, it does not repair — it mutates no
         # credential, logs nothing in and restarts nothing the runner did not start. The owner fixes
         # the machine; a green probe is how the loop finds out.
+        #
+        # TWO fresh-review P0 fixes live in the candidate selection below, and both are the same
+        # shape: the probe must ALWAYS have someone to ask, because while the hold stands its own
+        # suppression stops any lane parking — a tick that emits no probe AND no park is a state
+        # nothing in the loop can leave except a restart.
+        #
+        #   * it PREFERS an unsampled lane but FALLS BACK rather than filtering. Sent at plain
+        #     front-of-queue priority the probe lands back on a lane that has already refused, so a
+        #     WRONGLY-escalated hold (two genuinely lane-local faults, a healthy issue behind them)
+        #     would re-fail forever, charge no cap by design, and never lift. But an unsampled lane
+        #     the SCHEDULER then refuses — its territory claimed, a dependency still open — must not
+        #     cost the probe either; hence two passes rather than one filtered list.
+        #   * it relaxes the per-issue launch CAP (`at_cap_ok`). The cap answers "should this issue
+        #     be launched again, or parked?" — a question about the ISSUE. The probe asks whether the
+        #     MACHINE can start a session at all, which an at-cap lane answers as well as any other,
+        #     and it charges no cap either way. If that probe VERIFIES, the lane runs — exactly the
+        #     outcome the hold has been claiming all along: those failures were not the issue's.
         fail_at = dsk.get("launch_fail_at")
         if _real(fail_at) and now - fail_at >= CANARY_RETRY_SECONDS:
-            candidates = [dict(p, requeue_front=bool(ist.get("requeue_front")))
-                          for iid, p, ist in _eligible_launch_ids()
-                          if not _needs_touches(p)]   # a touches-missing issue is never the probe
+            rows = _eligible_rows(at_cap_ok=True)
             claims = territory_claims_from(issues_state)
-            probe = scheduler.launchable(candidates, lanes_in, cfg, usage_sched,
-                                         closed_nums, bool(frozen), territory_claims=claims)
+
+            def _probe_from(subset):
+                candidates = [dict(p, requeue_front=bool(ist.get("requeue_front")))
+                              for iid, p, ist in subset
+                              if not _needs_touches(p)]   # a touches-missing issue is never the probe
+                return scheduler.launchable(candidates, lanes_in, cfg, usage_sched,
+                                            closed_nums, bool(frozen), territory_claims=claims) \
+                    if candidates else []
+
+            probe = _probe_from(_unsampled(rows)) or _probe_from(rows)
             if probe:
                 sel = probe[0]                         # the single front-of-queue issue, priority order
                 out.append({"act": "launch", "id": sel["id"], "num": sel["num"],

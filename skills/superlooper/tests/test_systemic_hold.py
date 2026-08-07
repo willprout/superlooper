@@ -249,6 +249,65 @@ def test_the_held_queue_probes_itself_with_the_existing_canary():
     assert only(out, "park") == []
 
 
+def test_the_probe_tries_a_lane_that_has_NOT_already_refused():
+    """A WRONGLY-held queue must self-heal, and this is the only thing that makes it (fresh-review
+    P0). Two genuinely lane-local faults can reach the cap and escalate; if the probe then goes to
+    the front of the queue it lands back on a lane that has already refused, re-fails, charges no
+    cap by design, and the hold stands forever over a machine that was never broken. Probing the
+    healthy lane behind them is what ends the episode."""
+    dsk = _env_streak("gh_auth_dead", ["i5", "i6"])
+    dsk["launch_fail_at"] = NOW - actions.CANARY_RETRY_SECONDS - 1
+    out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
+    probes = only(out, "launch")
+    assert [p["id"] for p in probes] == ["i7"], probes
+    assert probes[0]["canary"] is True
+
+
+def test_an_unsampled_lane_the_SCHEDULER_refuses_does_not_cost_the_probe():
+    """The other half of preferring an unsampled lane, and the reason the probe takes two passes
+    rather than one filtered list: `_eligible_rows` is a pure eligibility filter, and the SCHEDULER
+    is what actually refuses a blocked or territory-claimed issue. Handing it only the unsampled
+    lane and taking its "no" for an answer would emit no probe at all — which, while the hold
+    suppresses every park, is a tick the loop cannot leave."""
+    dsk = _env_streak("gh_auth_dead", ["i5", "i6"])
+    dsk["launch_fail_at"] = NOW - actions.CANARY_RETRY_SECONDS - 1
+    blocked = parsed(7, blocked_by=[5])          # unsampled, but the scheduler will refuse it
+    out = decide(parsed_issues=[parsed(5), parsed(6), blocked], dsk=dsk)
+    probes = only(out, "launch")
+    assert len(probes) == 1 and probes[0]["canary"] is True, out
+    assert probes[0]["id"] in ("i5", "i6"), probes
+
+
+def test_the_probe_still_fires_when_every_candidate_is_at_its_launch_cap():
+    """The dead end the hold could otherwise create (fresh-review P0). While a hold stands it
+    suppresses every cap-park, so a queue whose candidates had all reached the cap would emit no
+    probe (the cap filters them out of the candidate set) AND no park — a state nothing in the loop
+    can leave except a restart. The probe asks about the MACHINE, which an at-cap lane answers as
+    well as any other, and it charges no cap either way."""
+    dsk = _env_streak("gh_auth_dead", ["i5", "i6"], extra_ist={
+        "i5": ist("ready", launch_failures=actions.LAUNCH_FAILURE_CAP,
+                  launch_evidence=_ev("gh_auth_dead")),
+        "i6": ist("ready", launch_failures=actions.LAUNCH_FAILURE_CAP,
+                  launch_evidence=_ev("gh_auth_dead"))})
+    dsk["launch_fail_at"] = NOW - actions.CANARY_RETRY_SECONDS - 1
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    probes = only(out, "launch")
+    assert len(probes) == 1 and probes[0]["canary"] is True, out
+    assert only(out, "park") == [], "and it still parks nothing"
+
+
+def test_the_normal_launch_path_never_relaxes_the_per_issue_cap():
+    """The other half of that fix: only the PROBE may ignore the cap. If the normal path did too, an
+    at-cap issue would launch forever instead of parking — the cap would stop meaning anything."""
+    dsk = disk(launch_anchor={"ok": True},
+               issues_state={"version": 1, "issues": {
+                   "i5": ist("ready", launch_failures=actions.LAUNCH_FAILURE_CAP,
+                             launch_evidence=_ev("gh_auth_dead"))}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert only(out, "launch") == []
+    assert [a["id"] for a in only(out, "park")] == ["i5"]
+
+
 def test_a_green_probe_lifts_the_hold_and_journals_the_recovery():
     """The streak is cleared by the runner on a verified delivery; THIS tick sees it fall while the
     durable ALERT still names the class — the exit edge. One journal record, and the alert retracts
@@ -380,6 +439,19 @@ def test_the_hold_line_says_nothing_is_parked():
     owner must not go looking for issues to re-approve."""
     line = actions.queue_hold_line({"reasons": ["gh_auth_dead_workers"]})
     assert "parked" in line.lower() or "re-approv" in line.lower()
+
+
+def test_no_held_class_claims_an_accounting_it_did_not_keep():
+    """Fresh-review P2. "No issue charged" is true of the CHANNEL classes and FALSE of the escalated
+    environment ones: those bump the refusing lane's own launch cap on the way in, which is exactly
+    what keeps a one-off broken worktree parking normally. A status line and an alert body that
+    overclaim are how an owner learns to stop believing them."""
+    assert "no issue charged" not in actions.queue_hold_line(
+        {"reasons": ["gh_auth_dead_workers"]}).lower()
+    for ev_reason in evidence.SYSTEMIC_ESCALATION_REASONS:
+        msg = actions._alert_message(actions.LAUNCH_ALERT_REASONS[ev_reason]).lower()
+        assert "no issue charged" not in msg, ev_reason
+        assert "nothing parked" in msg, ev_reason
 
 
 def test_the_morning_report_never_reads_a_held_queue_as_a_quiet_night():
