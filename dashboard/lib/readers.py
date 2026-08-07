@@ -254,6 +254,9 @@ def read_state_home(home, now=None):
       ``heartbeat_epoch``/``heartbeat_age``  runner tick epoch and its age (``None`` if absent)
       ``merges_frozen``  ``state/merges_frozen.json`` (``None`` absent; ``{}`` corrupt ⇒ frozen)
       ``alert``          ``state/ALERT`` (``None`` absent; ``{}`` corrupt ⇒ alerting)
+      ``stopped``        ``state/runner.stopped`` — the deliberate-stop marker (issue #239/#365).
+                         ``None`` absent; ``{}`` present-but-unparseable ⇒ STILL a stop; else the
+                         record (``stopped_at``, ``operator``, ``source``, ``home``, ``pid``)
       ``reports``        sorted issue ids with a per-issue report (morning digest excluded)
       ``session_windows`` the set of lane ids with a recorded session window (``state/panes/<id>``
                          — the engine's own marker, written at launch and removed when the window
@@ -284,6 +287,13 @@ def read_state_home(home, now=None):
         "heartbeat_age": age,
         "merges_frozen": _read_json_existence(os.path.join(state, "merges_frozen.json")),
         "alert": _read_json_existence(os.path.join(state, "ALERT")),
+        # The deliberate-stop marker `superlooper stop` writes (issues #239/#365) — the fact that
+        # tells a stop apart from a crash. Read with the existence-is-the-signal reader BECAUSE the
+        # engine reads it that way too: every reader of this file treats absent as permission to
+        # restart the loop, so a marker lost to a truncated write would hand the runner back to the
+        # guardians the owner just overruled. The flight model decides whether the stop actually
+        # TOOK (lib/flights.stop_state); this stays raw.
+        "stopped": _read_json_existence(os.path.join(state, "runner.stopped")),
         "reports": _report_ids(os.path.join(home, "reports")),
         # The lane ids with a recorded session window (state/panes/<id>) — the Open-session-window
         # button's gate, and the same marker `superlooper tidy` selects on (issue #340).

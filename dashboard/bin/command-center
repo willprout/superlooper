@@ -42,6 +42,7 @@ import janitor as janitor_mod  # noqa: E402
 import restart as restart_mod # noqa: E402
 import server                 # noqa: E402
 import session_window as session_window_mod  # noqa: E402
+import stopswitch as stopswitch_mod  # noqa: E402
 import tidy as tidy_mod       # noqa: E402
 import version as version_mod  # noqa: E402
 import watchdog as watchdog_mod  # noqa: E402
@@ -207,6 +208,17 @@ def main(argv):
     # Bound to the same configured CLI and watched-repo allow-list as Tidy, Restart and the Fixer.
     session_window = session_window_mod.SessionWindow(
         cfg["superlooper_cli"], {r["slug"]: r["path"] for r in cfg["repos"]})
+    # The Stop/Start button (issue #365) — the owner's deliberate off switch, and the way back on.
+    # A local-command verb like its siblings: it shells the ENGINE's `superlooper stop` / `start`
+    # (issue #239), which owns the whole mechanism — the marker the guardians read, the supervisor
+    # hold, the pid corroboration. Nothing about stopping a runner is re-implemented here.
+    # Bound to the same configured CLI and watched-repo allow-list as Tidy/Restart/Fixer, and signed
+    # with the operator so the marker and the journal record WHO turned the loop off and that a tap
+    # asked. Owner ruling 2026-07-13: the command center gets full parity with every owner-facing
+    # verb, and this is the verb an owner most wants from a screen — off for the night.
+    stopswitch = stopswitch_mod.StopSwitch(cfg["superlooper_cli"],
+                                           {r["slug"]: r["path"] for r in cfg["repos"]},
+                                           operator=config_mod.operator(cfg))
     replay_provider, digest_provider = build_data_providers(cfg)
     # The bind (in build_server) is the first thing that can fail on an otherwise-valid config: the
     # configured port may be taken by a second command-center or another app. Answer it the way a bad
@@ -217,7 +229,7 @@ def main(argv):
         httpd = server.build_server(provider, static_dir, port=cfg["port"], actions=verbs,
                                     desk=dashboard_desk, tidy=tidy, restart=restart, janitor=janitor,
                                     fixer=fixer, session_window=session_window,
-                                    replay_provider=replay_provider,
+                                    stopswitch=stopswitch, replay_provider=replay_provider,
                                     digest_provider=digest_provider, version=code_version)
     except OSError as e:
         sys.stderr.write(_bind_error_line(cfg["port"], e))

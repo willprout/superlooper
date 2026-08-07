@@ -161,6 +161,14 @@ _TIDY_PATHS = {"/api/tidy/dry-run": "dry_run", "/api/tidy": "execute"}
 # engine's word, carried in the CLI's home-correct ``how`` — issues #306/#310).
 _RESTART_PATHS = {"/api/restart/check": "preflight", "/api/restart": "execute"}
 
+# The Stop/Start endpoints (issue #365) — the deliberate off switch, over the engine's #239 verbs.
+# One path per direction and NO preflight: `stop` records itself before anything can die, so there
+# is no honest "would this work?" to ask that does not already change the answer. The confirm the
+# DoD requires is therefore the dialog's own, and it is the only gate between a tap and production
+# stopping. POST-only and same-origin gated like every write here — this is the most consequential
+# endpoint on the box after the Fixer, and the two are consequential in opposite directions.
+_STOP_PATHS = {"/api/stop": "stop", "/api/start": "start"}
+
 # The Janitor endpoints (issue #121) — the dashboard's THIRD button in the local-command class:
 # the GitHub-side debris sweep (``superlooper janitor``). Two steps: propose lists what the sweep
 # WOULD do (grouped by kind, the dialog shows exactly this), execute runs EXACTLY the keys the owner
@@ -298,6 +306,27 @@ def _route_restart(clean, body_bytes, restart):
     if not isinstance(repo, str) or not repo.strip():
         return _json_resp(400, {"ok": False, "error": "missing 'repo'"})
     return _json_resp(200, getattr(restart, _RESTART_PATHS[clean])(repo))
+
+
+def _route_stopswitch(clean, body_bytes, stopswitch):
+    """The Stop/Start endpoints (issue #365) — a local-command verb over the engine's off switch.
+    Same-origin is already enforced by the caller (a foreign page must not be able to stop the
+    owner's loop any more than it could drive the label writer). ``stopswitch=None`` (a read-only
+    embedder, or writes disabled) → 405: a dashboard that cannot write must not offer an off switch.
+
+    Dispatches to the tested pure ``lib.stopswitch.StopSwitch``, whose result already carries the
+    ``summary`` the dialog renders. A stop that did not take is that verb's own honest body at 200 —
+    the REQUEST was fine, the stop was not, and collapsing the two into an HTTP error would turn
+    'your loop is still running' into 'something went wrong'."""
+    if stopswitch is None:
+        return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
+    payload, err = _parse_json_body(body_bytes)
+    if err is not None:
+        return err
+    repo = payload.get("repo")
+    if not isinstance(repo, str) or not repo.strip():
+        return _json_resp(400, {"ok": False, "error": "missing 'repo'"})
+    return _json_resp(200, getattr(stopswitch, _STOP_PATHS[clean])(repo))
 
 
 def _route_session_window(body_bytes, session_window):
@@ -440,7 +469,8 @@ def _route_fixer(clean, body_bytes, fixer, snapshot_provider):
 
 
 def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, desk=None, tidy=None,
-                restart=None, janitor=None, version=None, fixer=None, session_window=None):
+                restart=None, janitor=None, version=None, fixer=None, session_window=None,
+                stopswitch=None):
     """The pure POST router. Order is deliberate: cross-origin → 403 (before any parsing, for every
     POST); the Tidy local-command endpoints (need only ``tidy``); the dashboard-local tower-seen
     write (needs only ``desk``); then the gh verbs — writes-disabled → 405; unknown action path →
@@ -453,6 +483,8 @@ def _route_post(clean, body_bytes, origin, host, actions, snapshot_provider, des
         return _route_tidy(clean, body_bytes, tidy)
     if clean in _RESTART_PATHS:
         return _route_restart(clean, body_bytes, restart)
+    if clean in _STOP_PATHS:
+        return _route_stopswitch(clean, body_bytes, stopswitch)
     if clean in _JANITOR_PATHS:
         return _route_janitor(clean, body_bytes, janitor)
     if clean in _FIXER_PATHS:
@@ -531,7 +563,7 @@ def _provider_get(provider, params):
 
 def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"", origin=None,
           host=None, desk=None, tidy=None, restart=None, janitor=None, replay_provider=None,
-          digest_provider=None, version=None, fixer=None, session_window=None):
+          digest_provider=None, version=None, fixer=None, session_window=None, stopswitch=None):
     """Map one request to a :class:`Response`, with no socket in sight (unit-testable with an
     injected ``snapshot_provider`` and ``actions``). ``POST`` drives the six mechanical verbs
     (Task 6) plus the dashboard-local tower-seen write (Task 9) via :func:`_route_post`;
@@ -554,7 +586,7 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
     clean = path.split("?", 1)[0]
     if method == "POST":
         return _route_post(clean, body, origin, host, actions, snapshot_provider, desk, tidy,
-                           restart, janitor, version, fixer, session_window)
+                           restart, janitor, version, fixer, session_window, stopswitch)
     if method not in ("GET", "HEAD"):
         return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
 
@@ -580,7 +612,7 @@ def route(method, path, snapshot_provider, static_root, *, actions=None, body=b"
 
 def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=None, restart=None,
                  janitor=None, replay_provider=None, digest_provider=None, version=None,
-                 fixer=None, session_window=None):
+                 fixer=None, session_window=None, stopswitch=None):
     """A ``BaseHTTPRequestHandler`` subclass that delegates to :func:`route`. Kept thin: the socket
     machinery lives here (reading the POST body + Origin), every decision lives in the pure router
     above. ``actions`` (an ``lib.actions.Actions``) enables the POST verbs; ``desk`` (a
@@ -630,14 +662,15 @@ def make_handler(snapshot_provider, static_root, actions=None, desk=None, tidy=N
                               actions=actions, body=self._read_body(),
                               origin=self.headers.get("Origin"), host=self.headers.get("Host"),
                               desk=desk, tidy=tidy, restart=restart, janitor=janitor,
-                              version=version, fixer=fixer, session_window=session_window))
+                              version=version, fixer=fixer, session_window=session_window,
+                              stopswitch=stopswitch))
 
     return _Handler
 
 
 def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, actions=None, desk=None,
                  tidy=None, restart=None, janitor=None, replay_provider=None, digest_provider=None,
-                 version=None, fixer=None, session_window=None):
+                 version=None, fixer=None, session_window=None, stopswitch=None):
     """Construct (do NOT start) the loopback HTTP server. Refuses any non-loopback ``host`` with a
     ``ValueError`` — binding ``0.0.0.0`` or a LAN interface would expose a label-writing (and now
     local-command-running, issue #41) server off the machine, a bright line (decision B.3).
@@ -657,7 +690,7 @@ def build_server(snapshot_provider, static_root, port=8611, host=BIND_HOST, acti
     return ThreadingHTTPServer((host, port),
                                make_handler(snapshot_provider, static_root, actions, desk, tidy,
                                             restart, janitor, replay_provider, digest_provider,
-                                            version, fixer, session_window))
+                                            version, fixer, session_window, stopswitch))
 
 
 # =============================== CachedGh — the gh slow clock (decision B.2) ===============================
@@ -839,6 +872,10 @@ for _i, _s in enumerate((flights.HOLDING, flights.STRANDED, flights.SESSION_FROZ
 _TROUBLE_TEXT = {
     "runner-down": "Runner down — the dashboard can't be trusted until it's back",
     "alert": "ALERT raised — a factory-stop the runner declared",
+    # The off switch (issue #365). Calm, not alarmed — this is a state the owner chose — but it
+    # still names the way back, because a stop with no visible resume strands a non-terminal owner.
+    flights.STOPPED: "Stopped by owner — the loop is off until you start it",
+    flights.STOP_NOT_TAKEN: "Stop not taken — a stop is recorded but the runner is still ticking",
     flights.AWAITING: "A decision is waiting on you",
     flights.PARKED: "Flights parked — your call",
     flights.SESSION_FROZEN: "A session has frozen on the field",
@@ -1559,10 +1596,19 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
 
     states = [f["stage"] for f in repo_flights]
     spinning = any(f["spinning"] for f in repo_flights)
+    # The deliberate off switch (issue #365, over the engine's #239 marker). Computed BEFORE the
+    # repo state because it is what decides whether a missing runner is an outage or a decision.
+    stopped = flights.stop_state(
+        facts["stopped"], heartbeat_epoch=facts["heartbeat_epoch"],
+        heartbeat_age=facts["heartbeat_age"],
+        heartbeat_down_seconds=config.get("heartbeat_down_seconds", 300))
+    stopped["headline"] = _stopped_headline(stopped)
+    stopped["message"] = _stopped_message(stopped, now)
     state = flights.repo_state(slug, states, spinning=spinning,
                                merges_frozen=facts["merges_frozen"], alert=facts["alert"],
                                heartbeat_age=facts["heartbeat_age"],
-                               heartbeat_down_seconds=config.get("heartbeat_down_seconds", 300))
+                               heartbeat_down_seconds=config.get("heartbeat_down_seconds", 300),
+                               stop=stopped)
 
     # The trouble dimming's spotlight list (§5): annotated once the repo's worst condition is
     # known — the field dims and exactly the offending planes stay lit.
@@ -1613,6 +1659,11 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         "incident": flights.incident_stats(journal),
         "state": state,
         "merges_frozen": facts["merges_frozen"], "alert": facts["alert"],
+        # The off switch (issue #365): `{present, state, condition, at, operator, source, message}`.
+        # Always present as a block — the shell binds it on every render, and an absent key is how a
+        # surface starts throwing at 3am. `message` is the one plain sentence, composed server-side
+        # (design B.1) so the JS carries no duration math and the wording is pinned by a test.
+        "stopped": stopped,
         "runner_down": bool(state["state"] == "runner-down"),
         "heartbeat_age": facts["heartbeat_age"],
         # The state-format handshake (issue #45): the engine stamps the shape it wrote, and this is
@@ -1647,6 +1698,13 @@ def _pill_message(pill, needs_you, runner_down):
     offender = pill.get("offender") or ""
     if st == "runner-down":
         return "RUNNER DOWN"
+    # The off switch (issue #365). `runner_down` above is already False for a deliberate stop —
+    # that substitution is made in the flight model, so these two can never both be true and the
+    # pill can never shout OUTAGE about a decision.
+    if st == flights.STOPPED:
+        return "STOPPED BY OWNER"
+    if st == flights.STOP_NOT_TAKEN:
+        return "STOP NOT TAKEN"
     if st == "alert":
         return "ALERT — %s" % offender
     if st == flights.AWAITING:
@@ -1662,6 +1720,61 @@ def _pill_message(pill, needs_you, runner_down):
     if st == flights.MERGES_FREEZE:
         return "landings paused — repair flight out"
     return str(st or "attention").replace("-", " ")
+
+
+# The three words the stopped banner can shout, one per state. Server-side (design B.1) so the big
+# word and the sentence under it are decided together and can never disagree — and so a state this
+# build has not met falls back to something true rather than to an empty banner.
+_STOPPED_HEADLINE = {"off": "STOPPED BY OWNER", "stopping": "STOPPING",
+                     "not-taken": "STOP NOT TAKEN"}
+
+
+def _stopped_headline(stopped):
+    """The banner's headline for a stopped repo, or ``""`` when no stop is recorded."""
+    if not stopped.get("present"):
+        return ""
+    return _STOPPED_HEADLINE.get(stopped.get("state"), "STOP RECORDED")
+
+
+def _stopped_message(stopped, now):
+    """The one plain sentence a stopped repo shows — or ``""`` when no stop is recorded.
+
+    Server-side (design B.1) so the JS carries no duration math and no opinion about what a stop
+    means, and so each of the three sentences is pinned by a test. Each one says a different true
+    thing, because the states differ in what the owner should DO:
+
+      * ``off``       — it is off, who turned it off, and that Start brings it back
+      * ``stopping``  — it is on its way out and what it is waiting for (a tick), so a runner still
+        visible for another minute is not read as a stop that failed
+      * ``not-taken`` — the loop is NOT off, said plainly, because this is the state in which the
+        owner's belief and the machine's behaviour have come apart
+    """
+    if not stopped.get("present"):
+        return ""
+    who = stopped.get("operator")
+    at = stopped.get("at")
+    ago = format_duration(now - at) if _finite(at) and _finite(now - at) else None
+    state = stopped.get("state")
+    if state == "not-taken":
+        return ("a stop is recorded%s but the runner has ticked since — the loop is NOT off. "
+                "Start withdraws the stop; Stop tries again."
+                % (" (%s ago)" % ago if ago else ""))
+    if state == "stopping":
+        return ("stopping — the runner finishes its current tick, then nothing will start it again")
+    lead = "stopped by %s" % (who or "owner")
+    when = " · %s ago" % ago if ago else ""
+    return "%s%s — the watchdog stands down; Start brings it back" % (lead, when)
+
+
+def _first_stopped(runner_repos, field):
+    """One field of the FIRST deliberately stopped repo's stop block, or ``""`` when none is stopped
+    — what the shell's camera-independent banner shows. First stopped repo wins, mirroring
+    ``_runner_message``'s single-offender shape; the headline and the sentence are read from the
+    same repo, so the big word and the line under it always describe one machine."""
+    for r in runner_repos:
+        if r["stopped"]["present"]:
+            return r["stopped"].get(field) or ""
+    return ""
 
 
 def _runner_message(runner_repos):
@@ -1786,7 +1899,11 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
         all_flight_records.extend(frecs)
         repo_states.append(state)
         runner_repos.append({"slug": repo["slug"], "down": rs["runner_down"],
-                             "heartbeat_age": rs["heartbeat_age"]})
+                             "heartbeat_age": rs["heartbeat_age"],
+                             # The off switch rides beside `down` (issue #365) so the dead-man's
+                             # switch reads ONE list and can never push about a stop the owner
+                             # asked for — `down` is already False for a deliberate stop.
+                             "stopped": rs["stopped"]})
         for rec in journal:
             all_journal.append({"repo": repo.get("name") or repo["slug"], "ts": rec.get("ts"),
                                 "num": _rec_num(rec), "raw": json.dumps(rec, separators=(",", ":")),
@@ -1803,6 +1920,14 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
         state = pill["state"]
         trouble = {"present": True, "level": pill["level"], "state": state,
                    "offender": pill["offender"],
+                   # Does this trouble have a PATIENT? Deploy Fixer launches a real interactive
+                   # debugger session on this machine, and a deliberate stop is the one board state
+                   # with nothing to debug: the loop is off because the owner turned it off. The
+                   # banner still NAMES the state (that is the DoD's visibility), but offering a
+                   # fixer for it would spend an agent launch on a decision — and frame the owner's
+                   # own choice as damage. STOP NOT TAKEN is deliberately still fixable: an off
+                   # switch that would not hold IS a patient (issue #365).
+                   "fixable": state != flights.STOPPED,
                    "text": "%s · %s" % (_TROUBLE_TEXT.get(state, state), pill["offender"])}
 
     # A whole-field GitHub-reachability aggregate (issue #38): gh is one binary/auth for every repo,
@@ -1833,7 +1958,13 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
         "github": {"reachable": gh_reachable, "unreachable": gh_unreachable},
         "runner": {"down": runner_down, "repos": runner_repos,
                    "message": _runner_message(runner_repos),
-                   "down_seconds": config.get("heartbeat_down_seconds", 300)},
+                   "down_seconds": config.get("heartbeat_down_seconds", 300),
+                   # The off switch, aggregated for the shell's own banner (issue #365) — the
+                   # camera-independent counterpart of `down`. First stopped repo wins the
+                   # sentence, exactly as `_runner_message` does for a downed one.
+                   "stopped": any(r["stopped"]["present"] for r in runner_repos),
+                   "stopped_headline": _first_stopped(runner_repos, "headline"),
+                   "stopped_message": _first_stopped(runner_repos, "message")},
         "usage": usage if isinstance(usage, dict) else dict(_UNKNOWN_USAGE),
         "trouble": trouble,
         "needs_you": needs,

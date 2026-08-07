@@ -28,6 +28,12 @@ It also models the Restart button's shell (issue #116; see ``route_request_resta
     superlooper request-restart --repo <path> --check --json   → reports live-runner liveness (JSON)
     superlooper request-restart --repo <path> --json           → 'drops the marker' (records a call)
 
+And the Stop/Start button's shell (issue #365 over the engine's #239 verbs; see ``route_stop`` /
+``route_start``):
+
+    superlooper stop  --repo <path> --json   → the deliberate off switch's own result body
+    superlooper start --repo <path> --json   → the way back on
+
 - ``--dry-run`` prints the contents of ``$SL_TIDY_FIXTURES/dry_run.txt`` when present, else a
   default two-window listing in the REAL CLI's exact print format (``  {id:5} {status:13}
   {surface}``), so ``lib/tidy.parse_windows`` is exercised against the true shape.
@@ -146,6 +152,12 @@ def route():
     if ARGS[:1] == ["request-restart"]:
         route_request_restart()
         return
+    if ARGS[:1] == ["stop"]:
+        route_stop()
+        return
+    if ARGS[:1] == ["start"]:
+        route_start()
+        return
     if ARGS[:1] == ["debug"]:
         route_debug()
         return
@@ -205,6 +217,104 @@ def route_request_restart():
            "requested": True, "manual": manual, "how": how}
     sys.stdout.write(json.dumps(out) + "\n")
     sys.exit(0)
+
+
+# ------------------------- the Stop/Start verbs (issues #239 / #365) -------------------------
+# The engine's deliberate off switch and the way back on. Every field below is copied from
+# `cmd_stop` / `cmd_start`'s own result dicts so the dashboard's adapter is exercised against the
+# TRUE contract — including the property the whole button rests on: a stop that did NOT take is a
+# well-formed body at a nonzero exit, never a crash, and it must never render as an all-clear.
+_JOB = "com.superlooper.runner.will-titan-command-center"
+_DOMAIN = "gui/501"
+_MARKER = "/nonexistent/state-home/state/runner.stopped"
+
+
+def _stop_base(repo, home):
+    return {"ok": True, "verb": "stop", "home": home, "was_running": True, "pid": 4242,
+            "job": _JOB if home == "login-item" else None,
+            "domain": _DOMAIN if home == "login-item" else None,
+            "held": True, "job_state": "gone" if home == "login-item" else None,
+            "job_pid": None, "process_gone": True, "signal_refused": None, "marker": _MARKER,
+            "start": "superlooper start --repo %s" % repo}
+
+
+def route_stop():
+    """Model `superlooper stop --repo <path> --json` (issue #239). ``SL_STOP_HOME`` picks the runner
+    home (``login-item`` default, ``pane``); ``SL_STOP_OUTCOME`` picks which of the verb's real
+    outcomes is answered; ``SL_STOP_GARBAGE=1`` prints non-JSON for the adapter's unparseable path.
+
+    Recorded as a mutation so a test can prove the tap reached the CLI with its audit fields — and,
+    on the failure outcomes, that it reached it and STILL did not claim success."""
+    if os.environ.get("SL_STOP_GARBAGE"):
+        sys.stdout.write("not json — the CLI misbehaved\n")
+        sys.exit(0)
+    repo = opt("--repo") or ""
+    home = os.environ.get("SL_STOP_HOME") or "login-item"
+    outcome = os.environ.get("SL_STOP_OUTCOME") or "stopped"
+    out = _stop_base(repo, home)
+    if outcome == "recorded":
+        # The DESIGNED clean stop in the long-tick case: the job is gone, the process is finishing
+        # its tick. The engine exits 0 — this is a success that is not yet a completed one.
+        out.update(process_gone=False)
+    elif outcome == "no_runner":
+        out.update(was_running=False, pid=None, process_gone=True)
+    elif outcome == "not_held":
+        # launchd still HAS the job → it can restart it → this is not a stop, and it exits 1.
+        out.update(ok=False, held=False, job_state="loaded", process_gone=False,
+                   error="%s is still loaded in %s, so launchd can restart it, so this is not a stop"
+                         % (_JOB, _DOMAIN),
+                   remedy="run it again, or boot the job out by hand")
+    elif outcome == "marker_failed":
+        # Refused BEFORE taking anything down: nothing stopped and nothing recorded.
+        out.update(ok=False, held=False, process_gone=False, marker=None, job_state=None,
+                   error="the deliberate-stop marker could not be written (read-only file system), "
+                         "so nothing was taken down — a stop the guardians cannot read is a crash "
+                         "to them",
+                   remedy="fix the state home at /nonexistent/state-home/state, then re-run")
+    record("runner_stop", repo=repo, operator=opt("--operator"), source=opt("--source"))
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.exit(0 if out["ok"] else 1)
+
+
+def route_start():
+    """Model `superlooper start --repo <path> --json` (issue #239) — the other half. ``started`` is
+    the field a UI branches on: True only when something is PROVABLY running, which is why the pane
+    home answers ok/started:false with a ``manual`` line and a stop that deliberately still stands.
+    ``SL_START_OUTCOME`` picks the outcome; ``SL_START_GARBAGE=1`` exercises the unparseable path."""
+    if os.environ.get("SL_START_GARBAGE"):
+        sys.stdout.write("not json — the CLI misbehaved\n")
+        sys.exit(0)
+    repo = opt("--repo") or ""
+    outcome = os.environ.get("SL_START_OUTCOME") or "started"
+    home = "pane" if outcome in ("manual", "pane_live") else "login-item"
+    out = {"ok": True, "verb": "start", "home": home, "cleared": True, "started": True,
+           "job": _JOB, "domain": _DOMAIN, "pid": 4242, "job_loaded": True,
+           "already_running": False, "manual": None}
+    if outcome == "already_running":
+        out.update(already_running=True)
+    elif outcome == "manual":
+        # The pane home cannot start anything (automated tab placement is owner-ruled out), so it
+        # hands back the one line to type and LEAVES the recorded stop standing.
+        out.update(cleared=False, started=False, job=None, domain=None, pid=None, job_loaded=None,
+                   manual="now start the runner in a visible cmux tab: superlooper run --repo %s"
+                          " — the stop clears when it boots" % repo)
+    elif outcome == "no_job":
+        out.update(ok=False, cleared=False, started=False, pid=None, job_loaded=None,
+                   error="no LaunchAgent is installed for this repo at "
+                         "/nonexistent/LaunchAgents/%s.plist" % _JOB,
+                   remedy="install it first: superlooper runner-home --repo %s --install --load"
+                          % repo)
+    elif outcome == "latched":
+        # The one bookkeeping failure that must reach the caller: the runner is up but the off
+        # switch will not come off, so the watchdog stays stood down over a live runner.
+        out.update(ok=False, started=False, cleared=False,
+                   error="the runner is up, but the deliberate-stop marker could not be removed "
+                         "(read-only file system) — while it is there the watchdog will not "
+                         "restart this runner",
+                   remedy="delete it by hand: %s" % _MARKER)
+    record("runner_start", repo=repo, operator=opt("--operator"), source=opt("--source"))
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.exit(0 if out["ok"] else 1)
 
 
 def route_debug():
