@@ -683,12 +683,16 @@ def _delivered_canary_clause(canary):
     text read as a broken channel. A delivered canary is the evidence that says otherwise out loud:
     the send path worked the last time anything used it. Only a `healthy` verdict is cited;
     `dead`/`unverified`/`unconfigured` prove nothing about the path, so they stay silent rather than
-    pad the line with a claim the journal does not support. Wrong-typed input cites nothing."""
+    pad the line with a claim the journal does not support. Wrong-typed input cites nothing.
+
+    The claim is deliberately PAST TENSE. The canary proves the path worked when it ran, and the
+    config has demonstrably changed since (there is no channel now), so 'the send path works' would
+    be a present-tense claim this evidence cannot carry (fresh-agent review)."""
     if not isinstance(canary, dict) or canary.get("status") != "healthy":
         return ""
     channel = canary.get("channel")
-    return (" — the journal's newest notify canary DID deliver (via %s), so the send path itself "
-            "works; what is missing is the configuration"
+    return (" — the journal's newest notify canary DID deliver (via %s), so the send path worked "
+            "when that canary ran; what is missing is the configuration"
             % (channel if _nonempty_string(channel) else "an earlier channel"))
 
 

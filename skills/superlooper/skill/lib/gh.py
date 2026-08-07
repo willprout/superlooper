@@ -503,9 +503,15 @@ def recent_branch_commits(branch, limit=DEV_CHECK_WINDOW):
     """The SHAs of `branch`'s most recent commits, newest first, capped at `limit` (issue #406).
     Fails closed to [] — the caller then reads the branch ref itself, which is exactly the
     single-commit read this window replaces, so a refusal is never worse than the old behavior.
-    The ref is URL-encoded so a slashed branch does not break the query."""
+    The ref is URL-encoded so a slashed branch does not break the query.
+
+    `limit` is CLAMPED to DEV_CHECK_WINDOW, never merely defaulted to it: the API-burn bound is a
+    promise this module makes, so it is enforced here rather than left to every caller to honour —
+    a future caller passing a bigger number would otherwise quietly turn an on-demand read into a
+    page-walk while the docstrings still said 'small and fixed' (fresh-agent review)."""
     if not (isinstance(limit, int) and not isinstance(limit, bool) and limit > 0):
         limit = DEV_CHECK_WINDOW
+    limit = min(limit, DEV_CHECK_WINDOW)
     lst = _json_list(["api", "repos/{owner}/{repo}/commits?sha=%s&per_page=%d"
                       % (quote(branch, safe=""), limit)])
     out = []
@@ -528,7 +534,8 @@ def recent_branch_check_entries(branch, limit=DEV_CHECK_WINDOW, stop_when_seen=N
     evidence that removes it.
 
     The window is SMALL AND FIXED (DEV_CHECK_WINDOW = 5 commits, two REST calls each), which is
-    the entire API-burn budget of this read. `stop_when_seen` shrinks it further at no cost to the
+    the entire API-burn budget of this read — `limit` can only shrink it, never grow it (the clamp
+    lives in recent_branch_commits). `stop_when_seen` shrinks it further at no cost to the
     answer: pass the names being audited and the walk stops as soon as every one has been observed
     here, because a name already seen on this surface cannot change its surface-membership by being
     seen again. The healthy case — a HEAD that reports everything — therefore costs the commit list

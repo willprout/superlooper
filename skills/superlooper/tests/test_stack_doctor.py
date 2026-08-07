@@ -506,6 +506,11 @@ def test_unconfigured_notify_fail_cites_a_journaled_canary_that_delivered():
     assert result.ok is False
     assert "canary" in result.detail.lower()
     assert "imessage" in result.detail
+    # past tense on purpose: the canary proves the path worked WHEN IT RAN, and the config has
+    # demonstrably changed since (there is no channel now), so a present-tense claim would
+    # overstate the evidence.
+    assert "worked when that canary ran" in result.detail
+    assert "path works" not in result.detail
 
 
 @pytest.mark.parametrize("canary", [

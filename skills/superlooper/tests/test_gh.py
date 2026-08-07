@@ -304,6 +304,21 @@ def test_recent_branch_check_entries_window_is_small_and_fixed(ghenv):
     assert len(_check_run_paths(ghenv)) == gh.DEV_CHECK_WINDOW
 
 
+def test_recent_branch_check_entries_clamps_a_caller_that_asks_for_more(ghenv):
+    # The bound is ENFORCED, not merely defaulted: a caller passing a bigger number cannot turn an
+    # on-demand read into a page-walk while the docstrings still promise "small and fixed".
+    (ghenv / "commits.json").write_text(json.dumps([{"sha": "c%d" % i} for i in range(20)]))
+    for i in range(20):
+        (ghenv / ("check_runs_c%d.json" % i)).write_text(json.dumps({"check_runs": []}))
+
+    gh.recent_branch_check_entries("main", limit=99)
+
+    assert len(_check_run_paths(ghenv)) == gh.DEV_CHECK_WINDOW
+    listed = [c[1] for c in _calls(ghenv)
+              if c and c[0] == "api" and len(c) > 1 and "/commits?" in c[1]]
+    assert all("per_page=%d" % gh.DEV_CHECK_WINDOW in p for p in listed)   # and GitHub is not asked
+
+
 def test_recent_branch_check_entries_stops_once_every_audited_name_is_seen(ghenv):
     # A name already observed on this surface cannot change its surface-membership by being
     # observed again, so the walk stops there — the healthy case costs one commit's reads, not five.
