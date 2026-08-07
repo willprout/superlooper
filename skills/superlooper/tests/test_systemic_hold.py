@@ -322,6 +322,30 @@ def test_a_green_probe_lifts_the_hold_and_journals_the_recovery():
     assert only(out, "park") == [] and only(out, "relabel") == []
 
 
+@pytest.mark.parametrize("alert_reason", sorted(actions.LAUNCH_HOLD_ALERT_REASONS))
+def test_every_name_a_launch_hold_can_wear_journals_its_own_recovery(alert_reason):
+    """Fresh-review P2. The recovery edge used to key on the GENERIC name alone, which was complete
+    only while that was the only thing a launch streak could be called. #299 broke it and this issue
+    widened it to five more classes — so a hold under any of them cleared SILENTLY: the alert
+    retracted, launching resumed, and the journal recorded that the outage simply stopped existing."""
+    dsk = disk(launch_anchor={"ok": True}, launch_env_fail_ids={},
+               alert={"reasons": [alert_reason], "since": NOW - 600},
+               issues_state={"version": 1, "issues": {}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    assert len(only(out, "launch_recovered")) == 1, alert_reason
+
+
+def test_a_reason_the_POLL_also_raises_is_not_read_as_a_launch_recovery():
+    """`gh_unreachable` is the one launch-alert reason a second detector raises (the poll's
+    consecutive-failure count). Its falling edge says GitHub answered, not that launch delivery came
+    back, so reading it as a launch recovery would journal one that never happened."""
+    assert "gh_unreachable" not in actions.LAUNCH_HOLD_ALERT_REASONS
+    dsk = disk(launch_anchor={"ok": True}, launch_env_fail_ids={},
+               alert={"reasons": ["gh_unreachable"], "since": NOW - 600},
+               issues_state={"version": 1, "issues": {}})
+    assert only(decide(parsed_issues=[parsed(5)], dsk=dsk), "launch_recovered") == []
+
+
 def test_the_recovery_record_is_emitted_once_not_every_tick():
     dsk = disk(launch_anchor={"ok": True}, launch_env_fail_ids={},
                issues_state={"version": 1, "issues": {}})
@@ -377,6 +401,33 @@ def test_a_verified_delivery_clears_the_streak(rig):
     rig.r._launch_env_fail_ids["gh_auth_dead"] = {"i101"}
     rig.r._delivery_cleared()
     assert rig.r._launch_env_fail_ids == {}
+
+
+def test_a_probes_own_per_issue_misfortune_never_renames_the_standing_hold(rig):
+    """Fresh-review P1. A canary only ever runs while a hold ALREADY stands, and the lane it probes
+    can fail for a reason of its own — a worktree that would not create, a brief that could not be
+    written. Recording that in the CHANNEL streak makes decide read it back as the streak's cause,
+    find no mapping for it, and append the generic `launch_systemic_failure` — so a queue held for
+    dead worker auth pages the owner a SECOND time, mid-episode, telling them to go reconfigure
+    macOS App Nap. That is the exact mis-blame this layer exists to end."""
+    rig.r.tick(now=NOW)
+    rig.r._launch_env_fail_ids["gh_auth_dead"] = {"i101", "i102"}
+    rig.calls.clear()
+    rig.rc_queue.append(runner_mod.ScriptRC(1, "[i103] could not create the worktree"))
+    rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    assert rig.r._launch_fail_ids == set(), "a probe's own git problem is not a channel fault"
+    assert rig.r._launch_fail_at == NOW, "but the probe still re-spaces its own retry clock"
+    assert issue_state(rig, "i101").get("launch_failures", 0) == 0, "and charges no cap either"
+
+
+def test_a_probes_CHANNEL_failure_does_still_feed_the_channel_streak(rig):
+    """The other side of that line: when the probe's own evidence really does name the channel, it
+    is evidence about the channel and belongs in the streak."""
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(runner_mod.ScriptRC(2, "[i101] shim never fired"))
+    rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    assert "i101" in rig.r._launch_fail_ids
 
 
 def test_a_per_issue_fault_outside_the_registry_never_enters_the_streak(rig):

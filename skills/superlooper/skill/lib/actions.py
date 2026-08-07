@@ -575,6 +575,17 @@ def _alert_message(reason):
 QUEUE_HELD_ALERT_REASONS = frozenset(
     {"launch_anchor_down", "launch_systemic_failure", "auth_dead"} | set(LAUNCH_ALERT_REASONS.values()))
 
+# The subset of those that ONLY a launch-streak hold ever raises — so their FALLING edge really is
+# "launch delivery works again" and nothing else. This is the durable episode marker the #115
+# recovery journal reads off the on-disk ALERT.
+#
+# Two deliberate exclusions, and both would otherwise journal a recovery that never happened:
+#   * `gh_unreachable` — the POLL detector raises it too, from consecutive_failures.
+#   * `launch_anchor_down` / `auth_dead` — separate detectors with their own self-re-arming probes;
+#     neither is a streak, so neither has a streak to recover.
+LAUNCH_HOLD_ALERT_REASONS = frozenset(
+    {"launch_systemic_failure"} | set(LAUNCH_ALERT_REASONS.values())) - {"gh_unreachable"}
+
 
 # The one non-reason `queue_hold_reasons` can return: a state/ALERT marker EXISTS but nothing can be
 # read out of it. Both callers read the marker with the runner's tri-state discipline (None absent,
@@ -1677,19 +1688,20 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # the same durable-marker discipline usage's prev_dark uses. Its falling edge (prev_systemic and
     # not systemic_launch) is the recovery the canary probe (or a restart) produces: the streak
     # cleared on a verified delivery while the alert still names it. Journaled once below (#115).
-    prev_systemic = bool(alert_on_disk) and "launch_systemic_failure" in _dget(alert_on_disk, "reasons", list)
+    # ...and it is read through LAUNCH_HOLD_ALERT_REASONS rather than the bare generic name (#320
+    # fresh review P2). The marker used to be `launch_systemic_failure` alone, which was complete
+    # only while that was the ONLY thing a launch streak could be called. #299 broke that (a runner
+    # gh-auth hold names itself and journaled no recovery when it lifted) and this issue widened it
+    # to five more classes, so a hold under any of them would clear silently — the alert retracts,
+    # launching resumes, and the journal records that the outage simply stopped existing.
+    prev_systemic = any(r in LAUNCH_HOLD_ALERT_REASONS
+                        for r in _dget(alert_on_disk, "reasons", list))
     # The reasons the durable ALERT already names — the same on-disk episode marker prev_systemic
     # reads, kept as a list so any reason can ask "am I already standing?" (issue #256 uses it to
     # keep per-poll view health from RETRACTING a page it already sent; see park_label_stuck).
     # `_dget` coerces a missing/wrong-typed value to [], so a damaged ALERT costs at most a
     # re-raise on the next tick — never a raise into the tick.
     prev_alert_reasons = _dget(alert_on_disk, "reasons", list)
-    # ...and the same durable marker for the ESCALATED classes (issue #320). Keyed on the `_workers`
-    # alert reasons ONLY, which nothing but this layer ever raises — `gh_unreachable` is deliberately
-    # excluded even though it is a launch-alert reason, because the POLL detector raises it too and
-    # its falling edge would journal a launch recovery that never happened.
-    prev_env_held = any(LAUNCH_ALERT_REASONS[r] in prev_alert_reasons
-                        for r in evidence.SYSTEMIC_ESCALATION_REASONS)
 
     # ================= A. alerts (safety first, before any work) =================
     reasons = []
@@ -1925,13 +1937,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # the durable marker (prev_systemic): once section A clears the alert, the next tick sees no
     # marker and emits nothing.
     #
-    # (#320) The ESCALATED environment classes ride the identical edge, and deliberately share the
-    # `held_now` conjunct rather than getting an edge of their own: with two classes standing at
-    # once, one clearing must not announce that launching resumed while the other still holds the
-    # queue. The two markers stay separate on the ENTRY side (each names its own alert reason) and
-    # join here, where the only question is whether anything is still holding.
+    # (#320) The ESCALATED environment classes ride the identical edge — one marker, read through
+    # LAUNCH_HOLD_ALERT_REASONS, covers every name a launch streak can wear. The `held_now` conjunct
+    # is what keeps that from mis-firing when two classes stand at once: one clearing must not
+    # announce that launching resumed while the other still holds the queue.
     held_now = systemic_launch or systemic_env
-    if (prev_systemic or prev_env_held) and not held_now:
+    if prev_systemic and not held_now:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "
                               "systemic launch streak is cleared and normal launching resumes in "
