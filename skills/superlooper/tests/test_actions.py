@@ -1762,6 +1762,148 @@ def test_a_wrong_typed_dependency_is_still_NAMED_in_the_reason():
     assert "no single condition named" not in holds[0]["reason"]
 
 
+# ---- issue #405: a held RELAUNCH must not read as a live flight ----
+# A worker that dies while usage is over ceiling gets a journal-only relaunch hold: the lane keeps
+# its `running` status, so every surface reading state paints a live flight for the whole frozen-tier
+# window and then a frozen session — the wrong story, while the runner is deliberately waiting for
+# quota. The hold action carries `relaunch`, which the executor stamps durably, so the state itself
+# names the dead worker. Nothing about the hold DECISION changes: this is visibility, not policy.
+
+def _usage_over_ceiling(now=NOW):
+    return {"auth_status": "ok", "five_hour_pct": 95.0, "seven_day_pct": 20.0,
+            "last_ok_at": now, "first_attempt_at": now - 60}
+
+
+def _exited_lane(**over):
+    d = disk(exited={"i5": "x rc=1"},
+             issues_state={"version": 1, "issues": {"i5": ist("running", retries=0)}})
+    d.update(over)
+    return d
+
+
+def test_an_exited_lane_held_for_usage_says_the_RELAUNCH_is_what_is_held():
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    out = decide(parsed_issues=[p5], dsk=_exited_lane(), usage=_usage_over_ceiling())
+    assert only(out, "recover") == [] and only(out, "park") == []    # unchanged: held, never parked
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and holds[0]["id"] == "i5"
+    assert holds[0]["relaunch"] is True                              # the worker is GONE, not running
+    assert "usage" in holds[0]["reason"].lower() or "quota" in holds[0]["reason"].lower()
+
+
+def test_the_auth_and_display_relaunch_holds_are_flagged_the_same_way():
+    # Same ladder, same silence: an exited lane held for dead auth or a sleeping display is just as
+    # indistinguishable from a live one. All three exited-tier holds carry the flag.
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    for dsk in (_exited_lane(auth_probe=_auth_dead()), _exited_lane(display_asleep=True)):
+        holds = only(decide(parsed_issues=[p5], dsk=dsk), "launch_hold")
+        assert len(holds) == 1 and holds[0]["relaunch"] is True
+
+
+def test_a_FRESH_launch_hold_is_never_flagged_as_a_relaunch():
+    # The mirror: an approved issue that never started has no worker to be dead, so the flag must
+    # stay False — otherwise every hold would claim a corpse the loop never had. (Uses the #172
+    # unlanded-read hold, which is one of the two fresh-candidate holds decide actually journals.)
+    holds = only(decide(parsed_issues=[parsed(5, blocked_by=[3])],
+                        gh_view=ghv(closed_nums=set(), closed_read_ok=False)), "launch_hold")
+    assert len(holds) == 1 and holds[0]["relaunch"] is False
+
+
+def test_the_relaunch_flag_is_payload_and_never_widens_the_dedup_key():
+    # The flag must not become a second reason to speak: a standing relaunch hold, tick after tick,
+    # still journals ONCE (the whole point of the stamp — a 15s tick must never be spammed). The
+    # executor writes reason and flag together, so within a generation they cannot disagree; a stamp
+    # from an engine that predates the flag is cleared by the boot re-announce, not re-journaled here.
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    first = only(decide(parsed_issues=[p5], dsk=_exited_lane(), usage=_usage_over_ceiling()),
+                 "launch_hold")[0]
+    for stored in (dict(relaunch_held=True), dict()):     # with the flag, and as an older stamp
+        d = _exited_lane()
+        d["issues_state"]["issues"]["i5"] = ist("running", retries=0,
+                                                launch_hold_reason=first["reason"], **stored)
+        assert only(decide(parsed_issues=[p5], dsk=d, usage=_usage_over_ceiling()),
+                    "launch_hold") == []
+
+
+# ---- issue #405: the engine generation is a dedup key, for EVERY hold family ----
+# A standing hold says its piece once per engine GENERATION, not once per lifetime. The knowledge
+# lives in three separate decide guards, so this table asks all three the same two questions: a
+# stamp from a PREVIOUS generation speaks again, a stamp from THIS one stays silent. A family that
+# forgets the generation conjunct fails the first; one that forgets the stamp fails the second —
+# which is the per-tick spam the stamps exist to prevent.
+
+def _launch_hold_case(gen):
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    d = _exited_lane()
+    d["issues_state"]["issues"]["i5"] = ist("running", retries=0,
+                                            launch_hold_reason=HELD_FOR_QUOTA_REASON,
+                                            launch_hold_generation=gen)
+    d["hold_generation"] = "gen-now"
+    return dict(parsed_issues=[p5], dsk=d, usage=_usage_over_ceiling()), "launch_hold"
+
+
+def _queue_invalid_case(gen):
+    # An UNKNOWN area name: the one queue-contract defect that is journaled while the issue still
+    # launches, so it reaches _queue_invalid rather than being parked by the touches check first.
+    p5 = parsed(5, touches=("nosucharea",))
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist(status=None,
+                                                              queue_invalid_signature=_unknown_area_sig(),
+                                                              queue_invalid_generation=gen)}})
+    d["hold_generation"] = "gen-now"
+    return dict(parsed_issues=[p5], dsk=d), "queue_invalid"
+
+
+def _wildcard_hold_case(gen):
+    # A well-declared candidate against a live NO-TOUCHES lane: the lane is a '*' that overlaps
+    # everything under hard affinity, so the queue serializes (the #36 shape).
+    p5 = parsed(5, touches=("api",))
+    d = disk(issues_state={"version": 1, "issues": {"i5": ist(status=None,
+                                                              wildcard_hold_journaled=True,
+                                                              wildcard_hold_generation=gen)}})
+    d["hold_generation"] = "gen-now"
+    return dict(parsed_issues=[p5], dsk=d, config=cfg(touches_required=False, lanes=3),
+                lane_state=[{"id": "i9", "touches": [], "type": "build"}]), "wildcard_hold"
+
+
+HELD_FOR_QUOTA_REASON = ("no usage headroom (the meter is unreadable/unhealthy, or at-or-over a "
+                         "ceiling) — the restart waits for quota, exactly as a fresh launch does")
+
+
+def _unknown_area_sig():
+    """The defect signature decide itself writes for the unknown-area case — read from the real
+    linter rather than hardcoded, so the stamp under test is the stamp the executor would store."""
+    said = only(decide(parsed_issues=[parsed(5, touches=("nosucharea",))]), "queue_invalid")
+    assert said, "fixture no longer produces a queue-contract defect"
+    return said[0]["signature"]
+
+
+_HOLD_FAMILIES = (_launch_hold_case, _queue_invalid_case, _wildcard_hold_case)
+
+
+@pytest.mark.parametrize("case", _HOLD_FAMILIES, ids=lambda c: c.__name__)
+def test_every_hold_family_re_announces_once_under_a_NEW_engine_generation(case):
+    kwargs, act = case("gen-previous")
+    said = only(decide(**kwargs), act)
+    assert len(said) == 1, act
+    assert said[0]["generation"] == "gen-now"        # ...and re-keyed to the generation that spoke
+
+
+@pytest.mark.parametrize("case", _HOLD_FAMILIES, ids=lambda c: c.__name__)
+def test_every_hold_family_stays_silent_inside_its_own_generation(case):
+    kwargs, act = case("gen-now")
+    assert only(decide(**kwargs), act) == [], act
+
+
+@pytest.mark.parametrize("case", _HOLD_FAMILIES, ids=lambda c: c.__name__)
+def test_an_absent_generation_degrades_to_exactly_the_pre_405_dedup(case):
+    # An older runner (or a hand-built view) supplies no `hold_generation`. Both sides of every
+    # comparison then read None, so a matching stamp is silent exactly as it was before #405 —
+    # nothing is re-journaled by a generation nobody declared.
+    kwargs, act = case(None)
+    kwargs["dsk"].pop("hold_generation")
+    assert only(decide(**kwargs), act) == [], act
+
+
 def test_touches_required_does_not_mislabel_a_control_label_conflict_issue():
     # P2-1: a no-touches issue that is ALSO ineligible for a control-label conflict must not be
     # parked with a "missing touches" memo (a misdiagnosis). It is left for its own handling.

@@ -12,9 +12,70 @@ module reads those back. The report's CURRENT-state facts (report date, freeze m
 queue, usage) arrive via `view` — the live snapshot the runner/CLI assembles for the report; its
 keys are documented on morning() below.
 """
+import math
 
 WEEK_SECONDS = 7 * 24 * 3600
 DAY_SECONDS = 24 * 3600
+
+# How long a standing hold — or the merge freeze — may stand before the report stops merely LISTING
+# it and raises an ALERT-tier line above the sections (issue #405). A hold is a WAIT by design: the
+# cause is re-derived every tick and clears itself the moment the world changes, so hours of holding
+# are normal and must not cry wolf. A FULL DAY of it is not a wait any more, it is a stall — nothing
+# in the loop will move that issue until the cause clears or the owner does something, and the eApp
+# loop proved a stall can sit silent for three days. The freeze shares the threshold for the same
+# reason: a dev-check freeze clears within a tick of dev going green and a nightly freeze within one
+# night, so a freeze still standing a day later has outlived both of its own recovery paths.
+HOLD_ALERT_SECONDS = DAY_SECONDS
+FREEZE_ALERT_SECONDS = DAY_SECONDS
+
+# The per-issue statuses that END a hold episode: the issue is done with the loop, so a stamp left
+# standing on it is history, not a hold. MIRRORS actions.TERMINAL_STATUSES — deliberately duplicated
+# rather than imported, because this module is the pure renderer and importing the runner's brain to
+# read one frozenset would drag the whole decide graph into every report. tests/test_report.py pins
+# the two together, so they cannot drift apart silently.
+_TERMINAL_STATUSES = frozenset({"merged", "parked", "needs_william", "bounced"})
+
+# A `launch_hold_reason` that begins with this is the ONE stamp whose content says the issue is NOT
+# held: issue #172's retirement prose, written when a previously-unlanded closed-list read has since
+# landed and the gate now PASSES. The engine has no clear-the-stamp verb, so it retires a stale stamp
+# by overwriting it with an honest all-clear — which means a truthy `launch_hold_reason` is not, by
+# itself, evidence of a hold. Listing one would print a self-refuting line ("has been held 1d 6h —
+# this issue is no longer held by the eligibility gate at all"), and an issue merely waiting for lane
+# capacity would raise a STALL alert at 24h. MIRRORS actions._LANE_BOUND_PREFIX, matched on the
+# PREFIX for the reason that constant documents (the tail prose may differ across releases, and a
+# stamp that cannot be recognized cannot be corrected). tests/test_report.py pins the two together.
+_LANE_BOUND_PREFIX = "the closed-issue list read has since LANDED"
+
+# The three durable stamps a standing hold dedups its JOURNALING on (issue #405). Each entry:
+# (stamp, the age clock its executor stamps beside it, the journal act that carries its prose, the
+# short TAG the report line uses, prose to fall back on when no reason can be recovered, and whether
+# the stamp ITSELF is the reason).
+#
+# The stamps are the loop's own record of who is held: every one is cleared at the exact points an
+# issue stops being held (launch, recover, resolve, park, re-approve), so a standing stamp means
+# "this issue has not moved since the loop refused it".
+#
+# Only `launch_hold_reason` (#150) carries prose. `wildcard_hold_journaled` (#36) is a bare bool, and
+# `queue_invalid_signature` (#225) is a string but an opaque defect FINGERPRINT — rendering it would
+# put "sig-a1b2" where the owner needs "missing `## Loop metadata`". Both read their reason back from
+# the latest journal record instead. The engine-generation re-announce puts one such record in the
+# journal per generation, which covers every restart; a runner whose UPTIME exceeds the journal's own
+# hot-retention window (journal.HOT_RETAIN_SECONDS) can still outlive its record, and that is what
+# the per-family fallback prose below is for — the line then names the family without claiming a
+# specific cause it can no longer read.
+_HOLD_KINDS = (
+    ("launch_hold_reason", "launch_hold_since", "launch_hold", "launch",
+     "the launch gate refused this start", True),
+    # Deliberately says WHICH SIDE is unknown: scheduler.launch_holds emits when the candidate is the
+    # no-touches wildcard AND when the in-flight lane blocking it is, and with no record to read back
+    # this line cannot tell them apart. Naming one would assert a mechanism that may be the wrong one.
+    ("wildcard_hold_journaled", "wildcard_hold_since", "wildcard_hold", "wildcard",
+     "a no-touches wildcard (this issue, or the lane blocking it) overlaps every lane under hard "
+     "affinity — the queue serializes", False),
+    ("queue_invalid_signature", "queue_invalid_since", "queue_invalid", "queue contract",
+     "the issue fails the mechanical queue contract", False),
+)
+_HOLD_ACTS = frozenset(k[2] for k in _HOLD_KINDS)
 
 
 # --------------------------- coercion helpers (fail closed) ---------------------------
@@ -453,11 +514,190 @@ def _resurrection(records, window_start):
     return lines
 
 
-def _freeze(view):
+# --------------------------- standing holds + ages (issue #405) ---------------------------
+
+def _age(seconds):
+    """A span as the coarse, readable duration the report speaks in: "3d 4h", "5h 12m", "40m".
+
+    Returns None for anything that cannot be trusted as a span — a wrong-typed value, a NEGATIVE one
+    (a hold stamped in the future by a clock jump), or a NON-FINITE one. An age the loop cannot prove
+    renders as no age at all; it is never invented, and it never feeds the alert threshold.
+
+    The non-finite guard is load-bearing, not defensive decoration: Python's json module round-trips
+    the bare literals `NaN` and `Infinity` without complaint, so a corrupt or hand-edited issues.json
+    can hand this module a stamp that `int()` refuses (ValueError / OverflowError). This module's
+    whole contract is that a broken overnight never takes the report down — a raise here would blank
+    the one surface the owner reads, which is precisely the silence #405 exists to end."""
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) \
+            or not math.isfinite(seconds) or seconds < 0:
+        return None
+    s = int(seconds)
+    d, rem = divmod(s, DAY_SECONDS)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def _since(v):
+    """An epoch stamp, or None if it is missing, wrong-typed (bool is an int — exclude it) or
+    non-finite (json round-trips `NaN`/`Infinity`). Dropped at the door so no downstream arithmetic —
+    the age render OR the alert threshold comparison — ever sees one."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) \
+        else None
+
+
+def _iid_num(iid):
+    """``i405`` -> ``405``; anything else -> None (sorts last, still rendered by its id)."""
+    if isinstance(iid, str) and iid.startswith("i") and iid[1:].isdigit():
+        return int(iid[1:])
+    return None
+
+
+def _hold_reasons(records):
+    """The LATEST journaled reason per (issue id, hold act) — the prose for the two hold families
+    whose durable stamp carries none. A record with no usable ts still counts (it sorts below every
+    real stamp), so a corrupt line degrades to "an older reason", never to no reason at all."""
+    latest = {}
+    for r in records:
+        act, iid = r.get("act"), r.get("id")
+        # `isinstance` first: a wrong-typed `act` could be an unhashable list, and `x in frozenset`
+        # raises on one — a corrupt journal line must be skipped, never fatal.
+        if not isinstance(act, str) or act not in _HOLD_ACTS or not isinstance(iid, str):
+            continue
+        ts = _ts(r)
+        ts = ts if ts is not None else float("-inf")
+        key = (iid, act)
+        if key not in latest or ts >= latest[key][0]:
+            latest[key] = (ts, r.get("reason"))
+    return {k: v[1] for k, v in latest.items()}
+
+
+def standing_holds(issues_state, journal_records=None):
+    """Every issue the loop is currently HOLDING, as records — the engine-side truth behind the
+    report's Standing holds section (issue #405), and the shape a later surface can render.
+
+    ``[{"id", "num", "kind", "tag", "reason", "since", "relaunch"}]``, sorted by issue number.
+    PURE: the runner's loopstate dict in (``view['issues_state']``), a list out. Every field is
+    coerced; a wrong-typed state, entry or stamp yields fewer holds, never an exception.
+
+    What counts as held is the DURABLE STAMP, not a re-derivation: decide re-derives hold conditions
+    every tick but only ever writes them down on change, and the stamps are cleared at every point an
+    issue stops being held. A terminal issue (parked/merged/bounced/needs_william) is excluded — its
+    episode ended, so a leftover stamp there is history.
+
+    Which means the LISTING is exact and the REASON can lag. A standing stamp always means the issue
+    has not launched, recovered, parked or been re-approved since the loop refused it — that is what
+    is being reported, and it is what an age is worth alerting on. But nothing clears a stamp when
+    only its CAUSE resolves (an issue whose queue-contract defect was fixed, then sat lane-bound,
+    still wears the old complaint until it launches); there is deliberately no clear-the-stamp verb
+    in the engine, and inventing one is a policy change this issue's boundaries exclude. The one
+    exception the engine DOES write is #172's lane-bound retirement, whose prose says the issue is
+    not held at all — skipped here, or it would print a self-refuting alert (see _LANE_BOUND_PREFIX).
+
+    ``relaunch`` is the fact that makes an exited lane legible: True means the worker DIED and its
+    relaunch is what is held, so a surface reading a lane whose status still says `running` can name
+    the real cause instead of painting a live flight."""
+    issues = _dict(_dict(issues_state).get("issues"))
+    reasons = _hold_reasons(_records(journal_records))
+    out = []
+    for iid, ist in issues.items():
+        if not isinstance(iid, str) or not isinstance(ist, dict):
+            continue
+        # `isinstance` before the membership test: a wrong-typed status could be an unhashable list,
+        # and `x in frozenset` RAISES on one — the coercion contract has to hold at the lookup too.
+        status = ist.get("status")
+        if isinstance(status, str) and status in _TERMINAL_STATUSES:
+            continue
+        for stamp, since_key, act, tag, fallback, stamp_is_reason in _HOLD_KINDS:
+            v = ist.get(stamp)
+            if not v:
+                continue
+            # `launch_hold_reason` IS the prose; the other two stamps carry none, so their reason
+            # comes from the journal. A wrong-typed stamp falls through to the same lookup rather
+            # than being rendered raw, and an unrecoverable reason falls back to the family's own
+            # prose — the line always says SOMETHING about why, never a bare "held".
+            reason = v if stamp_is_reason and isinstance(v, str) and v.strip() \
+                else reasons.get((iid, act))
+            # The all-clear check sits HERE, on the RESOLVED reason, not on the raw stamp: a
+            # wrong-typed `launch_hold_reason` (a truthy list) falls through to the journal
+            # fallback, which would re-supply the very retirement prose the skip exists to catch —
+            # and the line would then read "has been held 3d — this issue is no longer held".
+            if isinstance(reason, str) and reason.startswith(_LANE_BOUND_PREFIX):
+                continue                       # an all-clear, not a hold (see the constant)
+            out.append({"id": iid, "num": _iid_num(iid), "kind": act, "tag": tag,
+                        "reason": reason.strip() if isinstance(reason, str) and reason.strip()
+                        else fallback,
+                        "since": _since(ist.get(since_key)),
+                        "relaunch": act == "launch_hold" and bool(ist.get("relaunch_held"))})
+    out.sort(key=lambda h: (h["num"] if h["num"] is not None else 1 << 30, h["kind"]))
+    return out
+
+
+def _hold_age(hold, now):
+    return None if hold.get("since") is None else now - hold["since"]
+
+
+def _hold_head(hold):
+    num = hold.get("num")
+    return f"#{num} ({hold['id']})" if num is not None else hold["id"]
+
+
+def _standing_holds(holds, now):
+    """One line per standing hold: who, for how long, and why."""
+    lines = []
+    for h in holds:
+        age = _age(_hold_age(h, now))
+        when = f"held {age}" if age else "held — start time not recorded"
+        # The tag is a short noun, and the reason follows a colon: the reasons themselves carry em
+        # dashes, and three dashes in one line is unreadable exactly where the owner is reading for
+        # the cause.
+        tag = "relaunch (the worker EXITED)" if h.get("relaunch") else h["tag"]
+        lines.append(f"- {_hold_head(h)} — **{when}** · {tag}: {h['reason']}")
+    return lines
+
+
+def _hold_alerts(holds, view, now):
+    """The ALERT-tier lines a listing is not enough for (issue #405): a hold, or the freeze, that
+    has stood past its threshold. Rendered above the sections, where the owner cannot coffee past
+    them. No new notification is earned — these ride the one daily push the report already sends,
+    via the summary line's own count."""
+    # The threshold is tested against the age _age() would RENDER, never a raw span: an age this
+    # module cannot render honestly (wrong-typed, negative, non-finite) is one it cannot alert on
+    # either, and the two must agree or an alert could print "held None".
+    lines = []
+    for h in holds:
+        age, rendered = _hold_age(h, now), _age(_hold_age(h, now))
+        if rendered is None or age < HOLD_ALERT_SECONDS:
+            continue
+        lines.append(f"**{_hold_head(h)} has been held {rendered}** — {h['reason']} (a hold that "
+                     "old is a STALL, not a wait: nothing in the loop moves it until the cause "
+                     "clears).")
+    frozen = view.get("frozen")
+    if isinstance(frozen, dict) and frozen:
+        since = _since(frozen.get("since"))
+        age = None if since is None else now - since
+        rendered = _age(age)
+        if rendered is not None and age >= FREEZE_ALERT_SECONDS:
+            lines.append(f"**Merges have been FROZEN for {rendered}** — "
+                         f"{frozen.get('reason') or '(reason unrecorded)'}. A freeze this old has "
+                         "outlived both of its own recovery paths (a green dev check, a green "
+                         "nightly); it is a stall, not the safe idle state.")
+    return lines
+
+
+def _freeze(view, now):
     frozen = view.get("frozen")
     if isinstance(frozen, dict) and frozen:
         reason = frozen.get("reason") or "(reason unrecorded)"
-        return [f"Merges are **FROZEN** — {reason}. Building continues; this is the safe idle state."]
+        since = _since(frozen.get("since"))
+        age = None if since is None else _age(now - since)
+        for_bit = f" (frozen {age})" if age else ""
+        return [f"Merges are **FROZEN** — {reason}{for_bit}. Building continues; this is the safe "
+                "idle state."]
     return ["Merges flowing."]
 
 
@@ -517,7 +757,10 @@ def morning(journal_records, gh_view, ledger, config):
       gh_view          the live snapshot the runner/CLI assembles for the report:
                          {"date": "YYYY-MM-DD", "now": epoch (window reference; default: latest
                           journaled ts), "frozen": merges_frozen.json dict|None,
-                          "queue": [{"num","title"}, …] ready issues, "usage": usage dict|None}
+                          "queue": [{"num","title"}, …] ready issues, "usage": usage dict|None,
+                          "issues_state": the runner's loopstate dict (issues.json) — the durable
+                          hold stamps the Standing holds section is derived from (#405); absent or
+                          wrong-typed simply yields no holds}
       ledger           the known-failure ledger dict {fingerprint: {...}} (accepted-failure count).
       config           the per-repo config (repo for links, qa.quarantine size).
     Never raises; every arg is coerced to a safe empty shape."""
@@ -545,6 +788,8 @@ def morning(journal_records, gh_view, ledger, config):
     watchdog = _watchdog(records, overnight_start)
     resurrections = _resurrection(records, overnight_start)     # runner auto-restarts (#208)
     questions, q_total = _questions(records, overnight_start)   # owner-question rate (#163)
+    holds = standing_holds(view.get("issues_state"), records)   # standing holds + ages (#405)
+    hold_alerts = _hold_alerts(holds, view, now)
     frozen = isinstance(view.get("frozen"), dict) and bool(view.get("frozen"))
     queue = [q for q in view.get("queue") if isinstance(q, dict)] if isinstance(view.get("queue"), list) else []
 
@@ -552,17 +797,31 @@ def morning(journal_records, gh_view, ledger, config):
     # runs EVERY night, so counting it here would mean no night is ever quiet. A RED nightly shows
     # up as `frozen` instead, which does break quiet. An unattended debugger LAUNCH (or a launch
     # that failed) always breaks quiet — the owner must never coffee past one (issue #66).
+    # A hold or freeze that has stood past its threshold (#405) breaks quiet too: an issue nothing
+    # will move for a day is not "nothing happened overnight" — it is the one night that reads
+    # quiet precisely BECAUSE nothing moved. A hold under the threshold does NOT break quiet: it is
+    # a standing condition working as designed, and the section below lists it either way.
     quiet = not any((merged, parked, bounces, regens, wanders, watchdog, resurrections,
-                     questions, queue, frozen))
+                     questions, queue, frozen, hold_alerts))
     summary = ("Nothing happened overnight — queue empty." if quiet else
                f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · "
                f"{q_total} question(s) · queue: {len(queue)}.")
+    if hold_alerts:
+        # The summary line IS the push body, so the count rides the one notification the report
+        # already sends — an aged hold reaches the phone without earning a push of its own. It names
+        # no threshold: the count can mix hold and freeze alerts, which are governed by two constants
+        # that only happen to be equal today, and a single hardcoded number would become a lie the
+        # day they diverge. The alert lines below each state their own age.
+        summary += f" **{len(hold_alerts)} standing hold/freeze past its age threshold — see below.**"
 
     parts = [
         f"# superlooper morning report — {date}\n",
         f"{summary}\n",
     ]
+    # Alert-tier lines sit directly under the summary tally — above every section, and after the
+    # first non-title line so they never hijack the push body (the drift nudge's own discipline).
+    parts += [f"{line}\n" for line in hold_alerts]
     # The publish-drift nudge sits AFTER the summary tally so it never hijacks the push body (the
     # first non-title, non-blank line). Drift is a standing condition, not overnight activity, so it
     # is rendered independently of `quiet` — a quiet night with drift still reads "nothing happened".
@@ -579,7 +838,8 @@ def morning(journal_records, gh_view, ledger, config):
         _section("Unattended debugger", watchdog, "None — the watchdog launched nothing."),
         _section("Runner resurrection", resurrections, "None — the runner did not go down."),
         _section("Gate health", _gate_health(records, week_start, ledger, cfg)),
-        "## Freeze state\n" + "\n".join(_freeze(view)) + "\n",
+        _section("Standing holds", _standing_holds(holds, now), "None — nothing is held."),
+        "## Freeze state\n" + "\n".join(_freeze(view, now)) + "\n",
         _section("Usage / queue", _usage_queue(view)),
     ]
     return "\n".join(parts)

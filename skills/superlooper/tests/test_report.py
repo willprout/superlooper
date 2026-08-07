@@ -313,8 +313,25 @@ def test_gate_health_corrupt_boolean_is_not_rendered_green():
     assert "not auto-verified" in low or "unclear" in low
 
 
+def _golden_holds():
+    """Two standing holds for the "everything on" golden (#405): one past the alert threshold (so
+    the golden pins the alert-tier line and its summary count) and one young enough to be a plain
+    listing whose reason is read back from the journal."""
+    return {"version": 1, "issues": {
+        "i17": {"status": "ready", "launch_hold_since": 1100 - 3 * 24 * 3600 - 3600,
+                "launch_hold_reason": "no usage headroom (the meter is unreadable/unhealthy, or "
+                                      "at-or-over a ceiling) — the restart waits for quota, "
+                                      "exactly as a fresh launch does"},
+        "i18": {"status": "ready", "queue_invalid_signature": "sig-a1b2",
+                "queue_invalid_since": 1100 - 25 * 60}}}
+
+
 def test_full_report_matches_golden():
-    out = report.morning(_full_journal(), _view(),
+    out = report.morning(_full_journal() + [_rec(1017, "queue_invalid", id="i18", num=18,
+                                                 signature="sig-a1b2",
+                                                 reason="missing `## Loop metadata`",
+                                                 outcome="ok")],
+                         _view(issues_state=_golden_holds()),
                          ledger={"abc123": {"note": "x"}, "def456": {"note": "y"}}, config=_cfg())
     assert out == (_GOLDEN / "morning-full.md").read_text()
 
@@ -329,6 +346,263 @@ def test_wrong_typed_inputs_never_raise():
     out = report.morning(None, None, ledger=None, config=None)
     assert isinstance(out, str) and out
     assert report.morning("nope", 5, ledger=7, config=[])       # no raise
+
+
+# --- standing holds, and their AGE (issue #405) -------------------------------------------------
+# A hold condition is re-derived every tick, but its JOURNALING dedups on a durable stamp that
+# resets only when the issue launches, parks or is re-approved — so an issue that never does any of
+# those goes completely silent (a realized 3-day silent hold on the eApp loop, 2026-07-31 -> 08-03).
+# The report is the surface that has to say it out loud: WHO is held, WHY, and for HOW LONG. The
+# impure caller hands in the runner's loopstate (`view['issues_state']`); this module derives the
+# hold list purely, exactly as it derives everything else.
+
+DAY = 24 * 3600
+
+
+def _held_state(**issues):
+    return {"version": 1, "issues": issues}
+
+
+def _launch_held(since, reason="usage is at 97% of the seven-day ceiling", **over):
+    d = {"status": "ready", "launch_hold_reason": reason, "launch_hold_since": since}
+    d.update(over)
+    return d
+
+
+def test_the_standing_holds_section_lists_every_held_issue_with_reason_and_age():
+    now = 1_000_000
+    state = _held_state(
+        i12=_launch_held(now - 3 * DAY - 4 * 3600),
+        i13={"status": "ready", "queue_invalid_signature": "sig-1",
+             "queue_invalid_since": now - 90 * 60},
+        i14={"status": "ready", "wildcard_hold_journaled": True,
+             "wildcard_hold_since": now - 20 * 60})
+    j = [_rec(now - 3 * DAY, "queue_invalid", id="i13", num=13,
+              reason="missing `## Loop metadata`", outcome="ok"),
+         _rec(now - 20 * 60, "wildcard_hold", id="i14", num=14,
+              reason="launch held: it declares no `touches:` (wildcard '*')", outcome="ok")]
+    out = report.morning(j, _view(now=now, queue=[], issues_state=state),
+                         ledger={}, config=_cfg())
+    section = out.split("## Standing holds")[1].split("\n## ")[0]
+    # every held issue, named, with the reason and the age of the hold
+    assert "#12" in section and "97% of the seven-day ceiling" in section and "3d 4h" in section
+    assert "#13" in section and "missing `## Loop metadata`" in section and "1h 30m" in section
+    assert "#14" in section and "wildcard" in section and "20m" in section
+
+
+def test_a_hold_older_than_the_threshold_raises_an_alert_tier_line():
+    now = 1_000_000
+    state = _held_state(i12=_launch_held(now - report.HOLD_ALERT_SECONDS - 60))
+    out = report.morning([], _view(now=now, queue=[], issues_state=state),
+                         ledger={}, config=_cfg())
+    # beyond the listing: an alert-tier line ABOVE the sections, where the owner cannot coffee past
+    head = out.split("## ")[0]
+    assert "#12" in head and "stall" in head.lower()
+    # ...and the daily push's own summary line says one is standing, so the alert rides the push
+    # that already goes out rather than earning a new one
+    summary = next(ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#"))
+    assert "hold" in summary.lower()
+
+
+def test_a_young_hold_is_listed_but_never_alerted():
+    now = 1_000_000
+    state = _held_state(i12=_launch_held(now - 60))
+    out = report.morning([], _view(now=now, queue=[], issues_state=state),
+                         ledger={}, config=_cfg())
+    assert "#12" in out.split("## Standing holds")[1]        # listed
+    assert "stall" not in out.split("## ")[0].lower()        # but no alert-tier line
+
+
+def test_an_aged_hold_breaks_the_quiet_night_claim():
+    now = 1_000_000
+    state = _held_state(i12=_launch_held(now - 5 * DAY))
+    out = report.morning([], _view(now=now, queue=[], usage=None, issues_state=state),
+                         ledger={}, config=_cfg())
+    assert "nothing happened" not in out.lower()
+
+
+def test_a_relaunch_held_lane_says_the_worker_is_gone_not_that_it_is_running():
+    # The exited-worker + over-ceiling case (#405): the lane's status is still `running`, so the
+    # ONLY thing that can tell the truth is the hold record. It must name the dead worker.
+    now = 1_000_000
+    state = _held_state(i12=_launch_held(now - 3600, status="running", relaunch_held=True))
+    out = report.morning([], _view(now=now, queue=[], issues_state=state),
+                         ledger={}, config=_cfg())
+    section = out.split("## Standing holds")[1].split("\n## ")[0]
+    assert "#12" in section and "relaunch" in section.lower() and "exited" in section.lower()
+
+
+def test_a_hold_with_no_recorded_start_is_listed_without_an_age_and_never_alerts():
+    # A stamp written by an engine older than #405 has no clock. Say so — never invent an age, and
+    # never alert on one that cannot be proven.
+    now = 1_000_000
+    state = _held_state(i12={"status": "ready", "launch_hold_reason": "waiting on #3"})
+    out = report.morning([], _view(now=now, queue=[], issues_state=state),
+                         ledger={}, config=_cfg())
+    section = out.split("## Standing holds")[1].split("\n## ")[0]
+    assert "#12" in section and "not recorded" in section
+    assert "stall" not in out.split("## ")[0].lower()
+
+
+def test_a_terminal_issue_never_renders_as_held():
+    # park/merge/bounce END the episode; a leftover stamp on one of those is history, not a hold.
+    now = 1_000_000
+    state = _held_state(i12=_launch_held(now - 5 * DAY, status="parked"),
+                        i13=_launch_held(now - 5 * DAY, status="merged"),
+                        i14=_launch_held(now - 5 * DAY, status="bounced"),
+                        i15=_launch_held(now - 5 * DAY, status="needs_william"))
+    out = report.morning([], _view(now=now, queue=[], issues_state=state),
+                         ledger={}, config=_cfg())
+    assert "None — nothing is held." in out.split("## Standing holds")[1]
+
+
+def test_no_holds_renders_an_honest_empty_section():
+    out = report.morning([], _view(now=0, queue=[]), ledger={}, config=_cfg())
+    assert "## Standing holds" in out
+    assert "None — nothing is held." in out.split("## Standing holds")[1]
+
+
+def test_standing_holds_never_raises_on_wrong_typed_state():
+    for bad in (None, "nope", 5, [], {"issues": "nope"}, {"issues": {"i1": "nope", 7: {}}},
+                {"issues": {"i1": {"launch_hold_reason": 5, "launch_hold_since": "soon"}}}):
+        assert isinstance(report.standing_holds(bad), list)
+        out = report.morning([], _view(now=0, queue=[], issues_state=bad),
+                             ledger={}, config=_cfg())
+        assert isinstance(out, str) and "## Standing holds" in out
+
+
+def test_a_non_finite_timestamp_never_takes_the_report_down():
+    # json round-trips the bare literals NaN and Infinity, so a corrupt or hand-edited issues.json
+    # can hand this module a stamp int() refuses (ValueError / OverflowError). The report's whole
+    # contract is that a broken overnight never blanks it — the surface #405 exists to keep speaking.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        state = _held_state(i12={"status": "ready", "launch_hold_reason": "held",
+                                 "launch_hold_since": bad})
+        for frozen in (None, {"reason": "nightly red", "since": bad}):
+            out = report.morning([], _view(now=1_000_000, queue=[], issues_state=state,
+                                           frozen=frozen), ledger={}, config=_cfg())
+            section = out.split("## Standing holds")[1].split("\n## ")[0]
+            assert "#12" in section and "not recorded" in section   # listed, with no invented age
+            assert "None" not in out.split("## ")[0]                # and never an alert reading None
+    # ...and a non-finite reference clock (view['now']) is just as survivable.
+    state = _held_state(i12=_launch_held(0))
+    assert isinstance(report.morning([], _view(now=float("inf"), queue=[], issues_state=state),
+                                     ledger={}, config=_cfg()), str)
+
+
+def test_standing_holds_terminal_set_tracks_the_runners_own():
+    # The report's "this episode is over" test must be the SAME set the runner acts on, or a status
+    # the loop treats as terminal would keep renderings a hold forever (or vice versa).
+    import actions
+    assert report._TERMINAL_STATUSES == actions.TERMINAL_STATUSES
+
+
+# --- the one stamp that means NOT held -----------------------------------------------------------
+# The engine has no clear-the-stamp verb, so #172 retires a stale unlanded-read stamp by OVERWRITING
+# it with an honest all-clear. A truthy `launch_hold_reason` is therefore not, by itself, evidence of
+# a hold — and listing that one would print a line that refutes itself, then alert on it at 24h.
+
+def _retirement_stamp():
+    import actions
+    return actions._LANE_BOUND_AFTER_UNLANDED_READ
+
+
+def test_the_lane_bound_all_clear_stamp_is_never_listed_as_a_hold():
+    now = 1_000_000
+    state = _held_state(i50={"status": "ready", "launch_hold_reason": _retirement_stamp(),
+                             "launch_hold_since": now - 5 * DAY})
+    out = report.morning([], _view(now=now, queue=[], issues_state=state),
+                         ledger={}, config=_cfg())
+    assert report.standing_holds(state) == []
+    assert "None — nothing is held." in out.split("## Standing holds")[1]
+    assert "STALL" not in out                       # ...and no self-refuting alert at 24h
+    assert "nothing happened" in out.lower()        # ...and it never breaks a genuinely quiet night
+
+
+def test_the_all_clear_prefix_tracks_the_engines_own():
+    # Matched on the PREFIX, and pinned to the engine's constant: the tail prose is free to change
+    # across releases (durable stamps written by an older one are still on disk), but if the PREFIX
+    # ever drifts this report starts listing all-clears as holds again.
+    import actions
+    assert report._LANE_BOUND_PREFIX == actions._LANE_BOUND_PREFIX
+    assert _retirement_stamp().startswith(report._LANE_BOUND_PREFIX)
+
+
+def test_a_wrong_typed_stamp_cannot_smuggle_the_all_clear_in_through_the_journal():
+    # The skip has to sit on the RESOLVED reason, not the raw stamp: a wrong-typed
+    # `launch_hold_reason` (a truthy list) falls through to the journal fallback, which would
+    # re-supply the retirement prose — and the line would read "has been held 5d — this issue is
+    # no longer held by the eligibility gate at all", with a STALL alert on top of it.
+    now = 1_000_000
+    state = _held_state(i50={"status": "ready", "launch_hold_reason": ["nope"],
+                             "launch_hold_since": now - 5 * DAY})
+    j = [_rec(now - 5 * DAY, "launch_hold", id="i50", num=50, reason=_retirement_stamp(),
+              outcome="ok")]
+    assert report.standing_holds(state, j) == []
+    out = report.morning(j, _view(now=now, queue=[], issues_state=state), ledger={}, config=_cfg())
+    assert "None — nothing is held." in out.split("## Standing holds")[1]
+    assert "STALL" not in out
+
+
+def test_an_unlanded_read_hold_IS_still_listed():
+    # The mirror: only the RETIREMENT is an all-clear. The unlanded-read hold it replaces is a real
+    # hold and must still be reported.
+    import actions
+    now = 1_000_000
+    state = _held_state(i50={"status": "ready",
+                             "launch_hold_reason": actions.UNLANDED_CLOSED_READ_PREFIX + " — …",
+                             "launch_hold_since": now - 2 * 3600})
+    held = report.standing_holds(state)
+    assert len(held) == 1 and held[0]["id"] == "i50"
+
+
+def test_an_unhashable_status_or_journal_act_never_raises():
+    # `x in frozenset` RAISES on an unhashable value, so the coercion contract has to hold at the
+    # membership tests too — not just at the type checks around them.
+    state = _held_state(i12={"status": ["nope"], "launch_hold_reason": "held",
+                             "launch_hold_since": 1})
+    assert len(report.standing_holds(state)) == 1               # a wrong-typed status is not terminal
+    j = [{"ts": 1, "act": ["nope"], "id": "i12", "reason": "x"}, {"ts": 2, "act": {}, "id": "i12"}]
+    assert isinstance(report.standing_holds(state, j), list)
+    assert isinstance(report.morning(j, _view(now=1_000_000, queue=[], issues_state=state),
+                                     ledger={}, config=_cfg()), str)
+
+
+# --- the freeze marker's age (issue #405) -------------------------------------------------------
+
+def test_the_freeze_line_carries_its_age():
+    now = 1_000_000
+    frozen = {"reason": "dev checks red: quality-gate (failure)", "since": now - 2 * DAY - 5 * 3600}
+    out = report.morning([], _view(now=now, frozen=frozen, queue=[]), ledger={}, config=_cfg())
+    freeze = out.split("## Freeze state")[1]
+    assert "FROZEN" in freeze and "quality-gate" in freeze and "2d 5h" in freeze
+
+
+def test_an_old_freeze_raises_an_alert_tier_line():
+    now = 1_000_000
+    frozen = {"reason": "nightly red: 2 persistent failure(s)",
+              "since": now - report.FREEZE_ALERT_SECONDS - 60}
+    out = report.morning([], _view(now=now, frozen=frozen, queue=[]), ledger={}, config=_cfg())
+    head = out.split("## ")[0]
+    assert "frozen" in head.lower() and "nightly red" in head
+
+
+def test_a_fresh_freeze_is_reported_without_an_alert_line():
+    now = 1_000_000
+    frozen = {"reason": "dev checks red: ci (failure)", "since": now - 600}
+    out = report.morning([], _view(now=now, frozen=frozen, queue=[]), ledger={}, config=_cfg())
+    head = out.split("## ")[0]
+    assert "10m" in out.split("## Freeze state")[1]
+    assert "frozen for" not in head.lower()
+
+
+def test_a_freeze_with_no_since_still_renders_its_reason():
+    # Existence IS the freeze (fail closed): an unreadable/legacy marker with no clock must still
+    # render as frozen, just without an age — never dropped, never with an invented one.
+    out = report.morning([], _view(now=1_000_000, frozen={"reason": "marker unreadable"}, queue=[]),
+                         ledger={}, config=_cfg())
+    freeze = out.split("## Freeze state")[1]
+    assert "FROZEN" in freeze and "marker unreadable" in freeze
 
 
 # --- installed-engine publish drift notice (issue #39) -----------------------------------------
