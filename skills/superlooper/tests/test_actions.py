@@ -106,11 +106,13 @@ HEAD2 = "2" * 40
 
 
 def pr_view(num=555, branch="sl/i5-issue-5", mergeable="MERGEABLE", state="OPEN",
-            rollup=None, files=(), labels=(), comments=None, oid=HEAD1):
+            rollup=None, files=(), labels=(), comments=None, oid=HEAD1, body="Closes #5"):
     # the default comments carry a verdict PINNED to this PR's head — the shape a worker posts,
     # and the only shape the gate accepts as evidence for the code being merged (#154).
+    # ...and the default BODY closes the lane's own issue (i5), the shape the gate requires before
+    # any merge (#404) — without it every green-gate case below would land on step 2c's nudge.
     return {"number": num, "state": state, "mergeable": mergeable, "headRefName": branch,
-            "headRefOid": oid, "labels": list(labels),
+            "headRefOid": oid, "labels": list(labels), "body": body,
             "statusCheckRollup": list(GREEN) if rollup is None else rollup,
             "files": [{"path": p} for p in files],
             "comments": [{"body": f"{gate.pinned_review_marker(oid)} reviewed, no P0/P1"}]
@@ -2652,6 +2654,32 @@ def test_missing_sections_nudges_once_then_parks():
     d["issues_state"]["issues"]["i5"]["nudged"] = ["sections"]
     out = decide(dsk=d, gh_view=g)
     assert len(only(out, "park")) == 1 and has_notify(out)
+
+
+def test_a_pr_that_would_leave_its_issue_open_nudges_with_the_exact_line_to_add():
+    # Issue #404, end to end through decide: the gate refuses to merge a PR whose body carries no
+    # closing keyword for ITS issue, and the delivered nudge names the literal to paste. `closes`
+    # deliberately has NO entry in NUDGE_MESSAGES — a static string cannot interpolate the issue
+    # number, and "add `Closes #<the right number>`" is the whole content of this nudge.
+    d, g = _gating(pv=pr_view(body="## Summary\nBuilt it. Part of #5."))
+    out = decide(dsk=d, gh_view=g)
+    n = only(out, "nudge")
+    assert len(n) == 1 and n[0]["nudge_key"] == "closes"
+    assert "Closes #5" in n[0]["message"]
+    assert only(out, "merge") == []
+    # ...and it walks the same one-nudge-then-park ladder as every other worker-paperwork cause
+    d, g = _gating(pv=pr_view(body="Part of #5"),
+                   issues_extra={"i5": ist("gating", branch="sl/i5-issue-5", pr=555,
+                                           nudged=["closes"], nudged_at={"closes": NOW})})
+    out = decide(now=NOW + 100_000, dsk=d, gh_view=g)
+    assert len(only(out, "park")) == 1
+
+
+def test_a_pr_body_the_view_could_not_read_waits_instead_of_nudging():
+    # a corrupt view is refetched, never punished (#404) — and it must never merge, either
+    d, g = _gating(pv=pr_view(body=None))
+    out = decide(dsk=d, gh_view=g)
+    assert only(out, "merge") == [] and only(out, "nudge") == [] and only(out, "park") == []
 
 
 def test_gate_park_when_no_pr_exists():

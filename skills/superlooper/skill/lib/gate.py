@@ -77,6 +77,62 @@ def pinned_review_marker(sha=REVIEW_PIN_PLACEHOLDER):
     form this module parses."""
     return f"<!-- superlooper-review sha={sha} -->"
 
+# The closing keyword contract (issue #404). An issue closes when its PR merges ONLY because the PR
+# BODY carries one of GitHub's closing keywords for it — and until #404 nothing verified that the
+# keyword was there. The brief taught it (brief._FINISH_PR) and hoped; a body that says "Part of #7"
+# instead merges just as green, and the issue stays OPEN. It then reads as unstarted, gets
+# re-approved, and the work RUNS AGAIN. The realized stakes, old-engine eApp: a merged issue stayed
+# open and was re-approved, and its definition of done rotates live database credentials. Not every
+# definition of done is idempotent, so re-execution is the hazard class.
+#
+# The three layers this constant serves, per the point-of-error rule (#215/#225) — teach, enforce
+# where the mistake is made, and verify the outcome:
+#   1. HERE: the gate refuses to merge a PR whose body lacks the keyword for its own issue (step 2c).
+#   2. runner._exec_merge: after the merge, the engine reads the issue and closes it if it is still
+#      open, journaling that it did (GitHub honors closing keywords only for merges into the
+#      repository's DEFAULT branch — a repo whose `dev_branch` is not the default gets NO server-side
+#      closure however perfect the keyword, and that is exactly what layer 2 catches).
+#   3. janitor: an existing merged-PR-with-open-issue pair is proposed to the owner.
+#
+# The keyword set and reference forms are GitHub's own, not ours. Fail direction: this predicate
+# gates a MERGE, so a false negative parks correctly-finished work — the expensive error. It is
+# therefore permissive about separators (`Closes: #7`, `Closes #7`, `closes#7`), and layer 2 is what
+# makes that safe: anything this accepts that GitHub does not honor is closed after the merge anyway.
+_CLOSES_RE = re.compile(
+    r"\b(?:clos(?:e|es|ed)|fix(?:es|ed)?|resolve[sd]?)\b"
+    # separator: spaces and/or a colon, but never a NEWLINE. GitHub wants the keyword and its
+    # reference together, and allowing `\s` would read "...this does not fix\n#7 tracks it" as a
+    # closing keyword for #7 — a false ACCEPT on the one predicate this exists to decide.
+    r"[ \t]*:?[ \t]*"
+    # the reference: bare `#7`, the `GH-7` shorthand, or a full issue URL (any host — an enterprise
+    # GitHub is not github.com, and the number is the only part that identifies the issue).
+    # `owner/repo#7` is deliberately NOT recognized: it is a real GitHub form, but a CROSS-repo one
+    # closes someone else's #7, and this module cannot tell the two apart without knowing the repo.
+    # Missing it costs a nudge that names the working form; accepting it could vouch for nothing.
+    r"(?:\#|GH-|https?://\S+/issues/)(\d+)(?!\d)",
+    re.IGNORECASE)
+
+# What the brief teaches and the nudge names. ONE source of truth for the string, exactly like
+# pinned_review_marker: the form the worker is told to write cannot drift from the form parsed here.
+CLOSING_KEYWORD = "Closes"
+
+
+def closing_keyword_line(num):
+    """The literal a PR body must carry to close issue `num` on merge."""
+    return f"{CLOSING_KEYWORD} #{num}"
+
+
+def closes_issue(body, num):
+    """Does this PR BODY provably close issue `num` when it merges? True only when it does.
+
+    Wrong-typed body or number -> False (a body we cannot read is a body that proves nothing), and
+    the CALLER decides what an unreadable input means: gate_decision waits on a corrupt view and
+    parks on an unreadable issue number, rather than collapsing both into "the worker forgot"."""
+    if not isinstance(body, str) or type(num) is not int or num <= 0:
+        return False
+    return any(int(m) == num for m in _CLOSES_RE.findall(body))
+
+
 # Paths that define the loop's live referee. Unlike ordinary wander areas, a merged change here
 # immediately changes the rules that judge worker PRs, so these paths are owner-only stops.
 _REFEREE_PREFIXES = (".superlooper/", ".github/workflows/")
@@ -883,6 +939,8 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
 
     The view contract (assembled by the runner):
       issue_state — the loopstate entry merged with parsed-issue facts:
+        num (the issue's own GitHub number, parsed from the loopstate key — step 2c verifies the
+        PR body closes THIS issue),
         type ('build'|'investigate'|'diagnose-and-fix'), conflicts (int), nudged (list of
         nudge_keys already delivered), nudge_expired (issue #222: the subset of `nudged` keys
         whose compliance window has elapsed — decide computes it from the `nudged_at` stamps and
@@ -896,7 +954,9 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
       pr_view — gh.pr_for_branch(branch) ({} when none) with the PR's comments attached
         under 'comments' (gh.pr_comments) ONLY on a clean read; a REFUSED/starved comments read
         leaves the key ABSENT, and step 2b WAITs on it (comments_unread) rather than reading the
-        fail-closed empty as "no review marker" and parking a reviewed build (issue #78).
+        fail-closed empty as "no review marker" and parking a reviewed build (issue #78). Its
+        `body` is what step 2c judges the closing keyword on — a field of the SAME read, so the
+        check costs no extra GitHub call (issue #404).
       frozen — the merges_frozen.json MARKER dict, whose existence IS the freeze (a freeze stops
         MERGES only, never builds/closes), or any truthy value from a caller with no marker to
         hand over. Step 4 reads its `source` to tell a dev-check freeze from a nightly-owned one.
@@ -1069,6 +1129,40 @@ def gate_decision(issue_state, pr_view, report_text, config, frozen, inflight):
             "review_stale",
             "the review verdict is pinned to a superseded diff — the PR's head has moved since "
             "it was reviewed, so nothing vouches for the code being merged")
+
+    # step 2c: the PR body must CLOSE this issue (issue #404). Closure is delegated entirely to
+    # GitHub's closing keyword, so a body without it merges the work and leaves the issue OPEN —
+    # where it reads as unstarted, gets re-approved, and RUNS AGAIN (the eApp incident: a definition
+    # of done that rotates live database credentials). The brief already teaches the keyword; this
+    # enforces it at the moment of the mistake rather than trusting the teaching (#215/#225).
+    #
+    # It sits HERE, below the review verdict, because the remedy is free: editing a PR's BODY does
+    # not move its head, so the pinned verdict still vouches for the same diff and no re-review is
+    # owed. Placing it above 2b would only reorder two nudges; placing it below the merge would be
+    # too late.
+    num = ist.get("num")
+    if type(num) is not int or num <= 0:
+        # Not a transient: `num` is parsed from the loopstate KEY (`i<N>`), which no GitHub read can
+        # blip. Without it the gate cannot even ask "does the PR close ITS issue", so it hands the
+        # merge to the owner rather than merging on the assumption that the keyword is probably fine.
+        return {"action": "park", "needs_william": True,
+                "reason": f"the gate cannot read this issue's own number ({num!r}), so it cannot "
+                          "verify the PR closes it on merge — parking rather than merging a PR "
+                          f"that may leave its issue open ({op} decides)"}
+    body = pv.get("body")
+    if not isinstance(body, str):
+        # a corrupt VIEW is refetched, never punished — the same discipline as step 2b's unreadable
+        # head and step 3's unreadable files. A wrong-typed body is not proof the worker wrote none.
+        return {"action": "wait",
+                "reason": "PR body unreadable — refetching before judging whether it closes the "
+                          "issue on merge"}
+    if not closes_issue(body, num):
+        return nudge_or_park(
+            "closes",
+            f"the PR body carries no closing keyword for issue #{num}, so merging it would leave "
+            f"the issue OPEN — add the line `{closing_keyword_line(num)}` to the PR body "
+            f"(`gh pr edit {pv.get('number')} --body ...`); a bare `#{num}` or `Part of #{num}` "
+            "does not close anything")
 
     # step 3: touch verification from the PR's ACTUAL files (declared touches are a promise;
     # the diff is the truth). Wander only journals; an overlap with a live lane holds the merge.

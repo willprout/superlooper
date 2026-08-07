@@ -41,8 +41,10 @@
                   host_unreachable / unknown_lane. A local ops UI shells this instead of reaching
                   the session host itself
   janitor         propose GitHub-side cleanup (stale merged/superseded sl/* branches, open
-                  `superseded` PRs, aged parked/needs-william issues, and issues closed as
-                  COMPLETED by a bare commit keyword with no merged PR behind them — issue #229)
+                  `superseded` PRs, aged parked/needs-william issues, issues closed as
+                  COMPLETED by a bare commit keyword with no merged PR behind them — issue #229 —
+                  and open issues whose sl/i<N> PR already MERGED, which read as unstarted and can
+                  be re-approved and run twice — issue #404)
                   and execute ONLY what William approves (y/N or --yes) — list/--dry-run changes
                   nothing anywhere; nothing is ever auto-closed, auto-deleted or auto-reopened
                   (issue #62, spec §8 V2)
@@ -2923,6 +2925,11 @@ def _janitor_fetch(ls_issues, cfg=None):
             # refused read yields [] here, which proposes no reopens (fail closed); `doctor` is the
             # surface that distinguishes "read refused" from "nothing accidentally closed".
             "closed_issues": gh.closed_issue_closers().value,
+            # the merged-PR-with-open-issue pairs (issue #404). ONE list read for the whole sl/*
+            # PR history, on the sweep's own schedule — nothing on the runner's per-tick path reads
+            # it. Its open-issue half is `lint_issues` below (the SAME read), so the class costs one
+            # extra call, not two. A refused read yields [] and proposes nothing (fail closed).
+            "sl_prs": gh.sl_head_prs().value,
             "lint_issues": gh.open_issues_all(),
             "areas": cfg.get("areas"),
             "touches_required": bool(cfg.get("touches_required")),
@@ -2943,6 +2950,11 @@ def _janitor_what(p):
     title = p.get("title") or ""
     if p["kind"] == "issue-reopen":
         return f"REOPEN issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
+    if p["kind"] == "issue-merged-open":
+        # name the merged PR in the VERB, not only in the why (issue #404): the owner is being
+        # asked to close an open issue, and the merged work is the entire justification.
+        return (f"close issue #{p['target']} (PR #{p.get('pr')} merged)"
+                + (f" {title[:60]!r}" if title else ""))
     return f"close issue #{p['target']}" + (f" {title[:60]!r}" if title else "")
 
 

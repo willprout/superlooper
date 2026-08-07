@@ -12,6 +12,12 @@ shipped behind it. This module only ever PROPOSES; acting on a proposal is Willi
 `agent-ready` (the same propose/approve split as tidy). Nothing is ever auto-closed, auto-deleted
 or auto-reopened.
 
+Issue #404 added a class with the opposite shape to #229's: an issue that is only pretending to be
+UNDONE. A merged `sl/i<N>` PR whose issue is still OPEN reads as unstarted, gets re-approved, and
+runs a second time — realized on the old-engine eApp against a definition of done that rotates live
+database credentials. The gate and the post-merge verify stop new ones; this sweep is what finds the
+pairs that already exist.
+
 A fifth kind joined them on the owner's amendment of 2026-07-17 (issue #225): **metadata repair**
 for a mechanically-invalid issue — one the runner can never launch for want of a `type:` label or a
 parseable `## Loop metadata`. The 2026-07-16 audit found 25 of 35 open issues in that state and
@@ -201,9 +207,29 @@ def _metadata_proposals(lint_issues, areas, touches_required, ex_nums):
     return sorted(out, key=lambda p: (p["target"], p["key"]))
 
 
+def _merged_pr_by_issue(sl_prs):
+    """{issue number: the merged PR number that landed its work} from gh.sl_head_prs()'s list
+    (issue #404). Only `sl/i<N>` heads whose PR is provably MERGED count; the highest such PR wins
+    when an issue has several generations, so the `why` names the one that actually landed.
+
+    Wrong-typed everything fails closed to "not found", like every other selector here."""
+    out = {}
+    for p in sl_prs if isinstance(sl_prs, list) else []:
+        if not isinstance(p, dict) or p.get("state") != "MERGED":
+            continue
+        num = branch_issue_num(p.get("headRefName"))
+        pr = _pr_int(p.get("number"))
+        if num is None or pr is None:
+            continue
+        if pr > out.get(num, 0):
+            out[num] = pr
+    return out
+
+
 def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
             now, aged_park_days, refused=frozenset(), dev_branch="main",
-            closed_issues=(), lint_issues=None, areas=None, touches_required=False):
+            closed_issues=(), lint_issues=None, areas=None, touches_required=False,
+            sl_prs=()):
     """The full proposal list for one sweep, grouped branches -> PRs -> issues -> reopens, each
     sorted
     (deterministic; no input mutated). Returns {"proposals": [...], "refused": [...]} where
@@ -236,13 +262,20 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
     touches_required the repo's own knob. Defaults FALSE here, unlike the ENGINE's enforce-on-
                     garbage posture: the runner knows it is looking at its own adopted repo, while
                     a caller that forgets to pass this must propose FEWER edits, never more.
+    sl_prs          gh.sl_head_prs()'s list — every PR the repo has had on an `sl/*` head, any
+                    state (issue #404). Only the MERGED ones matter here, paired against
+                    `lint_issues` to find a merged PR whose issue is still open. Omitted or
+                    wrong-typed -> no pair proposals at all.
 
     Each proposal: {"kind", "key", "action", "target", "why"} (+ "head" for PRs, "title" for
-    issues, reopens and metadata, "commit" for reopens, "label"/"value"/"body"/"choose_group" for
-    metadata) — `key` is the stable identity ("branch:<name>" / "pr:<num>" / "issue:<num>" /
-    "reopen:<num>" / "meta:<num>:<what>") the refused map and reconcile() work in. A close and a
+    issues, reopens, pairs and metadata, "commit" for reopens, "pr" for pairs,
+    "label"/"value"/"body"/"choose_group" for metadata) — `key` is the stable identity
+    ("branch:<name>" / "pr:<num>" / "issue:<num>" / "reopen:<num>" / "closemerged:<num>" /
+    "meta:<num>:<what>") the refused map and reconcile() work in. A close and a
     reopen of the SAME issue number are deliberately different keys: they are opposite actions and
-    must never conflate in the refused map or a per-key tap. A non-null `choose_group` marks
+    must never conflate in the refused map or a per-key tap; `closemerged:<num>` is likewise
+    distinct from the aged-park `issue:<num>` because the two closes are justified by different
+    evidence and a shared key would conflate them. A non-null `choose_group` marks
     mutually-exclusive ALTERNATIVES: at most one member of a group may ever execute, and never
     from a bulk approval."""
     if not isinstance(ls_issues, dict):
@@ -391,6 +424,58 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
         seen_reopens.add(num)
         emit({"kind": "issue-reopen", "key": f"reopen:{num}", "action": "reopen-issue",
               "target": num, "title": f["title"], "commit": f["commit"], "why": f["why"]})
+
+    # --- a MERGED sl/i<N> PR whose issue is still OPEN: close it (issue #404) ---
+    # Layer 3 of "no merged PR may leave its issue open". The gate refuses to merge a PR without the
+    # closing keyword, and the engine verifies the closure right after the merge — but neither
+    # reaches BACKWARDS. Every pair created before those layers shipped, and every one their read
+    # failures could not confirm, is debris only a sweep can find. The harm is specific and was
+    # realized (old-engine eApp): an open issue behind merged work reads as UNSTARTED, gets
+    # re-approved, and the work runs a SECOND time against a definition of done that may not be
+    # idempotent — that one's rotates live database credentials.
+    #
+    # Identity is the branch, not the PR body: `sl/i<N>` is how brief.branch_for, closures and this
+    # module already pair an issue with its work, and a body-keyword scan would only re-ask the
+    # question layer 1 already answers at the gate. The open-issue universe is `lint_issues` — the
+    # SAME gh.open_issues_all read the metadata sweep makes, so this class costs one extra read
+    # (the PR list), not two.
+    #
+    # Both sides must be POSITIVE evidence: a merged PR found AND its issue found open. Every read
+    # failure shrinks one of those sets, so it proposes FEWER pairs, never more.
+    #
+    # The two label guards are the owner's own word. `agent-ready` on such an issue means he
+    # deliberately reopened and re-approved the work; `in-progress` means a lane holds it. Neither
+    # is debris — and neither can silently swallow the class, because the normal launch/merge path
+    # REMOVES both (launch: agent-ready -> in-progress; merge: -remove in-progress), so an issue a
+    # merged PR left open carries neither.
+    #
+    # One tension, named rather than coded around: an issue #229 reopened (owner-approved) whose
+    # sl/i<N> PR did merge will surface here on a later sweep as a close proposal. That is not a
+    # contradiction the janitor can settle — the work DID land, and why it was reopened is exactly
+    # the judgment only the owner has. It stays a PROPOSAL, and the `why` names the merged PR so he
+    # can tell the two apart at a glance.
+    merged_by_issue = _merged_pr_by_issue(sl_prs)
+    if merged_by_issue:
+        for i in sorted((i for i in (lint_issues if isinstance(lint_issues, list) else [])
+                         if isinstance(i, dict)),
+                        key=lambda i: (_pr_int(i.get("number")) is None,
+                                       _pr_int(i.get("number")) or 0)):
+            num = _pr_int(i.get("number"))
+            if num is None or num in ex_nums or num in seen_issues:
+                continue
+            pr = merged_by_issue.get(num)
+            if pr is None:
+                continue
+            if {"in-progress", "agent-ready"} & _label_names(i.get("labels")):
+                continue
+            seen_issues.add(num)                 # one close per issue, whichever justified it
+            emit({"kind": "issue-merged-open", "key": f"closemerged:{num}",
+                  "action": "close-issue", "target": num,
+                  "title": i.get("title") if isinstance(i.get("title"), str) else "",
+                  "pr": pr,
+                  "why": f"PR #{pr} merged but the issue is still OPEN — the closing keyword never "
+                         "closed it, so the work reads as unstarted and can be re-approved and run "
+                         "again"})
 
     # --- mechanically-invalid issues: the metadata the runner cannot launch without (issue #225) ---
     # `seen_issues` joins the exclusions here for the same reason it bounds the reopens above: an

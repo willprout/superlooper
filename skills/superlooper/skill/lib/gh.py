@@ -31,7 +31,10 @@ _ISSUE_FIELDS = "number,title,labels,body,createdAt"
 # headRefOid rides along for the runner's update_result bookkeeping: the gate's view contract
 # says update_result is "for the CURRENT head; the runner clears it whenever the PR head
 # changes", and the head is only detectable by its oid (Task 10).
-_PR_FIELDS = "number,state,mergeable,statusCheckRollup,files,headRefName,headRefOid,labels"
+# `body` rides this existing read (issue #404): the gate's step 2c must see whether the PR closes
+# its issue on merge, and adding a FIELD to a call the poll already makes costs no extra GitHub
+# request — the API-burn discipline that keeps the per-tick read budget where #21/#61 put it.
+_PR_FIELDS = "number,state,mergeable,statusCheckRollup,files,headRefName,headRefOid,labels,body"
 # statusCheckRollup needs no companion field for the gate's latest-run-per-name fold (issue #402):
 # `--json statusCheckRollup` is atomic — gh's own query already selects startedAt/completedAt on
 # every CheckRun and createdAt on every StatusContext, which is the recency gate._rollup_entries
@@ -322,6 +325,27 @@ def probe():
 
 def issue(num):
     return _json_dict(["issue", "view", str(num), "--json", _ISSUE_FIELDS])
+
+
+def issue_is_open(num):
+    """Is issue `num` open RIGHT NOW? True (open) / False (closed) / None (unreadable).
+
+    The post-merge closure verify (issue #404). A merged PR closes its issue only through GitHub's
+    closing keyword, and GitHub honors that keyword only for merges into the repository's DEFAULT
+    branch — so a repo whose `dev_branch` is not the default gets NO server-side closure however
+    perfect the keyword. This is the read that catches it, and it rides the MERGE path only: one
+    call per merge, nothing on the runner's per-tick poll.
+
+    None is the whole point of the tri-state. Collapsing a refused read into False would let the
+    verify declare the issue closed on an answer GitHub never gave — the #21/#61 refused-vs-
+    answered-empty discipline on the one read whose failure re-opens the incident it exists to
+    close. The caller journals the unverified merge and leaves the pair to the janitor sweep.
+    Anything but a recognized OPEN/CLOSED (either case — the state renders uppercase in GraphQL and
+    lowercase in some paths) is unreadable, never a guess."""
+    state = _json_dict(["issue", "view", str(num), "--json", "state"]).get("state")
+    if not isinstance(state, str):
+        return None
+    return {"OPEN": True, "CLOSED": False}.get(state.upper())
 
 
 # The comment-read contract (issue #21). A comment read has THREE outcomes, and the caller must

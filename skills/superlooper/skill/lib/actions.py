@@ -279,6 +279,10 @@ NUDGE_MESSAGES = {
                     "nothing vouches for.",
     "checks": "A required check failed on your PR. Investigate the failure, fix it, and push — "
               "the gate re-runs automatically.",
+    # `closes` (issue #404) is deliberately ABSENT: the nudge for a missing closing keyword has to
+    # name the issue's own number ("add `Closes #404`"), and a static string here cannot interpolate
+    # it. The fallback below delivers gate step 2c's reason, which already renders the exact literal
+    # from gate.closing_keyword_line — the one source of truth the gate itself parses.
     "investigation": "Post your root-cause report as an issue comment BEGINNING "
                      "`<!-- superlooper-investigation -->` — without that marker comment the "
                      "runner cannot even begin closing the parent (the close itself runs "
@@ -2009,7 +2013,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
             # and the freeze holds it: fail closed, exactly like the pre-authorization above.
             restore_green = gate.restore_green(p.get("labels")) if isinstance(p, dict) else False
             g = gate.gate_decision(
-                {"type": itype, "conflicts": conflicts, "nudged": nudged,
+                # `num` is the issue's own GitHub number, from the loopstate KEY (no GitHub read can
+                # blip it): step 2c verifies the PR body closes THIS issue before any merge (#404).
+                {"num": num, "type": itype, "conflicts": conflicts, "nudged": nudged,
                  "nudge_expired": nudge_expired,
                  "declared_touches": declared, "update_result": update_result,
                  "review_carry": ist.get("review_carry"),

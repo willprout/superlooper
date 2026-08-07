@@ -104,6 +104,19 @@ def test_ship_instructions_without_ship_cmd(_sl_home):
         "the brief must teach paste-the-oid, not a substitution gh will not expand"
 
 
+def test_the_brief_teaches_the_exact_closing_keyword_the_gate_parses(_sl_home):
+    """Issue #404. Since the gate refuses to merge a PR whose body lacks the closing keyword for
+    its issue, the literal the brief teaches and the literal the gate parses must be ONE string —
+    a hand-copied divergence would walk every worker into a nudge->park for paperwork they were
+    told to write differently (the #238 defect class). Proved by RENAMING the keyword: pinning the
+    same hardcoded text on both sides of the assertion would prove nothing."""
+    for cmd in (None, "scripts/ship.sh"):
+        out = brief.build(_issue(), _cfg(_sl_home, ship_cmd=cmd))
+        taught = gate.closing_keyword_line(123)            # _issue() is issue #123
+        assert taught in out, cmd
+        assert gate.closes_issue(taught, 123) is True      # what is taught is what merges
+
+
 def test_the_no_ship_cmd_flavour_states_the_shipping_rule_too(_sl_home):
     """Issue #226. `_SHIP_WITH_CMD` has always carried the rule — never a direct push to the dev
     branch, never `gh pr merge`, never a hand-posted status — and `_SHIP_NO_CMD` never did, so the

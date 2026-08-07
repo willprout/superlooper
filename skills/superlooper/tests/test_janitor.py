@@ -744,3 +744,127 @@ def test_a_metadata_repair_still_stands_for_an_issue_the_sweep_leaves_alone():
     keys = [p["key"] for p in res["proposals"]]
     assert "issue:9" not in keys                     # too fresh to close
     assert [k for k in keys if k.startswith("meta:9:")]
+
+
+# ------------- merged PR, issue still open (issue #404) -------------
+# Layer 3 of "no merged PR may leave its issue open": the DETECTION for pairs that already exist.
+# The gate now refuses to merge a keyword-less PR and the engine verifies the closure right after
+# the merge — but neither reaches backwards. Every pair created before those layers shipped (and
+# every one their read failures could not confirm) is debris only a sweep can find, and the harm is
+# specific: an open issue behind merged work reads as UNSTARTED, gets re-approved, and the work runs
+# a second time against a definition of done that may not be idempotent.
+#
+# Propose-only, like every other class here.
+
+def _merged(num, head, state="MERGED"):
+    """A gh.sl_head_prs entry: {number, state, headRefName}."""
+    return {"number": num, "state": state, "headRefName": head}
+
+
+def _pair_propose(**kw):
+    kw.setdefault("sl_prs", [_merged(12, "sl/i5-fix-thing")])
+    kw.setdefault("lint_issues", [_open_issue(5, ["type:build"])])
+    kw.setdefault("areas", _AREAS)
+    kw.setdefault("touches_required", True)
+    return propose(**kw)["proposals"]
+
+
+def test_a_merged_pr_whose_issue_is_still_open_is_proposed_for_closing():
+    props = _of_kind(_pair_propose(), "issue-merged-open")
+    assert [p["key"] for p in props] == ["closemerged:5"]
+    p = props[0]
+    assert p["action"] == "close-issue" and p["target"] == 5 and p["title"] == "An issue"
+    assert p["pr"] == 12
+    # the why becomes the audit comment on the closed issue: it must NAME the merged PR, or the
+    # close cannot be traced back to the work that justified it
+    assert "#12" in p["why"] and "merged" in p["why"].lower()
+
+
+def test_the_pair_key_never_collides_with_the_aged_park_close():
+    # `issue:<n>` is the aged-park close. A shared key would conflate two different justifications
+    # in the refused map and in a per-key tap — the same reason #229's reopen got its own prefix.
+    props = _pair_propose()
+    assert "issue:5" not in [p["key"] for p in props]
+
+
+def test_an_open_issue_with_no_merged_pr_is_never_proposed():
+    for prs in ([], [_merged(12, "sl/i5-x", state="OPEN")], [_merged(12, "sl/i5-x", "CLOSED")],
+                [_merged(12, "sl/i9-other")]):
+        assert _of_kind(_pair_propose(sl_prs=prs), "issue-merged-open") == [], prs
+
+
+def test_a_closed_issue_is_never_proposed_because_it_is_not_in_the_open_set():
+    # `lint_issues` IS the open-issue universe (gh.open_issues_all) — the same read the metadata
+    # sweep already makes, so this class adds no second issue read. An issue absent from it is
+    # either closed (nothing to do) or unread (fail closed to proposing nothing).
+    assert _of_kind(_pair_propose(lint_issues=[]), "issue-merged-open") == []
+    assert _of_kind(_pair_propose(lint_issues=None), "issue-merged-open") == []
+
+
+def test_a_generation_branch_still_names_its_issue():
+    # sl/i5-x-r2 is issue 5's rebuild — the same convention brief.branch_for/closures use.
+    props = _of_kind(_pair_propose(sl_prs=[_merged(30, "sl/i5-fix-thing-r2")]),
+                     "issue-merged-open")
+    assert [p["target"] for p in props] == [5]
+
+
+def test_an_issue_with_several_sl_prs_is_proposed_once_naming_a_merged_one():
+    props = _of_kind(_pair_propose(sl_prs=[_merged(12, "sl/i5-x", state="CLOSED"),
+                                           _merged(30, "sl/i5-x-r2")]), "issue-merged-open")
+    assert [p["target"] for p in props] == [5]
+    assert props[0]["pr"] == 30                      # the MERGED one, never the closed rebuild
+
+
+def test_an_in_flight_lane_is_never_proposed():
+    # a live lane on issue 5 (a rebuild after the first PR merged, say) is already being dealt with
+    props = _of_kind(_pair_propose(ls_issues={"i5": {"status": "running", "branch": "sl/i5-x"}}),
+                     "issue-merged-open")
+    assert props == []
+
+
+def test_a_reapproved_or_claimed_issue_is_never_proposed():
+    # the owner's own word is on it. `agent-ready` on a merged-PR issue means he deliberately
+    # re-opened and re-approved the work; `in-progress` means a lane holds it. Neither is debris.
+    # (Both labels are REMOVED by the normal launch/merge path — an issue left open by a merged PR
+    # carries neither — so this guard cannot silently swallow the class it is guarding.)
+    for label in ("agent-ready", "in-progress"):
+        props = _of_kind(_pair_propose(lint_issues=[_open_issue(5, ["type:build", label])]),
+                         "issue-merged-open")
+        assert props == [], label
+
+
+def test_an_issue_this_sweep_proposes_closing_as_aged_debris_is_not_proposed_twice():
+    # two justifications, one action: emitting both would put the same close in the menu twice.
+    aged = _issue(5, ("parked",), NOW - 21 * DAY)
+    keys = [p["key"] for p in propose(parked_issues=[aged], sl_prs=[_merged(12, "sl/i5-x")],
+                                      lint_issues=[_open_issue(5, ["parked"])],
+                                      areas=_AREAS, touches_required=True)["proposals"]]
+    assert "issue:5" in keys and "closemerged:5" not in keys
+
+
+def test_pairs_are_deterministic_and_sorted_by_issue():
+    props = _of_kind(_pair_propose(
+        sl_prs=[_merged(30, "sl/i9-b"), _merged(12, "sl/i5-a"), _merged(20, "sl/i7-c")],
+        lint_issues=[_open_issue(9), _open_issue(5), _open_issue(7)]), "issue-merged-open")
+    assert [p["target"] for p in props] == [5, 7, 9]
+
+
+def test_a_refused_pair_is_held_back_not_silently_retried():
+    r = propose(sl_prs=[_merged(12, "sl/i5-x")], lint_issues=[_open_issue(5, ["type:build"])],
+                areas=_AREAS, touches_required=True, refused=frozenset({"closemerged:5"}))
+    assert _of_kind(r["proposals"], "issue-merged-open") == []
+    assert r["refused"] == ["closemerged:5"]
+
+
+@pytest.mark.parametrize("bad", [None, "not a list", 42, [None], ["x"], [{}],
+                                 [{"number": 12}], [{"headRefName": "sl/i5-x"}],
+                                 [{"number": "12", "state": "MERGED", "headRefName": "sl/i5-x"}],
+                                 [{"number": 0, "state": "MERGED", "headRefName": "sl/i5-x"}],
+                                 [{"number": 12, "state": "MERGED", "headRefName": 42}]])
+def test_wrong_typed_sl_prs_propose_nothing(bad):
+    assert _of_kind(_pair_propose(sl_prs=bad), "issue-merged-open") == []
+
+
+def test_a_wrong_typed_open_issue_entry_is_skipped_not_proposed():
+    for bad in ([None], [42], [{}], [{"number": None}], [{"number": "5"}], [{"number": 0}]):
+        assert _of_kind(_pair_propose(lint_issues=bad), "issue-merged-open") == [], bad

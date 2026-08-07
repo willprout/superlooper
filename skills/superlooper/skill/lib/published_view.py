@@ -100,6 +100,20 @@ def _size_totals(pr):
     return out
 
 
+# Fields of the PR read that the published document DROPS. `body` joined gh's PR read in issue #404
+# so the gate can check the closing keyword before merging — a gate-only fact. Nothing downstream
+# reads it, and this document is rewritten every tick and re-read every 2s, so carrying it would be
+# the same growth `files` is collapsed to avoid. A PR body here is not small either: the brief tells
+# workers to attach evidence in the PR description, so it is unbounded worker text.
+_DROPPED_PR_KEYS = ("body",)
+
+
+def _published_pr(pr):
+    """One PR entry as the document keeps it: the read minus the fields nothing downstream reads."""
+    return {k: v for k, v in pr.items() if k not in _DROPPED_PR_KEYS} \
+        if isinstance(pr, dict) else pr
+
+
 def _carried_pr(pr, state):
     """The reduced entry a carried PR keeps: everything the dashboard reads (``number``, ``state``,
     ``mergeable``, ``statusCheckRollup`` and the review ``comments`` its gate checklist needs) with
@@ -109,7 +123,8 @@ def _carried_pr(pr, state):
 
     Summing at carry time also makes the entry a FIXED POINT: it re-carries itself unchanged on
     every later tick, which is what stops the chip blanking one poll window later instead of one."""
-    out = {k: v for k, v in pr.items() if k != "files" and k not in _SIZE_TOTAL_KEYS}
+    out = {k: v for k, v in pr.items()
+           if k != "files" and k not in _SIZE_TOTAL_KEYS and k not in _DROPPED_PR_KEYS}
     out["state"] = state
     out.update(_size_totals(pr))     # the validated totals are the only ones that survive the carry
     return out
@@ -194,7 +209,8 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
         # (a poll firing in between, which drops the entry to the carry: the `iid in merged` test
         # below runs BEFORE the settled-state test in both loops, so an OPEN-stamped carry entry is
         # promoted anyway and nothing is ever lost).
-        prs[iid] = _carried_pr(pr, "MERGED") if (isinstance(pr, dict) and iid in merged) else pr
+        prs[iid] = _carried_pr(pr, "MERGED") if (isinstance(pr, dict) and iid in merged) \
+            else _published_pr(pr)
     settling = []
     for iid, pr in _dict(carry_prs).items():
         if iid not in tracked or iid in prs or not isinstance(pr, dict):

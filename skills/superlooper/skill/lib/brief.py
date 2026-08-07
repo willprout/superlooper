@@ -93,8 +93,15 @@ _INVESTIGATE_WORK_BLOCK = """\
    one-line reply verifies, never on the marker alone."""
 
 # The PR-opening line of Finish — present for code types, empty for an investigation.
-_FINISH_PR = ("Open the PR with `Closes #{issue_num}` (unless you shipped via the configured ship "
-              "command, which already does this). ")
+#
+# The closing keyword is rendered from gate.closing_keyword_line, exactly like the review marker
+# below is rendered from gate.pinned_review_marker: since issue #404 the gate PARSES this literal
+# and refuses to merge a PR whose body lacks it, so a hand-copied string here could teach a form the
+# gate does not accept — the #238 defect class (an audit comment naming a label the gate had since
+# renamed). The rendered text is unchanged; only its source is.
+_FINISH_PR = ("Open the PR with `" + gate.closing_keyword_line("{issue_num}")
+              + "` (unless you shipped via the configured ship "
+                "command, which already does this). ")
 
 # The "if you can safely proceed on one assumption" hint — code types point at the PR body, but an
 # investigation opens no PR (cross-review Task 7: a PR instruction must not leak into a no-PR flow).
@@ -104,8 +111,9 @@ _ASSUME_INVESTIGATE = "prefer noting it in your root-cause report over blocking.
 _SHIP_WITH_CMD = ("Run the repo's own review pipeline and ship EXCLUSIVELY via `{ship_cmd}` — never a "
                   "direct `git push` to {dev_branch}, never `gh pr merge`, never a hand-posted status.")
 _SHIP_NO_CMD = ("Get a fresh-agent review of your diff (an agent that wrote none of it), address the "
-                "P0/P1 findings, push the branch, then `gh pr create --fill --body 'Closes "
-                "#{issue_num}'`. Post the reviewer's verdict as a PR comment BEGINNING "
+                "P0/P1 findings, push the branch, then `gh pr create --fill --body '"
+                + gate.closing_keyword_line("{issue_num}")
+                + "'`. Post the reviewer's verdict as a PR comment BEGINNING "
                 f"`{gate.pinned_review_marker()}`, naming what was reviewed and the P0/P1 outcome "
                 "— the runner mechanically refuses to merge without that comment. Replace "
                 f"{gate.REVIEW_PIN_PLACEHOLDER} with the oid `git rev-parse HEAD` prints after "

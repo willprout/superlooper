@@ -2004,6 +2004,59 @@ def test_janitor_yes_executes_all_three_actions_and_journals_them(rig):
     assert "3 executed" in r.stdout
 
 
+def _seed_merged_open_pair(rig, issue_num=101, pr=12, head=None):
+    """A merged sl/i<N> PR whose issue is still OPEN (issue #404) — the pair the janitor's fourth
+    close class exists to surface. `pr_list_heads.json` is gh.sl_head_prs's fixture; `issue_list.json`
+    is gh.open_issues_all's."""
+    head = head or f"sl/i{issue_num}-render-the-widget"
+    (rig.fixdir / "pr_list_heads.json").write_text(json.dumps(
+        [{"number": pr, "state": "MERGED", "headRefName": head}]))
+    issues = json.loads((rig.fixdir / "issue_list.json").read_text())
+    for i in issues:
+        # a merged-PR issue carries neither owner word: launch removes `agent-ready`, merge removes
+        # `in-progress`. Strip them so the fixture is the shape the defect actually leaves behind.
+        i["labels"] = [l for l in i["labels"] if l["name"] not in ("agent-ready", "in-progress")]
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(issues))
+
+
+def test_janitor_proposes_closing_an_issue_its_merged_pr_left_open(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_merged_open_pair(rig)
+    r = cli(rig, "janitor", "--dry-run", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    # the line names BOTH numbers: the issue being closed and the merged PR that justifies it
+    assert "close issue #101 (PR #12 merged)" in r.stdout
+    assert "still OPEN" in r.stdout and "run" in r.stdout
+    assert mutations(rig) == []                       # --dry-run executes nothing
+
+
+def test_janitor_executes_an_approved_merged_open_close_with_its_audit_comment(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_merged_open_pair(rig)
+    r = cli(rig, "janitor", "--yes", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    closes = {m["num"]: m for m in mutations(rig) if m["kind"] == "close_issue"}
+    assert "101" in closes
+    # the audit comment names the janitor AND the merged PR — a close nobody can trace back to the
+    # work that justified it is not evidence
+    assert "janitor" in closes["101"]["comment"] and "#12" in closes["101"]["comment"]
+    recs = [x for x in _janitor_journal(rig)
+            if x.get("act") == "janitor" and x.get("target") == 101]
+    assert len(recs) == 1 and recs[0]["outcome"] == "ok" and recs[0]["action"] == "close-issue"
+
+
+def test_janitor_json_carries_the_merged_open_pair_for_the_command_center(rig):
+    _seed_janitor_fixtures(rig)
+    _seed_merged_open_pair(rig)
+    r = cli(rig, "janitor", "--json", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    props = json.loads(r.stdout)["proposals"]
+    pair = [p for p in props if p["kind"] == "issue-merged-open"]
+    assert [p["key"] for p in pair] == ["closemerged:101"]
+    assert pair[0]["pr"] == 12 and pair[0]["target"] == 101
+    assert mutations(rig) == []                       # --json is propose-only
+
+
 def test_janitor_prompt_y_executes(rig):
     _seed_janitor_fixtures(rig)
     r = cli(rig, "janitor", "--repo", str(rig.repo), inp="y\n")
