@@ -657,13 +657,21 @@ def _rollup_entries(status_rollup):
     on the eApp loop (2026-08-05, its PRs #714/#717). Each name is therefore ranked by
     _entry_recency and only the newest run's state survives the fold; ties keep every tied entry.
 
-    Recency ranks only entries of the SAME NAME FROM THE SAME REPORTER (CheckRun against CheckRun,
-    StatusContext against StatusContext) — a re-run supersedes its own earlier attempt, and nothing
-    else. A commit status and a check-run that happen to share a name are two independent reporters
-    of that name, not two attempts at it (gh.branch_checks' docstring names this double-reported
-    shape as a real, if misconfigured, corner), so each keeps its own vote and a live red on one
-    side is never silenced by a newer green on the other — that would be a fail-OPEN the old fold
-    never had (cross-review P0).
+    Recency ranks only entries of the SAME NAME FROM THE SAME REPORTER — a re-run supersedes its
+    own earlier attempt, and nothing else. Reporter identity is the pair the rollup can actually
+    prove: which shape carried the name (CheckRun vs StatusContext), and for a CheckRun the
+    workflowName gh returns with it. So a commit status and a check-run that share a name, or two
+    DIFFERENT workflows both publishing one required name, are independent reporters of it — each
+    keeps its own vote, and a live red on one is never silenced by a newer green on the other.
+    Both were caught as fail-OPENs the old fold did not have (two cross-review rounds); the
+    double-reported shape is the same corner gh.branch_checks' docstring already names.
+
+    The residual, stated rather than hidden: check runs that carry NO workflowName (a non-Actions
+    app) group under one reporter per name, so there the fold cannot tell a re-run from a second
+    app claiming the same required name and ranks them together. That is GitHub's own reading of a
+    required check — it evaluates the name by its latest run — so the gate is not merging anything
+    GitHub itself would call red, and the alternative (never ranking such runs) would leave the
+    whole #402 bug unfixed for every repo whose CI is not Actions.
 
     FAIL-CLOSED FALLBACK: if ANY entry under a name+reporter has no usable timestamp, that group
     keeps ALL its entries and stays any-failure-wins — the old behavior, unchanged. No ordering
@@ -678,9 +686,15 @@ def _rollup_entries(status_rollup):
         if isinstance(c, dict):
             # Which field supplied the name IS the reporter — `name or context` verbatim (a
             # wrong-typed truthy `name` still shadows `context`, then fails the isinstance below
-            # exactly as before), just kept alongside the key it produced.
+            # exactly as before), just kept alongside the key it produced. For a CheckRun the
+            # workflow behind it refines that: gh hands us workflowName, and two different
+            # workflows publishing one required name are two reporters of it, not two attempts.
             named = c.get("name")
-            key, reporter = (named, "run") if named else (c.get("context"), "status")
+            if named:
+                wf = c.get("workflowName")
+                key, reporter = named, ("run", wf if isinstance(wf, str) else None)
+            else:
+                key, reporter = c.get("context"), ("status",)
             if isinstance(key, str):
                 v = c.get("conclusion") or c.get("state")
                 runs.setdefault((key, reporter), []).append(

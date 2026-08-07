@@ -479,11 +479,26 @@ def test_checks_rest_lowercase_conclusions_fold_like_graphql_uppercase():
 # whose live runs were all green — proven twice on the eApp loop (2026-08-05, PRs #714/#717:
 # close/reopen preserving the SHA, and a nudge-triggered re-run).
 
-def _run(name, conclusion, started, completed=None):
+def _run(name, conclusion, started, completed=None, workflow=None):
     """A CheckRun rollup entry in gh's exact shape (see gh.py's _PR_FIELDS query)."""
     return {"__typename": "CheckRun", "name": name, "conclusion": conclusion,
-            "status": "COMPLETED" if completed else "IN_PROGRESS",
+            "status": "COMPLETED" if completed else "IN_PROGRESS", "workflowName": workflow,
             "startedAt": started, "completedAt": completed}
+
+
+def test_checks_two_workflows_publishing_one_name_both_keep_a_vote():
+    # Second cross-review round, same class as the CheckRun-vs-StatusContext finding: recency ranks
+    # a RE-RUN against its own lineage. Two DIFFERENT workflows that both publish a required name
+    # are two reporters of it, not two attempts at it, so a newer green from one must not silence a
+    # live red from the other. gh hands us workflowName on every CheckRun, so this is decidable.
+    rollup = [_run("ci", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z", "nightly"),
+              _run("ci", "SUCCESS", "2026-08-05T11:00:00Z", "2026-08-05T11:05:00Z", "pr-checks")]
+    assert gate.required_checks_state(rollup, ["ci"]) == "fail"
+    # ...while a re-run of the SAME workflow is a lineage, and the latest attempt is the truth —
+    # the whole point of #402, and the shape actually observed on a live two-suite rollup.
+    same = [_run("ci", "FAILURE", "2026-08-05T10:00:00Z", "2026-08-05T10:05:00Z", "pr-checks"),
+            _run("ci", "SUCCESS", "2026-08-05T11:00:00Z", "2026-08-05T11:05:00Z", "pr-checks")]
+    assert gate.required_checks_state(same, ["ci"]) == "green"
 
 
 def test_checks_superseded_failure_loses_to_the_latest_green_run():
@@ -529,16 +544,16 @@ def test_checks_gh_zero_time_is_not_a_timestamp():
     # scored the live re-run as older than the failure it supersedes and failed the PR for the whole
     # re-run window. The zero time is the ABSENCE of a timestamp, so it is never one here.
     live = [{"__typename": "CheckRun", "name": "tests", "conclusion": "CANCELLED",
-             "status": "COMPLETED", "startedAt": "2026-08-07T00:25:30Z",
-             "completedAt": "2026-08-07T00:25:41Z"},
+             "status": "COMPLETED", "workflowName": "tests",
+             "startedAt": "2026-08-07T00:25:30Z", "completedAt": "2026-08-07T00:25:41Z"},
             {"__typename": "CheckRun", "name": "tests", "conclusion": "",
-             "status": "IN_PROGRESS", "startedAt": "2026-08-07T00:25:59Z",
-             "completedAt": "0001-01-01T00:00:00Z"}]
+             "status": "IN_PROGRESS", "workflowName": "tests",
+             "startedAt": "2026-08-07T00:25:59Z", "completedAt": "0001-01-01T00:00:00Z"}]
     assert gate.required_checks_state(live, ["tests"]) == "pending"     # wait out the re-run
     # ...and the same two suites once the live one lands green (the second real capture).
     live[1] = {"__typename": "CheckRun", "name": "tests", "conclusion": "SUCCESS",
-               "status": "COMPLETED", "startedAt": "2026-08-07T00:25:59Z",
-               "completedAt": "2026-08-07T00:41:27Z"}
+               "status": "COMPLETED", "workflowName": "tests",
+               "startedAt": "2026-08-07T00:25:59Z", "completedAt": "2026-08-07T00:41:27Z"}
     assert gate.required_checks_state(live, ["tests"]) == "green"
     # An entry whose ONLY stamps are the zero time carries no ordering at all -> fail closed.
     zeroed = [{"name": "tests", "conclusion": "FAILURE", "startedAt": "2026-08-07T00:25:30Z",
