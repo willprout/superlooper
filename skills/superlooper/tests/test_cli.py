@@ -1083,6 +1083,31 @@ def test_status_renders_lanes_gate_and_frozen(rig):
     assert "merge" in out                            # journal tail is rendered
 
 
+def test_status_says_the_queue_is_HELD_and_names_the_class(rig):
+    """A systemic hold (#320) is the quietest state the loop has — one alert hours ago, then no
+    park, no relabel, no text. `status` is where the owner asks "is anything running?", so it must
+    answer "held", name the class, and say in the same breath that there is nothing to re-approve;
+    otherwise a paused queue reads exactly like an idle one."""
+    state_home = rig.tmp / "slhome" / "o__r"
+    (state_home / "state").mkdir(parents=True)
+    loopstate.save(str(state_home / "state" / "issues.json"), loopstate.new_state())
+    loopstate.save(str(state_home / "state" / "ALERT"),
+                   {"reasons": ["gh_auth_dead_workers"], "since": 1})
+    r = cli(rig, "status", "--repo", str(rig.repo))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "queue: HELD" in r.stdout, r.stdout
+    assert "gh_auth_dead_workers" in r.stdout
+    assert "re-approval" in r.stdout
+
+
+def test_status_says_the_queue_is_flowing_when_no_hold_stands(rig):
+    state_home = rig.tmp / "slhome" / "o__r"
+    (state_home / "state").mkdir(parents=True)
+    loopstate.save(str(state_home / "state" / "issues.json"), loopstate.new_state())
+    r = cli(rig, "status", "--repo", str(rig.repo))
+    assert "queue: flowing" in r.stdout, r.stdout
+
+
 def test_status_on_a_never_run_repo_is_calm(rig):
     r = cli(rig, "status", "--repo", str(rig.repo))
     assert r.returncode == 0

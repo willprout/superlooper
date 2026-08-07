@@ -1806,8 +1806,16 @@ def cmd_status(args):
     else:
         age = int(time.time() - int(hb.strip() or 0))
         print(f"        last heartbeat {age}s ago   state home: {home}")
-    alert = _read(os.path.join(home, "state", "ALERT"))
+    alert_path = os.path.join(home, "state", "ALERT")
+    alert = _read(alert_path)
     print(f"ALERT: {alert.strip()}" if alert else "ALERT: none")
+    # A HELD queue is the quietest state the loop has — nothing parked, nothing relabelled, one
+    # alert already sent hours ago — which makes it indistinguishable from a queue with nothing to
+    # do (issue #320). Say it in the loop's own vocabulary, right where the reader is looking for
+    # "is anything running?", and say in the same breath that there is nothing to re-approve.
+    # The default is EXISTENCE-dependent, exactly as runner._read_json's is: a marker that is there
+    # but unreadable must not collapse into "absent", which prints a confident "flowing".
+    print(actions_lib.queue_hold_line(_alert_view(alert_path)))
     frozen = _read(os.path.join(home, "state", "merges_frozen.json"))
     if frozen:
         try:
@@ -2322,6 +2330,16 @@ def cmd_doctor(args):
 
 # ------------------------------- shared report I/O -------------------------------
 
+def _alert_view(path):
+    """The state/ALERT marker as the tri-state its readers need (issue #320): None when there is NO
+    marker, the parsed dict when it reads, and {} when a marker EXISTS but nothing can be read out
+    of it — a parse failure OR an OS-level unreadable, which `_read` collapses into the same None as
+    "absent". Keeping those apart is the whole point: a damaged marker must never print a confident
+    "queue: flowing". Mirrors runner._read_json's existence check, including its harmless stat race
+    (either resolution lands on the safe answer)."""
+    return _read_json_file(path, {} if os.path.exists(path) else None)
+
+
 def _read_json_file(path, default):
     """Tolerant read for the state files the reports consume: missing -> default; present but
     unparseable -> {} (existence still counts, e.g. an unreadable freeze marker reads as frozen)."""
@@ -2372,8 +2390,15 @@ def cmd_morning_report(args):
     cfg = _load_config(args.repo)
     home = str(config_lib.state_home(cfg))
     date = time.strftime("%Y-%m-%d", time.localtime())
+    # The PAUSED-queue state (issue #320), pre-shaped exactly as runner.py's _morning_report_hook
+    # does — a hand-run report must say "the queue is HELD" too, or the one surface the owner reaches
+    # for after a silent night is the one that cannot tell a pause from an idle loop.
+    _alert = _alert_view(os.path.join(home, "state", "ALERT"))
+    _held = actions_lib.queue_hold_reasons(_alert)
     view = {"date": date, "now": time.time(), "frozen": _frozen_view(home),
             "queue": _ready_queue(), "usage": None,
+            "queue_hold": {"reasons": _held,
+                           "since": (_alert or {}).get("since")} if _held else None,
             # Standing holds (issue #405) are derived from the durable hold stamps in loopstate.
             # Read tolerantly (missing/corrupt -> {}): a hand-run report must still render, just
             # with no holds — in parity with runner.py's _morning_report_hook.

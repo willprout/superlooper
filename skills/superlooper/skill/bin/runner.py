@@ -738,6 +738,15 @@ class Runner:
         # _consecutive_tick_errors): it is live runtime health, and a restart — the documented
         # recovery for a wedged anchor — is exactly when it should reset to a clean slate.
         self._launch_fail_ids = set()
+        # {evidence reason: DISTINCT issue ids} for the launch faults that are honestly PER-ISSUE on
+        # one sample and MACHINE-WIDE across several (issue #320) — a session's own dead gh, its own
+        # wrong Anthropic account, its own poisoned env (evidence.SYSTEMIC_ESCALATION_REASONS). Kept
+        # SEPARATE from the channel streak above because the charging rule is the opposite: an entry
+        # here does NOT spare the lane its own launch cap, so a genuinely one-off broken worktree
+        # still parks with its own memo. It only adds a sample to the environment question, which
+        # decide answers at actions.SYSTEMIC_ENV_FAILURE_CAP distinct lanes for the SAME reason.
+        # In-memory and cleared by any verified delivery, exactly like the channel streak.
+        self._launch_env_fail_ids = {}
         # The #115 canary retry clock: the wall-clock of the most recent launch-delivery FAILURE.
         # decide gates the systemic-hold canary on `now - this >= CANARY_RETRY_SECONDS`, so the first
         # probe waits a full interval after the trip and each failed canary re-spaces the next. Reset
@@ -2185,6 +2194,11 @@ class Runner:
         # can't sense itself (it is pure). The DISTINCT-failure streak always; the per-tick pane probe
         # only when there is demand to launch (so an idle runner never shells out to cmux or alerts).
         disk["launch_fail_ids"] = sorted(self._launch_fail_ids)
+        # ...and the per-reason ENVIRONMENT streak (issue #320) the systemic-outage layer counts
+        # DISTINCT lanes in. Sorted lists, not sets: this view is the runner's word to a pure decide,
+        # and an ordered, json-shaped payload is what keeps it inspectable in a journal or a dump.
+        disk["launch_env_fail_ids"] = {r: sorted(ids)
+                                       for r, ids in self._launch_env_fail_ids.items() if ids}
         disk["launch_fail_at"] = self._launch_fail_at    # the #115 canary retry clock (decide reads it)
         anchor = self._probe_launch_anchor()             # None = this home has no anchor, or no demand
         if anchor is not None:
@@ -3051,8 +3065,14 @@ class Runner:
         """A verified delivery proves the launch anchor is live (issue #24): clear the distinct-failure
         streak AND reset the #115 canary retry clock. Together they re-arm normal launching and let
         decide journal the systemic-hold recovery on the next tick. Called from every verified-delivery
-        path (fresh launch, recover-exited relaunch, resolve-conflict relaunch) so they never drift."""
+        path (fresh launch, recover-exited relaunch, resolve-conflict relaunch) so they never drift.
+
+        The ENVIRONMENT streak (issue #320) clears on the same evidence and for the same reason: one
+        session that really started proves the machine can start sessions, so whatever refused the
+        earlier lanes was not machine-wide after all. Clearing it here — rather than per-reason — is
+        deliberate: a green launch is a statement about the whole environment, not about one class."""
         self._launch_fail_ids.clear()
+        self._launch_env_fail_ids.clear()
         self._launch_fail_at = 0
 
     def _charge_launch_failure(self, iid, ev, now, canary=False, fields=None):
@@ -3065,6 +3085,14 @@ class Runner:
         systemic streak and the retry clock and NEVER bumps the per-issue launch cap, so no issue
         absorbs a fault none of them caused and a dead channel is detected even when only in-flight
         work is being relaunched. Every OTHER (per-issue) fault bumps the cap so the issue parks.
+        An ENVIRONMENT fault (evidence.is_escalatable_fault — issue #320) is charged BOTH ways, and
+        that is the point rather than a hedge: it is honestly this lane's problem on one sample, so
+        the per-issue cap keeps ticking and a genuinely one-off broken worktree still parks with its
+        own memo; and it is a SAMPLE of the machine's environment, so it is recorded per reason so
+        decide can see the same fault refuse a second DISTINCT lane and hold the queue instead. The
+        return value stays what it says — charged to the ISSUE — because that is what the callers
+        use it to report.
+
         `fields` are the caller's path-specific loopstate fields; launch_evidence is always stamped.
         Returns True when charged to the channel (held), False when charged to the issue."""
         merged = dict(fields or {}, launch_evidence=ev)
@@ -3073,6 +3101,12 @@ class Runner:
             self._launch_fail_ids.add(iid)
             self._update_issue(iid, merged)
             return True
+        if evidence.is_escalatable_fault(ev):
+            # The same clock the channel streak stamps: decide reads it BOTH to space the #115
+            # recovery probe once this escalates and to age out the "sample a different lane"
+            # preference, so a stale streak can never hold a lane out of the queue forever.
+            self._launch_fail_at = now
+            self._launch_env_fail_ids.setdefault(ev["reason"], set()).add(iid)
         self._update_issue(iid, merged, fn=lambda st, i: self._bump(i, "launch_failures"))
         return False
 
@@ -5066,8 +5100,16 @@ class Runner:
         # Standing holds section is derived from it. Handed in whole rather than pre-shaped —
         # report.standing_holds is the pure derivation, and keeping it there is what lets the CLI's
         # own morning-report entry point (`superlooper morning-report`) render exactly the same list.
+        # The PAUSED-queue state (issue #320): a systemic hold is one alert hours ago and then
+        # silence, so the morning after, a held queue renders exactly like an idle one. Pre-shaped
+        # here for the same reason engine_drift is — report.py stays pure and never imports the
+        # runner's brain to read one frozenset.
+        alert = _read_json(os.path.join(self.state, "ALERT"))
+        held = actions.queue_hold_reasons(alert)
         view = {"date": date, "now": now, "frozen": frozen, "queue": queue,
                 "usage": self.usage_view(), "engine_drift": drift,
+                "queue_hold": {"reasons": held,
+                               "since": (alert or {}).get("since")} if held else None,
                 "issues_state": self._load_state()}
         text = report.morning(records, view, ledger, self.config)
         try:
