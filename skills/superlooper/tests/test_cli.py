@@ -1231,12 +1231,13 @@ def test_run_refuses_to_start_when_required_checks_is_empty(rig):
     r = cli(rig, "run", "--repo", str(rig.repo), "--pane", "p1", "--ticks", "1",
             env_over={"SL_CMUX": _cmux_stub(rig, resolve=True)})
     assert r.returncode != 0
-    out = r.stdout + r.stderr
-    assert "FATAL" in out
+    # On STDERR, like every sibling refusal in this boot path: an operator who pipes stdout
+    # somewhere (or a job whose stdout is a log nobody reads) must still SEE why it refused.
+    assert "FATAL" in r.stderr
     # the three things the refusal must teach: the key, the consequence, the remedy
-    assert "required_checks" in out
-    assert "no ci requirement" in out.lower()
-    assert "superlooper doctor" in out
+    assert "required_checks" in r.stderr
+    assert "no ci requirement" in r.stderr.lower()
+    assert "superlooper doctor" in r.stderr
     # and it never started: the loop's own heartbeat is the proof
     assert not (rig.tmp / "slhome" / "o__r" / "state" / "runner.heartbeat").exists()
 
