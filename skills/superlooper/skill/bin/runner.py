@@ -1225,6 +1225,17 @@ class Runner:
         """Write this tick's GitHub view to ``state/gh_view.json`` (issue #146) — the file the
         dashboard renders as its PRIMARY truth.
 
+        ``ist_map`` is loopstate's issue map as of AFTER this tick's executors ran (#276) — the
+        caller's post-execute read, the same one the hygiene sweeps take. It supplies the two facts
+        the document cannot get from GitHub: which lanes this runner tracks, and which of them it
+        has merged itself. Handed the pre-execute map instead, both are one phase out of date and a
+        lane the loop merged this tick publishes as still in flight.
+
+        With ONE exception the caller owns: when that post-execute read fail-closes to empty, the
+        caller hands the pre-execute map instead, because an empty tracked set would prune the
+        carries permanently and a one-tick-stale merged set only delays a landing by a tick. Losing
+        a fact forever is worse than showing it late — see the fallback beside the call.
+
         The runner has always held this view and thrown it away each tick, which left the dashboard
         no choice but to ask GitHub the same questions on its own clock: a second poller on one
         rate-limit budget (a contributor to the 2026-07-08 storm, §1b) whose answers drifted from the
@@ -1244,11 +1255,12 @@ class Runner:
                 self._published_titles = prior.get("titles") if isinstance(prior.get("titles"), dict) else {}
                 self._published_prs = prior.get("prs") if isinstance(prior.get("prs"), dict) else {}
             tracked = set(ist_map) if isinstance(ist_map, dict) else set()
-            # The landings this runner performed itself. `_exec_merge` records them here and never
-            # back into gh_view, so loopstate is the ONLY place the merge is written down — and the
-            # cached PR it merged still reads OPEN (the gate can't merge one that doesn't). Without
-            # this the settled carry refuses every real landing and the cargo chip blanks a poll
-            # window later. `_status_of` is hash-safe: a wrong-typed status can't raise here (#95).
+            # The landings this runner performed itself, INCLUDING this tick's (#276 — the map is
+            # post-execute). `_exec_merge` records them here and never back into gh_view, so
+            # loopstate is the ONLY place the merge is written down — and the cached PR it merged
+            # still reads OPEN (the gate can't merge one that doesn't). Without this the settled
+            # carry refuses every real landing and the cargo chip blanks a poll window later.
+            # `_status_of` is hash-safe: a wrong-typed status can't raise here (#95).
             merged_ids = {iid for iid in tracked
                           if actions._status_of(ist_map.get(iid) if isinstance(ist_map.get(iid), dict)
                                                 else {}) == "merged"}
@@ -2235,6 +2247,17 @@ class Runner:
         # then survives to the relaunch, which is a smaller wrong than judging any lane by a status
         # that is one phase out of date.
         fresh = self._load_state()
+        fresh_ist_map = fresh.get("issues") if isinstance(fresh.get("issues"), dict) else {}
+        # What the publish below reads (#276), and the `or` is the load-bearing half (fresh-agent
+        # review). `_load_state` FAILS CLOSED to an empty state, so "loopstate is unreadable" and
+        # "loopstate tracks nothing" arrive here as the same empty map — and publishing that empty
+        # map would prune every carried title and settled PR out of the document AND out of the
+        # in-memory carry that re-seeds it, so one bad read would blank the arrivals board's landed
+        # flights PERMANENTLY. Nothing ever removes an issue from loopstate, so an empty
+        # post-execute map where the pre-execute one had entries can only be that failure: fall
+        # back to the map decide itself used rather than publish a prune nobody observed. When the
+        # read genuinely holds nothing, both maps are empty and the fallback changes nothing.
+        publish_ist_map = fresh_ist_map or ist_map
         self._reclaim_terminal_worktrees(fresh)        # opt-in only (#168): OFF by default, park-family persists
         self._drain_pending_teardowns(fresh)           # (#149) retry prunes declined under a live CLI
         if now - self._last_journal_rotate >= JOURNAL_ROTATE_SECONDS:
@@ -2250,7 +2273,20 @@ class Runner:
         # stories. Before the heartbeat, so a fresh heartbeat always has a view of its own vintage
         # behind it (the dashboard trusts the view exactly as far as the heartbeat is fresh); and
         # self-guarded, so a publish failure costs the document, never the tick.
-        self._publish_view(now, ist_map)
+        #
+        # Off the SAME post-execute read the two sweeps above take (#276), not the pre-decide `st` —
+        # otherwise "the view this tick decided against" was true of the decisions and false of the
+        # outcomes. The map feeds exactly two things: the merged set (a PR the gate landed THIS tick
+        # still reads OPEN in the cache — loopstate is the only place the landing is written down,
+        # and `_exec_merge` wrote it a few statements ago), and the tracked set that bounds both
+        # carries. Pre-execute, a lane the loop had already merged published as still in flight for
+        # a whole tick — ~15s of a dashboard polling every ~2s, and every one of those polls a
+        # landed PR rendered as OPEN. Nothing ever REMOVES an issue from loopstate, and an
+        # unreadable read falls back above rather than arriving as an empty one, so the tracked set
+        # this publishes can only be the same or larger than the pre-execute one: no lane loses its
+        # carried title or PR by the map being read later. Free, too — the read already happened
+        # for the sweeps.
+        self._publish_view(now, publish_ist_map)
 
         # Heartbeat = "a full tick completed", stamped LAST (incident 2026-07-07). It used to be
         # stamped at the TOP of the tick, so a tick that crashed part-way still read as freshly
