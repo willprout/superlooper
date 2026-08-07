@@ -424,6 +424,13 @@ def main_stateful():
             print(json.dumps({"data": {"repository": {"issues": {
                 "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}}}))
             sys.exit(0)
+        if re.search(r"/commits(\?|$)", path):
+            # the doctor's bounded dev-branch window (issue #406). This little GitHub keys its
+            # check-runs by REF NAME, not by sha, so the only "commit" it can model is the ref
+            # itself — a one-entry window that reads exactly what the HEAD-only poll reads.
+            m = re.search(r"[?&]sha=([^&]+)", path)
+            print(json.dumps([{"sha": unquote(m.group(1))}] if m else []))
+            sys.exit(0)
         if "check-runs" in path:
             ref = unquote(path.split("/commits/")[1].split("/check-runs")[0])
             runs = st.get("branch_checks", {}).get(ref, [])
@@ -737,10 +744,24 @@ def main_fixture():
             # the branch LIST endpoint (janitor sweep) — distinct from the single-branch
             # existence probe below (".../branches/<name>").
             serve_first(["branches.json"])
+        if re.search(r"/commits(\?|$)", path):
+            # the commit LIST endpoint — the doctor's bounded dev-branch window (issue #406),
+            # distinct from the per-commit check reads below (".../commits/<ref>/check-runs").
+            serve_first(["commits.json"])
         if "compare" in path:
             serve_first(["compare.json"])
+        if "/commits/" in path and "check-runs" in path:
+            # per-REF fixtures (issue #406): the doctor now reads a WINDOW of recent commits, so a
+            # test has to be able to say "this sha reported nothing, the one behind it was green".
+            # `check_runs_<ref>.json` wins when present; `check_runs.json` stays the every-ref
+            # default every older test relies on.
+            ref = unquote(path.split("/commits/")[1].split("/check-runs")[0])
+            serve_first(["check_runs_%s.json" % ref, "check_runs.json"])
         if "check-runs" in path:
             serve_first(["check_runs.json"])
+        if "/commits/" in path and path.endswith("/status"):
+            ref = unquote(path.split("/commits/")[1].split("/status")[0])
+            serve_first(["commit_status_%s.json" % ref, "commit_status.json"])
         if "/status" in path:
             serve_first(["commit_status.json"])
         if "/branches/" in path:

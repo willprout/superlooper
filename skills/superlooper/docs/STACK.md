@@ -63,7 +63,9 @@ A loop user needs enough local stack for a worker session to launch, work, repor
   reason), so a channel that is set but broken — the live incident where a missing recipient file
   made every send exit 2 and a park alert never arrived — is caught here instead of overnight.
   Desktop cmux toasts are only a local fallback and are not enough for unattended overnight
-  operation, so a configured-cmux-only setup still FAILs.
+  operation, so a configured-cmux-only setup still FAILs. With NO channel configured nothing is
+  sent at all, so the block says so — it FAILs on the missing CONFIGURATION rather than implying a
+  delivery failure, and when the journal holds a notify canary that did deliver it cites that too.
 - `launch shim sourced` - `~/.superlooper/launch-shim.zsh` must be installed and sourced from
   `.zshrc`, so new cmux tabs self-run the dropped worker command without keystrokes.
 - `cmux App Nap disabled` - cmux must carry the persistent `NSAppSleepDisabled` default, or macOS

@@ -435,6 +435,8 @@ def pr_for_branch(branch):
 def branch_checks(branch):
     """The dev branch HEAD's FULL required-check universe — check-runs AND commit statuses —
     used to poll dev checks post-merge, where no PR exists (the poll behind freeze/unfreeze).
+    `branch` is any ref GitHub's commit endpoints accept, so a SHA works identically — which is
+    how recent_branch_check_entries walks the doctor's window one commit at a time (issue #406).
 
     GitHub splits these across TWO REST endpoints: /check-runs (CheckRun) and /status (the
     combined commit-status, latest per context). The GraphQL statusCheckRollup the PR view reads
@@ -486,6 +488,74 @@ def branch_checks(branch):
     if isinstance(statuses, list):
         out += [{"context": s.get("context"), "state": s.get("state")}
                 for s in statuses if isinstance(s, dict)]
+    return out
+
+
+# How many recent dev-branch commits the DOCTOR's check-name audit looks back over (issue #406).
+# SMALL AND FIXED, deliberately: every commit in the window costs TWO REST calls (check-runs +
+# status), so this bound IS the API-burn budget of that read. Five is enough to see past a
+# just-merged HEAD whose check-run object does not exist yet — the whole failure this window
+# exists to remove — without turning an on-demand command into a page-walk.
+DEV_CHECK_WINDOW = 5
+
+
+def recent_branch_commits(branch, limit=DEV_CHECK_WINDOW):
+    """The SHAs of `branch`'s most recent commits, newest first, capped at `limit` (issue #406).
+    Fails closed to [] — the caller then reads the branch ref itself, which is exactly the
+    single-commit read this window replaces, so a refusal is never worse than the old behavior.
+    The ref is URL-encoded so a slashed branch does not break the query."""
+    if not (isinstance(limit, int) and not isinstance(limit, bool) and limit > 0):
+        limit = DEV_CHECK_WINDOW
+    lst = _json_list(["api", "repos/{owner}/{repo}/commits?sha=%s&per_page=%d"
+                      % (quote(branch, safe=""), limit)])
+    out = []
+    for c in lst[:limit]:
+        if isinstance(c, dict) and isinstance(c.get("sha"), str) and c["sha"]:
+            out.append(c["sha"])
+    return out
+
+
+def recent_branch_check_entries(branch, limit=DEV_CHECK_WINDOW, stop_when_seen=None):
+    """Every check entry a bounded window of `branch`'s most recent commits reported, unioned —
+    the DOCTOR's dev-surface evidence for the required_checks name cross-check (issue #406).
+
+    Why a window. The doctor reads the PR surface across ~30 recent PRs but used to read the dev
+    surface at the branch's single HEAD commit. Minutes after a merge that HEAD carries no
+    check-run object yet (and an API blip folds the same way), so the read came back empty and the
+    doctor announced "the branch has no check history yet to confirm it runs there" — a FAIL
+    downgraded to a WARN — while the commits immediately behind it carried green runs of that exact
+    check. The failure mode is false reassurance, never a false alarm, and recent commits are the
+    evidence that removes it.
+
+    The window is SMALL AND FIXED (DEV_CHECK_WINDOW = 5 commits, two REST calls each), which is
+    the entire API-burn budget of this read. `stop_when_seen` shrinks it further at no cost to the
+    answer: pass the names being audited and the walk stops as soon as every one has been observed
+    here, because a name already seen on this surface cannot change its surface-membership by being
+    seen again. The healthy case — a HEAD that reports everything — therefore costs the commit list
+    plus one commit's reads, barely more than the HEAD-only read it replaces.
+
+    Fails closed at every step, and always toward LESS evidence: an unreadable commit list falls
+    back to the branch ref itself, and an unreadable commit contributes nothing. Less evidence can
+    only turn a FAIL into "cannot verify yet"; it can never manufacture the observation that would
+    let a misconfigured name read as fine.
+
+    Entries carry branch_checks' normalized shapes, so gate.check_names folds them unchanged. This
+    is a doctor-only read: the runner's freeze/unfreeze poll still reads branch_checks at the
+    branch HEAD, where the question is what the mainline says RIGHT NOW, not whether a name has
+    ever run there."""
+    _seq = (set, list, tuple, frozenset)
+    want = ({n for n in stop_when_seen if isinstance(n, str) and n}
+            if isinstance(stop_when_seen, _seq) else set())
+    refs = recent_branch_commits(branch, limit=limit) or [branch]
+    out, seen = [], set()
+    for ref in refs:
+        entries = branch_checks(ref)
+        out += entries
+        if want:
+            seen |= {key for key in (e.get("name") or e.get("context") for e in entries)
+                     if isinstance(key, str) and key}
+            if want <= seen:
+                break
     return out
 
 

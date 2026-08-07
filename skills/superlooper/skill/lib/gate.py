@@ -872,8 +872,10 @@ def _closest_check_name(req, observed):
 def audit_required_checks(required, pr_names, dev_names):
     """Adoption-time cross-check (issue #26): every required_checks name must match a check the
     repo has ACTUALLY reported — on BOTH surfaces the loop reads. `pr_names` are check names seen
-    on recent PRs (the merge gate reads the PR statusCheckRollup); `dev_names` those seen on the
-    dev branch HEAD (the freeze/unfreeze poll reads gh.branch_checks). Names match CASE-SENSITIVELY
+    on recent PRs (the merge gate reads the PR statusCheckRollup); `dev_names` those seen across a
+    bounded window of recent dev-branch commits (gh.recent_branch_check_entries — a window, not the
+    single HEAD, because a just-merged HEAD reports nothing yet, issue #406; the freeze/unfreeze
+    poll itself still reads gh.branch_checks at HEAD). Names match CASE-SENSITIVELY
     — GitHub identifies a required check by exact name, so 'quality-gate' does NOT satisfy a repo
     that reports 'Quality Gate'. A check missing from EITHER surface reads as pending forever on
     that surface: a green PR that never merges (PR-side gap) or a mainline freeze that never lifts
