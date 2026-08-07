@@ -31,6 +31,9 @@ None — the runner did not go down.
 - Quarantine: 1 test(s). Accepted known failures: 0.
 - Notify channel: not verified this cycle (no canary recorded).
 
+## Standing holds
+None — nothing is held.
+
 ## Freeze state
 Merges flowing.
 

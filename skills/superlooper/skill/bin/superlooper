@@ -2343,6 +2343,10 @@ def cmd_morning_report(args):
     date = time.strftime("%Y-%m-%d", time.localtime())
     view = {"date": date, "now": time.time(), "frozen": _frozen_view(home),
             "queue": _ready_queue(), "usage": None,
+            # Standing holds (issue #405) are derived from the durable hold stamps in loopstate.
+            # Read tolerantly (missing/corrupt -> {}): a hand-run report must still render, just
+            # with no holds — in parity with runner.py's _morning_report_hook.
+            "issues_state": _read_json_file(os.path.join(home, "state", "issues.json"), {}),
             # Installed-engine publish drift (issue #39): computed here (git is impure; report.py
             # stays pure). engine_drift never raises and skips cleanly when there is no source
             # checkout, so a plain adopted repo simply carries no drift notice.

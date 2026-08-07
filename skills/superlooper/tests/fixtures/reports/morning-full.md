@@ -1,6 +1,8 @@
 # superlooper morning report — 2026-07-02
 
-3 merged · 2 parked/needs-owner · 1 bounce(s) · 1 regen(s) · 2 question(s) · queue: 2.
+3 merged · 2 parked/needs-owner · 1 bounce(s) · 1 regen(s) · 2 question(s) · queue: 2. **1 standing hold/freeze past 24h — see below.**
+
+**#17 (i17) has been held 3d 1h** — no usage headroom (the meter is unreadable/unhealthy, or at-or-over a ceiling) — the restart waits for quota, exactly as a fresh launch does (a hold that old is a STALL, not a wait: nothing in the loop moves it until the cause clears).
 
 ## Merged
 - #7 (i7) — https://github.com/titan/eapp/issues/7 · PR https://github.com/titan/eapp/pull/12
@@ -34,6 +36,10 @@ None — the runner did not go down.
 - 0/1 green over the last 7 nights; flakes last run: 2.
 - Quarantine: 1 test(s). Accepted known failures: 2.
 - Notify channel: not verified this cycle (no canary recorded).
+
+## Standing holds
+- #17 (i17) — **held 3d 1h** · launch: no usage headroom (the meter is unreadable/unhealthy, or at-or-over a ceiling) — the restart waits for quota, exactly as a fresh launch does
+- #18 (i18) — **held 25m** · queue contract: missing `## Loop metadata`
 
 ## Freeze state
 Merges flowing.

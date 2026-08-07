@@ -1324,20 +1324,34 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         return scheduler.launch_ok(p, closed_nums, bool(frozen), usage_sched, resume=resume,
                                    config=cfg)
 
-    def launch_hold(iid, num, p, reason=None):
+    def launch_hold(iid, num, p, reason=None, relaunch=False):
         """start_ok (or the #159 auth gate) said no: HOLD, legibly — never a silent launch (D8), and
         never a park. This is a WAIT, not a verdict: the retry cap and park semantics are untouched (a
         boundary of #150), the marker/labels stay exactly as they are, and the restart fires on the
         tick the gate passes. Journal ONCE per CAUSE — dedup on the reason the executor stamps
         durably, so a standing hold can't spam a 15s tick, while a CHANGED cause (the blocker closed
         but the labels went ambiguous) still speaks rather than leaving stale prose on the board. An
-        explicit `reason` overrides the usage/eligibility reason (the auth gate names auth)."""
+        explicit `reason` overrides the usage/eligibility reason (the auth gate names auth).
+
+        `relaunch` (issue #405) says this hold is holding the RESTART of a lane whose worker already
+        EXITED, not a start that never happened. Without it the two are indistinguishable in durable
+        state: the lane keeps its `running` status while the runner deliberately waits for quota, so
+        every surface paints a live flight for the whole frozen-tier window and then a frozen session
+        — the wrong story twice over. The executor stamps it, so the state itself names the corpse.
+
+        It is payload, NOT part of the dedup key, and that is deliberate. The executor writes the
+        flag and the reason together and clears them together, so the two can never disagree within
+        an engine generation; the only state where they could is a stamp written by an engine older
+        than this flag, and the boot re-announce (#405) clears every such stamp before the first tick.
+        Adding it to the key would buy nothing there and would re-journal a standing hold whose cause
+        never changed — the per-tick spam the stamp exists to prevent."""
         reason = reason if isinstance(reason, str) and reason \
             else _launch_gate_reason(p, closed_nums, usage_sched, config=cfg,
                                      closed_read_ok=closed_read_ok)
         if ist_of(iid).get("launch_hold_reason") == reason:
             return
-        out.append({"act": "launch_hold", "id": iid, "num": num, "reason": reason})
+        out.append({"act": "launch_hold", "id": iid, "num": num, "reason": reason,
+                    "relaunch": relaunch})
 
     # ---- launch-anchor liveness (issue #24): a dead launch anchor must never walk the queue ----
     # The runner launches every worker as a cmux tab in ONE pane (the anchor). When that pane stops
@@ -2369,7 +2383,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # to fix, and the lane resumes the tick it reads healthy). Checked FIRST so a lane
                 # already at its retry cap holds too, rather than parking under a fault that is not
                 # its own; the relaunch charges no attempt because it never fires.
-                launch_hold(iid, num, p,
+                launch_hold(iid, num, p, relaunch=True,
                             reason="account auth is not valid — relaunch held (see the auth_dead alert)")
             elif display_asleep:
                 # Display is asleep (issue #124): the recovery relaunch boots a FRESH tab, whose shell
@@ -2377,7 +2391,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # prevents. HOLD like the auth sibling (no attempt, no streak entry, no alert, no park
                 # even at cap); it resumes the tick the display wakes. Quiet — a sleeping display is
                 # normal overnight behavior, not a fault.
-                launch_hold(iid, num, p,
+                launch_hold(iid, num, p, relaunch=True,
                             reason="the display is asleep — relaunch held; macOS will not boot the "
                                    "new tab's shell until wake, when it resumes automatically")
             elif type(retries) is not int:             # corrupt counter -> to William, not a loop
@@ -2394,8 +2408,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # stopped it was the worker's own step-0 reconcile bouncing itself. It now asks the
                 # WHOLE gate. Usage is unchanged (start_ok's usage half IS usage_launchable's rule):
                 # no headroom still means the marker persists and the relaunch resumes with the
-                # quota — only now the wait says why, instead of passing silently.
-                launch_hold(iid, num, p)
+                # quota — only now the wait says why, instead of passing silently. `relaunch=True`
+                # (#405) is what stops the wait ALSO being invisible: this lane's worker is gone.
+                launch_hold(iid, num, p, relaunch=True)
             continue
         if iid in frozen_ids or status == "frozen":
             if in_wake_grace:

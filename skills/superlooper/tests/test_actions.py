@@ -1760,6 +1760,69 @@ def test_a_wrong_typed_dependency_is_still_NAMED_in_the_reason():
     assert "no single condition named" not in holds[0]["reason"]
 
 
+# ---- issue #405: a held RELAUNCH must not read as a live flight ----
+# A worker that dies while usage is over ceiling gets a journal-only relaunch hold: the lane keeps
+# its `running` status, so every surface reading state paints a live flight for the whole frozen-tier
+# window and then a frozen session — the wrong story, while the runner is deliberately waiting for
+# quota. The hold action carries `relaunch`, which the executor stamps durably, so the state itself
+# names the dead worker. Nothing about the hold DECISION changes: this is visibility, not policy.
+
+def _usage_over_ceiling(now=NOW):
+    return {"auth_status": "ok", "five_hour_pct": 95.0, "seven_day_pct": 20.0,
+            "last_ok_at": now, "first_attempt_at": now - 60}
+
+
+def _exited_lane(**over):
+    d = disk(exited={"i5": "x rc=1"},
+             issues_state={"version": 1, "issues": {"i5": ist("running", retries=0)}})
+    d.update(over)
+    return d
+
+
+def test_an_exited_lane_held_for_usage_says_the_RELAUNCH_is_what_is_held():
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    out = decide(parsed_issues=[p5], dsk=_exited_lane(), usage=_usage_over_ceiling())
+    assert only(out, "recover") == [] and only(out, "park") == []    # unchanged: held, never parked
+    holds = only(out, "launch_hold")
+    assert len(holds) == 1 and holds[0]["id"] == "i5"
+    assert holds[0]["relaunch"] is True                              # the worker is GONE, not running
+    assert "usage" in holds[0]["reason"].lower() or "quota" in holds[0]["reason"].lower()
+
+
+def test_the_auth_and_display_relaunch_holds_are_flagged_the_same_way():
+    # Same ladder, same silence: an exited lane held for dead auth or a sleeping display is just as
+    # indistinguishable from a live one. All three exited-tier holds carry the flag.
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    for dsk in (_exited_lane(auth_probe=_auth_dead()), _exited_lane(display_asleep=True)):
+        holds = only(decide(parsed_issues=[p5], dsk=dsk), "launch_hold")
+        assert len(holds) == 1 and holds[0]["relaunch"] is True
+
+
+def test_a_FRESH_launch_hold_is_never_flagged_as_a_relaunch():
+    # The mirror: an approved issue that never started has no worker to be dead, so the flag must
+    # stay False — otherwise every hold would claim a corpse the loop never had. (Uses the #172
+    # unlanded-read hold, which is one of the two fresh-candidate holds decide actually journals.)
+    holds = only(decide(parsed_issues=[parsed(5, blocked_by=[3])],
+                        gh_view=ghv(closed_nums=set(), closed_read_ok=False)), "launch_hold")
+    assert len(holds) == 1 and holds[0]["relaunch"] is False
+
+
+def test_the_relaunch_flag_is_payload_and_never_widens_the_dedup_key():
+    # The flag must not become a second reason to speak: a standing relaunch hold, tick after tick,
+    # still journals ONCE (the whole point of the stamp — a 15s tick must never be spammed). The
+    # executor writes reason and flag together, so within a generation they cannot disagree; a stamp
+    # from an engine that predates the flag is cleared by the boot re-announce, not re-journaled here.
+    p5 = parsed(5, labels=("in-progress", "type:build"))
+    first = only(decide(parsed_issues=[p5], dsk=_exited_lane(), usage=_usage_over_ceiling()),
+                 "launch_hold")[0]
+    for stored in (dict(relaunch_held=True), dict()):     # with the flag, and as an older stamp
+        d = _exited_lane()
+        d["issues_state"]["issues"]["i5"] = ist("running", retries=0,
+                                                launch_hold_reason=first["reason"], **stored)
+        assert only(decide(parsed_issues=[p5], dsk=d, usage=_usage_over_ceiling()),
+                    "launch_hold") == []
+
+
 def test_touches_required_does_not_mislabel_a_control_label_conflict_issue():
     # P2-1: a no-touches issue that is ALSO ineligible for a control-label conflict must not be
     # parked with a "missing touches" memo (a misdiagnosis). It is left for its own handling.
