@@ -32,6 +32,11 @@ _ISSUE_FIELDS = "number,title,labels,body,createdAt"
 # says update_result is "for the CURRENT head; the runner clears it whenever the PR head
 # changes", and the head is only detectable by its oid (Task 10).
 _PR_FIELDS = "number,state,mergeable,statusCheckRollup,files,headRefName,headRefOid,labels"
+# statusCheckRollup needs no companion field for the gate's latest-run-per-name fold (issue #402):
+# `--json statusCheckRollup` is atomic — gh's own query already selects startedAt/completedAt on
+# every CheckRun and createdAt on every StatusContext, which is the recency gate._rollup_entries
+# ranks by. Nothing to add here; a future gh that drops those timestamps would land the fold on
+# its documented fail-closed fallback (any-failure-wins), not on a wrong answer.
 
 
 def _binary():
@@ -417,6 +422,17 @@ def branch_checks(branch):
     them with no special-casing: check-runs -> {name, status, conclusion}; statuses ->
     {context, state}. gh substitutes {owner}/{repo}; the ref is URL-encoded so a slashed branch
     (sl/i1-x) doesn't split into extra path segments.
+
+    UNCHANGED by issue #402, and that is the point: the two surfaces now agree on latest-run-per-
+    name. This one already had it for free — /check-runs defaults to filter=latest and /status is
+    the COMBINED status (latest per context) — so EACH ENDPOINT contributes a given name at most
+    once and no superseded run is even fetched. (The double-reported corner above is unaffected:
+    that is one name from TWO reporters, which both surfaces still let vote independently — the PR
+    rollup fold ranks re-runs only within a reporter, never across.) The PR rollup had to be taught
+    latest-per-name (GraphQL keeps every run on the commit). These normalized entries carry no
+    timestamps, so they take gate._rollup_entries' fail-closed any-failure-wins branch, which over
+    one run per name is the same verdict as latest-wins: this poll's freeze/unfreeze behavior is
+    bit-for-bit what it was.
 
     The two reads fail closed INDEPENDENTLY to their empty contribution: a required check that
     never reports still reads pending (never a false green -> never a spurious unfreeze), and a
