@@ -37,6 +37,10 @@
   <!-- Issue #116: the Restart button's confirm dialog — an ops-verb overlay (runs
        `superlooper request-restart` locally). Loaded before shell.js so window.CCRestart exists. -->
   <script src="/restart.js"></script>
+  <!-- Issue #365: the Stop/Start confirm dialog — the owner's deliberate off switch and the way
+       back on (runs `superlooper stop` / `start` locally, over the engine's #239 verbs). Loaded
+       before shell.js so window.CCStop exists when the topbar control binds it. -->
+  <script src="/stop.js"></script>
   <!-- Issue #121: the Janitor sweep dialog — an ops-verb overlay (runs `superlooper janitor`
        locally to clear GitHub debris). Loaded before shell.js so window.CCJanitor exists when the
        button binds it. -->

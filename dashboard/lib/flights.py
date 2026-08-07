@@ -31,6 +31,7 @@ a test in ``tests/test_flights.py``:
   promotion never does. And the corner counter is outcome-only — no human-latency stopwatch may
   ever exist on this surface (§7 kill list #4).
 """
+import math
 import re
 import time
 
@@ -568,9 +569,21 @@ def corner_stats(journal, now=None, window_days=7):
 # airfield's tower FX read the same scale, so the global dot and the field agree. Rank ≥ _ALERT_RANK
 # is a factory-stop (red/"alert"); any lower non-zero rank is amber ("attention"); zero is "ok".
 _ALERT_RANK = 90
+# The deliberate off switch's two board conditions (issue #365, over the engine's #239 marker).
+# STOPPED is what a deliberate stop looks like from here; STOP_NOT_TAKEN is the contradiction —
+# a stop is on the books and the runner is ticking anyway.
+STOPPED = "stopped-by-owner"
+STOP_NOT_TAKEN = "stop-not-taken"
 _CONDITION_RANK = {
     "runner-down": 100,    # the dead-man's switch: no runner ⇒ the surface can't be trusted (§6)
     "alert": 90,           # an ALERT file is present (a factory-stop the runner declared)
+    STOP_NOT_TAKEN: 88,    # a stop is recorded and the runner ticked anyway — the owner believes
+                           #   the loop is off and it is not, and the guardians will stand down the
+                           #   moment it does die. Loud, but not an alarm: nothing is broken yet
+    STOPPED: 85,           # off because the owner said so. It outranks every flight condition
+                           #   because it EXPLAINS them — nothing will move until it is started —
+                           #   and stays under `alert`, which is a louder fact than an off switch.
+                           #   Attention, never alarm: nagging about a deliberate state is §0.2
     AWAITING: 50,          # an owner decision blocks work — the most actionable attention state
     PARKED: 45,            # the machine gave up on a flight
     SESSION_FROZEN: 30,    # a dead session stalled on the field
@@ -760,16 +773,109 @@ def source_mode(view, heartbeat_age, heartbeat_epoch, now, silent_after,
                      "banner": {"lines": [first, _GITHUB_DIRECT_LINE]}}, fmt)
 
 
+def _stop_epoch(v):
+    """A usable wall-clock epoch from the stop marker, or ``None``.
+
+    The marker is an untrusted file, and this is the boundary it enters through — so it is where a
+    value that cannot survive arithmetic has to be dropped. NaN and the infinities are the obvious
+    ones (``json.loads`` accepts both spellings). The one that is not obvious, and the one a fresh
+    reviewer caught: a 1000-digit INTEGER passes every ``isinstance`` check and then raises
+    ``OverflowError`` out of ``math.isfinite`` downstream, inside the 2-second snapshot poll — which
+    would blank the board for every repo over one junk file. So the finiteness test is taken here,
+    where it can be wrapped, and nothing downstream ever sees a number it cannot format.
+    """
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    try:
+        return v if math.isfinite(v) else None
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
+def stop_state(stopped, runner_live=None, heartbeat_epoch=None, heartbeat_age=None,
+               heartbeat_down_seconds=300):
+    """Is this repo's loop off because the OWNER turned it off — and did the stop actually take?
+
+    ``stopped`` is ``readers``' raw ``state/runner.stopped`` fact (``None`` absent, ``{}`` present-
+    but-unparseable, else the record); ``runner_live`` is ``readers``' pidfile liveness read
+    (``None`` ⇒ could not tell). Returns ``{present, state, condition, at, operator, source}`` where
+    ``state`` is one of:
+
+      * ``None``       — no stop recorded
+      * ``"off"``      — recorded, and there is a positive "no live runner" read
+      * ``"stopping"`` — recorded, and a runner is still up (the marker lands BEFORE anything is
+        taken down, so this window is normal — and transient)
+      * ``"not-taken"``— recorded, a runner is still up, AND it has completed a tick since. The
+        engine's own STOP NOT TAKEN: the owner believes the loop is off, it is not, and the
+        guardians will stand down the moment it does die
+
+    **The LIVE-RUNNER read decides, not the heartbeat — and the difference is not academic.** The
+    heartbeat says when the runner last finished a TICK, judged on a five-minute threshold. But
+    ``stop`` deliberately lets the runner finish the tick it is in, so a SUCCESSFUL stop routinely
+    stamps a heartbeat *after* the marker and then exits. Deciding on the heartbeat alone would
+    therefore read almost every real stop as ``not-taken`` — for the whole five minutes it takes
+    that final tick to go stale — which is the loudest possible false alarm about the one thing this
+    surface exists to get right. It fails the other way too: a runner that is up but has never
+    ticked would read ``off``, and ``off`` is what suppresses the dead-man's switch. (Both found by
+    a fresh reviewer against the engine's own contract.)
+
+    So this asks the engine's question, the engine's way: is the process there? ``off`` requires the
+    positive "nothing is running" observation, exactly as ``stop``'s own review established that a
+    marker buys the watchdog's silence only alongside one. And ``stopped_at`` versus the last tick
+    then separates the two LIVE cases — a runner that has completed a whole tick with the off switch
+    already on disk did not honour it; nothing weaker proves that.
+
+    ``runner_live=None`` (the caller could not tell) falls back to the heartbeat rule, conservatively:
+    stale ⇒ ``off``, fresh ⇒ never ``off``.
+
+    Total and clock-free: every failure to read the record degrades (unknown ``stopped_at`` ⇒ we
+    cannot prove a tick came after it ⇒ ``stopping``, never a claim either way), and it never
+    raises — it is called from the 2-second poll."""
+    if stopped is None:
+        return {"present": False, "state": None, "condition": None,
+                "at": None, "operator": None, "source": None}
+    rec = stopped if isinstance(stopped, dict) else {}
+    at = _stop_epoch(rec.get("stopped_at"))
+    epoch = heartbeat_epoch if (isinstance(heartbeat_epoch, (int, float))
+                                and not isinstance(heartbeat_epoch, bool)) else None
+    live = runner_live
+    if live is None:
+        live = not (heartbeat_age is None or heartbeat_age > heartbeat_down_seconds)
+    if not live:
+        state = "off"
+    elif at is not None and epoch is not None and epoch > at:
+        state = "not-taken"
+    else:
+        state = "stopping"
+    return {"present": True, "state": state,
+            "condition": STOP_NOT_TAKEN if state == "not-taken" else STOPPED,
+            "at": at,
+            "operator": rec.get("operator") if isinstance(rec.get("operator"), str) else None,
+            "source": rec.get("source") if isinstance(rec.get("source"), str) else None}
+
+
 def repo_state(slug, states, spinning=False, merges_frozen=None, alert=None,
-               heartbeat_age=None, heartbeat_down_seconds=300):
+               heartbeat_age=None, heartbeat_down_seconds=300, stop=None):
     """One repo's worst condition, for the pill. ``states`` is the list of that repo's flights'
     primary states (from ``flight_stage``); ``spinning`` is whether any flight is spinning;
     ``merges_frozen`` / ``alert`` are the repo's freeze/ALERT facts (``None`` ⇒ absent);
-    ``heartbeat_age`` is the runner-heartbeat age (``None`` ⇒ never written). Returns ``{slug, level,
-    state, rank}`` naming the single worst condition — ``ok`` when nothing is wrong. A stale OR
-    absent heartbeat is ``runner-down`` (a dead-man's switch can't fail open)."""
+    ``heartbeat_age`` is the runner-heartbeat age (``None`` ⇒ never written); ``stop`` is
+    :func:`stop_state`'s verdict (``None`` ⇒ no stop recorded). Returns ``{slug, level, state,
+    rank}`` naming the single worst condition — ``ok`` when nothing is wrong. A stale OR absent
+    heartbeat is ``runner-down`` (a dead-man's switch can't fail open) — UNLESS the owner
+    deliberately stopped the loop, which is the one case where a missing runner is not an outage.
+
+    That substitution is the whole of issue #365's board half, and its direction matters: the stop
+    condition REPLACES ``runner-down`` rather than sitting beside it, so the grey RUNNER DOWN
+    takeover and the dead-man's-switch push both stand down for a stop the owner asked for — the
+    3am text about an outage they created on purpose. It can only ever fire alongside a positive
+    "no live runner" read (see :func:`stop_state`), so a stop that did NOT take never silences
+    anything."""
     conditions = []
-    if heartbeat_age is None or heartbeat_age > heartbeat_down_seconds:
+    stop_condition = (stop or {}).get("condition")
+    if stop_condition:
+        conditions.append(stop_condition)
+    elif heartbeat_age is None or heartbeat_age > heartbeat_down_seconds:
         conditions.append("runner-down")
     if alert is not None:
         conditions.append("alert")

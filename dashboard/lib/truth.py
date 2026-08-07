@@ -50,6 +50,8 @@ LEVEL_DOWN = "down"
 # honest — the dashboard watches the runner, it does not command it, and a stale heartbeat is strong
 # evidence of a dead loop, never proof of one.
 _MAY_BE_DOWN = "loop may be down"
+# The same silence, with its reason known (issue #365). Not an alarm and not a shrug: a statement.
+_STOPPED_BY_OWNER = "stopped by owner"
 
 # What an age reads as when there is no honest number. Never "0s ago", which would claim the
 # freshest possible data at the exact moment we have none.
@@ -78,12 +80,25 @@ def _age(src, key):
     return txt if isinstance(txt, str) and txt else _UNKNOWN_AGE
 
 
-def _tick_line(src):
+def _tick_line(src, stopped=None):
     """Is the loop alive? The runner's last tick, and the named conclusion when it is stale.
 
     The staleness DECISION is the server's, taken from ``source_mode``'s reason — never re-derived
     here against a second threshold that could disagree with the board's.
+
+    ``stopped`` is that repo's ``flights.stop_state`` verdict (issue #365), and it changes only the
+    CONCLUSION, never the age: a silent runner the owner deliberately stopped is still silent, and
+    the strip still says when it last ticked. What it must not do is call it "may be down". That
+    sentence is the crash reading, in alarm red, three inches under a banner saying STOPPED BY
+    OWNER — one screen contradicting itself about the same fact, which is the exact failure this
+    module exists to prevent, arriving through the one condition it did not know about. (Found by
+    driving a browser, not by a test: the two clauses only contradict out loud.)
+
+    A stop that did NOT take is deliberately left alone: the runner is ticking, so the strip's
+    ordinary healthy reading is the true one, and the contradiction is named by the banner and the
+    pill rather than by muffling this.
     """
+    off = isinstance(stopped, dict) and stopped.get("state") in ("off", "stopping")
     tick_age = src.get("tick_age")
     numeric = isinstance(tick_age, (int, float)) and not isinstance(tick_age, bool)
 
@@ -91,11 +106,16 @@ def _tick_line(src):
     # This also catches every degraded input (no source verdict, a junk dict): unknown resolves to
     # the honest alarm, never to a calm silence.
     if not numeric:
+        if off:
+            return {"state": "stopped", "text": "no tick seen — %s" % _STOPPED_BY_OWNER}
         return {"state": "down", "text": "no tick seen — %s" % _MAY_BE_DOWN}
 
     # A runner that is TICKING but publishes no view (an engine older than #146) is not down, and
     # must never be called down: that would send the owner to debug a runner that is fine.
     if src.get("reason") == flights.FALLBACK_RUNNER_SILENT:
+        if off:
+            return {"state": "stopped",
+                    "text": "last tick %s — %s" % (_age(src, "tick"), _STOPPED_BY_OWNER)}
         return {"state": "down", "text": "last tick %s — %s" % (_age(src, "tick"), _MAY_BE_DOWN)}
     return {"state": "ok", "text": "last tick %s" % _age(src, "tick")}
 
@@ -162,12 +182,14 @@ def _engine_line(eng):
             "remedy": eng.get("remedy")}
 
 
-def banner(source, engine=None, github=None):
+def banner(source, engine=None, github=None, stopped=None):
     """The standing truth strip for one repo's field.
 
     ``source``  that repo's ``flights.source_mode`` verdict (the snapshot's ``repo.source``).
     ``engine``  the global ``lib.engine.EngineDrift`` state (the snapshot's ``engine``), or ``None``.
     ``github``  that repo's ``repo.github`` facts — read only for its ``unreachable`` flag.
+    ``stopped`` that repo's ``flights.stop_state`` verdict (the snapshot's ``repo.stopped``), or
+                ``None`` — it turns the tick line's conclusion from an alarm into a statement.
 
     Returns ``{level, tick, data, engine}``. ``level`` is the worst of the lines, so one glance at
     the strip's colour is a true summary of everything under it. Never raises: it is built on the
@@ -175,13 +197,19 @@ def banner(source, engine=None, github=None):
     actually came for.
     """
     src = source if isinstance(source, dict) else {}
-    tick = _tick_line(src)
+    tick = _tick_line(src, stopped)
     data = _data_line(src, github)
     eng = _engine_line(engine)
 
     level = LEVEL_OK
     if tick["state"] == "down":
         level = LEVEL_DOWN                # a dead loop is the headline; everything else can wait
+    elif tick["state"] == "stopped":
+        # A loop the owner switched off is a thing to KNOW, not an alarm (§0.2 — no nagging about a
+        # deliberate state). Deliberately reusing NOTICE rather than minting a level: an unknown
+        # level paints the CALM strip in the browser (see _level), so a new one is a false all-clear
+        # waiting on a CSS rule that has not been written yet.
+        level = LEVEL_NOTICE
     # `unvouched` is a NOTICE, not an alarm: nothing is broken — the loop is holding its blocked-by
     # issues correctly and journalling why (#172). It is a thing the owner should KNOW, because the
     # visible symptom is his queue standing still, and a strip that stayed green through it would be

@@ -206,6 +206,16 @@
     app.classList.toggle("runner-down", !!(s && s.runner && s.runner.down));
     var banner = el("runner-banner");
     if (banner) banner.hidden = !(s && s.runner && s.runner.down);
+    // The deliberate stop (issue #365). Its own class and its own banner, so the surface goes
+    // quiet-on-purpose rather than raising the RUNNER DOWN emergency over a decision the owner made.
+    var isStopped = !!(s && s.runner && s.runner.stopped);
+    app.classList.toggle("stopped", isStopped);
+    var stopBanner = el("stopped-banner");
+    if (stopBanner) stopBanner.hidden = !isStopped;
+    var stopT = el("stopped-banner-t");
+    if (stopT) stopT.textContent = (s && s.runner && s.runner.stopped_headline) || "";
+    var stopSub = el("stopped-banner-sub");
+    if (stopSub) stopSub.textContent = (s && s.runner && s.runner.stopped_message) || "";
     var conn = el("conn-warn");
     if (conn) conn.hidden = state.connOk;
     // The stale-tower NOTAM (issue #136) — the server's own decision, bound here because this is the
@@ -222,6 +232,15 @@
       '<div class="runner-banner" id="runner-banner" hidden>' +
         '<span class="dot"></span><span class="t">RUNNER DOWN</span>' +
         '<span class="sub">' + esc((s.runner && s.runner.message) || "") + '</span></div>' +
+      // The off switch's own banner (issue #365) — deliberately NOT the RUNNER DOWN one. They are
+      // bound to different snapshot facts and can never both show: `runner.down` is already false
+      // for a deliberate stop (the substitution happens in the flight model), so a stop the owner
+      // asked for never raises the red emergency. Both the headline and the sentence come from the
+      // server, so the three states — STOPPED BY OWNER, STOPPING, STOP NOT TAKEN — are worded once,
+      // in tested Python, and this file carries no duration math and no verdict of its own.
+      '<div class="stopped-banner" id="stopped-banner" hidden>' +
+        '<span class="dot"></span><span class="t" id="stopped-banner-t"></span>' +
+        '<span class="sub" id="stopped-banner-sub"></span></div>' +
       '<div class="shell">' +
         topbarHTML(s, r) +
         troubleHTML(s) +
@@ -291,6 +310,15 @@
       '<button class="restart-btn" data-act="restart-open" data-repo="' + esc(r ? r.slug : "") + '"' +
         (r ? "" : " disabled") +
         ' title="Restart the loop — asks the running runner to restart itself (runs superlooper request-restart locally; no GitHub)">\u{1F504} Restart</button>' +
+      // The Stop/Start control (issue #365) — the owner's deliberate off switch, and the way back
+      // on. One control, two directions: it is Stop while the loop runs and Start once a stop is
+      // recorded, because the off switch and the way back are the same switch — and because a stop
+      // button with no visible resume strands a non-terminal owner (the DoD's own line). BOTH
+      // directions are confirm-gated in the dialog, which is what makes a label that can flip under
+      // a 2-second poll safe: whatever the button said, the dialog names the verb again.
+      // The direction is the SERVER's fact (`repo.stopped.present`) — nothing here derives it.
+      // Carries the camera repo, like Tidy/Restart/Sweep/Flag, so a tap targets the repo on screen.
+      stopBtnHTML(r) +
       // The Janitor button (issue #121) — an ops-verb button: clears GitHub-side debris
       // (stale merged/superseded loop branches, superseded PRs, aged parked issues) and reopens
       // issues closed by a bare commit keyword (issue #229) by running `superlooper janitor`
@@ -305,6 +333,25 @@
     '</div>';
   }
 
+  // The Stop/Start control's markup (issue #365). Split out of the topbar template because it is
+  // the only button up there whose IDENTITY comes from the snapshot rather than being fixed: the
+  // server's `repo.stopped.present` decides which verb this is, so the surface can never offer to
+  // stop a loop that is already stopped (or to start one that is running) — and the JS derives
+  // nothing about the loop's state (design B.1).
+  function stopBtnHTML(r) {
+    var stopped = !!(r && r.stopped && r.stopped.present);
+    var mode = stopped ? "start" : "stop";
+    var label = stopped ? "▶ Start" : "⏹ Stop";
+    var title = stopped
+      ? "Start the loop — withdraws the recorded stop and starts the runner again (runs " +
+        "superlooper start locally; no GitHub)"
+      : "Stop the loop — the deliberate off switch: records the stop so the watchdog stands down, " +
+        "then takes the runner down (runs superlooper stop locally; no GitHub)";
+    return '<button class="stop-btn' + (stopped ? " is-start" : "") + '" data-act="stop-open"' +
+      ' data-repo="' + esc(r ? r.slug : "") + '" data-mode="' + mode + '"' +
+      (r ? "" : " disabled") + ' title="' + esc(title) + '">' + label + '</button>';
+  }
+
   // The trouble banner — and, since issue #141, the Deploy Fixer button. This is the ONE surface
   // that renders for every condition a fixer answers (runner down, ALERT, parks, frozen/stranded/
   // spinning flights, paused landings) and it is camera-independent (§4/§5), so an off-screen
@@ -316,7 +363,10 @@
     var cls = t.level === "alert" ? "trouble alert" : "trouble";
     // The button targets t.offender — the SERVER's slug for the repo the banner is naming — never
     // the currently-viewed repo, so the fixer always lands on the patient being reported.
-    var fix = t.offender
+    // `fixable` is the SERVER's call (issue #365): a deliberately stopped loop is named here but has
+    // no patient to deploy a debugger at. Absent on an older snapshot ⇒ treated as fixable, which is
+    // the pre-#365 behaviour for every condition that existed then.
+    var fix = (t.offender && t.fixable !== false)
       ? '<button class="trouble-fix" data-act="fixer-open" data-repo="' + esc(t.offender) + '"' +
           ' title="Deploy a fixer — launches one interactive sl-debugger session in its own' +
           ' session window, pointed at this trouble (no AI runs in this dashboard)">\u{1F527} Deploy Fixer</button>'
@@ -509,6 +559,10 @@
     if (act === "flag-open") { openFlagBox(repo); return; }
     if (act === "tidy-open") { if (window.CCTidy) window.CCTidy.open(repo); return; }
     if (act === "restart-open") { if (window.CCRestart) window.CCRestart.open(repo); return; }
+    if (act === "stop-open") {
+      if (window.CCStop) window.CCStop.open(repo, el.getAttribute("data-mode"));
+      return;
+    }
     if (act === "janitor-open") { if (window.CCJanitor) window.CCJanitor.open(repo); return; }
     if (act === "fixer-open") { if (window.CCFixer) window.CCFixer.open(repo); return; }
     if (act === "replay-open") { if (window.CCReplay) window.CCReplay.open(repo, state.snapshot && state.snapshot.fun); return; }

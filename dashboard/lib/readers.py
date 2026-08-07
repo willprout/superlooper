@@ -63,6 +63,30 @@ def _read_json_existence(path):
     return v if isinstance(v, dict) else {}
 
 
+def _read_stop_marker(path):
+    """The deliberate-stop marker (issue #239/#365), read the way the ENGINE reads it: ``None`` only
+    when the file is genuinely ABSENT, ``{}`` for present-but-unreadable in any way — corrupt JSON, a
+    non-dict body, a directory in its place, a permission-denied read.
+
+    Why this can't be ``_read_json_existence``: that reader maps a MISSING file and an UNOPENABLE one
+    to the same ``None``, which is right for ALERT and merges_frozen (absent and unreadable both mean
+    "not frozen") and exactly wrong here. For this file the two are opposite answers, and the wrong
+    one is the dangerous one: every reader of the marker treats absent as permission to restart the
+    loop, so an unreadable marker read as absent puts the board back to RUNNER DOWN and fires the
+    push over a stop the owner deliberately made — this issue's own defect, arriving through a
+    permission bit. The engine's ``runner.read_stop_marker`` draws the line with the same
+    ``os.path.exists`` check, and this mirrors it. (Found by a fresh reviewer.)
+    """
+    txt = _read(path)
+    if txt is None:
+        return {} if os.path.exists(path) else None
+    try:
+        v = json.loads(txt)
+    except _JSON_ERRORS:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def _read_state_format(path):
     """The engine's state-home format stamp (issue #45), with the fail direction the HANDSHAKE needs:
     ``None`` ONLY when truly ABSENT (a pre-handshake home ⇒ the flight model grandfathers it), and
@@ -223,6 +247,61 @@ def _report_ids(reports_dir):
 
 # --------------------------- heartbeat ---------------------------
 
+def _pid_alive(pid):
+    """Does ``pid`` name a live process? A PROBE, never a raise — it runs on the 2-second poll.
+
+    ``os.kill(pid, 0)`` sends no signal; signal 0 is the existence check, and it is the same one the
+    engine's ``runner._pid_alive`` uses. ``PermissionError`` means the process EXISTS and belongs to
+    someone else, which is still alive. Non-positive pids are refused outright: ``kill(0, …)`` and
+    ``kill(-n, …)`` address process GROUPS, so a junk pidfile must never be turned into a signal at
+    a group — even a signal that does nothing.
+
+    The catch list mirrors the engine's ``runner._probe_pid`` deliberately, and ``OverflowError`` is
+    the reason it has to: a pid too large for a C int raises it, and it is NOT an ``OSError``, so
+    catching only ``OSError`` lets a ``runner.lock`` holding an absurd number escape this reader and
+    500 the 2-second snapshot poll — blanking the whole board, every repo, over one junk file. Only
+    a definite "alive" counts as alive; everything a probe cannot answer reads False, exactly as the
+    engine's own bool face does. (Found by a fresh reviewer, who ran the probe rather than assuming.)
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (ValueError, TypeError, OverflowError, OSError):
+        return False
+    return True
+
+
+def _runner_live(state_dir):
+    """Is a runner actually RUNNING for this state home? The mirror of the engine's
+    ``runner.live_runner_pid``: its ``runner.lock`` pid, confirmed alive.
+
+    This exists because the heartbeat cannot answer it. The heartbeat says when the runner last
+    FINISHED A TICK, which is a freshness signal on a five-minute threshold — useful for "has the
+    loop gone quiet?", useless for "is the process there right now?". The difference is the whole
+    of issue #365's honesty: `superlooper stop` lets the runner finish its tick, so a SUCCESSFUL
+    stop routinely stamps a heartbeat AFTER the stop marker and then exits, and a heartbeat-only
+    read would call that a stop that did not take — for the five minutes it takes the heartbeat to
+    go stale, after every single stop.
+
+    A missing pidfile, an unparseable one, and a dead pid all read ``False``: that is the engine's
+    own reading, and the direction is load-bearing — this ``False`` is the positive "nothing is
+    running" observation that lets a stop marker mean the loop is off.
+    """
+    txt = _read(os.path.join(state_dir, "runner.lock"))
+    if txt is None:
+        return False
+    try:
+        pid = int(txt.strip())
+    except (TypeError, ValueError):
+        return False
+    return _pid_alive(pid)
+
+
 def _heartbeat(state_dir, now):
     """``(epoch, age)`` from ``state/runner.heartbeat`` (the runner writes ``str(int(now))`` each
     tick). Missing or unparseable ⇒ ``(None, None)`` — the flight model reads a ``None`` age as
@@ -254,6 +333,11 @@ def read_state_home(home, now=None):
       ``heartbeat_epoch``/``heartbeat_age``  runner tick epoch and its age (``None`` if absent)
       ``merges_frozen``  ``state/merges_frozen.json`` (``None`` absent; ``{}`` corrupt ⇒ frozen)
       ``alert``          ``state/ALERT`` (``None`` absent; ``{}`` corrupt ⇒ alerting)
+      ``stopped``        ``state/runner.stopped`` — the deliberate-stop marker (issue #239/#365).
+                         ``None`` absent; ``{}`` present-but-unparseable ⇒ STILL a stop; else the
+                         record (``stopped_at``, ``operator``, ``source``, ``home``, ``pid``)
+      ``runner_live``    is a runner PROCESS alive for this home (``state/runner.lock``'s pid,
+                         confirmed) — the engine's own liveness rule, not the heartbeat's freshness
       ``reports``        sorted issue ids with a per-issue report (morning digest excluded)
       ``session_windows`` the set of lane ids with a recorded session window (``state/panes/<id>``
                          — the engine's own marker, written at launch and removed when the window
@@ -284,6 +368,17 @@ def read_state_home(home, now=None):
         "heartbeat_age": age,
         "merges_frozen": _read_json_existence(os.path.join(state, "merges_frozen.json")),
         "alert": _read_json_existence(os.path.join(state, "ALERT")),
+        # The deliberate-stop marker `superlooper stop` writes (issues #239/#365) — the fact that
+        # tells a stop apart from a crash. Existence is the signal, in the engine's own strict sense
+        # (see _read_stop_marker): every reader of this file treats absent as permission to restart
+        # the loop, so a marker lost to a truncated write — or to a permission bit — would hand the
+        # runner back to the guardians the owner just overruled. The flight model decides whether
+        # the stop actually TOOK (lib/flights.stop_state); this stays raw.
+        "stopped": _read_stop_marker(os.path.join(state, "runner.stopped")),
+        # Is a runner PROCESS live right now (state/runner.lock, pid confirmed alive)? The engine's
+        # own liveness rule, mirrored — and the fact that decides whether a recorded stop actually
+        # TOOK. The heartbeat answers a different question on a five-minute clock; see _runner_live.
+        "runner_live": _runner_live(state),
         "reports": _report_ids(os.path.join(home, "reports")),
         # The lane ids with a recorded session window (state/panes/<id>) — the Open-session-window
         # button's gate, and the same marker `superlooper tidy` selects on (issue #340).
