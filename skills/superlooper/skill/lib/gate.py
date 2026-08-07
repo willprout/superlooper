@@ -100,16 +100,31 @@ def pinned_review_marker(sha=REVIEW_PIN_PLACEHOLDER):
 # makes that safe: anything this accepts that GitHub does not honor is closed after the merge anyway.
 _CLOSES_RE = re.compile(
     r"\b(?:clos(?:e|es|ed)|fix(?:es|ed)?|resolve[sd]?)\b"
-    # separator: spaces and/or a colon, but never a NEWLINE. GitHub wants the keyword and its
+    # separator: spaces, tabs and/or a colon, but never a NEWLINE. GitHub wants the keyword and its
     # reference together, and allowing `\s` would read "...this does not fix\n#7 tracks it" as a
     # closing keyword for #7 — a false ACCEPT on the one predicate this exists to decide.
-    r"[ \t]*:?[ \t]*"
-    # the reference: bare `#7`, the `GH-7` shorthand, or a full issue URL (any host — an enterprise
-    # GitHub is not github.com, and the number is the only part that identifies the issue).
-    # `owner/repo#7` is deliberately NOT recognized: it is a real GitHub form, but a CROSS-repo one
-    # closes someone else's #7, and this module cannot tell the two apart without knowing the repo.
-    # Missing it costs a nudge that names the working form; accepting it could vouch for nothing.
-    r"(?:\#|GH-|https?://\S+/issues/)(\d+)(?!\d)",
+    #
+    # ONE character class, one star — deliberately not the natural `[ \t]*:?[ \t]*`. Two adjacent
+    # stars around an optional are ambiguous, and the engine tries every split of a run of spaces
+    # that is not followed by a reference: measured QUADRATIC (20k spaces after the word `closes`
+    # took 2.6s; 1M would take hours). A PR body is worker-authored text on the tick path, and a
+    # gate that can be made to spin is a wedge, not a refusal.
+    r"[ \t:]*"
+    # The reference: bare `#7` or the `GH-7` shorthand — the two forms that can only ever mean an
+    # issue in THIS repo.
+    #
+    # The two REPO-QUALIFIED spellings GitHub also honors, `owner/repo#7` and a full issue URL, are
+    # deliberately absent. Both can name another repository, where they close someone ELSE's #7 and
+    # this repo's #7 stays open — and a pure function that is handed a body and a number cannot tell
+    # the two apart. Accepting them would be a false ACCEPT on exactly the proposition this exists to
+    # decide: the gate would vouch for a closure that will not happen. Missing them costs a nudge
+    # that names the working form, which the worker can satisfy with one `gh pr edit`.
+    #
+    # BOUNDED digits, not `\d+`. Python 3.11+ raises ValueError on int() of a >4300-digit string,
+    # so `Closes #<5000 digits>` in a PR body would raise straight out of a module contracted never
+    # to raise into the tick — the gate's own fail-closed promise, broken by worker-authored text.
+    # No issue number is 10 digits; with the lookahead, a longer run simply does not match at all.
+    r"(?:\#|GH-)(\d{1,9})(?!\d)",
     re.IGNORECASE)
 
 # What the brief teaches and the nudge names. ONE source of truth for the string, exactly like

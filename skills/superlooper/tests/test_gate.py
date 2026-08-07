@@ -362,14 +362,24 @@ def test_closes_issue_accepts_every_github_keyword():
 
 
 def test_closes_issue_accepts_the_forms_github_honors():
-    # colon, an issue URL, and the GH- shorthand are all GitHub-honored references
+    # colon and the GH- shorthand are both GitHub-honored references to THIS repo's issue
     assert gate.closes_issue("Closes: #404", 404) is True
     assert gate.closes_issue("Fixes GH-404", 404) is True
-    assert gate.closes_issue("Resolves https://github.com/willprout/superlooper/issues/404",
-                             404) is True
     # ...and it is found anywhere in a multi-line body, not only on the first line
     assert gate.closes_issue("## Summary\nsomething\n\nCloses #404\n\n## Tests\nall green",
                              404) is True
+
+
+def test_closes_issue_refuses_every_repo_qualified_reference():
+    """`owner/repo#404` and a full issue URL are real GitHub closing references — and both can name
+    ANOTHER repository, where they close someone else's #404 while ours stays open. A pure function
+    handed a body and a number cannot tell the two apart, so accepting either would be a false
+    ACCEPT on the one proposition this exists to decide: the gate would vouch for a closure that
+    never happens. Refusing costs a nudge naming the form that works."""
+    for body in ("Closes willprout/superlooper#404",
+                 "Closes https://github.com/willprout/superlooper/issues/404",
+                 "Fixes https://github.com/SOMEONE-ELSE/other-repo/issues/404"):
+        assert gate.closes_issue(body, 404) is False, body
 
 
 def test_closes_issue_rejects_a_bare_reference_or_the_wrong_issue():
@@ -410,6 +420,32 @@ def test_closes_issue_fails_closed_on_wrong_typed_input():
         assert gate.closes_issue("Closes #404", num) is False, num
 
 
+def test_a_pathological_pr_body_cannot_make_the_gate_spin():
+    """A PR body is worker-authored text judged on the tick path, so this predicate must be LINEAR
+    in it. The natural `[ \\t]*:?[ \\t]*` separator is two ambiguous stars: the engine tries every
+    split of a run of spaces that is not followed by a reference, which measured quadratic (20k
+    spaces after `closes` took 2.6s; 1M would take hours). A gate that can be made to spin is a
+    wedge, not a refusal — and this test fails loudly rather than slowly."""
+    import time
+    body = "closes" + " " * 400_000 + "\nPart of #404"
+    start = time.time()
+    assert gate.closes_issue(body, 404) is False
+    assert time.time() - start < 2.0, "the closing-keyword scan is superlinear in the PR body"
+
+
+def test_a_pathological_issue_number_never_raises_into_the_tick():
+    """The gate's never-raise contract, against text a WORKER authors. Python 3.11+ raises
+    ValueError converting a >4300-digit string to int, so an unbounded `\\d+` here would let
+    `Closes #<5000 digits>` in a PR body blow up the whole tick from inside a pure function."""
+    assert gate.closes_issue("Closes #" + "9" * 5000, 404) is False
+    # a 9-digit number is still an ordinary reference; only longer runs stop matching
+    assert gate.closes_issue("Closes #999999999", 999999999) is True
+    assert gate.closes_issue("Closes #1234567890", 1234567890) is False
+    # ...and the decision path swallows nothing by accident: it lands on the ordinary ladder
+    d = _decide(pr=_pr(body="Closes #" + "9" * 5000))
+    assert d["action"] == "nudge" and d["nudge_key"] == "closes"
+
+
 def test_closing_keyword_line_is_the_one_source_of_truth():
     # the brief teaches it, the nudge names it, the gate parses it — all from here, so what the
     # worker is told to write cannot drift from what the gate accepts
@@ -429,6 +465,20 @@ def test_gate_missing_closing_keyword_nudges_once_then_parks():   # step 2c
     assert d2["action"] == "wait"
     d3 = _decide(issue=_issue(nudged=["closes"], nudge_expired=["closes"]), pr=_pr(body=body))
     assert d3["action"] == "park"
+
+
+def test_a_ship_pipeline_repo_is_held_to_the_keyword_too():
+    """There is NO ship_cmd exemption, and that is the point: a repo whose pipeline opens PRs
+    without the keyword was already leaking open issues, which is the incident. But it means the
+    brief must not tell a worker the pipeline handles it — it says VERIFY, and this pins that the
+    gate really does judge a ship_cmd repo's body (step 2b is skipped there; 2c is not)."""
+    ship = _cfg(ship_cmd="scripts/ship.sh")
+    d = _decide(pr=_pr(body="Shipped via scripts/ship.sh", comments=[]), cfg=ship)
+    assert d["action"] == "nudge" and d["nudge_key"] == "closes"
+    assert "Closes #7" in d["reason"]
+    # ...and the same PR merges once the line is there, with no review comment needed (ship path)
+    assert _decide(pr=_pr(body="Shipped via scripts/ship.sh\n\nCloses #7", comments=[]),
+                   cfg=ship)["action"] == "merge"
 
 
 def test_gate_closing_keyword_for_another_issue_never_merges():

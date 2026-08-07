@@ -4078,7 +4078,20 @@ def test_merged_pr_state_is_absorbed_not_wedged():
     d, g = _gating(pv=pr_view(state="MERGED"))
     out = decide(dsk=d, gh_view=g)
     assert only(out, "merge") == [] and only(out, "park") == []
-    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
+    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}]
+
+
+def test_absorb_merged_carries_the_pr_the_poll_actually_read():
+    """(#404) The executor's closure verify NAMES the merged PR in the comment it leaves on a
+    still-open issue, and on the absorb path that audit trail is the whole product. Pinned HERE, at
+    the emit, because an executor test that hands itself a `pr` key decide never produces proves
+    nothing — which is exactly how "PR #None merged" survived the first round of tests."""
+    d, g = _gating(pv=pr_view(state="MERGED", num=909))
+    assert only(decide(dsk=d, gh_view=g), "absorb_merged")[0]["pr"] == 909
+    # ...and an unreadable number rides through as None rather than being invented: the executor
+    # says "its pull request" instead of printing a number nobody read.
+    d, g = _gating(pv=dict(pr_view(state="MERGED"), number=555))
+    assert "pr" in only(decide(dsk=d, gh_view=g), "absorb_merged")[0]
 
 
 # =============== in-flight branch->PR reconcile (issue #155) ===============
@@ -4102,7 +4115,7 @@ def test_inflight_lane_absorbs_an_out_of_band_merge():
     # A MERGED PR on this lane's active branch is the truth — settle it and free the lane.
     d, g = _inflight(pv=pr_view(state="MERGED"), pr=555)
     out = decide(dsk=d, gh_view=g)
-    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
+    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}]
     assert only(out, "park") == []
 
 
@@ -4114,7 +4127,7 @@ def test_an_out_of_band_merge_absorbs_even_if_the_lane_never_saw_the_pr_open():
     # rather than stall, which is the whole point of i328.
     d, g = _inflight(pv=pr_view(state="MERGED"), pr=None)
     out = decide(dsk=d, gh_view=g)
-    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
+    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}]
     assert only(out, "park") == []
 
 
@@ -4209,7 +4222,7 @@ def test_absorbed_merge_wins_over_the_question_lifecycle():
     d, g = _inflight(pv=pr_view(state="MERGED"), status="running", pr=555)
     d["blocked"] = {"i5": "which approach should I take?"}
     out = decide(dsk=d, gh_view=g)
-    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5}]
+    assert only(out, "absorb_merged") == [{"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}]
     assert only(out, "post_question") == []
 
 

@@ -3160,13 +3160,15 @@ def cmd_janitor(args):
     props, held = result["proposals"], result["refused"]
     bulk, menus = _janitor_split_menus(props)
     withheld = result.get("reopen_withheld") or 0
+    mo_withheld = result.get("merged_open_withheld") or 0
 
     if getattr(args, "json", False):
         # machine-readable propose: the full snapshot, one JSON object, and NOTHING is executed
         # or written. The command center renders this exactly the way `--dry-run` prints for a
         # human — same pure propose(), no re-derived safety anywhere.
         print(json.dumps({"ok": True, "proposals": props, "held": held,
-                          "aged_park_days": days, "reopen_withheld": withheld}))
+                          "aged_park_days": days, "reopen_withheld": withheld,
+                          "merged_open_withheld": mo_withheld}))
         return 0
 
     held_note = (f"({len(held)} previously refused action(s) held back — --retry-refused "
@@ -3177,11 +3179,18 @@ def cmd_janitor(args):
                      f"sweep — at most {janitor_lib.REOPEN_SWEEP_CAP} reopens per sweep; "
                      f"`superlooper doctor` lists them all and a later sweep proposes the rest)"
                      if withheld else "")
+    # Same discipline for the merged-PR/open-issue closes (issue #404). This cap is likelier to bite
+    # than the reopen one: a repo whose dev_branch is not its DEFAULT branch never had a closing
+    # keyword honoured at all, so its very first sweep finds one pair per merged issue.
+    mo_note = (f"({mo_withheld} more merged-PR/still-open issue(s) were found and NOT proposed this "
+               f"sweep — at most {janitor_lib.MERGED_OPEN_SWEEP_CAP} closes per sweep; later sweeps "
+               "propose the rest)" if mo_withheld else "")
 
     if not props:
         print("janitor: nothing to propose — no GitHub-side debris found."
               + (" " + held_note if held_note else "")
-              + (" " + withheld_note if withheld_note else ""))
+              + (" " + withheld_note if withheld_note else "")
+              + (" " + mo_note if mo_note else ""))
         return 0
 
     print(f"janitor proposals ({len(props)}) — nothing executes without your approval:")
@@ -3196,6 +3205,8 @@ def cmd_janitor(args):
         print(held_note)
     if withheld_note:
         print(withheld_note)
+    if mo_note:
+        print(mo_note)
     if args.dry_run:
         print("dry-run: nothing executed, nothing written.")
         return 0

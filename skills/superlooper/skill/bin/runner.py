@@ -4169,6 +4169,12 @@ class Runner:
         """
         try:
             if type(num) is not int or num <= 0:
+                # unreachable in both callers (the gate parks an unreadable number before it can
+                # merge; absorb's own set_labels fails first) — but it must still leave a RECORD.
+                # A silent return would be the one exit of this function nothing can audit.
+                journal.append(self.home, {"act": "post_merge_close", "id": iid, "num": num,
+                                           "pr": pr, "outcome": "unverified",
+                                           "error": "issue number unreadable"}, now)
                 return
             state = gh.issue_is_open(num)
             if state is False:
@@ -4176,8 +4182,13 @@ class Runner:
             if state is None:
                 outcome = "unverified"       # refused read — never "closed", never a close
             else:
+                # Name the merged PR when we have it, and say plainly that we do not when we don't.
+                # `absorb_merged` can reach here with an unreadable number (a poll that answered
+                # without one), and "PR #None merged" on the one path whose whole product is the
+                # audit trail would be worse than the honest sentence.
+                which = f"PR #{pr}" if type(pr) is int and pr > 0 else "its pull request"
                 closed = gh.close_issue(
-                    num, comment=f"PR #{pr} merged but this issue was still open — closed by "
+                    num, comment=f"{which} merged but this issue was still open — closed by "
                                  "superlooper's post-merge closure verify. GitHub's closing keyword "
                                  "did not close it (it fires only for merges into the repository's "
                                  "DEFAULT branch), so nothing else would have.")

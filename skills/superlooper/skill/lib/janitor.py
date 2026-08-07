@@ -72,8 +72,12 @@ BRANCH_PREFIX = "sl/"
 SUPERSEDED_LABEL = "superseded"
 PARK_LABELS = ("parked", "needs-owner", "needs-william")
 # How many accidental-close REOPENs one sweep may propose (issue #229). See the class's own comment
-# in propose() for why this class alone is capped; the remainder is reported, never dropped silently.
+# in propose() for why this class is capped; the remainder is reported, never dropped silently.
 REOPEN_SWEEP_CAP = 10
+# ...and the same bound on merged-PR/open-issue CLOSEs (issue #404), for the same reason: both are
+# classes whose population can be large all at once through no fault of the owner, and both execute
+# from a blanket `--yes`. See the class's comment in propose().
+MERGED_OPEN_SWEEP_CAP = 10
 
 _BRANCH_NUM_RE = re.compile(r"^sl/i(\d+)(?:-|$)")
 _ISO_Z = "%Y-%m-%dT%H:%M:%SZ"
@@ -281,7 +285,8 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
     if not isinstance(ls_issues, dict):
         # the exclusion source is unreadable: nothing is provably idle, so the whole sweep
         # fails closed — no proposals at all, whatever the candidates' own evidence says.
-        return {"proposals": [], "refused": [], "reopen_withheld": 0}
+        return {"proposals": [], "refused": [], "reopen_withheld": 0,
+                "merged_open_withheld": 0}
     ex_nums, ex_branches = _exclusions(ls_issues)
     refused = refused if isinstance(refused, (set, frozenset)) else frozenset()
     # A wrong-typed threshold must NOT coerce to the most aggressive setting (0d — propose
@@ -454,8 +459,23 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
     # contradiction the janitor can settle — the work DID land, and why it was reopened is exactly
     # the judgment only the owner has. It stays a PROPOSAL, and the `why` names the merged PR so he
     # can tell the two apart at a glance.
+    # And it is CAPPED, for the reason the reopen class above is. The population of this class can
+    # be LARGE all at once through no fault of the owner, and the headline case is exactly that:
+    # GitHub honors closing keywords only for merges into the DEFAULT branch, so a repo whose
+    # `dev_branch` is not the default has never had a single issue closed by a keyword — every
+    # merged issue is a pair. `--yes` is a blanket approval, and one that fires hundreds of closes
+    # (each a comment, each a notification, with no one command to undo) is the harm
+    # REOPEN_SWEEP_CAP exists for, pointed the other way. The remainder is REPORTED
+    # (`merged_open_withheld`), never dropped silently, and later sweeps propose the rest.
+    #
+    # Bounded by issue number rather than by a date, unlike the reopen cap: nothing in this class's
+    # inputs carries when the merge happened (sl_head_prs answers number/state/head only), and
+    # inventing a recency order out of the issue number is the substitution that cap had to drop.
+    # Lowest-numbered first is at least stable and explains itself: the oldest debris goes first.
     merged_by_issue = _merged_pr_by_issue(sl_prs)
+    merged_open_withheld = 0
     if merged_by_issue:
+        candidates = []
         for i in sorted((i for i in (lint_issues if isinstance(lint_issues, list) else [])
                          if isinstance(i, dict)),
                         key=lambda i: (_pr_int(i.get("number")) is None,
@@ -466,8 +486,25 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
             pr = merged_by_issue.get(num)
             if pr is None:
                 continue
-            if {"in-progress", "agent-ready"} & _label_names(i.get("labels")):
+            # The owner's own word, in either direction, takes this issue out of the class.
+            # `agent-ready` means he reopened and re-approved the work; `in-progress` means a lane
+            # holds it; a PARK label means he has it in his attention queue and closing it would
+            # answer a question he is still holding. None of the three can silently swallow the
+            # class: the normal launch/merge path removes the first two, and the third is never
+            # applied to a lane that merged (park and merge are different terminal paths).
+            if ({"in-progress", "agent-ready"} | set(PARK_LABELS)) & _label_names(i.get("labels")):
                 continue
+            candidates.append((num, pr, i))
+        cap = max(1, MERGED_OPEN_SWEEP_CAP)      # a 0 cap would invert the slice to "propose all"
+        # The cap bounds ACTIONS, so previously-refused keys keep their report without occupying a
+        # slot — the same split the reopen class makes, and for the same reason: a handful of stuck
+        # keys must not starve the class forever.
+        stale = [c for c in candidates if f"closemerged:{c[0]}" in refused]
+        fresh = [c for c in candidates if f"closemerged:{c[0]}" not in refused]
+        merged_open_withheld = len(fresh) - cap if len(fresh) > cap else 0
+        # sort by the NUMBER only — the tuples carry a raw gh dict, and a key-less sort would
+        # compare dicts on a tie and raise inside a module that must never raise.
+        for num, pr, i in sorted(stale + fresh[:cap], key=lambda c: c[0]):
             seen_issues.add(num)                 # one close per issue, whichever justified it
             emit({"kind": "issue-merged-open", "key": f"closemerged:{num}",
                   "action": "close-issue", "target": num,
@@ -487,7 +524,8 @@ def propose(*, branches, branch_prs, superseded_prs, parked_issues, ls_issues,
         emit(p)
 
     return {"proposals": proposals, "refused": sorted(p["key"] for p in held),
-            "reopen_withheld": withheld}
+            "reopen_withheld": withheld,
+            "merged_open_withheld": merged_open_withheld}
 
 
 def reconcile(approved, fresh_proposals):

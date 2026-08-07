@@ -1964,7 +1964,12 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # crash window (Codex round-1 C2): the merge landed but the runner died
                     # before settling local state/labels — ABSORB the merged fact
                     # (idempotent), never wedge in gate-wait with a stuck in-progress label.
-                    out.append({"act": "absorb_merged", "id": iid, "num": num})
+                    # `pr` rides along (#404): the executor's closure verify NAMES the merged PR in
+                    # the comment it leaves on a still-open issue, and on this path that audit trail
+                    # is the entire product. Absent/unreadable, the executor says so instead of
+                    # printing a number it does not have.
+                    out.append({"act": "absorb_merged", "id": iid, "num": num,
+                                "pr": pv.get("number")})
                     continue
 
             update_result = ist.get("update_result")
@@ -2250,7 +2255,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     # fact about the BRANCH, true whoever opened the PR, and the runner may have
                     # slept through the whole open->merge (a wake gap) and so never recorded it.
                     # Refusing to settle without a recorded number would re-open the i328 stall.
-                    out.append({"act": "absorb_merged", "id": iid, "num": num})
+                    # `pr` rides along for the executor's closure verify (#404) — see the sibling
+                    # emit above; it is the PR the poll actually read, not the lane's stale record.
+                    out.append({"act": "absorb_merged", "id": iid, "num": num, "pr": pr_num})
                     continue
                 if state == "CLOSED" and pr_num == ist.get("pr"):
                     # THIS episode's PR was closed under it. Out-of-band by construction: the runner

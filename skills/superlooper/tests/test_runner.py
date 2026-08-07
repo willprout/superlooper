@@ -475,6 +475,32 @@ def test_poll_builds_a_fresh_gh_view(rig):
     assert isinstance(gv["dev_checks"], list) and gv["dev_checks"]
 
 
+def _gh_calls(rig):
+    p = rig.fixdir / "calls.jsonl"
+    return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+
+def test_the_closing_keyword_check_adds_no_per_tick_github_read(rig):
+    """Issue #404's API-burn discipline, pinned mechanically rather than promised in a comment.
+
+    The gate's step 2c judges the PR BODY, and the body rides the pr_for_branch read the poll
+    ALREADY makes — one more `--json` field, not one more call. The closure verify rides the MERGE
+    path only. So a steady-state tick over a finished, gating issue must issue exactly the reads it
+    issued before: no `issue view --json state` anywhere.
+    """
+    seed_issue(rig, "i123", status="gating", branch="sl/i123-render-the-widget", type="build")
+    (rig.home / "reports" / "i123.md").write_text("## Tests\n" + "x" * 60)
+    rig.r.tick(now=NOW)
+    calls = _gh_calls(rig)
+    assert calls, "the tick must have polled at all — an empty log would make this vacuous"
+    pr_reads = [c for c in calls if c[:2] == ["pr", "list"] and "--head" in c]
+    assert pr_reads, "the poll's PR read must still happen"
+    assert all("body" in (c[c.index("--json") + 1] if "--json" in c else "") for c in pr_reads), \
+        "the body must ride the poll's own PR read"
+    assert not [c for c in calls if c[:2] == ["issue", "view"] and "state" in c], \
+        "the closure verify must never run on the poll path — it rides the merge only"
+
+
 def test_gh_outage_marks_the_view_stale_and_counts_failures(rig, monkeypatch):
     monkeypatch.setenv("GH_FAIL", "1")
     rig.r.tick(now=NOW)
@@ -2858,9 +2884,24 @@ def test_absorb_merged_also_closes_an_issue_the_merge_left_open(rig, monkeypatch
     seed_issue(rig, "i5", status="gating")
     _seed_issue_state(rig, 5, "OPEN")
     assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5, "pr": 555}, NOW) == "ok"
-    assert [m["num"] for m in mutations(rig) if m["kind"] == "close_issue"] == ["5"]
+    closes = [m for m in mutations(rig) if m["kind"] == "close_issue"]
+    assert [c["num"] for c in closes] == ["5"]
+    assert "555" in (closes[0]["comment"] or "")
     rec = [j for j in _journal(rig) if j.get("act") == "post_merge_close"]
     assert len(rec) == 1 and rec[0]["outcome"] == "closed"
+
+
+def test_absorb_merged_without_a_readable_pr_number_says_so_instead_of_printing_none(rig,
+                                                                                     monkeypatch):
+    """The audit trail IS the product on this path, and `decide` can reach it with a PR number the
+    poll never answered. "PR #None merged" would be worse than saying we do not have it."""
+    monkeypatch.setattr(runner_mod.gitops, "worktree_remove", lambda repo, path: True)
+    seed_issue(rig, "i5", status="gating")
+    _seed_issue_state(rig, 5, "OPEN")
+    assert rig.r._execute({"act": "absorb_merged", "id": "i5", "num": 5}, NOW) == "ok"
+    body = [m for m in mutations(rig) if m["kind"] == "close_issue"][0]["comment"]
+    assert "None" not in body and "#" not in body.split(" merged")[0]
+    assert "its pull request merged" in body
 
 
 def test_absorb_merged_leaves_an_already_closed_issue_alone(rig, monkeypatch):

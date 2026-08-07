@@ -473,7 +473,8 @@ def test_an_unreadable_loopstate_still_fails_the_whole_sweep_closed_including_re
     r = janitor.propose(branches={}, branch_prs={}, superseded_prs=[], parked_issues=[],
                         closed_issues=[_closed(189, closer=_bare())], ls_issues="garbage",
                         now=NOW, aged_park_days=14)
-    assert r == {"proposals": [], "refused": [], "reopen_withheld": 0}
+    assert r == {"proposals": [], "refused": [], "reopen_withheld": 0,
+                 "merged_open_withheld": 0}
 
 
 def test_closed_issues_defaults_to_nothing_so_every_existing_caller_keeps_working():
@@ -481,7 +482,7 @@ def test_closed_issues_defaults_to_nothing_so_every_existing_caller_keeps_workin
     # rather than raising (the CLI, upkeep and the dashboard all reach propose()).
     assert janitor.propose(branches={}, branch_prs={}, superseded_prs=[], parked_issues=[],
                            ls_issues={}, now=NOW, aged_park_days=14) == \
-        {"proposals": [], "refused": [], "reopen_withheld": 0}
+        {"proposals": [], "refused": [], "reopen_withheld": 0, "merged_open_withheld": 0}
 
 
 def test_a_tuple_of_closed_issues_is_accepted_like_a_list():
@@ -868,3 +869,53 @@ def test_wrong_typed_sl_prs_propose_nothing(bad):
 def test_a_wrong_typed_open_issue_entry_is_skipped_not_proposed():
     for bad in ([None], [42], [{}], [{"number": None}], [{"number": "5"}], [{"number": 0}]):
         assert _of_kind(_pair_propose(lint_issues=bad), "issue-merged-open") == [], bad
+
+
+def test_the_merged_open_class_is_capped_per_sweep_and_the_remainder_is_reported():
+    """UNLIKE a branch delete or an aged park, this class's population can be large ALL AT ONCE
+    through no fault of the owner — and the headline case is exactly that. GitHub honors closing
+    keywords only for merges into the DEFAULT branch, so a repo whose `dev_branch` is not the
+    default has never had one honored: every merged issue is a pair, from adoption. `--yes` is a
+    blanket approval, and one that fires hundreds of closes (each a comment, each a notification,
+    with no single undo) is the harm REOPEN_SWEEP_CAP exists for, pointed the other way."""
+    prs = [_merged(100 + n, "sl/i%d-x" % n) for n in range(1, 26)]
+    issues = [_open_issue(n) for n in range(1, 26)]
+    r = propose(sl_prs=prs, lint_issues=issues, areas=_AREAS, touches_required=True)
+    pairs = _of_kind(r["proposals"], "issue-merged-open")
+    assert len(pairs) == janitor.MERGED_OPEN_SWEEP_CAP
+    assert r["merged_open_withheld"] == 25 - janitor.MERGED_OPEN_SWEEP_CAP
+    # the OLDEST debris goes first, and the order is stable — nothing in this class's inputs
+    # carries when the merge happened, so a recency order would be invented, not read
+    assert [p["target"] for p in pairs] == list(range(1, 11))
+
+
+def test_a_refused_pair_keeps_its_report_without_occupying_a_cap_slot():
+    # a handful of stuck keys must never starve the class: the cap bounds ACTIONS, and a
+    # previously-refused key is a report (the same split the reopen class makes).
+    prs = [_merged(100 + n, "sl/i%d-x" % n) for n in range(1, 26)]
+    issues = [_open_issue(n) for n in range(1, 26)]
+    r = propose(sl_prs=prs, lint_issues=issues, areas=_AREAS, touches_required=True,
+                refused=frozenset({"closemerged:3"}))
+    pairs = _of_kind(r["proposals"], "issue-merged-open")
+    assert "closemerged:3" not in [p["key"] for p in pairs]
+    assert r["refused"] == ["closemerged:3"]
+    assert len(pairs) == janitor.MERGED_OPEN_SWEEP_CAP   # the refusal cost the class no slot
+
+
+def test_a_sweep_below_the_cap_reports_nothing_withheld():
+    r = propose(sl_prs=[_merged(12, "sl/i5-x")], lint_issues=[_open_issue(5)],
+                areas=_AREAS, touches_required=True)
+    assert r["merged_open_withheld"] == 0
+    # ...and a sweep that fails closed on an unreadable exclusion source still answers the key
+    assert propose(ls_issues="not a dict")["merged_open_withheld"] == 0
+
+
+def test_an_issue_in_the_owners_attention_queue_is_never_proposed():
+    """A park label means he is holding the issue open on purpose — closing it would answer a
+    question he has not answered. Combined with the cap above, this is the one way the class could
+    otherwise undo an owner decision under `--yes`. It cannot swallow the class it guards: park and
+    merge are different terminal paths, so an issue a merged PR left open carries no park label."""
+    for label in janitor.PARK_LABELS:
+        props = _of_kind(_pair_propose(lint_issues=[_open_issue(5, ["type:build", label])]),
+                         "issue-merged-open")
+        assert props == [], label
