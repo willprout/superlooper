@@ -170,6 +170,7 @@ def test_stack_doctor_all_checks_pass_with_injected_probe():
         ("cmux App Nap disabled", True),
         ("runner anchor (live)", True),      # no repo in this config -> cleanly skipped, passes
         ("runner home", True),               # ditto (#306): no config names no home to judge
+        ("watchdog job", True),               # ditto (#328): no repo names no watchdog job to find
         ("installed engine current", True),  # no VERSION stamp injected -> cleanly skipped, passes
         ("installed ops docs", True),        # no installed engine home injected -> clean skip (#199)
         ("host state hook", True),           # clean global settings, no engine home yet (#307)

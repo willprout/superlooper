@@ -87,6 +87,15 @@ AQUA = "Aqua"
 # (#304), so neither belongs in a PATH check owned by the runner's process home.
 REQUIRED_COMMANDS = ("gh", "git")
 
+# The same set for the WATCHDOG's job (issue #328). An ALIAS, not a copy, and shared on purpose:
+# `gh` is the one whose absence is silent — the watchdog's file-backed detectors keep reporting
+# while every GitHub read refuses, which it reads as UNOBSERVABLE and so freezes its clocks — and
+# `git` rides along because the shipped watchdog template instructs the operator to record both, and
+# because the watchdog hands its OWN environment to the launch shim it spawns a debugger session
+# through. A separate name rather than a bare re-use of REQUIRED_COMMANDS so the day the two jobs
+# genuinely need different sets, that is one edit here instead of a silent widening of both.
+WATCHDOG_COMMANDS = REQUIRED_COMMANDS
+
 # `launchctl print` renders a service as an indented block; the pid line is the one fact this
 # module reads out of it. Anchored to the line so a `pid` appearing inside some other value cannot
 # be mistaken for the service's own.
@@ -101,6 +110,12 @@ _RUNNING_STATES = frozenset({"running", "spawn scheduled"})
 # The shipped launchd label shape, matching the nightly and watchdog jobs already installed
 # (com.superlooper.<job>.<owner>__<name>) so one glance at `launchctl list` groups a repo's jobs.
 _LABEL_FMT = "com.superlooper.runner.%s__%s"
+
+# The WATCHDOG's job, in the same shape (issue #328). It lives here rather than beside the watchdog
+# because this module is where the launchd vocabulary is spelled — the domain, the print/bootstrap
+# argvs and the PATH rule are already shared, and a second file minting launchd labels is a second
+# file that can drift from the domain rule they all have to obey.
+_WATCHDOG_LABEL_FMT = "com.superlooper.watchdog.%s__%s"
 
 # The plist itself is a SHIPPED TEMPLATE, not a string in here — same home as the nightly and
 # watchdog plists, so an operator can read the job before installing it and `tests/test_templates.py`
@@ -161,18 +176,33 @@ def restart_mechanism(home):
 
 # ---------------------------------------------------------------------------- addressing the job
 
-def label(repo_slug):
-    """The LaunchAgent label for a repo's runner, or ValueError.
+def _slug_parts(repo_slug, job):
+    """``(owner, name)`` from an ``owner/name`` slug, or ValueError naming which job wanted it.
 
     Raises rather than sanitizing: a label is how every later verb (bootout, kickstart, print)
-    addresses this job, and a quietly-repaired one would address a different job — or none.
+    addresses a job, and a quietly-repaired one would address a different job — or none.
     """
     if not isinstance(repo_slug, str) or repo_slug.count("/") != 1:
-        raise ValueError("a runner label needs an owner/name slug, got %r" % (repo_slug,))
+        raise ValueError("a %s label needs an owner/name slug, got %r" % (job, repo_slug))
     owner, name = repo_slug.split("/", 1)
     if not owner or not name:
-        raise ValueError("a runner label needs an owner/name slug, got %r" % (repo_slug,))
-    return _LABEL_FMT % (owner, name)
+        raise ValueError("a %s label needs an owner/name slug, got %r" % (job, repo_slug))
+    return owner, name
+
+
+def label(repo_slug):
+    """The LaunchAgent label for a repo's runner, or ValueError."""
+    return _LABEL_FMT % _slug_parts(repo_slug, "runner")
+
+
+def watchdog_label(repo_slug):
+    """The LaunchAgent label for a repo's WATCHDOG job, or ValueError (issue #328).
+
+    A separate function rather than a ``job=`` parameter on ``label``: every caller of ``label``
+    means the runner, and a defaulted parameter is how one of them one day addresses the wrong job
+    while reading as though it addressed the right one.
+    """
+    return _WATCHDOG_LABEL_FMT % _slug_parts(repo_slug, "watchdog")
 
 
 def domain(uid):

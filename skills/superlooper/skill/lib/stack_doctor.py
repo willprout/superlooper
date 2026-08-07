@@ -1031,10 +1031,15 @@ def _launchd_uid(probe):
     return os.getuid()
 
 
-def _job_path_problem(probe, plist):
+def _job_path_problem(probe, plist, commands=runner_home.REQUIRED_COMMANDS):
     """"PATH does not resolve gh, git" for a job whose recorded PATH lost a required command, else
     "". An unreadable/unparseable plist is itself a problem — a job launchd cannot parse is a job
-    that never starts."""
+    that never starts.
+
+    ``commands`` is a parameter because TWO launchd jobs are judged this way now — the runner's
+    (issue #306) and the watchdog's (issue #328) — and each one names the commands IT shells. It
+    defaults to the runner's set so no existing caller changed meaning.
+    """
     text = probe.read_text(plist)
     if not _nonempty_string(text):
         return "its LaunchAgent could not be read"
@@ -1043,12 +1048,97 @@ def _job_path_problem(probe, plist):
     except Exception:
         return "its LaunchAgent is not parseable as a plist"
     dirs = [d for d in str(entries).split(":") if d]
-    missing = [c for c in runner_home.REQUIRED_COMMANDS
+    missing = [c for c in commands
                if not any(probe.executable(os.path.join(d, c)) for d in dirs)]
     if not missing:
         return ""
     return ("its recorded PATH does not resolve %s — launchd hands a job only %s, so these must be "
             "on the job's own PATH" % (", ".join(missing), runner_home.LAUNCHD_PATH))
+
+
+# The shipped template the watchdog's job is rendered from, repo-relative. Named once so the fix
+# line below and the operator's `find` agree, and so the doc lint's repo-path check covers it.
+_WATCHDOG_TEMPLATE_REL = "skills/superlooper/skill/templates/launchd.watchdog.plist"
+
+
+def check_watchdog_job(probe, config):
+    """The WATCHDOG's own launchd job — installed, loaded, and carrying a usable PATH (issue #328).
+
+    The sibling of ``check_runner_home`` above, for the other job launchd runs, and it exists
+    because the watchdog's characteristic failure is SILENT BY CONSTRUCTION. Its heartbeat and ALERT
+    detectors read FILES, so a job whose PATH lost ``gh`` keeps reporting them and prints as
+    perfectly healthy — while every GitHub read refuses, which ``lib/watchdog.py`` correctly treats
+    as UNOBSERVABLE and so FREEZES its clocks. The ``no_progress`` detector can then never fire. A
+    whole detector goes dark and nothing else in the stack notices, which is precisely what was true
+    on the fleet machine: its installed job carried launchd's own
+    ``/usr/bin:/bin:/usr/sbin:/sbin`` and no ``gh``. Issue #306 fixed the TEMPLATE, and a template
+    fix is inert for an already-installed job — so the difference is reported here.
+
+    Two deliberate DEPARTURES from the runner block, both of which would be bugs if copied across:
+
+    * **No liveness.** The watchdog is a scheduled ONE-SHOT (``StartInterval``, no ``KeepAlive``),
+      so "not running" is what a healthy one says nearly all the time. The runner block's pid reads,
+      its pidfile comparison and its loaded-but-idle WARN would all fire on a healthy watchdog — a
+      permanently yellow block is a block operators learn to skip.
+    * **Not installed is a SKIP, not a fault.** Running the watchdog is optional
+      (``plugin/skills/superlooper/references/runner-ops.md``), so a machine that never installed
+      one is not broken, and failing the stack over a job nobody asked for teaches the same lesson.
+
+    Report only: one ``launchctl print`` and one file read. The installed plist under
+    ``~/Library/LaunchAgents`` is the OWNER'S — nothing here re-renders, re-installs or bootstraps
+    it, because a doctor that repairs is not a doctor.
+    """
+    name = "watchdog job"
+    if not isinstance(config, dict) or not config.get("repo"):
+        return CheckResult(name, True, "no repo config — watchdog-job check skipped")
+    try:
+        job = runner_home.watchdog_label(config["repo"])
+    except (TypeError, ValueError) as e:
+        return CheckResult(name, False, "cannot derive a watchdog job label for this repo: %s" % e,
+                           "Fix `repo` in .superlooper/config.json (it must be owner/name).")
+    uid = _launchd_uid(probe)
+    plist = os.path.join(_launchagents_dir(probe), job + ".plist")
+    if not probe.exists(plist):
+        return CheckResult(name, True,
+                           "no watchdog LaunchAgent at %s — running the unattended-debugger "
+                           "watchdog is optional, so nothing is judged here" % plist)
+
+    proc = probe.run(runner_home.print_argv(_launchctl_bin(probe), uid, job))
+    loaded = getattr(proc, "returncode", 1) == 0
+    path_problem = _job_path_problem(probe, plist, runner_home.WATCHDOG_COMMANDS)
+    if path_problem:
+        # Judged FIRST, and whatever the job's load state is. Bootstrapping a job whose PATH lost
+        # `gh` only re-establishes the silent failure, so the operator has to fix the file before
+        # loading it — which is the order the one remedy below already puts them in. The load state
+        # still rides along in the detail: it changes what the operator does after the edit, and a
+        # second FAIL a minute later for the fault they could have fixed in the same pass is how a
+        # doctor earns the reputation of drip-feeding.
+        detail = ("the watchdog job %s is loaded in %s, but %s"
+                  % (job, runner_home.domain(uid), path_problem)) if loaded else (
+                  "the watchdog job %s is installed at %s and not loaded in %s, and %s"
+                  % (job, plist, runner_home.domain(uid), path_problem))
+        return CheckResult(
+            name, False, detail,
+            "Re-render the job from %s with {path} set to the absolute directories THIS machine "
+            "resolves %s in (`command -v gh git`) ahead of launchd's own %s, write it back to %s, "
+            "then reload it: `launchctl bootout %s` (a 'not found' error there is fine) followed by "
+            "`launchctl bootstrap %s %s`. Nothing rewrites that file for you — it is yours."
+            % (_WATCHDOG_TEMPLATE_REL, " and ".join(runner_home.WATCHDOG_COMMANDS),
+               runner_home.LAUNCHD_PATH, plist, runner_home.service_target(uid, job),
+               runner_home.domain(uid), plist))
+    if not loaded:
+        return CheckResult(
+            name, False,
+            "the watchdog job %s is installed at %s but not loaded in %s — launchd holds nothing "
+            "for it, so no check ever fires and the loop has no unattended fallback at all"
+            % (job, plist, runner_home.domain(uid)),
+            "Load it: `launchctl bootstrap %s %s`. If you no longer run the watchdog on this "
+            "machine, delete %s instead — an unloaded plist left lying there is indistinguishable "
+            "from one that was meant to be running."
+            % (runner_home.domain(uid), plist, plist))
+    return CheckResult(name, True, "watchdog job %s is loaded in %s and its PATH resolves %s"
+                       % (job, runner_home.domain(uid),
+                          ", ".join(runner_home.WATCHDOG_COMMANDS)))
 
 
 def check_runner_anchor(probe, config):
@@ -1692,6 +1782,10 @@ def check_stack(config, config_error=None, probe=None, sender=None, announce=Non
         check_cmux_app_nap(probe),
         check_runner_anchor(probe, config),
         check_runner_home(probe, config),
+        # The other job launchd runs for this repo (issue #328). Beside its sibling deliberately:
+        # both answer "is a launchd job this loop depends on actually able to do its work", and an
+        # operator reading a stack should meet them together.
+        check_watchdog_job(probe, config),
         check_engine_drift(probe, repo_path=repo_path, dev_branch=dev),
         check_ops_docs(probe),
         check_host_state_hook(probe),
