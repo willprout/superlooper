@@ -1948,8 +1948,15 @@ def test_a_dev_check_freeze_lifts_itself_with_no_human_and_no_external_flip(sim_
         [(r.get("act"), r.get("id"), r.get("outcome")) for r in sim.journal()]
     merges = sim.mutations("merge_pr")
     assert len(merges) == 1, "exactly one merge — the fix's own PR, nothing else"
-    assert [r for r in sim.journal("merge")
-            if r.get("id") == fix_id and r.get("outcome") == "ok"]
+    landed = [r for r in sim.journal("merge")
+              if r.get("id") == fix_id and r.get("outcome") == "ok"]
+    assert landed
+    # issue #403: this merge CROSSED a standing freeze, and the journal is where an operator finds
+    # out why. It used to read exactly like an ordinary merge — a merge under a freeze that nothing
+    # explained. It must name the exemption and the standing rule that granted it.
+    assert landed[-1].get("freeze_exempt") is True, landed[-1]
+    assert "auto-approved:nightly-red" in landed[-1].get("reason", ""), landed[-1]
+    assert "frozen" in landed[-1]["reason"]
 
     # ... and that merge is what greens dev, which lifts the freeze. No hand merge, no test-side
     # flip of the dev checks: the whole ladder ran on the loop's own actions.
@@ -1985,6 +1992,60 @@ def test_the_freeze_exemption_never_lets_ordinary_work_merge(sim_factory):
     merged_ids = {r.get("id") for r in sim.journal("merge") if r.get("outcome") == "ok"}
     assert sid not in merged_ids, "only the standing-rule fix may cross the freeze"
     assert merged_ids <= {fix_id}, merged_ids
+    assert sim.frozen_marker() is not None, "dev is still red — the freeze must stand"
+
+
+def test_a_freeze_that_begins_this_tick_suppresses_this_ticks_merges(sim_factory):
+    # issue #403. The tick snapshots merges_frozen.json ONCE, in disk_view, before decide runs — and
+    # a `freeze` act emitted by that same decide does not refresh the snapshot. So on the exact tick
+    # a freeze BEGINS, every merge behind it was cleared by a gate that read a green mainline, and
+    # safety acts execute FIRST: the marker was already written, the "merges frozen" text already
+    # sent, and the merge landed anyway. The journal then showed a merge under a freeze with nothing
+    # to explain it. No test covered the edge because every other freeze scenario starts frozen.
+    #
+    # Staging the collision needs a merge POISED but not taken. The PR's required check sits pending
+    # (the gate waits at step 5, merging nothing), then ONE edit flips it green AND reddens dev — so
+    # a single tick emits both acts, freeze first.
+    sim = sim_factory(session={"checks_pending_cap": 100000})   # generous bound: never escalates
+    sim.edit_gh_state(lambda st: st.update(pr_check_conclusion="PENDING"))
+    num = sim.add_issue(title="Poised to merge when dev goes red",
+                        scenario={"scenario": "happy", "linger": True})
+    sid = "i%d" % num
+
+    sim.tick()
+    assert sim.wait_file(os.path.join(sim.home, "reports", "%s.md" % sid))
+    assert sim.tick_until(lambda: sim.loop_issue(sid).get("status") in ("gating", "holding")), \
+        [(r.get("act"), r.get("outcome")) for r in sim.journal()]
+    assert sim.frozen_marker() is None, "nothing is frozen yet — the merge is merely waiting"
+    assert not sim.mutations("merge_pr")
+
+    def red_dev_and_a_green_check(st):
+        st.update(pr_check_conclusion="SUCCESS")
+        st["branch_checks"].update(main=[dict(c) for c in RED_CI])
+    sim.edit_gh_state(red_dev_and_a_green_check)
+    sim.tick()
+
+    # the freeze began on THIS tick...
+    marker = sim.frozen_marker()
+    assert marker and marker.get("source") == "dev-check", marker
+    assert [r for r in sim.journal("freeze") if r.get("outcome") == "ok"]
+    assert any("frozen" in ln for ln in sim.notify_lines())
+    # ...and the merge the gate had already cleared did NOT execute behind it
+    mine = [r for r in sim.journal("merge") if r.get("id") == sid]
+    assert mine, "the collision never happened — decide emitted no merge this tick"
+    assert mine[-1]["outcome"] != "ok", mine[-1]
+    assert "never judged against" in mine[-1]["outcome"], mine[-1]
+    assert not sim.mutations("merge_pr"), "nothing may land on the tick the freeze begins"
+    assert sim.loop_issue(sid).get("status") != "merged"
+
+    # ...and on the following ticks the gate SEES the marker and holds it for real: ordinary work
+    # is not the standing-rule fix, so it stays held until the mainline greens (#295's boundary).
+    for _ in range(4):
+        sim.tick()
+    assert sim.loop_issue(sid).get("status") == "holding"
+    assert not [r for r in sim.journal("merge")
+                if r.get("id") == sid and r.get("outcome") == "ok"], \
+        "the suppressed merge must be re-decided under the freeze, never merely retried"
     assert sim.frozen_marker() is not None, "dev is still red — the freeze must stand"
 
 

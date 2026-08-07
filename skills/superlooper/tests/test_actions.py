@@ -2553,6 +2553,25 @@ def test_restore_green_pr_merges_while_its_own_dev_check_freeze_stands():
     assert len(m) == 1 and m[0]["num"] == 5 and m[0]["pr"] == 555
 
 
+def test_an_exempt_merge_act_carries_the_flag_and_names_the_standing_rule():
+    # issue #403. Two things ride out on the act. The FLAG is what the merge executor re-checks the
+    # marker against when a freeze lands mid-tick (it must never re-derive the exemption itself),
+    # and the REASON is what the journal shows: a merge landing while the mainline is frozen used to
+    # journal indistinguishably from an ordinary one, so the record read as an unexplained merge
+    # under a freeze.
+    m = only(_red_mainline_gating(), "merge")[0]
+    assert m["freeze_exempt"] is True
+    assert gate.RESTORE_GREEN_LABEL in m["reason"], m["reason"]
+
+
+def test_ordinary_merges_journal_a_rationale_too():
+    # issue #403: no more reason-free merge lines. The ordinary green rationale is the gate's own
+    # words, carried verbatim rather than re-asserted here.
+    m = only(decide(dsk=_gating()[0], gh_view=_gating()[1]), "merge")[0]
+    assert "gate green" in m["reason"]
+    assert "freeze_exempt" not in m, "the exemption stays a signal, never boilerplate"
+
+
 def test_ordinary_finished_pr_still_holds_under_the_same_freeze():
     out = _red_mainline_gating(labels=("in-progress", "type:build"))
     assert only(out, "merge") == []
