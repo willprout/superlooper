@@ -612,16 +612,37 @@ def test_the_throwaway_host_carries_the_ambient_identity_a_real_fleet_server_has
     assert env.get(session_host.API_TOKEN_ENV_VAR), "the fenced host needs a token of its own"
 
 
+def test_the_lab_never_redirects_the_agent_s_own_installation_directory():
+    """The incident this whole file exists to prevent, turned into a test.
+
+    An earlier version pointed ``XDG_DATA_HOME`` at the throwaway lab. A pane inherits the server's
+    environment, that variable is where Claude Code installs its own versions, and a drill session
+    auto-updated mid-run: it wrote the new version inside the lab and repointed the MACHINE's
+    ``claude`` symlink at it. Teardown deleted the lab, and every launch on the box — the live loop
+    included — was left pointing at nothing. The acceptance broke the machine it was certifying,
+    and reported it only as "the lanes failed to start".
+    """
+    base = {"PATH": "/bin", "HOME": "/Users/somebody", "USER": "somebody",
+            "TERM": "xterm-256color", "XDG_DATA_HOME": "/Users/somebody/.local/share",
+            "XDG_STATE_HOME": "/Users/somebody/.local/state"}
+    env = acceptance.Lab("/tmp/lab", None, "/cfg").host_env("fenced", fenced=True, base=base)
+    for name in acceptance._NEVER_REDIRECT:
+        assert not str(env.get(name, "")).startswith("/tmp/lab"), (
+            "%s was pointed at the lab; a pane inherits it and the agent outlives the lab" % name)
+    assert env.get("XDG_DATA_HOME") in (None, "/Users/somebody/.local/share")
+    # The config home is the ONE redirect, and it is what gives each host its own socket.
+    assert env["XDG_CONFIG_HOME"].startswith("/tmp/lab")
+
+
 def test_the_unfenced_control_host_differs_in_exactly_one_variable():
     base = {"PATH": "/bin", "HOME": "/h", "USER": "u", "TERM": "xterm-256color"}
     lab = acceptance.Lab("/tmp/lab", None, "/cfg")
     fenced = lab.host_env("fenced", fenced=True, base=base)
     unfenced = lab.host_env("unfenced", fenced=False, base=base)
     differ = {k for k in set(fenced) | set(unfenced) if fenced.get(k) != unfenced.get(k)}
-    # The XDG homes differ because two hosts need two sockets; the fence token is the variable the
-    # drill is actually about. Nothing else may differ, or the pair proves nothing.
-    assert differ == {session_host.API_TOKEN_ENV_VAR, "XDG_CONFIG_HOME", "XDG_STATE_HOME",
-                      "XDG_DATA_HOME"}, differ
+    # The config home differs because two hosts need two sockets; the fence token is the variable
+    # the drill is actually about. Nothing else may differ, or the pair proves nothing.
+    assert differ == {session_host.API_TOKEN_ENV_VAR, "XDG_CONFIG_HOME"}, differ
     assert session_host.API_TOKEN_ENV_VAR not in unfenced
 
 

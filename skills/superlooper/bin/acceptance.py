@@ -797,6 +797,15 @@ _BUILD_SECONDS = 3600
 _AMBIENT = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "LANG", "LC_ALL",
             "__CF_USER_TEXT_ENCODING")
 
+# Variables the lab must NEVER point at itself, however tidy it would be. A pane inherits the
+# server's environment, so each of these would redirect something that belongs to the AGENT and
+# OUTLIVES the throwaway lab. `XDG_DATA_HOME` is here because it cost us: it is where Claude Code
+# installs its own versions, a drill session auto-updated into the lab, repointed the machine's
+# `claude` symlink at a directory inside it, and teardown then deleted that directory — leaving the
+# operator's `claude` dangling for every launch on the box. An acceptance may never be the thing
+# that breaks the machine it is certifying, and this is the list that keeps that true.
+_NEVER_REDIRECT = ("XDG_DATA_HOME", "XDG_STATE_HOME", "HOME", "CLAUDE_CONFIG_DIR")
+
 # The build script, relative to the engine. Spelled as one path so no component of it is a bare
 # host-binary literal (see `build_host`).
 _BUILD_REL = "vendor/herdr/build.sh"
@@ -844,20 +853,31 @@ class Lab:
            drill session must resolve its identity from the config dir it was ASSIGNED; an
            inherited `ANTHROPIC_API_KEY` silently bills somebody else and makes S10 meaningless.
 
-        The XDG homes ARE overridden: that is how two throwaway hosts get two sockets on one
-        machine without either of them being the operator's. The fleet reaches the same isolation
-        with a named session instead, and that difference is recorded in the run's notes rather
-        than smoothed over.
+        The CONFIG home — and ONLY the config home — is redirected: that is how two throwaway hosts
+        get two sockets on one machine without either of them being the operator's. The fleet
+        reaches the same isolation with a named session instead, and that difference is recorded in
+        the run's notes rather than smoothed over.
+
+        **Why only that one**, and this is the incident the whole file exists to avoid. An earlier
+        version of this method also redirected `XDG_DATA_HOME` at the lab. A pane inherits the
+        server's environment, `XDG_DATA_HOME` is where the AGENT installs itself, and a drill
+        session dutifully auto-updated mid-run: it wrote the new version into the throwaway lab and
+        repointed the MACHINE's `claude` symlink at it. Teardown then deleted the lab, and the
+        operator's `claude` was a dangling symlink — every launch on the box, loop included, broken
+        by the acceptance. Nothing in the run reported it, because from the suite's seat the lanes
+        merely "failed to start".
+
+        The rule that falls out is `_NEVER_REDIRECT`: a variable that steers the AGENT's own
+        installation or identity is not the lab's to move, however tidy it would be, because the
+        pane inherits it and the agent outlives the lab.
         """
         base = dict(os.environ if base is None else base)
         room = os.path.join(self.root, name)
         env = {key: base[key] for key in _AMBIENT if base.get(key)}
         env.setdefault("TERM", "xterm-256color")
-        env.update({
-            "XDG_CONFIG_HOME": os.path.join(room, "config"),
-            "XDG_STATE_HOME": os.path.join(room, "state"),
-            "XDG_DATA_HOME": os.path.join(room, "data"),
-        })
+        # ONLY the config home. See `_NEVER_REDIRECT` — this list used to include the data and
+        # state homes, and that broke the machine this suite exists to protect.
+        env["XDG_CONFIG_HOME"] = os.path.join(room, "config")
         if fenced:
             env[session_host.API_TOKEN_ENV_VAR] = "acceptance-" + os.urandom(12).hex()
         return env
@@ -1343,21 +1363,17 @@ def run_suite(args, report):
 def _judge_atomic_spawn(lab, report):
     """S1's negative half: a refused spawn RAISES and leaves nothing behind.
 
-    It runs on a host of its OWN, started for this drill and stopped again straight after, and that
-    isolation is not tidiness — it was measured (2026-08-07, three runs of this suite).
-
-    The probe asks the host to start an agent in a directory that does not exist. `workspace create`
+    It runs on a host of its OWN, started for this drill and stopped again straight after. The
+    probe asks the host to start an agent in a directory that does not exist; `workspace create`
     ACCEPTS that cwd — the host does not validate it — so the refusal happens one step later, at
-    `agent start`, which waits out its whole timeout and fails. And **a timed-out `agent start`
-    wedges the host: every subsequent `agent start` on that server then times out too**, on a fresh
-    workspace, indefinitely. Reproduced directly: probe raises after 30.3s, the next real lane on
-    the same host fails after its full 60s, and a lane spawned on an untouched host of the same
-    build starts in 3.5s.
+    `agent start`, which waits out its timeout and fails. That is a slow, destructive question to
+    ask, and asking it on a host four real lanes are about to be spawned on buys nothing: its own
+    host costs one server and removes the coupling entirely.
 
-    So run on the shared hosts, this one drill silently costs the run every lane it has — which is
-    exactly what happened, and what the run-level NOT RUN reporting then had to describe. The
-    behaviour itself is the host's and is reported upward rather than worked around here; what this
-    function owes the rest of the suite is not to be the thing that triggers it.
+    (An earlier version of this comment claimed the timed-out `agent start` WEDGED the host, on the
+    strength of a reproduction where the next spawn also failed. That was wrong, and the correction
+    is worth keeping: every spawn on the machine was failing by then, because the lab had broken
+    the machine's `claude` symlink — see `Lab.host_env`. Two failures in a row are not a mechanism.)
     """
     lab.start_host("probe", fenced=True)
     try:
