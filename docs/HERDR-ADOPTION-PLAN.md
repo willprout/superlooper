@@ -176,7 +176,16 @@ never moves. Two consequences worth stating plainly:
    Sub-decisions, ruled 2026-07-31: **runner lives OUTSIDE herdr** (plain login-item process
    talking to the server — the supervisor never lives inside what it supervises); **version
    policy = pin an exact release containing the #2063-class prompt fix + the #2064 restore fix**,
-   upgrades are deliberate events that re-run the acceptance spikes. **The pin is herdr `v0.8.0`**
+   upgrades are deliberate events that re-run the acceptance spikes. **What a bump RUNS is
+   `skills/superlooper/bin/acceptance.py`** (issue #348) — the suite as an artefact rather than as
+   #311's transcript. It builds a throwaway host from the carried patch as it currently stands,
+   stands it up on sockets of its own, drives it only through the five-verb doorway, never attaches
+   a client, and reports against the twelve criteria in `docs/ARCHITECTURE-PROPOSALS.md` §3 with
+   one evidence file each; a failed criterion exits non-zero and a criterion it cannot judge
+   unattended is reported NOT RUN with its reason rather than rounded up. Its paired controls are
+   the part that is load-bearing: the fenced and unfenced lanes run together in the same run, which
+   is the only reason #311 could say "a refused call" instead of "a broken build". It costs real
+   agent sessions and says so before it spends them. **The pin is herdr `v0.8.0`**
    — stable (`prerelease=false`), published 2026-08-03, commit
    `346411fa21afd297f5ed3b3fa56f9e3fbf7654b7`, retested asset `herdr-macos-aarch64` sha256
    `d53a9f93fccfdfcc55632927bf51002f5add0aa7990bcdf508ffbd84ac658178` (#302 proved by ancestry
