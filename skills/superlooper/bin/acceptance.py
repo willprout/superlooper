@@ -884,8 +884,7 @@ class Lab:
 
     def start_host(self, name, fenced):
         env = self.host_env(name, fenced)
-        for key in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"):
-            os.makedirs(env[key], exist_ok=True)
+        os.makedirs(env["XDG_CONFIG_HOME"], exist_ok=True)
         socket_path = session_host.session_socket_path(session_host.config_dir(env))
         refusal = socket_refusal(socket_path)
         if refusal:
