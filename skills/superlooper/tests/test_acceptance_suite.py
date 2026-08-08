@@ -76,6 +76,37 @@ def test_the_criteria_parser_keeps_the_doc_s_own_wording():
     assert got[2].group == "II. Host independence"
 
 
+# ------------------------------------------------------- the run cannot call what does not exist
+
+def test_the_run_calls_no_function_that_does_not_exist():
+    """A NameError here costs four real agent sessions before it fires.
+
+    Not hypothetical: an edit that spliced one drill out of the file left `run_suite` calling a
+    `_judge_lifecycle` that no longer existed. The suite built a host, spawned lanes, and only THEN
+    died — with S2 never judged. Nothing else in this file exercises `run_suite`'s body, because
+    doing so would need a real host; this reads it instead.
+    """
+    import ast
+    import builtins
+    tree = ast.parse(_SUITE.read_text())
+    module_names = {n.name for n in ast.walk(tree)
+                    if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+    module_names |= {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                     for t in n.targets if isinstance(t, ast.Name)}
+    run_suite = next(n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef) and n.name == "run_suite")
+    local = {a.arg for a in run_suite.args.args} | {
+        t.id for n in ast.walk(run_suite) if isinstance(n, ast.Assign)
+        for t in n.targets if isinstance(t, ast.Name)}
+    missing = sorted(
+        call.func.id for call in ast.walk(run_suite)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        and call.func.id not in module_names
+        and call.func.id not in local
+        and not hasattr(builtins, call.func.id))
+    assert not missing, "run_suite calls names this module does not define: %s" % missing
+
+
 # ------------------------------------------------------------------- verdicts and the exit code
 
 def _report(ids=("S1", "S2", "S3")):

@@ -1278,12 +1278,25 @@ def run_suite(args, report):
         outcomes = {}
         for lane in LANES:
             host_name = "fenced" if lane.fenced else "unfenced"
-            try:
-                lab.spawn(lane, host_name)
-            except Exception as exc:
+            # ONE retry, and only because a failed spawn is CLEAN: the doorway rolls its workspace
+            # back before it raises, so a second attempt starts from where the first began. Agent
+            # startup is the flakiest step in the whole run — it waits on a real agent reaching a
+            # real prompt — and a lane lost to one slow start costs the drill its control, which
+            # costs the run its verdict. Two attempts, then it is reported as not started.
+            last = None
+            for attempt in (1, 2):
+                try:
+                    lab.spawn(lane, host_name)
+                    if attempt > 1:
+                        report.note("lane %s started on attempt %d" % (lane.name, attempt))
+                    break
+                except Exception as exc:
+                    last = exc
+                    time.sleep(5)
+            else:
                 outcomes[lane.name] = LaneOutcome(lane.name, None, "the lane did not start: %s"
-                                                  % exc)
-                report.note("lane %s did not start: %s" % (lane.name, exc))
+                                                  % last)
+                report.note("lane %s did not start (2 attempts): %s" % (lane.name, last))
         _judge_spawn_and_state(lab, report)
         _judge_delivery_and_environment(lab, report, args)
         _judge_first_run_gate(lab, report)
@@ -1351,7 +1364,8 @@ def _judge_spawn_and_state(lab, report):
     record = lab.sessions.get("fenced-hooked")
     if not record:
         report.record(Finding("S4", NOT_RUN, "nothing",
-                              "no lane started, so nothing could be read back"))
+                              "the fenced-hooked lane did not start, so there was no session to "
+                              "read state back from"))
         return
     host = lab.wrapper(record["host"])
     argv, state = _pane_child_argv(host, record["session"])
@@ -1392,7 +1406,9 @@ def _judge_delivery_and_environment(lab, report, args):
     record = lab.sessions.get("fenced-hooked")
     if not record:
         for cid in ("S3", "S7"):
-            report.record(Finding(cid, NOT_RUN, "nothing", "no lane started"))
+            report.record(Finding(cid, NOT_RUN, "nothing",
+                                  "the fenced-hooked lane did not start, so there was no session "
+                                  "to send to"))
         return
     host = lab.wrapper(record["host"])
     target = os.path.join(record["cwd"], _ENV_PROBE_FILE)
@@ -1525,6 +1541,53 @@ def _capture_outcome(lab, lane):
 def _judge_from_capture(lab, report, capture, outcomes):
     for finding in derived_verdicts(capture, outcomes):
         report.record(finding)
+
+
+def _judge_lifecycle(lab, report):
+    """S2, DRIVEN rather than asserted: `exit` must refuse a live lane and `kill` must end it.
+
+    The subject is the untrusted lane — live, sitting at its first-run dialog, and the one lane
+    here that has taken no turn, so a teardown drill costs nothing. It is deliberately not one of
+    the capture drill's three lanes: ending a control before the drill it controls would be the
+    suite breaking its own pairing.
+    """
+    record = lab.sessions.get("fenced-untrusted")
+    if not record:
+        report.record(Finding("S2", NOT_RUN, "nothing",
+                              "the lifecycle drill's subject lane did not start, and the suite "
+                              "will not end one of the capture drill's lanes to get a subject"))
+        return
+    host = lab.wrapper(record["host"])
+    before = host.state(record["session"])
+    refused, refusal = False, ""
+    try:
+        host.exit(record["session"])
+    except session_host.TeardownRefused as exc:
+        refused, refusal = True, str(exc)[:300]
+    except Exception as exc:
+        refusal = "exit failed in a way the doorway does not name: %r" % exc
+    try:
+        torn = host.kill(record["session"])
+    except Exception as exc:
+        report.record(Finding("S2", FAIL, "the doorway's ordered teardown against a live lane",
+                              "`exit` %s, and `kill` then failed: %r"
+                              % ("refused as it should" if refused else "did not refuse", exc)))
+        lab.sessions.pop("fenced-untrusted", None)
+        return
+    after = host.state(record["session"])
+    ok = refused and torn.closed and after.name_resolves is False
+    report.record(Finding(
+        "S2", PASS if ok else FAIL,
+        "the doorway's ordered teardown against a live lane, and the name afterwards",
+        "before: %s (liveness from OS process facts — the pane's shell pid and a live child — "
+        "never from the host's agent list). `exit` %s. `kill` reported closed=%s signalled=%s "
+        "orphan=%s. Afterwards the host no longer resolves the name (name_resolves=%s), so \"no "
+        "live process in this lane\" is a real query rather than an inference."
+        % (_quick_state(before),
+           ("REFUSED the live session, as it must (%s)" % refusal) if refused
+           else ("did NOT refuse a live session — %s" % (refusal or "it closed it")),
+           torn.closed, torn.signalled, torn.orphan_pid, after.name_resolves)))
+    lab.sessions.pop("fenced-untrusted", None)
 
 
 def _judge_billing(report, args):
