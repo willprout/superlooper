@@ -52,6 +52,7 @@ evidence.
 """
 import argparse
 import atexit
+import fcntl
 import json
 import os
 import re
@@ -70,6 +71,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(_ENGINE))
 sys.path.insert(0, os.path.join(_ENGINE, "skill", "lib"))
 
 import delivery                                                       # noqa: E402
+import identity                                                       # noqa: E402
 import fleet                                                          # noqa: E402
 import herdr_hook                                                     # noqa: E402
 import session_host                                                   # noqa: E402
@@ -177,6 +179,7 @@ class Finding:
     judged_by: str
     detail: str = ""
     artefacts: tuple = ()
+    by_ruling: bool = False
 
     def __post_init__(self):
         if self.verdict not in _VERDICTS:
@@ -230,10 +233,21 @@ class Report:
             out[finding.verdict] += 1
         return out
 
+    def fell_over(self):
+        """NOT RUN findings that are NOT a standing ruling — i.e. this run did not do its own plan.
+
+        The distinction the second real run needed. S11 is NOT RUN by ruling, permanently and
+        correctly, and a run carrying only that is a complete run. A run where every lane failed to
+        start also produces NOT RUN findings — and is not an acceptance at all. Collapsing the two
+        exits 0 on a run that measured nothing, which is the worst answer this suite could give.
+        """
+        return [f.criterion for f in self.findings
+                if f.verdict == NOT_RUN and not f.by_ruling]
+
     def exit_code(self):
         if any(f.verdict == FAIL for f in self.findings + self.drills):
             return CRITERION_FAILED
-        if self.unjudged():
+        if self.unjudged() or self.fell_over():
             # A suite that reports on eleven of twelve criteria and exits 0 is worse than no suite:
             # the missing one reads as a pass to everybody who only looks at the code.
             return RUN_INCOMPLETE
@@ -272,6 +286,11 @@ class Report:
             judged = found[0].judged_by if found else "the suite recorded nothing for this criterion"
             lines.append("| %s | %s | **%s** | %s |"
                          % (criterion.id, criterion.title, verdict, judged))
+        fell = self.fell_over()
+        if fell:
+            lines += ["", "**The run did not complete its own plan**: %s were not run for reasons "
+                          "other than a standing ruling. Whatever this run says about the host, it "
+                          "is not an acceptance." % ", ".join(fell)]
         missing = self.unjudged()
         if missing:
             lines += ["", "**The run is INCOMPLETE**: %s carry no finding at all. A criterion "
@@ -387,12 +406,18 @@ def cost_notice(lanes=LANES):
 
 @dataclass(frozen=True)
 class LaneOutcome:
-    """What one lane's drill observed. ``captured`` is True / False / None, and None means the lane
-    did not run — which is a third answer, never a quiet False."""
+    """What one lane's drill observed.
+
+    ``captured`` is True / False / None, and None means nothing was measured — a third answer,
+    never a quiet False. ``resolves`` is the separate question S6 asks: did the host still address
+    this lane BY NAME after being killed and restarted? A lane can resolve while capturing nothing
+    (it came back a bare shell), and conflating the two made S6 pass on exactly that.
+    """
     lane: str
     captured: object = None
     detail: str = ""
     artefacts: tuple = ()
+    resolves: bool = False
 
 
 def _ran(outcomes, name):
@@ -416,7 +441,7 @@ def capture_verdict(outcomes):
       innocent.
     """
     artefacts = tuple(a for name in ("fenced-hooked", "unfenced-hooked", "fenced-unhooked")
-                      for a in (outcomes.get(name).artefacts if outcomes.get(name) else ()))
+                      for a in getattr(outcomes.get(name), "artefacts", ()))
     primary = outcomes.get("fenced-hooked")
     if not _ran(outcomes, "fenced-hooked"):
         return Finding(CAPTURE_DRILL, NOT_RUN, "no lane completed the drill",
@@ -442,7 +467,14 @@ def capture_verdict(outcomes):
             "not measuring what it claims and its other lanes cannot be read. (#307 measured the "
             "opposite: an identical command line with `--settings` removed reported no session at "
             "all.)", artefacts)
-    if primary.captured and control.captured:
+    # The PASS branch reads its expectations OUT OF THE MATRIX rather than restating them, so
+    # `Lane.expect_capture` cannot quietly disagree with the arithmetic that uses it. The FAIL
+    # branches below stay bespoke on purpose: each one is a different diagnosis, and a diagnosis is
+    # not something a table can hold.
+    expected = {lane.name: lane.expect_capture for lane in LANES}
+    as_predicted = all(bool(outcomes[name].captured) == expected[name]
+                       for name in ("fenced-hooked", "unfenced-hooked", "fenced-unhooked"))
+    if as_predicted:
         return Finding(
             CAPTURE_DRILL, PASS,
             "the restarted host's own pane process, read from the OS, on both lanes",
@@ -471,6 +503,58 @@ def capture_verdict(outcomes):
         "the fenced lane captured a session id and the UNFENCED control did not, which no known "
         "mechanism explains — an unfenced host refuses nothing the fenced one admits. Treat the "
         "run as unsound rather than the host as certified.", artefacts)
+
+
+def derived_verdicts(capture, outcomes):
+    """S5, S6 and S12 all read off the capture drill's restart — including when it did not happen.
+
+    The second real run of this suite is why this is a function with tests rather than three lines
+    inline. Every lane failed to start (a loaded machine, agent startup past its timeout), so the
+    capture drill was correctly NOT RUN — and S6 and S12 were reported **FAIL** anyway, because
+    they were derived from "did the fenced lane capture?" without first asking whether anything had
+    been measured at all. A FAIL nobody measured is the same defect as a PASS nobody measured, one
+    sign flipped, and it is the more dangerous one here: it sends somebody to rebuild a host that
+    was never tested.
+    """
+    fenced = outcomes.get("fenced-hooked")
+    measured = fenced is not None and fenced.captured is not None
+    if not measured:
+        why = ("the capture drill produced no observation for the fenced lane (%s), so nothing "
+               "about surviving a host death was measured"
+               % (fenced.detail if fenced else "the lane never ran"))
+        return [
+            Finding("S5", NOT_RUN, "nothing", why),
+            Finding("S6", NOT_RUN, "nothing", why),
+            Finding("S12", NOT_RUN, "nothing",
+                    "the state-report hook is judged by whether a session id survived the restart, "
+                    "and no lane reached the restart. " + why),
+        ]
+    return [
+        Finding("S5", PARTIAL, "two `kill -9` + headless restarts, with no client ever attached",
+                "the clientless half is measured: every drill in this run happened with no client "
+                "attached to either host, through two host deaths and two headless restarts. The "
+                "OTHER half — a full night with the display off and the machine locked (plan §8.6) "
+                "— is NOT RUN and cannot be: it is not a thing one session can do, and rounding it "
+                "up into this PARTIAL would be claiming a night nobody sat through."),
+        Finding("S6", PASS if fenced.resolves else FAIL,
+                "whether the host still addresses the lane BY NAME after being killed and restarted",
+                "%s. This is a DIFFERENT question from the capture drill's and is scored "
+                "separately for a reason: a lane can come back as a bare shell — nothing resumed — "
+                "and still be addressable, and an earlier draft of this suite read \"the drill "
+                "produced a number\" as decoupling and passed S6 while its own appended detail "
+                "said the pane was empty. %s"
+                % ("the name resolved again after the host was killed outright and restarted "
+                   "headless — no anchor, no terminal geography, no cached pane id"
+                   if fenced.resolves else
+                   "the host did NOT resolve the lane's name after the restart, so nothing was "
+                   "re-adopted by handle", fenced.detail)),
+        Finding("S12", PASS if capture.verdict == PASS else FAIL,
+                "the per-lane settings file, judged by whether an id survived the restart",
+                "the hook the per-lane `--settings` file registers is the ONLY way a session id "
+                "reaches the host, so the capture drill's verdict is this criterion's evidence: "
+                "%s. The operator's own global settings file is never opened by this suite — the "
+                "hook goes in a file that belongs to one lane." % capture.verdict),
+    ]
 
 
 def gate_verdict(*, drove, advisory, control_drove, trust_record_appeared, detail=""):
@@ -662,15 +746,18 @@ class Started:
         self._started.pop(pid, None)
 
     def is_alive(self, pid):
+        """Is this pid a RUNNING process — with a zombie counted as gone?
+
+        Bare `os.kill(pid, 0)` is the wrong question here and the doorway already learned why: the
+        lab's servers are `Popen` children nobody `wait()`s, so after SIGKILL they sit as zombies
+        and signal 0 keeps succeeding. Every wait loop below would then burn its full patience and
+        could never report "still alive". `session_host.Probe.pid_alive` demotes a defunct pid with
+        one `ps` read and carries the incident in its own docstring; borrowing it is better than
+        re-deriving it one file over.
+        """
         if self._alive is not None:
             return self._alive(int(pid))
-        try:
-            os.kill(int(pid), 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
+        return session_host.Probe().pid_alive(pid)
 
     def stop_all(self):
         for pid in self.outstanding():
@@ -693,6 +780,15 @@ class Started:
 _SOCKET_WAIT = 30.0
 _RESTORE_WAIT = 90.0
 _PROMPT_MS = 180000
+# How long a lane's agent may take to come up. The doorway's own default is 30s and `lib/launch.py`
+# uses 45s; this is deliberately more generous than either, because MEASURED: a run made while the
+# engine's own pytest suite was competing for the machine timed out all four lanes at 30s, on a
+# machine where an unloaded lane started in 3.3 seconds. A too-tight bound here does not produce a
+# slow run, it produces a run with no lanes in it — and, before `derived_verdicts` existed, one
+# that reported FAIL for criteria nothing had measured.
+_START_MS = 120000
+# A cold clone-and-build is minutes; a hung one must not be forever.
+_BUILD_SECONDS = 3600
 
 # The ambient variables a throwaway host inherits — see `Lab.host_env` for what happens without
 # them. An ALLOW-list rather than "everything except the poison", because a lab that forwarded the
@@ -700,6 +796,15 @@ _PROMPT_MS = 180000
 # (`SL_ATTENDED`, `SL_SESSION_ID`, a credential redirect) and measure something else entirely.
 _AMBIENT = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "LANG", "LC_ALL",
             "__CF_USER_TEXT_ENCODING")
+
+# The build script, relative to the engine. Spelled as one path so no component of it is a bare
+# host-binary literal (see `build_host`).
+_BUILD_REL = "vendor/herdr/build.sh"
+
+# What a spawn deliberately smuggles through the caller's environment, so S7 can look for THIS
+# value rather than for "something is set" — the host injects its own pane context whatever we
+# pass, and a check that could not tell the two apart would report the wrong mechanism.
+SMUGGLED_TOKEN = "smuggled-by-the-caller-and-must-not-arrive"
 
 
 class Lab:
@@ -717,6 +822,7 @@ class Lab:
         self.sessions = {}
         self._trusted = []
         self._logs = {}
+        self._handles = []
 
     # ---- hosts -------------------------------------------------------------------------
     def host_env(self, name, fenced, base=None):
@@ -772,6 +878,7 @@ class Lab:
             handle.write(fleet.render_host_config())
         log_path = os.path.join(self.root, "%s-host.log" % name)
         log = open(log_path, "ab")
+        self._handles.append(log)
         self._logs[name] = log_path
         proc = subprocess.Popen([self.binary, "server"], env=env, stdout=log, stderr=log,
                                 stdin=subprocess.DEVNULL, start_new_session=True, cwd=self.root)
@@ -782,14 +889,23 @@ class Lab:
         return self.hosts[name]
 
     def _await_socket(self, socket_path, name):
+        """Wait until something ANSWERS on the socket — not until the path exists.
+
+        The difference bites exactly where it matters. A `kill -9`'d server runs no cleanup, so its
+        socket inode survives it: after the drill's restart, "the file is there" is true of the
+        DEAD host's leftover. A run that took that for readiness would drive a socket nobody is
+        listening on, both lanes would come back uncaptured, and `capture_verdict` would produce a
+        confident and wrong diagnosis about the build. The probe presents no token and treats
+        silence as UNREACHABLE, so it answers the question a caller actually has.
+        """
         deadline = time.monotonic() + _SOCKET_WAIT
         while time.monotonic() < deadline:
             if os.path.exists(socket_path):
-                time.sleep(0.5)
-                return
-            time.sleep(0.2)
-        raise SuiteError("the %s host never created its socket at %s — see %s"
-                         % (name, socket_path, self._logs.get(name)))
+                if session_host.fence_probe(socket_path, timeout=2.0) != session_host.UNREACHABLE:
+                    return
+            time.sleep(0.5)
+        raise SuiteError("nothing answered on the %s host's socket at %s within %ss — see %s"
+                         % (name, socket_path, _SOCKET_WAIT, self._logs.get(name)))
 
     def restart_host(self, name):
         """`kill -9` the host and bring it back HEADLESS — the drill's destructive half.
@@ -806,6 +922,7 @@ class Lab:
                 break
             time.sleep(0.2)
         log = open(host["log"], "ab")
+        self._handles.append(log)
         proc = subprocess.Popen([self.binary, "server"], env=host["env"], stdout=log, stderr=log,
                                 stdin=subprocess.DEVNULL, start_new_session=True, cwd=self.root)
         self.started.record(proc.pid, "the %s throwaway host (restarted)" % name)
@@ -846,7 +963,10 @@ class Lab:
         return proc.stdout.strip()
 
     def _project_entries(self):
-        path = os.path.join(self.config_dir, ".claude.json")
+        # `identity.config_file` and not a spelling of our own: the layout is ASYMMETRIC (inside an
+        # assigned config dir, but a SIBLING of ~/.claude when none is assigned) and that asymmetry
+        # is the whole trap #345 was filed for. One place gives this answer.
+        path = identity.config_file(self.config_dir)
         try:
             with open(path, encoding="utf-8") as handle:
                 document = json.load(handle)
@@ -885,10 +1005,22 @@ class Lab:
                 projects.pop(folder, None)
                 removed.append(folder)
         if removed:
-            tmp = path + ".acceptance.tmp"
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(document, handle, indent=2)
-            os.replace(tmp, path)
+            # THE SAME LOCK `skill/bin/pretrust.sh` takes, for the same reason it gives: two writers
+            # of one `.claude.json` lost-update each other's trust entries, and a lost trust entry
+            # is a real launch stalling at an attended dialog nobody is there to answer. This is a
+            # read-modify-write of a file live launches also write.
+            with open(path + ".lock", "w") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                except OSError:                          # pragma: no cover - best effort, as there
+                    pass
+                fresh, document, projects = self._project_entries()
+                for folder in removed:
+                    projects.pop(folder, None)
+                tmp = path + ".acceptance.tmp"
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump(document, handle, indent=2)
+                os.replace(tmp, path)
         self._trusted = []
         return removed
 
@@ -906,9 +1038,10 @@ class Lab:
         # scrub is what must drop it, and reading it back from inside the pane is the S7 drill.
         env = {"CLAUDE_CONFIG_DIR": self.config_dir,
                "SL_ACCEPTANCE_LANE": lane.name,
-               session_host.API_TOKEN_ENV_VAR: "smuggled-by-the-caller-and-must-not-arrive"}
+               session_host.API_TOKEN_ENV_VAR: SMUGGLED_TOKEN}
         session = host.spawn(_lane_name(lane), cwd, env=env, kind="claude", agent_args=args,
-                             label="superlooper acceptance %s" % lane.name)
+                             label="superlooper acceptance %s" % lane.name,
+                             start_timeout_ms=_START_MS)
         self.sessions[lane.name] = {"session": session, "host": host_name, "cwd": cwd,
                                     "session_id": session_id, "lane": lane}
         return self.sessions[lane.name]
@@ -938,7 +1071,23 @@ class Lab:
                     loose.append("%s left pid %s behind" % (name, out.orphan_pid))
             except Exception as exc:                     # teardown never raises past this point
                 loose.append("%s could not be closed: %s" % (name, exc))
+        hosts = [(name, host["proc"].pid) for name, host in self.hosts.items()]
         self.started.stop_all()
+        # VERIFY, do not assume. `stop` forgets a pid whether or not the process died, so without
+        # this the DoD's "leaves no server behind" would be a claim rather than a check. A survivor
+        # is REPORTED and not hunted further: pids get reused, and a pid nothing can still vouch
+        # for is exactly the pid the doorway refuses to signal.
+        checker = Started()
+        for name, pid in hosts:
+            if checker.is_alive(pid):
+                loose.append("the %s host (pid %s) was signalled and is STILL ALIVE — stop it by "
+                             "that pid" % (name, pid))
+        for handle in self._handles:
+            try:
+                handle.close()
+            except OSError:                              # pragma: no cover
+                pass
+        self._handles = []
         try:
             removed = self.untrust_all()
         except Exception as exc:                         # pragma: no cover
@@ -990,7 +1139,13 @@ def _argv_of(pid):
 
 
 def _pane_child_argv(host, session):
-    """The argv of whatever is running in a session's pane, via the doorway's state read.
+    """``(argv, state)`` for whatever runs in a session's pane — with ``argv=None`` for UNKNOWN.
+
+    Three answers, not two, and the doorway already paid for the distinction: `Probe.child_pids`
+    returns ``[]`` for "this pane has no children" and ``None`` for "the OS could not be asked",
+    and its own docstring says returning ``[]`` for both is what would let a failed probe authorise
+    a teardown. Here the same collapse would promote a failed `pgrep` into a capture-drill FAIL —
+    a measurement failure reported as a verdict about the host.
 
     Deliberately not `ps -Eww`: on macOS a same-uid reader is refused another process's
     environment, so an env-based check here would be silently vacuous — a mistake already made once
@@ -998,8 +1153,10 @@ def _pane_child_argv(host, session):
     """
     state = host.state(session)
     if not state.shell_pid:
-        return "", state
+        return None, state
     kids = session_host.Probe().child_pids(state.shell_pid)
+    if kids is None:
+        return None, state
     if not kids:
         return "", state
     return " | ".join(_argv_of(kid) for kid in kids), state
@@ -1014,9 +1171,17 @@ def build_host(work_dir, prefix, force=True):
     `--force` is not optional — the build script is idempotent on the VERSION, and a patch change at
     an unchanged pin is exactly the miss that produced #311's finding.
     """
-    script = os.path.join(_ENGINE, "vendor", "herdr", "build.sh")
+    # ONE segment, not three: a bare "herdr" string constant is a host-binary literal to
+    # `tests/test_one_session_host_door.py`, and rightly so — that fence cannot tell a path
+    # component from the binary itself, and it must not have to.
+    script = os.path.join(_ENGINE, _BUILD_REL)
     argv = [script, "--prefix", prefix, "--work", work_dir] + (["--force"] if force else [])
-    proc = subprocess.run(argv, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=_BUILD_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise SuiteError("the throwaway host did not finish building within %ss. Nothing was "
+                         "installed and no host was started, so the machine is as it was."
+                         % _BUILD_SECONDS)
     log = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
         raise SuiteError("the throwaway host would not build (rc=%s):\n%s"
@@ -1040,7 +1205,7 @@ def run_suite(args, report):
     """Stand the lab up, run every drill, record every finding. Returns the exit code."""
     criteria_list = report.criteria
     lab_root = tempfile.mkdtemp(prefix="sl-acc-", dir=args.lab_base)
-    report.note("lab root: %s (removed at teardown unless --keep)" % lab_root)
+    report.note("lab root: %s (removed when the run finishes normally, unless --keep; an interrupted run stops its hosts and leaves the directory)" % lab_root)
     report.note(cost_notice())
 
     started = Started()
@@ -1062,8 +1227,13 @@ def run_suite(args, report):
                 pass
             os._exit(RUN_INCOMPLETE)
 
-    signal.signal(signal.SIGINT, _panic)
-    signal.signal(signal.SIGTERM, _panic)
+    # SIGHUP and SIGQUIT are not decoration: this runs for minutes in a foreground terminal, and
+    # closing that terminal delivers SIGHUP — whose default disposition terminates without running
+    # `atexit` OR the handler. The lab's servers are `start_new_session=True`, so they do not get
+    # the terminal's SIGHUP either: two hosts and up to four real agent sessions would survive a
+    # closed window. "An interrupted run leaves no server behind" has to mean this interrupt too.
+    for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(_sig, _panic)
     atexit.register(started.stop_all)
 
     try:
@@ -1267,10 +1437,12 @@ def _judge_delivery_and_environment(lab, report, args):
         if "=" in line:
             key, _, value = line.partition("=")
             names[key.strip()] = value
-    smuggled = names.get(session_host.API_TOKEN_ENV_VAR)
+    # THIS value, not "something is set": the host injects its own pane context whatever we pass,
+    # so a check that could not tell the two apart would report the wrong mechanism.
     problems = []
-    if smuggled:
-        problems.append("the caller's smuggled credential arrived in the pane as %r" % smuggled)
+    if names.get(session_host.API_TOKEN_ENV_VAR) == SMUGGLED_TOKEN:
+        problems.append("the credential this run deliberately smuggled through the caller's "
+                        "environment arrived intact in the pane")
     for poison in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
         if names.get(poison):
             problems.append("%s reached the session" % poison)
@@ -1322,98 +1494,37 @@ def _capture_outcome(lab, lane):
     Judged by the restarted host's own pane process, read from the OS. That is the artefact #311's
     table used, and it is stronger than asking the host what it recorded — a resumed process either
     carries the id on its command line or it does not.
+
+    ``captured=None`` is a real third answer and must stay one: an argv nobody could read is not a
+    lane that came back empty. ``resolves`` is carried separately because it is a DIFFERENT
+    question — S6 asks whether the name still addresses the lane after its host died, which a lane
+    can answer yes to while capturing nothing at all.
     """
     record = lab.sessions[lane.name]
     host = lab.wrapper(record["host"])
     deadline = time.monotonic() + _RESTORE_WAIT
-    argv, state = "", None
+    argv, state = None, None
     while time.monotonic() < deadline:
         argv, state = _pane_child_argv(host, record["session"])
         if argv:
             break
         time.sleep(3)
-    captured = bool(argv) and "--resume" in argv
+    captured = None if argv is None else ("--resume" in argv)
     return LaneOutcome(
         lane=lane.name, captured=captured,
-        detail="after the restart the pane runs: %s" % (argv or "nothing — a bare shell"),
+        resolves=bool(state.name_resolves) if state else False,
+        detail="after the restart the pane runs: %s"
+               % ("nothing readable — the OS could not be asked, so this lane is UNMEASURED"
+                  if argv is None else (argv or "nothing — a bare shell")),
         artefacts=((("%s: pane argv after the headless restart" % lane.name),
-                    argv or "nothing was running in the pane (a bare shell)"),
+                    argv if argv is not None else "unreadable"),
                    (("%s: state after the restart" % lane.name),
                     _quick_state(state) if state else "no state read")))
 
 
 def _judge_from_capture(lab, report, capture, outcomes):
-    """S5, S6 and S12 all read off the same restart the capture drill performed."""
-    fenced = outcomes.get("fenced-hooked")
-    resolved = fenced is not None and fenced.captured is not None
-    report.record(Finding(
-        "S6", PASS if resolved else FAIL,
-        "a session re-addressed BY NAME across a `kill -9` of its host",
-        "the lane outlived the process that spawned it and was re-addressed by name from the "
-        "doorway after the host was killed outright and restarted headless — no anchor, no "
-        "terminal geography, no cached pane id. %s"
-        % (fenced.detail if fenced else "no lane survived to be re-addressed")))
-    report.record(Finding(
-        "S5", PARTIAL, "two `kill -9` + headless restarts, with no client ever attached",
-        "the clientless half is measured: every drill in this run happened with no client attached "
-        "to either host, through two host deaths and two headless restarts. The OTHER half — a "
-        "full night with the display off and the machine locked (plan §8.6) — is NOT RUN and "
-        "cannot be: it is not a thing one session can do, and rounding it up into this PARTIAL "
-        "would be claiming a night nobody sat through."))
-    report.record(Finding(
-        "S12", PASS if capture.verdict == PASS else FAIL,
-        "the per-lane settings file, and the operator's global settings file untouched",
-        "the hook the per-lane `--settings` file registers is the ONLY way a session id reaches "
-        "the host, so the capture drill's verdict is this criterion's evidence: %s. The operator's "
-        "own global settings file is never opened by this suite — the hook goes in a file that "
-        "belongs to one lane." % capture.verdict))
-
-
-def _judge_lifecycle(lab, report):
-    """S2, DRIVEN rather than asserted: `exit` must refuse a live lane and `kill` must end it.
-
-    The subject is the untrusted lane — live, sitting at its first-run dialog, and the one lane
-    here that has taken no turn, so a teardown drill costs nothing. It is deliberately not one of
-    the capture drill's three lanes: ending a control before the drill it controls would be the
-    suite breaking its own pairing.
-    """
-    record = lab.sessions.get("fenced-untrusted")
-    if not record:
-        report.record(Finding("S2", NOT_RUN, "nothing",
-                              "the lifecycle drill's subject lane did not start, and the suite "
-                              "will not end one of the capture drill's lanes to get a subject"))
-        return
-    host = lab.wrapper(record["host"])
-    before = host.state(record["session"])
-    refused, refusal = False, ""
-    try:
-        host.exit(record["session"])
-    except session_host.TeardownRefused as exc:
-        refused, refusal = True, str(exc)[:300]
-    except Exception as exc:
-        refusal = "exit failed in a way the doorway does not name: %r" % exc
-    try:
-        torn = host.kill(record["session"])
-    except Exception as exc:
-        report.record(Finding("S2", FAIL, "the doorway's ordered teardown against a live lane",
-                              "`exit` %s, and `kill` then failed: %r"
-                              % ("refused as it should" if refused else "did not refuse", exc)))
-        lab.sessions.pop("fenced-untrusted", None)
-        return
-    after = host.state(record["session"])
-    ok = refused and torn.closed and after.name_resolves is False
-    report.record(Finding(
-        "S2", PASS if ok else FAIL,
-        "the doorway's ordered teardown against a live lane, and the name afterwards",
-        "before: %s (liveness from OS process facts — the pane's shell pid and a live child — "
-        "never from the host's agent list). `exit` %s. `kill` reported closed=%s signalled=%s "
-        "orphan=%s. Afterwards the host no longer resolves the name (name_resolves=%s), so \"no "
-        "live process in this lane\" is a real query rather than an inference."
-        % (_quick_state(before),
-           ("REFUSED the live session, as it must (%s)" % refusal) if refused
-           else ("did NOT refuse a live session — %s" % (refusal or "it closed it")),
-           torn.closed, torn.signalled, torn.orphan_pid, after.name_resolves)))
-    lab.sessions.pop("fenced-untrusted", None)
+    for finding in derived_verdicts(capture, outcomes):
+        report.record(finding)
 
 
 def _judge_billing(report, args):
@@ -1463,7 +1574,8 @@ def _record_unjudgeable(report, args):
         "S11", NOT_RUN, "nothing — deliberately",
         "attach-on-demand is not exercised, by ruling rather than by omission: this acceptance is "
         "CLIENTLESS end to end, and attaching a client to prove attaching works would break the "
-        "one property every other drill here depends on. Carried evidence only (#302, #311)."))
+        "one property every other drill here depends on. Carried evidence only (#302, #311).",
+        by_ruling=True))
 
 
 # --------------------------------------------------------------------------- the entry point

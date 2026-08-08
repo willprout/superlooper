@@ -108,11 +108,39 @@ def test_a_criterion_the_suite_cannot_judge_is_reported_not_run_and_is_never_a_p
     assert counts[acceptance.PASS] == 1
     assert counts[acceptance.NOT_RUN] == 1
     assert counts[acceptance.PARTIAL] == 1
-    # It does not fail the run — a not-run criterion is not a failed one — but it is never rounded
-    # up, and the verdict line says so out loud.
-    assert report.exit_code() == acceptance.OK
+    # Never a pass, never silently skipped, and the verdict line says so out loud. The exit code
+    # is RUN_INCOMPLETE rather than OK: this criterion was not run because the run could not run
+    # it, which is a different thing from a standing ruling (see the next test).
+    assert report.exit_code() == acceptance.RUN_INCOMPLETE
     assert "NOT GREEN" in report.summary()
     assert "S2" in report.summary()
+
+
+def test_a_criterion_not_run_by_standing_ruling_does_not_make_the_run_incomplete():
+    """S11 is NOT RUN permanently and correctly; a run carrying only that IS a complete run.
+
+    The distinction the suite's second real run needed. Every lane failed to start, so most
+    criteria came back NOT RUN — and without this the suite exited 0 on a run that had measured
+    nothing at all, which is the worst answer it could give.
+    """
+    report = _report()
+    report.record(acceptance.Finding("S1", acceptance.PASS, "an artefact", "fine"))
+    report.record(acceptance.Finding("S2", acceptance.PASS, "an artefact", "fine"))
+    report.record(acceptance.Finding("S3", acceptance.NOT_RUN, "nothing — deliberately",
+                                     "attaching a client would break the clientless posture",
+                                     by_ruling=True))
+    assert report.fell_over() == []
+    assert report.exit_code() == acceptance.OK
+
+
+def test_a_run_whose_lanes_never_started_does_not_exit_zero():
+    report = _report()
+    report.record(acceptance.Finding("S1", acceptance.PASS, "an artefact", "fine"))
+    report.record(acceptance.Finding("S2", acceptance.NOT_RUN, "nothing", "no lane started"))
+    report.record(acceptance.Finding("S3", acceptance.NOT_RUN, "nothing", "no lane started"))
+    assert report.fell_over() == ["S2", "S3"]
+    assert report.exit_code() == acceptance.RUN_INCOMPLETE
+    assert "did not complete its own plan" in report.summary()
 
 
 def test_a_not_run_finding_must_carry_its_reason():
@@ -209,6 +237,73 @@ def test_the_fence_drill_runs_its_own_control_too():
     assert unpaired.verdict == acceptance.NOT_RUN
 
 
+# ------------------------------------ criteria derived from a drill that did not run
+
+def _capture(verdict=None):
+    return acceptance.Finding(acceptance.CAPTURE_DRILL, verdict or acceptance.PASS, "a drill",
+                              "detail")
+
+
+def test_criteria_derived_from_a_drill_that_did_not_run_are_not_run_rather_than_failed():
+    """The defect the suite's SECOND real run produced.
+
+    Every lane failed to start (a loaded machine), the capture drill was correctly NOT RUN — and S6
+    and S12 were reported FAIL anyway, because they were derived from "did the fenced lane
+    capture?" without first asking whether anything had been measured. A FAIL nobody measured is
+    the same defect as a PASS nobody measured with the sign flipped, and it is the more dangerous
+    one: it sends somebody to rebuild a host that was never tested.
+    """
+    findings = acceptance.derived_verdicts(
+        _capture(acceptance.NOT_RUN),
+        {"fenced-hooked": acceptance.LaneOutcome("fenced-hooked", None, "the lane never started")})
+    verdicts = {f.criterion: f.verdict for f in findings}
+    assert verdicts == {"S5": acceptance.NOT_RUN, "S6": acceptance.NOT_RUN,
+                        "S12": acceptance.NOT_RUN}
+    assert all(f.detail.strip() for f in findings)
+
+
+def test_a_capture_drill_that_ran_and_passed_carries_its_criteria():
+    findings = acceptance.derived_verdicts(
+        _capture(acceptance.PASS),
+        {"fenced-hooked": acceptance.LaneOutcome("fenced-hooked", True, "came back resumed",
+                                                 resolves=True)})
+    verdicts = {f.criterion: f.verdict for f in findings}
+    assert verdicts == {"S5": acceptance.PARTIAL, "S6": acceptance.PASS, "S12": acceptance.PASS}
+
+
+def test_a_measured_but_failing_capture_fails_hook_continuity_and_not_the_others():
+    findings = acceptance.derived_verdicts(
+        _capture(acceptance.FAIL),
+        {"fenced-hooked": acceptance.LaneOutcome("fenced-hooked", False, "a bare shell",
+                                                 resolves=True)})
+    verdicts = {f.criterion: f.verdict for f in findings}
+    # The lane WAS measured across the restart and the host still addressed it BY NAME, so
+    # decoupling held; what failed is the capture.
+    assert verdicts["S12"] == acceptance.FAIL
+    assert verdicts["S6"] == acceptance.PASS
+
+
+def test_decoupling_fails_when_the_name_stopped_resolving_even_if_a_lane_was_measured():
+    """S6 is a DIFFERENT question from the capture drill's, and an earlier draft conflated them:
+    it read "the drill produced a number" as decoupling and passed S6 while its own appended
+    detail said the pane had come back a bare shell."""
+    findings = acceptance.derived_verdicts(
+        _capture(acceptance.FAIL),
+        {"fenced-hooked": acceptance.LaneOutcome("fenced-hooked", False, "a bare shell",
+                                                 resolves=False)})
+    assert {f.criterion: f.verdict for f in findings}["S6"] == acceptance.FAIL
+
+
+def test_no_criterion_is_derived_twice():
+    """Two findings for one criterion would make `counts()` disagree with the table."""
+    for capture, outcome in ((acceptance.PASS, True), (acceptance.NOT_RUN, None)):
+        findings = acceptance.derived_verdicts(
+            _capture(capture),
+            {"fenced-hooked": acceptance.LaneOutcome("fenced-hooked", outcome, "d")})
+        ids = [f.criterion for f in findings]
+        assert len(ids) == len(set(ids)), ids
+
+
 # --------------------------------------------- S9: refuse to name a mechanism nobody measured
 
 def _gate(drove, advisory, control_drove=True, trust_record_appeared=False):
@@ -293,6 +388,29 @@ def test_it_reads_back_whether_a_folder_it_never_pre_trusted_acquired_a_record(t
     lab = acceptance.Lab(str(tmp_path / "lab"), None, str(config))
     assert lab.trusted_by_someone_else(str(lane)) is True
     assert lab.trusted_by_someone_else(str(tmp_path / "lab" / "lanes" / "other")) is False
+
+
+def test_the_matrix_s_declared_expectations_are_the_ones_the_verdict_uses():
+    """`Lane.expect_capture` must be live, not decoration a `--list` prints while the arithmetic
+    hardcodes something else."""
+    expected = {lane.name: lane.expect_capture for lane in acceptance.LANES}
+    assert acceptance.capture_verdict(_lanes(**{
+        n: expected[n] for n in ("fenced-hooked", "unfenced-hooked", "fenced-unhooked")
+    })).verdict == acceptance.PASS
+    # Flip any one of them and the drill must stop passing.
+    for flip in ("fenced-hooked", "unfenced-hooked", "fenced-unhooked"):
+        lanes = {n: expected[n] for n in ("fenced-hooked", "unfenced-hooked", "fenced-unhooked")}
+        lanes[flip] = not lanes[flip]
+        assert acceptance.capture_verdict(_lanes(**lanes)).verdict != acceptance.PASS, flip
+
+
+def test_a_lane_whose_argv_could_not_be_read_is_unmeasured_not_uncaptured():
+    """A failed `pgrep` must not be promoted into a capture-drill FAIL about the host."""
+    finding = acceptance.capture_verdict({
+        "fenced-hooked": acceptance.LaneOutcome("fenced-hooked", None, "unreadable"),
+        "unfenced-hooked": _outcome("unfenced-hooked", True),
+        "fenced-unhooked": _outcome("fenced-unhooked", False)})
+    assert finding.verdict == acceptance.NOT_RUN
 
 
 def test_every_paired_drill_declares_a_control_that_the_matrix_actually_runs():
