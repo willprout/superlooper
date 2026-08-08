@@ -473,6 +473,50 @@ def capture_verdict(outcomes):
         "run as unsound rather than the host as certified.", artefacts)
 
 
+def gate_verdict(*, drove, advisory, control_drove, trust_record_appeared, detail=""):
+    """Judge S9 — and REFUSE to name a mechanism the drill did not measure.
+
+    This function exists because the first real run of this suite got it wrong. The untrusted lane
+    could not be driven, and the drill wrote "so a first-run gate is still there" — which the
+    evidence did not support: the host's own advisory word for that lane was ``done``, i.e. a
+    session that ENDED, not one sitting at a dialog, and the agent had meanwhile written
+    ``hasTrustDialogAccepted`` for the folder itself. "The lane could not be driven" and "a gate
+    stopped it" are two different claims, and only the second is the criterion.
+
+    So the ladder is: no control, no verdict; an untrusted lane that DELIVERED is a pass; an
+    untrusted lane the host itself reports ``blocked`` is the gate, because that is the pinned
+    release's own structured word for the trust dialog (#311 measured it changing from ``idle`` to
+    ``blocked``); anything else is NOT RUN with what was actually seen. Reading the screen would
+    settle it and is exactly what the plan's wrapper rules put outside the evidence path.
+    """
+    seen = ("the untrusted lane %s; the host's advisory word for it was %r; a trust record %s "
+            "appear for the folder without the suite writing one.%s"
+            % ("was driven" if drove else "could not be driven", advisory,
+               "DID" if trust_record_appeared else "did not", (" " + detail) if detail else ""))
+    if control_drove is not True:
+        return Finding("S9", NOT_RUN, "an unpaired lane, which is not evidence",
+                       "the pre-trusted control on the same host did not deliver either, so the "
+                       "untrusted lane's failure says nothing about a gate. " + seen)
+    if drove:
+        return Finding("S9", PASS, "an untrusted lane beside a pre-trusted control on the same host",
+                       "a lane in a folder with NO trust record took its prompt anyway, so no "
+                       "first-run gate stood between an unattended session and its work. " + seen)
+    if advisory == "blocked":
+        return Finding("S9", FAIL, "the host's own structured state for an untrusted lane",
+                       "the untrusted lane is reported BLOCKED by the host — the pinned release's "
+                       "own word for the first-run dialog — while the pre-trusted control on the "
+                       "same host and binary delivered. The criterion asks for ZERO attended "
+                       "gates, and this suite must itself write a trust record before any lane of "
+                       "its own will run (#345 owns which file that record goes in). " + seen)
+    return Finding("S9", NOT_RUN, "a contrast whose mechanism the suite cannot pin unattended",
+                   "the untrusted lane could not be driven while its pre-trusted control could, "
+                   "which is a real contrast — but it is NOT on its own evidence of a first-run "
+                   "gate: a session that simply ended produces the same failure to deliver. The "
+                   "one structured signal that would settle it is the host reporting the lane "
+                   "BLOCKED, and it did not. Naming the gate anyway would be the suite asserting "
+                   "a mechanism it did not measure. " + seen)
+
+
 def fence_verdict(probes):
     """Judge the fence itself, with its own control.
 
@@ -568,13 +612,40 @@ class Started:
     def describe(self, pid):
         return self._started.get(int(pid), "")
 
-    def stop(self, pid, patience=5.0):
-        """SIGTERM, then SIGKILL if it is still there. Refuses a pid this run did not start."""
+    def _mine(self, pid):
         pid = int(pid)
         if pid not in self._started:
             raise SuiteError(
                 "refusing to signal pid %s: this run did not start it. Every signal the suite "
                 "sends goes to a pid it recorded itself — never a name, never a pattern." % pid)
+        return pid
+
+    def kill_now(self, pid, patience=10.0):
+        """SIGKILL, with no SIGTERM first — the drill's own verb, not a tidy shutdown.
+
+        The capture drill is asking what a CRASHED host does, and a host that was asked politely
+        gets to run its own shutdown path. `kill -9` is what #311 measured and what the DoD names,
+        so the difference is not a detail: a graceful stop would be a different experiment wearing
+        the same label.
+        """
+        pid = self._mine(pid)
+        try:
+            self._kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            self._started.pop(pid, None)
+            return
+        waited = 0.0
+        while waited < patience and self.is_alive(pid):
+            self._sleep(0.2)
+            waited += 0.2
+        self._started.pop(pid, None)
+
+    def stop(self, pid, patience=5.0):
+        """SIGTERM, then SIGKILL if it is still there. Refuses a pid this run did not start.
+
+        The teardown verb — distinct from `kill_now` above, which is a drill.
+        """
+        pid = self._mine(pid)
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 self._kill(pid, sig)
@@ -728,7 +799,7 @@ class Lab:
         """
         host = self.hosts[name]
         pid = host["proc"].pid
-        self.started.stop(pid, patience=10.0)
+        self.started.kill_now(pid)
         socket_path = self.sockets[name]
         for _ in range(50):
             if not os.path.exists(socket_path):
@@ -774,20 +845,44 @@ class Lab:
         self._trusted.append(os.path.realpath(cwd))
         return proc.stdout.strip()
 
-    def untrust_all(self):
-        """Remove every trust record this run wrote. The lab leaves no state behind."""
+    def _project_entries(self):
         path = os.path.join(self.config_dir, ".claude.json")
-        removed = []
         try:
             with open(path, encoding="utf-8") as handle:
                 document = json.load(handle)
         except (OSError, ValueError):
-            return removed
+            return path, None, {}
         projects = document.get("projects")
-        if not isinstance(projects, dict):
+        return path, document, projects if isinstance(projects, dict) else {}
+
+    def trusted_by_someone_else(self, cwd):
+        """Did a folder the suite never pre-trusted acquire a trust record anyway?
+
+        A fact worth reading rather than assuming: the agent writes this file itself, so the answer
+        says whether it met the trust decision and settled it. `gate_verdict` reports it and does
+        NOT infer a mechanism from it.
+        """
+        _path, _doc, projects = self._project_entries()
+        entry = projects.get(os.path.realpath(str(cwd))) or {}
+        return bool(isinstance(entry, dict) and entry.get("hasTrustDialogAccepted"))
+
+    def untrust_all(self):
+        """Remove every project record under the lab, not merely the ones this run wrote.
+
+        The first real run of this suite left one behind: the UNTRUSTED lane never got a pre-trust
+        from us, and the agent wrote its own entry for that folder — so a cleanup keyed on "what we
+        wrote" left state in the operator's config for a directory that no longer exists. Keying on
+        the LAB ROOT instead is both wider and still exact: it is a directory this run made, and
+        nothing else on the machine can be under it.
+        """
+        path, document, projects = self._project_entries()
+        removed = []
+        if document is None:
             return removed
-        for folder in self._trusted:
-            if projects.pop(folder, None) is not None:
+        lab = os.path.realpath(self.root) + os.sep
+        for folder in list(projects):
+            if folder in self._trusted or os.path.realpath(str(folder)).startswith(lab):
+                projects.pop(folder, None)
                 removed.append(folder)
         if removed:
             tmp = path + ".acceptance.tmp"
@@ -1207,24 +1302,18 @@ def _judge_first_run_gate(lab, report):
     host = lab.wrapper(untrusted["host"])
     text = "Acceptance gate drill: reply with the single word ready."
     oracle = lab.oracle("fenced-untrusted", text)
-    gated, detail = None, ""
+    drove, detail = False, ""
     try:
         host.send(untrusted["session"], text, delivery=oracle, timeout_ms=60000)
-        gated = False
-        detail = "a session in a folder with NO trust record took the prompt anyway"
+        drove = True
     except Exception as exc:
-        gated = True
-        detail = "the untrusted lane could not be driven (%s: %s)" % (type(exc).__name__,
-                                                                      str(exc)[:300])
+        detail = "The send raised %s: %s" % (type(exc).__name__, str(exc)[:250])
     state = host.state(untrusted["session"])
-    report.record(Finding(
-        "S9", FAIL if gated else PASS,
-        "an untrusted lane beside a pre-trusted control on the same host",
-        "%s, while the pre-trusted control on the same host and the same binary delivered. The "
-        "host reads the untrusted lane as advisory=%r. So a first-run gate is still there and "
-        "pre-trust is still load-bearing: this criterion asks for ZERO attended gates, and the "
-        "suite itself has to write a trust record before any lane of its own will run (#345 owns "
-        "which file that record goes in)." % (detail, state.advisory)))
+    # The control's own delivery is the pairing: S3's finding is that same lane's send.
+    control_drove = any(f.criterion == "S3" and f.verdict == PASS for f in report.findings)
+    report.record(gate_verdict(
+        drove=drove, advisory=state.advisory, control_drove=control_drove,
+        trust_record_appeared=lab.trusted_by_someone_else(untrusted["cwd"]), detail=detail))
 
 
 def _capture_outcome(lab, lane):

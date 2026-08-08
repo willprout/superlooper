@@ -13,9 +13,11 @@ a live one. The seam between the two is the pure verdict functions below, which 
 OBSERVATIONS and produce findings; that is what makes the judging testable at all.
 """
 import importlib.util
+import json
 import os
 import pathlib
 import shutil
+import signal
 import tempfile
 
 import pytest
@@ -207,6 +209,92 @@ def test_the_fence_drill_runs_its_own_control_too():
     assert unpaired.verdict == acceptance.NOT_RUN
 
 
+# --------------------------------------------- S9: refuse to name a mechanism nobody measured
+
+def _gate(drove, advisory, control_drove=True, trust_record_appeared=False):
+    return acceptance.gate_verdict(drove=drove, advisory=advisory, control_drove=control_drove,
+                                   trust_record_appeared=trust_record_appeared)
+
+
+def test_a_lane_the_host_reports_blocked_is_the_first_run_gate():
+    finding = _gate(drove=False, advisory="blocked")
+    assert finding.verdict == acceptance.FAIL
+    assert "blocked" in finding.detail.lower()
+
+
+def test_an_untrusted_lane_that_delivered_anyway_is_a_pass():
+    finding = _gate(drove=True, advisory="idle")
+    assert finding.verdict == acceptance.PASS
+
+
+def test_a_lane_that_merely_failed_to_deliver_is_not_evidence_of_a_gate():
+    """The defect the suite's own first real run produced, turned into a test.
+
+    The untrusted lane could not be driven and the drill wrote "so a first-run gate is still
+    there" — while the host's advisory word for that lane was ``done``, i.e. a session that ENDED.
+    "Could not be driven" and "a gate stopped it" are two different claims.
+    """
+    finding = _gate(drove=False, advisory="done")
+    assert finding.verdict == acceptance.NOT_RUN
+    assert "did not measure" in finding.detail or "not measure" in finding.detail
+    assert "done" in finding.detail
+
+
+def test_the_gate_drill_needs_its_control_to_have_delivered():
+    finding = _gate(drove=False, advisory="blocked", control_drove=False)
+    assert finding.verdict == acceptance.NOT_RUN
+    assert "control" in finding.detail.lower()
+
+
+def test_the_gate_drill_reports_whether_the_agent_wrote_its_own_trust_record():
+    """A fact worth carrying: the agent writes that file itself, so it says whether it met the
+    decision. It is REPORTED, never turned into the verdict."""
+    seen = _gate(drove=False, advisory="done", trust_record_appeared=True)
+    unseen = _gate(drove=False, advisory="done", trust_record_appeared=False)
+    assert "DID" in seen.detail and "did not" in unseen.detail
+    assert seen.verdict == unseen.verdict == acceptance.NOT_RUN
+
+
+# ------------------------------------------------------ the lab leaves no state in a shared config
+
+def test_teardown_removes_project_records_the_agent_wrote_as_well_as_the_ones_it_did(tmp_path):
+    """The other defect the first real run produced.
+
+    The untrusted lane was never pre-trusted by the suite, so a cleanup keyed on "what we wrote"
+    left the agent's own entry for that folder in the operator's config — pointing at a directory
+    that no longer exists.
+    """
+    config = tmp_path / "cfg"
+    config.mkdir()
+    lab_root = tmp_path / "lab"
+    (lab_root / "lanes" / "untrusted").mkdir(parents=True)
+    ours = str(lab_root / "lanes" / "trusted")
+    (config / ".claude.json").write_text(json.dumps({"projects": {
+        ours: {"hasTrustDialogAccepted": True},
+        str(lab_root / "lanes" / "untrusted"): {"hasTrustDialogAccepted": True},
+        "/Users/somebody/real-project": {"hasTrustDialogAccepted": True},
+    }}))
+    lab = acceptance.Lab(str(lab_root), None, str(config))
+    removed = lab.untrust_all()
+
+    left = json.loads((config / ".claude.json").read_text())["projects"]
+    assert list(left) == ["/Users/somebody/real-project"], (
+        "the lab left records behind, or took one that was not its own: %s" % left)
+    assert len(removed) == 2
+
+
+def test_it_reads_back_whether_a_folder_it_never_pre_trusted_acquired_a_record(tmp_path):
+    config = tmp_path / "cfg"
+    config.mkdir()
+    lane = tmp_path / "lab" / "lanes" / "untrusted"
+    lane.mkdir(parents=True)
+    (config / ".claude.json").write_text(json.dumps({"projects": {
+        str(lane.resolve()): {"hasTrustDialogAccepted": True}}}))
+    lab = acceptance.Lab(str(tmp_path / "lab"), None, str(config))
+    assert lab.trusted_by_someone_else(str(lane)) is True
+    assert lab.trusted_by_someone_else(str(tmp_path / "lab" / "lanes" / "other")) is False
+
+
 def test_every_paired_drill_declares_a_control_that_the_matrix_actually_runs():
     """The discipline is structural: a drill cannot declare a control lane nobody stands up."""
     lanes = {lane.name for lane in acceptance.LANES}
@@ -307,6 +395,29 @@ def test_it_stops_what_it_started_and_only_that():
     started.stop_all()
     assert [pid for pid, _sig in signalled] == [77]
     assert started.outstanding() == []
+
+
+def test_the_capture_drill_kills_the_host_outright_rather_than_asking_it_to_stop():
+    """`kill -9`, with no SIGTERM first — the drill asks what a CRASHED host does.
+
+    A host asked politely runs its own shutdown path, which is a different experiment wearing the
+    same label. #311 measured `kill -9` and the DoD names it.
+    """
+    signalled = []
+    started = acceptance.Started(kill=lambda pid, sig: signalled.append(sig),
+                                 sleep=lambda _s: None, alive=lambda _pid: False)
+    started.record(31, "a lab host")
+    started.kill_now(31)
+    assert signalled == [signal.SIGKILL], "the drill sent %r, not a bare SIGKILL" % (signalled,)
+    assert started.outstanding() == []
+
+
+def test_the_drill_kill_refuses_a_pid_this_run_did_not_start_too():
+    signalled = []
+    started = acceptance.Started(kill=lambda pid, sig: signalled.append(sig))
+    with pytest.raises(acceptance.SuiteError):
+        started.kill_now(4242)
+    assert signalled == []
 
 
 def test_an_interrupted_run_leaves_no_server_behind():
