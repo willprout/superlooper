@@ -1,7 +1,29 @@
 import json
 import urllib.error
 from unittest import mock
+
+import pytest
+
+import identity
 import usage
+
+
+@pytest.fixture(autouse=True)
+def pinned_claude(tmp_path, monkeypatch):
+    """A resolvable `claude` for every test in this file (issue #350/#323).
+
+    The probe now resolves its binary through the launch stack's own ladder instead of a bare-name
+    PATH lookup, and conftest's ratchet pins SL_CLAUDE at a guaranteed-ABSENT path — so without
+    this, every probe test below would exercise only the "no runnable claude" branch and never
+    reach the status read it is about. This is a real, executable FILE and never a real claude:
+    `usage.subprocess.run` is mocked in every test here, so the ladder resolves this path and
+    nothing ever runs it.
+    """
+    stub = tmp_path / "claude"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("SL_CLAUDE", str(stub))
+    return str(stub)
 
 
 def _keychain_ok(token="tok"):
@@ -239,3 +261,208 @@ def test_keychain_ts_to_epoch_roundtrip():
     assert usage._keychain_ts_to_epoch("19700101000000") == 0
     assert usage._keychain_ts_to_epoch("garbage") is None
     assert usage._keychain_ts_to_epoch(None) is None
+
+
+# ---------------------------------------------------------------------------
+# #350: BOTH readers ask about the account a WORKER runs as, not the machine's default login.
+#
+# #314 put a per-worker Claude config dir on the spawn seam: when a machine sets
+# SL_FLEET_CLAUDE_CONFIG_DIR, every session runs under THAT dir's credential namespace. These two
+# readers predate that seam. The mechanism is not just an env var — `claude` derives its keychain
+# service name as `Claude Code-credentials-<8 hex of sha256(CLAUDE_CONFIG_DIR)>` (#300), so a
+# reader pointed at a config dir must look in that dir's OWN item; asking the unsuffixed one
+# answers about the owner. On a fleet machine that is a different rate-limit pool, which is exactly
+# the capacity determinism the owner's #314 ruling asked for.
+# ---------------------------------------------------------------------------
+_FLEET_DIR = "/Users/tester/.claude-fleet"
+_OWNER_SERVICE = "Claude Code-credentials"
+
+
+def _fleet_service():
+    return "%s-%s" % (_OWNER_SERVICE, identity.namespace_suffix(_FLEET_DIR))
+
+
+def _service_of(argv):
+    """The keychain service name a `security` argv named, or None for any other command."""
+    if not argv or argv[0] != "security" or "-s" not in argv:
+        return None
+    return argv[argv.index("-s") + 1]
+
+
+class _Spy:
+    """Records every argv (and the env it was handed) the reader shells out with."""
+
+    def __init__(self, answer):
+        self.calls, self.envs, self._answer = [], [], answer
+
+    def __call__(self, args, **kw):
+        argv = list(args)
+        self.calls.append(argv)
+        self.envs.append(kw.get("env"))
+        return self._answer(argv)
+
+    def env_for(self, command):
+        for argv, env in zip(self.calls, self.envs):
+            if argv and argv[0] == command:
+                return env
+        return None
+
+    def services(self):
+        return [s for s in (_service_of(c) for c in self.calls) if s]
+
+
+def test_the_keychain_suffix_is_the_launch_seams_own_derivation():
+    # ONE derivation of the namespace suffix for the whole engine: `identity.namespace_suffix` is
+    # what the launch seam refuses a mis-spelled config dir with, and a second copy here would be a
+    # second answer to "which keychain item holds this dir's login".
+    assert usage.credential_service(_FLEET_DIR) == _fleet_service()
+    # No assignment -> the bare, unsuffixed item, which is exactly what `claude` itself falls back
+    # to. A whitespace-only value is "no assignment" too, never its own namespace.
+    assert usage.credential_service(None) == _OWNER_SERVICE
+    assert usage.credential_service("   ") == _OWNER_SERVICE
+
+
+def test_probe_auth_asks_the_assigned_namespace_on_both_halves(monkeypatch):
+    monkeypatch.setenv("SL_FLEET_CLAUDE_CONFIG_DIR", _FLEET_DIR)
+    spy = _Spy(lambda argv: _keychain_attrs(True) if argv[0] == "security" else _claude_status(True))
+    with mock.patch("usage.subprocess.run", side_effect=spy):
+        r = usage.probe_auth()
+    # half one: the CLI status read runs under the assigned dir, so it reports THAT login...
+    assert spy.env_for(pinned_claude_path(spy))["CLAUDE_CONFIG_DIR"] == _FLEET_DIR
+    # ...half two: the credential item it reads is that dir's own, never the owner's unsuffixed one.
+    assert spy.services() == [_fleet_service()]
+    assert r["config_dir"] == _FLEET_DIR       # the snapshot says which account it is about
+    assert r["valid"] is True
+
+
+def pinned_claude_path(spy):
+    """The claude argv[0] the spy actually saw — the ladder-resolved path, not the bare name."""
+    for argv in spy.calls:
+        if argv and argv[0] != "security":
+            return argv[0]
+    raise AssertionError("the probe never ran a `claude auth status` read at all")
+
+
+def test_probe_auth_with_no_assignment_reads_the_default_namespace_as_today():
+    # The off-the-fleet path must be untouched: the unsuffixed item, and a status read with no
+    # config dir named at all (ABSENT, never empty — an empty CLAUDE_CONFIG_DIR is its own
+    # namespace, `sha256("")`, not "the default one").
+    spy = _Spy(lambda argv: _keychain_attrs(True) if argv[0] == "security" else _claude_status(True))
+    with mock.patch("usage.subprocess.run", side_effect=spy):
+        r = usage.probe_auth()
+    assert spy.services() == [_OWNER_SERVICE]
+    assert "CLAUDE_CONFIG_DIR" not in spy.env_for(pinned_claude_path(spy))
+    assert r["config_dir"] is None
+    assert r["cli"] == "logged_in" and r["valid"] is True
+
+
+def test_probe_auth_never_reads_the_owners_item_for_the_assigned_namespace(monkeypatch):
+    # The defect, stated as a test: the OWNER's credential item is healthy and the ASSIGNED
+    # namespace's is gone. Today's reader asked the unsuffixed item and reported a live account —
+    # the owner's answer read as this one's. It must read the namespace the workers actually use.
+    monkeypatch.setenv("SL_FLEET_CLAUDE_CONFIG_DIR", _FLEET_DIR)
+
+    def _answer(argv):
+        if argv[0] == "security":
+            return _keychain_attrs(_service_of(argv) == _OWNER_SERVICE)
+        return _claude_status(False)
+
+    spy = _Spy(_answer)
+    with mock.patch("usage.subprocess.run", side_effect=spy):
+        r = usage.probe_auth()
+    assert spy.services() == [_fleet_service()]
+    assert r["keychain_present"] is False
+    assert r["valid"] is False              # definitive for THAT namespace; the gate's rule is unchanged
+
+
+def test_probe_auth_unusable_assignment_is_unknown_rather_than_the_owners_answer(monkeypatch):
+    # A machine that NAMES a config dir this reader cannot turn into a namespace has no account it
+    # could honestly ask about. Falling back to the unsuffixed item would be a confident answer to
+    # a different question — the one outcome worse than "unknown" for a gate that holds the queue.
+    monkeypatch.setenv("SL_FLEET_CLAUDE_CONFIG_DIR", "relative/dir")
+    spy = _Spy(lambda argv: _keychain_attrs(True))
+    with mock.patch("usage.subprocess.run", side_effect=spy):
+        r = usage.probe_auth()
+    assert spy.calls == []                  # nothing was asked of anything
+    assert r["cli"] == "unknown"
+    assert r["keychain_present"] is None and r["keychain_mtime"] is None
+    assert r["valid"] is None               # fail open — a dark probe never freezes the loop
+    assert "relative" in (r["note"] or "")
+
+
+def test_probe_auth_runs_the_binary_the_launch_stack_would(pinned_claude):
+    # #323, absorbed into #350: the one reader whose answer gates spend used to resolve its
+    # `claude` by bare PATH order while every worker resolves by configuration (SL_CLAUDE -> the
+    # standalone install -> PATH). Two machines could disagree about which claude is authoritative.
+    spy = _Spy(lambda argv: _keychain_attrs(True) if argv[0] == "security" else _claude_status(True))
+    with mock.patch("usage.subprocess.run", side_effect=spy):
+        usage.probe_auth()
+    assert [c for c in spy.calls if c[0] != "security"] == [[pinned_claude, "auth", "status"]]
+    assert not any(c[0] == "claude" for c in spy.calls), "never a bare-name PATH lookup"
+
+
+def test_probe_auth_with_no_runnable_claude_stays_fail_open_unknown(monkeypatch):
+    # The ladder's fail-closed pin refusal reaches this reader too: a pin naming nothing runnable
+    # is never quietly downgraded to PATH. There is then no account read to make — but the keychain
+    # half is independent of the binary and still answers, exactly as it does today when `claude`
+    # cannot be spawned.
+    monkeypatch.setenv("SL_CLAUDE", "/nonexistent/superlooper-test-claude")
+    spy = _Spy(lambda argv: _keychain_attrs(True))
+    with mock.patch("usage.subprocess.run", side_effect=spy):
+        r = usage.probe_auth()
+    assert [c[0] for c in spy.calls] == ["security"]
+    assert r["cli"] == "unknown" and r["valid"] is None
+    assert "SL_CLAUDE" in (r["note"] or "")
+
+
+def test_fetch_usage_meters_the_assigned_namespaces_pool(monkeypatch):
+    monkeypatch.setenv("SL_FLEET_CLAUDE_CONFIG_DIR", _FLEET_DIR)
+    spy = _Spy(lambda argv: _keychain_ok())
+    with mock.patch("usage.subprocess.run", side_effect=spy), \
+         mock.patch("usage.urllib.request.urlopen", return_value=_http_ok()):
+        r = usage.fetch_claude_usage()
+    assert spy.services() == [_fleet_service()]
+    assert r["auth_status"] == "ok" and r["five_hour_pct"] == 73
+    assert r["config_dir"] == _FLEET_DIR      # which pool these numbers describe, on the record
+
+
+def test_fetch_usage_with_no_assignment_meters_the_default_pool_as_today():
+    spy = _Spy(lambda argv: _keychain_ok())
+    with mock.patch("usage.subprocess.run", side_effect=spy), \
+         mock.patch("usage.urllib.request.urlopen", return_value=_http_ok()):
+        r = usage.fetch_claude_usage()
+    assert spy.services() == [_OWNER_SERVICE]
+    assert r["auth_status"] == "ok" and r["config_dir"] is None
+
+
+def test_fetch_usage_reports_unknown_rather_than_another_accounts_numbers(monkeypatch):
+    # The scheduler paces lanes on this read. With the assigned namespace's credential item absent
+    # and the owner's present, the old reader returned the OWNER's utilisation — pacing the fleet's
+    # lanes against a pool they are not spending. Report the dark meter instead; `no_keychain` is
+    # not `ok`, so the scheduler's existing fail-closed-then-grace path takes it from here.
+    monkeypatch.setenv("SL_FLEET_CLAUDE_CONFIG_DIR", _FLEET_DIR)
+
+    def _answer(argv):
+        if _service_of(argv) == _OWNER_SERVICE:
+            return _keychain_ok("the-owners-token")
+        return mock.Mock(returncode=44, stdout="")
+
+    spy = _Spy(_answer)
+    with mock.patch("usage.subprocess.run", side_effect=spy), \
+         mock.patch("usage.urllib.request.urlopen", return_value=_http_ok()) as opened:
+        r = usage.fetch_claude_usage()
+    assert spy.services() == [_fleet_service()]
+    assert r["auth_status"] == "no_keychain"
+    assert r["five_hour_pct"] is None and r["seven_day_pct"] is None
+    assert not opened.called, "no token, so no call — never the owner's numbers under this label"
+
+
+def test_fetch_usage_unusable_assignment_never_reads_the_owners_item(monkeypatch):
+    monkeypatch.setenv("SL_FLEET_CLAUDE_CONFIG_DIR", "relative/dir")
+    spy = _Spy(lambda argv: _keychain_ok("the-owners-token"))
+    with mock.patch("usage.subprocess.run", side_effect=spy), \
+         mock.patch("usage.urllib.request.urlopen", return_value=_http_ok()) as opened:
+        r = usage.fetch_claude_usage()
+    assert spy.calls == [] and not opened.called
+    assert r["auth_status"] == "namespace_unknown"
+    assert r["five_hour_pct"] is None and r["seven_day_pct"] is None
