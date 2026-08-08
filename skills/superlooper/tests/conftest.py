@@ -252,9 +252,14 @@ def _never_probe_real_auth(monkeypatch):
     # exercise the probe set their own instance _probe_auth in-body (that instance attr wins); the
     # probe FUNCTION itself (usage.probe_auth) is untouched, so test_usage still tests the real thing.
     import runner as runner_mod
+    # Kept SHAPE-COMPLETE against usage.probe_auth's real return (issue #350 added config_dir and
+    # note). A stub with fewer keys than the thing it stands in for is the inverse of a useful test
+    # signal: the first consumer to read one of them would KeyError under every ticking-runner test
+    # while working perfectly in production.
     monkeypatch.setattr(runner_mod.Runner, "_probe_auth",
                         lambda self: {"cli": "unknown", "keychain_present": None,
-                                      "keychain_mtime": None, "valid": None, "status_raw": ""},
+                                      "keychain_mtime": None, "valid": None, "status_raw": "",
+                                      "config_dir": None, "note": ""},
                         raising=False)
 
 

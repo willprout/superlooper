@@ -161,12 +161,15 @@ def probe_auth(timeout=5, env=None) -> dict:
         status_raw       -> the (bounded) `claude auth status` text, for the forensic capture
         valid            -> True | False | None
         config_dir       -> the config dir this reading is ABOUT; None means the machine's DEFAULT
-                            login. There is ONE case where None means "no namespace at all": a
-                            machine whose assignment is unusable, and that case is the only one
-                            where every other field is also empty (`keychain_present` None and
-                            `status_raw` ""). `note` alone does not tell them apart — it is also
-                            set when the config dir was fine and only the BINARY was missing, a
-                            reading in which the keychain half answered normally.
+                            login, EXCEPT on the one branch where there was no namespace to read
+                            at all (an assignment this machine names but cannot use). Read the
+                            `note` TEXT to tell those apart — it opens "the config dir this
+                            machine assigns workers cannot be used" for the second and "the
+                            `claude` this stack would launch is not available" for the other reason
+                            a note exists. The shape of the rest of the snapshot does NOT
+                            distinguish them: a machine with no assignment, a broken binary pin and
+                            an unreadable keychain produces an identical all-empty reading, because
+                            the keychain half fails OPEN to None on an untrusted `security` error.
         note             -> why a half could not be asked, when one could not (else "")
     `valid` is the launch-gating verdict: False ONLY on a DEFINITIVE dead reading (the CLI reports
     not-logged-in, or the credential keychain item is gone) — those are exactly the states in which a

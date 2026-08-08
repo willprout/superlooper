@@ -19,11 +19,16 @@ def pinned_claude(tmp_path, monkeypatch):
     `usage.subprocess.run` is mocked in every test here, so the ladder resolves this path and
     nothing ever runs it.
 
-    The stub EXITS 97 rather than 0, which is the fail-closed half of that promise. A test added
-    here later that forgets to patch `usage.subprocess.run` would otherwise run this file, get a
-    clean rc, AND shell a real `security find-generic-password` against the owner's login keychain
-    — while looking exactly like a test that exercised the CLI half. 97 makes such a test read
-    `cli: unknown` instead, which is a failing assertion rather than a silent one.
+    It exits 97 so that a stub which somehow DID run is obvious in any output that captures it —
+    and that is the whole of what 97 buys, stated exactly, because the tempting claim is false:
+    `probe_auth` reads the status BODY and never the rc, so an empty-stdout stub reports
+    `cli: unknown` under rc 0 and rc 97 alike.
+
+    The residual hazard this fixture cannot close, named so nobody assumes it did: a test added
+    here that forgets to patch `usage.subprocess.run` still shells a REAL
+    `security find-generic-password` at the owner's login keychain, because the keychain half runs
+    unconditionally and — unlike `claude`, `gh`, `cmux` and the rest — `security` has no resolution
+    env var for conftest's ratchet to neutralize. Patch `usage.subprocess.run` in every test here.
     """
     stub = tmp_path / "claude"
     stub.write_text("#!/bin/sh\nexit 97\n")
