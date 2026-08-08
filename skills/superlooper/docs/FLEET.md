@@ -283,22 +283,36 @@ The rationale for the strictness is capacity, not secrecy: the two Max accounts 
 rate-limit pools and the runner's usage machinery reasons about one pool per lane, so a session on
 the wrong pool makes lane assignment non-deterministic even though both accounts are the owner's.
 
-## Every process that reads a pool reads it from its OWN environment (issue #350)
+## The engine's pool readers read the assignment from their OWN environment (issue #350)
 
 Since #350 the account-auth probe and the Max usage meter both ask about the config dir the
 machine assigns, rather than about the machine's default Claude login — which is what makes the
 paragraph above true of the numbers the scheduler actually paces on. They derive that dir from
 `SL_FLEET_CLAUDE_CONFIG_DIR` **in the environment of whatever process calls them**.
 
-Two processes call them, and they are separate jobs: the **runner** (the gate and the scheduler's
-meter) and the **watchdog** (its own exhausted-usage read, which decides whether the no-progress
-detector is suppressed). Neither launchd template bakes this variable — `launchd.runner.plist`
-carries PATH, `PYTHONUNBUFFERED` and an optional `SL_HOME`; `launchd.watchdog.plist` carries PATH
-alone. So on a fleet machine it must be set for **both**, or the two answer about different
-accounts: a runner correctly holding every launch on an exhausted fleet pool while the watchdog
-reads the owner's pool as healthy would page the owner and open a debugger session into the
-exhausted account, and the mirror case silently suppresses a real no-progress trip. Issue #437
-carries the question of how the assignment should reach a job that boots without a shell.
+Two engine processes call them, and they are separate launchd jobs: the **runner** (the launch gate
+and the scheduler's meter) and the **watchdog** (its own exhausted-usage read, which decides
+whether the no-progress detector is suppressed). Neither template bakes this variable —
+`launchd.runner.plist` carries PATH, `PYTHONUNBUFFERED` and an optional `SL_HOME`;
+`launchd.watchdog.plist` carries PATH alone. So on a fleet machine it must be set for **both**, or
+the two answer about different accounts, in both directions:
+
+* **watchdog unassigned, fleet pool exhausted.** The runner correctly holds every launch; the
+  watchdog reads the OWNER's pool, sees headroom, does not suppress the no-progress detector, and
+  opens a `d<N>` debugger. That debugger inherits the watchdog's environment, so it too carries no
+  assignment — it flies on the **owner's** login, spending the owner's subscription to repair a
+  lane that belongs to the fleet's, on a machine whose whole point is that the two are separate.
+* **watchdog unassigned, owner's pool exhausted.** The watchdog reads that exhausted pool as this
+  machine's, suppresses the detector, and a genuine no-progress stall goes unreported while the
+  fleet's own pool is fine.
+
+Issue #437 carries the question of how the assignment should reach a job that boots without a
+shell, for both jobs.
+
+The **dashboard** is deliberately not in that list: it keeps its own port of the usage read and
+still asks the unsuffixed credential item, so on a fleet machine its usage tile describes the
+owner's pool rather than the one the lanes spend. That is issue #436 — a different area, with its
+own question about which pool an owner-facing pill should show at all.
 
 **`fleet isolation`** — the fleet's named session, socket and prefix are its own, separate from the
 host's default session. This block is explicit about its reach: **production on the other machine

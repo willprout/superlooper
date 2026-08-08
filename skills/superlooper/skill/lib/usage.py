@@ -40,10 +40,12 @@ import identity
 USER_AGENT_VERSION = "2.1.90"  # keep current-ish or the endpoint 403s
 
 # The macOS login-keychain item Claude Code stores its OAuth credentials in when NO config dir is
-# assigned — the owner's default, unsuffixed namespace. Agent-specific by construction (this whole
-# file is inside the agent boundary). Every read below goes through `credential_service`, so the
-# probe and the meter can never end up asking about two different accounts.
-CRED_KEYCHAIN_SERVICE = "Claude Code-credentials"
+# assigned — the owner's default, unsuffixed namespace. The base string is `identity`'s, not a copy:
+# that module's mismatch memo names suffixed items too, and a rename that reached only one of us
+# would leave the other confidently pointing an operator at a keychain item that does not exist.
+# Every read below goes through `credential_service`, so the probe and the meter can never end up
+# asking about two different accounts.
+CRED_KEYCHAIN_SERVICE = identity.CREDENTIAL_SERVICE
 
 
 def iso_to_epoch(iso):
@@ -158,10 +160,13 @@ def probe_auth(timeout=5, env=None) -> dict:
         keychain_mtime   -> int epoch seconds | None
         status_raw       -> the (bounded) `claude auth status` text, for the forensic capture
         valid            -> True | False | None
-        config_dir       -> the config dir this reading is ABOUT. None means the reading is about
-                            the machine's DEFAULT login — or, when `note` is set, that there was no
-                            namespace to read at all; `note` is what tells those two apart, and a
-                            flight-recorder line without one is always the former.
+        config_dir       -> the config dir this reading is ABOUT; None means the machine's DEFAULT
+                            login. There is ONE case where None means "no namespace at all": a
+                            machine whose assignment is unusable, and that case is the only one
+                            where every other field is also empty (`keychain_present` None and
+                            `status_raw` ""). `note` alone does not tell them apart — it is also
+                            set when the config dir was fine and only the BINARY was missing, a
+                            reading in which the keychain half answered normally.
         note             -> why a half could not be asked, when one could not (else "")
     `valid` is the launch-gating verdict: False ONLY on a DEFINITIVE dead reading (the CLI reports
     not-logged-in, or the credential keychain item is gone) — those are exactly the states in which a
@@ -194,7 +199,7 @@ def probe_auth(timeout=5, env=None) -> dict:
         note = ("the config dir this machine assigns workers cannot be used, so which account they "
                 "run as is unknown: %s" % dir_problem)
         return {"cli": cli, "keychain_present": None, "keychain_mtime": None, "valid": None,
-                "status_raw": "", "config_dir": None, "note": note}
+                "status_raw": "", "config_dir": None, "note": note[:1000]}
 
     try:
         claude, why, _deferrable = identity.resolve_claude(env)
@@ -259,7 +264,11 @@ def probe_auth(timeout=5, env=None) -> dict:
             # `auth_probe.json` and appended to the ~30-min flight recorder, and a recorder that
             # did not say which credential namespace it measured would be unreadable on a machine
             # that has two.
-            "config_dir": config_dir, "note": note}
+            # Bounded like `status_raw` two lines up, and for the same reason: this whole dict is
+            # appended verbatim to the auth flight recorder, whose growth discipline bounds the
+            # number of LINES and not the length of one. The note interpolates operator-supplied
+            # values (a config dir, an SL_CLAUDE pin), so its length is not ours to assume.
+            "config_dir": config_dir, "note": note[:1000]}
 
 
 def fetch_claude_usage(env=None) -> dict:
@@ -272,6 +281,7 @@ def fetch_claude_usage(env=None) -> dict:
       auth_status -> ok | no_keychain | no_token | rate_limited | auth_expired | api_error
                      | namespace_unknown
       config_dir  -> the config dir whose pool these numbers describe (None = the machine's default)
+      note        -> why there was no pool to meter, on `namespace_unknown` only (else "")
     All numeric values are None on failure. macOS only (reads the Keychain).
 
     ISSUE #350: the pool metered is the one this machine's WORKERS spend, not the owner's default
@@ -284,7 +294,7 @@ def fetch_claude_usage(env=None) -> dict:
         "five_hour_pct": None, "seven_day_pct": None,
         "five_hour_resets": None, "seven_day_resets": None,
         "five_hour_resets_epoch": None, "seven_day_resets_epoch": None,
-        "auth_status": "unknown", "config_dir": None,
+        "auth_status": "unknown", "config_dir": None, "note": "",
     }
     # The same derivation `probe_auth` and the launch seam use. A configured-but-unusable value is
     # NOT "no assignment": there is no namespace to meter, and reading the unsuffixed item would
@@ -294,6 +304,11 @@ def fetch_claude_usage(env=None) -> dict:
     config_dir, dir_problem = _worker_namespace(env)
     if dir_problem:
         result["auth_status"] = "namespace_unknown"
+        # CARRIED, not dropped. Nothing consumes this — but this is the branch an operator's typo
+        # in SL_FLEET_CLAUDE_CONFIG_DIR lands in, and it leaves the meter permanently dark. A
+        # status enum with no reason beside it makes that a mystery to whoever reads the state
+        # file; the reason costs nothing and names the fix.
+        result["note"] = dir_problem[:1000]
         return result
     result["config_dir"] = config_dir
     try:

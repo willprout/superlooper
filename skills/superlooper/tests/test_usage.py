@@ -18,9 +18,15 @@ def pinned_claude(tmp_path, monkeypatch):
     reach the status read it is about. This is a real, executable FILE and never a real claude:
     `usage.subprocess.run` is mocked in every test here, so the ladder resolves this path and
     nothing ever runs it.
+
+    The stub EXITS 97 rather than 0, which is the fail-closed half of that promise. A test added
+    here later that forgets to patch `usage.subprocess.run` would otherwise run this file, get a
+    clean rc, AND shell a real `security find-generic-password` against the owner's login keychain
+    — while looking exactly like a test that exercised the CLI half. 97 makes such a test read
+    `cli: unknown` instead, which is a failing assertion rather than a silent one.
     """
     stub = tmp_path / "claude"
-    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.write_text("#!/bin/sh\nexit 97\n")
     stub.chmod(0o755)
     monkeypatch.setenv("SL_CLAUDE", str(stub))
     return str(stub)
@@ -202,7 +208,10 @@ def test_probe_auth_never_dumps_the_secret():
 
     def _spy(args, **kw):
         calls.append(list(args))
-        if args[0] == "claude":
+        # NOT `args[0] == "claude"`: since #350 the probe runs the ladder-RESOLVED path, so a
+        # bare-name test would answer the status read with keychain attributes and quietly stop
+        # exercising the branch it reads as exercising.
+        if args[0] != "security":
             return _claude_status(True)
         return _keychain_attrs(True)
 
@@ -485,3 +494,6 @@ def test_fetch_usage_unusable_assignment_never_reads_the_owners_item(monkeypatch
     assert spy.calls == [] and not opened.called
     assert r["auth_status"] == "namespace_unknown"
     assert r["five_hour_pct"] is None and r["seven_day_pct"] is None
+    # The reason travels with the verdict: this is where an operator's typo lands, and it leaves
+    # the meter dark until someone reads the state file and understands why.
+    assert "not an absolute path" in (r["note"] or "")
