@@ -930,6 +930,13 @@ class Lab:
         self._await_socket(socket_path, name)
         return proc.pid
 
+    def stop_host(self, name):
+        """Stop one host and forget it — by the pid this run recorded, like everything else here."""
+        host = self.hosts.pop(name, None)
+        self.sockets.pop(name, None)
+        if host:
+            self.started.stop(host["proc"].pid)
+
     def wrapper(self, name):
         """The five-verb doorway, pointed at one throwaway host. The ONLY way the suite talks."""
         env = dict(self.hosts[name]["env"])
@@ -1334,25 +1341,51 @@ def run_suite(args, report):
 
 
 def _judge_atomic_spawn(lab, report):
-    """S1's negative half: a refused spawn RAISES and leaves nothing behind."""
-    host = lab.wrapper("fenced")
-    impossible = os.path.join(lab.root, "no-such-directory-for-a-workspace")
-    detail, verdict = "", FAIL
+    """S1's negative half: a refused spawn RAISES and leaves nothing behind.
+
+    It runs on a host of its OWN, started for this drill and stopped again straight after, and that
+    isolation is not tidiness — it was measured (2026-08-07, three runs of this suite).
+
+    The probe asks the host to start an agent in a directory that does not exist. `workspace create`
+    ACCEPTS that cwd — the host does not validate it — so the refusal happens one step later, at
+    `agent start`, which waits out its whole timeout and fails. And **a timed-out `agent start`
+    wedges the host: every subsequent `agent start` on that server then times out too**, on a fresh
+    workspace, indefinitely. Reproduced directly: probe raises after 30.3s, the next real lane on
+    the same host fails after its full 60s, and a lane spawned on an untouched host of the same
+    build starts in 3.5s.
+
+    So run on the shared hosts, this one drill silently costs the run every lane it has — which is
+    exactly what happened, and what the run-level NOT RUN reporting then had to describe. The
+    behaviour itself is the host's and is reported upward rather than worked around here; what this
+    function owes the rest of the suite is not to be the thing that triggers it.
+    """
+    lab.start_host("probe", fenced=True)
     try:
-        host.spawn("accprobe", impossible, kind="claude", agent_args=["--version"])
-    except session_host.SpawnRefused as exc:
-        state = host.state(session_host.Session(name="accprobe", workspace=""))
-        verdict = PASS if state.name_resolves is False else FAIL
-        detail = ("a spawn into a directory that does not exist RAISED (%s) and the name does not "
-                  "resolve afterwards (%s) — the rollback ran, so there is no silent no-op path "
-                  "and no leaked workspace." % (type(exc).__name__, _quick_state(state)))
-    except Exception as exc:
-        detail = "the spawn failed in a way the doorway does not name: %r" % exc
-    else:
-        detail = ("a spawn into a directory that does not exist SUCCEEDED, which is the hollow "
-                  "launch this criterion exists to remove.")
-    report.record(Finding("S1", verdict, "a deliberately impossible spawn, driven through the "
-                                         "doorway", detail))
+        host = lab.wrapper("probe")
+        impossible = os.path.join(lab.root, "no-such-directory-for-a-workspace")
+        detail, verdict = "", FAIL
+        try:
+            host.spawn("accprobe", impossible, kind="claude", agent_args=["--version"],
+                       start_timeout_ms=20000)
+        except session_host.SpawnRefused as exc:
+            state = host.state(session_host.Session(name="accprobe", workspace=""))
+            verdict = PASS if state.name_resolves is False else FAIL
+            detail = ("a spawn into a directory that does not exist RAISED (%s: %s) and the name "
+                      "does not resolve afterwards (%s) — the rollback ran, so there is no silent "
+                      "no-op path and no leaked workspace."
+                      % (type(exc).__name__, str(exc)[:200], _quick_state(state)))
+        except Exception as exc:
+            detail = "the spawn failed in a way the doorway does not name: %r" % exc
+        else:
+            detail = ("a spawn into a directory that does not exist SUCCEEDED, which is the hollow "
+                      "launch this criterion exists to remove.")
+        report.record(Finding("S1", verdict,
+                              "a deliberately impossible spawn, on a host of its own",
+                              detail))
+    finally:
+        # Stopped whatever happened: this host may now be wedged, and it must not be one the
+        # drills are about to depend on.
+        lab.stop_host("probe")
 
 
 def _quick_state(state):
