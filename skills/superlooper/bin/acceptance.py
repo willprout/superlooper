@@ -12,7 +12,7 @@ will be run differently, or partly, or not at all.
 
 **What it does.** It builds a throwaway host from the carried patch as it currently stands, stands
 that host up on sockets of its own under config directories it created itself, drives it only
-through the five-verb doorway (`skill/lib/session_host.py`), never attaches a client, and judges
+through the six-verb doorway (`skill/lib/session_host.py`), never attaches a client, and judges
 each of the twelve criteria in `docs/ARCHITECTURE-PROPOSALS.md` §3 by an ARTEFACT rather than by a
 screen. Every criterion gets its own evidence file; a failed criterion exits non-zero.
 
@@ -41,11 +41,26 @@ that never ships. It also JUDGES and never repairs: it does not rebuild, install
 reconfigure the machine's live host, and it does not edit a config to make itself pass. Building
 its OWN host is setup, and is the only build it does.
 
-The two writes it makes outside its own lab are named here rather than buried: it pre-trusts each
-lane's throwaway folder in the Claude config dir the drill sessions run under (the same act
-`skill/bin/pretrust.sh` performs on every launch — without it no unattended session gets past a
-first-run dialog), and it removes those records again at teardown. Both are recorded in the
-evidence.
+**Everything it writes outside its own lab**, named here rather than buried, because a reader
+auditing that boundary will stop at this paragraph:
+
+* `<config dir>/.claude.json` — a folder-trust record per lane, the same act
+  `skill/bin/pretrust.sh` performs on every launch (without it no unattended session gets past a
+  first-run dialog). Removed again at teardown, along with any record the AGENT wrote for a lane
+  folder, and the removal is reported. Its `.lock` sibling is left behind, as `pretrust.sh` leaves
+  its own.
+* `<config dir>/projects/**` — the drill sessions' own transcripts, written by the agent, not by
+  this suite. They are the delivery oracle's evidence and are NOT cleaned up: deleting an agent's
+  transcripts is not this suite's business.
+* `<state base>/acceptance/src` — the upstream checkout and its `target/`, kept between runs so a
+  re-run is incremental. Several GB. `build.sh` also populates the machine's cargo registry.
+* `~/.local/state/herdr/**` — the throwaway hosts share the machine's host STATE dir (the fleet's
+  own server does too; only the config home is redirected here). What lives there is the host's
+  background-fetched agent-detection cache, which the fleet's doctor reads. Declared rather than
+  hidden: it is the one place a lab host and the live fleet meet.
+
+What it never touches: the live fleet's server or socket, the operator's own host, any launchd job,
+any keychain item, and any binary outside its own prefix.
 
 **Exit codes.** 0 — nothing failed. 1 — a criterion FAILED. 2 — the run could not be completed
 (a criterion left unjudged, a build that would not build, a host that never came up).
@@ -254,13 +269,23 @@ class Report:
         return OK
 
     def green(self):
-        return not self.unjudged() and all(f.passed for f in self.findings + self.drills)
+        """Is this run a PASS of the acceptance, in the sense a version bump cares about?
+
+        PARTIAL does not disqualify: four of the twelve criteria are partial BY RULING (the
+        vocabulary of S4, the night soak in S5, the OS containment in S8, the on-screen half of
+        S10), so a definition that required twelve PASSes could never be met by any host and the
+        headline would read NOT GREEN on a perfect run. What disqualifies is a FAIL, a criterion
+        nobody judged, and a NOT RUN that is not a standing ruling — which is exactly the exit code.
+        """
+        return self.exit_code() == OK
 
     # ---- rendering ---------------------------------------------------------------------
     def summary(self):
         counts = self.counts()
         lines = ["# Session-host acceptance — %s" % self.started_at, ""]
-        lines.append("**Verdict: %s.** %d of %d criteria pass; %d partial, %d failed, %d not run."
+        lines.append("**Verdict: %s.** %d of %d criteria pass; %d partial, %d failed, %d not run. "
+                     "(PARTIAL is not a failure — four criteria are partial by ruling; see each "
+                     "one's own file for which half was measured.)"
                      % ("GREEN" if self.green() else "NOT GREEN",
                         counts[PASS], len(self.criteria), counts[PARTIAL], counts[FAIL],
                         counts[NOT_RUN]))
@@ -377,8 +402,9 @@ LANES = (
              "capture is not coming from the hook and the drill is measuring something else"),
     Lane("fenced-untrusted", fenced=True, hooked=True, trusted=False, expect_capture=False,
          why="THE FIRST-RUN GATE (S9). A fresh folder with no trust record, so the gate is "
-             "measured rather than assumed — and it is the cheapest lane here, because a session "
-             "stopped at a dialog never takes a turn"),
+             "measured rather than assumed. Expected to be the cheap lane — a session stopped at a "
+             "dialog takes no turn — but that expectation is what the drill is testing, so it is "
+             "not a discount to count on"),
 )
 
 # Which drill needs which controls. Structural, so a drill cannot claim a control nobody runs —
@@ -388,6 +414,7 @@ CONTROLS = {
 }
 
 CAPTURE_DRILL = "capture drill (rebuild + kill -9 + headless restart)"
+TEARDOWN_DRILL = "teardown (no server left behind)"
 FENCE_DRILL = "fence pair (a tokenless caller, both hosts)"
 
 
@@ -395,11 +422,12 @@ def cost_notice(lanes=LANES):
     """What this run will spend, said before it spends it."""
     paid = [lane for lane in lanes if lane.trusted]
     return (
-        "This suite costs REAL agent sessions: %d lanes, of which %d take turns on the "
-        "subscription the drill config dir belongs to (the %d untrusted lane never gets past its "
-        "first-run dialog and therefore never takes one). The agent side is deliberately not "
-        "faked — the substrate's failures are all at the agent seam."
-        % (len(lanes), len(paid), len(lanes) - len(paid)))
+        "This suite costs REAL agent sessions: %d lanes, every one of them a real agent in a real "
+        "pane, and each is prompted at least once. The %d untrusted lane is the cheap one — it is "
+        "expected to stop at a first-run dialog and take no turn — but that is what the drill is "
+        "MEASURING, so it is not a discount to count on. The agent side is deliberately not faked: "
+        "the substrate's failures are all at the agent seam."
+        % (len(lanes), len(lanes) - len(paid)))
 
 
 # --------------------------------------------------------------- the paired verdicts (pure)
@@ -548,12 +576,19 @@ def derived_verdicts(capture, outcomes):
                    if fenced.resolves else
                    "the host did NOT resolve the lane's name after the restart, so nothing was "
                    "re-adopted by handle", fenced.detail)),
-        Finding("S12", PASS if capture.verdict == PASS else FAIL,
+        Finding("S12", PASS if capture.verdict == PASS else
+                (NOT_RUN if capture.verdict == NOT_RUN else FAIL),
                 "the per-lane settings file, judged by whether an id survived the restart",
                 "the hook the per-lane `--settings` file registers is the ONLY way a session id "
                 "reaches the host, so the capture drill's verdict is this criterion's evidence: "
                 "%s. The operator's own global settings file is never opened by this suite — the "
-                "hook goes in a file that belongs to one lane." % capture.verdict),
+                "hook goes in a file that belongs to one lane.%s"
+                % (capture.verdict,
+                   "" if capture.verdict != NOT_RUN else
+                   " The drill did not run — its lanes were not paired — so this criterion has no "
+                   "evidence either way. The FENCED lane alone cannot answer it: that is the same "
+                   "'a verdict nobody measured' this function exists to refuse, one level up, at "
+                   "the pair instead of the lane.")),
     ]
 
 
@@ -766,9 +801,10 @@ class Started:
             except SuiteError:                          # pragma: no cover - cannot happen
                 pass
 
-    # The interrupt path is the teardown path. A second one would be a second thing to get wrong,
-    # and it would only ever be exercised at the worst possible moment.
-    interrupted = stop_all
+    # NOTE: there is deliberately no `interrupted` alias here. The interrupt path is
+    # `Lab.teardown` — sessions through the doorway first, then these pids — and an alias on this
+    # class would be a second spelling of the property that nothing actually calls, with a test
+    # named for the property exercising the spelling instead of the path.
 
 
 # --------------------------------------------------------------------------- the live half
@@ -832,6 +868,10 @@ class Lab:
         self._trusted = []
         self._logs = {}
         self._handles = []
+        # Hosts that survived being signalled. A REPORTED verdict rather than a note: "an
+        # interrupted run leaves no server behind" is the DoD's property, and a property whose
+        # violation only appears in prose partway down a markdown file is not enforced.
+        self.survivors = []
 
     # ---- hosts -------------------------------------------------------------------------
     def host_env(self, name, fenced, base=None):
@@ -885,7 +925,7 @@ class Lab:
     def start_host(self, name, fenced):
         env = self.host_env(name, fenced)
         os.makedirs(env["XDG_CONFIG_HOME"], exist_ok=True)
-        socket_path = session_host.session_socket_path(session_host.config_dir(env))
+        socket_path = lane_socket(self.root, name)
         refusal = socket_refusal(socket_path)
         if refusal:
             raise SuiteError("refusing to bind %s: %s" % (socket_path, refusal))
@@ -957,7 +997,7 @@ class Lab:
             self.started.stop(host["proc"].pid)
 
     def wrapper(self, name):
-        """The five-verb doorway, pointed at one throwaway host. The ONLY way the suite talks."""
+        """The six-verb doorway, pointed at one throwaway host. The ONLY way the suite talks."""
         env = dict(self.hosts[name]["env"])
         return session_host.SessionHost(probe=_LabProbe(env), binary=self.binary, env=env,
                                         prompt_timeout_ms=_PROMPT_MS)
@@ -1040,13 +1080,32 @@ class Lab:
                     fcntl.flock(lock, fcntl.LOCK_EX)
                 except OSError:                          # pragma: no cover - best effort, as there
                     pass
-                fresh, document, projects = self._project_entries()
+                path, document, projects = self._project_entries()
+                # GUARDED, and this is a P0 the first draft got wrong. `_project_entries` swallows
+                # OSError and ValueError — and `json.JSONDecodeError` IS a ValueError, which is
+                # exactly what a read landing mid-write produces. Unguarded, `json.dump(None)`
+                # writes the four bytes `null` OVER the operator's `.claude.json`, losing their
+                # account, their onboarding state and every trust record in that config dir. A
+                # racing writer is not hypothetical here: `pretrust.sh`'s own comment says the lock
+                # is best-effort against the agent's own writes, and this runs against a config dir
+                # real sessions were using seconds earlier.
+                if document is None:
+                    return removed
                 for folder in removed:
                     projects.pop(folder, None)
                 tmp = path + ".acceptance.tmp"
-                with open(tmp, "w", encoding="utf-8") as handle:
-                    json.dump(document, handle, indent=2)
-                os.replace(tmp, path)
+                try:
+                    with open(tmp, "w", encoding="utf-8") as handle:
+                        json.dump(document, handle, indent=2)
+                    os.replace(tmp, path)
+                except OSError:
+                    # Leave the original alone rather than half-written, and take the temp file
+                    # with us — it lives beside the operator's config, not in our lab.
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
         self._trusted = []
         return removed
 
@@ -1103,9 +1162,12 @@ class Lab:
         # this the DoD's "leaves no server behind" would be a claim rather than a check. A survivor
         # is REPORTED and not hunted further: pids get reused, and a pid nothing can still vouch
         # for is exactly the pid the doorway refuses to signal.
-        checker = Started()
+        # The SAME liveness reader the stop path used, not a second one: `is_alive` does not
+        # depend on the recorded set, so there is no reason to build a fresh judge that could
+        # answer differently from the one that decided the process had died.
         for name, pid in hosts:
-            if checker.is_alive(pid):
+            if self.started.is_alive(pid):
+                self.survivors.append((name, pid))
                 loose.append("the %s host (pid %s) was signalled and is STILL ALIVE — stop it by "
                              "that pid" % (name, pid))
         for handle in self._handles:
@@ -1120,8 +1182,9 @@ class Lab:
             loose.append("trust records could not be removed: %s" % exc)
         else:
             if removed and self.report:
-                self.report.note("removed the %d folder-trust record(s) this run wrote to %s"
-                                 % (len(removed), os.path.join(self.config_dir, ".claude.json")))
+                self.report.note("removed %d project record(s) under the lab from %s — the ones "
+                                 "this run pre-trusted AND any the agent wrote for a lane folder "
+                                 "itself" % (len(removed), identity.config_file(self.config_dir)))
         if loose and self.report:
             self.report.note("teardown loose ends: " + "; ".join(loose))
         return loose
@@ -1221,18 +1284,20 @@ def build_host(work_dir, prefix, force=True):
 # --------------------------------------------------------------------------- the drills
 
 
-def _quick(host, session):
-    state = host.state(session)
-    return "liveness=%s advisory=%s name_resolves=%s pane=%s" % (
-        state.liveness, state.advisory, state.name_resolves, state.pane)
-
-
 def run_suite(args, report):
     """Stand the lab up, run every drill, record every finding. Returns the exit code."""
     criteria_list = report.criteria
     lab_root = tempfile.mkdtemp(prefix="sl-acc-", dir=args.lab_base)
     report.note("lab root: %s (removed when the run finishes normally, unless --keep; an interrupted run stops its hosts and leaves the directory)" % lab_root)
     report.note(cost_notice())
+    report.note("ISOLATION DEVIATION, stated rather than smoothed over: each throwaway host gets "
+                "its own `XDG_CONFIG_HOME`, which is how two of them share a machine without "
+                "sharing a socket. The fleet reaches the same isolation with a NAMED SESSION and "
+                "sets no XDG variable at all, deliberately — a pane inherits the server's "
+                "environment, and an inherited XDG config home was measured de-authenticating "
+                "`gh` (the launcher lists it as poison). The drills here never call `gh`, so the "
+                "cost is bounded, but the lab's panes are not identical to a fleet worker's on "
+                "this one variable.")
 
     started = Started()
     lab = Lab(lab_root, binary=None, config_dir=args.config_dir, report=report, started=started)
@@ -1272,6 +1337,11 @@ def run_suite(args, report):
             build_log = "not built: --host-binary was given"
         else:
             print("acceptance: building the throwaway host from the current patch (minutes)…")
+            # NOT tracked in `Started`: an interrupt during the build leaves the `cargo` child
+            # running for a while, writing only into the build cache. Said out loud because "an
+            # interrupted run leaves nothing behind" is otherwise read as absolute, and the
+            # property that IS absolute is the narrower and more important one: no SERVER, and no
+            # agent session, survives an interrupt.
             lab.binary, build_log = build_host(args.build_work,
                                                os.path.join(lab_root, "prefix"))
             report.note("built the throwaway host from `vendor/herdr/` as it currently stands")
@@ -1298,7 +1368,14 @@ def run_suite(args, report):
              ("state-report probes", json.dumps(reports, indent=2)))))
 
         # ---- 2. atomic spawn: the refusal half, before anything costs a session ----------
-        _judge_atomic_spawn(lab, report)
+        # Its own host, its own failure. A drill given a separate host precisely to decouple it
+        # from the run must not then couple the whole run to whether that host came up.
+        try:
+            _judge_atomic_spawn(lab, report)
+        except Exception as exc:
+            report.record(Finding("S1", NOT_RUN, "nothing",
+                                  "the probe host this drill runs on did not come up: %s" % exc))
+            lab.stop_host("probe")
 
         # ---- 3. the lanes ---------------------------------------------------------------
         outcomes = {}
@@ -1344,10 +1421,21 @@ def run_suite(args, report):
         _judge_from_capture(lab, report, capture, outcomes)
 
         # ---- 5. the criteria nothing here can judge -------------------------------------
-        _record_unjudgeable(report, args)
+        _record_unjudgeable(report)
     finally:
         lab.teardown()
-        if not args.keep:
+        if lab.survivors:
+            # A FAIL row, and the lab stays on disk: deleting a running server's config, socket and
+            # binary is the delete-under-a-live-process shape this suite exists to avoid, even when
+            # the process is only our own throwaway host.
+            report.record(Finding(
+                TEARDOWN_DRILL, FAIL, "each host's recorded pid, re-read after it was signalled",
+                "these hosts were signalled and are STILL RUNNING: %s. They were started by this "
+                "run, so they are this run's to stop — by those pids, never by name. The lab at %s "
+                "is deliberately left in place: removing a live server's socket and binary would "
+                "be worse than leaving the directory."
+                % ("; ".join("%s (pid %s)" % (n, p) for n, p in lab.survivors), lab_root)))
+        elif not args.keep:
             shutil.rmtree(lab_root, ignore_errors=True)
         else:
             report.note("--keep: the lab was left at %s" % lab_root)
@@ -1607,6 +1695,19 @@ def _judge_lifecycle(lab, report):
         return
     host = lab.wrapper(record["host"])
     before = host.state(record["session"])
+    if before.liveness != session_host.ALIVE:
+        # The drill's premise is a LIVE lane — `exit` is only obliged to refuse one. Against a lane
+        # whose agent has already gone, `exit` legitimately closes the window and the drill would
+        # record FAIL about a doorway that behaved exactly correctly. The premise is checked rather
+        # than asserted, because this lane is the one `gate_verdict` already measured ending on its
+        # own.
+        report.record(Finding("S2", NOT_RUN, "nothing",
+                              "the lifecycle drill needs a LIVE subject and its lane read %s (%s). "
+                              "`exit` is only required to refuse a live session, so running the "
+                              "drill against a dead one would record a failure about correct "
+                              "behaviour." % (before.liveness, before.detail)))
+        lab.sessions.pop("fenced-untrusted", None)
+        return
     refused, refusal = False, ""
     try:
         host.exit(record["session"])
@@ -1679,7 +1780,7 @@ def _judge_billing(report, args):
          ("operator default", json.dumps(default, indent=2)))))
 
 
-def _record_unjudgeable(report, args):
+def _record_unjudgeable(report):
     """The criteria this suite cannot judge unattended — named, with the reason, never skipped."""
     report.record(Finding(
         "S11", NOT_RUN, "nothing — deliberately",

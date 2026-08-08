@@ -302,6 +302,20 @@ def test_a_capture_drill_that_ran_and_passed_carries_its_criteria():
     assert verdicts == {"S5": acceptance.PARTIAL, "S6": acceptance.PASS, "S12": acceptance.PASS}
 
 
+def test_hook_continuity_is_not_run_when_the_capture_drill_did_not_run():
+    """The same "a verdict nobody measured" defect, one level up — at the PAIR, not the lane.
+
+    If the fenced lane was measured but a CONTROL lane failed to start, the capture drill correctly
+    reports NOT RUN. S12 must not then read FAIL off it, with an evidence file whose own text says
+    "this criterion's evidence: NOT RUN".
+    """
+    findings = acceptance.derived_verdicts(
+        _capture(acceptance.NOT_RUN),
+        {"fenced-hooked": acceptance.LaneOutcome("fenced-hooked", True, "captured",
+                                                 resolves=True)})
+    assert {f.criterion: f.verdict for f in findings}["S12"] == acceptance.NOT_RUN
+
+
 def test_a_measured_but_failing_capture_fails_hook_continuity_and_not_the_others():
     findings = acceptance.derived_verdicts(
         _capture(acceptance.FAIL),
@@ -382,6 +396,39 @@ def test_the_gate_drill_reports_whether_the_agent_wrote_its_own_trust_record():
 
 
 # ------------------------------------------------------ the lab leaves no state in a shared config
+
+def test_an_unreadable_config_is_never_overwritten_with_null(tmp_path):
+    """A P0 the first draft had: the read taken INSIDE the lock is the one written back.
+
+    `_project_entries` swallows ValueError, and `json.JSONDecodeError` IS one — exactly what a read
+    landing mid-write produces. Unguarded, the operator's `.claude.json` becomes the four bytes
+    `null`, losing their account, onboarding state and every trust record in that config dir.
+    """
+    config = tmp_path / "cfg"
+    config.mkdir()
+    lab_root = tmp_path / "lab"
+    (lab_root / "lanes" / "a").mkdir(parents=True)
+    real = {"oauthAccount": {"emailAddress": "someone@example.com"},
+            "projects": {str(lab_root / "lanes" / "a"): {"hasTrustDialogAccepted": True}}}
+    (config / ".claude.json").write_text(json.dumps(real))
+    lab = acceptance.Lab(str(lab_root), None, str(config))
+
+    # The first read succeeds (so there is something to remove); the second — inside the lock —
+    # returns the "unreadable" shape, which is what a concurrent writer produces.
+    calls = []
+    real_entries = lab._project_entries
+
+    def flaky():
+        calls.append(1)
+        return real_entries() if len(calls) == 1 else (str(config / ".claude.json"), None, {})
+
+    lab._project_entries = flaky
+    lab.untrust_all()
+
+    after = json.loads((config / ".claude.json").read_text())
+    assert after.get("oauthAccount"), "the operator's config was destroyed: %r" % after
+
+
 
 def test_teardown_removes_project_records_the_agent_wrote_as_well_as_the_ones_it_did(tmp_path):
     """The other defect the first real run produced.
@@ -569,15 +616,46 @@ def test_the_drill_kill_refuses_a_pid_this_run_did_not_start_too():
     assert signalled == []
 
 
-def test_an_interrupted_run_leaves_no_server_behind():
-    """The teardown is the SAME code path an interrupt takes — not a second, untested one."""
+class _FakeProc:
+    def __init__(self, pid):
+        self.pid = pid
+
+
+def test_an_interrupted_run_leaves_no_server_behind(tmp_path):
+    """Exercises `Lab.teardown` — the path an interrupt actually takes.
+
+    The earlier version of this test called a `Started.interrupted` alias that nothing in the run
+    ever invoked, so the test named for this property was testing a spelling rather than the path.
+    """
     signalled = []
     started = acceptance.Started(kill=lambda pid, sig: signalled.append((pid, sig)),
                                  sleep=lambda _s: None, alive=lambda _pid: False)
-    started.record(91, "the unfenced lab server")
-    started.interrupted()
-    assert [pid for pid, _sig in signalled] == [91]
+    lab = acceptance.Lab(str(tmp_path / "lab"), None, str(tmp_path), started=started)
+    lab.hosts["fenced"] = {"proc": _FakeProc(91), "env": {}, "fenced": True, "log": ""}
+    lab.hosts["unfenced"] = {"proc": _FakeProc(92), "env": {}, "fenced": False, "log": ""}
+    started.record(91, "the fenced lab server")
+    started.record(92, "the unfenced lab server")
+
+    loose = lab.teardown()
+
+    assert sorted(pid for pid, _sig in signalled) == [91, 92]
     assert started.outstanding() == []
+    assert lab.survivors == [] and loose == []
+
+
+def test_a_host_that_survived_being_signalled_is_a_verdict_not_a_footnote(tmp_path):
+    """"Leaves no server behind" is the DoD's property; a violation buried in prose is not
+    enforcement."""
+    started = acceptance.Started(kill=lambda pid, sig: None, sleep=lambda _s: None,
+                                 alive=lambda _pid: True)
+    lab = acceptance.Lab(str(tmp_path / "lab"), None, str(tmp_path), started=started)
+    lab.hosts["fenced"] = {"proc": _FakeProc(91), "env": {}, "fenced": True, "log": ""}
+    started.record(91, "the fenced lab server")
+
+    loose = lab.teardown()
+
+    assert lab.survivors == [("fenced", 91)]
+    assert any("STILL ALIVE" in line for line in loose)
 
 
 def test_stop_all_is_idempotent_so_a_teardown_after_an_interrupt_signals_nothing_twice():
