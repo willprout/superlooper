@@ -283,6 +283,23 @@ The rationale for the strictness is capacity, not secrecy: the two Max accounts 
 rate-limit pools and the runner's usage machinery reasons about one pool per lane, so a session on
 the wrong pool makes lane assignment non-deterministic even though both accounts are the owner's.
 
+## Every process that reads a pool reads it from its OWN environment (issue #350)
+
+Since #350 the account-auth probe and the Max usage meter both ask about the config dir the
+machine assigns, rather than about the machine's default Claude login — which is what makes the
+paragraph above true of the numbers the scheduler actually paces on. They derive that dir from
+`SL_FLEET_CLAUDE_CONFIG_DIR` **in the environment of whatever process calls them**.
+
+Two processes call them, and they are separate jobs: the **runner** (the gate and the scheduler's
+meter) and the **watchdog** (its own exhausted-usage read, which decides whether the no-progress
+detector is suppressed). Neither launchd template bakes this variable — `launchd.runner.plist`
+carries PATH, `PYTHONUNBUFFERED` and an optional `SL_HOME`; `launchd.watchdog.plist` carries PATH
+alone. So on a fleet machine it must be set for **both**, or the two answer about different
+accounts: a runner correctly holding every launch on an exhausted fleet pool while the watchdog
+reads the owner's pool as healthy would page the owner and open a debugger session into the
+exhausted account, and the mirror case silently suppresses a real no-progress trip. Issue #437
+carries the question of how the assignment should reach a job that boots without a shell.
+
 **`fleet isolation`** — the fleet's named session, socket and prefix are its own, separate from the
 host's default session. This block is explicit about its reach: **production on the other machine
 is not observable from here**, and it says so in its own output rather than implying a

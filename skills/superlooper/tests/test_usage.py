@@ -415,6 +415,25 @@ def test_probe_auth_with_no_runnable_claude_stays_fail_open_unknown(monkeypatch)
     assert "SL_CLAUDE" in (r["note"] or "")
 
 
+def test_an_unresolvable_claude_does_not_reset_the_keychain_half_to_the_owner(monkeypatch):
+    # The two halves are independent, and this is the branch where that could go wrong quietly:
+    # the binary is gone, so the CLI half cannot answer — but the credential item still must be the
+    # ASSIGNED namespace's. A regression that let the keychain read fall back to the unsuffixed
+    # item here would report the owner's live login as this fleet's, on exactly the machines that
+    # are half-broken already.
+    monkeypatch.setenv("SL_FLEET_CLAUDE_CONFIG_DIR", _FLEET_DIR)
+    monkeypatch.setenv("SL_CLAUDE", "/nonexistent/superlooper-test-claude")
+    spy = _Spy(lambda argv: _keychain_attrs(True))
+    with mock.patch("usage.subprocess.run", side_effect=spy):
+        r = usage.probe_auth()
+    assert spy.services() == [_fleet_service()]
+    assert r["cli"] == "unknown" and r["valid"] is None
+    assert r["config_dir"] == _FLEET_DIR
+    # ...and the note must not carry the phrase lib/evidence.py reads as a CHANNEL fault, which
+    # would turn one issue's park into a held queue if this text ever reached launcher stderr.
+    assert "could not resolve" not in (r["note"] or "")
+
+
 def test_fetch_usage_meters_the_assigned_namespaces_pool(monkeypatch):
     monkeypatch.setenv("SL_FLEET_CLAUDE_CONFIG_DIR", _FLEET_DIR)
     spy = _Spy(lambda argv: _keychain_ok())

@@ -95,23 +95,29 @@ def credential_service(config_dir=None):
     hash to its own namespace in the binary, but no launch path here ever emits one (``identity``
     treats empty as absent throughout), so treating it as the default is the reading that matches
     what a worker would actually get.
+
+    That last rule is why this is NOT the same function as the one behind ``identity.env_problem``'s
+    mismatch memo, which spells the suffixed name for a value a session INHERITED. There, a
+    set-but-empty ``CLAUDE_CONFIG_DIR`` really does land in ``sha256("")``'s own namespace and the
+    memo must say so; here, blank can only mean "this machine assigned nothing". Two questions, two
+    answers — what they share, and all they may share, is ``namespace_suffix``.
     """
     if isinstance(config_dir, str) and config_dir.strip():
         return "%s-%s" % (CRED_KEYCHAIN_SERVICE, identity.namespace_suffix(config_dir))
     return CRED_KEYCHAIN_SERVICE
 
 
-def _credential_keychain_state(timeout=5, service=CRED_KEYCHAIN_SERVICE):
+def _credential_keychain_state(service, timeout=5):
     """(present, mtime_epoch) for the Claude Code credential keychain item, reading its ATTRIBUTES
     only — never `-w`, so the OAuth secret is never dumped. present is False ONLY on a DEFINITIVE
     absence (rc == errSecItemNotFound); None (fail-open ambiguity) when `security` could not be run
     at all OR returned some other error we cannot trust as proof of absence; True otherwise.
     mtime_epoch is the item's `mdat` in epoch seconds, or None.
 
-    `service` is the namespace to ask about (see `credential_service`). It is a required-in-spirit
-    argument with a default rather than a constant, because "absent" is a DEFINITIVE verdict here:
-    read against the wrong service name it would report the fleet's login as gone, or the owner's
-    as alive, with equal confidence."""
+    `service` is the namespace to ask about (see `credential_service`), and it is REQUIRED rather
+    than defaulted, because "absent" is a DEFINITIVE verdict here: read against the wrong service
+    name it would report the fleet's login as gone, or the owner's as alive, with equal
+    confidence. A default would make that the quiet outcome of forgetting an argument."""
     try:
         r = subprocess.run(
             ["security", "find-generic-password", "-s", service],
@@ -126,6 +132,22 @@ def _credential_keychain_state(timeout=5, service=CRED_KEYCHAIN_SERVICE):
     return True, (_keychain_ts_to_epoch(m.group(1)) if m else None)
 
 
+def _worker_namespace(env):
+    """``(config dir or None, problem or None)`` — the namespace a WORKER on this machine runs in.
+
+    A thin guard around `identity.worker_config_dir` for ONE reason: both readers below used to be
+    total functions (every path returned a dict; nothing propagated), and their callers rely on
+    that — the runner's usage refresh keeps last-good on an exception, and the watchdog's read
+    swallows one. Introducing a call that can raise would move a decision the callers make
+    deliberately into an accident of where the exception happened to land. A derivation we could
+    not even run is treated as an unusable assignment, which is exactly what it is.
+    """
+    try:
+        return identity.worker_config_dir(env)
+    except Exception as e:                                   # pragma: no cover - defensive
+        return None, "the machine's worker config dir could not be derived (%s)" % e
+
+
 def probe_auth(timeout=5, env=None) -> dict:
     """The cheap, agent-specific, NEVER-metered auth probe (issue #159 / forensics U3).
 
@@ -136,7 +158,10 @@ def probe_auth(timeout=5, env=None) -> dict:
         keychain_mtime   -> int epoch seconds | None
         status_raw       -> the (bounded) `claude auth status` text, for the forensic capture
         valid            -> True | False | None
-        config_dir       -> the config dir this reading is ABOUT (None = the machine's default)
+        config_dir       -> the config dir this reading is ABOUT. None means the reading is about
+                            the machine's DEFAULT login — or, when `note` is set, that there was no
+                            namespace to read at all; `note` is what tells those two apart, and a
+                            flight-recorder line without one is always the former.
         note             -> why a half could not be asked, when one could not (else "")
     `valid` is the launch-gating verdict: False ONLY on a DEFINITIVE dead reading (the CLI reports
     not-logged-in, or the credential keychain item is gone) — those are exactly the states in which a
@@ -153,7 +178,7 @@ def probe_auth(timeout=5, env=None) -> dict:
     """
     # ONE derivation for both halves — a probe whose CLI read and keychain read could disagree
     # about the namespace would be two measurements presented as one.
-    config_dir, dir_problem = identity.worker_config_dir(env)
+    config_dir, dir_problem = _worker_namespace(env)
     cli = "unknown"
     status_raw = ""
     note = ""
@@ -171,13 +196,22 @@ def probe_auth(timeout=5, env=None) -> dict:
         return {"cli": cli, "keychain_present": None, "keychain_mtime": None, "valid": None,
                 "status_raw": "", "config_dir": None, "note": note}
 
-    claude, why, _deferrable = identity.resolve_claude(env)
+    try:
+        claude, why, _deferrable = identity.resolve_claude(env)
+    except Exception as e:                                   # pragma: no cover - defensive
+        claude, why = None, "the claude ladder could not be walked (%s)" % e
     if claude is None:
         # No runnable claude: report the existing fail-open unknown for the CLI half rather than a
         # confident answer. The keychain half below is independent of the binary and still answers,
         # exactly as it did before when spawning `claude` raised.
-        note = ("the `claude` this stack would launch could not be resolved, so no account status "
-                "was read: %s" % why)
+        #
+        # WORDED to avoid the substring `could not resolve`, for the same reason
+        # `identity.resolve_claude`'s own reason table is: lib/evidence.py matches that phrase as a
+        # CHANNEL fault (a network needle), and a stray match there converts one issue's park into
+        # a HELD QUEUE. This note reaches only the auth snapshot today, not launcher stderr — but
+        # the distance between "inert" and "live" here is one copy-paste.
+        note = ("the `claude` this stack would launch is not available, so no account status was "
+                "read: %s" % why)
     else:
         try:
             r = subprocess.run([claude, "auth", "status"], capture_output=True, text=True,
@@ -209,7 +243,7 @@ def probe_auth(timeout=5, env=None) -> dict:
             cli = "unknown"                    # hang / spawn failure -> unknown, never invalid
 
     keychain_present, keychain_mtime = _credential_keychain_state(
-        timeout=timeout, service=credential_service(config_dir))
+        credential_service(config_dir), timeout=timeout)
 
     if cli == "logged_out" or keychain_present is False:
         valid = False                          # definitive: block the spend, alert the owner
@@ -257,7 +291,7 @@ def fetch_claude_usage(env=None) -> dict:
     # pace the fleet's lanes against the owner's pool. `namespace_unknown` is simply not `ok`, so
     # every consumer (scheduler._usage_ok, watchdog.usage_reads_exhausted, the runner's last-good
     # keeper) already treats it as the dark meter it is.
-    config_dir, dir_problem = identity.worker_config_dir(env)
+    config_dir, dir_problem = _worker_namespace(env)
     if dir_problem:
         result["auth_status"] = "namespace_unknown"
         return result
