@@ -81,7 +81,11 @@ line — lives ONLY in: `start-session.sh`, `cross-review.sh` (the pinned codex 
 issue #158), the hook scripts + install.sh's hook registration, `pane_state.py`, `delivery.py`
 (the transcript layout, and the delivery oracle the session-host wrapper requires — issue #334; the
 wrapper takes an oracle from its caller precisely so this knowledge stays outside it), `pretrust.sh`,
-`usage.py`. No other file may reference Claude Code specifics; the runner, gate, contracts, and
+`usage.py`, `identity.py` (which Anthropic account a session runs as, and how `claude` derives a
+credential namespace from a config-dir string — issue #314; `usage.py` reads that DERIVATION
+(`namespace_suffix`) rather than keeping a second copy, so the launch seam and the readers can
+never disagree about which account is being measured).
+No other file may reference Claude Code specifics; the runner, gate, contracts, and
 GitHub protocol stay agent-agnostic. The cross-reviewer's model/effort is per-repo CONFIG
 (`models.reviewer` / `models.reviewer_effort`), so `cross-review.sh` realizes it in codex flags
 without hardcoding a Codex fact into the core.

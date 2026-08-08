@@ -51,6 +51,15 @@ REDIRECT_VAR = "CLAUDE_SECURESTORAGE_CONFIG_DIR"
 # its fleet under that dir" and "this session was assigned that dir by the launch that started it".
 ASSIGN_VAR = "SL_CLAUDE_CONFIG_DIR"
 FLEET_DIR_VAR = "SL_FLEET_CLAUDE_CONFIG_DIR"
+
+# The macOS login-keychain service name `claude` stores its OAuth credentials under, BEFORE the
+# per-config-dir suffix `namespace_suffix` derives. It lives here rather than beside either reader
+# because two callers spell it for two different questions — this module's mismatch memo names the
+# item a session's INHERITED value would look in, and `usage.credential_service` names the item the
+# machine's assignment means — and those questions disagree about a set-but-EMPTY config dir (its
+# namespace is `sha256("")`, not the bare name). What they must never disagree about is the base
+# string, so there is one of it.
+CREDENTIAL_SERVICE = "Claude Code-credentials"
 # The expected account, named in the pane by the launcher — and readable as an operator PIN in the
 # runner's own environment, the way `SL_EXPECT_GH_LOGIN` is (#299). One name for both halves,
 # pinned empty in the runner's launch env so a runner started from inside a worker pane can never
@@ -461,12 +470,17 @@ def env_problem(env):
     if raw_actual != assigned:
         return ("this session's %s is %r and the launch assigned %r — they must be BYTE-identical, "
                 "because the credential namespace is a hash of the string as written: %r would look "
-                "in `Claude Code-credentials-%s` while the fleet's login lives in "
-                "`Claude Code-credentials-%s`, and the only symptom is a session that reports "
+                "in `%s-%s` while the fleet's login lives in "
+                "`%s-%s`, and the only symptom is a session that reports "
                 "logged out (#300 landmine 1)"
                 % (CONFIG_DIR_VAR, raw_actual, assigned, raw_actual,
+                   CREDENTIAL_SERVICE,
+                   # NOT `usage.credential_service`: an inherited EMPTY value really does land in
+                   # `sha256("")`'s own namespace, and the reader's blank-means-no-assignment rule
+                   # would name the bare item here — the one spelling that would send the operator
+                   # to look in the wrong place.
                    namespace_suffix(raw_actual if isinstance(raw_actual, str) else ""),
-                   namespace_suffix(assigned)))
+                   CREDENTIAL_SERVICE, namespace_suffix(assigned)))
     return None
 
 
