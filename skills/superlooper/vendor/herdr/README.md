@@ -237,8 +237,11 @@ superlooper fleet --install --load                   # restart the server on the
 superlooper fleet                                    # `host state capture` says which build is live
 ```
 
-and step 4 of the procedure below (the negative test against the built binary) is re-run for a
-patch change for the same reason it is re-run for a bump: the property changed.
+and steps 4 and 6 of the procedure below (the negative test against the built binary, and the
+acceptance suite) are re-run for a patch change for the same reason they are re-run for a bump: the
+property changed. Step 6 is the one that would have caught #331's miss without anybody suspecting
+it — it builds its own host from the patch as it currently stands, so "the installed binary predates
+the patch" is not a state it can be in.
 
 Nothing on the filesystem records which generation of the patch a binary was built from — same
 version string, same compiled-in refusal message — so the live socket is the only witness, which is
@@ -290,6 +293,29 @@ it answers.
    so makes such a check silently vacuous. That mistake was made once here already; don't
    re-introduce it.
 5. **Record the new pin** in the table above.
+6. **Run the acceptance suite** — the rest of the bar, which the fence contract above deliberately
+   says nothing about:
+   ```sh
+   skills/superlooper/bin/acceptance.py --config-dir <the drill sessions' Claude config dir>
+   ```
+   Step 4 proves the fence is a fence. This proves the HOST is still a host: it builds its own
+   throwaway binary from the patch as it currently stands, stands two of them up on sockets of its
+   own, drives them only through the five-verb doorway with no client ever attached, and reports
+   against all twelve criteria in `docs/ARCHITECTURE-PROPOSALS.md` §3 with one evidence file each.
+   It is the runnable form of #311's hand-run acceptance (issue #348), and the plan's §8.1 names it
+   as the thing a bump runs.
+
+   The part that matters most here is the one this file's own history argues for. #331 changed the
+   patch at an unchanged pin and the mini kept running a binary built before it — capturing no
+   session ids and looking perfectly healthy. The suite's capture drill is that failure turned into
+   a check: it runs a **fenced** lane and an **unfenced** control on the same binary in the same
+   minute, `kill -9`s each host and restarts it headless, and reads the restored pane's own process
+   from the OS. Paired, a silence reads as the refused call it is; unpaired, it reads as a broken
+   build, which is the wrong repair. A run whose control did not run reports NOT RUN rather than a
+   pass, on purpose.
+
+   It costs real agent sessions and says so before it spends them. `--list` prints the criteria and
+   the lane matrix and spends nothing.
 
 Two probes ask these questions in one call each, presenting no token (both must ask what a *worker*
 would ask), and both treat silence as `UNREACHABLE` rather than as safety:
