@@ -343,8 +343,10 @@ def test_a_signalled_review_still_closes_its_breadcrumb_and_leaves_no_reviewer_b
     orphan burning the owner's subscription) and the EXIT trap must still close the breadcrumb, or
     the lane would read "cross-reviewing" until the staleness rule expired it.
 
-    The group is one this test created (``start_new_session``) and its id is the recorded child pid
-    — never a kill by name or pattern, which could match the owner's own processes."""
+    Death is asserted on the reviewer's OWN RECORDED PIDS, not on a marker file it would also fail
+    to write while merely still sleeping (round-2 review), and never by name or pattern — a pattern
+    could match the owner's live processes. The group is one this test created
+    (``start_new_session``) and its id is the recorded child pid."""
     import signal
     import time
 
@@ -353,10 +355,17 @@ def test_a_signalled_review_still_closes_its_breadcrumb_and_leaves_no_reviewer_b
     (run_root / "state").mkdir(parents=True)
     stubdir = tmp_path / "stub"
     stubdir.mkdir(exist_ok=True)
-    marker = tmp_path / "reviewer_finished"
-    # a reviewer that outlives the signal if nothing kills it — its own marker proves which happened
+    pids_file = tmp_path / "reviewer_pids"
+    # A reviewer that would outlive the signal if nothing killed it, and that writes down BOTH of
+    # its pids first — its own and the long sleep it waits on — so death can be asserted directly.
     _x(str(stubdir / "codex"),
-       '#!/usr/bin/env bash\ncat >/dev/null\nsleep 10\necho done > "$SL_TEST_MARKER"\n')
+       '#!/usr/bin/env bash\n'
+       'cat >/dev/null\n'
+       'echo "$$" > "$SL_TEST_PIDS"\n'
+       'sleep 30 &\n'
+       'SP=$!\n'
+       'echo "$SP" >> "$SL_TEST_PIDS"\n'
+       'wait "$SP"\n')
     home = tmp_path / "home"
     (home / ".codex").mkdir(parents=True, exist_ok=True)
     (home / ".codex" / "config.toml").write_text(POISON_TOML)
@@ -364,28 +373,51 @@ def test_a_signalled_review_still_closes_its_breadcrumb_and_leaves_no_reviewer_b
            if k not in ("SL_RUN_ROOT", "SL_ISSUE_ID", "SL_REVIEW_REPO_ROOT")}
     env.update({"PATH": f"{stubdir}:{os.environ['PATH']}", "HOME": str(home),
                 "SL_TEST_ARGS": str(tmp_path / "args"), "SL_TEST_STDIN": str(tmp_path / "stdin"),
-                "SL_TEST_MARKER": str(marker),
+                "SL_TEST_PIDS": str(pids_file),
                 "SL_RUN_ROOT": str(run_root), "SL_ISSUE_ID": "i158"})
     proc = subprocess.Popen([CROSS_REVIEW], cwd=str(repo), env=env, stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
+
+    def _pids():
+        try:
+            return [int(x) for x in pids_file.read_text().split()]
+        except (OSError, ValueError):
+            return []
+
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)                # signal 0 = an existence probe; it kills nothing
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True                    # exists, owned by someone else — still "alive"
+        return True
+
     try:
         proc.stdin.write(b"please review this artifact\n")
         proc.stdin.close()
-        deadline = time.time() + 15
-        while not _phase_file(run_root).exists() and time.time() < deadline:
-            time.sleep(0.05)
+        deadline = time.time() + 20
+        while len(_pids()) < 2 and time.time() < deadline:
+            time.sleep(0.05)               # the reviewer is up and sleeping once both pids land
+        reviewer = _pids()
+        assert len(reviewer) == 2, f"the stub reviewer never started (pids={reviewer})"
         assert _fields(_phase_file(run_root).read_text())[1]["event"] == "start"
 
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=15)
+        proc.wait(timeout=20)
     finally:
         if proc.poll() is None:                      # never leave the probe's own process behind
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=15)
+            proc.wait(timeout=20)
 
     _, f = _fields(_phase_file(run_root).read_text())
     assert f["event"] == "end", \
         "a killed review must still close its breadcrumb — else the lane claims to be reviewing"
-    time.sleep(0.5)
-    assert not marker.exists(), "the reviewer must die with the group, not outlive the wrapper"
+    # Both reviewer pids must actually be GONE. Polled briefly: signal delivery and the reaping of
+    # a reparented child are not instantaneous, and a zombie would still answer kill(pid, 0).
+    deadline = time.time() + 10
+    while any(_alive(pid) for pid in reviewer) and time.time() < deadline:
+        time.sleep(0.05)
+    still = [pid for pid in reviewer if _alive(pid)]
+    assert not still, f"the reviewer must outlive nothing (still alive: {still})"
