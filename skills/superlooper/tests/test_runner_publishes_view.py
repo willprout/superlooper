@@ -433,6 +433,16 @@ def test_a_finished_lane_publishes_no_phase_at_all(rig):
     assert "i15" not in view(rig)["phases"], "a landed flight must not read as a live worker"
 
 
+def test_a_report_the_loop_refuses_to_read_is_not_called_report_posted(rig):
+    # `disk_view` hands the DECIDER its reports through `_scan_dir`, which drops a file that will
+    # not decode — so an unreadable report is "no report" to every decision. The board must agree,
+    # or it would announce a landmark the loop itself refuses to see (fresh-agent review).
+    _seed_flying(rig, "i15")
+    (rig.home / "reports" / "i15.md").write_bytes(b"\x89PNG\r\n\x1a\n\x00not text")
+    rig.r.tick(now=NOW + 10_000)
+    assert view(rig)["phases"].get("i15") == "building"
+
+
 def test_a_corrupt_breadcrumb_costs_a_label_and_never_the_tick(rig):
     # Fail-soft end to end: the file is unreadable junk, the phase degrades to building, the tick
     # completes and the heartbeat (the dead-man's switch) is still stamped.

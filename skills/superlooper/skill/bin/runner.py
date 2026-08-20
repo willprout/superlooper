@@ -1264,8 +1264,12 @@ class Runner:
         return {
             "in_flight_ids": flying,
             "breadcrumbs": crumbs,
+            # Read, not `os.path.exists`: `disk_view` hands the DECIDER its reports through
+            # `_scan_dir`, which drops one that will not decode — so an unreadable report is "no
+            # report" to every decision, and this landmark must agree or the board would say
+            # "report-posted" about a file the loop refuses to see (fresh-agent review).
             "report_ids": {iid for iid in flying
-                           if os.path.exists(os.path.join(self.home, "reports", f"{iid}.md"))},
+                           if _read(os.path.join(self.home, "reports", f"{iid}.md")) is not None},
         }
 
     def _publish_view(self, now, ist_map):

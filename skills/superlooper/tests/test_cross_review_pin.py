@@ -332,3 +332,60 @@ def test_an_unwritable_breadcrumb_never_costs_the_review(tmp_path):
         assert argv is not None, "the review must run even when the breadcrumb cannot be written"
     finally:
         _os.chmod(run_root / "state", _stat.S_IRWXU)
+
+
+def test_a_signalled_review_still_closes_its_breadcrumb_and_leaves_no_reviewer_behind(tmp_path):
+    """The interrupted case, driven for real (fresh-agent review).
+
+    Dropping `exec` means a bash wrapper now sits between the caller and codex, so "what happens
+    when this is killed" is a genuinely new question. The realistic kill — a tool timeout, a Ctrl-C
+    — signals the PROCESS GROUP, and that is what this drives: the reviewer must die with it (no
+    orphan burning the owner's subscription) and the EXIT trap must still close the breadcrumb, or
+    the lane would read "cross-reviewing" until the staleness rule expired it.
+
+    The group is one this test created (``start_new_session``) and its id is the recorded child pid
+    — never a kill by name or pattern, which could match the owner's own processes."""
+    import signal
+    import time
+
+    repo = _repo(tmp_path)
+    run_root = tmp_path / "run"
+    (run_root / "state").mkdir(parents=True)
+    stubdir = tmp_path / "stub"
+    stubdir.mkdir(exist_ok=True)
+    marker = tmp_path / "reviewer_finished"
+    # a reviewer that outlives the signal if nothing kills it — its own marker proves which happened
+    _x(str(stubdir / "codex"),
+       '#!/usr/bin/env bash\ncat >/dev/null\nsleep 10\necho done > "$SL_TEST_MARKER"\n')
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    (home / ".codex" / "config.toml").write_text(POISON_TOML)
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("SL_RUN_ROOT", "SL_ISSUE_ID", "SL_REVIEW_REPO_ROOT")}
+    env.update({"PATH": f"{stubdir}:{os.environ['PATH']}", "HOME": str(home),
+                "SL_TEST_ARGS": str(tmp_path / "args"), "SL_TEST_STDIN": str(tmp_path / "stdin"),
+                "SL_TEST_MARKER": str(marker),
+                "SL_RUN_ROOT": str(run_root), "SL_ISSUE_ID": "i158"})
+    proc = subprocess.Popen([CROSS_REVIEW], cwd=str(repo), env=env, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    try:
+        proc.stdin.write(b"please review this artifact\n")
+        proc.stdin.close()
+        deadline = time.time() + 15
+        while not _phase_file(run_root).exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert _fields(_phase_file(run_root).read_text())[1]["event"] == "start"
+
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=15)
+    finally:
+        if proc.poll() is None:                      # never leave the probe's own process behind
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=15)
+
+    _, f = _fields(_phase_file(run_root).read_text())
+    assert f["event"] == "end", \
+        "a killed review must still close its breadcrumb — else the lane claims to be reviewing"
+    time.sleep(0.5)
+    assert not marker.exists(), "the reviewer must die with the group, not outlive the wrapper"

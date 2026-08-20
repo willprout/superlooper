@@ -136,10 +136,13 @@ _phase_stamp() {                       # $1 = start|end, $2 = the review's rc (e
 
 # Stamped only from HERE — past every refusal above — so a lane never reads "cross-reviewing" for a
 # review that was refused and never ran. The end stamp rides an EXIT trap rather than a line after
-# the review, so it lands whether codex succeeded, failed, or the script was interrupted: a start
-# with no end would pin the lane at "cross-reviewing" for the rest of its flight, the same lie this
-# issue exists to end, in a different place. (A SIGKILL still skips it — that is what the reader's
-# staleness rule is for.)
+# the review, so it lands whether codex succeeded, failed, or the script was signalled: a start with
+# no end would pin the lane at "cross-reviewing" for the rest of its flight, the same lie this issue
+# exists to end, in a different place. bash runs an EXIT trap for a SIGTERM/SIGINT delivered to the
+# process group — the realistic kill (a tool timeout, a Ctrl-C), and what the tests drive — but not
+# for a SIGKILL, which is what the reader's staleness rule is for. The `rc=` it records is
+# BEST-EFFORT diagnostic: on a signal path `$?` is the last completed command's status, not the
+# reviewer's. `event=end` is the load-bearing half; nothing reads `rc`.
 _phase_stamp start
 trap '_phase_stamp end "$?"' EXIT
 

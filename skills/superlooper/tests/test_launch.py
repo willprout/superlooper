@@ -1014,6 +1014,24 @@ def test_a_relaunch_clears_this_ids_stale_run_markers_only(tmp_path):
         "delivery receipts and other lanes' reports are history, and history survives a restart"
 
 
+def test_a_relaunch_clears_a_stale_cross_review_breadcrumb(tmp_path):
+    """(#443) The phase breadcrumb is a claim about what a session is doing RIGHT NOW, so it must
+    never outlive the session that wrote it. A worker killed between the cross-review script's start
+    stamp and its end trap leaves an OPEN one — and a relaunch inside its staleness window would
+    otherwise publish the fresh session as "cross-reviewing" while it is only building."""
+    spec = _spec(tmp_path)
+    state = os.path.join(spec.run_root, "state")
+    os.makedirs(os.path.join(state, "phase"), exist_ok=True)
+    mine = os.path.join(state, "phase", spec.id)
+    other = os.path.join(state, "phase", "i999")
+    for path in (mine, other):
+        with open(path, "w") as f:
+            f.write("1755712345 phase=cross-reviewing event=start\n")
+    _result, _edges, _host = _run(spec)
+    assert not os.path.exists(mine), "a fresh session must not inherit the last one's phase claim"
+    assert os.path.exists(other), "another lane's live breadcrumb is none of this launch's business"
+
+
 def test_a_worker_launch_without_a_repo_names_that_rather_than_the_branch(tmp_path):
     """Left to git it would fail the base-ref probe too, and exit 3 would send the owner to fix a
     dev_branch that is not what went wrong."""
