@@ -41,6 +41,7 @@ import gitops
 import journal
 import loopstate
 import panes as panes_lib
+import phase as phase_mod
 import published_view
 import runner_home
 import session_host
@@ -773,6 +774,7 @@ class Runner:
                     "state/identityfail",               # (#314) refused-on-wrong-account marks
                     "state/launch_stderr", "state/events/processed",
                     "state/pending_teardown",           # (#149) prunes declined under a live CLI
+                    "state/phase",                      # (#443) the cross-review script's breadcrumb
                     "briefs", "reports", "worktrees", "logs"):
             os.makedirs(os.path.join(self.home, sub), exist_ok=True)
         if not os.path.exists(self.issues_path):
@@ -1230,6 +1232,42 @@ class Runner:
     def _view_path(self):
         return os.path.join(self.state, "gh_view.json")
 
+    def _phase_facts(self, ist_map, tracked):
+        """The three facts the published PHASE is derived from (#443), as ``build`` kwargs.
+
+        A worker builds, cross-reviews, pushes and files its report inside ONE session, and the
+        engine advances a lane on journal LANDMARKS only — so a lane read "building" for essentially
+        its whole flight and then flicked through everything else in a tick or two. The missing sense
+        is the cross-review, which runs through an engine-owned script that now stamps
+        ``state/phase/<iid>`` on entry and (from an EXIT trap) on exit. Nothing here reads a screen
+        and nothing here asks GitHub anything: the breadcrumb and the report are files the engine
+        already owns, and the PR fact ``build`` takes from the view this tick already holds.
+
+        Read PER IN-FLIGHT LANE rather than by sweeping the directory. Nothing prunes
+        ``state/phase`` except a fresh episode, so it accumulates one file per issue ever reviewed
+        and a sweep would re-read the whole history every 15s to learn about (at most) `lanes` of
+        them. This reads 0-2 files instead, and it also makes a leftover breadcrumb from a finished
+        lane structurally unable to reach the document.
+
+        ``_read`` is the same fail-soft reader every other marker path uses: a missing file and one
+        that will not decode (a binary dropped in — the 2026-07-07 class) both answer None, which
+        lands on `phase.derive`'s ``building`` floor. Purely additive to the tick: no launch, no
+        alert, no decision reads any of it."""
+        flying = {iid for iid in tracked
+                  if phase_mod.in_flight(actions._status_of(
+                      ist_map.get(iid) if isinstance(ist_map.get(iid), dict) else {}))}
+        crumbs = {}
+        for iid in flying:
+            txt = _read(os.path.join(self.state, phase_mod.BREADCRUMB_DIR, iid))
+            if txt is not None:
+                crumbs[iid] = txt
+        return {
+            "in_flight_ids": flying,
+            "breadcrumbs": crumbs,
+            "report_ids": {iid for iid in flying
+                           if os.path.exists(os.path.join(self.home, "reports", f"{iid}.md"))},
+        }
+
     def _publish_view(self, now, ist_map):
         """Write this tick's GitHub view to ``state/gh_view.json`` (issue #146) — the file the
         dashboard renders as its PRIMARY truth.
@@ -1276,7 +1314,8 @@ class Runner:
             doc = published_view.build(
                 self.gh_view, self._raw_by_id, tracked_ids=tracked,
                 now=now, polled_at=self._last_poll_ok, carry_titles=self._published_titles,
-                carry_prs=self._published_prs, merged_ids=merged_ids)
+                carry_prs=self._published_prs, merged_ids=merged_ids,
+                **self._phase_facts(ist_map, tracked))
             loopstate.save(self._view_path(), doc)
             self._published_titles = doc["titles"]
             self._published_prs = doc["prs"]
@@ -3541,7 +3580,10 @@ class Runner:
         # NO-FINDINGS before re-investigating anything, closing the re-run without its own
         # interview. Pending mail only: the .consumed/.claimed/.discarded receipts are the
         # history of what was actually delivered and stay (the launcher's own rule).
-        for sub in ("blocked", "exited", "awaiting", "started", "mail", "ack"):
+        # `phase` joins this list (#443): the breadcrumb is a claim about what the lane is doing
+        # RIGHT NOW, so a fresh episode must not inherit the last one's. Its own staleness rule
+        # would expire it eventually; clearing it here makes the fresh start honest immediately.
+        for sub in ("blocked", "exited", "awaiting", "started", "mail", "ack", "phase"):
             _rm(os.path.join(self.state, sub, iid))
         # 2. durable state: zero the attempt counters and clear the stale run/gate fields that
         #    would otherwise re-park.
@@ -4603,7 +4645,7 @@ class Runner:
             return (f"worker still live in the worktree (pid {pid}) — deferring the rebuild "
                     f"(deferral {n} of {actions.TEARDOWN_DEFERRAL_CAP}; retries next tick)")
         _rm(os.path.join(self.home, "reports", f"{iid}.md"))
-        for sub in ("blocked", "exited", "awaiting"):
+        for sub in ("blocked", "exited", "awaiting", "phase"):     # (#443) see _exec_reapprove
             _rm(os.path.join(self.state, sub, iid))
         # 2. durable state: the new branch is stamped BEFORE any relabel, so a partial failure
         #    can never resurrect the old branch (the orphan sweep checks the stamp). The

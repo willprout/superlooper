@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# bin/cross-review.sh — pin the CROSS-REVIEWER's model + reasoning-effort per repo, then exec the
-# review. This is the mechanical fix for issue #158 / the 2026-07-14→15 incident: the plugin's
+# bin/cross-review.sh — pin the CROSS-REVIEWER's model + reasoning-effort per repo, run the review
+# with them, and stamp the lane's PHASE around it.
+#
+# The pin is the mechanical fix for issue #158 / the 2026-07-14→15 incident: the plugin's
 # cross-review ran `codex exec` BARE, so when the owner changed his machine-global
 # ~/.codex/config.toml for unrelated work, every in-flight review silently inherited ultra effort,
 # timed out, and aged workers past the freeze threshold. The truth for how a review is invoked must
@@ -8,9 +10,20 @@
 #
 # Contract: read the prompt on STDIN, resolve `models.reviewer` / `models.reviewer_effort` from the
 # repo's `.superlooper/config.json` (the per-repo pin — the loader fills concrete defaults, so the
-# fields are ALWAYS present), and `exec codex exec` with those as EXPLICIT flags. It NEVER runs
-# `codex` bare and NEVER reads ~/.codex/config.toml for the model/effort. If no config is
-# resolvable, it FAILS LOUD rather than fall back to a bare (ambient-poisoned) invocation.
+# fields are ALWAYS present), and run `codex exec` with those as EXPLICIT flags, exiting with the
+# reviewer's own status. It NEVER runs `codex` bare and NEVER reads ~/.codex/config.toml for the
+# model/effort. If no config is resolvable, it FAILS LOUD rather than fall back to a bare
+# (ambient-poisoned) invocation.
+#
+# Phase contract (issue #443): a worker builds, cross-reviews, pushes and files its report inside
+# ONE session, and the engine advances a lane on journal LANDMARKS only — so a lane read "building"
+# for essentially its whole flight and then flicked through every remaining stage in a tick or two.
+# The cross-review is the one long sub-step the engine can honestly sense, BECAUSE it runs through
+# this script: engine-owned code the worker merely invokes. So this stamps `state/phase/<id>` when
+# the review starts and again when it ends, and the runner reads the file — no screen read, no new
+# GitHub read, and no reliance on a worker remembering to announce anything. The stamp is a LABEL
+# ON A BOARD and nothing more: it holds no launch, raises no alert, and reaches no decision, so
+# every failure to write it is swallowed and the review runs regardless.
 #
 # AGENT BOUNDARY: like start-session.sh, this is the ONE place the codex-specific review command
 # line (`-m`, `-c model_reasoning_effort=`) lives. The pin itself is per-repo CONFIG, never a
@@ -94,7 +107,49 @@ if [ -n "${SL_RUN_ROOT:-}" ] && [ -n "${SL_ISSUE_ID:-}" ]; then
   fi
 fi
 
-# Exec the review: interactive-free `codex exec -` reads the prompt from OUR stdin (the caller's
+# PHASE BREADCRUMB (issue #443). One line, the state home's own house style — a leading epoch then
+# `key=value`, exactly what `state/exited` (`<epoch> rc=<n>`) and the pin file above already use.
+# Only inside a loop worker (same guard as the pin evidence): run standalone this script is just a
+# review command and must invent no lane state anywhere.
+#
+# Written to a temp file and RENAMED, because the runner re-reads this file every tick while the
+# review runs and must never catch it half-written. The temp name is FIXED (not mktemp) and
+# dot-prefixed: fixed so a stamp killed between create and rename is overwritten by the next one
+# instead of accumulating, and dot-prefixed so no directory scan can ever read one as a lane marker
+# (the .DS_Store rule the runner's marker scans already keep). One session owns one lane and the
+# review is synchronous, so nothing else is ever writing this name.
+# Every failure path returns 0: losing the label must never cost the review.
+_phase_stamp() {                       # $1 = start|end, $2 = the review's rc (end only)
+  [ -n "${SL_RUN_ROOT:-}" ] && [ -n "${SL_ISSUE_ID:-}" ] || return 0
+  local dir="$SL_RUN_ROOT/state/phase" line tmp
+  mkdir -p "$dir" 2>/dev/null || return 0
+  line="$(date +%s) phase=cross-reviewing event=$1"
+  [ -n "${2:-}" ] && line="$line rc=$2"
+  tmp="$dir/.$SL_ISSUE_ID.tmp"
+  if printf '%s\n' "$line" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$dir/$SL_ISSUE_ID" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  else
+    rm -f "$tmp" 2>/dev/null
+  fi
+  return 0
+}
+
+# Stamped only from HERE — past every refusal above — so a lane never reads "cross-reviewing" for a
+# review that was refused and never ran. The end stamp rides an EXIT trap rather than a line after
+# the review, so it lands whether codex succeeded, failed, or the script was interrupted: a start
+# with no end would pin the lane at "cross-reviewing" for the rest of its flight, the same lie this
+# issue exists to end, in a different place. (A SIGKILL still skips it — that is what the reader's
+# staleness rule is for.)
+_phase_stamp start
+trap '_phase_stamp end "$?"' EXIT
+
+# Run the review: interactive-free `codex exec -` reads the prompt from OUR stdin (the caller's
 # prompt); the -m / -c flags are pinned above, so codex never consults ~/.codex/config.toml for
-# them. exec replaces this process so codex owns the tty/stdin directly.
-exec codex exec -m "$MODEL" -c "model_reasoning_effort=$(toml_string "$EFFORT")" -
+# them. It is the LAST command, so this script exits with the reviewer's own status and the caller
+# sees the review's outcome unchanged.
+#
+# Deliberately NOT `exec` any more (it was, until #443): exec replaces this process, and a replaced
+# process cannot stamp its own end. codex still runs in the foreground of the same process group
+# and inherits this script's stdin/stdout/stderr and tty directly, so the review itself is
+# unaffected — the cost is one bash process left waiting, which is what buys the end stamp.
+codex exec -m "$MODEL" -c "model_reasoning_effort=$(toml_string "$EFFORT")" -

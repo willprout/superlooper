@@ -17,6 +17,14 @@ codex — kickoff rule) and a DELIBERATELY POISONED `$HOME/.codex/config.toml`, 
     running inside a loop worker) so a review that ran at the wrong tier is diagnosable;
   * with NO resolvable `.superlooper/config.json`, the helper refuses to run codex at all rather
     than fall back to a bare (ambient-poisoned) invocation.
+
+The same script also carries the loop's only MID-SESSION phase signal (issue #443). A worker
+builds, cross-reviews and files its report inside one session that emits no journal landmark, so a
+lane read "building" for essentially its whole flight. This script is engine-owned code the worker
+merely INVOKES, so it stamps `state/phase/<id>` when the review starts and again when it ends —
+the signal can never depend on a worker remembering to announce anything, and by doctrine nothing
+reads a screen. The tests below drive that with a stub codex that snapshots the breadcrumb from
+INSIDE the review, which is the only way to prove the "during" half.
 """
 import os
 import shutil
@@ -33,7 +41,13 @@ CROSS_REVIEW = os.path.join(REPO_ROOT, "skill", "bin", "cross-review.sh")
 STUB_CODEX = ('#!/usr/bin/env bash\n'
               'printf "%s\\n" "$@" > "$SL_TEST_ARGS"\n'
               'cat > "$SL_TEST_STDIN"\n'
-              'exit 0\n')
+              # copy the phase breadcrumb as the REVIEW SEES IT — the only way to observe the
+              # "during" half of a start/end pair from outside the process (issue #443).
+              'if [ -n "${SL_TEST_PHASE_SNAPSHOT:-}" ]; then\n'
+              '  cat "$SL_RUN_ROOT/state/phase/$SL_ISSUE_ID" > "$SL_TEST_PHASE_SNAPSHOT" 2>/dev/null'
+              ' || : > "$SL_TEST_PHASE_SNAPSHOT"\n'
+              'fi\n'
+              'exit "${SL_TEST_CODEX_RC:-0}"\n')
 
 # a hostile ambient config: if the helper ever ran `codex` bare, THIS is the model/effort it would
 # silently inherit. Every assertion below proves the repo pin wins over these values.
@@ -186,3 +200,135 @@ def test_bad_relative_repo_root_refuses_without_hanging(tmp_path):
                          extra_env={"SL_REVIEW_REPO_ROOT": "does-not-exist-relative"})
     assert proc.returncode != 0
     assert argv is None, "codex must not run when the pin cannot be resolved"
+
+
+# ===================== the mid-session phase breadcrumb (issue #443) =====================
+# The engine advances a lane on journal LANDMARKS, and a whole session's build-plus-review stretch
+# emits none — so the plane sat on the same leg for the entire flight. The cross-review is the one
+# long sub-step the engine can honestly sense, because it runs through THIS script. Start and end
+# are both stamped: a start-only breadcrumb would pin every reviewed lane at "cross-reviewing" for
+# the rest of its life, which is the same lie in a different place.
+
+def _phase_file(run_root, iid="i158"):
+    return run_root / "state" / "phase" / iid
+
+
+def _drive_with_snapshot(tmp_path, repo, run_root, **kw):
+    """Run the helper inside a loop worker, capturing the breadcrumb AS THE REVIEW SAW IT."""
+    snap = tmp_path / "phase_during"
+    if snap.exists():
+        snap.unlink()
+    env = {"SL_TEST_PHASE_SNAPSHOT": str(snap)}
+    env.update(kw.pop("extra_env", None) or {})
+    proc, argv, _ = _run(repo, tmp_path, run_root=run_root, extra_env=env, **kw)
+    during = snap.read_text() if snap.exists() else None
+    after = _phase_file(run_root).read_text() if _phase_file(run_root).exists() else None
+    return proc, argv, during, after
+
+
+def _fields(line):
+    """`<epoch> k=v k=v` -> (epoch, {k: v}); asserts the house format the runner parses."""
+    assert line, "expected a breadcrumb line"
+    parts = line.strip().split()
+    return int(parts[0]), dict(p.split("=", 1) for p in parts[1:] if "=" in p)
+
+
+def test_the_lane_reads_cross_reviewing_during_the_review_and_not_after(tmp_path):
+    repo = _repo(tmp_path)
+    run_root = tmp_path / "run"
+    (run_root / "state").mkdir(parents=True)
+    proc, argv, during, after = _drive_with_snapshot(tmp_path, repo, run_root)
+    assert proc.returncode == 0, proc.stderr
+    assert argv is not None, "the review must actually have been invoked"
+
+    at, f = _fields(during)
+    assert f["phase"] == "cross-reviewing" and f["event"] == "start"
+    assert at > 0
+
+    at2, f2 = _fields(after)
+    assert f2["phase"] == "cross-reviewing" and f2["event"] == "end", \
+        "a start with no end pins the lane at cross-reviewing for the rest of its flight"
+    assert at2 >= at
+
+
+def test_the_end_stamp_lands_even_when_the_review_fails(tmp_path):
+    # The failure case is the one that matters: a review that errored, timed out or was interrupted
+    # must not leave the lane claiming to be reviewing. The stamp rides an EXIT trap for this.
+    repo = _repo(tmp_path)
+    run_root = tmp_path / "run"
+    (run_root / "state").mkdir(parents=True)
+    proc, _, during, after = _drive_with_snapshot(tmp_path, repo, run_root,
+                                                  extra_env={"SL_TEST_CODEX_RC": "7"})
+    assert proc.returncode == 7, "the reviewer's exit code must still reach the caller"
+    assert _fields(during)[1]["event"] == "start"
+    _, f = _fields(after)
+    assert f["event"] == "end"
+    assert f.get("rc") == "7", "the end stamp records the review's outcome as diagnosable evidence"
+
+
+def test_the_breadcrumb_is_one_whole_line_the_runner_can_always_parse(tmp_path):
+    # The runner re-reads this file every tick while the review is running, so it must never be
+    # caught half-written. Written to a temp file and renamed, hence: exactly one line, always.
+    repo = _repo(tmp_path)
+    run_root = tmp_path / "run"
+    (run_root / "state").mkdir(parents=True)
+    _, _, during, after = _drive_with_snapshot(tmp_path, repo, run_root)
+    for text in (during, after):
+        assert text.endswith("\n") and len(text.strip().splitlines()) == 1, repr(text)
+    # No stray temp files left behind in the directory the runner scans.
+    leftovers = [p.name for p in _phase_file(run_root).parent.iterdir() if p.name != "i158"]
+    assert leftovers == [], leftovers
+
+
+def test_the_stamped_phase_is_what_the_engines_reader_derives(tmp_path):
+    # The writer and the reader are pinned to each other here, so the format can never drift into
+    # a breadcrumb the runner silently ignores (which would fail soft — and silently — forever).
+    import phase
+
+    repo = _repo(tmp_path)
+    run_root = tmp_path / "run"
+    (run_root / "state").mkdir(parents=True)
+    _, _, during, after = _drive_with_snapshot(tmp_path, repo, run_root)
+    now = _fields(during)[0] + 1
+    assert phase.derive(during, now=now) == phase.CROSS_REVIEWING
+    assert phase.derive(after, now=now) == phase.BUILDING
+
+
+def test_no_breadcrumb_is_written_outside_a_loop_worker(tmp_path):
+    # Run standalone (no SL_RUN_ROOT / SL_ISSUE_ID) the helper is just a review command; it must not
+    # invent a lane's state anywhere. Same guard the review_pin evidence file already uses.
+    repo = _repo(tmp_path)
+    proc, argv, _ = _run(repo, tmp_path)                     # no run_root
+    assert proc.returncode == 0, proc.stderr
+    assert argv is not None
+    assert not (tmp_path / "state" / "phase").exists()
+
+
+def test_a_refused_review_leaves_no_breadcrumb(tmp_path):
+    # The pin could not be resolved, so no review runs — and a lane must never read "cross-reviewing"
+    # for a review that never started.
+    bare = tmp_path / "not-a-repo"
+    bare.mkdir()
+    run_root = tmp_path / "run"
+    (run_root / "state").mkdir(parents=True)
+    proc, argv, _ = _run(bare, tmp_path, run_root=run_root)
+    assert proc.returncode != 0 and argv is None
+    assert not _phase_file(run_root).exists()
+
+
+def test_an_unwritable_breadcrumb_never_costs_the_review(tmp_path):
+    # Fail-soft in the direction that matters: the phase is a label on a board, the review is the
+    # work. A state home that refuses the write must lose the label, never the review.
+    import os as _os
+    import stat as _stat
+
+    repo = _repo(tmp_path)
+    run_root = tmp_path / "run"
+    (run_root / "state").mkdir(parents=True)
+    _os.chmod(run_root / "state", _stat.S_IRUSR | _stat.S_IXUSR)     # read+exec only: no new dirs
+    try:
+        proc, argv, _ = _run(repo, tmp_path, run_root=run_root)
+        assert proc.returncode == 0, proc.stderr
+        assert argv is not None, "the review must run even when the breadcrumb cannot be written"
+    finally:
+        _os.chmod(run_root / "state", _stat.S_IRWXU)

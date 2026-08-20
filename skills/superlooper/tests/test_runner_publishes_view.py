@@ -358,3 +358,87 @@ def test_an_unreadable_post_execute_state_read_never_prunes_the_carries(rig, mon
     assert doc["titles"].get("i123") == _LANDING_TITLE, "an unreadable read pruned the carried title"
     assert doc["prs"].get("i123", {}).get("state") == "MERGED", \
         "an unreadable read pruned the landed flight's PR"
+
+
+# ======================= the lane's current phase, on the tick (issue #443) =======================
+# `published_view.build` shapes the field and `phase.derive` is the rule; these pin that the RUNNER
+# actually feeds it — from loopstate's status, from the cross-review script's own breadcrumb file,
+# and from the report on disk. No screen is read and no GitHub call is added: the breadcrumb and the
+# report are files the engine already owns, and the PR fact comes from the view this tick already
+# holds.
+
+def _seed_flying(rig, iid, status="running", pr=None):
+    def m(st):
+        rec = st["issues"].setdefault(iid, loopstate.new_issue())
+        rec["status"] = status
+        if pr is not None:
+            rec["pr"] = pr["number"]
+    loopstate.update(str(rig.home / "state" / "issues.json"), m)
+    if pr is not None:
+        rig.r.gh_view = {**rig.r.gh_view, "prs": {iid: pr}, "stale": False}
+    rig.r._last_poll = NOW + 10_000          # inside the window: no re-poll rebuilds `prs`
+
+
+def _stamp(rig, iid, text):
+    d = rig.home / "state" / "phase"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / iid).write_text(text)
+
+
+def test_the_state_home_has_a_place_for_the_phase_breadcrumb(rig):
+    # The cross-review script writes into this directory with `mkdir -p`, but the runner laying it
+    # out is what makes the location a CONTRACT rather than a coincidence.
+    assert (rig.home / "state" / "phase").is_dir()
+
+
+def test_a_running_lane_publishes_a_phase(rig):
+    _seed_flying(rig, "i15")
+    rig.r.tick(now=NOW + 10_000)
+    assert view(rig)["phases"].get("i15") == "building"
+
+
+def test_the_runner_reads_the_cross_review_breadcrumb_off_disk(rig):
+    # THE issue: the long mid-session step the engine could never see. The script stamps the file;
+    # the supervisor reads the file. No screen read anywhere in that sentence.
+    _seed_flying(rig, "i15")
+    _stamp(rig, "i15", "%d phase=cross-reviewing event=start\n" % (NOW + 10_000))
+    rig.r.tick(now=NOW + 10_000)
+    assert view(rig)["phases"].get("i15") == "cross-reviewing"
+
+
+def test_the_end_stamp_takes_the_lane_back_off_cross_reviewing(rig):
+    _seed_flying(rig, "i15")
+    _stamp(rig, "i15", "%d phase=cross-reviewing event=end rc=0\n" % (NOW + 10_000))
+    rig.r.tick(now=NOW + 10_000)
+    assert view(rig)["phases"].get("i15") == "building"
+
+
+def test_a_filed_report_reaches_the_published_phase(rig):
+    _seed_flying(rig, "i15")
+    (rig.home / "reports" / "i15.md").write_text("## Tests\nok\n")
+    rig.r.tick(now=NOW + 10_000)
+    assert view(rig)["phases"].get("i15") == "report-posted"
+
+
+def test_an_open_pr_reaches_the_published_phase(rig):
+    _seed_flying(rig, "i15", pr={"number": 25, "state": "OPEN", "mergeable": "MERGEABLE"})
+    rig.r.tick(now=NOW + 10_000)
+    assert view(rig)["phases"].get("i15") == "pr-open"
+
+
+def test_a_finished_lane_publishes_no_phase_at_all(rig):
+    _seed_flying(rig, "i15", status="merged")
+    _stamp(rig, "i15", "%d phase=cross-reviewing event=start\n" % (NOW + 10_000))
+    rig.r.tick(now=NOW + 10_000)
+    assert "i15" not in view(rig)["phases"], "a landed flight must not read as a live worker"
+
+
+def test_a_corrupt_breadcrumb_costs_a_label_and_never_the_tick(rig):
+    # Fail-soft end to end: the file is unreadable junk, the phase degrades to building, the tick
+    # completes and the heartbeat (the dead-man's switch) is still stamped.
+    _seed_flying(rig, "i15")
+    (rig.home / "state" / "phase").mkdir(parents=True, exist_ok=True)
+    (rig.home / "state" / "phase" / "i15").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00garbage")
+    rig.r.tick(now=NOW + 10_000)
+    assert view(rig)["phases"].get("i15") == "building"
+    assert (rig.home / "state" / "runner.heartbeat").read_text().strip() == str(int(NOW + 10_000))
