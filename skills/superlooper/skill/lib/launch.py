@@ -851,7 +851,8 @@ def _prepare_state(spec, iid, session_id, token):
     """Everything that must exist (or must NOT survive) before a session starts."""
     state = os.path.join(spec.run_root, "state")
     for sub in ("activity", "panes", "started", "blocked", "exited", "awaiting", "sessions",
-                "authfail", "envfail", "identityfail", "mail", "status", "launch_stderr"):
+                "authfail", "envfail", "identityfail", "mail", "status", "launch_stderr",
+                "phase"):                          # (#443) the cross-review script's breadcrumb
         os.makedirs(os.path.join(state, sub), exist_ok=True)
     os.makedirs(os.path.join(spec.run_root, "reports"), exist_ok=True)
 
@@ -876,7 +877,15 @@ def _prepare_state(spec, iid, session_id, token):
                  os.path.join(state, "exited", iid),
                  os.path.join(state, "awaiting", iid),
                  os.path.join(state, "mail", iid),
-                 os.path.join(state, "status", "%s.json" % iid)):
+                 os.path.join(state, "status", "%s.json" % iid),
+                 # (#443) The phase breadcrumb is a claim about what a session is doing RIGHT NOW,
+                 # so it must never outlive the session that wrote it. A worker killed between the
+                 # cross-review script's start stamp and its end trap leaves an OPEN one, and a
+                 # relaunch inside its staleness window would publish the fresh session as
+                 # "cross-reviewing" while it is only building. This is the common pre-session
+                 # hygiene point (the reapprove/rebuild executors clear it too, on paths that can
+                 # abort before ever reaching a launch).
+                 os.path.join(state, "phase", iid)):
         _rm_quiet(path)
 
     # Sweep this id's ABANDONED self-refusal markers. Nothing else prunes them: the launcher only

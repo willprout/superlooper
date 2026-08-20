@@ -306,3 +306,93 @@ def test_a_wrong_typed_total_is_never_immortalized_by_the_carry():
                                carry_prs={"i15": pr})
     got = doc["prs"]["i15"]
     assert "additions" not in got and "changedFiles" not in got
+
+
+# ============================ the lane's current phase (issue #443) ============================
+# The engine advances a lane's position on journal LANDMARKS only, and a worker builds, reviews,
+# pushes and files its report inside ONE session that emits none of them — so a lane read "building"
+# for essentially its whole flight and then flicked through everything else in a tick or two. The
+# document now carries a per-lane phase built from the cross-review script's own breadcrumb plus the
+# landmarks the runner already holds (`phase.derive` is the pure rule; tests/test_phase.py pins it).
+# Here we pin the DOCUMENT's half: which lanes get an entry, where each input comes from, and that a
+# broken input costs a label and never the tick.
+
+_OPEN_REVIEW = "1000 phase=cross-reviewing event=start"
+_ENDED_REVIEW = "1000 phase=cross-reviewing event=end rc=0"
+
+
+def _phases(now=1010, **kw):
+    kw.setdefault("in_flight_ids", {"i7"})
+    doc = published_view.build(_view(prs=kw.pop("prs", {})), {}, tracked_ids={"i7"},
+                               now=now, polled_at=now, **kw)
+    return doc["phases"]
+
+
+def test_a_building_lane_reads_building():
+    assert _phases() == {"i7": "building"}
+
+
+def test_a_lane_inside_a_live_cross_review_reads_cross_reviewing():
+    # THE point of the issue: the long mid-session step the engine could never see before.
+    assert _phases(breadcrumbs={"i7": _OPEN_REVIEW})["i7"] == "cross-reviewing"
+
+
+def test_a_lane_whose_review_finished_stops_reading_cross_reviewing():
+    assert _phases(breadcrumbs={"i7": _ENDED_REVIEW})["i7"] == "building"
+
+
+def test_a_lane_with_an_open_pr_reads_pr_open():
+    # Taken from the PR facts THIS document already holds — no new GitHub read exists or is needed.
+    assert _phases(prs={"i7": {"number": 3, "state": "OPEN"}})["i7"] == "pr-open"
+
+
+def test_a_lane_with_a_filed_report_reads_report_posted():
+    assert _phases(report_ids={"i7"})["i7"] == "report-posted"
+
+
+def test_a_merged_prs_lane_is_never_called_pr_open():
+    assert _phases(prs={"i7": {"number": 3, "state": "MERGED"}})["i7"] == "building"
+
+
+def test_only_in_flight_lanes_carry_a_phase():
+    # A queued or finished lane publishes NOTHING rather than a fabricated "building" — the
+    # never-invent discipline this document is built on. `in_flight_ids` is the runner's answer.
+    doc = published_view.build(_view(), {}, tracked_ids={"i7", "i8"}, now=1010, polled_at=1010,
+                               in_flight_ids={"i7"}, breadcrumbs={"i8": _OPEN_REVIEW},
+                               report_ids={"i8"})
+    assert doc["phases"] == {"i7": "building"}
+
+
+def test_the_phases_map_is_always_present_even_when_empty():
+    # The dashboard binds this key; an absent one would be indistinguishable from "no lanes flying".
+    doc = published_view.build(_view(), {}, tracked_ids=set(), now=1, polled_at=1)
+    assert doc["phases"] == {}
+
+
+def test_a_missing_stale_or_malformed_breadcrumb_degrades_to_building():
+    # Fail-soft, end to end: nothing here can raise, and every unreadable breadcrumb resolves DOWN.
+    import phase as phase_mod
+    for crumb in (None, "", "garbage", 17, b"bytes", {"phase": "cross-reviewing"},
+                  "1000 phase=cross-reviewing",              # half a stamp — no event field
+                  "1000 phase=cross-reviewing event=start",  # well-formed but EXPIRED at this `now`
+                  ):
+        got = _phases(now=1000 + phase_mod.STALE_SECONDS + 1, breadcrumbs={"i7": crumb})
+        assert got == {"i7": "building"}, crumb
+
+
+def test_a_wrong_typed_phase_input_never_raises():
+    # The publish step runs ahead of the heartbeat stamp; a raise here would present a healthy loop
+    # as dead (the 2026-07-07 class). Junk in every phase argument must still produce a document.
+    for bad in ("nope", 7, None, object()):
+        doc = published_view.build(_view(), {}, tracked_ids={"i7"}, now=1010, polled_at=1010,
+                                   in_flight_ids=bad, breadcrumbs=bad, report_ids=bad)
+        assert isinstance(doc["phases"], dict)
+
+
+def test_every_published_phase_is_in_the_closed_vocabulary():
+    import phase as phase_mod
+    for crumb in (None, _OPEN_REVIEW, _ENDED_REVIEW, "garbage"):
+        for prs in ({}, {"i7": {"number": 3, "state": "OPEN"}}):
+            for reports in (set(), {"i7"}):
+                got = _phases(breadcrumbs={"i7": crumb}, prs=prs, report_ids=reports)
+                assert got["i7"] in phase_mod.PHASES

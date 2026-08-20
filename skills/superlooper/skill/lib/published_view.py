@@ -29,6 +29,7 @@ Two disciplines are load-bearing:
 This module never raises: it runs inside the tick, ahead of the heartbeat stamp, and a raise here
 would wedge the loop exactly as the 2026-07-07 binary-file incident did.
 """
+import phase
 
 # The issue fields the dashboard needs to draw a queue row: the identity (number/title), the
 # labels it renders as chips, the body it parses `connections:` out of, and the createdAt it
@@ -63,6 +64,15 @@ _SIZE_TOTAL_KEYS = ("additions", "deletions", "changedFiles")
 
 def _dict(v):
     return v if isinstance(v, dict) else {}
+
+
+def _iid_set(v):
+    """An iid set from whatever the caller passed. Non-str members are dropped so the result always
+    sorts (a mixed-type set raises on `sorted`) and can only ever name a real lane key — the same
+    fail-soft-to-empty coercion `_dict` gives the map arguments."""
+    if not isinstance(v, (set, frozenset, list, tuple)):
+        return set()
+    return {x for x in v if isinstance(x, str)}
 
 
 def _issue_row(raw):
@@ -141,7 +151,8 @@ def _closed_list(closed_nums):
 
 
 def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=None,
-          carry_prs=None, merged_ids=None):
+          carry_prs=None, merged_ids=None, in_flight_ids=None, breadcrumbs=None,
+          report_ids=None):
     """The document for ``state/gh_view.json``.
 
     ``gh_view``     the runner's in-memory view (``stale``, ``consecutive_failures``,
@@ -156,6 +167,12 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
     ``carry_prs``    the previous document's ``prs`` map; only SETTLED entries are remembered.
     ``merged_ids``   the iids loopstate records as ``merged`` — the runner's own record of its own
                      landings, and what settles a cached PR still reading OPEN (see below).
+    ``in_flight_ids`` the iids loopstate says are IN THE AIR (``phase.in_flight``) — the only lanes
+                     that get a ``phases`` entry at all.
+    ``breadcrumbs``  ``{iid: raw text of state/phase/<iid>}`` — the cross-review script's own stamp
+                     (issue #443). Absent/garbage is expected and fail-softs to ``building``.
+    ``report_ids``   the iids whose ``reports/<iid>.md`` exists — the landmark the engine already
+                     holds, passed in rather than read here so this stays pure.
 
     An unreadable ``gh_view`` yields an empty-but-typed document marked ``stale`` — never a
     confident all-clear.
@@ -230,6 +247,29 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
     for iid, pr in settling[:CARRY_PR_LIMIT]:
         prs[iid] = pr
 
+    # The lane's CURRENT PHASE (issue #443). The engine advances a lane on journal landmarks only,
+    # and a worker builds, cross-reviews, pushes and files its report inside ONE session that emits
+    # none of them — so a lane read "building" for essentially its whole flight and then flicked
+    # through everything else in a tick or two. `phase.derive` is the pure rule (see its precedence
+    # note); the two facts it needs beyond the breadcrumb are `report_present`, which the caller
+    # supplies, and `pr_open`, which comes from the PR map THIS document just built — so the sense
+    # costs no new GitHub read and no screen read.
+    #
+    # Only IN-FLIGHT lanes get an entry: a queued or finished lane publishes NOTHING rather than a
+    # fabricated "building" a reader would mistake for a live worker (the never-invent discipline).
+    # Sorted so an unchanged view rewrites an unchanged file, same reason as `_closed_list`.
+    # Nothing in here can raise — `phase` is total, and the inputs are coerced to safe empties — so
+    # a corrupt breadcrumb costs a LABEL and never the tick.
+    crumbs = _dict(breadcrumbs)
+    reported = _iid_set(report_ids)
+    phases = {}
+    for iid in sorted(_iid_set(in_flight_ids)):
+        entry = prs.get(iid)
+        phases[iid] = phase.derive(
+            crumbs.get(iid), now,
+            report_present=iid in reported,
+            pr_open=isinstance(entry, dict) and entry.get("state") == "OPEN")
+
     return {
         "published_at": int(now),
         "polled_at": int(polled_at) if isinstance(polled_at, (int, float)) else None,
@@ -252,5 +292,8 @@ def build(gh_view, raw_by_id, tracked_ids, now, polled_at=None, carry_titles=Non
         # in decide before "fixing" the divergence.)
         "closed_read_ok": view.get("closed_read_ok") is True,
         "prs": prs,
+        # {iid: one of phase.PHASES} for lanes in the air (issue #443). Always present — an absent
+        # key would be indistinguishable from "no lanes are flying".
+        "phases": phases,
         "dev_checks": _dict(view.get("dev_checks")),
     }
