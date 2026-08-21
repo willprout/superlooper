@@ -17,6 +17,8 @@
              link: 'ok'|'lost' (GitHub data link — 'lost' darkens the tower beacon, issue #38),
              resetKey: string (repo switch clears sprite state),
              banners: [{num, text}] (a name cloth towed behind EACH downwind leg plane, issue #204),
+             landmarks: [bool x4] (which painted landmark under the leg is lit — the SERVER's
+                        verdict, one flag per sign west→east, issue #444),
              flights: [{num, label, stage, circuitStage, runway, contrail, spinning, trouble,
                         tail}] }
 
@@ -136,7 +138,8 @@
 
     var base = document.createElement('canvas');
     var baseKey = '';
-    var model = { time: 'day', status: 'ok', dim: false, link: 'ok', flights: [], banners: [], resetKey: '' };
+    var model = { time: 'day', status: 'ok', dim: false, link: 'ok', flights: [], banners: [],
+                  landmarks: [false, false, false, false], resetKey: '' };
     var sprites = {};          // num -> persistent sprite state (cur pos, trail, transit)
     var bannerCache = [];      // pinned cloth rects for this poll (issue #204) — shared by update/draw/separate
     var raf = 0, last = 0, frame = 0;
@@ -267,14 +270,19 @@
     }
 
     function landmarkFlags() {
-      // Only TRUE claims light up (costume rule 1): a downwind flight IS building, so Build
-      // Island lights. Reconcile/Review/CI landmarks stay scenery — the runner journals no
-      // per-phase fact that could honestly place a plane over them (known MVP data gap, §9).
-      var buildIsland = Object.keys(sprites).some(function (k) {
-        var f = sprites[k].flight;
-        return f && placementOf(f) === 'downwind';
-      });
-      return [false, buildIsland, false, false];
+      // Only TRUE claims light up (costume rule 1) — and WHICH claim is true is the server's, not
+      // ours (design B.1). Until issue #443 the engine sensed no per-phase fact, so this derived
+      // the one claim it could ("a downwind plane IS building") and the other three signs stayed
+      // scenery. The engine now publishes the lane's sub-phase and lib/flights.field_landmarks
+      // turns it into this list, with a test per phase value — CI runs no JS, so a second
+      // derivation here would be untested forever. We bind it and nothing else.
+      //
+      // Fails soft to an all-dark row: a model with no list (an embedder, a half-built snapshot)
+      // renders four unlit signs — scenery, exactly what this surface showed for its whole life —
+      // never an invented light and never a throw inside the rAF loop.
+      var lit = model && model.landmarks;
+      if (!lit || lit.length !== 4) return [false, false, false, false];
+      return [!!lit[0], !!lit[1], !!lit[2], !!lit[3]];
     }
 
     // ---------- per-frame motion ----------

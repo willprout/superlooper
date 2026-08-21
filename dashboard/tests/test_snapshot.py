@@ -799,11 +799,12 @@ def test_caption_suppressed_by_a_fresh_landing_still_taxiing(tmp_path):
     assert snap["repos"][0]["field_caption"] is None
 
 
-def _leg(num, stage, on_field=True, elapsed="1h 0m", label=None):
+def _leg(num, stage, on_field=True, elapsed="1h 0m", label=None, phase=None):
     """A minimal projected flight for the pure banner-selection unit tests: only the fields
-    ``_field_banners`` reads (stage, on_field, num, label, elapsed)."""
+    ``_field_banners`` reads (stage, on_field, num, label, elapsed, phase)."""
     return {"num": num, "label": label if label is not None else ("SL-%d" % num),
-            "stage": stage, "display": {"on_field": on_field, "elapsed": elapsed}}
+            "stage": stage, "phase": phase,
+            "display": {"on_field": on_field, "elapsed": elapsed}}
 
 
 def test_field_banners_lists_every_on_field_downwind_leg_flight():
@@ -875,6 +876,55 @@ def test_field_banners_wired_into_the_snapshot(home):
     assert [b["num"] for b in banners] == [16, 23]         # both leg planes, ordered by number
     assert banners[0]["text"].startswith("SL-16") and "BUILDING" in banners[0]["text"]
     assert banners[1]["text"].startswith("SL-23")
+
+
+# ---- the cloth names the sub-phase the engine senses (issue #444, over #443) ----
+
+def test_the_cloth_names_each_published_phase():
+    # A plane on the leg is no longer just "BUILDING": the cloth carries WHICH sub-step the engine
+    # senses it on, so the leg differentiates instead of reading one word for the whole flight.
+    cases = {"building": "BUILDING", "cross-reviewing": "REVIEWING",
+             "pr-open": "PR OPEN", "report-posted": "REPORTED"}
+    for phase, word in cases.items():
+        got = server._field_banners([_leg(16, flights.DOWNWIND, elapsed="41m", phase=phase)])
+        assert got[0]["text"] == "SL-16 · %s · 41M" % word, phase
+
+
+def test_a_cloth_with_no_published_phase_reads_exactly_as_it_did_before():
+    # THE FALLBACK PIN (issue #444 DoD). An older engine, a missing breadcrumb, a lane the view
+    # never listed: the cloth is byte-for-byte the string this surface has always drawn.
+    assert server._field_banners([_leg(16, flights.DOWNWIND, elapsed="2h 30m")])[0]["text"] == \
+        "SL-16 · BUILDING · 2H 30M"
+
+
+def test_an_unknown_phase_word_never_reaches_the_cloth():
+    # A newer engine's vocabulary, or a hand-edited value: the cloth falls back to the word it
+    # always carried rather than painting a term this build has no rendering test for.
+    got = server._field_banners([_leg(16, flights.DOWNWIND, elapsed="41m", phase="deploying")])
+    assert got[0]["text"] == "SL-16 · BUILDING · 41M"
+
+
+def test_no_phase_word_outgrows_the_word_the_cloth_already_carried():
+    # The cloth is a fixed 74 logical px (the width #204's occlusion-free stagger is proven
+    # against) and it CLIPS what does not fit. Measured in the browser at that width: a phase word
+    # four characters longer than "BUILDING" pushed the line past the cloth, where it broke onto a
+    # second row and landed on the landmark label below the leg. So the bound is the word this
+    # cloth has always drawn — no phase may exceed it by more than a character, which keeps the
+    # longest line this surface can produce within one character of the longest it always could.
+    longest = max(len(flights.phase_word(p)) for p in flights.LEG_PHASES)
+    assert longest <= len("BUILDING") + 1, (
+        "a phase word must not outgrow the cloth: %r" %
+        [flights.phase_word(p) for p in flights.LEG_PHASES])
+
+
+# ---- the landmarks under the leg (issue #444) ----
+
+def test_the_snapshot_carries_the_lit_landmarks(home):
+    # Which landmark is TRUE is a semantic, so it is derived server-side and the JS only binds it
+    # (design B.1) — CI runs no JS, and "only true claims light up" is exactly what needs a test.
+    repo = server.assemble_snapshot(_config(home), now=NOW)["repos"][0]
+    assert repo["field_landmarks"] == list(repo["field_landmarks"])
+    assert len(repo["field_landmarks"]) == len(flights.FIELD_LANDMARKS)
 
 
 # =============================== Task 8 — the departures board is the real launch order ===============================

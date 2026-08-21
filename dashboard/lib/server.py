@@ -1037,12 +1037,20 @@ def _field_banners(repo_flights):
 
     Ordered by flight number so the list never flickers between polls; the client staggers the
     cloths so no banner ever covers a plane or another banner (issue #204, owner ruling #3). Empty
-    (never ``None``) when nothing is on the leg."""
+    (never ``None``) when nothing is on the leg.
+
+    The middle field is the SUB-PHASE the engine senses (issue #444 over #443), not the flat word
+    "BUILDING" this cloth carried for every plane for its whole flight. It is the same slot and the
+    same 74px of cloth — the phase had to fit the furniture, because that width is the load-bearing
+    premise of #204's occlusion-free stagger. A lane with no published phase (an older engine, a
+    missing breadcrumb, the loud fallback where the runner's document is not what's on screen)
+    still reads "BUILDING": exactly the string this surface has always drawn."""
     working = sorted((f for f in repo_flights
                       if f["stage"] == flights.DOWNWIND and f["display"]["on_field"]),
                      key=lambda f: f["num"])
     return [{"num": f["num"], "label": f["label"],
-             "text": "%s · BUILDING · %s" % (f["label"], f["display"]["elapsed"].upper())}
+             "text": "%s · %s · %s" % (f["label"], flights.phase_word(f.get("phase")),
+                                       f["display"]["elapsed"].upper())}
             for f in working]
 
 
@@ -1447,6 +1455,16 @@ def _flight_closed(source, slug, num, open_nums):
     return bool(source is not None and num not in open_nums)
 
 
+def _flight_phase(source, iid):
+    """Lane ``iid``'s published sub-phase, from a source that has one — else ``None`` (issue #444).
+
+    Same shape as ``_flight_closed``: the runner's view answers it, the GitHub adapter has no such
+    method, and a source that cannot answer yields the fallback rather than a guess. Zero egress by
+    construction — there is no GitHub question here to ask."""
+    reader = getattr(source, "phase", None)
+    return reader(iid) if callable(reader) else None
+
+
 def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concluded=None):
     """Fold one repo's state home into its snapshot slice: flights (each with its drawer), boards,
     tower window (with the since-you-last-looked divider against ``last_seen``), shipped delta,
@@ -1561,6 +1579,13 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
             # tidy` selects on — so the button that opens a window and the verb that closes one can
             # never disagree about which lanes have one (issue #340).
             "session_window": iid in facts["session_windows"],
+            # WHICH sub-step of the building leg this lane is on (issue #444), as the ENGINE senses
+            # it (#443). Asked the way `is_closed` is: only of a source that can honestly answer.
+            # The runner's published view carries it; the GitHub adapter has no such notion, so the
+            # loud fallback — where that document is explicitly NOT what is on screen — yields no
+            # phase and the leg renders exactly as it did before this issue. No new read of any
+            # kind: this is a field of the document `readers` already loaded this tick.
+            "phase": _flight_phase(source, iid),
             # The three-way review state (issue #176), judged against the PR's CURRENT head so a
             # verdict pinned to a superseded diff reads 'stale', not a false green. ``review_present``
             # is the field's historical name; it now carries that state string (gate_checklist and
@@ -1653,6 +1678,12 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         # tri-state inspectable (True answered · False refused · None no gh wired / unknown).
         "github": {"reachable": gh_reachable, "unreachable": gh_unreachable},
         "field_banners": _field_banners(repo_flights),
+        # Which of the four painted landmarks under the downwind leg are lit (issue #444). Derived
+        # here, not in the pixels (design B.1): "is this claim TRUE" is a semantic, and costume rule
+        # 1 says only true claims light up. Before #443 the engine sensed no per-phase fact, so
+        # three of the four stood dark as scenery; Review Ridge and CI Shoals now light for the
+        # phases that honestly place a plane over them.
+        "field_landmarks": flights.field_landmarks(repo_flights),
         "tower_log": tower_rows,
         "tower_new": tower_new,
         "shipped": flights.corner_stats(journal, now=now),

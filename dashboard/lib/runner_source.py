@@ -104,6 +104,10 @@ class RunnerSource:
         self._issues = _dict(v.get("issues"))
         self._titles = _dict(v.get("titles"))
         self._prs = _dict(v.get("prs"))
+        # The lane phases the engine senses inside the building leg (issue #443). Not a
+        # GitHub-shaped question — a plain field of the document the dashboard already holds — so
+        # reading it costs nothing and adds no surface to the gh face below.
+        self._phases = _dict(v.get("phases"))
         self._closed = {n for n in (v.get("closed_nums") or []) if _int(n) is not None} \
             if isinstance(v.get("closed_nums"), list) else set()
         # The runner's OWN reachability verdict. Passing it through (rather than forming a second
@@ -192,6 +196,26 @@ class RunnerSource:
         if title:
             return {"number": n, "title": title}
         return {}          # unknown to the runner: the callers all fail closed on {}
+
+    # --------------------------- the lane's phase (issue #443) ---------------------------
+
+    def phase(self, iid):
+        """The sub-phase the runner published for lane ``iid`` (``i444``), or ``None``.
+
+        Deliberately NOT one of the gh-faced methods above: the phase is not a question the
+        dashboard could ever have asked GitHub — it is the engine's own sense of what a worker is
+        doing inside its one long building leg, and it rides the document this object already holds.
+        So there is no fallback twin on the GitHub adapter, and the assembler asks for it the way it
+        asks for ``is_closed``: only of a source that can answer. A source that can't (the loud
+        fallback, where the runner's document is not what's on screen) yields no phase, which the
+        display renders as exactly today's downwind.
+
+        Hands back a STRING or ``None``; the closed vocabulary is enforced downstream, in the pure
+        display layer that has a rendering test per value (``flights.leg_phase``). Fails soft to
+        ``None`` on every corruption, like every other answer here — an absent phase costs a LABEL,
+        never the poll."""
+        v = self._phases.get(iid)
+        return v if isinstance(v, str) else None
 
     # --------------------------- PRs ---------------------------
 

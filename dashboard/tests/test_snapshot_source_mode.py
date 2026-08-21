@@ -500,3 +500,87 @@ def test_cachedgh_snapshot_rides_the_slow_clock(home):
         clock[0] = NOW + i          # five polls inside one 120s window
         server.assemble_snapshot(_config(home), now=clock[0], gh_mod=cached)
     assert inner.snaps == [SLUG], "the snapshot must ride the slow clock, not fire every poll"
+
+
+# =========== the lane's sub-phase rides the view it is published in (issue #444) ===========
+# The engine senses WHICH sub-step of the one long building leg a lane is on (#443) and publishes
+# it in the same document this mode already renders. These pin the whole seam end to end: the
+# phase reaches the field in LIVE, it is DROPPED in fallback (where that document is explicitly not
+# what is on screen), and a view that carries no phase renders exactly the leg it always did.
+
+def _leg_home(home, phases=None, drop_phases=False):
+    """Rebuild the fixture's i16 as a pure downwind flight and publish a view for it."""
+    import json
+    p = home / "state" / "issues.json"
+    body = json.loads(p.read_text())
+    body["issues"]["i16"]["status"] = "running"
+    p.write_text(json.dumps(body))
+    rp = home / "reports" / "i16.md"
+    if rp.exists():
+        rp.unlink()                       # a filed report is base-turn; this needs pure downwind
+    doc = {"closed_nums": []}
+    if not drop_phases:
+        doc["phases"] = phases or {}
+    _publish(home, **doc)
+    _heartbeat(home, 5)
+    return home
+
+
+def _leg_flight(home, gh):
+    repo = server.assemble_snapshot(_config(home), now=NOW, gh_mod=gh)["repos"][0]
+    by = {f["num"]: f for f in repo["flights"]}
+    return repo, by[16]
+
+
+def _cloth(repo, num=16):
+    """The text on flight ``num``'s towed cloth, or None when it tows none."""
+    for b in repo["field_banners"]:
+        if b["num"] == num:
+            return b["text"]
+    return None
+
+
+def test_the_published_phase_reaches_the_leg_in_live(home):
+    gh = _CountingGh()
+    repo, f = _leg_flight(_leg_home(home, {"i16": "cross-reviewing"}), gh)
+    assert repo["source"]["mode"] == flights.SOURCE_LIVE
+    assert f["stage"] == flights.DOWNWIND and f["phase"] == "cross-reviewing"
+    assert _cloth(repo) == "%s · REVIEWING · %s" % (f["label"], f["display"]["elapsed"].upper())
+    assert repo["field_landmarks"] == [False, False, True, False], "Review Ridge, and only it"
+    assert gh.reads == [], "reading a phase must cost no GitHub read: %r" % (gh.reads,)
+
+
+def test_a_view_that_publishes_no_phases_renders_the_leg_exactly_as_before(home):
+    # THE FALLBACK CONTRACT (issue #444 DoD): an engine older than #443 publishes no such key.
+    repo, f = _leg_flight(_leg_home(home, drop_phases=True), _CountingGh())
+    assert f["stage"] == flights.DOWNWIND and f["phase"] is None
+    assert _cloth(repo) == "%s · BUILDING · %s" % (f["label"], f["display"]["elapsed"].upper())
+    assert repo["field_landmarks"] == [False, True, False, False], "Build Island, exactly as today"
+
+
+def test_a_silent_runner_s_leg_carries_no_phase(home):
+    # In FALLBACK the runner's document is explicitly NOT what is on screen — the field shouts as
+    # much. Rendering a phase out of an abandoned document would be the one number on the board
+    # still claiming to be the runner's live word. It degrades to today's leg instead.
+    h = _leg_home(home, {"i16": "cross-reviewing"})
+    _heartbeat(h, SILENT_AFTER + 60)
+    repo, f = _leg_flight(h, _CountingGh())
+    assert repo["source"]["mode"] == flights.SOURCE_FALLBACK
+    assert f["stage"] == flights.DOWNWIND and f["phase"] is None
+    assert _cloth(repo) == "%s · BUILDING · %s" % (f["label"], f["display"]["elapsed"].upper())
+
+
+def test_a_phase_the_view_still_names_for_a_finished_lane_leaves_no_remnant(home):
+    # The realistic race: loopstate on disk has already parked the lane, but the view the runner
+    # published a tick ago still names the phase it was in. The BOARD is what must never contradict
+    # itself, so the stage machine wins — no cloth, no lit landmark, no stale word.
+    import json
+    h = _leg_home(home, {"i16": "cross-reviewing"})
+    p = h / "state" / "issues.json"
+    body = json.loads(p.read_text())
+    body["issues"]["i16"]["status"] = "parked"
+    p.write_text(json.dumps(body))
+    repo, f = _leg_flight(h, _CountingGh())
+    assert f["stage"] == flights.PARKED and f["phase"] is None
+    assert _cloth(repo) is None
+    assert repo["field_landmarks"] == [False, False, False, False]
