@@ -114,3 +114,20 @@ def test_the_towed_cloth_keeps_its_text_on_one_line():
         "landmark label below the leg (issue #444)")
     assert "overflow: hidden" in m.group(1), (
         "the cloth must still clip what does not fit — nowrap without it would overflow sideways")
+
+
+def test_the_cloth_clips_its_tail_and_never_its_flight_number():
+    # The cloth exists to answer "which flight is that?" (issue #204), so the NUMBER is the one part
+    # clipping may never eat. A plainly CENTRED line that outgrows the cloth overflows BOTH edges and
+    # is clipped from both — the head goes first (fresh-agent review of 70010c3). `safe center`
+    # centres while it fits and falls back to the start edge the moment it does not, which is exactly
+    # the rule wanted; a browser that does not know the keyword drops the declaration and gets the
+    # flex default, `flex-start` — the same protection, less prettily.
+    m = re.search(r"\.fld-banner\s*\{(.*?)\}", _SHELL_CSS, flags=re.S)
+    rule = m.group(1)
+    assert "safe center" in rule, (
+        "the cloth must align `safe center`, so an overflowing line clips its TAIL, not its "
+        "flight number (issue #444 review)")
+    assert not re.search(r"place-items\s*:\s*center\s*;", rule), (
+        "plain `place-items: center` clips an overflowing cloth from both edges — the flight "
+        "number is the first thing lost")

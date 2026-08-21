@@ -407,16 +407,23 @@ html, body {
   opacity: 0; transition: opacity 0.35s; white-space: nowrap;
 }
 .fld-banner {
-  position: absolute; display: grid; place-items: center; text-align: center;
+  position: absolute; display: flex; align-items: center;
   font: 600 10px var(--mono); letter-spacing: 0.3px; color: #232830; overflow: hidden;
-  /* One line, always (issue #444). The cloth is a fixed 74 logical px — the width #204's
-     occlusion-free stagger is proven against — and its text must stay INSIDE it. Wrapping was the
-     one way out: a long line broke into a second row that spilled past the 14px cloth and landed on
-     the landmark label painted just below the leg (seen the moment a phase word made the line
-     longer than "BUILDING"). Clipping the tail keeps the cloth's promise — no cloth ever covers a
-     plane, a neighbouring cloth, or a landmark — and the flight NUMBER, which is why the cloth
-     exists, is at the head of the line where clipping can never reach it. */
-  white-space: nowrap;
+  /* One line, always, clipped from the TAIL (issue #444). The cloth is a fixed 74 logical px — the
+     width #204's occlusion-free stagger is proven against — and its text must stay INSIDE it.
+     Wrapping was one way out and the wrong one: a long line broke into a second row that spilled
+     past the 14px cloth and landed on the landmark label painted just below the leg (seen in the
+     browser the moment a phase word made the line longer than "BUILDING").
+
+     Which edge gets clipped is the other half, and it decides what is LOST. The cloth exists to
+     answer "which flight is that?", so the flight number is the one part clipping may never eat —
+     and a plainly centred line that outgrows its box overflows BOTH edges, taking the head first
+     (fresh-agent review). `safe center` centres it while it fits and falls back to the start edge
+     the moment it does not; a browser that doesn't know the keyword drops the declaration and gets
+     the flex default, flex-start — the same protection, less prettily. Either way the number
+     survives and the elapsed is what goes. */
+  white-space: nowrap; justify-content: safe center;
+  box-sizing: border-box; padding: 0 2px;
 }
 .fld-caption {
   position: absolute; left: 50%; top: 10px; transform: translateX(-50%); white-space: nowrap;
