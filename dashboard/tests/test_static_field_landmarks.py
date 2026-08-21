@@ -139,3 +139,25 @@ def test_the_cloth_clips_its_tail_and_never_its_flight_number():
     assert not re.search(r"place-items\s*:\s*center\s*;", rule), (
         "plain `place-items: center` clips an overflowing cloth from both edges — the flight "
         "number is the first thing lost")
+
+
+def test_the_python_mirror_of_placementOf_has_not_drifted():
+    # `field_landmarks` must light a sign for exactly the planes the BROWSER parks on the leg, so
+    # `flights._PLACED_AT_CIRCUIT` mirrors the off-path branch of `placementOf` in airfield_live.js
+    # — the function that actually chooses the anchor. Drift is silent and one-directional: add a
+    # fourth off-path state to placementOf that falls back to circuitStage, forget this list, and a
+    # plane visibly sitting on the leg quietly stops lighting anything under it. The mirror is the
+    # claim `_PLACED_AT_CIRCUIT`'s comment makes; this is the test that comment names.
+    import flights
+    body = _fn_body(_LIVE_CODE, "placementOf")
+    assert body, "airfield_live.js must define placementOf() — where a flight's plane sits"
+    # The off-path stages placementOf sends to the flight's UNDERLYING circuit position: every
+    # stage it names that is NOT given an anchor of its own.
+    own_anchor = re.findall(r"f\.stage\s*===\s*'([a-z-]+)'\s*\)\s*return\s*'([a-z-]+)'", body)
+    to_circuit = re.findall(r"f\.stage\s*===\s*'([a-z-]+)'", body)
+    placed = [s for s in to_circuit if s not in {a for a, _ in own_anchor}]
+    assert "circuitStage" in body, "placementOf must still route those stages to circuitStage"
+    assert set(placed) == set(flights._PLACED_AT_CIRCUIT), (
+        "the JS parks %r at their circuit position but flights._PLACED_AT_CIRCUIT holds %r — a "
+        "plane the browser draws on the leg would light no landmark under it" %
+        (sorted(placed), sorted(flights._PLACED_AT_CIRCUIT)))
