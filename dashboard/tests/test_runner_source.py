@@ -283,3 +283,41 @@ def test_a_wrong_typed_total_is_dropped_not_rendered():
     pr = {"number": 25, "state": "MERGED", "additions": "lots", "changedFiles": True}
     got = src(prs={"i23": pr}).pr_for_branch("o/r", "sl/i23-x")
     assert "additions" not in got and "changedFiles" not in got
+
+
+# --------------------------- the lane's phase (issue #444, over #443) ---------------------------
+# The engine publishes `phases` — {iid: building|cross-reviewing|report-posted|pr-open} for lanes in
+# the air. It is not a GitHub-shaped question, so it is not one of the gh-faced methods; it is a
+# plain read of the document the dashboard ALREADY holds. Zero new reads of any kind.
+
+def test_the_published_phase_is_handed_back_for_a_lane_in_the_air():
+    s = src(phases={"i16": "cross-reviewing", "i23": "building"})
+    assert s.phase("i16") == "cross-reviewing"
+    assert s.phase("i23") == "building"
+
+
+def test_a_lane_the_view_publishes_no_phase_for_has_none():
+    # The engine publishes phases for IN-FLIGHT lanes only, so a queued or finished lane is simply
+    # absent — and absent must read as "no phase", the fallback that renders today's downwind.
+    assert src(phases={"i16": "building"}).phase("i23") is None
+
+
+def test_a_view_with_no_phases_map_at_all_has_no_phase():
+    # An engine older than #443, or a half-written document: never a raise, never an invented value.
+    assert src().phase("i16") is None
+    assert src(phases=None).phase("i16") is None
+    assert src(phases="building").phase("i16") is None
+    assert src(phases=["building"]).phase("i16") is None
+
+
+def test_a_wrong_typed_phase_value_is_dropped_not_passed_on():
+    # The word is validated for MEANING downstream (flights.leg_phase, the closed vocabulary); this
+    # boundary only guarantees the display gets a string or nothing, never a dict to render.
+    for junk in (7, True, None, [], {}, b"building"):
+        assert src(phases={"i16": junk}).phase("i16") is None
+
+
+def test_asking_for_a_phase_is_still_zero_egress():
+    s = src(phases={"i16": "cross-reviewing"})
+    assert not hasattr(s, "_gh")
+    assert s.phase("i16") == "cross-reviewing"

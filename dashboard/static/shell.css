@@ -409,6 +409,14 @@ html, body {
 .fld-banner {
   position: absolute; display: grid; place-items: center; text-align: center;
   font: 600 10px var(--mono); letter-spacing: 0.3px; color: #232830; overflow: hidden;
+  /* One line, always (issue #444). The cloth is a fixed 74 logical px — the width #204's
+     occlusion-free stagger is proven against — and its text must stay INSIDE it. Wrapping was the
+     one way out: a long line broke into a second row that spilled past the 14px cloth and landed on
+     the landmark label painted just below the leg (seen the moment a phase word made the line
+     longer than "BUILDING"). Clipping the tail keeps the cloth's promise — no cloth ever covers a
+     plane, a neighbouring cloth, or a landmark — and the flight NUMBER, which is why the cloth
+     exists, is at the head of the line where clipping can never reach it. */
+  white-space: nowrap;
 }
 .fld-caption {
   position: absolute; left: 50%; top: 10px; transform: translateX(-50%); white-space: nowrap;

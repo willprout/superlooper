@@ -1801,3 +1801,158 @@ def test_build_flight_session_window_fails_closed_when_the_fact_is_missing():
     # surface can do.
     f = flights.build_flight({"id": "i9", "num": 9, "status": "running", "journal": []}, _REPO)
     assert f["session_window"] is False
+
+
+# =============== the downwind sub-phase (issue #444, over the engine's #443 sense) ===============
+# The engine now publishes WHICH sub-step a lane is on inside its one long building leg
+# (`phases` in the runner's view: building / cross-reviewing / report-posted / pr-open). These pin
+# the truth layer's half: a closed vocabulary, a fail-soft to exactly today's undifferentiated
+# downwind, and a phase that can never contradict the stage machine it decorates.
+
+def _leg(num, stage, phase=None, on_field=True, circuit=None):
+    """A minimal projected flight for the landmark selection — only the fields it reads."""
+    return {"num": num, "label": "SL-%d" % num, "stage": stage,
+            "circuit_stage": circuit if circuit is not None else stage,
+            "phase": phase, "display": {"on_field": on_field}}
+
+
+def test_the_published_phase_vocabulary_is_the_engine_s():
+    # The dashboard renders a field the ENGINE owns; the two vocabularies must be the same four
+    # words or a value would arrive that no rendering test has ever seen.
+    assert flights.LEG_PHASES == ("building", "cross-reviewing", "report-posted", "pr-open")
+
+
+def test_leg_phase_accepts_every_published_value_on_the_leg():
+    for p in flights.LEG_PHASES:
+        assert flights.leg_phase(flights.DOWNWIND, p) == p
+
+
+def test_leg_phase_is_none_when_the_view_carries_no_phase():
+    # THE FALLBACK CONTRACT: an older engine, a missing breadcrumb, a lane the view never listed.
+    # No phase is not an unknown to invent a word for — it is exactly today's downwind.
+    assert flights.leg_phase(flights.DOWNWIND, None) is None
+
+
+def test_leg_phase_rejects_anything_outside_the_vocabulary():
+    # A newer engine's word, a hand-edited file, a wrong-typed value: all read as NO phase, so this
+    # build can only ever render a phase it has a test for. Never a raise — this runs in the poll.
+    for junk in ("deploying", "", "BUILDING", " building", 7, True, None, [], {}, b"building"):
+        assert flights.leg_phase(flights.DOWNWIND, junk) is None
+
+
+def test_leg_phase_is_none_anywhere_but_the_downwind_leg():
+    # The phase decorates ONE leg. A landed, parked, holding or queued flight showing a phase would
+    # be a stale remnant contradicting the stage machine — the plane is demonstrably not building.
+    for stage in flights.CIRCUIT_STAGES + flights.OFF_PATH_STATES:
+        if stage == flights.DOWNWIND:
+            continue
+        assert flights.leg_phase(stage, "cross-reviewing") is None, stage
+
+
+def test_phase_word_falls_back_to_the_word_the_leg_already_said():
+    # No phase ⇒ the cloth reads exactly what it read before this issue existed.
+    assert flights.phase_word(None) == "BUILDING"
+    assert flights.phase_word("deploying") == "BUILDING"
+
+
+def test_phase_word_names_each_phase_in_the_field_s_own_register():
+    assert flights.phase_word("building") == "BUILDING"
+    assert flights.phase_word("cross-reviewing") == "REVIEWING"
+    assert flights.phase_word("pr-open") == "PR OPEN"
+    assert flights.phase_word("report-posted") == "REPORTED"
+
+
+# ---- the landmarks the leg flies over (design record §3: "landmarks mark real phases") ----
+
+def test_field_landmarks_light_nothing_over_an_empty_field():
+    assert flights.field_landmarks([]) == [False, False, False, False]
+
+
+def test_a_phaseless_leg_plane_lights_build_island_exactly_as_today():
+    # THE FALLBACK PIN. Before #443 every downwind plane lit Build Island and nothing else; a view
+    # with no phase field must render precisely that, not a new dark or a new unknown.
+    assert flights.field_landmarks([_leg(16, flights.DOWNWIND)]) == [False, True, False, False]
+    assert flights.field_landmarks([_leg(16, flights.DOWNWIND, phase="building")]) == \
+        [False, True, False, False]
+
+
+def test_a_cross_reviewing_plane_lights_review_ridge():
+    # Review Ridge is the design record's own name for "fresh-agent review" (§3) and it has stood
+    # dark since Task 7 for want of exactly this fact. It is the phase's payoff.
+    assert flights.field_landmarks([_leg(16, flights.DOWNWIND, phase="cross-reviewing")]) == \
+        [False, False, True, False]
+
+
+def test_a_pr_open_plane_lights_ci_shoals():
+    assert flights.field_landmarks([_leg(16, flights.DOWNWIND, phase="pr-open")]) == \
+        [False, False, False, True]
+
+
+def test_a_report_filed_plane_is_past_every_landmark():
+    # The report is the worker's LAST action — the plane is east of CI Shoals, about to turn base.
+    assert flights.field_landmarks([_leg(16, flights.DOWNWIND, phase="report-posted")]) == \
+        [False, False, False, False]
+
+
+def test_reconcile_point_never_lights():
+    # Costume rule 1 — only TRUE claims light up. The engine senses no step-0 reconcile fact, so
+    # that landmark stays scenery no matter what phase is published.
+    for p in (None,) + flights.LEG_PHASES:
+        assert flights.field_landmarks([_leg(16, flights.DOWNWIND, phase=p)])[0] is False
+
+
+def test_every_leg_plane_lights_its_own_landmark():
+    lit = flights.field_landmarks([
+        _leg(16, flights.DOWNWIND, phase="building"),
+        _leg(23, flights.DOWNWIND, phase="cross-reviewing"),
+        _leg(31, flights.DOWNWIND, phase="pr-open"),
+    ])
+    assert lit == [False, True, True, True]
+
+
+def test_a_leg_plane_that_has_left_the_field_lights_nothing():
+    # The landmark marks where a plane IS; a flight the field no longer draws is not over anything.
+    assert flights.field_landmarks([_leg(16, flights.DOWNWIND, on_field=False)]) == \
+        [False, False, False, False]
+
+
+def test_planes_that_are_not_on_the_leg_light_nothing():
+    assert flights.field_landmarks([
+        _leg(1, flights.AT_STAND), _leg(2, flights.TAKEOFF), _leg(3, flights.BASE_TURN),
+        _leg(4, flights.FINAL), _leg(5, flights.TOUCHDOWN), _leg(6, flights.TAXI_IN),
+        _leg(7, flights.PARKED), _leg(8, flights.HOLDING),
+    ]) == [False, False, False, False]
+
+
+def test_an_off_path_plane_sitting_on_the_leg_still_lights_build_island():
+    # §5: an amber / grey / stranded plane renders AT its honest circuit position, so it is still
+    # physically over the leg. It carries no phase (the stage machine gate), so it lights the leg's
+    # default landmark — exactly what it lit before this issue.
+    for stage in (flights.AWAITING, flights.SESSION_FROZEN, flights.STRANDED):
+        assert flights.field_landmarks([_leg(9, stage, circuit=flights.DOWNWIND)]) == \
+            [False, True, False, False], stage
+
+
+def test_build_flight_carries_the_validated_leg_phase():
+    issue = {"id": "i16", "num": 16, "status": "running", "journal": [],
+             "activity_mtime": _REPO["now"] - 30, "phase": "cross-reviewing"}
+    f = flights.build_flight(issue, _REPO)
+    assert f["stage"] == flights.DOWNWIND and f["phase"] == "cross-reviewing"
+
+
+def test_build_flight_drops_a_phase_the_stage_machine_contradicts():
+    # The view is a snapshot the runner published a tick ago; loopstate on disk may already have
+    # moved the lane on. The BOARD is what must never contradict itself, so the gate lives here —
+    # a landed or parked flight shows no remnant of the phase it was in.
+    for status in ("merged", "parked"):
+        f = flights.build_flight(
+            {"id": "i16", "num": 16, "status": status, "journal": [],
+             "activity_mtime": _REPO["now"] - 30, "phase": "cross-reviewing"}, _REPO)
+        assert f["stage"] != flights.DOWNWIND and f["phase"] is None, status
+
+
+def test_build_flight_has_no_phase_when_nothing_published_one():
+    f = flights.build_flight(
+        {"id": "i16", "num": 16, "status": "running", "journal": [],
+         "activity_mtime": _REPO["now"] - 30}, _REPO)
+    assert f["stage"] == flights.DOWNWIND and f["phase"] is None

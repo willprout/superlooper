@@ -332,6 +332,128 @@ def flight_stage(status, liveness=None, bounced=False, long_wait=False,
     return stage
 
 
+# ============ the downwind sub-phase (issue #444, over the engine's #443 sense) ============
+# THE PROBLEM #443 NAMED. A worker builds, cross-reviews its diff, pushes, opens the PR and files
+# its report inside ONE session that emits no journal landmark at all — so its plane sat on the
+# downwind leg for essentially the whole flight and then flicked through every remaining stage in a
+# tick or two. That was a missing SENSE, not a missing renderer, and the engine now supplies it:
+# `published_view.build` carries a `phases` map for in-flight lanes, derived from a breadcrumb the
+# engine's own cross-review script stamps. This half RENDERS it.
+#
+# Three disciplines, each pinned in tests/test_flights.py:
+#
+#   * **The vocabulary is CLOSED and it is the engine's.** A value this build has no rendering test
+#     for — a newer engine's word, a hand-edited file, a wrong type — reads as NO phase, never as a
+#     new unknown invented on screen.
+#   * **No phase is exactly today's downwind.** An older engine, an absent breadcrumb, a lane the
+#     view never listed: the leg renders precisely as it did before this issue, same word, same lit
+#     landmark. The fallback is a pin, not a best effort.
+#   * **The phase can never contradict the stage machine.** It decorates ONE leg. The published view
+#     is a snapshot from a tick ago and loopstate on disk may already have moved the lane on, so the
+#     gate lives HERE rather than in trust: anything but ``DOWNWIND`` carries no phase at all, and a
+#     landed or parked flight therefore shows no remnant of the phase it was in.
+LEG_BUILDING = "building"                   # working, or nothing legible enough to say more
+LEG_CROSS_REVIEWING = "cross-reviewing"     # a fresh-agent review is running RIGHT NOW
+LEG_REPORT_POSTED = "report-posted"         # the report is filed — the worker's LAST action
+LEG_PR_OPEN = "pr-open"                     # a PR is open and the report is not filed yet
+LEG_PHASES = (LEG_BUILDING, LEG_CROSS_REVIEWING, LEG_REPORT_POSTED, LEG_PR_OPEN)
+
+# The word the towed name cloth carries in place of the undifferentiated "BUILDING" it always read.
+# Field register: upper case, mono, and SHORT — the cloth is 74 logical px and that width is the
+# load-bearing premise of #204's occlusion-free stagger, so the phase fits the furniture rather than
+# the furniture growing to fit the phase. The bound is the word the cloth already carried: no phase
+# word may exceed "BUILDING" by more than a character, which is what keeps the longest possible line
+# within one character of the longest line this cloth has always drawn. Measured in the browser: at
+# 74px "CROSS-REVIEW" wrapped out of the cloth and collided with the landmark label under it.
+_PHASE_WORDS = {
+    LEG_BUILDING: "BUILDING",
+    LEG_CROSS_REVIEWING: "REVIEWING",
+    LEG_REPORT_POSTED: "REPORTED",
+    LEG_PR_OPEN: "PR OPEN",
+}
+
+# The four painted landmarks under the leg, west → east, in the order field.js draws them. The
+# design record named them as the leg's real sub-phases (§3: "landmarks mark real phases: Reconcile
+# Point = the mandatory step-0 issue-vs-reality check, Build Island, Review Ridge = fresh-agent
+# review, CI Shoals") and they have stood dark since Task 7 for want of exactly the fact #443 now
+# publishes. West → east is the direction the leg is flown, so the mapping below is also the order.
+FIELD_LANDMARKS = ("reconcile-pt", "build-island", "review-ridge", "ci-shoals")
+
+# phase -> the landmark index it honestly places a plane over, or None for "past them all".
+#
+#   * ``building`` ⇒ Build Island. Also the answer for NO phase, which is what makes a phaseless
+#     view render as today's field to the pixel.
+#   * ``cross-reviewing`` ⇒ Review Ridge. The design record's own gloss for that landmark is
+#     "fresh-agent review", and the engine's breadcrumb is stamped by the cross-review script
+#     itself — the same event, named the same way. This is the phase's payoff.
+#   * ``pr-open`` ⇒ CI Shoals: the diff is up and with the checks. Note what it does NOT claim —
+#     that they are GREEN. The gate checklist owns that, and a lit shoal is a position, not a pass.
+#   * ``report-posted`` ⇒ nothing. The report is the worker's last action, so the plane is east of
+#     every landmark, about to turn base. (On the leg this is a near-impossibility — a filed report
+#     is BASE_TURN to circuit_stage — so it is the honest answer to a disagreement, not a look.)
+#   * Reconcile Point never lights: the engine senses no step-0 reconcile fact, and costume rule 1
+#     is that only TRUE claims light up.
+_PHASE_LANDMARK = {
+    LEG_BUILDING: 1,
+    LEG_CROSS_REVIEWING: 2,
+    LEG_PR_OPEN: 3,
+    LEG_REPORT_POSTED: None,
+}
+
+# The off-path states whose plane is drawn at its UNDERLYING circuit position (§5 — the amber ring,
+# the grey hull and the stranded plane render in place, never teleported to a magic fix). A mirror
+# of ``placementOf`` in static/airfield_live.js, which is what actually parks the sprite; the string
+# guard in tests/test_static_field_landmarks.py fails if the two lists ever drift apart.
+_PLACED_AT_CIRCUIT = (AWAITING, SESSION_FROZEN, STRANDED)
+
+
+def leg_phase(stage, raw):
+    """The lane's validated downwind sub-phase, or ``None`` — the ONLY door the engine's published
+    ``phases`` value enters the display through.
+
+    ``None`` for: no published phase, a value outside :data:`LEG_PHASES`, and ANY stage but
+    ``DOWNWIND``. Total and never raises — this runs inside the 2-second poll, and the worst a
+    dropped phase can cost is a leg that reads exactly as it read before #443."""
+    if stage != DOWNWIND:
+        return None
+    return raw if isinstance(raw, str) and raw in LEG_PHASES else None
+
+
+def phase_word(phase):
+    """The field-register word for a phase — the middle field of the towed name cloth. An absent or
+    unknown phase answers ``BUILDING``, the word the leg carried before this issue, so a view with
+    no phase renders the cloth byte-for-byte as today's."""
+    return _PHASE_WORDS.get(phase, _PHASE_WORDS[LEG_BUILDING])
+
+
+def _on_the_leg(flight):
+    """Is this flight's plane physically drawn on the downwind leg, on the field the eye sees?"""
+    if not isinstance(flight, dict) or not (flight.get("display") or {}).get("on_field"):
+        return False
+    stage = flight.get("stage")
+    if stage in _PLACED_AT_CIRCUIT:
+        return (flight.get("circuit_stage") or DOWNWIND) == DOWNWIND
+    return stage == DOWNWIND
+
+
+def field_landmarks(repo_flights):
+    """Which of the four painted landmarks are lit, as ``[bool, bool, bool, bool]`` in
+    :data:`FIELD_LANDMARKS` order — derived HERE, not in the pixels (design record B.1), because
+    "is this claim TRUE" is a semantic and CI runs no JS.
+
+    A landmark lights when at least one plane ON THE LEG is over it. An off-path plane sitting at
+    the downwind anchor carries no phase (``leg_phase``'s stage gate) and so lights the leg's
+    default, Build Island — exactly what it lit before this issue existed."""
+    lit = [False] * len(FIELD_LANDMARKS)
+    for f in repo_flights or []:
+        if not _on_the_leg(f):
+            continue
+        idx = _PHASE_LANDMARK.get(leg_phase(f.get("stage"), f.get("phase")), 1)
+        if idx is not None:
+            lit[idx] = True
+    return lit
+
+
 # =============================== progress ≠ liveness → spinning (§5) ===============================
 # The doom-loop detector's two tunable knobs. A flat window is one with real REPETITION (not merely
 # a quiet session) and no diff growth. Design record §8 flags these as needing calibration against
@@ -1302,6 +1424,13 @@ def build_flight(issue, repo):
         "stage": stage,
         "on_circuit": stage in CIRCUIT_STAGES,
         "circuit_stage": stage_on_circuit,
+        # WHICH sub-step of the one long building leg this lane is on (issue #444), from the phase
+        # the engine publishes (#443). `leg_phase` is the only door that value enters through: it
+        # validates against the closed vocabulary AND gates on the stage, so a landed or parked
+        # flight can never show a remnant of the phase it was in, and an unknown word never reaches
+        # the field. `None` — no published phase, an older engine, any stage but downwind — renders
+        # exactly as the leg rendered before this issue.
+        "phase": leg_phase(stage, issue.get("phase")),
         "contrail": contrail,
         "liveness": live,
         "progress": prog,

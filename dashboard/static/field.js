@@ -197,6 +197,14 @@
     // to the cloths; the engine staggers the placement occlusion-free.
     var banners = repo.field_banners || [];
 
+    // Which painted landmark under the leg is LIT (issue #444). A semantic, so it is the server's
+    // verdict (repo.field_landmarks, one flag per sign west→east — the LM_LABELS order below) and
+    // this file only carries it, exactly like the cloth texts above. Before #443 the engine sensed
+    // no per-phase fact and three of the four signs stood dark as scenery; now a cross-reviewing
+    // plane lights Review Ridge and an open PR lights CI Shoals. An absent list renders them all
+    // dark — never an invented light (design B.1, costume rule 1).
+    var landmarks = repo.field_landmarks || null;
+
     // GitHub-unreachable (issue #38): the server's honest flag → the engine's `link` state. When the
     // link is lost the tower beacon goes dark and sweeps for a signal (a dark tower, never a red
     // alarm — this is "can't see the boards," not "the runner died"). Local flights stay lit; the
@@ -211,6 +219,7 @@
       dim: anyLit || (repo.state && repo.state.state === 'alert'),
       link: linkLost ? 'lost' : 'ok',
       banners: banners,
+      landmarks: landmarks,
       flights: flights.concat(standFlights)
     });
 
