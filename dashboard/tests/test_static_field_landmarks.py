@@ -54,6 +54,16 @@ _LIVE_CODE = _strip_js_comments(_LIVE)
 _FIELD_CODE = _strip_js_comments(_FIELD)
 
 
+def _css_rule(selector):
+    """One CSS rule's DECLARATIONS, comments stripped. The stripping is load-bearing, not tidiness:
+    every declaration these guards look for is also named in the prose explaining WHY it is there,
+    so matching the raw rule would keep passing for a removed declaration whose comment survived —
+    a guard that guards nothing (fresh-agent review, round 2)."""
+    m = re.search(re.escape(selector) + r"\s*\{(.*?)\}", _SHELL_CSS, flags=re.S)
+    assert m, "shell.css must style %s" % selector
+    return re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+
+
 def test_the_binder_carries_the_server_s_lit_landmarks_into_the_engine():
     assert "field_landmarks" in _FIELD_CODE, (
         "field.js must bind repo.field_landmarks — the server's verdict on which landmark is TRUE")
@@ -107,12 +117,11 @@ def test_the_towed_cloth_keeps_its_text_on_one_line():
     # falls straight onto the landmark label painted below the leg — observed in the browser the
     # moment a phase word made the line longer than "BUILDING" (issue #444). Clipping keeps the
     # cloth's promise, and the flight number leads the line so clipping can never eat it.
-    m = re.search(r"\.fld-banner\s*\{(.*?)\}", _SHELL_CSS, flags=re.S)
-    assert m, "shell.css must style .fld-banner — the towed name cloth"
-    assert "nowrap" in m.group(1), (
+    rule = _css_rule(".fld-banner")
+    assert re.search(r"white-space\s*:\s*nowrap\s*;", rule), (
         "the cloth must never wrap: a broken second row spills past the 14px cloth onto the "
         "landmark label below the leg (issue #444)")
-    assert "overflow: hidden" in m.group(1), (
+    assert re.search(r"overflow\s*:\s*hidden\s*;", rule), (
         "the cloth must still clip what does not fit — nowrap without it would overflow sideways")
 
 
@@ -123,9 +132,8 @@ def test_the_cloth_clips_its_tail_and_never_its_flight_number():
     # centres while it fits and falls back to the start edge the moment it does not, which is exactly
     # the rule wanted; a browser that does not know the keyword drops the declaration and gets the
     # flex default, `flex-start` — the same protection, less prettily.
-    m = re.search(r"\.fld-banner\s*\{(.*?)\}", _SHELL_CSS, flags=re.S)
-    rule = m.group(1)
-    assert "safe center" in rule, (
+    rule = _css_rule(".fld-banner")
+    assert re.search(r"justify-content\s*:\s*safe\s+center\s*;", rule), (
         "the cloth must align `safe center`, so an overflowing line clips its TAIL, not its "
         "flight number (issue #444 review)")
     assert not re.search(r"place-items\s*:\s*center\s*;", rule), (
