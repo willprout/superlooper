@@ -59,7 +59,6 @@ Both reads FAIL CLOSED, in opposite directions, because the two costs are not sy
      last flight has nothing for a new one to say.
 """
 import hashlib
-import json
 import os
 import re
 
@@ -124,7 +123,15 @@ def verdicts_path(state_home):
 
 
 def run_log_path(state_home, date):
-    """The markdown log for one flight — and the day stamp that bounds it to one a day."""
+    """The markdown log for one flight — and the day stamp that bounds it to one a day.
+
+    None for any date this cannot read. The check lives HERE, on the path builder, rather than
+    only in the two callers that happen to ask first: the date becomes a path SEGMENT, so a later
+    caller handed one from somewhere else would otherwise inherit a traversal hole this module
+    already knows how to close (fresh-agent review, P1).
+    """
+    if not isinstance(date, str) or not _DATE_RE.match(date):
+        return None
     return os.path.join(runs_dir(state_home), "%s.md" % date)
 
 
@@ -228,38 +235,55 @@ def ran_on(state_home, date):
     FAIL CLOSED to True on any date this cannot read: with no usable date the one-a-day bound
     cannot be applied at all, and answering "no" would make the trigger unbounded.
     """
-    if not isinstance(date, str) or not _DATE_RE.match(date):
+    path = run_log_path(state_home, date)
+    if path is None:
         return True
     try:
-        return os.path.isfile(run_log_path(state_home, date))
+        return os.path.isfile(path)
     except OSError:
         return True
 
 
 def mark_launched(state_home, date):
-    """Stamp the day and open its run log. Returns the log's path, or None if it could not land.
+    """TAKE THE DAY'S LEASE and open its run log. Returns the log's path, or None.
 
-    Called by the TRIGGER, BEFORE the session is created. That ordering is the whole bound: a
-    flight killed hard enough to write nothing has still consumed its day, so nothing re-launches
-    it an hour later. The flight then APPENDS its own log to this file.
+    **A caller that gets None MUST NOT LAUNCH.** None means one of three things and every one of
+    them is "not yours to fly": the date is unreadable, the stamp could not be written, or
+    SOMEBODY ELSE ALREADY HOLDS TODAY.
 
-    A caller that gets None MUST NOT LAUNCH. The stamp is the only thing making "at most one
-    flight per day" true, and a launch without it is an unbounded relaunch loop.
+    An exclusive create (``O_CREAT | O_EXCL``), not a check-then-write, and that is the whole
+    reason this function exists rather than being two lines at the call site (fresh-agent review,
+    P0). ``due()`` reading ``ran_on`` and then a caller writing the stamp is a race two runners
+    lose together — a restart overlapping its predecessor, or a hand ``superlooper run`` beside
+    the LaunchAgent, and the queue gets two flights acting on it at once. The exclusive create is
+    what makes "at most one flight per day" a property of the filesystem instead of a property of
+    how carefully every caller ordered its checks.
 
-    Never truncates: a second call on a day whose log the flight has already been writing into
-    leaves it exactly as it stands.
+    Called by the TRIGGER, BEFORE the session is created. That ordering is the other half of the
+    bound: a flight killed hard enough to write nothing has still consumed its day, so nothing
+    re-launches it an hour later. The flight then APPENDS its own log to this file.
+
+    The loser of the race never touches the winner's log — it does not open it at all.
     """
-    if not isinstance(date, str) or not _DATE_RE.match(date):
-        return None
     path = run_log_path(state_home, date)
+    if path is None:
+        return None
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        if not os.path.exists(path):
-            with open(path, "w") as f:
-                f.write("# Triage flight %s\n\n" % date)
-        return path
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return None                      # somebody else already holds today
     except OSError:
+        return None                      # unwritable state home — fail closed, do not launch
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("# Triage flight %s\n\n" % date)
+    except OSError:
+        # The lease IS the file, and it now exists — so the day is consumed either way and no
+        # second flight can be launched for it. An empty log is a worse artifact than a headed
+        # one; it is not a reason to hand the caller a launch it cannot record.
         return None
+    return path
 
 
 def recent_run_logs(state_home, limit=3):
@@ -267,12 +291,16 @@ def recent_run_logs(state_home, limit=3):
     last three run logs plus the verdicts file before acting". Unreadable logs are skipped rather
     than raised: a corrupt one costs the flight context, never its tick."""
     try:
+        count = max(0, int(limit))
+    except (TypeError, ValueError):
+        return []                        # the no-raise posture holds for every argument
+    try:
         names = sorted((n for n in os.listdir(runs_dir(state_home)) if n.endswith(".md")),
                        reverse=True)
     except OSError:
         return []
     out = []
-    for name in names[:max(0, int(limit))]:
+    for name in names[:count]:
         try:
             with open(os.path.join(runs_dir(state_home), name)) as f:
                 out.append((name[:-3], f.read()))

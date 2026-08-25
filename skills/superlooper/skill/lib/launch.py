@@ -337,13 +337,18 @@ class WorktreeLock:
 def _mode_of(spec):
     """Which session class this Spec declares, or None for one this launcher cannot read.
 
-    An empty ``mode`` derives the ORIGINAL rule — ``cwd`` present means debugger, absent means
-    worker — so every pre-#448 call site keeps working unchanged. An unrecognised one is None
-    rather than a fallback: falling through to the worker path is precisely the silent
-    wrong-typed-input failure the guards exist to make loud.
+    The EXACT empty string (or no ``mode`` attribute at all, for a Spec built before #448) derives
+    the ORIGINAL rule — ``cwd`` present means debugger, absent means worker — so every pre-#448
+    call site keeps working unchanged.
+
+    Everything else is None, INCLUDING a wrong-typed one: ``None``, ``False``, ``0``, ``[]`` and a
+    blank-but-not-empty ``" "`` are all a caller that meant SOMETHING, and coercing them to
+    "said nothing" would route them to the worker path — the silent fail-open on wrong-typed
+    input that these guards exist to make loud (fresh-agent review, P1). Fail closed on
+    wrong-typed input, not merely on unsafe input.
     """
-    declared = str(getattr(spec, "mode", "") or "").strip()
-    if not declared:
+    declared = getattr(spec, "mode", "")
+    if declared == "" and isinstance(declared, str):
         return DEBUGGER if spec.cwd is not None else WORKER
     return declared if declared in MODES else None
 
@@ -371,8 +376,9 @@ def _launch(spec, host, edges):
         return Result(ABORTED, "[%s] id sanitize validation failed — not launching" % (spec.id,))
     mode = _mode_of(spec)
     if mode is None:
-        return Result(ABORTED, "[%s] unknown session mode %r (expected: %s) — refusing"
-                      % (iid, str(getattr(spec, "mode", "")), " or ".join(MODES)))
+        return Result(ABORTED, "[%s] unknown session mode %r (expected: %s, or \"\" to derive it "
+                               "from --cwd) — refusing"
+                      % (iid, getattr(spec, "mode", ""), ", ".join(MODES)))
     # ``--cwd`` belongs to the debugger and to nothing else. Checked BEFORE the id guard so a
     # triage spec carrying one is refused with the debugger's own sentence — the confusion it
     # names is real, and the class it was confused with is the one holding the fence's token.
