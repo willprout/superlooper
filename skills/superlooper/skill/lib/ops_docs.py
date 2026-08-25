@@ -80,6 +80,12 @@ OPS_DOCS = (
     # What approval means and what the gate will and will not merge.
     ("plugin/skills/superlooper/references/approval-protocol.md",
      "superlooper/references/approval-protocol.md"),
+    # The triage flight's standing rule: what a t<N> flight may close, merge and relabel on its
+    # own word, and the nit rubric it closes against. Operational for the same reason the approval
+    # protocol above is — it is read to settle "was that autonomous close legitimate?" — and it
+    # cites `approval-protocol.md` as a sibling, which only resolves if both land in one directory.
+    ("plugin/skills/superlooper/references/triage-standing-rule.md",
+     "superlooper/references/triage-standing-rule.md"),
     # The debugger playbook, whole. The entry page routes to all four references; the unattended
     # contract is the one a watchdog-launched session is held to.
     ("plugin/skills/sl-debugger/SKILL.md", "sl-debugger/PLAYBOOK.md"),
