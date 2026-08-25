@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 import runner_home
+import triage as _triage
 
 # The night window during which routine owner-DECISION pages are batched to the morning report
 # (issue #164). The ONE source of truth: the notify default below embeds it, and actions.py imports
@@ -149,6 +150,24 @@ _NESTED_DEFAULTS = {
     "watchdog": {"authority": "full", "allowlist": [], "grace_minutes": 30,
                  "heartbeat_stale_minutes": 20, "no_progress_minutes": 30,
                  "resurrection_max_per_hour": 5},
+    # triage (issue #448): the `t<N>` flight — the queue-hygiene session the owner delegated in
+    # `plugin/skills/superlooper/references/triage-standing-rule.md`. TWO keys, and both defaults
+    # are decisions rather than conveniences.
+    #
+    # `enabled` DEFAULTS FALSE, and this is the wave's master switch: the brief the flight receives
+    # is a separate issue, so until it lands a repo that says nothing must not start closing issues
+    # the day the key appears. Unlike `runner_home`, whose default preserves an existing behaviour,
+    # this one withholds a NEW one — the direction a switch on an autonomous, issue-closing session
+    # class has to fail in.
+    #
+    # `home` DEFAULTS "checkout": the flight runs in the repo's REAL checkout so it sees what an
+    # orchestrator sees, gitignored working files included — a fresh worktree by definition cannot
+    # show those, and triage that cannot see the overlay is triage about a different repository.
+    # A repo whose gitignored overlay is sensitive sets "worktree" and accepts that loss. The
+    # working tree stays READ-ONLY to the flight either way; that discipline is the brief's, not
+    # this key's. `lib/triage.py` owns the two spellings so the loader and the launcher cannot
+    # drift apart about what they mean.
+    "triage": {"enabled": False, "home": _triage.CHECKOUT},
 }
 
 _ALLOWED_TOP = set(_TOP_DEFAULTS) | set(_NESTED_DEFAULTS) | {"repo", "operator"}
@@ -434,6 +453,18 @@ def _validate_and_fill(raw):
              f"got {wd['authority']!r}")
     if not isinstance(wd["allowlist"], list) or any(not isinstance(x, str) for x in wd["allowlist"]):
         _err(f"'watchdog.allowlist' must be a list of strings, got {wd['allowlist']!r}")
+    tri = out["triage"]
+    # A REAL boolean only. `"false"` is truthy and `0`/`1` are ints that read as booleans to a
+    # careless check, and this switch arms a session class that closes issues — so the loader
+    # refuses anything but true/false rather than coercing (the version:true trap, one key over).
+    if not isinstance(tri["enabled"], bool):
+        _err(f"'triage.enabled' must be true or false, got {tri['enabled']!r}")
+    # Validated LOUDLY, like `runner_home` and for the same reason: the two homes see DIFFERENT
+    # repositories (only the checkout shows the gitignored overlay), so a typo must name itself at
+    # adopt time rather than silently selecting the home the owner did not ask for.
+    if not isinstance(tri["home"], str) or tri["home"] not in _triage.HOMES:
+        _err(f"'triage.home' must be one of {sorted(_triage.HOMES)}, got {tri['home']!r}")
+
     # grace may be 0 (launch on the tripping check); the detection bounds must be >= 1 —
     # a zero bound would trip on any instantaneous glimpse of the condition. resurrection_max_per_hour
     # may be 0 (disables auto-restart -> escalate immediately on a provably-gone runner).

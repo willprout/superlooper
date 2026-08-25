@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Mechanical launch of ONE session — the single spawn path (issue #308).
 
-Two modes, unchanged from the cmux launcher this replaces:
+Three modes — the first two unchanged from the cmux launcher this replaces:
 
     launch-session.py <i-id>                worker:   worktree off origin/<dev>, then launch
     launch-session.py --cwd <dir> <d-id>    debugger: launch in an existing dir (no worktree)
+    launch-session.py --triage <t-id>       triage:   the flight (#448) — the repo's own checkout,
+                                                      or SL_TRIAGE_HOME=worktree for a detached one
+
+The triage mode takes a FLAG rather than being inferred from the id, because its default home
+creates nothing and takes no directory — so on the old "``--cwd`` selects the mode" rule it would
+be indistinguishable from a worker launch, and would be run as one. Where it runs is an SL_*
+variable like every other knob, resolved from the repo's `triage.home` by whoever calls this.
 
 The decision core is ``lib/launch.py``; this is the process boundary around it, so the runner,
 the watchdog, the dashboard Fixer (through ``superlooper debug``) and ``superlooper resume`` all
@@ -39,18 +46,27 @@ def _int(value, default):
         return default
 
 
+_USAGE = ("usage: launch-session.py <i-id>  (or --cwd <dir> <d-id>, or --triage <t-id>)")
+
+
 def _spec(argv):
-    """Parse the two modes into a Spec, or return None (usage went to stderr)."""
+    """Parse the three modes into a Spec, or return None (usage went to stderr)."""
     cwd = None
+    mode = ""
     if argv[:1] == ["--cwd"]:
         if len(argv) < 3:
             print("usage: launch-session.py --cwd <dir> <d-id>", file=sys.stderr)
             return None
         cwd, iid = argv[1], argv[2]
+    elif argv[:1] == ["--triage"]:
+        if len(argv) < 2 or not argv[1]:
+            print("usage: launch-session.py --triage <t-id>", file=sys.stderr)
+            return None
+        mode, iid = launch.TRIAGE, argv[1]
     elif len(argv) >= 1 and argv[0]:
         iid = argv[0]
     else:
-        print("usage: launch-session.py <i-id>  (or --cwd <dir> <d-id>)", file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
         return None
 
     env = os.environ
@@ -66,6 +82,12 @@ def _spec(argv):
         repo=env.get("SL_REPO", ""),
         dev_branch=env.get("SL_DEV_BRANCH", "main"),
         cwd=cwd,
+        mode=mode,
+        # PASSED THROUGH, never defaulted here: an unreadable value must reach lib/launch, which
+        # REFUSES rather than choosing a home — the two homes see different repositories, so a
+        # quiet fallback in the process boundary would launch the flight against the wrong one.
+        # Empty means "say nothing", and the Spec default (checkout) then stands.
+        triage_home=env.get("SL_TRIAGE_HOME") or launch.Spec.triage_home,
         engine_bin=_HERE,
         agent=env.get("SL_AGENT") or "claude",
         model=env.get("SL_MODEL", ""),

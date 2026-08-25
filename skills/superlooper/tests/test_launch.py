@@ -4,8 +4,9 @@ Three spawners (runner worker, watchdog debugger, dashboard Fixer's owner tap) p
 path all call ``lib/launch.py``; it is the only thing left that creates a session. These tests
 pin what the plan's §9 said must survive the port to the session-host wrapper:
 
-  * the ``^i[0-9]+$`` / ``^d[0-9]+$`` mode guards (a debugger id can never spin up a worktree,
-    and an issue id can never take the in-place ``--cwd`` path),
+  * the ``^i[0-9]+$`` / ``^d[0-9]+$`` / ``^t[0-9]+$`` mode guards (a debugger id can never spin up
+    a worktree, an issue id can never take the in-place ``--cwd`` path, and a triage flight is
+    mutually exclusive with both — issue #448),
   * the base-ref check with its DISTINCT exit 3,
   * worktree creation under a lock, and the preservation rule (an existing checkout is reused,
     never destroyed),
@@ -25,6 +26,7 @@ import pytest
 import journal
 import launch
 import session_host
+import triage
 
 
 # --------------------------------------------------------------------------- fakes
@@ -1090,4 +1092,306 @@ def test_a_session_id_that_could_not_be_recorded_refuses_the_launch(tmp_path):
     assert "failed unexpectedly" not in result.stderr, \
         "a deliberate refusal must not render as 'the launcher failed unexpectedly'"
     assert "could not record the session id" in result.stderr
+    assert host.spawned == []
+
+
+# ------------------------------------------------------- the t<N> session class (issue #448)
+# A THIRD session class beside the worker and the debugger: the triage flight. The standing rule
+# it implements is ruled and recorded (plugin/skills/superlooper/references/
+# triage-standing-rule.md); what is pinned here is the plumbing that rule needs — that the class
+# exists, that it is mutually exclusive with the other two, that its home is the repo's REAL
+# checkout by default, and that it is handed no capability over the fleet.
+
+def _triage_home(tmp_path, iid="t1"):
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "briefs").mkdir(parents=True, exist_ok=True)
+    (home / "briefs" / f"{iid}.md").write_text("triage the queue")
+    (home / "state" / "issues.json").write_text(json.dumps({"issues": {}}))
+    return home
+
+
+def _triage_spec(tmp_path, iid="t1", **over):
+    kw = {"home": _triage_home(tmp_path, iid), "mode": launch.TRIAGE}
+    kw.update(over)
+    return _spec(tmp_path, iid=iid, **kw)
+
+
+# --------------------------------------------------------- the mode guards, all six crossings
+
+def test_a_triage_id_can_never_be_launched_as_a_worker(tmp_path):
+    """The `^i[0-9]+$` guard, now load-bearing for a third id shape: a t<N> routed through the
+    worker path would take a lane's worktree and bump an issue counter that names nothing."""
+    spec = _spec(tmp_path, iid="t1", home=_triage_home(tmp_path))
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "worker mode expects an issue id" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_triage_id_can_never_take_the_in_place_debugger_path(tmp_path):
+    """A t<N> handed --cwd would be launched as a REPAIR session — and a repair session is given
+    the control-socket token. The guard is what keeps the fence's grant on d<N> alone."""
+    spec = _spec(tmp_path, iid="t1", home=_triage_home(tmp_path), cwd=str(tmp_path))
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "debugger (d<N>) ids only" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_worker_id_can_never_be_launched_as_a_triage_flight(tmp_path):
+    """The symmetric guard. An i<N> here would run the issue's session in the repo's REAL
+    checkout — no worktree, no branch, straight onto the owner's working tree."""
+    spec = _spec(tmp_path, iid="i308", mode=launch.TRIAGE)
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "triage mode expects a triage id" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_debugger_id_can_never_be_launched_as_a_triage_flight(tmp_path):
+    spec = _spec(tmp_path, iid="d12", home=_home(tmp_path, "d12"), mode=launch.TRIAGE)
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "triage mode expects a triage id" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_triage_spec_that_also_passes_cwd_is_refused(tmp_path):
+    """--cwd belongs to the debugger and to nothing else. A triage flight's home is chosen by the
+    repo's config, so a caller offering a directory here is a caller that has confused two
+    session classes — and the one it confused this with holds the fence's token."""
+    spec = _triage_spec(tmp_path, cwd=str(tmp_path))
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "debugger (d<N>) ids only" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_mode_this_launcher_does_not_recognise_is_refused(tmp_path):
+    """Fail closed on wrong-typed input, the rule the two original guards were written for: an
+    unrecognised mode must never fall through to the worker path."""
+    spec = _triage_spec(tmp_path, mode="janitor")
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "unknown session mode" in result.stderr
+    assert host.spawned == []
+
+
+# ------------------------------------------------------------------------------- the home
+
+def test_a_triage_flight_runs_in_the_repos_real_checkout_by_default(tmp_path):
+    """The ruled default (the standing rule's Home section): the flight sees what an orchestrator
+    sees, gitignored working files included — which a fresh worktree by definition cannot show."""
+    spec = _triage_spec(tmp_path)
+    result, edges, host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned[0]["cwd"] == os.path.realpath(spec.repo)
+    assert not any("worktree" in " ".join(c) for c in edges.calls), \
+        "the checkout home creates nothing: no worktree, no branch"
+    assert not os.path.isdir(os.path.join(spec.run_root, "worktrees", "t1"))
+
+
+def test_a_repo_may_select_a_worktree_home_and_gets_a_detached_checkout(tmp_path):
+    """The opt-out for a repo whose gitignored overlay is sensitive. It is DETACHED: the flight
+    never commits, never pushes and must never create a ref of its own."""
+    spec = _triage_spec(tmp_path, triage_home=triage.WORKTREE)
+    result, edges, host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned[0]["cwd"] == os.path.join(spec.run_root, "worktrees", "t1")
+    added = [c for c in edges.calls if "worktree" in c and "add" in c]
+    assert added, "the worktree home creates one"
+    assert "--detach" in added[0] and "-b" not in added[0], \
+        "a triage worktree carries no branch — the flight creates no ref"
+
+
+def test_an_unreadable_triage_home_refuses_rather_than_choosing_one(tmp_path):
+    """A typo'd home must not silently pick the other one: the two see DIFFERENT repositories
+    (one shows the gitignored overlay, the other cannot), so guessing is a wrong answer either way."""
+    spec = _triage_spec(tmp_path, triage_home="somewhere")
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "unknown triage home" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_triage_flight_without_a_repo_names_that_rather_than_the_branch(tmp_path):
+    spec = _triage_spec(tmp_path, repo="")
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "no target repo" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_triage_flight_opens_on_its_own_brief(tmp_path):
+    spec = _triage_spec(tmp_path)
+    os.remove(os.path.join(spec.run_root, "briefs", "t1.md"))   # AFTER the rig built the world
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "missing brief" in result.stderr
+    assert host.spawned == []
+
+
+# ------------------------------------------------------------------------------- the floor
+
+def test_a_triage_flight_is_pretrusted_like_a_worker(tmp_path):
+    """The same floor: a folder whose first-run trust dialog would block the session with nobody
+    there to answer it stalls a triage flight exactly as it stalls a worker."""
+    spec = _triage_spec(tmp_path)
+    result, edges, _host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    trusted = [c for c in edges.calls if c and c[0].endswith("pretrust.sh")]
+    assert trusted and trusted[0][1] == os.path.realpath(spec.repo)
+
+
+def test_a_failed_pretrust_refuses_a_triage_launch_too(tmp_path):
+    edges = FakeEdges({"pretrust.sh": (1, "", "")})
+    spec = _triage_spec(tmp_path)
+    result, _edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.ABORTED
+    assert "could not pre-trust" in result.stderr
+    assert host.spawned == []
+
+
+def test_no_poison_and_no_host_variable_reaches_a_triage_pane(tmp_path):
+    """DoD: no fence token and no host env variables reach a t<N> pane. The token is decided by
+    the NAME (session_host.receives_token), so a triage id provably cannot receive it; the
+    HERDR_* scrub is the launcher's near half of the same rule."""
+    assert session_host.receives_token("t1") is False
+    spec = _triage_spec(tmp_path, forwarded_env={"HERDR_API_TOKEN": "real-secret",
+                                                 "HERDR_SOCKET_PATH": "/tmp/h.sock",
+                                                 "ANTHROPIC_API_KEY": "sk-live",
+                                                 "XDG_CONFIG_HOME": "/tmp/elsewhere",
+                                                 "PATH": "/usr/bin"})
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    env = host.spawned[0]["env"]
+    assert not [k for k in env if k.startswith("HERDR")]
+    assert session_host.API_TOKEN_ENV_VAR not in env
+    assert session_host.API_TOKEN_FILE_ENV_VAR not in env
+    for poison in ("ANTHROPIC_API_KEY", "XDG_CONFIG_HOME"):
+        assert poison not in env
+    assert env["PATH"] == "/usr/bin"
+    assert host.spawned[0]["name"] == "t1", \
+        "the wrapper decides the grant from the NAME, so the name must be the session id"
+
+
+def test_a_triage_launch_is_fenced_exactly_like_a_worker(tmp_path, monkeypatch):
+    """A t<N> is TOKENLESS, so on an open socket it could drive every pane on the machine — the
+    same exposure the worker gate exists for. The d<N> exemption is about the token it RECEIVES,
+    and a triage flight receives none."""
+    _fleet(monkeypatch)
+    spec = _triage_spec(tmp_path)
+    result, _edges, host = _run(spec, edges=FakeEdges(fence=session_host.OPEN))
+    assert result.rc == launch.FENCE_DOWN
+    assert "FENCE DOWN" in result.stderr
+    assert host.spawned == []
+
+
+def test_a_triage_flight_never_bumps_an_issue_counter(tmp_path):
+    """`launches`/`retries` are mechanical telemetry about a tracked ISSUE's lane. A triage
+    flight is not a tracked issue and has no counter — exactly as a debugger has none."""
+    spec = _triage_spec(tmp_path)
+    result, _edges, _host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    with open(os.path.join(spec.run_root, "state", "issues.json")) as f:
+        assert json.load(f)["issues"] == {}
+
+
+def test_a_verified_triage_delivery_records_the_handle_and_the_liveness_baseline(tmp_path):
+    spec = _triage_spec(tmp_path)
+    result, _edges, _host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    with open(os.path.join(spec.run_root, "state", "panes", "t1")) as f:
+        assert f.read() == "w9:p1"
+    assert os.path.exists(os.path.join(spec.run_root, "state", "activity", "t1"))
+
+
+def test_a_wrong_typed_mode_is_refused_rather_than_read_as_absent(tmp_path):
+    """Fail closed on WRONG-TYPED input, not merely on unsafe input — the guards' own stated rule
+    (fresh-agent review, P1). Only the EXACT empty string is the legacy "say nothing" case that
+    derives worker/debugger from ``cwd``; every other unreadable value is a caller that meant
+    something, and reading it as "worker" is precisely the silent mis-route the guards exist for."""
+    for junk in (None, False, 0, [], " ", "  \t "):
+        spec = _spec(tmp_path, iid="i308", mode=junk)
+        result, _edges, host = _run(spec)
+        assert result.rc == launch.ABORTED, junk
+        assert "unknown session mode" in result.stderr, junk
+        assert host.spawned == []
+
+
+def test_an_absent_mode_field_still_derives_the_two_original_classes(tmp_path):
+    """The compatibility case, asserted rather than assumed: a Spec that predates #448 — no mode
+    attribute at all — is still routed by ``cwd``, so no existing call site changed behaviour."""
+    class Legacy:
+        pass
+
+    spec = _spec(tmp_path)
+    legacy = Legacy()
+    for name, value in vars(spec).items():
+        if name != "mode":
+            setattr(legacy, name, value)
+    assert not hasattr(legacy, "mode")
+    result, _edges, host = _run(legacy)
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned[0]["cwd"] == os.path.join(spec.run_root, "worktrees", "i308")
+
+
+def test_a_wrong_typed_triage_home_is_refused_rather_than_defaulted(tmp_path):
+    """The SAME fail-open the mode guard was hardened against, one field over (fresh-agent review
+    round 2, P0). A falsy wrong-typed home used to coerce to "checkout" — which is the home that
+    puts a session in the owner's REAL working tree, so the coercion failed in the worse of the
+    two directions. Present-but-unreadable is a caller bug; only an ABSENT field defaults."""
+    for junk in (None, False, 0, [], " ", "Checkout", "repo"):
+        spec = _triage_spec(tmp_path, triage_home=junk)
+        result, _edges, host = _run(spec)
+        assert result.rc == launch.ABORTED, junk
+        assert "unknown triage home" in result.stderr, junk
+        assert host.spawned == []
+
+
+def test_an_absent_triage_home_field_still_takes_the_ruled_default(tmp_path):
+    """The compatibility half: a Spec that predates the field is homed in the checkout, which is
+    the ruled default — so the refusal above is about a value a caller WROTE, never about silence."""
+    class Legacy:
+        pass
+
+    spec = _triage_spec(tmp_path)
+    legacy = Legacy()
+    for name, value in vars(spec).items():
+        if name != "triage_home":
+            setattr(legacy, name, value)
+    assert not hasattr(legacy, "triage_home")
+    result, _edges, host = _run(legacy)
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned[0]["cwd"] == os.path.realpath(spec.repo)
+
+
+def test_a_mode_that_merely_CLAIMS_to_equal_one_is_not_one(tmp_path):
+    """`in` compares by VALUE, so an object with a co-operative __eq__/__hash__ would walk
+    straight through a membership test into the guard table — the same coercion trap
+    `issues.dep_met` documents for `blocked_by=[True]`. The type is checked, not just the value."""
+    class Pretender:
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return hash("worker")
+
+    spec = _triage_spec(tmp_path, mode=Pretender())
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "unknown session mode" in result.stderr
+    assert host.spawned == []
+
+    class Explodes:
+        def __eq__(self, other):
+            raise RuntimeError("a mode that cannot be compared must not take the launcher down")
+
+        __hash__ = None
+
+    spec = _triage_spec(tmp_path, mode=Explodes())
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "unknown session mode" in result.stderr
     assert host.spawned == []

@@ -646,3 +646,52 @@ def test_operator_resolver_is_defensive():
     assert config.operator({}) == "the owner"
     assert config.operator({"operator": "  "}) == "the owner"   # blank -> neutral fallback
     assert config.operator(None) == "the owner"
+
+
+# --------------------------- triage block (issue #448) ---------------------------
+
+def test_triage_ships_disabled_and_homed_in_the_real_checkout(tmp_path):
+    # issue #448: the t<N> session class ships DISABLED — the brief the flight receives is part 2
+    # of the wave, so a repo that says nothing must not start flying triage the day the key
+    # appears. The HOME default is the ruled one (the standing rule's Home section): the repo's
+    # real checkout, so the flight sees what an orchestrator sees, gitignored overlay included.
+    _write_cfg(tmp_path, {"repo": "me/tool"})
+    assert config.load(tmp_path)["triage"] == {"enabled": False, "home": "checkout"}
+
+
+def test_triage_example_template_is_off_by_default():
+    # `adopt` copies config.example.json VERBATIM, so its value is exactly what a fresh adopt
+    # writes — and a fresh adopt must never arrive with the flight already armed.
+    raw = json.loads(_EXAMPLE.read_text())
+    assert raw["triage"] == {"enabled": False, "home": "checkout"}
+
+
+def test_triage_home_parses_both_modes(tmp_path):
+    for home in ("checkout", "worktree"):
+        _write_cfg(tmp_path, {"repo": "o/r", "triage": {"home": home}})
+        assert config.load(tmp_path)["triage"]["home"] == home
+
+
+def test_triage_home_rejects_unknown_values(tmp_path):
+    # The two homes see DIFFERENT repositories, so a typo must fail the adopt loudly rather than
+    # silently selecting the one the owner did not ask for.
+    for bad in ("Checkout", "", "repo", None, 1, ["worktree"]):
+        _write_cfg(tmp_path, {"repo": "o/r", "triage": {"home": bad}})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "triage.home" in str(e.value)
+
+
+def test_triage_enabled_must_be_a_real_boolean(tmp_path):
+    for bad in ("true", 1, 0, None, [], {}):
+        _write_cfg(tmp_path, {"repo": "o/r", "triage": {"enabled": bad}})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "triage.enabled" in str(e.value)
+
+
+def test_triage_unknown_subkey_rejected(tmp_path):
+    _write_cfg(tmp_path, {"repo": "o/r", "triage": {"enabled": True, "hoem": "worktree"}})
+    with pytest.raises(ValueError) as e:
+        config.load(tmp_path)
+    assert "triage.hoem" in str(e.value)

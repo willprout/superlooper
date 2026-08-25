@@ -80,6 +80,13 @@ OPS_DOCS = (
     # What approval means and what the gate will and will not merge.
     ("plugin/skills/superlooper/references/approval-protocol.md",
      "superlooper/references/approval-protocol.md"),
+    # The triage flight's standing rule: what a `t<N>` session may do autonomously, the per-issue
+    # verdict vocabulary, and the default nit rubric. It rides for the same reason the unattended
+    # contract does — it is the document that BOUNDS an unattended session, and a flight running on
+    # a machine where its own authority doc is absent is exactly D12's shape. (The doc landed on
+    # main without this entry; issue #448's launcher work is what noticed.)
+    ("plugin/skills/superlooper/references/triage-standing-rule.md",
+     "superlooper/references/triage-standing-rule.md"),
     # The debugger playbook, whole. The entry page routes to all four references; the unattended
     # contract is the one a watchdog-launched session is held to.
     ("plugin/skills/sl-debugger/SKILL.md", "sl-debugger/PLAYBOOK.md"),
