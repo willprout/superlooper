@@ -35,7 +35,7 @@ def test_what_the_launcher_writes_is_what_the_reader_reads(tmp_path):
     state = _state(tmp_path)
     spawned = session_host.Session(name="i9", workspace="ws-abc", pane="ws-abc:p1", tab="ws-abc:t1",
                                    shell_pid=4242)
-    launch._record_delivery(_spec(tmp_path), "i9", spawned, debugger=True, resume=False)
+    launch._record_delivery(_spec(tmp_path), "i9", spawned, untracked=True, resume=False)
     handle = panes.read(state, "i9")
     assert (handle.pane, handle.workspace) == (spawned.pane, spawned.workspace)
 

@@ -166,13 +166,24 @@ def test_the_day_is_stamped_at_launch_not_by_the_flight(tmp_path):
     assert triage.ran_on(tmp_path, "2026-08-26") is False
 
 
-def test_a_second_stamp_on_one_day_never_truncates_the_first(tmp_path):
-    """A caller that stamped and then stamped again (a bug, or a hand re-run) must not wipe the
-    log the day's flight has been writing into."""
+def test_the_stamp_is_a_LEASE_that_exactly_one_caller_can_take(tmp_path):
+    """The bound is not "check, then write" — that is a race two runners lose together. The stamp
+    is CREATED EXCLUSIVELY, so of two callers asking for the same day exactly one is handed a
+    path and the other is told no. Anything else and a machine running two runners (a restart
+    overlapping its predecessor, a hand `superlooper run` beside the LaunchAgent) flies twice."""
+    first = triage.mark_launched(tmp_path, "2026-08-25")
+    assert first is not None
+    assert triage.mark_launched(tmp_path, "2026-08-25") is None, \
+        "the second caller must NOT be handed a launch"
+    assert triage.mark_launched(tmp_path, "2026-08-26") is not None, "a new day is a new lease"
+
+
+def test_a_lost_lease_never_touches_the_winners_log(tmp_path):
+    """The loser of the race must not truncate the log the winner's flight is already writing."""
     triage.mark_launched(tmp_path, "2026-08-25")
     with open(triage.run_log_path(tmp_path, "2026-08-25"), "a") as f:
         f.write("\nthe flight wrote this\n")
-    triage.mark_launched(tmp_path, "2026-08-25")
+    assert triage.mark_launched(tmp_path, "2026-08-25") is None
     assert "the flight wrote this" in open(triage.run_log_path(tmp_path, "2026-08-25")).read()
 
 
@@ -192,6 +203,33 @@ def test_an_unreadable_day_stamp_reads_as_already_ran(tmp_path):
     assert triage.ran_on(tmp_path, None) is True
     assert triage.ran_on(tmp_path, "") is True
     assert triage.ran_on(tmp_path, "../escape") is True
+
+
+def test_a_date_that_is_not_one_can_never_name_a_path(tmp_path):
+    """The date becomes a path SEGMENT, so the guard belongs on the path builder itself and not
+    only on the two callers that happen to check first — a later caller would inherit the hole."""
+    for junk in ("../escape", "2026-08-25/../../x", "..", "/etc/passwd", "", None, 20260825,
+                 "2026-8-25"):
+        assert triage.run_log_path(tmp_path, junk) is None, junk
+        assert triage.mark_launched(tmp_path, junk) is None, junk
+        assert triage.ran_on(tmp_path, junk) is True, junk
+
+
+def test_recent_run_logs_never_raises_on_a_wrong_typed_limit(tmp_path):
+    """The module's no-raise posture holds for every argument, not only the ones a caller is
+    likely to get right."""
+    triage.mark_launched(tmp_path, "2026-08-25")
+    assert triage.recent_run_logs(tmp_path) == [("2026-08-25", "# Triage flight 2026-08-25\n\n")]
+    for junk in (None, "three", [], -1, 0):
+        assert triage.recent_run_logs(tmp_path, limit=junk) == []
+    assert triage.recent_run_logs(tmp_path / "nowhere") == []
+
+
+def test_recent_run_logs_are_newest_first_and_bounded(tmp_path):
+    for date in ("2026-08-22", "2026-08-23", "2026-08-24", "2026-08-25"):
+        triage.mark_launched(tmp_path, date)
+    assert [d for d, _ in triage.recent_run_logs(tmp_path)] == ["2026-08-25", "2026-08-24",
+                                                                "2026-08-23"]
 
 
 # --------------------------------------------------------------------------- the config reads

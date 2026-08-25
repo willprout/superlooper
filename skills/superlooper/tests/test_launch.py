@@ -1305,3 +1305,33 @@ def test_a_verified_triage_delivery_records_the_handle_and_the_liveness_baseline
     with open(os.path.join(spec.run_root, "state", "panes", "t1")) as f:
         assert f.read() == "w9:p1"
     assert os.path.exists(os.path.join(spec.run_root, "state", "activity", "t1"))
+
+
+def test_a_wrong_typed_mode_is_refused_rather_than_read_as_absent(tmp_path):
+    """Fail closed on WRONG-TYPED input, not merely on unsafe input — the guards' own stated rule
+    (fresh-agent review, P1). Only the EXACT empty string is the legacy "say nothing" case that
+    derives worker/debugger from ``cwd``; every other unreadable value is a caller that meant
+    something, and reading it as "worker" is precisely the silent mis-route the guards exist for."""
+    for junk in (None, False, 0, [], " ", "  \t "):
+        spec = _spec(tmp_path, iid="i308", mode=junk)
+        result, _edges, host = _run(spec)
+        assert result.rc == launch.ABORTED, junk
+        assert "unknown session mode" in result.stderr, junk
+        assert host.spawned == []
+
+
+def test_an_absent_mode_field_still_derives_the_two_original_classes(tmp_path):
+    """The compatibility case, asserted rather than assumed: a Spec that predates #448 — no mode
+    attribute at all — is still routed by ``cwd``, so no existing call site changed behaviour."""
+    class Legacy:
+        pass
+
+    spec = _spec(tmp_path)
+    legacy = Legacy()
+    for name, value in vars(spec).items():
+        if name != "mode":
+            setattr(legacy, name, value)
+    assert not hasattr(legacy, "mode")
+    result, _edges, host = _run(legacy)
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned[0]["cwd"] == os.path.join(spec.run_root, "worktrees", "i308")
