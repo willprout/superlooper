@@ -1335,3 +1335,63 @@ def test_an_absent_mode_field_still_derives_the_two_original_classes(tmp_path):
     result, _edges, host = _run(legacy)
     assert result.rc == launch.OK, result.stderr
     assert host.spawned[0]["cwd"] == os.path.join(spec.run_root, "worktrees", "i308")
+
+
+def test_a_wrong_typed_triage_home_is_refused_rather_than_defaulted(tmp_path):
+    """The SAME fail-open the mode guard was hardened against, one field over (fresh-agent review
+    round 2, P0). A falsy wrong-typed home used to coerce to "checkout" — which is the home that
+    puts a session in the owner's REAL working tree, so the coercion failed in the worse of the
+    two directions. Present-but-unreadable is a caller bug; only an ABSENT field defaults."""
+    for junk in (None, False, 0, [], " ", "Checkout", "repo"):
+        spec = _triage_spec(tmp_path, triage_home=junk)
+        result, _edges, host = _run(spec)
+        assert result.rc == launch.ABORTED, junk
+        assert "unknown triage home" in result.stderr, junk
+        assert host.spawned == []
+
+
+def test_an_absent_triage_home_field_still_takes_the_ruled_default(tmp_path):
+    """The compatibility half: a Spec that predates the field is homed in the checkout, which is
+    the ruled default — so the refusal above is about a value a caller WROTE, never about silence."""
+    class Legacy:
+        pass
+
+    spec = _triage_spec(tmp_path)
+    legacy = Legacy()
+    for name, value in vars(spec).items():
+        if name != "triage_home":
+            setattr(legacy, name, value)
+    assert not hasattr(legacy, "triage_home")
+    result, _edges, host = _run(legacy)
+    assert result.rc == launch.OK, result.stderr
+    assert host.spawned[0]["cwd"] == os.path.realpath(spec.repo)
+
+
+def test_a_mode_that_merely_CLAIMS_to_equal_one_is_not_one(tmp_path):
+    """`in` compares by VALUE, so an object with a co-operative __eq__/__hash__ would walk
+    straight through a membership test into the guard table — the same coercion trap
+    `issues.dep_met` documents for `blocked_by=[True]`. The type is checked, not just the value."""
+    class Pretender:
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return hash("worker")
+
+    spec = _triage_spec(tmp_path, mode=Pretender())
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "unknown session mode" in result.stderr
+    assert host.spawned == []
+
+    class Explodes:
+        def __eq__(self, other):
+            raise RuntimeError("a mode that cannot be compared must not take the launcher down")
+
+        __hash__ = None
+
+    spec = _triage_spec(tmp_path, mode=Explodes())
+    result, _edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "unknown session mode" in result.stderr
+    assert host.spawned == []

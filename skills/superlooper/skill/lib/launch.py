@@ -348,7 +348,14 @@ def _mode_of(spec):
     wrong-typed input, not merely on unsafe input.
     """
     declared = getattr(spec, "mode", "")
-    if declared == "" and isinstance(declared, str):
+    # TYPE first, and `type(...) is str` rather than isinstance: `==` and `in` compare by VALUE, so
+    # an object with a co-operative ``__eq__``/``__hash__`` would answer yes to both and walk into
+    # the guard table, while one whose ``__eq__`` raises would take the launcher down instead of
+    # refusing (fresh-agent review round 2). Same coercion trap `issues.dep_met` documents for
+    # `blocked_by=[True]`: not-raising is only half of "counts as unreadable".
+    if type(declared) is not str:
+        return None
+    if declared == "":
         return DEBUGGER if spec.cwd is not None else WORKER
     return declared if declared in MODES else None
 
@@ -514,8 +521,12 @@ def _launch(spec, host, edges):
         # checkout shows the gitignored working files an orchestrator sees — so an unreadable
         # value is REFUSED rather than defaulted: guessing here is a wrong answer either way, and
         # the loader is where a typo already fails loudly at adopt time.
-        home_kind = str(spec.triage_home or triage.CHECKOUT)
-        if home_kind not in triage.HOMES:
+        # `getattr` for the ABSENT case and a strict check on everything else — never
+        # `spec.triage_home or CHECKOUT`, which coerced None/False/0/[] into "checkout" and so
+        # fail-OPENED a caller bug straight into the owner's REAL working tree (fresh-agent review
+        # round 2, P0). Silence takes the ruled default; a value a caller WROTE must be readable.
+        home_kind = getattr(spec, "triage_home", triage.CHECKOUT)
+        if type(home_kind) is not str or home_kind not in triage.HOMES:
             return Result(ABORTED, "[%s] unknown triage home %r (expected: %s) — refusing"
                           % (iid, home_kind, " or ".join(triage.HOMES)))
         if not spec.repo:
