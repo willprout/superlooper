@@ -36,5 +36,6 @@
   "notify": { "imessage_to": null, "cmd": null,
               "quiet_hours": { "start": "21:00", "end": "08:00" } },
   "report_time": "08:45",
-  "runner_home": "pane"
+  "runner_home": "pane",
+  "triage": { "enabled": false, "home": "checkout" }
 }

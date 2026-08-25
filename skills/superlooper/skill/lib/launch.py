@@ -9,6 +9,9 @@ comes through here, and this module is the only thing left that does:
 caller               spawns                      trigger
 ===================  ==========================  ===========================================
 runner               worker ``i<N>``             an approved issue (launch/recover/regenerate)
+runner               triage flight ``t<N>``      at most once a day, and only when some open
+                                                 issue's body changed since the last verdicts
+                                                 (``lib/triage.py``, issue #448)
 watchdog             sl-debugger ``d<N>``        unattended fault, no owner present
 dashboard Fixer      sl-debugger ``d<N>``        the owner taps Debug (via ``superlooper debug``)
 ``superlooper resume``  either, revived          an operator re-enters an interrupted flight
@@ -75,14 +78,35 @@ import loopstate
 import panes
 import sanitize
 import session_host
+import triage
 
-# The two mode guards, spelled here exactly as the cmux launcher spelled them. They are what stop
-# a debugger id from being launched as a worker and vice versa — fail closed on WRONG-TYPED input,
+# The THREE mode guards, the first two spelled exactly as the cmux launcher spelled them. They are
+# what stop one session class from being launched as another — fail closed on WRONG-TYPED input,
 # not merely on unsafe input. Without the worker guard a caller bug routes a d<N> through worktree
 # creation and the issue counter; without the debugger guard an i<N> silently skips worktree
-# creation and runs in whatever directory the caller happened to pass.
+# creation and runs in whatever directory the caller happened to pass; and since #448 a third id
+# shape exists, so both of those crossings now have a second way to go wrong.
 WORKER_RE = re.compile(r"^i[0-9]+$")
 DEBUGGER_RE = re.compile(r"^d[0-9]+$")
+TRIAGE_RE = re.compile(r"^t[0-9]+$")
+
+# The session classes, as a caller DECLARES one (``Spec.mode``). Spelled out rather than inferred,
+# because a third class is exactly where "``cwd`` selects the mode and nothing else does" stops
+# being enough: a triage flight in its default home takes no ``cwd`` and creates no worktree, so
+# on the old rule it is indistinguishable from a worker launch — and would be run as one.
+WORKER = "worker"
+DEBUGGER = "debugger"
+TRIAGE = "triage"
+MODES = (WORKER, DEBUGGER, TRIAGE)
+
+_MODE_GUARDS = {WORKER: WORKER_RE, DEBUGGER: DEBUGGER_RE, TRIAGE: TRIAGE_RE}
+# One refusal sentence per mode. The first two are VERBATIM — ``evidence.py`` classifies launcher
+# stderr on phrases, and tests/test_launch_delivery drives them through the real CLI.
+_MODE_REFUSALS = {
+    WORKER: "[%s] worker mode expects an issue id (i<N>) — refusing",
+    DEBUGGER: "[%s] --cwd mode is for debugger (d<N>) ids only — refusing",
+    TRIAGE: "[%s] triage mode expects a triage id (t<N>) — refusing",
+}
 
 OK = 0
 ABORTED = 1
@@ -174,16 +198,29 @@ class Result:
 class Spec:
     """One launch request, fully resolved by its caller.
 
-    ``cwd`` selects the mode and nothing else does: present means the in-place debugger path
-    (``d<N>``, no worktree and no branch), absent means the worker path (``i<N>``, a worktree off
-    ``origin/<dev_branch>``). Deriving the mode from the id instead would make a caller's mistake
-    silent — the guards below exist to make it loud.
+    ``mode`` selects the session class, and the id must then MATCH it — deriving the class from
+    the id instead would make a caller's mistake silent, and the guards exist to make it loud:
+
+    * ``worker`` (``i<N>``)   — a worktree off ``origin/<dev_branch>``, on the issue's branch.
+    * ``debugger`` (``d<N>``) — in place, in ``cwd``; no worktree and no branch. THE class that
+      receives the control-socket token, which is why nothing else may reach it by accident.
+    * ``triage`` (``t<N>``)   — the flight (#448). ``triage_home`` says where: ``checkout`` (the
+      ruled default) runs it in ``repo`` itself, creating nothing; ``worktree`` gives it a
+      DETACHED checkout of the base, for a repo whose gitignored overlay is sensitive. ``cwd`` is
+      refused here — a triage flight's home comes from the repo's config, and a caller offering a
+      directory has confused this class with the one that holds the token.
+
+    An EMPTY ``mode`` keeps the original rule for the two original classes — ``cwd`` present means
+    debugger, absent means worker — so every pre-#448 call site is unchanged. A triage flight must
+    say so explicitly: its default home takes no ``cwd``, so silence would read as "worker".
     """
     id: str
     run_root: str
     repo: str = ""
     dev_branch: str = "main"
     cwd: str = None
+    mode: str = ""                       # "" -> derive from `cwd` (worker / debugger), as before
+    triage_home: str = triage.CHECKOUT   # triage only: `checkout` (default) or `worktree`
     engine_bin: str = ""
     agent: str = "claude"
     model: str = ""
@@ -295,6 +332,22 @@ class WorktreeLock:
         self._fh = None
 
 
+# --------------------------------------------------------------------------- the mode
+
+def _mode_of(spec):
+    """Which session class this Spec declares, or None for one this launcher cannot read.
+
+    An empty ``mode`` derives the ORIGINAL rule — ``cwd`` present means debugger, absent means
+    worker — so every pre-#448 call site keeps working unchanged. An unrecognised one is None
+    rather than a fallback: falling through to the worker path is precisely the silent
+    wrong-typed-input failure the guards exist to make loud.
+    """
+    declared = str(getattr(spec, "mode", "") or "").strip()
+    if not declared:
+        return DEBUGGER if spec.cwd is not None else WORKER
+    return declared if declared in MODES else None
+
+
 # --------------------------------------------------------------------------- the launch
 
 def launch(spec, host=None, edges=None):
@@ -316,13 +369,19 @@ def _launch(spec, host, edges):
         iid = sanitize.worktree_id(spec.id)
     except (ValueError, TypeError):
         return Result(ABORTED, "[%s] id sanitize validation failed — not launching" % (spec.id,))
-    debugger = spec.cwd is not None
-    if debugger:
-        if not DEBUGGER_RE.match(iid):
-            return Result(ABORTED, "[%s] --cwd mode is for debugger (d<N>) ids only — refusing"
-                          % iid)
-    elif not WORKER_RE.match(iid):
-        return Result(ABORTED, "[%s] worker mode expects an issue id (i<N>) — refusing" % iid)
+    mode = _mode_of(spec)
+    if mode is None:
+        return Result(ABORTED, "[%s] unknown session mode %r (expected: %s) — refusing"
+                      % (iid, str(getattr(spec, "mode", "")), " or ".join(MODES)))
+    # ``--cwd`` belongs to the debugger and to nothing else. Checked BEFORE the id guard so a
+    # triage spec carrying one is refused with the debugger's own sentence — the confusion it
+    # names is real, and the class it was confused with is the one holding the fence's token.
+    if mode == TRIAGE and spec.cwd is not None:
+        return Result(ABORTED, _MODE_REFUSALS[DEBUGGER] % iid)
+    if not _MODE_GUARDS[mode].match(iid):
+        return Result(ABORTED, _MODE_REFUSALS[mode] % iid)
+    debugger = mode == DEBUGGER
+    flight = mode == TRIAGE
     if spec.agent not in AGENTS:
         return Result(UNSUPPORTED_AGENT,
                       "[%s] unsupported agent '%s' (expected: %s)"
@@ -335,7 +394,7 @@ def _launch(spec, host, edges):
     # first would be resolving whose account a launch runs under when the launch was never going to
     # be permitted. Like them, it is ordered before the worktree and before any host RPC so a
     # refusal costs no orphan pane and no leftover checkout (the base-missing discipline, #28).
-    if not debugger:
+    if not debugger:                     # every TOKENLESS class: the worker and the flight
         refused = _fence_preflight(spec, iid, edges)
         if refused is not None:
             return refused
@@ -444,6 +503,39 @@ def _launch(spec, host, edges):
         # ABSOLUTE and PHYSICAL: the pane's shell starts in its own default dir, so a relative one
         # would name nothing there.
         worktree = os.path.realpath(spec.cwd)
+    elif flight:
+        # The triage flight's home (#448). The two answers see DIFFERENT repositories — only the
+        # checkout shows the gitignored working files an orchestrator sees — so an unreadable
+        # value is REFUSED rather than defaulted: guessing here is a wrong answer either way, and
+        # the loader is where a typo already fails loudly at adopt time.
+        home_kind = str(spec.triage_home or triage.CHECKOUT)
+        if home_kind not in triage.HOMES:
+            return Result(ABORTED, "[%s] unknown triage home %r (expected: %s) — refusing"
+                          % (iid, home_kind, " or ".join(triage.HOMES)))
+        if not spec.repo:
+            # Named rather than left to git, for the reason the worker refusal below spells out:
+            # without it the base probe fails and the launch would blame a dev_branch that is not
+            # what went wrong.
+            return Result(ABORTED, "[%s] no target repo was given for a triage launch (SL_REPO) — "
+                                   "not launching" % iid)
+        if home_kind == triage.CHECKOUT:
+            if not os.path.isdir(spec.repo):
+                return Result(ABORTED, "[%s] the repo checkout does not exist: %s"
+                              % (iid, spec.repo))
+            # Nothing is created: the flight runs in the checkout an orchestrator would open. Its
+            # read-only discipline there (fetch first, judge against origin/main, write only to
+            # GitHub and the state home) is the BRIEF's to enforce — no code here writes to it.
+            worktree = os.path.realpath(spec.repo)
+        else:
+            try:
+                base = "origin/%s" % sanitize.branch(spec.dev_branch)
+            except (ValueError, TypeError):
+                return Result(ABORTED, "[%s] dev_branch sanitize validation failed — not launching"
+                              % iid)
+            worktree = os.path.join(spec.run_root, "worktrees", iid)
+            failed = _make_worktree(spec, edges, iid, worktree, "", base)
+            if failed is not None:
+                return failed
     else:
         if not spec.repo:
             # Named rather than left to git. Without it `git -C ''` fails, the base-ref probe
@@ -563,7 +655,7 @@ def _launch(spec, host, edges):
             "installed? (bin/install-launch-shim.sh)" % iid,
             "[%s] Tore the pane down; NOT marking active." % iid]))
 
-    _record_delivery(spec, iid, session, debugger, resume)
+    _record_delivery(spec, iid, session, debugger or flight, resume)
     return Result(OK, "", "[launch] %s  branch=%s pane=%s ws=%s name='%s' (delivery verified)"
                   % (iid, branch or "<none>", session.pane, session.workspace, name),
                   session=session)
@@ -590,11 +682,16 @@ def _fence_preflight(spec, iid, edges):
     because it answers. This is the check that turns "the fence is up" from an assumption a machine
     inherited at build time into an observation made on every launch.
 
-    **WORKER launches only.** The MODE decides and nothing else does, exactly as
+    **EVERY TOKENLESS launch.** The MODE decides and nothing else does, exactly as
     ``session_host.receives_token`` lets the NAME decide who gets the token:
 
     * an ``i<N>`` is the thing the fence exists to contain. It is handed no token, so on a fenced
       socket it is refused and on an open one it can drive every pane on the machine.
+    * a ``t<N>`` is the same exposure one session class over (#448): the standing rule's own words
+      are that a triage flight "holds no fence token and drives no herdr surface", so it is gated
+      exactly as a worker is. The d<N> exemption below is about the token a repair session
+      RECEIVES, and a flight receives none — reading the exemption as "not a worker" would have
+      handed the whole fleet to the one class whose job is to act on the queue unattended.
     * a ``d<N>`` RECEIVES the token by design, so an open socket grants a repair session nothing it
       does not already hold — and refusing repair BECAUSE the fence is down would mean no
       unattended repair at exactly the moment repair is needed, which is the landmine the whole
@@ -700,6 +797,10 @@ def _make_worktree(spec, edges, iid, worktree, branch, base):
     PRESERVATION: an existing checkout is REUSED, never removed. A relaunch or regenerate lands in
     the id's own worktree with its unpushed work intact (#190/#168) — the launcher has no path
     that destroys one, which is why c17's remove-force half was rejected.
+
+    An EMPTY ``branch`` is the triage flight's worktree home (#448): a DETACHED checkout of the
+    base. A flight never commits, never pushes and must never create a ref, so there is no branch
+    to make and no existing one to attach — it goes straight to the base-ref verdict on failure.
     """
     if os.path.isdir(worktree):
         return None
@@ -707,15 +808,23 @@ def _make_worktree(spec, edges, iid, worktree, branch, base):
         if os.path.isdir(worktree):          # another launch won the race and made it for us
             return None
         os.makedirs(os.path.dirname(worktree), exist_ok=True)
-        fresh = edges.run(["git", "-C", spec.repo, "worktree", "add", "-b", branch, worktree,
-                           base], timeout=120)
-        if fresh.rc == 0:
-            return None
-        # The fallback attaches an EXISTING branch — a relaunch or regenerate reuses the name.
-        attach = edges.run(["git", "-C", spec.repo, "worktree", "add", worktree, branch],
-                           timeout=120)
-        if attach.rc == 0:
-            return None
+        attach_rc = "n/a"
+        if branch:
+            fresh = edges.run(["git", "-C", spec.repo, "worktree", "add", "-b", branch, worktree,
+                               base], timeout=120)
+            if fresh.rc == 0:
+                return None
+            # The fallback attaches an EXISTING branch — a relaunch or regenerate reuses the name.
+            attach = edges.run(["git", "-C", spec.repo, "worktree", "add", worktree, branch],
+                               timeout=120)
+            attach_rc = attach.rc
+            if attach.rc == 0:
+                return None
+        else:
+            fresh = edges.run(["git", "-C", spec.repo, "worktree", "add", "--detach", worktree,
+                               base], timeout=120)
+            if fresh.rc == 0:
+                return None
         exists = edges.run(["git", "-C", spec.repo, "rev-parse", "--verify", "--quiet",
                             "%s^{commit}" % base], timeout=30)
         # rc=1 is git's own "that ref is not here" under `--verify --quiet`. Anything else — a
@@ -741,7 +850,8 @@ def _make_worktree(spec, edges, iid, worktree, branch, base):
         return Result(ABORTED,
                       "[%s] could not create the worktree at '%s' for branch '%s' off base '%s' "
                       "(git rc: create=%s attach=%s verify=%s)"
-                      % (iid, worktree, branch, base, fresh.rc, attach.rc, exists.rc))
+                      % (iid, worktree, branch or "<detached>", base, fresh.rc, attach_rc,
+                         exists.rc))
 
 
 def pane_environment(spec, iid, session_id, resume, expect_login, token,
@@ -999,10 +1109,13 @@ def _teardown(host, session):
                                          # not replace the diagnosis with its own error
 
 
-def _record_delivery(spec, iid, session, debugger, resume):
+def _record_delivery(spec, iid, session, untracked, resume):
     """Only NOW is it honest to record liveness. Writing the activity stamp before delivery was
     confirmed is exactly what fabricated 'launched & alive' for 45 minutes while no worker had
-    started."""
+    started.
+
+    ``untracked`` is every session class that is not a queued ISSUE — the debugger and, since
+    #448, the triage flight. Neither has a lane counter to bump."""
     state = os.path.join(spec.run_root, "state")
     _write_atomic(os.path.join(state, "activity", iid), str(int(time.time())))
     # THE one writer of the recorded handle, and it writes through `lib/panes` so that what a
@@ -1010,10 +1123,11 @@ def _record_delivery(spec, iid, session, debugger, resume):
     # hand-rolled path joins (issue #334 — the #308 format change was invisible precisely because
     # there was no such place).
     panes.record(state, iid, session)
-    if debugger or resume:
-        # A debugger is not a tracked issue, so it has no counter; and a REVIVE is deliberately
-        # not counted (#298) — `retries` is mechanical telemetry about how many times a lane had
-        # to be STARTED OVER, and re-entering the same conversation is the opposite of that.
+    if untracked or resume:
+        # A debugger and a triage flight are not tracked issues, so neither has a counter; and a
+        # REVIVE is deliberately not counted (#298) — `retries` is mechanical telemetry about how
+        # many times a lane had to be STARTED OVER, and re-entering the same conversation is the
+        # opposite of that.
         return
     def bump(st):
         issue = st["issues"].setdefault(iid, loopstate.new_issue())
@@ -1048,6 +1162,7 @@ def _rm_quiet(path):
 
 
 __all__ = ["Spec", "Result", "Ran", "Edges", "WorktreeLock", "launch", "pane_environment",
-           "is_poison", "WORKER_RE", "DEBUGGER_RE", "OK", "ABORTED", "NOT_DELIVERED",
+           "is_poison", "WORKER_RE", "DEBUGGER_RE", "TRIAGE_RE", "WORKER", "DEBUGGER", "TRIAGE",
+           "MODES", "OK", "ABORTED", "NOT_DELIVERED",
            "BASE_MISSING", "AUTH_DEAD", "AUTH_DEAD_RUNNER", "ENV_POISONED", "FENCE_DOWN",
            "UNSUPPORTED_AGENT"]
