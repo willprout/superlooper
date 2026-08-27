@@ -49,6 +49,9 @@ DEBUGGER_ENV = {"SL_ISSUE_ID": "d3", "SL_RUN_ROOT": "/runs/willprout"}
 # The owner tap (`superlooper debug`, issue #144): the SAME d<N> shape, but a person is at the
 # keyboard — the launcher carries SL_ATTENDED=1 into the session for exactly this distinction.
 ATTENDED_DEBUGGER_ENV = {**DEBUGGER_ENV, "SL_ATTENDED": "1"}
+# The triage flight (#448) — the third id shape a loop launcher can produce. Until it had a role
+# here, `_role("t1")` answered None and a flight was allowed EVERY hazard this module denies.
+TRIAGE_ENV = {"SL_ISSUE_ID": "t1", "SL_RUN_ROOT": "/runs/willprout"}
 
 
 # --------------------------- the pure decision core: run() ---------------------------
@@ -156,6 +159,26 @@ def test_debugger_ask_user_question_is_denied_with_the_memo_fallback():
     assert reason, "AskUserQuestion must be denied in an unattended debugger session"
     assert "/runs/willprout/reports" in reason, "the memo path is the debugger's escalation channel"
     assert "state/blocked" not in reason, "the worker blocked-file protocol is wrong for a debugger"
+
+
+def test_triage_ask_user_question_is_denied_with_the_flights_own_fallback():
+    """#448: the triage flight (`t<N>`) has neither of the other two protocols. It holds no lane,
+    so `state/blocked/<id>` is a dead drop (the runner reads one for an `i<N>` alone) and there is
+    no "a fresh session resumes you with the answer" to promise — a flight is not resumed. Its
+    unanswerable items are ESCALATIONS on the owner's sitting sheet, recorded in its run log."""
+    reason = wp.run(_pre("AskUserQuestion", {"questions": []}), TRIAGE_ENV)
+    assert reason, "AskUserQuestion must be denied in an unattended triage flight"
+    assert "/runs/willprout/triage/runs" in reason, "the run log is where a flight records"
+    assert "state/blocked" not in reason, "the worker blocked-file protocol is a dead drop for t<N>"
+    assert "sl-debugger" not in reason, "nor is the debugger's memo contract the flight's"
+
+
+def test_a_triage_flight_can_never_claim_attendance():
+    """The owner tap (`d<N>`) is the ONLY attended session the loop can launch. A flight is
+    launched on a schedule with nobody there, and its pane environment pins SL_ATTENDED empty — so
+    an ambient `export SL_ATTENDED=1` anywhere upstream must not be able to disarm duty 1 for it."""
+    assert wp.run(_pre("AskUserQuestion", {"questions": []}),
+                  {**TRIAGE_ENV, "SL_ATTENDED": "1"}) is not None
 
 
 def test_attended_owner_tap_debugger_may_still_ask():
@@ -735,7 +758,7 @@ def test_an_absolute_path_to_gh_is_still_gh(tmp_path):
 
 # --- the duty holds for every session the loop launches, and nowhere else ---
 
-@pytest.mark.parametrize("env", [WORKER_ENV, DEBUGGER_ENV, ATTENDED_DEBUGGER_ENV])
+@pytest.mark.parametrize("env", [WORKER_ENV, DEBUGGER_ENV, ATTENDED_DEBUGGER_ENV, TRIAGE_ENV])
 def test_the_deny_holds_for_every_role_attended_or_not(tmp_path, env):
     # Attendance carves out duty 1 ONLY: a person at the pane does not make an unlaunchable issue
     # launchable, and the correction is just as cheap for them.
@@ -1266,9 +1289,10 @@ def test_an_exotic_refspec_is_an_accepted_miss(tmp_path):
 
 # --------------------------- the three duties hold everywhere the others do ---------------------
 
-@pytest.mark.parametrize("env", [WORKER_ENV, DEBUGGER_ENV, ATTENDED_DEBUGGER_ENV])
+@pytest.mark.parametrize("env", [WORKER_ENV, DEBUGGER_ENV, ATTENDED_DEBUGGER_ENV, TRIAGE_ENV])
 @pytest.mark.parametrize("command", ["gh api repos/o/r/statuses/abc -f state=success",
                                      "gh issue edit 4 --add-label agent-ready",
+                                     "gh issue edit 4 --add-label pre-authorized:referee",
                                      "gh pr merge 42",
                                      "git push --force origin sl/x"])
 def test_the_bad_merge_denies_hold_for_every_role_attended_or_not(tmp_path, env, command):

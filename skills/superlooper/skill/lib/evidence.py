@@ -196,6 +196,13 @@ _LAUNCH_TEXT = (
     # can be inserted above. Costs the readings below nothing — "FENCE DOWN" is the loop's OWN
     # phrase from lib/launch.py, which gh, git and cmux can never emit, and which no variable name
     # in an env-poison refusal can contain (it has a space in it).
+    #
+    # It KEEPS the lead over the triage entry below, which was the other candidate for this slot
+    # (fresh-agent review, P2). Swapping them would close one hole by opening a worse one: a socket
+    # path containing the triage phrase would read a REAL fence refusal as per-issue, which is a
+    # fail-OPEN on the one check whose whole job is to fail closed. The hole that swap was aimed at
+    # is closed at its source instead — lib/launch.py no longer interpolates the unvalidated config
+    # value into that refusal at all, so there is nothing there to forge a reason with.
     (("fence down",),
      ("fence_down",
       "this machine declares its fleet fenced and the pre-flight found the session host's control "
@@ -203,6 +210,27 @@ _LAUNCH_TEXT = (
       "launched onto it. A machine-level fault no queued issue caused and none can fix by "
       "re-approving: rebuild the patched host and reinstall the fleet server, or declare the "
       "machine unfenced deliberately")),
+    # SECOND (issue #448) — directly under the fence and ahead of everything else. These refusals
+    # now interpolate NOTHING a caller or a repo chose: not the config value, not the checkout path
+    # (three successive fresh reviews took a run at this, each closing one more echo). lib/launch.py
+    # names the KEY and the allowed set instead, which is why this entry can sit second rather than
+    # fight the fence for the lead — nothing in the text can forge the needle above it, and this
+    # needle is the loop's own phrase, which gh, git and the session host can never emit.
+    # It is a PER-ISSUE reason, deliberately, and that is the whole point of the entry: these are
+    # per-REPO CONFIGURATION faults (a typo'd home, an SL_REPO naming a checkout that moved), and
+    # without a needle they fall through to the rc=1 default `launch_failed_before_delivery` —
+    # which IS a channel fault. One repo's config typo would then hold the entire approved queue,
+    # waiting on something that never self-heals and that no queued issue caused. `TRIAGE LAUNCH
+    # REFUSED` is the loop's OWN phrase from lib/launch.py; gh, git and the session host can never
+    # emit it, and it contains spaces, so no variable name or path can carry it by accident.
+    (("triage launch refused",),
+     ("triage_launch_refused",
+      "the triage flight could not be launched because nothing told it a place to run — an "
+      "unreadable `triage.home`, or an SL_REPO naming a checkout that is not there. No session was "
+      "created. Fix the repo's `.superlooper/config.json`, or the checkout path; note that a "
+      "MISSING CHECKOUT is a machine-level fault every worker launch is hitting too, and their own "
+      "refusals are what hold the queue for it — this reading only says the flight did not go "
+      "out, which is deliberately not a reason on its own to stop the approved queue")),
     # THEN (issue #301), ahead of the gh needles. A poisoned environment is causally
     # UPSTREAM of the auth death it can produce — an inherited XDG_CONFIG_HOME is exactly how `gh`
     # dies — so when the session's refusal names the environment, the environment is the honest

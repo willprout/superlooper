@@ -420,6 +420,134 @@ def test_the_worker_mode_refuses_a_debugger_id(rig):
     assert not (rig["stub"] / "pane.env").exists()
 
 
+def test_the_worker_mode_refuses_a_triage_id(rig):
+    """The third id shape, through the real CLI (issue #448). A t<N> routed as a worker would take
+    a lane's worktree and bump an issue counter that names nothing."""
+    (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
+    r = _launch(rig, args=("t3",))
+    assert r.returncode == 1
+    assert "worker mode expects an issue id" in r.stderr
+    assert not (rig["stub"] / "pane.env").exists()
+
+
+def test_the_triage_mode_refuses_an_issue_id(rig):
+    r = _launch(rig, args=("--triage", "i1"))
+    assert r.returncode == 1
+    assert "triage mode expects a triage id" in r.stderr
+    assert not (rig["stub"] / "pane.env").exists()
+
+
+def test_the_triage_mode_refuses_a_debugger_id(rig):
+    """The crossing that matters most: a d<N> is the class the fence GRANTS its token to, and a
+    triage flight is a tokenless session that acts on the queue unattended."""
+    (rig["run_root"] / "briefs" / "d7.md").write_text("diagnose")
+    r = _launch(rig, args=("--triage", "d7"))
+    assert r.returncode == 1
+    assert "triage mode expects a triage id" in r.stderr
+    assert not (rig["stub"] / "pane.env").exists()
+
+
+def test_the_cwd_mode_refuses_a_triage_id(rig):
+    (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
+    r = _launch(rig, args=("--cwd", str(rig["repo"]), "t3"))
+    assert r.returncode == 1
+    assert "debugger (d<N>) ids only" in r.stderr
+    assert not (rig["stub"] / "pane.env").exists()
+
+
+# ------------------------------------------------------- the t<N> session class (issue #448)
+
+def _tree_snapshot(root):
+    """Every path under `root` with its size and mtime — what "the working tree is untouched" has
+    to mean to be worth asserting. An existence check alone only proves nothing was DELETED; the
+    launcher could add or rewrite a file and it would pass (fresh-agent review, P2)."""
+    out = {}
+    for base, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(base, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            out[os.path.relpath(path, root)] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def test_the_triage_flight_runs_in_the_repos_real_checkout(rig):
+    """The RULED default home: the flight opens the checkout an orchestrator would open, so it
+    sees the gitignored working files a fresh worktree by definition cannot show.
+
+    And THE LAUNCHER opens it read-only. That is the issue's own hard boundary — "nothing this
+    issue builds may itself write to the working tree" — so the tree is compared whole (every path,
+    size and mtime) across the launch, not merely spot-checked for a survivor.
+
+    Scoped to the launcher deliberately, because that is all this can honestly measure: the
+    launcher returns as soon as the in-pane floor stamps its start sentinel, which
+    `start-session.sh` does BEFORE the agent runs, so the floor and the stub are still alive when
+    the second snapshot is taken. What the floor and `pretrust.sh` write is their own contract
+    (the Claude config store, `$SL_RUN_ROOT/state/**`, `$HOME/.superlooper` — none of them in the
+    checkout), and the FLIGHT's own read-only discipline in that tree is the brief's (part 2)."""
+    (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
+    (rig["repo"] / "notes.local").write_text("a gitignored working file\n")
+    before = _tree_snapshot(rig["repo"])
+    assert "notes.local" in before, "the rig must actually stage the overlay this is about"
+    r = _launch(rig, args=("--triage", "t3"))
+    assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
+    assert not (rig["run_root"] / "worktrees").exists(), "the checkout home creates no worktree"
+    assert (rig["stub"] / "cwd").read_text() == os.path.realpath(str(rig["repo"]))
+    assert (rig["run_root"] / "state" / "panes" / "t3").read_text() == "w9:p1"
+    after = _tree_snapshot(rig["repo"])
+    assert after == before, "the launch must not add, remove or rewrite one byte of the checkout"
+
+
+def test_a_worktree_home_gives_the_flight_a_detached_checkout(rig):
+    """The opt-out for a repo whose gitignored overlay is sensitive. DETACHED, because the flight
+    never commits, never pushes and must never create a ref of its own."""
+    (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
+    r = _launch(rig, args=("--triage", "t3"), extra_env={"SL_TRIAGE_HOME": "worktree"})
+    assert r.returncode == 0, f"rc={r.returncode}\n{r.stderr}"
+    wt = rig["run_root"] / "worktrees" / "t3"
+    assert wt.is_dir()
+    assert (rig["stub"] / "cwd").read_text() == str(wt)
+    head = subprocess.run(["git", "-C", str(wt), "symbolic-ref", "-q", "HEAD"],
+                          capture_output=True, text=True)
+    assert head.returncode != 0, "a triage worktree is detached — it is on no branch at all"
+
+
+def test_a_triage_home_the_launcher_cannot_read_refuses_rather_than_choosing_one(rig):
+    (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
+    r = _launch(rig, args=("--triage", "t3"), extra_env={"SL_TRIAGE_HOME": "Checkout"})
+    assert r.returncode == 1
+    assert "TRIAGE LAUNCH REFUSED: the triage home is not one this engine knows" in r.stderr
+    assert not (rig["stub"] / "pane.env").exists()
+
+
+def test_a_triage_flight_provably_never_receives_the_token(rig):
+    """DoD: no fence token and no host env variables reach a t<N> pane — asserted where it is
+    decided, in the environment the pane was actually handed."""
+    import session_host
+    (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
+    r = _launch(rig, args=("--triage", "t3"))
+    assert r.returncode == 0, r.stderr
+    env = _pane_env(rig)
+    assert session_host.API_TOKEN_ENV_VAR not in env
+    assert session_host.API_TOKEN_FILE_ENV_VAR not in env
+    assert not [k for k in env if k.startswith("HERDR")], \
+        "no host variable of ours reaches a triage pane"
+    assert env["SL_ISSUE_ID"] == "t3"
+
+
+def test_a_triage_flight_bumps_no_issue_counter(rig):
+    import loopstate
+    (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
+    r = _launch(rig, args=("--triage", "t3"))
+    assert r.returncode == 0, r.stderr
+    st = loopstate.load(str(rig["run_root"] / "state" / "issues.json"))
+    assert "t3" not in st["issues"]
+    assert st["issues"]["i1"].get("launches", 0) == 0
+
+
 # --------------------------------------------------------------------------- the two d<N> paths
 
 def test_the_debugger_path_launches_in_place_with_no_worktree(rig):
