@@ -193,3 +193,12 @@ def test_fixture_journal_digest_is_coherent():
     assert d["counts"]["parks"] == 1                      # i7 parked
     kinds = {e["kind"] for e in d["exceptions"]}
     assert {"park", "go_around"} <= kinds
+
+
+def test_an_integer_ts_no_float_can_hold_never_raises():
+    # The fourth corrupt-ts shape (issue #458 review round 3): json.loads parses an arbitrarily
+    # large integer and math.isfinite RAISES on it. The digest endpoint reads the same journal.
+    out = digest.build_digest([{"ts": 10 ** 309, "act": "merge", "id": "i1", "num": 1,
+                                "outcome": "ok"}],
+                              slug="o/r", name="r", start=0, end=10 ** 12)
+    assert isinstance(out, dict)

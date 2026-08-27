@@ -162,3 +162,109 @@ def test_the_box_names_the_verb_and_what_it_will_do():
     low = _FIXER_JS.lower()
     assert "sl-debugger" in low, "the box must name what it launches, in the owner's own vocabulary"
     assert "deploy fixer" in low or "deploy" in low
+
+
+# =============================== the tap renders its outcome (issue #458) ===============================
+#
+# On 2026-08-26 the owner tapped Deploy Fixer during a Claude-auth outage. The request was consumed,
+# the engine attempted the launch, the attempt failed, the failure was journaled — and the dashboard
+# showed nothing. The mechanism was structural: the ONLY surface that ever named a result was the
+# note box above, and a close, a page reload or a superseding open threw it away. "Seems to have
+# done nothing" about a button that did something is the dishonest surface this project keeps
+# killing, so the outcome now rides the SNAPSHOT and renders beside the button that was tapped.
+#
+# Every semantic is the server's (``lib/fixer.last_launch`` → ``trouble.fixer``): the sentence, the
+# headline, whether an open-session affordance is honest. These guards pin that the shipped bundle
+# BINDS them and derives nothing.
+
+def _trouble_body():
+    m = re.search(r"function troubleHTML\(s\)\s*\{(.+?)\n  \}", _SHELL_JS, re.S)
+    assert m, "troubleHTML must still exist — it is where the button lives"
+    return m.group(1)
+
+
+def _fixer_outcome_body():
+    """The renderer's CODE — whole-line comments stripped, because the header legitimately explains
+    the outcome vocabulary it must not itself compose."""
+    code = re.sub(r"(?m)^\s*//.*$", "", _SHELL_JS)
+    m = re.search(r"function fixerOutcomeHTML\([^)]*\)\s*\{(.+?)\n  \}", code, re.S)
+    assert m, ("shell.js must render the Deploy Fixer outcome (fixerOutcomeHTML) — a tap the "
+               "machine consumed must never be followed by silence")
+    return m.group(1)
+
+
+def test_the_outcome_renders_in_the_banner_the_button_was_tapped_from():
+    body = _trouble_body()
+    assert "fixerOutcomeHTML" in body, (
+        "the last tap's outcome must render INSIDE the trouble banner — the surface the Deploy "
+        "Fixer button lives on (tap-where-you-read, §0.3), not in a dialog that a close throws away")
+    assert re.search(r"fixerOutcomeHTML\([^)]*\.fixer", body), (
+        "it must bind trouble.fixer — the SERVER's block for the repo the banner is naming")
+
+
+def test_the_sentence_is_the_servers_never_composed_in_the_pixels():
+    body = _fixer_outcome_body()
+    assert re.search(r"\.text\b", body), "the banner must bind the server's finished sentence"
+    for invented in ("did not launch", "deployed", "launched", "outcome not yet"):
+        assert invented not in body.lower(), (
+            "the JS must not compose its own verdict wording (%r) — lib/fixer owns every sentence, "
+            "so the banner and the tower log can never disagree about one launch" % invented)
+
+
+def test_all_three_outcomes_reach_the_owner_and_none_of_them_is_silence():
+    body = _fixer_outcome_body()
+    # The ONE early return allowed is "there has never been a tap" — the honest absence of a launch.
+    early = re.findall(r"if\s*\(([^)]*)\)\s*return\s*\"\";", body)
+    assert early, "the renderer must return nothing only when there is no tap to report"
+    for guard in early:
+        assert "present" in guard, (
+            "an outcome may never be suppressed by the pixels — the only silence allowed is a repo "
+            "that has never had a tap (%r)" % guard)
+    assert "outcome" in body, "the outcome must reach the markup so each state can read differently"
+
+
+def test_a_launched_fixer_gets_the_same_open_session_affordance_a_flight_card_has():
+    body = _fixer_outcome_body()
+    assert "session-window" in body, (
+        "a launched fixer must offer the SAME verb the flight card already has — naming a live "
+        "session and offering no way into it is half an answer")
+    assert "data-fixer" in body, "the affordance must target the fixer's own d<N> seat"
+    assert re.search(r"\.session\b", body), (
+        "the affordance must be gated on the SERVER's `session` flag — the one state in which "
+        "offering to open a window is honest (a confirmed launch with a named lane)")
+
+
+def test_the_affordance_is_never_offered_for_a_launch_that_did_not_happen():
+    body = _fixer_outcome_body()
+    # The gate must be a CONDITION on the button, not a button with a condition inside it.
+    m = re.search(r"\.session\b[\s\S]{0,120}session-window", body)
+    assert m, "the open-session button must be produced only under the `session` gate"
+
+
+def test_the_verb_the_affordance_fires_is_the_one_already_tested():
+    assert 'act === "session-window"' in _SHELL_JS, (
+        "the fixer's window must ride the existing session-window dispatch — one verb, one tested "
+        "handler, not a second copy of the engine's four outcomes")
+    m = re.search(r"function doSessionWindow\(([^)]*)\)\s*\{(.+?)\n  \}", _SHELL_JS, re.S)
+    assert m, "doSessionWindow must still exist"
+    assert "fixer" in m.group(2), (
+        "the handler must be able to name a fixer seat, so the POST carries `fixer` instead of `num`")
+
+
+def test_the_outcome_has_a_style_of_its_own_in_all_three_states():
+    assert ".trouble-fixer" in _CSS, "the outcome strip needs its own style hook"
+    for state in ("launched", "failed", "pending"):
+        assert re.search(r"\.trouble-fixer\.%s\b" % state, _CSS), (
+            "the %r outcome must be visually distinct — three states that look identical are one "
+            "state wearing three names" % state)
+
+
+def test_the_affordance_targets_the_servers_canonical_seat_not_the_journals_own_string():
+    # Fresh-agent review (P1). `id` is whatever the journal line carried; `lane` is the seat the
+    # server canonicalised through the SAME fence the endpoint validates against. Binding `id` here
+    # would ship a button that 400s the moment a record carries an id the route refuses.
+    body = _fixer_outcome_body()
+    assert re.search(r"data-fixer=\"'\s*\+\s*esc\(f\.lane\)", body), (
+        "the open-session button must carry f.lane — the server's canonical d<N> seat")
+    assert not re.search(r"data-fixer=\"'\s*\+\s*esc\(f\.id\)", body), (
+        "it must never put the journal's raw id on the wire")

@@ -35,6 +35,7 @@ import cards as cards_mod
 import config as config_mod
 import digest as digest_mod
 import engine as engine_mod
+import fixer as fixer_mod
 import flights
 import launch_rules
 import notify as notify_mod
@@ -43,6 +44,7 @@ import readers
 import review_marker
 import runner_source
 import replay as replay_mod
+import session_window as session_window_mod
 import tower as tower_mod
 import truth
 import version as version_mod
@@ -66,8 +68,18 @@ def _resp(status, content_type, body, headers=None):
 def _finite(v):
     """``True`` only for a real, finite number (never a bool, never NaN/Infinity). ``json.loads``
     accepts ``NaN``/``Infinity``, so a corrupt journal ts can be a non-finite float — every ts/age
-    the server does arithmetic on is screened through this so one bad line can't crash a snapshot."""
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    the server does arithmetic on is screened through this so one bad line can't crash a snapshot.
+
+    ``OverflowError`` is caught because json.loads also parses an arbitrarily large INTEGER, and
+    ``math.isfinite(10**309)`` RAISES rather than answering False — so the one screen standing
+    between a corrupt journal line and a 500 was itself the thing that crashed (fresh-agent review,
+    issue #458). A number no float can hold is not a usable timestamp: the honest answer is False."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
 
 
 def format_duration(seconds):
@@ -187,7 +199,8 @@ _FIXER_PATHS = {"/api/fixer/check": "preflight", "/api/fixer": "execute"}
 # flight's own window to the front (owner ruling 2026-07-30: a button on the card that opens that
 # session's window — attach, which is proven — instead of observe-stream plumbing). There is no
 # preflight and no confirm gate because the verb changes nothing about the loop: it opens a window
-# the owner already owns.
+# the owner already owns. Since issue #458 it also takes a launched FIXER's own `d<N>` seat, so the
+# fixer the trouble banner now names can be opened from the banner too — one verb, two lane shapes.
 _SESSION_WINDOW_PATH = "/api/session-window"
 
 
@@ -340,7 +353,14 @@ def _route_session_window(body_bytes, session_window):
     turns that into the engine's ``--id`` — so no string from a request body can ever become a
     subprocess argument. A lane with no window (a session that never launched, or one already
     closed) is the verb's own honest ``ok: false`` body at 200 — the request itself was fine —
-    never an HTTP error and never a silent success."""
+    never an HTTP error and never a silent success.
+
+    Since issue #458 a second target is accepted: ``fixer``, a launched fixer's own ``d<N>`` seat,
+    so the outcome the trouble banner now names can also be opened from there. A fixer id cannot be
+    derived from a number (the engine mints it), so it arrives as a string — and is put through
+    ``lib.session_window.debugger_lane_id`` HERE, which rebuilds it from a parsed integer. The
+    bright line is unchanged: what reaches argv is a string this process composed. The explicit
+    seat wins over any ``num`` in the same body, so one tap can never resolve two ways."""
     if session_window is None:
         return _resp(405, "text/plain", "method not allowed", {"Allow": "GET, HEAD"})
     payload, err = _parse_json_body(body_bytes)
@@ -349,6 +369,11 @@ def _route_session_window(body_bytes, session_window):
     repo = payload.get("repo")
     if not isinstance(repo, str) or not repo.strip():
         return _json_resp(400, {"ok": False, "error": "missing 'repo'"})
+    if "fixer" in payload:
+        sid = session_window_mod.debugger_lane_id(payload.get("fixer"))
+        if sid is None:
+            return _json_resp(400, {"ok": False, "error": "bad 'fixer'"})
+        return _json_resp(200, session_window.open_debugger(repo, sid))
     num = _num_of(payload)
     if num is None:
         return _json_resp(400, {"ok": False, "error": "missing or bad 'num'"})
@@ -1465,6 +1490,20 @@ def _flight_phase(source, iid):
     return reader(iid) if callable(reader) else None
 
 
+def _fixer_block(records, now):
+    """What became of this repo's last Deploy Fixer tap, ready for the surface to bind (issue #458).
+
+    The gloss is ``lib/fixer.last_launch`` — pure, clock-free, and fed the journal slice the caller
+    ALREADY read. The two display stamps are added here, exactly as :func:`_needs_you` adds its age
+    numeral: a stated outcome with no time behind it is a fact the owner cannot place, and a JS that
+    computed one would be deriving a semantic (design record B.1)."""
+    block = fixer_mod.last_launch(records)
+    ts = block["ts"]
+    block["hhmm"] = _hhmm(ts) if ts is not None else ""
+    block["age_seconds"] = (now - ts) if (ts is not None and _finite(now - ts)) else None
+    return block
+
+
 def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concluded=None):
     """Fold one repo's state home into its snapshot slice: flights (each with its drawer), boards,
     tower window (with the since-you-last-looked divider against ``last_seen``), shipped delta,
@@ -1686,6 +1725,13 @@ def _assemble_repo(repo, config, now, gh_mod, diff_reader, last_seen=None, concl
         "field_landmarks": flights.field_landmarks(repo_flights),
         "tower_log": tower_rows,
         "tower_new": tower_new,
+        # What became of the last Deploy Fixer tap (issue #458). Derived from the SAME
+        # ``debug_launch`` records the tower log is glossed from — one read, two renderings,
+        # so the button's own surface and the comms feed can never disagree about a launch.
+        # Before this the ONLY surface that named a result was the note box, and a close, a
+        # reload or a superseding open threw it away: on 2026-08-26 a tap during an auth
+        # outage was consumed, attempted, failed and journaled, and the board said nothing.
+        "fixer": _fixer_block(journal, now),
         "shipped": flights.corner_stats(journal, now=now),
         "incident": flights.incident_stats(journal),
         "state": state,
@@ -1905,6 +1951,16 @@ def _live_cargo(all_flights):
     return {"present": present, "added": added, "removed": removed}
 
 
+def _offender_fixer(repo_snaps, slug, now):
+    """The fixer-launch block for the repo the trouble banner is NAMING — never the camera's repo.
+    An offender we have no slice for yields the honest absent block (every key present), so the
+    banner binds the same shape whatever the field looks like."""
+    for rs in repo_snaps:
+        if rs.get("slug") == slug:
+            return rs["fixer"]
+    return _fixer_block([], now)
+
+
 def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=None, desk=None,
                       concluded=None, version=None, engine=None):
     """Compose the whole snapshot the front-end binds. Reads FRESH local state every call; ``gh_mod``
@@ -1963,6 +2019,12 @@ def assemble_snapshot(config, *, now=None, gh_mod=None, usage=None, diff_reader=
                    # own choice as damage. STOP NOT TAKEN is deliberately still fixable: an off
                    # switch that would not hold IS a patient (issue #365).
                    "fixable": state != flights.STOPPED,
+                   # What the LAST tap of this banner's own button did (issue #458). The button
+                   # lives here (tap-where-you-read, §0.3), so its outcome has to live here too:
+                   # a tap the machine consumed must never be followed by silence at the place it
+                   # was made. The block is the OFFENDING repo's, the same repo the button targets,
+                   # so the sentence and the tap can never be about two different patients.
+                   "fixer": _offender_fixer(repo_snaps, pill["offender"], now),
                    "text": "%s · %s" % (_TROUBLE_TEXT.get(state, state), pill["offender"])}
 
     # A whole-field GitHub-reachability aggregate (issue #38): gh is one binary/auth for every repo,

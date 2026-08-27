@@ -582,3 +582,34 @@ def test_the_four_engine_level_acts_survive_corrupt_records():
         row = tower.comms_row(rec)
         assert row["text"].strip(), rec
         assert "None" not in row["text"], rec
+
+
+def test_a_fixer_launch_the_engine_never_named_is_not_reported_as_a_failure():
+    # Issue #458. The engine journals exactly two outcomes today (`launched` / `launch_failed`), and
+    # this gloss read EVERYTHING else — a record with no outcome, or a word a newer engine invents —
+    # as "did not launch". That is a claim the record does not support, and once the trouble banner
+    # started reading the same act it became a contradiction between two surfaces about ONE launch.
+    # The classification is now `lib/fixer.launch_outcome`, shared by both, so it can only be made
+    # once.
+    row = tower.comms_row({"act": "debug_launch", "id": "d9", "operator": "William"})
+    low = row["text"].lower()
+    assert "did not launch" not in low, "an unrecorded outcome is not a failure"
+    assert "deployed" not in low, "and it is certainly not a session that exists"
+    assert "d9" in row["text"] and row["text"], "it must still render — silence is the worse answer"
+
+
+def test_a_fixer_launch_outcome_from_a_newer_engine_is_quoted_not_translated():
+    row = tower.comms_row({"act": "debug_launch", "id": "d9", "outcome": "queued"})
+    assert "queued" in row["text"]
+    assert "did not launch" not in row["text"].lower()
+
+
+def test_the_divider_survives_an_integer_timestamp_no_float_can_hold():
+    # Fresh-agent review round 3 (P1). `math.isfinite(10**309)` RAISES OverflowError, and this
+    # helper runs on the 2-second snapshot poll the moment a tower watermark exists — so one corrupt
+    # journal line 500'd the whole board. The precedent for the guard is `flights._stop_epoch`,
+    # which a prior fresh reviewer hardened against the identical shape.
+    rows = [{"ts": 10 ** 309, "tier": "comms"}, {"ts": 20, "tier": "comms"}]
+    assert tower.apply_divider(rows, 10) == 1          # must not raise
+    assert rows[0].get("fresh") is False, "a ts no float can hold is not newer than anything"
+    assert rows[1]["fresh"] is True and rows[1].get("divider") is True

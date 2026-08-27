@@ -50,6 +50,14 @@ What remains here:
 * **The dashboard's OWN launch log.** Beside ``desk.json``, never inside a loop state home
   (decision B.4). The engine journals the tap in the tower log; this is the center's own record of
   what its own button did, including the failures.
+* **What became of the last tap** (:func:`last_launch`, issue #458). A pure read of the ENGINE's
+  ``debug_launch`` acts — the records the snapshot assembler already holds — turned into the one
+  sentence the trouble banner binds beside the button. On 2026-08-26 a tap during a Claude-auth
+  outage was consumed, attempted, failed and journaled, and the board said nothing: the only surface
+  that had ever named a result was the note box, and a close or a reload threw it away. Deriving the
+  answer from the journal rather than from this module's own log is what keeps the banner and the
+  tower log from being able to disagree about one launch — and what keeps the fix free of any new
+  read.
 
 Bright lines this module encodes (not conveniences):
 
@@ -69,6 +77,7 @@ import time
 from pathlib import Path
 
 import flights
+import session_window
 
 # Per-call hard timeout (seconds) for the CLI, which opens a session window and VERIFIES delivery. A
 # module constant, not a literal, so a test can shrink it and trip the timeout path (mirrors
@@ -304,8 +313,8 @@ class Fixer:
         return out
 
     def _stamp(self):
-        ts = self._now() if callable(self._now) else self._now
-        return ts if isinstance(ts, (int, float)) and math.isfinite(ts) else time.time()
+        ts = _usable_ts(self._now() if callable(self._now) else self._now)
+        return ts if ts is not None else time.time()
 
     def _record(self, ts, repo, fixer_id, note, ctx, ok, error=None):
         """Append one launch record to the dashboard's own log — timestamped, with the note and the
@@ -394,3 +403,170 @@ class Fixer:
             return res
         self._record(ts, repo, res.get("id"), sent_note, ctx, False, error=res.get("error"))
         return res
+
+
+# =============================== what became of the tap (issue #458) ===============================
+#
+# The tap has to RENDER ITS OUTCOME. On 2026-08-26 the owner tapped Deploy Fixer during a
+# Claude-auth outage: the request was consumed, the engine attempted the launch, the attempt failed,
+# the failure was journaled — and the dashboard showed nothing. The only surface that had ever named
+# a result was the note box itself, and a close, a page reload or a superseding open threw it away;
+# "seems to have done nothing" about a button that did something is exactly the dishonest surface
+# this project keeps killing.
+#
+# So the outcome is derived from the ENGINE's own ``debug_launch`` acts, which the snapshot
+# assembler already reads for the tower log — no new read anywhere, and no second source of truth
+# that could disagree with the tower's own sentence about the same launch. Pure and clock-free
+# (design record B.1: semantics server-side, so the JS binds a finished sentence and derives
+# nothing); the caller stamps the display time from the record's ``ts``.
+
+LAUNCH_ACT = "debug_launch"
+
+# The three states the button's surface can be in. PENDING is the one that must exist: the engine
+# journals an outcome only AFTER the launch has resolved, and a later engine may journal a word this
+# build has never met. Reading either as "failed" claims something we cannot support, and rendering
+# neither is the silence this issue exists to kill.
+LAUNCHED = "launched"
+FAILED = "failed"
+PENDING = "pending"
+
+# The engine's own words for the two outcomes it currently journals (skill/bin/superlooper ▸
+# cmd_debug). Anything else — a missing outcome, a blank one, a word from a newer engine — is
+# PENDING, in that engine's own word.
+_ENGINE_LAUNCHED = "launched"
+_ENGINE_FAILED = "launch_failed"
+
+_HEADLINES = {LAUNCHED: "FIXER DEPLOYED", FAILED: "FIXER DID NOT LAUNCH",
+              PENDING: "FIXER OUTCOME UNKNOWN"}
+
+# A journaled reason is a message, not a manuscript: a shim that hands back a traceback must not be
+# able to take over the banner it is being reported in.
+REASON_MAX = 200
+
+
+def _one_line(text, limit=REASON_MAX):
+    """The first non-empty line of a journaled field, trimmed and bounded — ``""`` when the field
+    says nothing. The banner is one line; a multi-line stderr would otherwise break it apart."""
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if line:
+            return (line[:limit - 1].rstrip() + "…") if len(line) > limit else line
+    return ""
+
+
+def launch_outcome(rec):
+    """Which of the three states a ``debug_launch`` record is in — :data:`LAUNCHED`,
+    :data:`FAILED` or :data:`PENDING`. PURE.
+
+    Exported because TWO surfaces gloss the same record: the trouble banner (through
+    :func:`last_launch`) and the tower log (``lib/tower``). Making the call twice is how they end up
+    disagreeing about one launch in the same 2-second frame — which is exactly what happened before
+    issue #458, when the tower read every word that was not the literal ``launched`` as "did not
+    launch" and the banner had learned to say "not yet known"."""
+    recorded = _one_line((rec or {}).get("outcome"), 60)
+    if recorded == _ENGINE_LAUNCHED:
+        return LAUNCHED
+    return FAILED if recorded == _ENGINE_FAILED else PENDING
+
+
+def _usable_ts(ts):
+    """A journal ``ts`` that arithmetic can safely touch, else ``None``. The journal is append-only
+    text a crashing runner writes, so every shape it can carry has to answer rather than raise:
+    ``json.loads`` accepts ``NaN``/``Infinity``, AND parses an arbitrarily large integer for which
+    ``math.isfinite`` itself raises ``OverflowError`` (fresh-agent review, issue #458). One corrupt
+    line must never take down the 2-second poll — least of all on the record this surface exists to
+    render."""
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    try:
+        return ts if math.isfinite(ts) else None
+    except OverflowError:
+        return None
+
+
+def _blank_launch():
+    """The absent block — every key present, so a caller never branches on a missing one (the shape
+    ``lib/session_window`` holds for the same reason)."""
+    return {"present": False, "outcome": None, "id": None, "lane": None, "operator": None,
+            "ts": None, "reason": "", "recorded": "", "headline": "", "text": "", "session": False}
+
+
+def _launch_sentence(outcome, name, operator, reason, recorded, lane):
+    """The one plain sentence the surface binds, composed HERE so the wording is pinned by a test and
+    the pixels carry no opinion about what a launch outcome means."""
+    if outcome == LAUNCHED:
+        by = (" by %s" % operator) if operator else ""
+        if lane:
+            return "%s launched%s — it has its own session window." % (name, by)
+        # The engine's word stands — a session launched — but the record names no seat this board
+        # can point at, so there is no way in to offer. Saying so is the honest half of that: a
+        # sentence that promised a window while the button was missing would be the same over-claim
+        # this issue exists to kill (fresh-agent review, P1).
+        return ("%s launched%s — it has its own session window, but the journal records no seat "
+                "this board can open." % (name, by))
+    if outcome == FAILED:
+        return "%s did not launch — %s." % (name, reason)
+    if recorded:
+        # An outcome a newer engine invented. Quote it rather than translate it: this build cannot
+        # honestly call it a launch or a failure, and pretending either way is the worse answer.
+        return ("%s — outcome not yet known (the engine recorded “%s”); nothing has "
+                "confirmed a session." % (name, recorded))
+    return ("%s — the launch is recorded with no outcome beside it; nothing has confirmed a "
+            "session." % name)
+
+
+def last_launch(records):
+    """The NEWEST fixer launch in ``records`` and what became of it — the block the tap surface
+    binds so a tap is never followed by silence.
+
+    ``records`` is one repo's journal slice, exactly as the assembler already read it. The journal is
+    append-only, so the last ``debug_launch`` line in file order is the newest one (the same rule
+    ``server._last_ts`` uses); a rewritten ``ts`` cannot reorder it.
+
+    Three outcomes, and none of them is nothing:
+
+    ``launched``   the engine confirmed a session and named it. ``session`` is True — and ONLY here
+                   — because that is the one state in which offering to open a window is honest
+    ``failed``     the engine said the launch did not land, in the words IT journaled. A record with
+                   no reason still says it failed, with an honest stand-in rather than a blank
+    ``pending``    the outcome is not one this build can read: absent, blank, or a word a newer
+                   engine invented. Rendering it as a failure would claim what we cannot support
+
+    ``present`` is False when this repo has never had a tap — the honest absence of a launch, which
+    is not the same as saying nothing about one that happened.
+    """
+    rec = None
+    for r in records or []:
+        if isinstance(r, dict) and r.get("act") == LAUNCH_ACT:
+            rec = r                                   # file order: the last match is the newest
+    if rec is None:
+        return _blank_launch()
+
+    recorded = _one_line(rec.get("outcome"), 60)
+    outcome = launch_outcome(rec)
+
+    sid = rec.get("id")
+    sid = sid.strip() if isinstance(sid, str) and sid.strip() else None
+    operator = rec.get("operator")
+    operator = operator.strip() if isinstance(operator, str) and operator.strip() else None
+    # A launch that failed with nothing said is still a launch that failed — the engine's own
+    # fallback wording, so the banner and the tower log read the same on the same record.
+    reason = _one_line(rec.get("error")) if outcome == FAILED else ""
+    if outcome == FAILED and not reason:
+        reason = "no session was confirmed"
+    ts = _usable_ts(rec.get("ts"))
+
+    name = ("Fixer %s" % sid) if sid else "The fixer"
+    # The seat the open-session affordance may target, canonicalised by the SAME fence the route
+    # validates against (``lib/session_window.debugger_lane_id``) — one definition of what a fixer
+    # seat is, so the surface can never offer a button the endpoint behind it refuses. ``id`` stays
+    # the journal's own string (that is what the record says); ``lane`` is what may go on a wire.
+    lane = session_window.debugger_lane_id(sid) if outcome == LAUNCHED else None
+    return {"present": True, "outcome": outcome, "id": sid, "lane": lane, "operator": operator,
+            "ts": ts, "reason": reason, "recorded": recorded, "headline": _HEADLINES[outcome],
+            "text": _launch_sentence(outcome, name, operator, reason, recorded, lane),
+            # The open-session affordance the flight card already has, offered for the fixer's own
+            # d<N> lane — but only on a launch the engine CONFIRMED and named with a seat this board
+            # can actually open. On a failure it would point at a window that was never opened; on a
+            # corrupt id it would be a dead control that 400s when tapped.
+            "session": lane is not None}

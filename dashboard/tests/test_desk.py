@@ -85,3 +85,12 @@ def test_default_path_lives_under_sl_home(tmp_path, monkeypatch):
     p = desk.default_path()
     assert str(p).startswith(str(tmp_path))
     assert p.name == "desk.json"
+
+
+def test_a_watermark_no_float_can_hold_is_ignored(tmp_path):
+    # desk.json is a local file a hand-edit can corrupt, and `math.isfinite` RAISES on an integer
+    # too large to convert to a float — so this screen had to answer rather than crash the boot
+    # that reads it (issue #458 review round 3).
+    p = tmp_path / "desk.json"
+    p.write_text('{"tower_last_seen": %d}' % 10 ** 309)
+    assert desk.Desk(str(p)).tower_last_seen() is None

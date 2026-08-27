@@ -271,3 +271,66 @@ def test_the_verb_makes_exactly_one_call_and_it_changes_nothing(fixtures):
     assert len(ran) == 1
     assert ran[0]["argv"][0] == "focus-session", (
         "focus-session is the engine's read-only door; no other verb belongs on this path")
+
+
+# =============================== the fixer's own seat (issue #458) ===============================
+#
+# A Deploy Fixer tap that LANDS puts an interactive sl-debugger session on the field, and the
+# dashboard now names it at the button (``lib/fixer.last_launch``). Naming it and then offering no
+# way in would be half an answer, so the launched fixer gets the same open-session affordance the
+# flight card already has — pointed at its own lane.
+#
+# A debugger seat is a ``d<N>`` lane, not a flight number. The engine has always resolved both
+# (``skill/lib/focus.LANE_ID_RE`` is ``^[id][0-9]+$``, and focusing is read-only, so unlike ``tidy``
+# — which CLOSES, and deliberately leaves a debugger seat alone — there is nothing here a d-lane
+# needs protecting from). What is new is only that the dashboard can now ASK for one, behind the
+# same fence: an id is REBUILT from an integer, so no string from a request body reaches argv.
+
+def test_debugger_lane_id_derives_the_engine_argument_from_a_fixer_id():
+    assert sw.debugger_lane_id("d4") == "d4"
+    assert sw.debugger_lane_id(" d12 ") == "d12"          # a trimmed body string is still a d-lane
+
+
+@pytest.mark.parametrize("bad", [None, True, False, 4, 1.5, "", "  ", "i4", "d", "dd4", "d4x",
+                                 "d-1", "d 4", "d4; rm -rf /", "d²", {"id": "d4"}, "d" + "9" * 40])
+def test_debugger_lane_id_refuses_anything_that_is_not_a_fixer_seat(bad):
+    # The same fence ``lane_id`` draws, for the other lane shape: only a d followed by digits — of a
+    # sane length — becomes an id, and the returned string is REBUILT from the parsed integer, so
+    # the caller's own bytes never reach the subprocess.
+    assert sw.debugger_lane_id(bad) is None
+
+
+def test_a_body_string_can_never_become_the_fixers_target(fixtures):
+    res = verb().open_debugger(SLUG, "d4 --repo /somewhere/else")
+    assert res["ok"] is False
+    assert calls(fixtures) == [], "nothing may run for a target that is not a fixer seat"
+
+
+def test_opening_a_fixers_window_shells_the_same_read_only_verb(fixtures):
+    res = verb(binary=FAKE).open_debugger(SLUG, "d4")
+    argv = calls(fixtures)[0]["argv"]
+    assert argv[:2] == ["focus-session", "--repo"]
+    assert argv[2] == PATH
+    assert "--id" in argv and argv[argv.index("--id") + 1] == "d4"
+    assert res["ok"] is True and res["id"] == "d4"
+    assert "d4" in res["message"], "the sentence must name the fixer the owner tapped"
+
+
+def test_a_fixer_whose_window_is_gone_reads_as_a_fact_not_a_failure(fixtures, monkeypatch):
+    monkeypatch.setenv("SL_FOCUS_OUTCOME", "no_window")
+    res = verb(binary=FAKE).open_debugger(SLUG, "d4")
+    assert res["ok"] is False and res["outcome"] == "no_window"
+    assert res["message"] and "no session window is recorded" in res["message"]
+
+
+def test_the_fixer_answer_carries_the_same_keys_as_a_flights(fixtures):
+    flight = verb(binary=FAKE).open(SLUG, 340)
+    fixer = verb(binary=FAKE).open_debugger(SLUG, "d4")
+    assert set(flight) == set(fixer)
+    assert fixer["num"] is None, "a debugger seat is not a flight — it must not borrow a number"
+
+
+def test_an_unwatched_repo_is_refused_before_any_subprocess_for_a_fixer_too(fixtures):
+    res = sw.SessionWindow(FAKE, {}).open_debugger(SLUG, "d4")
+    assert res["ok"] is False and res["error"] == "unknown repo"
+    assert calls(fixtures) == []

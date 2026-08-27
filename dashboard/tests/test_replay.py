@@ -234,3 +234,12 @@ def test_fixture_journal_reconstructs_a_coherent_movie():
     # i7 was parked; i16 regenerated (attempt 2).
     assert by_num[7]["stage"] == flights.PARKED
     assert by_num[16]["label"] == flights.flight_label(16, 2)
+
+
+def test_an_integer_ts_no_float_can_hold_never_raises():
+    # The fourth corrupt-ts shape (issue #458 review round 3): json.loads parses an arbitrarily
+    # large integer and math.isfinite RAISES on it. The replay endpoint reads the same journal.
+    out = replay.build_replay([{"ts": 10 ** 309, "act": "merge", "id": "i1", "num": 1,
+                               "outcome": "ok"}],
+                              slug="o/r", name="r", start=0, end=10 ** 12)
+    assert isinstance(out, dict)
