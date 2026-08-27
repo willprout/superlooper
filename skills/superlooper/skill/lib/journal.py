@@ -212,8 +212,9 @@ def rotate(state_home, now, retain_seconds=HOT_RETAIN_SECONDS):
     not have arrived, and never a recovery record (that edge keys on a delivery actually seen). Losing a foreign spawner's verified DELIVERY (`launched` /
     `resumed`) is the direction that costs something: the streak keeps refusals that delivery
     already answered, so a hold persists or re-arms over a machine that did start a session. Both
-    are bounded by the next flight — the #115 probe clears the streak on its own — and the window
-    is milliseconds, four times a day, against a runner that is this file's dominant writer.
+    are bounded by the next flight that starts a session — usually the #115 probe, though a machine
+    with nothing approved and every lane alive has none to make — and the window is milliseconds,
+    four times a day, against a runner that is this file's dominant writer.
 
     Concurrency caveat: unlike append() (lock-free, O_APPEND-atomic across processes), the read ->
     os.replace here is NOT atomic against a CONCURRENT appender in another process (watchdog / a

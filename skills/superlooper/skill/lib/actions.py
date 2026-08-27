@@ -1883,8 +1883,21 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         isinstance(p, dict) and isinstance(p.get("labels"), list) and "in-progress" in p["labels"]
         for p in parsed_by_id.values()) or any(
         _iid_num(k) is not None and _status_of(ist_of(k)) not in TERMINAL_STATUSES for k in exited)
-    systemic_auth_death = (attempt_streak and auth_death_demand
-                           and (episode_active or auth_unconfirmed) and not already_named)
+    # THE CONJUNCT LATCHES, exactly as its usage sibling does. `episode_active` continues on
+    # `prev_dark`, the durable usage_stale marker, precisely so a dark-meter episode cannot flap;
+    # this one had no equivalent, and it is read from a 5-second `claude auth status` subprocess
+    # refreshed every 60 s that reports `unknown` on any timeout. Re-evaluated fresh every tick in
+    # the shape this class is FOR — the runner launching nothing, so no flight ever settles it — a
+    # probe flipping unknown/logged_in raised, retracted and re-raised once a minute, journalling a
+    # lift each time and landing the launch-cap parks it had been suppressing on every release.
+    #
+    # So the conjunct decides whether the episode OPENS; once the durable ALERT names it, only the
+    # streak ends it — and the streak ends on exactly one thing, a session starting. That is also
+    # what its exit record claims, so the lifecycle and the claim are one fact. The #115 probe is
+    # what supplies that fact on a machine that has recovered.
+    auth_death_standing = AUTH_DEATH_ALERT_REASON in _dget(alert_on_disk, "reasons", list)
+    systemic_auth_death = (attempt_streak and auth_death_demand and not already_named
+                           and (episode_active or auth_unconfirmed or auth_death_standing))
     # ONE degraded mode for every detector above: hold every fresh launch and suppress the
     # per-issue launch-cap park (phases D+E), so the queue is left intact for when the cause clears.
     launch_degraded = anchor_down or systemic_launch or systemic_env or systemic_auth_death
@@ -2209,31 +2222,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                               "still stands. The per-issue launch-cap parks this hold was "
                               "suppressing resume with it: a lane already at its cap parks on this "
                               "tick and needs re-approving."})
-    # (#457) ...and the OTHER way this class's hold ends: its CONJUNCT falls while the streak still
-    # stands. NB the demand conjunct is excluded here on purpose — demand going away (the last lane
-    # parks, the queue empties) is not a lift, it is a queue with nothing to hold, and this class
-    # retracts its page then for the same reason `launch_anchor_down` and `auth_dead` do. It
-    # re-raises when work is next approved and the machine is still refusing, which is one extra
-    # page across an outage that spans an empty queue — the price those two already pay.
-    #
-    # The remaining case is a real lift: its conjunct falls while the streak still stands — the meter reads again, or `claude auth status` finally confirms the account. That is
-    # a real lift (launching resumes on the same tick) but it is NOT a verified delivery, so it may
-    # not borrow the record below. Without one of its own the alert simply retracted and the journal
-    # said nothing at all, which is the silence LAUNCH_HOLD_ALERT_REASONS exists to prevent. Deduped
-    # by the same durable marker every edge here uses: once section A rewrites the ALERT this reads
-    # False. Guarded on `already_named` so a narrower class TAKING the naming is never read as a
-    # lift — that is a worsening outage, not an ending one.
-    if (AUTH_DEATH_ALERT_REASON in prev_alert_reasons and attempt_streak and auth_death_demand
-            and not systemic_auth_death and not already_named):
-        out.append({"act": "launch_recovered",
-                    "reason": "the machine-wide credential hold no longer stands: the usage meter "
-                              "reads again and/or `claude auth status` confirms the account. NOT a "
-                              "verified delivery — the launch-refusal streak is unchanged, so if "
-                              "flights are still refusing this will re-arm. Normal launching "
-                              "resumes unless a separate hold (a dead anchor, a sleeping display) "
-                              "still stands — and with it the per-issue launch-cap parks this hold "
-                              "had been suppressing: a lane already at its cap parks on this tick "
-                              "and needs re-approving."})
+    # There is no second edge any more. An earlier cut journalled one when this class's CONJUNCT
+    # fell while the streak stood — but with the conjunct LATCHED (see its note above), a hold that
+    # is standing ends on the streak and nothing else, so that record has no event left to describe.
+    # Its other trigger, demand going away, was never a lift: that is a queue with nothing to hold,
+    # and the page retracts then for the same reason `launch_anchor_down` and `auth_dead` retract
+    # theirs — re-raising when work is next approved and the machine is still refusing, which is one
+    # extra page across an outage that spans an empty queue, the price those two already pay.
     if generic_recovered:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "

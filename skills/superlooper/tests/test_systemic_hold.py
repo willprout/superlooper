@@ -987,21 +987,40 @@ def test_a_WORSENING_outage_never_journals_a_recovery(rising):
     assert only(out, "launch_recovered") == [], out
 
 
-def test_a_meter_that_reads_again_lifts_the_hold_but_says_so_HONESTLY():
-    """The other way this hold ends, and it must not borrow the delivery record. Three of the faults
-    this streak admits (`gh_auth_dead`, its runner sibling, `env_poisoned`) are things `claude auth
-    status` and the usage meter cannot see at all, so their reading healthy is not evidence about
-    them — nothing was verified and the refusal streak is unchanged. But the lift is real (launching
-    resumes on this tick), and an alert that simply retracts with the journal saying nothing is the
-    silence this whole family of records exists to prevent."""
+def test_a_probe_that_reads_healthy_does_NOT_lift_a_standing_hold():
+    """The conjunct LATCHES once the episode is on disk. It is a 5-second `claude auth status`
+    subprocess refreshed every 60 s that answers `unknown` on any timeout — and three of the faults
+    this streak admits (`gh_auth_dead`, its runner sibling, `env_poisoned`) are things that probe
+    and the usage meter cannot see at all, so their reading healthy is not evidence about them.
+    Re-asked fresh every tick in the shape this class is FOR — the runner launching nothing, so no
+    flight ever settles it — a flip raised, retracted and re-raised the page once a minute,
+    journalling a lift each time and landing the launch-cap parks it had been suppressing."""
     dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_HEALTHY,
-                    alert={"reasons": [AUTH_DEATH], "since": NOW - 600})
+                    alert={"reasons": [AUTH_DEATH], "since": NOW - 600},
+                    issues_state={"version": 1, "issues": {
+                        "i5": ist("ready", launch_failures=actions.LAUNCH_FAILURE_CAP)}})
     out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
-    rec = only(out, "launch_recovered")
-    assert len(rec) == 1, out
-    assert "NOT a verified delivery" in rec[0]["reason"], rec
-    assert only(out, "clear_alert") and [a["id"] for a in only(out, "launch")]
-    assert only(out, "park") == [] and only(out, "relabel") == []
+    assert only(out, "launch_recovered") == [], out
+    assert only(out, "clear_alert") == [] and only(out, "launch") == []
+    assert only(out, "park") == [], "and the parks it suppresses stay suppressed"
+
+
+def test_a_FLAPPING_probe_pages_once_and_stays_paged():
+    """The same rule as a sequence, which is how it was found: twelve ticks of an alternating probe
+    used to be six pages, five retractions and five journalled lifts on a machine where nothing had
+    flown. Once the ALERT names the class, only the streak ends it."""
+    seen = []
+    alert = None
+    for tick in range(6):
+        dsk = _attempts(["i5", "d26"], alert=alert,
+                        auth_probe=_AUTH_HEALTHY if tick % 2 else _AUTH_UNKNOWN)
+        out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+        for a in only(out, "alert"):
+            alert = {"reasons": a["reasons"], "since": NOW}
+            seen.append(a["reasons"])
+        assert only(out, "clear_alert") == [], tick
+        assert only(out, "launch_recovered") == [], tick
+    assert seen == [[AUTH_DEATH]], seen
 
 
 def test_a_narrower_class_TAKING_the_naming_is_never_read_as_a_lift():
@@ -1864,3 +1883,19 @@ def test_a_resolve_conflict_refusal_is_a_sample_like_any_other(rig):
         "evidence": {"kind": "launch", "rc": 6, "reason": "env_poisoned", "captured": "x"}},
         NOW + 2)
     assert _streak(rig)["samples"] == {"d26": ["watchdog"], "i5": ["runner"]}
+
+
+def test_every_act_that_runs_the_launcher_is_in_one_of_the_streak_tables():
+    """The vocabulary guard the reason and spawner registries already have. The dangerous direction
+    is a missed DELIVERY: a new spawner whose success this reader cannot recognise leaves the streak
+    standing over a machine that has demonstrably started a session. Pinned against the launcher's
+    actual call sites so a fourth one cannot be added without a row here."""
+    import re as _re
+    known = set(runner_mod.RUNNER_LAUNCH_ACTS) | {runner_mod.RUNNER_RELAUNCH_ACT} \
+        | set(runner_mod.FOREIGN_LAUNCH_OUTCOMES)
+    # the runner's own launcher call sites, read off the source rather than listed by hand
+    src = open(_re.sub(r"\.pyc$", ".py", runner_mod.__file__)).read()
+    assert src.count("self._script(LAUNCHER)") == len(runner_mod.RUNNER_LAUNCH_ACTS) + 1, \
+        "a launcher call site was added or removed — does it journal an act this streak reads?"
+    assert {"launch", "recover", "resolve_conflict"} <= known
+    assert {"watchdog", "debug_launch", "resume"} <= known
