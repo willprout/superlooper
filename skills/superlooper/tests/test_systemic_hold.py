@@ -1899,3 +1899,56 @@ def test_every_act_that_runs_the_launcher_is_in_one_of_the_streak_tables():
         "a launcher call site was added or removed — does it journal an act this streak reads?"
     assert {"launch", "recover", "resolve_conflict"} <= known
     assert {"watchdog", "debug_launch", "resume"} <= known
+
+
+@pytest.mark.parametrize("flap", ["auth_dead", "anchor_down"])
+def test_a_STANDING_hold_keeps_its_name_through_a_flapping_probe(flap):
+    """The latch keeps its memory in the durable ALERT — and the mute is what rewrites that field.
+    Both probe-driven muters read a five-second subprocess every tick (`claude auth status`, the
+    pane probe), so one flapping renamed the episode back and forth and paged the owner once a
+    minute for a whole outage, twice as often as before this class existed.
+
+    The mute exists so an episode is never named twice AT ONCE; it is not a reason to rename one.
+    An episode keeps the name it opened under — #320's own rule, one class up."""
+    alert, pages = None, []
+    for tick in range(6):
+        # tick 0 is the healthy reading, so THIS class opens the episode and the flap starts after
+        over = {"auth_probe": _AUTH_DEAD if tick % 2 else _AUTH_UNKNOWN} if flap == "auth_dead" \
+            else {"auth_probe": _AUTH_UNKNOWN, "launch_anchor": {"ok": not tick % 2}}
+        out = decide(parsed_issues=[parsed(5), parsed(6)], usage=_dark_meter(),
+                     dsk=_attempts(["i5", "d26"], alert=alert, **over))
+        for a in only(out, "alert"):
+            alert = {"reasons": a["reasons"], "since": NOW}
+            pages.append(a["reasons"])
+        assert only(out, "launch_recovered") == [], tick
+    assert pages, "the episode must be said at least once"
+    # THE CLAIM: once this class has named the episode, it never stops naming it. What still moves
+    # is the flapping detector's OWN reason joining and leaving the list beside it — that is
+    # `auth_dead`'s and `launch_anchor_down`'s pre-existing behaviour (on a queue with no hold at
+    # all those two raise and retract with their probe), and latching THEIR readings is their own
+    # issue, not this one's. What this class must never do is let the episode be renamed away from
+    # it and re-opened, which is what turned one outage into a page a minute.
+    assert all(AUTH_DEATH in p for p in pages), pages
+    other = "auth_dead" if flap == "auth_dead" else "launch_anchor_down"
+    assert {frozenset(p) for p in pages} <= {
+        frozenset([AUTH_DEATH, "usage_stale"]),
+        frozenset([AUTH_DEATH, other, "usage_stale"])}, pages
+
+
+def test_a_narrower_class_arriving_FIRST_still_takes_the_naming():
+    """...and the mute is not disarmed, only bounded to what it is for. With nothing standing yet, a
+    definitive dead reading names the episode and this class stays quiet — the whole point of the
+    backstop."""
+    out = decide(parsed_issues=[parsed(5), parsed(6)], usage=_dark_meter(),
+                 dsk=_attempts(["i5", "d26"], auth_probe=_AUTH_DEAD, alert=None))
+    assert _reasons(out) == ["auth_dead", "usage_stale"], _reasons(out)
+
+
+def test_an_over_long_session_id_costs_a_sample_not_the_tick():
+    """`_iid_num` does a bare `int(iid[1:])`, and Python refuses an integer literal past 4300 digits
+    — so an id this admits could raise out of the whole tick, before the heartbeat is stamped, which
+    is how a live runner reads as dead (#95). Every other garbage shape in this path costs a sample."""
+    dsk = _attempts({"samples": {"i" + "1" * 5000: ["runner"], "d26": ["watchdog"]}},
+                    auth_probe=_AUTH_UNKNOWN)
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
+    assert AUTH_DEATH not in _reasons(out), "one usable sample is not a streak"

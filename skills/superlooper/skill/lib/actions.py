@@ -943,10 +943,17 @@ def _sorted_ids(ids):
     return sorted(ids, key=_iid_num)
 
 
+# Longer than any issue number or flight counter will ever be, and short enough that `int()` will
+# always take it. TWO ways this matters, and both end at `_iid_num`'s bare `int(iid[1:])`: Python
+# refuses to parse an integer literal past 4300 digits, and `str.isdigit` accepts superscripts and
+# other numeric forms `int()` also refuses. Either raises out of the whole tick — before the
+# heartbeat is stamped, so the dashboard reads a live runner as dead (#95) — where every other
+# garbage shape in this path costs one sample. The ids reaching here come off a journal three
+# separate processes append to. `gate.py` guards the identical hazard the same way.
+_SESSION_ID_MAX = 13
+
+
 def _is_session_id(sid):
-    # NB `.isascii()` before `.isdigit()`: str.isdigit accepts superscripts and other numeric forms
-    # int() then refuses, so without it this admits an id `_iid_num` RAISES on — and that raise
-    # leaves the whole tick, where every other garbage shape in this path costs one sample.
     """True for any launch SESSION id: a queued issue's lane (i<N>), an sl-debugger flight (d<N>)
     or a triage flight (t<N>) — issue #457.
 
@@ -954,8 +961,8 @@ def _is_session_id(sid):
     per-issue accounting in this module is about an ISSUE and must keep refusing a d/t id; but
     "can this machine start a session at all" is answered by ANY flight, and on 2026-08-26 the only
     flights attempted for hours were the watchdog's d<N> repair launches."""
-    return (isinstance(sid, str) and len(sid) > 1 and sid[0] in ("i", "d", "t")
-            and sid[1:].isascii() and sid[1:].isdigit())
+    return (isinstance(sid, str) and 1 < len(sid) <= _SESSION_ID_MAX
+            and sid[0] in ("i", "d", "t") and sid[1:].isascii() and sid[1:].isdigit())
 
 
 def _dget(d, key, want):
@@ -1862,9 +1869,22 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # needs a FRESH launch pending; auth_dead and this class also count an in-flight lane), so
     # muting on the flag produced a queue held with nothing said at all — the one outcome worse
     # than a hold with a vague name.
+    auth_death_standing = AUTH_DEATH_ALERT_REASON in _dget(alert_on_disk, "reasons", list)
     anchor_named = anchor_down and has_pending_launch
     auth_dead_named = auth_invalid and (has_pending_launch or has_relaunch_demand)
-    already_named = anchor_named or systemic_launch or systemic_env or auth_dead_named
+    # ...and the two PROBE-DRIVEN ones mute this class only while it is not already standing. The
+    # mute exists so an episode is never named twice AT ONCE; it is not a reason to RENAME one every
+    # time a five-second subprocess answers differently. Both of those read a live probe every tick
+    # (`claude auth status`, the pane probe), and renaming rewrites the durable ALERT — which is
+    # where this class's own latch keeps its memory, so a flapping probe erased the latch and paged
+    # the owner once a minute for a whole outage. An episode keeps the name it opened under; that is
+    # #320's own rule for a canary re-reading an outage, one class up.
+    #
+    # `systemic_launch`/`systemic_env` stay unconditional: they are in-memory streaks that do not
+    # flap tick to tick, and a channel or per-reason environment escalation is a genuinely more
+    # precise reading of the same evidence.
+    already_named = systemic_launch or systemic_env or (
+        (anchor_named or auth_dead_named) and not auth_death_standing)
     # ...and, like the anchor and auth_dead alerts beside it, only while something is actually
     # waiting on it. That gate belongs on the CLASS and not merely on its page: the runner stops
     # feeding an auth probe the moment there is no spend pending, so a class that kept evaluating
@@ -1895,7 +1915,6 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # streak ends it — and the streak ends on exactly one thing, a session starting. That is also
     # what its exit record claims, so the lifecycle and the claim are one fact. The #115 probe is
     # what supplies that fact on a machine that has recovered.
-    auth_death_standing = AUTH_DEATH_ALERT_REASON in _dget(alert_on_disk, "reasons", list)
     systemic_auth_death = (attempt_streak and auth_death_demand and not already_named
                            and (episode_active or auth_unconfirmed or auth_death_standing))
     # ONE degraded mode for every detector above: hold every fresh launch and suppress the
@@ -2227,8 +2246,10 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # is standing ends on the streak and nothing else, so that record has no event left to describe.
     # Its other trigger, demand going away, was never a lift: that is a queue with nothing to hold,
     # and the page retracts then for the same reason `launch_anchor_down` and `auth_dead` retract
-    # theirs — re-raising when work is next approved and the machine is still refusing, which is one
-    # extra page across an outage that spans an empty queue, the price those two already pay.
+    # theirs. It re-raises when work is next approved IF the conjunct opens again — the latch went
+    # with the page, so a machine whose meter and probe both read healthy stays quiet until the next
+    # refusal, which then feeds #24/#320 on its own account. One extra page across an outage that
+    # spans an empty queue is the price those two classes already pay.
     if generic_recovered:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "
