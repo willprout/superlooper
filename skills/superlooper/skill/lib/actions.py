@@ -674,7 +674,7 @@ QUEUE_HELD_ALERT_REASONS = frozenset(
 # (#457) `claude_auth_dead_machine` is deliberately ABSENT, a third exclusion for a third reason.
 # It is a streak hold — but its streak is DERIVED from the journal where every other one here is
 # in-memory, so on a runner restart the two fall out of lockstep and one shared edge journals the
-# wrong thing for whichever class did not reset. It owns two edges of its own instead (see decide),
+# wrong thing for whichever class did not reset.
 # It owns an exit edge of its own instead (see decide), and is kept out of this set rather than
 # subtracted at the one reader, so a second reader cannot pick up the name this discipline
 # excludes.
