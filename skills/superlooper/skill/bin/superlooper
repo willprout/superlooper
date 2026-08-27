@@ -3407,7 +3407,11 @@ def cmd_janitor(args):
 # journal.read. The layout and all the census arithmetic live in lib/upkeep.py, pure and
 # unit-tested; this half only gathers.
 
-_UPKEEP_WORKTREE_RE = re.compile(r"i\d+")
+# `[idt]` — a leftover TRIAGE checkout (#448, the non-default `worktree` home) is invisible to
+# every other page: it has no loopstate entry by design, so `tidy.reclaimable_worktrees` cannot see
+# it either. The weekly census is the one surface that walks the DIRECTORY rather than the queue, so
+# widening it here is what keeps such a checkout from accumulating unseen (fresh-agent review).
+_UPKEEP_WORKTREE_RE = re.compile(r"[idt]\d+")
 
 
 def _upkeep_janitor_view(home, cfg, dev):

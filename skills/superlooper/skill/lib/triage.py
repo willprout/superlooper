@@ -215,14 +215,24 @@ def record_verdict(state_home, num, body, verdict, date):
     it exists to answer is "has THIS body been judged". Hashing happens here rather than at the
     call site so the store and ``changed()`` can never disagree about the scheme.
     """
+    # The path FIRST, so one caller bug has one answer. `verdicts_path` raises TypeError on a
+    # state_home that is not a path at all — loudly, because a WRITE to a garbage location is not
+    # something to degrade past — and doing it here means that answer no longer depends on whether
+    # some other argument happened to be wrong too (fresh-agent review, P2).
+    path = verdicts_path(state_home)
     # REFUSED rather than coerced (fresh-agent review, P1). The old `verdict if isinstance(...)
     # else ""` wrote a record with a correct body_hash and an empty verdict, which `changed()` then
     # read as judged — a wrong-typed argument silently retiring an issue from triage forever, which
     # is the fail-open on wrong-typed input this codebase forbids. The store is left EXACTLY as it
     # stands and returned unchanged, so the issue stays a cue and the next flight looks again.
+    #
+    # `date` takes the SAME rule, in the same breath: it sat in this very dict literal still being
+    # coerced to "", which is the identical fail-open one field over. It is advertised in the state
+    # contract, so a record carrying a blank one is a record that lies about when it was reached.
     if not (isinstance(verdict, str) and verdict.strip()):
         return load_verdicts(state_home)
-    path = verdicts_path(state_home)
+    if not (isinstance(date, str) and date.strip()):
+        return load_verdicts(state_home)
     # The folder is created HERE rather than assumed: the first verdict a repo ever records may
     # well arrive before any run log has (`loopstate.save` writes its temp file beside the target,
     # so a missing parent is a FileNotFoundError, not an empty file).
@@ -243,9 +253,7 @@ def record_verdict(state_home, num, body, verdict, date):
     token = loopstate._acquire(lock_path)
     try:
         current = load_verdicts(state_home)      # already fail-closed to {} on corruption
-        current[_key(num)] = {"body_hash": body_hash(body),
-                              "verdict": verdict,
-                              "date": date if isinstance(date, str) else ""}
+        current[_key(num)] = {"body_hash": body_hash(body), "verdict": verdict, "date": date}
         loopstate.save(path, current)
     finally:
         # A lock we never got is a lock we must not release — `_release` is token-checked, but
@@ -488,6 +496,14 @@ def due(open_issues, state_home, date, config):
     if not isinstance(date, str) or not _DATE_RE.match(date):
         return False, ("no usable local date (%r) — the one-a-day bound cannot be applied, so no "
                        "flight is launched" % (date,))
+    # ASKED BEFORE `ran_on`, because `ran_on` fails closed to True and would otherwise report an
+    # unreadable state home as "a flight already went out on <date>" — journal and report prose, by
+    # this function's own docstring, and a self-concealing lie repeated every day forever
+    # (fresh-agent review, P2). The direction is unchanged (no launch); only the diagnosis is.
+    if run_log_path(state_home, date) is None:
+        return False, ("the triage state home could not be read (%r), so whether a flight already "
+                       "went out today cannot be established — launching nothing"
+                       % (state_home,))
     if ran_on(state_home, date):
         return False, "a triage flight already went out on %s" % date
     fresh = changed(open_issues, load_verdicts(state_home))

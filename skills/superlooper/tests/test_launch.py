@@ -1273,21 +1273,28 @@ def test_a_hostile_triage_home_value_cannot_forge_a_channel_fault(tmp_path, host
     what outranks them, exactly as `FENCE DOWN` does for the socket path it interpolates. This is
     the `[i429]` bug's shape one variable over."""
     import evidence
-    result, _edges, host = _run(_triage_spec(tmp_path, triage_home=hostile))
-    assert result.rc == launch.ABORTED and host.spawned == []
-    assert hostile not in result.stderr, \
-        "the unvalidated value must not reach a line evidence.py classifies"
-    assert "expected checkout or worktree" in result.stderr, "the actionable half survives"
-    rec = evidence.build("launch", result.rc, result.stderr)
-    assert rec["reason"] == "triage_launch_refused", rec
-    assert not evidence.is_channel_fault(rec), rec
+    # BOTH untrusted inputs, not just the config one: a checkout PATH can carry a needle exactly as
+    # a config string can — including `fence down`, the single needle that outranks this refusal's
+    # own — and an earlier spelling of this test varied only `triage_home`, so it could not see it.
+    specs = [_triage_spec(tmp_path, triage_home=hostile),
+             _triage_spec(tmp_path, repo=str(tmp_path / hostile / "gone"))]
+    for spec in specs:
+        result, _edges, host = _run(spec)
+        assert result.rc == launch.ABORTED and host.spawned == []
+        assert hostile not in result.stderr, \
+            "no untrusted value may reach a line evidence.py classifies"
+        rec = evidence.build("launch", result.rc, result.stderr)
+        assert rec["reason"] == "triage_launch_refused", rec
+        assert not evidence.is_channel_fault(rec), rec
 
 
 def test_a_real_fence_refusal_still_outranks_everything_it_used_to(tmp_path, monkeypatch):
-    """The other side of that reorder. The triage needle now leads the table, so this pins that a
-    genuine FENCE DOWN is untouched by it — at rc=9, where the rc is authoritative, and at rc=1,
-    the version-skew fallback the fence entry exists for. A triage refusal can never carry rc=9,
-    which is what makes the two orderings independent."""
+    """`fence down` KEEPS the lead over the triage needle, and this pins the reading that lead
+    protects. Swapping them was proposed and refused: a socket path containing the triage phrase
+    would make a REAL fence refusal read per-issue, which is a fail-OPEN on the one check whose
+    whole job is to fail closed. The hole that swap was aimed at is closed at its source instead —
+    no triage refusal interpolates anything a caller or a repo chose. Pinned at rc=9, where the rc
+    is authoritative, and at rc=1, the version-skew fallback the fence entry exists for."""
     import evidence
     edges = FakeEdges(fence=session_host.OPEN)
     _fleet(monkeypatch)
@@ -1297,6 +1304,47 @@ def test_a_real_fence_refusal_still_outranks_everything_it_used_to(tmp_path, mon
         rec = evidence.build("launch", rc, result.stderr)
         assert rec["reason"] == "fence_down", (rc, rec)
         assert evidence.is_channel_fault(rec), "an unfenced fleet still holds the queue"
+
+
+def test_a_reused_flight_worktree_is_re_pointed_at_its_base(tmp_path):
+    """`_make_worktree` returns early on an existing directory — the #190 PRESERVATION rule, which
+    is about a WORKER's unpushed branch and has nothing to preserve here. Left alone, the second
+    flight in this home opens a detached tree still frozen at the FIRST flight's base and judges
+    staleness against it, silently — and for the repo that chose this home, that worktree is its
+    entire view of the repository (fresh-agent review, P1)."""
+    spec = _triage_spec(tmp_path, triage_home=triage.WORKTREE)
+    result, edges, _host = _run(spec)
+    assert result.rc == launch.OK, result.stderr
+    wt = os.path.join(spec.run_root, "worktrees", "t1")
+    os.makedirs(wt, exist_ok=True)                       # it exists now: the next flight REUSES it
+    assert not [c for c in edges.calls if "checkout" in c], "the first flight re-points nothing"
+
+    spec2 = _triage_spec(tmp_path, triage_home=triage.WORKTREE, home=spec.run_root)
+    result, edges, _host = _run(spec2)
+    assert result.rc == launch.OK, result.stderr
+    assert not [c for c in edges.calls if "worktree" in c and "add" in c], \
+        "an existing checkout is reused, never recreated"
+    repoint = [c for c in edges.calls if "checkout" in c and "--detach" in c]
+    assert len(repoint) == 1, edges.calls
+    assert repoint[0][:3] == ["git", "-C", wt] and repoint[0][-1] == "origin/main"
+
+
+def test_a_reused_flight_worktree_that_cannot_be_re_pointed_refuses(tmp_path):
+    """Fail CLOSED: a flight that judged this queue against a stale tree would close issues as
+    `overtaken` on evidence that is a day old, and its closes are the whole point of the class."""
+    spec = _triage_spec(tmp_path, triage_home=triage.WORKTREE)
+    _run(spec)
+    os.makedirs(os.path.join(spec.run_root, "worktrees", "t1"), exist_ok=True)
+    edges = FakeEdges({"checkout --detach": (128, "", "fatal: reference is not a tree")})
+    spec2 = _triage_spec(tmp_path, triage_home=triage.WORKTREE, home=spec.run_root)
+    result, _edges, host = _run(spec2, edges=edges)
+    assert result.rc == launch.ABORTED
+    assert "could not be re-pointed at its base" in result.stderr
+    assert "stale tree" in result.stderr
+    assert host.spawned == []
+    import evidence
+    rec = evidence.build("launch", result.rc, result.stderr)
+    assert not evidence.is_channel_fault(rec), rec
 
 
 def test_a_triage_worktree_off_a_missing_base_still_exits_3(tmp_path):
@@ -1320,7 +1368,7 @@ def test_a_checkout_home_whose_checkout_is_gone_refuses_before_anything_is_creat
     spec = _triage_spec(tmp_path, repo=str(tmp_path / "not-a-checkout"))
     result, edges, host = _run(spec)
     assert result.rc == launch.ABORTED
-    assert "checkout does not exist" in result.stderr
+    assert "the repo checkout named by SL_REPO is not a directory" in result.stderr
     assert not any("pretrust" in " ".join(c) for c in edges.calls), edges.calls
     assert host.spawned == []
 

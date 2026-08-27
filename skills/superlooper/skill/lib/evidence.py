@@ -210,15 +210,12 @@ _LAUNCH_TEXT = (
       "launched onto it. A machine-level fault no queued issue caused and none can fix by "
       "re-approving: rebuild the patched host and reinstall the fleet server, or declare the "
       "machine unfenced deliberately")),
-    # SECOND (issue #448) — directly under the fence and ahead of everything else, because the only
-    # value these refusals still interpolate is a filesystem PATH, and a path can contain any needle
-    # below. The unvalidated config STRING that used to ride here is gone from the text entirely
-    # (lib/launch.py names the key and the allowed set instead), which is what lets this sit second
-    # rather than fighting the fence for the lead — see the note above.
-    # two of the triage launcher's refusals interpolate a value the engine did not choose (a
-    # per-repo `triage.home` string, a checkout path), so any position a later needle could be
-    # inserted above is a position where `SL_TRIAGE_HOME=not_found` reads as a dead cmux workspace.
-    #
+    # SECOND (issue #448) — directly under the fence and ahead of everything else. These refusals
+    # now interpolate NOTHING a caller or a repo chose: not the config value, not the checkout path
+    # (three successive fresh reviews took a run at this, each closing one more echo). lib/launch.py
+    # names the KEY and the allowed set instead, which is why this entry can sit second rather than
+    # fight the fence for the lead — nothing in the text can forge the needle above it, and this
+    # needle is the loop's own phrase, which gh, git and the session host can never emit.
     # It is a PER-ISSUE reason, deliberately, and that is the whole point of the entry: these are
     # per-REPO CONFIGURATION faults (a typo'd home, an SL_REPO naming a checkout that moved), and
     # without a needle they fall through to the rc=1 default `launch_failed_before_delivery` —

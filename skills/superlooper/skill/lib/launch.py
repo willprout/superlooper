@@ -389,9 +389,12 @@ def _launch(spec, host, edges):
         return Result(ABORTED, "[%s] id sanitize validation failed — not launching" % (spec.id,))
     mode = _mode_of(spec)
     if mode is None:
-        return Result(ABORTED, "[%s] unknown session mode %r (expected: %s, or \"\" to derive it "
-                               "from --cwd) — refusing"
-                      % (iid, getattr(spec, "mode", ""), ", ".join(MODES)))
+        # The declared value is NOT echoed, for the reason the triage refusals below do not echo
+        # theirs: this line is classified by `evidence.py`, and `Spec(mode="fence down")` would
+        # render a caller bug as an unfenced fleet and hold the whole approved queue. Only a caller
+        # can set `mode`, so naming the allowed set is the whole of the remedy.
+        return Result(ABORTED, "[%s] unknown session mode (expected: %s, or \"\" to derive it "
+                               "from --cwd) — refusing" % (iid, ", ".join(MODES)))
     # ``--cwd`` belongs to the debugger and to nothing else. Checked BEFORE the id guard so a
     # triage spec carrying one is refused with the debugger's own sentence — the confusion it
     # names is real, and the class it was confused with is the one holding the fence's token.
@@ -541,16 +544,21 @@ def _launch(spec, host, edges):
         # fail-OPENED a caller bug straight into the owner's REAL working tree (fresh-agent review
         # round 2, P0). Silence takes the ruled default; a value a caller WROTE must be readable.
         #
-        # All three refusals below LEAD with `TRIAGE LAUNCH REFUSED`, and that phrase is contract
+        # The refusals below LEAD with `TRIAGE LAUNCH REFUSED`, and that phrase is contract
         # (fresh-agent review, P1). Every one of them is a per-repo CONFIGURATION fault — a typo'd
         # `triage.home`, an `SL_REPO` naming a checkout that moved — and without a needle of their
         # own they fall through `evidence.py` to the rc=1 default, `launch_failed_before_delivery`,
         # which is in CHANNEL_FAULT_REASONS: one repo's config typo would HOLD THE WHOLE APPROVED
-        # QUEUE, waiting for a fault that never self-heals and that no queued issue caused. The
-        # phrase also has to come FIRST in the text, for the reason `fence down` leads the needle
-        # table: two of these interpolate a value the engine did not choose (a config string, a
-        # path), and an interpolated `not_found` or `dial tcp` would otherwise be read as a dead
-        # cmux workspace or a GitHub outage.
+        # QUEUE, waiting for a fault that never self-heals and that no queued issue caused.
+        #
+        # And NONE of them interpolates a value the engine did not choose — not the config string,
+        # not the checkout path (two successive reviews took a run at this). `evidence.py`
+        # classifies these lines, every needle in that table is a phrase somebody could put in a
+        # config value or a directory name, and one of them — `fence down` — deliberately outranks
+        # this refusal's own. So the rule here is simply that nothing untrusted reaches the text:
+        # each refusal names the KEY and the allowed set, which is the actionable half anyway,
+        # because the loader already refuses a bad `triage.home` loudly at adopt time WITH the
+        # value and a hand-set SL_* is a value its operator typed.
         home_kind = getattr(spec, "triage_home", triage.CHECKOUT)
         if type(home_kind) is not str or home_kind not in triage.HOMES:
             # The VALUE is deliberately not echoed (fresh-agent review, P2). It is the one thing
@@ -571,8 +579,13 @@ def _launch(spec, host, edges):
                                    "triage launch (SL_REPO) — not launching" % iid)
         if home_kind == triage.CHECKOUT:
             if not os.path.isdir(spec.repo):
-                return Result(ABORTED, "[%s] TRIAGE LAUNCH REFUSED: the repo checkout does not "
-                                       "exist: %s" % (iid, spec.repo))
+                # The PATH is not echoed either, for the reason the home value is not (below):
+                # `evidence.py` classifies this line, and a checkout path is just as capable of
+                # containing a channel needle as a config string — including `fence down`, the one
+                # needle that outranks this refusal's own (fresh-agent review, P2). SL_REPO is
+                # named instead, which is the thing an operator acts on.
+                return Result(ABORTED, "[%s] TRIAGE LAUNCH REFUSED: the repo checkout named by "
+                                       "SL_REPO is not a directory — refusing" % iid)
             # Nothing is created: the flight runs in the checkout an orchestrator would open. Its
             # read-only discipline there (fetch first, judge against origin/main, write only to
             # GitHub and the state home) is the BRIEF's to enforce — no code here writes to it.
@@ -584,9 +597,30 @@ def _launch(spec, host, edges):
                 return Result(ABORTED, "[%s] dev_branch sanitize validation failed — not launching"
                               % iid)
             worktree = os.path.join(spec.run_root, "worktrees", iid)
+            existed = os.path.isdir(worktree)
             failed = _make_worktree(spec, edges, iid, worktree, "", base)
             if failed is not None:
                 return failed
+            if existed:
+                # RE-POINT a reused checkout (fresh-agent review, P1). `_make_worktree` returns
+                # early on an existing directory — the #190 PRESERVATION rule, which is about a
+                # worker's unpushed branch and has nothing to preserve here: a flight never
+                # commits, never pushes, and writes only to GitHub and its own state home. Left
+                # alone, the second flight in this home would open a detached tree still frozen at
+                # the FIRST flight's base and judge staleness against it, silently — and for the
+                # repo that chose this home that worktree is its entire view of the repository.
+                # `--detach` again rather than a pull: the base is a remote-tracking ref the
+                # runner's own fetch already advanced, and a flight must still create no ref.
+                repointed = edges.run(["git", "-C", worktree, "checkout", "--detach", base],
+                                      timeout=120)
+                if repointed.rc != 0:
+                    # rc ONLY, no git text — evidence.py classifies this line and its channel
+                    # needles are matched first (the rule the worktree refusal below spells out).
+                    return Result(ABORTED,
+                                  "[%s] TRIAGE LAUNCH REFUSED: the reused flight checkout at '%s' "
+                                  "could not be re-pointed at its base (git rc=%s), so it would "
+                                  "have judged this queue against a stale tree — refusing"
+                                  % (iid, worktree, repointed.rc))
     else:
         if not spec.repo:
             # Named rather than left to git. Without it `git -C ''` fails, the base-ref probe

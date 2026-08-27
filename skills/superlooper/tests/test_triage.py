@@ -19,6 +19,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 import triage
 
 
@@ -329,6 +331,75 @@ def test_concurrent_verdict_writers_do_not_lose_each_others_rulings(tmp_path):
     recorded = triage.load_verdicts(home)
     assert sorted(int(k) for k in recorded) == [1] + list(range(10, 26)), \
         "every writer's ruling must survive: %s" % sorted(recorded)
+
+
+def test_a_run_log_that_is_not_utf8_costs_context_and_never_a_tick(tmp_path):
+    """This is THE reader the standing rule names ("the flight reads the last three run logs plus
+    the verdicts file before acting"), and its writer is an AGENT appending markdown — so a write
+    truncated mid-multibyte character, or a raw byte out of some tool's output, is ordinary. A bare
+    read raises UnicodeDecodeError, which is a ValueError and slips past `except OSError`, out of a
+    core that promises it never raises: one corrupt log would strand every subsequent flight."""
+    home = str(tmp_path)
+    path = triage.mark_launched(home, "2026-08-25")
+    with open(path, "ab") as f:
+        f.write(b"\xff\xfe not utf-8 \x80\n")
+    logs = triage.recent_run_logs(home, 3)
+    assert [d for d, _text in logs] == ["2026-08-25"], "the log is READ, not skipped"
+    assert triage.due([], home, "2026-08-26", {"triage": {"enabled": True}})[0] is False
+
+
+@pytest.mark.parametrize("junk", [5, None, object(), b"/runs", ["/runs"]])
+def test_a_state_home_that_is_not_a_path_degrades_per_reader(tmp_path, junk):
+    """Every reader answers in its OWN fail-safe direction rather than raising TypeError out of a
+    tick: the day stamp reads as ALREADY RAN (a missed day is a day; a second flight is two
+    sessions on one queue), and the rest read as empty."""
+    assert triage.ran_on(junk, "2026-08-25") is True
+    assert triage.recent_run_logs(junk) == []
+    assert triage.load_verdicts(junk) == {}
+    assert triage.run_log_path(junk, "2026-08-25") is None
+    assert triage.mark_launched(junk, "2026-08-25") is None
+    due, why = triage.due([], junk, "2026-08-25", {"triage": {"enabled": True}})
+    assert due is False
+    # ...and it says WHAT it could not do. Reporting this as "a flight already went out today"
+    # would be a self-concealing lie repeated every day forever.
+    assert "state home could not be read" in why, why
+
+
+def test_a_verdict_that_is_not_a_ruling_is_refused_rather_than_written(tmp_path):
+    """The fail-open this store exists to prevent, one layer in. `load_verdicts` is hardened so a
+    truncated FILE cannot retire everything; a coerced-to-blank ENTRY would retire ONE issue just
+    as permanently, and on a wrong-typed argument, which this codebase forbids outright."""
+    home = str(tmp_path)
+    issue = {"number": 700, "body": "a real body", "labels": [{"name": "type:build"}]}
+    triage.record_verdict(home, 1, "seed", triage.BUILDABLE, "2026-08-25")
+    before = triage.load_verdicts(home)
+    for junk in (None, "", "   ", 5, [], {}, True):
+        triage.record_verdict(home, 700, issue["body"], junk, "2026-08-25")
+        assert triage.load_verdicts(home) == before, "a bad verdict leaves the store untouched: %r" % junk
+        assert triage.changed([issue], triage.load_verdicts(home)) == [700], \
+            "and the issue stays a cue: %r" % junk
+    for junk in (None, "", 5, []):       # the same rule for `date`, in the same dict literal
+        triage.record_verdict(home, 700, issue["body"], triage.BUILDABLE, junk)
+        assert triage.load_verdicts(home) == before, "a bad date leaves the store untouched: %r" % junk
+    triage.record_verdict(home, 700, issue["body"], triage.BUILDABLE, "2026-08-25")
+    assert triage.changed([issue], triage.load_verdicts(home)) == [], "a real ruling retires it"
+
+
+def test_a_record_with_a_hash_but_no_ruling_is_re_read(tmp_path):
+    """A hand-edited or half-written entry — the exact shape `load_verdicts`' docstring names, one
+    level down. `changed()` used to compare only the hash, so a correct hash beside a blank or
+    absent verdict silently removed that issue from triage forever."""
+    issue = {"number": 701, "body": "a real body", "labels": [{"name": "type:build"}]}
+    good = triage.body_hash(issue["body"])
+    for record in ({"body_hash": good},                       # verdict key absent entirely
+                   {"body_hash": good, "verdict": ""},        # written, never reached
+                   {"body_hash": good, "verdict": "   "},
+                   {"body_hash": good, "verdict": None},
+                   {"body_hash": good, "verdict": 7},
+                   "not a record at all"):
+        assert triage.changed([issue], {"701": record}) == [701], record
+    assert triage.changed([issue], {"701": {"body_hash": good,
+                                            "verdict": triage.BUILDABLE}}) == []
 
 
 def test_recent_run_logs_never_raises_on_a_wrong_typed_limit(tmp_path):
