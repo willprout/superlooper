@@ -76,6 +76,65 @@ def read(state_home):
     return _read_records(_path(state_home))
 
 
+# The cold-start tail `follow()` reads when it has no offset to resume from. Big enough to carry
+# the recent past (a runner that just came up must still see the launch failures of the last few
+# minutes), small enough that a tick never pays for the whole hot window.
+FOLLOW_COLD_START_BYTES = 256 * 1024
+
+
+def follow(state_home, offset=None, max_bytes=FOLLOW_COLD_START_BYTES):
+    """Records appended to the hot journal SINCE `offset`, plus the offset to pass in next time.
+
+    The incremental read a per-tick absorb needs (issue #457): the runner learns about launches it
+    did not run — the watchdog's unattended sl-debugger, the owner's `superlooper debug` tap —
+    only from this file, and it may not re-parse a 14-day window every ~20 s to do it.
+
+    `offset` None is a COLD start: it reads at most the last `max_bytes` and DROPS the first line,
+    which the byte-seek may have landed in the middle of. A file that SHRANK since the last call
+    (rotate() moved the hot window to the archive) restarts from 0 rather than seeking past its end.
+
+    Fails closed exactly like read(): an unreadable file yields ([], offset unchanged), a corrupt or
+    wrong-typed line is skipped, and a TRAILING PARTIAL line is left unconsumed — the returned
+    offset stops at the last newline, so the next call re-reads that record whole instead of
+    parsing half of one. (append() writes each record with a single write+flush+fsync, so a partial
+    tail is rare; being wrong about it once would mis-read a record, which is why it is handled.)
+    """
+    path = _path(state_home)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return [], offset
+    trim_first = False
+    if offset is None:
+        start = max(0, size - int(max_bytes))
+        trim_first = start > 0
+    elif isinstance(offset, int) and not isinstance(offset, bool) and 0 <= offset <= size:
+        start = offset
+    else:
+        start = 0                       # rotated, truncated, or a wrong-typed offset: start over
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            blob = f.read()
+    except OSError:
+        return [], offset
+    consumed = blob.rfind(b"\n") + 1    # 0 when no COMPLETE line is present
+    lines = blob[:consumed].decode("utf-8", "replace").splitlines()
+    if trim_first and lines:
+        lines = lines[1:]
+    out = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out, start + consumed
+
+
 def read_all(state_home):
     """Every record ever logged — archived first, then the hot window — for audit/forensics. NOT
     the hot path: its cost grows with total history BY DESIGN (that is what read() avoids). Same

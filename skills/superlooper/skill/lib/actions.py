@@ -202,6 +202,18 @@ LAUNCH_ALERT_REASONS = {
 # "every worker env", and the second distinct lane is exactly the evidence that settles it. Two
 # different environment faults with one lane each is the one-off case twice over, not an outage.
 SYSTEMIC_ENV_FAILURE_CAP = 2
+# >= this many DISTINCT SESSION ids whose launch failed CONSECUTIVELY, with no verified delivery
+# between them, before the machine-wide Claude-auth-death class is read (issue #457). Two, and
+# deliberately the same number as the environment cap above, because it is the same inference one
+# rung wider: one sample cannot tell a broken lane from a broken machine, and the second distinct
+# SESSION is what settles it. Two rather than three is what keeps the DoD's "zero per-issue parks"
+# structural — a lane's own launch cap is LAUNCH_FAILURE_CAP (2) attempts, so a third sample would
+# always arrive after the first lane had already parked itself.
+AUTH_DEATH_LAUNCH_CAP = 2
+# The one name that hold ever wears. It is NOT keyed off an evidence reason like the entries in
+# LAUNCH_ALERT_REASONS above, and that is the point: the class is what several DIFFERENT refusal
+# reasons look like when none of them ever reaches a cap of its own.
+AUTH_DEATH_ALERT_REASON = "claude_auth_dead_machine"
 # How long the launcher prefers an UNSAMPLED lane while an environment streak is open but below the
 # cap (issue #320). With one refusal on the board the environment question is open, and the cheapest
 # way to settle it is to try a DIFFERENT lane — otherwise a serialized queue (one lane, or one
@@ -396,6 +408,34 @@ ALERT_MESSAGES = {
                             "XDG_CONFIG_HOME/GH_CONFIG_DIR in a shell rc file, a LaunchAgent or a "
                             "wrapper. This is NOT the runner's own credential (gh_auth_dead_runner) "
                             "and NOT a cmux/App Nap fault.",
+    # ---- the machine-wide Claude-auth-death class (issue #457) ----
+    # The 2026-08-26 shape, and the one class above that had no name: launches keep refusing across
+    # DISTINCT SESSION ids while the two things that could confirm the account is alive — the usage
+    # meter and the auth probe — are unreadable or will not answer. It is deliberately reason-
+    # AGNOSTIC, because in the realized outage no single reason ever reached a cap of its own: three
+    # watchdog flights refused one way, the owner's Debug tap another, and the queue's own lanes
+    # never launched at all. What they had in common was that NOTHING started.
+    #
+    # The body says the alternative reading out loud. This class is the widest net the layer casts,
+    # so it is the one most able to be wrong — and an owner who is told "your auth is dead" about
+    # two coincidentally broken lanes learns to stop believing the alert.
+    "claude_auth_dead_machine": "NOTHING ON THIS MACHINE CAN START A SESSION (issue #457): several "
+                               "launches in a row — across distinct session ids, the queue's own "
+                               "lanes and/or the watchdog's unattended repair flights — refused "
+                               "with no successful launch between them, while the usage meter was "
+                               "unreadable and/or `claude auth status` would not confirm the "
+                               "account this machine assigns workers. That combination is the "
+                               "Claude-auth-death shape: the OAuth login for the fleet's config "
+                               "dir has expired or been signed out, so every flight lands on a "
+                               "login screen. Fix: open a supervised `claude` window under that "
+                               "config dir and log back in, then check `superlooper doctor`. "
+                               "Launches are HELD: the hold itself parks nothing and moves no "
+                               "label, and a probe launch every few minutes lifts it the moment "
+                               "one flies — a lane that reached its OWN launch cap before the "
+                               "outage was proven may already have parked; re-approve that one. "
+                               "IF INSTEAD two lanes simply broke for reasons of their own, that "
+                               "probe clears this within minutes and no re-approval is owed. This "
+                               "is NOT a cmux/App Nap fault and NOT a GitHub credential.",
     "claude_identity_wrong_workers": "CLAUDE CODE is unusable in every WORKER environment (issue "
                                      "#320): several distinct lanes in a row refused their flight "
                                      "because, from inside the SESSION's own environment, `claude "
@@ -582,7 +622,8 @@ def _alert_message(reason):
 # reports "idle" must be able to say "held" instead, from ONE list, so a class added to the layer
 # above becomes visible everywhere without a second edit.
 QUEUE_HELD_ALERT_REASONS = frozenset(
-    {"launch_anchor_down", "launch_systemic_failure", "auth_dead"} | set(LAUNCH_ALERT_REASONS.values()))
+    {"launch_anchor_down", "launch_systemic_failure", "auth_dead", AUTH_DEATH_ALERT_REASON}
+    | set(LAUNCH_ALERT_REASONS.values()))
 
 # The subset of those that ONLY a launch-streak hold ever raises — so their FALLING edge really is
 # "launch delivery works again" and nothing else. This is the durable episode marker the #115
@@ -592,8 +633,12 @@ QUEUE_HELD_ALERT_REASONS = frozenset(
 #   * `gh_unreachable` — the POLL detector raises it too, from consecutive_failures.
 #   * `launch_anchor_down` / `auth_dead` — separate detectors with their own self-re-arming probes;
 #     neither is a streak, so neither has a streak to recover.
+#
+# (#457) `claude_auth_dead_machine` IS a streak hold and belongs here: its streak clears only on a
+# verified delivery, so its falling edge really is "a session started again" and nothing else.
 LAUNCH_HOLD_ALERT_REASONS = frozenset(
-    {"launch_systemic_failure"} | set(LAUNCH_ALERT_REASONS.values())) - {"gh_unreachable"}
+    {"launch_systemic_failure", AUTH_DEATH_ALERT_REASON}
+    | set(LAUNCH_ALERT_REASONS.values())) - {"gh_unreachable"}
 
 
 # The one non-reason `queue_hold_reasons` can return: a state/ALERT marker EXISTS but nothing can be
@@ -860,6 +905,18 @@ def _iid_num(iid):
 
 def _sorted_ids(ids):
     return sorted(ids, key=_iid_num)
+
+
+def _is_session_id(sid):
+    """True for any launch SESSION id: a queued issue's lane (i<N>), an sl-debugger flight (d<N>)
+    or a triage flight (t<N>) — issue #457.
+
+    Wider than `_iid_num` on purpose, and only the machine-wide launch question may use it. Every
+    per-issue accounting in this module is about an ISSUE and must keep refusing a d/t id; but
+    "can this machine start a session at all" is answered by ANY flight, and on 2026-08-26 the only
+    flights attempted for hours were the watchdog's d<N> repair launches."""
+    return (isinstance(sid, str) and len(sid) > 1 and sid[0] in ("i", "d", "t")
+            and sid[1:].isdigit())
 
 
 def _dget(d, key, want):
@@ -1656,9 +1713,6 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
         return ("agent-ready" in labels and "in-progress" not in labels
                 and _status_of(ist_of(iid)) in RELAUNCHABLE_STATUSES)
     has_pending_launch = any(_held_queue_member(iid, p) for iid, p in parsed_by_id.items())
-    # One degraded mode for both detectors: hold every fresh launch and suppress the per-issue
-    # launch-cap park (phases D+E), so the queue is left intact for when the anchor resolves.
-    launch_degraded = anchor_down or systemic_launch or systemic_env
     # Account-level AUTH gate (issue #159 / forensics U3). The runner hands us a `claude auth status`
     # + credential-keychain snapshot when a spend is pending; a DEFINITIVE dead reading (valid is
     # literally False — the CLI is not-logged-in, or the keychain item is gone) means a fresh launch
@@ -1669,6 +1723,50 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # relaunches (below) and, when there is real spend demand, raises the auth_dead ALERT.
     auth_probe = dsk.get("auth_probe")
     auth_invalid = isinstance(auth_probe, dict) and auth_probe.get("valid") is False
+    # ---- the machine-wide CLAUDE-AUTH-DEATH class (issue #457), one rung wider than #320 --------
+    # 2026-08-26 was exactly the outage this layer exists for and it never tripped. The meter went
+    # unreadable and the engine failed open (its own decision, untouched here); then EVERY launch on
+    # the machine refused for hours — three watchdog repair flights, an owner-tapped Debug, and the
+    # in-flight lanes' dead sessions — while the auth probe answered `unknown`. No hold, no alert,
+    # no pause. Nothing above could see it: both #320 streaks count launches THIS process ran and
+    # key on a single reason reaching its own cap, and here the runner ran none, the reasons were
+    # mixed, and no cap was ever reached.
+    #
+    # So this detector asks a deliberately cruder question, and asks it of SESSIONS rather than
+    # issues: did N distinct session ids in a row fail to start, with no successful launch between
+    # them? The runner publishes that streak, absorbing the out-of-process spawners' outcomes from
+    # the journal so a d<N> flight counts exactly as a lane does.
+    #
+    # ...AND the conjunct that keeps it honest. `unknown` is refused-not-answered: the probe reads
+    # it on healthy machines every day, so it may never hold anything BY ITSELF (the owner's rule,
+    # and the reason this is a conjunction rather than an auth reading with a longer grace). The
+    # launch failures are the evidence; the unreadable meter / unconfirmed account is what makes
+    # "the machine cannot start a session" the reading rather than "two lanes broke".
+    #
+    # Fails OPEN on everything unusable, like every streak here: a non-list view, a non-session id,
+    # a repeated id. And it is the widest net this layer casts, so it is the one most able to be
+    # WRONG — which is why the recovery probe below is not optional for it: a hold over two
+    # coincidentally-broken lanes lifts itself the first time any flight flies.
+    raw_attempts = dsk.get("launch_attempt_fail_ids")
+    attempt_fail_ids = {x for x in raw_attempts if _is_session_id(x)} \
+        if isinstance(raw_attempts, (list, set, tuple, frozenset)) else set()
+    # Not affirmatively alive: `unknown` (the probe would not answer), absent (no probe was fed),
+    # or a definitive dead reading. Only a positive `valid is True` clears this conjunct.
+    auth_unconfirmed = not (isinstance(auth_probe, dict) and auth_probe.get("valid") is True)
+    # ...and it is a BACKSTOP, silent whenever a more specific detector already holds the queue.
+    # This is #320's own rule read the other way round: a hold that arrives wearing another class's
+    # banner is the mis-blame that layer exists to end, and stapling a second, cruder name onto an
+    # episode `claude_identity_wrong_workers` (or a dead anchor, or a definitive `auth_dead`
+    # reading) has already named precisely is the same harm — two names for one outage, and an
+    # owner told to check two different things. The specific classes hold when they can see the
+    # fault; this one speaks for the shape none of them could see.
+    already_named = anchor_down or systemic_launch or systemic_env or auth_invalid
+    systemic_auth_death = (len(attempt_fail_ids) >= AUTH_DEATH_LAUNCH_CAP
+                           and (episode_active or auth_unconfirmed)
+                           and not already_named)
+    # ONE degraded mode for every detector above: hold every fresh launch and suppress the
+    # per-issue launch-cap park (phases D+E), so the queue is left intact for when the cause clears.
+    launch_degraded = anchor_down or systemic_launch or systemic_env or systemic_auth_death
     # Display-sleep launch hold (issue #124). macOS will not boot a fresh cmux tab's shell while the
     # DISPLAY sleeps, so a launch attempted then is created and closed as an orphan (exit 2) — a burned
     # attempt that feeds #24's systemic streak and churns an alert every sleeping episode. The runner
@@ -1910,6 +2008,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # fallback here and none wanted: this streak is keyed BY the reason, so a class that reached the
     # cap is a class this engine has a message for — the reader above drops any reason it does not.
     reasons.extend(LAUNCH_ALERT_REASONS[r] for r in systemic_env_reasons)
+    if systemic_auth_death:                            # (#457) the machine-wide Claude-auth-death
+        reasons.append(AUTH_DEATH_ALERT_REASON)        # class: one name, whatever the refusals said
     if auth_invalid and (has_pending_launch or has_relaunch_demand):   # dead auth only matters with a
         reasons.append("auth_dead")                    # spend pending (idle -> quiet, like the anchor)
     # DEDUPE, not just sort (#299). Two independent detectors can now name the SAME reason:
@@ -1956,7 +2056,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # LAUNCH_HOLD_ALERT_REASONS, covers every name a launch streak can wear. The `held_now` conjunct
     # is what keeps that from mis-firing when two classes stand at once: one clearing must not
     # announce that launching resumed while the other still holds the queue.
-    held_now = systemic_launch or systemic_env
+    held_now = systemic_launch or systemic_env or systemic_auth_death
     if prev_systemic and not held_now:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "
@@ -3190,7 +3290,8 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                 # costs the same by a second route (`or gh_stale` above swaps the wording whenever
                 # the whole view is doubted).
                 launch_hold(cid, c.get("num"), c, reason=reason)
-    elif ((systemic_launch or systemic_env) and not anchor_down and not auth_invalid
+    elif ((systemic_launch or systemic_env or systemic_auth_death)
+            and not anchor_down and not auth_invalid
             and not display_asleep
             and not gh_stale and not issue_state_corrupt_for_launches):
         # ...and NOT while the display sleeps (#124): a canary into a sleeping display would just

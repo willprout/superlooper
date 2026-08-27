@@ -744,3 +744,439 @@ def test_a_single_broken_lane_under_the_same_fault_still_parks(outage):
     assert [p.get("id") for p in parks] == ["i102"], parks
     # the memo names AUTH — the reason #299 kept this fault per-issue in the first place
     assert "gh auth login" in json.dumps(parks[0])
+
+
+# ============ the machine-wide Claude-auth-death class (issue #457) ==========================
+#
+# 2026-08-26 was exactly the class this layer exists for, and it stayed silent for a full day.
+# The realized shape, from the repo's own journal:
+#
+#   18:30  the usage meter goes unreadable past the grace -> usage_stale ALERT + FAIL OPEN
+#          (a deliberate, recorded decision — this issue does not touch it)
+#   19:03  the watchdog's unattended sl-debugger launch REFUSES               (d26)
+#   19:08  ...again                                                           (d27)
+#   19:13  ...again                                                           (d28)
+#   15:19  the owner taps Debug from the command center; it refuses too       (d29)
+#          "[d29] CLAUDE IDENTITY REFUSED ... this environment is not logged in to Claude"
+#
+# ...while the auth probe answered `unknown` throughout, and the queue's own lanes were all
+# in-flight with dead sessions, so the runner attempted no launch of its own for hours.
+#
+# NOTHING in #320 could see that. Its two streaks count the RUNNER's own launches — and every
+# launch attempted on that machine was made by another PROCESS (the watchdog's check, the
+# dashboard's Debug tap), which the runner never hears about. So there was no hold, no single
+# alert, no pause: the loop sat "idle" over a machine that could not start a session at all.
+#
+# The class this section pins: N consecutive launch failures across DISTINCT SESSION ids with no
+# success between, combined with a meter we cannot read or an auth probe that will not confirm the
+# account is alive. The discipline it must NOT break is the owner's refused-not-answered rule: an
+# `unknown` probe is a question the machine declined to answer, and by itself it must never hold
+# anything. It is the OBSERVED launch failures that tip the verdict — evidence, not absence.
+
+AUTH_DEATH = "claude_auth_dead_machine"
+_AUTH_UNKNOWN = {"cli": "unknown", "keychain_present": True, "keychain_mtime": NOW - 3600,
+                 "valid": None, "status_raw": ""}
+_AUTH_HEALTHY = {"cli": "logged_in", "keychain_present": True, "keychain_mtime": NOW - 3600,
+                 "valid": True, "status_raw": ""}
+_AUTH_DEAD = dict(_AUTH_UNKNOWN, cli="logged_out", valid=False)
+
+
+def _dark_meter(now=NOW):
+    """A usage view whose meter has been unreadable PAST the fail-open grace — the first half of the
+    2026-08-26 shape, and the posture #46 deliberately FAILS OPEN on (untouched here)."""
+    return {"auth_status": "api_error", "five_hour_pct": None, "seven_day_pct": None,
+            "last_ok_at": now - actions.USAGE_FAIL_OPEN_GRACE_SECONDS - 1,
+            "first_attempt_at": now - 7200}
+
+
+def _attempts(ids, fail_at=NOW - 10, **over):
+    """A disk view whose ATTEMPT streak names `ids` — the distinct session ids whose launch failed
+    with no verified delivery since, which is what the runner publishes after absorbing its own
+    launches AND the out-of-process ones (the watchdog's, the owner's Debug tap)."""
+    over.setdefault("launch_anchor", {"ok": True})
+    return disk(launch_attempt_fail_ids=ids, launch_fail_at=fail_at, **over)
+
+
+def _reasons(out):
+    return sorted({r for a in only(out, "alert") for r in a["reasons"]})
+
+
+def test_the_auth_death_class_is_held_named_and_carries_its_own_remedy():
+    """Every held class says its OWN cause and its OWN remedy (#320's rule, and a held queue writes
+    no park memo, so this body is the whole story the owner gets)."""
+    assert AUTH_DEATH in actions.QUEUE_HELD_ALERT_REASONS
+    assert AUTH_DEATH in actions.LAUNCH_HOLD_ALERT_REASONS
+    msg = actions._alert_message(AUTH_DEATH)
+    assert msg != AUTH_DEATH, "it falls back to its bare code"
+    assert len(msg) > 80
+    assert msg != actions.ALERT_MESSAGES["launch_systemic_failure"]
+    assert "NSAppSleepDisabled" not in msg and "defaults write" not in msg
+    assert "held" in msg.lower() or "hold" in msg.lower()
+    assert "claude" in msg.lower(), "the class names the Anthropic account, not GitHub"
+    assert "parks nothing" in msg.lower()
+
+
+def test_the_realized_shape_holds_the_queue_dark_meter_then_distinct_session_failures():
+    """THE 2026-08-26 detector fact: an unreadable meter, then consecutive failed launches across
+    distinct session ids with no success between. One alert, nothing parked, nothing launched."""
+    dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_UNKNOWN)
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
+    assert AUTH_DEATH in _reasons(out), _reasons(out)
+    assert len(only(out, "alert")) == 1, "one alert, not one per class and not one per tick"
+    assert only(out, "park") == [], "a machine-wide fault parks nothing"
+    assert only(out, "launch") == [], "and launches nothing new into the same wall"
+    assert only(out, "relabel") == []
+    assert has_notify(out)
+
+
+def test_an_unknown_probe_with_no_launch_failures_never_holds_anything():
+    """THE refused-not-answered rule, in the owner's own words: `unknown` is a question the machine
+    declined to answer, not a dead credential. It must never trip the hold by ITSELF — the loop
+    reads `unknown` on healthy machines every day (the live probe reads it right now)."""
+    dsk = disk(launch_anchor={"ok": True}, auth_probe=_AUTH_UNKNOWN)
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk, usage=_dark_meter())
+    assert AUTH_DEATH not in _reasons(out), _reasons(out)
+    assert [a["id"] for a in only(out, "launch")] == ["i5"], "and the queue keeps flying"
+
+
+def test_an_unknown_probe_with_consecutive_failures_IS_the_verdict():
+    """The other half of the same rule: N OBSERVED launch failures is EVIDENCE, and evidence is what
+    tips a probe that would not answer. Here the meter is perfectly readable — the auth half of the
+    disjunction carries it alone."""
+    dsk = _attempts(["i5", "i6"], auth_probe=_AUTH_UNKNOWN)
+    out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
+    assert AUTH_DEATH in _reasons(out), _reasons(out)
+    assert only(out, "launch") == [] and only(out, "park") == []
+
+
+def test_a_single_failed_launch_is_not_a_streak():
+    """One sample cannot tell a broken lane from a broken machine — the same discriminator #320
+    settled for the environment classes, applied to session ids."""
+    dsk = _attempts(["d26"], auth_probe=_AUTH_UNKNOWN)
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk, usage=_dark_meter())
+    assert AUTH_DEATH not in _reasons(out)
+
+
+def test_a_repeat_of_the_SAME_session_id_is_one_sample_not_two():
+    dsk = _attempts(["d26", "d26"], auth_probe=_AUTH_UNKNOWN)
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk, usage=_dark_meter())
+    assert AUTH_DEATH not in _reasons(out)
+
+
+def test_a_confirmed_HEALTHY_account_and_a_readable_meter_never_hold():
+    """The conjunction is load-bearing in both directions. Two launches that failed while the meter
+    reads fine AND `claude auth status` positively reports the assigned account is not an auth
+    death — it is two lanes with problems of their own, and they must park on the normal schedule."""
+    dsk = _attempts(["i5", "i6"], auth_probe=_AUTH_HEALTHY)
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    assert AUTH_DEATH not in _reasons(out), _reasons(out)
+
+
+def test_a_more_specific_class_keeps_its_own_name_and_this_one_stays_quiet():
+    """The backstop rule, and the reason it is a rule. A hold that arrives wearing another class's
+    banner is the mis-blame #320 exists to end; stapling this cruder name onto an episode a specific
+    detector has ALREADY named precisely is the same harm from the other side — two names for one
+    outage, and an owner sent to check two different things. Every specific hold is pinned here."""
+    # a DEFINITIVE dead reading: #159's own auth_dead already holds and names it
+    out = decide(parsed_issues=[parsed(5), parsed(6)],
+                 dsk=_attempts(["d26", "d27"], auth_probe=_AUTH_DEAD))
+    assert _reasons(out) == ["auth_dead"], _reasons(out)
+    # #320's environment escalation, with an attempt streak standing beside it
+    dsk = _env_streak("gh_auth_dead", ["i5", "i6"])
+    dsk["launch_attempt_fail_ids"] = ["i5", "i6"]
+    dsk["auth_probe"] = _AUTH_UNKNOWN
+    out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
+    assert _reasons(out) == ["gh_auth_dead_workers"], _reasons(out)
+    # a dead launch ANCHOR (#24), whose remedy is a cmux tab and nothing to do with an account
+    dsk = _attempts(["i5", "i6"], auth_probe=_AUTH_UNKNOWN, launch_anchor={"ok": False})
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    assert AUTH_DEATH not in _reasons(out), _reasons(out)
+    # ...and the CHANNEL streak (#153), which holds on its very first entry
+    dsk = _attempts(["i5", "i6"], auth_probe=_AUTH_UNKNOWN, launch_fail_ids=["i5"])
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    assert AUTH_DEATH not in _reasons(out), _reasons(out)
+
+
+def test_a_garbage_attempt_streak_never_holds_the_queue():
+    """Fail OPEN on unreadable input — a wrongly-held queue is the bigger, quieter outage, and this
+    view is data the runner writes."""
+    for bad in (None, "x", 5, {}, ["", None], ["nope", "alsonope"], [5, 6], ["i5", "i5"]):
+        dsk = _attempts(bad, auth_probe=_AUTH_UNKNOWN)
+        out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
+        assert AUTH_DEATH not in _reasons(out), bad
+
+
+def test_the_hold_suppresses_the_per_issue_launch_cap_park():
+    """A lane already AT its cap when the outage is recognised is held, not parked: it is one of the
+    N re-approvals this whole layer exists to stop charging the owner."""
+    dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_UNKNOWN, issues_state={
+        "version": 1, "issues": {"i5": ist("ready", launch_failures=actions.LAUNCH_FAILURE_CAP)}})
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
+    assert only(out, "park") == []
+
+
+def test_the_auth_death_hold_probes_itself_with_the_existing_canary():
+    """The hold cannot clear itself — nothing launches while it stands, and only a launch can prove
+    the machine came back. #115's canary is the recovery probe, reused unchanged."""
+    dsk = _attempts(["d26", "d27"], fail_at=NOW - actions.CANARY_RETRY_SECONDS - 1,
+                    auth_probe=_AUTH_UNKNOWN)
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
+    probes = only(out, "launch")
+    assert len(probes) == 1 and probes[0]["canary"] is True, out
+    assert only(out, "park") == []
+
+
+def test_a_recovery_lifts_the_hold_and_relabels_nothing():
+    """The exit edge: the streak cleared on a verified delivery (a green probe, or a launch that
+    simply worked) while the durable ALERT still names the class. One journal record, the alert
+    retracts itself, the queue resumes — no issue relabeled, no re-approval asked for."""
+    dsk = disk(launch_anchor={"ok": True}, launch_attempt_fail_ids=[],
+               auth_probe=_AUTH_UNKNOWN,
+               alert={"reasons": [AUTH_DEATH], "since": NOW - 600},
+               issues_state={"version": 1, "issues": {}})
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    assert len(only(out, "launch_recovered")) == 1
+    assert only(out, "clear_alert"), "the hold's alert must retract itself"
+    assert [a["id"] for a in only(out, "launch")], "and launching resumes on its own"
+    assert only(out, "park") == [] and only(out, "relabel") == []
+
+
+def test_a_still_held_auth_death_does_not_journal_a_recovery():
+    dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_UNKNOWN,
+                    alert={"reasons": [AUTH_DEATH], "since": NOW - 600})
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
+    assert only(out, "launch_recovered") == []
+
+
+def test_the_usage_fail_open_decision_is_untouched_and_the_detector_composes_with_it():
+    """The DoD's boundary, driven together. The dark meter still FAILS OPEN (its own alert stands,
+    its own episode record is journaled, the scheduler is still told to launch normally) — this
+    detector sits ABOVE that decision and holds for a reason of its own, naming BOTH."""
+    dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_UNKNOWN)
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
+    assert "usage_stale" in _reasons(out), "the fail-open alert is not suppressed"
+    assert AUTH_DEATH in _reasons(out), "and the hold names itself beside it"
+    assert len(only(out, "fail_open")) == 1, "the fail-open episode is still journaled"
+    # ...and the composition is one page, not two: both reasons ride ONE alert record.
+    assert len(only(out, "alert")) == 1
+
+
+def test_the_existing_env_escalation_is_untouched_by_the_new_class():
+    """#320's gh-auth class still holds under ITS name on two distinct lanes, with no attempt
+    streak published at all — the new detector adds a class, it does not re-plumb the old ones."""
+    out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)],
+                 dsk=_env_streak("gh_auth_dead", ["i5", "i6"]))
+    assert _reasons(out) == ["gh_auth_dead_workers"], _reasons(out)
+
+
+def test_the_status_line_and_the_morning_report_name_the_auth_death_hold():
+    """A paused queue is not an idle one — and this is the class that spent a whole day looking
+    exactly like one."""
+    line = actions.queue_hold_line({"reasons": [AUTH_DEATH], "since": NOW})
+    assert line.startswith("queue: HELD") and AUTH_DEATH in line
+    view = {"date": "2026-08-26", "now": NOW, "frozen": None, "queue": [], "usage": None,
+            "queue_hold": {"reasons": [AUTH_DEATH], "since": NOW - 3600}}
+    text = report_lib.morning([], view, {}, cfg())
+    assert "Nothing happened overnight" not in text
+    assert AUTH_DEATH in text
+
+
+# --------------- the runner half: what the runner could not see before ----------------------
+
+def _oop(rig, act, outcome, sid, ts=NOW, **extra):
+    """Journal the record an OUT-OF-PROCESS spawner writes — the watchdog's own check process, or
+    the owner's `superlooper debug` tap. Neither runs inside the runner, so the journal is the only
+    place the runner can ever learn that a launch was attempted at all."""
+    import journal as journal_mod
+    journal_mod.append(str(rig.home), dict({"act": act, "outcome": outcome, "id": sid}, **extra), ts)
+
+
+def test_a_watchdog_debugger_launch_failure_feeds_the_attempt_streak(rig):
+    """d26/d27/d28 on 2026-08-25: three unattended repair flights refused in ten minutes, and the
+    systemic layer never heard about one of them."""
+    rig.r.tick(now=NOW)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5, signals=["alert"])
+    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5, signals=["alert"])
+    rig.r.tick(now=NOW + 20)
+    assert rig.r._launch_attempt_streak(NOW + 20) == ["d26", "d27"]
+
+
+def test_an_owner_tapped_debug_launch_failure_feeds_the_attempt_streak(rig):
+    """d29 on 2026-08-26: the owner tapped Debug in the command center and the launcher refused with
+    CLAUDE IDENTITY REFUSED. A person watching it fail is the loudest sample there is."""
+    rig.r.tick(now=NOW)
+    _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 1, operator="willprout",
+         source="command-center", error="[d29] CLAUDE IDENTITY REFUSED in the session's own env")
+    rig.r.tick(now=NOW + 20)
+    assert rig.r._launch_attempt_streak(NOW + 20) == ["d29"]
+
+
+def test_an_out_of_process_launch_that_STARTED_clears_the_streak(rig):
+    """A session that really started proves the machine can start sessions, whoever started it."""
+    rig.r.tick(now=NOW)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
+    _oop(rig, "debug_launch", "launched", "d27", ts=NOW + 2, operator="willprout")
+    rig.r.tick(now=NOW + 20)
+    assert rig.r._launch_attempt_streak(NOW + 20) == []
+
+
+def test_a_stale_out_of_process_failure_never_holds_todays_queue(rig):
+    """The streak is about NOW. A refusal from days ago says nothing about this morning's machine,
+    and a cold-started runner reading the journal's tail must not resurrect one."""
+    rig.r.tick(now=NOW)
+    old = NOW - runner_mod.AUTH_DEATH_STREAK_WINDOW_SECONDS - 60
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=old, rc=5)
+    _oop(rig, "watchdog", "launch_failed", "d27", ts=old + 1, rc=5)
+    rig.r.tick(now=NOW + 20)
+    assert rig.r._launch_attempt_streak(NOW + 20) == []
+
+
+def test_the_runners_OWN_launch_failure_feeds_the_same_streak(rig):
+    """One streak, whoever attempted the launch — otherwise the same outage would need two."""
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(runner_mod.ScriptRC(7, "[i101] CLAUDE IDENTITY REFUSED: not logged in"))
+    rig.r._execute(_launch_action(), NOW)
+    assert rig.r._launch_attempt_streak(NOW) == ["i101"]
+
+
+def test_a_verified_delivery_clears_the_attempt_streak(rig):
+    rig.r.tick(now=NOW)
+    rig.r._record_launch_attempt_failure("d26", NOW)
+    rig.r._delivery_cleared()
+    assert rig.r._launch_attempt_streak(NOW) == []
+
+
+def test_the_attempt_streak_is_published_for_decide_to_read(rig, monkeypatch):
+    """decide is PURE — it can only see what the tick hands it."""
+    seen = {}
+    real = actions.decide
+
+    def spy(now, config, usage, parsed_issues, lane_state, events, dsk, gh_view, **kw):
+        seen.update(dsk)
+        return real(now, config, usage, parsed_issues, lane_state, events, dsk, gh_view, **kw)
+
+    rig.r.tick(now=NOW)
+    rig.r._record_launch_attempt_failure("d27", NOW)
+    rig.r._record_launch_attempt_failure("d26", NOW)
+    monkeypatch.setattr(actions, "decide", spy)
+    rig.r.tick(now=NOW + 20)
+    assert seen["launch_attempt_fail_ids"] == ["d26", "d27"]
+
+
+# ------------------------- the arc: the 2026-08-26 outage, replayed -------------------------
+
+@pytest.fixture
+def auth_outage(rig):
+    """The realized 2026-08-26 machine, in the shape that made it invisible.
+
+    ONE lane is approved — the queue that day was serialized behind a wildcard in-flight lane, so
+    only one issue could ever be sampled. The usage meter is dark (every fetch refuses) and the auth
+    probe answers `unknown`: refused, not dead, exactly as it did. Every launch refuses the way the
+    owner's own Debug tap did that afternoon: CLAUDE IDENTITY REFUSED, this environment is not
+    logged in to Claude.
+
+    That is the whole trap. #320's environment class needs TWO distinct lanes refusing the same way
+    and there is only one to give it; the channel class never sees an environment fault at all; and
+    the lane's own launch cap is two attempts, so the single approved issue simply parks and the
+    loop goes quiet over a machine that cannot start a session at all.
+    """
+    rows = json.loads((rig.fixdir / "issue_list.json").read_text())
+    for row in rows:
+        if row["number"] != 101:
+            row["labels"] = [{"name": "type:build"}, {"name": "needs-owner"}]
+    (rig.fixdir / "issue_list.json").write_text(json.dumps(rows))
+
+    fault = {"rc": 7}
+    launched = []
+    inner = rig.r._run_script
+
+    def run_script(args, env=None, timeout=None):
+        a = [str(x) for x in args]
+        if a and a[0].endswith("launch-session.py"):
+            launched.append(a[1])
+            if fault["rc"]:
+                inner(args, env=env, timeout=timeout)       # still recorded in rig.calls
+                return runner_mod.ScriptRC(
+                    fault["rc"],
+                    "[%s] CLAUDE IDENTITY REFUSED in the session's own environment — this "
+                    "environment is not logged in to Claude" % a[1])
+        return inner(args, env=env, timeout=timeout)
+
+    rig.r._run_script = run_script
+    rig.r._fetch_usage = lambda: {"auth_status": "api_error", "five_hour_pct": None,
+                                  "seven_day_pct": None}
+    rig.r._probe_auth = lambda: dict(_AUTH_UNKNOWN)
+    rig.fault = fault
+    rig.launched = launched
+    return rig
+
+
+def _agent_ready_removed(rig):
+    return [m for m in mutations(rig)
+            if m.get("kind") == "set_labels" and "agent-ready" in (m.get("remove") or [])]
+
+
+def test_the_2026_08_26_outage_holds_the_queue_and_resumes_on_its_own(auth_outage):
+    """THE acceptance fact, replaying the day the hold was supposed to trip and did not.
+
+    A dark meter (failing open — its own recorded decision, untouched here), an auth probe that will
+    not answer, one lane refusing and one unattended repair flight refusing from its OWN process:
+    together they are two distinct session ids that could not start, with nothing starting between
+    them. ONE alert naming this class, zero parks, nothing relabeled, no further launch attempt
+    while it stands — and when the owner logs back in, the recovery probe finds out by itself.
+    """
+    rig = auth_outage
+    t = NOW
+    rig.r.tick(now=t)                                   # the meter's first (failed) read
+    while t < NOW + actions.USAGE_FAIL_OPEN_GRACE_SECONDS + 60:
+        t += 900                                        # ...and it stays dark past the grace, in
+        rig.r.tick(now=t)                               # steps under the wake-gap threshold
+    assert _journal(rig, "fail_open"), "the usage fail-open decision is untouched"
+
+    # the meter is failing open now, so the one approved lane flies — and refuses
+    assert rig.launched == ["i101"], rig.launched
+    assert issue_state(rig, "i101")["launch_failures"] == 1, "the lane's own cap still ticks"
+    assert AUTH_DEATH not in (_alert_file(rig) or {}).get("reasons", []), \
+        "one sample cannot tell a broken lane from a broken machine"
+
+    # ...and the watchdog's unattended repair flight refuses too, from its own process. THAT is the
+    # second distinct session, and the whole thing #320 could not see.
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=t + 1, rc=5, signals=["alert"])
+    t += 20
+    rig.r.tick(now=t)
+
+    # --- HELD, under a name of its own ---
+    alert = _alert_file(rig)
+    assert AUTH_DEATH in alert["reasons"], alert
+    assert len([a for a in _journal(rig, "alert")
+                if AUTH_DEATH in (a.get("reasons") or [])]) == 1, _journal(rig, "alert")
+    assert actions.queue_hold_line(alert).startswith("queue: HELD")
+
+    # --- nothing parked, nothing relabeled, no further launch attempted ---
+    flights = list(rig.launched)
+    for _ in range(3):                                  # ...and it stays that way, tick after tick
+        t += 20
+        rig.r.tick(now=t)
+    st = loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]
+    assert [i for i, d in st.items() if d.get("status") == "parked"] == []
+    assert _journal(rig, "park") == []
+    assert _agent_ready_removed(rig) == [], "no re-approval is owed"
+    assert rig.launched == flights, "a held queue attempts no fresh launch"
+    assert len([a for a in _journal(rig, "alert")
+                if AUTH_DEATH in (a.get("reasons") or [])]) == 1, "and it pages exactly once"
+
+    # --- the owner logs back in; the recovery probe finds out on its own ---
+    rig.fault["rc"] = 0
+    rig.r._probe_auth = lambda: dict(_AUTH_HEALTHY)
+    t += actions.CANARY_RETRY_SECONDS + 30
+    rig.r.tick(now=t)                                   # the canary probe
+    assert len(rig.launched) == len(flights) + 1, "exactly one probe, not a re-storm"
+    t += 20
+    rig.r.tick(now=t)                                   # the tick that sees the streak cleared
+
+    assert len(_journal(rig, "launch_recovered")) == 1
+    assert AUTH_DEATH not in ((_alert_file(rig) or {}).get("reasons") or [])
+    assert _journal(rig, "park") == [], "and it parked nothing on the way out either"
+    assert loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]["i101"]["status"] \
+        == "running", "the queue resumed on its own"

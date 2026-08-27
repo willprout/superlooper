@@ -172,3 +172,78 @@ def test_rotate_appends_to_an_existing_archive(tmp_path):
 
 def test_read_all_is_empty_when_nothing_written(tmp_path):
     assert journal.read_all(tmp_path / "nowhere") == []
+
+
+# ---------------- follow(): the bounded incremental read (issue #457) ----------------------
+#
+# The runner absorbs the launches it did NOT run — the watchdog's unattended sl-debugger, the
+# owner's `superlooper debug` tap — from this file, on every ~20 s tick. read() would re-parse the
+# whole 14-day hot window to do that. follow() reads only what was appended since last time, and on
+# a cold start (no offset — a runner that just came up) only a bounded tail of it.
+
+
+def test_follow_returns_only_what_was_appended_since_the_offset(tmp_path):
+    journal.append(tmp_path, {"act": "a"}, now=1)
+    first, off = journal.follow(tmp_path)
+    assert [r["act"] for r in first] == ["a"]
+    journal.append(tmp_path, {"act": "b"}, now=2)
+    journal.append(tmp_path, {"act": "c"}, now=3)
+    second, off2 = journal.follow(tmp_path, off)
+    assert [r["act"] for r in second] == ["b", "c"]
+    assert off2 > off
+    assert journal.follow(tmp_path, off2)[0] == [], "a quiet file yields nothing, not a re-read"
+
+
+def test_follow_on_a_cold_start_reads_a_bounded_tail_not_the_whole_file(tmp_path):
+    for i in range(400):
+        journal.append(tmp_path, {"act": "pad", "n": i, "filler": "x" * 200}, now=i)
+    journal.append(tmp_path, {"act": "the_recent_one"}, now=999)
+    recs, off = journal.follow(tmp_path, None, max_bytes=4096)
+    assert recs, "the recent past must still be visible"
+    assert recs[-1]["act"] == "the_recent_one"
+    assert len(recs) < 400, "but not the whole history"
+    assert off == (tmp_path / "journal.jsonl").stat().st_size
+
+
+def test_follow_drops_the_partial_first_line_a_byte_seek_can_land_in(tmp_path):
+    """A cold start seeks by BYTES, so its first line is very likely half a record. Parsing half of
+    one would be a silent mis-read; dropping it costs one record of history."""
+    journal.append(tmp_path, {"act": "first", "filler": "x" * 500}, now=1)
+    journal.append(tmp_path, {"act": "second"}, now=2)
+    recs, _ = journal.follow(tmp_path, None, max_bytes=100)
+    assert [r["act"] for r in recs] == ["second"]
+
+
+def test_follow_leaves_a_trailing_partial_line_unconsumed(tmp_path):
+    """A writer caught mid-append must be re-read WHOLE next time, never parsed in halves."""
+    journal.append(tmp_path, {"act": "whole"}, now=1)
+    with open(tmp_path / "journal.jsonl", "a") as f:
+        f.write('{"ts": 2, "act": "half')                 # no newline: still being written
+    recs, off = journal.follow(tmp_path)
+    assert [r["act"] for r in recs] == ["whole"]
+    with open(tmp_path / "journal.jsonl", "a") as f:
+        f.write('written"}\n')                            # the rest of that record lands
+    recs2, _ = journal.follow(tmp_path, off)
+    assert [r["act"] for r in recs2] == ["halfwritten"]
+
+
+def test_follow_restarts_from_zero_when_the_file_shrank(tmp_path):
+    """rotate() moves the hot window into the archive, so the file this reader follows can get
+    SMALLER. Seeking past its end would silently read nothing forever."""
+    for i in range(5):
+        journal.append(tmp_path, {"act": "old", "n": i}, now=i)
+    _, off = journal.follow(tmp_path)
+    (tmp_path / "journal.jsonl").write_text('{"ts": 9, "act": "fresh"}\n')
+    recs, _ = journal.follow(tmp_path, off)
+    assert [r["act"] for r in recs] == ["fresh"]
+
+
+def test_follow_fails_closed_on_garbage_input(tmp_path):
+    assert journal.follow(tmp_path) == ([], None), "a missing file reads as nothing"
+    journal.append(tmp_path, {"act": "a"}, now=1)
+    with open(tmp_path / "journal.jsonl", "a") as f:
+        f.write("not json at all\n[]\n")
+    journal.append(tmp_path, {"act": "b"}, now=2)
+    for bad in (-1, "x", 10 ** 9, True, 1.5):
+        recs, _ = journal.follow(tmp_path, bad)
+        assert [r["act"] for r in recs] == ["a", "b"], bad
