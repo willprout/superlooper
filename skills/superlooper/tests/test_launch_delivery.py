@@ -519,7 +519,7 @@ def test_a_triage_home_the_launcher_cannot_read_refuses_rather_than_choosing_one
     (rig["run_root"] / "briefs" / "t3.md").write_text("triage the queue")
     r = _launch(rig, args=("--triage", "t3"), extra_env={"SL_TRIAGE_HOME": "Checkout"})
     assert r.returncode == 1
-    assert "TRIAGE LAUNCH REFUSED: unknown triage home" in r.stderr
+    assert "TRIAGE LAUNCH REFUSED: the triage home is not one this engine knows" in r.stderr
     assert not (rig["stub"] / "pane.env").exists()
 
 

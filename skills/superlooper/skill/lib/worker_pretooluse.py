@@ -241,7 +241,7 @@ def _triage_ask_reason(state_home, issue_id):
 # that is almost never taken.
 #
 # And a LITERAL is safe here in a way it would not be elsewhere: `test_triage.py` pins these two
-# segments against `triage.DIR` / `triage.RUNS_DIRNAME`, so a rename fails a test rather than
+# segments against `triage.DIR` / `triage.RUNS`, so a rename fails a test rather than
 # quietly sending a stranded flight to a folder that does not exist.
 def _triage_runs_dir(state_home):
     return os.path.join(state_home, "triage", "runs")

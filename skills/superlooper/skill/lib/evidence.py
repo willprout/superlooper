@@ -196,6 +196,13 @@ _LAUNCH_TEXT = (
     # can be inserted above. Costs the readings below nothing — "FENCE DOWN" is the loop's OWN
     # phrase from lib/launch.py, which gh, git and cmux can never emit, and which no variable name
     # in an env-poison refusal can contain (it has a space in it).
+    #
+    # It KEEPS the lead over the triage entry below, which was the other candidate for this slot
+    # (fresh-agent review, P2). Swapping them would close one hole by opening a worse one: a socket
+    # path containing the triage phrase would read a REAL fence refusal as per-issue, which is a
+    # fail-OPEN on the one check whose whole job is to fail closed. The hole that swap was aimed at
+    # is closed at its source instead — lib/launch.py no longer interpolates the unvalidated config
+    # value into that refusal at all, so there is nothing there to forge a reason with.
     (("fence down",),
      ("fence_down",
       "this machine declares its fleet fenced and the pre-flight found the session host's control "
@@ -203,7 +210,11 @@ _LAUNCH_TEXT = (
       "launched onto it. A machine-level fault no queued issue caused and none can fix by "
       "re-approving: rebuild the patched host and reinstall the fleet server, or declare the "
       "machine unfenced deliberately")),
-    # SECOND (issue #448), and ahead of everything below for the same reason `fence down` leads:
+    # SECOND (issue #448) — directly under the fence and ahead of everything else, because the only
+    # value these refusals still interpolate is a filesystem PATH, and a path can contain any needle
+    # below. The unvalidated config STRING that used to ride here is gone from the text entirely
+    # (lib/launch.py names the key and the allowed set instead), which is what lets this sit second
+    # rather than fighting the fence for the lead — see the note above.
     # two of the triage launcher's refusals interpolate a value the engine did not choose (a
     # per-repo `triage.home` string, a checkout path), so any position a later needle could be
     # inserted above is a position where `SL_TRIAGE_HOME=not_found` reads as a dead cmux workspace.

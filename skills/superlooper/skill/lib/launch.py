@@ -553,9 +553,16 @@ def _launch(spec, host, edges):
         # cmux workspace or a GitHub outage.
         home_kind = getattr(spec, "triage_home", triage.CHECKOUT)
         if type(home_kind) is not str or home_kind not in triage.HOMES:
-            return Result(ABORTED, "[%s] TRIAGE LAUNCH REFUSED: unknown triage home %r "
-                                   "(expected: %s) — refusing"
-                          % (iid, home_kind, " or ".join(triage.HOMES)))
+            # The VALUE is deliberately not echoed (fresh-agent review, P2). It is the one thing
+            # here that a repo's own config — or a hand-exported SL_TRIAGE_HOME — puts verbatim
+            # into a line `evidence.py` CLASSIFIES, and every channel needle in that table is a
+            # phrase somebody could type into it: `SL_TRIAGE_HOME="fence down"` was measured
+            # holding the whole approved queue. Naming the key and the allowed set is the
+            # actionable half anyway — the loader already refuses a bad `triage.home` loudly at
+            # adopt time WITH the value, and a hand-set variable is a value its operator typed.
+            return Result(ABORTED, "[%s] TRIAGE LAUNCH REFUSED: the triage home is not one this "
+                                   "engine knows (expected %s in `triage.home`, or SL_TRIAGE_HOME) "
+                                   "— refusing" % (iid, " or ".join(triage.HOMES)))
         if not spec.repo:
             # Named rather than left to git, for the reason the worker refusal below spells out:
             # without it the base probe fails and the launch would blame a dev_branch that is not

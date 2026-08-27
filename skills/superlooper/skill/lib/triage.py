@@ -137,6 +137,13 @@ def nit(rubric_line):
 # --------------------------------------------------------------------------- paths
 
 def home(state_home):
+    """``<state_home>/triage``.
+
+    A ``state_home`` that cannot be expressed as a path is a CALLER bug, and `os.fspath` reports it
+    as one (TypeError) rather than degrading into a plausible-looking path under a garbage name —
+    silently reading and writing somewhere nobody chose is worse than a loud stop. Every READER
+    below catches it and answers in its own fail-safe direction, so no tick dies for it.
+    """
     return os.path.join(os.fspath(state_home), DIR)
 
 
@@ -158,7 +165,10 @@ def run_log_path(state_home, date):
     """
     if not isinstance(date, str) or not _DATE_RE.match(date):
         return None
-    return os.path.join(runs_dir(state_home), "%s.md" % date)
+    try:
+        return os.path.join(runs_dir(state_home), "%s.md" % date)
+    except TypeError:                    # a state_home that is not a path at all (see `home`)
+        return None
 
 
 # --------------------------------------------------------------------------- the body hash
@@ -193,7 +203,7 @@ def load_verdicts(state_home):
     """
     try:
         obj = loopstate.load(verdicts_path(state_home))
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return {}
     return obj if isinstance(obj, dict) else {}
 
@@ -205,6 +215,13 @@ def record_verdict(state_home, num, body, verdict, date):
     it exists to answer is "has THIS body been judged". Hashing happens here rather than at the
     call site so the store and ``changed()`` can never disagree about the scheme.
     """
+    # REFUSED rather than coerced (fresh-agent review, P1). The old `verdict if isinstance(...)
+    # else ""` wrote a record with a correct body_hash and an empty verdict, which `changed()` then
+    # read as judged — a wrong-typed argument silently retiring an issue from triage forever, which
+    # is the fail-open on wrong-typed input this codebase forbids. The store is left EXACTLY as it
+    # stands and returned unchanged, so the issue stays a cue and the next flight looks again.
+    if not (isinstance(verdict, str) and verdict.strip()):
+        return load_verdicts(state_home)
     path = verdicts_path(state_home)
     # The folder is created HERE rather than assumed: the first verdict a repo ever records may
     # well arrive before any run log has (`loopstate.save` writes its temp file beside the target,
@@ -227,7 +244,7 @@ def record_verdict(state_home, num, body, verdict, date):
     try:
         current = load_verdicts(state_home)      # already fail-closed to {} on corruption
         current[_key(num)] = {"body_hash": body_hash(body),
-                              "verdict": verdict if isinstance(verdict, str) else "",
+                              "verdict": verdict,
                               "date": date if isinstance(date, str) else ""}
         loopstate.save(path, current)
     finally:
@@ -242,6 +259,15 @@ def record_verdict(state_home, num, body, verdict, date):
 
 def _key(num):
     return str(num)
+
+
+def _judged(record):
+    """Is this store entry a RULING, rather than the wreckage of one? A dict carrying a non-empty
+    string verdict. Anything else — not a dict, no `verdict` key, a blank one, a wrong-typed one —
+    is a record no flight can be shown to have reached, and reading it as judged would remove that
+    issue from triage permanently."""
+    return (isinstance(record, dict) and isinstance(record.get("verdict"), str)
+            and bool(record["verdict"].strip()))
 
 
 # --------------------------------------------------------------------------- what changed
@@ -274,9 +300,18 @@ def changed(open_issues, verdicts):
     by itself, summon a flight. It cannot: an edit to frozen text is the owner editing his own, and
     the flight has nothing to say about it.
 
+    **THIS IS THE LAUNCH CUE, AND NEVER THE ACTION LIST.** It answers one question — is there
+    anything new to look at — and a caller must not reuse it as "the issues this flight may act
+    on". The two differ where it matters: `parked` / `needs-owner` are cues (they are out of the
+    loop's hands and a flight judging one ends the cue) but a `needs-owner` issue is one the owner
+    has been explicitly ASKED to decide, and the standing rule's "anything the owner has personally
+    flagged" line plus its escalate-never-act discipline both point away from closing it. What a
+    flight may DO with each verdict is the brief's contract (part 2), not this function's.
+
     Defensive like every other pure core here: a partial or wrong-typed view (a broken gh call, a
     half-written cache) yields fewer issues to triage, never an exception into a tick. An entry
-    whose verdict record is not a readable dict counts as UNJUDGED, which is the re-read direction.
+    that is not a readable RULING — not a dict, or carrying no usable verdict — counts as
+    UNJUDGED, which is the re-read direction.
     A wrong-typed label set reads as NO labels (``issues._label_names``' own contract), i.e. as
     unapproved — the direction that costs a second look rather than a missed one.
     """
@@ -300,7 +335,15 @@ def changed(open_issues, verdicts):
         if any(held in names for held in HELD_LABELS):
             continue                     # never the flight's to judge -> never the flight's cue
         record = known.get(_key(num))
-        if not isinstance(record, dict) or record.get("body_hash") != body_hash(issue.get("body")):
+        # BOTH halves of a record have to be readable for it to retire an issue (fresh-agent
+        # review, P1). `load_verdicts` is hardened so a truncated FILE cannot silently retire
+        # everything; this is the same invariant one layer in, for a single truncated or
+        # hand-edited ENTRY. A record carrying a correct body_hash and a blank or absent verdict
+        # means the flight recorded a hash and never reached a ruling — reading that as "judged"
+        # is exactly the silent-forever-retirement `load_verdicts`' own docstring names, and it
+        # is a fail-OPEN on wrong-typed input, which this codebase forbids. Unjudged is the
+        # re-read direction: it costs a second look, never a missed issue.
+        if not _judged(record) or record.get("body_hash") != body_hash(issue.get("body")):
             out.add(num)
     return sorted(out)
 
@@ -375,14 +418,22 @@ def recent_run_logs(state_home, limit=3):
     try:
         names = sorted((n for n in os.listdir(runs_dir(state_home)) if n.endswith(".md")),
                        reverse=True)
-    except OSError:
+    except (OSError, TypeError):
         return []
     out = []
     for name in names[:count]:
         try:
-            with open(os.path.join(runs_dir(state_home), name)) as f:
+            # `errors="replace"` and NOT a bare open (fresh-agent review, P1). A run log is written
+            # by the FLIGHT — an agent appending markdown — so a write truncated mid-multibyte
+            # character, or a raw byte pasted out of some tool's output, is ordinary rather than
+            # exotic. A bare read raises UnicodeDecodeError, which is a ValueError and so slips
+            # past `except OSError` and out of a core whose docstring promises it never raises —
+            # and this is THE reader the standing rule names, so one corrupt log would strand
+            # every subsequent flight. `load_verdicts` already gets this right; this one did not.
+            with open(os.path.join(runs_dir(state_home), name), encoding="utf-8",
+                      errors="replace") as f:
                 out.append((name[:-3], f.read()))
-        except OSError:
+        except (OSError, ValueError):
             continue
     return out
 

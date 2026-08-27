@@ -1226,7 +1226,7 @@ def test_an_unreadable_triage_home_refuses_rather_than_choosing_one(tmp_path):
     spec = _triage_spec(tmp_path, triage_home="somewhere")
     result, _edges, host = _run(spec)
     assert result.rc == launch.ABORTED
-    assert "TRIAGE LAUNCH REFUSED: unknown triage home" in result.stderr
+    assert "TRIAGE LAUNCH REFUSED: the triage home is not one this engine knows" in result.stderr
     assert host.spawned == []
 
 
@@ -1260,7 +1260,12 @@ def test_a_triage_config_fault_can_never_hold_the_whole_queue(tmp_path):
 
 
 @pytest.mark.parametrize("hostile", ["not_found", "dial tcp", "could not connect",
-                                     "no answer within", "broken pipe", "http 429"])
+                                     "no answer within", "broken pipe", "http 429",
+                                     # THE one an earlier spelling of this test missed, and the
+                                     # only one that actually worked: `fence down` sat ABOVE the
+                                     # triage needle, so a repo could hold the whole approved queue
+                                     # with a string typed into its own config (fresh-agent review).
+                                     "fence down", "FENCE DOWN"])
 def test_a_hostile_triage_home_value_cannot_forge_a_channel_fault(tmp_path, hostile):
     """Two of these refusals interpolate a value the ENGINE did not choose. Every string here is a
     needle belonging to a channel reason further down the table — a held queue with a remedy
@@ -1270,10 +1275,28 @@ def test_a_hostile_triage_home_value_cannot_forge_a_channel_fault(tmp_path, host
     import evidence
     result, _edges, host = _run(_triage_spec(tmp_path, triage_home=hostile))
     assert result.rc == launch.ABORTED and host.spawned == []
-    assert hostile in result.stderr, "the owner still sees what was written"
+    assert hostile not in result.stderr, \
+        "the unvalidated value must not reach a line evidence.py classifies"
+    assert "expected checkout or worktree" in result.stderr, "the actionable half survives"
     rec = evidence.build("launch", result.rc, result.stderr)
     assert rec["reason"] == "triage_launch_refused", rec
     assert not evidence.is_channel_fault(rec), rec
+
+
+def test_a_real_fence_refusal_still_outranks_everything_it_used_to(tmp_path, monkeypatch):
+    """The other side of that reorder. The triage needle now leads the table, so this pins that a
+    genuine FENCE DOWN is untouched by it — at rc=9, where the rc is authoritative, and at rc=1,
+    the version-skew fallback the fence entry exists for. A triage refusal can never carry rc=9,
+    which is what makes the two orderings independent."""
+    import evidence
+    edges = FakeEdges(fence=session_host.OPEN)
+    _fleet(monkeypatch)
+    result, _edges, host = _run(_spec(tmp_path), edges=edges, started=False)
+    assert result.rc == launch.FENCE_DOWN and host.spawned == []
+    for rc in (launch.FENCE_DOWN, launch.ABORTED):
+        rec = evidence.build("launch", rc, result.stderr)
+        assert rec["reason"] == "fence_down", (rc, rec)
+        assert evidence.is_channel_fault(rec), "an unfenced fleet still holds the queue"
 
 
 def test_a_triage_worktree_off_a_missing_base_still_exits_3(tmp_path):
@@ -1425,7 +1448,7 @@ def test_a_wrong_typed_triage_home_is_refused_rather_than_defaulted(tmp_path):
         spec = _triage_spec(tmp_path, triage_home=junk)
         result, _edges, host = _run(spec)
         assert result.rc == launch.ABORTED, junk
-        assert "TRIAGE LAUNCH REFUSED: unknown triage home" in result.stderr, junk
+        assert "TRIAGE LAUNCH REFUSED: the triage home is not one this engine knows" in result.stderr, junk
         assert host.spawned == []
 
 
