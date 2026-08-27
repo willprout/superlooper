@@ -30,13 +30,15 @@ _BRIEF = _TEMPLATES / "triage-brief.md"
 # template without teaching the launcher to fill it fails this suite instead of a live flight.
 _PLACEHOLDERS = ("{flight_id}", "{date}", "{repo_slug}", "{repo_path}", "{dev_branch}",
                  "{operator}", "{state_home}", "{run_log}", "{rubric}", "{recent_runs}",
-                 "{verdicts}", "{pile}", "{ledger}", "{cli}")
+                 "{verdicts}", "{pile}", "{ledger}", "{cli}", "{home_note}")
 
 _FILL = {
     "flight_id": "t7", "date": "2026-08-27", "repo_slug": "o/r", "repo_path": "/Users/w/r",
     "dev_branch": "main", "operator": "willprout", "state_home": "/Users/w/.superlooper/o__r",
     "run_log": "/Users/w/.superlooper/o__r/triage/runs/2026-08-27.md",
     "rubric": triage_run.render_rubric({}),
+    "home_note": "You are running in the repo's REAL checkout (`/Users/w/r`)... "
+                 "It is **read-only to you** and it is **not evidence**.",
     "recent_runs": "### 2026-08-26\n\n- `triage_close` **#131** — overtaken\n",
     "verdicts": "- #131 -> overtaken (2026-08-26)\n",
     "pile": "- #140 *A nit* — no verdict recorded\n",

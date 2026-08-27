@@ -815,3 +815,23 @@ def test_a_ledger_read_that_gitHub_refuses_never_closes_a_nit_unfiled(rig):
     assert not res["ok"] and "could not be read" in res["error"]
     assert rig.issue(40)["state"] == "open"
     assert rig.comments(12) == [], "nothing filed, because nothing was closed"
+
+
+def test_the_brief_describes_the_home_the_flight_is_actually_standing_in(tmp_path):
+    """`triage.home` selects between two DIFFERENT repositories, and the checkout home is chosen
+    precisely FOR the gitignored overlay. A brief that described the checkout to a flight running
+    in a detached worktree would have it judging staleness against a repo it is not in."""
+    for home, expect, forbid in ((triage.CHECKOUT, "REAL checkout", "DETACHED worktree"),
+                                 (triage.WORKTREE, "DETACHED worktree", "REAL checkout")):
+        rig = Rig(tmp_path / home, cfg_extra={"triage": {"enabled": True, "home": home}})
+        rig.github([_issue(10, "Something to look at")])
+        r = run(rig, "triage-flight", "--repo", str(rig.repo), "--dry-run")
+        assert r.returncode == 0, r.stderr
+        assert expect in r.stdout, home
+        assert forbid not in r.stdout, home
+        assert "{" not in r.stdout.replace("{}", ""), "the home note must render clean too"
+    # ...and the launcher is told which one, so the two can never disagree
+    rig = Rig(tmp_path / "launched", cfg_extra={"triage": {"enabled": True, "home": "worktree"}})
+    rig.github([_issue(10, "Something")])
+    assert out(run(rig, "triage-flight", "--repo", str(rig.repo), "--json"))["ok"]
+    assert rig.launches()[0]["TRIAGE_HOME"] == "worktree"

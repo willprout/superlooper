@@ -31,11 +31,8 @@ Everything else in this brief is held by a verb that will refuse you at the call
 yours to keep:
 
 1. **Fetch first, and judge every staleness claim against `origin/{dev_branch}` — never the working
-   tree.** You are running in the repo's real checkout (`{repo_path}`) precisely so you can see
-   what an orchestrator sees, gitignored working files included. That checkout may sit on any
-   branch, dirty, mid-anything. It is **read-only to you** and it is **not evidence**. Run
-   `git -C {repo_path} fetch origin` before your first judgement, and reason from
-   `origin/{dev_branch}` alone.
+   tree.** {home_note} Run `git -C {repo_path} fetch origin` before your first judgement, and reason
+   from `origin/{dev_branch}` alone.
 2. **Read the last three run logs and the verdicts file before acting.** Both are quoted below.
    They are how you avoid re-litigating what a previous flight already settled, and how you notice
    a pattern across days that no single day shows.

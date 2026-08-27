@@ -3126,6 +3126,26 @@ def _triage_next_id(home):
     return "t%d" % nxt
 
 
+# What the flight is standing in, per `triage.home`. Two DIFFERENT repositories (`lib/triage.py`
+# and `lib/launch.py` both say so), so the brief must not describe one and hand the flight the
+# other — the checkout home is chosen precisely FOR the gitignored overlay, and a flight in the
+# worktree home that believed it could see one would judge staleness against a repository it is
+# not in.
+_TRIAGE_HOME_NOTE = {
+    triage.CHECKOUT: (
+        "You are running in the repo's REAL checkout (`{repo_path}`) precisely so you can see what "
+        "an orchestrator sees, gitignored working files included. That checkout may sit on any "
+        "branch, dirty, mid-anything. It is **read-only to you** and it is **not evidence**."),
+    triage.WORKTREE: (
+        "You are running in a DETACHED worktree of `origin/{dev_branch}` — this repo set "
+        "`triage.home: worktree`, so the gitignored working files an orchestrator sees are NOT "
+        "visible to you and nothing you can see here is unpublished. Your working tree is still "
+        "**read-only to you** and still **not evidence**. The verbs below take "
+        "`--repo {repo_path}` — the repo's real checkout, where this loop's config lives; that is "
+        "an address for them, not somewhere for you to read or write."),
+}
+
+
 def _triage_brief(cfg, home, repo_path, flight_id, date, open_issues, verdicts):
     template = _read(os.path.join(_TEMPLATES, "triage-brief.md")) or ""
     health = gh.marked_issues_health(limitations.LEDGER_LABEL)
@@ -3139,6 +3159,10 @@ def _triage_brief(cfg, home, repo_path, flight_id, date, open_issues, verdicts):
         "operator": config_lib.operator(cfg),
         "state_home": home,
         "run_log": triage.run_log_path(home, date) or os.path.join(triage.runs_dir(home), date),
+        "home_note": triage_run.render_brief(
+            _TRIAGE_HOME_NOTE[triage.home_kind(cfg)],
+            {"repo_path": os.path.abspath(repo_path),
+             "dev_branch": cfg.get("dev_branch") or "main"}),
         "rubric": triage_run.render_rubric(cfg),
         "recent_runs": _triage_recent_block(home, date),
         "verdicts": _triage_verdicts_block(verdicts),
