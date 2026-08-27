@@ -234,6 +234,12 @@ def _issue_view(issue, want_fields):
             # scenarios deliberately feed the product parsers wrong-typed JSON, and the fake
             # must deliver the garbage, not choke on it
             out["labels"] = [{"name": n} for n in labs] if isinstance(labs, list) else labs
+        elif f == "isPinned":
+            # GitHub answers a BOOL for every issue, never null — an issue nobody pinned is
+            # `false`. Defaulting here (rather than letting .get return None) keeps the fake from
+            # teaching a shape the real service never sends; a state that SETS the key, including
+            # to garbage, still wins, like every other field.
+            out[f] = issue.get("isPinned", False)
         else:
             out[f] = issue.get(f)
     return out
@@ -530,6 +536,23 @@ def main_stateful():
             }
             save_state(st)
         sys.stdout.write("https://github.com/fake/repo/issues/%s\n" % num)
+        sys.exit(0)
+
+    elif sub == ["issue", "pin"]:
+        # adopt's limitations-ledger scaffold (issue #450). Real gh REFUSES a second pin on an
+        # already-pinned issue, and that refusal is exactly what the product avoids by reading
+        # `isPinned` first — so the fake refuses too, or the product could regress to pinning
+        # blind and no test would notice.
+        with _Lock(STATE_PATH):
+            st = load_state()
+            issue = st.get("issues", {}).get(ARGS[2])
+            if issue is None:
+                die("no such issue %s" % ARGS[2])
+            if issue.get("isPinned"):
+                die("GraphQL: Issue is already pinned to the repository (pinIssue)")
+            issue["isPinned"] = True
+            save_state(st)
+        record("pin_issue", num=ARGS[2])
         sys.exit(0)
 
     elif sub == ["issue", "close"]:
@@ -845,6 +868,12 @@ def main_fixture():
 
     elif sub == ["pr", "edit"]:
         record("pr_add_labels", num=ARGS[2], add=opt("--add-label"))
+        sys.exit(0)
+
+    elif sub == ["issue", "pin"]:
+        # adopt's limitations-ledger scaffold (issue #450). Fixture mode holds no pin state, so
+        # this simply records the attempt; a test that needs a refusal arms a fail rule.
+        record("pin_issue", num=ARGS[2])
         sys.exit(0)
 
     elif sub == ["issue", "close"]:

@@ -608,7 +608,11 @@ def test_every_gh_helper_that_names_a_label_flag_is_classified():
     # Read-by-label queries: they pass a label as a FILTER. A filter naming a label the repo lacks
     # returns nothing; it cannot freeze an issue, so the vocabulary check does not apply to them.
     readers = {"ready_issues", "ready_issues_health", "open_issues", "open_issues_activity",
-               "open_prs_labeled"}
+               "open_prs_labeled",
+               # adopt's ledger read (issue #450): `--label limitations-ledger` FILTERS for the one
+               # issue that already carries the marker. The APPLY of that marker happens at the
+               # `create_issue(labels=[...])` call in the CLI, which the fence resolves there.
+               "marked_issues_health"}
     tree = _parse((_REPO / _ENGINE / "lib" / "gh.py").read_text(encoding="utf-8"))
     assert tree is not None, "lib/gh.py must parse"
     naming = set()

@@ -107,6 +107,13 @@ import labels as labels_lib          # the vocabulary itself, for the specs adop
 from labels import LABELS, missing_runner_labels, runner_managed_labels
 import journal
 import ledger as ledger_lib
+# The limitations ledger (issue #450) — NOT ledger_lib above, which is the known-FAILURE ledger in
+# the state home. This one is prose on a pinned GitHub issue: the marker, the title, the body adopt
+# writes, and the pure create-or-find that keeps re-adopting idempotent. Imported UNALIASED on
+# purpose: the #337 label fence resolves a cross-module constant by the module's file stem, so
+# `import limitations as limitations_lib` would make `LEDGER_LABEL` unreadable to it and buy an
+# allow-list entry instead of a checked label.
+import limitations
 import loopstate
 import panes
 import nightly as nightly_lib
@@ -1896,6 +1903,54 @@ def cmd_status(args):
 
 # ------------------------------- adopt -------------------------------
 
+def _scaffold_ledger():
+    """Create-or-find the repo's ONE **pinned** limitations ledger issue (issue #450).
+
+    Returns ``(ok, line, unpinned)``: whether adopt's ledger half is COMPLETE, a printable status
+    line, and — when the ledger exists but could not be pinned — its issue number, so the caller
+    can print the memo that actually fits (the ledger is fine; only the pin is missing).
+
+    A failed pin is NOT a success (fresh-agent review, #450). It is tempting to wave it through
+    because every consumer finds the ledger by its LABEL and none of them needs the pin — but the
+    thing adoption promises is a PINNED ledger, and exiting 0 on a pin that never landed is the
+    issue-#29 defect exactly: a report of a success that did not happen, whose gap surfaces later
+    as "why is nothing pinned". So the pin's failure rides out on ``ok`` like every other half.
+
+    The read is fail-CLOSED in the direction that matters. Every other list read in this engine
+    degrades a refusal to "[]" and the caller safely acts on nothing; here the response to nothing
+    is to CREATE, so a throttled read read as an empty answer would scaffold a second ledger on
+    every re-run — and adopt is documented as safe to re-run. Hence marked_issues_health, and
+    hence: no ok, no create.
+    """
+    rh = gh.marked_issues_health(limitations.LEDGER_LABEL)
+    if not rh.ok:
+        return (False,
+                "  FAIL  could not READ the ledger (gh refused) — creating nothing. A refused read "
+                "is not\n        an empty repo: scaffolding on it would add a SECOND ledger every "
+                "re-run.", None)
+    found = limitations.find_ledger(rh.value)
+    if found is None:
+        num = gh.create_issue(limitations.LEDGER_TITLE, limitations.ledger_body(),
+                              labels=[limitations.LEDGER_LABEL])
+        if num is None:
+            return (False, "  FAIL  could not create the ledger issue", None)
+        if gh.pin_issue(num):
+            return (True, "  ok    created and pinned ledger issue #%d" % num, None)
+        return (False, "  WARN  created ledger issue #%d — but PINNING it failed" % num, num)
+    num = found["number"]
+    if found.get("isPinned"):
+        return (True, "  ok    ledger issue #%d already exists (pinned) — nothing created" % num,
+                None)
+    # Found but unpinned: the one case a re-adopt still writes. Pinning is what makes the ledger the
+    # first thing a reader sees, and reading `isPinned` first is what lets us pin ONLY here — real
+    # gh refuses a second pin on an already-pinned issue, so pinning blind would print a failure on
+    # every healthy re-adopt and teach the operator to ignore this line.
+    if gh.pin_issue(num):
+        return (True, "  ok    ledger issue #%d already exists — re-pinned it" % num, None)
+    return (False, "  WARN  ledger issue #%d already exists, but is unpinned and pinning it failed"
+                   % num, num)
+
+
 def cmd_adopt(args):
     cfg_path = os.path.join(args.repo, ".superlooper", "config.json")
     if os.path.exists(cfg_path):
@@ -1961,6 +2016,22 @@ def cmd_adopt(args):
         if not ok:
             failed.append(name)
 
+    # The limitations ledger (issue #450): the durable home for findings that are true but not
+    # worth a lane, so a nit close is a filing rather than a loss. Scaffolded HERE, after the label
+    # set, and only when its own marker landed — `gh issue create` is all-or-nothing on labels, so
+    # firing the create with the marker missing would be refused outright and the ledger would
+    # silently never exist (the #165/#337 defect class, reached from the filing end).
+    print("scaffolding the limitations ledger (idempotent):")
+    ledger_unpinned = None
+    if limitations.LEDGER_LABEL in failed:
+        ledger_ok = False
+        print("  FAIL  skipped — its marker label `%s` could not be created, and `gh issue create` "
+              "is\n        all-or-nothing on labels (the create would be refused outright)"
+              % limitations.LEDGER_LABEL)
+    else:
+        ledger_ok, ledger_line, ledger_unpinned = _scaffold_ledger()
+        print(ledger_line)
+
     dev = "main"
     raw = _read(cfg_path)
     if raw:
@@ -1978,6 +2049,32 @@ Branch protection recommendations for `{dev}` (print-only in v1 — apply by han
   - keep force pushes blocked (superlooper has no force path at all)
 
 {_CHECKS_REQUIREMENT}""")
+
+    # The ledger half of the same issue-#29 rule, checked FIRST because the label memo below is the
+    # better advice whenever labels ALSO failed (fix the labels, re-run, and the ledger follows).
+    # Exiting 0 on a missing ledger would report a success that never happened: the gap surfaces
+    # later as a worker told to consult a ledger the repo does not have.
+    if ledger_unpinned is not None and not failed:
+        # The ledger EXISTS and carries its marker, so every consumer can already find it — only
+        # the pin is missing, and re-running is not necessarily the fix. So this memo is separate
+        # from the one below: same nonzero exit, different one true action.
+        print(f"""
+LIMITATIONS LEDGER NOT PINNED — issue #{ledger_unpinned} exists and carries
+`{limitations.LEDGER_LABEL}`, so every consumer can already find it; only the pin is missing.
+GitHub allows at most THREE pinned issues per repository, so the usual cause is that this repo's
+three pins are already taken (the other is a token without write access). Unpin one and run
+`gh issue pin {ledger_unpinned}`, or re-run `superlooper adopt --repo {args.repo}` — it pins the
+EXISTING ledger and never creates a second one.""")
+        return 1
+    if not ledger_ok and not failed:
+        print(f"""
+LIMITATIONS LEDGER PENDING — the label set is complete, but the repo's ledger issue is not.
+Until it exists, the consult-the-ledger line in every worker brief and cross-review points at
+nothing, and a nit close has nowhere to file. Most likely cause: gh is unauthenticated or rate
+limited. Run `gh auth login` (or wait out the limit), then re-run this exact command —
+`superlooper adopt --repo {args.repo}` is idempotent: it FINDS an existing ledger and creates a
+second one only if none exists.""")
+        return 1
 
     # Issue #29: adopt's GitHub half can fail while its file half succeeds — run before `gh auth
     # login`, every label create fails but the config is already on disk. Exiting 0 there reports

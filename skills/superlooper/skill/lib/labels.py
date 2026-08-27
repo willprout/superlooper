@@ -104,6 +104,17 @@ LABELS = [
      "provenance: auto-filed by the restore-green QA filer (runner-managed)"),
     ("source:dashboard-flag", "5a32a3",
      "provenance: filed by the command center's Flag button"),
+    # The repo's ONE pinned limitations ledger issue (issue #450). `adopt` creates this label and
+    # then creates-or-finds the issue that carries it; the marker is a LABEL rather than a number
+    # recorded in `.superlooper/config.json` because that file is the referee's own rulebook (no
+    # loop worker may edit it) and because a label is what a human filtering the issue list
+    # actually reaches for. Deliberately NOT '(runner-managed)': the runner never applies it — the
+    # only writer is adopt, once, at scaffold time — so the #160 boot migration has nothing to heal
+    # here. It must still be REGISTERED, because `gh issue create --label` is all-or-nothing: an
+    # unregistered marker would mean adopt's ledger create fails entirely and the repo silently has
+    # no ledger, which is the #165/#337 defect class reached from the filing end.
+    ("limitations-ledger", "bfd4f2",
+     "the repo's ONE pinned limitations ledger: accepted limitations, filed rather than lost"),
 ]
 
 # name -> (color, description-template). Built once; label_spec resolves a create step's color/desc.
