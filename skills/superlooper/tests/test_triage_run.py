@@ -179,3 +179,18 @@ def test_the_sitting_sheet_is_silent_with_nothing_to_escalate():
     assert triage_run.sitting_sheet([]) == ""
     sheet = triage_run.sitting_sheet([triage_run.sitting_line(1, "t", "n", "r")])
     assert triage_run.SITTING_HEADING in sheet and "#1" in sheet
+
+
+def test_a_label_entry_this_cannot_read_counts_as_held():
+    """Fail CLOSED on wrong-typed input, not merely on unsafe input — the acting guard's own rule.
+
+    A dict label whose `name` is not a string is a label set this cannot read, and reading it as
+    "no such label" is how `{"labels": [{"name": 7}]}` gets edited and closed. (Fresh-agent review.)
+    """
+    for broken in ({"name": 7}, {"name": None}, {}, {"nome": "agent-ready"}, ["agent-ready"], 7):
+        assert triage_run.held({"number": 5, "labels": [broken]}) is True, broken
+    # a readable set beside an unreadable entry is still unreadable
+    assert triage_run.held({"number": 5, "labels": [{"name": "type:build"}, {"name": 7}]}) is True
+    # ...and a wholly readable one answers honestly, in both spellings gh uses
+    assert triage_run.held({"number": 5, "labels": [{"name": "type:build"}]}) is False
+    assert triage_run.held({"number": 5, "labels": ["agent-ready"]}) is True

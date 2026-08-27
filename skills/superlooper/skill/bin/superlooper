@@ -2818,6 +2818,21 @@ def _triage_keep(args, cfg, home, date, view, body, verdict, refuse):
     fixes = []
     new_body = None
     if args.fix_body_file:
+        # The replacement body must be one the flight COMPOSED, in the one place it is allowed to
+        # write (fresh-agent review, P1). Unconstrained, this flag is a pipe from any local path
+        # onto a public issue — and a flight runs in the repo's REAL checkout precisely so it can
+        # see the gitignored overlay an orchestrator sees. The contract already says where its
+        # writes go; this makes the flag obey it. Resolved through realpath on BOTH sides, so a
+        # symlink out of the state home is not a way round.
+        try:
+            staged = os.path.realpath(args.fix_body_file)
+            allowed = os.path.realpath(home)
+        except OSError as e:
+            return refuse("could not resolve the replacement body path: %s" % e)
+        if not (staged == allowed or staged.startswith(allowed + os.sep)):
+            return refuse("a replacement body must be a file the flight composed inside its own "
+                          "state home (%s) — its only writes are GitHub and that folder. Write "
+                          "the body there and pass that path." % allowed)
         try:
             with open(args.fix_body_file, encoding="utf-8") as f:
                 new_body = f.read()
@@ -2867,6 +2882,14 @@ def _triage_absorb(args, cfg, home, date, view, body, title, verdict, refuse):
         return refuse("the absorbing issue #%d is approved, in flight, or awaiting the owner's "
                       "answer — its body is frozen owner text and a merge would rewrite it. "
                       "Escalate the pair instead." % absorber_num)
+    # BOTH ends, not just the source (fresh-agent review, P1). The source-issue guard above the
+    # dispatch stops a flight judging the ledger; without the same check here, `duplicate-of-#<the
+    # ledger>` would append an arbitrary issue's content INTO the repo's accepted-limitations
+    # record and close the source — the same door, entered from the absorber side.
+    if any(skip in issues_lib._label_names(absorber) for skip in triage.NOT_SUBJECT_LABELS):
+        return refuse("#%d is this repo's limitations ledger — nothing may be absorbed INTO it. "
+                      "A flight files entries there; it never merges issues into it."
+                      % absorber_num)
 
     if not (args.why or "").strip():
         return refuse("a duplicate merge must say what makes the two ONE issue (--why) — that "
@@ -2967,7 +2990,12 @@ def _triage_nit(args, cfg, home, date, body, verdict, refuse):
         rec = ("run `superlooper adopt` to scaffold the limitations ledger, then this closes "
                "itself on the next flight — or close it by hand if you agree")
         sitting = triage_run.sitting_line(args.issue, "", finding, rec)
-        triage.record_verdict(home, args.issue, body, triage.CONTAINS_OWNER_DECISION, date)
+        # NO VERDICT IS RECORDED, and that is what makes the recommendation above true
+        # (fresh-agent review, P1). A verdict against this body would retire the issue as settled,
+        # `triage.changed()` would stop offering it, and the finding would be lost the moment the
+        # ledger appeared. Unjudged, it stays a cue: the next flight after `adopt` closes and files
+        # it. The cost is that the escalation repeats until the owner spends one command, which is
+        # the right way round — a repeated line beats a lost finding.
         _triage_record(home, date, "triage_escalate", args.issue,
                        "nit with no ledger to file it in", held=False,
                        verdict=triage.CONTAINS_OWNER_DECISION, finding=finding, recommend=rec,
@@ -3249,7 +3277,11 @@ def cmd_triage_flight(args):
     rc, out, err, spawned = _triage_shim_run(cfg, args.repo, home, flight_id)
     combined = ((out or "") + (err or "")).strip()
     if combined:
-        print(combined)
+        # NEVER onto stdout under --json (fresh-agent review, P1): `--json` promises ONE object
+        # there, and a single launcher warning line ahead of it breaks `json.loads(stdout)` for
+        # every consumer — a dashboard, a test, the flight's own parsing. It rides IN the object
+        # instead, and goes to stderr for the human running this at a terminal.
+        print(combined, file=sys.stderr if getattr(args, "json", False) else sys.stdout)
     if not spawned:
         _rm_quiet(brief_path)                        # the brief reached nobody
     if rc != 0:
@@ -3258,18 +3290,19 @@ def cmd_triage_flight(args):
                                "detail": (err or "")[:200]})
         triage.append_run_log(home, date,
                               "- `triage_launch` FAILED (rc=%s) — no flight ran today\n" % rc)
-        _triage_emit(args, {"ok": False, "id": flight_id, "rc": rc,
-                     "reason": "the launcher refused or could not verify delivery (rc=%s)"
-                               % rc},
-              "triage-flight: launch failed (rc=%s)" % rc)
+        _triage_emit(args,
+                     {"ok": False, "id": flight_id, "rc": rc, "launcher_output": combined,
+                      "reason": "the launcher refused or could not verify delivery (rc=%s)" % rc},
+                     "triage-flight: launch failed (rc=%s)" % rc)
         return 1
 
     _triage_journal(home, {"act": "triage_launch", "id": flight_id, "date": date, "num": None,
                            "detail": reason, "outcome": "launched"})
     triage.append_run_log(home, date, "- `triage_launch` %s — %s\n" % (flight_id, reason))
-    _triage_emit(args, {"ok": True, "id": flight_id, "date": date, "brief": brief_path,
-                 "reason": reason},
-          "triage-flight: launched %s — brief: %s" % (flight_id, brief_path))
+    _triage_emit(args,
+                 {"ok": True, "id": flight_id, "date": date, "brief": brief_path,
+                  "reason": reason, "launcher_output": combined},
+                 "triage-flight: launched %s — brief: %s" % (flight_id, brief_path))
     return 0
 
 

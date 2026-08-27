@@ -437,7 +437,9 @@ def test_an_unchanged_body_is_skipped_by_the_next_runs_trigger(rig):
 
 def test_a_mechanical_format_fix_lands_on_an_unapproved_issue(rig):
     rig.github([_issue(10, "Mislabelled", labels=["type:build", "type:investigate"])])
-    fixed = rig.tmp / "fixed-body.md"
+    # composed where the flight is allowed to write — its state home, never the working tree
+    fixed = rig.home / "triage" / "bodies" / "i10.md"
+    fixed.parent.mkdir(parents=True, exist_ok=True)
     fixed.write_text(_BODY.format(goal="Mislabelled") + "\nparent: #9\n")
 
     res = act(rig, 10, "underspecified", "--fix-body-file", str(fixed),
@@ -682,3 +684,78 @@ def test_a_hand_run_act_outside_a_flight_never_forges_the_days_lease(rig):
     # the day is still the flight's to take
     flight = out(run(rig, "triage-flight", "--repo", str(rig.repo), "--json"))
     assert flight["ok"] and rig.run_log() is not None
+
+
+# --------------------------- fresh-agent review round 1 ---------------------------
+
+def test_the_ledger_can_never_be_the_ABSORBER_of_a_duplicate_merge(rig):
+    """The source-issue guard alone was half a guard (fresh-agent review, P1): `duplicate-of-#<the
+    ledger>` would have appended an arbitrary issue's content into the repo's accepted-limitations
+    record and then closed the source."""
+    rig.github([_issue(21, "An ordinary issue"), _ledger(12)])
+    before = json.dumps(rig.issue(12), sort_keys=True)
+
+    res = act(rig, 21, "duplicate-of-#12", "--why", "they feel related", expect=3)
+
+    assert not res["ok"] and "ledger" in res["error"].lower()
+    assert json.dumps(rig.issue(12), sort_keys=True) == before, "the ledger is untouched"
+    assert rig.issue(21)["state"] == "open"
+
+
+def test_the_flights_json_contract_survives_a_chatty_launcher(rig):
+    """`--json` promises ONE object on stdout. The launcher's own output used to be printed there
+    first, so any warning line broke `json.loads(stdout)` for a dashboard or a test."""
+    rig.github([_issue(10, "Something to look at")])
+    chatty = rig.tmp / "chatty-launch.sh"
+    chatty.write_text("#!/bin/bash\necho 'warning: pane reuse'\necho 'note: on stderr' >&2\nexit 0\n")
+    chatty.chmod(chatty.stat().st_mode | stat.S_IXUSR)
+
+    r = run(rig, "triage-flight", "--repo", str(rig.repo), "--json",
+            env_over={"SL_LAUNCH_SESSION": str(chatty)})
+    assert r.returncode == 0, r.stderr
+    res = json.loads(r.stdout)                       # would have raised before the fix
+    assert res["ok"] and "pane reuse" in res["launcher_output"]
+    # a human running it WITHOUT --json still sees the launcher's words
+    rig.github([_issue(11, "Another")])
+    (rig.home / "triage" / "runs").exists() and None
+    plain = run(rig, "triage-flight", "--repo", str(rig.repo),
+                env_over={"SL_LAUNCH_SESSION": str(chatty)})
+    assert "already went out" in plain.stdout or "pane reuse" in plain.stdout
+
+
+def test_a_nit_with_no_ledger_stays_judgeable_so_it_closes_once_one_exists(rig):
+    """The escalation tells the owner to run `adopt` and says the nit then closes itself. That is
+    only true if the issue stays a CUE — recording a verdict against the current body would retire
+    it as settled and the finding would be lost forever (fresh-agent review, P1)."""
+    rig.github([_issue(40, "A nit with nowhere to file it")])
+    res = act(rig, 40, "nit(N3)", "--why", "cosmetic only")
+    assert res["ok"] and res["action"] == "escalate"
+    assert "40" not in rig.verdicts(), "an unfiled nit must not be retired as judged"
+    assert triage.changed([rig.issue(40)], rig.verdicts()) == [40]
+
+    # the owner scaffolds the ledger; the very next act closes and files it
+    st = rig.state()
+    st["issues"]["12"] = _ledger(12)
+    (rig.fixdir / "state.json").write_text(json.dumps(st))
+    again = act(rig, 40, "nit(N3)", "--why", "cosmetic only")
+    assert again["ok"] and again["action"] == "close" and again["ledger"] == 12
+    assert rig.verdicts()["40"]["verdict"] == "nit(N3)"
+
+
+def test_a_body_file_outside_the_flights_own_state_home_is_refused(rig):
+    """A flight's only writes are GitHub and its own state home — so the body it publishes must be
+    one it composed THERE. Without this, `--fix-body-file` is a pipe from any local path (a
+    gitignored overlay, a credentials file) onto a public issue (fresh-agent review, P1)."""
+    rig.github([_issue(10, "An issue")])
+    secret = rig.tmp / "not-mine.txt"
+    secret.write_text("## Goal\nsomething that is not the flight's to publish\n")
+    res = act(rig, 10, "underspecified", "--fix-body-file", str(secret), expect=3)
+    assert not res["ok"] and "state home" in res["error"]
+    assert "not the flight's to publish" not in rig.issue(10)["body"]
+
+    # the same content, composed where the flight is allowed to write, goes through
+    staged = rig.home / "triage" / "bodies" / "i10.md"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_text(_BODY.format(goal="A properly composed body") + "\nparent: #9\n")
+    ok = act(rig, 10, "underspecified", "--fix-body-file", str(staged))
+    assert ok["ok"] and "parent: #9" in rig.issue(10)["body"]

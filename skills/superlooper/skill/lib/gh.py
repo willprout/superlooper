@@ -964,8 +964,12 @@ def comment_link(num, body):
     from the write rather than reconstructed, because a comment id is not something a caller can
     derive — and a link built by guessing would point at nothing.
 
-    Falls back to None on a gh that printed nothing recognisable; the caller then links the ledger
-    issue instead. A weaker link is not a reason to leave a nit unfiled.
+    None means the comment cannot be shown to have landed, and the ONE caller treats it as a
+    failed write rather than as "posted, link unknown" (fresh-agent review, P2): a nit close whose
+    comment says "filed in the ledger" when nothing was filed is exactly the lie the two-write
+    protocol exists to make impossible. So this is deliberately strict — a gh that wrote the
+    comment but printed nothing recognisable costs one retry on the next flight, which is the
+    cheap side of the trade.
     """
     rc, out = _run(["issue", "comment", str(num), "--body", body])
     if rc != 0:

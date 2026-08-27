@@ -81,7 +81,7 @@ Give **exactly one verdict per issue you judge**, from the rule's vocabulary:
 
 ```
 {cli} triage-act --repo {repo_path} --issue <N> --verdict buildable
-{cli} triage-act --repo {repo_path} --issue <N> --verdict underspecified [--fix-body-file <path>] [--add-label X] [--remove-label Y]
+{cli} triage-act --repo {repo_path} --issue <N> --verdict underspecified [--fix-body-file {state_home}/triage/bodies/<N>.md] [--add-label X] [--remove-label Y]
 {cli} triage-act --repo {repo_path} --issue <N> --verdict contains-owner-decision --finding "<one line>" --recommend "<one line>"
 {cli} triage-act --repo {repo_path} --issue <N> --verdict duplicate-of-#<M> --why "<the evidence they are one issue>"
 {cli} triage-act --repo {repo_path} --issue <N> --verdict overtaken --commit <sha> --why "<what that commit did>"
@@ -91,7 +91,10 @@ Give **exactly one verdict per issue you judge**, from the rule's vocabulary:
 - `buildable` / `underspecified` — **silence on the issue** (silence means kept). The verdict is
   recorded; nothing is posted. Use `underspecified` with the `--fix-*` flags when the gap is
   mechanical (a missing section, a wrong `type:` label, a dishonest `touches:`); escalate it
-  instead when the gap needs a decision.
+  instead when the gap needs a decision. A replacement body must be a file you WROTE, under
+  `{state_home}` — the working tree is read-only to you, and a body you did not compose is not
+  yours to publish. `{state_home}/triage/bodies/` is the place; the verb refuses anything outside
+  it. Labels must be names this engine registers, and it will tell you the set if you miss.
 - `contains-owner-decision` — **never acts.** It goes on the owner's sitting sheet with your one
   line and your one recommendation.
 - `duplicate-of-#<M>` — `<M>` absorbs this issue: its body gains this one's content, and this one

@@ -225,8 +225,13 @@ def held(issue):
     for entry in labels:
         if isinstance(entry, dict):
             name = entry.get("name")
-            if isinstance(name, str):
-                names.add(name)
+            # A dict with no usable `name` is an entry this cannot read, and skipping it would be
+            # a fail-OPEN on wrong-typed input at the one guard that stands between a flight and
+            # frozen owner text (fresh-agent review, P1): `{"labels": [{"name": 7}]}` would read
+            # as "carries no held label" and the issue would be edited and closed.
+            if not isinstance(name, str):
+                return True
+            names.add(name)
         elif isinstance(entry, str):
             names.add(entry)                 # the flat shape `gh issue list` returns in some views
         else:
