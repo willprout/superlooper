@@ -379,6 +379,11 @@ def _seed_home(rig, *, canary=True):
     home = Path(rig.env["SL_HOME"]) / "o__r"
     (home / "state").mkdir(parents=True, exist_ok=True)
     (home / "worktrees" / "i7").mkdir(parents=True, exist_ok=True)
+    # A leftover TRIAGE checkout (#448, the non-default `worktree` home). It is invisible to every
+    # other page — a flight has no loopstate entry by design, so `tidy.reclaimable_worktrees`
+    # cannot see it — which makes this census the one surface that can, because it walks the
+    # DIRECTORY rather than the queue.
+    (home / "worktrees" / "t3").mkdir(parents=True, exist_ok=True)
     now = time.time()
     records = [
         {"ts": now - 100, "act": "post_question", "num": 5, "id": "i5", "outcome": "ok"},
@@ -429,6 +434,26 @@ def test_upkeep_reads_the_journal_for_the_weeks_counts_and_the_notify_canary(upk
     assert "healthy" in out and "imessage" in out
     assert "1 owner question" in out
     assert "1 park" in out
+
+
+def test_the_census_counts_a_leftover_triage_checkout(upkeep_rig):
+    r"""`_UPKEEP_WORKTREE_RE` was `i\d+`, so a `t<N>` checkout appeared on no page at all: the
+    reapers walk loopstate (which a flight is deliberately absent from) and this was the only
+    directory walk. Both other columns must stay quiet for a clean one, though — `tidy` can never
+    select it (no lane record) and a clean detached tree carries no reclaim block — so a leftover
+    flight checkout is COUNTED, never proposed for removal and never reported as unsaved work."""
+    rig = upkeep_rig
+    home = Path(rig.env["SL_HOME"]) / "o__r"
+    assert (home / "worktrees" / "t3").is_dir(), "the rig must actually seed one"
+    r = cli(rig, "upkeep", "--repo", str(rig.repo), env_over=_upkeep_env(rig))
+    assert r.returncode == 0, r.stdout + r.stderr
+    census = upkeep.worktree_census(
+        ["i7", "t3"],
+        {"i7": {"status": "parked"}, "i9": {"status": "merged"}},
+        {"i7": None, "t3": None})
+    assert census["total"] == 2, census
+    assert "t3" not in census["reclaimable"], "a flight has no lane record; tidy can never take it"
+    assert [h["id"] for h in census["held"]] == [], census
 
 
 def test_upkeep_never_sends_a_notify_message(rig):                     # noqa: F811
@@ -492,8 +517,10 @@ def test_upkeep_reports_the_branch_and_worktree_census(upkeep_rig):
     # branches.json carries main + two sl/* branches — assert the real rendered row, so the COUNT
     # is checked, not just the presence of the substring "sl/*"
     assert "2 `sl/*` branches on the remote" in r.stdout, r.stdout
-    # the fixture home has exactly one worktree on disk (i7, parked)
-    assert "1 on disk" in r.stdout
+    # the fixture home has two worktrees on disk: i7 (parked) and t3 (a leftover triage flight
+    # checkout, #448). The count is 2 BECAUSE the census walks the directory rather than the
+    # queue — `_UPKEEP_WORKTREE_RE` was `i\d+` and a flight appeared on no page at all.
+    assert "2 on disk" in r.stdout
 
 
 def test_upkeep_marks_the_gh_backed_rows_unread_when_github_is_down(upkeep_rig):

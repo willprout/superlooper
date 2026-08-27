@@ -614,13 +614,23 @@ def _launch(spec, host, edges):
                 repointed = edges.run(["git", "-C", worktree, "checkout", "--detach", base],
                                       timeout=120)
                 if repointed.rc != 0:
-                    # rc ONLY, no git text — evidence.py classifies this line and its channel
-                    # needles are matched first (the rule the worktree refusal below spells out).
+                    # rc ONLY — no git text, and NO PATH. `worktree` is built from the run root,
+                    # which is `SL_HOME` and therefore operator-settable to anything: echoing it
+                    # here would be the very echo the refusals above just stopped making, and
+                    # `SL_HOME=/vol/fence down/state` would classify this as an unfenced fleet and
+                    # hold the whole approved queue (fresh-agent review, P2 — the commit that added
+                    # this line broke its own new rule one screen down from stating it).
+                    #
+                    # The remedy IS named, structurally: the usual cause is a leftover modified
+                    # file in that tree, `git checkout` refusing rather than overwriting it, and
+                    # nothing reclaims a flight checkout yet (#463) — so without this clause the
+                    # home would simply stall forever with no stated way out.
                     return Result(ABORTED,
-                                  "[%s] TRIAGE LAUNCH REFUSED: the reused flight checkout at '%s' "
-                                  "could not be re-pointed at its base (git rc=%s), so it would "
-                                  "have judged this queue against a stale tree — refusing"
-                                  % (iid, worktree, repointed.rc))
+                                  "[%s] TRIAGE LAUNCH REFUSED: the reused flight checkout under "
+                                  "<run root>/worktrees/<id> could not be re-pointed at its base "
+                                  "(git rc=%s), so this flight would have judged the queue against "
+                                  "a stale tree — refusing. Remove that directory and the next "
+                                  "flight rebuilds it." % (iid, repointed.rc))
     else:
         if not spec.repo:
             # Named rather than left to git. Without it `git -C ''` fails, the base-ref probe

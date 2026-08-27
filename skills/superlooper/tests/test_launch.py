@@ -1276,10 +1276,17 @@ def test_a_hostile_triage_home_value_cannot_forge_a_channel_fault(tmp_path, host
     # BOTH untrusted inputs, not just the config one: a checkout PATH can carry a needle exactly as
     # a config string can — including `fence down`, the single needle that outranks this refusal's
     # own — and an earlier spelling of this test varied only `triage_home`, so it could not see it.
+    # A THIRD arm: the reused-checkout refusal builds its text from the RUN ROOT, which is
+    # SL_HOME and just as operator-settable as the other two — an earlier spelling of this test
+    # exercised only checkout-home refusals and so could not see it.
+    hostile_root = _triage_home(tmp_path / hostile, "t1")
+    os.makedirs(os.path.join(str(hostile_root), "worktrees", "t1"), exist_ok=True)
     specs = [_triage_spec(tmp_path, triage_home=hostile),
-             _triage_spec(tmp_path, repo=str(tmp_path / hostile / "gone"))]
+             _triage_spec(tmp_path, repo=str(tmp_path / hostile / "gone")),
+             _triage_spec(tmp_path, triage_home=triage.WORKTREE, home=hostile_root)]
     for spec in specs:
-        result, _edges, host = _run(spec)
+        edges = FakeEdges({"checkout --detach": (128, "", "fatal: local changes")})
+        result, _edges, host = _run(spec, edges=edges)
         assert result.rc == launch.ABORTED and host.spawned == []
         assert hostile not in result.stderr, \
             "no untrusted value may reach a line evidence.py classifies"
@@ -1341,6 +1348,8 @@ def test_a_reused_flight_worktree_that_cannot_be_re_pointed_refuses(tmp_path):
     assert result.rc == launch.ABORTED
     assert "could not be re-pointed at its base" in result.stderr
     assert "stale tree" in result.stderr
+    assert "Remove that directory" in result.stderr, "the refusal names a way out"
+    assert spec2.run_root not in result.stderr, "and echoes no operator-settable path"
     assert host.spawned == []
     import evidence
     rec = evidence.build("launch", result.rc, result.stderr)
