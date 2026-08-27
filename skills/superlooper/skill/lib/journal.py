@@ -84,13 +84,15 @@ def read(state_home):
 # MEASURED, because the first guess was wrong by an order of magnitude: this repo's own archive runs
 # 250-270 KB on an ordinary busy day and hit 9.7 MB on 2026-08-04 (a question storm, ~5 KB a
 # record). Two megabytes is roughly a week of ordinary days and comfortably past that incident's
-# span; a storm can still outrun it, but a storm means the loop is DELIVERING, and a delivery is
-# what the caller is looking back to anyway. Truncation past the slice is safe rather than merely
-# bounded — a delivery that scrolls off takes every refusal it answered with it (see tail()) — so
-# the failure direction is a hold that arrives late, never one that should not have.
+# span. A storm can still outrun it — 2026-08-04 was a label-retry loop that delivered nothing for
+# nine hours, so "busy" and "delivering" are not the same thing — and truncation is safe anyway, by
+# construction rather than by luck: what the slice yields is always a SUFFIX of the true streak,
+# because a delivery that scrolls off the front takes every refusal it answered with it. A smaller
+# slice can only mean fewer samples, so the failure direction is a hold that arrives late, never
+# one that should not have arrived at all.
 #
-# Cost is a constant rather than a function of the retention window: ~3 ms per megabyte parsed,
-# against a tick measured in tens of seconds.
+# Cost is a constant rather than a function of the retention window: measured ~15 ms for a 2 MB
+# slice of this journal's typical ~200-byte records, against a tick measured in tens of seconds.
 TAIL_MAX_BYTES = 2 * 1024 * 1024
 
 
@@ -148,12 +150,8 @@ def tail(state_home, max_bytes=TAIL_MAX_BYTES):
     # none of those can appear raw today — but _read_records splits on \n only, and two readers of
     # one file that disagree about what a line is would be a defect nobody could reproduce.
     lines = blob[:consumed].decode("utf-8", "replace").split("\n")
-    if not aligned and len(lines) > 1:
-        lines = lines[1:]                               # the seek landed mid-record. Only when
-                                                        # something survives it: a slice holding ONE
-                                                        # line is either that record whole or
-                                                        # unparseable, and dropping it unread would
-                                                        # cost the caller its whole answer.
+    if not aligned and lines:
+        lines = lines[1:]                               # the seek landed mid-record
     out = []
     for line in lines:
         if not line.strip():

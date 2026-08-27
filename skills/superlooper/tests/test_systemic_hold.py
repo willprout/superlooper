@@ -1711,3 +1711,44 @@ def test_and_it_re_raises_when_work_is_approved_again_and_nothing_has_flown():
     dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_UNKNOWN, alert=None)
     out = decide(parsed_issues=[parsed(5)], dsk=dsk, usage=_dark_meter())
     assert AUTH_DEATH in _reasons(out), _reasons(out)
+
+
+def test_a_320_hold_lifting_via_RESTART_still_journals_its_own_recovery(rig):
+    """The edges must not be shared, and a restart is what proves it. #320's streaks live in memory
+    and reset with the process; this class's is derived from the journal and does not — and the two
+    co-occur by design, because #320's escalatable reasons are members of this streak's family and
+    its own standing ALERT is a watchdog signal that opens the episode supplying the second spawner.
+    Sharing one exit edge meant a #320 hold lifting via the documented #24 restart fallback
+    journalled nothing at all, while its record's own text names that very case."""
+    dsk = disk(launch_anchor={"ok": True}, launch_env_fail_ids={},   # the restart cleared #320's
+               launch_attempt_streak={"samples": {"i5": "runner", "d26": "watchdog"}},
+               auth_probe=_AUTH_UNKNOWN,
+               alert={"reasons": ["gh_auth_dead_workers"], "since": NOW - 600},
+               issues_state={"version": 1, "issues": {}})
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    recs = only(out, "launch_recovered")
+    assert len(recs) == 1, out
+    assert "launch delivery verified again" in recs[0]["reason"], recs
+
+
+def test_this_classs_own_streak_clearing_journals_a_recovery_of_its_own():
+    """...and its own edge says what actually happened: a session started. It may make that claim —
+    a verified delivery is the only thing that clears this streak."""
+    dsk = disk(launch_anchor={"ok": True}, launch_attempt_streak={"samples": {}},
+               auth_probe=_AUTH_UNKNOWN,
+               alert={"reasons": [AUTH_DEATH], "since": NOW - 600},
+               issues_state={"version": 1, "issues": {}})
+    out = decide(parsed_issues=[parsed(5)], dsk=dsk)
+    recs = only(out, "launch_recovered")
+    assert len(recs) == 1 and "a session started again" in recs[0]["reason"], out
+    assert only(out, "clear_alert") and only(out, "park") == [] and only(out, "relabel") == []
+
+
+def test_a_narrower_class_rising_still_journals_no_recovery_on_either_edge():
+    """Both edges guarded together: a worsening outage is not an ending one, whichever edge is
+    asked. The streak stands (so the first cannot fire) and the class is muted rather than lifted
+    (so the second must not)."""
+    dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_DEAD,
+                    alert={"reasons": [AUTH_DEATH], "since": NOW - 600})
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
+    assert only(out, "launch_recovered") == [], out

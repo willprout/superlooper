@@ -452,9 +452,10 @@ ALERT_MESSAGES = {
                                "HELD: the hold itself parks nothing and moves no label, and it "
                                "lifts by itself the moment ANY flight flies — a probe launch of an "
                                "approved issue, a recovery relaunch of an in-flight lane, or a "
-                               "repair session. If nothing is approved and no lane is in flight "
-                               "there is nothing to fly, so the hold simply waits for the first "
-                               "one. A lane that reached its OWN cap before the outage was proven "
+                               "repair session. If nothing is approved and no lane is in flight, "
+                               "nothing is being denied and this page retracts on its own; the "
+                               "refusal streak stands, so it returns the moment there is work "
+                               "again and the machine is still refusing. A lane that reached its OWN cap before the outage was proven "
                                "may park on its own account even while this stands — the hold "
                                "suppresses the LAUNCH-cap park, not an in-flight lane's own retry "
                                "cap, because holding that too would leave an all-in-flight machine "
@@ -1888,7 +1889,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # gh-auth hold names itself and journaled no recovery when it lifted) and this issue widened it
     # to five more classes, so a hold under any of them would clear silently — the alert retracts,
     # launching resumes, and the journal records that the outage simply stopped existing.
-    prev_systemic = any(r in LAUNCH_HOLD_ALERT_REASONS
+    #
+    # (#457) ...MINUS this issue's own class, which owns two edges of its own below. Its streak is
+    # DERIVED from the journal while every other launch streak is in-memory, so on a restart — the
+    # documented #24 fallback, which the generic record's own text names — the two fall out of
+    # lockstep: the channel/environment streaks reset with the process while this one does not.
+    # Sharing one edge then meant a #320 hold lifting via restart journalled nothing at all, which
+    # is the silence LAUNCH_HOLD_ALERT_REASONS was widened to prevent. They co-occur by design, not
+    # by accident: #320's escalatable reasons are members of this streak's family too, and its
+    # standing ALERT is itself a watchdog signal, so the episode that supplies this class's second
+    # spawner is opened by #320's own page.
+    prev_systemic = any(r in LAUNCH_HOLD_ALERT_REASONS - {AUTH_DEATH_ALERT_REASON}
                         for r in _dget(alert_on_disk, "reasons", list))
     # The reasons the durable ALERT already names — the same on-disk episode marker prev_systemic
     # reads, kept as a list so any reason can ask "am I already standing?" (issue #256 uses it to
@@ -2149,7 +2160,17 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # delivery verified again" over a machine that verified nothing, retract the alert, and page the
     # owner a second time when the class re-armed. The streak itself clears on ONE thing, a verified
     # delivery, which is exactly what this record claims.
-    held_now = systemic_launch or systemic_env or attempt_streak
+    held_now = systemic_launch or systemic_env
+    # (#457) This class's own exit edges, kept apart from the generic one above for the reason its
+    # note gives. FIRST: the streak itself cleared, which happens on exactly one thing — a verified
+    # delivery — so this may make the claim the generic record makes.
+    if (AUTH_DEATH_ALERT_REASON in prev_alert_reasons
+            and not attempt_streak and not systemic_auth_death):
+        out.append({"act": "launch_recovered",
+                    "reason": "a session started again (a canary probe, a recovery relaunch or a "
+                              "repair flight) — the machine-wide credential streak is cleared and "
+                              "normal launching resumes in priority order (unless a separate hold "
+                              "still stands)."})
     # (#457) ...and the OTHER way this class's hold ends: its CONJUNCT falls while the streak still
     # stands. NB the demand conjunct is excluded here on purpose — demand going away (the last lane
     # parks, the queue empties) is not a lift, it is a queue with nothing to hold, and this class
@@ -2170,8 +2191,9 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     "reason": "the machine-wide credential hold no longer stands: the usage meter "
                               "reads again and/or `claude auth status` confirms the account. NOT a "
                               "verified delivery — the launch-refusal streak is unchanged, so if "
-                              "flights are still refusing this will re-arm; the queue resumes "
-                              "meanwhile and nothing was parked or relabeled."})
+                              "flights are still refusing this will re-arm. Nothing was parked "
+                              "or relabeled, and normal launching resumes unless a separate hold "
+                              "(a dead anchor, a sleeping display) still stands."})
     if prev_systemic and not held_now:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "
