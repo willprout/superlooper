@@ -759,3 +759,59 @@ def test_a_body_file_outside_the_flights_own_state_home_is_refused(rig):
     staged.write_text(_BODY.format(goal="A properly composed body") + "\nparent: #9\n")
     ok = act(rig, 10, "underspecified", "--fix-body-file", str(staged))
     assert ok["ok"] and "parent: #9" in rig.issue(10)["body"]
+
+
+def test_a_nit_close_that_fails_after_its_ledger_entry_is_finished_not_re_filed(rig):
+    """The two-write nit protocol, at the seam it exists for.
+
+    The ledger entry is written FIRST so the close comment can link something real. If the close
+    then fails, the recoverable state is a FILED limitation on a still-open issue — and the next
+    flight must FINISH that close, recognising its own entry by the marker, rather than file a
+    second entry for one accepted limitation.
+    """
+    rig.github([_issue(40, "The report rounds to whole minutes"), _ledger(12)])
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "issue close 40", "times": 1,
+          "stderr": "HTTP 502: Bad gateway (issues/40)"}]))
+
+    first = act(rig, 40, "nit(N3)", "--why", "a 20-second run reads as 0m", expect=3)
+    assert not first["ok"]
+    assert rig.issue(40)["state"] == "open", "the close is what failed"
+    entries = [c for c in rig.comments(12) if triage_run.ledger_marker(40) in c]
+    assert len(entries) == 1, "the filing landed and stands"
+    assert "40" not in rig.verdicts(), "an unfinished act records no verdict"
+
+    second = act(rig, 40, "nit(N3)", "--why", "a 20-second run reads as 0m")
+    assert second["ok"] and second["action"] == "close"
+    assert rig.issue(40)["state"] == "closed"
+    entries = [c for c in rig.comments(12) if triage_run.ledger_marker(40) in c]
+    assert len(entries) == 1, "one accepted limitation, one entry — never a second"
+    # ...and the close still links the entry that already existed
+    closing = [c for c in rig.comments(40) if triage_run.MARKER in c][0]
+    assert second["ledger_link"] in closing
+
+
+def test_a_github_that_cannot_be_read_writes_nothing_and_says_so(rig):
+    """Fail closed, loudly. A refused read looks exactly like an unlabelled issue with an empty
+    body — i.e. like the one shape every guard here would wave through."""
+    rig.github([_issue(40, "An issue"), _ledger(12)])
+    r = run(rig, "triage-act", "--repo", str(rig.repo), "--issue", "40",
+            "--verdict", "overtaken", "--commit", rig.head(), "--why", "x", "--json",
+            env_over={"GH_FAIL": "1", "SL_ISSUE_ID": "t1"})
+    assert r.returncode == 1
+    assert "could not be read" in out(r)["error"]
+    assert rig.issue(40)["state"] == "open" and rig.comments(40) == []
+    assert rig.verdicts() == {}
+
+
+def test_a_ledger_read_that_gitHub_refuses_never_closes_a_nit_unfiled(rig):
+    """`marked_issues_health` exists so a REFUSED read and an answered-empty are told apart. Here
+    the difference is a nit closed with its filing silently lost."""
+    rig.github([_issue(40, "An issue"), _ledger(12)])
+    (rig.fixdir / "fail_rules.json").write_text(json.dumps(
+        [{"match": "--label limitations-ledger", "times": 1,
+          "stderr": "HTTP 403: rate limit exceeded"}]))
+    res = act(rig, 40, "nit(N3)", "--why", "cosmetic", expect=3)
+    assert not res["ok"] and "could not be read" in res["error"]
+    assert rig.issue(40)["state"] == "open"
+    assert rig.comments(12) == [], "nothing filed, because nothing was closed"
