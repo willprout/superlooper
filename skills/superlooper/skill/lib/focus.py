@@ -47,6 +47,13 @@ to be one it can render honestly:
 
 The three host-side words are ``session_host``'s, imported rather than re-spelled: this module and
 the doorway must not be able to drift into two vocabularies for the same three answers.
+
+**Two callers now, and both are attended** (issue #459). Besides ``superlooper focus-session`` —
+the dashboard's open-session-window button — ``superlooper debug`` calls :func:`focus_lane` itself
+once an owner-tapped fixer's spawn confirms, so the terminal the owner asked for comes up in front
+of him. That caller renders the outcome exactly as this one does (it journals the word beside the
+launch) and branches on none of it: the launch's verdict is the shim's, never this module's. The
+watchdog's unattended debugger deliberately does not call here at all.
 """
 import os
 import re
@@ -131,7 +138,7 @@ class Result:
         return "Result(outcome=%r, id=%r, workspace=%r)" % (self.outcome, self.id, self.workspace)
 
 
-def focus_lane(home, iid, host=None):
+def focus_lane(home, iid, host=None, call_seconds=None):
     """Bring lane ``iid``'s session window to the front, for the repo whose state home is ``home``.
 
     Never raises, and that is a promise rather than a happy accident — see the ``except`` below.
@@ -141,6 +148,17 @@ def focus_lane(home, iid, host=None):
 
     ``host`` is injected for the tests; production builds the doorway here so that no caller has to
     know one exists.
+
+    ``call_seconds`` SHORTENS that doorway's own budget, for callers who have less than
+    :data:`CALL_SECONDS` to spend — today ``superlooper debug``, whose tap has already spent most of
+    its patience on the launch (issue #459). It exists so that caller does not have to build a
+    doorway of its own to say so: the one construction stays here, where the default is documented
+    and where a host swap finds it.
+
+    It can only shorten, and the clamp is the enforcement rather than the prose (second fresh-agent
+    review): the reason this verb's ceiling is low is written on :data:`CALL_SECONDS` and belongs to
+    the verb, not to whoever calls it — a later caller that asked for a minute would be quietly
+    re-deciding that a person watching for their window can be left at a spinner.
     """
     iid = (iid or "").strip() if isinstance(iid, str) else ""
     if not LANE_ID_RE.match(iid):
@@ -165,7 +183,8 @@ def focus_lane(home, iid, host=None):
                       detail="no session window is recorded for %s — it has not launched, its "
                              "session ended, or `superlooper tidy` closed the window" % iid)
 
-    door = host if host is not None else session_host.SessionHost(call_seconds=CALL_SECONDS)
+    door = host if host is not None else session_host.SessionHost(
+        call_seconds=CALL_SECONDS if call_seconds is None else min(CALL_SECONDS, call_seconds))
     try:
         got = door.focus(session)
     except ValueError as e:

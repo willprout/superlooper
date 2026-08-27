@@ -64,7 +64,10 @@
                   (issue #144) — the attended sibling of `watchdog`'s unattended fallback. Owns the
                   d<N> id allocation and single-flight under the watchdog's own lock, composes the
                   brief from --note + --context-file, and journals the tap. A local ops UI over the
-                  loop shells this instead of re-implementing the launch handshake
+                  loop shells this instead of re-implementing the launch handshake. Once the spawn
+                  CONFIRMS it brings that session's own window to the front (issue #459) — the tap
+                  is attended, so the person who made it gets the terminal to watch and type into;
+                  the window is best-effort and never the launch's verdict
   resume          re-enter an interrupted session's CONVERSATION instead of restarting it cold
                   (issue #298). Every launch mints a session id at spawn and records it in
                   state/sessions/<id>; this verb spends that record — `claude --resume <id>` back
@@ -5151,6 +5154,91 @@ def _debug_journal(home, record):
               file=sys.stderr)
 
 
+# What a tap may spend on the WINDOW, and it is deliberately whatever the rest of the verb left.
+#
+# The window is garnish; the ANSWER is not. `superlooper debug` runs inside a budget its caller
+# sized for the LAUNCH alone: the local ops UI that taps it kills the whole verb at the same
+# WATCHDOG_LAUNCH_TIMEOUT the launcher itself gets, having sized its own patience to match this
+# constant. So every second spent raising a window is a second the report of a session that REALLY
+# STARTED might not get back in. A launch that confirmed at 175s and was then killed
+# mid-focus would print no JSON at all, and the caller would render "no session was confirmed"
+# about a live debugger: the one failure shape this issue forbids, and the one that invites a
+# second tap onto one patient (fresh-agent review, P0).
+#
+# So the window is paid for out of the remainder: never more than the doorway's own short budget,
+# never at the expense of the reserve below, and when the rest of the verb spent the lot the window
+# is not asked for AT ALL rather than allowed to eat the report. Nothing here shortens the LAUNCH's
+# own timeout to make room — that would turn a slow-but-real launch into a killed one, which is the
+# same forbidden failure wearing the other hat.
+#
+# MEASURED FROM THE TOP OF THE VERB, not from the launch (second fresh-agent review, P0). The
+# launch is the big spender but it is not the only one: the config read, the context file, the lock
+# acquisition, the id allocation and the brief write all happen on the caller's clock too, and a
+# budget that counted only the shim would hand the window seconds the caller had already spent.
+# The reserve absorbs what happens before this verb's own clock can start — interpreter startup and
+# argument parsing — and the journalling and printing that happen after the window.
+_DEBUG_FOCUS_RESERVE = 5.0
+# Not one of lib/focus's four outcomes, and it must not become a fifth: those four are answers
+# ABOUT a window, and this is this verb saying it never asked for one.
+_DEBUG_FOCUS_NOT_ASKED = "not_asked"
+
+
+def _debug_focus_budget(elapsed):
+    """Seconds the window may spend, given that the verb has already been running ``elapsed``
+    seconds. Pure, and separate from the call for exactly that reason: the arithmetic that keeps a
+    real launch reportable is then testable without a three-minute launcher."""
+    return min(focus_lib.CALL_SECONDS,
+               WATCHDOG_LAUNCH_TIMEOUT - _DEBUG_FOCUS_RESERVE - max(0.0, elapsed))
+
+
+def _debug_focus(home, sid, seconds):
+    """Bring the just-launched ``d<N>`` session's OWN window to the front (issue #459).
+
+    Returns ``(outcome, detail)`` — the pair the caller records and prints. A PAIR rather than a
+    ``focus.Result`` because one of the outcomes is not lib/focus's to give: see
+    ``_DEBUG_FOCUS_NOT_ASKED``.
+
+    Called from HERE and nowhere else, and that placement is the whole rule. ``superlooper debug``
+    is the engine's one attended launch: a person tapped Deploy Fixer and is standing at the
+    dashboard waiting to watch the fixer work, so taking his screen is precisely what he asked for.
+    The watchdog's debugger — the same session, launched off a timer at any hour onto whatever he
+    happens to be doing — never comes through this function, and must not: an unattended repair
+    that yanked his focus mid-sentence would be the loop interrupting him to say it is handling
+    something without him.
+
+    GARNISH, NEVER LOAD-BEARING. The session already exists when this runs — the shim VERIFIED
+    delivery — so every way a focus can fail is a fact about a window and none of them touches the
+    verdict on the launch. That is why the caller journals what came back beside the launch instead
+    of branching on it: a fixer that launched but did not surface must never read as a fixer that
+    did not launch.
+
+    Goes through ``lib/focus``, the engine's one way to raise a lane's window (issue #339): it
+    resolves the id to the window THIS repo recorded at spawn and calls the session-host doorway's
+    ``focus`` verb. No new door opens here — the wait is bounded by ``seconds``, which
+    ``_debug_focus_budget`` sized out of what the rest of the verb left.
+    """
+    if seconds <= 0:
+        return (_DEBUG_FOCUS_NOT_ASKED,
+                "this tap's whole budget went on the launch, so the window was never asked for — "
+                "the session launched and is unaffected, and `superlooper focus-session --id %s` "
+                "raises its window whenever you want it" % sid)
+    try:
+        got = focus_lib.focus_lane(home, sid, call_seconds=seconds)
+    except Exception as e:                 # belt + braces: focus_lane ANSWERS rather than raises,
+        # by contract — and that contract is a promise to a UI. If it is ever broken, a traceback
+        # here would replace the `--json` body of a launch that genuinely happened with an empty
+        # stdout, which is the one report that invites a second tap onto one patient.
+        #
+        # HOST_UNREACHABLE because that outcome means "we could not be told", which is exactly what
+        # an engine-side failure leaves us — never "your session is gone". The detail says whose
+        # fault it was, so nobody reads this as a verdict on the host (fresh-agent review, nit).
+        return (focus_lib.HOST_UNREACHABLE,
+                "the focus attempt failed inside the engine itself (%s: %s) — this says nothing "
+                "about the host or the window; the session launched and is unaffected"
+                % (type(e).__name__, e))
+    return got.outcome, got.detail
+
+
 def _emit_debug(args, result):
     """Print a debug result: one JSON object when ``--json`` (for a local ops UI to parse), else a
     plain human line for a terminal operator."""
@@ -5160,6 +5248,14 @@ def _emit_debug(args, result):
     if result.get("ok") and result.get("verb") == "debug":
         sys.stdout.write("launched sl-debugger session %s — brief: %s\n"
                          % (result.get("id"), result.get("brief")))
+        if result.get("focus"):
+            # The window gets its own line, on every outcome and not only the sad ones: raising it
+            # is what the tap ASKED for (issue #459), so "it came to the front" is an answer the
+            # person wanted and "it did not" is one he needs before he goes looking for it. Spelled
+            # with the same outcome word the JSON carries, so the two renderings cannot drift into
+            # separate vocabularies for one fact.
+            sys.stdout.write("  its window (%s): %s\n"
+                             % (result.get("focus"), result.get("focus_detail") or ""))
     elif result.get("verb") == "debug-check":
         sys.stdout.write(("a debugger session (%s) is already live for this repo.\n"
                           % result.get("live_id")) if result.get("live")
@@ -5297,7 +5393,16 @@ def cmd_debug(args):
     Refuses — changing nothing, launching nothing — when a debugger is already live, when a watchdog
     check holds the lock. ``ok`` is the shim's real verdict on
     delivery, never a pretend one. ``--check`` is the read-only preflight (writes NOTHING), so a
-    confirm dialog can decide what to show before the owner commits."""
+    confirm dialog can decide what to show before the owner commits.
+
+    Once the spawn CONFIRMS, the new session's window comes to the front (issue #459) — see
+    :func:`_debug_focus` for why here and only here, and why its answer is journaled rather than
+    branched on. A refusal, and a launch that never confirmed, ask the host for nothing: there is
+    no session, so there is no window."""
+    # The caller's clock, started before anything this verb does can spend from it — see
+    # `_DEBUG_FOCUS_RESERVE`. Read here rather than at the launch because the launch is the big
+    # spender, not the only one.
+    started = time.monotonic()
     import watchdog as watchdog_lib
     cfg = _load_config(args.repo)
     home = str(config_lib.state_home(cfg))
@@ -5394,11 +5499,24 @@ def cmd_debug(args):
         _watchdog_release_lock(lock)
 
     if rc == 0:
+        # The window comes forward BEFORE the record is written and the answer printed. One tap is
+        # one `debug_launch` record and the window is a FIELD on it, not a second act: the command
+        # center renders journal acts it knows by name, so an act invented here would print as an
+        # unresolved row sitting beside the launch it belongs to. What that ordering costs is
+        # bounded by `_debug_focus_budget`, which is what stops the window ever outliving the
+        # answer about the session it belongs to.
+        outcome, detail = _debug_focus(home, sid,
+                                       _debug_focus_budget(time.monotonic() - started))
         _debug_journal(home, {"act": "debug_launch", "outcome": "launched", "id": sid,
                               "operator": operator, "source": source,
-                              "note": _debug_bounded(args.note, _DEBUG_NOTE_MAX, "note")})
+                              "note": _debug_bounded(args.note, _DEBUG_NOTE_MAX, "note"),
+                              # NOT part of the launch verdict — `outcome` above stays "launched"
+                              # whatever these say. They are here so a window that never came
+                              # forward leaves a trace to read afterwards rather than a silence.
+                              "focus": outcome, "focus_detail": detail})
         _emit_debug(args, {"ok": True, "verb": "debug", "id": sid, "live": True,
-                           "live_id": sid, "brief": brief_path})
+                           "live_id": sid, "brief": brief_path,
+                           "focus": outcome, "focus_detail": detail})
         return 0
 
     error = _debug_error(rc, err, out)
