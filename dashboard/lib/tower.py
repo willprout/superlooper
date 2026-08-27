@@ -479,7 +479,16 @@ def comms_row(rec, operator="the owner"):
 # =============================== the "since you last looked" divider (§4) ===============================
 
 def _finite(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    """``True`` only for a real, finite number. ``OverflowError`` is caught because ``json.loads``
+    parses an arbitrarily large INTEGER and ``math.isfinite(10**309)`` RAISES on it rather than
+    answering False — so the one screen between a corrupt line and a crash was itself what crashed
+    (issue #458; the precedent is ``flights._stop_epoch``, hardened against the same shape)."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
 
 
 def apply_divider(rows, last_seen):

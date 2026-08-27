@@ -313,8 +313,8 @@ class Fixer:
         return out
 
     def _stamp(self):
-        ts = self._now() if callable(self._now) else self._now
-        return ts if isinstance(ts, (int, float)) and math.isfinite(ts) else time.time()
+        ts = _usable_ts(self._now() if callable(self._now) else self._now)
+        return ts if ts is not None else time.time()
 
     def _record(self, ts, repo, fixer_id, note, ctx, ok, error=None):
         """Append one launch record to the dashboard's own log — timestamped, with the note and the

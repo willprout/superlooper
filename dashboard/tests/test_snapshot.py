@@ -1492,3 +1492,25 @@ def test_an_integer_timestamp_too_large_for_a_float_never_crashes_the_snapshot(t
 @pytest.mark.parametrize("huge", [10 ** 309, -10 ** 309, 10 ** 4000])
 def test_finite_answers_false_for_an_int_no_float_can_hold(huge):
     assert server._finite(huge) is False
+
+
+def test_a_huge_integer_ts_survives_assembly_WITH_a_tower_watermark(tmp_path):
+    # The reviewer's round-3 scenario, end to end: the divider only runs once a watermark exists, so
+    # the desk-less assembly above short-circuits past `tower._finite` and would have stayed green
+    # while the real dashboard — which always has a desk — 500'd on the same line.
+    import desk as desk_mod
+    dst = tmp_path / "will-titan__hugets2"
+    (dst / "state").mkdir(parents=True)
+    (dst / "state" / "issues.json").write_text(json.dumps(
+        {"version": 1, "issues": {"i1": {"status": "running", "branch": "sl/i1", "pr": None}}}))
+    (dst / "state" / "runner.heartbeat").write_text(str(NOW - 5))
+    (dst / "journal.jsonl").write_text(
+        '{"ts": %d, "act": "launch", "id": "i1", "num": 1}\n'
+        '{"ts": %d, "act": "merge", "id": "i1", "num": 1, "pr": 2, "outcome": "ok"}\n'
+        % (10 ** 309, NOW - 60))
+    d = desk_mod.Desk(str(tmp_path / "desk.json"))
+    d.mark_tower_seen(NOW - 120)
+    snap = server.assemble_snapshot(_config(dst), now=NOW, desk=d)     # must not raise
+    rows = snap["repos"][0]["tower_log"]
+    assert rows, "the good row must still render beside the corrupt one"
+    assert any(r.get("fresh") for r in rows)

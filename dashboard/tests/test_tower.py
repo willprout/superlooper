@@ -602,3 +602,14 @@ def test_a_fixer_launch_outcome_from_a_newer_engine_is_quoted_not_translated():
     row = tower.comms_row({"act": "debug_launch", "id": "d9", "outcome": "queued"})
     assert "queued" in row["text"]
     assert "did not launch" not in row["text"].lower()
+
+
+def test_the_divider_survives_an_integer_timestamp_no_float_can_hold():
+    # Fresh-agent review round 3 (P1). `math.isfinite(10**309)` RAISES OverflowError, and this
+    # helper runs on the 2-second snapshot poll the moment a tower watermark exists — so one corrupt
+    # journal line 500'd the whole board. The precedent for the guard is `flights._stop_epoch`,
+    # which a prior fresh reviewer hardened against the identical shape.
+    rows = [{"ts": 10 ** 309, "tier": "comms"}, {"ts": 20, "tier": "comms"}]
+    assert tower.apply_divider(rows, 10) == 1          # must not raise
+    assert rows[0].get("fresh") is False, "a ts no float can hold is not newer than anything"
+    assert rows[1]["fresh"] is True and rows[1].get("divider") is True
