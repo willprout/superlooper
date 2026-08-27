@@ -219,3 +219,17 @@ def test_the_banner_and_the_tower_log_never_contradict_each_other(home, rec, ban
     assert snap["repos"][0]["fixer"]["outcome"] == banner_says
     row = [r for r in snap["repos"][0]["tower_log"] if "d4" in r["text"]][-1]
     assert tower_must_not_say not in row["text"].lower()
+
+
+def test_a_timestamp_too_large_for_a_float_never_takes_the_poll_down(home):
+    # Fresh-agent review round 2 (P1), at the view. `math.isfinite` RAISES on an int too large to
+    # convert to a float, so a single corrupt journal line would have 500'd the whole snapshot —
+    # silencing the board over exactly the record this issue exists to render.
+    with open(str(home / "journal.jsonl"), "a") as f:
+        f.write('{"ts": %d, "act": "debug_launch", "outcome": "launch_failed", "id": "d4", '
+                '"error": "claude auth expired"}\n' % 10 ** 309)
+    snap = _snap(home)                                        # must not raise
+    block = snap["trouble"]["fixer"]
+    assert block["outcome"] == fixer_mod.FAILED
+    assert "claude auth expired" in block["text"]
+    assert block["hhmm"] == "" and block["age_seconds"] is None

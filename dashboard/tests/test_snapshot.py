@@ -1469,3 +1469,26 @@ def test_a_repo_that_declares_no_territory_contract_judges_labels_alone(home):
     snap = server.assemble_snapshot(_config(home), now=NOW, gh_mod=_QueueGh(ready))
     d = snap["repos"][0]["boards"]["departures"][0]
     assert d["launchable"] is True and d["refusal"] is None
+
+
+def test_an_integer_timestamp_too_large_for_a_float_never_crashes_the_snapshot(tmp_path):
+    # The fourth corrupt-ts shape, and the one the three above miss: json.loads parses an
+    # arbitrarily large INTEGER, and `math.isfinite(10**309)` raises OverflowError instead of
+    # answering False — so `_finite`, whose whole job is "one bad line can't crash a snapshot",
+    # was the thing that crashed it. Found by fresh-agent review on issue #458.
+    dst = tmp_path / "will-titan__hugets"
+    (dst / "state").mkdir(parents=True)
+    (dst / "state" / "issues.json").write_text(json.dumps(
+        {"version": 1, "issues": {"i1": {"status": "running", "branch": "sl/i1", "pr": None}}}))
+    (dst / "state" / "runner.heartbeat").write_text(str(NOW - 5))
+    (dst / "journal.jsonl").write_text(
+        '{"ts": %d, "act": "launch", "id": "i1", "num": 1}\n' % 10 ** 309)
+    snap = server.assemble_snapshot(_config(dst), now=NOW)      # must not raise
+    f = next(f for f in snap["flights"] if f["num"] == 1)
+    assert f["display"]["elapsed"] == "—"
+    assert snap["repos"][0]["tower_log"][0]["hhmm"] == ""
+
+
+@pytest.mark.parametrize("huge", [10 ** 309, -10 ** 309, 10 ** 4000])
+def test_finite_answers_false_for_an_int_no_float_can_hold(huge):
+    assert server._finite(huge) is False

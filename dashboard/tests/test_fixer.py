@@ -625,3 +625,22 @@ def test_the_seat_the_affordance_targets_is_canonical_not_the_journals_bytes():
 def test_a_failed_launch_never_carries_a_seat_to_open():
     out = fixer_mod.last_launch([_launch_rec(outcome="launch_failed", error="no pane")])
     assert out["lane"] is None and out["session"] is False
+
+
+def test_a_timestamp_too_large_for_a_float_is_dropped_not_raised():
+    # Fresh-agent review round 2 (P1). ``json.loads`` parses an arbitrarily large integer, and
+    # ``math.isfinite(10**309)`` RAISES OverflowError rather than answering False — so one corrupt
+    # journal line would have taken the whole 2-second poll down with it, and the board would have
+    # gone silent over the very record this issue exists to render.
+    out = fixer_mod.last_launch([_launch_rec(ts=10 ** 309, outcome="launch_failed", error="auth")])
+    assert out["ts"] is None                       # unusable, so nothing downstream does math on it
+    assert out["outcome"] == fixer_mod.FAILED      # and the launch still renders
+    assert "auth" in out["text"]
+
+
+@pytest.mark.parametrize("bad_ts", [float("nan"), float("inf"), float("-inf"), 10 ** 400,
+                                    -10 ** 400, "1783364000", None, True, [1]])
+def test_no_timestamp_a_journal_can_carry_ever_raises(bad_ts):
+    out = fixer_mod.last_launch([_launch_rec(ts=bad_ts)])
+    assert out["ts"] is None or isinstance(out["ts"], (int, float))
+    assert out["text"]

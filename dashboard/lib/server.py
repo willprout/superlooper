@@ -68,8 +68,18 @@ def _resp(status, content_type, body, headers=None):
 def _finite(v):
     """``True`` only for a real, finite number (never a bool, never NaN/Infinity). ``json.loads``
     accepts ``NaN``/``Infinity``, so a corrupt journal ts can be a non-finite float — every ts/age
-    the server does arithmetic on is screened through this so one bad line can't crash a snapshot."""
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    the server does arithmetic on is screened through this so one bad line can't crash a snapshot.
+
+    ``OverflowError`` is caught because json.loads also parses an arbitrarily large INTEGER, and
+    ``math.isfinite(10**309)`` RAISES rather than answering False — so the one screen standing
+    between a corrupt journal line and a 500 was itself the thing that crashed (fresh-agent review,
+    issue #458). A number no float can hold is not a usable timestamp: the honest answer is False."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
 
 
 def format_duration(seconds):

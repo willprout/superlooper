@@ -469,6 +469,21 @@ def launch_outcome(rec):
     return FAILED if recorded == _ENGINE_FAILED else PENDING
 
 
+def _usable_ts(ts):
+    """A journal ``ts`` that arithmetic can safely touch, else ``None``. The journal is append-only
+    text a crashing runner writes, so every shape it can carry has to answer rather than raise:
+    ``json.loads`` accepts ``NaN``/``Infinity``, AND parses an arbitrarily large integer for which
+    ``math.isfinite`` itself raises ``OverflowError`` (fresh-agent review, issue #458). One corrupt
+    line must never take down the 2-second poll — least of all on the record this surface exists to
+    render."""
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    try:
+        return ts if math.isfinite(ts) else None
+    except OverflowError:
+        return None
+
+
 def _blank_launch():
     """The absent block — every key present, so a caller never branches on a missing one (the shape
     ``lib/session_window`` holds for the same reason)."""
@@ -539,8 +554,7 @@ def last_launch(records):
     reason = _one_line(rec.get("error")) if outcome == FAILED else ""
     if outcome == FAILED and not reason:
         reason = "no session was confirmed"
-    ts = rec.get("ts")
-    ts = ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts) else None
+    ts = _usable_ts(rec.get("ts"))
 
     name = ("Fixer %s" % sid) if sid else "The fixer"
     # The seat the open-session affordance may target, canonicalised by the SAME fence the route
