@@ -663,11 +663,14 @@ QUEUE_HELD_ALERT_REASONS = frozenset(
 #   * `launch_anchor_down` / `auth_dead` — separate detectors with their own self-re-arming probes;
 #     neither is a streak, so neither has a streak to recover.
 #
-# (#457) `claude_auth_dead_machine` IS a streak hold and belongs here: its streak clears only on a
-# verified delivery, so its falling edge really is "a session started again" and nothing else.
+# (#457) `claude_auth_dead_machine` is deliberately ABSENT, a third exclusion for a third reason.
+# It is a streak hold — but its streak is DERIVED from the journal where every other one here is
+# in-memory, so on a runner restart the two fall out of lockstep and one shared edge journals the
+# wrong thing for whichever class did not reset. It owns two edges of its own instead (see decide),
+# and is kept out of this set rather than subtracted at the one reader, so a second reader cannot
+# pick up the name this discipline excludes.
 LAUNCH_HOLD_ALERT_REASONS = frozenset(
-    {"launch_systemic_failure", AUTH_DEATH_ALERT_REASON}
-    | set(LAUNCH_ALERT_REASONS.values())) - {"gh_unreachable"}
+    {"launch_systemic_failure"} | set(LAUNCH_ALERT_REASONS.values())) - {"gh_unreachable"}
 
 
 # The one non-reason `queue_hold_reasons` can return: a state/ALERT marker EXISTS but nothing can be
@@ -1792,10 +1795,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # Vetted TOGETHER, id and spawner in one pass: given two separate lists this counted a spawner
     # whose only sample it had rejected, which is exactly the independence a garbage view must not
     # be able to manufacture.
-    attempt_samples = {k: v for k, v in _dget(raw_attempts, "samples", dict).items()
-                       if _is_session_id(k) and isinstance(v, str) and v in AUTH_DEATH_SPAWNERS}
+    attempt_samples = {
+        k: [x for x in v if isinstance(x, str) and x in AUTH_DEATH_SPAWNERS]
+        for k, v in _dget(raw_attempts, "samples", dict).items()
+        if _is_session_id(k) and isinstance(v, (list, tuple))}
+    attempt_samples = {k: v for k, v in attempt_samples.items() if v}
     attempt_fail_ids = set(attempt_samples)
-    attempt_spawners = set(attempt_samples.values())
+    attempt_spawners = {x for v in attempt_samples.values() for x in v}
     # ...and they must come from at least AUTH_DEATH_SPAWNER_CAP INDEPENDENT SPAWNERS. Each spawner
     # runs the launcher in an environment of its own — the runner's, the watchdog's launchd job, an
     # operator's shell or the dashboard — so one of them refusing says only that ITS environment is
@@ -1899,7 +1905,7 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # by accident: #320's escalatable reasons are members of this streak's family too, and its
     # standing ALERT is itself a watchdog signal, so the episode that supplies this class's second
     # spawner is opened by #320's own page.
-    prev_systemic = any(r in LAUNCH_HOLD_ALERT_REASONS - {AUTH_DEATH_ALERT_REASON}
+    prev_systemic = any(r in LAUNCH_HOLD_ALERT_REASONS
                         for r in _dget(alert_on_disk, "reasons", list))
     # The reasons the durable ALERT already names — the same on-disk episode marker prev_systemic
     # reads, kept as a list so any reason can ask "am I already standing?" (issue #256 uses it to
@@ -2164,8 +2170,13 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
     # (#457) This class's own exit edges, kept apart from the generic one above for the reason its
     # note gives. FIRST: the streak itself cleared, which happens on exactly one thing — a verified
     # delivery — so this may make the claim the generic record makes.
-    if (AUTH_DEATH_ALERT_REASON in prev_alert_reasons
-            and not attempt_streak and not systemic_auth_death):
+    # ...and it keys on the SAMPLES being gone, never on the threshold predicate falling. Those are
+    # different facts: the map empties on exactly one event (a verified delivery), while the
+    # predicate can also drop because a sample was lost to a truncated read. Read as a delivery,
+    # that lost sample retracts a standing page mid-outage, lands every launch-cap park the hold was
+    # suppressing, and launches the queue back into the wall — a false record with teeth. A streak
+    # that merely thinned says nothing here; the alert simply stops naming it.
+    if AUTH_DEATH_ALERT_REASON in prev_alert_reasons and not attempt_fail_ids:
         out.append({"act": "launch_recovered",
                     "reason": "a session started again (a canary probe, a recovery relaunch or a "
                               "repair flight) — the machine-wide credential streak is cleared and "
@@ -2191,9 +2202,11 @@ def decide(now, config, usage, parsed_issues, lane_state, events, disk, gh_view,
                     "reason": "the machine-wide credential hold no longer stands: the usage meter "
                               "reads again and/or `claude auth status` confirms the account. NOT a "
                               "verified delivery — the launch-refusal streak is unchanged, so if "
-                              "flights are still refusing this will re-arm. Nothing was parked "
-                              "or relabeled, and normal launching resumes unless a separate hold "
-                              "(a dead anchor, a sleeping display) still stands."})
+                              "flights are still refusing this will re-arm. Normal launching "
+                              "resumes unless a separate hold (a dead anchor, a sleeping display) "
+                              "still stands — and with it the per-issue launch-cap parks this hold "
+                              "had been suppressing: a lane already at its cap parks on this tick "
+                              "and needs re-approving."})
     if prev_systemic and not held_now:
         out.append({"act": "launch_recovered",
                     "reason": "launch delivery verified again (a canary probe or a restart) — the "

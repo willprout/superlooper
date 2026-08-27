@@ -88,8 +88,10 @@ def read(state_home):
 # nine hours, so "busy" and "delivering" are not the same thing — and truncation is safe anyway, by
 # construction rather than by luck: what the slice yields is always a SUFFIX of the true streak,
 # because a delivery that scrolls off the front takes every refusal it answered with it. A smaller
-# slice can only mean fewer samples, so the failure direction is a hold that arrives late, never
-# one that should not have arrived at all.
+# slice can only mean FEWER samples — never a sample that did not happen — so a lost one costs a
+# hold that arrives late, or one that lifts early and re-arms on the next refusal. It can never
+# manufacture a hold, and (since #457's recovery edge keys on the samples being GONE rather than on
+# its threshold falling) it can never manufacture a recovery record either.
 #
 # Cost is a constant rather than a function of the retention window: measured ~15 ms for a 2 MB
 # slice of this journal's typical ~200-byte records, against a tick measured in tens of seconds.
@@ -203,8 +205,9 @@ def rotate(state_home, now, retain_seconds=HOT_RETAIN_SECONDS):
 
     Caveat worth stating since #457: a record lost in the concurrency window below is no longer
     audit-only — the runner's machine-wide launch-attempt streak reads this file back through
-    tail(). Losing a REFUSAL costs one sample of an outage that is still refusing every launch, and
-    the hold arrives a tick later. Losing a foreign spawner's verified DELIVERY (`launched` /
+    tail(). Losing a REFUSAL costs one sample of an outage that is still refusing every launch: the
+    hold arrives a tick later, or lifts and re-arms on the next refusal — never a hold that should
+    not have arrived, and never a recovery record (that edge keys on the samples being gone). Losing a foreign spawner's verified DELIVERY (`launched` /
     `resumed`) is the direction that costs something: the streak keeps refusals that delivery
     already answered, so a hold persists or re-arms over a machine that did start a session. Both
     are bounded by the next flight — the #115 probe clears the streak on its own — and the window

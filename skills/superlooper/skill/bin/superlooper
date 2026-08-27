@@ -4561,10 +4561,11 @@ def cmd_debug(args):
     error = _debug_error(rc, err, out)
     # The rc rides along beside the human text (issue #457). This verb runs in its OWN process, so
     # the journal is the only thing the runner ever hears about a Debug tap that refused — and
-    # `lib/evidence` needs the rc: its text pass runs first, but the launcher's refusals reach here
-    # already wrapped in this CLI's own prose, so the rc is what actually names most of them.
-    # Recording only the prose left the runner able to see that a flight failed but not what
-    # refused it, which is the difference between a classified sample and a guessed one.
+    # `lib/evidence` reads both: its text pass runs first, and `_debug_error` relays the launcher's
+    # own stderr verbatim, so most refusals name themselves. The rc is what covers the rest — a
+    # timeout, an unrunnable shim, an empty-output failure — and recording only the prose left those
+    # visible as "a flight failed" and nothing more, which is the difference between a classified
+    # sample and a guessed one.
     _debug_journal(home, {"act": "debug_launch", "outcome": "launch_failed", "id": sid, "rc": rc,
                           "operator": operator, "source": source, "error": error})
     _emit_debug(args, {"ok": False, "verb": "debug", "id": sid, "live": False, "live_id": None,

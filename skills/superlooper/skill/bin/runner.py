@@ -3209,9 +3209,12 @@ class Runner:
     def _launch_attempt_streak(self, now=None):
         """The machine-wide launch-attempt streak (issue #457), derived from the journal.
 
-        Returns ``{"samples": {session id: spawner}}`` — the distinct session ids whose launch
+        Returns ``{"samples": {session id: [spawners]}}`` — the distinct session ids whose launch
         refused for a CREDENTIAL/ENVIRONMENT reason with no verified delivery since, each mapped to
-        the SPAWNER whose environment read that refusal. decide holds on two spawners agreeing,
+        EVERY spawner whose environment read a refusal of it. A list rather than one name because
+        the same session can be refused by two: the runner tries to relaunch a lane, and the owner
+        then hand-`resume`s it. Keeping only the last would silently DOWNGRADE the evidence — two
+        environments agreeing would collapse to one and read as though the streak had cleared. decide holds on two spawners agreeing,
         never on two ids: each spawner runs the launcher in its own environment, so one of them
         refusing says only that ITS environment is wrong (see the constants above for both ways
         that goes wrong when ids are counted instead).
@@ -3266,7 +3269,7 @@ class Runner:
                 samples = {}
             elif outcome == failed:
                 self._note_attempt_failure(samples, rec, spawner)
-        return {"samples": dict(sorted(samples.items()))}
+        return {"samples": {k: sorted(v) for k, v in sorted(samples.items())}}
 
     def _note_attempt_failure(self, samples, rec, spawner):
         """Record one refused flight, if it is a sample at all (issue #457).
@@ -3280,7 +3283,7 @@ class Runner:
             return                                     # two sides disagreeing about what a sample
                                                        # is is how a rejected id once still counted
         if self._streak_reason(rec) in AUTH_DEATH_STREAK_REASONS:
-            samples[sid] = spawner
+            samples.setdefault(sid, set()).add(spawner)
 
     @staticmethod
     def _streak_reason(rec):
