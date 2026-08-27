@@ -254,3 +254,17 @@ def test_tail_fails_closed_on_garbage(tmp_path):
         f.write("not json at all\n[]\n")
     journal.append(tmp_path, {"act": "b"}, now=2)
     assert [r["act"] for r in journal.tail(tmp_path)] == ["a", "b"]
+
+
+def test_tail_keeps_a_complete_first_record_when_the_seek_lands_on_a_boundary(tmp_path):
+    """Dropping line 0 unconditionally throws away a COMPLETE record whenever the byte arithmetic
+    happens to land exactly on a newline. The streak this feeds trips on two samples, so one lost
+    record is a hold that arrives late."""
+    journal.append(tmp_path, {"act": "first"}, now=1)
+    first_len = (tmp_path / "journal.jsonl").stat().st_size
+    journal.append(tmp_path, {"act": "second"}, now=2)
+    size = (tmp_path / "journal.jsonl").stat().st_size
+    recs = journal.tail(tmp_path, max_bytes=size - first_len)   # starts exactly at record 2
+    assert [r["act"] for r in recs] == ["second"], recs
+    recs = journal.tail(tmp_path, max_bytes=size)                # starts at 0
+    assert [r["act"] for r in recs] == ["first", "second"], recs

@@ -771,14 +771,18 @@ def test_a_single_broken_lane_under_the_same_fault_still_parks(outage):
 # machine that could not start a session at all.
 #
 # The class this section pins: N distinct SESSION ids whose launches refused for a
-# CREDENTIAL/ENVIRONMENT reason, consecutively, with nothing starting between them — combined with a
-# meter we cannot read or an auth probe that will not confirm the account. Two disciplines bound it:
+# CREDENTIAL/ENVIRONMENT reason, consecutively, with nothing starting between them — AT LEAST ONE OF
+# THEM A FLIGHT THE QUEUE DOES NOT OWN — combined with a meter we cannot read or an auth probe that
+# will not confirm the account. Three disciplines bound it:
 #
 #   * REFUSED IS NOT DEAD. An `unknown` probe is a question the machine declined to answer (the
 #     live probe reads it right now, on a healthy machine), so it may never hold anything by
 #     itself. The OBSERVED launch failures are the evidence that tips the verdict.
-#   * NAME WHAT ACTUALLY FAILED. Only a genuinely MIXED streak wears the machine-wide banner; a
-#     streak whose samples agree is named for the fault they name, with that fault's own remedy.
+#   * A BROKEN WORKTREE IS NOT A BROKEN MACHINE. The owner's rule (2026-08-03) is that two
+#     different environment faults with one lane each is the one-off case twice over. A d<N> flight
+#     runs in the repo's own checkout, owns no worktree, and is what makes the difference.
+#   * THE LOOP MUST ALWAYS BE ABLE TO LEAVE. A hold that suppressed every flight would be a state
+#     nothing but a restart could end, and this streak clears on exactly one thing: a launch.
 
 AUTH_DEATH = "claude_auth_dead_machine"
 _AUTH_UNKNOWN = {"cli": "unknown", "keychain_present": True, "keychain_mtime": NOW - 3600,
@@ -786,9 +790,6 @@ _AUTH_UNKNOWN = {"cli": "unknown", "keychain_present": True, "keychain_mtime": N
 _AUTH_HEALTHY = {"cli": "logged_in", "keychain_present": True, "keychain_mtime": NOW - 3600,
                  "valid": True, "status_raw": ""}
 _AUTH_DEAD = dict(_AUTH_UNKNOWN, cli="logged_out", valid=False)
-# The realized 08-26 mix: the runner's own gh refused some flights, the session's own Claude account
-# refused others. Neither reached a cap of its own; together they are the machine.
-_MIXED = ["gh_auth_dead_runner", "claude_identity_wrong"]
 
 
 def _dark_meter(now=NOW):
@@ -799,14 +800,12 @@ def _dark_meter(now=NOW):
             "first_attempt_at": now - 7200}
 
 
-def _attempts(ids, reasons=_MIXED, fail_at=NOW - 10, **over):
+def _attempts(ids, fail_at=NOW - 10, **over):
     """A disk view whose ATTEMPT streak names `ids` — the distinct session ids whose launch refused
     for a credential/environment reason with no verified delivery since, which is what the runner
-    publishes after folding in the launches it did not run (the watchdog's, the owner's Debug tap).
-    """
+    publishes after folding in the launches it did not run (the watchdog's, the owner's taps)."""
     over.setdefault("launch_anchor", {"ok": True})
-    streak = {"ids": list(ids), "reasons": list(reasons)} if isinstance(ids, (list, tuple)) else ids
-    return disk(launch_attempt_streak=streak, launch_fail_at=fail_at, **over)
+    return disk(launch_attempt_fail_ids=ids, launch_fail_at=fail_at, **over)
 
 
 def _reasons(out):
@@ -815,7 +814,9 @@ def _reasons(out):
 
 def test_the_auth_death_class_is_held_named_and_carries_its_own_remedy():
     """Every held class says its OWN cause and its OWN remedy (#320's rule, and a held queue writes
-    no park memo, so this body is the whole story the owner gets)."""
+    no park memo, so this body is the whole story the owner gets). This streak by construction has
+    NOT settled on one of the three credential faults, so the body names all three rather than
+    guessing — and says out loud what it would mean if the escalation were wrong."""
     assert AUTH_DEATH in actions.QUEUE_HELD_ALERT_REASONS
     assert AUTH_DEATH in actions.LAUNCH_HOLD_ALERT_REASONS
     msg = actions._alert_message(AUTH_DEATH)
@@ -825,6 +826,8 @@ def test_the_auth_death_class_is_held_named_and_carries_its_own_remedy():
     assert "NSAppSleepDisabled" not in msg and "defaults write" not in msg
     assert "held" in msg.lower() or "hold" in msg.lower()
     assert "parks nothing" in msg.lower()
+    for remedy in ("claude auth status", "gh auth login", "ANTHROPIC_API_KEY"):
+        assert remedy in msg, remedy
 
 
 def test_the_realized_shape_holds_the_queue_dark_meter_then_distinct_session_failures():
@@ -840,23 +843,24 @@ def test_the_realized_shape_holds_the_queue_dark_meter_then_distinct_session_fai
     assert has_notify(out)
 
 
-def test_a_streak_whose_samples_AGREE_is_named_for_what_they_name():
-    """The mis-blame guard, in the direction this class could most easily get wrong. Two flights
-    refused because the SESSION's Anthropic account was absent — that has a name, a body and a
-    remedy of its own (#320), and the machine-wide banner would be a vaguer answer to a question
-    the evidence already answered. The generic name is for a MIXED streak and nothing else."""
-    dsk = _attempts(["d26", "d27"], reasons=["claude_identity_wrong"], auth_probe=_AUTH_UNKNOWN)
-    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
-    assert "claude_identity_wrong_workers" in _reasons(out), _reasons(out)
-    assert AUTH_DEATH not in _reasons(out)
-    assert only(out, "launch") == [] and only(out, "park") == [], "and it still HOLDS"
+def test_two_QUEUE_LANES_alone_are_never_this_class_however_many_they_are():
+    """The owner's own rule, and the one this class could most easily break: "two different
+    environment faults with one lane each is the one-off case twice over, not an outage"
+    (2026-08-03, the rule SYSTEMIC_ENV_FAILURE_CAP is per-reason for). Two lanes with two separately
+    broken worktrees must park with their own memos, not freeze the healthy queue behind them under
+    a banner saying the machine's login expired."""
+    for ids in (["i5", "i6"], ["i5", "i6", "i7"]):
+        dsk = _attempts(ids, auth_probe=_AUTH_UNKNOWN)
+        out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk, usage=_dark_meter())
+        assert AUTH_DEATH not in _reasons(out), ids
 
 
-def test_a_streak_carrying_a_reason_this_engine_cannot_name_falls_back_to_the_generic():
-    """Fail SAFE on the naming, not silent: a reason with no alert row must not vanish from the
-    page. The queue is held either way; the owner is told the honest, wider thing."""
-    dsk = _attempts(["d26", "d27"], reasons=["claude_identity_wrong", "some_future_reason"],
-                    auth_probe=_AUTH_UNKNOWN)
+def test_one_flight_the_QUEUE_DOES_NOT_OWN_is_what_makes_it_the_machine():
+    """...and the discriminator that separates the two. A d<N> repair flight runs in the repo's own
+    checkout and owns no worktree, so a credential refusal there is a statement about the MACHINE
+    that no per-lane accounting explains away. It is also, exactly, the evidence #320 structurally
+    cannot count."""
+    dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_UNKNOWN)
     out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
     assert AUTH_DEATH in _reasons(out), _reasons(out)
 
@@ -875,13 +879,13 @@ def test_an_unknown_probe_with_consecutive_failures_IS_the_verdict():
     """The other half of the same rule: N OBSERVED launch failures is EVIDENCE, and evidence is what
     tips a probe that would not answer. Here the meter is perfectly readable — the auth half of the
     disjunction carries it alone."""
-    dsk = _attempts(["i5", "i6"], auth_probe=_AUTH_UNKNOWN)
+    dsk = _attempts(["i5", "d26"], auth_probe=_AUTH_UNKNOWN)
     out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
     assert AUTH_DEATH in _reasons(out), _reasons(out)
     assert only(out, "launch") == [] and only(out, "park") == []
 
 
-def test_a_single_failed_launch_is_not_a_streak():
+def test_a_single_failed_flight_is_not_a_streak():
     """One sample cannot tell a broken lane from a broken machine — the same discriminator #320
     settled for the environment classes, applied to session ids."""
     dsk = _attempts(["d26"], auth_probe=_AUTH_UNKNOWN)
@@ -896,10 +900,9 @@ def test_a_repeat_of_the_SAME_session_id_is_one_sample_not_two():
 
 
 def test_a_confirmed_HEALTHY_account_and_a_readable_meter_never_hold():
-    """The conjunction is load-bearing in both directions. Two launches that failed while the meter
-    reads fine AND `claude auth status` positively reports the assigned account is not an auth
-    death — those lanes have problems of their own and must park on the normal schedule."""
-    dsk = _attempts(["i5", "i6"], auth_probe=_AUTH_HEALTHY)
+    """The conjunction is load-bearing in both directions. Flights that failed while the meter reads
+    fine AND `claude auth status` positively reports the assigned account are not an auth death."""
+    dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_HEALTHY)
     out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
     assert AUTH_DEATH not in _reasons(out), _reasons(out)
 
@@ -915,38 +918,52 @@ def test_a_more_specific_class_keeps_its_own_name_and_this_one_stays_quiet():
     assert _reasons(out) == ["auth_dead"], _reasons(out)
     # #320's environment escalation, with an attempt streak standing beside it
     dsk = _env_streak("gh_auth_dead", ["i5", "i6"])
-    dsk["launch_attempt_streak"] = {"ids": ["i5", "i6"], "reasons": list(_MIXED)}
+    dsk["launch_attempt_fail_ids"] = ["i5", "d26"]
     dsk["auth_probe"] = _AUTH_UNKNOWN
     out = decide(parsed_issues=[parsed(5), parsed(6), parsed(7)], dsk=dsk)
     assert _reasons(out) == ["gh_auth_dead_workers"], _reasons(out)
     # a dead launch ANCHOR (#24), whose remedy is a cmux tab and nothing to do with an account
-    dsk = _attempts(["i5", "i6"], auth_probe=_AUTH_UNKNOWN, launch_anchor={"ok": False})
+    dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_UNKNOWN, launch_anchor={"ok": False})
     out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
     assert AUTH_DEATH not in _reasons(out), _reasons(out)
     # ...and the CHANNEL streak (#153), which holds on its very first entry
-    dsk = _attempts(["i5", "i6"], auth_probe=_AUTH_UNKNOWN, launch_fail_ids=["i5"])
+    dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_UNKNOWN, launch_fail_ids=["i5"])
     out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
     assert AUTH_DEATH not in _reasons(out), _reasons(out)
+
+
+@pytest.mark.parametrize("rising", ["auth_dead", "anchor_down"])
+def test_a_WORSENING_outage_never_journals_a_recovery(rising):
+    """The edge that must key on EVIDENCE, not on the flag. When a more specific class rises — the
+    auth probe finally answers "dead", or the anchor drops — this class stops naming the episode,
+    and a recovery edge keyed on that flag would journal "launch delivery verified again" on the
+    exact tick the outage was PROVEN, retract the alert, and page again when it re-armed. The streak
+    itself clears on one thing, a verified delivery, which is what the record claims."""
+    over = {"auth_probe": _AUTH_DEAD} if rising == "auth_dead" \
+        else {"auth_probe": _AUTH_UNKNOWN, "launch_anchor": {"ok": False}}
+    dsk = _attempts(["d26", "d27"], alert={"reasons": [AUTH_DEATH], "since": NOW - 600}, **over)
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
+    assert only(out, "launch_recovered") == [], out
+
+
+def test_a_meter_that_reads_again_is_not_a_launch_and_journals_no_recovery():
+    """Same rule through the other conjunct. Three of the faults this streak admits (`gh_auth_dead`,
+    its runner sibling, `env_poisoned`) are things `claude auth status` and the usage meter cannot
+    see at all, so their recovery is not evidence about them."""
+    dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_HEALTHY,
+                    alert={"reasons": [AUTH_DEATH], "since": NOW - 600})
+    out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk)
+    assert only(out, "launch_recovered") == [], out
 
 
 def test_a_garbage_attempt_streak_never_holds_the_queue():
     """Fail OPEN on unreadable input — a wrongly-held queue is the bigger, quieter outage, and this
     view is data the runner writes."""
-    bad_views = (None, "x", 5, {}, {"ids": None}, {"ids": "d26d27"},
-                 {"ids": ["", None], "reasons": _MIXED},
-                 {"ids": ["nope", "alsonope"], "reasons": _MIXED},
-                 {"ids": [5, 6], "reasons": _MIXED},
-                 {"ids": ["i5", "i5"], "reasons": _MIXED},
-                 {"ids": ["i5", "i6"], "reasons": "gh_auth_dead"})
-    for bad in bad_views:
+    for bad in (None, "x", 5, {}, ["", None], ["nope", "alsonope"], [5, 6], ["d26", "d26"],
+                {"ids": ["d26", "d27"]}):
         dsk = _attempts(bad, auth_probe=_AUTH_UNKNOWN)
         out = decide(parsed_issues=[parsed(5), parsed(6)], dsk=dsk, usage=_dark_meter())
-        if bad == {"ids": ["i5", "i6"], "reasons": "gh_auth_dead"}:
-            # a wrong-typed reasons list is unusable for NAMING but the ids still count: the hold
-            # stands, under the honest generic name, rather than being dropped on a formatting bug
-            assert AUTH_DEATH in _reasons(out), bad
-        else:
-            assert AUTH_DEATH not in _reasons(out), bad
+        assert AUTH_DEATH not in _reasons(out), bad
 
 
 def test_the_hold_suppresses_the_per_issue_launch_cap_park():
@@ -958,19 +975,27 @@ def test_the_hold_suppresses_the_per_issue_launch_cap_park():
     assert only(out, "park") == []
 
 
-def test_an_exited_lane_at_its_retry_cap_is_HELD_not_parked_under_the_machine_wide_hold():
-    """The realized shape included "the in-flight lanes' dead sessions", and a dead lane at its
-    retry cap parks — a per-issue park, and a re-approval owed, for a machine-wide fault it did not
-    cause. Held instead, exactly as the auth_dead sibling holds it: no attempt, no park, and it
-    resumes by itself. Lanes BELOW the cap keep relaunching, which is what can still clear the
-    streak and lift the hold."""
+def test_the_loop_can_always_LEAVE_this_hold_even_with_nothing_to_probe():
+    """The state nothing could end. On the realized machine there is no approved queue at all (it
+    was serialized behind an in-flight wildcard lane), so the #115 probe has no candidate — its
+    candidate set is issue lanes, and this streak can be made entirely of flights that are not. If
+    the hold ALSO suppressed the recovery relaunch of an exited lane at its retry cap, nothing on
+    the machine could fly and nothing could ever clear the streak. So the relaunch ladder is left
+    exactly as it is: the lane below its cap relaunches (and a green one lifts the hold), and the
+    lane at its cap still parks — one visible park the owner can re-approve beats a frozen loop."""
     dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_UNKNOWN,
                     exited={"i5": 1}, issues_state={"version": 1, "issues": {
-                        "i5": ist("running", retries=9, branch="sl/i5-x", num=5)}})
+                        "i5": ist("running", retries=0, branch="sl/i5-x", num=5)}})
     out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=dsk,
                  usage=_dark_meter())
-    assert only(out, "park") == [], out
-    assert only(out, "recover") == [], "and it is not relaunched into the same wall either"
+    assert only(out, "recover") != [], "a lane with retries left still flies — that is the exit"
+    # ...and at the cap it parks rather than vanishing into the hold
+    dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_UNKNOWN,
+                    exited={"i5": 1}, issues_state={"version": 1, "issues": {
+                        "i5": ist("running", retries=99, branch="sl/i5-x", num=5)}})
+    out = decide(parsed_issues=[parsed(5, labels=("in-progress", "type:build"))], dsk=dsk,
+                 usage=_dark_meter())
+    assert [a["id"] for a in only(out, "park")] == ["i5"], out
 
 
 def test_the_auth_death_hold_probes_itself_with_the_existing_canary():
@@ -991,7 +1016,7 @@ def test_a_recovery_lifts_the_hold_and_relabels_nothing():
 
     NOTE the probe is still `unknown` here. The streak clearing is what lifts this hold; an auth
     reading that never answers must not be able to keep it standing."""
-    dsk = disk(launch_anchor={"ok": True}, launch_attempt_streak={"ids": [], "reasons": []},
+    dsk = disk(launch_anchor={"ok": True}, launch_attempt_fail_ids=[],
                auth_probe=_AUTH_UNKNOWN,
                alert={"reasons": [AUTH_DEATH], "since": NOW - 600},
                issues_state={"version": 1, "issues": {}})
@@ -1019,7 +1044,7 @@ def test_an_idle_machine_is_never_paged_for_a_hold_it_is_being_denied_nothing_by
     assert AUTH_DEATH not in _reasons(out), _reasons(out)
 
 
-def test_an_in_flight_lane_alone_is_demand_enough_to_be_told(rig=None):
+def test_an_in_flight_lane_alone_is_demand_enough_to_be_told():
     """...and the 2026-08-26 shape is exactly that case: no approved queue (it was serialized behind
     a wildcard lane), but lanes in flight whose dead sessions would be relaunched into the wall."""
     dsk = _attempts(["d26", "d27"], auth_probe=_AUTH_UNKNOWN,
@@ -1065,9 +1090,9 @@ def test_the_status_line_and_the_morning_report_name_the_auth_death_hold():
 # --------------- the runner half: what the runner could not see before ----------------------
 
 def _oop(rig, act, outcome, sid, ts=NOW, **extra):
-    """Journal the record an OUT-OF-PROCESS spawner writes — the watchdog's own check process, or
-    the owner's `superlooper debug` tap. Neither runs inside the runner, so the journal is the only
-    place the runner can ever learn that a launch was attempted at all."""
+    """Journal the record an OUT-OF-PROCESS spawner writes — the watchdog's own check process, the
+    owner's `superlooper debug` tap, `superlooper resume`. None of them runs inside the runner, so
+    the journal is the only place it can ever learn a launch was attempted at all."""
     import journal as journal_mod
     journal_mod.append(str(rig.home), dict({"act": act, "outcome": outcome, "id": sid}, **extra), ts)
 
@@ -1083,7 +1108,7 @@ def test_a_watchdog_debugger_launch_failure_feeds_the_attempt_streak(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5, signals=["alert"])
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == {"ids": ["d26", "d27"], "reasons": ["gh_auth_dead_runner"]}
+    assert _streak(rig) == ["d26", "d27"]
 
 
 def test_an_owner_tapped_debug_launch_failure_feeds_the_attempt_streak(rig):
@@ -1093,7 +1118,21 @@ def test_an_owner_tapped_debug_launch_failure_feeds_the_attempt_streak(rig):
     _oop(rig, "debug_launch", "launch_failed", "d29", ts=NOW + 1, rc=7, operator="willprout",
          source="command-center", error="[d29] CLAUDE IDENTITY REFUSED in the session's own env")
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig) == {"ids": ["d29"], "reasons": ["claude_identity_wrong"]}
+    assert _streak(rig) == ["d29"]
+
+
+def test_a_resume_is_the_same_launcher_and_counts_both_ways(rig):
+    """`superlooper resume` drives the SAME launcher from its own process. Its refusal is a sample;
+    its success is proof the machine can start a session, and a hold left standing over a machine
+    the owner has just visibly resumed work on is the failure this whole class is about."""
+    rig.r.tick(now=NOW)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
+    _oop(rig, "resume", "resume_failed", "i104", ts=NOW + 2, rc=7, session_id="abc")
+    rig.r.tick(now=NOW + 20)
+    assert _streak(rig) == ["d26", "i104"]
+    _oop(rig, "resume", "resumed", "i104", ts=NOW + 30, session_id="abc")
+    rig.r.tick(now=NOW + 40)
+    assert _streak(rig, NOW + 40) == []
 
 
 def test_a_DELIVERY_CHANNEL_refusal_never_enters_this_streak(rig):
@@ -1106,19 +1145,31 @@ def test_a_DELIVERY_CHANNEL_refusal_never_enters_this_streak(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=2, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=124, signals=["alert"])
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig)["ids"] == []
+    assert _streak(rig) == []
 
 
 def test_a_PER_ISSUE_refusal_never_enters_this_streak(rig):
     """The same guard on the runner's own launches. A worktree that would not create and a brief
-    that could not be written are two lanes with problems of their own, six hours apart — paging the
-    owner "your Claude login has expired" over a stale git index.lock is the exact mis-blame."""
+    that could not be written are two lanes with problems of their own — paging the owner "your
+    Claude login has expired" over a stale git index.lock is the exact mis-blame."""
     rig.r.tick(now=NOW)
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(1, "[i101] could not create the worktree"))
     rig.r._execute(_launch_action(), NOW)
-    assert _streak(rig, NOW)["ids"] == []
+    assert _streak(rig, NOW) == []
     assert issue_state(rig, "i101")["launch_failures"] == 1, "it still parks on its own schedule"
+
+
+def test_a_CANARY_probes_refusal_is_never_a_sample(rig):
+    """#320's rule, rounds 2 and 3, and it applies here for the same reason: a probe only ever runs
+    while a hold already stands, and it can refuse for a fault of the LANE it happened to probe —
+    which would enter this streak as though the MACHINE had produced it, and keep a wrongly-held
+    queue held by its own probing. A probe is not a sample."""
+    rig.r.tick(now=NOW)
+    rig.calls.clear()
+    rig.rc_queue.append(runner_mod.ScriptRC(6, "[i101] ENV POISONED: ANTHROPIC_API_KEY survived"))
+    rig.r._execute(dict(_launch_action(), canary=True), NOW)
+    assert _streak(rig, NOW) == []
 
 
 def test_a_record_with_no_readable_rc_is_dropped_rather_than_guessed_at(rig):
@@ -1128,7 +1179,7 @@ def test_a_record_with_no_readable_rc_is_dropped_rather_than_guessed_at(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, signals=["alert"])
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc="five", signals=["alert"])
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig)["ids"] == []
+    assert _streak(rig) == []
 
 
 def test_an_out_of_process_launch_that_STARTED_clears_the_streak(rig):
@@ -1137,18 +1188,20 @@ def test_an_out_of_process_launch_that_STARTED_clears_the_streak(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "debug_launch", "launched", "d27", ts=NOW + 2, operator="willprout")
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig)["ids"] == []
+    assert _streak(rig) == []
 
 
 def test_a_verified_delivery_BETWEEN_two_refusals_breaks_the_streak(rig):
-    """"Consecutive, with no success between them" is the whole claim. Two refusals with a session
-    that really started between them are not a machine that cannot start sessions."""
+    """"Consecutive, with no success between them" is the whole claim — and it is a claim about
+    WHEN, so the absorb orders by timestamp rather than by the order records happened to be
+    written. This runner stamps its records with the clock the TICK started on while the other
+    spawners stamp real wall time, and a launch may take up to LAUNCH_TIMEOUT."""
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
-    _oop(rig, "debug_launch", "launched", "d27", ts=NOW + 2, operator="willprout")
     _oop(rig, "watchdog", "launch_failed", "d28", ts=NOW + 3, rc=5)
+    _oop(rig, "debug_launch", "launched", "d27", ts=NOW + 2, operator="willprout")   # out of order
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig)["ids"] == ["d28"]
+    assert _streak(rig) == ["d28"], "the success at +2 clears d26 and only d26"
 
 
 def test_the_streak_never_expires_on_its_own_mid_outage(rig):
@@ -1162,7 +1215,7 @@ def test_the_streak_never_expires_on_its_own_mid_outage(rig):
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5)
     rig.r.tick(now=NOW + 20)
     long_after = NOW + 10 * runner_mod.AUTH_DEATH_STREAK_WINDOW_SECONDS
-    assert _streak(rig, long_after)["ids"] == ["d26", "d27"], "only a delivery clears it"
+    assert _streak(rig, long_after) == ["d26", "d27"], "only a delivery clears it"
 
 
 def test_a_stale_out_of_process_failure_is_never_ADOPTED_from_the_journal(rig):
@@ -1174,7 +1227,7 @@ def test_a_stale_out_of_process_failure_is_never_ADOPTED_from_the_journal(rig):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=old, rc=5)
     _oop(rig, "watchdog", "launch_failed", "d27", ts=old + 1, rc=5)
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig)["ids"] == []
+    assert _streak(rig) == []
 
 
 def test_the_runners_OWN_launch_failure_feeds_the_same_streak(rig):
@@ -1183,14 +1236,14 @@ def test_the_runners_OWN_launch_failure_feeds_the_same_streak(rig):
     rig.calls.clear()
     rig.rc_queue.append(runner_mod.ScriptRC(7, "[i101] CLAUDE IDENTITY REFUSED: not logged in"))
     rig.r._execute(_launch_action(), NOW)
-    assert _streak(rig, NOW) == {"ids": ["i101"], "reasons": ["claude_identity_wrong"]}
+    assert _streak(rig, NOW) == ["i101"]
 
 
 def test_a_verified_delivery_clears_the_attempt_streak(rig):
     rig.r.tick(now=NOW)
     rig.r._record_launch_attempt_failure("d26", "gh_auth_dead_runner")
     rig.r._delivery_cleared()
-    assert _streak(rig, NOW)["ids"] == []
+    assert _streak(rig, NOW) == []
 
 
 def test_a_RESTART_does_not_resurrect_a_streak_a_later_launch_already_answered(rig):
@@ -1202,7 +1255,7 @@ def test_a_RESTART_does_not_resurrect_a_streak_a_later_launch_already_answered(r
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5)
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig)["ids"] == ["d26", "d27"]
+    assert _streak(rig) == ["d26", "d27"]
     import journal as journal_mod
     journal_mod.append(str(rig.home), {"act": "launch", "id": "i101", "num": 101,
                                        "outcome": "ok"}, NOW + 30)
@@ -1210,7 +1263,7 @@ def test_a_RESTART_does_not_resurrect_a_streak_a_later_launch_already_answered(r
                          pane="pane-1", run_script=lambda *a, **k: 0,
                          fetch_usage=lambda: {"auth_status": "ok"})
     reborn._absorb_out_of_process_launches(NOW + 40)
-    assert reborn._launch_attempt_streak(NOW + 40)["ids"] == []
+    assert reborn._launch_attempt_streak(NOW + 40) == []
 
 
 def test_a_successful_NUDGE_is_not_a_launch_and_never_clears_the_streak(rig):
@@ -1225,7 +1278,7 @@ def test_a_successful_NUDGE_is_not_a_launch_and_never_clears_the_streak(rig):
     journal_mod.append(str(rig.home), {"act": "recover", "id": "i101", "tier": "idle",
                                        "outcome": "ok"}, NOW + 3)
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig)["ids"] == ["d26", "d27"]
+    assert _streak(rig) == ["d26", "d27"]
 
 
 def test_a_record_is_absorbed_exactly_once_however_often_the_tail_is_re_read(rig):
@@ -1235,15 +1288,17 @@ def test_a_record_is_absorbed_exactly_once_however_often_the_tail_is_re_read(rig
     rig.r.tick(now=NOW)
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
     rig.r.tick(now=NOW + 20)
-    assert _streak(rig)["ids"] == ["d26"]
+    assert _streak(rig) == ["d26"]
     rig.r._delivery_cleared()
     for n in range(3):
         rig.r.tick(now=NOW + 40 + n * 20)
-    assert _streak(rig, NOW + 100)["ids"] == [], "a cleared streak is not rebuilt from old records"
+    assert _streak(rig, NOW + 100) == [], "a cleared streak is not rebuilt from old records"
 
 
 def test_the_attempt_streak_is_published_for_decide_to_read(rig, monkeypatch):
-    """decide is PURE — it can only see what the tick hands it."""
+    """decide is PURE — it can only see what the tick hands it. The evidence REASONS stay on the
+    runner's side: this class wears one name, and a pure boundary that accepts a reason it cannot
+    vet is a reason it will one day act on."""
     seen = {}
     real = actions.decide
 
@@ -1256,8 +1311,7 @@ def test_the_attempt_streak_is_published_for_decide_to_read(rig, monkeypatch):
     _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 3, rc=5)
     monkeypatch.setattr(actions, "decide", spy)
     rig.r.tick(now=NOW + 20)
-    assert seen["launch_attempt_streak"] == {"ids": ["d26", "d27"],
-                                             "reasons": ["gh_auth_dead_runner"]}
+    assert seen["launch_attempt_fail_ids"] == ["d26", "d27"]
 
 
 # ------------------------- the arc: the 2026-08-26 outage, replayed -------------------------
@@ -1318,10 +1372,10 @@ def test_the_2026_08_26_outage_holds_the_queue_and_resumes_on_its_own(auth_outag
 
     A dark meter (failing open — its own recorded decision, untouched here), an auth probe that will
     not answer, one lane refusing for the SESSION's Claude account and one unattended repair flight
-    refusing for the RUNNER's gh: two distinct session ids that could not start, two different
-    credential faults, neither anywhere near a cap of its own. ONE alert, zero parks, nothing
-    relabeled, and no launch but the recovery probe while it stands — and when the owner logs back
-    in, the probe finds out by itself.
+    refusing for the RUNNER's gh: two distinct session ids that could not start, one of them a
+    flight the queue does not own, neither anywhere near a cap of its own. ONE alert, zero parks,
+    nothing relabeled, and no launch but the recovery probe while it stands — and when the owner
+    logs back in, the probe finds out by itself.
     """
     rig = auth_outage
     t = NOW
@@ -1338,12 +1392,13 @@ def test_the_2026_08_26_outage_holds_the_queue_and_resumes_on_its_own(auth_outag
         "one sample cannot tell a broken lane from a broken machine"
 
     # ...and the watchdog's unattended repair flight refuses too, from its own process and for a
-    # DIFFERENT credential. That is the second distinct session, and the whole thing #320 cannot see.
+    # DIFFERENT credential. That is the second distinct session — and the one the queue does not
+    # own, which is what makes this the machine rather than a worktree.
     _oop(rig, "watchdog", "launch_failed", "d26", ts=t + 1, rc=5, signals=["alert"])
     t += 20
     rig.r.tick(now=t)
 
-    # --- HELD, under the machine-wide name a mixed streak earns ---
+    # --- HELD ---
     alert = _alert_file(rig)
     assert AUTH_DEATH in alert["reasons"], alert
     assert len([a for a in _journal(rig, "alert")
@@ -1382,3 +1437,20 @@ def test_the_2026_08_26_outage_holds_the_queue_and_resumes_on_its_own(auth_outag
     assert _journal(rig, "park") == [], "and it parked nothing on the way out either"
     assert loopstate.load(str(rig.home / "state" / "issues.json"))["issues"]["i101"]["status"] \
         == "running", "the queue resumed on its own"
+
+
+def test_an_unrelated_journal_record_is_never_read_as_a_verified_delivery(rig):
+    """The absorb walks EVERY record in the tail, and most of them are not launches at all. One with
+    no `outcome` field must not match a missing table row and read as a session that started — it
+    did, once, and silently emptied the streak on the very tick the hold should have tripped."""
+    rig.r.tick(now=NOW)
+    _oop(rig, "watchdog", "launch_failed", "d26", ts=NOW + 1, rc=5)
+    _oop(rig, "watchdog", "launch_failed", "d27", ts=NOW + 2, rc=5)
+    import journal as journal_mod
+    for rec in ({"act": "brief_comments", "id": "i101", "num": 101, "fetched": 1},
+                {"act": "alert", "reasons": ["usage_stale"], "outcome": "ok"},
+                {"act": "watchdog", "id": "d99"},                  # our own act, no outcome
+                {"act": "resume", "id": "i5", "outcome": None}):
+        journal_mod.append(str(rig.home), rec, NOW + 3)
+    rig.r.tick(now=NOW + 20)
+    assert _streak(rig) == ["d26", "d27"]

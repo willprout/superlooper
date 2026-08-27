@@ -4561,9 +4561,10 @@ def cmd_debug(args):
     error = _debug_error(rc, err, out)
     # The rc rides along beside the human text (issue #457). This verb runs in its OWN process, so
     # the journal is the only thing the runner ever hears about a Debug tap that refused — and
-    # `lib/evidence` reads the launcher's EXIT CODE first (its `_RC_AUTHORITATIVE` set) and its
-    # stderr second. Recording only the prose left the runner able to see that a flight failed but
-    # not what refused it, which is the difference between a named hold and a guessed one.
+    # `lib/evidence` needs the rc: its text pass runs first, but the launcher's refusals reach here
+    # already wrapped in this CLI's own prose, so the rc is what actually names most of them.
+    # Recording only the prose left the runner able to see that a flight failed but not what
+    # refused it, which is the difference between a classified sample and a guessed one.
     _debug_journal(home, {"act": "debug_launch", "outcome": "launch_failed", "id": sid, "rc": rc,
                           "operator": operator, "source": source, "error": error})
     _emit_debug(args, {"ok": False, "verb": "debug", "id": sid, "live": False, "live_id": None,
@@ -4854,7 +4855,9 @@ def cmd_resume(args):
                             "brief": brief_path})
         return 0
     error = _debug_error(rc, err, out)
-    _debug_journal(home, {"act": "resume", "outcome": "resume_failed", "id": iid,
+    # The rc rides along beside the prose, exactly as the debug tap's does (issue #457) — this verb
+    # runs in its own process against the same launcher, so the journal is all the runner ever hears.
+    _debug_journal(home, {"act": "resume", "outcome": "resume_failed", "id": iid, "rc": rc,
                           "session_id": session_id, "error": error})
     return refuse(error, session_id=session_id)
 

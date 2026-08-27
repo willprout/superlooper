@@ -98,8 +98,8 @@ def tail(state_home, max_bytes=TAIL_MAX_BYTES):
     a bounded tail every tick costs a constant few hundred KB and cannot be wrong about either.
 
     Fails closed exactly like read(): an unreadable file yields [], a corrupt or wrong-typed line is
-    skipped, the FIRST line is dropped when the byte seek may have landed inside it, and a TRAILING
-    partial line is left unparsed rather than parsed in halves. (append() writes each record with a
+    skipped, the FIRST line is dropped when the byte seek landed INSIDE it (checked, not assumed),
+    and a TRAILING partial line is left unparsed rather than parsed in halves. (append() writes each record with a
     single write+flush+fsync, so a partial tail is rare; being wrong about it once would mis-read a
     record, which is why it is handled.)
     """
@@ -112,6 +112,15 @@ def tail(state_home, max_bytes=TAIL_MAX_BYTES):
             except OSError:                             # pragma: no cover - defensive
                 size = 0
             start = max(0, size - int(max_bytes))
+            # Is `start` already a record boundary? Reading the byte BEFORE it answers that, and it
+            # is worth one seek: without the check the first line is dropped unconditionally, which
+            # throws away a COMPLETE record whenever the arithmetic happens to land on a newline.
+            # The streak this feeds trips on two samples, so one lost record is a hold that arrives
+            # late — cheap to prevent, awkward to reproduce.
+            aligned = start == 0
+            if not aligned:
+                f.seek(start - 1)
+                aligned = f.read(1) == b"\n"
             f.seek(start)
             blob = f.read()
     except OSError:
@@ -122,8 +131,8 @@ def tail(state_home, max_bytes=TAIL_MAX_BYTES):
     # none of those can appear raw today — but _read_records splits on \n only, and two readers of
     # one file that disagree about what a line is would be a defect nobody could reproduce.
     lines = blob[:consumed].decode("utf-8", "replace").split("\n")
-    if start > 0 and lines:
-        lines = lines[1:]                               # the seek may have landed mid-record
+    if not aligned and lines:
+        lines = lines[1:]                               # the seek landed mid-record
     out = []
     for line in lines:
         if not line.strip():

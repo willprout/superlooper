@@ -143,12 +143,18 @@ AUTH_DEATH_STREAK_WINDOW_SECONDS = 6 * 3600
 # WHEN A FOURTH SPAWNER APPEARS, ITS ACT BELONGS HERE. The triage flight (#448) ships disabled and
 # journals no launch act yet; `actions._is_session_id` already admits its `t<N>` ids, so wiring it
 # is one row here and nothing else.
-OUT_OF_PROCESS_LAUNCH_ACTS = ("watchdog", "debug_launch")
+OUT_OF_PROCESS_LAUNCH_ACTS = ("watchdog", "debug_launch", "resume")
+# Each of those verbs spells its own outcomes. One table, so a fourth spawner is a row and not a
+# branch — and so a verb whose success this runner cannot recognise can never leave a hold standing
+# over a machine that has demonstrably started a session (`resume` was exactly that miss).
+OUT_OF_PROCESS_OUTCOMES = {
+    "watchdog": ("launched", "launch_failed"),
+    "debug_launch": ("launched", "launch_failed"),
+    "resume": ("resumed", "resume_failed"),
+}
 # The outcomes those acts use. "launched" is a VERIFIED delivery — the launcher proved a session
 # started — so it clears the streak for the same reason the runner's own verified delivery does:
 # one session that really started proves the machine can start sessions, whoever started it.
-OUT_OF_PROCESS_LAUNCH_FAILED = "launch_failed"
-OUT_OF_PROCESS_LAUNCH_OK = "launched"
 # The runner's OWN verified launch, as the journal records it. The absorb has to recognise this to
 # get the CHRONOLOGY right across a restart: the streak is "consecutive failures with no success
 # BETWEEN them", and a fresh process re-reads a bounded tail that may still contain out-of-process
@@ -2334,7 +2340,7 @@ class Runner:
         # did not run. Absorbed HERE, one line before it is published, so the tick that first hears
         # about an out-of-process refusal is the tick that can act on it.
         self._absorb_out_of_process_launches(now)
-        disk["launch_attempt_streak"] = self._launch_attempt_streak(now)
+        disk["launch_attempt_fail_ids"] = self._launch_attempt_streak(now)
         anchor = self._probe_launch_anchor()             # None = this home has no anchor, or no demand
         if anchor is not None:
             disk["launch_anchor"] = anchor
@@ -3231,13 +3237,16 @@ class Runner:
         return True
 
     def _launch_attempt_streak(self, now=None):
-        """The streak as decide reads it: {"ids": [...], "reasons": [...]} (issue #457).
+        """The streak as decide reads it: the sorted distinct session ids (issue #457).
 
-        `now` is accepted and unused — the streak has no clock of its own (see the field's note);
-        the parameter is kept so the publish site reads like the two beside it and a future reader
-        does not go looking for an expiry that was deliberately removed."""
-        return {"ids": sorted(self._launch_attempt_fails),
-                "reasons": sorted(set(self._launch_attempt_fails.values()))}
+        The evidence REASONS stay on this side. decide does not need them — this class wears one
+        name — and a pure boundary that accepts a reason it cannot vet is a reason it will one day
+        act on: the filter that decides what counts as a sample belongs where the classifier runs.
+
+        `now` is accepted and unused: the streak has no clock of its own (see the field's note), and
+        the parameter keeps the publish site reading like the two beside it so a future reader does
+        not go looking for an expiry that was deliberately removed."""
+        return sorted(self._launch_attempt_fails)
 
     def _absorb_out_of_process_launches(self, now):
         """Fold the launches this process did NOT run into the same attempt streak its own feed.
@@ -3264,31 +3273,32 @@ class Runner:
             return
         cutoff = now - AUTH_DEATH_STREAK_WINDOW_SECONDS
         seen = self._journal_watermark
-        for rec in records:
-            at = rec.get("ts")
-            if not isinstance(at, (int, float)) or isinstance(at, bool) or at <= seen or at < cutoff:
-                continue
+        fresh = [(r.get("ts"), r) for r in records
+                 if isinstance(r.get("ts"), (int, float)) and not isinstance(r.get("ts"), bool)
+                 and seen < r["ts"] and r["ts"] >= cutoff]
+        # BY TIMESTAMP, not file order. "Consecutive, with no success between them" is a claim about
+        # WHEN things happened, and file order is not that: this runner stamps its records with the
+        # clock the TICK started on while the other spawners stamp real wall time, and a launch may
+        # take up to LAUNCH_TIMEOUT — so a verified delivery can be written after, but happened
+        # before, a refusal another process recorded meanwhile.
+        for at, rec in sorted(fresh, key=lambda pair: pair[0]):
             self._journal_watermark = max(self._journal_watermark, at)
             act, outcome = rec.get("act"), rec.get("outcome")
             if act == RUNNER_LAUNCH_ACT and outcome == RUNNER_LAUNCH_OK:
                 self._launch_attempt_fails = {}        # this runner's own verified delivery
                 continue
-            if act not in OUT_OF_PROCESS_LAUNCH_ACTS:
-                continue
-            if outcome == OUT_OF_PROCESS_LAUNCH_OK:
+            if act not in OUT_OF_PROCESS_OUTCOMES or not isinstance(outcome, str):
+                continue                               # NB: an act with no outcome at all must not
+            ok, failed = OUT_OF_PROCESS_OUTCOMES[act]  # match a missing table row and read as a
+            if outcome == ok:                          # verified delivery (it did, and cleared it)
                 # A verified delivery from another process. It clears THIS streak only: the channel
                 # and per-reason environment streaks above are the runner's own accounting, and a
                 # debugger flight is not a sample of the WORKER environments they describe.
                 self._launch_attempt_fails = {}
-                continue
-            if outcome != OUT_OF_PROCESS_LAUNCH_FAILED:
-                continue
-            ev = self._out_of_process_evidence(rec)
-            if ev is None or not self._record_launch_attempt_failure(rec.get("id"), ev["reason"]):
-                continue
-            # The #115 canary clock too, so a hold this absorb TRIPS spaces its own first probe a
-            # full interval out instead of firing on the very next tick.
-            self._launch_fail_at = max(self._launch_fail_at, at)
+            elif outcome == failed:
+                ev = self._out_of_process_evidence(rec)
+                if ev is not None:
+                    self._record_launch_attempt_failure(rec.get("id"), ev["reason"])
 
     def _out_of_process_evidence(self, rec):
         """Classify one out-of-process launch failure, or None when its record says too little.
@@ -3332,12 +3342,18 @@ class Runner:
         Returns True when charged to the channel (held), False when charged to the issue."""
         merged = dict(fields or {}, launch_evidence=ev)
         # (#457) A CREDENTIAL/ENVIRONMENT refusal is a sample of "can this machine start a session"
-        # whichever way it is charged below — including a #115 canary's, whose whole job is to ask
-        # that question. `_record_launch_attempt_failure` applies the family filter, so a per-issue
-        # fault (a worktree that would not create, a brief that could not be written) and a channel
-        # fault (a dead anchor, an unfired shim) both fall straight through: neither is evidence
-        # about credentials, and each already has a detector and a remedy of its own.
-        self._record_launch_attempt_failure(iid, ev.get("reason") if isinstance(ev, dict) else None)
+        # whichever way it is charged below. `_record_launch_attempt_failure` applies the family
+        # filter, so a per-issue fault (a worktree that would not create, a brief that could not be
+        # written) and a channel fault (a dead anchor, an unfired shim) both fall straight through:
+        # neither is evidence about credentials, and each already has a detector and a remedy.
+        #
+        # A #115 CANARY is excluded, exactly as it is from the two streaks below and for the same
+        # reason (#320, fresh review rounds 2 and 3): a probe only ever runs while a hold already
+        # stands, so it answers "is one standing" with nothing new — and it can refuse for a fault
+        # of the LANE it happened to probe, which would enter this streak as though the machine had
+        # produced it. A probe is not a sample.
+        if not canary:
+            self._record_launch_attempt_failure(iid, ev.get("reason") if isinstance(ev, dict) else None)
         if canary or evidence.is_channel_fault(ev):
             self._launch_fail_at = now
             # A canary is a PROBE, not a SAMPLE, and the difference is what keeps a held queue to one
