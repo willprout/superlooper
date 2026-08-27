@@ -1223,6 +1223,32 @@ def test_a_triage_flight_without_a_repo_names_that_rather_than_the_branch(tmp_pa
     assert host.spawned == []
 
 
+def test_a_triage_worktree_off_a_missing_base_still_exits_3(tmp_path):
+    """Issue #28's discipline reaches the third class. A dev_branch that is not on origin is a
+    per-repo CONFIG fault, and its distinct code is what makes the park memo blame the branch
+    rather than the launch machinery — a flight must not be the one launch shape that loses it."""
+    # rc=1 is what `rev-parse --verify --quiet` returns for a ref that is genuinely not there.
+    edges = FakeEdges({"worktree add": (1, "", "fatal: invalid reference"),
+                       "rev-parse --verify": (1, "", "")})
+    spec = _triage_spec(tmp_path, triage_home=triage.WORKTREE)
+    result, _edges, host = _run(spec, edges=edges)
+    assert result.rc == launch.BASE_MISSING
+    assert "origin/main" in result.stderr
+    assert host.spawned == [], "a missing base costs no pane"
+
+
+def test_a_checkout_home_whose_checkout_is_gone_refuses_before_anything_is_created(tmp_path):
+    """The checkout home's whole premise is that the directory IS the repo an orchestrator opens.
+    If it is not there, the flight has nothing to see — and the refusal must land before pretrust
+    and before any host RPC, the same base-missing discipline every other refusal here follows."""
+    spec = _triage_spec(tmp_path, repo=str(tmp_path / "not-a-checkout"))
+    result, edges, host = _run(spec)
+    assert result.rc == launch.ABORTED
+    assert "checkout does not exist" in result.stderr
+    assert not any("pretrust" in " ".join(c) for c in edges.calls), edges.calls
+    assert host.spawned == []
+
+
 def test_a_triage_flight_opens_on_its_own_brief(tmp_path):
     spec = _triage_spec(tmp_path)
     os.remove(os.path.join(spec.run_root, "briefs", "t1.md"))   # AFTER the rig built the world

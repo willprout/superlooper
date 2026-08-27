@@ -739,7 +739,10 @@ def receives_token(name):
     passed is a flag that will one day be passed by the wrong call site.
 
     Deny by default: only a real ``d<N>`` id is a repair session. Anything unrecognised is treated
-    as a worker, which is the direction a mistake here should fail in.
+    as a worker, which is the direction a mistake here should fail in — and it is what makes the
+    triage flight (``t<N>``, #448) tokenless for free: the standing rule says a flight holds no
+    fence token and drives no herdr surface, and that is true here because a NEW session class
+    denies by construction rather than because anyone remembered to come back and add it.
 
     Holding the token is CAPABILITY, never PERMISSION — the D13 supervised/unattended rails still
     govern what a ``d<N>`` session may actually do with it.
