@@ -839,3 +839,151 @@ def test_latest_canary_wins_and_absence_reads_as_not_verified():
 
     none_out = report.morning([], _view(now=0, queue=[], usage=None), ledger={}, config=_cfg())
     assert "notify channel" in none_out.lower() and "not verified" in none_out.lower()
+
+
+# --------------------------- the triage flight's section (issue #449) ---------------------------
+# The flight's acts reach the owner exactly where every other overnight act does. The section is
+# SILENT on a day with no run: a heading reading "None." over a delegation that never flew would
+# put a standing question in front of the owner every single morning.
+
+def _triage_night():
+    return [
+        _rec(1030, "triage_launch", id="t7", date="2026-07-02", outcome="launched",
+             detail="3 open issue(s) changed since the last recorded verdicts"),
+        _rec(1031, "triage_merge", num=21, date="2026-07-02", absorber=20,
+             detail="absorbed into #20", outcome="ok"),
+        _rec(1032, "triage_close", num=30, date="2026-07-02", verdict="overtaken",
+             commit="abc1234", ledger=None, detail="overtaken by abc1234", outcome="ok"),
+        _rec(1033, "triage_close", num=40, date="2026-07-02", verdict="nit(N3)", rubric="N3",
+             ledger=12, detail="nit under N3, filed in the ledger (#12)", outcome="ok"),
+        _rec(1034, "triage_fix", num=45, date="2026-07-02", fixed=["labels"],
+             detail="fixed labels (underspecified)", outcome="ok"),
+        _rec(1035, "triage_escalate", num=50, date="2026-07-02", held=False,
+             finding="the body asks which database to use",
+             recommend="decide the engine, then I will fix the body",
+             line="- **#50** Storage — the body asks which database to use\n"
+                  "  - **Recommend:** decide the engine, then I will fix the body",
+             detail="the body asks which database to use", outcome="ok"),
+        _rec(1036, "triage_finish", date="2026-07-02",
+             counts={"judged": 5, "merged": 1, "closed": 2, "ledger": 1, "fixed": 1,
+                     "escalated": 1},
+             detail="judged 5 · 1 merged · 2 closed (1 to the ledger) · 1 fixed · 1 escalated",
+             outcome="ok"),
+    ]
+
+
+def test_the_triage_section_renders_the_runs_counts_and_links():
+    out = report.morning(_triage_night(), _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "## Triage" in out
+    # the tally the run log carries, repeated verbatim so the two surfaces cannot disagree
+    assert "1 merged" in out and "2 closed (1 to the ledger)" in out
+    assert "1 fixed" in out and "1 escalated" in out
+    # every act names its issue as a LINK — the owner reads the report, then the issue
+    for num in (21, 30, 40, 45, 50):
+        assert f"https://github.com/{REPO}/issues/{num}" in out
+    assert "#20" in out and "abc1234" in out and "N3" in out
+    # the sitting sheet's recommendation is what makes an escalation actionable at breakfast
+    assert "decide the engine" in out
+
+
+def test_a_triage_run_breaks_the_quiet_night():
+    out = report.morning(_triage_night(), _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "nothing happened" not in out.lower()
+
+
+def test_the_triage_section_is_absent_on_a_day_with_no_run():
+    out = report.morning(_full_journal(), _view(), ledger={}, config=_cfg())
+    assert "## Triage" not in out
+    out = report.morning([], _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "## Triage" not in out
+
+
+def test_a_flight_that_only_looked_still_renders_but_claims_nothing():
+    # A flight that judged a queue and found nothing to do IS news — it is the delegation working —
+    # but it must not be dressed up as activity. The tally says what happened; no act lines follow.
+    j = [_rec(1030, "triage_launch", id="t7", date="2026-07-02", outcome="launched", detail="1 changed"),
+         _rec(1031, "triage_keep", num=10, date="2026-07-02", verdict="buildable",
+              detail="kept (buildable)", outcome="ok"),
+         _rec(1032, "triage_finish", date="2026-07-02",
+              counts={"judged": 1, "merged": 0, "closed": 0, "ledger": 0, "fixed": 0,
+                      "escalated": 0},
+              detail="judged 1 · 0 merged · 0 closed (0 to the ledger) · 0 fixed · 0 escalated",
+              outcome="ok")]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "## Triage" in out and "judged 1" in out
+    assert "https://github.com/%s/issues/10" % REPO not in out, (
+        "a kept issue gets silence on GitHub and silence here — only acts are reported")
+
+
+def test_a_refused_triage_act_reaches_the_owner():
+    # The delegation's edges refusing IS the audit trail. A flight that tried to close a reopened
+    # issue, or cited a commit that never landed, is something the owner should see once.
+    j = [_rec(1030, "triage_launch", id="t7", date="2026-07-02", outcome="launched", detail="x"),
+         _rec(1031, "triage_refused", num=70, date="2026-07-02", verdict="overtaken",
+              detail="a previous flight closed #70 ... it has since been REOPENED",
+              outcome="refused")]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "## Triage" in out and "REFUSED" in out and "#70" in out
+
+
+def test_a_failed_triage_launch_is_reported_not_swallowed():
+    j = [_rec(1030, "triage_launch", id="t7", date="2026-07-02", outcome="launch failed (rc=124)",
+              detail="timed out")]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "## Triage" in out and "FAILED" in out and "t7" in out
+    assert "nothing happened" not in out.lower()
+
+
+def test_the_triage_section_never_raises_on_wrong_typed_records():
+    j = [_rec(1030, "triage_close", num=None, date=7, ledger="twelve", detail=None),
+         _rec(1031, "triage_escalate", num="fifty", line=42, recommend=None),
+         _rec(1032, "triage_finish", counts="not a dict", detail=None)]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert isinstance(out, str) and out
+
+
+def test_the_summary_tally_names_the_triage_run():
+    """The summary line IS the push body. A night on which a flight closed three issues must not
+    reach the owner's phone as "0 merged · 0 parked · queue: 1" — the one surface that would make
+    an autonomous delegation invisible is the one it has to be visible on."""
+    out = report.morning(_triage_night(), _view(queue=[], usage=None), ledger={}, config=_cfg())
+    summary = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#")][0]
+    assert "triage" in summary.lower()
+    assert "1 merged" in summary and "2 closed" in summary and "1 escalated" in summary
+
+
+def test_a_night_with_no_flight_leaves_the_summary_exactly_as_it_was():
+    out = report.morning(_full_journal(), _view(), ledger={}, config=_cfg())
+    summary = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#")][0]
+    assert "triage" not in summary.lower()
+
+
+def test_refusal_lines_are_bounded_and_never_flood_the_report():
+    """A refusal's reason is written for the FLIGHT — it can name a whole label vocabulary. The
+    owner's morning surface gets the gist and a pointer, never the wall."""
+    long_reason = "`type:buidl` is not a label this engine registers. Choose from: " + \
+                  ", ".join("label-%02d" % i for i in range(40))
+    j = [_rec(1030, "triage_launch", id="t7", date="2026-07-02", outcome="launched", detail="x")]
+    j += [_rec(1040 + i, "triage_refused", num=90 + i, date="2026-07-02",
+               detail=long_reason, outcome="refused") for i in range(9)]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    section = out.split("## Triage", 1)[1].split("\n## ", 1)[0]
+    for line in section.splitlines():
+        assert len(line) <= 320, line
+    # the cap is STATED, never silent
+    assert "4 more refusal" in section
+    assert section.count("REFUSED on #") == 5
+
+
+def test_a_flight_that_died_before_finishing_still_reports_what_it_closed():
+    """`triage-finish` writes the tally, and a session can die before running it. What it already
+    did to the queue is not conditional on it having tidied up afterwards."""
+    j = [_rec(1030, "triage_launch", id="t7", date="2026-07-02", outcome="launched", detail="x"),
+         _rec(1031, "triage_close", num=30, date="2026-07-02", verdict="overtaken",
+              commit="abc1234", ledger=None, detail="overtaken by abc1234", outcome="ok"),
+         _rec(1032, "triage_merge", num=21, date="2026-07-02", absorber=20,
+              detail="absorbed into #20", outcome="ok")]
+    out = report.morning(j, _view(queue=[], usage=None), ledger={}, config=_cfg())
+    assert "## Triage" in out and "#21" in out and "#30" in out
+    summary = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith("#")][0]
+    assert "Triage: 1 merged · 1 closed · 0 escalated." in summary

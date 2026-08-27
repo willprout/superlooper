@@ -63,6 +63,7 @@ import os
 import re
 
 import issues
+import limitations
 import loopstate
 
 # --------------------------------------------------------------------------- the layout
@@ -95,6 +96,24 @@ VERDICTS = "verdicts.json"          # <state_home>/triage/verdicts.json
 # forever-cue this list exists to prevent, because a flight may judge one, record its verdict, and
 # end the cue. Bare literals, as every other reader in this engine spells them.
 HELD_LABELS = ("agent-ready", "in-progress", "awaiting-answer")
+
+# The labels that mean THIS ISSUE IS NOT A TRIAGE SUBJECT AT ALL — a different thing from
+# HELD_LABELS above, which mean "the loop holds it" (issue #449).
+#
+# The limitations ledger (#450) is the repo's own durable record of accepted limitations, and a
+# flight WRITES to it: a nit close files an entry there. A thing you write to is not a thing you
+# triage, and nothing good comes of a flight judging its own filing cabinet `underspecified`.
+#
+# It must be excluded HERE, in the cue, for the reason HELD_LABELS was widened twice: the ledger
+# carries no held label and will never earn a verdict, so under a "no verdict means changed" test
+# it is permanently changed — and a repo whose queue is otherwise quiet would launch an unattended
+# session every day forever on the strength of one pinned issue nobody has touched. That is the
+# very bound this module exists to keep, reproduced one label over.
+#
+# Spelled from `limitations.LEDGER_LABEL` rather than as a literal so the marker has ONE spelling:
+# adopt applies it, `find_ledger` confirms it, and this excludes it. `limitations` is pure and
+# imports nothing, so this costs the trigger no new dependency of substance.
+NOT_SUBJECT_LABELS = (limitations.LEDGER_LABEL,)
 
 # The run log's name IS the local date, which is also the day stamp. Matched strictly rather than
 # trusted: this string becomes a path segment, and a caller handing over a date it read from
@@ -342,6 +361,8 @@ def changed(open_issues, verdicts):
         names = issues._label_names(issue)
         if any(held in names for held in HELD_LABELS):
             continue                     # never the flight's to judge -> never the flight's cue
+        if any(skip in names for skip in NOT_SUBJECT_LABELS):
+            continue                     # not a subject at all -> and never a forever-cue
         record = known.get(_key(num))
         # BOTH halves of a record have to be readable for it to retire an issue (fresh-agent
         # review, P1). `load_verdicts` is hardened so a truncated FILE cannot silently retire
@@ -413,6 +434,43 @@ def mark_launched(state_home, date):
         # one; it is not a reason to hand the caller a launch it cannot record.
         return None
     return path
+
+
+def append_run_log(state_home, date, text):
+    """APPEND to a day's run log — the flight's own record, written a line at a time as it acts.
+
+    Appending as each act lands, rather than composing one document at the end, is deliberate: a
+    flight killed mid-run — a crash, a usage cap, the machine sleeping — still leaves an honest
+    record of what it had already done to the queue, and the acts are the half that is not
+    reversible from the log alone.
+
+    **It NEVER creates the file.** The run log IS the day's lease, and ``mark_launched`` is the
+    only thing that may take it — this module's own contract, in as many words: "the stamp is
+    written by the TRIGGER, before the session exists, never by the flight". Creating it here
+    would quietly break that: a single hand-run ``triage-act`` in the morning would leave a stamp
+    that reads as "a flight already went out today", and the day's whole triage pass would be
+    skipped because somebody fixed one label by hand. An act outside a flight is still durable —
+    it is in the journal, which is what the morning report reads — it simply does not forge a
+    lease it never took.
+
+    True when the line landed, False when there was no log to append to (or the date is unreadable,
+    or the state home is unwritable). Never raises: a log that cannot be written must not undo an
+    act that already landed on GitHub.
+    """
+    path = run_log_path(state_home, date)
+    if path is None or not isinstance(text, str):
+        return False
+    try:
+        # "a" would CREATE, so the existence check is the guard and it has to be here rather than
+        # in the caller: every caller of this function is an act that has already happened, and
+        # not one of them is in a position to decide whether it may take the day.
+        if not os.path.isfile(path):
+            return False
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+    except OSError:
+        return False
+    return True
 
 
 def recent_run_logs(state_home, limit=3):
@@ -514,9 +572,9 @@ def due(open_issues, state_home, date, config):
         len(fresh), named, ", ..." if len(fresh) > 10 else "")
 
 
-__all__ = ["DIR", "CONFIG_KEY", "RUNS", "VERDICTS", "HELD_LABELS",
+__all__ = ["DIR", "CONFIG_KEY", "RUNS", "VERDICTS", "HELD_LABELS", "NOT_SUBJECT_LABELS",
            "CHECKOUT", "WORKTREE", "HOMES",
            "BUILDABLE", "UNDERSPECIFIED", "CONTAINS_OWNER_DECISION", "OVERTAKEN",
            "duplicate_of", "nit", "home", "runs_dir", "verdicts_path", "run_log_path",
            "body_hash", "load_verdicts", "record_verdict", "changed", "ran_on",
-           "mark_launched", "recent_run_logs", "enabled", "home_kind", "due"]
+           "mark_launched", "append_run_log", "recent_run_logs", "enabled", "home_kind", "due"]

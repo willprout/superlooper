@@ -23,6 +23,18 @@
   morning-report  render reports/morning-<date>.md from the journal + notify (Task 11)
   nightly         fresh worktree of origin/<dev> -> qa.nightly_cmd -> flake/persistent triage;
                   a persistent failure freezes merges + files a scoped fix issue (Task 12)
+  triage-flight   launch today's TRIAGE FLIGHT (`t<N>`, issue #449) — the queue-hygiene session
+                  the owner delegated by standing rule. At most one a local day, only on a repo
+                  that opted in, and only when some open unapproved issue changed since the last
+                  verdicts. --check answers without consuming the day; --dry-run prints the brief
+  triage-act      ONE verdict on ONE unapproved issue — the only write a flight may make. The
+                  verdict selects the act (keep / fix / escalate / absorb a duplicate / close as
+                  overtaken citing a commit really on origin/<dev> / close a nit AND file it in
+                  the limitations ledger). It holds the delegation's edges at the call: an
+                  approved or in-flight issue is escalated, never touched; a reopened issue with
+                  an unchanged body is never re-closed; approval labels are refused
+  triage-finish   close the run — every escalation composed into the owner's sitting sheet in the
+                  run log, one line and one recommendation each, plus the run's tally
   promote-report  dev->prod EVIDENCE (suite vs known-failure ledger, merges since last promotion,
                   open issues) — NO verdict; William decides (Task 12)
   accept-failure  accept a failure by fingerprint into the ledger — one approval, ever (Task 12)
@@ -124,6 +136,11 @@ import report
 import runner_home
 import stack_doctor
 import tidy as tidy_lib
+# The triage flight (#448 state contract + trigger, #449 the acts). Imported
+# UNALIASED for the same reason `limitations` is: the #337 label fence resolves a
+# cross-module constant by the module's file stem.
+import triage
+import triage_run
 import upkeep as upkeep_lib
 
 _TEMPLATES = os.path.abspath(os.path.join(_HERE, "..", "templates"))
@@ -2554,6 +2571,832 @@ def cmd_morning_report(args):
                else "sent via %s" % r.channel if r.ok
                else "%s send failed (rc=%s)" % (r.channel, r.rc))
     print(f"wrote {out_path}\nnotify: {outcome}")
+    return 0
+
+
+# ------------------------------- the triage flight (issue #449) -------------------------------
+#
+# The `t<N>` flight is the queue-hygiene session the owner delegated by standing rule
+# (`plugin/skills/superlooper/references/triage-standing-rule.md`). #448 shipped the session class,
+# the state contract and the daily trigger; `lib/triage_run.py` holds what a verdict MEANS. These
+# three verbs are the whole surface between them:
+#
+#   triage-flight   is a flight due? -> take the day's lease -> compose the brief -> launch
+#   triage-act      the ONE write a flight may make, per issue, per verdict
+#   triage-finish   compose the escalations into the owner's sitting sheet and close the run
+#
+# **Every write the delegation permits goes through `triage-act`, and that is the design.** A brief
+# can only ASK a session to stay inside the rule; a verb can REFUSE it. So each of the rule's limits
+# is a guard here, at the moment of the mistake, with the reason in the refusal — the discipline
+# #215/#225 paid for. A flight that reaches for `gh issue close` itself is outside all of it, which
+# is why the brief says so in as many words.
+
+
+def _triage_home(cfg):
+    return str(config_lib.state_home(cfg))
+
+
+def _triage_emit(args, result, human=None):
+    """One JSON object with --json (a UI, a test, or the flight's own parsing), else a plain line."""
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(result) + "\n")
+    elif human:
+        sys.stdout.write(human.rstrip("\n") + "\n")
+    return result
+
+
+def _triage_today():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _triage_flight_id():
+    """The flight this act belongs to, from the session's OWN environment.
+
+    `SL_ISSUE_ID` is what the launcher stamps on every session it creates (`t7` here, `i7` for a
+    worker), so the flight never has to be told its own name and can never mistype it into the
+    record. Empty for a hand-run act outside a flight, which is a legitimate thing for an operator
+    to do and is recorded honestly as such rather than attributed to a flight that never ran.
+    """
+    ident = (os.environ.get("SL_ISSUE_ID") or "").strip()
+    return ident if re.fullmatch(r"t[0-9]+", ident) else ""
+
+
+def _triage_journal(home, record):
+    """Journal one triage act. Never fatal: the act already landed on GitHub, and losing its
+    journal line must not turn a completed act into an error the flight retries."""
+    try:
+        journal.append(home, record)
+    except (OSError, ValueError):
+        pass
+
+
+def _triage_record(home, date, act, num, detail, **fields):
+    """The ONE place an act becomes durable: a journal record (what the morning report and the
+    dashboard read) and a line in the day's run log (what the next flight reads). Both, always,
+    from one call — so a new act cannot be added to one surface and forgotten on the other."""
+    rec = {"act": act, "num": num, "date": date, "flight": _triage_flight_id(),
+           "detail": detail, "outcome": "ok"}
+    rec.update(fields)
+    _triage_journal(home, rec)
+    triage.append_run_log(home, date, triage_run.run_log_line(act, num, detail))
+    return rec
+
+
+def _triage_issue_view(num):
+    """One issue as the verb needs it, or None when GitHub could not be read.
+
+    None is a REFUSAL, never an empty issue: every guard below reasons from the labels, the body
+    and the state, and a read that failed looks exactly like an unlabelled issue with an empty body
+    — i.e. like the one shape every guard would wave through.
+    """
+    view = gh.triage_issue(num)
+    if not isinstance(view, dict) or type(view.get("number")) is not int:
+        return None
+    return view
+
+
+def _triage_is_open(view):
+    state = view.get("state")
+    return isinstance(state, str) and state.upper() == "OPEN"
+
+
+def cmd_triage_act(args):
+    """ONE verdict on ONE unapproved issue, and the one act that verdict authorises.
+
+    Exit codes are the flight's feedback channel and are load-bearing:
+      0  acted (or kept, or escalated — an escalation is a completed act, not a failure)
+      1  this call is malformed, or the repo has not opted in, or GitHub could not be read
+      3  REFUSED by one of the delegation's own edges. The message says which; the flight fixes
+         its call or leaves the issue alone. Nothing was written.
+    """
+    try:
+        cfg = _load_config(args.repo)
+    except (ValueError, OSError) as e:
+        _triage_emit(args, {"ok": False, "error": str(e)}, "triage-act: %s" % e)
+        return 1
+    home = _triage_home(cfg)
+    date = _triage_today()
+    dev = cfg.get("dev_branch") or "main"
+
+    def refuse(error, code=3, **extra):
+        # A refusal is JOURNALED. The audit trail of a delegation is not only what it did — it is
+        # also what its edges stopped, which is the evidence that the edges are load-bearing at all.
+        _triage_journal(home, {"act": "triage_refused", "num": args.issue, "date": date,
+                               "flight": _triage_flight_id(), "verdict": args.verdict,
+                               "detail": error, "outcome": "refused"})
+        triage.append_run_log(home, date,
+                              triage_run.run_log_line("triage_refused", args.issue, error))
+        out = {"ok": False, "action": "refused", "num": args.issue, "error": error}
+        out.update(extra)
+        _triage_emit(args, out, "triage-act #%s REFUSED: %s" % (args.issue, error))
+        return code
+
+    if not triage.enabled(cfg):
+        # Deliberately NOT a guard the flight can be coached past: a repo that has not opted in has
+        # no triage delegation at all, so this verb has no authority there to spend.
+        msg = ("this repo has not opted into the triage flight (`triage.enabled` is false in "
+               ".superlooper/config.json) — nothing was written")
+        _triage_emit(args, {"ok": False, "action": "refused", "num": args.issue, "error": msg},
+              "triage-act: %s" % msg)
+        return 1
+
+    verdict = triage_run.parse_verdict(args.verdict)
+    if verdict is None:
+        msg = ("%r is not one of the standing rule's verdicts (buildable, underspecified, "
+               "contains-owner-decision, duplicate-of-#N, overtaken, nit(<rubric line>))"
+               % (args.verdict,))
+        _triage_emit(args, {"ok": False, "action": "refused", "num": args.issue, "error": msg},
+              "triage-act: %s" % msg)
+        return 1
+
+    # Label writes are screened BEFORE the issue is even read: `agent-ready` and `pre-authorized:*`
+    # are the owner's word, and the answer does not depend on which issue was named.
+    for name in list(args.add_label or []) + list(args.remove_label or []):
+        why = triage_run.forbidden_label(name)
+        if why is not None:
+            return refuse(why)
+    # ...and every name is checked against the repo's REGISTERED vocabulary, here, at the call.
+    # This is the #165/#337 defect class arriving from a new direction: the flight composes label
+    # names itself, from prose, and `gh` refuses a label the repo does not have. Left to gh, the
+    # flight would get an opaque nonzero rc; told here, it gets the name it invented and the set it
+    # may choose from. Removals are checked against the wider set (LABELS + RETIRED_LABELS) for the
+    # reason the fence itself documents: clearing a retired `needs-william` beside a live
+    # `needs-owner` is legitimate, and only on the remove side.
+    registered = {name for name, _c, _d in labels_lib.LABELS}
+    for name in (args.add_label or []):
+        if name not in registered:
+            return refuse("`%s` is not a label this engine registers, so gh would refuse to apply "
+                          "it. Choose from: %s" % (name, ", ".join(sorted(registered))))
+    for name in (args.remove_label or []):
+        if name not in registered and name not in labels_lib.RETIRED_LABELS:
+            return refuse("`%s` is not a label this engine registers or has retired, so there is "
+                          "nothing of that name to remove." % name)
+
+    view = _triage_issue_view(args.issue)
+    if view is None:
+        msg = "issue #%s could not be read from GitHub — nothing was written" % args.issue
+        _triage_emit(args, {"ok": False, "action": "refused", "num": args.issue, "error": msg},
+              "triage-act: %s" % msg)
+        return 1
+    if not _triage_is_open(view):
+        return refuse("issue #%s is not open — a flight judges the OPEN queue" % args.issue)
+    # The ledger is where a flight FILES; it is not a thing a flight judges. Refused here as well
+    # as excluded from the cue (`triage.NOT_SUBJECT_LABELS`), because the two answer different
+    # questions: the cue decides whether to fly, and this decides whether a named issue may be
+    # acted on — a hand-run verb, or a flight given the number some other way, reaches only this.
+    if any(skip in issues_lib._label_names(view) for skip in triage.NOT_SUBJECT_LABELS):
+        return refuse("#%s is this repo's limitations ledger — a flight FILES to it and never "
+                      "judges it. Nothing was written." % args.issue)
+
+    body = view.get("body") if isinstance(view.get("body"), str) else ""
+    title = view.get("title") if isinstance(view.get("title"), str) else ""
+
+    # ---- edge 1: the loop holds this issue, so the most that may happen is a FLAG -------------
+    if triage_run.held(view):
+        finding = (args.finding or "").strip() or (
+            "an approved / in-flight / awaiting-answer issue the flight judged `%s`"
+            % verdict.name)
+        rec = (args.recommend or "").strip() or (
+            "apply `%s` yourself if you agree — the flight may not touch an issue the loop holds"
+            % verdict.name)
+        line = triage_run.sitting_line(args.issue, title, finding, rec)
+        _triage_record(home, date, "triage_escalate", args.issue,
+                       "held by the loop; flagged, not acted on", held=True,
+                       verdict=verdict.name, finding=finding, recommend=rec, line=line)
+        _triage_emit(args, {"ok": True, "action": "escalate", "num": args.issue,
+                            "held": True, "verdict": verdict.name,
+                            "reason": "the loop holds this issue — flagged for the owner"},
+                     "triage-act #%s: held by the loop — flagged, not acted on"
+                     % args.issue)
+        return 0
+
+    # ---- edge 2: a reopened issue is owner protest ---------------------------------------------
+    record = triage.load_verdicts(home).get(str(args.issue))
+    if verdict.act in (triage_run.CLOSE, triage_run.ABSORB) and triage_run.reopen_protest(record, body):
+        return refuse(
+            "a previous flight closed #%s as `%s` on this very body, and it has since been "
+            "REOPENED — a reopened issue is owner protest, and the rule forbids closing it again "
+            "unless its body has changed. Escalate your reasoning instead."
+            % (args.issue, record.get("verdict")))
+
+    # ---- the acts ------------------------------------------------------------------------------
+    if verdict.act == triage_run.ESCALATE:
+        finding = (args.finding or "").strip()
+        rec = (args.recommend or "").strip()
+        if not finding or not rec:
+            msg = ("an escalation carries one line and ONE recommendation — pass both "
+                   "--finding and --recommend (nothing was written)")
+            _triage_emit(args, {"ok": False, "action": "refused", "num": args.issue,
+                         "error": msg}, "triage-act: %s" % msg)
+            return 1
+        line = triage_run.sitting_line(args.issue, title, finding, rec)
+        triage.record_verdict(home, args.issue, body, verdict.name, date)
+        _triage_record(home, date, "triage_escalate", args.issue, finding, held=False,
+                       verdict=verdict.name, finding=finding, recommend=rec, line=line)
+        _triage_emit(args, {"ok": True, "action": "escalate", "num": args.issue,
+                            "held": False, "verdict": verdict.name,
+                            "reason": "escalated to the owner's sitting sheet"},
+                     "triage-act #%s: escalated — %s" % (args.issue, finding))
+        return 0
+
+    if verdict.act == triage_run.KEEP:
+        return _triage_keep(args, cfg, home, date, view, body, verdict, refuse)
+
+    if verdict.act == triage_run.ABSORB:
+        return _triage_absorb(args, cfg, home, date, view, body, title, verdict, refuse)
+
+    if verdict.param is None:                        # overtaken
+        return _triage_overtaken(args, cfg, home, date, body, dev, verdict, refuse)
+    return _triage_nit(args, cfg, home, date, body, verdict, refuse)
+
+
+def _triage_keep(args, cfg, home, date, view, body, verdict, refuse):
+    """`buildable` / `underspecified` — the issue is KEPT. Silence on GitHub is the rule's own
+    signal that a flight looked and left it alone, so nothing is posted here even when the
+    mechanical format fix below lands: an edit that announces itself is an edit the owner has to
+    read past every morning."""
+    fixes = []
+    new_body = None
+    if args.fix_body_file:
+        # The replacement body must be one the flight COMPOSED, in the one place it is allowed to
+        # write (fresh-agent review, P1). Unconstrained, this flag is a pipe from any local path
+        # onto a public issue — and a flight runs in the repo's REAL checkout precisely so it can
+        # see the gitignored overlay an orchestrator sees. The contract already says where its
+        # writes go; this makes the flag obey it. Resolved through realpath on BOTH sides, so a
+        # symlink out of the state home is not a way round.
+        try:
+            staged = os.path.realpath(args.fix_body_file)
+            allowed = os.path.realpath(home)
+        except OSError as e:
+            return refuse("could not resolve the replacement body path: %s" % e)
+        if not (staged == allowed or staged.startswith(allowed + os.sep)):
+            return refuse("a replacement body must be a file the flight composed inside its own "
+                          "state home (%s) — its only writes are GitHub and that folder. Write "
+                          "the body there and pass that path." % allowed)
+        try:
+            with open(args.fix_body_file, encoding="utf-8") as f:
+                new_body = f.read()
+        except OSError as e:
+            return refuse("could not read the replacement body (%s): %s" % (args.fix_body_file, e))
+        if not new_body.strip():
+            return refuse("the replacement body is empty — a format fix must not blank an issue")
+    if new_body is not None and new_body != body:
+        if not gh.set_issue_body(args.issue, new_body):
+            return refuse("GitHub refused the body edit on #%s — nothing else was attempted"
+                          % args.issue)
+        fixes.append("body")
+        body = new_body                              # the verdict binds to what now STANDS
+    if args.add_label or args.remove_label:
+        if not gh.set_labels(args.issue, add=list(args.add_label or []),
+                             remove=list(args.remove_label or [])):
+            return refuse("GitHub refused the label edit on #%s" % args.issue)
+        fixes.append("labels")
+    triage.record_verdict(home, args.issue, body, verdict.name, date)
+    act = "triage_fix" if fixes else "triage_keep"
+    detail = ("fixed %s (%s)" % (" and ".join(fixes), verdict.name) if fixes
+              else "kept (%s)" % verdict.name)
+    _triage_record(home, date, act, args.issue, detail, verdict=verdict.name, fixed=fixes)
+    _triage_emit(args, {"ok": True, "action": "fix" if fixes else "keep",
+                        "num": args.issue, "verdict": verdict.name, "fixed": fixes},
+                 "triage-act #%s: %s" % (args.issue, detail))
+    return 0
+
+
+def _triage_absorb(args, cfg, home, date, view, body, title, verdict, refuse):
+    """`duplicate-of-#M` — M absorbs this issue's content, then this one closes cross-referenced.
+
+    The ABSORBER is checked as carefully as the absorbed: the rule delegates merging duplicates
+    *among unapproved issues*, so absorbing into an approved one would write into frozen owner text
+    through the back door.
+    """
+    absorber_num = verdict.param
+    if absorber_num == args.issue:
+        return refuse("#%s cannot be a duplicate of itself" % args.issue)
+    absorber = _triage_issue_view(absorber_num)
+    if absorber is None:
+        return refuse("the absorbing issue #%d could not be read from GitHub" % absorber_num)
+    if not _triage_is_open(absorber):
+        return refuse("the absorbing issue #%d is not open — absorbing into a closed issue loses "
+                      "both" % absorber_num)
+    if triage_run.held(absorber):
+        return refuse("the absorbing issue #%d is approved, in flight, or awaiting the owner's "
+                      "answer — its body is frozen owner text and a merge would rewrite it. "
+                      "Escalate the pair instead." % absorber_num)
+    # BOTH ends, not just the source (fresh-agent review, P1). The source-issue guard above the
+    # dispatch stops a flight judging the ledger; without the same check here, `duplicate-of-#<the
+    # ledger>` would append an arbitrary issue's content INTO the repo's accepted-limitations
+    # record and close the source — the same door, entered from the absorber side.
+    if any(skip in issues_lib._label_names(absorber) for skip in triage.NOT_SUBJECT_LABELS):
+        return refuse("#%d is this repo's limitations ledger — nothing may be absorbed INTO it. "
+                      "A flight files entries there; it never merges issues into it."
+                      % absorber_num)
+
+    if not (args.why or "").strip():
+        return refuse("a duplicate merge must say what makes the two ONE issue (--why) — that "
+                      "sentence is the evidence the close carries, and it is what the owner reads "
+                      "if he disagrees")
+    merged = triage_run.absorbed_body(absorber.get("body") or "", args.issue, title, body)
+    if not gh.set_issue_body(absorber_num, merged):
+        return refuse("GitHub refused the body edit on the absorbing issue #%d — #%s is untouched"
+                      % (absorber_num, args.issue))
+    # The cross-reference on the absorber is posted BEFORE the close and is BEST EFFORT: the
+    # absorber's body already carries an `## Absorbed: #N` heading, so the trail reads in both
+    # directions with or without it, and losing a courtesy comment is not a reason to strand a
+    # merge whose content half has already landed.
+    gh.comment(absorber_num, triage_run.absorber_comment(args.issue, title, args.why.strip()))
+    if not gh.close_issue(args.issue,
+                          triage_run.duplicate_close_comment(absorber_num, args.why.strip())):
+        return refuse("GitHub refused the close on #%s — its content is already on #%d, so this "
+                      "act is half-landed and the next flight will finish it"
+                      % (args.issue, absorber_num))
+    triage.record_verdict(home, args.issue, body, verdict.name, date)
+    _triage_record(home, date, "triage_merge", args.issue,
+                   "absorbed into #%d" % absorber_num, verdict=verdict.name,
+                   absorber=absorber_num)
+    _triage_emit(args, {"ok": True, "action": "merge", "num": args.issue,
+                        "absorber": absorber_num, "verdict": verdict.name},
+                 "triage-act #%s: absorbed into #%d" % (args.issue, absorber_num))
+    return 0
+
+
+def _triage_overtaken(args, cfg, home, date, body, dev, verdict, refuse):
+    """`overtaken` — closed citing commit-level evidence on `origin/<dev>`.
+
+    The fetch and the ancestry check are what make the rule's "citing commit-level evidence"
+    something the engine KNOWS rather than something the flight asserts. Judged against
+    `origin/<dev>` and never the working tree, because the flight runs in the repo's real checkout
+    — which may sit on any branch, dirty, mid-anything.
+    """
+    if not (args.commit or "").strip():
+        return refuse("an overtaken close must cite the commit that overtook it (--commit <sha>)")
+    if not (args.why or "").strip():
+        return refuse("an overtaken close must say what that commit did (--why)")
+    gitops.fetch(args.repo)                          # fetch first — the rule's own discipline
+    ref = "origin/%s" % dev
+    answer = gitops.commit_on_branch(args.repo, args.commit, ref)
+    if answer is False:
+        return refuse("commit %s is not on %s — the working tree is not evidence. Cite a commit "
+                      "that actually landed, or escalate." % (args.commit, ref))
+    if answer is None:
+        # Deliberately one refusal for two causes, and it names both: the citation was not an
+        # object id (a ref NAME is not evidence — `origin/main` is its own ancestor), or git could
+        # not resolve what was cited. A flight acts on either the same way.
+        return refuse("%r is not commit-level evidence on %s: cite the OBJECT ID of the commit "
+                      "that overtook this issue (7-40 hex characters — a branch or tag name is "
+                      "not evidence, since it is trivially its own ancestor). If you did cite a "
+                      "sha, this repository could not resolve it or %s. Nothing was closed."
+                      % (args.commit, ref, ref))
+    comment = triage_run.overtaken_close_comment(args.commit, args.why.strip(), dev)
+    if not gh.close_issue(args.issue, comment):
+        return refuse("GitHub refused the close on #%s — nothing was written" % args.issue)
+    triage.record_verdict(home, args.issue, body, verdict.name, date)
+    _triage_record(home, date, "triage_close", args.issue,
+                   "overtaken by %s" % args.commit, verdict=verdict.name,
+                   commit=args.commit, ledger=None)
+    _triage_emit(args, {"ok": True, "action": "close", "num": args.issue,
+                        "verdict": verdict.name, "commit": args.commit, "ledger": None},
+                 "triage-act #%s: closed as overtaken by %s"
+                 % (args.issue, args.commit))
+    return 0
+
+
+def _triage_nit(args, cfg, home, date, body, verdict, refuse):
+    """`nit(<line>)` — closed AND filed in the repo's limitations ledger, naming the rubric line.
+
+    The two halves are written in one order and only one: the LEDGER ENTRY first, then the close
+    that links it. That way the link in the close comment always points at something that exists,
+    and the failure mode of a half-landed act is a filed limitation on a still-open issue — which
+    the next flight sees, recognises by its marker, and finishes — rather than a closed issue whose
+    stated filing is a lie.
+
+    With NO ledger in the repo the act DEGRADES to an escalation rather than closing anyway. That
+    is the boundary this issue was given: scaffolding a ledger belongs to `adopt` (#450), and a
+    flight that created one would be inventing the repo's own accepted-limitations record.
+    """
+    line = triage_run.rubric_line(cfg, verdict.param)
+    if line is None:
+        return refuse("%r is not a line in this repo's nit rubric (%s). A close names the line "
+                      "that made it closable, so a line nobody can look up is a close nobody can "
+                      "check." % (verdict.param,
+                                  ", ".join(l.id for l in triage_run.rubric(cfg))))
+    if not (args.why or "").strip():
+        return refuse("a nit close must state the limitation being accepted (--why) — that "
+                      "sentence IS the ledger entry")
+
+    health = gh.marked_issues_health(limitations.LEDGER_LABEL)
+    if not health.ok:
+        return refuse("the limitations ledger could not be read from GitHub, so a nit cannot be "
+                      "filed — and a nit that is not filed is a nit that is lost. Nothing was "
+                      "closed.")
+    ledger = limitations.find_ledger(health.value)
+    if ledger is None:
+        # DEGRADE, do not refuse: the finding is real and must not evaporate because the repo has
+        # not been adopted far enough. It goes to the owner with the rubric line named.
+        finding = "a nit under rubric line %s: %s" % (line.id, args.why.strip())
+        rec = ("run `superlooper adopt` to scaffold the limitations ledger, then this closes "
+               "itself on the next flight — or close it by hand if you agree")
+        sitting = triage_run.sitting_line(args.issue, "", finding, rec)
+        # NO VERDICT IS RECORDED, and that is what makes the recommendation above true
+        # (fresh-agent review, P1). A verdict against this body would retire the issue as settled,
+        # `triage.changed()` would stop offering it, and the finding would be lost the moment the
+        # ledger appeared. Unjudged, it stays a cue: the next flight after `adopt` closes and files
+        # it. The cost is that the escalation repeats until the owner spends one command, which is
+        # the right way round — a repeated line beats a lost finding.
+        _triage_record(home, date, "triage_escalate", args.issue,
+                       "nit with no ledger to file it in", held=False,
+                       verdict=triage.CONTAINS_OWNER_DECISION, finding=finding, recommend=rec,
+                       line=sitting)
+        _triage_emit(args, {"ok": True, "action": "escalate", "num": args.issue,
+                            "held": False, "verdict": triage.CONTAINS_OWNER_DECISION,
+                            "reason": ("this repo has no limitations ledger, so the nit "
+                                       "was escalated rather than closed")},
+                     "triage-act #%s: no limitations ledger — escalated, not closed"
+                     % args.issue)
+        return 0
+
+    ledger_num = ledger["number"]
+    entry = triage_run.ledger_entry(line, args.why.strip(), args.issue)
+    link = _triage_existing_entry(ledger_num, args.issue)
+    if link is None:
+        link = gh.comment_link(ledger_num, entry)
+        if link is None:
+            return refuse("GitHub refused the ledger entry on #%d, so nothing was closed — a nit "
+                          "close and its filing are written together or not at all" % ledger_num)
+    comment = triage_run.nit_close_comment(line, args.why.strip(), ledger_num, link)
+    if not gh.close_issue(args.issue, comment):
+        return refuse("GitHub refused the close on #%s. Its ledger entry on #%d already stands "
+                      "and carries a marker, so the next flight will finish the close rather "
+                      "than file it twice." % (args.issue, ledger_num))
+    triage.record_verdict(home, args.issue, body, verdict.name, date)
+    _triage_record(home, date, "triage_close", args.issue,
+                   "nit under %s, filed in the ledger (#%d)" % (line.id, ledger_num),
+                   verdict=verdict.name, rubric=line.id, ledger=ledger_num, ledger_link=link)
+    _triage_emit(args, {"ok": True, "action": "close", "num": args.issue,
+                        "verdict": verdict.name, "rubric": line.id,
+                        "ledger": ledger_num, "ledger_link": link},
+                 "triage-act #%s: closed as a nit (%s), filed in the ledger #%d"
+                 % (args.issue, line.id, ledger_num))
+    return 0
+
+
+def _triage_existing_entry(ledger_num, source_num):
+    """The url of a ledger entry ALREADY filed for this source issue, or None.
+
+    The idempotence half of the nit protocol. A close that failed after its entry landed leaves the
+    source issue open with a filed limitation; the next flight must finish the close, not file a
+    second entry. Recognised by the marker the entry carries, never by prose. A refused read
+    answers None, which files a second entry — the safe direction, since a duplicate entry is
+    visible and correctable while a lost one is neither.
+    """
+    read = gh.issue_comments(ledger_num)
+    if not read.ok:
+        return None
+    marker = triage_run.ledger_marker(source_num)
+    for c in read.comments:
+        if isinstance(c, dict) and isinstance(c.get("body"), str) and marker in c["body"]:
+            url = c.get("url")
+            return url if isinstance(url, str) and url.startswith("http") else "#%d" % ledger_num
+    return None
+
+
+# ------------------------------- the flight itself -------------------------------
+
+def _triage_pile(open_issues, verdicts):
+    """The UNAPPROVED open issues, as the brief lists them — number, title, and what a previous
+    flight already concluded about that exact body.
+
+    The held ones are absent, not merely marked: the rule forbids acting on them at all, and a
+    list is an invitation. A flight that notices a defect in one can still escalate it — the brief
+    says so — but it will not go looking down a list it was handed.
+    """
+    lines = []
+    for issue in open_issues:
+        if not isinstance(issue, dict) or type(issue.get("number")) is not int:
+            continue
+        if triage_run.held(issue):
+            continue
+        if any(skip in issues_lib._label_names(issue) for skip in triage.NOT_SUBJECT_LABELS):
+            continue                     # the ledger is where nits are FILED, not a queue item
+        num = issue["number"]
+        record = verdicts.get(str(num))
+        if isinstance(record, dict) and record.get("body_hash") == triage.body_hash(
+                issue.get("body")):
+            note = "SETTLED — `%s` on %s (this exact body); do not re-litigate" % (
+                record.get("verdict"), record.get("date"))
+        elif isinstance(record, dict) and isinstance(record.get("verdict"), str):
+            note = "changed since `%s` (%s) — judge it again" % (record.get("verdict"),
+                                                                record.get("date"))
+        else:
+            note = "no verdict on record"
+        title = issue.get("title") if isinstance(issue.get("title"), str) else ""
+        lines.append("- **#%d** %s — %s" % (num, title, note))
+    return "\n".join(lines) if lines else "_(nothing unapproved is open — say so and end.)_"
+
+
+def _triage_verdicts_block(verdicts):
+    rows = []
+    for key in sorted(verdicts, key=lambda k: int(k) if k.isdigit() else 1 << 30):
+        rec = verdicts[key]
+        if not isinstance(rec, dict) or not isinstance(rec.get("verdict"), str):
+            continue
+        rows.append("- #%s -> `%s` (%s)" % (key, rec["verdict"], rec.get("date") or "?"))
+    return "\n".join(rows) if rows else "_(no verdicts on record — this is the first flight.)_"
+
+
+def _triage_recent_block(home, today):
+    """The last three run logs, as the rule asks — PREVIOUS ones.
+
+    Today's log is excluded deliberately: the lease created it moments ago and it is this very
+    flight's own, so quoting it would spend one of the three slots on an empty heading and push a
+    real previous run out of the brief.
+    """
+    logs = [(d, text) for d, text in triage.recent_run_logs(home, 4) if d != today][:3]
+    if not logs:
+        return "_(no previous run logs — this is the first flight.)_"
+    return "\n".join("### %s\n\n%s" % (date, text.strip() or "_(empty)_") for date, text in logs)
+
+
+def _triage_next_id(home):
+    """The next `t<N>`, from a counter in the flight's own state folder.
+
+    Monotonic forever, and never derived from the run logs alone: those can be pruned, and a reused
+    id would collide with a previous flight's pane record and its brief. Taken under the day lease,
+    which the caller already holds, so no second exclusion is needed.
+    """
+    path = os.path.join(triage.home(home), "flights.json")
+    state = _read_json_file(path, {})
+    last = state.get("last") if isinstance(state, dict) else None
+    nxt = (last + 1) if isinstance(last, int) and not isinstance(last, bool) and last >= 0 else 1
+    os.makedirs(triage.home(home), exist_ok=True)
+    loopstate.save(path, {"last": nxt})
+    return "t%d" % nxt
+
+
+# What the flight is standing in, per `triage.home`. Two DIFFERENT repositories (`lib/triage.py`
+# and `lib/launch.py` both say so), so the brief must not describe one and hand the flight the
+# other — the checkout home is chosen precisely FOR the gitignored overlay, and a flight in the
+# worktree home that believed it could see one would judge staleness against a repository it is
+# not in.
+_TRIAGE_HOME_NOTE = {
+    triage.CHECKOUT: (
+        "You are running in the repo's REAL checkout (`{repo_path}`) precisely so you can see what "
+        "an orchestrator sees, gitignored working files included. That checkout may sit on any "
+        "branch, dirty, mid-anything. It is **read-only to you** and it is **not evidence**."),
+    triage.WORKTREE: (
+        "You are running in a DETACHED worktree of `origin/{dev_branch}` — this repo set "
+        "`triage.home: worktree`, so the gitignored working files an orchestrator sees are NOT "
+        "visible to you and nothing you can see here is unpublished. Your working tree is still "
+        "**read-only to you** and still **not evidence**. The verbs below take "
+        "`--repo {repo_path}` — the repo's real checkout, where this loop's config lives; that is "
+        "an address for them, not somewhere for you to read or write."),
+}
+
+
+def _triage_brief(cfg, home, repo_path, flight_id, date, open_issues, verdicts):
+    template = _read(os.path.join(_TEMPLATES, "triage-brief.md")) or ""
+    health = gh.marked_issues_health(limitations.LEDGER_LABEL)
+    ledger = limitations.find_ledger(health.value) if health.ok else None
+    return triage_run.render_brief(template, {
+        "flight_id": flight_id,
+        "date": date,
+        "repo_slug": cfg.get("repo"),
+        "repo_path": os.path.abspath(repo_path),
+        "dev_branch": cfg.get("dev_branch") or "main",
+        "operator": config_lib.operator(cfg),
+        "state_home": home,
+        "run_log": triage.run_log_path(home, date) or os.path.join(triage.runs_dir(home), date),
+        "home_note": triage_run.render_brief(
+            _TRIAGE_HOME_NOTE[triage.home_kind(cfg)],
+            {"repo_path": os.path.abspath(repo_path),
+             "dev_branch": cfg.get("dev_branch") or "main"}),
+        "rubric": triage_run.render_rubric(cfg),
+        "recent_runs": _triage_recent_block(home, date),
+        "verdicts": _triage_verdicts_block(verdicts),
+        "pile": _triage_pile(open_issues, verdicts),
+        # An unreadable ledger read is reported as unreadable rather than as "there is none": the
+        # two send a flight to different places, and a nit escalated because GitHub blinked is a
+        # different (and correctable) thing from a nit escalated because the repo has no ledger.
+        "ledger": ("#%d" % ledger["number"] if ledger is not None else
+                   "none in this repo — a nit is not closable here, escalate it"
+                   if health.ok else
+                   "could not be read from GitHub just now — treat nits as unclosable this run"),
+        "cli": _triage_cli_name(),
+    })
+
+
+def _triage_cli_name():
+    """How the flight invokes this CLI. The bare name when it is on PATH (the ordinary case, since
+    `install-cli-link.sh` puts it there), else this very script's own absolute path — because a
+    brief that names a command the session cannot run is a brief that stops the flight dead."""
+    return "superlooper" if shutil.which("superlooper") else os.path.join(_HERE, "superlooper")
+
+
+def _triage_shim_run(cfg, repo, home, flight_id):
+    """Launch ONE triage flight through the shared launcher. Returns (rc, stdout, stderr, spawned).
+
+    Shaped exactly like `_debugger_shim_run` and pinning the same variables for the same reasons —
+    an ambient `SL_ATTENDED`, `SL_RESUME_SESSION_ID` or `SL_EXPECT_GH_LOGIN` in whatever shell the
+    scheduler runs from must never change what a flight is. The one variable that is this class's
+    own is `SL_TRIAGE_HOME`: it selects which REPOSITORY the flight sees (the real checkout, or a
+    detached worktree), and `lib/launch.py` refuses a value it cannot read rather than choosing.
+    """
+    models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    env = {**os.environ,
+           "SL_RUN_ROOT": home, "SL_PANE": "",
+           "SL_REPO": os.path.abspath(repo),
+           "SL_DEV_BRANCH": cfg.get("dev_branch") or "main",
+           "SL_TRIAGE_HOME": triage.home_kind(cfg),
+           # The flight reads a whole queue and writes verdicts on it; it runs on the worker's
+           # configured model rather than a cheaper one, because the judgement is the product.
+           "SL_MODEL": models.get("worker") or "opus[1m]", "SL_EFFORT": "",
+           "SL_LAUNCH_VERIFY_SECONDS": "30",
+           # PINNED EMPTY: nobody is watching a flight. The PreToolUse deny (#185) reads this to
+           # decide whether an AskUserQuestion has anyone to answer it, and an ambient
+           # `export SL_ATTENDED=1` would hand an unattended session a dialog that stalls all night.
+           "SL_ATTENDED": "",
+           "SL_RESUME_SESSION_ID": "",
+           "SL_EXPECT_GH_LOGIN": "",
+           "SL_AGENT": cfg.get("agent") if cfg.get("agent") in ("claude", "codex") else "claude"}
+    try:
+        r = subprocess.run([_launcher(), "--triage", flight_id], env=env,
+                           capture_output=True, text=True, timeout=WATCHDOG_LAUNCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out", True
+    except (OSError, ValueError):
+        return 127, "", "could not run the launch shim", False
+    return r.returncode, r.stdout, r.stderr, True
+
+
+def cmd_triage_flight(args):
+    """Launch today's triage flight, if one is due.
+
+    `--check` answers WITHOUT consuming the day — a report line or a dashboard tile must be able to
+    say "a flight is due" without spending the flight. `--dry-run` renders the brief and prints it,
+    taking no lease and launching nothing, so an operator (or a test) can read exactly what a
+    flight would be told.
+
+    The lease and the launch sit at ONE call site with nothing between them, which is `triage.due`'s
+    own instruction: reading `due()` and launching without taking the lease is a check-then-act that
+    reproduces the unbounded relaunch the lease exists to prevent.
+    """
+    try:
+        cfg = _load_config(args.repo)
+    except (ValueError, OSError) as e:
+        _triage_emit(args, {"ok": False, "reason": str(e)}, "triage-flight: %s" % e)
+        return 1
+    home = _triage_home(cfg)
+    date = _triage_today()
+    # READ-HEALTH, not a bare list (#92/#172). `triage.due` answers an empty queue with "no open
+    # issue's body has changed since the last recorded verdicts" and this verb PRINTS that as the
+    # reason nothing flew — so a throttled or refused gh, which also answers [], would tell the
+    # owner his queue is quiet every single day. Same direction, honest diagnosis.
+    health = gh.open_issues_all_health()
+    if not health.ok:
+        reason = ("the open-issue list could not be read from GitHub, so whether anything has "
+                  "changed cannot be established — launching nothing")
+        _triage_emit(args, {"ok": False, "due": False, "reason": reason, "date": date},
+              "triage-flight: %s" % reason)
+        return 3
+    open_issues = health.value
+    verdicts = triage.load_verdicts(home)
+    due, reason = triage.due(open_issues, home, date, cfg)
+
+    if getattr(args, "check", False):
+        _triage_emit(args, {"ok": True, "due": due, "reason": reason, "date": date},
+              "triage-flight: %s — %s" % ("DUE" if due else "not due", reason))
+        return 0 if due else 3
+
+    if getattr(args, "dry_run", False):
+        # No lease, no id burned, no launch: the brief is rendered against a placeholder id so an
+        # operator can read it without the next real flight losing its number.
+        text = _triage_brief(cfg, home, args.repo, "t<N>", date, open_issues, verdicts)
+        if getattr(args, "json", False):
+            _triage_emit(args, {"ok": True, "due": due, "reason": reason, "brief": text})
+        else:
+            sys.stdout.write(text.rstrip("\n") + "\n")
+        return 0
+
+    if not due:
+        _triage_emit(args, {"ok": False, "due": False, "reason": reason, "date": date},
+              "triage-flight: no flight — %s" % reason)
+        return 3
+
+    log_path = triage.mark_launched(home, date)
+    if log_path is None:
+        reason = ("the day's lease could not be taken for %s — either another runner already holds "
+                  "today or the state home is unwritable; launching nothing" % date)
+        _triage_emit(args, {"ok": False, "due": True, "reason": reason, "date": date},
+              "triage-flight: %s" % reason)
+        return 3
+
+    flight_id = _triage_next_id(home)
+    brief_path = os.path.join(home, "briefs", "%s.md" % flight_id)
+    try:
+        os.makedirs(os.path.join(home, "briefs"), exist_ok=True)
+        with open(brief_path, "w") as f:
+            f.write(_triage_brief(cfg, home, args.repo, flight_id, date, open_issues, verdicts))
+    except OSError as e:
+        # open(,"w") truncates before write() runs, so a partial brief for a session that never
+        # launched would read to a later reader as one that existed (the #144 lesson). Remove it.
+        _rm_quiet(brief_path)
+        msg = "could not write the flight's brief: %s" % e
+        _triage_emit(args, {"ok": False, "id": flight_id, "reason": msg},
+              "triage-flight: %s" % msg)
+        return 1
+
+    rc, out, err, spawned = _triage_shim_run(cfg, args.repo, home, flight_id)
+    combined = ((out or "") + (err or "")).strip()
+    if combined:
+        # NEVER onto stdout under --json (fresh-agent review, P1): `--json` promises ONE object
+        # there, and a single launcher warning line ahead of it breaks `json.loads(stdout)` for
+        # every consumer — a dashboard, a test, the flight's own parsing. It rides IN the object
+        # instead, and goes to stderr for the human running this at a terminal.
+        print(combined, file=sys.stderr if getattr(args, "json", False) else sys.stdout)
+    if not spawned:
+        _rm_quiet(brief_path)                        # the brief reached nobody
+    if rc != 0:
+        _triage_journal(home, {"act": "triage_launch", "id": flight_id, "date": date,
+                               "num": None, "outcome": "launch failed (rc=%s)" % rc,
+                               "detail": (err or "")[:200]})
+        triage.append_run_log(home, date,
+                              "- `triage_launch` FAILED (rc=%s) — no flight ran today\n" % rc)
+        _triage_emit(args,
+                     {"ok": False, "id": flight_id, "rc": rc, "launcher_output": combined,
+                      "reason": "the launcher refused or could not verify delivery (rc=%s)" % rc},
+                     "triage-flight: launch failed (rc=%s)" % rc)
+        return 1
+
+    _triage_journal(home, {"act": "triage_launch", "id": flight_id, "date": date, "num": None,
+                           "detail": reason, "outcome": "launched"})
+    triage.append_run_log(home, date, "- `triage_launch` %s — %s\n" % (flight_id, reason))
+    _triage_emit(args,
+                 {"ok": True, "id": flight_id, "date": date, "brief": brief_path,
+                  "reason": reason, "launcher_output": combined},
+                 "triage-flight: launched %s — brief: %s" % (flight_id, brief_path))
+    return 0
+
+
+# ------------------------------- closing the run -------------------------------
+
+_TRIAGE_ACT_COUNTS = {"triage_keep": "judged", "triage_fix": "fixed", "triage_merge": "merged",
+                      "triage_close": "closed", "triage_escalate": "escalated"}
+
+
+def _triage_counts(records, date):
+    """The run's tally from the journal — the ONE derivation `triage-finish` writes into the run
+    log and the morning report renders. Pure, and shared so the two can never disagree about what
+    a day did."""
+    counts = {"judged": 0, "merged": 0, "closed": 0, "ledger": 0, "fixed": 0, "escalated": 0}
+    for r in records:
+        if not isinstance(r, dict) or r.get("date") != date:
+            continue
+        act = r.get("act")
+        if act not in _TRIAGE_ACT_COUNTS:
+            continue
+        counts["judged"] += 1
+        if act == "triage_merge":
+            counts["merged"] += 1
+        elif act == "triage_close":
+            counts["closed"] += 1
+            if type(r.get("ledger")) is int:
+                counts["ledger"] += 1
+        elif act == "triage_fix":
+            counts["fixed"] += 1
+        elif act == "triage_escalate":
+            counts["escalated"] += 1
+    return counts
+
+
+def cmd_triage_finish(args):
+    """Close the run: the escalations become the owner's SITTING SHEET in the run log, and the
+    run's tally is written under it.
+
+    Derived from the journal rather than from an accumulator the flight carries, for the reason
+    every other report in this engine is: the journal is what survives a session that died halfway,
+    and a tally that only exists in a live process is a tally that vanishes with it.
+    """
+    try:
+        cfg = _load_config(args.repo)
+    except (ValueError, OSError) as e:
+        _triage_emit(args, {"ok": False, "error": str(e)}, "triage-finish: %s" % e)
+        return 1
+    home = _triage_home(cfg)
+    date = _triage_today()
+    records = [r for r in journal.read(home)
+               if isinstance(r, dict) and r.get("date") == date
+               and str(r.get("act", "")).startswith("triage")]
+    lines = [r.get("line") for r in records
+             if r.get("act") == "triage_escalate" and isinstance(r.get("line"), str)]
+    counts = _triage_counts(records, date)
+    sheet = triage_run.sitting_sheet(lines)
+    summary = triage_run.run_summary(counts)
+    triage.append_run_log(home, date, "\n%s\n## The run\n\n%s\n" % (sheet, summary))
+    _triage_journal(home, {"act": "triage_finish", "date": date, "num": None,
+                           "flight": _triage_flight_id(), "counts": counts,
+                           "detail": summary, "outcome": "ok"})
+    _triage_emit(args, {"ok": True, "date": date, "counts": counts, "summary": summary,
+                 "sitting_sheet": sheet},
+          "triage-finish: %s\n\n%s" % (summary, sheet or "(nothing to escalate)"))
     return 0
 
 
@@ -5020,6 +5863,78 @@ def main(argv=None):
                            help="check machine-level loop stack prerequisites instead of "
                                 "repo-level adoption state")})
     add("nightly", cmd_nightly)
+    add("triage-flight", cmd_triage_flight,
+        description=(
+            "Launch today's TRIAGE FLIGHT (`t<N>`) — the queue-hygiene session the owner\n"
+            "delegated by standing rule (references/triage-standing-rule.md).\n"
+            "\n"
+            "It flies at most once a local day, only on a repo that opted in\n"
+            "(`triage.enabled`), and only when some open, unapproved issue's body has changed\n"
+            "since the last recorded verdicts — a queue nobody has edited has nothing for a new\n"
+            "flight to say. The day's lease is the run log itself, taken BEFORE the session\n"
+            "exists, so a flight that dies having written nothing still consumes its day.\n"
+            "\n"
+            "Exit codes: 0 launched (or, with --check, a flight is due) · 3 no flight today\n"
+            "(the reason says which of the three rules said no) · 1 something failed."),
+        **{"--check": dict(action="store_true",
+                           help="report whether a flight is due and write NOTHING — the day is "
+                                "not consumed by asking"),
+           "--dry-run": dict(action="store_true",
+                             help="render the brief a flight would receive and print it; take no "
+                                  "lease, burn no id, launch nothing"),
+           "--json": dict(action="store_true",
+                          help="emit a single JSON object (for a UI over the loop to parse)")})
+    add("triage-act", cmd_triage_act,
+        description=(
+            "ONE verdict on ONE unapproved issue — the only write a triage flight may make.\n"
+            "\n"
+            "The verdict selects the act: `buildable`/`underspecified` keep it (silently; add\n"
+            "--fix-body-file / --add-label / --remove-label for a mechanical format fix),\n"
+            "`contains-owner-decision` escalates, `duplicate-of-#M` absorbs into M and closes\n"
+            "this one, `overtaken` closes citing a commit that must really be on origin/<dev>,\n"
+            "and `nit(<line>)` closes AND files the limitation in the repo's ledger.\n"
+            "\n"
+            "This verb holds the delegation's edges so the brief does not have to: an approved,\n"
+            "in-flight or awaiting-answer issue is escalated instead of touched; a reopened\n"
+            "issue whose body has not changed is never re-closed; `agent-ready` and\n"
+            "`pre-authorized:*` are refused outright.\n"
+            "\n"
+            "Exit codes: 0 acted · 1 malformed call / not opted in / GitHub unreadable ·\n"
+            "3 refused by one of those edges, with the reason (nothing was written)."),
+        **{"--issue": dict(type=int, required=True, metavar="N",
+                           help="the issue to judge"),
+           "--verdict": dict(required=True,
+                             help="buildable | underspecified | contains-owner-decision | "
+                                  "duplicate-of-#N | overtaken | nit(<rubric line>)"),
+           "--why": dict(default=None,
+                         help="the evidence or the limitation, in a sentence or two — required "
+                              "for overtaken, duplicate and nit closes (it becomes the ledger "
+                              "entry for a nit)"),
+           "--commit": dict(default=None, metavar="SHA",
+                            help="the commit that overtook this issue; verified to be on "
+                                 "origin/<dev_branch> before anything is closed"),
+           "--finding": dict(default=None,
+                             help="an escalation's one line — what the owner needs to know"),
+           "--recommend": dict(default=None,
+                               help="an escalation's one recommendation — what you would do"),
+           "--fix-body-file": dict(default=None, metavar="PATH",
+                                   help="replace an UNAPPROVED issue's body with this file "
+                                        "(a mechanical format fix)"),
+           "--add-label": dict(action="append", default=[], metavar="LABEL",
+                               help="label to add (repeatable); approval labels are refused"),
+           "--remove-label": dict(action="append", default=[], metavar="LABEL",
+                                  help="label to remove (repeatable); approval labels are "
+                                       "refused"),
+           "--json": dict(action="store_true",
+                          help="emit a single JSON object (for a UI over the loop to parse)")})
+    add("triage-finish", cmd_triage_finish,
+        description=(
+            "Close today's triage run: compose every escalation into the owner's SITTING SHEET\n"
+            "in the run log, one line and one recommendation each, and write the run's tally\n"
+            "under it. Derived from the journal, so a flight that died halfway still closes\n"
+            "honestly — and so the morning report and the run log can never disagree."),
+        **{"--json": dict(action="store_true",
+                          help="emit a single JSON object (for a UI over the loop to parse)")})
     add("morning-report", cmd_morning_report)
     add("promote-report", cmd_promote_report,
         **{"--use-latest-nightly": dict(action="store_true",

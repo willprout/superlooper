@@ -167,7 +167,13 @@ _NESTED_DEFAULTS = {
     # working tree stays READ-ONLY to the flight either way; that discipline is the brief's, not
     # this key's. `lib/triage.py` owns the two spellings so the loader and the launcher cannot
     # drift apart about what they mean.
-    "triage": {"enabled": False, "home": _triage.CHECKOUT},
+    #
+    # `rubric` (issue #449) DEFAULTS NULL, and null is not "no rubric" — it is "the owner's own".
+    # The nit rubric the flight closes against lives in the standing rule; a repo that says nothing
+    # inherits it as WRITTEN rather than a copy in its config that can drift from the document.
+    # A repo whose "true but not worth a lane" is a different question replaces the set entirely
+    # (`lib/triage_run.py` reads it, and an override is a replacement, never an addition).
+    "triage": {"enabled": False, "home": _triage.CHECKOUT, "rubric": None},
 }
 
 _ALLOWED_TOP = set(_TOP_DEFAULTS) | set(_NESTED_DEFAULTS) | {"repo", "operator"}
@@ -238,6 +244,50 @@ def _validate_quiet_hours(qh):
             _err(f"'notify.quiet_hours' must set both 'start' and 'end' (missing: {k})")
         if not _valid_hhmm(qh[k]):
             _err(f"'notify.quiet_hours.{k}' must be a zero-padded 24h time \"HH:MM\", got {qh[k]!r}")
+
+
+_RUBRIC_FIELDS = ("id", "title", "test")
+
+
+def _validate_rubric(v):
+    """`triage.rubric` is EITHER null (the standing rule's own four lines apply — the default and
+    the common case) OR a NON-EMPTY list of `{"id", "title", "test"}` objects that REPLACES that
+    set entirely (issue #449).
+
+    Every field is required and every one must be a non-blank string, because all three are printed
+    verbatim: the id into the recorded verdict (`nit(<id>)`), the id + title into the close comment,
+    and all three into the repo's limitations ledger. A close whose cited rubric line reads
+    `nit()` — or names a line nobody can look up — is a close whose reason cannot be checked, on an
+    issue that is now shut.
+
+    An EMPTY list is refused rather than treated as "no override". The two readings differ by a
+    whole delegated power: silently making every nit unclosable is not a thing a repo should be
+    able to say by accident. Say `null`, or say the lines.
+    """
+    if not isinstance(v, list) or not v:
+        _err("'triage.rubric' must be null (use the standing rule's own nit rubric) or a "
+             'non-empty list of {"id", "title", "test"} objects, got %r' % (v,))
+    seen = set()
+    for i, line in enumerate(v):
+        where = f"'triage.rubric'[{i}]"
+        if not isinstance(line, dict):
+            _err(f'{where} must be an object {{"id", "title", "test"}}, got {line!r}')
+        for k in line:
+            if k not in _RUBRIC_FIELDS:
+                _err(f"unknown key '{where}.{k}' (allowed: {', '.join(_RUBRIC_FIELDS)})")
+        for k in _RUBRIC_FIELDS:
+            if k not in line:
+                _err(f"{where} must set '{k}' — a rubric line is quoted verbatim in the close "
+                     "comment and the ledger entry, so no field of one may be missing")
+            if not isinstance(line[k], str) or not line[k].strip():
+                _err(f"'triage.rubric'[{i}].{k} must be a non-empty string, got {line[k]!r}")
+        # Two lines sharing an id would make `nit(<id>)` ambiguous — the verdict is the store's
+        # durable record of WHY an issue was closed, and it must resolve to exactly one line.
+        ident = line["id"].strip()
+        if ident in seen:
+            _err(f"'triage.rubric' has two lines with id {ident!r} — a recorded verdict "
+                 "`nit(<id>)` must name exactly one line")
+        seen.add(ident)
 
 
 def _validate_lanes(v):
@@ -464,6 +514,13 @@ def _validate_and_fill(raw):
     # adopt time rather than silently selecting the home the owner did not ask for.
     if not isinstance(tri["home"], str) or tri["home"] not in _triage.HOMES:
         _err(f"'triage.home' must be one of {sorted(_triage.HOMES)}, got {tri['home']!r}")
+    # The nit rubric override (issue #449). Validated LOUDLY and in full, because every field of a
+    # rubric line is printed VERBATIM into a close comment and into the repo's limitations ledger:
+    # a half-formed line would put an uncheckable reason on an issue that is now closed. `None` is
+    # the documented "use the owner's own rubric" — an EMPTY list is not the same thing and is
+    # refused, because it silently makes every nit unclosable.
+    if tri["rubric"] is not None:
+        _validate_rubric(tri["rubric"])
 
     # grace may be 0 (launch on the tripping check); the detection bounds must be >= 1 —
     # a zero bound would trip on any instantaneous glimpse of the condition. resurrection_max_per_hour

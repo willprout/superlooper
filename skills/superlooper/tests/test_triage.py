@@ -518,3 +518,45 @@ def test_a_date_the_trigger_cannot_read_never_launches(tmp_path):
         due, why = triage.due([_issue(1, "new")], tmp_path, junk, _cfg(enabled=True))
         assert due is False, junk
         assert "date" in why
+
+
+# ------------------- the ledger is not a triage subject (issue #449) -------------------
+# The limitations ledger (#450) is the repo's own durable record of accepted limitations: a flight
+# FILES to it, and a thing you write to is not a thing you triage. It is also the exact shape of
+# the forever-cue HELD_LABELS exists to prevent, one label over — it carries no held label and
+# will never earn a verdict, so under a "no verdict means changed" test it would summon a flight
+# every single day on a queue that has nothing in it.
+
+def test_the_limitations_ledger_is_never_a_cue():
+    import limitations
+    ledger = {"number": 120, "body": "## Entries\n\n_(none yet)_\n",
+              "labels": [{"name": limitations.LEDGER_LABEL}]}
+    assert triage.changed([ledger], {}) == []
+    # ...and it stays out of the way even beside a real cue
+    real = _issue(140, "a genuinely unjudged issue")
+    assert triage.changed([ledger, real], {}) == [140]
+
+
+def test_a_repo_whose_only_open_issue_is_the_ledger_never_summons_a_flight(tmp_path):
+    import limitations
+    ledger = {"number": 120, "body": "x", "labels": [{"name": limitations.LEDGER_LABEL}]}
+    ok, why = triage.due([ledger], str(tmp_path), "2026-08-27",
+                         {"triage": {"enabled": True}})
+    assert ok is False and "changed" in why
+
+
+def test_appending_to_a_run_log_never_forges_the_days_lease(tmp_path):
+    """The run log IS the day stamp, and `mark_launched` is the only thing that may take it.
+
+    An append that CREATED the file would mean one hand-run act in the morning left a stamp
+    reading "a flight already went out today" — and the day's whole triage pass would be skipped
+    because somebody fixed one label by hand.
+    """
+    home = str(tmp_path)
+    assert triage.append_run_log(home, "2026-08-27", "- an act with no flight behind it") is False
+    assert triage.ran_on(home, "2026-08-27") is False, "the day is still free"
+    assert triage.recent_run_logs(home) == []
+    # once the TRIGGER has taken it, the same append lands
+    assert triage.mark_launched(home, "2026-08-27") is not None
+    assert triage.append_run_log(home, "2026-08-27", "- `triage_keep` **#10** — kept") is True
+    assert "#10" in open(triage.run_log_path(home, "2026-08-27")).read()

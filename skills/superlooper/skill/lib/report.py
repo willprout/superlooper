@@ -519,6 +519,146 @@ def _resurrection(records, window_start):
     return lines
 
 
+# --------------------------- the triage flight (issue #449) ---------------------------
+# The queue-hygiene flight the owner delegated by standing rule closes and merges issues on its own
+# word. That authority is only safe if its exercise is VISIBLE, once, on the surface the owner
+# already reads — so every act it takes, and every act its own edges refused, lands here.
+#
+# Derived from the journal like every other section, and from nothing else. The flight writes a
+# markdown run log in its state home too, but that log is prose for the NEXT flight; the journal is
+# what the report and the dashboard read, so they can never drift from each other.
+
+# The acts, in the order they render, with the verb the line leads with. `triage_keep` is
+# deliberately absent: silence means kept — an issue a flight looked at and left alone is not news,
+# and listing every one would bury the four that are.
+_TRIAGE_ACTS = ("triage_merge", "triage_close", "triage_fix", "triage_escalate", "triage_refused")
+
+# A refusal's reason is written for the FLIGHT, at the moment of its mistake, and it can legitimately
+# name a whole label vocabulary. The owner's morning surface gets the gist; the journal and the run
+# log keep the whole thing. Bounded here rather than at the source for exactly that reason — the
+# audience differs, so the length should.
+_TRIAGE_REASON_MAX = 180
+# And how many refusals may render before the rest become a counted line. A flight whose every act
+# is refused is a flight with a broken brief, not a report to scroll — but the overflow is STATED,
+# never silently dropped.
+_TRIAGE_REFUSALS_MAX = 5
+
+
+def _triage_records(records, window_start):
+    return [r for r in records
+            if isinstance(r.get("act"), str) and r["act"].startswith("triage_")
+            and _in_window(r, window_start)]
+
+
+def _triage_line(rec, repo):
+    """One act as one line, leading with what happened and ending with the issue's link."""
+    act = rec.get("act")
+    num = _num(rec.get("num"))
+    link = _issue_link(repo, num) if num is not None else None
+    where = " — %s" % link if link else ""
+    if act == "triage_merge":
+        other = _num(rec.get("absorber"))
+        return "- Merged #%s into #%s (its content was absorbed there)%s" % (
+            num, other if other is not None else "?", where)
+    if act == "triage_close":
+        # A nit is told from an overtaken close by its VERDICT, not by the presence of a ledger
+        # number: a nit whose ledger id went unrecorded is still a nit, and rendering it as
+        # "overtaken by (commit unrecorded)" would state a reason the flight never gave.
+        verdict = rec.get("verdict")
+        ledger = _num(rec.get("ledger"))
+        if isinstance(verdict, str) and verdict.startswith("nit(") or ledger is not None:
+            return "- Closed #%s as a nit under rubric line %s — filed in the ledger%s%s" % (
+                num, rec.get("rubric") or "?",
+                " #%s" % ledger if ledger is not None else "", where)
+        commit = rec.get("commit")
+        return "- Closed #%s as overtaken by `%s`%s" % (
+            num, commit if isinstance(commit, str) and commit.strip() else "(commit unrecorded)",
+            where)
+    if act == "triage_fix":
+        fixed = rec.get("fixed")
+        what = ", ".join(x for x in fixed if isinstance(x, str)) if isinstance(fixed, list) else ""
+        return "- Fixed #%s (%s)%s" % (num, what or "metadata", where)
+    if act == "triage_escalate":
+        head = "- **#%s escalated**%s" % (num, " (approved — flagged only)" if rec.get("held")
+                                         else "")
+        finding = rec.get("finding") or rec.get("detail")
+        rec_line = rec.get("recommend")
+        parts = [head]
+        if isinstance(finding, str) and finding.strip():
+            parts.append(" — %s" % finding.strip().replace("\n", " "))
+        if link:
+            parts.append(" — %s" % link)
+        out = "".join(parts)
+        if isinstance(rec_line, str) and rec_line.strip():
+            out += "\n  - **Recommend:** %s" % rec_line.strip().replace("\n", " ")
+        return out
+    # triage_refused — the delegation's own edges doing their job, which the owner sees once.
+    detail = rec.get("detail")
+    reason = (detail if isinstance(detail, str) and detail.strip()
+              else "(reason unrecorded)").replace("\n", " ")
+    if len(reason) > _TRIAGE_REASON_MAX:
+        reason = reason[:_TRIAGE_REASON_MAX].rstrip() + "… (full reason in the run log)"
+    return "- REFUSED on #%s: %s%s" % (num, reason, where)
+
+
+def _triage_summary(records, window_start):
+    """The clause the summary tally gains on a night a flight flew — short, because the summary
+    line is the push body. Built from the run's own `triage_finish` counts when it wrote them, and
+    counted from the acts themselves when it did not: a flight that died before finishing still
+    closed whatever it closed, and the owner must still be told."""
+    mine = _triage_records(records, window_start)
+    counts = None
+    for rec in mine:
+        if rec.get("act") == "triage_finish" and isinstance(rec.get("counts"), dict):
+            counts = rec["counts"]
+    if counts is None:
+        counts = {"merged": sum(1 for r in mine if r.get("act") == "triage_merge"),
+                  "closed": sum(1 for r in mine if r.get("act") == "triage_close"),
+                  "escalated": sum(1 for r in mine if r.get("act") == "triage_escalate")}
+    return " Triage: %d merged · %d closed · %d escalated." % (
+        _count(counts.get("merged")), _count(counts.get("closed")),
+        _count(counts.get("escalated")))
+
+
+def _triage(records, repo, window_start):
+    """The flight's overnight lines, or [] on a day with no run.
+
+    Empty is the whole point on a quiet day: the caller renders NO SECTION at all rather than a
+    "None." under a heading. A delegation that did not fly is not a standing item on the owner's
+    morning, and a heading that appears every day stops being read on the day it matters."""
+    mine = _triage_records(records, window_start)
+    if not mine:
+        return []
+    # The run's own tally leads, then any launch that FAILED (a night with no triage at all is the
+    # thing to notice first), then the acts in the order they happened.
+    head, acts, refused = [], [], 0
+    for rec in mine:
+        act = rec.get("act")
+        if act == "triage_finish":
+            detail = rec.get("detail")
+            counts = rec.get("counts")
+            if isinstance(detail, str) and detail.strip():
+                head.append("- The flight: %s." % detail.strip())
+            elif isinstance(counts, dict):
+                head.append("- The flight: judged %s." % _count(counts.get("judged")))
+        elif act == "triage_launch":
+            outcome = rec.get("outcome")
+            if isinstance(outcome, str) and outcome != "launched":
+                head.append("- Flight %s FAILED to launch — %s. Nothing was triaged today."
+                            % (rec.get("id") or "t?", outcome))
+        elif act in _TRIAGE_ACTS:
+            if act == "triage_refused":
+                refused += 1
+                if refused > _TRIAGE_REFUSALS_MAX:
+                    continue
+            acts.append(_triage_line(rec, repo))
+    if refused > _TRIAGE_REFUSALS_MAX:
+        # NO SILENT CAP: say how many were left out, and where the rest of them are.
+        acts.append("- …and %d more refusal(s) this run — the full list is in the run log."
+                    % (refused - _TRIAGE_REFUSALS_MAX))
+    return head + acts
+
+
 # --------------------------- standing holds + ages (issue #405) ---------------------------
 
 def _age(seconds):
@@ -839,6 +979,7 @@ def morning(journal_records, gh_view, ledger, config):
     watchdog = _watchdog(records, overnight_start)
     resurrections = _resurrection(records, overnight_start)     # runner auto-restarts (#208)
     questions, q_total = _questions(records, overnight_start)   # owner-question rate (#163)
+    triage_lines = _triage(records, repo, overnight_start)      # the triage flight (#449)
     holds = standing_holds(view.get("issues_state"), records)   # standing holds + ages (#405)
     hold_alerts = _hold_alerts(holds, view, now)
     queue_hold = _queue_hold(view, now)                         # the PAUSED queue (#320)
@@ -857,12 +998,22 @@ def morning(journal_records, gh_view, ledger, config):
     # per-lane hold: a paused loop is precisely the night that reads "nothing happened" BECAUSE
     # nothing could happen, and the queue may well be empty on top of it (the outage started before
     # anything was approved), so no other term here would catch it.
+    # A triage flight breaks quiet unconditionally: it is an autonomous session that CLOSED and
+    # MERGED the owner's issues on a standing delegation, and "nothing happened overnight" over a
+    # night when six issues were shut is the one sentence that would retire the delegation.
     quiet = not any((merged, parked, bounces, regens, wanders, watchdog, resurrections,
-                     questions, queue, frozen, hold_alerts, queue_hold))
+                     questions, queue, frozen, hold_alerts, queue_hold, triage_lines))
     summary = ("Nothing happened overnight — queue empty." if quiet else
                f"{len(merged)} merged · {len(parked)} parked/needs-owner · "
                f"{len(bounces)} bounce(s) · {len(regens)} regen(s) · "
                f"{q_total} question(s) · queue: {len(queue)}.")
+    if triage_lines:
+        # The summary line IS the push body, and it is the ONE place an autonomous delegation could
+        # become invisible: a night on which a flight closed three issues would otherwise reach the
+        # owner's phone as "0 merged · 0 parked · queue: 1". Appended as its own clause rather than
+        # folded into the tally above, because those terms are the LOOP's — a merge there is a PR
+        # landing on the mainline, and a flight never merges anything of the kind.
+        summary += _triage_summary(records, overnight_start)
     if queue_hold:
         # The summary line IS the push body, so this rides the report's one notification. It leads
         # the other alert-tier suffixes because it is the only one that says the whole loop stopped:
@@ -899,6 +1050,10 @@ def morning(journal_records, gh_view, ledger, config):
         _section("Wanders", wanders),
         _section("Unattended debugger", watchdog, "None — the watchdog launched nothing."),
         _section("Runner resurrection", resurrections, "None — the runner did not go down."),
+        # SILENT on a day with no flight (the list is empty, so no heading at all) — unlike every
+        # section above, which renders its own "None." line. A delegation that did not fly is not a
+        # standing item on the owner's morning.
+        *([_section("Triage", triage_lines)] if triage_lines else []),
         _section("Gate health", _gate_health(records, week_start, ledger, cfg)),
         _section("Standing holds", _standing_holds(holds, now), "None — nothing is held."),
         "## Freeze state\n" + "\n".join(_freeze(view, now)) + "\n",

@@ -477,8 +477,20 @@ def main_stateful():
 
     # ---------- writes (mutations.jsonl still records every one) ----------
     elif sub == ["issue", "edit"] and opt("--body-file"):
-        # The janitor's metadata repair (issue #225) — a body edit, not a label edit.
-        record("set_body", num=ARGS[2], body=_read_body_file(opt("--body-file")))
+        # The janitor's metadata repair (issue #225) — a body edit, not a label edit. In STATEFUL
+        # mode it really lands on the issue, the way a label edit already does: a triage flight's
+        # duplicate merge appends to the ABSORBER's body and the absorbed issue's close then points
+        # at it (#449), so a fake that only recorded the attempt would let a merge that lost the
+        # content pass green.
+        body = _read_body_file(opt("--body-file"))
+        record("set_body", num=ARGS[2], body=body)
+        with _Lock(STATE_PATH):
+            st = load_state()
+            issue = st.get("issues", {}).get(ARGS[2])
+            if issue is None:
+                die("no such issue %s" % ARGS[2])
+            issue["body"] = body
+            save_state(st)
         sys.exit(0)
 
     elif sub == ["issue", "edit"]:
@@ -505,8 +517,18 @@ def main_stateful():
             issue = st.get("issues", {}).get(ARGS[2])
             if issue is None:
                 die("no such issue %s" % ARGS[2])
-            issue.setdefault("comments", []).append({"body": opt("--body")})
+            cid = st.get("next_comment_id", 1)
+            st["next_comment_id"] = cid + 1
+            url = ("https://github.com/fake/repo/issues/%s#issuecomment-%d"
+                   % (ARGS[2], cid))
+            issue.setdefault("comments", []).append(
+                {"body": opt("--body"), "id": cid, "url": url})
             save_state(st)
+        # Real gh PRINTS the new comment's permalink, and `gh.comment_link` reads it back — the
+        # triage flight's nit close links the ledger ENTRY it just filed (#449). A fake that
+        # printed nothing would make that link untestable, so it prints one, with a per-state
+        # counter so two entries are two different urls.
+        print(url)
         sys.exit(0)
 
     elif sub == ["pr", "comment"]:
@@ -840,6 +862,9 @@ def main_fixture():
 
     elif sub == ["issue", "comment"]:
         record("comment", num=ARGS[2], body=opt("--body"))
+        # gh prints the new comment's permalink (see the stateful arm); fixture mode holds no
+        # comment ids, so it prints a stable one derived from the issue number.
+        print("https://github.com/fake/repo/issues/%s#issuecomment-1" % ARGS[2])
         sys.exit(0)
 
     elif sub == ["pr", "comment"]:

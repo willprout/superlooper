@@ -329,3 +329,66 @@ def test_reclaim_block_never_reads_a_broken_git_as_safe(repos, tmp_path, monkeyp
     (lane / "only_copy.txt").write_text("unsaved work")           # dirty + real
     monkeypatch.setattr(gitops, "_git", lambda *a, **k: (127, "git: command not found"))
     assert gitops.worktree_reclaim_block(lane) == "unreadable"    # NOT None
+
+
+# --------------------------- commit_on_branch (issue #449) ---------------------------
+# The triage flight closes an issue as "overtaken" by CITING a commit, and the standing rule
+# requires that evidence to be on `origin/<dev>`. This is where the citation is checked, so a
+# close whose sha is wishful thinking is refused before the issue is shut.
+
+def test_a_commit_that_really_landed_on_the_dev_branch_is_confirmed(repos):
+    landed = _sh(repos["dev"], "rev-parse", "HEAD")
+    assert gitops.commit_on_branch(repos["wt"], landed, "origin/main") is True
+    assert gitops.commit_on_branch(repos["wt"], landed[:8], "origin/main") is True
+
+
+def test_a_commit_that_is_only_local_is_not_evidence_on_the_dev_branch(repos):
+    # The working tree is NOT evidence — the flight runs in the repo's real checkout, which may sit
+    # on anything. A commit that exists here but was never pushed must read as "not on origin/main".
+    _commit_file(repos["wt"], "local.txt", "not pushed\n", "local only")
+    local = _sh(repos["wt"], "rev-parse", "HEAD")
+    assert gitops.commit_on_branch(repos["wt"], local, "origin/main") is False
+
+
+def test_an_unknown_sha_or_ref_answers_none_rather_than_false(repos):
+    # None is "git could not tell us", which a caller treats as "do not act" — but it is kept
+    # distinct so the refusal can say which of the two happened.
+    assert gitops.commit_on_branch(repos["wt"], "0" * 40, "origin/main") is None
+    landed = _sh(repos["dev"], "rev-parse", "HEAD")
+    assert gitops.commit_on_branch(repos["wt"], landed, "origin/no-such-branch") is None
+
+
+def test_a_rev_expression_never_reaches_git(repos):
+    # The sha arrives from an UNATTENDED session's own words. argv form already keeps a shell out
+    # of it; this keeps an expression from being resolved into an answer nobody cited.
+    for bad in ("HEAD~1..HEAD", "-C", "", "   ", None, 7, "HEAD ; rm -rf /"):
+        assert gitops.commit_on_branch(repos["wt"], bad, "origin/main") is None
+
+
+def test_a_ref_NAME_is_not_commit_level_evidence(repos):
+    """`origin/main` is trivially an ancestor of `origin/main`. A flight closing an issue as
+    overtaken must cite a COMMIT — the standing rule's words are "commit-level evidence" — so a
+    ref name has to be refused before git is asked a question whose answer is always yes
+    (fresh-agent review round 3, P1)."""
+    for name in ("origin/main", "main", "HEAD", "@", "v1.0", "origin/HEAD"):
+        assert gitops.commit_on_branch(repos["wt"], name, "origin/main") is None, name
+
+
+def test_a_branch_whose_NAME_looks_like_a_sha_is_still_not_a_sha(repos):
+    """The hex-shape gate alone would let a branch called `deadbeef` through, and git would
+    resolve it. The resolved oid must actually START with what was cited."""
+    _sh(repos["dev"], "branch", "deadbeef")
+    _sh(repos["dev"], "push", "origin", "deadbeef")
+    _sh(repos["wt"], "fetch", "origin")
+    assert gitops.commit_on_branch(repos["wt"], "deadbeef", "origin/main") is None
+    # ...while a real abbreviated oid of the same length still works
+    landed = _sh(repos["dev"], "rev-parse", "HEAD")
+    assert gitops.commit_on_branch(repos["wt"], landed[:8], "origin/main") is True
+    assert gitops.commit_on_branch(repos["wt"], landed.upper(), "origin/main") is True
+
+
+def test_an_abbreviation_too_short_to_be_meant_is_refused(repos):
+    landed = _sh(repos["dev"], "rev-parse", "HEAD")
+    for short in (landed[:1], landed[:4], landed[:6]):
+        assert gitops.commit_on_branch(repos["wt"], short, "origin/main") is None, short
+    assert gitops.commit_on_branch(repos["wt"], landed[:7], "origin/main") is True

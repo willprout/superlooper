@@ -656,14 +656,15 @@ def test_triage_ships_disabled_and_homed_in_the_real_checkout(tmp_path):
     # appears. The HOME default is the ruled one (the standing rule's Home section): the repo's
     # real checkout, so the flight sees what an orchestrator sees, gitignored overlay included.
     _write_cfg(tmp_path, {"repo": "me/tool"})
-    assert config.load(tmp_path)["triage"] == {"enabled": False, "home": "checkout"}
+    assert config.load(tmp_path)["triage"] == {"enabled": False, "home": "checkout",
+                                               "rubric": None}
 
 
 def test_triage_example_template_is_off_by_default():
     # `adopt` copies config.example.json VERBATIM, so its value is exactly what a fresh adopt
     # writes — and a fresh adopt must never arrive with the flight already armed.
     raw = json.loads(_EXAMPLE.read_text())
-    assert raw["triage"] == {"enabled": False, "home": "checkout"}
+    assert raw["triage"] == {"enabled": False, "home": "checkout", "rubric": None}
 
 
 def test_triage_home_parses_both_modes(tmp_path):
@@ -695,3 +696,46 @@ def test_triage_unknown_subkey_rejected(tmp_path):
     with pytest.raises(ValueError) as e:
         config.load(tmp_path)
     assert "triage.hoem" in str(e.value)
+
+
+# --------------------------- the nit rubric override (issue #449) ---------------------------
+
+def test_the_nit_rubric_is_unset_by_default_and_the_rule_s_own_lines_apply(tmp_path):
+    # The rubric a flight closes nits against is the owner's, and it lives in the standing rule.
+    # `triage.rubric` is the per-repo OVERRIDE, and its default is null — a repo that says nothing
+    # inherits the rule as written rather than a copy of it that can drift.
+    import triage_run
+    _write_cfg(tmp_path, {"repo": "me/tool"})
+    cfg = config.load(tmp_path)
+    assert cfg["triage"]["rubric"] is None
+    assert triage_run.rubric(cfg) == triage_run.DEFAULT_RUBRIC
+    assert json.loads(_EXAMPLE.read_text())["triage"]["rubric"] is None
+
+
+def test_a_per_repo_nit_rubric_loads_and_replaces_the_default_set(tmp_path):
+    import triage_run
+    _write_cfg(tmp_path, {"repo": "o/r", "triage": {
+        "rubric": [{"id": "X1", "title": "Ours only", "test": "what we decided is cheap."}]}})
+    cfg = config.load(tmp_path)
+    assert [l.id for l in triage_run.rubric(cfg)] == ["X1"]
+
+
+def test_a_malformed_nit_rubric_fails_the_adopt_loudly(tmp_path):
+    # The loader is the ONE place an owner can still fix a typo. A rubric line is printed verbatim
+    # into a close comment and into the ledger, so a half-formed line would put an unreadable
+    # reason on an issue nobody can reopen the argument about.
+    bad_values = [
+        "N1",                                                   # not a list
+        [],                                                     # an empty rubric closes nothing
+        ["N1 unreachable input"],                               # a list of strings, not lines
+        [{"id": "N1", "title": "t"}],                           # no `test`
+        [{"id": "", "title": "t", "test": "x"}],                # a line nothing can cite
+        [{"id": "N1", "title": "t", "test": "x", "why": "?"}],  # an unknown field
+        [{"id": "N1", "title": "a", "test": "x"},
+         {"id": "N1", "title": "b", "test": "y"}],              # two lines, one id
+    ]
+    for bad in bad_values:
+        _write_cfg(tmp_path, {"repo": "o/r", "triage": {"rubric": bad}})
+        with pytest.raises(ValueError) as e:
+            config.load(tmp_path)
+        assert "triage.rubric" in str(e.value), bad

@@ -145,6 +145,18 @@ _UNREADABLE = {
         "payload is a dict literal carrying NIGHTLY_FIX_LABELS, which layer 1 resolves and checks "
         "at its own site. (Separate from the runner's file-issue path above — the runner does not "
         "import nightly; the CLI is nightly's only caller.)"),
+    (_ENGINE + "/bin/superlooper", "list(args.add_label or [])"): (1,
+        "The triage flight's format-fix act (#449) applies label names the FLIGHT composed — from "
+        "prose, at runtime — so no literal exists here and none ever can. This is the one label "
+        "write in the engine whose names are not in the source at all, and it is therefore checked "
+        "the only way such a write can be: `cmd_triage_act` screens every name against "
+        "`labels_lib.LABELS` before this call and REFUSES an unregistered one with the name it "
+        "invented and the set it may choose from — the #337 guarantee kept at the moment of the "
+        "mistake rather than by a static scan. `agent-ready` and `pre-authorized:*` are refused one "
+        "screen earlier, by triage_run.forbidden_label."),
+    (_ENGINE + "/bin/superlooper", "list(args.remove_label or [])"): (1,
+        "The remove half of the same act, screened by the same code one line over — against "
+        "LABELS + RETIRED_LABELS, the wider set this fence itself allows on the remove side."),
     (_ENGINE + "/bin/superlooper", "[p['label']]"): (1,
         "The janitor's add-label repair applies a label its PLAN computed, so no literal exists "
         "here at all. The plan can only ever compute `type:<kind>` for kind in issues.VALID_TYPES "
