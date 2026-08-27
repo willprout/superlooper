@@ -47,6 +47,12 @@ class _RecordingSessionWindow:
                 "id": "i%s" % num, "outcome": self._outcome, "message": self._message,
                 "error": None if self._ok else self._message}
 
+    def open_debugger(self, repo, sid):
+        self.calls.append((repo, sid))
+        return {"ok": self._ok, "verb": "session-window", "repo": repo, "num": None,
+                "id": sid, "outcome": self._outcome, "message": self._message,
+                "error": None if self._ok else self._message}
+
 
 def _post(path, payload, session_window, origin=None, host=None):
     body = json.dumps(payload).encode("utf-8")
@@ -190,3 +196,53 @@ def test_an_unwatched_repo_is_refused_over_the_route(monkeypatch, tmp_path):
     assert resp.status == 200
     assert json.loads(resp.body)["error"] == "unknown repo"
     assert not (tmp_path / "calls.jsonl").exists(), "an unwatched repo must run nothing"
+
+
+# =============================== the fixer's own seat (issue #458) ===============================
+#
+# A Deploy Fixer tap that lands is now NAMED at the button, with the same open-session affordance a
+# flight card already has — so this endpoint takes a second kind of target: a fixer's ``d<N>`` seat.
+# The lane shape differs; the discipline does not. The route parses the id with the verb's own pure
+# fence and refuses anything else at 400, so no client-supplied string becomes a subprocess argument.
+
+def test_a_fixer_seat_dispatches_to_the_debugger_door():
+    s = _RecordingSessionWindow()
+    resp = _post("/api/session-window", {"repo": REPO, "fixer": "d4"}, s)
+    assert resp.status == 200
+    out = json.loads(resp.body)
+    assert out["ok"] is True and out["id"] == "d4" and out["num"] is None
+    assert s.calls[-1] == (REPO, "d4")
+
+
+def test_the_fixer_id_is_canonicalised_before_it_is_dispatched():
+    # What reaches the verb is a string the ROUTE composed from a parsed integer — never the
+    # caller's own bytes, however innocent they look.
+    s = _RecordingSessionWindow()
+    _post("/api/session-window", {"repo": REPO, "fixer": " d04 "}, s)
+    assert s.calls[-1] == (REPO, "d4")
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "i340", "d", "d4x", "d4; rm -rf /", "340", 4, True,
+                                 None, ["d4"], {"id": "d4"}])
+def test_a_fixer_target_that_is_not_a_seat_is_400(bad):
+    s = _RecordingSessionWindow()
+    resp = _post("/api/session-window", {"repo": REPO, "fixer": bad}, s)
+    assert resp.status == 400
+    assert s.calls == [], "nothing may dispatch for a target that is not a fixer seat"
+
+
+def test_a_fixer_target_is_never_confused_with_a_flight():
+    # Both keys present is a client bug, not a choice to make quietly: the explicit fixer seat wins
+    # and the number is ignored, so one tap can never raise two different windows on two builds.
+    s = _RecordingSessionWindow()
+    _post("/api/session-window", {"repo": REPO, "fixer": "d4", "num": 340}, s)
+    assert s.calls[-1] == (REPO, "d4")
+
+
+def test_a_fixer_whose_window_is_gone_is_an_honest_200_body():
+    s = _RecordingSessionWindow(ok=False, outcome="no_window",
+                                message="no session window is recorded for d4")
+    resp = _post("/api/session-window", {"repo": REPO, "fixer": "d4"}, s)
+    assert resp.status == 200
+    out = json.loads(resp.body)
+    assert out["ok"] is False and out["outcome"] == "no_window"

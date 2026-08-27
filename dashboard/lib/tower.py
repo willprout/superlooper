@@ -26,6 +26,8 @@ Their sentences name the mechanism instead, and the runner keeps the tower it al
 import math
 import re
 
+import fixer as fixer_mod
+
 
 # =============================== the comms/routine tier (issue #36) ===============================
 # The tower log is the CURATED comms channel (design record §4) — machine bookkeeping does not belong
@@ -432,13 +434,25 @@ def comms_row(rec, operator="the owner"):
         # name — a launch made from a terminal by someone else must not be signed with the owner's.
         sid = rec.get("id") or "a fixer"
         by = rec.get("operator") or operator
-        if rec.get("outcome") == "launched":
+        # The three-way read is ``lib/fixer.launch_outcome``'s, not a second copy of it: the trouble
+        # banner glosses this same record beside the button that made it (issue #458), and two
+        # classifications of one launch is how two surfaces come to disagree in the same frame.
+        outcome = fixer_mod.launch_outcome(rec)
+        if outcome == fixer_mod.LAUNCHED:
             row = {"radio": "Engineering to the field.", "kind": "launch",
                    "text": "Fixer %s deployed by %s — a debug session is on the field." % (sid, by)}
-        else:                              # no flourish for a dishonest state (§7): it did NOT start
+        elif outcome == fixer_mod.FAILED:   # no flourish for a dishonest state (§7): it did NOT start
             why = _first_line(rec.get("error")) or "no session was confirmed"
             row = {"radio": "", "kind": "alert",
                    "text": "Fixer %s did not launch — %s." % (sid, why)}
+        else:
+            # Neither of the engine's two words: no outcome beside the record, or one a newer engine
+            # invented. "Did not launch" was a claim this record does not support — and reporting a
+            # launch nobody has resolved as a failure is the same over-claim in the other direction.
+            said = _first_line(rec.get("outcome"))
+            row = {"radio": "", "kind": "unknown",
+                   "text": "Fixer %s — no launch outcome is recorded%s; nothing has confirmed a "
+                           "session." % (sid, (" (the engine said “%s”)" % said) if said else "")}
     # The three engine-level acts that name no flight (issue #253). Each fell through to the generic
     # fallback below and reached the owner as a sentence about a flight that does not exist — the
     # same defect #144 fixed for the owner-tap fixer, three more times over.

@@ -43,6 +43,7 @@ entry point and the tests agree on binary resolution.
 """
 import json
 import os
+import re
 import subprocess
 
 # Per-call hard timeout (seconds). The engine grants its own single control call 10s (lib/focus's
@@ -110,6 +111,33 @@ def lane_id(num):
     return "i%d" % n if n > 0 else None
 
 
+# A debugger seat's id, as the engine spells it (``skill/lib/focus.LANE_ID_RE`` is ``^[id][0-9]+$``:
+# ``i<N>`` is an issue worker, ``d<N>`` a debugger). Bounded at nine digits — a real counter never
+# reaches that, and an unbounded one lets a caller push an arbitrarily long argument at a
+# subprocess for nothing.
+_DEBUGGER_ID_RE = re.compile(r"^d([0-9]{1,9})$")
+
+
+def debugger_lane_id(sid):
+    """The engine's ``--id`` argument for a FIXER's own seat (``"d4"`` -> ``"d4"``), or ``None`` when
+    ``sid`` is not one. PURE.
+
+    The sibling of :func:`lane_id`, and the same fence for the other lane shape. A launched fixer is
+    named in the journal as ``d<N>`` — the dashboard does not mint that id and cannot derive it from
+    a number, so unlike a flight this one is READ from the published view and handed on. That makes
+    the fence the only thing standing between a journal string and argv, so the returned id is
+    REBUILT from the parsed integer rather than passed through: whatever the caller sent, what
+    reaches the subprocess is a string this function composed.
+
+    ``bool`` is screened out with every other non-string, because there is no debugger seat a
+    non-string could plausibly name.
+    """
+    if not isinstance(sid, str):
+        return None
+    m = _DEBUGGER_ID_RE.match(sid.strip())
+    return "d%d" % int(m.group(1)) if m else None
+
+
 def parse_result(stdout):
     """The single JSON object ``superlooper focus-session --json`` prints, or ``None`` when stdout
     carries no parseable object (a missing/crashed/too-old CLI). Pure and unit-tested, so the
@@ -159,9 +187,11 @@ class SessionWindow:
     mapping each WATCHED repo slug to its checkout path (the ``--repo`` the engine resolves this
     repo's state home from).
 
-    One method — :meth:`open` — because the verb is one tap: it opens a window the owner already
-    owns and changes nothing, so there is no confirm gate to build (contrast Tidy/Restart/Janitor,
-    every one of which closes, restarts or deletes something)."""
+    Two entry points and no confirm gate between them, because the verb is one tap: it opens a
+    window the owner already owns and changes nothing (contrast Tidy/Restart/Janitor, every one
+    of which closes, restarts or deletes something). :meth:`open` names a FLIGHT, :meth:`open_debugger`
+    a fixer's own seat (issue #458); both go through the same :meth:`_focus`, so the engine's four
+    outcomes are rendered once."""
 
     def __init__(self, superlooper_cli, repo_paths, timeout=None):
         self._binary = superlooper_cli
@@ -186,15 +216,36 @@ class SessionWindow:
         the caller can render "that lane has no window" as the ordinary fact it is rather than as a
         failure, and can tell it apart from a host that would not answer at all.
         """
+        return self._focus(repo, num, lane_id(num), "SL-%s" % num,
+                           "%r is not a flight number — there is no lane to open" % (num,))
+
+    def open_debugger(self, repo, sid):
+        """Bring a FIXER's own session window to the front (issue #458) — the same read-only verb,
+        aimed at a debugger seat instead of a flight.
+
+        A Deploy Fixer tap that lands puts a real interactive session on the field, and the board now
+        names it at the button it was tapped from. Naming it and offering no way in would be half an
+        answer, so a launched fixer carries the same affordance a flight card already has. The engine
+        has always resolved a ``d<N>`` lane (``lib/focus.LANE_ID_RE``), and focusing is read-only —
+        unlike ``tidy``, which CLOSES and deliberately leaves a debugger seat to the owner.
+
+        The id is not derived from a number here (there is none): it is READ from the published
+        journal and handed on, so :func:`debugger_lane_id` is the whole fence — see its docstring.
+        """
+        return self._focus(repo, None, debugger_lane_id(sid), "fixer %s" % sid,
+                           "%r is not a fixer id — there is no lane to open" % (sid,))
+
+    def _focus(self, repo, num, iid, label, bad_target):
+        """One focus attempt, whichever lane shape asked for it. ``label`` is how the lane is NAMED
+        back to the owner ("SL-340", "fixer d4") — the only difference between the two callers, so
+        the four outcomes cannot drift into two vocabularies for the same four answers."""
         path = self._paths.get(repo)
         if path is None:
             # An unwatched repo is refused BEFORE any subprocess — the command runner only ever acts
             # for the checkouts the operator configured (the bright line every button here draws).
             return self._answer(repo, num, None, None, "unknown repo")
-        iid = lane_id(num)
         if iid is None:
-            return self._answer(repo, num, None, None,
-                                "%r is not a flight number — there is no lane to open" % (num,))
+            return self._answer(repo, num, None, None, bad_target)
 
         binary = _binary(self._binary)
         rc, out, err = _run(binary, ["focus-session", "--repo", path, "--id", iid, "--json"],
@@ -212,16 +263,16 @@ class SessionWindow:
             # about the machine rather than about the lane, and over-claiming here would send the
             # owner hunting for a window that came up somewhere he is not looking.
             return self._answer(repo, num, iid, FOCUSED,
-                                "SL-%s — the session host moved its focus to that window" % num,
+                                "%s — the session host moved its focus to that window" % label,
                                 ok=True)
         if not isinstance(outcome, str) or not outcome.strip():
             # A body without an outcome is a body we cannot read. Say that; never infer one.
             return self._answer(repo, num, iid, None,
-                                "superlooper focus-session gave no readable answer for SL-%s" % num)
+                                "superlooper focus-session gave no readable answer for %s" % label)
         # Every other outcome — including one a LATER engine invents — is reported in the engine's
         # own words. ``ok`` is derived from the outcome rather than trusted from the body, so a
         # future ``{"ok": true, "outcome": "no_window"}`` could never toast a success over a window
         # that was never opened.
         return self._answer(repo, num, iid, outcome,
-                            detail or ("superlooper focus-session answered %r for SL-%s"
-                                       % (outcome, num)))
+                            detail or ("superlooper focus-session answered %r for %s"
+                                       % (outcome, label)))

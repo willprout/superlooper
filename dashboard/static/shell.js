@@ -372,7 +372,36 @@
           ' session window, pointed at this trouble (no AI runs in this dashboard)">\u{1F527} Deploy Fixer</button>'
       : "";
     return '<div class="' + cls + '"><span class="dot"></span>' +
-             '<span class="trouble-text">' + esc(t.text) + '</span>' + fix + '</div>';
+             '<span class="trouble-text">' + esc(t.text) + '</span>' +
+             fixerOutcomeHTML(t.fixer, t.offender) + fix + '</div>';
+  }
+
+  // What the LAST tap of that button did (issue #458). On 2026-08-26 the owner tapped Deploy Fixer
+  // during a Claude-auth outage: the request was consumed, the engine attempted the launch, the
+  // attempt failed and the failure was journaled — and the board showed nothing, because the only
+  // surface that had ever named a result was the note box, which a close, a reload or a superseding
+  // open threw away. So the outcome rides the SNAPSHOT and renders here, beside the button it
+  // belongs to, for as long as the banner that carries the button is up.
+  //
+  // Every semantic is the server's (`lib/fixer.last_launch`, folded into `trouble.fixer` for the
+  // repo the banner is naming): the sentence, the headline, the wall clock, and whether an
+  // open-session affordance is honest at all. This binds them and derives nothing (design B.1).
+  function fixerOutcomeHTML(f, slug) {
+    if (!f || !f.present) return "";     // no tap has ever been made here — the one honest silence
+    // The affordance a launched fixer gets is the SAME verb the flight card already has, pointed at
+    // the fixer's own d<N> seat. It rides `f.session`, which the server sets for exactly one state:
+    // a launch the engine confirmed AND named. A button onto a window that was never opened would
+    // be the same lie in a different costume.
+    var open = f.session
+      ? '<button class="tf-open" data-act="session-window" data-repo="' + esc(slug) + '"' +
+          ' data-fixer="' + esc(f.id) + '" title="Bring this fixer’s own session window to the' +
+          ' front — the real terminal, so you can watch it and type into it.">' +
+          '\u{1F5A5}\uFE0F Open session window</button>'
+      : "";
+    return '<span class="trouble-fixer ' + esc(f.outcome) + '" title="' + esc(f.headline) + '">' +
+             (f.hhmm ? '<span class="tf-when">' + esc(f.hhmm) + '</span>' : "") +
+             '<span class="tf-text">' + esc(f.text) + '</span>' + open +
+           '</span>';
   }
 
   function needsYouHTML(s) {
@@ -567,7 +596,10 @@
     if (act === "fixer-open") { if (window.CCFixer) window.CCFixer.open(repo); return; }
     if (act === "replay-open") { if (window.CCReplay) window.CCReplay.open(repo, state.snapshot && state.snapshot.fun); return; }
     if (act === "digest-open") { if (window.CCDigest) window.CCDigest.open(repo); return; }
-    if (act === "session-window") { doSessionWindow(repo, num); return; }
+    if (act === "session-window") {
+      doSessionWindow(repo, num, el.getAttribute("data-fixer"));
+      return;
+    }
     if (act === "discuss") { doDiscuss(repo, num); return; }
     if (act === "answer") { doAnswer(el, repo, num); return; }
     if (act === "approve") {
@@ -611,11 +643,18 @@
   // apart from its failures on purpose — a session that exited, or a window `superlooper tidy`
   // closed, is the COMMON answer, not a fault — so it gets a neutral tone of its own here. Painting
   // it red would teach the owner to distrust a truthful answer; toasting a success would be a lie.
-  function doSessionWindow(repo, num) {
-    postJSON("/api/session-window", { repo: repo, num: Number(num) })
+  //
+  // Since issue #458 the same handler also opens a launched FIXER's window: a flight names a
+  // number, a fixer names its own `d<N>` seat. One handler, because the answer is identical — the
+  // engine's same four outcomes, rendered with the same discipline. Two copies would be two places
+  // for `no_window` to start reading as a failure.
+  function doSessionWindow(repo, num, fixerId) {
+    var payload = fixerId ? { repo: repo, fixer: String(fixerId) } : { repo: repo, num: Number(num) };
+    var who = fixerId ? ("fixer " + fixerId) : ("SL-" + num);
+    postJSON("/api/session-window", payload)
       .then(function (res) {
         var b = (res && res.body) || {};
-        var said = b.message || b.error || "couldn't open the session window for SL-" + num;
+        var said = b.message || b.error || "couldn't open the session window for " + who;
         if (res.status === 200 && b.ok) { toast(said, "ok"); return; }
         toast(said, b.outcome === "no_window" ? "note" : "err");
       })

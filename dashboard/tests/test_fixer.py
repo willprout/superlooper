@@ -483,3 +483,120 @@ def _strip_comments_and_docstrings(src):
     src = re.sub(r'"""(?:.|\n)*?"""', "", src)
     src = re.sub(r"'''(?:.|\n)*?'''", "", src)
     return "\n".join(line.split("#", 1)[0] for line in src.splitlines())
+
+
+# =============================== what became of the tap (issue #458) ===============================
+#
+# On 2026-08-26 the owner tapped Deploy Fixer during a Claude-auth outage. The request was consumed,
+# the engine attempted the launch, the attempt failed, and the failure was journaled — and the
+# dashboard showed NOTHING. The only surface that had ever named a result was the transient note
+# box, and a close, a reload or a superseding open threw it away; "seems to have done nothing" about
+# a button that did something is the dishonest surface this project keeps killing.
+#
+# ``last_launch`` is the fix's server half: a PURE read of the ``debug_launch`` acts the assembler
+# ALREADY holds (no new read anywhere), turning them into the one sentence the banner binds beside
+# the button that was tapped. Three outcomes, and none of them is silence.
+
+def _launch_rec(**over):
+    rec = {"ts": 1783364000, "act": "debug_launch", "outcome": "launched", "id": "d4",
+           "operator": "william"}
+    rec.update(over)
+    return rec
+
+
+def test_no_tap_in_the_journal_is_an_absent_block_never_a_fabricated_one():
+    out = fixer_mod.last_launch([{"act": "merge", "num": 23, "outcome": "ok"}, "junk", None])
+    assert out["present"] is False
+    assert out["outcome"] is None
+    assert out["text"] == "" and out["headline"] == ""
+
+
+def test_every_key_is_present_on_every_outcome():
+    # The session-window verb holds this same rule for the same reason: a client that has to test
+    # for a missing key writes a different branch per answer, which is how one ends up unhandled.
+    keys = set(fixer_mod.last_launch([]))
+    for rec in (_launch_rec(), _launch_rec(outcome="launch_failed", error="nope"),
+                _launch_rec(outcome=None)):
+        assert set(fixer_mod.last_launch([rec])) == keys
+
+
+def test_a_failed_launch_names_the_reason_the_engine_journaled():
+    reason = "the launch timed out — no session was confirmed"
+    out = fixer_mod.last_launch([_launch_rec(outcome="launch_failed", error=reason)])
+    assert out["present"] is True
+    assert out["outcome"] == fixer_mod.FAILED
+    assert out["reason"] == reason
+    assert "d4" in out["text"] and reason in out["text"]
+    assert out["headline"]
+    # No open-session affordance: nothing was launched, so there is no window to offer.
+    assert out["session"] is False
+
+
+def test_a_failed_launch_with_no_journaled_reason_still_says_it_failed():
+    out = fixer_mod.last_launch([_launch_rec(outcome="launch_failed")])
+    assert out["outcome"] == fixer_mod.FAILED
+    assert out["reason"]                      # an honest stand-in, never an empty sentence
+    assert "did not launch" in out["text"]
+
+
+def test_a_successful_launch_renders_the_fixers_identity():
+    out = fixer_mod.last_launch([_launch_rec()])
+    assert out["outcome"] == fixer_mod.LAUNCHED
+    assert out["id"] == "d4"
+    assert "d4" in out["text"]
+    assert out["operator"] == "william"
+    # The open-session affordance is honest here and ONLY here: a confirmed launch with a named lane.
+    assert out["session"] is True
+
+
+def test_a_launch_the_engine_did_not_name_is_pending_never_silence():
+    out = fixer_mod.last_launch([_launch_rec(outcome=None)])
+    assert out["present"] is True
+    assert out["outcome"] == fixer_mod.PENDING
+    assert out["text"]                        # a sentence, not an empty string
+    assert out["session"] is False
+
+
+def test_an_outcome_this_build_cannot_read_is_pending_and_quotes_the_engines_word():
+    # A later engine may journal an outcome this dashboard has never met. Rendering it as "failed"
+    # would be a claim we cannot support, and rendering nothing is the defect this issue exists to
+    # kill — so it is pending, in the engine's own word.
+    out = fixer_mod.last_launch([_launch_rec(outcome="queued")])
+    assert out["outcome"] == fixer_mod.PENDING
+    assert "queued" in out["text"]
+    assert out["recorded"] == "queued"
+    assert out["session"] is False
+
+
+def test_an_unnamed_fixer_still_renders_a_sentence():
+    out = fixer_mod.last_launch([_launch_rec(id=None, outcome="launch_failed", error="no pane")])
+    assert out["id"] is None
+    assert out["text"] and "no pane" in out["text"]
+    assert out["session"] is False
+
+
+def test_the_newest_tap_wins_the_banner():
+    # The journal is append-only, so the last debug_launch line in the file is the newest one.
+    recs = [_launch_rec(id="d3", outcome="launch_failed", error="auth expired"),
+            {"act": "merge", "num": 23}, _launch_rec(id="d4")]
+    out = fixer_mod.last_launch(recs)
+    assert out["id"] == "d4" and out["outcome"] == fixer_mod.LAUNCHED
+
+
+def test_the_reason_is_one_line_so_a_stack_trace_cannot_take_over_the_banner():
+    out = fixer_mod.last_launch([_launch_rec(outcome="launch_failed",
+                                             error="auth expired\nTraceback (most recent call last):\n  ...")])
+    assert "\n" not in out["text"]
+    assert "auth expired" in out["reason"]
+
+
+def test_the_operator_comes_from_the_record_never_the_dashboards_configured_name():
+    # A launch made from a terminal by someone else must not be signed with the owner's name — the
+    # same discipline lib/tower already holds for this act.
+    out = fixer_mod.last_launch([_launch_rec(operator="pat")])
+    assert out["operator"] == "pat" and "pat" in out["text"]
+
+
+def test_a_non_launch_act_named_debug_never_hijacks_the_banner():
+    out = fixer_mod.last_launch([{"act": "resume", "outcome": "resume_failed", "id": "i23"}])
+    assert out["present"] is False

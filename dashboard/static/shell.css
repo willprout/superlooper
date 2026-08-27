@@ -201,6 +201,49 @@ html, body {
 }
 .trouble.alert .trouble-fix:hover { filter: brightness(1.18); }
 
+/* What the last Deploy Fixer tap DID (issue #458) — the outcome strip, sitting between the trouble
+   it answered and the button that fires the next one. It reads as a flight-strip note pinned beside
+   the scramble switch: mono, small, with its wall clock first, because a stated outcome the owner
+   cannot place in time is half a fact. The three states are deliberately three different colours —
+   a launch that landed, one that did not, and one nobody has named yet are three different things to
+   do next, and three states that look identical are one state wearing three names. */
+.trouble-fixer {
+  flex: 0 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 7px;
+  padding: 3px 9px; border-radius: 5px;
+  font: 600 11px var(--mono); letter-spacing: 0.2px;
+  border: 1px solid transparent;
+}
+.trouble-fixer .tf-when { flex: 0 0 auto; opacity: 0.75; font-variant-numeric: tabular-nums; }
+.trouble-fixer .tf-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trouble-fixer.launched {
+  background: rgba(93, 199, 138, 0.16); border-color: rgba(41, 122, 78, 0.45); color: #1F6B45;
+}
+.trouble-fixer.failed {
+  background: rgba(192, 57, 43, 0.14); border-color: rgba(192, 57, 43, 0.5); color: #8E2A20;
+}
+/* Pending is amber-on-quiet, not red: nothing has gone wrong yet — the answer simply has not
+   arrived. Painting it as a failure would teach the owner to distrust a state that often resolves. */
+.trouble-fixer.pending {
+  background: rgba(240, 173, 78, 0.18); border-color: rgba(150, 100, 25, 0.42); color: #7A5312;
+}
+/* On the ALERT banner the bar is dark, so every one of the three has to re-light against it. */
+.trouble.alert .trouble-fixer.launched { background: rgba(93, 199, 138, 0.16); color: #9BE0B6; border-color: rgba(93, 199, 138, 0.4); }
+.trouble.alert .trouble-fixer.failed { background: rgba(255, 90, 72, 0.18); color: #FFC0B6; border-color: rgba(255, 122, 104, 0.45); }
+.trouble.alert .trouble-fixer.pending { background: rgba(240, 173, 78, 0.16); color: #F0CD92; border-color: rgba(240, 173, 78, 0.4); }
+
+/* The way IN to a fixer that launched — the same verb the flight card's own button fires, so it
+   wears the same quiet-ghost treatment rather than competing with the scramble switch beside it. */
+.tf-open {
+  flex: 0 0 auto; cursor: pointer; white-space: nowrap;
+  padding: 2px 8px; border-radius: 4px;
+  font: 700 10px var(--mono); letter-spacing: 0.6px; text-transform: uppercase;
+  background: transparent; border: 1px solid currentColor; color: inherit;
+}
+.tf-open:hover { background: rgba(255, 255, 255, 0.22); }
+.tf-open:active { transform: translateY(0.5px); }
+.trouble.alert .tf-open:hover { background: rgba(255, 255, 255, 0.14); }
+
 /* ---- main row ---- */
 .main {
   display: grid;
